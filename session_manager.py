@@ -15,6 +15,7 @@ import sys
 import webbrowser
 import zipfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -90,6 +91,140 @@ def _delete_name(session_id: str) -> None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+_summary_cache: dict = {}  # key: (path_str, mtime, size) -> summary dict
+
+def _format_size(file_bytes: int) -> str:
+    if file_bytes < 1024:
+        return f"{file_bytes} B"
+    elif file_bytes < 1024 * 1024:
+        return f"{file_bytes / 1024:.1f} KB"
+    return f"{file_bytes / (1024*1024):.1f} MB"
+
+def load_session_summary(path: Path) -> dict:
+    """Fast cached summary — reads head + tail of file, skips middle."""
+    try:
+        st = path.stat()
+    except Exception:
+        return {"id": path.stem, "error": "stat failed", "custom_title": None,
+                "display_title": path.stem, "date": "", "last_activity": "", "preview": "",
+                "last_activity_ts": 0, "sort_ts": 0, "size": "0 B", "file_bytes": 0, "message_count": 0}
+
+    cache_key = (str(path), st.st_mtime, st.st_size)
+    cached = _summary_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    custom_title = None
+    first_user_content = ""
+    first_ts = None
+    last_ts = None
+    message_count = 0
+
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+
+        # Count messages by fast substring search instead of JSON-parsing every line
+        message_count = raw.count(b'"type":"user"') + raw.count(b'"type":"assistant"') \
+                      + raw.count(b'"type": "user"') + raw.count(b'"type": "assistant"')
+
+        # Only JSON-parse the first ~32KB (for title/preview/first_ts)
+        # and last ~8KB (for last_ts and any late custom-title)
+        head = raw[:32768].decode("utf-8", errors="replace")
+        tail_start = max(0, len(raw) - 8192)
+        tail = raw[tail_start:].decode("utf-8", errors="replace") if tail_start > 0 else ""
+
+        for line in head.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            t = obj.get("type", "")
+            if t == "custom-title":
+                custom_title = obj.get("customTitle", "")
+            elif t in ("user", "assistant"):
+                ts_str = obj.get("timestamp", "")
+                if ts_str and first_ts is None:
+                    try:
+                        first_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    except Exception:
+                        pass
+                if t == "user" and not first_user_content:
+                    msg = obj.get("message", {})
+                    raw_c = msg.get("content", "")
+                    if isinstance(raw_c, str):
+                        first_user_content = raw_c.strip()
+                    elif isinstance(raw_c, list):
+                        parts = [b.get("text", "") for b in raw_c
+                                 if isinstance(b, dict) and b.get("type") == "text"]
+                        first_user_content = " ".join(parts).strip()
+                # Once we have title, preview, and first_ts we can stop the head scan
+                if first_ts and first_user_content:
+                    break
+
+        # Scan tail for last timestamp and any late custom-title
+        if tail:
+            for line in reversed(tail.splitlines()):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                t = obj.get("type", "")
+                if t == "custom-title":
+                    custom_title = obj.get("customTitle", "")
+                if t in ("user", "assistant") and last_ts is None:
+                    ts_str = obj.get("timestamp", "")
+                    if ts_str:
+                        try:
+                            last_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        except Exception:
+                            pass
+                if last_ts and custom_title is not None:
+                    break
+
+    except Exception as e:
+        return {"id": path.stem, "error": str(e), "custom_title": None,
+                "display_title": path.stem, "date": "", "last_activity": "", "preview": "",
+                "last_activity_ts": 0, "sort_ts": 0, "size": "0 B", "file_bytes": 0, "message_count": 0}
+
+    if first_ts:
+        date_str = first_ts.strftime("%b %d, %Y  %I:%M %p")
+    else:
+        date_str = datetime.fromtimestamp(st.st_mtime).strftime("%b %d, %Y  %I:%M %p")
+        first_ts = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+
+    if last_ts is None:
+        last_ts = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+    last_activity_str = last_ts.strftime("%b %d, %Y  %I:%M %p")
+
+    preview = first_user_content[:120] + ("…" if len(first_user_content) > 120 else "")
+
+    user_set_name = _load_names().get(path.stem)
+    effective_title = user_set_name or custom_title
+
+    result = {
+        "id": path.stem,
+        "custom_title": effective_title,
+        "display_title": effective_title if effective_title else (first_user_content[:60] + ("…" if len(first_user_content) > 60 else "")) or path.stem,
+        "date": date_str,
+        "last_activity": last_activity_str,
+        "last_activity_ts": last_ts.timestamp() if last_ts else 0,
+        "sort_ts": first_ts.timestamp() if first_ts else 0,
+        "file_bytes": st.st_size,
+        "size": _format_size(st.st_size),
+        "preview": preview,
+        "message_count": message_count,
+    }
+    _summary_cache[cache_key] = result
+    return result
+
 
 def load_session(path: Path) -> dict:
     """Parse a .jsonl session file and return a summary dict."""
@@ -198,11 +333,14 @@ def load_session(path: Path) -> dict:
     }
 
 
-def all_sessions() -> list:
-    sessions = []
-    for f in _sessions_dir().glob("*.jsonl"):
-        s = load_session(f)
-        sessions.append(s)
+def all_sessions(summary_only: bool = False) -> list:
+    files = list(_sessions_dir().glob("*.jsonl"))
+    loader = load_session_summary if summary_only else load_session
+    if summary_only and len(files) > 10:
+        with ThreadPoolExecutor(max_workers=min(16, len(files))) as pool:
+            sessions = list(pool.map(loader, files))
+    else:
+        sessions = [loader(f) for f in files]
     sessions.sort(key=lambda x: x["sort_ts"], reverse=True)
     return sessions
 
@@ -532,26 +670,53 @@ def api_set_project():
     return jsonify({"ok": True, "project": encoded, "display": _decode_project(encoded)})
 
 
-@app.route("/api/git-status")
-def api_git_status():
+_git_cache = {"ahead": 0, "behind": 0, "uncommitted": False, "has_git": False, "ready": False}
+_git_fetch_lock = threading.Lock()
+
+def _bg_git_fetch():
+    """Run git fetch + status in background, update cache when done."""
     proj = _CLAUDEGUI_DIR
     if not (proj / ".git").is_dir():
-        return jsonify({"has_git": False})
-    subprocess.run(["git", "-C", str(proj), "fetch", "--quiet"],
-                   capture_output=True, timeout=12)
-    r = subprocess.run(
-        ["git", "-C", str(proj), "rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
-        capture_output=True, text=True, timeout=5)
+        _git_cache.update({"has_git": False, "ready": True})
+        return
+    try:
+        subprocess.run(["git", "-C", str(proj), "fetch", "--quiet"],
+                       capture_output=True, timeout=15)
+    except Exception:
+        pass
     ahead = behind = 0
-    if r.returncode == 0:
-        parts = r.stdout.strip().split()
-        if len(parts) == 2:
-            ahead, behind = int(parts[0]), int(parts[1])
-    dirty = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"],
-                           capture_output=True, text=True, timeout=5)
-    uncommitted = bool(dirty.stdout.strip())
-    return jsonify({"has_git": True, "ahead": ahead, "behind": behind,
-                    "uncommitted": uncommitted})
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(proj), "rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            parts = r.stdout.strip().split()
+            if len(parts) == 2:
+                ahead, behind = int(parts[0]), int(parts[1])
+    except Exception:
+        pass
+    uncommitted = False
+    try:
+        dirty = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"],
+                               capture_output=True, text=True, timeout=5)
+        uncommitted = bool(dirty.stdout.strip())
+    except Exception:
+        pass
+    _git_cache.update({"has_git": True, "ahead": ahead, "behind": behind,
+                       "uncommitted": uncommitted, "ready": True})
+
+# Kick off first fetch immediately at startup
+threading.Thread(target=_bg_git_fetch, daemon=True).start()
+
+@app.route("/api/git-status")
+def api_git_status():
+    # Return cached result instantly; trigger a refresh in background
+    if not _git_fetch_lock.locked():
+        def _refresh():
+            with _git_fetch_lock:
+                _bg_git_fetch()
+        threading.Thread(target=_refresh, daemon=True).start()
+    return jsonify(_git_cache)
 
 
 @app.route("/api/git-sync", methods=["POST"])
@@ -612,11 +777,7 @@ def api_git_sync():
 
 @app.route("/api/sessions")
 def api_sessions():
-    sessions = all_sessions()
-    # Strip messages from list view to keep it light
-    for s in sessions:
-        s.pop("messages", None)
-    return jsonify(sessions)
+    return jsonify(all_sessions(summary_only=True))
 
 
 @app.route("/api/session/<session_id>")
@@ -665,7 +826,7 @@ def api_autoname(session_id):
     messages = [m for m in session["messages"] if m["content"]]
 
     if not messages:
-        all_s = all_sessions()
+        all_s = all_sessions(summary_only=True)
         empty_count = sum(
             1 for s in all_s
             if (s.get("custom_title") or "").startswith("Empty Session")
@@ -1257,19 +1418,20 @@ HTML = r"""
     cursor: pointer; border-radius: 5px;
   }
   .hdr-sys-dropdown button:hover { background: #2a2a2a; color: #fff; }
-  #btn-git-publish, #btn-git-update {
+  #btn-git-publish, #btn-git-update, #btn-git-sync {
     display: none; background: #1e1e1e; border: 1px solid #333; border-radius: 6px;
     color: #aaa; font-size: 11px; padding: 4px 10px; cursor: pointer;
     white-space: nowrap; align-items: center; gap: 5px;
   }
-  #btn-git-publish:hover, #btn-git-update:hover { border-color: #555; color: #fff; }
-  #btn-git-publish:disabled, #btn-git-update:disabled { opacity: 0.5; cursor: default; }
-  #git-badge-push, #git-badge-pull {
+  #btn-git-publish:hover, #btn-git-update:hover, #btn-git-sync:hover { border-color: #555; color: #fff; }
+  #btn-git-publish:disabled, #btn-git-update:disabled, #btn-git-sync:disabled { opacity: 0.5; cursor: default; }
+  #git-badge-push, #git-badge-pull, #git-badge-sync {
     color: #fff; font-size: 10px; padding: 1px 4px;
     border-radius: 8px; font-weight: 700; line-height: 1.4;
   }
   #git-badge-push { background: #4a6abf; }
   #git-badge-pull { background: #3a8a5a; }
+  #git-badge-sync { background: #8a6abf; }
 
   .layout {
     display: flex;
@@ -1600,6 +1762,29 @@ HTML = r"""
     vertical-align: middle;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ---- Skeleton loading ---- */
+  @keyframes shimmer {
+    0%   { background-position: -400px 0; }
+    100% { background-position: 400px 0; }
+  }
+  .skel-row {
+    display: grid;
+    grid-template-columns: var(--col-name, 1fr) var(--col-date, 140px) var(--col-size, 70px);
+    border-bottom: 1px solid #1a1a1a;
+    padding: 0;
+  }
+  .skel-row > div { padding: 9px 8px; }
+  .skel-bar {
+    height: 11px;
+    border-radius: 4px;
+    background: linear-gradient(90deg, #1a1a1a 25%, #252525 50%, #1a1a1a 75%);
+    background-size: 800px 100%;
+    animation: shimmer 1.5s infinite linear;
+  }
+  .skel-bar.name { width: 70%; }
+  .skel-bar.date { width: 85%; }
+  .skel-bar.size { width: 40%; margin-left: auto; }
 
   /* ---- Waiting-for-input sessions ---- */
   @keyframes waitpulse {
@@ -2097,6 +2282,7 @@ function mdParse(md) {
   </div>
   <button id="btn-git-update" onclick="openGitUpdate()">Update App <span id="git-badge-pull"></span></button>
   <button id="btn-git-publish" onclick="openGitPublish()">Publish App Update <span id="git-badge-push"></span></button>
+  <button id="btn-git-sync" onclick="openGitSyncBoth()">Sync App <span id="git-badge-sync"></span></button>
   <div class="hdr-spacer"></div>
   <select id="project-picker" title="Switch project"></select>
   <span class="sub" id="session-count"></span>
@@ -2115,8 +2301,24 @@ function mdParse(md) {
       </div>
     </div>
     <div class="session-list" id="session-list">
-      <div style="padding:20px;color:#444;font-size:12px;">Loading…</div>
     </div>
+    <script>
+    // Show skeleton immediately before any async work
+    (function(){
+      var el = document.getElementById('session-list');
+      var html = '';
+      for (var i = 0; i < 20; i++) {
+        var nw = 40 + Math.random() * 45;
+        var d = (i * 0.06).toFixed(2);
+        html += '<div class="skel-row">'
+          + '<div><div class="skel-bar name" style="width:' + nw + '%;animation-delay:' + d + 's"></div></div>'
+          + '<div><div class="skel-bar date" style="animation-delay:' + d + 's"></div></div>'
+          + '<div><div class="skel-bar size" style="animation-delay:' + d + 's"></div></div>'
+          + '</div>';
+      }
+      el.innerHTML = html;
+    })();
+    </script>
     <div class="wf-sort-bar" id="wf-sort-bar" style="display:none;">
       <button class="wf-sort-btn active" id="wf-btn-status" onclick="setWfSort('status')">Status</button>
       <button class="wf-sort-btn" id="wf-btn-recent" onclick="setWfSort('recent')">Recent</button>
@@ -2328,7 +2530,23 @@ document.getElementById('project-picker').addEventListener('change', e => {
   setProject(e.target.value);
 });
 
+function showSkeletonLoader() {
+  const el = document.getElementById('session-list');
+  let html = '';
+  for (let i = 0; i < 20; i++) {
+    const nw = 40 + Math.random() * 45;
+    const delay = (i * 0.06).toFixed(2);
+    html += '<div class="skel-row">'
+      + '<div><div class="skel-bar name" style="width:' + nw + '%;animation-delay:' + delay + 's"></div></div>'
+      + '<div><div class="skel-bar date" style="animation-delay:' + delay + 's"></div></div>'
+      + '<div><div class="skel-bar size" style="animation-delay:' + delay + 's"></div></div>'
+      + '</div>';
+  }
+  el.innerHTML = html;
+}
+
 async function loadSessions() {
+  showSkeletonLoader();
   const resp = await fetch('/api/sessions');
   allSessions = await resp.json();
   document.getElementById('session-count').textContent = allSessions.length + ' sessions';
@@ -2770,19 +2988,30 @@ async function pollGitStatus() {
     const s = await res.json();
     _gitStatus = s;
     const hasPush = s.ahead > 0 || s.uncommitted;
+    const hasPull = s.behind > 0;
     const btnUpdate  = document.getElementById('btn-git-update');
     const btnPublish = document.getElementById('btn-git-publish');
-    if (s.behind > 0) {
-      document.getElementById('git-badge-pull').textContent = '\u2193';
-      btnUpdate.style.display = 'inline-flex';
-    } else {
+    const btnSync    = document.getElementById('btn-git-sync');
+    if (hasPull && hasPush) {
+      // Both directions — show single Sync button
       btnUpdate.style.display = 'none';
-    }
-    if (hasPush) {
-      document.getElementById('git-badge-push').textContent = '\u2191';
-      btnPublish.style.display = 'inline-flex';
-    } else {
       btnPublish.style.display = 'none';
+      document.getElementById('git-badge-sync').textContent = '\u2193\u2191';
+      btnSync.style.display = 'inline-flex';
+    } else {
+      btnSync.style.display = 'none';
+      if (hasPull) {
+        document.getElementById('git-badge-pull').textContent = '\u2193';
+        btnUpdate.style.display = 'inline-flex';
+      } else {
+        btnUpdate.style.display = 'none';
+      }
+      if (hasPush) {
+        document.getElementById('git-badge-push').textContent = '\u2191';
+        btnPublish.style.display = 'inline-flex';
+      } else {
+        btnPublish.style.display = 'none';
+      }
     }
   } catch(e) {}
 }
@@ -2803,6 +3032,17 @@ function openGitPublish() {
   }
   showGitSyncModal('Publish App Update', body, [
     {label: 'Publish Now', primary: true, onclick: () => executeGitAction('both', 'btn-git-publish', 'Publish App Update')},
+    {label: 'Cancel', onclick: closeGitSyncModal}
+  ]);
+}
+
+function openGitSyncBoth() {
+  const s = _gitStatus;
+  let body = '<p><b style="color:#fff">' + s.behind + ' update(s)</b> to pull and '
+    + '<b style="color:#fff">' + (s.ahead + (s.uncommitted ? 1 : 0)) + ' change(s)</b> to push.</p>'
+    + '<p style="color:#888;font-size:12px">Remote updates will be pulled first, merge conflicts resolved automatically, then your changes pushed.</p>';
+  showGitSyncModal('Sync App', body, [
+    {label: 'Sync Now', primary: true, onclick: () => executeGitAction('both', 'btn-git-sync', 'Sync App')},
     {label: 'Cancel', onclick: closeGitSyncModal}
   ]);
 }
