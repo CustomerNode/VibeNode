@@ -22,6 +22,7 @@ from flask import Flask, jsonify, request, render_template_string, send_file
 
 _CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 _active_project: str = ""   # encoded dir name; empty = auto-detect
+_CLAUDEGUI_DIR = Path(__file__).resolve().parent  # always the ClaudeGUI repo
 
 def _sessions_dir() -> Path:
     """Return the active project's session directory, auto-detecting if needed."""
@@ -501,16 +502,19 @@ def index():
 
 @app.route("/api/projects")
 def api_projects():
+    docs = str(Path.home() / "Documents").replace("\\", "/").lower()
     results = []
     for d in sorted(_CLAUDE_PROJECTS.iterdir()):
         if not d.is_dir() or d.name.startswith("subagents"):
             continue
-        count = sum(1 for _ in d.glob("*.jsonl"))
-        if count == 0:
+        display = _decode_project(d.name)
+        # Only show projects that live inside the user's Documents folder
+        if not display.replace("\\", "/").lower().startswith(docs + "/"):
             continue
+        count = sum(1 for _ in d.glob("*.jsonl"))
         results.append({
             "encoded": d.name,
-            "display": _decode_project(d.name),
+            "display": display,
             "session_count": count,
             "active": d.name == _active_project,
         })
@@ -526,6 +530,84 @@ def api_set_project():
         return jsonify({"error": "Not found"}), 404
     _active_project = encoded
     return jsonify({"ok": True, "project": encoded, "display": _decode_project(encoded)})
+
+
+@app.route("/api/git-status")
+def api_git_status():
+    proj = _CLAUDEGUI_DIR
+    if not (proj / ".git").is_dir():
+        return jsonify({"has_git": False})
+    subprocess.run(["git", "-C", str(proj), "fetch", "--quiet"],
+                   capture_output=True, timeout=12)
+    r = subprocess.run(
+        ["git", "-C", str(proj), "rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+        capture_output=True, text=True, timeout=5)
+    ahead = behind = 0
+    if r.returncode == 0:
+        parts = r.stdout.strip().split()
+        if len(parts) == 2:
+            ahead, behind = int(parts[0]), int(parts[1])
+    dirty = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"],
+                           capture_output=True, text=True, timeout=5)
+    uncommitted = bool(dirty.stdout.strip())
+    return jsonify({"has_git": True, "ahead": ahead, "behind": behind,
+                    "uncommitted": uncommitted})
+
+
+@app.route("/api/git-sync", methods=["POST"])
+def api_git_sync():
+    proj = _CLAUDEGUI_DIR
+    if not (proj / ".git").is_dir():
+        return jsonify({"ok": False, "messages": ["ClaudeGUI has no git repo."]})
+    action = (request.get_json() or {}).get("action", "both")
+    messages = []
+    ok = True
+
+    if action in ("pull", "both"):
+        stash = subprocess.run(["git", "-C", str(proj), "stash", "--include-untracked"],
+                               capture_output=True, text=True, timeout=15)
+        stashed = "No local changes" not in stash.stdout
+        pull = subprocess.run(
+            ["git", "-C", str(proj), "pull", "--rebase", "-X", "theirs"],
+            capture_output=True, text=True, timeout=30)
+        if pull.returncode != 0:
+            subprocess.run(["git", "-C", str(proj), "rebase", "--abort"], capture_output=True)
+            pull2 = subprocess.run(["git", "-C", str(proj), "pull", "-X", "theirs"],
+                                   capture_output=True, text=True, timeout=30)
+            if pull2.returncode != 0:
+                ok = False
+                messages.append("Could not pull: " + pull2.stderr.strip())
+                return jsonify({"ok": ok, "messages": messages})
+            out = pull2.stdout.strip()
+        else:
+            out = pull.stdout.strip()
+        if stashed:
+            subprocess.run(["git", "-C", str(proj), "stash", "pop"], capture_output=True)
+        if "Already up to date" in out:
+            messages.append("Claude GUI is already up to date.")
+        else:
+            messages.append("Pulled latest Claude GUI updates from remote.")
+
+    if action in ("push", "both") and ok:
+        # Auto-commit any uncommitted changes before pushing
+        dirty = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"],
+                               capture_output=True, text=True, timeout=5)
+        if dirty.stdout.strip():
+            from datetime import datetime as _dt
+            subprocess.run(["git", "-C", str(proj), "add", "-A"], capture_output=True)
+            msg = "Update Claude GUI " + _dt.now().strftime("%Y-%m-%d %H:%M")
+            subprocess.run(["git", "-C", str(proj), "commit", "-m", msg],
+                           capture_output=True, text=True, timeout=10)
+            messages.append("Saved your local changes as a new version.")
+        push = subprocess.run(["git", "-C", str(proj), "push"],
+                               capture_output=True, text=True, timeout=30)
+        if push.returncode != 0:
+            ok = False
+            messages.append("Could not push: " + (push.stderr.strip() or push.stdout.strip()))
+        else:
+            messages.append("Your Claude GUI changes have been pushed to remote.")
+
+    return jsonify({"ok": ok, "messages": messages})
 
 
 @app.route("/api/sessions")
@@ -1137,6 +1219,41 @@ HTML = r"""
   #project-picker:focus { outline: none; border-color: #7c7cff; color: #fff; }
   header h1 { font-size: 15px; font-weight: 600; color: #fff; }
   header .sub { font-size: 12px; color: #666; margin-left: 4px; }
+  .hdr-spacer { flex: 1; }
+  .hdr-sys { position: relative; }
+  .hdr-sys-btn {
+    background: #1e1e1e; border: 1px solid #333; border-radius: 6px;
+    color: #aaa; font-size: 11px; padding: 4px 10px; cursor: pointer;
+    white-space: nowrap;
+  }
+  .hdr-sys-btn:hover { border-color: #555; color: #fff; }
+  .hdr-sys-dropdown {
+    display: none; position: absolute; top: calc(100% + 4px); left: 0;
+    background: #1e1e1e; border: 1px solid #333; border-radius: 8px;
+    padding: 4px; min-width: 180px; z-index: 200;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+  }
+  .hdr-sys-dropdown.open { display: block; }
+  .hdr-sys-dropdown button {
+    display: block; width: 100%; text-align: left; background: none;
+    border: none; color: #ccc; font-size: 12px; padding: 7px 12px;
+    cursor: pointer; border-radius: 5px;
+  }
+  .hdr-sys-dropdown button:hover { background: #2a2a2a; color: #fff; }
+  #btn-git-sync {
+    background: #1e1e1e; border: 1px solid #333; border-radius: 6px;
+    color: #aaa; font-size: 11px; padding: 4px 10px; cursor: pointer;
+    white-space: nowrap; display: flex; align-items: center; gap: 5px;
+  }
+  #btn-git-sync:hover { border-color: #555; color: #fff; }
+  #btn-git-sync:disabled { opacity: 0.5; cursor: default; }
+  #git-badge {
+    display: none; background: #7c7cff; color: #fff; font-size: 10px;
+    padding: 1px 5px; border-radius: 8px; font-weight: 600; line-height: 1.4;
+  }
+  #git-badge.pull { background: #3a8a5a; }
+  #git-badge.push { background: #4a6abf; }
+  #git-badge.both { background: #8a5aaa; }
 
   .layout {
     display: flex;
@@ -1832,6 +1949,14 @@ HTML = r"""
 
 <header>
   <h1>Claude Sessions</h1>
+  <div class="hdr-sys" id="hdr-sys">
+    <button class="hdr-sys-btn" onclick="toggleHdrSys()">System &#9662;</button>
+    <div class="hdr-sys-dropdown" id="hdr-sys-dropdown">
+      <button onclick="deleteEmptySessions();closeHdrSys()">Delete Empty Sessions</button>
+    </div>
+  </div>
+  <button id="btn-git-sync" onclick="openGitSync()">Sync Claude GUI <span id="git-badge"></span></button>
+  <div class="hdr-spacer"></div>
   <select id="project-picker" title="Switch project"></select>
   <span class="sub" id="session-count"></span>
 </header>
@@ -1892,13 +2017,6 @@ HTML = r"""
           <button class="btn" id="btn-extract" onclick="openExtract()" disabled>Extract Code</button>
           <button class="btn" id="btn-export"  onclick="triggerExport()" disabled>Export Project</button>
           <button class="btn" id="btn-compare" onclick="openCompare()">Compare</button>
-        </div>
-      </div>
-      <div class="btn-group-divider"></div>
-      <div class="btn-group" id="grp-cleanup">
-        <span class="btn-group-label" onclick="toggleGrpDropdown('grp-cleanup')">Cleanup &#9662;</span>
-        <div class="btn-group-inner">
-          <button class="btn danger" onclick="deleteEmptySessions()">Delete Empty Sessions</button>
         </div>
       </div>
     </div>
@@ -1979,6 +2097,15 @@ HTML = r"""
   </div>
 </div>
 
+<!-- Git Sync modal -->
+<div class="overlay" id="git-sync-overlay">
+  <div class="modal" style="width:460px;max-width:92vw;">
+    <h2 id="git-sync-title">Git Sync</h2>
+    <div id="git-sync-body" style="color:#ccc;font-size:13px;line-height:1.6;margin-bottom:18px;"></div>
+    <div class="modal-actions" id="git-sync-actions"></div>
+  </div>
+</div>
+
 <!-- Rename modal -->
 <div class="overlay" id="rename-overlay">
   <div class="modal">
@@ -2039,7 +2166,7 @@ async function loadProjects() {
   }).join('');
   // If saved project exists in list, activate it; otherwise use first
   const target = projects.find(p => p.encoded === saved) ? saved : (projects[0] && projects[0].encoded);
-  if (target) await setProject(target, false);
+  if (target) await setProject(target, true);
 }
 
 async function setProject(encoded, reload = true) {
@@ -2466,6 +2593,119 @@ function escHtml(str) {
 document.getElementById('rename-overlay').addEventListener('click', function(e) {
   if (e.target === this) closeRename();
 });
+document.getElementById('git-sync-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeGitSyncModal();
+});
+
+// --- Header System dropdown ---
+function toggleHdrSys() {
+  document.getElementById('hdr-sys-dropdown').classList.toggle('open');
+}
+function closeHdrSys() {
+  document.getElementById('hdr-sys-dropdown').classList.remove('open');
+}
+document.addEventListener('click', function(e) {
+  if (!document.getElementById('hdr-sys').contains(e.target)) closeHdrSys();
+});
+
+// --- Git Sync ---
+let _gitStatus = {};
+
+async function pollGitStatus() {
+  try {
+    const res = await fetch('/api/git-status');
+    const s = await res.json();
+    _gitStatus = s;
+    const badge = document.getElementById('git-badge');
+    const hasPush = s.ahead > 0 || s.uncommitted;
+    if (!s.has_git || (!hasPush && !s.behind)) {
+      badge.style.display = 'none'; return;
+    }
+    const parts = [];
+    if (s.behind > 0) parts.push('\u2193' + s.behind);
+    if (hasPush) parts.push('\u2191' + (s.ahead || ''));
+    badge.textContent = parts.join(' ').trim();
+    badge.className = hasPush && s.behind ? 'both' : s.behind ? 'pull' : 'push';
+    badge.style.display = 'inline-block';
+  } catch(e) {}
+}
+
+function openGitSync() {
+  const s = _gitStatus;
+  if (!s.has_git) {
+    showGitSyncModal('Git Sync', '<p style="color:#aaa">This project has no git remote configured.</p>', []);
+    return;
+  }
+  const hasPush = s.ahead > 0 || s.uncommitted;
+  let body = '', action = '';
+  if (hasPush && s.behind > 0) {
+    body = '<p>Changes are going in both directions:</p><ul style="margin:10px 0 10px 16px;color:#bbb;">'
+      + '<li><b style="color:#fff">' + s.behind + ' update(s)</b> ready to pull from remote</li>'
+      + '<li><b style="color:#fff">Your local changes</b> ready to push</li></ul>'
+      + '<p style="color:#888;font-size:12px">Claude will pull first, then push. Any conflicts are resolved automatically.</p>';
+    action = 'both';
+  } else if (s.behind > 0) {
+    body = '<p><b style="color:#fff">' + s.behind + ' new update(s)</b> are available to pull from remote.</p>'
+      + '<p style="color:#888;font-size:12px">Your app will be updated to the latest version.</p>';
+    action = 'pull';
+  } else if (hasPush) {
+    body = '<p>You have <b style="color:#fff">local changes</b> ready to push to remote.</p>'
+      + '<p style="color:#888;font-size:12px">Your changes will be saved and uploaded automatically.</p>';
+    action = 'push';
+  } else {
+    body = '<p style="color:#aaa">Everything is up to date \u2014 nothing to sync.</p>';
+    showGitSyncModal('Sync Claude GUI', body, [{label:'OK', onclick: closeGitSyncModal}]);
+    return;
+  }
+  showGitSyncModal('Sync Claude GUI', body, [
+    {label: 'Sync Now', primary: true, onclick: () => executeGitSync(action)},
+    {label: 'Cancel', onclick: closeGitSyncModal}
+  ]);
+}
+
+function showGitSyncModal(title, body, btns) {
+  document.getElementById('git-sync-title').textContent = title;
+  document.getElementById('git-sync-body').innerHTML = body;
+  const acts = document.getElementById('git-sync-actions');
+  acts.innerHTML = '';
+  btns.forEach(b => {
+    const el = document.createElement('button');
+    el.className = 'btn' + (b.primary ? ' primary' : '');
+    el.textContent = b.label;
+    el.onclick = b.onclick;
+    acts.appendChild(el);
+  });
+  document.getElementById('git-sync-overlay').classList.add('show');
+}
+
+function closeGitSyncModal() {
+  document.getElementById('git-sync-overlay').classList.remove('show');
+}
+
+async function executeGitSync(action) {
+  closeGitSyncModal();
+  const btn = document.getElementById('btn-git-sync');
+  btn.disabled = true;
+  btn.childNodes[0].nodeValue = 'Syncing\u2026 ';
+  try {
+    const res = await fetch('/api/git-sync', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({action})
+    });
+    const r = await res.json();
+    const body = '<ul style="margin:10px 0 0 16px;color:#bbb;">'
+      + r.messages.map(m => '<li>' + escHtml(m) + '</li>').join('')
+      + '</ul>';
+    showGitSyncModal(r.ok ? 'Sync Complete \u2713' : 'Sync Problem', body,
+      [{label:'OK', primary:true, onclick: closeGitSyncModal}]);
+    await pollGitStatus();
+  } catch(e) {
+    showGitSyncModal('Error', '<p style="color:#f88">Could not complete sync.</p>', [{label:'OK', onclick: closeGitSyncModal}]);
+  } finally {
+    btn.disabled = false;
+    btn.childNodes[0].nodeValue = 'Sync Claude GUI ';
+  }
+}
 
 async function deleteEmptySessions() {
   const empty = allSessions.filter(s => s.message_count === 0);
@@ -3459,7 +3699,9 @@ function renderCompare(d) {
   body.innerHTML = meta + statsBar + `<div class="sum-label" style="margin-bottom:8px;">Code Comparison</div>` + diffRows;
 }
 
-loadSessions();
+loadProjects();
+pollGitStatus();
+setInterval(pollGitStatus, 60000);
 </script>
 <div id="session-tooltip"></div>
 </body>
