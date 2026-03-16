@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Claude Code GUI</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32' fill='none'%3E%3Crect x='2' y='4' width='28' height='22' rx='4' stroke='%23999' stroke-width='2'/%3E%3Cpath d='M12 11L8 15.5L12 20' stroke='%237c7cff' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M20 11L24 15.5L20 20' stroke='%237c7cff' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='24' cy='26' r='5.5' fill='%237c7cff'/%3E%3Cpath d='M21.5 26.2L23 25C23.4 24.7 23.9 24.7 24.3 25L25 25.5C25.4 25.8 25.9 25.8 26.3 25.5' stroke='white' stroke-width='1.2' stroke-linecap='round'/%3E%3Cpath d='M21.8 27.5L23.2 26.8' stroke='white' stroke-width='0.8' stroke-linecap='round'/%3E%3Cpath d='M25.8 27L24.8 26.5' stroke='white' stroke-width='0.8' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/style.css">
 <script>
 // Apply saved theme immediately to avoid flash
@@ -20,7 +21,22 @@
 <body>
 
 <header>
-  <h1>Claude Code GUI</h1>
+  <div class="hdr-brand">
+    <svg class="app-logo" width="22" height="22" viewBox="0 0 32 32" fill="none">
+      <rect x="2" y="4" width="28" height="22" rx="4" stroke="currentColor" stroke-width="2"/>
+      <path d="M12 11L8 15.5L12 20" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M20 11L24 15.5L20 20" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="24" cy="26" r="5.5" fill="var(--accent)"/>
+      <path d="M21.5 26.2L23 25C23.4 24.7 23.9 24.7 24.3 25L25 25.5C25.4 25.8 25.9 25.8 26.3 25.5" stroke="#fff" stroke-width="1.2" stroke-linecap="round"/>
+      <path d="M21.8 27.5L23.2 26.8" stroke="#fff" stroke-width="0.8" stroke-linecap="round"/>
+      <path d="M25.8 27L24.8 26.5" stroke="#fff" stroke-width="0.8" stroke-linecap="round"/>
+    </svg>
+    <div>
+      <h1>Claude Code GUI</h1>
+      <a class="hdr-byline" href="https://customernode.com" target="_blank">by CustomerNode</a>
+    </div>
+  </div>
+  <div class="hdr-spacer"></div>
   <div class="hdr-sys" id="hdr-sys">
     <button class="hdr-sys-btn" onclick="toggleHdrSys()">System &#9662;</button>
     <div class="hdr-sys-dropdown" id="hdr-sys-dropdown">
@@ -31,30 +47,43 @@
   <button id="btn-git-publish" onclick="openGitPublish()">Publish App Update <span id="git-badge-push"></span></button>
   <button id="btn-git-sync" onclick="openGitSyncBoth()">Sync App <span id="git-badge-sync"></span></button>
   <button id="btn-theme" onclick="cycleTheme()" title="Toggle theme"></button>
-  <div class="hdr-spacer"></div>
-  <button id="btn-project" onclick="openProjectOverlay()" title="Switch project">
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-    <span id="project-label">Select project</span>
-  </button>
-  <span class="sub" id="session-count"></span>
 </header>
 
 <div class="layout">
   <!-- Sidebar -->
   <div class="sidebar">
-    <div class="sidebar-toolbar">
-      <div style="display:flex;align-items:center;gap:6px;">
+    <div class="sidebar-header">
+      <!-- Project selector -->
+      <button id="btn-project" onclick="openProjectOverlay()" title="Switch project">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        <span id="project-label">Select project</span>
+      </button>
+      <!-- Session count -->
+      <span class="sidebar-meta" id="session-count"></span>
+      <!-- View toggle -->
+      <div class="sidebar-row">
         <div class="view-toggle">
-          <button class="view-toggle-btn active" id="btn-view-workforce" onclick="setViewMode('workforce')" title="Workforce view">&#128101;</button>
-          <button class="view-toggle-btn" id="btn-view-list" onclick="setViewMode('list')" title="List view">&#9776;</button>
+          <button class="view-toggle-btn active" id="btn-view-workforce" onclick="setViewMode('workforce')" title="Workforce view">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+          </button>
+          <button class="view-toggle-btn" id="btn-view-list" onclick="setViewMode('list')" title="List view">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+          </button>
         </div>
-        <input type="text" id="search" placeholder="Search sessions…" oninput="filterSessions()" style="flex:1;width:auto;">
+        <!-- Sort (workforce) -->
+        <div class="wf-sort-bar" id="wf-sort-bar" style="display:none;">
+          <button class="wf-sort-btn active" id="wf-btn-status" onclick="setWfSort('status')">Status</button>
+          <button class="wf-sort-btn" id="wf-btn-recent" onclick="setWfSort('recent')">Recent</button>
+          <button class="wf-sort-btn" id="wf-btn-name" onclick="setWfSort('name')">Name</button>
+        </div>
       </div>
+      <!-- Search -->
+      <input type="text" id="search" placeholder="Search sessions\u2026" oninput="filterSessions()">
     </div>
+    <!-- Scrollable content -->
     <div class="session-list" id="session-list">
     </div>
     <script>
-    // Show skeleton immediately before any async work
     (function(){
       var el = document.getElementById('session-list');
       var html = '';
@@ -70,11 +99,6 @@
       el.innerHTML = html;
     })();
     </script>
-    <div class="wf-sort-bar" id="wf-sort-bar" style="display:none;">
-      <button class="wf-sort-btn active" id="wf-btn-status" onclick="setWfSort('status')">Status</button>
-      <button class="wf-sort-btn" id="wf-btn-recent" onclick="setWfSort('recent')">Recent</button>
-      <button class="wf-sort-btn" id="wf-btn-name" onclick="setWfSort('name')">Name</button>
-    </div>
     <div id="workforce-grid"></div>
   </div>
 
