@@ -822,9 +822,9 @@ def api_open(session_id):
     if not path.exists():
         return jsonify({"error": "Not found"}), 404
     try:
-        import subprocess
+        proj_dir = _decode_project(_active_project) if _active_project else str(Path.home())
         subprocess.Popen(
-            f'start cmd /k "cd /d C:\\Users\\donca\\Documents\\FileTaskNode && claude -r {session_id}"',
+            f'start cmd /k "cd /d {proj_dir} && claude --resume {session_id}"',
             shell=True
         )
         return jsonify({"ok": True})
@@ -1165,14 +1165,31 @@ def api_session_log(session_id):
 
 @app.route("/api/close/<session_id>", methods=["POST"])
 def api_close_session(session_id):
-    """Terminate the running Claude process for this session."""
+    """Terminate the running Claude process and its parent cmd window."""
     running = _get_running_session_ids()
     pid = running.get(session_id)
     if not pid:
         return jsonify({"ok": False, "error": "Session not running"})
     try:
-        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                       capture_output=True, timeout=5)
+        # Get parent PID before killing (wmic query while process still exists)
+        parent_pid = None
+        try:
+            r = subprocess.run(
+                ["wmic", "process", "where", f"ProcessId={pid}", "get", "ParentProcessId"],
+                capture_output=True, text=True, timeout=5)
+            lines = [l.strip() for l in r.stdout.strip().splitlines() if l.strip() and not l.strip().startswith("Parent")]
+            if lines:
+                parent_pid = int(lines[0])
+        except Exception:
+            pass
+        # Kill the Claude process
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5)
+        # Kill the parent cmd window if it exists
+        if parent_pid:
+            try:
+                subprocess.run(["taskkill", "/F", "/PID", str(parent_pid)], capture_output=True, timeout=5)
+            except Exception:
+                pass
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
@@ -1415,9 +1432,9 @@ HTML = r"""
   }
 
   .btn {
-    background: #1e1e1e;
-    border: 1px solid #333;
-    color: #ccc;
+    background: #252535;
+    border: 1px solid #44447a;
+    color: #c8c8ff;
     padding: 5px 12px;
     border-radius: 6px;
     font-size: 12px;
@@ -1425,7 +1442,7 @@ HTML = r"""
     white-space: nowrap;
     transition: background 0.15s, border-color 0.15s;
   }
-  .btn:hover { background: #2a2a2a; border-color: #444; color: #fff; }
+  .btn:hover { background: #32325a; border-color: #6666bb; color: #fff; }
   .btn.primary { background: #2e2e6e; border-color: #4040aa; color: #aaaaff; }
   .btn.primary:hover { background: #3a3a8a; border-color: #5555cc; color: #ccccff; }
   .btn.danger { color: #ff6b6b; border-color: #4a2020; }
@@ -1477,18 +1494,50 @@ HTML = r"""
   }
   .msg.user .msg-role { color: #7c7cff; }
   .msg.assistant .msg-role { color: #44aa88; }
+  /* markdown inside assistant messages */
+  .msg.assistant .msg-body h1,.msg.assistant .msg-body h2,.msg.assistant .msg-body h3 { color:#88ddbb; margin:.6em 0 .3em; font-weight:600; }
+  .msg.assistant .msg-body h1 { font-size:1.15em; }
+  .msg.assistant .msg-body h2 { font-size:1.05em; }
+  .msg.assistant .msg-body h3 { font-size:.95em; }
+  .msg.assistant .msg-body p { margin:.4em 0; }
+  .msg.assistant .msg-body ul,.msg.assistant .msg-body ol { padding-left:1.4em; margin:.3em 0; }
+  .msg.assistant .msg-body li { margin:.15em 0; }
+  .msg.assistant .msg-body code { background:#0d0d1a; border:1px solid #333; border-radius:3px; padding:1px 5px; font-size:12px; color:#b8ffc8; font-family:monospace; }
+  .msg.assistant .msg-body pre { background:#0d0d1a; border:1px solid #333; border-radius:6px; padding:10px 14px; overflow-x:auto; margin:.5em 0; }
+  .msg.assistant .msg-body pre code { background:none; border:none; padding:0; color:#b8ffc8; }
+  .msg.assistant .msg-body blockquote { border-left:3px solid #4a4a8a; margin:.4em 0; padding:.2em .8em; color:#999; }
+  .msg.assistant .msg-body table { border-collapse:collapse; margin:.8em 0; font-size:12px; width:100%; border-radius:6px; overflow:hidden; border:1px solid #1e3a2e; }
+  .msg.assistant .msg-body th { background:#0e2a1e; color:#88ddbb; font-weight:600; padding:8px 14px; text-align:left; border-bottom:2px solid #2a5a3a; border-right:1px solid #1e3a2e; font-size:11px; letter-spacing:.04em; text-transform:uppercase; }
+  .msg.assistant .msg-body td { padding:7px 14px; border-bottom:1px solid #222; border-right:1px solid #222; color:#ccc; vertical-align:top; }
+  .msg.assistant .msg-body tr:last-child td { border-bottom:none; }
+  .msg.assistant .msg-body th:last-child,.msg.assistant .msg-body td:last-child { border-right:none; }
+  .msg.assistant .msg-body tr:nth-child(even) td { background:#0f0f1e; }
+  .msg.assistant .msg-body tr:hover td { background:#1a1a2e; }
+  .msg.assistant .msg-body a { color:#7c7cff; }
+  .msg.assistant .msg-body hr { border:none; border-top:1px solid #2a2a2a; margin:.6em 0; }
+
   .msg-body {
     font-size: 13px;
     line-height: 1.65;
     color: #ccc;
-    background: #161616;
-    border: 1px solid #222;
-    border-radius: 8px;
+    border-radius: 10px;
     padding: 12px 16px;
-    white-space: pre-wrap;
     word-break: break-word;
   }
-  .msg.user .msg-body { background: #12122a; border-color: #2a2a55; }
+  /* User messages — right-aligned blue bubble */
+  .msg.user { display:flex; flex-direction:column; align-items:flex-end; }
+  .msg.user .msg-body {
+    background: #1a1a40;
+    border: 1px solid #3a3a80;
+    color: #d0d0ff;
+    max-width: 85%;
+  }
+  /* Assistant messages — left-aligned, subtle dark card */
+  .msg.assistant .msg-body {
+    background: #131318;
+    border: 1px solid #2a2a35;
+    color: #d0d0d8;
+  }
 
   /* ---- Rename modal ---- */
   .overlay {
@@ -1881,7 +1930,21 @@ HTML = r"""
   .live-entry-asst   .live-label { color:#44aa88; }
   .live-entry-tool   .live-label { color:#ff9500; }
   .live-entry-result .live-label { color:#444; }
-  .live-text { color:#ccc; white-space:pre-wrap; word-break:break-word; font-size:12px; }
+  .live-text { color:#ccc; word-break:break-word; font-size:12px; }
+  .live-entry-user .live-text { color:#aaaaee; white-space:pre-wrap; }
+  .live-entry-asst .live-text p { margin:.3em 0; }
+  .live-entry-asst .live-text h1,.live-entry-asst .live-text h2,.live-entry-asst .live-text h3 { color:#88ddbb; margin:.5em 0 .2em; }
+  .live-entry-asst .live-text code { background:#0d0d1a; border:1px solid #333; border-radius:3px; padding:1px 4px; color:#b8ffc8; font-size:11px; }
+  .live-entry-asst .live-text pre { background:#0d0d1a; border:1px solid #333; border-radius:5px; padding:8px 12px; overflow-x:auto; margin:.4em 0; }
+  .live-entry-asst .live-text pre code { background:none; border:none; padding:0; }
+  .live-entry-asst .live-text ul,.live-entry-asst .live-text ol { padding-left:1.3em; margin:.3em 0; }
+  .live-entry-asst .live-text table { border-collapse:collapse; margin:.6em 0; font-size:11px; width:100%; border:1px solid #1e3a2e; border-radius:6px; overflow:hidden; }
+  .live-entry-asst .live-text th { background:#0e2a1e; color:#88ddbb; font-weight:600; padding:6px 12px; text-align:left; border-bottom:2px solid #2a5a3a; border-right:1px solid #1e3a2e; font-size:10px; text-transform:uppercase; letter-spacing:.04em; }
+  .live-entry-asst .live-text td { padding:5px 12px; border-bottom:1px solid #222; border-right:1px solid #222; color:#ccc; vertical-align:top; }
+  .live-entry-asst .live-text tr:last-child td { border-bottom:none; }
+  .live-entry-asst .live-text th:last-child,.live-entry-asst .live-text td:last-child { border-right:none; }
+  .live-entry-asst .live-text tr:nth-child(even) td { background:#0f0f1e; }
+  .live-entry-asst .live-text tr:hover td { background:#1a1a2e; }
   .live-entry-user .live-text { color:#aaaaee; }
   .live-expand-btn {
     background:none; border:none; color:#444; cursor:pointer;
@@ -1943,6 +2006,84 @@ HTML = r"""
     display:flex; align-items:center; gap:10px; justify-content:space-between;
   }
 </style>
+<script>
+// Lightweight markdown renderer (no CDN dependency)
+function mdParse(md) {
+    if (!md) return '';
+    let html = md;
+    // Escape HTML in non-code regions (we'll handle code blocks first)
+    const codeBlocks = [];
+    // Fenced code blocks
+    html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+      const idx = codeBlocks.length;
+      codeBlocks.push('<pre><code>' + code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</code></pre>');
+      return '\x00CODE' + idx + '\x00';
+    });
+    // Inline code
+    html = html.replace(/`([^`]+)`/g, (_, code) => {
+      const idx = codeBlocks.length;
+      codeBlocks.push('<code>' + code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</code>');
+      return '\x00CODE' + idx + '\x00';
+    });
+    // Escape remaining HTML
+    html = html.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    // Headers
+    html = html.replace(/^######\s+(.+)$/gm, '<h6>$1</h6>');
+    html = html.replace(/^#####\s+(.+)$/gm, '<h5>$1</h5>');
+    html = html.replace(/^####\s+(.+)$/gm, '<h4>$1</h4>');
+    html = html.replace(/^###\s+(.+)$/gm, '<h3>$1</h3>');
+    html = html.replace(/^##\s+(.+)$/gm, '<h2>$1</h2>');
+    html = html.replace(/^#\s+(.+)$/gm, '<h1>$1</h1>');
+    // Bold / italic
+    html = html.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
+    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    html = html.replace(/___(.+?)___/g, '<strong><em>$1</em></strong>');
+    html = html.replace(/__(.+?)__/g, '<strong>$1</strong>');
+    html = html.replace(/_(.+?)_/g, '<em>$1</em>');
+    // Blockquotes
+    html = html.replace(/^&gt;\s?(.+)$/gm, '<blockquote>$1</blockquote>');
+    // Horizontal rule
+    html = html.replace(/^[-*_]{3,}$/gm, '<hr>');
+    // Lists — collect consecutive lines
+    html = html.replace(/((?:^[-*+]\s+.+\n?)+)/gm, (block) => {
+      const items = block.trim().split('\n').map(l => '<li>' + l.replace(/^[-*+]\s+/, '') + '</li>').join('');
+      return '<ul>' + items + '</ul>\n';
+    });
+    html = html.replace(/((?:^\d+\.\s+.+\n?)+)/gm, (block) => {
+      const items = block.trim().split('\n').map(l => '<li>' + l.replace(/^\d+\.\s+/, '') + '</li>').join('');
+      return '<ol>' + items + '</ol>\n';
+    });
+    // Tables — | col | col | rows with a separator row of |---|---|
+    html = html.replace(/((?:^\|.+\|\n?)+)/gm, (block) => {
+      const rows = block.trim().split('\n').filter(r => r.trim());
+      if (rows.length < 2) return block;
+      const sepIdx = rows.findIndex(r => /^\|[\s\-|:]+\|$/.test(r.trim()));
+      if (sepIdx < 0) return block;
+      const headerRows = rows.slice(0, sepIdx);
+      const bodyRows = rows.slice(sepIdx + 1);
+      const parseRow = (r, tag) => '<tr>' + r.replace(/^\||\|$/g,'').split('|').map(c => `<${tag}>${c.trim()}</${tag}>`).join('') + '</tr>';
+      const thead = '<thead>' + headerRows.map(r => parseRow(r,'th')).join('') + '</thead>';
+      const tbody = bodyRows.length ? '<tbody>' + bodyRows.map(r => parseRow(r,'td')).join('') + '</tbody>' : '';
+      return '<table>' + thead + tbody + '</table>\n';
+    });
+    // Links
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+    // Paragraphs — wrap double-newline separated blocks
+    html = html.split(/\n{2,}/).map(para => {
+      para = para.trim();
+      if (!para) return '';
+      if (/^<(h[1-6]|ul|ol|li|blockquote|hr|pre|table)/.test(para)) return para;
+      if (para.includes('\x00CODE')) return para;
+      return '<p>' + para.replace(/\n/g, '<br>') + '</p>';
+    }).join('\n');
+    // Restore code blocks
+    codeBlocks.forEach((block, idx) => {
+      html = html.replace('\x00CODE' + idx + '\x00', block);
+    });
+    return html;
+}
+</script>
 </head>
 <body>
 
@@ -1994,29 +2135,30 @@ HTML = r"""
       <div class="btn-group" id="grp-session">
         <span class="btn-group-label" onclick="toggleGrpDropdown('grp-session')">Session &#9662;</span>
         <div class="btn-group-inner">
-          <button class="btn" id="btn-open" disabled onclick="openInClaude(activeId)" style="background:#1a2e1a;border-color:#2a5a2a;color:#88cc88;">Open in Claude</button>
-          <button class="btn" id="btn-continue" disabled onclick="continueSession(activeId)" style="background:#1a1a2e;border-color:#4040aa;color:#aaaaff;">Continue</button>
-          <button class="btn danger" id="btn-close" disabled onclick="closeSession(activeId)">Close Session</button>
+          <button class="btn" id="btn-open-gui" disabled onclick="openInGUI(activeId)" title="View this session's live terminal and chat log inside the app">Open in Claude Code GUI</button>
+          <button class="btn" id="btn-open" disabled onclick="openInClaude(activeId)" title="Launch this session in a separate Claude terminal window">Claude Terminal</button>
+          <button class="btn" id="btn-continue" disabled onclick="continueSession(activeId)" title="Start a new Claude session that continues from where this one left off">Continue</button>
+          <button class="btn danger" id="btn-close" disabled onclick="closeSession(activeId)" title="Close the running Claude process for this session">Close Session</button>
         </div>
       </div>
       <div class="btn-group-divider"></div>
       <div class="btn-group" id="grp-manage">
         <span class="btn-group-label" onclick="toggleGrpDropdown('grp-manage')">Manage &#9662;</span>
         <div class="btn-group-inner">
-          <button class="btn" id="btn-autoname" disabled onclick="autoName(activeId)">Auto-name</button>
-          <button class="btn" id="btn-duplicate" disabled onclick="duplicateSession(activeId)">Duplicate</button>
-          <button class="btn danger" id="btn-delete" disabled onclick="deleteSession(activeId)">Delete</button>
+          <button class="btn" id="btn-autoname" disabled onclick="autoName(activeId)" title="Let Claude read the conversation and suggest a meaningful name">Auto-name</button>
+          <button class="btn" id="btn-duplicate" disabled onclick="duplicateSession(activeId)" title="Create a copy of this session to branch off in a new direction">Duplicate</button>
+          <button class="btn danger" id="btn-delete" disabled onclick="deleteSession(activeId)" title="Permanently delete this session and its history">Delete</button>
         </div>
       </div>
       <div class="btn-group-divider"></div>
       <div class="btn-group" id="grp-analyze">
         <span class="btn-group-label" onclick="toggleGrpDropdown('grp-analyze')">Analyze &#9662;</span>
         <div class="btn-group-inner">
-          <button class="btn" id="btn-summary" disabled onclick="showSummary(activeId)">Summary</button>
-          <button class="btn" id="btn-find"    onclick="openFind()">Find</button>
-          <button class="btn" id="btn-extract" onclick="openExtract()" disabled>Extract Code</button>
-          <button class="btn" id="btn-export"  onclick="triggerExport()" disabled>Export Project</button>
-          <button class="btn" id="btn-compare" onclick="openCompare()">Compare</button>
+          <button class="btn" id="btn-summary" disabled onclick="showSummary(activeId)" title="Generate an AI summary of what was accomplished in this session">Summary</button>
+          <button class="btn" id="btn-find"    onclick="openFind()" title="Search for text within the session transcript">Find</button>
+          <button class="btn" id="btn-extract" onclick="openExtract()" disabled title="Pull out all code blocks from this session into a downloadable file">Extract Code</button>
+          <button class="btn" id="btn-export"  onclick="triggerExport()" disabled title="Export the full session as a zip file including all generated files">Export Project</button>
+          <button class="btn" id="btn-compare" onclick="openCompare()" title="Diff two sessions side by side to see what changed">Compare</button>
         </div>
       </div>
     </div>
@@ -2165,7 +2307,11 @@ async function loadProjects() {
     return '<option value="' + escHtml(p.encoded) + '"' + selected + '>' + escHtml(label) + '</option>';
   }).join('');
   // If saved project exists in list, activate it; otherwise use first
-  const target = projects.find(p => p.encoded === saved) ? saved : (projects[0] && projects[0].encoded);
+  const savedMatch = projects.find(p => p.encoded === saved);
+  // If saved project has sessions use it; otherwise pick the project with the most sessions
+  const target = (savedMatch && savedMatch.session_count > 0)
+    ? saved
+    : (projects.slice().sort((a,b) => b.session_count - a.session_count)[0] || {}).encoded;
   if (target) await setProject(target, true);
 }
 
@@ -2232,7 +2378,7 @@ function renderList(sessions) {
     const isRunning = !isWaiting && runningIds.has(s.id);
     const stateClass = isWaiting ? ' waiting' : (isRunning ? ' running' : '');
     const activeClass = s.id === activeId ? ' active' : '';
-    const colClick = `onclick="selectSession('${s.id}')" style="cursor:pointer;"`;
+    const colClick = `onclick="singleOrDouble('${s.id}',event)" style="cursor:pointer;"`;
     const icon = isWaiting
       ? '<span title="Waiting for input" style="color:#ff9500;margin-right:4px;">&#x23F3;</span>'
       : isRunning
@@ -2313,12 +2459,12 @@ function setToolbarSession(id, titleText, isUntitled, customTitle) {
   titleEl.dataset.customTitle = customTitle || '';
   titleEl.dataset.editable = id ? 'true' : 'false';
   titleEl.title = id ? 'Click to rename' : '';
-  ['btn-autoname','btn-open','btn-delete','btn-duplicate','btn-continue','btn-summary','btn-extract','btn-export'].forEach(b => {
+  ['btn-autoname','btn-open','btn-open-gui','btn-delete','btn-duplicate','btn-continue','btn-summary','btn-extract','btn-export'].forEach(b => {
     document.getElementById(b).disabled = !id;
   });
-  // btn-close is only enabled when the live panel is active for this session
+  // btn-close enabled when session is running or open in GUI
   const btnClose = document.getElementById('btn-close');
-  if (btnClose) btnClose.disabled = !id || !runningIds.has(id);
+  if (btnClose) btnClose.disabled = !id || (!runningIds.has(id) && !guiOpenSessions.has(id));
 }
 
 function startListInlineRename() {
@@ -2466,22 +2612,29 @@ async function selectSession(id) {
   const titleText = s.custom_title || s.display_title;
   setToolbarSession(id, titleText, !s.custom_title, s.custom_title || '');
 
-  if (runningIds.has(id)) {
-    startLivePanel(id);
-  } else {
-    document.getElementById('main-body').innerHTML =
-      '<div class="conversation" id="convo">' + renderMessages(s.messages) + '</div>';
-  }
+  // Single click always shows static preview; double click / openInGUI starts live panel
+  document.getElementById('main-body').innerHTML =
+    '<div class="conversation" id="convo">' + renderMessages(s.messages) + '</div>';
+  setTimeout(() => {
+    const convo = document.getElementById('convo');
+    if (convo) convo.scrollTop = convo.scrollHeight;
+  }, 50);
 }
 
 function renderMessages(messages) {
   if (!messages || !messages.length) return '<div style="color:#444;font-size:13px;">No messages</div>';
-  return messages.map(m => `
-    <div class="msg ${m.role}">
+  return messages.map(m => {
+    let body;
+    if (m.role === 'assistant') {
+      body = mdParse(m.content || '');
+    } else {
+      body = '<pre style="white-space:pre-wrap;margin:0;">' + escHtml(m.content || '(empty)') + '</pre>';
+    }
+    return `<div class="msg ${m.role}">
       <div class="msg-role">${m.role}</div>
-      <div class="msg-body msg-content">${escHtml(m.content || '(empty)')}</div>
-    </div>
-  `).join('');
+      <div class="msg-body msg-content">${body}</div>
+    </div>`;
+  }).join('');
 }
 
 function openRename(id, currentTitle) {
@@ -2918,7 +3071,7 @@ async function pollWaiting() {
 
     // Update Close Session button enabled state
     const btnClose = document.getElementById('btn-close');
-    if (btnClose && activeId) btnClose.disabled = !newRunning.has(activeId);
+    if (btnClose && activeId) btnClose.disabled = !newRunning.has(activeId) && !guiOpenSessions.has(activeId);
 
   } catch(e) {}
   finally {
@@ -3012,15 +3165,24 @@ function renderLiveEntry(e) {
     const text = e.text || '';
     const textDiv = document.createElement('div');
     textDiv.className = 'live-text';
-    textDiv.textContent = text.length > LIMIT ? text.slice(0, LIMIT) : text;
+    const displayText = text.length > LIMIT ? text.slice(0, LIMIT) : text;
+    if (e.kind === 'asst') {
+      textDiv.innerHTML = mdParse(displayText);
+    } else {
+      textDiv.textContent = displayText;
+    }
     div.appendChild(textDiv);
 
     if (text.length > LIMIT) {
       const btn = document.createElement('button');
       btn.className = 'live-expand-btn';
       btn.textContent = '\u2026 show more';
-      btn.onclick = () => { textDiv.textContent = text; btn.remove(); };
-      textDiv.appendChild(btn);
+      btn.onclick = () => {
+        if (e.kind === 'asst') { textDiv.innerHTML = mdParse(text); }
+        else { textDiv.textContent = text; }
+        btn.remove();
+      };
+      div.appendChild(btn);
     }
 
   } else if (e.kind === 'tool_use') {
@@ -3079,6 +3241,33 @@ function renderLiveEntry(e) {
 }
 
 let liveBarState = null;   // 'ended' | 'question:<questionText>' | 'idle' | 'working'
+let _guiFocusPending = false;
+let guiOpenSessions = new Set(JSON.parse(localStorage.getItem('guiOpenSessions') || '[]'));  // persists across reloads
+
+function guiOpenAdd(id) {
+  guiOpenSessions.add(id);
+  localStorage.setItem('guiOpenSessions', JSON.stringify([...guiOpenSessions]));
+}
+function guiOpenDelete(id) {
+  guiOpenSessions.delete(id);
+  localStorage.setItem('guiOpenSessions', JSON.stringify([...guiOpenSessions]));
+}
+
+async function openInGUI(id) {
+  _guiFocusPending = true;
+  closeAllGrpDropdowns();
+  activeId = id;
+  guiOpenAdd(id);  // track as GUI-open so we show idle state (persisted)
+  if (liveSessionId && liveSessionId !== id) stopLivePanel();
+  filterSessions();
+
+  setToolbarSession(id, 'Loading…', true, '');
+  const resp = await fetch('/api/session/' + id);
+  const s = await resp.json();
+  setToolbarSession(id, s.custom_title || s.display_title, !s.custom_title, s.custom_title || '');
+
+  startLivePanel(id);
+}
 
 function updateLiveInputBar() {
   if (!liveSessionId) return;
@@ -3104,12 +3293,26 @@ function updateLiveInputBar() {
 
   if (!isRunning) {
     bar.innerHTML =
-      '<div class="live-ended">' +
-      '<span>Session has ended.</span>' +
-      '<button class="btn" onclick="continueSession(\'' + id + '\')" style="background:#1a1a2e;border-color:#4040aa;color:#aaaaff;font-size:11px;padding:4px 10px;">Continue Session</button>' +
+      '<div class="live-ended" style="margin-bottom:6px;">' +
+      '<span style="color:#555;font-size:11px;">Session ended \u2014 start a new message to continue</span>' +
+      '</div>' +
+      '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="Type a message to start a new session\u2026"' +
+      ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey))liveSubmitContinue(\'' + id + '\')"></textarea>' +
+      '<div class="live-bar-row">' +
+      '<span style="font-size:10px;color:#444;">Ctrl+Enter to send</span>' +
+      '<button class="live-send-btn" onclick="liveSubmitContinue(\'' + id + '\')">Send \u21b5</button>' +
       '</div>';
     const btnClose = document.getElementById('btn-close');
     if (btnClose) btnClose.disabled = true;
+    if (_guiFocusPending) {
+      _guiFocusPending = false;
+      setTimeout(() => {
+        const logEl = document.getElementById('live-log');
+        if (logEl) logEl.scrollTop = logEl.scrollHeight;
+        const ta = document.getElementById('live-input-ta');
+        if (ta) ta.focus();
+      }, 50);
+    }
 
   } else if (kind === 'question') {
     // Claude is asking something — show question text + option buttons + free-form textarea
@@ -3158,7 +3361,15 @@ function updateLiveInputBar() {
     const ta = document.getElementById('live-input-ta');
     if (ta) {
       if (prefill) ta.value = prefill;
-      setTimeout(() => ta.focus(), 50);
+      const shouldFocus = _guiFocusPending || true;
+      if (shouldFocus) {
+        _guiFocusPending = false;
+        setTimeout(() => {
+          const logEl = document.getElementById('live-log');
+          if (logEl) logEl.scrollTop = logEl.scrollHeight;
+          ta.focus();
+        }, 50);
+      }
     }
 
   } else if (kind === 'idle') {
@@ -3169,6 +3380,15 @@ function updateLiveInputBar() {
       '<span style="font-size:10px;color:#444;">Ctrl+Enter to send</span>' +
       '<button class="live-send-btn" onclick="liveSubmitIdle()">Send \u21b5</button>' +
       '</div>';
+    if (_guiFocusPending) {
+      _guiFocusPending = false;
+      setTimeout(() => {
+        const logEl = document.getElementById('live-log');
+        if (logEl) logEl.scrollTop = logEl.scrollHeight;
+        const ta = document.getElementById('live-input-ta');
+        if (ta) ta.focus();
+      }, 50);
+    }
 
   } else {
     bar.innerHTML =
@@ -3250,6 +3470,27 @@ async function liveSubmitIdle() {
   }
 }
 
+async function liveSubmitContinue(fromId) {
+  const ta = document.getElementById('live-input-ta');
+  const text = ta ? ta.value.trim() : '';
+  // Continue the session (creates new session), then send the typed text
+  const resp = await fetch('/api/continue/' + fromId, { method: 'POST' });
+  const data = await resp.json();
+  if (!data.ok) { showToast('Could not continue session'); return; }
+  await loadSessions();
+  _guiFocusPending = true;
+  await openInGUI(data.new_id);
+  if (text) {
+    // Wait for the new session to start, then send the text
+    setTimeout(async () => {
+      const r = await fetch('/api/respond/' + data.new_id, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text})
+      });
+    }, 1500);
+  }
+}
+
 async function liveSubmitWaiting() {
   const ta = document.getElementById('live-input-ta');
   if (!ta || !liveSessionId) return;
@@ -3286,29 +3527,35 @@ async function closeSession(id) {
   if (!id) return;
   const s = allSessions.find(x => x.id === id);
   const name = (s && s.display_title) || id.slice(0, 8);
-  if (!confirm('Close session "' + name + '"?\n\nThis will stop the running Claude process. Any work in progress will halt.')) return;
-  const r = await fetch('/api/close/' + id, { method: 'POST' });
-  const d = await r.json();
-  if (d.ok) {
-    showToast('Session closed');
-    stopLivePanel();
-    // Reload and show static conversation
-    const sr = await fetch('/api/session/' + id);
-    const sess = await sr.json();
-    document.getElementById('main-body').innerHTML =
-      '<div class="conversation" id="convo">' + renderMessages(sess.messages) + '</div>';
-    runningIds.delete(id);
-    filterSessions();
-  } else {
-    showToast('Close failed: ' + (d.error || 'unknown'), true);
+  if (!confirm('Close session "' + name + '"?\n\nThis will stop the running Claude process and close the terminal window.')) return;
+  // Attempt to kill the process (may already be stopped — that's fine)
+  if (runningIds.has(id)) {
+    const r = await fetch('/api/close/' + id, { method: 'POST' });
+    const d = await r.json();
+    if (!d.ok) showToast('Process stop: ' + (d.error || 'unknown'));
   }
+  // Always clear GUI state and show static preview
+  stopLivePanel();
+  guiOpenDelete(id);
+  runningIds.delete(id);
+  showToast('Session closed');
+  const sr = await fetch('/api/session/' + id);
+  const sess = await sr.json();
+  document.getElementById('main-body').innerHTML =
+    '<div class="conversation" id="convo">' + renderMessages(sess.messages) + '</div>';
+  setTimeout(() => { const c = document.getElementById('convo'); if (c) c.scrollTop = c.scrollHeight; }, 50);
+  filterSessions();
 }
 
 // ---- Workforce mode helpers ----
 let sessionKinds = {};   // session_id → 'question' | 'working' | 'idle'
 
 function getSessionStatus(id) {
-  if (!runningIds.has(id)) return 'sleeping';
+  if (!runningIds.has(id)) {
+    // Sessions opened in GUI panel are considered idle even if no OS process detected
+    if (guiOpenSessions.has(id)) return 'idle';
+    return 'sleeping';
+  }
   return sessionKinds[id] || 'working';
 }
 
@@ -3380,13 +3627,33 @@ function renderWorkforce(sessions) {
     const selClass = s.id === activeId ? ' wf-selected' : '';
     const name = escHtml((s.display_title||s.id).slice(0,22) + ((s.display_title||'').length>22?'\u2026':''));
     const date = (s.last_activity||'').split('  ')[0] || '';
-    return `<div class="wf-card wf-${st}${selClass}" onclick="wfCardClick('${s.id}')" title="${escHtml(s.display_title)}">
+    return `<div class="wf-card wf-${st}${selClass}" onclick="singleOrDouble('${s.id}',event)" title="${escHtml(s.display_title)} — double-click to open in Claude Code GUI">
       <div class="wf-avatar">${emoji}</div>
       <div class="wf-status-label">${label}</div>
       <div class="wf-name">${name}</div>
       <div class="wf-meta">${escHtml(date)}</div>
     </div>`;
   }).join('');
+}
+
+let _clickTimer = null;
+let _lastClickId = null;
+let _lastClickTime = 0;
+
+function singleOrDouble(id, e) {
+  const now = Date.now();
+  const isDouble = (_lastClickId === id && now - _lastClickTime < 400);
+  _lastClickId = id;
+  _lastClickTime = now;
+  if (isDouble) {
+    // Double click — cancel pending single-click and open in GUI
+    if (_clickTimer) { clearTimeout(_clickTimer); _clickTimer = null; }
+    openInGUI(id);
+  } else {
+    // Single click — delay so double-click can cancel it
+    if (_clickTimer) clearTimeout(_clickTimer);
+    _clickTimer = setTimeout(() => { _clickTimer = null; selectSession(id); }, 400);
+  }
 }
 
 function wfCardClick(id) {
@@ -3731,7 +3998,7 @@ def _get_running_session_ids():
 
         running = {}
         resume_pids = []
-        uuid_re = re.compile(r"-r\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
+        uuid_re = re.compile(r"(?:--resume|-r)\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
 
         for proc in data:
             cmdline = proc.get("CommandLine") or ""
@@ -3889,6 +4156,12 @@ def _parse_session_kind(path: Path) -> str:
     # Recent file activity always means working
     if file_age < 10:
         return 'working'
+
+    # If the file hasn't been touched in >30s and a process is running,
+    # Claude is sitting idle at the prompt waiting for input — regardless of
+    # what the last entry pattern looks like (e.g. resumed sessions, finished tasks)
+    if file_age > 30:
+        return 'idle'
 
     try:
         lines = [l.strip() for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
