@@ -4360,4 +4360,4 @@ def open_browser():
 if __name__ == "__main__":
     print("Starting Session Manager at http://localhost:5050")
     threading.Thread(target=open_browser, daemon=True).start()
-    app.run(port=5050, debug=False, threaded=True)
+    app.run(host="0.0.0.0", port=5050, debug=False, threaded=True)
