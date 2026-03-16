@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Code GUI</title>
+<link rel="stylesheet" href="/static/style.css">
+<script>
+// Apply saved theme immediately to avoid flash
+(function(){
+  var t = localStorage.getItem('theme') || 'dark';
+  if (t === 'auto') {
+    var h = new Date().getHours();
+    t = (h >= 7 && h < 19) ? 'light' : 'dark';
+  }
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
+</head>
+<body>
+
+<header>
+  <h1>Claude Code GUI</h1>
+  <div class="hdr-sys" id="hdr-sys">
+    <button class="hdr-sys-btn" onclick="toggleHdrSys()">System &#9662;</button>
+    <div class="hdr-sys-dropdown" id="hdr-sys-dropdown">
+      <button onclick="deleteEmptySessions();closeHdrSys()">Delete Empty Sessions</button>
+    </div>
+  </div>
+  <button id="btn-git-update" onclick="openGitUpdate()">Update App <span id="git-badge-pull"></span></button>
+  <button id="btn-git-publish" onclick="openGitPublish()">Publish App Update <span id="git-badge-push"></span></button>
+  <button id="btn-git-sync" onclick="openGitSyncBoth()">Sync App <span id="git-badge-sync"></span></button>
+  <button id="btn-theme" onclick="cycleTheme()" title="Toggle theme"></button>
+  <div class="hdr-spacer"></div>
+  <button id="btn-project" onclick="openProjectOverlay()" title="Switch project">
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+    <span id="project-label">Select project</span>
+  </button>
+  <span class="sub" id="session-count"></span>
+</header>
+
+<div class="layout">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-toolbar">
+      <div style="display:flex;align-items:center;gap:6px;">
+        <div class="view-toggle">
+          <button class="view-toggle-btn active" id="btn-view-workforce" onclick="setViewMode('workforce')" title="Workforce view">&#128101;</button>
+          <button class="view-toggle-btn" id="btn-view-list" onclick="setViewMode('list')" title="List view">&#9776;</button>
+        </div>
+        <input type="text" id="search" placeholder="Search sessions…" oninput="filterSessions()" style="flex:1;width:auto;">
+      </div>
+    </div>
+    <div class="session-list" id="session-list">
+    </div>
+    <script>
+    // Show skeleton immediately before any async work
+    (function(){
+      var el = document.getElementById('session-list');
+      var html = '';
+      for (var i = 0; i < 20; i++) {
+        var nw = 40 + Math.random() * 45;
+        var d = (i * 0.06).toFixed(2);
+        html += '<div class="skel-row">'
+          + '<div><div class="skel-bar name" style="width:' + nw + '%;animation-delay:' + d + 's"></div></div>'
+          + '<div><div class="skel-bar date" style="animation-delay:' + d + 's"></div></div>'
+          + '<div><div class="skel-bar size" style="animation-delay:' + d + 's"></div></div>'
+          + '</div>';
+      }
+      el.innerHTML = html;
+    })();
+    </script>
+    <div class="wf-sort-bar" id="wf-sort-bar" style="display:none;">
+      <button class="wf-sort-btn active" id="wf-btn-status" onclick="setWfSort('status')">Status</button>
+      <button class="wf-sort-btn" id="wf-btn-recent" onclick="setWfSort('recent')">Recent</button>
+      <button class="wf-sort-btn" id="wf-btn-name" onclick="setWfSort('name')">Name</button>
+    </div>
+    <div id="workforce-grid"></div>
+  </div>
+
+  <!-- Resize handle -->
+  <div class="resize-handle" id="resize-handle"></div>
+
+  <!-- Main -->
+  <div class="main" id="main-panel">
+    <div class="main-toolbar" id="main-toolbar" style="display:none">
+      <div id="main-title" data-editable="false" data-custom-title=""></div>
+      <div class="btn-group" id="grp-session">
+        <span class="btn-group-label" onclick="toggleGrpDropdown('grp-session')">Session &#9662;</span>
+        <div class="btn-group-inner">
+          <button class="btn" id="btn-open-gui" disabled onclick="openInGUI(activeId)" title="View this session's live terminal and chat log inside the app">Open in Claude Code GUI</button>
+          <button class="btn" id="btn-open" disabled onclick="openInClaude(activeId)" title="Launch this session in a separate Claude terminal window">Claude Terminal</button>
+          <button class="btn" id="btn-continue" disabled onclick="continueSession(activeId)" title="Start a new Claude session that continues from where this one left off">Continue</button>
+          <button class="btn danger" id="btn-close" disabled onclick="closeSession(activeId)" title="Close the running Claude process for this session">Close Session</button>
+        </div>
+      </div>
+      <div class="btn-group-divider"></div>
+      <div class="btn-group" id="grp-manage">
+        <span class="btn-group-label" onclick="toggleGrpDropdown('grp-manage')">Manage &#9662;</span>
+        <div class="btn-group-inner">
+          <button class="btn" id="btn-autoname" disabled onclick="autoName(activeId)" title="Let Claude read the conversation and suggest a meaningful name">Auto-name</button>
+          <button class="btn" id="btn-duplicate" disabled onclick="duplicateSession(activeId)" title="Create a copy of this session to branch off in a new direction">Duplicate</button>
+          <button class="btn danger" id="btn-delete" disabled onclick="deleteSession(activeId)" title="Permanently delete this session and its history">Delete</button>
+        </div>
+      </div>
+      <div class="btn-group-divider"></div>
+      <div class="btn-group" id="grp-analyze">
+        <span class="btn-group-label" onclick="toggleGrpDropdown('grp-analyze')">Analyze &#9662;</span>
+        <div class="btn-group-inner">
+          <button class="btn" id="btn-summary" disabled onclick="showSummary(activeId)" title="Generate an AI summary of what was accomplished in this session">Summary</button>
+          <button class="btn" id="btn-find"    onclick="openFind()" title="Search for text within the session transcript">Find</button>
+          <button class="btn" id="btn-extract" onclick="openExtract()" disabled title="Pull out all code blocks from this session into a downloadable file">Extract Code</button>
+          <button class="btn" id="btn-export"  onclick="triggerExport()" disabled title="Export the full session as a zip file including all generated files">Export Project</button>
+          <button class="btn" id="btn-compare" onclick="openCompare()" title="Diff two sessions side by side to see what changed">Compare</button>
+        </div>
+      </div>
+    </div>
+    <div id="find-bar">
+      <input id="find-input" placeholder="Search in session…" oninput="runFind()" onkeydown="findKeyNav(event)">
+      <span id="find-count"></span>
+      <button class="find-nav-btn" onclick="findNav(-1)">&uarr;</button>
+      <button class="find-nav-btn" onclick="findNav(1)">&darr;</button>
+      <button class="find-nav-btn" onclick="closeFind()">&#10005;</button>
+    </div>
+    <div id="main-body">
+      <div class="empty-state">
+        <div class="icon">&#x1F4AC;</div>
+        <div>Select a session to preview it</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Summary modal -->
+<div class="overlay" id="summary-overlay">
+  <div class="modal" style="width:520px;max-width:92vw;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <h2 style="font-size:14px;">Session Summary</h2>
+      <button class="btn" onclick="closeSummary()" style="padding:3px 10px;">&#10005;</button>
+    </div>
+    <div id="summary-body" style="min-height:80px;"></div>
+  </div>
+</div>
+
+<!-- Respond-to-waiting modal -->
+<div id="respond-overlay">
+  <div id="respond-box">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <h3 style="margin:0;">&#x23F3; Session waiting for input</h3>
+      <button class="btn" onclick="closeRespond()" style="padding:2px 9px;">&#10005;</button>
+    </div>
+    <div id="respond-question"></div>
+    <div id="respond-options"></div>
+    <div id="respond-or" style="display:none;">&mdash; or type a custom response &mdash;</div>
+    <div id="respond-custom-row">
+      <textarea id="respond-input" placeholder="Type your response…"
+        onkeydown="if(event.key==='Enter'&&(event.ctrlKey||event.metaKey))submitRespond()"></textarea>
+      <div class="respond-btns">
+        <button id="respond-cancel" onclick="closeRespond()">Cancel</button>
+        <button id="respond-send" onclick="submitRespond()">Send &#8629;</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Extract Code drawer -->
+<div id="extract-drawer">
+  <div id="extract-drawer-header">
+    <span style="font-size:13px;font-weight:600;color:#fff;">Code Blocks</span>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <button id="extract-copy-all" style="display:none;">Copy All</button>
+      <button id="extract-export-btn" class="btn" style="padding:4px 10px;font-size:11px;">Export ZIP</button>
+      <button class="btn" onclick="closeExtract()" style="padding:3px 10px;">&#10005;</button>
+    </div>
+  </div>
+  <div id="extract-body" style="flex:1;overflow-y:auto;"></div>
+</div>
+
+<!-- Compare modal -->
+<div id="compare-overlay">
+  <div id="compare-box">
+    <div id="compare-box-header">
+      <span style="font-size:13px;font-weight:600;color:#fff;">Compare Sessions</span>
+      <button class="btn" onclick="closeCompare()" style="padding:3px 10px;">&#10005;</button>
+    </div>
+    <div id="compare-picker">
+      <span style="font-size:12px;color:#888;white-space:nowrap;">Compare with:</span>
+      <select id="compare-select"></select>
+      <button id="compare-run" onclick="runCompare()">Compare</button>
+    </div>
+    <div id="compare-body"><p style="color:#555;padding:20px;font-size:12px;">Select a session above and click Compare.</p></div>
+  </div>
+</div>
+
+<!-- Git Sync modal -->
+<div class="overlay" id="git-sync-overlay">
+  <div class="modal" style="width:460px;max-width:92vw;">
+    <h2 id="git-sync-title">Git Sync</h2>
+    <div id="git-sync-body" style="color:#ccc;font-size:13px;line-height:1.6;margin-bottom:18px;"></div>
+    <div class="modal-actions" id="git-sync-actions"></div>
+  </div>
+</div>
+
+<!-- Rename modal -->
+<div class="overlay" id="rename-overlay">
+  <div class="modal">
+    <h2>Rename Session</h2>
+    <input type="text" id="rename-input" placeholder="Enter a name…" onkeydown="if(event.key==='Enter')submitRename(); if(event.key==='Escape')closeRename();">
+    <div class="modal-actions">
+      <button class="btn" onclick="closeRename()">Cancel</button>
+      <button class="btn primary" onclick="submitRename()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Premium modal system -->
+<div id="pm-overlay"></div>
+
+<!-- Project overlay -->
+<div id="project-overlay">
+  <div class="project-card pm-enter" id="project-card">
+    <div class="project-header">
+      <button class="overlay-close" onclick="closeProjectOverlay()" title="Close">&times;</button>
+      <h2>Projects</h2>
+      <p>Select a Claude Code project to view its sessions. Each project corresponds to a directory where you've used Claude.</p>
+    </div>
+    <div class="project-list" id="project-list"></div>
+    <div class="project-footer">
+      <button class="pm-btn pm-btn-secondary" onclick="addProjectOverlay()">+ Add Project</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- JavaScript files — load order matters -->
+<script src="/static/js/utils.js"></script>
+<script src="/static/js/markdown.js"></script>
+<script src="/static/js/chat-component.js"></script>
+<script src="/static/js/app.js"></script>
+<script src="/static/js/workforce.js"></script>
+<script src="/static/js/sessions.js"></script>
+<script src="/static/js/toolbar.js"></script>
+<script src="/static/js/modals.js"></script>
+<script src="/static/js/git-sync.js"></script>
+<script src="/static/js/live-panel.js"></script>
+<script src="/static/js/find.js"></script>
+<script src="/static/js/extract.js"></script>
+<script src="/static/js/compare.js"></script>
+<script src="/static/js/theme.js"></script>
+<script src="/static/js/polling.js"></script>
+
+<div id="session-tooltip"></div>
+</body>
+</html>

@@ -1,4 +1,4 @@
-# ClaudeGUI
+# ClaudeCodeGUI
 
 A GUI for Claude Code, developed by CustomerNode LLC and independent contributors.
 
@@ -22,9 +22,9 @@ A local web interface for managing Claude Code sessions.
 
 If you have [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed, open your terminal and tell Claude:
 
-> Get me set up with https://github.com/CustomerNode/ClaudeGUI
+> Get me set up with https://github.com/CustomerNode/ClaudeCodeGUI
 
-Claude handles the rest — cloning the repo, installing Python and Flask if needed, creating a desktop shortcut, and launching ClaudeGUI for you.
+Claude handles the rest — cloning the repo, installing Python and Flask if needed, creating a desktop shortcut, and launching ClaudeCodeGUI for you.
 
 See [FileTaskNode](https://github.com/CustomerNode/FileTaskNode) for an example of a Claude Code workspace built around this kind of AI-assisted setup.
 
@@ -33,8 +33,8 @@ See [FileTaskNode](https://github.com/CustomerNode/FileTaskNode) for an example 
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/CustomerNode/ClaudeGUI.git
-cd ClaudeGUI
+git clone https://github.com/CustomerNode/ClaudeCodeGUI.git
+cd ClaudeCodeGUI
 pip install flask
 ```
 
@@ -48,15 +48,15 @@ The browser opens automatically to http://localhost:5050.
 
 ### 3. Desktop shortcut (Windows)
 
-Run this once in PowerShell to create a desktop shortcut that launches ClaudeGUI with one click:
+Run this once in PowerShell to create a desktop shortcut that launches ClaudeCodeGUI with one click:
 
 ```powershell
 $WshShell = New-Object -ComObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut("$env:USERPROFILE\Desktop\ClaudeGUI.lnk")
+$Shortcut = $WshShell.CreateShortcut("$env:USERPROFILE\Desktop\ClaudeCodeGUI.lnk")
 $Shortcut.TargetPath = "python"
 $Shortcut.Arguments = "session_manager.py"
-$Shortcut.WorkingDirectory = "$env:USERPROFILE\Documents\ClaudeGUI"
-$Shortcut.IconLocation = "$env:USERPROFILE\Documents\ClaudeGUI\claudecodegui.ico,0"
+$Shortcut.WorkingDirectory = "$env:USERPROFILE\Documents\ClaudeCodeGUI"
+$Shortcut.IconLocation = "$env:USERPROFILE\Documents\ClaudeCodeGUI\claudecodegui.ico,0"
 $Shortcut.WindowStyle = 7
 $Shortcut.Save()
 ```
