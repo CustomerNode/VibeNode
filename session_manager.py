@@ -20,8 +20,43 @@ from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request, render_template_string, send_file
 
-SESSIONS_DIR = Path(r"C:\Users\donca\.claude\projects\C--Users-donca-Documents-FileTaskNode")
-NAMES_FILE   = SESSIONS_DIR / "_session_names.json"
+_CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+_active_project: str = ""   # encoded dir name; empty = auto-detect
+
+def _sessions_dir() -> Path:
+    """Return the active project's session directory, auto-detecting if needed."""
+    global _active_project
+    if _active_project:
+        p = _CLAUDE_PROJECTS / _active_project
+        if p.is_dir():
+            return p
+    # Auto-detect: pick the project with the most recent .jsonl file
+    best, best_ts = None, 0.0
+    for d in _CLAUDE_PROJECTS.iterdir():
+        if not d.is_dir() or d.name.startswith("subagents"):
+            continue
+        for f in d.glob("*.jsonl"):
+            if f.stat().st_mtime > best_ts:
+                best_ts = f.stat().st_mtime
+                best = d
+    if best:
+        _active_project = best.name
+        return best
+    return _CLAUDE_PROJECTS
+
+def _names_file() -> Path:
+    return _sessions_dir() / "_session_names.json"
+
+def _decode_project(encoded: str) -> str:
+    """Convert C--Users-donca-Documents-FileTaskNode → C:/Users/donca/Documents/FileTaskNode (display only)."""
+    if "--" in encoded:
+        drive, rest = encoded.split("--", 1)
+        return drive + ":/" + rest.replace("-", "/")
+    return encoded
+
+# Legacy aliases so existing code keeps working (replaced below via find/replace in routes)
+SESSIONS_DIR = _sessions_dir()
+NAMES_FILE   = _names_file()
 
 app = Flask(__name__)
 
@@ -33,7 +68,7 @@ app = Flask(__name__)
 def _load_names() -> dict:
     """Return {session_id: name} for all user-manually-set names."""
     try:
-        return json.loads(NAMES_FILE.read_text(encoding="utf-8"))
+        return json.loads(_names_file().read_text(encoding="utf-8"))
     except Exception:
         return {}
 
@@ -41,14 +76,14 @@ def _save_name(session_id: str, name: str) -> None:
     """Persist a user-set name. Creates or updates _session_names.json."""
     names = _load_names()
     names[session_id] = name
-    NAMES_FILE.write_text(json.dumps(names, indent=2, ensure_ascii=False), encoding="utf-8")
+    _names_file().write_text(json.dumps(names, indent=2, ensure_ascii=False), encoding="utf-8")
 
 def _delete_name(session_id: str) -> None:
     """Remove a session from the user-names store (e.g. on delete)."""
     names = _load_names()
     if session_id in names:
         names.pop(session_id)
-        NAMES_FILE.write_text(json.dumps(names, indent=2, ensure_ascii=False), encoding="utf-8")
+        _names_file().write_text(json.dumps(names, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -62,12 +97,15 @@ def load_session(path: Path) -> dict:
     first_ts = None
 
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                obj = json.loads(line)
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue   # skip partial/corrupt lines (e.g. mid-write)
                 t = obj.get("type", "")
 
                 if t == "custom-title":
@@ -161,7 +199,7 @@ def load_session(path: Path) -> dict:
 
 def all_sessions() -> list:
     sessions = []
-    for f in SESSIONS_DIR.glob("*.jsonl"):
+    for f in _sessions_dir().glob("*.jsonl"):
         s = load_session(f)
         sessions.append(s)
     sessions.sort(key=lambda x: x["sort_ts"], reverse=True)
@@ -461,6 +499,35 @@ def index():
     return render_template_string(HTML)
 
 
+@app.route("/api/projects")
+def api_projects():
+    results = []
+    for d in sorted(_CLAUDE_PROJECTS.iterdir()):
+        if not d.is_dir() or d.name.startswith("subagents"):
+            continue
+        count = sum(1 for _ in d.glob("*.jsonl"))
+        if count == 0:
+            continue
+        results.append({
+            "encoded": d.name,
+            "display": _decode_project(d.name),
+            "session_count": count,
+            "active": d.name == _active_project,
+        })
+    return jsonify(results)
+
+
+@app.route("/api/set-project", methods=["POST"])
+def api_set_project():
+    global _active_project
+    encoded = (request.get_json() or {}).get("project", "").strip()
+    target = _CLAUDE_PROJECTS / encoded
+    if not target.is_dir():
+        return jsonify({"error": "Not found"}), 404
+    _active_project = encoded
+    return jsonify({"ok": True, "project": encoded, "display": _decode_project(encoded)})
+
+
 @app.route("/api/sessions")
 def api_sessions():
     sessions = all_sessions()
@@ -472,7 +539,7 @@ def api_sessions():
 
 @app.route("/api/session/<session_id>")
 def api_session(session_id):
-    path = SESSIONS_DIR / f"{session_id}.jsonl"
+    path = _sessions_dir() / f"{session_id}.jsonl"
     if not path.exists():
         return jsonify({"error": "Not found"}), 404
     return jsonify(load_session(path))
@@ -480,7 +547,7 @@ def api_session(session_id):
 
 @app.route("/api/rename/<session_id>", methods=["POST"])
 def api_rename(session_id):
-    path = SESSIONS_DIR / f"{session_id}.jsonl"
+    path = _sessions_dir() / f"{session_id}.jsonl"
     if not path.exists():
         return jsonify({"error": "Not found"}), 404
 
@@ -502,7 +569,7 @@ def api_rename(session_id):
 
 @app.route("/api/autonname/<session_id>", methods=["POST"])
 def api_autoname(session_id):
-    path = SESSIONS_DIR / f"{session_id}.jsonl"
+    path = _sessions_dir() / f"{session_id}.jsonl"
     if not path.exists():
         return jsonify({"error": "Not found"}), 404
 
@@ -544,10 +611,10 @@ def api_autoname(session_id):
 @app.route("/api/delete-empty", methods=["DELETE"])
 def api_delete_empty():
     deleted = []
-    for f in SESSIONS_DIR.glob("*.jsonl"):
+    for f in _sessions_dir().glob("*.jsonl"):
         s = load_session(f)
         if s.get("message_count", 0) == 0:
-            folder = SESSIONS_DIR / f.stem
+            folder = _sessions_dir() / f.stem
             f.unlink()
             if folder.exists() and folder.is_dir():
                 shutil.rmtree(folder)
@@ -557,7 +624,7 @@ def api_delete_empty():
 
 @app.route("/api/summary/<session_id>")
 def api_summary(session_id):
-    path = SESSIONS_DIR / f"{session_id}.jsonl"
+    path = _sessions_dir() / f"{session_id}.jsonl"
     if not path.exists():
         return jsonify({"error": "Not found"}), 404
 
@@ -669,7 +736,7 @@ def api_summary(session_id):
 
 @app.route("/api/open/<session_id>", methods=["POST"])
 def api_open(session_id):
-    path = SESSIONS_DIR / f"{session_id}.jsonl"
+    path = _sessions_dir() / f"{session_id}.jsonl"
     if not path.exists():
         return jsonify({"error": "Not found"}), 404
     try:
@@ -686,12 +753,12 @@ def api_open(session_id):
 @app.route("/api/duplicate/<session_id>", methods=["POST"])
 def api_duplicate(session_id):
     import uuid as uuid_mod
-    src = SESSIONS_DIR / f"{session_id}.jsonl"
+    src = _sessions_dir() / f"{session_id}.jsonl"
     if not src.exists():
         return jsonify({"error": "Not found"}), 404
 
     new_id = str(uuid_mod.uuid4())
-    dst = SESSIONS_DIR / f"{new_id}.jsonl"
+    dst = _sessions_dir() / f"{new_id}.jsonl"
 
     # Copy file, rewriting sessionId in every line
     lines_out = []
@@ -716,7 +783,7 @@ def api_continue(session_id):
     import uuid as uuid_mod
     from datetime import datetime, timezone as tz
 
-    src = SESSIONS_DIR / f"{session_id}.jsonl"
+    src = _sessions_dir() / f"{session_id}.jsonl"
     if not src.exists():
         return jsonify({"error": "Not found"}), 404
 
@@ -758,13 +825,13 @@ def api_continue(session_id):
                 "snapshot": {"messageId": msg_uuid, "trackedFileBackups": {}, "timestamp": now},
                 "isSnapshotUpdate": False}
     user_entry = {"parentUuid": None, "isSidechain": False, "userType": "external",
-                  "cwd": str(SESSIONS_DIR.parent.parent.parent / "Documents" / "FileTaskNode"),
+                  "cwd": _decode_project(_active_project).replace("/", "\\"),
                   "sessionId": new_id, "version": "2.1.71", "gitBranch": "main",
                   "type": "user", "message": {"role": "user", "content": handoff},
                   "uuid": msg_uuid, "timestamp": now}
     title_entry = {"type": "custom-title", "customTitle": f"[cont] {topic[:55]}", "sessionId": new_id}
 
-    dst = SESSIONS_DIR / f"{new_id}.jsonl"
+    dst = _sessions_dir() / f"{new_id}.jsonl"
     with open(dst, "w", encoding="utf-8") as f:
         f.write(json.dumps(snapshot) + "\n")
         f.write(json.dumps(user_entry) + "\n")
@@ -775,8 +842,8 @@ def api_continue(session_id):
 
 @app.route("/api/delete/<session_id>", methods=["DELETE"])
 def api_delete(session_id):
-    path = SESSIONS_DIR / f"{session_id}.jsonl"
-    folder = SESSIONS_DIR / session_id
+    path = _sessions_dir() / f"{session_id}.jsonl"
+    folder = _sessions_dir() / session_id
 
     if not path.exists():
         return jsonify({"error": "Not found"}), 404
@@ -790,7 +857,7 @@ def api_delete(session_id):
 
 @app.route("/api/extract-code/<session_id>")
 def api_extract_code(session_id):
-    path = SESSIONS_DIR / f"{session_id}.jsonl"
+    path = _sessions_dir() / f"{session_id}.jsonl"
     if not path.exists():
         return jsonify({"error": "Not found"}), 404
     blocks = _extract_code_blocks(path)
@@ -800,7 +867,7 @@ def api_extract_code(session_id):
 
 @app.route("/api/export-project/<session_id>")
 def api_export_project(session_id):
-    path = SESSIONS_DIR / f"{session_id}.jsonl"
+    path = _sessions_dir() / f"{session_id}.jsonl"
     if not path.exists():
         return jsonify({"error": "Not found"}), 404
 
@@ -857,8 +924,8 @@ def api_export_project(session_id):
 
 @app.route("/api/compare/<id1>/<id2>")
 def api_compare(id1, id2):
-    path1 = SESSIONS_DIR / f"{id1}.jsonl"
-    path2 = SESSIONS_DIR / f"{id2}.jsonl"
+    path1 = _sessions_dir() / f"{id1}.jsonl"
+    path2 = _sessions_dir() / f"{id2}.jsonl"
     if not path1.exists():
         return jsonify({"error": f"Session {id1} not found"}), 404
     if not path2.exists():
@@ -940,7 +1007,7 @@ def api_compare(id1, id2):
 @app.route("/api/session-log/<session_id>")
 def api_session_log(session_id):
     """Return structured log entries for the live terminal panel."""
-    path = SESSIONS_DIR / f"{session_id}.jsonl"
+    path = _sessions_dir() / f"{session_id}.jsonl"
     if not path.exists():
         return jsonify({"error": "Not found"}), 404
     since = int(request.args.get("since", 0))
@@ -1062,6 +1129,12 @@ HTML = r"""
     gap: 10px;
     flex-shrink: 0;
   }
+  #project-picker {
+    background: #1e1e1e; border: 1px solid #333; border-radius: 6px;
+    color: #aaa; font-size: 11px; padding: 4px 8px; cursor: pointer;
+    max-width: 200px; flex-shrink: 1;
+  }
+  #project-picker:focus { outline: none; border-color: #7c7cff; color: #fff; }
   header h1 { font-size: 15px; font-weight: 600; color: #fff; }
   header .sub { font-size: 12px; color: #666; margin-left: 4px; }
 
@@ -1759,6 +1832,7 @@ HTML = r"""
 
 <header>
   <h1>Claude Sessions</h1>
+  <select id="project-picker" title="Switch project"></select>
   <span class="sub" id="session-count"></span>
 </header>
 
@@ -1951,6 +2025,35 @@ function sortedSessions(sessions) {
   }
   return copy;
 }
+
+async function loadProjects() {
+  const res = await fetch('/api/projects');
+  const projects = await res.json();
+  const sel = document.getElementById('project-picker');
+  const saved = localStorage.getItem('activeProject');
+  sel.innerHTML = projects.map(p => {
+    const parts = p.display.replace(/\\/g, '/').split('/');
+    const label = parts.slice(-2).join('/') + ' (' + p.session_count + ')';
+    const selected = p.encoded === saved ? ' selected' : '';
+    return '<option value="' + escHtml(p.encoded) + '"' + selected + '>' + escHtml(label) + '</option>';
+  }).join('');
+  // If saved project exists in list, activate it; otherwise use first
+  const target = projects.find(p => p.encoded === saved) ? saved : (projects[0] && projects[0].encoded);
+  if (target) await setProject(target, false);
+}
+
+async function setProject(encoded, reload = true) {
+  await fetch('/api/set-project', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({project: encoded})
+  });
+  localStorage.setItem('activeProject', encoded);
+  if (reload) loadSessions();
+}
+
+document.getElementById('project-picker').addEventListener('change', e => {
+  setProject(e.target.value);
+});
 
 async function loadSessions() {
   const resp = await fetch('/api/sessions');
@@ -3401,7 +3504,7 @@ def _get_running_session_ids():
         # No time limit — --resume can resume sessions that have been idle for hours.
         if resume_pids:
             candidates = sorted(
-                [(f.stat().st_mtime, f.stem) for f in SESSIONS_DIR.glob("*.jsonl")
+                [(f.stat().st_mtime, f.stem) for f in _sessions_dir().glob("*.jsonl")
                  if f.stem not in running],
                 reverse=True
             )
@@ -3586,17 +3689,23 @@ def _parse_session_kind(path: Path) -> str:
                     return 'working'   # Claude fired a tool, awaiting result
 
         # Last entry is assistant text (no tool_use).
-        # Could be: (a) Claude genuinely finished, or (b) a planning message
-        # mid-task before firing the next tool.
-        # Check recent history: if any of the last few entries show tool activity
-        # AND the file is less than 2 minutes old, Claude is still mid-task.
-        if file_age < 120:
-            for prev in entries[1:]:
-                pc = prev.get("message", {}).get("content", "")
-                if isinstance(pc, list):
-                    for block in pc:
-                        if block.get("type") in ("tool_use", "tool_result"):
-                            return 'working'
+        # Idle only when Claude genuinely finished answering the user:
+        #   pattern = user+text → assistant+text (direct Q&A, no tools)
+        # Everything else is mid-task:
+        #   tool_result before it  → Claude just got results, writing next step
+        #   assistant before it    → Claude sent multiple messages in a row (announcing work)
+        #   thinking before it     → Claude is still reasoning
+        if len(entries) > 1:
+            prev = entries[1]
+            pt = prev.get("type", "")
+            pc = prev.get("message", {}).get("content", "")
+            prev_is_user_text = (
+                pt == "user" and
+                isinstance(pc, list) and
+                all(b.get("type") != "tool_result" for b in pc)
+            ) or (pt == "user" and isinstance(pc, str))
+            if not prev_is_user_text:
+                return 'working'
 
         return 'idle'
 
@@ -3609,7 +3718,7 @@ def api_waiting():
     running = _get_running_session_ids()
     result = []
     for sid, pid in running.items():
-        path = SESSIONS_DIR / f"{sid}.jsonl"
+        path = _sessions_dir() / f"{sid}.jsonl"
         if not path.exists():
             continue
         state = _parse_waiting_state(path)
