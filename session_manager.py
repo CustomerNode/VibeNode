@@ -1188,7 +1188,7 @@ HTML = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Claude Sessions</title>
+<title>Claude Code GUI</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -1240,20 +1240,19 @@ HTML = r"""
     cursor: pointer; border-radius: 5px;
   }
   .hdr-sys-dropdown button:hover { background: #2a2a2a; color: #fff; }
-  #btn-git-sync {
-    background: #1e1e1e; border: 1px solid #333; border-radius: 6px;
+  #btn-git-publish, #btn-git-update {
+    display: none; background: #1e1e1e; border: 1px solid #333; border-radius: 6px;
     color: #aaa; font-size: 11px; padding: 4px 10px; cursor: pointer;
-    white-space: nowrap; display: flex; align-items: center; gap: 5px;
+    white-space: nowrap; align-items: center; gap: 5px;
   }
-  #btn-git-sync:hover { border-color: #555; color: #fff; }
-  #btn-git-sync:disabled { opacity: 0.5; cursor: default; }
-  #git-badge {
-    display: none; background: #7c7cff; color: #fff; font-size: 10px;
-    padding: 1px 5px; border-radius: 8px; font-weight: 600; line-height: 1.4;
+  #btn-git-publish:hover, #btn-git-update:hover { border-color: #555; color: #fff; }
+  #btn-git-publish:disabled, #btn-git-update:disabled { opacity: 0.5; cursor: default; }
+  #git-badge-push, #git-badge-pull {
+    color: #fff; font-size: 10px; padding: 1px 4px;
+    border-radius: 8px; font-weight: 700; line-height: 1.4;
   }
-  #git-badge.pull { background: #3a8a5a; }
-  #git-badge.push { background: #4a6abf; }
-  #git-badge.both { background: #8a5aaa; }
+  #git-badge-push { background: #4a6abf; }
+  #git-badge-pull { background: #3a8a5a; }
 
   .layout {
     display: flex;
@@ -1948,14 +1947,15 @@ HTML = r"""
 <body>
 
 <header>
-  <h1>Claude Sessions</h1>
+  <h1>Claude Code GUI</h1>
   <div class="hdr-sys" id="hdr-sys">
     <button class="hdr-sys-btn" onclick="toggleHdrSys()">System &#9662;</button>
     <div class="hdr-sys-dropdown" id="hdr-sys-dropdown">
       <button onclick="deleteEmptySessions();closeHdrSys()">Delete Empty Sessions</button>
     </div>
   </div>
-  <button id="btn-git-sync" onclick="openGitSync()">Sync Claude GUI <span id="git-badge"></span></button>
+  <button id="btn-git-update" onclick="openGitUpdate()">Update App <span id="git-badge-pull"></span></button>
+  <button id="btn-git-publish" onclick="openGitPublish()">Publish App Update <span id="git-badge-push"></span></button>
   <div class="hdr-spacer"></div>
   <select id="project-picker" title="Switch project"></select>
   <span class="sub" id="session-count"></span>
@@ -1967,8 +1967,8 @@ HTML = r"""
     <div class="sidebar-toolbar">
       <div style="display:flex;align-items:center;gap:6px;">
         <div class="view-toggle">
-          <button class="view-toggle-btn active" id="btn-view-list" onclick="setViewMode('list')" title="List view">&#9776;</button>
-          <button class="view-toggle-btn" id="btn-view-workforce" onclick="setViewMode('workforce')" title="Workforce view">&#128101;</button>
+          <button class="view-toggle-btn active" id="btn-view-workforce" onclick="setViewMode('workforce')" title="Workforce view">&#128101;</button>
+          <button class="view-toggle-btn" id="btn-view-list" onclick="setViewMode('list')" title="List view">&#9776;</button>
         </div>
         <input type="text" id="search" placeholder="Search sessions…" oninput="filterSessions()" style="flex:1;width:auto;">
       </div>
@@ -2126,7 +2126,7 @@ let activeId = null;
 let renameTarget = null;
 let sortMode = 'date';  // 'date' | 'size'
 let sortAsc  = false;   // false = descending (newest/largest first)
-let viewMode = localStorage.getItem('viewMode') || 'list';
+let viewMode = localStorage.getItem('viewMode') || 'workforce';
 let wfSort = localStorage.getItem('wfSort') || 'status';
 let runningIds = new Set();
 
@@ -2616,49 +2616,54 @@ async function pollGitStatus() {
     const res = await fetch('/api/git-status');
     const s = await res.json();
     _gitStatus = s;
-    const badge = document.getElementById('git-badge');
+    const pushBadge = document.getElementById('git-badge-push');
+    const pullBadge = document.getElementById('git-badge-pull');
     const hasPush = s.ahead > 0 || s.uncommitted;
-    if (!s.has_git || (!hasPush && !s.behind)) {
-      badge.style.display = 'none'; return;
+    if (hasPush) {
+      pushBadge.textContent = '\u2191';
+      pushBadge.style.display = 'inline-block';
+    } else {
+      pushBadge.style.display = 'none';
     }
-    const parts = [];
-    if (s.behind > 0) parts.push('\u2193' + s.behind);
-    if (hasPush) parts.push('\u2191' + (s.ahead || ''));
-    badge.textContent = parts.join(' ').trim();
-    badge.className = hasPush && s.behind ? 'both' : s.behind ? 'pull' : 'push';
-    badge.style.display = 'inline-block';
+    if (s.behind > 0) {
+      pullBadge.textContent = '\u2193' + s.behind;
+      pullBadge.style.display = 'inline-block';
+    } else {
+      pullBadge.style.display = 'none';
+    }
   } catch(e) {}
 }
 
-function openGitSync() {
+function openGitPublish() {
   const s = _gitStatus;
-  if (!s.has_git) {
-    showGitSyncModal('Git Sync', '<p style="color:#aaa">This project has no git remote configured.</p>', []);
-    return;
-  }
   const hasPush = s.ahead > 0 || s.uncommitted;
-  let body = '', action = '';
-  if (hasPush && s.behind > 0) {
-    body = '<p>Changes are going in both directions:</p><ul style="margin:10px 0 10px 16px;color:#bbb;">'
-      + '<li><b style="color:#fff">' + s.behind + ' update(s)</b> ready to pull from remote</li>'
-      + '<li><b style="color:#fff">Your local changes</b> ready to push</li></ul>'
-      + '<p style="color:#888;font-size:12px">Claude will pull first, then push. Any conflicts are resolved automatically.</p>';
-    action = 'both';
-  } else if (s.behind > 0) {
-    body = '<p><b style="color:#fff">' + s.behind + ' new update(s)</b> are available to pull from remote.</p>'
-      + '<p style="color:#888;font-size:12px">Your app will be updated to the latest version.</p>';
-    action = 'pull';
-  } else if (hasPush) {
-    body = '<p>You have <b style="color:#fff">local changes</b> ready to push to remote.</p>'
-      + '<p style="color:#888;font-size:12px">Your changes will be saved and uploaded automatically.</p>';
-    action = 'push';
-  } else {
-    body = '<p style="color:#aaa">Everything is up to date \u2014 nothing to sync.</p>';
-    showGitSyncModal('Sync Claude GUI', body, [{label:'OK', onclick: closeGitSyncModal}]);
+  if (!hasPush) {
+    showGitSyncModal('Publish App Update', '<p style="color:#aaa">Nothing to publish \u2014 your app is already up to date on remote.</p>',
+      [{label:'OK', onclick: closeGitSyncModal}]);
     return;
   }
-  showGitSyncModal('Sync Claude GUI', body, [
-    {label: 'Sync Now', primary: true, onclick: () => executeGitSync(action)},
+  let body = '<p>Your local changes are ready to publish.</p>'
+    + '<p style="color:#888;font-size:12px">They will be saved and uploaded to remote automatically.</p>';
+  if (s.behind > 0) {
+    body += '<p style="color:#aaa;font-size:12px;margin-top:8px">'
+      + s.behind + ' remote update(s) will be pulled in first, then your changes pushed.</p>';
+  }
+  showGitSyncModal('Publish App Update', body, [
+    {label: 'Publish Now', primary: true, onclick: () => executeGitAction('both', 'btn-git-publish', 'Publish App Update')},
+    {label: 'Cancel', onclick: closeGitSyncModal}
+  ]);
+}
+
+function openGitUpdate() {
+  const s = _gitStatus;
+  if (s.behind === 0) {
+    showGitSyncModal('Update App', '<p style="color:#aaa">Your app is already up to date.</p>',
+      [{label:'OK', onclick: closeGitSyncModal}]);
+    return;
+  }
+  showGitSyncModal('Update App', '<p><b style="color:#fff">' + s.behind + ' update(s)</b> are available from remote.</p>'
+    + '<p style="color:#888;font-size:12px">Your app will be updated to the latest version. Your local changes are safe.</p>', [
+    {label: 'Update Now', primary: true, onclick: () => executeGitAction('pull', 'btn-git-update', 'Update App')},
     {label: 'Cancel', onclick: closeGitSyncModal}
   ]);
 }
@@ -2682,11 +2687,10 @@ function closeGitSyncModal() {
   document.getElementById('git-sync-overlay').classList.remove('show');
 }
 
-async function executeGitSync(action) {
+async function executeGitAction(action, btnId, btnLabel) {
   closeGitSyncModal();
-  const btn = document.getElementById('btn-git-sync');
+  const btn = document.getElementById(btnId);
   btn.disabled = true;
-  btn.childNodes[0].nodeValue = 'Syncing\u2026 ';
   try {
     const res = await fetch('/api/git-sync', {
       method: 'POST', headers: {'Content-Type':'application/json'},
@@ -2694,16 +2698,15 @@ async function executeGitSync(action) {
     });
     const r = await res.json();
     const body = '<ul style="margin:10px 0 0 16px;color:#bbb;">'
-      + r.messages.map(m => '<li>' + escHtml(m) + '</li>').join('')
-      + '</ul>';
-    showGitSyncModal(r.ok ? 'Sync Complete \u2713' : 'Sync Problem', body,
+      + r.messages.map(m => '<li>' + escHtml(m) + '</li>').join('') + '</ul>';
+    showGitSyncModal(r.ok ? btnLabel + ' \u2713' : 'Problem', body,
       [{label:'OK', primary:true, onclick: closeGitSyncModal}]);
     await pollGitStatus();
   } catch(e) {
-    showGitSyncModal('Error', '<p style="color:#f88">Could not complete sync.</p>', [{label:'OK', onclick: closeGitSyncModal}]);
+    showGitSyncModal('Error', '<p style="color:#f88">Could not complete. Try again.</p>',
+      [{label:'OK', onclick: closeGitSyncModal}]);
   } finally {
     btn.disabled = false;
-    btn.childNodes[0].nodeValue = 'Sync Claude GUI ';
   }
 }
 
