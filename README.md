@@ -18,14 +18,50 @@ A local web interface for managing Claude Code sessions.
 - Claude Code installed and at least one session created
 - Windows (uses PowerShell for process detection and input)
 
-## Setup
+## Setup (AI-assisted — recommended)
+
+If you have [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed, open your terminal and tell Claude:
+
+> Get me set up with https://github.com/CustomerNode/ClaudeGUI
+
+Claude handles the rest — cloning the repo, installing Python and Flask if needed, creating a desktop shortcut, and launching ClaudeGUI for you.
+
+See [FileTaskNode](https://github.com/CustomerNode/FileTaskNode) for an example of a Claude Code workspace built around this kind of AI-assisted setup.
+
+## Setup (manual)
+
+### 1. Clone and install
 
 ```bash
+git clone https://github.com/CustomerNode/ClaudeGUI.git
+cd ClaudeGUI
 pip install flask
+```
+
+### 2. Run
+
+```bash
 python session_manager.py
 ```
 
-Then open http://localhost:5050 in your browser.
+The browser opens automatically to http://localhost:5050.
+
+### 3. Desktop shortcut (Windows)
+
+Run this once in PowerShell to create a desktop shortcut that launches ClaudeGUI with one click:
+
+```powershell
+$WshShell = New-Object -ComObject WScript.Shell
+$Shortcut = $WshShell.CreateShortcut("$env:USERPROFILE\Desktop\ClaudeGUI.lnk")
+$Shortcut.TargetPath = "python"
+$Shortcut.Arguments = "session_manager.py"
+$Shortcut.WorkingDirectory = "$env:USERPROFILE\Documents\ClaudeGUI"
+$Shortcut.IconLocation = "$env:USERPROFILE\Documents\ClaudeGUI\claudecodegui.ico,0"
+$Shortcut.WindowStyle = 7
+$Shortcut.Save()
+```
+
+This starts the server minimized and opens the browser automatically.
 
 ## Notes
 
