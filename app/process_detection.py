@@ -43,19 +43,41 @@ def _get_running_session_ids():
             proc_data = [proc_data]
 
         live_pids = set()
+        proc_lookup = {}  # pid -> proc info, for parent-chain walking
         for proc in proc_data:
             cmdline = proc.get("CommandLine") or ""
             name = (proc.get("Name") or "").lower()
+            pid = proc.get("ProcessId")
+            proc_lookup[pid] = proc
             if name not in ("node.exe", "claude.exe", "claude"):
                 continue
             if "--output-format" in cmdline:
                 continue
-            live_pids.add(proc.get("ProcessId"))
+            live_pids.add(pid)
+
+        def _has_cmd_parent(start_pid):
+            """Return True if any ancestor of start_pid is cmd.exe."""
+            cur = start_pid
+            visited = set()
+            while cur and cur > 4:
+                if cur in visited:
+                    break
+                visited.add(cur)
+                p = proc_lookup.get(cur)
+                if not p:
+                    break
+                if (p.get("Name") or "").lower() == "cmd.exe":
+                    return True
+                cur = int(p.get("ParentProcessId") or 0)
+            return False
 
         running = {}
+        cmd_parented = {}   # session_id -> pid, only for cmd.exe-rooted processes
         current_dir = _sessions_dir()
 
-        # Match via registry: authoritative PID -> session ID mapping
+        # Match via registry: authoritative PID -> session ID mapping.
+        # When multiple PIDs map to the same session (e.g. external + GUI resume),
+        # prefer the cmd.exe-parented one — WriteConsoleInput only works there.
         for pid, info in registry.items():
             if pid not in live_pids:
                 continue  # stale registry entry
@@ -64,7 +86,14 @@ def _get_running_session_ids():
                 continue
             # Only include if session belongs to current project
             if (current_dir / f"{sid}.jsonl").exists():
-                running[sid] = pid  # positive = confirmed
+                if _has_cmd_parent(pid):
+                    cmd_parented[sid] = pid
+                else:
+                    if sid not in running:
+                        running[sid] = pid  # fallback, only if no cmd.exe version yet
+
+        # cmd.exe-parented processes win over external ones
+        running.update(cmd_parented)
 
         # Fallback: command-line UUID matching for sessions not in registry
         uuid_re = re.compile(r"(?:--resume|-r)\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
