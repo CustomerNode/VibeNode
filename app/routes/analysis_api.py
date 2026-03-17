@@ -1,5 +1,5 @@
 """
-Analysis routes — summary, code extraction, export, compare.
+Analysis routes -- summary, code extraction, export, compare.
 """
 
 import io
@@ -103,7 +103,7 @@ def api_summary(session_id):
 
     # Recent focus = last 3 meaningful user requests
     recent_items = "".join(
-        f"<li>{t[:1].upper()}{t[1:130]}{'\u2026' if len(t)>130 else ''}</li>"
+        f"<li>{t[:1].upper()}{t[1:130]}{chr(8230) if len(t)>130 else ''}</li>"
         for t in meaningful[-3:]
     )
     recent_html = (f'<div class="sum-section"><div class="sum-label">Recent focus</div>'

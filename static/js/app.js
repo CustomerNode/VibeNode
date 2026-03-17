@@ -1,10 +1,10 @@
 /* app.js — global state, project loading, session loading */
 
 let allSessions = [];
-let activeId = null;
+let activeId = localStorage.getItem('activeSessionId') || null;
 let renameTarget = null;
-let sortMode = 'date';  // 'date' | 'size'
-let sortAsc  = false;   // false = descending (newest/largest first)
+let sortMode = localStorage.getItem('sortMode') || 'date';
+let sortAsc  = localStorage.getItem('sortAsc') === 'true';
 let viewMode = localStorage.getItem('viewMode') || 'workforce';
 let wfSort = localStorage.getItem('wfSort') || 'status';
 let runningIds = new Set();
@@ -45,13 +45,16 @@ function _updateProjectLabel(project) {
 }
 
 async function setProject(encoded, reload = true) {
+  if (activeId) deselectSession();
+  const p = _allProjects.find(x => x.encoded === encoded);
+  _updateProjectLabel(p);
+  localStorage.setItem('activeProject', encoded);
+  // Show skeleton immediately
+  if (reload) showSkeletonLoader();
   await fetch('/api/set-project', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({project: encoded})
   });
-  localStorage.setItem('activeProject', encoded);
-  const p = _allProjects.find(x => x.encoded === encoded);
-  _updateProjectLabel(p);
   if (reload) loadSessions();
 }
 
@@ -106,6 +109,7 @@ function closeProjectOverlay() {
 
 async function selectProjectFromOverlay(encoded) {
   closeProjectOverlay();
+  showToast('Switching workspace\u2026');
   await setProject(encoded, true);
 }
 
@@ -394,13 +398,27 @@ function _updateViewModeButton(mode) {
 // Hydrate view mode button on load
 _updateViewModeButton(viewMode);
 
-// --- Sort dropdown ---
-function toggleSortDropdown() {
-  document.getElementById('sidebar-sort-dropdown').classList.toggle('open');
+// Hydrate sort label on load
+(function() {
+  const opts = document.querySelectorAll('.sidebar-sort-opt');
+  opts.forEach(el => {
+    if (el.dataset.sort === sortMode && String(el.dataset.asc) === String(sortAsc)) {
+      el.classList.add('active');
+      document.getElementById('sidebar-sort-label').textContent = el.textContent;
+    }
+  });
+})();
+
+// --- Sidebar menu (three dots) ---
+function toggleSidebarMenu() {
+  document.getElementById('sidebar-menu-dropdown').classList.toggle('open');
+}
+function closeSidebarMenu() {
+  document.getElementById('sidebar-menu-dropdown').classList.remove('open');
 }
 
 function pickSort(mode, asc) {
-  document.getElementById('sidebar-sort-dropdown').classList.remove('open');
+  closeSidebarMenu();
   // Find the label from the clicked option
   const opts = document.querySelectorAll('.sidebar-sort-opt');
   let label = mode;
@@ -420,28 +438,130 @@ function pickSort(mode, asc) {
   filterSessions();
 }
 
-// Close sort dropdown on outside click
+// Close sidebar menu on outside click
 document.addEventListener('click', function(e) {
-  const wrap = document.querySelector('.sidebar-sort-wrap');
-  if (wrap && !wrap.contains(e.target)) {
-    document.getElementById('sidebar-sort-dropdown').classList.remove('open');
-  }
+  const wrap = document.querySelector('.sidebar-menu-wrap');
+  if (wrap && !wrap.contains(e.target)) closeSidebarMenu();
 });
+
+// --- Sleep All ---
+async function sleepAllSessions() {
+  const running = allSessions.filter(s => runningIds.has(s.id));
+  if (!running.length) { showToast('No running sessions'); return; }
+  const ok = await showConfirm('Sleep All Sessions', '<p>Close <strong>' + running.length + '</strong> running session' + (running.length > 1 ? 's' : '') + ' in this workspace?</p>', { danger: true, confirmText: 'Sleep All', icon: '\uD83D\uDCA4' });
+  if (!ok) return;
+  let closed = 0;
+  for (const s of running) {
+    try {
+      const r = await fetch('/api/close/' + s.id, { method: 'POST' });
+      const d = await r.json();
+      if (d.ok) closed++;
+    } catch(e) {}
+  }
+  showToast(closed + ' session' + (closed !== 1 ? 's' : '') + ' closed');
+  guiOpenSessions.clear();
+  localStorage.setItem('guiOpenSessions', '[]');
+  if (liveSessionId) updateLiveInputBar();
+  pollWaiting();
+}
+
+// --- Delete All ---
+async function deleteAllSessions() {
+  const count = allSessions.length;
+  if (!count) { showToast('No sessions to delete'); return; }
+  const ok = await showConfirm('Delete All Sessions', '<p>Permanently delete <strong>all ' + count + ' sessions</strong> in this workspace?</p><p>This cannot be undone.</p>', { danger: true, confirmText: 'Delete All', icon: '\u26A0\uFE0F' });
+  if (!ok) return;
+  // Double confirm for safety
+  const ok2 = await showConfirm('Are you sure?', '<p>This will permanently delete <strong>' + count + ' sessions</strong> and all their history.</p>', { danger: true, confirmText: 'Yes, delete everything' });
+  if (!ok2) return;
+  let deleted = 0;
+  for (const s of [...allSessions]) {
+    try {
+      const r = await fetch('/api/delete/' + s.id, { method: 'DELETE' });
+      const d = await r.json();
+      if (d.ok) deleted++;
+    } catch(e) {}
+  }
+  if (liveSessionId) stopLivePanel();
+  deselectSession();
+  await loadSessions();
+  showToast(deleted + ' sessions deleted');
+}
 
 // --- New Agent ---
 async function addNewAgent() {
-  // Opens a new Claude Code session in a terminal
+  const name = await showPrompt('New Session', '<p>Give this session a name (optional).</p>', {
+    placeholder: 'e.g. Fix login bug',
+    confirmText: 'Start',
+    icon: '\u2795',
+  });
+  if (name === null) return;
+
+  // Optimistic UI: add placeholder to sidebar + show spinner in main body
+  const tempId = '_pending_' + Date.now();
+  const optimistic = {
+    id: tempId,
+    display_title: name || 'New Session',
+    custom_title: name || '',
+    last_activity: 'Starting\u2026',
+    size: '',
+    message_count: 0,
+    preview: '',
+  };
+  allSessions.unshift(optimistic);
+  filterSessions();
+  // Highlight the optimistic entry
+  activeId = tempId;
+  document.getElementById('main-body').innerHTML =
+    '<div class="live-panel" id="live-panel">' +
+    '<div class="conversation live-log" id="live-log">' +
+    '<div class="empty-state" style="padding:40px 0;">' +
+    '<div class="spinner" style="margin:0 auto 12px;"></div>' +
+    '<div style="color:var(--text-muted);font-size:13px;">Starting new session\u2026</div>' +
+    '</div></div>' +
+    '<div class="live-input-bar" id="live-input-bar"></div></div>';
+
   try {
-    const resp = await fetch('/api/new-session', { method: 'POST' });
+    const resp = await fetch('/api/new-session', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name || ''})
+    });
     const data = await resp.json();
-    if (data.ok) {
-      showToast('New session started');
-      await loadSessions();
+    // Remove optimistic entry
+    allSessions = allSessions.filter(s => s.id !== tempId);
+    if (data.ok && data.new_id) {
+      guiOpenAdd(data.new_id);
+      // Pre-seed as running+idle so the input bar doesn't flash "not running"
+      runningIds.add(data.new_id);
+      sessionKinds[data.new_id] = 'idle';
+      // Quietly refresh sidebar (no skeleton flash)
+      const sr = await fetch('/api/sessions');
+      allSessions = await sr.json();
+      document.getElementById('search').placeholder = 'Search ' + allSessions.length + ' sessions\u2026';
+      filterSessions();
+      // Open live panel directly (skip chat skeleton since we already show spinner)
+      activeId = data.new_id;
+      localStorage.setItem('activeSessionId', data.new_id);
+      const cached = allSessions.find(x => x.id === data.new_id);
+      setToolbarSession(data.new_id, (cached && cached.custom_title) || name || 'New Session', !cached, name || '');
+      startLivePanel(data.new_id);
+      showToast('Session started');
+    } else if (data.ok) {
+      const sr = await fetch('/api/sessions');
+      allSessions = await sr.json();
+      filterSessions();
+      showToast('Session launched \u2014 check sidebar for new entry');
     } else {
+      filterSessions();
       showToast(data.error || 'Could not start session', true);
+      document.getElementById('main-body').innerHTML = _buildDashboard();
     }
   } catch(e) {
+    allSessions = allSessions.filter(s => s.id !== tempId);
+    filterSessions();
     showToast('Could not start session', true);
+    document.getElementById('main-body').innerHTML = _buildDashboard();
   }
 }
 
@@ -467,6 +587,13 @@ async function loadSessions() {
   allSessions = await resp.json();
   document.getElementById('search').placeholder = 'Search ' + allSessions.length + ' sessions\u2026';
   setViewMode(viewMode);
+  // Restore previously selected session or show dashboard
+  const savedSession = localStorage.getItem('activeSessionId');
+  if (savedSession && allSessions.find(s => s.id === savedSession)) {
+    openInGUI(savedSession);
+  } else {
+    document.getElementById('main-body').innerHTML = _buildDashboard();
+  }
 }
 
 function filterSessions() {

@@ -28,11 +28,24 @@ if __name__ == "__main__":
     if cli:
         cli.show_server_banner = lambda *a, **k: None
 
-    print("\n  ClaudeCodeGUI is running.\n"
+    print("\n"
+          "  =========================================================\n"
+          "    CLAUDE CODE GUI RUNNING - KEEP THIS TERMINAL OPEN\n"
+          "  =========================================================\n\n"
           "  Open your browser to: http://localhost:5050\n\n"
           "  This is a local server for personal use.\n"
-          "  Leave this window open while using ClaudeCodeGUI.\n"
-          "  Close it or press Ctrl+C to stop.\n", flush=True)
+          "  Close it or press Ctrl+C to stop.\n\n"
+          "  ---------------------------------------------------------\n\n"
+          "  Building something complex and need to sell it?\n\n"
+          "  CustomerNode.com\n"
+          "  Turns Complex Deals Into Executable Journeys.\n"
+          "  One shared path from discovery to mutual success.\n"
+          "  Guided for buyers. Repeatable for sellers.\n"
+          "  Powered by First-Party AI(TM).\n\n"
+          "  Developed by the team at customernode.com\n"
+          "  MIT License | Copyright 2026 CustomerNode LLC\n\n"
+          "  ---------------------------------------------------------\n",
+          flush=True)
 
     threading.Thread(target=open_browser, daemon=True).start()
     app.run(host="0.0.0.0", port=5050, debug=False, threaded=True)

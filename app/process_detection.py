@@ -1,5 +1,5 @@
 """
-Windows process detection — find running Claude sessions, detect waiting state,
+Windows process detection -- find running Claude sessions, detect waiting state,
 and send keystrokes to terminal windows.
 """
 
@@ -13,43 +13,77 @@ from .config import _sessions_dir
 
 
 def _get_running_session_ids():
-    """Return {session_id: pid} for any claude sessions currently running."""
+    """Return {session_id: pid} for any claude sessions currently running.
+
+    Positive PIDs = UUID confirmed via session registry (safe to send to).
+    Negative PIDs = unmatched process (display-only, not killable).
+    """
     try:
+        # Primary source: Claude's own session registry (~/.claude/sessions/{pid}.json)
+        # Each file maps a running PID to its session ID and cwd.
+        sessions_reg = Path.home() / ".claude" / "sessions"
+        registry = {}  # pid -> {sessionId, cwd}
+        if sessions_reg.is_dir():
+            for f in sessions_reg.glob("*.json"):
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                    pid = int(f.stem)
+                    registry[pid] = data
+                except Exception:
+                    continue
+
+        # Get running claude processes (to filter out stale registry entries)
         result = subprocess.run(
             ["powershell", "-NoProfile", "-command",
-             "Get-WmiObject Win32_Process | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress"],
+             "Get-WmiObject Win32_Process | Where-Object { $_.Name -match 'claude|node' } | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress"],
             capture_output=True, text=True, timeout=8
         )
-        data = json.loads(result.stdout or "[]")
-        if isinstance(data, dict):
-            data = [data]
+        proc_data = json.loads(result.stdout or "[]")
+        if isinstance(proc_data, dict):
+            proc_data = [proc_data]
 
-        running = {}
-        resume_pids = []
-        uuid_re = re.compile(r"(?:--resume|-r)\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
-
-        for proc in data:
+        live_pids = set()
+        for proc in proc_data:
             cmdline = proc.get("CommandLine") or ""
             name = (proc.get("Name") or "").lower()
             if name not in ("node.exe", "claude.exe", "claude"):
                 continue
-            m = uuid_re.search(cmdline)
-            if m:
-                running[m.group(1)] = proc.get("ProcessId")
-            elif re.search(r"\b(--resume|resume)\b", cmdline):
-                # claude --resume: UUID not in command line -- resolve by recent file activity
-                resume_pids.append(proc.get("ProcessId"))
+            if "--output-format" in cmdline:
+                continue
+            live_pids.add(proc.get("ProcessId"))
 
-        # For --resume processes, match to the most recently active .jsonl not already claimed.
-        # No time limit -- --resume can resume sessions that have been idle for hours.
-        if resume_pids:
-            candidates = sorted(
-                [(f.stat().st_mtime, f.stem) for f in _sessions_dir().glob("*.jsonl")
-                 if f.stem not in running],
-                reverse=True
-            )
-            for pid, (_, sid) in zip(resume_pids, candidates):
-                running[sid] = pid
+        running = {}
+        current_dir = _sessions_dir()
+
+        # Match via registry: authoritative PID -> session ID mapping
+        for pid, info in registry.items():
+            if pid not in live_pids:
+                continue  # stale registry entry
+            sid = info.get("sessionId")
+            if not sid:
+                continue
+            # Only include if session belongs to current project
+            if (current_dir / f"{sid}.jsonl").exists():
+                running[sid] = pid  # positive = confirmed
+
+        # Fallback: command-line UUID matching for sessions not in registry
+        uuid_re = re.compile(r"(?:--resume|-r)\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
+        matched_pids = set(running.values())
+        unmatched_pids = []
+        for proc in proc_data:
+            cmdline = proc.get("CommandLine") or ""
+            name = (proc.get("Name") or "").lower()
+            if name not in ("node.exe", "claude.exe", "claude"):
+                continue
+            if "--output-format" in cmdline:
+                continue
+            pid = proc.get("ProcessId")
+            m = uuid_re.search(cmdline)
+            if m and m.group(1) not in running:
+                running[m.group(1)] = pid
+                matched_pids.add(pid)
+            elif pid not in matched_pids:
+                unmatched_pids.append(pid)
 
         return running
     except Exception:
@@ -179,6 +213,10 @@ def _parse_session_kind(path: Path) -> str:
     """
     file_age = time.time() - path.stat().st_mtime
 
+    # Empty/new file = Claude is at the prompt, not working
+    if path.stat().st_size == 0:
+        return 'idle'
+
     # Recent file activity always means working
     if file_age < 10:
         return 'working'
@@ -211,7 +249,7 @@ def _parse_session_kind(path: Path) -> str:
             break
 
     if not entries:
-        return 'working'
+        return 'idle'  # empty/new session — Claude is at the prompt
 
     last = entries[0]
     t = last.get("type", "")
@@ -251,6 +289,11 @@ def _parse_session_kind(path: Path) -> str:
             if not prev_is_user_text:
                 return 'working'
 
+        # If file was modified in the last 3 seconds, Claude might still
+        # be mid-response (JSONL writes are batched)
+        if time.time() - path.stat().st_mtime < 3:
+            return 'working'
+
         return 'idle'
 
     return 'working'
@@ -258,70 +301,129 @@ def _parse_session_kind(path: Path) -> str:
 
 def send_to_session(pid: int, text: str) -> dict:
     """
-    Send text to a running Claude session via PowerShell SendKeys.
-    Returns a result dict with 'ok', 'method', and optionally 'err'.
+    Send text to a running Claude session via WriteConsoleInput.
+    Writes directly to the console input buffer — no focus stealing,
+    no window activation, works reliably for repeated sends.
     """
     import tempfile
     import os as _os
     import base64 as _b64
 
     b64 = _b64.b64encode(text.encode("utf-8")).decode("ascii")
-    ps_script = f"""$inputBytes = [System.Convert]::FromBase64String('{b64}')
+    ps_script = f"""
+$inputBytes = [System.Convert]::FromBase64String('{b64}')
 $inputText  = [System.Text.Encoding]::UTF8.GetString($inputBytes)
 
-function Find-Window([int]$Pid) {{
-    $visited = @{{}}
-    $cur = $Pid
-    while ($cur -gt 4) {{
-        if ($visited.ContainsKey($cur)) {{ break }}
-        $visited[$cur] = 1
-        try {{
-            $p = Get-Process -Id $cur -EA Stop
-            if ($p.MainWindowHandle -ne [IntPtr]::Zero) {{ return $p }}
-        }} catch {{}}
-        try {{
-            $cur = [int](Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -EA Stop).ParentProcessId
-        }} catch {{ break }}
-    }}
-    return $null
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+[StructLayout(LayoutKind.Explicit)]
+public struct KEY_EVENT_RECORD {{
+    [FieldOffset(0)] public bool bKeyDown;
+    [FieldOffset(4)] public short wRepeatCount;
+    [FieldOffset(6)] public short wVirtualKeyCode;
+    [FieldOffset(8)] public short wVirtualScanCode;
+    [FieldOffset(10)] public char UnicodeChar;
+    [FieldOffset(12)] public int dwControlKeyState;
 }}
 
-$wp = Find-Window {pid}
-if (-not $wp) {{ Write-Error "No window for pid {pid}"; exit 1 }}
+[StructLayout(LayoutKind.Explicit)]
+public struct INPUT_RECORD {{
+    [FieldOffset(0)] public short EventType;
+    [FieldOffset(4)] public KEY_EVENT_RECORD KeyEvent;
+}}
 
-Add-Type -TypeDefinition @'
-using System; using System.Runtime.InteropServices;
-public class WU {{
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+public class ConsoleIO {{
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool FreeConsole();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool AttachConsole(uint dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool WriteConsoleInput(
+        IntPtr hConsoleInput,
+        INPUT_RECORD[] lpBuffer,
+        uint nLength,
+        out uint lpNumberOfEventsWritten);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool AllocConsole();
+
+    public static void SendString(uint pid, string text) {{
+        FreeConsole();
+        if (!AttachConsole(pid)) {{
+            AllocConsole();
+            throw new Exception("AttachConsole failed for pid " + pid + ", error " + Marshal.GetLastWin32Error());
+        }}
+        try {{
+            IntPtr hInput = GetStdHandle(-10); // STD_INPUT_HANDLE
+            foreach (char ch in text) {{
+                INPUT_RECORD[] recs = new INPUT_RECORD[2];
+                recs[0].EventType = 1; // KEY_EVENT
+                recs[0].KeyEvent.bKeyDown = true;
+                recs[0].KeyEvent.wRepeatCount = 1;
+                recs[0].KeyEvent.UnicodeChar = ch;
+                recs[1].EventType = 1;
+                recs[1].KeyEvent.bKeyDown = false;
+                recs[1].KeyEvent.wRepeatCount = 1;
+                recs[1].KeyEvent.UnicodeChar = ch;
+                uint written;
+                WriteConsoleInput(hInput, recs, 2, out written);
+            }}
+            // Send Enter
+            INPUT_RECORD[] enter = new INPUT_RECORD[2];
+            enter[0].EventType = 1;
+            enter[0].KeyEvent.bKeyDown = true;
+            enter[0].KeyEvent.wRepeatCount = 1;
+            enter[0].KeyEvent.wVirtualKeyCode = 0x0D;
+            enter[0].KeyEvent.UnicodeChar = (char)13;
+            enter[1].EventType = 1;
+            enter[1].KeyEvent.bKeyDown = false;
+            enter[1].KeyEvent.wRepeatCount = 1;
+            enter[1].KeyEvent.wVirtualKeyCode = 0x0D;
+            enter[1].KeyEvent.UnicodeChar = (char)13;
+            uint w2;
+            WriteConsoleInput(hInput, enter, 2, out w2);
+        }} finally {{
+            FreeConsole();
+            AllocConsole();
+        }}
+    }}
 }}
 '@
 
-[WU]::ShowWindow($wp.MainWindowHandle, 9)
-[WU]::SetForegroundWindow($wp.MainWindowHandle)
-Start-Sleep -Milliseconds 300
-
-Add-Type -AssemblyName System.Windows.Forms
-$specialChars = [char[]]@('+','^','%','~','(',')','{{'[0],'}}'[0],'[',']')
-foreach ($ch in $inputText.ToCharArray()) {{
-    $str = [string]$ch
-    if ($specialChars -contains $ch) {{
-        [System.Windows.Forms.SendKeys]::SendWait("{{" + $str + "}}")
-    }} else {{
-        [System.Windows.Forms.SendKeys]::SendWait($str)
-    }}
-    Start-Sleep -Milliseconds 20
+# Find the cmd.exe parent (the console host)
+$cur = {pid}
+$consolePid = $null
+while ($cur -gt 4) {{
+    try {{
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -EA Stop
+        if ($proc.Name -eq 'cmd.exe') {{ $consolePid = $cur; break }}
+        $cur = [int]$proc.ParentProcessId
+    }} catch {{ break }}
 }}
-[System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+if (-not $consolePid) {{ $consolePid = {pid} }}
+
+[ConsoleIO]::SendString([uint32]$consolePid, $inputText)
 """
     tmp_ps = None
     try:
         with tempfile.NamedTemporaryFile(mode='w', suffix='.ps1', delete=False, encoding='utf-8') as f:
             f.write(ps_script)
             tmp_ps = f.name
+        si = subprocess.STARTUPINFO()
+        si.dwFlags = subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0  # SW_HIDE
         res = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", tmp_ps],
-            capture_output=True, timeout=12
+            capture_output=True, timeout=15,
+            startupinfo=si,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
         )
         if res.returncode == 0:
             return {"ok": True, "method": "sent"}

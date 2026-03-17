@@ -17,27 +17,36 @@ function setToolbarSession(id, titleText, isUntitled, customTitle) {
   if (btnClose) btnClose.disabled = !id || (!runningIds.has(id) && !guiOpenSessions.has(id));
 }
 
+function deselectSession() {
+  activeId = null;
+  localStorage.removeItem('activeSessionId');
+  if (liveSessionId) stopLivePanel();
+  filterSessions();
+  setToolbarSession(null, 'No session selected', true, '');
+  document.getElementById('main-body').innerHTML = _buildDashboard();
+}
+
 function handleSessionClick(id) {
   if (id === activeId) { startListInlineRename(); } else { selectSession(id); }
 }
 
 async function handleNameClick(id) {
   if (id !== activeId) {
-    await selectSession(id);   // first click — just select
+    openInGUI(id);
   } else {
-    startListInlineRename();   // second click on already-active row — rename
+    startListInlineRename();
   }
 }
 
 async function selectSession(id) {
   activeId = id;
+  localStorage.setItem('activeSessionId', id || '');
   // Stop live panel for a different session
   if (liveSessionId && liveSessionId !== id) stopLivePanel();
   filterSessions();
 
   setToolbarSession(id, 'Loading\u2026', true, '');
-  document.getElementById('main-body').innerHTML =
-    '<div class="empty-state"><div class="spinner"></div></div>';
+  document.getElementById('main-body').innerHTML = _chatSkeleton();
 
   const resp = await fetch('/api/session/' + id);
   const s = await resp.json();
@@ -135,6 +144,105 @@ function cancelListInlineRename() {
   // Alias for compatibility — escape is handled in startListInlineRename
 }
 
+function _buildDashboard() {
+  const project = _allProjects.find(p => p.encoded === localStorage.getItem('activeProject'));
+  const projectName = project ? _projectShortName(project) : 'No project';
+  const total = allSessions.length;
+  const working = allSessions.filter(s => sessionKinds[s.id] === 'working').length;
+  const idle = allSessions.filter(s => sessionKinds[s.id] === 'idle').length;
+  const question = allSessions.filter(s => sessionKinds[s.id] === 'question').length;
+  const sleeping = total - working - idle - question;
+
+  const stats = [
+    {label: 'Working', count: working, color: 'var(--accent)', icon: '<img src="/static/svg/pickaxe.svg" width="16" height="16" style="filter:brightness(0) saturate(100%) invert(55%) sepia(78%) saturate(1000%) hue-rotate(215deg);">'},
+    {label: 'Waiting', count: question, color: '#ff9500', icon: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r=".5" fill="#ff9500"/></svg>'},
+    {label: 'Idle', count: idle, color: 'var(--idle-label)', icon: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--idle-label)" stroke-width="2" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>'},
+    {label: 'Sleeping', count: sleeping, color: 'var(--text-faint)', icon: '<img src="/static/svg/sleeping.svg" width="16" height="16" class="sleeping-icon">'},
+  ];
+
+  return `
+  <div class="dashboard">
+    <div class="dash-header">
+      <div class="dash-project" onclick="openProjectOverlay()">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        <div>
+          <div class="dash-project-name">${escHtml(projectName)}</div>
+          <div class="dash-project-sub">${total} sessions</div>
+        </div>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-left:auto;opacity:0.4;"><polyline points="6 9 12 15 18 9"/></svg>
+      </div>
+    </div>
+
+    <div class="dash-stats">
+      ${stats.map(s => `
+        <div class="dash-stat">
+          <div class="dash-stat-icon">${s.icon}</div>
+          <div class="dash-stat-count" style="color:${s.color}">${s.count}</div>
+          <div class="dash-stat-label">${s.label}</div>
+        </div>
+      `).join('')}
+    </div>
+
+    <button class="dash-new-btn" onclick="addNewAgent()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      New Session
+    </button>
+
+    <div class="dash-hint">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="opacity:0.3;flex-shrink:0;"><polyline points="15 18 9 12 15 6"/></svg>
+      <span>Select a session from the sidebar to view its conversation</span>
+    </div>
+  </div>`;
+}
+
+function dashStartSession() {
+  const input = document.getElementById('dash-new-input');
+  const text = input ? input.value.trim() : '';
+  if (!text) { showToast('Type a message first'); return; }
+  // TODO: wire to actual session creation
+  showToast('Starting session\u2026');
+  addNewAgent();
+}
+
+function _colorDiffLines(html) {
+  return html.split('\n').map(line => {
+    if (/^\+[^+]/.test(line)) return '<span style="color:#4c4;opacity:0.8;">' + line + '</span>';
+    if (/^-[^-]/.test(line)) return '<span style="color:#c44;opacity:0.8;">' + line + '</span>';
+    if (/^@@/.test(line)) return '<span style="color:var(--accent);opacity:0.6;">' + line + '</span>';
+    return line;
+  }).join('\n');
+}
+
+function _chatSkeleton() {
+  let html = '<div class="conversation">';
+  const msgs = [
+    {role:'user', lines:2},
+    {role:'asst', lines:4},
+    {role:'user', lines:1},
+    {role:'asst', lines:6},
+    {role:'user', lines:2},
+    {role:'asst', lines:5},
+  ];
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+    const d = (i * 0.1).toFixed(2);
+    const isUser = m.role === 'user';
+    html += `<div class="msg ${isUser ? 'user' : 'assistant'}" style="margin-bottom:20px;">`;
+    // Role label skeleton
+    html += `<div style="margin-bottom:5px;"><div class="skel-bar" style="width:40px;height:7px;animation-delay:${d}s;border-radius:3px;"></div></div>`;
+    // Bubble skeleton — same style for both sides
+    const bw = isUser ? (200 + Math.random() * 150) : (300 + Math.random() * 200);
+    html += `<div class="msg-body" style="width:${bw}px;max-width:85%;padding:14px 16px;">`;
+    for (let l = 0; l < m.lines; l++) {
+      const lw = l === m.lines - 1 ? (40 + Math.random() * 35) : (75 + Math.random() * 25);
+      html += `<div class="skel-bar" style="width:${lw}%;height:11px;margin-bottom:${l < m.lines - 1 ? 8 : 0}px;border-radius:4px;animation-delay:${(parseFloat(d) + l * 0.04).toFixed(2)}s;"></div>`;
+    }
+    html += '</div></div>';
+  }
+  html += '</div>';
+  return html;
+}
+
 async function loadAllMessages(id) {
   const btn = document.getElementById('btn-load-all');
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Loading...'; }
@@ -148,20 +256,101 @@ async function loadAllMessages(id) {
   }, 50);
 }
 
+function _cleanUserContent(text) {
+  // Strip all XML-like system tags injected by Claude Code / IDE
+  return text
+    .replace(/<[a-z_-]+(?:\s[^>]*)?>[\s\S]*?<\/[a-z_-]+>/g, '')  // matched pairs
+    .replace(/<[a-z_-]+(?:\s[^>]*)?\/>/g, '')  // self-closing
+    .replace(/<[a-z_-]+(?:\s[^>]*)?>[\s\S]*$/g, '')  // unclosed tag to end
+    .trim();
+}
+
+function _isSystemMessage(text) {
+  const t = text.trim();
+  return /^<[a-z_-]+[\s>]/.test(t) ||
+    /^This (session is being continued|is a continuation)/.test(t) ||
+    /^The user (opened|selected|is viewing)/.test(t) ||
+    /^\*\*What we were working on/.test(t) ||
+    /^\*\*Key context/.test(t) ||
+    /^\*\*Most recent exchanges/.test(t);
+}
+
 function renderMessages(messages) {
-  if (!messages || !messages.length) return '<div style="color:#444;font-size:13px;">No messages</div>';
-  return messages.map(m => {
-    let body;
-    if (m.role === 'assistant') {
-      body = mdParse(m.content || '');
-    } else {
-      body = '<pre style="white-space:pre-wrap;margin:0;">' + escHtml(m.content || '(empty)') + '</pre>';
+  if (!messages || !messages.length) return '<div class="empty-state" style="padding:40px 0;"><div style="color:var(--text-faint);font-size:13px;">No messages yet</div></div>';
+  return messages.filter(m => m.content).map(m => {
+    // Tool use: gear icon + tool names
+    if (m.type === 'tool') {
+      const names = m.content.replace(/[\[\]]/g, '');
+      return `<div class="live-entry live-entry-tool">
+        <div class="live-tool-line" onclick="this.nextElementSibling.classList.toggle('open')">
+          <span class="live-tool-icon">\u2699</span>
+          <span class="live-tool-name">${escHtml(names)}</span>
+          <button class="live-expand-btn">\u25be</button>
+        </div>
+        <div class="live-tool-detail">${escHtml(m.content)}</div>
+      </div>`;
     }
-    return `<div class="msg ${m.role}">
-      <div class="msg-role">${m.role}</div>
-      <div class="msg-body msg-content">${body}</div>
+    // Tool result: expandable output
+    if (m.type === 'tool_result') {
+      const text = m.content;
+      const isShort = text.split('\n').length <= 6;
+      return `<div class="live-entry live-entry-result">
+        <div class="live-result-line live-result-ok" onclick="this.nextElementSibling.classList.toggle('open')" style="cursor:pointer;">
+          \u2713 ${escHtml(text.slice(0, 80))}${text.length > 80 ? '\u2026' : ''}
+        </div>
+        <div class="live-tool-detail${isShort ? ' open' : ''}">${mdParse(_colorDiffLines(escHtml(text)))}</div>
+      </div>`;
+    }
+    // User message
+    if (m.role === 'user') {
+      const cleaned = _cleanUserContent(m.content);
+      if (!cleaned) return ''; // skip empty after cleaning
+      // System-injected messages render as context, not "me"
+      if (_isSystemMessage(m.content)) {
+        return `<div class="live-entry live-entry-result">
+          <div class="live-result-line" style="color:var(--text-faint);cursor:pointer;" onclick="this.nextElementSibling.classList.toggle('open')">
+            \u2139 ${escHtml(cleaned.slice(0, 100))}${cleaned.length > 100 ? '\u2026' : ''}
+          </div>
+          <div class="live-tool-detail">${mdParse(escHtml(cleaned))}</div>
+        </div>`;
+      }
+      return `<div class="msg user">
+        <div class="msg-role">me</div>
+        <div class="msg-body msg-content">${mdParse(cleaned)}</div>
+      </div>`;
+    }
+    // Assistant message
+    return `<div class="msg assistant">
+      <div class="msg-role">claude</div>
+      <div class="msg-body msg-content">${mdParse(m.content || '')}</div>
     </div>`;
   }).join('');
+}
+
+async function startToolbarRename() {
+  if (!activeId) return;
+  const titleEl = document.getElementById('main-title');
+  const current = titleEl.dataset.customTitle || titleEl.textContent;
+  const newName = await showPrompt('Rename Session', '<p>Enter a new name for this session.</p>', {
+    value: current,
+    confirmText: 'Save',
+    placeholder: 'Session name',
+  });
+  if (newName === null) return;
+  const resp = await fetch('/api/rename/' + activeId, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name: newName})
+  });
+  const data = await resp.json();
+  if (data.ok) {
+    setToolbarSession(activeId, newName || activeId, !newName, newName);
+    const s = allSessions.find(x => x.id === activeId);
+    if (s) { s.custom_title = newName; s.display_title = newName || s.display_title; }
+    filterSessions();
+    showToast('Renamed');
+  } else {
+    showToast(data.error || 'Rename failed', true);
+  }
 }
 
 function openRename(id, currentTitle) {
@@ -242,12 +431,9 @@ async function deleteSession(id) {
 
   if (data.ok) {
     allSessions = allSessions.filter(x => x.id !== id);
-    activeId = null;
-    filterSessions();
-    document.getElementById('session-count').textContent = allSessions.length + ' sessions';
-    setToolbarSession(null, 'No session selected', true, '');
-    document.getElementById('main-body').innerHTML =
-      '<div class="empty-state"><div class="icon">\uD83D\uDDD1</div><div>Session deleted</div></div>';
+    if (liveSessionId === id) stopLivePanel();
+    deselectSession();
+    document.getElementById('search').placeholder = 'Search ' + allSessions.length + ' sessions\u2026';
     showToast('Session deleted');
   } else {
     showToast('Delete failed', true);

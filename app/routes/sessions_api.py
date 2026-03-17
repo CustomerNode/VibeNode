@@ -1,5 +1,5 @@
 """
-Session CRUD routes — list, view, rename, auto-name, delete, duplicate, continue, open.
+Session CRUD routes -- list, view, rename, auto-name, delete, duplicate, continue, open.
 """
 
 import json
@@ -226,9 +226,14 @@ def api_open(session_id):
     try:
         active_project = get_active_project()
         proj_dir = _decode_project(active_project) if active_project else str(Path.home())
+        proj_dir = proj_dir.replace("/", "\\")
+        si = subprocess.STARTUPINFO()
+        si.dwFlags = subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 7  # SW_SHOWMINNOACTIVE
         subprocess.Popen(
-            f'start cmd /k "cd /d {proj_dir} && claude --resume {session_id}"',
-            shell=True
+            f'cmd /k cd /d "{proj_dir}" && claude --resume {session_id}',
+            startupinfo=si,
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
         )
         return jsonify({"ok": True})
     except Exception as e:

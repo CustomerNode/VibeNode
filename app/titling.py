@@ -1,5 +1,5 @@
 """
-Smart title generation — scoring and titling logic for sessions.
+Smart title generation -- scoring and titling logic for sessions.
 """
 
 import re
@@ -26,9 +26,14 @@ _STRIP_PREFIXES = re.compile(
 
 
 def _clean_message(text: str) -> str:
-    """Strip system tags and normalise whitespace."""
+    """Strip system tags, continuation preambles, and normalise whitespace."""
     text = re.sub(r"<[^>]{1,60}>.*?</[^>]{1,60}>", " ", text, flags=re.DOTALL)
     text = re.sub(r"<[^>]{1,60}/?>", " ", text)
+    # Strip continuation preambles
+    text = re.sub(r"^This (session is being continued|is a continuation).*?\n", "", text, flags=re.DOTALL)
+    text = re.sub(r"\*\*What we were working on:\*\*.*?(?=\n\n|\Z)", "", text, flags=re.DOTALL)
+    text = re.sub(r"\*\*Key context.*?\*\*.*?(?=\n\n|\Z)", "", text, flags=re.DOTALL)
+    text = re.sub(r"\*\*Most recent exchanges.*?\*\*.*?(?=\n\n|\Z)", "", text, flags=re.DOTALL)
     return " ".join(text.split())
 
 
@@ -49,6 +54,8 @@ def _score(text: str) -> float:
     # Penalise if it looks like a system prompt or pasted code block
     if text.strip().startswith(("```", "import ", "def ", "class ", "SELECT ", "<")):
         score *= 0.2
+    if "continuation" in text.lower() or "previous session" in text.lower():
+        score *= 0.05
     return score
 
 

@@ -51,20 +51,36 @@ function toggleGrpDropdown(grpId) {
   popup.className = 'grp-popup';
   popup._grpId = grpId;
 
+  // Add session status header for Session group
+  if (grpId === 'grp-session' && activeId) {
+    const kind = sessionKinds[activeId] || 'sleeping';
+    const icons = {
+      question: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r=".5" fill="#ff9500"/></svg>',
+      working: '<img src="/static/svg/pickaxe.svg" width="12" height="12" style="filter:brightness(0) saturate(100%) invert(55%) sepia(78%) saturate(1000%) hue-rotate(215deg);">',
+      idle: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--idle-label)" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>',
+      sleeping: '<img src="/static/svg/sleeping.svg" width="12" height="12" class="sleeping-icon">',
+    };
+    const labels = {question:'Waiting for input', working:'Working', idle:'Idle', sleeping:'Not running'};
+    const hdr = document.createElement('div');
+    hdr.style.cssText = 'display:flex;align-items:center;gap:6px;padding:8px 12px 6px;font-size:11px;color:var(--text-faint);border-bottom:1px solid var(--border-subtle);margin-bottom:4px;';
+    hdr.innerHTML = (icons[kind] || icons.sleeping) + ' ' + (labels[kind] || 'Not running');
+    popup.appendChild(hdr);
+  }
+
   Array.from(inner.children).forEach(btn => {
+    // Skip permanently hidden buttons
+    if (btn.style.display === 'none') return;
     const clone = btn.cloneNode(true);
-    clone.style.removeProperty('display');
-    // Wire the onclick — copy the attribute
     const oc = btn.getAttribute('onclick');
     if (oc) clone.setAttribute('onclick', oc);
     clone.addEventListener('click', () => { closeAllGrpDropdowns(); });
     popup.appendChild(clone);
   });
 
-  // Position below the label
+  // Position below the label, aligned to the right edge
   const rect = label.getBoundingClientRect();
   popup.style.top  = (rect.bottom + 4) + 'px';
-  popup.style.left = rect.left + 'px';
+  popup.style.right = (window.innerWidth - rect.right) + 'px';
   document.body.appendChild(popup);
   _activeGrpPopup = popup;
 }
@@ -88,7 +104,7 @@ function openRespond(id) {
   respondTarget = id;
 
   // Question text
-  document.getElementById('respond-question').textContent = w.question || '(no question text)';
+  document.getElementById('respond-question').innerHTML = mdParse(w.question || '(no question text)');
 
   // Option buttons
   const optsEl = document.getElementById('respond-options');

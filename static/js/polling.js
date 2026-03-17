@@ -9,6 +9,8 @@ async function pollWaiting() {
     const newRunning = new Set();
     const newKinds = {};
     list.forEach(w => {
+      // Only show idle sessions if the user explicitly opened them in GUI
+      if (w.kind === 'idle' && !guiOpenSessions.has(w.id) && w.id !== liveSessionId) return;
       newRunning.add(w.id);
       newKinds[w.id] = w.kind;   // 'question' | 'working' | 'idle'
       if (w.kind === 'question') newWaiting[w.id] = w;
@@ -38,6 +40,11 @@ async function pollWaiting() {
       if (newRunning.has(id)) row.classList.add('si-' + (newKinds[id] || 'working'));
     });
 
+    // Respect optimistic idle grace period — don't let server 'working' overwrite it
+    if (liveSessionId && _optimisticIdleUntil > Date.now() && newKinds[liveSessionId] === 'working') {
+      newKinds[liveSessionId] = 'idle';
+    }
+
     waitingData = newWaiting;
     runningIds  = newRunning;
     sessionKinds = newKinds;
@@ -51,6 +58,12 @@ async function pollWaiting() {
     // Update live panel input bar state
     if (liveSessionId) updateLiveInputBar();
 
+    // Refresh dashboard if no session selected
+    if (!activeId) {
+      const dash = document.querySelector('.dashboard');
+      if (dash) document.getElementById('main-body').innerHTML = _buildDashboard();
+    }
+
     // Update Close Session button enabled state
     const btnClose = document.getElementById('btn-close');
     if (btnClose && activeId) btnClose.disabled = !newRunning.has(activeId) && !guiOpenSessions.has(activeId);
@@ -58,8 +71,16 @@ async function pollWaiting() {
   } catch(e) {}
   finally {
     // Schedule next poll only after this one finishes — avoids overlap if WMI is slow
-    setTimeout(pollWaiting, 2000);
+    _waitingPollTimer = setTimeout(pollWaiting, 2000);
   }
+}
+
+let _waitingPollTimer = null;
+
+/** Poke the poll loop to run sooner (without creating duplicate chains). */
+function pokeWaiting() {
+  if (_waitingPollTimer) clearTimeout(_waitingPollTimer);
+  _waitingPollTimer = setTimeout(pollWaiting, 100);
 }
 
 // ---- Startup ----

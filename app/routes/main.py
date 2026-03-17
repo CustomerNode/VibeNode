@@ -1,5 +1,5 @@
 """
-Main route — serves the single-page application.
+Main route -- serves the single-page application.
 """
 
 from flask import Blueprint, render_template

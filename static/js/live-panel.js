@@ -1,11 +1,22 @@
 /* live-panel.js — live terminal panel, input bar state machine, GUI session management */
 
+function _formatMsgTime(tsStr) {
+  const d = new Date(tsStr);
+  if (isNaN(d)) return '';
+  let h = d.getHours();
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  h = h % 12 || 12;
+  return h + ':' + String(d.getMinutes()).padStart(2, '0') + ' ' + ampm;
+}
+
 let liveLineCount = 0;
+let _liveSending = false;  // blocks updateLiveInputBar while sending
 let livePollTimer = null;
 let liveAutoScroll = true;
 let liveQueuedText = '';
 let liveBarState = null;   // 'ended' | 'question:<questionText>' | 'idle' | 'working'
 let _guiFocusPending = false;
+let _optimisticIdleUntil = 0;  // timestamp: trust optimistic idle until this time
 
 function guiOpenAdd(id) {
   guiOpenSessions.add(id);
@@ -20,11 +31,16 @@ async function openInGUI(id) {
   _guiFocusPending = true;
   closeAllGrpDropdowns();
   activeId = id;
-  guiOpenAdd(id);  // track as GUI-open so we show idle state (persisted)
+  localStorage.setItem('activeSessionId', id || '');
+  if (runningIds.has(id)) guiOpenAdd(id);
   if (liveSessionId && liveSessionId !== id) stopLivePanel();
   filterSessions();
 
-  setToolbarSession(id, 'Loading\u2026', true, '');
+  // Show title from sidebar data immediately (no mismatch)
+  const cached = allSessions.find(x => x.id === id);
+  const initTitle = cached ? cached.display_title : 'Loading\u2026';
+  setToolbarSession(id, initTitle, !(cached && cached.custom_title), (cached && cached.custom_title) || '');
+  document.getElementById('main-body').innerHTML = _chatSkeleton();
   const resp = await fetch('/api/session/' + id);
   const s = await resp.json();
   setToolbarSession(id, s.custom_title || s.display_title, !s.custom_title, s.custom_title || '');
@@ -40,12 +56,11 @@ function startLivePanel(id) {
   liveQueuedText = '';
   liveBarState = null;  // force fresh render
 
+  const skelHtml = _chatSkeleton().replace('<div class="conversation">', '').replace(/<\/div>$/, '');
   document.getElementById('main-body').innerHTML =
     '<div class="live-panel" id="live-panel">' +
-    '<div class="live-log" id="live-log"></div>' +
-    '<div class="live-input-bar" id="live-input-bar">' +
-    '<div class="live-working"><span class="spinner"></span>Loading session\u2026</div>' +
-    '</div></div>';
+    '<div class="conversation live-log" id="live-log">' + skelHtml + '</div>' +
+    '<div class="live-input-bar" id="live-input-bar"></div></div>';
 
   const logEl = document.getElementById('live-log');
   logEl.addEventListener('scroll', () => {
@@ -70,6 +85,13 @@ function stopLivePanel() {
 async function fetchLiveLog() {
   if (!liveSessionId) return;
   const id = liveSessionId;
+
+  // While sending, don't fetch — the optimistic bubble is already in the DOM
+  if (_liveSending) {
+    if (liveSessionId === id) livePollTimer = setTimeout(fetchLiveLog, 2000);
+    return;
+  }
+
   try {
     const r = await fetch('/api/session-log/' + id + '?since=' + liveLineCount);
     if (!r.ok) throw new Error('bad response');
@@ -79,12 +101,32 @@ async function fetchLiveLog() {
     const logEl = document.getElementById('live-log');
     if (!logEl) return;
 
-    if (d.entries && d.entries.length) {
+    const hadNew = d.entries && d.entries.length;
+    if (hadNew) {
+      // Clear skeleton on first real data
+      if (liveLineCount === 0) logEl.innerHTML = '';
       d.entries.forEach(e => logEl.appendChild(renderLiveEntry(e)));
+    } else if (liveLineCount === 0 && d.total_lines === 0) {
+      // No messages yet — just clear the skeleton quietly
+      logEl.innerHTML = '';
     }
     liveLineCount = d.total_lines || liveLineCount;
 
     if (liveAutoScroll) logEl.scrollTop = logEl.scrollHeight;
+
+    // If new entries arrived, check if Claude just finished responding
+    if (hadNew) {
+      const last = d.entries[d.entries.length - 1];
+      if (last.kind === 'asst' && runningIds.has(id)) {
+        // Assistant text = Claude finished, optimistically go idle immediately
+        // Grace period prevents the next poll from reverting to 'working'
+        sessionKinds[id] = 'idle';
+        liveBarState = null;
+        _optimisticIdleUntil = Date.now() + 12000;
+      } else {
+        pokeWaiting();
+      }
+    }
 
     updateLiveInputBar();
   } catch(e) {}
@@ -97,64 +139,46 @@ async function fetchLiveLog() {
 
 function renderLiveEntry(e) {
   const div = document.createElement('div');
-  div.className = 'live-entry';
 
   if (e.kind === 'user' || e.kind === 'asst') {
-    div.classList.add(e.kind === 'user' ? 'live-entry-user' : 'live-entry-asst');
-    const LIMIT = e.kind === 'asst' ? 600 : 800;
-    const labelDiv = document.createElement('div');
-    labelDiv.className = 'live-label';
-    labelDiv.textContent = e.kind === 'user' ? 'You' : 'Claude';
-    div.appendChild(labelDiv);
-
+    const role = e.kind === 'user' ? 'user' : 'assistant';
+    div.className = 'msg ' + role;
     const text = e.text || '';
-    const textDiv = document.createElement('div');
-    textDiv.className = 'live-text';
+    const LIMIT = e.kind === 'asst' ? 600 : 800;
     const displayText = text.length > LIMIT ? text.slice(0, LIMIT) : text;
+
+    const roleLabel = e.kind === 'user' ? 'me' : 'claude';
+    const ts = e.ts ? _formatMsgTime(e.ts) : '';
+    let body;
     if (e.kind === 'asst') {
-      textDiv.innerHTML = mdParse(displayText);
+      body = mdParse(displayText);
     } else {
-      textDiv.textContent = displayText;
+      body = '<pre style="white-space:pre-wrap;margin:0;">' + escHtml(displayText) + '</pre>';
     }
-    div.appendChild(textDiv);
+    div.innerHTML = '<div class="msg-role">' + roleLabel + (ts ? ' <span class="msg-time">' + ts + '</span>' : '') + '</div>' +
+      '<div class="msg-body msg-content">' + body + '</div>';
 
     if (text.length > LIMIT) {
       const btn = document.createElement('button');
       btn.className = 'live-expand-btn';
       btn.textContent = '\u2026 show more';
       btn.onclick = () => {
-        if (e.kind === 'asst') { textDiv.innerHTML = mdParse(text); }
-        else { textDiv.textContent = text; }
+        const bodyEl = div.querySelector('.msg-body');
+        if (e.kind === 'asst') { bodyEl.innerHTML = mdParse(text); }
+        else { bodyEl.innerHTML = '<pre style="white-space:pre-wrap;margin:0;">' + escHtml(text) + '</pre>'; }
         btn.remove();
       };
       div.appendChild(btn);
     }
 
   } else if (e.kind === 'tool_use') {
-    div.classList.add('live-entry-tool');
+    div.className = 'live-entry live-entry-tool';
     const toolLine = document.createElement('div');
     toolLine.className = 'live-tool-line';
-
-    const icon = document.createElement('span');
-    icon.className = 'live-tool-icon';
-    icon.textContent = '\u2699';
-
-    const nameEl = document.createElement('span');
-    nameEl.className = 'live-tool-name';
-    nameEl.textContent = e.name || 'tool';
-
-    const descEl = document.createElement('span');
-    descEl.className = 'live-tool-desc';
-    descEl.textContent = (e.desc || '').slice(0, 120);
-
-    const toggle = document.createElement('button');
-    toggle.className = 'live-expand-btn';
-    toggle.textContent = '\u25be';
-
-    toolLine.appendChild(icon);
-    toolLine.appendChild(nameEl);
-    toolLine.appendChild(descEl);
-    toolLine.appendChild(toggle);
+    toolLine.innerHTML = '<span class="live-tool-icon">\u2699</span>' +
+      '<span class="live-tool-name">' + escHtml(e.name || 'tool') + '</span>' +
+      '<span class="live-tool-desc">' + escHtml((e.desc || '').slice(0, 120)) + '</span>' +
+      '<button class="live-expand-btn">\u25be</button>';
 
     const detail = document.createElement('div');
     detail.className = 'live-tool-detail';
@@ -165,17 +189,18 @@ function renderLiveEntry(e) {
     div.appendChild(detail);
 
   } else if (e.kind === 'tool_result') {
-    div.classList.add('live-entry-result');
+    div.className = 'live-entry live-entry-result';
     const ok = !e.is_error;
     const text = e.text || '';
 
     const line = document.createElement('div');
     line.className = 'live-result-line ' + (ok ? 'live-result-ok' : 'live-result-err');
+    line.style.cursor = 'pointer';
     line.textContent = (ok ? '\u2713 ' : '\u2717 ') + text.slice(0, 80) + (text.length > 80 ? '\u2026' : '');
 
     const detail = document.createElement('div');
     detail.className = 'live-tool-detail';
-    detail.textContent = text;
+    detail.innerHTML = mdParse(_colorDiffLines(escHtml(text)));
 
     line.onclick = () => detail.classList.toggle('open');
     div.appendChild(line);
@@ -186,6 +211,7 @@ function renderLiveEntry(e) {
 }
 
 function updateLiveInputBar() {
+  if (_liveSending) return;  // don't overwrite while sending
   if (!liveSessionId) return;
   const id = liveSessionId;
   const bar = document.getElementById('live-input-bar');
@@ -204,31 +230,31 @@ function updateLiveInputBar() {
 
   // Don't re-render if the bar is already showing this exact state.
   // This is critical: prevents the 2s poll from wiping user's in-progress typed text.
+  // Exception: working state updates the timer tick via interval, not re-render.
   if (stateKey === liveBarState) return;
   liveBarState = stateKey;
 
   if (!isRunning) {
     bar.innerHTML =
-      '<div class="live-ended" style="margin-bottom:6px;">' +
-      '<span style="color:#555;font-size:11px;">Session ended \u2014 start a new message to continue</span>' +
+      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;padding:8px 12px;background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:8px;">' +
+      '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--text-faint)" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="8" y1="12" x2="16" y2="12"/></svg>' +
+      '<span style="font-size:12px;color:var(--text-muted);">Session not running. Type a message to resume.</span>' +
       '</div>' +
-      '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="Type a message to start a new session\u2026"' +
-      ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey))liveSubmitContinue(\'' + id + '\')"></textarea>' +
+      '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="Type a message to continue\u2026"' +
+      ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey)){event.preventDefault();liveSubmitContinue(\'' + id + '\')}"></textarea>' +
       '<div class="live-bar-row">' +
-      '<span style="font-size:10px;color:#444;">Ctrl+Enter to send</span>' +
+      '<span style="font-size:10px;color:var(--text-faint);">Ctrl+Enter to send</span>' +
       '<button class="live-send-btn" onclick="liveSubmitContinue(\'' + id + '\')">Send \u21b5</button>' +
       '</div>';
     const btnClose = document.getElementById('btn-close');
     if (btnClose) btnClose.disabled = true;
-    if (_guiFocusPending) {
-      _guiFocusPending = false;
-      setTimeout(() => {
-        const logEl = document.getElementById('live-log');
-        if (logEl) logEl.scrollTop = logEl.scrollHeight;
-        const ta = document.getElementById('live-input-ta');
-        if (ta) ta.focus();
-      }, 50);
-    }
+    _guiFocusPending = false;
+    setTimeout(() => {
+      const logEl = document.getElementById('live-log');
+      if (logEl) logEl.scrollTop = logEl.scrollHeight;
+      const ta = document.getElementById('live-input-ta');
+      if (ta) ta.focus();
+    }, 50);
 
   } else if (kind === 'question') {
     // Claude is asking something — show question text + option buttons + free-form textarea
@@ -242,7 +268,7 @@ function updateLiveInputBar() {
     if (questionText) {
       // Escape and show last ~400 chars of question (truncate top if very long)
       const display = questionText.length > 400 ? '\u2026' + questionText.slice(-400) : questionText;
-      questionHTML = '<div class="live-question-text">' + escHtml(display) + '</div>';
+      questionHTML = '<div class="live-question-text">' + mdParse(display) + '</div>';
     }
 
     // Render option buttons (y/n/a, yes/no, or numbered list)
@@ -269,7 +295,7 @@ function updateLiveInputBar() {
       questionHTML +
       optBtns +
       '<textarea id="live-input-ta" class="live-textarea waiting-focus" rows="2" placeholder="Type your response\u2026 (or click an option above)"' +
-      ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey))liveSubmitWaiting()"></textarea>' +
+      ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey)){event.preventDefault();liveSubmitWaiting()}"></textarea>' +
       '<div class="live-bar-row">' +
       '<span style="font-size:10px;color:#554400;">Ctrl+Enter to send</span>' +
       '<button class="live-send-btn waiting" onclick="liveSubmitWaiting()">Send \u21b5</button>' +
@@ -291,26 +317,27 @@ function updateLiveInputBar() {
   } else if (kind === 'idle') {
     bar.innerHTML =
       '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="Type your next command\u2026"' +
-      ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey))liveSubmitIdle()"></textarea>' +
+      ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey)){event.preventDefault();liveSubmitIdle()}"></textarea>' +
       '<div class="live-bar-row">' +
       '<span style="font-size:10px;color:#444;">Ctrl+Enter to send</span>' +
       '<button class="live-send-btn" onclick="liveSubmitIdle()">Send \u21b5</button>' +
       '</div>';
-    if (_guiFocusPending) {
-      _guiFocusPending = false;
-      setTimeout(() => {
-        const logEl = document.getElementById('live-log');
-        if (logEl) logEl.scrollTop = logEl.scrollHeight;
-        const ta = document.getElementById('live-input-ta');
-        if (ta) ta.focus();
-      }, 50);
-    }
+    _guiFocusPending = false;
+    setTimeout(() => {
+      const logEl = document.getElementById('live-log');
+      if (logEl) logEl.scrollTop = logEl.scrollHeight;
+      const ta = document.getElementById('live-input-ta');
+      if (ta) ta.focus();
+    }, 50);
 
   } else {
     bar.innerHTML =
-      '<div class="live-working" style="margin-bottom:6px;"><span class="spinner"></span>Claude is working\u2026</div>' +
+      '<div class="live-working-status">' +
+      '<div class="live-working-indicator"><span class="spinner"></span> Working\u2026</div>' +
+      '</div>' +
       '<textarea id="live-queue-ta" class="live-textarea" rows="2" ' +
-      'style="opacity:0.6;" placeholder="Type your next command \u2014 will send when Claude finishes\u2026">' +
+      'style="opacity:0.6;" placeholder="Type your next command \u2014 will send when Claude finishes\u2026"' +
+      ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey)){event.preventDefault();liveQueueSave()}">' +
       (liveQueuedText ? escHtml(liveQueuedText) : '') +
       '</textarea>' +
       '<div class="live-bar-row">' +
@@ -360,51 +387,127 @@ async function liveSubmitIdle() {
   if (!ta || !liveSessionId) return;
   const text = ta.value.trim();
   if (!text) return;
-  ta.disabled = true;
-  try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 8000);
-    const r = await fetch('/api/respond/' + liveSessionId, {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({text}), signal: ctrl.signal
-    });
-    clearTimeout(timer);
-    const d = await r.json();
-    if (d.method === 'sent') {
-      ta.value = '';
-      setTimeout(pollWaiting, 500);
-    } else if (d.method === 'clipboard') {
-      showAlert('Copied to Clipboard', '<p>' + escHtml(d.message) + '</p>', { icon: '\uD83D\uDCCB' });
-    } else {
-      showAlert('Send Failed', '<p>' + escHtml(d.err || d.method) + '</p>', { icon: '\u26A0\uFE0F' });
-    }
-  } catch(e) {
-    if (e.name === 'AbortError') showAlert('Timed Out', '<p>Copied to clipboard. Paste in your terminal.</p>', { icon: '\u23F1\uFE0F' });
-    else showAlert('Error', '<p>' + escHtml(e.message) + '</p>', { icon: '\u26A0\uFE0F' });
-  } finally {
-    if (ta) ta.disabled = false;
-  }
+  // Reuse the same logic as continue
+  await liveSubmitContinue(liveSessionId);
 }
 
 async function liveSubmitContinue(fromId) {
   const ta = document.getElementById('live-input-ta');
   const text = ta ? ta.value.trim() : '';
-  // Continue the session (creates new session), then send the typed text
-  const resp = await fetch('/api/continue/' + fromId, { method: 'POST' });
-  const data = await resp.json();
-  if (!data.ok) { showToast('Could not continue session'); return; }
-  await loadSessions();
-  _guiFocusPending = true;
-  await openInGUI(data.new_id);
-  if (text) {
-    // Wait for the new session to start, then send the text
-    setTimeout(async () => {
-      const r = await fetch('/api/respond/' + data.new_id, {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({text})
-      });
-    }, 1500);
+  if (!text) return;
+
+  // IMMEDIATE feedback — show user message in chat, replace input bar with sending indicator
+  const savedText = text;
+  ta.value = '';
+  ta.disabled = true;
+  const now = new Date();
+  const timeStr = now.getHours() % 12 || 12;
+  const timestamp = timeStr + ':' + String(now.getMinutes()).padStart(2,'0') + ' ' + (now.getHours() >= 12 ? 'PM' : 'AM');
+  const logEl = document.getElementById('live-log');
+  if (logEl) {
+    const userMsg = document.createElement('div');
+    userMsg.className = 'msg user';
+    userMsg.innerHTML = '<div class="msg-role">me <span class="msg-time">' + timestamp + '</span></div><div class="msg-body msg-content">' + mdParse(savedText) + '</div>';
+    logEl.appendChild(userMsg);
+    logEl.scrollTop = logEl.scrollHeight;
   }
+  // Replace entire input bar with sending status — block polls from overwriting
+  _liveSending = true;
+  const bar = document.getElementById('live-input-bar');
+  if (bar) bar.innerHTML = '<div class="live-working-status"><div class="live-working-indicator"><span class="spinner"></span> Sending\u2026</div></div>';
+
+  // Try SendKeys
+  try {
+    const r = await fetch('/api/respond/' + fromId, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text: savedText})
+    });
+    const d = await r.json();
+    if (d.ok === false) console.warn('respond failed:', d);
+    if (d.method === 'sent') {
+      // Success — sync line count so we don't duplicate the optimistic bubble
+      try {
+        const sync = await fetch('/api/session-log/' + fromId + '?since=' + liveLineCount);
+        const sd = await sync.json();
+        if (sd.total_lines) liveLineCount = sd.total_lines;
+      } catch(e) {}
+      _liveSending = false;
+      ta.disabled = false;
+      liveBarState = null;
+      pokeWaiting();
+      return;
+    }
+  } catch(e) {}
+
+  // SendKeys failed — resume the SAME session
+  if (bar) bar.innerHTML = '<div class="live-working-status"><div class="live-working-indicator"><span class="spinner"></span> Resuming session\u2026</div></div>';
+  try {
+    await fetch('/api/new-session', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({resume_id: fromId})
+    });
+  } catch(e) {}
+
+  // Wait for terminal to start, then retry SendKeys (3 attempts, 2s apart)
+  let sent = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await new Promise(r => setTimeout(r, attempt === 0 ? 4000 : 2000));
+    try {
+      const r2 = await fetch('/api/respond/' + fromId, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text: savedText})
+      });
+      const d2 = await r2.json();
+      if (d2.method === 'sent') {
+            // Sync line count so poll doesn't duplicate the optimistic bubble
+            try {
+              const sync = await fetch('/api/session-log/' + fromId + '?since=' + liveLineCount);
+              const sd = await sync.json();
+              if (sd.total_lines) liveLineCount = sd.total_lines;
+            } catch(e) {}
+            sent = true; break;
+          }
+    } catch(e) {}
+  }
+
+  if (!sent) {
+    // All retries failed — show persistent in-body error
+    if (bar) bar.innerHTML =
+      '<div style="padding:12px;background:var(--bg-card);border:1px solid #663333;border-radius:8px;margin-bottom:8px;">' +
+      '<div style="color:#cc6666;font-size:13px;margin-bottom:8px;">Could not deliver message. The session terminal may not have started.</div>' +
+      '<div style="color:var(--text-muted);font-size:12px;margin-bottom:8px;">Your message: <em>' + escHtml(savedText.slice(0, 200)) + '</em></div>' +
+      '<button class="live-send-btn" onclick="liveRetrySend(\'' + fromId.replace(/'/g,"\\'") + '\', ' + JSON.stringify(savedText) + ')">Retry Send</button>' +
+      '</div>';
+  }
+
+  _liveSending = false;
+  ta.disabled = false;
+  liveBarState = null;
+  pokeWaiting();
+}
+
+async function liveRetrySend(sessionId, text) {
+  const bar = document.getElementById('live-input-bar');
+  if (bar) bar.innerHTML = '<div class="live-working-status"><div class="live-working-indicator"><span class="spinner"></span> Retrying\u2026</div></div>';
+  _liveSending = true;
+  try {
+    const r = await fetch('/api/respond/' + sessionId, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text: text})
+    });
+    const d = await r.json();
+    if (d.method === 'sent') {
+      showToast('Message sent');
+      _liveSending = false;
+      liveBarState = null;
+      pokeWaiting();
+      return;
+    }
+  } catch(e) {}
+  _liveSending = false;
+  liveBarState = null;
+  showToast('Still could not send. Check if the terminal is running.', true);
+  updateLiveInputBar();
 }
 
 async function liveSubmitWaiting() {
@@ -412,31 +515,8 @@ async function liveSubmitWaiting() {
   if (!ta || !liveSessionId) return;
   const text = ta.value.trim();
   if (!text) return;
-  ta.disabled = true;
-  try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 8000);
-    const r = await fetch('/api/respond/' + liveSessionId, {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({text}), signal: ctrl.signal
-    });
-    clearTimeout(timer);
-    const d = await r.json();
-    if (d.method === 'sent') {
-      ta.value = '';
-      liveBarState = null;  // force bar to re-render next poll (question -> working)
-      setTimeout(pollWaiting, 500);
-    } else if (d.method === 'clipboard') {
-      showAlert('Copied to Clipboard', '<p>' + escHtml(d.message) + '</p>', { icon: '\uD83D\uDCCB' });
-    } else {
-      showAlert('Send Failed', '<p>' + escHtml(d.err || d.method) + '</p>', { icon: '\u26A0\uFE0F' });
-    }
-  } catch(e) {
-    if (e.name === 'AbortError') showAlert('Timed Out', '<p>Response copied to clipboard. Paste in your terminal.</p>', { icon: '\u23F1\uFE0F' });
-    else showAlert('Error', '<p>' + escHtml(e.message) + '</p>', { icon: '\u26A0\uFE0F' });
-  } finally {
-    if (ta) ta.disabled = false;
-  }
+  // Reuse the same logic — try send, auto-resume if needed
+  await liveSubmitContinue(liveSessionId);
 }
 
 async function closeSession(id) {
@@ -451,15 +531,10 @@ async function closeSession(id) {
     const d = await r.json();
     if (!d.ok) showToast('Process stop: ' + (d.error || 'unknown'));
   }
-  // Always clear GUI state and show static preview
-  stopLivePanel();
   guiOpenDelete(id);
   runningIds.delete(id);
   showToast('Session closed');
-  const sr = await fetch('/api/session/' + id);
-  const sess = await sr.json();
-  document.getElementById('main-body').innerHTML =
-    '<div class="conversation" id="convo">' + renderMessages(sess.messages) + '</div>';
-  setTimeout(() => { const c = document.getElementById('convo'); if (c) c.scrollTop = c.scrollHeight; }, 50);
+  // Update the input bar to reflect stopped state — keep chat visible
+  updateLiveInputBar();
   filterSessions();
 }

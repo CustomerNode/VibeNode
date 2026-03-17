@@ -4,13 +4,15 @@ ClaudeCodeGUI Flask application factory.
 
 from flask import Flask
 
+from .config import _CLAUDECODEGUI_DIR
+
 
 def create_app() -> Flask:
     """Create and configure the Flask application."""
     app = Flask(
         __name__,
-        template_folder='../templates',
-        static_folder='../static',
+        template_folder=str(_CLAUDECODEGUI_DIR / "templates"),
+        static_folder=str(_CLAUDECODEGUI_DIR / "static"),
     )
 
     # Register blueprints

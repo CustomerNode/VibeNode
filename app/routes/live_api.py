@@ -1,5 +1,5 @@
 """
-Live session routes — log streaming, waiting detection, respond, close.
+Live session routes -- log streaming, waiting detection, respond, close.
 """
 
 import json
@@ -13,7 +13,6 @@ from ..process_detection import (
     _parse_waiting_state,
     _parse_session_kind,
     send_to_session,
-    send_to_clipboard,
 )
 
 bp = Blueprint('live_api', __name__)
@@ -100,21 +99,24 @@ def api_session_log(session_id):
 def api_waiting():
     """Return all running sessions with kind: 'question' | 'working' | 'idle'."""
     running = _get_running_session_ids()
+    current_dir = _sessions_dir()
     result = []
-    for sid, pid in running.items():
-        path = _sessions_dir() / f"{sid}.jsonl"
+    for sid, raw_pid in running.items():
+        path = current_dir / f"{sid}.jsonl"
         if not path.exists():
-            continue
+            continue  # session belongs to a different project
+        apid = abs(raw_pid)
+        safe = raw_pid > 0  # positive = UUID confirmed, safe to kill
         state = _parse_waiting_state(path)
         if state is not None:
-            # Normalise kind to 'question' so JS state machine has consistent values
-            result.append({"id": sid, "pid": pid,
+            result.append({"id": sid, "pid": apid, "safe": safe,
                            "question": state["question"],
                            "options":  state["options"],
                            "kind":     "question"})
         else:
             kind = _parse_session_kind(path)
-            result.append({"id": sid, "pid": pid, "question": None, "options": None, "kind": kind})
+            result.append({"id": sid, "pid": apid, "safe": safe,
+                           "question": None, "options": None, "kind": kind})
     return jsonify(result)
 
 
@@ -127,24 +129,31 @@ def api_respond(session_id):
         return jsonify({"error": "No text provided"}), 400
 
     running = _get_running_session_ids()
-    pid = running.get(session_id)
+    raw_pid = running.get(session_id)
+    pid = abs(raw_pid) if raw_pid else None
 
     if pid:
         result = send_to_session(pid, text)
         return jsonify(result)
 
-    # Fallback: clipboard
-    result = send_to_clipboard(text)
-    return jsonify(result)
+    # Session not running — tell the client so it can resume
+    return jsonify({"ok": False, "method": "not_running"})
 
 
 @bp.route("/api/close/<session_id>", methods=["POST"])
 def api_close_session(session_id):
     """Terminate the running Claude process and its parent cmd window."""
+    # SAFETY: Only close sessions where we can verify the UUID in the command line
+    # AND the session belongs to the current project.
+    current_dir = _sessions_dir()
+    if not (current_dir / f"{session_id}.jsonl").exists():
+        return jsonify({"ok": False, "error": "Session not in current project"})
     running = _get_running_session_ids()
     pid = running.get(session_id)
     if not pid:
         return jsonify({"ok": False, "error": "Session not running"})
+    if pid < 0:
+        return jsonify({"ok": False, "error": "Cannot close \u2014 session was not launched from GUI. Close it from its terminal instead."})
     try:
         # Get parent PID before killing (wmic query while process still exists)
         parent_pid = None

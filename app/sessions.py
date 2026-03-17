@@ -1,5 +1,5 @@
 """
-Session loading — fast summary parser and full session parser.
+Session loading -- fast summary parser and full session parser.
 """
 
 import json
@@ -179,16 +179,40 @@ def load_session(path: Path) -> dict:
                 elif t in ("user", "assistant"):
                     role = t
                     content = ""
+                    block_type = ""
                     msg = obj.get("message", {})
                     raw = msg.get("content", "")
                     if isinstance(raw, str):
                         content = raw
                     elif isinstance(raw, list):
-                        parts = []
+                        text_parts = []
+                        tool_names = []
                         for block in raw:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                parts.append(block.get("text", ""))
-                        content = " ".join(parts)
+                            if not isinstance(block, dict):
+                                continue
+                            bt = block.get("type", "")
+                            if bt == "text":
+                                text_parts.append(block.get("text", ""))
+                            elif bt == "tool_use":
+                                tool_names.append(block.get("name", "tool"))
+                            elif bt == "tool_result":
+                                block_type = "tool_result"
+                                tr_content = block.get("content", "")
+                                if isinstance(tr_content, str) and tr_content.strip():
+                                    text_parts.append(tr_content)
+                                elif isinstance(tr_content, list):
+                                    for sub in tr_content:
+                                        if isinstance(sub, dict) and sub.get("type") == "text":
+                                            text_parts.append(sub.get("text", ""))
+                        content = " ".join(text_parts)
+                        if not content and tool_names:
+                            content = "[" + ", ".join(tool_names) + "]"
+                            block_type = "tool"
+                        elif tool_names and not block_type:
+                            block_type = "tool"
+                        # User messages with only tool_results are system output
+                        if role == "user" and block_type == "tool_result":
+                            block_type = "tool_result"
 
                     ts_str = obj.get("timestamp", "")
                     ts = None
@@ -201,7 +225,12 @@ def load_session(path: Path) -> dict:
                     if ts and first_ts is None:
                         first_ts = ts
 
-                    messages.append({"role": role, "content": content.strip(), "ts": ts_str})
+                    # Skip empty thinking-only messages
+                    if content.strip():
+                        msg_data = {"role": role, "content": content.strip(), "ts": ts_str}
+                        if block_type:
+                            msg_data["type"] = block_type
+                        messages.append(msg_data)
 
     except Exception as e:
         return {"id": path.stem, "error": str(e), "messages": [], "custom_title": None,
@@ -238,9 +267,9 @@ def load_session(path: Path) -> dict:
     if file_bytes < 1024:
         size_str = f"{file_bytes} B"
     elif file_bytes < 1024 * 1024:
-        size_str = f"{file_bytes / 1024:.1f} KB"
+        size_str = f"{file_bytes / 1024:.0f} KB"
     else:
-        size_str = f"{file_bytes / (1024*1024):.1f} MB"
+        size_str = f"{file_bytes / (1024*1024):.0f} MB"
 
     # User-set names in _session_names.json always win over anything in the .jsonl
     user_set_name = _load_names().get(path.stem)

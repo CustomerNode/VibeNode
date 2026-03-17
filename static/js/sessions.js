@@ -32,6 +32,8 @@ function setSort(mode) {
     sortMode = mode;
     sortAsc = false;      // new column — default descending
   }
+  localStorage.setItem('sortMode', sortMode);
+  localStorage.setItem('sortAsc', sortAsc);
   filterSessions();
 }
 
@@ -80,7 +82,7 @@ function renderList(sessions) {
     const icon = isWaiting
       ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2" stroke-linecap="round" title="Waiting for input"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>'
       : isRunning
-      ? '<svg class="state-icon" width="10" height="10" viewBox="0 0 24 24" fill="#44bb66" stroke="none" title="Running"><circle cx="12" cy="12" r="6"/></svg>'
+      ? '<img class="state-icon" src="/static/svg/pickaxe.svg" width="12" height="12" style="filter:brightness(0) saturate(100%) invert(55%) sepia(78%) saturate(1000%) hue-rotate(215deg);" title="Working">'
       : '';
     return `
     <div class="session-item${activeClass}${stateClass}" data-sid="${s.id}">
@@ -199,17 +201,5 @@ let _lastClickId = null;
 let _lastClickTime = 0;
 
 function singleOrDouble(id, e) {
-  const now = Date.now();
-  const isDouble = (_lastClickId === id && now - _lastClickTime < 400);
-  _lastClickId = id;
-  _lastClickTime = now;
-  if (isDouble) {
-    // Double click — cancel pending single-click and open in GUI
-    if (_clickTimer) { clearTimeout(_clickTimer); _clickTimer = null; }
-    openInGUI(id);
-  } else {
-    // Single click — delay so double-click can cancel it
-    if (_clickTimer) clearTimeout(_clickTimer);
-    _clickTimer = setTimeout(() => { _clickTimer = null; selectSession(id); }, 400);
-  }
+  openInGUI(id);
 }
