@@ -1,5 +1,17 @@
 /* live-panel.js — live terminal panel, input bar state machine, GUI session management */
 
+function _updateLastMessageTimes() {
+  const log = document.getElementById('live-log');
+  if (!log) return;
+  // Clear existing
+  log.querySelectorAll('.show-time').forEach(el => el.classList.remove('show-time'));
+  // Find last user and last assistant
+  const users = log.querySelectorAll('.msg.user');
+  const assts = log.querySelectorAll('.msg.assistant');
+  if (users.length) users[users.length - 1].classList.add('show-time');
+  if (assts.length) assts[assts.length - 1].classList.add('show-time');
+}
+
 function _formatMsgTime(tsStr) {
   // Backend sends Unix seconds (time.time()), JS Date expects milliseconds
   const val = typeof tsStr === 'number' && tsStr < 1e12 ? tsStr * 1000 : tsStr;
@@ -44,6 +56,42 @@ async function openInGUI(id) {
   setToolbarSession(id, initTitle, !(cached && cached.custom_title), (cached && cached.custom_title) || '');
   document.getElementById('main-body').innerHTML = _chatSkeleton();
   const resp = await fetch('/api/session/' + id);
+
+  // New session with no .jsonl yet — re-show the new session input
+  if (!resp.ok) {
+    if (guiOpenSessions.has(id) && !runningIds.has(id)) {
+      // Re-create the new session chat view
+      setToolbarSession(id, 'New Session', true, '');
+      document.getElementById('main-body').innerHTML =
+        '<div class="live-panel" id="live-panel">' +
+        '<div class="conversation live-log" id="live-log">' +
+        '<div class="empty-state" style="padding:60px 0;text-align:center;">' +
+        '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-faint)" stroke-width="1.5" stroke-linecap="round" style="margin-bottom:12px;opacity:0.4;"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
+        '<div style="color:var(--text-faint);font-size:13px;">What should Claude work on?</div>' +
+        '</div></div>' +
+        '<div class="live-input-bar" id="live-input-bar"></div></div>';
+      liveSessionId = id;
+      liveBarState = null;
+      const bar = document.getElementById('live-input-bar');
+      if (bar) {
+        bar.innerHTML =
+          '<textarea id="live-input-ta" class="live-textarea" rows="3" placeholder="Describe what you want Claude to do\u2026" autofocus' +
+          ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey)){event.preventDefault();_newSessionSubmit(\'' + id + '\')}">' +
+          '</textarea>' +
+          '<div class="live-bar-row">' +
+          '<span style="font-size:10px;color:var(--text-faint);">Ctrl+Enter to send</span>' +
+          '<button class="live-send-btn" id="live-voice-btn"></button>' +
+          '</div>';
+        setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => _newSessionSubmit(id));
+        setTimeout(() => { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }, 50);
+      }
+      return;
+    }
+    // Truly not found — show error
+    document.getElementById('main-body').innerHTML = '<div style="padding:40px;color:var(--text-faint);text-align:center;">Session not found</div>';
+    return;
+  }
+
   const s = await resp.json();
   setToolbarSession(id, s.custom_title || s.display_title, !s.custom_title, s.custom_title || '');
 
@@ -56,6 +104,10 @@ function startLivePanel(id) {
   liveLineCount = 0;
   liveAutoScroll = true;
   liveQueuedText = '';
+  // Restore working_since from the map (set by state_snapshot/session_state)
+  if (window._workingSinceMap && window._workingSinceMap[id]) {
+    _liveWorkingStart = window._workingSinceMap[id];
+  }
   liveBarState = null;  // force fresh render
 
   const skelHtml = _chatSkeleton().replace('<div class="conversation">', '').replace(/<\/div>$/, '');
@@ -360,15 +412,33 @@ function updateLiveInputBar() {
       '<span id="live-queue-hint" style="font-size:10px;color:var(--text-faint);">' +
       (liveQueuedText ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Command queued' : 'Will send automatically when done') +
       '</span>' +
-      '<button class="live-send-btn" style="background:var(--bg-card);color:var(--text-muted);border-color:var(--border-subtle);" onclick="liveQueueSave()">Queue</button>' +
-      '<button class="live-send-btn danger" style="margin-left:2px;" onclick="liveClearQueue()" title="Cancel queued command"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>' +
+      '<button class="live-send-btn" id="live-voice-btn"></button>' +
+      (liveQueuedText ? '<button class="live-send-btn danger" id="live-queue-clear" style="margin-left:2px;" onclick="liveClearQueue()" title="Cancel queued command"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>' : '') +
       '</div>';
+    setupVoiceButton(document.getElementById('live-queue-ta'), document.getElementById('live-voice-btn'), liveQueueSave);
     const qta = document.getElementById('live-queue-ta');
     if (qta) {
       qta.addEventListener('input', () => {
         liveQueuedText = qta.value;
         const hint = document.getElementById('live-queue-hint');
         if (hint) hint.innerHTML = qta.value.trim() ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Command queued' : 'Will send automatically when done';
+        // Show/hide clear button based on content
+        const clearBtn = document.getElementById('live-queue-clear');
+        if (clearBtn) clearBtn.style.display = qta.value.trim() ? '' : 'none';
+        if (!clearBtn && qta.value.trim()) {
+          // Add clear button dynamically
+          const row = qta.closest('.live-input-bar')?.querySelector('.live-bar-row');
+          if (row) {
+            const btn = document.createElement('button');
+            btn.className = 'live-send-btn danger';
+            btn.id = 'live-queue-clear';
+            btn.style.marginLeft = '2px';
+            btn.onclick = liveClearQueue;
+            btn.title = 'Cancel queued command';
+            btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+            row.appendChild(btn);
+          }
+        }
       });
     }
     // Start elapsed timer — update only the time span, NOT the whole bar

@@ -396,12 +396,10 @@ class SessionManager:
         if info.state != SessionState.IDLE:
             return {"ok": False, "error": f"Session is {info.state.value}, not idle"}
 
-        # Add user entry
+        # Add user entry to history (don't emit — frontend shows it optimistically)
         entry = LogEntry(kind="user", text=text)
         with info._lock:
             info.entries.append(entry)
-            entry_index = len(info.entries) - 1
-        self._emit_entry(session_id, entry, entry_index)
 
         # Set state to WORKING before submitting query
         info.state = SessionState.WORKING

@@ -62,13 +62,22 @@ function setupVoiceButton(textarea, button, onSubmit) {
 
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     const recognition = new SR();
-    recognition.continuous = false;
+    recognition.continuous = true;
     recognition.interimResults = true;
     recognition.lang = 'en-US';
     recognition._target = textarea;
     _activeRecognition = recognition;
 
     let finalTranscript = '';
+    let silenceTimer = null;
+
+    const resetSilenceTimer = () => {
+      if (silenceTimer) clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(() => {
+        // 3 seconds of silence — stop recording and send
+        recognition.stop();
+      }, 3000);
+    };
 
     recognition.onresult = (e) => {
       let interim = '';
@@ -81,28 +90,18 @@ function setupVoiceButton(textarea, button, onSubmit) {
       }
       textarea.value = finalTranscript + interim;
       textarea.dispatchEvent(new Event('input'));
+      resetSilenceTimer();
     };
 
     recognition.onend = () => {
+      if (silenceTimer) clearTimeout(silenceTimer);
       if (_activeRecognition === recognition) _activeRecognition = null;
       textarea.value = finalTranscript;
       textarea.dispatchEvent(new Event('input'));
       updateIcon();
-      // Auto-send after a pause so the user can finish their thought
+      // Auto-send if we got text
       if (finalTranscript.trim() && onSubmit) {
-        showToast('Sending in 3s\u2026 (type to cancel)');
-        const sendTimer = setTimeout(() => {
-          if (textarea.value.trim() === finalTranscript.trim()) {
-            onSubmit();
-          }
-        }, 3000);
-        // If user starts typing, cancel auto-send
-        const cancelHandler = () => {
-          clearTimeout(sendTimer);
-          textarea.removeEventListener('input', cancelHandler);
-        };
-        textarea.addEventListener('input', cancelHandler);
-        textarea.focus();
+        onSubmit();
       } else {
         textarea.focus();
       }

@@ -32,6 +32,23 @@ def api_sessions():
 def api_session(session_id):
     path = _sessions_dir() / f"{session_id}.jsonl"
     if not path.exists():
+        # Check if it's an SDK-managed session with no .jsonl yet
+        sm = current_app.session_manager
+        if sm.has_session(session_id):
+            entries = sm.get_entries(session_id)
+            state = sm.get_session_state(session_id) or "idle"
+            return jsonify({
+                "id": session_id,
+                "display_title": "New Session",
+                "custom_title": "",
+                "date": "",
+                "size": "0 B",
+                "message_count": len(entries),
+                "messages": [{"role": "user" if e.get("kind") == "user" else "assistant",
+                              "content": e.get("text", ""),
+                              "type": e.get("kind", "")} for e in entries],
+                "preview": entries[0].get("text", "")[:100] if entries else "",
+            })
         return jsonify({"error": "Not found"}), 404
     return jsonify(load_session(path))
 

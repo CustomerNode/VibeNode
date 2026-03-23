@@ -20,7 +20,8 @@
       "WebFetch(domain:docs.anthropic.com)",
       "Bash(pip install:*)",
       "Bash(where claude:*)",
-      "Bash(npm root:*)"
+      "Bash(npm root:*)",
+      "Bash(grep -rn \"workplace\\\\|Workplace\" static/js/*.js templates/index.html)"
     ]
   }
 }
