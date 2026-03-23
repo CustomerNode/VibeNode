@@ -904,19 +904,20 @@ class SessionManager:
 
                 elif isinstance(block, TextBlock):
                     user_text = (block.text or "")[:2000]
-                    # Dedup: skip if this matches the last user entry (SDK echo)
+                    # Never emit user text entries — they're already shown:
+                    # - Initial prompt: added by _drive_session
+                    # - Follow-ups: added by send_message
+                    # - Frontend: shows optimistic bubble immediately
+                    # Just add to history for get_session_log, don't emit
                     with info._lock:
+                        # Only add if not a duplicate of the last user entry
                         last_user = None
                         for e in reversed(info.entries):
                             if e.kind == "user":
                                 last_user = e
                                 break
-                        if last_user and last_user.text.strip() == user_text.strip():
-                            continue  # skip duplicate
-                    entry = LogEntry(kind="user", text=user_text)
-                    with info._lock:
-                        info.entries.append(entry)
-                    self._emit_entry(session_id, entry, len(info.entries) - 1)
+                        if not last_user or last_user.text.strip() != user_text.strip():
+                            info.entries.append(LogEntry(kind="user", text=user_text))
 
         elif isinstance(message, ResultMessage):
             info.cost_usd = getattr(message, 'total_cost_usd', 0.0) or 0.0
