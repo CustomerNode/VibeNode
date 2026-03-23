@@ -306,7 +306,7 @@ function renderMessages(messages) {
       const names = m.content.replace(/[\[\]]/g, '');
       return `<div class="live-entry live-entry-tool">
         <div class="live-tool-line" onclick="this.nextElementSibling.classList.toggle('open')">
-          <span class="live-tool-icon">\u2699</span>
+          <span class="live-tool-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9"/></svg></span>
           <span class="live-tool-name">${escHtml(names)}</span>
           <button class="live-expand-btn">\u25be</button>
         </div>
@@ -319,7 +319,7 @@ function renderMessages(messages) {
       const isShort = text.split('\n').length <= 6;
       return `<div class="live-entry live-entry-result">
         <div class="live-result-line live-result-ok" onclick="this.nextElementSibling.classList.toggle('open')" style="cursor:pointer;">
-          \u2713 ${escHtml(text.slice(0, 80))}${text.length > 80 ? '\u2026' : ''}
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><polyline points="20 6 9 17 4 12"/></svg>${escHtml(text.slice(0, 80))}${text.length > 80 ? '\u2026' : ''}
         </div>
         <div class="live-tool-detail${isShort ? ' open' : ''}">${mdParse(_colorDiffLines(escHtml(text)))}</div>
       </div>`;
@@ -332,7 +332,7 @@ function renderMessages(messages) {
       if (_isSystemMessage(m.content)) {
         return `<div class="live-entry live-entry-result">
           <div class="live-result-line" style="color:var(--text-faint);cursor:pointer;" onclick="this.nextElementSibling.classList.toggle('open')">
-            \u2139 ${escHtml(cleaned.slice(0, 100))}${cleaned.length > 100 ? '\u2026' : ''}
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>${escHtml(cleaned.slice(0, 100))}${cleaned.length > 100 ? '\u2026' : ''}
           </div>
           <div class="live-tool-detail">${mdParse(escHtml(cleaned))}</div>
         </div>`;
@@ -449,7 +449,7 @@ async function autoName(id) {
 async function deleteSession(id) {
   const s = allSessions.find(x => x.id === id);
   const name = (s && s.display_title) || id.slice(0, 8);
-  const confirmed = await showConfirm('Delete Session', '<p>Delete <strong>' + escHtml(name) + '</strong>?</p><p>This cannot be undone.</p>', { danger: true, confirmText: 'Delete', icon: '\uD83D\uDDD1\uFE0F' });
+  const confirmed = await showConfirm('Delete Session', '<p>Delete <strong>' + escHtml(name) + '</strong>?</p><p>This cannot be undone.</p>', { danger: true, confirmText: 'Delete', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>' });
   if (!confirmed) return;
 
   // Close the session if it's still running
@@ -464,7 +464,8 @@ async function deleteSession(id) {
   const resp = await fetch('/api/delete/' + id, { method: 'DELETE' });
   const data = await resp.json();
 
-  if (data.ok) {
+  // Always clean up UI even if backend file doesn't exist (new sessions)
+  if (data.ok || resp.status === 404) {
     allSessions = allSessions.filter(x => x.id !== id);
     if (liveSessionId === id) stopLivePanel();
     deselectSession();
@@ -478,7 +479,7 @@ async function deleteSession(id) {
 async function deleteEmptySessions() {
   const empty = allSessions.filter(s => s.message_count === 0);
   if (!empty.length) { showToast('No empty sessions found'); return; }
-  const confirmed = await showConfirm('Delete Empty Sessions', `<p>Delete <strong>${empty.length}</strong> empty session${empty.length > 1 ? 's' : ''}?</p>`, { danger: true, confirmText: 'Delete All', icon: '\uD83E\uDDF9' });
+  const confirmed = await showConfirm('Delete Empty Sessions', `<p>Delete <strong>${empty.length}</strong> empty session${empty.length > 1 ? 's' : ''}?</p>`, { danger: true, confirmText: 'Delete All', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>' });
   if (!confirmed) return;
 
   const resp = await fetch('/api/delete-empty', { method: 'DELETE' });
@@ -496,7 +497,7 @@ async function deleteEmptySessions() {
         activeId = null;
         setToolbarSession(null, 'No session selected', true, '');
         document.getElementById('main-body').innerHTML =
-          '<div class="empty-state"><div class="icon">\uD83D\uDDD1</div><div>Sessions deleted</div></div>';
+          '<div class="empty-state"><div class="icon"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></div><div>Sessions deleted</div></div>';
       }
     }
     filterSessions();

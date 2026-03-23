@@ -9,11 +9,15 @@ loop.call_soon_threadsafe().
 
 import anyio
 import asyncio
+import json
 import logging
+import os
+import tempfile
 import threading
 import time
 from enum import Enum
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from claude_code_sdk import ClaudeSDKClient, ClaudeCodeOptions
@@ -240,6 +244,15 @@ class SessionInfo:
         return d
 
 
+# ---------------------------------------------------------------------------
+# Registry file for crash recovery
+# ---------------------------------------------------------------------------
+_REGISTRY_PATH = Path.home() / ".claude" / "gui_active_sessions.json"
+
+# Maximum age (seconds) for a session to be eligible for recovery
+_MAX_RECOVERY_AGE = 3600  # 1 hour
+
+
 class SessionManager:
     """Manages all Claude Code SDK sessions on a dedicated asyncio event loop."""
 
@@ -250,6 +263,8 @@ class SessionManager:
         self._thread: Optional[threading.Thread] = None
         self._socketio = None
         self._started = False
+        self._registry_timer: Optional[threading.Timer] = None
+        self._registry_dirty = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -269,6 +284,12 @@ class SessionManager:
         self._started = True
         logger.info("SessionManager started")
 
+        # Recover sessions from a previous crash (non-blocking background task)
+        threading.Thread(
+            target=self._recover_sessions, daemon=True,
+            name="session-recovery"
+        ).start()
+
     def _run_loop(self) -> None:
         """Entry point for the background thread."""
         asyncio.set_event_loop(self._loop)
@@ -278,6 +299,10 @@ class SessionManager:
         """Stop the event loop and all sessions. Called on shutdown."""
         if not self._started:
             return
+        # Cancel any pending registry save timer
+        if self._registry_timer:
+            self._registry_timer.cancel()
+            self._registry_timer = None
         # Close all sessions
         with self._lock:
             session_ids = list(self._sessions.keys())
@@ -286,6 +311,8 @@ class SessionManager:
                 self._run_sync(self._close_session(sid))
             except Exception:
                 pass
+        # Clear the registry since all sessions are intentionally stopped
+        self._save_registry_now()
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread:
@@ -334,6 +361,7 @@ class SessionManager:
             self._sessions[session_id] = info
 
         self._emit_state(info)
+        self._schedule_registry_save()
 
         # Verify the event loop is alive before submitting
         if not self._loop or not self._loop.is_running():
@@ -639,10 +667,12 @@ class SessionManager:
             info.state = SessionState.STOPPED
             info.client = None
             self._emit_state(info)
+            self._schedule_registry_save()
         except Exception as e:
             logger.exception("Close error for %s: %s", session_id, e)
             info.state = SessionState.STOPPED
             self._emit_state(info)
+            self._schedule_registry_save()
 
     # ------------------------------------------------------------------
     # Permission callback
@@ -882,6 +912,146 @@ class SessionManager:
         return ""
 
     # ------------------------------------------------------------------
+    # Persistent session registry (crash recovery)
+    # ------------------------------------------------------------------
+
+    def _load_registry(self) -> dict:
+        """Read the session registry from disk. Returns empty dict on error."""
+        try:
+            if _REGISTRY_PATH.exists():
+                data = json.loads(_REGISTRY_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and "sessions" in data:
+                    return data
+        except Exception as e:
+            logger.warning("Failed to load session registry: %s", e)
+        return {"sessions": {}}
+
+    def _save_registry_now(self) -> None:
+        """Write the current session state to the registry file atomically.
+
+        Only includes non-STOPPED sessions so that on recovery we know
+        which sessions were still alive when the server went down.
+        """
+        try:
+            _REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            sessions_data = {}
+            with self._lock:
+                for sid, info in self._sessions.items():
+                    if info.state == SessionState.STOPPED:
+                        continue
+                    sessions_data[sid] = {
+                        "name": info.name,
+                        "cwd": info.cwd,
+                        "model": info.model,
+                        "state": info.state.value,
+                        "started_at": (
+                            info.entries[0].timestamp if info.entries else time.time()
+                        ),
+                        "last_activity": time.time(),
+                    }
+            registry = {"sessions": sessions_data}
+            payload = json.dumps(registry, indent=2, ensure_ascii=False)
+
+            # Atomic write: write to a temp file then rename
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=str(_REGISTRY_PATH.parent), suffix=".tmp"
+            )
+            try:
+                os.write(tmp_fd, payload.encode("utf-8"))
+                os.close(tmp_fd)
+                # On Windows, os.rename fails if destination exists; use os.replace
+                os.replace(tmp_path, str(_REGISTRY_PATH))
+            except Exception:
+                try:
+                    os.close(tmp_fd)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception as e:
+            logger.warning("Failed to save session registry: %s", e)
+
+    def _schedule_registry_save(self) -> None:
+        """Debounced save -- batches writes so we don't hit disk on every event.
+
+        If a timer is already pending, skip (the pending save will capture
+        the latest state).  Otherwise set a 3-second timer.
+        """
+        if self._registry_timer and self._registry_timer.is_alive():
+            # A save is already scheduled; it will pick up the newest state
+            return
+        self._registry_timer = threading.Timer(3.0, self._save_registry_now)
+        self._registry_timer.daemon = True
+        self._registry_timer.start()
+
+    def _recover_sessions(self) -> None:
+        """Recover sessions that were active before a crash.
+
+        Called once at startup in a background thread. Reads the registry,
+        filters out stale or stopped entries, and resumes each one via the
+        SDK's --resume flag.
+        """
+        try:
+            registry = self._load_registry()
+            sessions = registry.get("sessions", {})
+            if not sessions:
+                logger.debug("No sessions to recover from registry")
+                return
+
+            now = time.time()
+            recovered = 0
+            for sid, meta in sessions.items():
+                state = meta.get("state", "stopped")
+                if state == "stopped":
+                    continue
+
+                last_activity = meta.get("last_activity", 0)
+                age = now - last_activity
+                if age > _MAX_RECOVERY_AGE:
+                    logger.info(
+                        "Skipping stale session %s (%.0f min old)", sid, age / 60
+                    )
+                    continue
+
+                name = meta.get("name", "")
+                cwd = meta.get("cwd", "")
+                model = meta.get("model", "")
+
+                logger.info(
+                    "Recovering session %s (%s) from registry", sid, name or "unnamed"
+                )
+
+                # Use start_session with resume=True to reconnect via SDK --resume
+                result = self.start_session(
+                    session_id=sid,
+                    prompt="",       # no new prompt; just reconnect
+                    cwd=cwd,
+                    name=name,
+                    resume=True,
+                    model=model if model else None,
+                )
+                if result.get("ok"):
+                    recovered += 1
+                else:
+                    logger.warning(
+                        "Failed to recover session %s: %s",
+                        sid, result.get("error", "unknown")
+                    )
+
+            if recovered:
+                logger.info("Recovered %d session(s) from crash registry", recovered)
+
+            # Clear the registry now that recovery is done; ongoing state
+            # changes will re-populate it via _schedule_registry_save()
+            # (Don't clear -- let the normal emit_state cycle keep it updated)
+
+        except Exception as e:
+            logger.exception("Session recovery failed: %s", e)
+
+    # ------------------------------------------------------------------
     # WebSocket emission helpers
     # ------------------------------------------------------------------
 
@@ -890,6 +1060,7 @@ class SessionManager:
 
         Uses a background thread to ensure cross-context compatibility
         (works from both the main asyncio loop and anyio task groups).
+        Also schedules a registry save so crash recovery data stays fresh.
         """
         if self._socketio:
             data = info.to_state_dict()
@@ -898,6 +1069,8 @@ class SessionManager:
                 target=lambda: self._socketio.emit('session_state', data),
                 daemon=True
             ).start()
+        # Keep the persistent registry up to date
+        self._schedule_registry_save()
 
     def _emit_entry(self, session_id: str, entry: LogEntry, index: int) -> None:
         """Push a new log entry to all connected WebSocket clients."""

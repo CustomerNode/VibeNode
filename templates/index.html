@@ -32,6 +32,7 @@
   <div class="hdr-sys" id="hdr-sys">
     <button class="hdr-sys-btn" onclick="toggleHdrSys()">System &#9662;</button>
     <div class="hdr-sys-dropdown" id="hdr-sys-dropdown">
+      <button onclick="openPermissionPolicySelector();closeHdrSys()">Permission Policy</button>
       <button onclick="deleteEmptySessions();closeHdrSys()">Delete Empty Sessions</button>
       <button onclick="_showHelpModal();closeHdrSys()">Keyboard Shortcuts</button>
     </div>
@@ -115,6 +116,7 @@
     })();
     </script>
     <div id="workforce-grid"></div>
+    <div id="sidebar-perm-panel" style="display:none;"></div>
     <div class="sidebar-footer">&copy; 2026 CustomerNode LLC</div>
   </div>
 

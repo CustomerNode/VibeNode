@@ -12,6 +12,7 @@ function getSessionStatus(id) {
 }
 
 function setViewMode(mode) {
+  const prevMode = viewMode;
   viewMode = mode;
   localStorage.setItem('viewMode', mode);
   const listEl = document.getElementById('session-list');
@@ -19,24 +20,69 @@ function setViewMode(mode) {
   const btnList = document.getElementById('btn-view-list');
   const btnWf   = document.getElementById('btn-view-workforce');
 
-  // Handle workplace mode: activate workspace, hide list+grid
+  // --- Clean up when LEAVING a mode ---
+
+  // Leaving workplace: clear workspace state, stop live panel if expanded card was open
+  if (prevMode === 'workplace' && mode !== 'workplace') {
+    if (_wsExpandedId) {
+      _wsExpandedId = null;
+      const backBtn = document.getElementById('ws-back-btn');
+      if (backBtn) backBtn.remove();
+    }
+    if (liveSessionId) stopLivePanel();
+    activeId = null;
+    localStorage.removeItem('activeSessionId');
+    // Restore main-body to dashboard (workplace overwrites it)
+    document.getElementById('main-toolbar').style.display = 'none';
+    document.getElementById('main-body').innerHTML = _buildDashboard();
+    // Clear sidebar permission panel
+    const spp = document.getElementById('sidebar-perm-panel');
+    if (spp) { spp.innerHTML = ''; spp.style.display = 'none'; }
+  }
+
+  // Leaving workforce or list into workplace: clear active session so
+  // main-body is fully owned by workspace renderer
+  if (mode === 'workplace' && prevMode !== 'workplace') {
+    if (liveSessionId) stopLivePanel();
+    activeId = null;
+    localStorage.removeItem('activeSessionId');
+    document.getElementById('main-toolbar').style.display = 'none';
+  }
+
+  // --- Set new mode state ---
   if (typeof workspaceActive !== 'undefined') workspaceActive = (mode === 'workplace');
+
+  // Sidebar elements to show/hide per mode
+  const searchRow = document.querySelector('.sidebar-search-row');
+  const menuWrap = document.querySelector('.sidebar-menu-wrap');
+  const sidebarPermPanel = document.getElementById('sidebar-perm-panel');
 
   if (mode === 'workforce') {
     listEl.style.display = 'none';
     gridEl.classList.add('visible');
     if (btnList) btnList.classList.remove('active');
     if (btnWf)   btnWf.classList.add('active');
+    if (searchRow) searchRow.style.display = '';
+    if (menuWrap) menuWrap.style.display = '';
+    if (sidebarPermPanel) sidebarPermPanel.style.display = 'none';
   } else if (mode === 'workplace') {
     listEl.style.display = 'none';
     gridEl.classList.remove('visible');
     if (btnList) btnList.classList.remove('active');
     if (btnWf)   btnWf.classList.remove('active');
+    // Hide search and sort — workplace has its own layout
+    if (searchRow) searchRow.style.display = 'none';
+    if (menuWrap) menuWrap.style.display = 'none';
+    // Show permission panel in sidebar
+    if (sidebarPermPanel) sidebarPermPanel.style.display = '';
   } else {
     listEl.style.display = '';
     gridEl.classList.remove('visible');
     if (btnList) btnList.classList.add('active');
     if (btnWf)   btnWf.classList.remove('active');
+    if (searchRow) searchRow.style.display = '';
+    if (menuWrap) menuWrap.style.display = '';
+    if (sidebarPermPanel) sidebarPermPanel.style.display = 'none';
   }
   filterSessions();
 }

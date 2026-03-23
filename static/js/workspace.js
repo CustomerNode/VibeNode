@@ -85,32 +85,34 @@ function renderWorkspace(sessions) {
     </div>`;
   }
 
-  // Permission panel
-  const permHtml = _buildPermissionPanel();
+  // Permission panel goes in the sidebar, not main-body
+  const sidebarPermEl = document.getElementById('sidebar-perm-panel');
+  if (sidebarPermEl) {
+    sidebarPermEl.innerHTML = _buildPermissionPanel();
+    sidebarPermEl.style.display = '';
+  }
 
   mainBody.innerHTML =
     '<div class="ws-container">' +
     '<div class="ws-canvas">' + cardsHtml + hiddenHtml + '</div>' +
-    permHtml +
     '</div>';
 }
 
 // ---- Permission panel ----
 function _buildPermissionPanel() {
-  const policyIcons = {auto: '\u26A1', manual: '\u270B', custom: '\u2699'};
+  const policyIcons = {
+    manual: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
+    auto: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
+    custom: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9"/></svg>',
+  };
   const policyLabels = {auto: 'Auto-Approve', manual: 'Manual', custom: 'Custom Rules'};
 
   let headerHtml = `<div class="ws-perm-header">
-    <span class="ws-perm-title">Permission Requests</span>
-    <div class="ws-policy-wrap">
+    <span class="ws-perm-title">Permissions</span>
+    <button class="ws-policy-btn" onclick="openPermissionPolicySelector()">
       <span class="ws-policy-indicator ws-policy-${permissionPolicy}">${policyIcons[permissionPolicy] || ''} ${policyLabels[permissionPolicy] || 'Manual'}</span>
-      <select class="ws-policy-select" onchange="setPermissionPolicy(this.value)">
-        <option value="manual"${permissionPolicy==='manual'?' selected':''}>Manual</option>
-        <option value="auto"${permissionPolicy==='auto'?' selected':''}>Auto-Approve All</option>
-        <option value="custom"${permissionPolicy==='custom'?' selected':''}>Custom Rules</option>
-      </select>
-      ${permissionPolicy === 'custom' ? '<button class="ws-policy-edit-btn" onclick="openCustomPolicies()">Edit Rules</button>' : ''}
-    </div>
+      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="opacity:0.5;"><polyline points="6 9 12 15 18 9"/></svg>
+    </button>
   </div>`;
 
   let rowsHtml = '';
@@ -144,8 +146,8 @@ function _buildPermissionPanel() {
 }
 
 // ---- Permission queue update (called from socket events) ----
+// Auto-approve policies are GLOBAL — apply them regardless of view mode.
 function _updatePermissionQueue(newWaiting) {
-  if (!workspaceActive) return;
 
   const newQueue = [];
   for (const [sid, data] of Object.entries(newWaiting)) {
@@ -174,16 +176,21 @@ function _updatePermissionQueue(newWaiting) {
 
   permissionQueue = newQueue;
 
-  // DOM update is handled by filterSessions() -> renderWorkspace() which runs
-  // right after this. When a card is expanded, renderWorkspace() skips, so we
-  // do the incremental panel update only in that case.
-  if (!_wsExpandedId) return;
-  const panel = document.querySelector('.ws-perm-panel');
-  if (panel) {
-    const temp = document.createElement('div');
-    temp.innerHTML = _buildPermissionPanel();
-    const newPanel = temp.firstElementChild;
-    panel.replaceWith(newPanel);
+  // Update sidebar permission panel (always visible in workplace mode)
+  const sidebarPermEl = document.getElementById('sidebar-perm-panel');
+  if (sidebarPermEl && sidebarPermEl.style.display !== 'none') {
+    sidebarPermEl.innerHTML = _buildPermissionPanel();
+  }
+
+  // When a card is expanded, renderWorkspace() skips, so do incremental update
+  if (_wsExpandedId) {
+    const panel = document.querySelector('.ws-perm-panel');
+    if (panel) {
+      const temp = document.createElement('div');
+      temp.innerHTML = _buildPermissionPanel();
+      const newPanel = temp.firstElementChild;
+      panel.replaceWith(newPanel);
+    }
   }
 }
 
@@ -266,6 +273,54 @@ async function wsPermissionAnswer(sessionId, answer) {
 }
 
 // ---- Policy controls ----
+function openPermissionPolicySelector() {
+  const overlay = document.getElementById('pm-overlay');
+  const policies = [
+    {key: 'manual', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>', title: 'Manual', desc: 'Review and approve each tool use individually'},
+    {key: 'auto', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>', title: 'Auto-Approve All', desc: 'Automatically approve all permission requests'},
+    {key: 'custom', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>', title: 'Custom Rules', desc: 'Define per-tool auto-approve rules'},
+  ];
+
+  let html = '<div class="pm-card pm-enter" style="width:380px;">'
+    + '<h2 class="pm-title">Permission Policy</h2>'
+    + '<div class="pm-body"><p>Choose how tool permission requests are handled.</p></div>'
+    + '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:20px;">';
+
+  for (const p of policies) {
+    const isActive = p.key === permissionPolicy;
+    html += `<div class="add-mode-card${isActive ? ' active' : ''}" data-policy="${p.key}">
+      <div class="add-mode-icon" style="font-size:20px;">${p.icon}</div>
+      <div class="add-mode-info">
+        <div class="add-mode-title">${p.title}</div>
+        <div class="add-mode-desc">${p.desc}</div>
+      </div>
+    </div>`;
+  }
+
+  html += '</div><div class="pm-actions"><button class="pm-btn pm-btn-secondary" id="pm-policy-close">Close</button></div></div>';
+  overlay.innerHTML = html;
+  overlay.classList.add('show');
+  requestAnimationFrame(() => overlay.querySelector('.pm-card').classList.remove('pm-enter'));
+
+  document.getElementById('pm-policy-close').onclick = () => _closePm();
+  overlay.onclick = e => { if (e.target === overlay) _closePm(); };
+
+  overlay.querySelectorAll('.add-mode-card').forEach(card => {
+    card.onclick = () => {
+      const key = card.dataset.policy;
+      _closePm();
+      setPermissionPolicy(key);
+      if (key === 'custom') {
+        // Delay opening custom policies modal until _closePm() animation completes
+        // _closePm() uses a 150ms timeout to clear the overlay, so we wait 200ms
+        setTimeout(() => openCustomPolicies(), 200);
+      } else {
+        showToast('Policy: ' + policies.find(p => p.key === key).title);
+      }
+    };
+  });
+}
+
 function setPermissionPolicy(policy) {
   permissionPolicy = policy;
   localStorage.setItem('permPolicy', policy);
@@ -287,9 +342,9 @@ function openCustomPolicies() {
   const overlay = document.getElementById('pm-overlay');
   const cp = customPolicies;
   overlay.innerHTML = `
-    <div class="pm-card pm-enter" style="width:400px;">
+    <div class="pm-card pm-enter" style="width:400px;max-height:85vh;display:flex;flex-direction:column;">
       <h2 class="pm-title">Custom Auto-Approve Rules</h2>
-      <div class="pm-body">
+      <div class="pm-body" style="overflow-y:auto;flex:1;min-height:0;">
         <p style="margin-bottom:12px;">Select which tool types to auto-approve:</p>
         <label class="ws-policy-check"><input type="checkbox" id="cp-reads" ${cp.approveAllReads?'checked':''}> Approve all Read operations</label>
         <label class="ws-policy-check"><input type="checkbox" id="cp-glob" ${cp.approveGlob?'checked':''}> Approve Glob (file search)</label>
