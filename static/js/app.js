@@ -603,9 +603,11 @@ function _newSessionSubmit(sessionId) {
   // Switch to live panel mode
   startLivePanel(sessionId);
 
-  // Auto-name after a short delay (let Claude process first)
+  // Auto-name after a delay. Silent retry if .jsonl not ready yet.
   setTimeout(() => {
-    autoName(sessionId);
+    autoName(sessionId, true);
+    // Retry at 20s in case the first attempt was too early
+    setTimeout(() => autoName(sessionId, true), 12000);
   }, 8000);
 }
 

@@ -417,8 +417,8 @@ async function submitRename() {
   }
 }
 
-async function autoName(id) {
-  const btn = document.getElementById('btn-autoname');
+async function autoName(id, silent) {
+  const btn = silent ? null : document.getElementById('btn-autoname');
   const btnOrigHtml = btn ? btn.innerHTML : '';
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Naming\u2026'; }
 
@@ -428,7 +428,7 @@ async function autoName(id) {
     data = await resp.json();
   } catch(e) {
     if (btn) { btn.disabled = false; btn.innerHTML = btnOrigHtml; }
-    showToast('Auto-name failed: ' + e.message, true);
+    if (!silent) showToast('Auto-name failed: ' + e.message, true);
     return;
   }
 
