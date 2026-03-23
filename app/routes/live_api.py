@@ -380,25 +380,59 @@ def put_folder_tree():
 # Available models API
 # ---------------------------------------------------------------------------
 
+_models_cache = {"data": None, "ts": 0}
+
 @bp.route('/api/models')
 def get_models():
-    """Return available Claude models dynamically from the CLI init message."""
-    import subprocess
+    """Return available Claude models dynamically from the Anthropic API."""
+    import time as _time
+
+    # Cache for 10 minutes
+    if _models_cache["data"] and _time.time() - _models_cache["ts"] < 600:
+        return jsonify(_models_cache["data"])
+
+    models = []
     try:
-        # Run a minimal CLI command to get the init message with model info
+        import subprocess
+        # Query the CLI for its init message which includes the current model
         r = subprocess.run(
-            ["claude", "-p", "", "--output-format", "json", "--max-turns", "0"],
-            capture_output=True, text=True, timeout=10
+            ["claude", "-p", "hi", "--output-format", "stream-json",
+             "--verbose", "--max-turns", "1"],
+            capture_output=True, text=True, timeout=15
         )
-        # Parse the init system message for model info
-        # The CLI reports its current model in the result
+        current_model = None
+        for line in r.stdout.strip().split("\n"):
+            try:
+                d = json.loads(line)
+                if d.get("type") == "system" and d.get("subtype") == "init":
+                    current_model = d.get("model", "")
+                if d.get("type") == "result":
+                    model_usage = d.get("modelUsage", {})
+                    for mid in model_usage:
+                        info = model_usage[mid]
+                        # Extract clean name from model ID
+                        clean = mid.split("[")[0]  # remove [1m] suffix
+                        models.append({
+                            "id": clean,
+                            "name": clean.replace("claude-", "Claude ").replace("-", " ").title(),
+                            "context_window": info.get("contextWindow", 0),
+                            "max_output": info.get("maxOutputTokens", 0),
+                            "current": mid == current_model,
+                        })
+            except (json.JSONDecodeError, KeyError):
+                continue
     except Exception:
         pass
 
-    # Known model families — the CLI accepts short IDs
-    return jsonify([
+    # Always include the alias shortcuts the CLI accepts
+    aliases = [
         {"id": "", "name": "Default", "desc": "Uses your Claude Code settings", "default": True},
-        {"id": "sonnet", "name": "Claude Sonnet", "desc": "Fast, capable, balanced"},
-        {"id": "opus", "name": "Claude Opus", "desc": "Most capable, deeper reasoning"},
-        {"id": "haiku", "name": "Claude Haiku", "desc": "Fastest, most cost-efficient"},
-    ])
+        {"id": "sonnet", "name": "Sonnet", "desc": "Fast, capable, balanced", "alias": True},
+        {"id": "opus", "name": "Opus", "desc": "Most capable, deeper reasoning", "alias": True},
+        {"id": "haiku", "name": "Haiku", "desc": "Fastest, most cost-efficient", "alias": True},
+    ]
+
+    result = aliases + models
+    _models_cache["data"] = result
+    _models_cache["ts"] = _time.time()
+    return jsonify(result)

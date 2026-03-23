@@ -32,7 +32,13 @@
   <div class="hdr-sys" id="hdr-sys">
     <button class="hdr-sys-btn" onclick="toggleHdrSys()">System &#9662;</button>
     <div class="hdr-sys-dropdown" id="hdr-sys-dropdown">
+      <button onclick="openModelSelector();closeHdrSys()">Model <span class="sys-item-value" id="sys-model-label">Default</span></button>
+      <button onclick="openThinkingSelector();closeHdrSys()">Thinking <span class="sys-item-value" id="sys-thinking-label">Default</span></button>
+      <div class="sys-separator"></div>
       <button onclick="openPermissionPolicySelector();closeHdrSys()">Permission Policy</button>
+      <button onclick="openWorkspaceTemplateSelector();closeHdrSys()">Workspace Template</button>
+      <button onclick="openAddDepartment();closeHdrSys()">Add Department</button>
+      <div class="sys-separator"></div>
       <button onclick="wsShowAll();closeHdrSys();showToast('All sessions unhidden')">Unhide All Sessions</button>
       <button onclick="deleteEmptySessions();closeHdrSys()">Delete Empty Sessions</button>
       <button onclick="_showHelpModal();closeHdrSys()">Keyboard Shortcuts</button>
@@ -286,6 +292,8 @@
 <script src="/static/js/chat-component.js"></script>
 <script src="/static/js/app.js"></script>
 <script src="/static/js/workforce.js"></script>
+<script src="/static/js/folder-superset.js"></script>
+<script src="/static/js/folders.js"></script>
 <script src="/static/js/workspace.js"></script>
 <script src="/static/js/sessions.js"></script>
 <script src="/static/js/toolbar.js"></script>

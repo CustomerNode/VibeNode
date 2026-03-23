@@ -545,6 +545,11 @@ async function addNewAgent() {
     setToolbarSession(newId, 'New Session', true, '');
   }
 
+  // Register session in current folder if in workplace hierarchy
+  if (workspaceActive && typeof addSessionToFolder === 'function' && typeof _currentFolderId !== 'undefined' && _currentFolderId) {
+    addSessionToFolder(newId, _currentFolderId);
+  }
+
   // Show empty chat with focused input — no dialog, no spinner
   document.getElementById('main-body').innerHTML =
     '<div class="live-panel" id="live-panel">' +
@@ -588,13 +593,29 @@ function _newSessionSubmit(sessionId) {
   runningIds.add(sessionId);
   sessionKinds[sessionId] = 'working';
 
-  // Start the SDK session with the message
-  socket.emit('start_session', {
+  // Get skill from current folder (if in workplace mode with folder tree)
+  let systemPrompt = null;
+  if (workspaceActive && typeof _currentFolderId !== 'undefined' && _currentFolderId) {
+    const skill = (typeof getFolderSkill === 'function') ? getFolderSkill(_currentFolderId) : null;
+    if (skill && skill.systemPrompt) systemPrompt = skill.systemPrompt;
+  }
+
+  const startOpts = {
     session_id: sessionId,
     prompt: text,
     cwd: _currentProjectDir(),
     name: '',
-  });
+  };
+  if (defaultModel) startOpts.model = defaultModel;
+  if (defaultThinking) startOpts.thinking_level = defaultThinking;
+  if (systemPrompt) startOpts.system_prompt = systemPrompt;
+
+  socket.emit('start_session', startOpts);
+
+  // Register session in current folder
+  if (workspaceActive && typeof addSessionToFolder === 'function') {
+    addSessionToFolder(sessionId, _currentFolderId);
+  }
 
   // Clear the empty state and show the user's message
   const logEl = document.getElementById('live-log');
@@ -790,6 +811,12 @@ async function loadSessions() {
   allSessions = await resp.json();
   document.getElementById('search').placeholder = 'Search ' + allSessions.length + ' sessions\u2026';
   setViewMode(viewMode);
+  // First-run template selector for workplace mode
+  if (viewMode === 'workplace' && typeof getFolderTree === 'function' && !getFolderTree()) {
+    if (typeof showTemplateSelector === 'function') {
+      showTemplateSelector(() => filterSessions());
+    }
+  }
   // In workplace mode, the workspace canvas is already rendered by setViewMode->filterSessions.
   // Don't restore an active session — the user can click a workspace card to expand it.
   // Clear stale activeId so socket handlers don't get confused.
@@ -822,4 +849,175 @@ function filterSessions() {
   } else {
     renderList(sortedSessions(filtered));
   }
+}
+
+// ===== Model / Thinking / Template / Department selectors =====
+
+// --- Model Selector ---
+let defaultModel = localStorage.getItem('defaultModel') || '';
+
+function openModelSelector() {
+  const overlay = document.getElementById('pm-overlay');
+  const models = [
+    {key: 'claude-sonnet-4-6', name: 'Claude Sonnet 4', desc: 'Fast, capable, balanced'},
+    {key: 'claude-opus-4-6', name: 'Claude Opus 4', desc: 'Most capable, slower'},
+    {key: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5', desc: 'Fastest, most cost-efficient'},
+  ];
+
+  let html = '<div class="pm-card pm-enter" style="width:380px;">'
+    + '<h2 class="pm-title">Select Model</h2>'
+    + '<div class="pm-body"><p>Choose the default model for new sessions.</p></div>'
+    + '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:20px;">';
+  for (const m of models) {
+    const isActive = m.key === defaultModel;
+    html += `<div class="add-mode-card${isActive ? ' active' : ''}" data-model="${m.key}">
+      <div class="add-mode-info">
+        <div class="add-mode-title">${m.name}</div>
+        <div class="add-mode-desc">${m.desc}</div>
+      </div>
+    </div>`;
+  }
+  html += '</div><div class="pm-actions"><button class="pm-btn pm-btn-secondary" id="pm-model-close">Close</button></div></div>';
+  overlay.innerHTML = html;
+  overlay.classList.add('show');
+  requestAnimationFrame(() => overlay.querySelector('.pm-card').classList.remove('pm-enter'));
+  document.getElementById('pm-model-close').onclick = () => _closePm();
+  overlay.onclick = e => { if (e.target === overlay) _closePm(); };
+  overlay.querySelectorAll('.add-mode-card').forEach(card => {
+    card.onclick = () => {
+      defaultModel = card.dataset.model;
+      localStorage.setItem('defaultModel', defaultModel);
+      _closePm();
+      _updateModelLabel();
+      showToast('Model: ' + card.querySelector('.add-mode-title').textContent);
+    };
+  });
+}
+
+function _updateModelLabel() {
+  const el = document.getElementById('sys-model-label');
+  if (!el) return;
+  if (!defaultModel) { el.textContent = 'Default'; return; }
+  if (defaultModel.includes('sonnet')) el.textContent = 'Sonnet 4';
+  else if (defaultModel.includes('opus')) el.textContent = 'Opus 4';
+  else if (defaultModel.includes('haiku')) el.textContent = 'Haiku 4.5';
+  else el.textContent = defaultModel.split('-').pop();
+}
+_updateModelLabel();
+
+// --- Thinking Level Selector ---
+let defaultThinking = localStorage.getItem('defaultThinking') || '';
+
+function openThinkingSelector() {
+  const overlay = document.getElementById('pm-overlay');
+  const levels = [
+    {key: '', name: 'Default', desc: 'Use model default'},
+    {key: 'none', name: 'None', desc: 'No extended thinking'},
+    {key: 'low', name: 'Low', desc: 'Brief reasoning step'},
+    {key: 'medium', name: 'Medium', desc: 'Moderate reasoning'},
+    {key: 'high', name: 'High', desc: 'Deep reasoning for hard tasks'},
+  ];
+  let html = '<div class="pm-card pm-enter" style="width:380px;">'
+    + '<h2 class="pm-title">Thinking Level</h2>'
+    + '<div class="pm-body"><p>Set the extended thinking level for new sessions.</p></div>'
+    + '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:20px;">';
+  for (const l of levels) {
+    const isActive = l.key === defaultThinking;
+    html += `<div class="add-mode-card${isActive ? ' active' : ''}" data-level="${l.key}">
+      <div class="add-mode-info">
+        <div class="add-mode-title">${l.name}</div>
+        <div class="add-mode-desc">${l.desc}</div>
+      </div>
+    </div>`;
+  }
+  html += '</div><div class="pm-actions"><button class="pm-btn pm-btn-secondary" id="pm-think-close">Close</button></div></div>';
+  overlay.innerHTML = html;
+  overlay.classList.add('show');
+  requestAnimationFrame(() => overlay.querySelector('.pm-card').classList.remove('pm-enter'));
+  document.getElementById('pm-think-close').onclick = () => _closePm();
+  overlay.onclick = e => { if (e.target === overlay) _closePm(); };
+  overlay.querySelectorAll('.add-mode-card').forEach(card => {
+    card.onclick = () => {
+      defaultThinking = card.dataset.level;
+      localStorage.setItem('defaultThinking', defaultThinking);
+      _closePm();
+      _updateThinkingLabel();
+      showToast('Thinking: ' + card.querySelector('.add-mode-title').textContent);
+    };
+  });
+}
+
+function _updateThinkingLabel() {
+  const el = document.getElementById('sys-thinking-label');
+  if (!el) return;
+  el.textContent = defaultThinking ? defaultThinking.charAt(0).toUpperCase() + defaultThinking.slice(1) : 'Default';
+}
+_updateThinkingLabel();
+
+function openWorkspaceTemplateSelector() {
+  if (typeof showTemplateSelector !== 'function') {
+    showToast('Folder system not loaded');
+    return;
+  }
+  showTemplateSelector(() => {
+    filterSessions();
+    showToast('Workspace template applied');
+  });
+}
+
+function openAddDepartment() {
+  if (typeof FOLDER_SUPERSET === 'undefined' || typeof getFolderTree !== 'function') {
+    showToast('Folder system not loaded');
+    return;
+  }
+  const tree = getFolderTree();
+  if (!tree) {
+    showToast('Set up a workspace template first');
+    return;
+  }
+
+  // Get available departments (root-level folders not already in tree)
+  const existing = new Set(Object.keys(tree.folders));
+  const available = Object.entries(FOLDER_SUPERSET)
+    .filter(([id, def]) => !def.parentId && !existing.has(id))
+    .map(([id, def]) => ({id, name: def.name, childCount: def.children.length}));
+
+  if (!available.length) {
+    showToast('All departments already added');
+    return;
+  }
+
+  const overlay = document.getElementById('pm-overlay');
+  let html = '<div class="pm-card pm-enter" style="width:420px;max-height:80vh;display:flex;flex-direction:column;">'
+    + '<h2 class="pm-title">Add Department</h2>'
+    + '<div class="pm-body" style="overflow-y:auto;flex:1;min-height:0;">'
+    + '<p>Select a department to add to your workspace.</p>'
+    + '<div style="display:flex;flex-direction:column;gap:6px;margin-top:12px;">';
+
+  for (const dept of available) {
+    html += `<div class="add-mode-card" data-dept="${dept.id}" style="padding:12px;">
+      <div class="add-mode-info">
+        <div class="add-mode-title">${escHtml(dept.name)}</div>
+        <div class="add-mode-desc">${dept.childCount} sub-folders</div>
+      </div>
+    </div>`;
+  }
+
+  html += '</div></div>'
+    + '<div class="pm-actions"><button class="pm-btn pm-btn-secondary" id="pm-dept-close">Close</button></div></div>';
+  overlay.innerHTML = html;
+  overlay.classList.add('show');
+  requestAnimationFrame(() => overlay.querySelector('.pm-card').classList.remove('pm-enter'));
+  document.getElementById('pm-dept-close').onclick = () => _closePm();
+  overlay.onclick = e => { if (e.target === overlay) _closePm(); };
+
+  overlay.querySelectorAll('.add-mode-card').forEach(card => {
+    card.onclick = () => {
+      const deptId = card.dataset.dept;
+      addDepartmentFromSuperset(deptId);
+      _closePm();
+      filterSessions();
+      showToast('Added ' + card.querySelector('.add-mode-title').textContent);
+    };
+  });
 }
