@@ -310,19 +310,21 @@ def register_ws_events(socketio, app):
 
         sm = app.session_manager
 
-        # Always load the .jsonl history first (the authoritative record)
-        entries = _parse_jsonl_entries(app, session_id, since)
+        # Load from .jsonl first, then SDK entries for anything not yet on disk
+        jsonl_entries = _parse_jsonl_entries(app, session_id, since)
+        sdk_entries = sm.get_entries(session_id, since=0) if sm.has_session(session_id) else []
 
-        # Append any SDK-only entries (e.g., system messages from current session)
-        # that aren't in the .jsonl yet
-        if sm.has_session(session_id):
-            sdk_entries = sm.get_entries(session_id, since=0)
-            # Only add SDK entries that came after the .jsonl entries
-            # (SDK entries like "Session interrupted" won't be in the file)
-            jsonl_count = len(entries)
-            for sdk_e in sdk_entries:
-                if sdk_e.get("kind") == "system":
-                    entries.append(sdk_e)
+        if jsonl_entries and not sdk_entries:
+            # Historical session — only .jsonl
+            entries = jsonl_entries
+        elif sdk_entries and not jsonl_entries:
+            # SDK-only session (no .jsonl yet)
+            entries = sdk_entries
+        elif sdk_entries and jsonl_entries:
+            # Both exist — use whichever has more entries (SDK is more current)
+            entries = sdk_entries if len(sdk_entries) >= len(jsonl_entries) else jsonl_entries
+        else:
+            entries = []
 
         emit('session_log', {
             'session_id': session_id,

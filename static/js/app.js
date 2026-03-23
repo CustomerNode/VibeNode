@@ -515,6 +515,136 @@ async function deleteAllSessions() {
   showToast(deleted + ' sessions deleted');
 }
 
+// --- Bulk Operations Modal ---
+function openBulkOperations() {
+  const overlay = document.getElementById('pm-overlay');
+
+  // Gather counts for dynamic descriptions
+  const hiddenCount = (typeof workspaceHiddenSessions !== 'undefined' && workspaceHiddenSessions) ? workspaceHiddenSessions.size : 0;
+  const runningCount = allSessions.filter(s => runningIds.has(s.id)).length;
+  const emptyCount = allSessions.filter(s => s.message_count === 0).length;
+  const untitledCount = allSessions.filter(s => !s.custom_title && s.message_count > 0).length;
+  const totalCount = allSessions.length;
+
+  const operations = [
+    {
+      icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
+      title: 'Unhide All Sessions',
+      desc: hiddenCount > 0 ? hiddenCount + ' hidden session' + (hiddenCount !== 1 ? 's' : '') : 'No hidden sessions',
+      disabled: hiddenCount === 0,
+      danger: false,
+      action: "wsShowAll();closeBulkOperations();showToast('All sessions unhidden')"
+    },
+    {
+      icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',
+      title: 'Sleep All Sessions',
+      desc: runningCount > 0 ? runningCount + ' running session' + (runningCount !== 1 ? 's' : '') : 'No running sessions',
+      disabled: runningCount === 0,
+      danger: false,
+      action: "closeBulkOperations();sleepAllSessions()"
+    },
+    {
+      icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
+      title: 'Auto-name All Sessions',
+      desc: untitledCount > 0 ? untitledCount + ' untitled session' + (untitledCount !== 1 ? 's' : '') : 'All sessions named',
+      disabled: untitledCount === 0,
+      danger: false,
+      action: "closeBulkOperations();autoNameAllSessions()"
+    },
+    {
+      icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>',
+      title: 'Delete Empty Sessions',
+      desc: emptyCount > 0 ? emptyCount + ' empty session' + (emptyCount !== 1 ? 's' : '') : 'No empty sessions',
+      disabled: emptyCount === 0,
+      danger: true,
+      action: "closeBulkOperations();deleteEmptySessions()"
+    },
+    {
+      icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+      title: 'Delete All Sessions',
+      desc: totalCount > 0 ? totalCount + ' session' + (totalCount !== 1 ? 's' : '') + ' in workspace' : 'No sessions',
+      disabled: totalCount === 0,
+      danger: true,
+      action: "closeBulkOperations();deleteAllSessions()"
+    },
+  ];
+
+  var html = '<div class="pm-card pm-enter" style="width:480px;max-width:92vw;">';
+  html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">';
+  html += '<h2 class="pm-title" style="margin:0;">Bulk Operations</h2>';
+  html += '<button class="pm-btn pm-btn-secondary" style="padding:4px 10px;font-size:12px;" onclick="closeBulkOperations()">&times;</button>';
+  html += '</div>';
+  html += '<div class="pm-body"><p>Perform actions across all sessions in this workspace.</p></div>';
+  html += '<div class="bulk-ops-list">';
+
+  for (var i = 0; i < operations.length; i++) {
+    var op = operations[i];
+    html += '<div class="bulk-ops-item' + (op.disabled ? ' disabled' : '') + '">';
+    html += '<div class="bulk-ops-icon' + (op.danger ? ' danger' : '') + '">' + op.icon + '</div>';
+    html += '<div class="bulk-ops-info">';
+    html += '<div class="bulk-ops-title">' + op.title + '</div>';
+    html += '<div class="bulk-ops-desc">' + op.desc + '</div>';
+    html += '</div>';
+    html += '<button class="pm-btn ' + (op.danger ? 'pm-btn-danger' : 'pm-btn-secondary') + ' bulk-ops-btn" '
+          + (op.disabled ? 'disabled ' : '')
+          + 'onclick="' + op.action + '">Run</button>';
+    html += '</div>';
+  }
+
+  html += '</div></div>';
+
+  overlay.innerHTML = html;
+  overlay.classList.add('show');
+  requestAnimationFrame(function() {
+    var card = overlay.querySelector('.pm-card');
+    if (card) card.classList.remove('pm-enter');
+  });
+}
+
+function closeBulkOperations() {
+  _closePm();
+}
+
+// --- Auto-name All Sessions ---
+async function autoNameAllSessions() {
+  const untitled = allSessions.filter(s => !s.custom_title && s.message_count > 0);
+  if (!untitled.length) { showToast('All sessions already named'); return; }
+
+  const ok = await showConfirm(
+    'Auto-name All Sessions',
+    '<p>Auto-name <strong>' + untitled.length + '</strong> untitled session' + (untitled.length !== 1 ? 's' : '') + '?</p>'
+    + '<p>This uses AI to generate meaningful names based on each session\u2019s content. Sessions with user-set names will be skipped.</p>',
+    {
+      confirmText: 'Name All',
+      icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>'
+    }
+  );
+  if (!ok) return;
+
+  showToast('Naming ' + untitled.length + ' session' + (untitled.length !== 1 ? 's' : '') + '\u2026');
+  let named = 0;
+  for (const s of untitled) {
+    try {
+      const resp = await fetch('/api/autonname/' + s.id, { method: 'POST' });
+      const data = await resp.json();
+      if (data.ok && data.title) {
+        s.custom_title = data.title;
+        s.display_title = data.title;
+        named++;
+      }
+    } catch(e) { /* skip failures silently */ }
+  }
+  filterSessions();
+  // Update toolbar if the active session was renamed
+  if (activeId) {
+    const active = allSessions.find(x => x.id === activeId);
+    if (active && active.custom_title) {
+      setToolbarSession(activeId, active.custom_title, false, active.custom_title);
+    }
+  }
+  showToast('Named ' + named + ' session' + (named !== 1 ? 's' : ''));
+}
+
 // --- New Agent ---
 async function addNewAgent() {
   const newId = crypto.randomUUID();
