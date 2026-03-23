@@ -11,6 +11,8 @@ work with CLI 2.x.
 """
 
 import json
+import os
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -305,6 +307,69 @@ def put_config():
         tmp_path = settings_path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp_path.replace(settings_path)
+
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Folder-tree persistence API
+# ---------------------------------------------------------------------------
+
+_CLAUDE_DIR = Path.home() / ".claude"
+
+
+def _folder_tree_path() -> Path:
+    """Return path to the per-project folder tree JSON file."""
+    proj = get_active_project()
+    if proj:
+        return _CLAUDE_DIR / f"gui_folder_tree_{proj}.json"
+    return _CLAUDE_DIR / "gui_folder_tree.json"
+
+
+@bp.route('/api/folder-tree', methods=['GET'])
+def get_folder_tree():
+    """Read folder tree from ~/.claude/gui_folder_tree_{project}.json"""
+    try:
+        ft_path = _folder_tree_path()
+        if ft_path.is_file():
+            content = json.loads(ft_path.read_text(encoding="utf-8"))
+            return jsonify(content)
+        return jsonify({})
+    except json.JSONDecodeError:
+        return jsonify({}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route('/api/folder-tree', methods=['PUT'])
+def put_folder_tree():
+    """Write folder tree to ~/.claude/gui_folder_tree_{project}.json (atomic)."""
+    try:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "Request body must be a JSON object"}), 400
+
+        ft_path = _folder_tree_path()
+        ft_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Atomic write: write to temp file in same directory, then rename
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(ft_path.parent), suffix=".tmp", prefix="gui_ft_"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            # On Windows, target must not exist for os.rename; use replace
+            os.replace(tmp_path, str(ft_path))
+        except Exception:
+            # Clean up temp file on failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
         return jsonify({"ok": True})
     except Exception as e:
