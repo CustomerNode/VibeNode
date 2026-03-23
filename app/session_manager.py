@@ -445,11 +445,54 @@ class SessionManager:
         return {"ok": True}
 
     def set_permission_policy(self, policy: str, custom_rules: dict = None) -> None:
-        """Update the permission policy (called from WebSocket handler)."""
-        if policy in ('manual', 'auto', 'custom'):
-            self._permission_policy = policy
-            self._custom_rules = custom_rules or {}
-            logger.info("Permission policy set to: %s", policy)
+        """Update the permission policy (synced from browser)."""
+        if policy not in ("manual", "auto", "custom"):
+            return
+        self._permission_policy = policy
+        self._custom_rules = custom_rules or {}
+        logger.info("Permission policy updated: %s", policy)
+
+    def _should_auto_approve(self, tool_name: str, tool_input: dict) -> bool:
+        """Check if a tool use should be auto-approved based on the current policy."""
+        policy = self._permission_policy
+
+        if policy == "manual":
+            return False
+        if policy == "auto":
+            return True
+        if policy == "custom":
+            rules = self._custom_rules
+            tool_lower = (tool_name or "").lower()
+
+            if rules.get("approveAllReads") and tool_lower == "read":
+                return True
+            if rules.get("approveProjectReads") and tool_lower == "read":
+                return True
+            if rules.get("approveAllBash") and tool_lower == "bash":
+                return True
+            if rules.get("approveProjectWrites") and tool_lower in ("write", "edit"):
+                return True
+            if rules.get("approveGlob") and tool_lower == "glob":
+                return True
+            if rules.get("approveGrep") and tool_lower == "grep":
+                return True
+
+            # Custom regex pattern
+            custom_pattern = rules.get("customPattern", "")
+            if custom_pattern:
+                import re
+                try:
+                    # Build a question string similar to the frontend
+                    desc = ""
+                    if isinstance(tool_input, dict):
+                        desc = tool_input.get("command", "") or tool_input.get("file_path", "") or tool_input.get("path", "") or tool_input.get("pattern", "")
+                    question = f"Claude wants to use {tool_name}:\n\n{desc}"
+                    if re.search(custom_pattern, question, re.IGNORECASE):
+                        return True
+                except re.error:
+                    pass
+
+        return False
 
     def interrupt_session(self, session_id: str) -> dict:
         """Interrupt a running session."""
@@ -713,51 +756,10 @@ class SessionManager:
             if tool_name in info.always_allowed_tools:
                 return PermissionResultAllow()
 
-            # --- Server-side policy check ---
-            policy = manager._permission_policy
-            if policy == 'auto':
-                logger.debug("Auto-approving %s (policy=auto)", tool_name)
+            # Server-side policy check -- resolve without browser round-trip
+            if manager._should_auto_approve(tool_name, tool_input if isinstance(tool_input, dict) else {}):
+                logger.debug("Auto-approved %s via server policy", tool_name)
                 return PermissionResultAllow()
-
-            if policy == 'custom':
-                rules = manager._custom_rules
-                tool_lower = (tool_name or '').lower()
-                auto_approve = False
-
-                if rules.get('approveAllReads') and tool_lower == 'read':
-                    auto_approve = True
-                elif rules.get('approveProjectReads') and tool_lower == 'read':
-                    auto_approve = True
-                elif rules.get('approveAllBash') and tool_lower == 'bash':
-                    auto_approve = True
-                elif rules.get('approveProjectWrites') and tool_lower in ('write', 'edit'):
-                    auto_approve = True
-                elif rules.get('approveGlob') and tool_lower == 'glob':
-                    auto_approve = True
-                elif rules.get('approveGrep') and tool_lower == 'grep':
-                    auto_approve = True
-
-                # Custom regex pattern
-                if not auto_approve and rules.get('customPattern'):
-                    import re
-                    try:
-                        pattern = rules['customPattern']
-                        # Build the question text same way the browser does
-                        desc = ''
-                        if isinstance(tool_input, dict):
-                            desc = tool_input.get('command', '') or tool_input.get('file_path', '') or tool_input.get('path', '') or tool_input.get('pattern', '')
-                        question_text = f"Claude wants to use {tool_name}:\n\n{desc}"
-                        if re.search(pattern, question_text, re.IGNORECASE):
-                            auto_approve = True
-                    except Exception:
-                        pass
-
-                if auto_approve:
-                    logger.debug("Auto-approving %s (policy=custom, matched rule)", tool_name)
-                    return PermissionResultAllow()
-
-            # --- END server-side policy check ---
-            # Fall through to existing browser-prompt logic for 'manual' or unmatched custom rules
 
             # Use threading.Event (fully thread-safe) with anyio.sleep polling.
             # anyio.Event + call_soon_threadsafe doesn't reliably wake the waiter.
@@ -1063,7 +1065,9 @@ class SessionManager:
             recovered = 0
             for sid, meta in sessions.items():
                 state = meta.get("state", "stopped")
-                if state == "stopped":
+                # Only recover sessions that were mid-task (working/waiting).
+                # Idle sessions were done — no need to resume them.
+                if state not in ("working", "waiting", "starting"):
                     continue
 
                 last_activity = meta.get("last_activity", 0)

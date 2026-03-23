@@ -325,3 +325,5 @@ function pokeWaiting() {
 loadProjects();
 pollGitStatus();
 setInterval(pollGitStatus, 60000);
+// Initialize folder tree (shows template selector on first run)
+if (typeof initFolderTree === 'function') initFolderTree();
