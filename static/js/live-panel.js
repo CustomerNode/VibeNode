@@ -76,12 +76,23 @@ function startLivePanel(id) {
   // Request the log via WebSocket instead of polling
   socket.emit('get_session_log', {session_id: id, since: 0});
 
-  // Render input bar immediately and schedule a re-render in case
-  // state events arrived before the DOM was ready
+  // Render input bar immediately and schedule re-renders in case
+  // state events arrived before the DOM was ready.
+  // BUT: skip re-render if user has already started typing.
   liveBarState = null;
   updateLiveInputBar();
-  setTimeout(() => { liveBarState = null; updateLiveInputBar(); }, 500);
-  setTimeout(() => { liveBarState = null; updateLiveInputBar(); }, 2000);
+  setTimeout(() => {
+    const ta = document.getElementById('live-input-ta');
+    if (ta && ta.value.trim()) return; // user is typing, don't clobber
+    liveBarState = null;
+    updateLiveInputBar();
+  }, 500);
+  setTimeout(() => {
+    const ta = document.getElementById('live-input-ta');
+    if (ta && ta.value.trim()) return;
+    liveBarState = null;
+    updateLiveInputBar();
+  }, 2000);
 }
 
 function stopLivePanel() {
@@ -196,6 +207,10 @@ function updateLiveInputBar() {
   const id = liveSessionId;
   const bar = document.getElementById('live-input-bar');
   if (!bar) return;
+
+  // Don't clobber if user has typed/pasted content in the textarea
+  const existingTa = bar.querySelector('textarea');
+  if (existingTa && existingTa.value.trim()) return;
 
   const kind = sessionKinds[id];  // 'question' | 'working' | 'idle' | undefined
   const isRunning = runningIds.has(id);
