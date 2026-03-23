@@ -104,13 +104,13 @@ def api_delete(session_id):
     path = _sessions_dir() / f"{session_id}.jsonl"
     folder = _sessions_dir() / session_id
 
-    if not path.exists():
-        return jsonify({"error": "Not found"}), 404
-
     # Close the SDK session if it's running
     sm = current_app.session_manager
     if sm.has_session(session_id):
         sm.close_session(session_id)
+
+    if not path.exists():
+        return jsonify({"ok": True})  # Already gone or never created
 
     path.unlink()
     if folder.exists() and folder.is_dir():

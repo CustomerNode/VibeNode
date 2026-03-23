@@ -51,7 +51,7 @@ async function loadProjects() {
     // No project available — clear skeleton and show prompt
     const listEl = document.getElementById('session-list');
     if (listEl) listEl.innerHTML = '<div class="empty-state" style="padding:24px;text-align:center;color:var(--text-muted);font-size:13px;">No projects found.<br>Click the project selector above to get started.</div>';
-    document.getElementById('main-body').innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;flex-direction:column;gap:8px;"><span style="font-size:24px;">\uD83D\uDCC1</span><span>Select a project to begin</span></div>';
+    document.getElementById('main-body').innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;flex-direction:column;gap:8px;"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg><span>Select a project to begin</span></div>';
   }
 }
 
@@ -166,7 +166,7 @@ async function deleteProjectOverlay(encoded, name) {
   const confirmed = await showConfirm('Delete Project', `<p>Delete <strong>${escHtml(name)}</strong> and all its sessions?</p><p>This cannot be undone.</p>`, {
     danger: true,
     confirmText: 'Delete',
-    icon: '\uD83D\uDDD1\uFE0F',
+    icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
   });
   if (!confirmed) return;
   try {
@@ -317,7 +317,7 @@ async function addProjectCreate() {
   const name = await showPrompt('Create Project', '<p>Enter a name for your new project.</p>', {
     placeholder: 'My Project',
     confirmText: 'Create',
-    icon: '\uD83D\uDCC1',
+    icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
   });
   if (!name) return;
   try {
@@ -473,7 +473,7 @@ document.addEventListener('click', function(e) {
 async function sleepAllSessions() {
   const running = allSessions.filter(s => runningIds.has(s.id));
   if (!running.length) { showToast('No running sessions'); return; }
-  const ok = await showConfirm('Sleep All Sessions', '<p>Close <strong>' + running.length + '</strong> running session' + (running.length > 1 ? 's' : '') + ' in this workspace?</p>', { danger: true, confirmText: 'Sleep All', icon: '\uD83D\uDCA4' });
+  const ok = await showConfirm('Sleep All Sessions', '<p>Close <strong>' + running.length + '</strong> running session' + (running.length > 1 ? 's' : '') + ' in this workspace?</p>', { danger: true, confirmText: 'Sleep All', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>' });
   if (!ok) return;
   let closed = 0;
   for (const s of running) {
@@ -496,7 +496,7 @@ async function sleepAllSessions() {
 async function deleteAllSessions() {
   const count = allSessions.length;
   if (!count) { showToast('No sessions to delete'); return; }
-  const ok = await showConfirm('Delete All Sessions', '<p>Permanently delete <strong>all ' + count + ' sessions</strong> in this workspace?</p><p>This cannot be undone.</p>', { danger: true, confirmText: 'Delete All', icon: '\u26A0\uFE0F' });
+  const ok = await showConfirm('Delete All Sessions', '<p>Permanently delete <strong>all ' + count + ' sessions</strong> in this workspace?</p><p>This cannot be undone.</p>', { danger: true, confirmText: 'Delete All', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>' });
   if (!ok) return;
   // Double confirm for safety
   const ok2 = await showConfirm('Are you sure?', '<p>This will permanently delete <strong>' + count + ' sessions</strong> and all their history.</p>', { danger: true, confirmText: 'Yes, delete everything' });
@@ -517,18 +517,14 @@ async function deleteAllSessions() {
 
 // --- New Agent ---
 async function addNewAgent() {
-  const result = await _showNewSessionDialog();
-  if (!result) return;
-  const { name, message } = result;
-
   const newId = crypto.randomUUID();
 
-  // Optimistic UI: add placeholder to sidebar + show spinner in main body
+  // Optimistic UI: add placeholder to sidebar
   const optimistic = {
     id: newId,
-    display_title: name || 'New Session',
-    custom_title: name || '',
-    last_activity: 'Starting\u2026',
+    display_title: 'New Session',
+    custom_title: '',
+    last_activity: '',
     size: '',
     message_count: 0,
     preview: '',
@@ -536,80 +532,81 @@ async function addNewAgent() {
   allSessions.unshift(optimistic);
   filterSessions();
 
-  // Pre-seed as running+idle so the input bar doesn't flash "not running"
+  // Pre-seed as running+idle
   guiOpenAdd(newId);
   runningIds.add(newId);
   sessionKinds[newId] = 'idle';
 
-  activeId = newId;
-  localStorage.setItem('activeSessionId', newId);
-  setToolbarSession(newId, name || 'New Session', !name, name || '');
+  // In workplace mode, expand the card
+  if (workspaceActive) {
+    expandWorkspaceCard(newId);
+  } else {
+    activeId = newId;
+    localStorage.setItem('activeSessionId', newId);
+    setToolbarSession(newId, 'New Session', true, '');
+  }
 
+  // Show empty chat with focused input — no dialog, no spinner
   document.getElementById('main-body').innerHTML =
     '<div class="live-panel" id="live-panel">' +
     '<div class="conversation live-log" id="live-log">' +
-    '<div class="empty-state" style="padding:40px 0;">' +
-    '<div class="spinner" style="margin:0 auto 12px;"></div>' +
-    '<div style="color:var(--text-muted);font-size:13px;">Starting new session\u2026</div>' +
+    '<div class="empty-state" style="padding:60px 0;text-align:center;">' +
+    '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-faint)" stroke-width="1.5" stroke-linecap="round" style="margin-bottom:12px;opacity:0.4;"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
+    '<div style="color:var(--text-faint);font-size:13px;">What should Claude work on?</div>' +
     '</div></div>' +
     '<div class="live-input-bar" id="live-input-bar"></div></div>';
 
-  // Build start payload
-  const startPayload = {
-    session_id: newId,
-    prompt: message || '',
+  // Show idle input bar immediately — user types their first message here
+  liveSessionId = newId;
+  liveLineCount = 0;
+  liveAutoScroll = true;
+  liveBarState = null;
+
+  const bar = document.getElementById('live-input-bar');
+  if (bar) {
+    bar.innerHTML =
+      '<textarea id="live-input-ta" class="live-textarea" rows="3" placeholder="Describe what you want Claude to do\u2026" autofocus' +
+      ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey)){event.preventDefault();_newSessionSubmit(\'' + newId + '\')}">' +
+      '</textarea>' +
+      '<div class="live-bar-row">' +
+      '<span style="font-size:10px;color:var(--text-faint);">Ctrl+Enter to send</span>' +
+      '<button class="live-send-btn" onclick="_newSessionSubmit(\'' + newId + '\')">Start</button>' +
+      '</div>';
+    setTimeout(() => {
+      const ta = document.getElementById('live-input-ta');
+      if (ta) ta.focus();
+    }, 50);
+  }
+}
+
+function _newSessionSubmit(sessionId) {
+  const ta = document.getElementById('live-input-ta');
+  if (!ta) return;
+  const text = ta.value.trim();
+  if (!text) { showToast('Type a message first'); return; }
+
+  // Start the SDK session with the message
+  socket.emit('start_session', {
+    session_id: sessionId,
+    prompt: text,
     cwd: _currentProjectDir(),
-    name: name || '',
-  };
-
-  // Start via WebSocket
-  socket.emit('start_session', startPayload);
-
-  // Start live panel
-  startLivePanel(newId);
-  showToast('Session started');
-}
-
-function _showNewSessionDialog() {
-  return new Promise(resolve => {
-    const overlay = document.getElementById('pm-overlay');
-    overlay.innerHTML = `
-      <div class="pm-card pm-enter" style="width:420px;">
-        <h2 class="pm-title">New Session</h2>
-        <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:20px;">
-          <div>
-            <label class="ns-label" for="ns-name">Name <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
-            <input class="pm-input" id="ns-name" type="text" placeholder="e.g. Fix login bug" autocomplete="off" spellcheck="false" style="margin-bottom:0;">
-          </div>
-          <div>
-            <label class="ns-label" for="ns-message">Message <span style="color:var(--text-faint);font-weight:400;">(optional)</span></label>
-            <textarea class="ns-textarea" id="ns-message" rows="3" placeholder="What should Claude work on?"></textarea>
-          </div>
-        </div>
-        <div class="pm-actions">
-          <button class="pm-btn pm-btn-secondary" id="ns-cancel">Cancel</button>
-          <button class="pm-btn pm-btn-primary" id="ns-start">Start Session</button>
-        </div>
-      </div>`;
-    overlay.classList.add('show');
-    requestAnimationFrame(() => overlay.querySelector('.pm-card').classList.remove('pm-enter'));
-
-    const close = (val) => { _closePm(); resolve(val); };
-    const submit = () => {
-      close({
-        name: document.getElementById('ns-name').value.trim(),
-        message: (document.getElementById('ns-message').value || '').trim(),
-      });
-    };
-
-    document.getElementById('ns-start').onclick = submit;
-    document.getElementById('ns-cancel').onclick = () => close(null);
-    overlay.onclick = e => { if (e.target === overlay) close(null); };
-    const nameInput = document.getElementById('ns-name');
-    nameInput.onkeydown = e => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') close(null); };
-    nameInput.focus();
+    name: '',
   });
+
+  // Clear the empty state and show the user's message
+  const logEl = document.getElementById('live-log');
+  if (logEl) logEl.innerHTML = '';
+
+  // Switch to live panel mode
+  startLivePanel(sessionId);
+
+  // Auto-name after a short delay (let Claude process first)
+  setTimeout(() => {
+    autoName(sessionId);
+  }, 8000);
 }
+
+// _showNewSessionDialog removed — addNewAgent now goes straight to chat
 
 // --- Keyboard Navigation ---
 document.addEventListener('keydown', (e) => {
@@ -788,6 +785,14 @@ async function loadSessions() {
   allSessions = await resp.json();
   document.getElementById('search').placeholder = 'Search ' + allSessions.length + ' sessions\u2026';
   setViewMode(viewMode);
+  // In workplace mode, the workspace canvas is already rendered by setViewMode->filterSessions.
+  // Don't restore an active session — the user can click a workspace card to expand it.
+  // Clear stale activeId so socket handlers don't get confused.
+  if (viewMode === 'workplace') {
+    activeId = null;
+    localStorage.removeItem('activeSessionId');
+    return;
+  }
   // Restore previously selected session or show dashboard
   const savedSession = localStorage.getItem('activeSessionId');
   if (savedSession && allSessions.find(s => s.id === savedSession)) {

@@ -8,7 +8,9 @@
       "Bash(pip show:*)",
       "Bash(grep -v \"^$\")",
       "Bash(PYTHONIOENCODING=utf-8 python -c \":*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(grep -rn \"[\\\\x{1F300}-\\\\x{1F9FF}]\\\\|\\\\u[0-9a-fA-F]\\\\{4\\\\}\\\\|&#x[0-9a-fA-F]\" static/js/*.js)",
+      "Bash(curl:*)"
     ]
   }
 }

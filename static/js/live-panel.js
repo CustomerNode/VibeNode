@@ -130,7 +130,7 @@ function renderLiveEntry(e) {
     div.className = 'live-entry live-entry-tool';
     const toolLine = document.createElement('div');
     toolLine.className = 'live-tool-line';
-    toolLine.innerHTML = '<span class="live-tool-icon">\u2699</span>' +
+    toolLine.innerHTML = '<span class="live-tool-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9"/></svg></span>' +
       '<span class="live-tool-name">' + escHtml(e.name || 'tool') + '</span>' +
       '<span class="live-tool-desc">' + escHtml((e.desc || '').slice(0, 120)) + '</span>' +
       '<button class="live-expand-btn">\u25be</button>';
@@ -151,7 +151,9 @@ function renderLiveEntry(e) {
     const line = document.createElement('div');
     line.className = 'live-result-line ' + (ok ? 'live-result-ok' : 'live-result-err');
     line.style.cursor = 'pointer';
-    line.textContent = (ok ? '\u2713 ' : '\u2717 ') + text.slice(0, 80) + (text.length > 80 ? '\u2026' : '');
+    const checkSvg = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><polyline points="20 6 9 17 4 12"/></svg>';
+    const xSvg = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+    line.innerHTML = (ok ? checkSvg : xSvg) + escHtml(text.slice(0, 80)) + (text.length > 80 ? '\u2026' : '');
 
     const detail = document.createElement('div');
     detail.className = 'live-tool-detail';
@@ -167,7 +169,7 @@ function renderLiveEntry(e) {
     const line = document.createElement('div');
     line.className = 'live-result-line live-result-err';
     line.style.cursor = 'pointer';
-    line.textContent = '\u26A0 ' + text.slice(0, 120) + (text.length > 120 ? '\u2026' : '');
+    line.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>' + escHtml(text.slice(0, 120)) + (text.length > 120 ? '\u2026' : '');
 
     const detail = document.createElement('div');
     detail.className = 'live-tool-detail';
@@ -256,7 +258,10 @@ function updateLiveInputBar() {
 
     // Render option buttons (y/n/a, yes/no, or numbered list)
     const isTool = (wd && wd.kind === 'tool');
-    const optLabels = { y: '\u2713 Yes', n: '\u2717 No', a: '\u2605 Always', yes: '\u2713 Yes', no: '\u2717 No' };
+    const _chk = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="vertical-align:middle;"><polyline points="20 6 9 17 4 12"/></svg>';
+    const _xic = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="vertical-align:middle;"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+    const _star = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
+    const optLabels = { y: _chk + ' Yes', n: _xic + ' No', a: _star + ' Always', yes: _chk + ' Yes', no: _xic + ' No' };
     let optBtns = '';
     if (options && options.length) {
       optBtns = '<div class="live-option-btns">' +
@@ -274,7 +279,7 @@ function updateLiveInputBar() {
     }
 
     bar.innerHTML =
-      '<div class="live-waiting-label">\uD83D\uDCAC Claude has a question</div>' +
+      '<div class="live-waiting-label"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg> Claude has a question</div>' +
       questionHTML +
       optBtns +
       '<textarea id="live-input-ta" class="live-textarea waiting-focus" rows="2" placeholder="Type your response\u2026 (or click an option above)"' +
@@ -330,17 +335,17 @@ function updateLiveInputBar() {
       '</textarea>' +
       '<div class="live-bar-row">' +
       '<span id="live-queue-hint" style="font-size:10px;color:var(--text-faint);">' +
-      (liveQueuedText ? '\u23f3 Command queued' : 'Will send automatically when done') +
+      (liveQueuedText ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Command queued' : 'Will send automatically when done') +
       '</span>' +
       '<button class="live-send-btn" style="background:var(--bg-card);color:var(--text-muted);border-color:var(--border-subtle);" onclick="liveQueueSave()">Queue</button>' +
-      '<button class="live-send-btn danger" style="margin-left:2px;" onclick="liveClearQueue()" title="Cancel queued command">\u2715</button>' +
+      '<button class="live-send-btn danger" style="margin-left:2px;" onclick="liveClearQueue()" title="Cancel queued command"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>' +
       '</div>';
     const qta = document.getElementById('live-queue-ta');
     if (qta) {
       qta.addEventListener('input', () => {
         liveQueuedText = qta.value;
         const hint = document.getElementById('live-queue-hint');
-        if (hint) hint.textContent = qta.value.trim() ? '\u23f3 Command queued' : 'Will send automatically when done';
+        if (hint) hint.innerHTML = qta.value.trim() ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Command queued' : 'Will send automatically when done';
       });
     }
     // Start elapsed timer — update only the time span, NOT the whole bar
@@ -527,7 +532,7 @@ async function closeSession(id) {
   if (!id) return;
   const s = allSessions.find(x => x.id === id);
   const name = (s && s.display_title) || id.slice(0, 8);
-  const confirmed = await showConfirm('Close Session', '<p>Close <strong>' + escHtml(name) + '</strong>?</p><p>This will stop the running Claude process and close the terminal window.</p>', { danger: true, confirmText: 'Close', icon: '\u23F9\uFE0F' });
+  const confirmed = await showConfirm('Close Session', '<p>Close <strong>' + escHtml(name) + '</strong>?</p><p>This will stop the running Claude process and close the terminal window.</p>', { danger: true, confirmText: 'Close', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>' });
   if (!confirmed) return;
   // Close via WebSocket
   if (runningIds.has(id)) {

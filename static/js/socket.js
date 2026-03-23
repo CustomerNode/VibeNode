@@ -82,10 +82,17 @@ socket.on('state_snapshot', (data) => {
     // Update live panel input bar state
     if (liveSessionId) updateLiveInputBar();
 
-    // Refresh dashboard if no session selected
-    if (!activeId) {
+    // Refresh dashboard if no session selected (but not in workplace mode —
+    // workplace owns main-body and the dashboard would clobber the workspace canvas)
+    if (!activeId && !workspaceActive) {
         const dash = document.querySelector('.dashboard');
         if (dash) document.getElementById('main-body').innerHTML = _buildDashboard();
+    }
+
+    // Update workspace permission queue after state refresh
+    // Auto-approve policies are global — run regardless of view mode
+    if (typeof _updatePermissionQueue === 'function') {
+        _updatePermissionQueue(waitingData);
     }
 
     // Update Close Session button enabled state
@@ -160,8 +167,8 @@ socket.on('session_state', (data) => {
         if (_logEl && liveAutoScroll) setTimeout(() => { _logEl.scrollTop = _logEl.scrollHeight; }, 100);
     }
 
-    // Refresh dashboard if no session selected
-    if (!activeId) {
+    // Refresh dashboard if no session selected (skip in workplace mode)
+    if (!activeId && !workspaceActive) {
         const dash = document.querySelector('.dashboard');
         if (dash) document.getElementById('main-body').innerHTML = _buildDashboard();
     }
@@ -224,7 +231,8 @@ socket.on('session_permission', (data) => {
     // Update sidebar
     _updateRowState(data.session_id, 'waiting');
     // Update workspace permission queue if active
-    if (workspaceActive && typeof _updatePermissionQueue === 'function') {
+    // Auto-approve policies are global — run regardless of view mode
+    if (typeof _updatePermissionQueue === 'function') {
         _updatePermissionQueue(waitingData);
     }
     if (viewMode === 'workforce' || viewMode === 'workplace') filterSessions();
