@@ -147,7 +147,9 @@ function _renderHierarchicalWorkspace(mainBody, sessions, tree) {
   if (childFolders.length) {
     html += '<div class="ws-section-label">Folders</div>';
     html += '<div class="ws-canvas">';
-    for (const fid of childFolders) {
+    for (const f of childFolders) {
+      // getCurrentFolderChildren returns folder objects, extract ID
+      const fid = (typeof f === 'string') ? f : (f && f.id ? f.id : f);
       html += _buildFolderCard(tree, fid);
     }
     html += '</div>';
