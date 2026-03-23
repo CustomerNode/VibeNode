@@ -9,6 +9,10 @@ socket.on('connect', () => {
     // Update status bar connection indicator
     const sbConn = document.getElementById('sb-connection');
     if (sbConn) { sbConn.textContent = '\u25CF'; sbConn.style.color = 'var(--idle-label)'; sbConn.title = 'Connected'; }
+    // Sync permission policy to backend on connect
+    if (typeof permissionPolicy !== 'undefined') {
+        socket.emit('set_permission_policy', { policy: permissionPolicy, customRules: customPolicies || {} });
+    }
 });
 
 socket.on('disconnect', () => {
@@ -34,6 +38,10 @@ socket.on('state_snapshot', (data) => {
 
     (data.sessions || []).forEach(s => {
         const id = s.session_id;
+        // Restore working_since for elapsed timer on refresh
+        if (s.working_since && s.state === 'working' && id === liveSessionId) {
+            _liveWorkingStart = s.working_since * 1000;
+        }
         if (s.state === 'waiting') {
             newKinds[id] = 'question';
             if (s.permission) {
@@ -102,7 +110,14 @@ socket.on('state_snapshot', (data) => {
 
 // Incremental state updates
 socket.on('session_state', (data) => {
-    const {session_id, state, cost_usd, error, name, model} = data;
+    const {session_id, state, cost_usd, error, name, model, working_since} = data;
+
+    // Sync server-side working_since for elapsed timer (survives refresh)
+    if (working_since && state === 'working') {
+        _liveWorkingStart = working_since * 1000; // server sends seconds, JS uses ms
+    } else if (state !== 'working') {
+        if (session_id === liveSessionId) _liveWorkingStart = null;
+    }
 
     // Map SDK states to existing UI state names
     if (state === 'waiting') {

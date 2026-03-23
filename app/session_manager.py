@@ -222,6 +222,7 @@ class SessionInfo:
     pending_tool_name: str = ""
     pending_tool_input: dict = field(default_factory=dict)
     always_allowed_tools: set = field(default_factory=set)
+    working_since: float = 0.0  # time.time() when state last became WORKING
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def to_state_dict(self) -> dict:
@@ -233,6 +234,7 @@ class SessionInfo:
             "name": self.name,
             "cwd": self.cwd,
             "model": self.model,
+            "working_since": self.working_since if self.state == SessionState.WORKING else 0,
         }
         # Include permission details for WAITING sessions so reconnecting
         # clients can display the permission prompt
@@ -265,6 +267,9 @@ class SessionManager:
         self._started = False
         self._registry_timer: Optional[threading.Timer] = None
         self._registry_dirty = False
+        # Permission policy (synced from browser)
+        self._permission_policy = "manual"     # 'manual' | 'auto' | 'custom'
+        self._custom_rules = {}                # dict of custom auto-approve rules
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -438,6 +443,13 @@ class SessionManager:
             perm_event.set()  # threading.Event.set() is fully thread-safe
 
         return {"ok": True}
+
+    def set_permission_policy(self, policy: str, custom_rules: dict = None) -> None:
+        """Update the permission policy (called from WebSocket handler)."""
+        if policy in ('manual', 'auto', 'custom'):
+            self._permission_policy = policy
+            self._custom_rules = custom_rules or {}
+            logger.info("Permission policy set to: %s", policy)
 
     def interrupt_session(self, session_id: str) -> dict:
         """Interrupt a running session."""
@@ -700,6 +712,52 @@ class SessionManager:
             # Auto-approve if user previously clicked "Always" for this tool
             if tool_name in info.always_allowed_tools:
                 return PermissionResultAllow()
+
+            # --- Server-side policy check ---
+            policy = manager._permission_policy
+            if policy == 'auto':
+                logger.debug("Auto-approving %s (policy=auto)", tool_name)
+                return PermissionResultAllow()
+
+            if policy == 'custom':
+                rules = manager._custom_rules
+                tool_lower = (tool_name or '').lower()
+                auto_approve = False
+
+                if rules.get('approveAllReads') and tool_lower == 'read':
+                    auto_approve = True
+                elif rules.get('approveProjectReads') and tool_lower == 'read':
+                    auto_approve = True
+                elif rules.get('approveAllBash') and tool_lower == 'bash':
+                    auto_approve = True
+                elif rules.get('approveProjectWrites') and tool_lower in ('write', 'edit'):
+                    auto_approve = True
+                elif rules.get('approveGlob') and tool_lower == 'glob':
+                    auto_approve = True
+                elif rules.get('approveGrep') and tool_lower == 'grep':
+                    auto_approve = True
+
+                # Custom regex pattern
+                if not auto_approve and rules.get('customPattern'):
+                    import re
+                    try:
+                        pattern = rules['customPattern']
+                        # Build the question text same way the browser does
+                        desc = ''
+                        if isinstance(tool_input, dict):
+                            desc = tool_input.get('command', '') or tool_input.get('file_path', '') or tool_input.get('path', '') or tool_input.get('pattern', '')
+                        question_text = f"Claude wants to use {tool_name}:\n\n{desc}"
+                        if re.search(pattern, question_text, re.IGNORECASE):
+                            auto_approve = True
+                    except Exception:
+                        pass
+
+                if auto_approve:
+                    logger.debug("Auto-approving %s (policy=custom, matched rule)", tool_name)
+                    return PermissionResultAllow()
+
+            # --- END server-side policy check ---
+            # Fall through to existing browser-prompt logic for 'manual' or unmatched custom rules
 
             # Use threading.Event (fully thread-safe) with anyio.sleep polling.
             # anyio.Event + call_soon_threadsafe doesn't reliably wake the waiter.
@@ -1062,6 +1120,11 @@ class SessionManager:
         (works from both the main asyncio loop and anyio task groups).
         Also schedules a registry save so crash recovery data stays fresh.
         """
+        # Track when session entered WORKING state for elapsed timer
+        if info.state == SessionState.WORKING and info.working_since == 0.0:
+            info.working_since = time.time()
+        elif info.state != SessionState.WORKING:
+            info.working_since = 0.0
         if self._socketio:
             data = info.to_state_dict()
             import threading
