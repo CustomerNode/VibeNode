@@ -123,14 +123,17 @@ def load_session_summary(path: Path) -> dict:
         return _err
 
     if first_ts:
-        date_str = first_ts.strftime("%b %d, %Y  %I:%M %p")
+        # Convert UTC to local time for display
+        local_ts = first_ts.astimezone() if first_ts.tzinfo else first_ts
+        date_str = local_ts.strftime("%b %d, %Y  %I:%M %p")
     else:
         date_str = datetime.fromtimestamp(st.st_mtime).strftime("%b %d, %Y  %I:%M %p")
         first_ts = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
 
     if last_ts is None:
         last_ts = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
-    last_activity_str = last_ts.strftime("%b %d, %Y  %I:%M %p")
+    local_last = last_ts.astimezone() if last_ts.tzinfo else last_ts
+    last_activity_str = local_last.strftime("%b %d, %Y  %I:%M %p")
 
     preview = first_user_content[:120] + ("\u2026" if len(first_user_content) > 120 else "")
 
@@ -260,7 +263,8 @@ def load_session(path: Path) -> dict:
                 pass
     if last_ts is None:
         last_ts = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-    last_activity_str = last_ts.strftime("%b %d, %Y  %I:%M %p")
+    local_last = last_ts.astimezone() if last_ts.tzinfo else last_ts
+    last_activity_str = local_last.strftime("%b %d, %Y  %I:%M %p")
 
     # File size (bytes of the .jsonl file only)
     file_bytes = path.stat().st_size
