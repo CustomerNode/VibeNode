@@ -238,7 +238,7 @@ header h1 { font-size: 15px; font-weight: 600; color: var(--text-heading); margi
 }
 .hdr-sys-btn:hover { border-color: var(--border-hover); color: var(--text-heading); }
 .hdr-sys-dropdown {
-  display: none; position: absolute; top: calc(100% + 4px); left: 0;
+  display: none; position: absolute; top: calc(100% + 4px); right: 0;
   background: var(--bg-dropdown); border: 1px solid var(--border-light); border-radius: 8px;
   padding: 4px; min-width: 180px; z-index: 200;
   box-shadow: 0 4px 16px var(--shadow);
