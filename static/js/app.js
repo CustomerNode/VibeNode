@@ -532,10 +532,9 @@ async function addNewAgent() {
   allSessions.unshift(optimistic);
   filterSessions();
 
-  // Pre-seed as running+idle
+  // Mark as GUI-opened but DON'T add to runningIds or sessionKinds yet.
+  // The session doesn't exist on the server until _newSessionSubmit sends it.
   guiOpenAdd(newId);
-  runningIds.add(newId);
-  sessionKinds[newId] = 'idle';
 
   // In workplace mode, expand the card
   if (workspaceActive) {
@@ -584,6 +583,10 @@ function _newSessionSubmit(sessionId) {
   if (!ta) return;
   const text = ta.value.trim();
   if (!text) { showToast('Type a message first'); return; }
+
+  // NOW seed as running (session will exist on server after this emit)
+  runningIds.add(sessionId);
+  sessionKinds[sessionId] = 'working';
 
   // Start the SDK session with the message
   socket.emit('start_session', {
