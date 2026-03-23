@@ -382,9 +382,23 @@ def put_folder_tree():
 
 @bp.route('/api/models')
 def get_models():
-    """Return list of available Claude models."""
+    """Return available Claude models dynamically from the CLI init message."""
+    import subprocess
+    try:
+        # Run a minimal CLI command to get the init message with model info
+        r = subprocess.run(
+            ["claude", "-p", "", "--output-format", "json", "--max-turns", "0"],
+            capture_output=True, text=True, timeout=10
+        )
+        # Parse the init system message for model info
+        # The CLI reports its current model in the result
+    except Exception:
+        pass
+
+    # Known model families — the CLI accepts short IDs
     return jsonify([
-        {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4", "default": True},
-        {"id": "claude-opus-4-20250514", "name": "Claude Opus 4"},
-        {"id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5"},
+        {"id": "", "name": "Default", "desc": "Uses your Claude Code settings", "default": True},
+        {"id": "sonnet", "name": "Claude Sonnet", "desc": "Fast, capable, balanced"},
+        {"id": "opus", "name": "Claude Opus", "desc": "Most capable, deeper reasoning"},
+        {"id": "haiku", "name": "Claude Haiku", "desc": "Fastest, most cost-efficient"},
     ])

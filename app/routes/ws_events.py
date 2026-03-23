@@ -7,7 +7,7 @@ Server -> Client events:
 
 Client -> Server events:
     connect, start_session, send_message, permission_response,
-    interrupt_session, close_session, get_session_log
+    interrupt_session, close_session, get_session_log, set_permission_policy
 """
 
 import json
@@ -134,6 +134,7 @@ def register_ws_events(socketio, app):
         # Optional session options
         model = (data.get('model') or '').strip() or None
         system_prompt = (data.get('system_prompt') or '').strip() or None
+        thinking_level = (data.get('thinking_level') or '').strip() or None
         max_turns = data.get('max_turns')
         if max_turns is not None:
             try:
@@ -308,13 +309,40 @@ def register_ws_events(socketio, app):
             return
 
         sm = app.session_manager
-        entries = sm.get_entries(session_id, since=since)
 
-        # Fall back to .jsonl file parsing for historical sessions
-        if not entries and not sm.has_session(session_id):
-            entries = _parse_jsonl_entries(app, session_id, since)
+        # Always load the .jsonl history first (the authoritative record)
+        entries = _parse_jsonl_entries(app, session_id, since)
+
+        # Append any SDK-only entries (e.g., system messages from current session)
+        # that aren't in the .jsonl yet
+        if sm.has_session(session_id):
+            sdk_entries = sm.get_entries(session_id, since=0)
+            # Only add SDK entries that came after the .jsonl entries
+            # (SDK entries like "Session interrupted" won't be in the file)
+            jsonl_count = len(entries)
+            for sdk_e in sdk_entries:
+                if sdk_e.get("kind") == "system":
+                    entries.append(sdk_e)
 
         emit('session_log', {
             'session_id': session_id,
             'entries': entries,
         })
+
+    @socketio.on('set_permission_policy')
+    def handle_set_permission_policy(data):
+        """Sync permission policy from browser to server."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        policy = (data.get('policy') or '').strip()
+        custom_rules = data.get('customRules') or {}
+
+        if policy not in ('manual', 'auto', 'custom'):
+            emit('error', {'message': 'Invalid policy: must be manual, auto, or custom'})
+            return
+
+        sm = app.session_manager
+        sm.set_permission_policy(policy, custom_rules)
+        logger.debug("Permission policy synced: %s", policy)
