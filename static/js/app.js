@@ -364,10 +364,10 @@ const _viewModes = {
   },
   workplace: {
     icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><circle cx="7" cy="10" r="1.5"/><circle cx="17" cy="10" r="1.5"/><path d="M10 10h4"/></svg>',
-    label: 'Workplace',
-    title: 'Workplace',
-    desc: 'Virtual office space for agent collaboration',
-    // badge: 'Coming Soon',  -- workplace is now live
+    label: 'Workforce',
+    title: 'Workforce',
+    desc: 'Organize sessions by department with specialized skills',
+    badge: 'Experimental',
   },
 };
 
@@ -381,7 +381,7 @@ async function openViewModeSelector() {
 
   for (const [key, m] of Object.entries(_viewModes)) {
     const isActive = key === current;
-    const disabled = m.badge ? ' style="opacity:0.5;cursor:default;"' : '';
+    const disabled = (m.badge === 'Coming Soon') ? ' style="opacity:0.5;cursor:default;"' : '';
     html += `<div class="add-mode-card${isActive ? ' active' : ''}" data-mode="${key}"${disabled}>
       <div class="add-mode-icon">${m.icon}</div>
       <div class="add-mode-info">
@@ -400,7 +400,7 @@ async function openViewModeSelector() {
 
   overlay.querySelectorAll('.add-mode-card').forEach(card => {
     const mode = card.dataset.mode;
-    if (_viewModes[mode].badge) return; // disabled
+    if (_viewModes[mode].badge === 'Coming Soon') return; // disabled
     card.onclick = () => {
       _closePm();
       setViewMode(mode);
@@ -538,7 +538,14 @@ async function addNewAgent() {
 
   // In workplace mode, expand the card
   if (workspaceActive) {
-    expandWorkspaceCard(newId);
+    // Set workspace expanded state but DON'T call expandWorkspaceCard
+    // (it would start the live panel before the user has typed anything)
+    _wsExpandedId = newId;
+    activeId = newId;
+    localStorage.setItem('activeSessionId', newId);
+    document.getElementById('main-toolbar').style.display = '';
+    setToolbarSession(newId, 'New Session', true, '');
+    _addWorkspaceBackBtn();
   } else {
     activeId = newId;
     localStorage.setItem('activeSessionId', newId);
@@ -816,12 +823,7 @@ async function loadSessions() {
   allSessions = await resp.json();
   document.getElementById('search').placeholder = 'Search ' + allSessions.length + ' sessions\u2026';
   setViewMode(viewMode);
-  // First-run template selector for workplace mode
-  if (viewMode === 'workplace' && typeof getFolderTree === 'function' && !getFolderTree()) {
-    if (typeof showTemplateSelector === 'function') {
-      showTemplateSelector(() => filterSessions());
-    }
-  }
+  // Template selector is handled by initFolderTree() — no duplicate call here
   // In workplace mode, the workspace canvas is already rendered by setViewMode->filterSessions.
   // Don't restore an active session — the user can click a workspace card to expand it.
   // Clear stale activeId so socket handlers don't get confused.
@@ -861,31 +863,50 @@ function filterSessions() {
 // --- Model Selector ---
 let defaultModel = localStorage.getItem('defaultModel') || '';
 
-function openModelSelector() {
+async function openModelSelector() {
   const overlay = document.getElementById('pm-overlay');
-  const models = [
-    {key: 'claude-sonnet-4-6', name: 'Claude Sonnet 4', desc: 'Fast, capable, balanced'},
-    {key: 'claude-opus-4-6', name: 'Claude Opus 4', desc: 'Most capable, slower'},
-    {key: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5', desc: 'Fastest, most cost-efficient'},
-  ];
 
-  let html = '<div class="pm-card pm-enter" style="width:380px;">'
-    + '<h2 class="pm-title">Select Model</h2>'
-    + '<div class="pm-body"><p>Choose the default model for new sessions.</p></div>'
-    + '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:20px;">';
-  for (const m of models) {
-    const isActive = m.key === defaultModel;
-    html += `<div class="add-mode-card${isActive ? ' active' : ''}" data-model="${m.key}">
-      <div class="add-mode-info">
-        <div class="add-mode-title">${m.name}</div>
-        <div class="add-mode-desc">${m.desc}</div>
-      </div>
-    </div>`;
-  }
-  html += '</div><div class="pm-actions"><button class="pm-btn pm-btn-secondary" id="pm-model-close">Close</button></div></div>';
-  overlay.innerHTML = html;
+  // Show loading state
+  overlay.innerHTML = '<div class="pm-card pm-enter" style="width:380px;"><h2 class="pm-title">Select Model</h2><div class="pm-body"><span class="spinner"></span> Loading models...</div></div>';
   overlay.classList.add('show');
   requestAnimationFrame(() => overlay.querySelector('.pm-card').classList.remove('pm-enter'));
+  overlay.onclick = e => { if (e.target === overlay) _closePm(); };
+
+  // Fetch models dynamically from server
+  let models;
+  try {
+    const resp = await fetch('/api/models');
+    models = await resp.json();
+  } catch (e) {
+    models = [
+      {id: '', name: 'Default', desc: 'Uses your Claude Code settings', default: true},
+      {id: 'sonnet', name: 'Sonnet', desc: 'Fast, capable, balanced'},
+      {id: 'opus', name: 'Opus', desc: 'Most capable, deeper reasoning'},
+      {id: 'haiku', name: 'Haiku', desc: 'Fastest, most cost-efficient'},
+    ];
+  }
+
+  let cardsHtml = '';
+  for (const m of models) {
+    const key = m.id || '';
+    const isActive = key === defaultModel || (m.default && !defaultModel);
+    const name = m.name || key;
+    const desc = m.desc || '';
+    const extra = m.context_window ? ' (' + Math.round(m.context_window/1000) + 'K context)' : '';
+    const current = m.current ? ' <span style="font-size:9px;background:var(--accent);color:#fff;padding:2px 6px;border-radius:8px;font-weight:700;">Current</span>' : '';
+    cardsHtml += '<div class="add-mode-card' + (isActive ? ' active' : '') + '" data-model="' + escHtml(key) + '">'
+      + '<div class="add-mode-info">'
+      + '<div class="add-mode-title">' + escHtml(name) + extra + current + '</div>'
+      + '<div class="add-mode-desc">' + escHtml(desc) + '</div>'
+      + '</div></div>';
+  }
+
+  overlay.innerHTML = '<div class="pm-card" style="width:380px;">'
+    + '<h2 class="pm-title">Select Model</h2>'
+    + '<div class="pm-body"><p>Choose the default model for new sessions.</p></div>'
+    + '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:20px;">' + cardsHtml + '</div>'
+    + '<div class="pm-actions"><button class="pm-btn pm-btn-secondary" id="pm-model-close">Close</button></div></div>';
+
   document.getElementById('pm-model-close').onclick = () => _closePm();
   overlay.onclick = e => { if (e.target === overlay) _closePm(); };
   overlay.querySelectorAll('.add-mode-card').forEach(card => {
@@ -894,7 +915,7 @@ function openModelSelector() {
       localStorage.setItem('defaultModel', defaultModel);
       _closePm();
       _updateModelLabel();
-      showToast('Model: ' + card.querySelector('.add-mode-title').textContent);
+      showToast('Model: ' + (card.querySelector('.add-mode-title').textContent || 'Default'));
     };
   });
 }

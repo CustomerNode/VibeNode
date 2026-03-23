@@ -38,9 +38,12 @@ socket.on('state_snapshot', (data) => {
 
     (data.sessions || []).forEach(s => {
         const id = s.session_id;
-        // Restore working_since for elapsed timer on refresh
-        if (s.working_since && s.state === 'working' && id === liveSessionId) {
-            _liveWorkingStart = s.working_since * 1000;
+        // Store working_since for elapsed timer — keyed per session
+        // so it's available when the user opens the live panel later
+        if (s.working_since && s.state === 'working') {
+            if (!window._workingSinceMap) window._workingSinceMap = {};
+            window._workingSinceMap[id] = s.working_since * 1000;
+            if (id === liveSessionId) _liveWorkingStart = s.working_since * 1000;
         }
         if (s.state === 'waiting') {
             newKinds[id] = 'question';
@@ -113,9 +116,12 @@ socket.on('session_state', (data) => {
     const {session_id, state, cost_usd, error, name, model, working_since} = data;
 
     // Sync server-side working_since for elapsed timer (survives refresh)
+    if (!window._workingSinceMap) window._workingSinceMap = {};
     if (working_since && state === 'working') {
-        _liveWorkingStart = working_since * 1000; // server sends seconds, JS uses ms
+        window._workingSinceMap[session_id] = working_since * 1000;
+        if (session_id === liveSessionId) _liveWorkingStart = working_since * 1000;
     } else if (state !== 'working') {
+        delete window._workingSinceMap[session_id];
         if (session_id === liveSessionId) _liveWorkingStart = null;
     }
 
@@ -223,6 +229,7 @@ socket.on('session_entry', (data) => {
     }
     logEl.appendChild(renderLiveEntry(data.entry));
     liveLineCount = (data.index != null) ? data.index + 1 : liveLineCount + 1;
+    if (typeof _updateLastMessageTimes === 'function') _updateLastMessageTimes();
     if (liveAutoScroll) {
         logEl.scrollTop = logEl.scrollHeight;
     }
@@ -276,6 +283,7 @@ socket.on('session_log', (data) => {
     } else {
         liveLineCount = 0;
     }
+    if (typeof _updateLastMessageTimes === 'function') _updateLastMessageTimes();
     if (liveAutoScroll) logEl.scrollTop = logEl.scrollHeight;
 });
 

@@ -325,6 +325,10 @@ def _folder_tree_path() -> Path:
     proj = get_active_project()
     if proj:
         return _CLAUDE_DIR / f"gui_folder_tree_{proj}.json"
+    # No active project yet — try to find any existing tree file
+    candidates = list(_CLAUDE_DIR.glob("gui_folder_tree_*.json"))
+    if candidates:
+        return candidates[0]
     return _CLAUDE_DIR / "gui_folder_tree.json"
 
 

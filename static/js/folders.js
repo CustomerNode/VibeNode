@@ -50,7 +50,7 @@ async function initFolderTree() {
     var resp = await fetch('/api/folder-tree');
     if (resp.ok) {
       var data = await resp.json();
-      if (data && typeof data === 'object' && data.version) {
+      if (data && typeof data === 'object' && (data.version || data.activeTemplate || data.folders)) {
         _folderTreeCache = data;
         return data;
       }
@@ -368,6 +368,9 @@ function assignSessionToFolder(sessionId, folderId) {
 }
 
 function removeSessionFromFolder(sessionId) {
+  return unassignSession(sessionId);
+}
+function removeSessionFromAllFolders(sessionId) {
   return unassignSession(sessionId);
 }
 

@@ -141,28 +141,11 @@ function _renderHierarchicalWorkspace(mainBody, sessions, tree) {
   const sessionMap = {};
   for (const s of sessions) sessionMap[s.id] = s;
 
-  let html = '<div class="ws-container">';
-
-  // Breadcrumb bar
-  html += _buildBreadcrumbs(tree, currentId);
-
-  // Child folders of current level
+  // Pre-compute folder contents to decide breadcrumb button visibility
   const childFolders = (typeof getCurrentFolderChildren === 'function')
     ? getCurrentFolderChildren()
     : _getChildFoldersFallback(tree, currentId);
 
-  if (childFolders.length) {
-    html += '<div class="ws-section-label">Folders</div>';
-    html += '<div class="ws-canvas">';
-    for (const f of childFolders) {
-      // getCurrentFolderChildren returns folder objects, extract ID
-      const fid = (typeof f === 'string') ? f : (f && f.id ? f.id : f);
-      html += _buildFolderCard(tree, fid);
-    }
-    html += '</div>';
-  }
-
-  // Session cards for current folder
   let folderSessionIds;
   if (isRoot) {
     folderSessionIds = tree.rootSessions || [];
@@ -171,12 +154,140 @@ function _renderHierarchicalWorkspace(mainBody, sessions, tree) {
       ? getCurrentFolderSessions()
       : _getFolderSessionsFallback(tree, currentId);
   }
+  const hasContent = childFolders.length > 0 || folderSessionIds.length > 0;
+
+  let html = '<div class="ws-container">';
+
+  // ---- ROOT: Command Center Dashboard ----
+  if (isRoot) {
+    // Aggregate stats across ALL sessions
+    const totalSessions = sessions.length;
+    let working = 0, waiting = 0, idle = 0, sleeping = 0;
+    for (const s of sessions) {
+      const st = getSessionStatus(s.id);
+      if (st === 'working') working++;
+      else if (st === 'question') waiting++;
+      else if (st === 'idle') idle++;
+      else sleeping++;
+    }
+    const totalDepts = (tree.rootChildren || []).length;
+    html += '<div class="wf-command-center">';
+
+    // Header
+    html += '<div class="wf-cc-header">';
+    html += '<div class="wf-cc-title">Workforce</div>';
+    let totalSubDepts = 0;
+    const _countSubs = (fids) => { for (const fid of fids) { const f = tree.folders[typeof fid === 'string' ? fid : fid.id]; if (f) { totalSubDepts += (f.children || []).length; _countSubs(f.children || []); } } };
+    _countSubs(tree.rootChildren || []);
+    html += '<div class="wf-cc-subtitle">' + totalDepts + ' department' + (totalDepts !== 1 ? 's' : '') + (totalSubDepts ? ' &middot; ' + totalSubDepts + ' sub-department' + (totalSubDepts !== 1 ? 's' : '') : '') + ' &middot; ' + totalSessions + ' session' + (totalSessions !== 1 ? 's' : '') + '</div>';
+    html += '</div>';
+
+    // Stat cards with icons
+    const _ccIcons = {
+      working: '<img src="/static/svg/pickaxe.svg" width="20" height="20" style="filter:brightness(0) saturate(100%) invert(55%) sepia(78%) saturate(1000%) hue-rotate(215deg);">',
+      waiting: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r=".5" fill="#ff9500"/></svg>',
+      idle: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--idle-label)" stroke-width="2" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>',
+      sleeping: '<img src="/static/svg/sleeping.svg" width="20" height="20" class="sleeping-icon">',
+    };
+    html += '<div class="wf-cc-stats">';
+    html += '<div class="wf-cc-stat wf-cc-stat-working" onclick="_openStatusPopup(\'working\')"><div class="wf-cc-stat-icon">' + _ccIcons.working + '</div><div class="wf-cc-stat-num">' + working + '</div><div class="wf-cc-stat-label">Working</div></div>';
+    html += '<div class="wf-cc-stat wf-cc-stat-waiting" onclick="_openStatusPopup(\'question\')"><div class="wf-cc-stat-icon">' + _ccIcons.waiting + '</div><div class="wf-cc-stat-num">' + waiting + '</div><div class="wf-cc-stat-label">Waiting</div></div>';
+    html += '<div class="wf-cc-stat wf-cc-stat-idle" onclick="_openStatusPopup(\'idle\')"><div class="wf-cc-stat-icon">' + _ccIcons.idle + '</div><div class="wf-cc-stat-num">' + idle + '</div><div class="wf-cc-stat-label">Idle</div></div>';
+    html += '<div class="wf-cc-stat wf-cc-stat-sleeping" onclick="_openStatusPopup(\'sleeping\')"><div class="wf-cc-stat-icon">' + _ccIcons.sleeping + '</div><div class="wf-cc-stat-num">' + sleeping + '</div><div class="wf-cc-stat-label">Sleeping</div></div>';
+    html += '</div>';
+
+    // Departments section
+    html += '<div class="wf-cc-section-label">Departments</div>';
+    html += '<div class="ws-canvas">';
+    for (const f of childFolders) {
+      const fid = (typeof f === 'string') ? f : (f && f.id ? f.id : f);
+      html += _buildFolderCard(tree, fid);
+    }
+    html += '<div class="ws-folder-card ws-add-folder-card" onclick="wsCreateSubfolder(null)">'
+      + '<div class="ws-folder-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></div>'
+      + '<div class="ws-folder-name">New Department</div>'
+      + '</div>';
+    html += '</div>';
+
+    // Recent sessions — sorted by last activity, show department label
+    const recentSessions = sessions
+      .filter(s => !workspaceHiddenSessions.has(s.id))
+      .sort((a, b) => (b.last_activity_ts || b.sort_ts || 0) - (a.last_activity_ts || a.sort_ts || 0))
+      .slice(0, 10);
+
+    if (recentSessions.length) {
+      // Build session→folder lookup
+      const _sidToFolder = {};
+      for (const fid in tree.folders) {
+        for (const sid of (tree.folders[fid].sessions || [])) {
+          _sidToFolder[sid] = tree.folders[fid].name;
+        }
+      }
+
+      html += '<div class="wf-cc-section-label">Recent Sessions</div>';
+      html += '<div class="wf-cc-recent">';
+      for (const s of recentSessions) {
+        const st = getSessionStatus(s.id);
+        const stIcon = _ccIcons[st] || _ccIcons.sleeping;
+        const name = escHtml((s.display_title || s.id.slice(0, 8)).slice(0, 40));
+        const dept = _sidToFolder[s.id] ? '<span class="wf-cc-recent-dept">' + escHtml(_sidToFolder[s.id]) + '</span>' : '';
+        const date = (s.last_activity || '').split('  ')[0] || '';
+        html += '<div class="wf-cc-recent-row" onclick="expandWorkspaceCard(\'' + s.id + '\')">'
+          + '<span class="wf-cc-recent-icon">' + stIcon + '</span>'
+          + '<span class="wf-cc-recent-name">' + name + '</span>'
+          + dept
+          + '<span class="wf-cc-recent-date">' + escHtml(date) + '</span>'
+          + '</div>';
+      }
+      html += '</div>';
+    }
+
+    html += '</div>'; // close command center
+    html += '</div>'; // close ws-container
+    mainBody.innerHTML = html;
+
+    // Sidebar
+    const listEl = document.getElementById('session-list');
+    const searchRow = document.querySelector('.sidebar-search-row');
+    const menuWrap = document.querySelector('.sidebar-menu-wrap');
+    if (listEl) listEl.style.display = 'none';
+    if (searchRow) searchRow.style.display = 'none';
+    if (menuWrap) menuWrap.style.display = 'none';
+    const sidebarPermEl = document.getElementById('sidebar-perm-panel');
+    if (sidebarPermEl) {
+      sidebarPermEl.innerHTML = _buildPermissionPanel();
+      sidebarPermEl.style.display = '';
+    }
+    return;
+  }
+
+  // ---- NON-ROOT: Folder view with breadcrumbs ----
+  html += _buildBreadcrumbs(tree, currentId, hasContent);
+
+  if (childFolders.length) {
+    html += '<div class="ws-section-label">Sub-departments</div>';
+    html += '<div class="ws-canvas">';
+    for (const f of childFolders) {
+      const fid = (typeof f === 'string') ? f : (f && f.id ? f.id : f);
+      html += _buildFolderCard(tree, fid);
+    }
+    const addTarget = "'" + currentId + "'";
+    html += '<div class="ws-folder-card ws-add-folder-card" onclick="wsCreateSubfolder(' + addTarget + ')">'
+      + '<div class="ws-folder-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></div>'
+      + '<div class="ws-folder-name">New Department</div>'
+      + '</div>';
+    html += '</div>';
+  }
 
   const folderSessions = folderSessionIds
-    .map(sid => sessionMap[sid])
+    .map(sid => {
+      // Try allSessions first, then create a stub for SDK-managed sessions
+      if (sessionMap[sid]) return sessionMap[sid];
+      // Session exists in folder tree but not in allSessions (SDK-managed, no .jsonl yet)
+      return { id: sid, display_title: sid.slice(0, 8), custom_title: '', last_activity: '', size: '', message_count: 0, preview: '', sort_ts: 0, last_activity_ts: 0 };
+    })
     .filter(s => s && !workspaceHiddenSessions.has(s.id));
 
-  // Sort sessions same as flat view
   const statusOrder = {question:0, working:1, idle:2, sleeping:3};
   folderSessions.sort((a, b) => {
     const pa = workspaceCardPositions[a.id] ?? 9999;
@@ -188,13 +299,31 @@ function _renderHierarchicalWorkspace(mainBody, sessions, tree) {
     return (b.last_activity_ts||b.sort_ts||0) - (a.last_activity_ts||a.sort_ts||0);
   });
 
-  if (folderSessions.length) {
+  const _skillLabel = currentId && tree.folders[currentId] && tree.folders[currentId].skill ? tree.folders[currentId].skill.label : '';
+  const _newSessionSkillPill = _skillLabel
+    ? '<span class="ws-add-session-pill">' + escHtml(_skillLabel) + '</span>'
+    : '';
+
+  if (folderSessions.length || hasContent) {
     if (childFolders.length) {
       html += '<div class="ws-section-label">Sessions</div>';
     }
     html += '<div class="ws-canvas">';
+    // "New Session" card first
+    html += '<div class="ws-card ws-add-session-card" onclick="addNewAgent()">'
+      + '<div class="ws-avatar"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></div>'
+      + '<div class="ws-name">New Session</div>'
+      + _newSessionSkillPill
+      + '</div>';
     html += _buildSessionCardsHtml(folderSessions);
     html += '</div>';
+    // If no sub-departments exist, show a subtle add button
+    if (!childFolders.length && currentId) {
+      const addTarget = "'" + currentId + "'";
+      html += '<div class="ws-add-subdept-link" onclick="wsCreateSubfolder(' + addTarget + ')">'
+        + '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>'
+        + ' Add sub-department</div>';
+    }
   }
 
   // Hidden sessions count
@@ -210,25 +339,22 @@ function _renderHierarchicalWorkspace(mainBody, sessions, tree) {
     html += _buildArchivedSection(tree);
   }
 
-  // Empty state — no folders and no sessions
+  // Empty state — centered, clean
   if (!childFolders.length && !folderSessions.length) {
     const addFolderTarget = currentId ? "'" + currentId + "'" : 'null';
-    html += `<div class="ws-empty-folder">
-      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" style="opacity:0.2;margin-bottom:8px;">
-        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-      </svg>
-      <div style="margin-bottom:16px;">No sessions yet</div>
-      <div style="display:flex;gap:8px;">
-        <button class="ws-empty-btn" onclick="addNewAgent()">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-          New Session
-        </button>
-        <button class="ws-empty-btn ws-empty-btn-secondary" onclick="wsCreateSubfolder(${addFolderTarget})">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
-          Add Sub-folder
-        </button>
-      </div>
-    </div>`;
+    const _emptySkill = currentId && tree.folders[currentId] && tree.folders[currentId].skill ? tree.folders[currentId].skill.label : '';
+    const _emptyLabel = _emptySkill ? 'Chat with ' + escHtml(_emptySkill) : 'New Session';
+    html += '<div class="ws-empty-state">';
+    html += '<div class="ws-empty-icon"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>';
+    if (_emptySkill) {
+      html += '<div class="ws-empty-skill">' + escHtml(_emptySkill) + '</div>';
+    }
+    html += '<div class="ws-empty-text">No sessions yet</div>';
+    html += '<button class="ws-empty-primary" onclick="addNewAgent()">'
+      + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> '
+      + _emptyLabel + '</button>';
+    html += '<button class="ws-empty-secondary" onclick="wsCreateSubfolder(' + addFolderTarget + ')">or add a sub-department</button>';
+    html += '</div>';
   }
 
   html += '</div>';
@@ -250,15 +376,12 @@ function _getFolderSessionsFallback(tree, currentId) {
 }
 
 // ---- Build breadcrumb bar ----
-function _buildBreadcrumbs(tree, currentId) {
+function _buildBreadcrumbs(tree, currentId, hasContent) {
   const isRoot = !currentId;
 
   if (isRoot) {
-    return '<div class="ws-breadcrumbs"><span class="ws-crumb-current" style="opacity:0.5;">Root</span>'
-      + '<span class="ws-crumb-actions">'
-      + '<button class="ws-crumb-btn ws-crumb-btn-primary" onclick="addNewAgent()" title="New session"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> New Session</button>'
-      + '<button class="ws-crumb-btn" onclick="wsCreateSubfolder(null)" title="New folder"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg></button>'
-      + '</span></div>';
+    let rootHtml = '<div class="ws-breadcrumbs"><span class="ws-crumb-current" style="opacity:0.5;">Root</span></div>';
+    return rootHtml;
   }
 
   const crumbs = (typeof getBreadcrumbs === 'function')
@@ -283,13 +406,6 @@ function _buildBreadcrumbs(tree, currentId) {
       html += '<span class="ws-crumb" onclick="navigateToFolder(' + navId + ')" ondragover="event.preventDefault()" ondrop="_wsDropOnCrumb(event, ' + navId + ')">' + escHtml(c.name) + '</span>';
     }
   }
-
-  // Action buttons at the end of the breadcrumb bar
-  html += '<span class="ws-crumb-actions">';
-  html += '<button class="ws-crumb-btn ws-crumb-btn-primary" onclick="addNewAgent()" title="New session in this folder"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> New Session</button>';
-  const addFolderTarget = currentId ? "'" + currentId + "'" : 'null';
-  html += '<button class="ws-crumb-btn" onclick="wsCreateSubfolder(' + addFolderTarget + ')" title="New sub-folder"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg></button>';
-  html += '</span>';
 
   html += '</div>';
   return html;
@@ -319,7 +435,7 @@ function _buildFolderCard(tree, fid) {
   const childCount = (folder.children || []).length;
   const sessionCount = (folder.sessions || []).length;
   const countParts = [];
-  if (childCount) countParts.push(childCount + ' folder' + (childCount !== 1 ? 's' : ''));
+  if (childCount) countParts.push(childCount + ' sub-department' + (childCount !== 1 ? 's' : ''));
   if (sessionCount) countParts.push(sessionCount + ' session' + (sessionCount !== 1 ? 's' : ''));
   const countsText = countParts.join(' &middot; ');
 
@@ -358,8 +474,12 @@ function _buildFolderCard(tree, fid) {
       </svg>
     </div>
     <div class="ws-folder-name">${name}</div>
+    ${folder.skill && folder.skill.label ? '<div class="ws-folder-skill">' + escHtml(folder.skill.label) + '</div>' : ''}
     ${countsText ? '<div class="ws-folder-counts">' + countsText + '</div>' : ''}
     ${statusHtml}
+    <button class="ws-folder-menu-btn" onclick="event.stopPropagation();_wsFolderContextMenu(event,'${fid}')" title="Options">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/></svg>
+    </button>
   </div>`;
 }
 
@@ -487,10 +607,38 @@ function _deleteArchivedFolder(folderId) {
 }
 
 // ---- Folder navigation ----
-function navigateToFolder(folderId) {
+function navigateToFolder(folderId, skipHistory) {
   _currentFolderId = folderId || null;
+  // Push to browser history so back/forward works
+  if (!skipHistory) {
+    const url = new URL(window.location);
+    if (folderId) {
+      url.searchParams.set('folder', folderId);
+    } else {
+      url.searchParams.delete('folder');
+    }
+    history.pushState({ folder: folderId }, '', url);
+  }
   filterSessions();
 }
+
+// Restore folder from URL on load + handle back/forward
+window.addEventListener('popstate', function(e) {
+  if (e.state && typeof e.state.folder !== 'undefined') {
+    navigateToFolder(e.state.folder, true);
+  } else {
+    // Check URL params
+    const url = new URL(window.location);
+    const f = url.searchParams.get('folder');
+    navigateToFolder(f || null, true);
+  }
+});
+// On initial load, restore from URL
+(function() {
+  const url = new URL(window.location);
+  const f = url.searchParams.get('folder');
+  if (f) _currentFolderId = f;
+})();
 
 // ---- Permission panel ----
 function _buildPermissionPanel() {
@@ -983,7 +1131,7 @@ function _wsFolderContextMenu(e, folderId) {
   menu.innerHTML = `
     <div class="ws-ctx-item" onclick="_wsCtxRename('${folderId}')">Rename</div>
     <div class="ws-ctx-item" onclick="_wsCtxEditSkill('${folderId}')">Edit Skill</div>
-    <div class="ws-ctx-item" onclick="_wsCtxAddSub('${folderId}')">Add Sub-folder</div>
+    <div class="ws-ctx-item" onclick="_wsCtxAddSub('${folderId}')">Add Sub-department</div>
     <div class="ws-ctx-divider"></div>
     <div class="ws-ctx-item danger" onclick="_wsCtxDelete('${folderId}')">Delete</div>
   `;
@@ -1016,7 +1164,7 @@ async function _wsCtxRename(folderId) {
   var folder = tree?.folders[folderId];
   if (!folder) return;
   var newName = await showPrompt('Rename Folder', '', {
-    placeholder: 'Folder name',
+    placeholder: 'Department name',
     value: folder.name,
     confirmText: 'Rename',
   });
@@ -1063,8 +1211,8 @@ async function _wsCtxEditSkill(folderId) {
 
 async function _wsCtxAddSub(folderId) {
   document.querySelector('.ws-ctx-menu')?.remove();
-  var name = await showPrompt('Add Sub-folder', '', {
-    placeholder: 'Folder name',
+  var name = await showPrompt('Add Sub-department', '', {
+    placeholder: 'Department name',
     confirmText: 'Create',
   });
   if (name) {
@@ -1079,7 +1227,7 @@ async function _wsCtxDelete(folderId) {
   var tree = (typeof getFolderTree === 'function') ? getFolderTree() : null;
   var folder = tree?.folders[folderId];
   if (!folder) return;
-  var ok = await showConfirm('Delete Folder', `<p>Delete <strong>${escHtml(folder.name)}</strong>?</p><p>Sub-folders and sessions will be moved to the parent.</p>`, {
+  var ok = await showConfirm('Delete Department', `<p>Delete <strong>${escHtml(folder.name)}</strong>?</p><p>Sub-departments and sessions will be moved to the parent.</p>`, {
     danger: true,
     confirmText: 'Delete',
   });
@@ -1095,17 +1243,202 @@ async function _wsCtxDelete(folderId) {
 }
 
 // ---- Hide/Show sessions ----
-async function wsCreateSubfolder(parentId) {
-  const name = await showPrompt('New Folder', '<p>Enter a name for the new folder.</p>', {
-    placeholder: 'Folder name',
-    confirmText: 'Create',
-  });
-  if (!name) return;
-  if (typeof createFolder === 'function') {
-    createFolder(parentId, name.trim());
+async function wsEditFolderSkill(folderId) {
+  const tree = (typeof getFolderTree === 'function') ? getFolderTree() : null;
+  if (!tree || !tree.folders[folderId]) return;
+  const folder = tree.folders[folderId];
+  const skill = folder.skill || { label: '', systemPrompt: '', icon: '' };
+
+  const overlay = document.getElementById('pm-overlay');
+  overlay.innerHTML = `
+    <div class="pm-card pm-enter" style="width:500px;max-height:85vh;display:flex;flex-direction:column;">
+      <h2 class="pm-title">Edit Skill — ${escHtml(folder.name)}</h2>
+      <div class="pm-body" style="overflow-y:auto;flex:1;min-height:0;">
+        <div style="margin-bottom:12px;">
+          <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">Role Title</label>
+          <input class="pm-input" id="skill-label" type="text" value="${escHtml(skill.label)}" placeholder="e.g. Senior Frontend Engineer" style="margin-bottom:0;">
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">System Prompt</label>
+          <textarea class="ns-textarea" id="skill-prompt" rows="8" placeholder="Describe the expertise and behavior for sessions in this folder..." style="min-height:120px;">${escHtml(skill.systemPrompt)}</textarea>
+        </div>
+      </div>
+      <div class="pm-actions">
+        <button class="pm-btn pm-btn-secondary" id="skill-cancel">Cancel</button>
+        <button class="pm-btn pm-btn-primary" id="skill-save">Save</button>
+      </div>
+    </div>`;
+  overlay.classList.add('show');
+  requestAnimationFrame(() => overlay.querySelector('.pm-card').classList.remove('pm-enter'));
+
+  document.getElementById('skill-cancel').onclick = () => _closePm();
+  overlay.onclick = e => { if (e.target === overlay) _closePm(); };
+  document.getElementById('skill-save').onclick = () => {
+    const newLabel = document.getElementById('skill-label').value.trim();
+    const newPrompt = document.getElementById('skill-prompt').value.trim();
+    if (typeof setFolderSkill === 'function') {
+      setFolderSkill(folderId, { label: newLabel, systemPrompt: newPrompt, icon: '' });
+    } else {
+      folder.skill = { label: newLabel, systemPrompt: newPrompt, icon: '' };
+      if (typeof saveFolderTree === 'function') saveFolderTree(tree);
+    }
+    _closePm();
     filterSessions();
-    showToast('Folder created: ' + name.trim());
+    showToast('Skill updated: ' + (newLabel || folder.name));
+  };
+  document.getElementById('skill-label').focus();
+}
+
+async function wsCreateSubfolder(parentId) {
+  const overlay = document.getElementById('pm-overlay');
+  overlay.innerHTML = `
+    <div class="pm-card pm-enter" style="width:460px;">
+      <h2 class="pm-title">New Department</h2>
+      <div class="pm-body">
+        <div style="margin-bottom:14px;">
+          <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">Name</label>
+          <input class="pm-input" id="dept-name" type="text" placeholder="e.g. Frontend, QA, Marketing" autocomplete="off" style="margin-bottom:0;">
+        </div>
+        <div style="margin-bottom:14px;">
+          <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">Role Title <span style="opacity:0.5;">(optional)</span></label>
+          <input class="pm-input" id="dept-skill-label" type="text" placeholder="e.g. Senior Frontend Engineer" style="margin-bottom:0;">
+        </div>
+        <div>
+          <label style="font-size:11px;color:var(--text-muted);display:block;margin-bottom:4px;">System Prompt <span style="opacity:0.5;">(optional)</span></label>
+          <textarea class="ns-textarea" id="dept-skill-prompt" rows="4" placeholder="Describe the expertise for sessions in this department..."></textarea>
+        </div>
+      </div>
+      <div class="pm-actions">
+        <button class="pm-btn pm-btn-secondary" id="dept-cancel">Cancel</button>
+        <button class="pm-btn pm-btn-primary" id="dept-create">Create</button>
+      </div>
+    </div>`;
+  overlay.classList.add('show');
+  requestAnimationFrame(() => overlay.querySelector('.pm-card').classList.remove('pm-enter'));
+
+  document.getElementById('dept-cancel').onclick = () => _closePm();
+  overlay.onclick = e => { if (e.target === overlay) _closePm(); };
+
+  document.getElementById('dept-create').onclick = () => {
+    const name = document.getElementById('dept-name').value.trim();
+    if (!name) { showToast('Enter a department name'); return; }
+    const skillLabel = document.getElementById('dept-skill-label').value.trim();
+    const skillPrompt = document.getElementById('dept-skill-prompt').value.trim();
+
+    if (typeof createFolder === 'function') {
+      const skill = (skillLabel || skillPrompt) ? { label: skillLabel, systemPrompt: skillPrompt, icon: '' } : null;
+      createFolder(parentId, name, skill);
+    }
+    _closePm();
+    filterSessions();
+    showToast('Department created: ' + name);
+  };
+
+  const nameInput = document.getElementById('dept-name');
+  nameInput.onkeydown = e => { if (e.key === 'Enter') document.getElementById('dept-create').click(); if (e.key === 'Escape') _closePm(); };
+  nameInput.focus();
+}
+
+// AI assist feature removed
+
+// (AI assist removed — old code below was dead)
+function _openStatusPopup(status) {
+  const statusLabels = { working: 'Working', question: 'Waiting', idle: 'Idle', sleeping: 'Sleeping' };
+  const label = statusLabels[status] || status;
+
+  // Build session-to-folder lookup
+  const tree = (typeof getFolderTree === 'function') ? getFolderTree() : null;
+  const _sidToFolder = {};
+  if (tree) {
+    for (const fid in tree.folders) {
+      for (const sid of (tree.folders[fid].sessions || [])) {
+        _sidToFolder[sid] = tree.folders[fid].name;
+      }
+    }
   }
+
+  // Filter sessions by status
+  let filtered = allSessions.filter(s => getSessionStatus(s.id) === status);
+
+  const overlay = document.getElementById('pm-overlay');
+
+  const _renderList = (sessions, sortKey, sortAsc, query) => {
+    // Filter by search
+    let list = sessions;
+    if (query) {
+      const q = query.toLowerCase();
+      list = list.filter(s => (s.display_title || '').toLowerCase().includes(q) || (_sidToFolder[s.id] || '').toLowerCase().includes(q));
+    }
+    // Sort
+    list.sort((a, b) => {
+      let va, vb;
+      if (sortKey === 'name') { va = (a.display_title || '').toLowerCase(); vb = (b.display_title || '').toLowerCase(); }
+      else if (sortKey === 'dept') { va = (_sidToFolder[a.id] || '').toLowerCase(); vb = (_sidToFolder[b.id] || '').toLowerCase(); }
+      else { va = a.last_activity_ts || a.sort_ts || 0; vb = b.last_activity_ts || b.sort_ts || 0; }
+      if (va < vb) return sortAsc ? -1 : 1;
+      if (va > vb) return sortAsc ? 1 : -1;
+      return 0;
+    });
+
+    let rowsHtml = '';
+    if (!list.length) {
+      rowsHtml = '<div style="padding:20px;text-align:center;color:var(--text-faint);">No sessions</div>';
+    } else {
+      for (const s of list) {
+        const name = escHtml((s.display_title || s.id.slice(0, 8)).slice(0, 50));
+        const dept = _sidToFolder[s.id] || '';
+        const date = (s.last_activity || '').split('  ')[0] || '';
+        rowsHtml += '<div class="wf-status-row" onclick="_closePm();expandWorkspaceCard(\'' + s.id + '\')">'
+          + '<div class="wf-status-row-name">' + name + '</div>'
+          + (dept ? '<div class="wf-status-row-dept">' + escHtml(dept) + '</div>' : '')
+          + '<div class="wf-status-row-date">' + escHtml(date) + '</div>'
+          + '</div>';
+      }
+    }
+    const bodyEl = document.getElementById('wf-status-body');
+    if (bodyEl) bodyEl.innerHTML = rowsHtml;
+    const countEl = document.getElementById('wf-status-count');
+    if (countEl) countEl.textContent = list.length + ' session' + (list.length !== 1 ? 's' : '');
+  };
+
+  let currentSort = 'date';
+  let currentAsc = false;
+  let currentQuery = '';
+
+  overlay.innerHTML = '<div class="pm-card pm-enter" style="width:560px;max-height:80vh;display:flex;flex-direction:column;">'
+    + '<h2 class="pm-title">' + label + ' Sessions <span id="wf-status-count" style="font-size:12px;font-weight:400;color:var(--text-muted);margin-left:8px;"></span></h2>'
+    + '<div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;">'
+    + '<input class="pm-input" id="wf-status-search" type="text" placeholder="Search sessions..." style="margin:0;flex:1;">'
+    + '<select class="ns-select" id="wf-status-sort" style="width:auto;padding:6px 8px;font-size:11px;">'
+    + '<option value="date-desc">Newest</option>'
+    + '<option value="date-asc">Oldest</option>'
+    + '<option value="name-asc">Name A-Z</option>'
+    + '<option value="name-desc">Name Z-A</option>'
+    + '<option value="dept-asc">Department A-Z</option>'
+    + '</select>'
+    + '</div>'
+    + '<div id="wf-status-body" style="overflow-y:auto;flex:1;min-height:0;"></div>'
+    + '<div class="pm-actions"><button class="pm-btn pm-btn-secondary" id="wf-status-close">Close</button></div>'
+    + '</div>';
+  overlay.classList.add('show');
+  requestAnimationFrame(() => overlay.querySelector('.pm-card').classList.remove('pm-enter'));
+
+  _renderList(filtered, currentSort, currentAsc, currentQuery);
+
+  document.getElementById('wf-status-close').onclick = () => _closePm();
+  overlay.onclick = e => { if (e.target === overlay) _closePm(); };
+
+  document.getElementById('wf-status-search').oninput = function() {
+    currentQuery = this.value;
+    _renderList(filtered, currentSort, currentAsc, currentQuery);
+  };
+  document.getElementById('wf-status-sort').onchange = function() {
+    const v = this.value.split('-');
+    currentSort = v[0];
+    currentAsc = v[1] === 'asc';
+    _renderList(filtered, currentSort, currentAsc, currentQuery);
+  };
+  document.getElementById('wf-status-search').focus();
 }
 
 function wsHideSession(id) {

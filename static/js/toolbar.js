@@ -467,6 +467,8 @@ async function deleteSession(id) {
   // Always clean up UI even if backend file doesn't exist (new sessions)
   if (data.ok || resp.status === 404) {
     allSessions = allSessions.filter(x => x.id !== id);
+    // Remove from folder tree
+    if (typeof removeSessionFromAllFolders === 'function') removeSessionFromAllFolders(id);
     if (liveSessionId === id) stopLivePanel();
     deselectSession();
     document.getElementById('search').placeholder = 'Search ' + allSessions.length + ' sessions\u2026';
