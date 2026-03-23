@@ -440,9 +440,9 @@ async function autoName(id, silent) {
     filterSessions();
     const titleEl = document.getElementById('main-title');
     if (titleEl) { titleEl.textContent = data.title; titleEl.classList.remove('untitled'); }
-    showToast('Auto-named: "' + data.title + '"');
+    if (!silent) showToast('Auto-named: "' + data.title + '"');
   } else {
-    showToast('Auto-name failed: ' + (data.error || 'unknown error'), true);
+    if (!silent) showToast('Auto-name failed: ' + (data.error || 'unknown error'), true);
   }
 }
 

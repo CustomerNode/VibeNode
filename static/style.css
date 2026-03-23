@@ -1539,6 +1539,15 @@ mark.find-match.current { background: var(--accent); color:#fff; }
 }
 .live-send-btn:hover { background: var(--bg-btn-primary-hover); color: var(--accent-light); }
 .live-send-btn:disabled { opacity:0.4; cursor:default; }
+.live-send-btn.recording {
+  background: transparent;
+  border-color: var(--result-err, #c44);
+  animation: recording-pulse 1.2s ease-in-out infinite;
+}
+@keyframes recording-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(204, 68, 68, 0.3); }
+  50% { box-shadow: 0 0 0 6px rgba(204, 68, 68, 0); }
+}
 .live-send-btn.waiting { background:var(--question-bg, #ff9500); color:var(--question-text, #000); border-color:var(--question-bg, #ff9500); }
 .live-send-btn.waiting:hover { opacity:0.85; }
 .live-send-btn.danger { background:transparent; color:var(--result-err, #c44); border:1px solid var(--result-err, #c44); cursor:pointer; transition:all 0.15s; }
@@ -2593,6 +2602,69 @@ mark.find-match.current { background: var(--accent); color:#fff; }
   background: rgba(124, 124, 255, 0.08);
   border-radius: 10px;
   font-weight: 500;
+}
+
+/* Breadcrumb action buttons */
+.ws-crumb-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+}
+.ws-crumb-btn {
+  background: none;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 3px 6px;
+  display: flex;
+  align-items: center;
+  transition: all 0.15s;
+}
+.ws-crumb-btn:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.ws-crumb-btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  font-size: 11px;
+  gap: 4px;
+}
+.ws-crumb-btn-primary:hover {
+  background: var(--accent);
+  opacity: 0.85;
+  color: #fff;
+  border-color: var(--accent);
+}
+
+/* Empty folder action buttons */
+.ws-empty-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.ws-empty-btn:hover { opacity: 0.85; }
+.ws-empty-btn-secondary {
+  background: transparent;
+  color: var(--text-secondary);
+  border-color: var(--border-subtle);
+}
+.ws-empty-btn-secondary:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-hover);
 }
 
 /* Folder Cards */

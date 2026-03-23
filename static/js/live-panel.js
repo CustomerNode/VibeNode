@@ -249,11 +249,12 @@ function updateLiveInputBar() {
       ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey)){event.preventDefault();liveSubmitContinue(\'' + id + '\')}"></textarea>' +
       '<div class="live-bar-row">' +
       '<span style="font-size:10px;color:var(--text-faint);">Ctrl+Enter to send</span>' +
-      '<button class="live-send-btn" onclick="liveSubmitContinue(\'' + id + '\')">Send \u21b5</button>' +
+      '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>';
     const btnClose = document.getElementById('btn-close');
     if (btnClose) btnClose.disabled = true;
     _guiFocusPending = false;
+    setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => liveSubmitContinue(id));
     setTimeout(() => {
       const logEl = document.getElementById('live-log');
       if (logEl) logEl.scrollTop = logEl.scrollHeight;
@@ -306,8 +307,9 @@ function updateLiveInputBar() {
       ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey)){event.preventDefault();liveSubmitWaiting()}"></textarea>' +
       '<div class="live-bar-row">' +
       '<span style="font-size:10px;color:var(--text-faint);">Ctrl+Enter to send</span>' +
-      '<button class="live-send-btn waiting" onclick="liveSubmitWaiting()">Send \u21b5</button>' +
+      '<button class="live-send-btn waiting" id="live-voice-btn"></button>' +
       '</div>';
+    setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), liveSubmitWaiting);
     const ta = document.getElementById('live-input-ta');
     if (ta) {
       if (prefill) ta.value = prefill;
@@ -328,8 +330,9 @@ function updateLiveInputBar() {
       ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey)){event.preventDefault();liveSubmitIdle()}"></textarea>' +
       '<div class="live-bar-row">' +
       '<span style="font-size:10px;color:var(--text-faint);">Ctrl+Enter to send</span>' +
-      '<button class="live-send-btn" onclick="liveSubmitIdle()">Send \u21b5</button>' +
+      '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>';
+    setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), liveSubmitIdle);
     _guiFocusPending = false;
     setTimeout(() => {
       const logEl = document.getElementById('live-log');

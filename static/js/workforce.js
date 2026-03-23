@@ -38,6 +38,9 @@ function setViewMode(mode) {
     // Clear sidebar permission panel
     const spp = document.getElementById('sidebar-perm-panel');
     if (spp) { spp.innerHTML = ''; spp.style.display = 'none'; }
+    // Restore new session button
+    const btnAdd = document.getElementById('btn-add-agent');
+    if (btnAdd) btnAdd.style.display = '';
   }
 
   // Leaving workforce or list into workplace: clear active session so
@@ -66,15 +69,14 @@ function setViewMode(mode) {
     if (menuWrap) menuWrap.style.display = '';
     if (sidebarPermPanel) sidebarPermPanel.style.display = 'none';
   } else if (mode === 'workplace') {
-    listEl.style.display = 'none';
+    // Don't hide the session list yet — let it show skeleton until
+    // renderWorkspace finishes. renderWorkspace will hide it atomically.
     gridEl.classList.remove('visible');
     if (btnList) btnList.classList.remove('active');
     if (btnWf)   btnWf.classList.remove('active');
-    // Hide search and sort — workplace has its own layout
-    if (searchRow) searchRow.style.display = 'none';
-    if (menuWrap) menuWrap.style.display = 'none';
-    // Show permission panel in sidebar (content rendered by filterSessions->renderWorkspace)
-    if (sidebarPermPanel) { sidebarPermPanel.style.display = ''; sidebarPermPanel.innerHTML = ''; }
+    if (sidebarPermPanel) { sidebarPermPanel.style.display = 'none'; sidebarPermPanel.innerHTML = ''; }
+    const btnAdd = document.getElementById('btn-add-agent');
+    if (btnAdd) btnAdd.style.display = 'none';
   } else {
     listEl.style.display = '';
     gridEl.classList.remove('visible');

@@ -15,7 +15,12 @@
       "Bash(claude --version)",
       "Bash(claude -p \"list your model id\" --output-format json --max-turns 1)",
       "Bash(claude -p \"list all available model IDs you can use\" --output-format stream-json --verbose --max-turns 0)",
-      "Bash(claude config:*)"
+      "Bash(claude config:*)",
+      "Read(//c/Users/15512/.claude/**)",
+      "WebFetch(domain:docs.anthropic.com)",
+      "Bash(pip install:*)",
+      "Bash(where claude:*)",
+      "Bash(npm root:*)"
     ]
   }
 }

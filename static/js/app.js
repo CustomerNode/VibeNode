@@ -574,8 +574,9 @@ async function addNewAgent() {
       '</textarea>' +
       '<div class="live-bar-row">' +
       '<span style="font-size:10px;color:var(--text-faint);">Ctrl+Enter to send</span>' +
-      '<button class="live-send-btn" onclick="_newSessionSubmit(\'' + newId + '\')">Start</button>' +
+      '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>';
+    setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => _newSessionSubmit(newId));
     setTimeout(() => {
       const ta = document.getElementById('live-input-ta');
       if (ta) ta.focus();

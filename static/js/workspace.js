@@ -37,7 +37,14 @@ function renderWorkspace(sessions) {
     _renderFlatWorkspace(mainBody, sessions);  // existing behavior
   }
 
-  // Permission panel goes in sidebar (unchanged)
+  // Atomic sidebar switch: hide list/search/menu, show permission panel
+  // Done here (after rendering) so there's no intermediate flash state
+  const listEl = document.getElementById('session-list');
+  const searchRow = document.querySelector('.sidebar-search-row');
+  const menuWrap = document.querySelector('.sidebar-menu-wrap');
+  if (listEl) listEl.style.display = 'none';
+  if (searchRow) searchRow.style.display = 'none';
+  if (menuWrap) menuWrap.style.display = 'none';
   const sidebarPermEl = document.getElementById('sidebar-perm-panel');
   if (sidebarPermEl) {
     sidebarPermEl.innerHTML = _buildPermissionPanel();
@@ -205,12 +212,22 @@ function _renderHierarchicalWorkspace(mainBody, sessions, tree) {
 
   // Empty state — no folders and no sessions
   if (!childFolders.length && !folderSessions.length) {
+    const addFolderTarget = currentId ? "'" + currentId + "'" : 'null';
     html += `<div class="ws-empty-folder">
-      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" style="opacity:0.3;">
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" style="opacity:0.2;margin-bottom:8px;">
         <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
       </svg>
-      <div>This folder is empty</div>
-      <div style="font-size:11px;color:var(--text-faint);">Drag sessions here or create sub-folders</div>
+      <div style="margin-bottom:16px;">No sessions yet</div>
+      <div style="display:flex;gap:8px;">
+        <button class="ws-empty-btn" onclick="addNewAgent()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          New Session
+        </button>
+        <button class="ws-empty-btn ws-empty-btn-secondary" onclick="wsCreateSubfolder(${addFolderTarget})">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
+          Add Sub-folder
+        </button>
+      </div>
     </div>`;
   }
 
@@ -237,7 +254,11 @@ function _buildBreadcrumbs(tree, currentId) {
   const isRoot = !currentId;
 
   if (isRoot) {
-    return '<div class="ws-breadcrumbs"><span class="ws-crumb-current" style="opacity:0.5;">Root</span></div>';
+    return '<div class="ws-breadcrumbs"><span class="ws-crumb-current" style="opacity:0.5;">Root</span>'
+      + '<span class="ws-crumb-actions">'
+      + '<button class="ws-crumb-btn ws-crumb-btn-primary" onclick="addNewAgent()" title="New session"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> New Session</button>'
+      + '<button class="ws-crumb-btn" onclick="wsCreateSubfolder(null)" title="New folder"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg></button>'
+      + '</span></div>';
   }
 
   const crumbs = (typeof getBreadcrumbs === 'function')
@@ -246,11 +267,8 @@ function _buildBreadcrumbs(tree, currentId) {
 
   let html = '<div class="ws-breadcrumbs">';
 
-  // Root crumb (always clickable when not at root)
-  html += '<span class="ws-crumb" onclick="navigateToFolder(null)" ondragover="event.preventDefault()" ondrop="_wsDropOnCrumb(event, null)">Root</span>';
-
   for (let i = 0; i < crumbs.length; i++) {
-    html += '<span class="ws-crumb-sep">&rsaquo;</span>';
+    if (i > 0) html += '<span class="ws-crumb-sep">&rsaquo;</span>';
     const c = crumbs[i];
     const isLast = (i === crumbs.length - 1);
     if (isLast) {
@@ -261,9 +279,17 @@ function _buildBreadcrumbs(tree, currentId) {
         html += '<span class="ws-crumb-skill">' + escHtml(folder.skill.label) + '</span>';
       }
     } else {
-      html += '<span class="ws-crumb" onclick="navigateToFolder(\'' + c.id + '\')" ondragover="event.preventDefault()" ondrop="_wsDropOnCrumb(event, \'' + c.id + '\')">' + escHtml(c.name) + '</span>';
+      const navId = c.id ? "'" + c.id + "'" : 'null';
+      html += '<span class="ws-crumb" onclick="navigateToFolder(' + navId + ')" ondragover="event.preventDefault()" ondrop="_wsDropOnCrumb(event, ' + navId + ')">' + escHtml(c.name) + '</span>';
     }
   }
+
+  // Action buttons at the end of the breadcrumb bar
+  html += '<span class="ws-crumb-actions">';
+  html += '<button class="ws-crumb-btn ws-crumb-btn-primary" onclick="addNewAgent()" title="New session in this folder"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> New Session</button>';
+  const addFolderTarget = currentId ? "'" + currentId + "'" : 'null';
+  html += '<button class="ws-crumb-btn" onclick="wsCreateSubfolder(' + addFolderTarget + ')" title="New sub-folder"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg></button>';
+  html += '</span>';
 
   html += '</div>';
   return html;
@@ -546,8 +572,9 @@ function _updatePermissionQueue(newWaiting) {
 
   // Update sidebar permission panel (always visible in workplace mode)
   const sidebarPermEl = document.getElementById('sidebar-perm-panel');
-  if (sidebarPermEl && sidebarPermEl.style.display !== 'none') {
+  if (sidebarPermEl && workspaceActive) {
     sidebarPermEl.innerHTML = _buildPermissionPanel();
+    sidebarPermEl.style.display = '';
   }
 
   // When a card is expanded, renderWorkspace() skips, so do incremental update
@@ -1068,6 +1095,19 @@ async function _wsCtxDelete(folderId) {
 }
 
 // ---- Hide/Show sessions ----
+async function wsCreateSubfolder(parentId) {
+  const name = await showPrompt('New Folder', '<p>Enter a name for the new folder.</p>', {
+    placeholder: 'Folder name',
+    confirmText: 'Create',
+  });
+  if (!name) return;
+  if (typeof createFolder === 'function') {
+    createFolder(parentId, name.trim());
+    filterSessions();
+    showToast('Folder created: ' + name.trim());
+  }
+}
+
 function wsHideSession(id) {
   workspaceHiddenSessions.add(id);
   localStorage.setItem('wsHiddenSessions', JSON.stringify([...workspaceHiddenSessions]));

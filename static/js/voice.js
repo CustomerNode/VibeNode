@@ -88,7 +88,24 @@ function setupVoiceButton(textarea, button, onSubmit) {
       textarea.value = finalTranscript;
       textarea.dispatchEvent(new Event('input'));
       updateIcon();
-      textarea.focus();
+      // Auto-send after a pause so the user can finish their thought
+      if (finalTranscript.trim() && onSubmit) {
+        showToast('Sending in 3s\u2026 (type to cancel)');
+        const sendTimer = setTimeout(() => {
+          if (textarea.value.trim() === finalTranscript.trim()) {
+            onSubmit();
+          }
+        }, 3000);
+        // If user starts typing, cancel auto-send
+        const cancelHandler = () => {
+          clearTimeout(sendTimer);
+          textarea.removeEventListener('input', cancelHandler);
+        };
+        textarea.addEventListener('input', cancelHandler);
+        textarea.focus();
+      } else {
+        textarea.focus();
+      }
     };
 
     recognition.onerror = (e) => {
