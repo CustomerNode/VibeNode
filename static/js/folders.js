@@ -84,11 +84,13 @@ function _showTemplateSelector(onComplete) {
   for (var i = 0; i < tmplEntries.length; i++) {
     var key = tmplEntries[i][0];
     var tmpl = tmplEntries[i][1];
-    cardsHtml += '<div class="add-mode-card" data-tmpl="' + key + '">'
+    var badge = escHtml(tmpl.count);
+    if (key === 'small-team') badge += '</span> <span style="font-size:9px;background:var(--accent);color:#fff;padding:2px 6px;border-radius:8px;font-weight:700;margin-left:4px;">Recommended';
+    cardsHtml += '<div class="add-mode-card' + (key === 'small-team' ? ' active' : '') + '" data-tmpl="' + key + '">'
       + '<div class="add-mode-icon">' + templateIcon + '</div>'
       + '<div class="add-mode-info">'
       + '<div class="add-mode-title">' + escHtml(tmpl.name)
-      + ' <span style="font-size:9px;background:var(--border);color:var(--text-muted);padding:2px 6px;border-radius:8px;font-weight:600;margin-left:6px;">' + escHtml(tmpl.count) + '</span></div>'
+      + ' <span style="font-size:9px;background:var(--border);color:var(--text-muted);padding:2px 6px;border-radius:8px;font-weight:600;margin-left:6px;">' + badge + '</span></div>'
       + '<div class="add-mode-desc">' + escHtml(tmpl.desc) + '</div>'
       + '</div></div>';
   }
@@ -106,8 +108,13 @@ function _showTemplateSelector(onComplete) {
     if (card) card.classList.remove('pm-enter');
   });
 
-  // Click outside does nothing — user must pick a template
-  overlay.onclick = function(e) { if (e.target === overlay) { /* block dismiss */ } };
+  // Click outside to dismiss (applies empty/no template)
+  overlay.onclick = function(e) {
+    if (e.target === overlay) {
+      _closePm();
+      if (typeof onComplete === 'function') onComplete();
+    }
+  };
 
   overlay.querySelectorAll('.add-mode-card').forEach(function(card) {
     card.onclick = function() {
