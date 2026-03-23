@@ -208,12 +208,16 @@ function updateLiveInputBar() {
   const bar = document.getElementById('live-input-bar');
   if (!bar) return;
 
+  // Don't touch the bar for sessions that haven't started on the server yet.
+  // addNewAgent() renders its own input bar with _newSessionSubmit handler.
+  // If neither runningIds nor sessionKinds know about this session, leave it alone.
+  const isRunning = runningIds.has(id);
+  const kind = sessionKinds[id];  // 'question' | 'working' | 'idle' | undefined
+  if (!isRunning && !kind && guiOpenSessions.has(id)) return;
+
   // Don't clobber if user has typed/pasted content in the textarea
   const existingTa = bar.querySelector('textarea');
   if (existingTa && existingTa.value.trim()) return;
-
-  const kind = sessionKinds[id];  // 'question' | 'working' | 'idle' | undefined
-  const isRunning = runningIds.has(id);
   const wd = waitingData[id];     // {question, options, kind} or undefined
 
   // Compute a state key — for question state, include question text so we re-render if the question changed
