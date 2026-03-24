@@ -78,6 +78,9 @@ async function setProject(encoded, reload = true) {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({project: encoded})
   });
+  // Reset agent catalog so it gets re-written for the new project
+  _agentCatalogPath = null;
+  _agentCatalogPromise = null;
   if (reload) loadSessions();
 }
 
@@ -721,40 +724,65 @@ async function addNewAgent() {
   }
 }
 
-// Build a compact agent catalog from FOLDER_SUPERSET for injection into the
-// system prompt.  This lets Claude spawn any workforce role as a subprocess
-// regardless of what project directory the session is running in.
-function _buildAgentDefinitions() {
-  if (typeof FOLDER_SUPERSET !== 'object' || !FOLDER_SUPERSET) return '';
+// ---------------------------------------------------------------------------
+// Agent catalog — write all definitions to a temp file, system prompt gets
+// just a single-line pointer.  Keeps the CLI argument short.
+// ---------------------------------------------------------------------------
 
-  // Count agents that have skills
-  const agents = Object.entries(FOLDER_SUPERSET).filter(([, def]) => def.skill && def.skill.systemPrompt);
-  if (!agents.length) return '';
+let _agentCatalogPath = null;
+let _agentCatalogPromise = null;
 
-  const lines = [
-    '# AVAILABLE AGENTS',
-    '',
-    'You have ' + agents.length + ' specialist agents available in your workforce. ' +
-    'These agents are defined HERE in this system prompt — do NOT look for them on disk ' +
-    'or in .claude/agents/. This is the authoritative and complete list.',
-    '',
-    'When a task would benefit from a specialist, use the Agent tool to spawn one. ' +
-    'Copy that agent\'s FULL system prompt (provided below) into the Agent tool\'s ' +
-    '"prompt" parameter so the subprocess adopts that role.',
-    '',
-    'When a user asks what agents are available, list them from this section. ' +
-    'Do not search the filesystem for agent definitions.',
-    '',
-  ];
-  for (const [id, def] of agents) {
-    lines.push(`### ${def.skill.label || def.name} (${id})`);
-    lines.push(def.skill.systemPrompt);
-    lines.push('');
-  }
-  return lines.join('\n');
+/**
+ * POST all agent definitions to the backend which writes them to a temp
+ * file.  Returns the absolute file path (cached after first call).
+ */
+async function _ensureAgentCatalog() {
+  if (_agentCatalogPath) return _agentCatalogPath;
+  if (_agentCatalogPromise) return _agentCatalogPromise;
+
+  _agentCatalogPromise = (async () => {
+    try {
+      if (typeof FOLDER_SUPERSET !== 'object' || !FOLDER_SUPERSET) return null;
+
+      const agents = Object.entries(FOLDER_SUPERSET)
+        .filter(([, def]) => def.skill && def.skill.systemPrompt)
+        .map(([id, def]) => ({
+          id,
+          label: def.skill.label || def.name,
+          systemPrompt: def.skill.systemPrompt,
+        }));
+      if (!agents.length) return null;
+
+      const resp = await fetch('/api/agents/write-catalog', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agents }),
+      });
+      const data = await resp.json();
+      if (data.ok && data.path) {
+        _agentCatalogPath = data.path;
+        return _agentCatalogPath;
+      }
+    } catch (e) {
+      console.warn('Failed to write agent catalog:', e);
+    }
+    return null;
+  })();
+
+  return _agentCatalogPromise;
 }
 
-function _newSessionSubmit(sessionId) {
+/**
+ * Returns a single-line system prompt pointer to the agent catalog file.
+ */
+function _buildAgentDefinitions() {
+  if (!_agentCatalogPath) return '';
+  return 'You have specialist agents available. Read the agent catalog file at ' +
+    _agentCatalogPath + ' for the full list, instructions, and system prompts. ' +
+    'You MUST read that file before spawning any agent.';
+}
+
+async function _newSessionSubmit(sessionId) {
   const ta = document.getElementById('live-input-ta');
   if (!ta) return;
   const text = ta.value.trim();
@@ -771,8 +799,9 @@ function _newSessionSubmit(sessionId) {
     if (skill && skill.systemPrompt) systemPrompt = skill.systemPrompt;
   }
 
-  // Inject available agent definitions so Claude can spawn them as subprocesses
+  // Ensure agent catalog temp file is written, then inject compact index
   if (typeof FOLDER_SUPERSET === 'object' && FOLDER_SUPERSET) {
+    await _ensureAgentCatalog();
     const agentBlock = _buildAgentDefinitions();
     if (agentBlock) {
       systemPrompt = systemPrompt

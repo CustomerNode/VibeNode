@@ -411,3 +411,92 @@ def get_models():
     _models_cache["data"] = result
     _models_cache["ts"] = _time.time()
     return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# Agent catalog file — write agent definitions to a temp file so the system
+# prompt only needs a compact index + file path (saves ~8K tokens).
+# ---------------------------------------------------------------------------
+
+# Cache keyed by project encoded string → absolute file path
+_agent_catalog_paths: dict[str, str] = {}
+
+
+@bp.route('/api/agents/write-catalog', methods=['POST'])
+def write_agent_catalog():
+    """Write agent definitions to a per-project temp file.
+
+    Receives a JSON body with an ``agents`` array of
+    ``{id, label, systemPrompt}`` objects.  Writes them as a readable Markdown
+    file scoped to the current project and returns
+    ``{ok: true, path: "<absolute path>"}``.
+    """
+    proj = get_active_project() or "default"
+
+    # Fast path: already written for this project
+    cached = _agent_catalog_paths.get(proj)
+    if cached and os.path.isfile(cached):
+        return jsonify({"ok": True, "path": cached})
+
+    data = request.get_json(silent=True) or {}
+    agents = data.get('agents', [])
+    if not agents:
+        return jsonify({"ok": False, "error": "No agents provided"}), 400
+
+    # Build the complete catalog file: instructions + index + full prompts.
+    # Everything Claude needs is in this one file so the system prompt can
+    # be a single-line pointer.
+    agent_count = len(agents)
+    lines = [
+        "# AVAILABLE AGENTS",
+        "",
+        f"You have {agent_count} specialist agents available in your workforce.",
+        "These agents are defined HERE in this file — do NOT look for them on",
+        "disk or in .claude/agents/. This is the authoritative and complete list.",
+        "",
+        "When a task would benefit from a specialist, use the Agent tool to spawn",
+        "one. Copy that agent's FULL system prompt (provided below) into the",
+        'Agent tool\'s "prompt" parameter so the subprocess adopts that role.',
+        "",
+        "When a user asks what agents are available, list them from this file.",
+        "Do not search the filesystem for agent definitions.",
+        "",
+        "## Agent Index",
+        "",
+    ]
+    for agent in agents:
+        aid = agent.get('id', '')
+        label = agent.get('label', aid)
+        lines.append(f"- **{label}** ({aid})")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## Full Agent Definitions")
+    lines.append("")
+    for agent in agents:
+        aid = agent.get('id', '')
+        label = agent.get('label', aid)
+        prompt = agent.get('systemPrompt', '')
+        lines.append(f"### {label} ({aid})")
+        lines.append(prompt)
+        lines.append("")
+
+    content = "\n".join(lines)
+
+    # Write to a per-project file in the OS temp directory
+    filepath = os.path.join(
+        tempfile.gettempdir(),
+        f"claude-gui-agent-catalog_{proj}.md",
+    )
+    try:
+        tmp = filepath + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content)
+        if os.path.exists(filepath):
+            os.replace(tmp, filepath)
+        else:
+            os.rename(tmp, filepath)
+        _agent_catalog_paths[proj] = filepath
+        return jsonify({"ok": True, "path": filepath})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
