@@ -21,9 +21,9 @@ def create_app() -> Flask:
     # Initialize SocketIO with threading mode (Flask's default)
     socketio.init_app(app, async_mode='threading', cors_allowed_origins='*')
 
-    # Initialize the SDK session manager
-    from .session_manager import SessionManager
-    app.session_manager = SessionManager()
+    # Connect to the session daemon (runs in a separate process)
+    from .daemon_client import DaemonClient
+    app.session_manager = DaemonClient()
     app.session_manager.start(socketio, app=app)
 
     # Register WebSocket event handlers

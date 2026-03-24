@@ -2,12 +2,79 @@
 Entry point for the ClaudeCodeGUI Flask application.
 Run with: python run.py
 Then open: http://localhost:5050
+
+Architecture: The Web UI (this process) connects to a separate Session Daemon
+that manages Claude Code SDK sessions. The daemon survives Web UI restarts,
+so running sessions continue uninterrupted when you restart the server.
 """
 
 import logging
+import socket
+import subprocess
 import sys
 import threading
+import time
 import webbrowser
+from pathlib import Path
+
+DAEMON_PORT = 5051
+
+
+def ensure_daemon():
+    """Make sure the session daemon is running. Start it if not."""
+    # Try to connect
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        sock.connect(("127.0.0.1", DAEMON_PORT))
+        sock.close()
+        print("  Session daemon already running on port %d" % DAEMON_PORT, flush=True)
+        return
+    except (ConnectionRefusedError, OSError):
+        pass
+
+    # Start daemon as a detached subprocess
+    daemon_script = Path(__file__).parent / "daemon" / "daemon_server.py"
+    if not daemon_script.exists():
+        print("  WARNING: daemon_server.py not found at %s" % daemon_script, flush=True)
+        return
+
+    try:
+        # Windows: CREATE_NO_WINDOW so it doesn't pop up a console
+        # Also CREATE_NEW_PROCESS_GROUP so it survives this process dying
+        creation_flags = 0
+        if sys.platform == "win32":
+            creation_flags = (
+                subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        subprocess.Popen(
+            [sys.executable, str(daemon_script)],
+            cwd=str(daemon_script.parent.parent),
+            creationflags=creation_flags,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print("  WARNING: Could not start daemon: %s" % e, flush=True)
+        return
+
+    # Wait for it to be ready
+    for _ in range(50):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            sock.connect(("127.0.0.1", DAEMON_PORT))
+            sock.close()
+            print("  Session daemon started on port %d" % DAEMON_PORT, flush=True)
+            return
+        except (ConnectionRefusedError, OSError):
+            time.sleep(0.1)
+
+    print("  WARNING: Daemon started but not responding on port %d" % DAEMON_PORT, flush=True)
+
+
+# Ensure daemon is running before creating the Flask app
+ensure_daemon()
 
 from app import create_app, socketio
 

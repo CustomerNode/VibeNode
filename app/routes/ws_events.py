@@ -222,28 +222,13 @@ def register_ws_events(socketio, app):
 
         sm = app.session_manager
 
-        # First try hook-based permission (CLI 2.x)
-        with sm._lock:
-            info = sm._sessions.get(session_id)
-        hook_req_id = getattr(info, '_hook_req_id', None) if info else None
-
-        if hook_req_id:
-            from .live_api import resolve_hook_permission
-            hook_action = "allow" if allow else "deny"
-            resolved = resolve_hook_permission(hook_req_id, hook_action)
-            if not resolved:
-                emit('error', {
-                    'message': 'Hook permission request not found',
-                    'session_id': session_id,
-                })
-        else:
-            # Fall back to SDK callback
-            result = sm.resolve_permission(session_id, allow=allow, always=always)
-            if not result.get('ok'):
-                emit('error', {
-                    'message': result.get('error', 'Failed to resolve permission'),
-                    'session_id': session_id,
-                })
+        # Daemon handles both hook and SDK permissions via resolve_permission
+        result = sm.resolve_permission(session_id, allow=allow, always=always)
+        if isinstance(result, dict) and not result.get('ok'):
+            emit('error', {
+                'message': result.get('error', 'Failed to resolve permission'),
+                'session_id': session_id,
+            })
 
     @socketio.on('interrupt_session')
     def handle_interrupt_session(data):

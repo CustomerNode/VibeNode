@@ -13,7 +13,6 @@ work with CLI 2.x.
 import json
 import os
 import tempfile
-import threading
 import time
 from pathlib import Path
 
@@ -31,8 +30,8 @@ bp = Blueprint('live_api', __name__)
 def internal_emit_permission():
     """Internal endpoint: emit session_permission via SocketIO.
 
-    Called by the SessionManager's permission callback because socketio.emit
-    doesn't work from inside anyio task group context.
+    Legacy endpoint — kept for compatibility. In the daemon architecture,
+    permissions are pushed via IPC instead.
     """
     data = request.get_json(silent=True) or {}
     _app_socketio.emit('session_state', {
@@ -45,56 +44,28 @@ def internal_emit_permission():
     _app_socketio.emit('session_permission', data)
     return jsonify({"ok": True})
 
-# Pending hook permissions: {request_id: {"event": threading.Event, "result": str}}
-_hook_pending = {}
-_hook_lock = threading.Lock()
-
 
 @bp.route("/api/hook/pre-tool", methods=["POST"])
 def hook_pre_tool():
     """Handle PreToolUse hook callback from Claude CLI.
 
-    The hook script POSTs tool info here and blocks until the user responds
-    via the WebSocket permission_response event. Returns allow/deny.
+    Proxies the request to the session daemon, which blocks until the
+    user responds via the WebSocket permission_response event.
     """
     data = request.get_json(silent=True) or {}
     tool_name = data.get("tool_name", "unknown")
     tool_input = data.get("tool_input", {})
     session_id = data.get("session_id", "")
 
-    # Create a blocking event for this request
-    import uuid
-    req_id = str(uuid.uuid4())[:8]
-    event = threading.Event()
-    with _hook_lock:
-        _hook_pending[req_id] = {"event": event, "result": "allow"}
-
-    # Find the session in SessionManager and set it to WAITING
     sm = current_app.session_manager
-    sm._hook_permission_start(session_id, req_id, tool_name, tool_input)
-
-    # Block until user responds (up to 1 hour)
-    event.wait(timeout=3600)
-
-    with _hook_lock:
-        entry = _hook_pending.pop(req_id, {})
-    result = entry.get("result", "allow")
-
-    # Tell SessionManager the permission was resolved
-    sm._hook_permission_end(session_id)
-
-    return jsonify({"action": result})
-
-
-def resolve_hook_permission(req_id: str, action: str):
-    """Called from WebSocket handler to resolve a pending hook permission."""
-    with _hook_lock:
-        entry = _hook_pending.get(req_id)
-    if not entry:
-        return False
-    entry["result"] = action
-    entry["event"].set()
-    return True
+    result = sm.hook_pre_tool(
+        tool_name=tool_name,
+        tool_input=tool_input,
+        session_id=session_id,
+    )
+    if isinstance(result, dict):
+        return jsonify(result)
+    return jsonify({"action": "allow"})
 
 
 @bp.route("/api/session-log/<session_id>")
