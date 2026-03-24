@@ -84,7 +84,12 @@ app = create_app()
 def open_browser():
     import time
     time.sleep(0.8)
-    webbrowser.open("http://localhost:5050")
+    # Use Chrome explicitly (Firefox doesn't handle WebSockets well)
+    chrome = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    try:
+        subprocess.Popen([chrome, "http://localhost:5050"])
+    except FileNotFoundError:
+        webbrowser.open("http://localhost:5050")
 
 
 if __name__ == "__main__":
