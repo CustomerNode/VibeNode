@@ -45,7 +45,10 @@ def _bg_git_fetch():
     try:
         dirty = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"],
                                capture_output=True, text=True, timeout=5)
-        uncommitted = bool(dirty.stdout.strip())
+        # Ignore .claude/worktrees — internal Claude Code artifacts, not real changes
+        lines = [l for l in dirty.stdout.strip().splitlines()
+                 if not l.lstrip(" M?!").startswith(".claude/worktrees")]
+        uncommitted = bool(lines)
     except Exception:
         pass
     _git_cache.update({"has_git": True, "ahead": ahead, "behind": behind,
@@ -116,7 +119,9 @@ def do_git_sync(action: str) -> dict:
         # Auto-commit any uncommitted changes before pushing
         dirty = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"],
                                capture_output=True, text=True, timeout=5)
-        if dirty.stdout.strip():
+        dirty_lines = [l for l in dirty.stdout.strip().splitlines()
+                       if not l.lstrip(" M?!").startswith(".claude/worktrees")]
+        if dirty_lines:
             from datetime import datetime as _dt
             subprocess.run(["git", "-C", str(proj), "add", "-A"], capture_output=True)
             msg = "Update Claude Code GUI " + _dt.now().strftime("%Y-%m-%d %H:%M")
@@ -143,8 +148,10 @@ def do_git_sync(action: str) -> dict:
                 a, b = int(parts[0]), int(parts[1])
         d = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"],
                            capture_output=True, text=True, timeout=5)
+        dlines = [l for l in d.stdout.strip().splitlines()
+                  if not l.lstrip(" M?!").startswith(".claude/worktrees")]
         _git_cache.update({"has_git": True, "ahead": a, "behind": b,
-                           "uncommitted": bool(d.stdout.strip()), "ready": True})
+                           "uncommitted": bool(dlines), "ready": True})
     except Exception:
         pass
 
