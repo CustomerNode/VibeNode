@@ -38,6 +38,15 @@ from claude_code_sdk.types import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Ensure Claude Code CLI is discoverable.
+# When the daemon is spawned with CREATE_NO_WINDOW the PATH may be stripped.
+# Add the standard install location so shutil.which("claude") always works.
+# ---------------------------------------------------------------------------
+_local_bin = str(Path.home() / ".local" / "bin")
+if _local_bin not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _local_bin + os.pathsep + os.environ.get("PATH", "")
+
+# ---------------------------------------------------------------------------
 # Monkey-patch: make the SDK tolerant of unknown message types.
 # The SDK raises MessageParseError for types like "rate_limit_event" which
 # kills the entire receive_messages() generator. Patch parse_message to
