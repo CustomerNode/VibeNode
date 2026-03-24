@@ -17,6 +17,43 @@ function showToast(msg, isError=false) {
 }
 
 // ---------------------------------------------------------------------------
+// Send Behavior Preference — 'ctrl-enter' (default) or 'enter'
+// ---------------------------------------------------------------------------
+let sendBehavior = localStorage.getItem('sendBehavior') || 'ctrl-enter';
+
+/** Returns true if the keyboard event should trigger a send based on preference */
+function _shouldSend(e) {
+  if (sendBehavior === 'enter') return e.key === 'Enter' && !e.shiftKey;
+  return e.key === 'Enter' && (e.ctrlKey || e.metaKey);
+}
+
+/** Returns HTML for the current send hint + toggle button */
+function _sendHint() {
+  const text = sendBehavior === 'enter' ? 'Enter to send · Shift+Enter for new line' : 'Ctrl+Enter to send';
+  return text + '<span class="send-hint-btn" onclick="_toggleSendBehavior(event)" title="Change send shortcut">'
+    + '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">'
+    + '<polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/>'
+    + '<polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>'
+    + '</svg></span>';
+}
+
+/** Toggle send behavior between ctrl-enter and enter */
+function _toggleSendBehavior(e) {
+  if (e) e.stopPropagation();
+  sendBehavior = sendBehavior === 'enter' ? 'ctrl-enter' : 'enter';
+  localStorage.setItem('sendBehavior', sendBehavior);
+  _refreshSendHints();
+  showToast('Send: ' + (sendBehavior === 'enter' ? 'Enter to send' : 'Ctrl+Enter to send'));
+}
+
+/** Refresh all visible send-hint labels */
+function _refreshSendHints() {
+  document.querySelectorAll('.send-hint').forEach(el => {
+    el.innerHTML = _sendHint();
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Premium Modal System — replaces browser confirm/alert/prompt
 // ---------------------------------------------------------------------------
 

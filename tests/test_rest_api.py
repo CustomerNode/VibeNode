@@ -1,5 +1,5 @@
 """
-Comprehensive REST API tests for ClaudeCodeGUI.
+Comprehensive REST API tests for VibeNode.
 
 Tests cover all HTTP endpoints across:
 - Session log (/api/session-log)

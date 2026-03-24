@@ -3,8 +3,11 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Claude Code GUI</title>
+<title>VibeNode</title>
 <link rel="icon" href="/static/images/logo.png" type="image/png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/style.css">
 <script>
 // Apply saved theme immediately to avoid flash
@@ -22,10 +25,9 @@
 
 <header>
   <div class="hdr-brand">
-    <img class="app-logo" src="/static/images/logo.png" alt="Claude Code GUI" width="28" height="22">
+    <img class="app-logo" src="/static/images/logo.png" alt="VibeNode" width="28" height="22">
     <div>
-      <h1>Claude Code GUI</h1>
-      <a class="hdr-byline" href="https://customernode.com" target="_blank">by CustomerNode</a>
+      <h1>VibeNode</h1>
     </div>
   </div>
   <div class="hdr-spacer"></div>
@@ -34,6 +36,7 @@
     <div class="hdr-sys-dropdown" id="hdr-sys-dropdown">
       <button onclick="openModelSelector();closeHdrSys()">Model <span class="sys-item-value" id="sys-model-label">Default</span></button>
       <button onclick="openThinkingSelector();closeHdrSys()">Thinking <span class="sys-item-value" id="sys-thinking-label">Default</span></button>
+      <button onclick="openPreferences();closeHdrSys()">Preferences</button>
       <div class="sys-separator"></div>
       <button onclick="openPermissionPolicySelector();closeHdrSys()">Permission Policy</button>
       <button onclick="openWorkspaceTemplateSelector();closeHdrSys()">Workspace Template</button>
@@ -122,7 +125,7 @@
     </script>
     <div id="workforce-grid"></div>
     <div id="sidebar-perm-panel" style="display:none;"></div>
-    <div class="sidebar-footer">&copy; 2026 CustomerNode LLC</div>
+    <div class="sidebar-footer"><span>by <a href="https://customernode.com" target="_blank">CustomerNode&trade;</a> and <a href="https://claude.ai/download" target="_blank">Claude Code</a></span><span>&copy; 2026 CustomerNode LLC</span></div>
   </div>
 
   <!-- Resize handle -->
@@ -150,6 +153,9 @@
         <div class="btn-group-inner">
           <button class="btn" id="btn-autoname" disabled onclick="autoName(activeId)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg> Auto-name</button>
           <button class="btn" id="btn-duplicate" disabled onclick="duplicateSession(activeId)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Duplicate</button>
+          <button class="btn" id="btn-fork" disabled onclick="showMessagePicker(activeId,'fork')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v1a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V9"/><line x1="12" y1="12" x2="12" y2="15"/></svg> Fork</button>
+          <button class="btn" id="btn-rewind" disabled onclick="showMessagePicker(activeId,'rewind')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg> Rewind Code</button>
+          <button class="btn" id="btn-fork-rewind" disabled onclick="showMessagePicker(activeId,'fork-rewind')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v1a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V9"/><line x1="12" y1="12" x2="12" y2="15"/></svg> Fork + Rewind</button>
           <button class="btn danger" id="btn-delete" disabled onclick="deleteSession(activeId)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> Delete</button>
         </div>
       </div>
@@ -204,7 +210,7 @@
     <div id="respond-or" style="display:none;">&mdash; or type a custom response &mdash;</div>
     <div id="respond-custom-row">
       <textarea id="respond-input" placeholder="Type your response…"
-        onkeydown="if(event.key==='Enter'&&(event.ctrlKey||event.metaKey))submitRespond()"></textarea>
+        onkeydown="if(_shouldSend(event)){event.preventDefault();submitRespond()}"></textarea>
       <div class="respond-btns">
         <button id="respond-cancel" onclick="closeRespond()">Cancel</button>
         <button id="respond-send" onclick="submitRespond()">Send &#8629;</button>

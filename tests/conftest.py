@@ -1,4 +1,4 @@
-"""Shared test fixtures for ClaudeCodeGUI."""
+"""Shared test fixtures for VibeNode."""
 
 import json
 import pytest

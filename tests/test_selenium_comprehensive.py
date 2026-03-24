@@ -1,4 +1,4 @@
-"""Comprehensive Selenium E2E tests for ClaudeCodeGUI.
+"""Comprehensive Selenium E2E tests for VibeNode.
 
 Tests every user-facing flow via headless Chrome against the live server.
 """

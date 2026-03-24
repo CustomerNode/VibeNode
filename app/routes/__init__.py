@@ -1,1 +1,1 @@
-# Route blueprints for ClaudeCodeGUI
+# Route blueprints for VibeNode

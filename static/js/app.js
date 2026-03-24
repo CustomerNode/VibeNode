@@ -710,10 +710,10 @@ async function addNewAgent() {
   if (bar) {
     bar.innerHTML =
       '<textarea id="live-input-ta" class="live-textarea" rows="3" placeholder="Describe what you want Claude to do\u2026" autofocus' +
-      ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey)){event.preventDefault();_newSessionSubmit(\'' + newId + '\')}">' +
+      ' onkeydown="if(_shouldSend(event)){event.preventDefault();_newSessionSubmit(\'' + newId + '\')}">' +
       '</textarea>' +
       '<div class="live-bar-row">' +
-      '<span style="font-size:10px;color:var(--text-faint);">Ctrl+Enter to send</span>' +
+      '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>';
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => _newSessionSubmit(newId));
@@ -821,6 +821,13 @@ async function _newSessionSubmit(sessionId) {
   if (systemPrompt) startOpts.system_prompt = systemPrompt;
 
   socket.emit('start_session', startOpts);
+
+  // Use the user's first message as a placeholder title until auto-name kicks in
+  const _placeholder = text.split('\n')[0].slice(0, 65) + (text.length > 65 ? '\u2026' : '');
+  const s = allSessions.find(x => x.id === sessionId);
+  if (s) { s.display_title = _placeholder; }
+  setToolbarSession(sessionId, _placeholder, true, '');
+  filterSessions();
 
   // Register session in current folder
   if (workspaceActive && typeof addSessionToFolder === 'function') {
@@ -1181,6 +1188,44 @@ function _updateThinkingLabel() {
   el.textContent = defaultThinking ? defaultThinking.charAt(0).toUpperCase() + defaultThinking.slice(1) : 'Default';
 }
 _updateThinkingLabel();
+
+// --- Preferences Modal ---
+function openPreferences() {
+  const overlay = document.getElementById('pm-overlay');
+  const options = [
+    {key: 'ctrl-enter', name: 'Ctrl+Enter to send', desc: 'Press Ctrl+Enter to send messages. Enter adds a new line.'},
+    {key: 'enter', name: 'Enter to send', desc: 'Press Enter to send messages. Shift+Enter adds a new line.'},
+  ];
+  let html = '<div class="pm-card pm-enter" style="width:420px;">'
+    + '<h2 class="pm-title">Preferences</h2>'
+    + '<div class="pm-body"><p style="margin-bottom:4px;font-weight:600;font-size:13px;">Send Behavior</p>'
+    + '<p style="font-size:12px;color:var(--text-muted);">Choose how messages are sent from input fields.</p></div>'
+    + '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:20px;">';
+  for (const o of options) {
+    const isActive = o.key === sendBehavior;
+    html += `<div class="add-mode-card${isActive ? ' active' : ''}" data-pref="${o.key}">
+      <div class="add-mode-info">
+        <div class="add-mode-title">${o.name}</div>
+        <div class="add-mode-desc">${o.desc}</div>
+      </div>
+    </div>`;
+  }
+  html += '</div><div class="pm-actions"><button class="pm-btn pm-btn-secondary" id="pm-pref-close">Close</button></div></div>';
+  overlay.innerHTML = html;
+  overlay.classList.add('show');
+  requestAnimationFrame(() => overlay.querySelector('.pm-card').classList.remove('pm-enter'));
+  document.getElementById('pm-pref-close').onclick = () => _closePm();
+  overlay.onclick = e => { if (e.target === overlay) _closePm(); };
+  overlay.querySelectorAll('.add-mode-card').forEach(card => {
+    card.onclick = () => {
+      sendBehavior = card.dataset.pref;
+      localStorage.setItem('sendBehavior', sendBehavior);
+      _closePm();
+      showToast('Send: ' + card.querySelector('.add-mode-title').textContent);
+      _refreshSendHints();
+    };
+  });
+}
 
 function openWorkspaceTemplateSelector() {
   if (typeof showTemplateSelector !== 'function') {

@@ -11,7 +11,7 @@ from pathlib import Path
 
 _CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 _active_project: str = ""   # encoded dir name; empty = auto-detect
-_CLAUDECODEGUI_DIR = Path(__file__).resolve().parent.parent  # always the ClaudeCodeGUI repo
+_VIBENODE_DIR = Path(__file__).resolve().parent.parent  # always the VibeNode repo
 
 
 # ---------------------------------------------------------------------------

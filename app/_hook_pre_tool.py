@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PreToolUse hook script for ClaudeCodeGUI.
+"""PreToolUse hook script for VibeNode.
 
 Called by Claude Code CLI before each tool use. Reads hook event from stdin,
 POSTs it to the GUI server, and blocks until the user approves/denies.

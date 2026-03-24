@@ -7,7 +7,7 @@ function setToolbarSession(id, titleText, isUntitled, customTitle) {
   titleEl.dataset.customTitle = customTitle || '';
   titleEl.dataset.editable = id ? 'true' : 'false';
   titleEl.title = id ? 'Click to rename' : '';
-  ['btn-autoname','btn-open','btn-open-gui','btn-delete','btn-duplicate','btn-continue','btn-summary','btn-extract','btn-export'].forEach(b => {
+  ['btn-autoname','btn-open','btn-open-gui','btn-delete','btn-duplicate','btn-continue','btn-summary','btn-extract','btn-export','btn-fork','btn-rewind','btn-fork-rewind'].forEach(b => {
     document.getElementById(b).disabled = !id;
   });
   // Hide entire toolbar when no session is selected
@@ -417,32 +417,64 @@ async function submitRename() {
   }
 }
 
+const _autoNamingInFlight = new Set();
+
 async function autoName(id, silent) {
   const btn = silent ? null : document.getElementById('btn-autoname');
   const btnOrigHtml = btn ? btn.innerHTML : '';
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>Naming\u2026'; }
+
+  // Mark in-flight so the sidebar can show a "Naming\u2026" indicator
+  _autoNamingInFlight.add(id);
+  _updateNamingIndicator(id);
 
   let data;
   try {
     const resp = await fetch('/api/autonname/' + id, { method: 'POST' });
     data = await resp.json();
   } catch(e) {
+    _autoNamingInFlight.delete(id);
+    _updateNamingIndicator(id);
     if (btn) { btn.disabled = false; btn.innerHTML = btnOrigHtml; }
     if (!silent) showToast('Auto-name failed: ' + e.message, true);
     return;
   }
 
+  _autoNamingInFlight.delete(id);
   if (btn) { btn.disabled = false; btn.innerHTML = btnOrigHtml; }
 
   if (data.ok) {
     const s = allSessions.find(x => x.id === id);
     if (s) { s.custom_title = data.title; s.display_title = data.title; }
     filterSessions();
-    const titleEl = document.getElementById('main-title');
-    if (titleEl) { titleEl.textContent = data.title; titleEl.classList.remove('untitled'); }
+    // Only touch the toolbar title if this is the active session
+    if (id === activeId) {
+      const titleEl = document.getElementById('main-title');
+      if (titleEl) { titleEl.textContent = data.title; titleEl.classList.remove('untitled'); }
+    }
     if (!silent) showToast('Auto-named: "' + data.title + '"');
   } else {
+    _updateNamingIndicator(id);
     if (!silent) showToast('Auto-name failed: ' + (data.error || 'unknown error'), true);
+  }
+}
+
+/** Update the "Naming…" indicator on a sidebar row without a full re-render. */
+function _updateNamingIndicator(id) {
+  const row = document.querySelector('.session-item[data-sid="' + id + '"]');
+  if (!row) return;
+  const nameCell = row.querySelector('.session-col-name');
+  if (!nameCell) return;
+  const existing = nameCell.querySelector('.naming-badge');
+  if (_autoNamingInFlight.has(id)) {
+    if (!existing) {
+      const badge = document.createElement('span');
+      badge.className = 'naming-badge';
+      badge.innerHTML = '<span class="naming-dot"></span>Naming\u2026';
+      nameCell.appendChild(badge);
+    }
+  } else if (existing) {
+    existing.remove();
   }
 }
 
@@ -547,6 +579,193 @@ async function openInClaude(id) {
   const data = await resp.json();
   if (data.ok) showToast('Opening session in Claude\u2026');
   else showToast('Failed to open: ' + (data.error || 'unknown'), true);
+}
+
+/* ---- Fork / Rewind / Fork+Rewind message picker ---- */
+
+let _pickerSelectedLine = null;
+let _pickerMode = null;
+let _pickerSessionId = null;
+
+async function showMessagePicker(sessionId, mode) {
+  _pickerMode = mode;
+  _pickerSessionId = sessionId;
+  _pickerSelectedLine = null;
+
+  const titles = {
+    'fork': 'Fork Conversation',
+    'rewind': 'Rewind Code',
+    'fork-rewind': 'Fork + Rewind Code',
+  };
+  const descs = {
+    'fork': 'Create a new session forked from the selected message. All messages after it will be excluded.',
+    'rewind': 'Restore source files to the state they were in at the selected message.',
+    'fork-rewind': 'Fork the conversation AND restore source files to the selected message.',
+  };
+
+  const overlay = document.getElementById('pm-overlay');
+  overlay.innerHTML = `
+    <div class="pm-card pm-enter" style="width:680px;max-width:94vw;max-height:85vh;display:flex;flex-direction:column;">
+      <h2 class="pm-title">${escHtml(titles[mode] || 'Select Message')}</h2>
+      <div class="pm-body" style="margin-bottom:12px;flex-shrink:0;">
+        <p>${descs[mode] || ''}</p>
+      </div>
+      <div class="msg-timeline" id="msg-timeline" style="flex:1;overflow-y:auto;min-height:100px;">
+        <div style="padding:24px;text-align:center;color:var(--text-faint);font-size:13px;">
+          <span class="spinner"></span> Loading messages\u2026
+        </div>
+      </div>
+      <div class="pm-actions" style="flex-shrink:0;padding-top:12px;">
+        <button class="pm-btn pm-btn-secondary" id="pm-cancel">Cancel</button>
+        <button class="pm-btn pm-btn-primary" id="pm-confirm" disabled>${escHtml(titles[mode] || 'Confirm')}</button>
+      </div>
+    </div>`;
+  overlay.classList.add('show');
+  requestAnimationFrame(() => overlay.querySelector('.pm-card').classList.remove('pm-enter'));
+
+  document.getElementById('pm-cancel').onclick = () => _closePm();
+  overlay.onclick = e => { if (e.target === overlay) _closePm(); };
+  document.getElementById('pm-confirm').onclick = () => _confirmPicker();
+
+  // Fetch timeline
+  try {
+    const url = '/api/session-timeline/' + sessionId;
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      let errMsg = 'HTTP ' + resp.status;
+      try { const d = await resp.json(); errMsg = d.error || errMsg; } catch(e) {}
+      document.getElementById('msg-timeline').innerHTML = '<div style="padding:20px;color:#ff9500;font-size:12px;">' + escHtml(errMsg) + '</div>';
+      return;
+    }
+    const data = await resp.json();
+    if (data.error) {
+      document.getElementById('msg-timeline').innerHTML = '<div style="padding:20px;color:#ff9500;font-size:12px;">' + escHtml(data.error) + '</div>';
+      return;
+    }
+    _renderTimeline(data.messages, data.has_snapshots, mode);
+  } catch (e) {
+    document.getElementById('msg-timeline').innerHTML = '<div style="padding:20px;color:#ff9500;font-size:12px;">Failed to load: ' + escHtml(e.message) + '</div>';
+  }
+}
+
+function _renderTimeline(messages, hasSnapshots, mode) {
+  const el = document.getElementById('msg-timeline');
+  if (!messages || !messages.length) {
+    el.innerHTML = '<div style="padding:20px;color:var(--text-faint);text-align:center;">No messages found in this session.</div>';
+    return;
+  }
+
+  // For rewind modes, warn if no snapshots
+  if ((mode === 'rewind' || mode === 'fork-rewind') && !hasSnapshots) {
+    el.innerHTML = '<div style="padding:20px;color:#ff9500;text-align:center;">This session has no file snapshots. Code rewind is not available.</div>';
+    return;
+  }
+
+  let html = '';
+  for (const m of messages) {
+    const roleClass = m.role === 'user' ? 'user' : 'assistant';
+    const roleLabel = m.role === 'user' ? 'me' : 'claude';
+
+    // Format timestamp
+    let tsDisplay = '';
+    if (m.ts) {
+      try {
+        const d = new Date(m.ts);
+        tsDisplay = d.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
+      } catch(e) { tsDisplay = ''; }
+    }
+
+    // Change counts
+    let changesHtml = '';
+    if (m.changes && (m.changes.added || m.changes.removed)) {
+      const parts = [];
+      if (m.changes.added) parts.push('<span class="tl-add">+' + m.changes.added + '</span>');
+      if (m.changes.removed) parts.push('<span class="tl-rem">-' + m.changes.removed + '</span>');
+      changesHtml = parts.join(' ');
+    }
+
+    // File badges
+    let filesHtml = '';
+    if (m.changes && m.changes.files && m.changes.files.length) {
+      filesHtml = '<span class="tl-files">' + m.changes.files.map(f => escHtml(f)).join(', ') + '</span>';
+    }
+
+    // Snapshot indicator
+    const snapIcon = m.has_snapshot ? '<span class="tl-snap" title="File snapshot available">&#128190;</span>' : '';
+
+    html += '<div class="tl-row" data-line="' + m.line_number + '" onclick="_selectTimelineRow(this)">'
+      + '<span class="tl-idx">#' + (m.index + 1) + '</span>'
+      + '<span class="tl-role ' + roleClass + '">' + roleLabel + '</span>'
+      + '<span class="tl-preview">' + escHtml(m.preview) + '</span>'
+      + (filesHtml ? '<span class="tl-file-wrap">' + filesHtml + '</span>' : '')
+      + (changesHtml ? '<span class="tl-changes">' + changesHtml + '</span>' : '')
+      + snapIcon
+      + '<span class="tl-ts">' + escHtml(tsDisplay) + '</span>'
+      + '</div>';
+  }
+  el.innerHTML = html;
+}
+
+function _selectTimelineRow(rowEl) {
+  // Deselect previous
+  const prev = document.querySelector('.tl-row.selected');
+  if (prev) prev.classList.remove('selected');
+  rowEl.classList.add('selected');
+  _pickerSelectedLine = parseInt(rowEl.dataset.line, 10);
+  const btn = document.getElementById('pm-confirm');
+  if (btn) btn.disabled = false;
+}
+
+async function _confirmPicker() {
+  if (!_pickerSelectedLine || !_pickerSessionId || !_pickerMode) return;
+
+  const btn = document.getElementById('pm-confirm');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Working\u2026'; }
+
+  const body = JSON.stringify({ up_to_line: _pickerSelectedLine });
+  const hdrs = { 'Content-Type': 'application/json' };
+
+  try {
+    let endpoint = '';
+    if (_pickerMode === 'fork') endpoint = '/api/fork/';
+    else if (_pickerMode === 'rewind') endpoint = '/api/rewind/';
+    else endpoint = '/api/fork-rewind/';
+
+    const resp = await fetch(endpoint + _pickerSessionId, { method: 'POST', headers: hdrs, body });
+    const data = await resp.json();
+    _closePm();
+
+    if (data.error) {
+      showToast(data.error, true);
+      return;
+    }
+
+    if (_pickerMode === 'fork' || _pickerMode === 'fork-rewind') {
+      await loadSessions();
+      if (data.new_id) await selectSession(data.new_id);
+
+      let msg = 'Session forked';
+      if (data.files_restored && data.files_restored.length) {
+        msg += ' and ' + data.files_restored.length + ' file(s) restored';
+      }
+      showToast(msg);
+    } else {
+      // rewind only
+      let msg = '';
+      if (data.files_restored && data.files_restored.length) {
+        msg = data.files_restored.length + ' file(s) restored to earlier state';
+      } else {
+        msg = 'Rewind complete (no files to restore)';
+      }
+      if (data.files_skipped && data.files_skipped.length) {
+        msg += ' (' + data.files_skipped.length + ' skipped)';
+      }
+      showToast(msg);
+    }
+  } catch (e) {
+    _closePm();
+    showToast('Operation failed: ' + e.message, true);
+  }
 }
 
 /* ---- Sidebar resize ---- */

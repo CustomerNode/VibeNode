@@ -1,5 +1,6 @@
+# This is a test comment for rewind testing
 """
-Entry point for the ClaudeCodeGUI Flask application.
+Entry point for the VibeNode Flask application.
 Run with: python run.py
 Then open: http://localhost:5050
 
@@ -17,7 +18,7 @@ import time
 import webbrowser
 from pathlib import Path
 
-DAEMON_PORT = 5051
+DAEMON_PORT = 5051  # TODO: remove this test comment for rewind
 
 
 def ensure_daemon():
@@ -102,7 +103,7 @@ if __name__ == "__main__":
 
     print("\n"
           "  =========================================================\n"
-          "    CLAUDE CODE GUI RUNNING - KEEP THIS TERMINAL OPEN\n"
+          "    VIBENODE RUNNING - KEEP THIS TERMINAL OPEN\n"
           "  =========================================================\n\n"
           "  Open your browser to: http://localhost:5050\n\n"
           "  This is a local server for personal use.\n"

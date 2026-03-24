@@ -1,16 +1,14 @@
-# ClaudeCodeGUI
+# VibeNode
 
-A GUI for Claude Code, developed by CustomerNode LLC and independent contributors.
-
-A local web interface for managing Claude Code sessions.
+A local web interface for managing Claude Code sessions — built by [CustomerNode](https://customernode.com) and [Claude Code](https://claude.ai/download).
 
 ## What it does
 
-- Lists all your Claude Code sessions with live state (Working ⛏️ / Idle 💻 / Question 🙋 / Sleeping 😴)
+- Lists all your Claude Code sessions with live state (Working / Idle / Question / Sleeping)
 - Live terminal panel — watch Claude work in real time
 - Answer Claude's questions directly from the browser (with clickable option buttons)
 - Send commands to running sessions
-- Session tools: auto-name, duplicate, delete, summarize, extract code, compare sessions
+- Session tools: auto-name, duplicate, fork, rewind, delete, summarize, extract code, compare sessions
 
 ## Requirements
 
@@ -22,9 +20,9 @@ A local web interface for managing Claude Code sessions.
 
 If you have [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed, open your terminal and tell Claude:
 
-> Get me set up with https://github.com/CustomerNode/ClaudeCodeGUI
+> Get me set up with https://github.com/CustomerNode/VibeNode
 
-Claude handles the rest — cloning the repo, installing Python and Flask if needed, creating a desktop shortcut, and launching ClaudeCodeGUI for you.
+Claude handles the rest — cloning the repo, installing Python and Flask if needed, creating a desktop shortcut, and launching VibeNode for you.
 
 See [FileTaskNode](https://github.com/CustomerNode/FileTaskNode) for an example of a Claude Code workspace built around this kind of AI-assisted setup.
 
@@ -33,8 +31,8 @@ See [FileTaskNode](https://github.com/CustomerNode/FileTaskNode) for an example 
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/CustomerNode/ClaudeCodeGUI.git
-cd ClaudeCodeGUI
+git clone https://github.com/CustomerNode/VibeNode.git
+cd VibeNode
 pip install flask
 ```
 
@@ -48,15 +46,15 @@ The browser opens automatically to http://localhost:5050.
 
 ### 3. Desktop shortcut (Windows)
 
-Run this once in PowerShell to create a desktop shortcut that launches ClaudeCodeGUI with one click:
+Run this once in PowerShell to create a desktop shortcut that launches VibeNode with one click:
 
 ```powershell
 $WshShell = New-Object -ComObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut("$env:USERPROFILE\Desktop\ClaudeCodeGUI.lnk")
+$Shortcut = $WshShell.CreateShortcut("$env:USERPROFILE\Desktop\VibeNode.lnk")
 $Shortcut.TargetPath = "python"
 $Shortcut.Arguments = "session_manager.py"
-$Shortcut.WorkingDirectory = "$env:USERPROFILE\Documents\ClaudeCodeGUI"
-$Shortcut.IconLocation = "$env:USERPROFILE\Documents\ClaudeCodeGUI\claudecodegui.ico,0"
+$Shortcut.WorkingDirectory = "$env:USERPROFILE\Documents\VibeNode"
+$Shortcut.IconLocation = "$env:USERPROFILE\Documents\VibeNode\vibenode.ico,0"
 $Shortcut.WindowStyle = 7
 $Shortcut.Save()
 ```

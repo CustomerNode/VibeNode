@@ -295,6 +295,165 @@ def load_session(path: Path) -> dict:
     }
 
 
+def load_session_timeline(path: Path) -> dict:
+    """Parse a .jsonl session for the message timeline picker.
+
+    Returns a lightweight list of user/assistant messages with metadata
+    (preview, timestamp, change counts) for the fork/rewind UI.
+    """
+    messages = []
+    snapshots = {}
+    has_any_snapshot = False
+    line_num = 0
+    custom_title = None
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line_num += 1
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    continue
+
+                t = obj.get("type", "")
+
+                if t == "custom-title":
+                    custom_title = obj.get("customTitle", "")
+
+                elif t == "file-history-snapshot":
+                    snap = obj.get("snapshot", {})
+                    mid = obj.get("messageId", "")
+                    if mid:
+                        snapshots[mid] = snap
+                    if snap.get("trackedFileBackups"):
+                        has_any_snapshot = True
+
+                elif t in ("user", "assistant"):
+                    role = t
+                    msg = obj.get("message", {})
+                    raw_c = msg.get("content", "")
+                    content = ""
+                    block_type = ""
+                    added = 0
+                    removed = 0
+                    changed_files = []
+
+                    if isinstance(raw_c, str):
+                        content = raw_c
+                    elif isinstance(raw_c, list):
+                        text_parts = []
+                        tool_names = []
+                        for block in raw_c:
+                            if not isinstance(block, dict):
+                                continue
+                            bt = block.get("type", "")
+                            if bt == "text":
+                                text_parts.append(block.get("text", ""))
+                            elif bt == "tool_use":
+                                tname = block.get("name", "tool")
+                                tool_names.append(tname)
+                                inp = block.get("input", {})
+                                if tname in ("Edit", "MultiEdit"):
+                                    fp = inp.get("file_path", "")
+                                    if fp:
+                                        fname = fp.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                                        if fname not in changed_files:
+                                            changed_files.append(fname)
+                                    old_s = inp.get("old_string", "")
+                                    new_s = inp.get("new_string", "")
+                                    if old_s or new_s:
+                                        ol = old_s.count("\n") + (1 if old_s else 0)
+                                        nl = new_s.count("\n") + (1 if new_s else 0)
+                                        added += max(0, nl - ol)
+                                        removed += max(0, ol - nl)
+                                elif tname == "Write":
+                                    fp = inp.get("file_path", "")
+                                    if fp:
+                                        fname = fp.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                                        if fname not in changed_files:
+                                            changed_files.append(fname)
+                                    wc = inp.get("content", "")
+                                    if wc:
+                                        added += wc.count("\n") + 1
+                            elif bt == "tool_result":
+                                block_type = "tool_result"
+                                tr_content = block.get("content", "")
+                                if isinstance(tr_content, str) and tr_content.strip():
+                                    text_parts.append(tr_content)
+                                elif isinstance(tr_content, list):
+                                    for sub in tr_content:
+                                        if isinstance(sub, dict) and sub.get("type") == "text":
+                                            text_parts.append(sub.get("text", ""))
+                        content = " ".join(text_parts)
+                        if not content and tool_names:
+                            content = "[" + ", ".join(tool_names) + "]"
+                            block_type = "tool"
+                        elif tool_names and not block_type:
+                            block_type = "tool"
+                        if role == "user" and block_type == "tool_result":
+                            block_type = "tool_result"
+
+                    # Skip user tool_result messages (system feedback)
+                    if role == "user" and block_type == "tool_result":
+                        continue
+                    # For assistant messages: keep if they have text or changes,
+                    # even if they also have tool_use blocks
+                    cleaned = content.strip()
+                    if not cleaned and block_type == "tool":
+                        continue
+                    if not cleaned:
+                        continue
+                    if role == "user" and _is_system_content(cleaned):
+                        continue
+
+                    ts_str = obj.get("timestamp", "")
+                    uuid = obj.get("uuid", "")
+                    snap = snapshots.get(uuid, {})
+
+                    messages.append({
+                        "index": len(messages),
+                        "line_number": line_num,
+                        "role": role,
+                        "preview": cleaned[:140],
+                        "ts": ts_str,
+                        "uuid": uuid,
+                        "has_snapshot": bool(snap.get("trackedFileBackups")),
+                        "changes": {
+                            "added": added,
+                            "removed": removed,
+                            "files": changed_files[:5],
+                        },
+                    })
+
+    except Exception:
+        return {"messages": [], "has_snapshots": False, "title": path.stem}
+
+    return {
+        "messages": messages,
+        "has_snapshots": has_any_snapshot,
+        "title": custom_title or path.stem,
+    }
+
+
+def _is_system_content(text: str) -> bool:
+    t = text.strip()
+    return bool(
+        t.startswith("<") and not t.startswith("<!") or
+        t.startswith("This session is being continued") or
+        t.startswith("This is a continuation") or
+        t.startswith("The user opened") or
+        t.startswith("The user selected") or
+        t.startswith("The user is viewing") or
+        t.startswith("**What we were working on") or
+        t.startswith("**Key context") or
+        t.startswith("**Most recent exchanges")
+    )
+
+
 def all_sessions(summary_only: bool = False) -> list:
     files = list(_sessions_dir().glob("*.jsonl"))
     loader = load_session_summary if summary_only else load_session

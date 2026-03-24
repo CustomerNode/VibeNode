@@ -138,7 +138,7 @@ function renderWorkforce(sessions) {
     const selClass = s.id === activeId ? ' wf-selected' : '';
     const name = escHtml((s.display_title||s.id).slice(0,22) + ((s.display_title||'').length>22?'\u2026':''));
     const date = (s.last_activity||'').split('  ')[0] || '';
-    return `<div class="wf-card wf-${st}${selClass}" onclick="singleOrDouble('${s.id}',event)" title="${escHtml(s.display_title)} \u2014 double-click to open in Claude Code GUI">
+    return `<div class="wf-card wf-${st}${selClass}" onclick="singleOrDouble('${s.id}',event)" title="${escHtml(s.display_title)} \u2014 double-click to open in VibeNode">
       <div class="wf-avatar">${emoji}</div>
       <div class="wf-status-label">${label}</div>
       <div class="wf-name">${name}</div>

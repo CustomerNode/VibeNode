@@ -109,7 +109,7 @@ class TestPageServing:
     def test_index_returns_html(self, client):
         resp = client.get("/")
         assert resp.status_code == 200
-        assert b"ClaudeCodeGUI" in resp.data or b"Claude Code GUI" in resp.data
+        assert b"VibeNode" in resp.data
 
     def test_static_css_accessible(self, client):
         resp = client.get("/static/style.css")

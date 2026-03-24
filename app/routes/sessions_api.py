@@ -17,7 +17,7 @@ from ..config import (
     _decode_project,
     get_active_project,
 )
-from ..sessions import load_session, all_sessions
+from ..sessions import load_session, load_session_timeline, all_sessions
 from ..titling import smart_title
 
 bp = Blueprint('sessions_api', __name__)
@@ -242,6 +242,234 @@ def api_continue(session_id):
         f.write(json.dumps(title_entry) + "\n")
 
     return jsonify({"ok": True, "new_id": new_id, "title": f"[cont] {topic[:55]}"})
+
+
+@bp.route("/api/session-timeline/<session_id>")
+def api_session_timeline(session_id):
+    """Return lightweight message list for the fork/rewind timeline picker."""
+    path = _sessions_dir() / f"{session_id}.jsonl"
+    if not path.exists():
+        # Check SDK-managed sessions with no .jsonl yet
+        sm = current_app.session_manager
+        if sm.has_session(session_id):
+            return jsonify({"messages": [], "has_snapshots": False,
+                            "title": "New Session",
+                            "error": "This session is still in-memory (no .jsonl file yet). Try again after some messages have been exchanged."})
+        return jsonify({"error": "Session not found. The .jsonl file does not exist at: " + str(path)}), 404
+    return jsonify(load_session_timeline(path))
+
+
+@bp.route("/api/fork/<session_id>", methods=["POST"])
+def api_fork(session_id):
+    """Create a new session containing only JSONL lines up to a given line number."""
+    import uuid as uuid_mod
+
+    src = _sessions_dir() / f"{session_id}.jsonl"
+    if not src.exists():
+        return jsonify({"error": "Not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    up_to_line = data.get("up_to_line")
+    if not up_to_line or not isinstance(up_to_line, int):
+        return jsonify({"error": "up_to_line is required"}), 400
+
+    new_id = str(uuid_mod.uuid4())
+    dst = _sessions_dir() / f"{new_id}.jsonl"
+
+    lines_out = []
+    line_num = 0
+    original_title = session_id[:8]
+    with open(src, encoding="utf-8") as f:
+        for line in f:
+            line_num += 1
+            if line_num > up_to_line:
+                break
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                lines_out.append(raw)
+                continue
+            if obj.get("type") == "custom-title":
+                original_title = obj.get("customTitle", original_title)
+            if "sessionId" in obj:
+                obj["sessionId"] = new_id
+            lines_out.append(json.dumps(obj))
+
+    # Append a fork title
+    fork_title = f"[fork] {original_title[:55]}"
+    lines_out.append(json.dumps({
+        "type": "custom-title",
+        "customTitle": fork_title,
+        "sessionId": new_id,
+    }))
+
+    with open(dst, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines_out) + "\n")
+
+    return jsonify({"ok": True, "new_id": new_id, "title": fork_title})
+
+
+@bp.route("/api/rewind/<session_id>", methods=["POST"])
+def api_rewind(session_id):
+    """Rewind tracked files to the state at a given message line number."""
+    src = _sessions_dir() / f"{session_id}.jsonl"
+    if not src.exists():
+        return jsonify({"error": "Not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    up_to_line = data.get("up_to_line")
+    if not up_to_line or not isinstance(up_to_line, int):
+        return jsonify({"error": "up_to_line is required"}), 400
+
+    # Find the last snapshot at or before the target line
+    best_snapshot = None
+    line_num = 0
+    with open(src, encoding="utf-8") as f:
+        for line in f:
+            line_num += 1
+            if line_num > up_to_line:
+                break
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if obj.get("type") == "file-history-snapshot":
+                snap = obj.get("snapshot", {})
+                if snap.get("trackedFileBackups"):
+                    best_snapshot = snap
+
+    if not best_snapshot:
+        return jsonify({"error": "No file snapshot found at or before this message"}), 400
+
+    # Restore files from snapshot
+    active_project = get_active_project()
+    proj_dir = _decode_project(active_project) if active_project else str(Path.home())
+    history_dir = Path.home() / ".claude" / "file-history" / session_id
+
+    restored = []
+    skipped = []
+    for rel_path, backup_info in best_snapshot.get("trackedFileBackups", {}).items():
+        backup_name = backup_info.get("backupFileName", "")
+        if not backup_name:
+            continue
+        backup_path = history_dir / backup_name
+        if not backup_path.exists():
+            skipped.append(rel_path)
+            continue
+
+        # Resolve the target path relative to the project root
+        norm_rel = rel_path.replace("\\", "/")
+        target = Path(proj_dir) / norm_rel
+
+        try:
+            backup_content = backup_path.read_bytes()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(backup_content)
+            restored.append(rel_path)
+        except Exception:
+            skipped.append(rel_path)
+
+    return jsonify({
+        "ok": True,
+        "files_restored": restored,
+        "files_skipped": skipped,
+    })
+
+
+@bp.route("/api/fork-rewind/<session_id>", methods=["POST"])
+def api_fork_rewind(session_id):
+    """Fork conversation AND rewind code to a given message."""
+    import uuid as uuid_mod
+
+    src = _sessions_dir() / f"{session_id}.jsonl"
+    if not src.exists():
+        return jsonify({"error": "Not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    up_to_line = data.get("up_to_line")
+    if not up_to_line or not isinstance(up_to_line, int):
+        return jsonify({"error": "up_to_line is required"}), 400
+
+    # --- Fork ---
+    new_id = str(uuid_mod.uuid4())
+    dst = _sessions_dir() / f"{new_id}.jsonl"
+
+    lines_out = []
+    line_num = 0
+    original_title = session_id[:8]
+    best_snapshot = None
+
+    with open(src, encoding="utf-8") as f:
+        for line in f:
+            line_num += 1
+            if line_num > up_to_line:
+                break
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                lines_out.append(raw)
+                continue
+            if obj.get("type") == "custom-title":
+                original_title = obj.get("customTitle", original_title)
+            if obj.get("type") == "file-history-snapshot":
+                snap = obj.get("snapshot", {})
+                if snap.get("trackedFileBackups"):
+                    best_snapshot = snap
+            if "sessionId" in obj:
+                obj["sessionId"] = new_id
+            lines_out.append(json.dumps(obj))
+
+    fork_title = f"[fork+rewind] {original_title[:48]}"
+    lines_out.append(json.dumps({
+        "type": "custom-title",
+        "customTitle": fork_title,
+        "sessionId": new_id,
+    }))
+
+    with open(dst, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines_out) + "\n")
+
+    # --- Rewind ---
+    restored = []
+    skipped = []
+    if best_snapshot:
+        active_project = get_active_project()
+        proj_dir = _decode_project(active_project) if active_project else str(Path.home())
+        history_dir = Path.home() / ".claude" / "file-history" / session_id
+
+        for rel_path, backup_info in best_snapshot.get("trackedFileBackups", {}).items():
+            backup_name = backup_info.get("backupFileName", "")
+            if not backup_name:
+                continue
+            backup_path = history_dir / backup_name
+            if not backup_path.exists():
+                skipped.append(rel_path)
+                continue
+            norm_rel = rel_path.replace("\\", "/")
+            target = Path(proj_dir) / norm_rel
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(backup_path.read_bytes())
+                restored.append(rel_path)
+            except Exception:
+                skipped.append(rel_path)
+
+    return jsonify({
+        "ok": True,
+        "new_id": new_id,
+        "title": fork_title,
+        "files_restored": restored,
+        "files_skipped": skipped,
+    })
 
 
 @bp.route("/api/open/<session_id>", methods=["POST"])

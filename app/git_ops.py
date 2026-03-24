@@ -5,7 +5,7 @@ Git operations — background fetch, status cache, and sync logic.
 import subprocess
 import threading
 
-from .config import _CLAUDECODEGUI_DIR
+from .config import _VIBENODE_DIR
 
 # ---------------------------------------------------------------------------
 # Git cache and lock
@@ -21,7 +21,7 @@ _git_fetch_lock = threading.Lock()
 
 def _bg_git_fetch():
     """Run git fetch + status in background, update cache when done."""
-    proj = _CLAUDECODEGUI_DIR
+    proj = _VIBENODE_DIR
     if not (proj / ".git").is_dir():
         _git_cache.update({"has_git": False, "ready": True})
         return
@@ -80,9 +80,9 @@ def do_git_sync(action: str) -> dict:
     Perform git sync (pull, push, or both).
     Returns {"ok": bool, "messages": list[str]}.
     """
-    proj = _CLAUDECODEGUI_DIR
+    proj = _VIBENODE_DIR
     if not (proj / ".git").is_dir():
-        return {"ok": False, "messages": ["ClaudeCodeGUI has no git repo."]}
+        return {"ok": False, "messages": ["VibeNode has no git repo."]}
 
     messages = []
     ok = True
@@ -108,9 +108,9 @@ def do_git_sync(action: str) -> dict:
         if stashed:
             subprocess.run(["git", "-C", str(proj), "stash", "pop"], capture_output=True)
         if "Already up to date" in out:
-            messages.append("Claude Code GUI is already up to date.")
+            messages.append("VibeNode is already up to date.")
         else:
-            messages.append("Pulled latest Claude Code GUI updates from remote.")
+            messages.append("Pulled latest VibeNode updates from remote.")
 
     if action in ("push", "both") and ok:
         # Auto-commit any uncommitted changes before pushing
@@ -119,7 +119,7 @@ def do_git_sync(action: str) -> dict:
         if dirty.stdout.strip():
             from datetime import datetime as _dt
             subprocess.run(["git", "-C", str(proj), "add", "-A"], capture_output=True)
-            msg = "Update Claude Code GUI " + _dt.now().strftime("%Y-%m-%d %H:%M")
+            msg = "Update VibeNode " + _dt.now().strftime("%Y-%m-%d %H:%M")
             subprocess.run(["git", "-C", str(proj), "commit", "-m", msg],
                            capture_output=True, text=True, timeout=10)
             messages.append("Saved your local changes as a new version.")
@@ -129,7 +129,7 @@ def do_git_sync(action: str) -> dict:
             ok = False
             messages.append("Could not push: " + (push.stderr.strip() or push.stdout.strip()))
         else:
-            messages.append("Your Claude Code GUI changes have been pushed to remote.")
+            messages.append("Your VibeNode changes have been pushed to remote.")
 
     # Update git cache immediately so the next pollGitStatus gets fresh data
     try:

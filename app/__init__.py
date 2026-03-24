@@ -1,11 +1,11 @@
 """
-ClaudeCodeGUI Flask application factory.
+VibeNode Flask application factory.
 """
 
 from flask import Flask
 from flask_socketio import SocketIO
 
-from .config import _CLAUDECODEGUI_DIR
+from .config import _VIBENODE_DIR
 
 socketio = SocketIO()
 
@@ -14,8 +14,8 @@ def create_app() -> Flask:
     """Create and configure the Flask application."""
     app = Flask(
         __name__,
-        template_folder=str(_CLAUDECODEGUI_DIR / "templates"),
-        static_folder=str(_CLAUDECODEGUI_DIR / "static"),
+        template_folder=str(_VIBENODE_DIR / "templates"),
+        static_folder=str(_VIBENODE_DIR / "static"),
     )
 
     # Initialize SocketIO with threading mode (Flask's default)

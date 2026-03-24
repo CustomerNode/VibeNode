@@ -76,10 +76,10 @@ async function openInGUI(id) {
       if (bar) {
         bar.innerHTML =
           '<textarea id="live-input-ta" class="live-textarea" rows="3" placeholder="Describe what you want Claude to do\u2026" autofocus' +
-          ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey)){event.preventDefault();_newSessionSubmit(\'' + id + '\')}">' +
+          ' onkeydown="if(_shouldSend(event)){event.preventDefault();_newSessionSubmit(\'' + id + '\')}">' +
           '</textarea>' +
           '<div class="live-bar-row">' +
-          '<span style="font-size:10px;color:var(--text-faint);">Ctrl+Enter to send</span>' +
+          '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
           '<button class="live-send-btn" id="live-voice-btn"></button>' +
           '</div>';
         setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => _newSessionSubmit(id));
@@ -298,9 +298,9 @@ function updateLiveInputBar() {
       '<span style="font-size:12px;color:var(--text-muted);">Session not running. Type a message to resume.</span>' +
       '</div>' +
       '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="Type a message to continue\u2026"' +
-      ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey)){event.preventDefault();liveSubmitContinue(\'' + id + '\')}"></textarea>' +
+      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitContinue(\'' + id + '\')}"></textarea>' +
       '<div class="live-bar-row">' +
-      '<span style="font-size:10px;color:var(--text-faint);">Ctrl+Enter to send</span>' +
+      '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>';
     const btnClose = document.getElementById('btn-close');
@@ -356,9 +356,9 @@ function updateLiveInputBar() {
       questionHTML +
       optBtns +
       '<textarea id="live-input-ta" class="live-textarea waiting-focus" rows="2" placeholder="Type your response\u2026 (or click an option above)"' +
-      ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey)){event.preventDefault();liveSubmitWaiting()}"></textarea>' +
+      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitWaiting()}"></textarea>' +
       '<div class="live-bar-row">' +
-      '<span style="font-size:10px;color:var(--text-faint);">Ctrl+Enter to send</span>' +
+      '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
       '<button class="live-send-btn waiting" id="live-voice-btn"></button>' +
       '</div>';
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), liveSubmitWaiting);
@@ -379,9 +379,9 @@ function updateLiveInputBar() {
   } else if (kind === 'idle') {
     bar.innerHTML =
       '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="Type your next command\u2026"' +
-      ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey)){event.preventDefault();liveSubmitIdle()}"></textarea>' +
+      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitIdle()}"></textarea>' +
       '<div class="live-bar-row">' +
-      '<span style="font-size:10px;color:var(--text-faint);">Ctrl+Enter to send</span>' +
+      '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>';
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), liveSubmitIdle);
@@ -405,7 +405,7 @@ function updateLiveInputBar() {
       '</div>' +
       '<textarea id="live-queue-ta" class="live-textarea" rows="2" ' +
       'style="opacity:0.6;" placeholder="Type your next command \u2014 will send when Claude finishes\u2026"' +
-      ' onkeydown="if(event.key===\'Enter\'&&(event.ctrlKey||event.metaKey)){event.preventDefault();liveQueueSave()}">' +
+      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveQueueSave()}">' +
       (liveQueuedText ? escHtml(liveQueuedText) : '') +
       '</textarea>' +
       '<div class="live-bar-row">' +

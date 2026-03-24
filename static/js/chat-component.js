@@ -53,7 +53,7 @@ class ChatComponent {
     // Event listeners
     this.sendBtn.onclick = () => this.send();
     this.inputEl.onkeydown = (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); this.send(); }
+      if (_shouldSend(e)) { e.preventDefault(); this.send(); }
     };
     // Auto-resize textarea
     this.inputEl.oninput = () => {
