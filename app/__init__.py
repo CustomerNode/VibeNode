@@ -37,6 +37,7 @@ def create_app() -> Flask:
     from .routes.git_api import bp as git_bp
     from .routes.live_api import bp as live_bp
     from .routes.analysis_api import bp as analysis_bp
+    from .routes.auth_api import bp as auth_bp
 
     app.register_blueprint(main_bp)
     app.register_blueprint(sessions_bp)
@@ -44,6 +45,7 @@ def create_app() -> Flask:
     app.register_blueprint(git_bp)
     app.register_blueprint(live_bp)
     app.register_blueprint(analysis_bp)
+    app.register_blueprint(auth_bp)
 
     # Start background git fetch at startup
     from .git_ops import start_bg_fetch

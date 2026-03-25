@@ -966,8 +966,11 @@ class SessionManager:
         manager = self
 
         async def can_use_tool(tool_name, tool_input, context):
+            # Resolve through aliases — the SDK remaps session IDs on
+            # ResultMessage, so the closed-over session_id may be stale.
+            resolved_id = manager._resolve_id(session_id)
             with manager._lock:
-                info = manager._sessions.get(session_id)
+                info = manager._sessions.get(resolved_id)
             if not info:
                 return PermissionResultDeny(message="Session not found", interrupt=True)
 
@@ -993,8 +996,9 @@ class SessionManager:
             info.state = SessionState.WAITING
 
             # Emit permission via push_callback.
+            # Use resolved_id so the frontend matches the current session key.
             perm_data = {
-                'session_id': session_id,
+                'session_id': resolved_id,
                 'tool_name': tool_name,
                 'tool_input': info.pending_tool_input,
             }

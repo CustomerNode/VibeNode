@@ -287,6 +287,18 @@
   </div>
 </div>
 
+<!-- Health-check blocker (unkillable — only dismissed when all checks pass) -->
+<div id="health-blocker">
+  <div class="hb-card">
+    <div class="hb-icon"></div>
+    <div class="hb-label"></div>
+    <div class="hb-message"></div>
+    <div class="hb-action" style="display:none"></div>
+    <div class="hb-spinner"><div class="hb-dot"></div><div class="hb-dot"></div><div class="hb-dot"></div></div>
+    <div class="hb-retry">Retrying automatically&hellip;</div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <!-- JavaScript files — load order matters -->
@@ -309,6 +321,7 @@
 <script src="/static/js/compare.js"></script>
 <script src="/static/js/voice.js"></script>
 <script src="/static/js/theme.js"></script>
+<script src="/static/js/healthchecks.js"></script>
 <script src="/static/js/socket.js"></script>
 
 <div id="session-tooltip"></div>

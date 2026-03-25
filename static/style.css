@@ -3632,3 +3632,88 @@ mark.find-match.current { background: var(--accent); color:#fff; }
   color: var(--text-muted);
   font-size: 11px;
 }
+
+/* ===== Health-check blocker overlay ===== */
+#health-blocker {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 99999;
+  background: var(--bg-body);
+  align-items: center;
+  justify-content: center;
+  pointer-events: all;
+}
+#health-blocker.show {
+  display: flex;
+}
+.hb-card {
+  text-align: center;
+  max-width: 420px;
+  padding: 48px 40px 40px;
+}
+.hb-icon {
+  margin-bottom: 20px;
+  color: var(--text-muted);
+  line-height: 1;
+}
+.hb-icon svg {
+  width: 64px;
+  height: 64px;
+}
+.hb-label {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-heading);
+  margin-bottom: 10px;
+  font-family: 'Space Grotesk', sans-serif;
+}
+.hb-message {
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.6;
+  margin-bottom: 28px;
+}
+.hb-spinner {
+  display: flex;
+  justify-content: center;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.hb-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.3;
+  animation: hbPulse 1.4s ease-in-out infinite;
+}
+.hb-dot:nth-child(2) { animation-delay: 0.2s; }
+.hb-dot:nth-child(3) { animation-delay: 0.4s; }
+@keyframes hbPulse {
+  0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
+  40% { opacity: 1; transform: scale(1); }
+}
+.hb-action {
+  margin-bottom: 24px;
+}
+.hb-btn {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 10px 28px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: 'Space Grotesk', sans-serif;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.hb-btn:hover {
+  opacity: 0.85;
+}
+.hb-retry {
+  font-size: 11px;
+  color: var(--text-faint);
+  letter-spacing: 0.3px;
+}
