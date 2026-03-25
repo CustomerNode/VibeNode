@@ -805,7 +805,7 @@ class SessionManager:
 
             # Add user's message to the log and send
             if prompt:
-                entry = LogEntry(kind="user", text=prompt[:2000])
+                entry = LogEntry(kind="user", text=prompt[:20000])
                 with info._lock:
                     info.entries.append(entry)
                     entry_index = len(info.entries) - 1
@@ -1066,7 +1066,7 @@ class SessionManager:
         if isinstance(message, AssistantMessage):
             for block in (message.content if hasattr(message, 'content') else []):
                 if isinstance(block, TextBlock):
-                    entry = LogEntry(kind="asst", text=(block.text or "")[:3000])
+                    entry = LogEntry(kind="asst", text=(block.text or "")[:50000])
                     with info._lock:
                         info.entries.append(entry)
                     self._emit_entry(session_id, entry, len(info.entries) - 1)
@@ -1108,7 +1108,7 @@ class SessionManager:
 
                     entry = LogEntry(
                         kind="tool_result",
-                        text=rt[:600],
+                        text=rt[:5000],
                         tool_use_id=getattr(block, 'tool_use_id', '') or '',
                         is_error=bool(getattr(block, 'is_error', False)),
                     )
@@ -1117,7 +1117,7 @@ class SessionManager:
                     self._emit_entry(session_id, entry, len(info.entries) - 1)
 
                 elif isinstance(block, TextBlock):
-                    user_text = (block.text or "")[:2000]
+                    user_text = (block.text or "")[:20000]
                     # Never emit user text entries — they're already shown:
                     # - Initial prompt: added by _drive_session
                     # - Follow-ups: added by send_message

@@ -70,6 +70,9 @@ class ChatComponent {
       ? '<div class="chat-msg-bubble chat-bubble-asst">' + (typeof mdParse === 'function' ? mdParse(content) : escHtml(content)) + '</div>'
       : '<div class="chat-msg-bubble chat-bubble-user">' + escHtml(content) + '</div>';
     this.messagesEl.appendChild(div);
+    if (role === 'assistant' && typeof addSmartCopyButtons === 'function') {
+      addSmartCopyButtons(div.querySelector('.chat-bubble-asst'), content);
+    }
     this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
     return div;
   }
