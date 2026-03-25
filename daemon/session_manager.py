@@ -232,7 +232,6 @@ class SessionInfo:
     pending_tool_input: dict = field(default_factory=dict)
     always_allowed_tools: set = field(default_factory=set)
     working_since: float = 0.0  # time.time() when state last became WORKING
-    queue: list = field(default_factory=list)  # server-side message queue
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def to_state_dict(self) -> dict:
@@ -253,9 +252,7 @@ class SessionInfo:
                 "tool_name": self.pending_tool_name,
                 "tool_input": self.pending_tool_input,
             }
-        # Always include queue so frontend can display it
-        if self.queue:
-            d["queue"] = list(self.queue)
+        # Queue data is included by _emit_state from SessionManager._queues
         return d
 
 
@@ -820,8 +817,11 @@ class SessionManager:
                 if message is not None:
                     await self._process_message(session_id, message)
 
-            # If we exit the message loop normally, session is idle
-            if info.state != SessionState.STOPPED:
+            # If we exit the message loop normally, session is idle.
+            # Only set IDLE if still WORKING — _process_message may have
+            # already transitioned to IDLE and dispatched a queued message
+            # (which sets WORKING again).  Re-setting IDLE would double-dispatch.
+            if info.state == SessionState.WORKING:
                 info.state = SessionState.IDLE
                 self._emit_state(info)
 
@@ -855,10 +855,9 @@ class SessionManager:
                 if message is not None:
                     await self._process_message(session_id, message)
 
-            # After response completes, go idle
-            if info.state != SessionState.STOPPED:
-                info.state = SessionState.IDLE
-                self._emit_state(info)
+            # NOTE: Do NOT set IDLE here — _process_message already sets
+            # IDLE on ResultMessage and triggers queue dispatch.  A second
+            # IDLE transition here would double-dispatch queued messages.
 
         except asyncio.CancelledError:
             pass

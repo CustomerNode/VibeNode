@@ -108,10 +108,16 @@ def register_ws_events(socketio, app):
 
     @socketio.on('connect')
     def handle_connect():
-        """On connect, send current state of all sessions."""
+        """On connect, send current state of all sessions including queue data."""
         sm = app.session_manager
         sessions = sm.get_all_states()
-        emit('state_snapshot', {'sessions': sessions})
+        # Build top-level queues dict from per-session data for frontend sync
+        queues = {}
+        for s in sessions:
+            q = s.get('queue')
+            if q:
+                queues[s['session_id']] = q
+        emit('state_snapshot', {'sessions': sessions, 'queues': queues})
         logger.debug("WebSocket client connected, sent %d session states", len(sessions))
 
     @socketio.on('disconnect')

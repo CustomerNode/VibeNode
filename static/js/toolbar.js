@@ -136,6 +136,7 @@ function startListInlineRename() {
       return;
     }
 
+    _userNamedSessions.add(activeId);  // kill auto-naming instantly
     const resp = await fetch('/api/rename/' + activeId, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -363,6 +364,7 @@ async function startToolbarRename() {
     placeholder: 'Session name',
   });
   if (newName === null) return;
+  _userNamedSessions.add(activeId);  // kill auto-naming instantly
   const resp = await fetch('/api/rename/' + activeId, {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({title: newName})
@@ -399,6 +401,7 @@ async function submitRename() {
 
   // Save renameTarget before closeRename() nulls it
   const targetId = renameTarget;
+  _userNamedSessions.add(targetId);  // kill auto-naming instantly
   const resp = await fetch('/api/rename/' + targetId, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},

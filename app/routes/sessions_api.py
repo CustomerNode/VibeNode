@@ -14,6 +14,7 @@ from ..config import (
     _load_names,
     _save_name,
     _delete_name,
+    _remap_name,
     _decode_project,
     get_active_project,
     _summary_cache,
@@ -58,24 +59,46 @@ def api_session(session_id):
 
 @bp.route("/api/rename/<session_id>", methods=["POST"])
 def api_rename(session_id):
-    path = _sessions_dir() / f"{session_id}.jsonl"
-    if not path.exists():
-        return jsonify({"error": "Not found"}), 404
-
     data = request.get_json(silent=True) or {}
     new_title = data.get("title", "").strip()
     if not new_title:
         return jsonify({"error": "Title cannot be empty"}), 400
 
-    # Save to the persistent names store -- this survives Claude Code's own auto-naming
+    # Save to the persistent names store FIRST -- this always succeeds even if
+    # the .jsonl doesn't exist yet (new sessions before first message).
     _save_name(session_id, new_title)
 
-    # Also write to the .jsonl so Claude Code's own UI sees the name
-    entry = json.dumps({"type": "custom-title", "customTitle": new_title, "sessionId": session_id})
-    with open(path, "a", encoding="utf-8") as f:
-        f.write("\n" + entry + "\n")
+    # Also write to the .jsonl so Claude Code's own UI sees the name (if file exists)
+    path = _sessions_dir() / f"{session_id}.jsonl"
+    if path.exists():
+        entry = json.dumps({"type": "custom-title", "customTitle": new_title, "sessionId": session_id})
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n" + entry + "\n")
 
     return jsonify({"ok": True, "title": new_title})
+
+
+@bp.route("/api/remap-name", methods=["POST"])
+def api_remap_name():
+    """Re-persist a user-set name under a new session ID after SDK remaps."""
+    data = request.get_json(silent=True) or {}
+    old_id = data.get("old_id", "").strip()
+    new_id = data.get("new_id", "").strip()
+    if not old_id or not new_id:
+        return jsonify({"error": "old_id and new_id required"}), 400
+
+    title = _remap_name(old_id, new_id)
+    if not title:
+        return jsonify({"ok": True, "skipped": True})
+
+    # Write custom-title entry to the new .jsonl if it exists
+    path = _sessions_dir() / f"{new_id}.jsonl"
+    if path.exists():
+        entry = json.dumps({"type": "custom-title", "customTitle": title, "sessionId": new_id})
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n" + entry + "\n")
+
+    return jsonify({"ok": True, "title": title})
 
 
 @bp.route("/api/autonname/<session_id>", methods=["POST"])
