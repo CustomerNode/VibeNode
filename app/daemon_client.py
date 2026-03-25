@@ -316,3 +316,33 @@ class DaemonClient:
             "tool_name": tool_name, "tool_input": tool_input,
             "session_id": session_id,
         }, timeout=3600)
+
+    # ------------------------------------------------------------------
+    # Server-side message queue
+    # ------------------------------------------------------------------
+
+    def queue_message(self, session_id, text):
+        return self._send_request("queue_message", {
+            "session_id": session_id, "text": text,
+        })
+
+    def get_queue(self, session_id):
+        result = self._send_request("get_queue", {"session_id": session_id})
+        if isinstance(result, list):
+            return result
+        return []
+
+    def remove_queue_item(self, session_id, index):
+        return self._send_request("remove_queue_item", {
+            "session_id": session_id, "index": index,
+        })
+
+    def edit_queue_item(self, session_id, index, text):
+        return self._send_request("edit_queue_item", {
+            "session_id": session_id, "index": index, "text": text,
+        })
+
+    def clear_queue(self, session_id):
+        return self._send_request("clear_queue", {
+            "session_id": session_id,
+        })

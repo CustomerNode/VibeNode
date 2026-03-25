@@ -125,10 +125,12 @@ class SessionDaemon:
             except Exception:
                 pass
 
-        # Send initial state snapshot
+        # Send initial state snapshot (includes all queues)
         try:
             states = self.session_manager.get_all_states()
-            self._push_event("state_snapshot", {"sessions": states})
+            with self.session_manager._queue_lock:
+                queues = {k: list(v) for k, v in self.session_manager._queues.items() if v}
+            self._push_event("state_snapshot", {"sessions": states, "queues": queues})
         except Exception as e:
             logger.warning("Failed to send state snapshot: %s", e)
 
@@ -201,6 +203,11 @@ class SessionDaemon:
             "get_session_state": self.session_manager.get_session_state,
             "set_permission_policy": self.session_manager.set_permission_policy,
             "resolve_hook_permission": self.session_manager.resolve_hook_permission,
+            "queue_message": self.session_manager.queue_message,
+            "get_queue": lambda **kw: self.session_manager.get_queue(**kw),
+            "remove_queue_item": self.session_manager.remove_queue_item,
+            "edit_queue_item": self.session_manager.edit_queue_item,
+            "clear_queue": self.session_manager.clear_queue,
             "ping": lambda **kw: {"ok": True, "pid": os.getpid()},
         }
 

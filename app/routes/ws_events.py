@@ -195,10 +195,20 @@ def register_ws_events(socketio, app):
         result = sm.send_message(session_id, text)
 
         if not result.get('ok'):
-            emit('error', {
-                'message': result.get('error', 'Failed to send message'),
-                'session_id': session_id,
-            })
+            # If session isn't idle, auto-queue instead of erroring
+            err = result.get('error', '')
+            if 'not idle' in err:
+                q_result = sm.queue_message(session_id, text)
+                if not q_result.get('ok'):
+                    emit('error', {
+                        'message': q_result.get('error', 'Failed to queue message'),
+                        'session_id': session_id,
+                    })
+            else:
+                emit('error', {
+                    'message': err or 'Failed to send message',
+                    'session_id': session_id,
+                })
 
     @socketio.on('permission_response')
     def handle_permission_response(data):
@@ -333,3 +343,85 @@ def register_ws_events(socketio, app):
         sm = app.session_manager
         sm.set_permission_policy(policy, custom_rules)
         logger.debug("Permission policy synced: %s", policy)
+
+    # ------------------------------------------------------------------
+    # Server-side message queue events
+    # ------------------------------------------------------------------
+
+    @socketio.on('queue_message')
+    def handle_queue_message(data):
+        """Add a message to a session's server-side queue."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+        session_id = (data.get('session_id') or '').strip()
+        text = (data.get('text') or '').strip()
+        if not session_id or not text:
+            emit('error', {'message': 'session_id and text are required'})
+            return
+        sm = app.session_manager
+        result = sm.queue_message(session_id, text)
+        if not result.get('ok'):
+            emit('error', {'message': result.get('error', 'Failed to queue'), 'session_id': session_id})
+
+    @socketio.on('remove_queue_item')
+    def handle_remove_queue_item(data):
+        """Remove one item from a session's queue."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+        session_id = (data.get('session_id') or '').strip()
+        index = data.get('index', -1)
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+        sm = app.session_manager
+        result = sm.remove_queue_item(session_id, int(index))
+        if not result.get('ok'):
+            emit('error', {'message': result.get('error', 'Failed to remove'), 'session_id': session_id})
+
+    @socketio.on('edit_queue_item')
+    def handle_edit_queue_item(data):
+        """Edit one item in a session's queue."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+        session_id = (data.get('session_id') or '').strip()
+        index = data.get('index', -1)
+        text = (data.get('text') or '').strip()
+        if not session_id or not text:
+            emit('error', {'message': 'session_id and text are required'})
+            return
+        sm = app.session_manager
+        result = sm.edit_queue_item(session_id, int(index), text)
+        if not result.get('ok'):
+            emit('error', {'message': result.get('error', 'Failed to edit'), 'session_id': session_id})
+
+    @socketio.on('clear_queue')
+    def handle_clear_queue(data):
+        """Clear all queued messages for a session."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+        session_id = (data.get('session_id') or '').strip()
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+        sm = app.session_manager
+        result = sm.clear_queue(session_id)
+        if not result.get('ok'):
+            emit('error', {'message': result.get('error', 'Failed to clear'), 'session_id': session_id})
+
+    @socketio.on('get_queue')
+    def handle_get_queue(data):
+        """Return the current queue for a session."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+        session_id = (data.get('session_id') or '').strip()
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+        sm = app.session_manager
+        items = sm.get_queue(session_id)
+        emit('queue_updated', {'session_id': session_id, 'queue': items})

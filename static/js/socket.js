@@ -106,6 +106,17 @@ socket.on('state_snapshot', (data) => {
         _updatePermissionQueue(waitingData);
     }
 
+    // Sync server-side queue cache from snapshot (top-level queues dict from daemon)
+    if (data.queues && typeof _sessionQueues !== 'undefined') {
+        for (const k in _sessionQueues) delete _sessionQueues[k];
+        for (const k in data.queues) {
+            if (Array.isArray(data.queues[k]) && data.queues[k].length) {
+                _sessionQueues[k] = data.queues[k];
+            }
+        }
+        if (typeof _renderQueueBanner === 'function') _renderQueueBanner();
+    }
+
     // Update Close Session button enabled state
     const btnClose = document.getElementById('btn-close');
     if (btnClose && activeId) btnClose.disabled = !newRunning.has(activeId) && !guiOpenSessions.has(activeId);
@@ -164,17 +175,18 @@ socket.on('session_state', (data) => {
         }
     }
 
-    // Auto-send queued input when Claude transitions to idle (works even if navigated away)
-    // Uses _shiftQueue for FIFO — sends first message, rest wait for next idle
-    if (_getQueue(session_id) && state === 'idle') {
-        const textToSend = _shiftQueue(session_id);
-        const remaining = _getQueueList(session_id).length;
-        showToast('Sending queued command\u2026' + (remaining ? ' (' + remaining + ' remaining)' : ''));
-        if (liveSessionId === session_id) {
-            _liveSubmitDirect(session_id, textToSend, {});
+    // Sync queue cache from server state event (authoritative source).
+    // Every session_state event now carries the current queue from the server.
+    // Auto-dispatch is handled server-side in SessionManager._emit_state.
+    if (typeof _sessionQueues !== 'undefined') {
+        if (data.queue && Array.isArray(data.queue) && data.queue.length) {
+            _sessionQueues[session_id] = data.queue;
         } else {
-            socket.emit('send_message', {session_id: session_id, text: textToSend});
+            delete _sessionQueues[session_id];
         }
+        _queueViewIndex = 0;
+    }
+    if (session_id === liveSessionId && typeof _renderQueueBanner === 'function') {
         _renderQueueBanner();
     }
 
@@ -267,6 +279,35 @@ socket.on('session_permission', (data) => {
     if (viewMode === 'workforce' || viewMode === 'workplace') filterSessions();
 });
 
+// Server-side queue updates — replaces client-side localStorage queue
+socket.on('queue_updated', (data) => {
+    const sid = data.session_id;
+    const items = data.queue || [];
+    // Update local cache from authoritative server data
+    if (items.length) {
+        _sessionQueues[sid] = items;
+    } else {
+        delete _sessionQueues[sid];
+    }
+    _queueViewIndex = 0;
+    // Re-render queue banner if viewing this session
+    if (sid === liveSessionId && typeof _renderQueueBanner === 'function') {
+        _renderQueueBanner();
+    }
+});
+
+// Server auto-dispatched a queued message — show toast + optimistic user bubble
+socket.on('queue_dispatched', (data) => {
+    const sid = data.session_id;
+    const text = data.text || '';
+    const remaining = data.remaining || 0;
+    showToast('Sending queued command\u2026' + (remaining ? ' (' + remaining + ' remaining)' : ''));
+    // Add optimistic user bubble for the dispatched message
+    if (sid === liveSessionId && text && typeof _addOptimisticBubble === 'function') {
+        _addOptimisticBubble(sid, text);
+    }
+});
+
 // Session started confirmation
 socket.on('session_started', (data) => {
     if (data.session_id) {
@@ -290,11 +331,18 @@ socket.on('session_id_remapped', (data) => {
     const s = allSessions.find(x => x.id === oldId);
     if (s) s.id = newId;
 
-    // Update activeId and URL
+    // Update activeId and URL — use replaceState (not pushState) so the
+    // temporary client-generated UUID does not linger in browser history
+    // and break back/forward/refresh navigation
     if (activeId === oldId) {
         activeId = newId;
         localStorage.setItem('activeSessionId', newId);
-        _pushChatUrl(newId);
+        const _remapUrl = new URL(window.location);
+        _remapUrl.searchParams.set('chat', newId);
+        history.replaceState({
+            folder: (typeof _currentFolderId !== 'undefined' ? _currentFolderId : null),
+            chat: newId
+        }, '', _remapUrl);
     }
 
     // Update liveSessionId

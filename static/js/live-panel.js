@@ -27,49 +27,69 @@ let liveLineCount = 0;
 let _liveSending = false;
 let liveAutoScroll = true;
 const _renderedUserTexts = new Set();
-// Per-session queue storage with localStorage persistence (array per session)
+// Per-session queue — server-backed local cache (synced via queue_updated events)
 const _sessionQueues = {};
 let _queueViewIndex = 0;
-(function _loadQueues() {
+
+// Migrate any old localStorage queues to server on first load
+(function _migrateOldQueues() {
   try {
     const raw = JSON.parse(localStorage.getItem('_sessionQueues') || '{}');
+    let migrated = false;
     for (const k in raw) {
-      // Migrate old string format to array
-      _sessionQueues[k] = Array.isArray(raw[k]) ? raw[k] : (raw[k] ? [raw[k]] : []);
+      const arr = Array.isArray(raw[k]) ? raw[k] : (raw[k] ? [raw[k]] : []);
+      if (arr.length) {
+        _sessionQueues[k] = arr;
+        // Push to server once socket is connected
+        setTimeout(() => {
+          if (typeof socket !== 'undefined' && socket.connected) {
+            arr.forEach(text => socket.emit('queue_message', {session_id: k, text: text}));
+          }
+        }, 2000);
+        migrated = true;
+      }
     }
+    if (migrated) localStorage.removeItem('_sessionQueues');
   } catch(e) {}
 })();
-function _saveQueues() { localStorage.setItem('_sessionQueues', JSON.stringify(_sessionQueues)); }
+
+// Read-only local cache accessors (data comes from server via queue_updated events)
 function _getQueueList(sid) { return (sid && _sessionQueues[sid]) || []; }
 function _getQueue(sid) { const q = _getQueueList(sid); return q.length ? q[0] : ''; }
-function _setQueue(sid, text) {
-  if (!sid) return;
-  if (text) _sessionQueues[sid] = [text]; else delete _sessionQueues[sid];
-  _queueViewIndex = 0;
-  _saveQueues();
-}
+
+// Server-backed queue mutations — emit to server, cache updated via queue_updated event
 function _addQueue(sid, text) {
   if (!sid || !text) return;
+  // Optimistic local update for instant UI feedback
   if (!_sessionQueues[sid]) _sessionQueues[sid] = [];
   _sessionQueues[sid].push(text);
   _queueViewIndex = _sessionQueues[sid].length - 1;
-  _saveQueues();
+  // Send to server (authoritative)
+  socket.emit('queue_message', {session_id: sid, text: text});
 }
 function _removeQueueAt(sid, idx) {
   if (!sid || !_sessionQueues[sid]) return;
+  // Optimistic local update
   _sessionQueues[sid].splice(idx, 1);
   if (!_sessionQueues[sid].length) delete _sessionQueues[sid];
   else if (_queueViewIndex >= _sessionQueues[sid].length) _queueViewIndex = _sessionQueues[sid].length - 1;
-  _saveQueues();
+  // Send to server
+  socket.emit('remove_queue_item', {session_id: sid, index: idx});
 }
-function _shiftQueue(sid) {
-  if (!sid || !_sessionQueues[sid] || !_sessionQueues[sid].length) return '';
-  const text = _sessionQueues[sid].shift();
-  if (!_sessionQueues[sid].length) delete _sessionQueues[sid];
-  _queueViewIndex = 0;
-  _saveQueues();
-  return text;
+function _setQueue(sid, text) {
+  if (!sid) return;
+  // Clear then add — server-backed
+  socket.emit('clear_queue', {session_id: sid});
+  if (text) {
+    _sessionQueues[sid] = [text];
+    _queueViewIndex = 0;
+    socket.emit('queue_message', {session_id: sid, text: text});
+  } else {
+    delete _sessionQueues[sid];
+    _queueViewIndex = 0;
+  }
 }
+// _shiftQueue is no longer used — server auto-dispatches from queue on idle
 
 /** Render (or clear) the queue banner in the dedicated #live-queue-area div. */
 function _renderQueueBanner() {
@@ -431,7 +451,7 @@ function updateLiveInputBar() {
 
   } else if (kind === 'question') {
     // Claude is asking something — show question text + option buttons + free-form textarea
-    const prefill = _shiftQueue(id);
+    // Queue is managed server-side; never pop queue items into permission responses
     _renderQueueBanner();
     const questionText = (wd && wd.question) ? wd.question : '';
     const options = (wd && wd.options) ? wd.options : null;
@@ -479,7 +499,6 @@ function updateLiveInputBar() {
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), liveSubmitWaiting);
     const ta = document.getElementById('live-input-ta');
     if (ta) {
-      if (prefill) ta.value = prefill;
       _guiFocusPending = false;
       if (_barHadFocus) ta.focus();
       _initAutoResize(ta);
@@ -628,8 +647,9 @@ function _liveSubmitDirect(sid, text, opts) {
   if (!sid) return;
   _liveSending = true;
 
-  // If it's a permission response (from waitingData), use permission_response event
-  const wasPermission = !!waitingData[sid];
+  // Only treat as permission response if explicitly flagged (not from queue)
+  const isPermission = opts && opts.isPermission;
+  const wasPermission = isPermission && !!waitingData[sid];
   if (wasPermission) {
     const actionMap = {yes: 'y', no: 'n', always: 'a', allow: 'y', deny: 'n'};
     const action = actionMap[text.toLowerCase()] || text;
@@ -638,7 +658,7 @@ function _liveSubmitDirect(sid, text, opts) {
     delete waitingData[sid];
     sessionKinds[sid] = 'working';
   } else if (runningIds.has(sid)) {
-    // Send message to running session
+    // Send message — server will process if idle, or queue if busy
     socket.emit('send_message', {session_id: sid, text: text});
   }
 
@@ -760,11 +780,10 @@ function liveSubmitWaiting() {
 function liveSubmitInterrupt() {
   if (!liveSessionId) return;
   // Clear any queued commands — user is intentionally stopping, so we must
-  // NOT auto-send queued text when the session_state(idle) event arrives.
-  // Without this, the auto-send in socket.js fires immediately, setting
-  // sessionKinds back to 'working' while _updateRowState shows 'idle',
-  // causing the left menu and chat UI to be out of sync.
-  _setQueue(liveSessionId, '');
+  // NOT auto-send queued text when the session goes idle.
+  // Server-side clear ensures queue is emptied even if GUI disconnects.
+  socket.emit('clear_queue', {session_id: liveSessionId});
+  delete _sessionQueues[liveSessionId]; // optimistic local clear
   _renderQueueBanner();
   socket.emit('interrupt_session', {session_id: liveSessionId});
   // Optimistic: immediately show idle state in the chat UI

@@ -232,6 +232,7 @@ class SessionInfo:
     pending_tool_input: dict = field(default_factory=dict)
     always_allowed_tools: set = field(default_factory=set)
     working_since: float = 0.0  # time.time() when state last became WORKING
+    queue: list = field(default_factory=list)  # server-side message queue
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def to_state_dict(self) -> dict:
@@ -252,6 +253,9 @@ class SessionInfo:
                 "tool_name": self.pending_tool_name,
                 "tool_input": self.pending_tool_input,
             }
+        # Always include queue so frontend can display it
+        if self.queue:
+            d["queue"] = list(self.queue)
         return d
 
 
@@ -283,6 +287,11 @@ class SessionManager:
         # Hook-based permission storage
         self._hook_pending = {}  # {req_id: {"event": threading.Event, "result": str}}
         self._hook_lock = threading.Lock()
+        # Server-side message queue (per-session, FIFO)
+        self._queues: dict[str, list[str]] = {}
+        self._queue_lock = threading.Lock()
+        self._queue_path = Path.home() / ".claude" / "gui_message_queues.json"
+        self._load_queues()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -404,14 +413,23 @@ class SessionManager:
         return {"ok": True}
 
     def send_message(self, session_id: str, text: str) -> dict:
-        """Send a follow-up message to an idle session."""
+        """Send a follow-up message to an idle session.
+
+        If the session is busy (WORKING/WAITING/STARTING), the message is
+        automatically queued and will be dispatched when the session next
+        becomes IDLE.  This eliminates race conditions where the frontend
+        thinks the session is idle but it has already transitioned.
+        """
         session_id = self._resolve_id(session_id)
         with self._lock:
             info = self._sessions.get(session_id)
         if not info:
             return {"ok": False, "error": "Session not found"}
+        if info.state == SessionState.STOPPED:
+            return {"ok": False, "error": "Session is stopped"}
         if info.state != SessionState.IDLE:
-            return {"ok": False, "error": f"Session is {info.state.value}, not idle"}
+            # Auto-queue instead of returning an error
+            return self.queue_message(session_id, text)
 
         # Add user entry to history (don't emit — frontend shows it optimistically)
         entry = LogEntry(kind="user", text=text)
@@ -510,8 +528,146 @@ class SessionManager:
 
         return False
 
-    def interrupt_session(self, session_id: str) -> dict:
-        """Interrupt a running session."""
+    # ------------------------------------------------------------------
+    # Server-side message queue
+    # ------------------------------------------------------------------
+
+    def _load_queues(self) -> None:
+        """Load persisted queues from disk."""
+        try:
+            if self._queue_path.exists():
+                raw = json.loads(self._queue_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    for k, v in raw.items():
+                        if isinstance(v, list) and all(isinstance(x, str) for x in v):
+                            self._queues[k] = v
+        except Exception as e:
+            logger.warning("Failed to load queues: %s", e)
+
+    def _save_queues(self) -> None:
+        """Persist queues to disk."""
+        try:
+            self._queue_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._queue_lock:
+                data = {k: v for k, v in self._queues.items() if v}
+            self._queue_path.write_text(json.dumps(data), encoding="utf-8")
+        except Exception as e:
+            logger.debug("Failed to save queues: %s", e)
+
+    def _emit_queue_update(self, session_id: str) -> None:
+        """Push queue state to connected clients."""
+        with self._queue_lock:
+            items = list(self._queues.get(session_id, []))
+        if self._push_callback:
+            self._push_callback('queue_updated', {
+                'session_id': session_id,
+                'queue': items,
+            })
+
+    def queue_message(self, session_id: str, text: str) -> dict:
+        """Add a message to a session's queue."""
+        session_id = self._resolve_id(session_id)
+        with self._queue_lock:
+            if session_id not in self._queues:
+                self._queues[session_id] = []
+            self._queues[session_id].append(text)
+        self._save_queues()
+        self._emit_queue_update(session_id)
+        logger.info("Queued message for %s (%d in queue)", session_id,
+                     len(self._queues.get(session_id, [])))
+        return {"ok": True, "queued": True}
+
+    def get_queue(self, session_id: str) -> list:
+        """Return the queue for a session."""
+        session_id = self._resolve_id(session_id)
+        with self._queue_lock:
+            return list(self._queues.get(session_id, []))
+
+    def remove_queue_item(self, session_id: str, index: int) -> dict:
+        """Remove one item from a session's queue by index."""
+        session_id = self._resolve_id(session_id)
+        with self._queue_lock:
+            q = self._queues.get(session_id, [])
+            if 0 <= index < len(q):
+                q.pop(index)
+                if not q:
+                    self._queues.pop(session_id, None)
+            else:
+                return {"ok": False, "error": "Index out of range"}
+        self._save_queues()
+        self._emit_queue_update(session_id)
+        return {"ok": True}
+
+    def edit_queue_item(self, session_id: str, index: int, text: str) -> dict:
+        """Edit one item in a session's queue by index."""
+        session_id = self._resolve_id(session_id)
+        with self._queue_lock:
+            q = self._queues.get(session_id, [])
+            if 0 <= index < len(q):
+                q[index] = text
+            else:
+                return {"ok": False, "error": "Index out of range"}
+        self._save_queues()
+        self._emit_queue_update(session_id)
+        return {"ok": True}
+
+    def clear_queue(self, session_id: str) -> dict:
+        """Clear all queued messages for a session."""
+        session_id = self._resolve_id(session_id)
+        with self._queue_lock:
+            self._queues.pop(session_id, None)
+        self._save_queues()
+        self._emit_queue_update(session_id)
+        return {"ok": True}
+
+    def _try_dispatch_queue(self, session_id: str) -> None:
+        """If session is IDLE and queue has items, dispatch the first one.
+
+        Called from _emit_state on IDLE transitions. Runs send_message
+        which sets state to WORKING and submits the query asynchronously.
+        """
+        with self._queue_lock:
+            q = self._queues.get(session_id, [])
+            if not q:
+                return
+            text = q.pop(0)
+            remaining = len(q)
+            if not q:
+                self._queues.pop(session_id, None)
+
+        self._save_queues()
+        self._emit_queue_update(session_id)
+
+        logger.info("Auto-dispatching queued message for %s (%d remaining)",
+                     session_id, remaining)
+
+        # Notify frontend that a queued message is being sent
+        if self._push_callback:
+            self._push_callback('queue_dispatched', {
+                'session_id': session_id,
+                'text': text,
+                'remaining': remaining,
+            })
+
+        # send_message checks state==IDLE and sets WORKING atomically
+        result = self.send_message(session_id, text)
+        if not result.get("ok") and not result.get("queued"):
+            # Send failed (race condition) — re-queue at front
+            logger.warning("Queue dispatch failed for %s: %s — re-queuing",
+                          session_id, result.get("error"))
+            with self._queue_lock:
+                if session_id not in self._queues:
+                    self._queues[session_id] = []
+                self._queues[session_id].insert(0, text)
+            self._save_queues()
+            self._emit_queue_update(session_id)
+
+    def interrupt_session(self, session_id: str, clear_queue: bool = True) -> dict:
+        """Interrupt a running session.
+
+        When clear_queue is True (default), also clears any queued messages
+        to prevent auto-dispatch when the session goes idle after interrupt.
+        """
         session_id = self._resolve_id(session_id)
         with self._lock:
             info = self._sessions.get(session_id)
@@ -519,6 +675,15 @@ class SessionManager:
             return {"ok": False, "error": "Session not found"}
         if info.state == SessionState.STOPPED:
             return {"ok": False, "error": "Session already stopped"}
+
+        # Clear queue atomically BEFORE the interrupt so _emit_state(IDLE)
+        # won't auto-dispatch a queued message after the interrupt completes.
+        if clear_queue:
+            with self._queue_lock:
+                if session_id in self._queues:
+                    self._queues.pop(session_id)
+                    self._save_queues()
+                    self._emit_queue_update(session_id)
 
         asyncio.run_coroutine_threadsafe(
             self._interrupt_session(session_id), self._loop
@@ -561,9 +726,21 @@ class SessionManager:
             self._sessions.pop(session_id, None)
 
     def get_all_states(self) -> list:
-        """Return snapshot of all session states for initial WebSocket connect."""
+        """Return snapshot of all session states for initial WebSocket connect.
+
+        Includes queue data from the server-side queue store so reconnecting
+        clients can immediately display queued items.
+        """
         with self._lock:
-            return [info.to_state_dict() for info in self._sessions.values()]
+            states = [info.to_state_dict() for info in self._sessions.values()]
+        # Merge queue data from _queues into state dicts
+        with self._queue_lock:
+            for s in states:
+                sid = s.get("session_id", "")
+                q = self._queues.get(sid, [])
+                if q:
+                    s["queue"] = list(q)
+        return states
 
     def get_entries(self, session_id: str, since: int = 0) -> list:
         """Return log entries for a session, optionally from an index."""
@@ -978,6 +1155,12 @@ class SessionManager:
                         del self._sessions[session_id]
                     self._id_aliases[session_id] = result_session_id
 
+                # Remap queue to new session ID
+                with self._queue_lock:
+                    if session_id in self._queues:
+                        self._queues[result_session_id] = self._queues.pop(session_id)
+                self._save_queues()
+
                 # Notify frontend to update its references (URL, activeId, etc.)
                 if self._push_callback:
                     self._push_callback(
@@ -1169,6 +1352,7 @@ class SessionManager:
 
         Uses push_callback to ensure cross-context compatibility.
         Also schedules a registry save so crash recovery data stays fresh.
+        When a session transitions to IDLE, auto-dispatches queued messages.
         """
         # Track when session entered WORKING state for elapsed timer
         if info.state == SessionState.WORKING and info.working_since == 0.0:
@@ -1177,9 +1361,17 @@ class SessionManager:
             info.working_since = 0.0
         if self._push_callback:
             data = info.to_state_dict()
+            # Include queue data from server-side store
+            with self._queue_lock:
+                q = self._queues.get(info.session_id, [])
+                if q:
+                    data["queue"] = list(q)
             self._push_callback('session_state', data)
         # Keep the persistent registry up to date
         self._schedule_registry_save()
+        # Auto-dispatch queued messages when session goes IDLE
+        if info.state == SessionState.IDLE:
+            self._try_dispatch_queue(info.session_id)
 
     def _emit_entry(self, session_id: str, entry: LogEntry, index: int) -> None:
         """Push a new log entry to all connected WebSocket clients."""

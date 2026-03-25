@@ -25,26 +25,7 @@ async function pollWaiting() {
       if (w.kind === 'question') newWaiting[w.id] = w;
     });
 
-    // Auto-send queued input when any session transitions from working -> idle
-    // (works even if user navigated away from the session)
-    for (const _qSid of Object.keys(_sessionQueues)) {
-      const _qText = _getQueue(_qSid);
-      if (!_qText || _liveSending) continue;
-      const wasWorking = (sessionKinds[_qSid] === 'working');
-      const nowIdle    = (newKinds[_qSid] === 'idle');
-      if (wasWorking && nowIdle) {
-        _shiftQueue(_qSid);
-        const remaining = _getQueueList(_qSid).length;
-        showToast('Sending queued command\u2026' + (remaining ? ' (' + remaining + ' remaining)' : ''));
-        if (liveSessionId === _qSid) {
-          _renderQueueBanner();
-          liveBarState = null;
-          _liveSubmitDirect(_qSid, _qText, {});
-        } else {
-          socket.emit('send_message', {session_id: _qSid, text: _qText});
-        }
-      }
-    }
+    // Queue auto-dispatch is now handled server-side — no client-side auto-send needed.
 
     // Update row state classes (4 states: si-question, si-working, si-idle, or none)
     document.querySelectorAll('.session-item[data-sid]').forEach(row => {
