@@ -116,6 +116,11 @@ def api_autoname(session_id):
     session = load_session(path)
     messages = [m for m in session["messages"] if m["content"]]
 
+    # Check if this is a re-evaluate request (session already has an auto-title)
+    old_title = session.get("custom_title", "")
+    data = request.get_json(silent=True) or {}
+    is_re_evaluate = data.get("re_evaluate", False) and old_title
+
     if not messages:
         all_s = all_sessions(summary_only=True)
         empty_count = sum(
@@ -132,11 +137,16 @@ def api_autoname(session_id):
     try:
         title = smart_title(session["messages"])
 
+        # If re-evaluating, only update if the new title is meaningfully different
+        if is_re_evaluate and title == old_title:
+            return jsonify({"ok": True, "title": old_title, "skipped": True,
+                            "reason": "Title unchanged"})
+
         entry = json.dumps({"type": "custom-title", "customTitle": title, "sessionId": session_id})
         with open(path, "a", encoding="utf-8") as f:
             f.write("\n" + entry + "\n")
 
-        return jsonify({"ok": True, "title": title})
+        return jsonify({"ok": True, "title": title, "renamed": is_re_evaluate})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500

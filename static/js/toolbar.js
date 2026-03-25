@@ -429,7 +429,7 @@ const _autoNamingInFlight = new Set();
 // Sessions the user has manually renamed — auto-naming will never touch these.
 const _userNamedSessions = new Set();
 
-async function autoName(id, silent) {
+async function autoName(id, silent, reEvaluate) {
   // Never auto-name a session the user has explicitly renamed
   if (_userNamedSessions.has(id)) return;
   const btn = silent ? null : document.getElementById('btn-autoname');
@@ -442,7 +442,9 @@ async function autoName(id, silent) {
 
   let data;
   try {
-    const resp = await fetch('/api/autonname/' + id, { method: 'POST' });
+    const body = reEvaluate ? JSON.stringify({ re_evaluate: true }) : null;
+    const headers = reEvaluate ? { 'Content-Type': 'application/json' } : {};
+    const resp = await fetch('/api/autonname/' + id, { method: 'POST', headers, body });
     data = await resp.json();
   } catch(e) {
     _autoNamingInFlight.delete(id);

@@ -841,11 +841,17 @@ async function _newSessionSubmit(sessionId) {
 
   socket.emit('start_session', startOpts);
 
-  // Use the user's first message as a placeholder title until auto-name kicks in
-  const _placeholder = text.split('\n')[0].slice(0, 65) + (text.length > 65 ? '\u2026' : '');
+  // Use the user's first message as a placeholder title until auto-name kicks in,
+  // BUT respect any name the user already set — don't overwrite it.
   const s = allSessions.find(x => x.id === sessionId);
-  if (s) { s.display_title = _placeholder; }
-  setToolbarSession(sessionId, _placeholder, true, '');
+  if (s && s.custom_title && _userNamedSessions.has(sessionId)) {
+    // User already named this session — keep their title
+    setToolbarSession(sessionId, s.custom_title, false, s.custom_title);
+  } else {
+    const _placeholder = text.split('\n')[0].slice(0, 65) + (text.length > 65 ? '\u2026' : '');
+    if (s) { s.display_title = _placeholder; }
+    setToolbarSession(sessionId, _placeholder, true, '');
+  }
   filterSessions();
 
   // Register session in current folder

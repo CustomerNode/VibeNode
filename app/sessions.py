@@ -1,5 +1,5 @@
 """
-Session loading -- fast summary parser and full session parser.
+Session loading -- summary parser and full session parser.
 """
 
 import json
@@ -18,7 +18,7 @@ from .config import (
 
 
 def load_session_summary(path: Path) -> dict:
-    """Fast cached summary -- seeks head + tail only, never reads entire file."""
+    """Cached summary — reads the whole file, no head/tail tricks."""
     _err = {"id": path.stem, "error": "", "custom_title": None,
             "display_title": path.stem, "date": "", "last_activity": "", "preview": "",
             "last_activity_ts": 0, "sort_ts": 0, "size": "0 B", "file_bytes": 0, "message_count": 0}
@@ -37,69 +37,10 @@ def load_session_summary(path: Path) -> dict:
     first_ts = None
     last_ts = None
     message_count = 0
-    HEAD_SIZE = 16384
-    TAIL_SIZE = 8192
 
     try:
-        file_size = st.st_size
-        with open(path, "rb") as f:
-            head = f.read(HEAD_SIZE)
-            # Estimate message count from file size for large files
-            if file_size > HEAD_SIZE + TAIL_SIZE:
-                # Read tail by seeking
-                f.seek(max(0, file_size - TAIL_SIZE))
-                tail = f.read()
-                # Estimate message count: count in head+tail, scale by file proportion
-                sampled = head + tail
-                sample_count = (sampled.count(b'"type":"user"') + sampled.count(b'"type":"assistant"')
-                              + sampled.count(b'"type": "user"') + sampled.count(b'"type": "assistant"'))
-                sample_bytes = len(sampled)
-                message_count = max(sample_count, int(sample_count * file_size / sample_bytes)) if sample_bytes else 0
-            else:
-                tail = head[HEAD_SIZE:]  # empty if file < HEAD_SIZE
-                if file_size > HEAD_SIZE:
-                    f.seek(max(0, file_size - TAIL_SIZE))
-                    tail = f.read()
-                message_count = (head.count(b'"type":"user"') + head.count(b'"type":"assistant"')
-                               + head.count(b'"type": "user"') + head.count(b'"type": "assistant"')
-                               + tail.count(b'"type":"user"') + tail.count(b'"type":"assistant"')
-                               + tail.count(b'"type": "user"') + tail.count(b'"type": "assistant"'))
-
-        head_str = head.decode("utf-8", errors="replace")
-        for line in head_str.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            t = obj.get("type", "")
-            if t == "custom-title":
-                custom_title = obj.get("customTitle", "")
-            elif t in ("user", "assistant"):
-                ts_str = obj.get("timestamp", "")
-                if ts_str and first_ts is None:
-                    try:
-                        first_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    except Exception:
-                        pass
-                if t == "user" and not first_user_content:
-                    msg = obj.get("message", {})
-                    raw_c = msg.get("content", "")
-                    if isinstance(raw_c, str):
-                        first_user_content = raw_c.strip()
-                    elif isinstance(raw_c, list):
-                        parts = [b.get("text", "") for b in raw_c
-                                 if isinstance(b, dict) and b.get("type") == "text"]
-                        first_user_content = " ".join(parts).strip()
-                if first_ts and first_user_content:
-                    break
-
-        # Scan tail for last timestamp and any late custom-title
-        if file_size > HEAD_SIZE:
-            tail_str = tail.decode("utf-8", errors="replace")
-            for line in reversed(tail_str.splitlines()):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
                 line = line.strip()
                 if not line:
                     continue
@@ -107,24 +48,38 @@ def load_session_summary(path: Path) -> dict:
                     obj = json.loads(line)
                 except Exception:
                     continue
+
                 t = obj.get("type", "")
+
                 if t == "custom-title":
+                    # Always overwrite — last one wins
                     custom_title = obj.get("customTitle", "")
-                if t in ("user", "assistant") and last_ts is None:
+
+                elif t in ("user", "assistant"):
+                    message_count += 1
                     ts_str = obj.get("timestamp", "")
                     if ts_str:
                         try:
-                            last_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                            if first_ts is None:
+                                first_ts = ts
+                            last_ts = ts
                         except Exception:
                             pass
-                if last_ts and custom_title is not None:
-                    break
+                    if t == "user" and not first_user_content:
+                        msg = obj.get("message", {})
+                        raw_c = msg.get("content", "")
+                        if isinstance(raw_c, str):
+                            first_user_content = raw_c.strip()
+                        elif isinstance(raw_c, list):
+                            parts = [b.get("text", "") for b in raw_c
+                                     if isinstance(b, dict) and b.get("type") == "text"]
+                            first_user_content = " ".join(parts).strip()
 
     except Exception:
         return _err
 
     if first_ts:
-        # Convert UTC to local time for display
         local_ts = first_ts.astimezone() if first_ts.tzinfo else first_ts
         date_str = local_ts.strftime("%b %d, %Y  %I:%M %p")
     else:
