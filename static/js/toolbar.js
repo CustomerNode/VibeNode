@@ -91,6 +91,7 @@ async function selectSession(id) {
   }
   document.getElementById('main-body').innerHTML =
     '<div class="conversation" id="convo">' + loadMoreHtml + renderMessages(visibleMsgs) + '</div>';
+  _addCopyButtonsToConvo();
   setTimeout(() => {
     const convo = document.getElementById('convo');
     if (convo) convo.scrollTop = convo.scrollHeight;
@@ -277,10 +278,19 @@ async function loadAllMessages(id) {
   const s = await resp.json();
   document.getElementById('main-body').innerHTML =
     '<div class="conversation" id="convo">' + renderMessages(s.messages) + '</div>';
+  _addCopyButtonsToConvo();
   setTimeout(() => {
     const convo = document.getElementById('convo');
     if (convo) convo.scrollTop = convo.scrollHeight;
   }, 50);
+}
+
+/** Add smart copy buttons to all assistant messages in the conversation view */
+function _addCopyButtonsToConvo() {
+  if (typeof addSmartCopyButtons !== 'function') return;
+  document.querySelectorAll('#convo .msg.assistant .msg-body').forEach(body => {
+    addSmartCopyButtons(body, body.textContent);
+  });
 }
 
 function _cleanUserContent(text) {

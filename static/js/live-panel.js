@@ -284,7 +284,7 @@ function renderLiveEntry(e) {
     const role = e.kind === 'user' ? 'user' : 'assistant';
     div.className = 'msg ' + role;
     const text = e.text || '';
-    const LIMIT = e.kind === 'asst' ? 600 : 800;
+    const LIMIT = e.kind === 'asst' ? 2000 : 2000;
     const displayText = text.length > LIMIT ? text.slice(0, LIMIT) : text;
 
     const roleLabel = e.kind === 'user' ? 'me' : 'claude';
@@ -298,13 +298,21 @@ function renderLiveEntry(e) {
     div.innerHTML = '<div class="msg-role">' + roleLabel + (ts ? ' <span class="msg-time">' + ts + '</span>' : '') + '</div>' +
       '<div class="msg-body msg-content">' + body + '</div>';
 
+    // Smart copy buttons for assistant messages
+    if (e.kind === 'asst' && typeof addSmartCopyButtons === 'function') {
+      addSmartCopyButtons(div.querySelector('.msg-body'), displayText);
+    }
+
     if (text.length > LIMIT) {
       const btn = document.createElement('button');
       btn.className = 'live-expand-btn';
       btn.textContent = '\u2026 show more';
       btn.onclick = () => {
         const bodyEl = div.querySelector('.msg-body');
-        if (e.kind === 'asst') { bodyEl.innerHTML = mdParse(text); }
+        if (e.kind === 'asst') {
+          bodyEl.innerHTML = mdParse(text);
+          if (typeof addSmartCopyButtons === 'function') addSmartCopyButtons(bodyEl, text);
+        }
         else { bodyEl.innerHTML = '<pre style="white-space:pre-wrap;margin:0;">' + escHtml(text) + '</pre>'; }
         btn.remove();
       };
