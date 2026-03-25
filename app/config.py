@@ -159,6 +159,16 @@ def _delete_name(session_id: str) -> None:
         _names_file().write_text(json.dumps(names, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _remap_name(old_id: str, new_id: str):
+    """Move a user-set name from old_id to new_id. Returns the title or None."""
+    names = _load_names()
+    title = names.pop(old_id, None)
+    if title:
+        names[new_id] = title
+        _names_file().write_text(json.dumps(names, indent=2, ensure_ascii=False), encoding="utf-8")
+    return title
+
+
 # ---------------------------------------------------------------------------
 # Deletion tombstones -- prevent zombie sessions from reappearing
 # ---------------------------------------------------------------------------

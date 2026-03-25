@@ -95,11 +95,13 @@ class DaemonClient:
         logger.warning("Could not connect to session daemon after 50 attempts")
 
     def _reconnect_loop(self):
-        """Background reconnection loop."""
+        """Background reconnection loop. Restarts daemon if it crashed."""
+        attempts = 0
         while self._should_run and not self._connected:
             time.sleep(2)
             if not self._should_run:
                 break
+            attempts += 1
             try:
                 self._connect()
                 if self._connected:
@@ -107,6 +109,38 @@ class DaemonClient:
                     break
             except Exception:
                 pass
+            # After 5 failed reconnect rounds (~10s), the daemon is probably dead.
+            # Try to restart it.
+            if attempts == 5:
+                self._restart_daemon()
+
+    @staticmethod
+    def _restart_daemon():
+        """Attempt to restart the session daemon if it crashed."""
+        import subprocess, sys
+        from pathlib import Path
+        daemon_script = Path(__file__).resolve().parent.parent / "daemon" / "daemon_server.py"
+        if not daemon_script.exists():
+            logger.warning("Cannot restart daemon: %s not found", daemon_script)
+            return
+        logger.info("Daemon appears dead — restarting it")
+        try:
+            creation_flags = 0
+            if sys.platform == "win32":
+                creation_flags = (
+                    subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+                )
+            log_file = daemon_script.parent.parent / "daemon_debug.log"
+            fh = open(log_file, "a")
+            subprocess.Popen(
+                [sys.executable, str(daemon_script)],
+                cwd=str(daemon_script.parent.parent),
+                creationflags=creation_flags,
+                stdout=fh,
+                stderr=fh,
+            )
+        except Exception as e:
+            logger.warning("Failed to restart daemon: %s", e)
 
     def _start_reconnect(self):
         """Start reconnection in background if not already running."""

@@ -106,14 +106,24 @@ socket.on('state_snapshot', (data) => {
         _updatePermissionQueue(waitingData);
     }
 
-    // Sync server-side queue cache from snapshot (top-level queues dict from daemon)
-    if (data.queues && typeof _sessionQueues !== 'undefined') {
+    // Sync server-side queue cache from snapshot
+    if (typeof _sessionQueues !== 'undefined') {
         for (const k in _sessionQueues) delete _sessionQueues[k];
-        for (const k in data.queues) {
-            if (Array.isArray(data.queues[k]) && data.queues[k].length) {
-                _sessionQueues[k] = data.queues[k];
+        // Prefer top-level queues dict; fall back to per-session queue field
+        if (data.queues) {
+            for (const k in data.queues) {
+                if (Array.isArray(data.queues[k]) && data.queues[k].length) {
+                    _sessionQueues[k] = data.queues[k];
+                }
             }
+        } else {
+            (data.sessions || []).forEach(s => {
+                if (s.queue && Array.isArray(s.queue) && s.queue.length) {
+                    _sessionQueues[s.session_id] = s.queue;
+                }
+            });
         }
+        _queueViewIndex = 0;
         if (typeof _renderQueueBanner === 'function') _renderQueueBanner();
     }
 
@@ -376,6 +386,8 @@ socket.on('session_id_remapped', (data) => {
     if (typeof _userNamedSessions !== 'undefined' && _userNamedSessions.has(oldId)) {
         _userNamedSessions.delete(oldId);
         _userNamedSessions.add(newId);
+        // Re-persist the name under the new UUID on the server so it survives page refresh
+        fetch('/api/remap-name', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({old_id:oldId, new_id:newId})}).catch(()=>{});
     }
 
     // Update working since map
