@@ -51,29 +51,16 @@ function toggleGrpDropdown(grpId) {
   popup.className = 'grp-popup';
   popup._grpId = grpId;
 
-  // Add session status header for Session group
-  if (grpId === 'grp-session' && activeId) {
-    const kind = sessionKinds[activeId] || 'sleeping';
-    const icons = {
-      question: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r=".5" fill="#ff9500"/></svg>',
-      working: '<img src="/static/svg/pickaxe.svg" width="12" height="12" style="filter:brightness(0) saturate(100%) invert(55%) sepia(78%) saturate(1000%) hue-rotate(215deg);">',
-      idle: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--idle-label)" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>',
-      sleeping: '<img src="/static/svg/sleeping.svg" width="12" height="12" class="sleeping-icon">',
-    };
-    const labels = {question:'Waiting for input', working:'Working', idle:'Idle', sleeping:'Not running'};
-    const hdr = document.createElement('div');
-    hdr.style.cssText = 'display:flex;align-items:center;gap:6px;padding:8px 12px 6px;font-size:11px;color:var(--text-faint);border-bottom:1px solid var(--border-subtle);margin-bottom:4px;';
-    hdr.innerHTML = (icons[kind] || icons.sleeping) + ' ' + (labels[kind] || 'Not running');
-    popup.appendChild(hdr);
-  }
-
-  Array.from(inner.children).forEach(btn => {
-    // Skip permanently hidden buttons
-    if (btn.style.display === 'none') return;
-    const clone = btn.cloneNode(true);
-    const oc = btn.getAttribute('onclick');
-    if (oc) clone.setAttribute('onclick', oc);
-    clone.addEventListener('click', () => { closeAllGrpDropdowns(); });
+  Array.from(inner.children).forEach(el => {
+    // Skip permanently hidden elements
+    if (el.style.display === 'none') return;
+    const clone = el.cloneNode(true);
+    // Only wire up click handlers for actual buttons
+    if (el.tagName === 'BUTTON') {
+      const oc = el.getAttribute('onclick');
+      if (oc) clone.setAttribute('onclick', oc);
+      clone.addEventListener('click', () => { closeAllGrpDropdowns(); });
+    }
     popup.appendChild(clone);
   });
 
@@ -95,6 +82,39 @@ document.addEventListener('click', e => {
   if (!_activeGrpPopup) return;
   if (e.target.closest('.grp-popup') || e.target.closest('.btn-group-label')) return;
   closeAllGrpDropdowns();
+});
+
+// --- Actions popup ---
+function openActionsPopup() {
+  // Update the status badge
+  const statusEl = document.getElementById('actions-status');
+  if (activeId) {
+    const kind = sessionKinds[activeId] || 'sleeping';
+    const icons = {
+      question: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r=".5" fill="#ff9500"/></svg>',
+      working: '<img src="/static/svg/pickaxe.svg" width="12" height="12" style="filter:brightness(0) saturate(100%) invert(55%) sepia(78%) saturate(1000%) hue-rotate(215deg);">',
+      idle: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--idle-label)" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>',
+      sleeping: '<img src="/static/svg/sleeping.svg" width="12" height="12" class="sleeping-icon">',
+    };
+    const labels = {question:'Waiting for input', working:'Working', idle:'Idle', sleeping:'Not running'};
+    statusEl.innerHTML = (icons[kind] || icons.sleeping) + ' ' + (labels[kind] || 'Not running');
+  } else {
+    statusEl.innerHTML = '';
+  }
+  document.getElementById('actions-overlay').classList.add('show');
+}
+
+function closeActionsPopup() {
+  document.getElementById('actions-overlay').classList.remove('show');
+}
+
+function switchActionsTab(tabName) {
+  document.querySelectorAll('.actions-tab').forEach(t => t.classList.toggle('active', t.getAttribute('onclick').includes("'" + tabName + "'")));
+  document.querySelectorAll('.actions-tab-panel').forEach(p => p.classList.toggle('active', p.dataset.tab === tabName));
+}
+
+document.getElementById('actions-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeActionsPopup();
 });
 
 // --- Respond popup ---

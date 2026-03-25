@@ -136,29 +136,8 @@
     <div class="main-toolbar" id="main-toolbar" style="display:none">
       <button class="toolbar-close" onclick="deselectSession()" title="Close session">&times;</button>
       <div id="main-title" data-editable="false" data-custom-title="" onclick="if(this.dataset.editable==='true')startToolbarRename()"></div>
-      <div class="btn-group" id="grp-session">
-        <span class="btn-group-label" onclick="toggleGrpDropdown('grp-session')">Session &#9662;</span>
-        <div class="btn-group-inner">
-          <button class="btn" id="btn-open-gui" style="display:none"></button>
-          <button class="btn" id="btn-open" disabled onclick="openInClaude(activeId)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg> Terminal</button>
-          <button class="btn" id="btn-continue" disabled onclick="continueSession(activeId)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/></svg> Continue</button>
-          <button class="btn" id="btn-clear" onclick="liveClearDisplay()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> Clear</button>
-          <button class="btn" id="btn-compact" onclick="liveCompact()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg> Compact</button>
-          <button class="btn danger" id="btn-close" disabled onclick="closeSession(activeId)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg> Close</button>
-        </div>
-      </div>
-      <div class="btn-group-divider"></div>
-      <div class="btn-group" id="grp-manage">
-        <span class="btn-group-label" onclick="toggleGrpDropdown('grp-manage')">Manage &#9662;</span>
-        <div class="btn-group-inner">
-          <button class="btn" id="btn-autoname" disabled onclick="autoName(activeId)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg> Auto-name</button>
-          <button class="btn" id="btn-duplicate" disabled onclick="duplicateSession(activeId)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Duplicate</button>
-          <button class="btn" id="btn-fork" disabled onclick="showMessagePicker(activeId,'fork')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v1a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V9"/><line x1="12" y1="12" x2="12" y2="15"/></svg> Fork</button>
-          <button class="btn" id="btn-rewind" disabled onclick="showMessagePicker(activeId,'rewind')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg> Rewind Code</button>
-          <button class="btn" id="btn-fork-rewind" disabled onclick="showMessagePicker(activeId,'fork-rewind')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg> Fork + Rewind</button>
-          <button class="btn danger" id="btn-delete" disabled onclick="deleteSession(activeId)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> Delete</button>
-        </div>
-      </div>
+      <button class="btn" id="btn-open-gui" style="display:none"></button>
+      <span class="btn-group-label" onclick="openActionsPopup()">Actions</span>
       <div class="btn-group-divider"></div>
       <div class="btn-group" id="grp-analyze">
         <span class="btn-group-label" onclick="toggleGrpDropdown('grp-analyze')">Analyze &#9662;</span>
@@ -195,6 +174,74 @@
       <button class="btn" onclick="closeSummary()" style="padding:3px 10px;">&#10005;</button>
     </div>
     <div id="summary-body" style="min-height:80px;"></div>
+  </div>
+</div>
+
+<!-- Actions popup -->
+<div class="overlay" id="actions-overlay">
+  <div class="actions-popup">
+    <div class="actions-header">
+      <div class="actions-tabs">
+        <button class="actions-tab active" onclick="switchActionsTab('organize')">Organize</button>
+        <button class="actions-tab" onclick="switchActionsTab('branch')">Branch</button>
+        <button class="actions-tab" onclick="switchActionsTab('agent')">Agent</button>
+      </div>
+      <div class="actions-status" id="actions-status"></div>
+      <button class="btn" onclick="closeActionsPopup()" style="padding:3px 10px;">&#10005;</button>
+    </div>
+    <!-- Organize tab -->
+    <div class="actions-body actions-tab-panel active" data-tab="organize">
+      <button class="actions-item" id="btn-autoname" disabled onclick="autoName(activeId);closeActionsPopup()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+        <div class="actions-item-text"><div class="actions-item-name">Auto-name</div><div class="actions-item-desc">Generate a descriptive name using AI</div></div>
+      </button>
+      <button class="actions-item actions-danger" id="btn-delete" disabled onclick="deleteSession(activeId);closeActionsPopup()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+        <div class="actions-item-text"><div class="actions-item-name">Delete</div><div class="actions-item-desc">Permanently remove this session and its data</div></div>
+      </button>
+    </div>
+    <!-- Branch & History tab -->
+    <div class="actions-body actions-tab-panel" data-tab="branch">
+      <button class="actions-item" id="btn-continue" disabled onclick="continueSession(activeId);closeActionsPopup()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/></svg>
+        <div class="actions-item-text"><div class="actions-item-name">Continue</div><div class="actions-item-desc">Start a new session with context carried forward</div></div>
+      </button>
+      <button class="actions-item" id="btn-duplicate" disabled onclick="duplicateSession(activeId);closeActionsPopup()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        <div class="actions-item-text"><div class="actions-item-name">Duplicate</div><div class="actions-item-desc">Create an exact copy of this session</div></div>
+      </button>
+      <button class="actions-item" id="btn-fork" disabled onclick="showMessagePicker(activeId,'fork');closeActionsPopup()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v1a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V9"/><line x1="12" y1="12" x2="12" y2="15"/></svg>
+        <div class="actions-item-text"><div class="actions-item-name">Fork</div><div class="actions-item-desc">Branch the conversation from a specific message</div></div>
+      </button>
+      <button class="actions-item" id="btn-rewind" disabled onclick="showMessagePicker(activeId,'rewind');closeActionsPopup()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+        <div class="actions-item-text"><div class="actions-item-name">Rewind Code</div><div class="actions-item-desc">Restore files to their state at a chosen message</div></div>
+      </button>
+      <button class="actions-item" id="btn-fork-rewind" disabled onclick="showMessagePicker(activeId,'fork-rewind');closeActionsPopup()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg>
+        <div class="actions-item-text"><div class="actions-item-name">Fork + Rewind</div><div class="actions-item-desc">Fork conversation and restore files in one step</div></div>
+      </button>
+    </div>
+    <!-- Agent Controls tab -->
+    <div class="actions-body actions-tab-panel" data-tab="agent">
+      <button class="actions-item" id="btn-open" disabled onclick="openInClaude(activeId);closeActionsPopup()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+        <div class="actions-item-text"><div class="actions-item-name">Open in Terminal</div><div class="actions-item-desc">Launch this session in the Claude CLI</div></div>
+      </button>
+      <button class="actions-item" id="btn-compact" onclick="liveCompact();closeActionsPopup()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+        <div class="actions-item-text"><div class="actions-item-name">Compact Context</div><div class="actions-item-desc">Summarize history to free up the context window</div></div>
+      </button>
+      <button class="actions-item" id="btn-clear" onclick="liveClearDisplay();closeActionsPopup()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        <div class="actions-item-text"><div class="actions-item-name">Clear Display</div><div class="actions-item-desc">Clear the log view without affecting the session</div></div>
+      </button>
+      <button class="actions-item actions-danger" id="btn-close" disabled onclick="closeSession(activeId);closeActionsPopup()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>
+        <div class="actions-item-text"><div class="actions-item-name">Stop Agent</div><div class="actions-item-desc">Shut down the running Claude process</div></div>
+      </button>
+    </div>
   </div>
 </div>
 
@@ -316,6 +363,7 @@
 <script src="/static/js/toolbar.js"></script>
 <script src="/static/js/modals.js"></script>
 <script src="/static/js/git-sync.js"></script>
+<script src="/static/js/sticky-user-msg.js"></script>
 <script src="/static/js/live-panel.js"></script>
 <script src="/static/js/find.js"></script>
 <script src="/static/js/extract.js"></script>

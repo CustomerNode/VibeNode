@@ -161,11 +161,10 @@ class TestDuplicate:
     def test_load_session(self, driver, sdir, plain_session):
         _setup(driver, plain_session, sdir)
 
-    def test_manage_dropdown_visible(self, driver):
-        grp = driver.find_element(By.ID, "grp-manage")
-        grp.find_element(By.CSS_SELECTOR, ".btn-group-label").click()
+    def test_actions_popup_visible(self, driver):
+        driver.execute_script("openActionsPopup()")
         time.sleep(0.3)
-        assert grp.find_element(By.CSS_SELECTOR, ".btn-group-inner").is_displayed()
+        assert driver.find_element(By.ID, "actions-overlay").is_displayed()
 
     def test_duplicate_button_exists(self, driver):
         btn = driver.find_element(By.ID, "btn-duplicate")
@@ -479,8 +478,10 @@ class TestManageButtons:
         _setup(driver, snap_session, sdir)
 
     def test_all_four_present(self, driver):
-        grp = driver.find_element(By.ID, "grp-manage")
-        ids = [b.get_attribute("id") for b in grp.find_elements(By.CSS_SELECTOR, ".btn")]
+        driver.execute_script("openActionsPopup()")
+        time.sleep(0.3)
+        overlay = driver.find_element(By.ID, "actions-overlay")
+        ids = [b.get_attribute("id") for b in overlay.find_elements(By.CSS_SELECTOR, ".actions-item")]
         for exp in ("btn-duplicate","btn-fork","btn-rewind","btn-fork-rewind"):
             assert exp in ids, f"{exp} missing"
 

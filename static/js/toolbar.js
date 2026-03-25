@@ -65,8 +65,11 @@ async function selectSession(id) {
   activeId = id;
   localStorage.setItem('activeSessionId', id || '');
   _pushChatUrl(id);
-  // Stop live panel for a different session
-  if (liveSessionId && liveSessionId !== id) stopLivePanel();
+  // Auto-send any pending input, then stop live panel for a different session
+  if (liveSessionId && liveSessionId !== id) {
+    _autoSendPendingInput();
+    stopLivePanel();
+  }
   filterSessions();
 
   setToolbarSession(id, 'Loading\u2026', true, '');
@@ -94,7 +97,10 @@ async function selectSession(id) {
   _addCopyButtonsToConvo();
   setTimeout(() => {
     const convo = document.getElementById('convo');
-    if (convo) convo.scrollTop = convo.scrollHeight;
+    if (convo) {
+      convo.scrollTop = convo.scrollHeight;
+      if (typeof initStickyUserMessages === 'function') initStickyUserMessages(convo);
+    }
   }, 50);
 }
 
@@ -281,7 +287,10 @@ async function loadAllMessages(id) {
   _addCopyButtonsToConvo();
   setTimeout(() => {
     const convo = document.getElementById('convo');
-    if (convo) convo.scrollTop = convo.scrollHeight;
+    if (convo) {
+      convo.scrollTop = convo.scrollHeight;
+      if (typeof initStickyUserMessages === 'function') initStickyUserMessages(convo);
+    }
   }, 50);
 }
 
@@ -353,7 +362,7 @@ function renderMessages(messages) {
       }
       return `<div class="msg user">
         <div class="msg-role">me</div>
-        <div class="msg-body msg-content">${mdParse(cleaned)}</div>
+        <div class="msg-body msg-content"><pre style="white-space:pre-wrap;margin:0;">${escHtml(cleaned)}</pre></div>
       </div>`;
     }
     // Assistant message
@@ -520,11 +529,26 @@ async function deleteSession(id) {
   }
 
   showToast('Deleting session\u2026');
-  const resp = await fetch('/api/delete/' + id, { method: 'DELETE' });
-  const data = await resp.json();
+  let deleteOk = false;
+  try {
+    const resp = await fetch('/api/delete/' + id, { method: 'DELETE' });
+    // Server may return HTML 500 if unlink failed — guard the JSON parse
+    try {
+      const data = await resp.json();
+      deleteOk = !!(data.ok) || resp.status === 404;
+    } catch (_jsonErr) {
+      // Non-JSON response (e.g. 500 HTML) — the server-side tombstone is
+      // already set so the session won't reappear on reload.  Treat as ok
+      // so the card is cleaned up immediately.
+      deleteOk = true;
+    }
+  } catch (_fetchErr) {
+    // Network error — still clean up the local card; a refresh will
+    // reconcile with the server.
+    deleteOk = true;
+  }
 
-  // Always clean up UI even if backend file doesn't exist (new sessions)
-  if (data.ok || resp.status === 404) {
+  if (deleteOk) {
     allSessions = allSessions.filter(x => x.id !== id);
     // Remove from folder tree
     if (typeof removeSessionFromAllFolders === 'function') removeSessionFromAllFolders(id);
@@ -688,8 +712,17 @@ function _renderTimeline(messages, hasSnapshots, mode) {
     return;
   }
 
+  // For fork modes, only show user messages (forking from Claude output doesn't make sense)
+  const forkOnly = (mode === 'fork' || mode === 'fork-rewind');
+  const filtered = forkOnly ? messages.filter(m => m.role === 'user') : messages;
+
+  if (!filtered.length) {
+    el.innerHTML = '<div style="padding:20px;color:var(--text-faint);text-align:center;">No user messages found in this session.</div>';
+    return;
+  }
+
   let html = '';
-  for (const m of messages) {
+  for (const m of filtered) {
     const roleClass = m.role === 'user' ? 'user' : 'assistant';
     const roleLabel = m.role === 'user' ? 'me' : 'claude';
 
@@ -759,6 +792,13 @@ async function _confirmPicker() {
     else endpoint = '/api/fork-rewind/';
 
     const resp = await fetch(endpoint + _pickerSessionId, { method: 'POST', headers: hdrs, body });
+    if (!resp.ok) {
+      let errMsg = 'HTTP ' + resp.status;
+      try { const d = await resp.json(); errMsg = d.error || errMsg; } catch(e) {}
+      _closePm();
+      showToast(errMsg, true);
+      return;
+    }
     const data = await resp.json();
     _closePm();
 
@@ -769,7 +809,7 @@ async function _confirmPicker() {
 
     if (_pickerMode === 'fork' || _pickerMode === 'fork-rewind') {
       await loadSessions();
-      if (data.new_id) await selectSession(data.new_id);
+      if (data.new_id) await openInGUI(data.new_id);
 
       let msg = 'Session forked';
       if (data.files_restored && data.files_restored.length) {

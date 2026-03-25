@@ -286,7 +286,18 @@ def load_session_timeline(path: Path) -> dict:
                     mid = obj.get("messageId", "")
                     if mid:
                         snapshots[mid] = snap
-                    if snap.get("trackedFileBackups"):
+                    # Also index by inner snapshot.messageId (handles isSnapshotUpdate
+                    # entries where outer and inner messageIds differ)
+                    inner_mid = snap.get("messageId", "")
+                    if inner_mid and inner_mid != mid:
+                        snapshots[inner_mid] = snap
+                    # Only count as a valid snapshot if at least one backup has
+                    # a non-null backupFileName (null means file wasn't backed up)
+                    backups = snap.get("trackedFileBackups", {})
+                    if backups and any(
+                        (v.get("backupFileName") if isinstance(v, dict) else v)
+                        for v in backups.values()
+                    ):
                         has_any_snapshot = True
 
                 elif t in ("user", "assistant"):
@@ -396,7 +407,11 @@ def load_session_timeline(path: Path) -> dict:
         for m in messages:
             if m["uuid"] and m["uuid"] in snapshots:
                 snap = snapshots[m["uuid"]]
-                m["has_snapshot"] = bool(snap.get("trackedFileBackups"))
+                backups = snap.get("trackedFileBackups", {})
+                m["has_snapshot"] = bool(backups and any(
+                    (v.get("backupFileName") if isinstance(v, dict) else v)
+                    for v in backups.values()
+                ))
 
     return {
         "messages": messages,

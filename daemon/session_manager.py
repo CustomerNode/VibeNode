@@ -9,12 +9,15 @@ loop.call_soon_threadsafe().
 
 import anyio
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import tempfile
 import threading
 import time
+import uuid as uuid_mod
+from datetime import datetime, timezone
 from enum import Enum
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -232,6 +235,11 @@ class SessionInfo:
     pending_tool_input: dict = field(default_factory=dict)
     always_allowed_tools: set = field(default_factory=set)
     working_since: float = 0.0  # time.time() when state last became WORKING
+    tracked_files: set = field(default_factory=set)      # absolute paths modified by tools
+    file_versions: dict = field(default_factory=dict)    # file_path -> backup version counter
+    _last_hashes: dict = field(default_factory=dict)     # file_path -> last backed-up content hash
+    _pre_turn_mtimes: dict = field(default_factory=dict) # file_path -> mtime before turn
+    _turn_had_direct_edit: bool = False                  # True if streaming saw Edit/Write this turn
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def to_state_dict(self) -> dict:
@@ -803,6 +811,19 @@ class SessionManager:
             info.state = SessionState.WORKING
             self._emit_state(info)
 
+            # Reset per-turn state and record mtimes for change detection.
+            # Mtimes are only used as fallback when no direct Edit/Write is
+            # seen in the stream (e.g. Agent sub-agent did the editing).
+            #
+            # NOTE: We do NOT write a pre-turn snapshot here.  On the first
+            # turn the SDK hasn't sent a ResultMessage yet, so the session_id
+            # hasn't been remapped to the CLI's real UUID.  Writing a snapshot
+            # now would target the wrong JSONL file.  Pre-populate and pre-turn
+            # snapshots are deferred to _send_query (follow-up turns), where
+            # the remap has already occurred.
+            info._turn_had_direct_edit = False
+            self._record_pre_turn_mtimes(info)
+
             # Add user's message to the log and send
             if prompt:
                 entry = LogEntry(kind="user", text=prompt[:20000])
@@ -839,6 +860,20 @@ class SessionManager:
                 entry_index = len(info.entries) - 1
             self._emit_entry(session_id, entry, entry_index)
             self._emit_state(info)
+        finally:
+            # Post-turn snapshot: captures file state AFTER Claude's edits.
+            # By now the SDK remap has occurred (ResultMessage was processed
+            # in the message loop), so _resolve_id will find the correct
+            # session JSONL.
+            try:
+                resolved = self._resolve_id(session_id)
+                with self._lock:
+                    finfo = self._sessions.get(resolved)
+                if finfo:
+                    self._prepopulate_tracked_files(finfo)
+                self._write_file_snapshot(session_id, is_post_turn=True)
+            except Exception as snap_err:
+                logger.warning("Snapshot in finally for %s failed: %s", session_id, snap_err)
 
     async def _send_query(self, session_id: str, text: str) -> None:
         """Send a follow-up query to an already-connected session."""
@@ -846,6 +881,19 @@ class SessionManager:
             info = self._sessions.get(session_id)
         if not info or not info.client:
             return
+
+        # Pre-populate tracked_files on follow-up turns (covers daemon
+        # restart scenarios where tracked_files was lost).
+        self._prepopulate_tracked_files(info)
+
+        # Pre-turn snapshot (isSnapshotUpdate=false, linked to user UUID)
+        # Safe here because the SDK remap has already happened by the time
+        # _send_query is called (remap occurs on first turn's ResultMessage).
+        self._write_file_snapshot(session_id, is_post_turn=False)
+
+        # Reset per-turn state and record mtimes for fallback detection
+        info._turn_had_direct_edit = False
+        self._record_pre_turn_mtimes(info)
 
         try:
             await info.client.query(text)
@@ -871,6 +919,12 @@ class SessionManager:
                 entry_index = len(info.entries) - 1
             self._emit_entry(session_id, entry, entry_index)
             self._emit_state(info)
+        finally:
+            # Post-turn snapshot (isSnapshotUpdate=true, linked to assistant UUID)
+            try:
+                self._write_file_snapshot(session_id, is_post_turn=True)
+            except Exception as snap_err:
+                logger.warning("Snapshot in finally for %s failed: %s", session_id, snap_err)
 
     async def _interrupt_session(self, session_id: str) -> None:
         """Interrupt a running session."""
@@ -1084,6 +1138,17 @@ class SessionManager:
                         info.entries.append(entry)
                     self._emit_entry(session_id, entry, len(info.entries) - 1)
 
+                    # Track file modifications for rewind/snapshot support
+                    tool_name = entry.name
+                    logger.info("Tool use: %s (input keys: %s)", tool_name, list(inp.keys())[:5])
+                    if tool_name in ('Edit', 'Write', 'MultiEdit', 'NotebookEdit'):
+                        fp = inp.get('file_path', '') or inp.get('path', '')
+                        logger.info("  File tracking: tool=%s fp=%s", tool_name, fp[:80] if fp else "(empty)")
+                        if fp:
+                            info.tracked_files.add(fp)
+                            info._turn_had_direct_edit = True
+                            logger.info("  tracked_files now has %d entries", len(info.tracked_files))
+
                 elif isinstance(block, ThinkingBlock):
                     # Skip thinking blocks -- they're internal reasoning
                     pass
@@ -1210,6 +1275,339 @@ class SessionManager:
             first_key = next(iter(inp))
             return f"{first_key}: {str(inp[first_key])[:200]}"
         return ""
+
+    # ------------------------------------------------------------------
+    # File-history snapshot support (rewind feature)
+    # ------------------------------------------------------------------
+
+    # File extensions worth tracking for change detection
+    _SOURCE_EXTS = {
+        '.py', '.js', '.ts', '.tsx', '.jsx', '.css', '.html', '.json',
+        '.yaml', '.yml', '.toml', '.cfg', '.ini', '.sh', '.bat', '.md',
+        '.txt', '.xml', '.sql', '.rb', '.go', '.rs', '.java', '.c',
+        '.cpp', '.h', '.hpp', '.cs', '.vue', '.svelte', '.astro',
+    }
+    _SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv',
+                  '.tox', '.mypy_cache', '.pytest_cache', 'dist', 'build',
+                  '.next', '.nuxt', '.claude'}
+
+    def _record_pre_turn_mtimes(self, info: SessionInfo) -> None:
+        """Snapshot mtimes of source files in the working directory.
+
+        Only used as a fallback when the streaming message handler doesn't
+        see direct Edit/Write tool uses (e.g. Agent sub-agent edits).
+        The scan is deferred: we always record here (it's cheap enough)
+        so the baseline is ready if _detect_changed_files needs it later.
+        """
+        cwd = info.cwd
+        if not cwd:
+            return
+        cwd_path = Path(cwd)
+        if not cwd_path.is_dir():
+            return
+
+        mtimes = {}
+        try:
+            for f in cwd_path.rglob('*'):
+                if f.is_dir():
+                    continue
+                if self._SKIP_DIRS & set(f.relative_to(cwd_path).parts):
+                    continue
+                if f.suffix.lower() not in self._SOURCE_EXTS:
+                    continue
+                try:
+                    mtimes[str(f)] = f.stat().st_mtime
+                except OSError:
+                    pass
+        except Exception as e:
+            logger.warning("_record_pre_turn_mtimes failed: %s", e)
+        info._pre_turn_mtimes = mtimes
+        logger.debug("_record_pre_turn_mtimes: recorded %d files in %s", len(mtimes), cwd)
+
+    def _detect_changed_files(self, info: SessionInfo) -> set:
+        """Compare current file mtimes against the pre-turn snapshot.
+
+        Returns absolute paths of files that were created or modified
+        since _record_pre_turn_mtimes was called.
+        """
+        cwd = info.cwd
+        if not cwd:
+            return set()
+        cwd_path = Path(cwd)
+        if not cwd_path.is_dir():
+            return set()
+
+        pre = info._pre_turn_mtimes
+        changed = set()
+        try:
+            for f in cwd_path.rglob('*'):
+                if f.is_dir():
+                    continue
+                if self._SKIP_DIRS & set(f.relative_to(cwd_path).parts):
+                    continue
+                if f.suffix.lower() not in self._SOURCE_EXTS:
+                    continue
+                fpath = str(f)
+                try:
+                    current_mtime = f.stat().st_mtime
+                except OSError:
+                    continue
+                if fpath not in pre or pre[fpath] != current_mtime:
+                    changed.add(fpath)
+        except Exception as e:
+            logger.warning("_detect_changed_files failed: %s", e)
+        return changed
+
+    def _prepopulate_tracked_files(self, info: SessionInfo) -> None:
+        """Scan the session JSONL for tracked files from two sources:
+
+        1. Past Edit/Write/MultiEdit/NotebookEdit tool_use blocks
+        2. Existing file-history-snapshot entries (catches files tracked
+           by previous daemon runs or the CLI itself)
+
+        This ensures snapshots work after daemon restart or for resumed
+        sessions.
+        """
+        try:
+            jsonl_path = self._find_session_jsonl(info)
+            if not jsonl_path or not jsonl_path.exists():
+                logger.info("_prepopulate_tracked_files: no JSONL for %s", info.session_id)
+                return
+
+            edit_tools = {'Edit', 'Write', 'MultiEdit', 'NotebookEdit'}
+            found = set()
+            max_version = {}  # track highest version per file for file_versions
+
+            with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+
+                    t = obj.get("type", "")
+
+                    # Source 1: tool_use blocks in assistant messages
+                    if t == "assistant":
+                        msg = obj.get("message", {})
+                        content = msg.get("content", [])
+                        if not isinstance(content, list):
+                            continue
+                        for block in content:
+                            if not isinstance(block, dict):
+                                continue
+                            if block.get("type") != "tool_use":
+                                continue
+                            if block.get("name") not in edit_tools:
+                                continue
+                            inp = block.get("input", {})
+                            fp = inp.get("file_path", "") or inp.get("path", "")
+                            if fp:
+                                found.add(fp)
+
+                    # Source 2: existing file-history-snapshot entries
+                    elif t == "file-history-snapshot":
+                        snap = obj.get("snapshot", {})
+                        for fp, binfo in snap.get("trackedFileBackups", {}).items():
+                            if fp:
+                                found.add(fp)
+                            if isinstance(binfo, dict):
+                                v = binfo.get("version", 0)
+                                if v > max_version.get(fp, 0):
+                                    max_version[fp] = v
+
+            if found:
+                info.tracked_files.update(found)
+                # Restore version counters so new backups don't collide
+                for fp, v in max_version.items():
+                    if v > info.file_versions.get(fp, 0):
+                        info.file_versions[fp] = v
+                logger.info(
+                    "_prepopulate_tracked_files(%s): found %d files from JSONL",
+                    info.session_id, len(found),
+                )
+        except Exception as e:
+            logger.warning("_prepopulate_tracked_files failed for %s: %s", info.session_id, e)
+
+    def _write_file_snapshot(self, session_id: str, is_post_turn: bool = False) -> None:
+        """Create file backups and append a file-history-snapshot to the JSONL.
+
+        Replicates the native Claude Code CLI behavior:
+        - Pre-turn  (is_post_turn=False): ``isSnapshotUpdate: false``,
+          linked to the **user** message UUID.  Captures state before edits.
+        - Post-turn (is_post_turn=True):  ``isSnapshotUpdate: true``,
+          outer ``messageId`` = latest **assistant** UUID, inner
+          ``messageId`` = the user UUID from the pre-turn snapshot.
+          Captures state after edits.
+
+        File change detection uses filesystem mtime comparison so it
+        catches edits from Agent sub-agents, Bash, or anything else.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            logger.info("_write_file_snapshot(%s): skipped (no session info)", session_id)
+            return
+
+        # Only fall back to filesystem mtime scanning when the streaming
+        # message handler didn't see any direct Edit/Write tool uses.
+        # This avoids scanning the entire project directory on every turn —
+        # only needed when something opaque (Agent, Bash) may have edited files.
+        if not info._turn_had_direct_edit:
+            fs_changed = self._detect_changed_files(info)
+            if fs_changed:
+                info.tracked_files.update(fs_changed)
+                logger.info("_write_file_snapshot(%s): filesystem fallback detected %d changed files",
+                            session_id, len(fs_changed))
+
+        if not info.tracked_files:
+            logger.info("_write_file_snapshot(%s): skipped (no tracked files)", session_id)
+            return
+
+        try:
+            sid = info.session_id
+            history_dir = Path.home() / ".claude" / "file-history" / sid
+            history_dir.mkdir(parents=True, exist_ok=True)
+
+            tracked_backups = {}
+            for fpath in list(info.tracked_files):
+                p = Path(fpath)
+                if not p.exists():
+                    # Only record missing-file entry if we previously had a backup
+                    if fpath in info._last_hashes:
+                        tracked_backups[fpath] = {
+                            "backupFileName": None,
+                            "version": 0,
+                            "backupTime": None,
+                        }
+                    continue
+                try:
+                    content = p.read_bytes()
+                except Exception:
+                    continue
+
+                content_hash = hashlib.md5(content).hexdigest()[:16]
+
+                # Skip if content hasn't changed since last backup
+                if info._last_hashes.get(fpath) == content_hash:
+                    continue
+
+                version = info.file_versions.get(fpath, 0) + 1
+                info.file_versions[fpath] = version
+                info._last_hashes[fpath] = content_hash
+
+                backup_name = f"{content_hash}@v{version}"
+
+                backup_path = history_dir / backup_name
+                if not backup_path.exists():
+                    backup_path.write_bytes(content)
+
+                tracked_backups[fpath] = {
+                    "backupFileName": backup_name,
+                    "version": version,
+                    "backupTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                }
+
+            has_valid = any(
+                isinstance(v, dict) and v.get("backupFileName")
+                for v in tracked_backups.values()
+            )
+            if not has_valid:
+                logger.info("_write_file_snapshot: no valid backups, skipping")
+                return
+
+            jsonl_path = self._find_session_jsonl(info)
+            if not jsonl_path or not jsonl_path.exists():
+                logger.warning("_write_file_snapshot: JSONL not found (cwd=%s, sid=%s)",
+                               info.cwd, info.session_id)
+                return
+
+            # Read the latest user and assistant UUIDs from the JSONL.
+            last_user_uuid = ""
+            last_asst_uuid = ""
+            try:
+                with open(jsonl_path, "r", encoding="utf-8", errors="replace") as rf:
+                    for raw_line in rf:
+                        raw_line = raw_line.strip()
+                        if not raw_line:
+                            continue
+                        try:
+                            obj = json.loads(raw_line)
+                        except Exception:
+                            continue
+                        t = obj.get("type", "")
+                        uid = obj.get("uuid", "")
+                        if t == "user" and uid:
+                            last_user_uuid = uid
+                        elif t == "assistant" and uid:
+                            last_asst_uuid = uid
+            except Exception:
+                pass
+
+            # CLI pattern:
+            #   pre-turn:  outer=user_uuid, inner=user_uuid, isSnapshotUpdate=false
+            #   post-turn: outer=asst_uuid, inner=user_uuid, isSnapshotUpdate=true
+            fallback = str(uuid_mod.uuid4())
+            if is_post_turn:
+                outer_mid = last_asst_uuid or fallback
+                inner_mid = last_user_uuid or outer_mid
+                is_update = True
+            else:
+                outer_mid = last_user_uuid or fallback
+                inner_mid = outer_mid
+                is_update = False
+
+            now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            snapshot_entry = {
+                "type": "file-history-snapshot",
+                "messageId": outer_mid,
+                "snapshot": {
+                    "messageId": inner_mid,
+                    "trackedFileBackups": tracked_backups,
+                    "timestamp": now_iso,
+                },
+                "isSnapshotUpdate": is_update,
+            }
+
+            with open(jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(snapshot_entry) + "\n")
+
+            logger.info(
+                "Wrote file-history-snapshot for %s (update=%s, %d files, outer=%s inner=%s)",
+                sid, is_update,
+                sum(1 for v in tracked_backups.values()
+                    if isinstance(v, dict) and v.get("backupFileName")),
+                outer_mid[:12], inner_mid[:12],
+            )
+        except Exception as e:
+            logger.warning("Failed to write file snapshot for %s: %s", session_id, e)
+
+    @staticmethod
+    def _find_session_jsonl(info: SessionInfo) -> Optional[Path]:
+        """Locate the .jsonl file for a session on disk."""
+        projects_dir = Path.home() / ".claude" / "projects"
+        sid = info.session_id
+
+        # Try the encoded cwd first (fastest path)
+        cwd = info.cwd or ""
+        if cwd:
+            encoded = cwd.replace("\\", "/").replace(":", "-").replace("/", "-")
+            candidate = projects_dir / encoded / f"{sid}.jsonl"
+            if candidate.exists():
+                return candidate
+
+        # Fallback: scan project directories
+        if projects_dir.is_dir():
+            for d in projects_dir.iterdir():
+                if d.is_dir() and not d.name.startswith("subagents"):
+                    candidate = d / f"{sid}.jsonl"
+                    if candidate.exists():
+                        return candidate
+        return None
 
     # ------------------------------------------------------------------
     # Persistent session registry (crash recovery)

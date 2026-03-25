@@ -62,25 +62,44 @@ def _asst_msg(content, ts=None, uid=None, session_id="test-sess",
     })
 
 
-def _snapshot(message_id, tracked_files=None):
-    """Build a file-history-snapshot JSONL line."""
+def _snapshot(message_id, tracked_files=None, inner_message_id=None,
+              is_update=False):
+    """Build a file-history-snapshot JSONL line.
+
+    Uses realistic data formats that match real Claude Code JSONL:
+    - tracked_files values can be a backup name string (hash@vN format),
+      a dict with full backup_info, or None for unrestorable entries.
+    - inner_message_id: if provided, the inner snapshot.messageId differs
+      from the outer messageId (as with isSnapshotUpdate entries).
+    """
     backups = {}
+    version = 0
     if tracked_files:
-        for rel_path, backup_name in tracked_files.items():
-            backups[rel_path] = {
-                "backupFileName": backup_name,
-                "version": 1,
-                "backupTime": _ts(),
-            }
+        for rel_path, backup_val in tracked_files.items():
+            version += 1
+            if backup_val is None:
+                backups[rel_path] = {
+                    "backupFileName": None,
+                    "version": version,
+                    "backupTime": None,
+                }
+            elif isinstance(backup_val, dict):
+                backups[rel_path] = backup_val
+            else:
+                backups[rel_path] = {
+                    "backupFileName": backup_val,
+                    "version": version,
+                    "backupTime": _ts(),
+                }
     return json.dumps({
         "type": "file-history-snapshot",
         "messageId": message_id,
         "snapshot": {
-            "messageId": message_id,
+            "messageId": inner_message_id or message_id,
             "trackedFileBackups": backups,
             "timestamp": _ts(),
         },
-        "isSnapshotUpdate": bool(tracked_files),
+        "isSnapshotUpdate": is_update or bool(inner_message_id),
     })
 
 
@@ -156,47 +175,69 @@ def client(app):
     return app.test_client()
 
 
-# A rich session with user/assistant messages, tool_use, snapshots
+# A rich session with user/assistant messages, tool_use, snapshots.
+# Uses REALISTIC data formats matching real Claude Code JSONL:
+# - Absolute paths as trackedFileBackups keys (inside tmp_path so tests can write)
+# - Hash-based backup filenames (hash@vN)
+# - isSnapshotUpdate entries with differing outer/inner messageIds
+# - A null backupFileName entry (file tracked but not yet backed up)
 @pytest.fixture()
 def rich_session(fake_project, tmp_path):
-    uid1 = _uuid()
-    uid2 = _uuid()
-    uid3 = _uuid()
-    uid4 = _uuid()
-    uid5 = _uuid()
+    uid1 = _uuid()  # user msg 1
+    uid2 = _uuid()  # asst msg 1 (Read tool_use)
+    uid3 = _uuid()  # user msg 2
+    uid4 = _uuid()  # asst msg 2 (Edit + Write tool_use)
+    uid5 = _uuid()  # user msg 3
+
+    # Realistic backup filename (hash@version)
+    backup_name = "a1b2c3d4e5f6a7b8@v1"
 
     # Create file-history backup
     fh_dir = tmp_path / "file-history" / "sess-rich"
     fh_dir.mkdir(parents=True)
-    (fh_dir / "backup_app_py_v1").write_text("print('hello')\n",
-                                              encoding="utf-8")
+    (fh_dir / backup_name).write_text("print('hello')\n", encoding="utf-8")
+
+    # Absolute paths inside tmp_path (writable in tests) — this matches
+    # real Claude Code which uses absolute Windows paths like
+    # C:\Users\user\Documents\project\app.py
+    proj_root = tmp_path / "project"
+    proj_root.mkdir(parents=True, exist_ok=True)
+    abs_app_py = str(proj_root / "app.py")
+    abs_test_py = str(proj_root / "tests" / "test_app.py")
 
     # NOTE: In real Claude Code JSONL, file-history-snapshot entries appear
     # AFTER the message they reference (the message is written first, then
     # the snapshot is appended).  The fixture mirrors this real-world ordering.
     lines = [
-        _user_msg("Fix the login bug", _ts(0, 0), uid1, "sess-rich"),  # line 1
-        _snapshot(uid1),  # line 2: empty snapshot (baseline) — after its message
+        _user_msg("Fix the login bug", _ts(0, 0), uid1, "sess-rich"),       # line 1
+        _snapshot(uid1),  # line 2: empty baseline snapshot — after its msg
         _asst_msg("I'll look at the code", _ts(0, 5), uid2, "sess-rich",
                   tool_uses=[
-                      {"name": "Read", "input": {"file_path": "/app.py"}},
-                  ]),  # line 3
-        _user_msg("Now add tests", _ts(1, 0), uid3, "sess-rich"),  # line 4
-        _snapshot(uid3, {"app.py": "backup_app_py_v1"}),  # line 5: snapshot with backup — after its message
+                      {"name": "Read", "input": {"file_path": abs_app_py}},
+                  ]),                                                          # line 3
+        _user_msg("Now add tests", _ts(1, 0), uid3, "sess-rich"),            # line 4
+        # isSnapshotUpdate: outer=uid4 (assistant), inner=uid3 (user)
+        # This is how real Claude Code writes update snapshots.
+        # Also includes a null entry for test_app.py (newly tracked, not backed up)
+        _snapshot(uid4, {
+            abs_app_py: backup_name,
+            abs_test_py: None,
+        }, inner_message_id=uid3, is_update=True),                             # line 5
         _asst_msg("Here are the changes", _ts(1, 10), uid4, "sess-rich",
                   tool_uses=[
                       {"name": "Edit", "input": {
-                          "file_path": "/app.py",
+                          "file_path": abs_app_py,
                           "old_string": "print('hello')",
                           "new_string": "print('hello')\nprint('world')\nprint('test')",
                       }},
                       {"name": "Write", "input": {
-                          "file_path": "/tests/test_app.py",
+                          "file_path": abs_test_py,
                           "content": "import pytest\n\ndef test_hello():\n    assert True\n",
                       }},
-                  ]),  # line 6
-        _user_msg("Looks good, ship it", _ts(2, 0), uid5, "sess-rich"),  # line 7
-        _asst_msg("Done! Everything is committed.", _ts(2, 5), session_id="sess-rich"),  # line 8
+                  ]),                                                          # line 6
+        _user_msg("Looks good, ship it", _ts(2, 0), uid5, "sess-rich"),      # line 7
+        _asst_msg("Done! Everything is committed.", _ts(2, 5),
+                  session_id="sess-rich"),                                     # line 8
     ]
 
     path = _write_session(fake_project, "sess-rich", lines)
@@ -205,6 +246,10 @@ def rich_session(fake_project, tmp_path):
         "session_id": "sess-rich",
         "uids": [uid1, uid2, uid3, uid4, uid5],
         "fh_dir": fh_dir,
+        "backup_name": backup_name,
+        "abs_app_py": abs_app_py,
+        "abs_test_py": abs_test_py,
+        "proj_root": proj_root,
     }
 
 
@@ -281,12 +326,15 @@ class TestLoadSessionTimeline:
             _user_msg("Hello", _ts(0, 0), uid_a, "sess-snap-order"),
             _asst_msg("I edited the file", _ts(0, 5), uid_b, "sess-snap-order",
                       tool_uses=[{"name": "Edit", "input": {
-                          "file_path": "/foo.py",
+                          "file_path": "C:\\Users\\test\\proj\\foo.py",
                           "old_string": "old",
                           "new_string": "new",
                       }}]),
             # Snapshot comes AFTER the assistant message it references
-            _snapshot(uid_b, {"foo.py": "backup_foo_py_v1"}),
+            # Uses realistic hash@version backup name
+            _snapshot(uid_b, {
+                "C:\\Users\\test\\proj\\foo.py": "e4a1f6c823b09d17@v1",
+            }),
         ]
         _write_session(fake_project, "sess-snap-order", lines)
         result = load_session_timeline(fake_project / "sess-snap-order.jsonl")
@@ -499,50 +547,43 @@ class TestRewindEndpoint:
 
     def test_rewind_restores_files(self, client, fake_project,
                                     rich_session, tmp_path):
-        # Set up: create the project dir and a current version of app.py
-        proj_dir = tmp_path / "project"
-        proj_dir.mkdir()
-        (proj_dir / "app.py").write_text("print('modified')\n",
-                                          encoding="utf-8")
-
+        """Rewind restores files from realistic snapshot data including
+        absolute paths and hash-based backup filenames."""
         sid = rich_session["session_id"]
-        # Patch _decode_project and home dir for file-history lookup
-        with patch("app.routes.sessions_api.get_active_project",
-                   return_value="test-proj"), \
-             patch("app.routes.sessions_api._decode_project",
-                   return_value=str(proj_dir)), \
-             patch("app.routes.sessions_api.Path") as MockPath:
-            # Make Path.home() return our tmp_path (for file-history lookup)
-            MockPath.home.return_value = tmp_path
-            # But Path(proj_dir) / norm_rel should still work
-            MockPath.side_effect = Path
-            MockPath.home.return_value = tmp_path
+        backup_name = rich_session["backup_name"]
+        abs_app_py = rich_session["abs_app_py"]
+        proj_root = rich_session["proj_root"]
 
-            # Actually, let's just move the file-history to the right place
-            # The endpoint does: Path.home() / ".claude" / "file-history" / session_id
-            fh_target = tmp_path / ".claude" / "file-history" / sid
-            fh_target.mkdir(parents=True, exist_ok=True)
-            # Copy backup from rich_session fixture
-            src_backup = rich_session["fh_dir"] / "backup_app_py_v1"
-            (fh_target / "backup_app_py_v1").write_bytes(
-                src_backup.read_bytes())
+        # Write a "modified" version to the target (absolute path in tmp_path)
+        Path(abs_app_py).write_text("print('modified version')\n",
+                                     encoding="utf-8")
 
-            # Now just patch home() and project resolution
-            with patch("app.routes.sessions_api.Path") as MP:
-                # We need Path to work normally but Path.home() to return tmp_path
-                MP.side_effect = Path
-                MP.home.return_value = tmp_path
+        # Set up file-history with the backup
+        fh_target = tmp_path / ".claude" / "file-history" / sid
+        fh_target.mkdir(parents=True, exist_ok=True)
+        src_backup = rich_session["fh_dir"] / backup_name
+        (fh_target / backup_name).write_bytes(src_backup.read_bytes())
 
-                with patch("app.routes.sessions_api.get_active_project",
-                           return_value="test"), \
-                     patch("app.routes.sessions_api._decode_project",
-                           return_value=str(proj_dir)):
-                    resp = client.post(f"/api/rewind/{sid}",
-                                       json={"up_to_line": 7})
+        with patch("app.routes.sessions_api.Path") as MP:
+            MP.side_effect = Path
+            MP.home.return_value = tmp_path
+            with patch("app.routes.sessions_api.get_active_project",
+                       return_value="test"), \
+                 patch("app.routes.sessions_api._decode_project",
+                       return_value=str(proj_root)):
+                resp = client.post(f"/api/rewind/{sid}",
+                                   json={"up_to_line": 7})
 
         data = resp.get_json()
         assert data["ok"] is True
-        assert "files_restored" in data
+        # Must have actually restored at least one file
+        assert len(data["files_restored"]) >= 1
+        assert abs_app_py in data["files_restored"]
+        # The null-backupFileName entry (test_app.py) should NOT appear
+        # in files_restored (it's silently skipped by the null check)
+        assert rich_session["abs_test_py"] not in data["files_restored"]
+        # Verify the restored content matches the backup
+        assert Path(abs_app_py).read_text() == "print('hello')\n"
 
     def test_rewind_no_snapshot_returns_error(self, client, fake_project,
                                               simple_session):
@@ -572,13 +613,14 @@ class TestForkRewindEndpoint:
         self, client, fake_project, rich_session, tmp_path
     ):
         sid = rich_session["session_id"]
-        proj_dir = tmp_path / "project"
-        proj_dir.mkdir()
+        backup_name = rich_session["backup_name"]
+        abs_app_py = rich_session["abs_app_py"]
+        proj_root = rich_session["proj_root"]
 
         fh_target = tmp_path / ".claude" / "file-history" / sid
         fh_target.mkdir(parents=True, exist_ok=True)
-        (fh_target / "backup_app_py_v1").write_text("print('hello')\n",
-                                                      encoding="utf-8")
+        (fh_target / backup_name).write_text("print('hello')\n",
+                                              encoding="utf-8")
 
         with patch("app.routes.sessions_api.Path") as MP:
             MP.side_effect = Path
@@ -586,7 +628,7 @@ class TestForkRewindEndpoint:
             with patch("app.routes.sessions_api.get_active_project",
                        return_value="test"), \
                  patch("app.routes.sessions_api._decode_project",
-                       return_value=str(proj_dir)):
+                       return_value=str(proj_root)):
                 resp = client.post(f"/api/fork-rewind/{sid}",
                                    json={"up_to_line": 7})
 
@@ -598,6 +640,10 @@ class TestForkRewindEndpoint:
         # New session file should exist
         new_path = fake_project / f"{data['new_id']}.jsonl"
         assert new_path.exists()
+
+        # File should be restored with correct content
+        assert len(data["files_restored"]) >= 1
+        assert Path(abs_app_py).read_text() == "print('hello')\n"
 
     def test_fork_rewind_nonexistent_returns_404(self, client):
         resp = client.post("/api/fork-rewind/no-such-id",
@@ -667,3 +713,683 @@ class TestEdgeCases:
         # Both should exist
         assert (fake_project / f"{id1}.jsonl").exists()
         assert (fake_project / f"{id2}.jsonl").exists()
+
+
+# ===================================================================
+# 7. SNAPSHOT MERGING AND PATH RESOLUTION TESTS
+# ===================================================================
+
+class TestSnapshotMerging:
+    """Verify that multiple snapshots are merged correctly and that
+    absolute paths are handled in the rewind endpoint."""
+
+    def test_rewind_merges_multiple_snapshots(self, client, fake_project,
+                                                tmp_path):
+        """Multiple snapshots should be merged — later entries override
+        earlier ones for the same file."""
+        uid1 = _uuid()
+        uid2 = _uuid()
+        uid3 = _uuid()
+        snap1_id = _uuid()
+        snap2_id = _uuid()
+
+        # Build session with two snapshots tracking different files
+        lines = [
+            _user_msg("First change", _ts(0, 0), uid1, "sess-merge"),
+            # Snapshot 1: tracks file_a with backup
+            json.dumps({
+                "type": "file-history-snapshot",
+                "messageId": snap1_id,
+                "snapshot": {
+                    "messageId": snap1_id,
+                    "trackedFileBackups": {
+                        "file_a.py": {
+                            "backupFileName": "backup_a_v1",
+                            "version": 1,
+                            "backupTime": _ts(0, 1),
+                        },
+                    },
+                    "timestamp": _ts(0, 1),
+                },
+            }),
+            _asst_msg("Changed file_a", _ts(0, 5), uid2, "sess-merge"),
+            _user_msg("Second change", _ts(1, 0), uid3, "sess-merge"),
+            # Snapshot 2: tracks file_b and updates file_a
+            json.dumps({
+                "type": "file-history-snapshot",
+                "messageId": snap2_id,
+                "snapshot": {
+                    "messageId": snap2_id,
+                    "trackedFileBackups": {
+                        "file_a.py": {
+                            "backupFileName": "backup_a_v2",
+                            "version": 2,
+                            "backupTime": _ts(1, 1),
+                        },
+                        "file_b.py": {
+                            "backupFileName": "backup_b_v1",
+                            "version": 1,
+                            "backupTime": _ts(1, 1),
+                        },
+                    },
+                    "timestamp": _ts(1, 1),
+                },
+            }),
+        ]
+        _write_session(fake_project, "sess-merge", lines)
+
+        # Create backup files
+        proj_dir = tmp_path / "project"
+        proj_dir.mkdir()
+        fh = tmp_path / ".claude" / "file-history" / "sess-merge"
+        fh.mkdir(parents=True)
+        (fh / "backup_a_v1").write_text("file_a version 1", encoding="utf-8")
+        (fh / "backup_a_v2").write_text("file_a version 2", encoding="utf-8")
+        (fh / "backup_b_v1").write_text("file_b version 1", encoding="utf-8")
+
+        with patch("app.routes.sessions_api.Path") as MP:
+            MP.side_effect = Path
+            MP.home.return_value = tmp_path
+            with patch("app.routes.sessions_api.get_active_project",
+                       return_value="test"), \
+                 patch("app.routes.sessions_api._decode_project",
+                       return_value=str(proj_dir)):
+                resp = client.post("/api/rewind/sess-merge",
+                                   json={"up_to_line": 999})
+
+        data = resp.get_json()
+        assert data["ok"] is True
+        # Both files should be restored
+        assert len(data["files_restored"]) == 2
+        # file_a should use v2 (the later snapshot)
+        assert (proj_dir / "file_a.py").read_text() == "file_a version 2"
+        # file_b should use v1
+        assert (proj_dir / "file_b.py").read_text() == "file_b version 1"
+
+    def test_rewind_handles_absolute_paths(self, client, fake_project,
+                                             tmp_path):
+        """Absolute paths in trackedFileBackups should be used directly."""
+        snap_id = _uuid()
+        abs_path = str(tmp_path / "project" / "abs_file.py").replace("\\", "/")
+
+        lines = [
+            _user_msg("Make a change", _ts(0, 0), session_id="sess-abs"),
+            json.dumps({
+                "type": "file-history-snapshot",
+                "messageId": snap_id,
+                "snapshot": {
+                    "messageId": snap_id,
+                    "trackedFileBackups": {
+                        abs_path: {
+                            "backupFileName": "backup_abs_v1",
+                            "version": 1,
+                            "backupTime": _ts(0, 1),
+                        },
+                    },
+                    "timestamp": _ts(0, 1),
+                },
+            }),
+        ]
+        _write_session(fake_project, "sess-abs", lines)
+
+        # Create backup
+        (tmp_path / "project").mkdir(parents=True, exist_ok=True)
+        fh = tmp_path / ".claude" / "file-history" / "sess-abs"
+        fh.mkdir(parents=True)
+        (fh / "backup_abs_v1").write_text("absolute content", encoding="utf-8")
+
+        with patch("app.routes.sessions_api.Path") as MP:
+            MP.side_effect = Path
+            MP.home.return_value = tmp_path
+            with patch("app.routes.sessions_api.get_active_project",
+                       return_value="test"), \
+                 patch("app.routes.sessions_api._decode_project",
+                       return_value=str(tmp_path / "other")):
+                resp = client.post("/api/rewind/sess-abs",
+                                   json={"up_to_line": 999})
+
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert len(data["files_restored"]) == 1
+        # File should be restored to the absolute path, not relative to proj_dir
+        assert (tmp_path / "project" / "abs_file.py").read_text() == "absolute content"
+
+    def test_null_backupFileName_not_counted_as_valid_snapshot(
+        self, fake_project
+    ):
+        """Snapshots where all backupFileNames are null should not set
+        has_snapshots=True in the timeline."""
+        from app.sessions import load_session_timeline
+
+        snap_id = _uuid()
+        lines = [
+            _user_msg("Hello", session_id="sess-null"),
+            json.dumps({
+                "type": "file-history-snapshot",
+                "messageId": snap_id,
+                "snapshot": {
+                    "messageId": snap_id,
+                    "trackedFileBackups": {
+                        "file.py": {
+                            "backupFileName": None,
+                            "version": 0,
+                            "backupTime": None,
+                        },
+                    },
+                    "timestamp": _ts(),
+                },
+            }),
+        ]
+        _write_session(fake_project, "sess-null", lines)
+        result = load_session_timeline(fake_project / "sess-null.jsonl")
+        assert result["has_snapshots"] is False
+
+    def test_isSnapshotUpdate_linked_via_inner_messageId(self, fake_project):
+        """isSnapshotUpdate entries should be linked via the inner
+        snapshot.messageId, not just the outer messageId."""
+        from app.sessions import load_session_timeline
+
+        user_uid = _uuid()
+        asst_uid = _uuid()
+
+        lines = [
+            _user_msg("Hello", _ts(0, 0), user_uid, "sess-update"),
+            _asst_msg("I edited a file", _ts(0, 5), asst_uid, "sess-update",
+                      tool_uses=[{"name": "Edit", "input": {
+                          "file_path": "/app.py",
+                          "old_string": "old",
+                          "new_string": "new",
+                      }}]),
+            # isSnapshotUpdate: outer messageId=asst_uid, inner=user_uid
+            json.dumps({
+                "type": "file-history-snapshot",
+                "messageId": asst_uid,
+                "isSnapshotUpdate": True,
+                "snapshot": {
+                    "messageId": user_uid,
+                    "trackedFileBackups": {
+                        "app.py": {
+                            "backupFileName": "backup_v1",
+                            "version": 1,
+                            "backupTime": _ts(),
+                        },
+                    },
+                    "timestamp": _ts(),
+                },
+            }),
+        ]
+        _write_session(fake_project, "sess-update", lines)
+        result = load_session_timeline(fake_project / "sess-update.jsonl")
+        assert result["has_snapshots"] is True
+
+        # Both the user message (via inner messageId) and the assistant
+        # message (via outer messageId) should be linkable
+        snap_msgs = [m for m in result["messages"] if m["has_snapshot"]]
+        assert len(snap_msgs) >= 1
+
+
+# ===================================================================
+# 8. DAEMON SNAPSHOT CREATION TESTS
+# ===================================================================
+
+class TestDaemonSnapshotCreation:
+    """Test the SessionManager._write_file_snapshot method."""
+
+    def test_write_file_snapshot_creates_backups(self, tmp_path):
+        """_write_file_snapshot should create backup files and append
+        a snapshot entry to the JSONL."""
+        from daemon.session_manager import SessionManager, SessionInfo, SessionState
+
+        # Set up a fake session with tracked files
+        session_id = "test-snap-daemon"
+        cwd = str(tmp_path / "myproject")
+        (tmp_path / "myproject").mkdir()
+
+        # Create a source file to be backed up
+        src_file = tmp_path / "myproject" / "app.py"
+        src_file.write_text("print('hello')\n", encoding="utf-8")
+
+        # Create the project dir and JSONL
+        encoded = cwd.replace("\\", "/").replace(":", "-").replace("/", "-")
+        proj_dir = tmp_path / ".claude" / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+        jsonl = proj_dir / f"{session_id}.jsonl"
+        jsonl.write_text(
+            _user_msg("Fix bug", session_id=session_id) + "\n",
+            encoding="utf-8",
+        )
+
+        # Create SessionInfo with tracked file
+        info = SessionInfo(
+            session_id=session_id,
+            cwd=cwd,
+            state=SessionState.IDLE,
+        )
+        info.tracked_files.add(str(src_file))
+
+        # Create a minimal SessionManager and inject the session
+        mgr = SessionManager()
+        with mgr._lock:
+            mgr._sessions[session_id] = info
+
+        # Patch Path.home to use our tmp_path
+        with patch("daemon.session_manager.Path") as MP:
+            MP.side_effect = Path
+            MP.home.return_value = tmp_path
+            mgr._write_file_snapshot(session_id)
+
+        # Verify backup was created
+        history_dir = tmp_path / ".claude" / "file-history" / session_id
+        assert history_dir.exists()
+        backup_files = list(history_dir.iterdir())
+        assert len(backup_files) >= 1
+
+        # Verify backup content matches original
+        backup_content = backup_files[0].read_text(encoding="utf-8")
+        assert backup_content == "print('hello')\n"
+
+        # Verify snapshot entry was appended to JSONL
+        lines = jsonl.read_text(encoding="utf-8").strip().split("\n")
+        assert len(lines) == 2  # original message + snapshot
+        snap_line = json.loads(lines[1])
+        assert snap_line["type"] == "file-history-snapshot"
+        assert snap_line["snapshot"]["trackedFileBackups"]
+
+        # Verify the backup filename is referenced in the snapshot
+        tracked = snap_line["snapshot"]["trackedFileBackups"]
+        assert str(src_file) in tracked
+        assert tracked[str(src_file)]["backupFileName"] == backup_files[0].name
+
+        # Verify the snapshot's messageId is linked to the user message
+        # (not a random UUID) so the timeline picker can show the 💾 icon
+        user_line = json.loads(lines[0])
+        assert snap_line["messageId"] == user_line["uuid"]
+
+    def test_write_file_snapshot_skips_when_no_tracked_files(self, tmp_path):
+        """Should be a no-op when there are no tracked files."""
+        from daemon.session_manager import SessionManager, SessionInfo, SessionState
+
+        session_id = "test-snap-empty"
+        info = SessionInfo(
+            session_id=session_id,
+            cwd=str(tmp_path),
+            state=SessionState.IDLE,
+        )
+        # tracked_files is empty by default
+
+        mgr = SessionManager()
+        with mgr._lock:
+            mgr._sessions[session_id] = info
+
+        # Should not raise
+        mgr._write_file_snapshot(session_id)
+
+        # No history dir should be created
+        history_dir = tmp_path / ".claude" / "file-history" / session_id
+        assert not history_dir.exists()
+
+    def test_write_file_snapshot_handles_missing_files(self, tmp_path):
+        """Should gracefully handle tracked files that don't exist on disk."""
+        from daemon.session_manager import SessionManager, SessionInfo, SessionState
+
+        session_id = "test-snap-missing"
+        cwd = str(tmp_path / "proj")
+        (tmp_path / "proj").mkdir()
+
+        # Create JSONL
+        encoded = cwd.replace("\\", "/").replace(":", "-").replace("/", "-")
+        proj_dir = tmp_path / ".claude" / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+        jsonl = proj_dir / f"{session_id}.jsonl"
+        jsonl.write_text(
+            _user_msg("Hello", session_id=session_id) + "\n",
+            encoding="utf-8",
+        )
+
+        info = SessionInfo(
+            session_id=session_id,
+            cwd=cwd,
+            state=SessionState.IDLE,
+        )
+        info.tracked_files.add(str(tmp_path / "proj" / "nonexistent.py"))
+
+        mgr = SessionManager()
+        with mgr._lock:
+            mgr._sessions[session_id] = info
+
+        with patch("daemon.session_manager.Path") as MP:
+            MP.side_effect = Path
+            MP.home.return_value = tmp_path
+            mgr._write_file_snapshot(session_id)
+
+        # JSONL should NOT have a snapshot (all files had null backups)
+        lines = jsonl.read_text(encoding="utf-8").strip().split("\n")
+        assert len(lines) == 1  # only the original message
+
+    def test_prepopulate_tracked_files_from_jsonl(self, tmp_path):
+        """_prepopulate_tracked_files should scan the JSONL for past Edit/Write
+        tool uses and populate tracked_files — critical for daemon restarts."""
+        from daemon.session_manager import SessionManager, SessionInfo, SessionState
+
+        session_id = "test-prepop"
+        cwd = str(tmp_path / "myproject")
+        (tmp_path / "myproject").mkdir()
+
+        # Create a JSONL with real assistant messages containing tool_use blocks
+        abs_file1 = str(tmp_path / "myproject" / "app.py")
+        abs_file2 = str(tmp_path / "myproject" / "utils.py")
+        lines = [
+            _user_msg("Fix stuff", session_id=session_id),
+            _asst_msg("I'll fix it", session_id=session_id, tool_uses=[
+                {"name": "Read", "input": {"file_path": abs_file1}},
+            ]),
+            _asst_msg("Here's the fix", session_id=session_id, tool_uses=[
+                {"name": "Edit", "input": {
+                    "file_path": abs_file1,
+                    "old_string": "old",
+                    "new_string": "new",
+                }},
+            ]),
+            _asst_msg("New file too", session_id=session_id, tool_uses=[
+                {"name": "Write", "input": {
+                    "file_path": abs_file2,
+                    "content": "# utils\n",
+                }},
+            ]),
+        ]
+        encoded = cwd.replace("\\", "/").replace(":", "-").replace("/", "-")
+        proj_dir = tmp_path / ".claude" / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+        _write_session(proj_dir, session_id, lines)
+
+        # Create SessionInfo with empty tracked_files (simulates daemon restart)
+        info = SessionInfo(
+            session_id=session_id,
+            cwd=cwd,
+            state=SessionState.WORKING,
+        )
+        assert len(info.tracked_files) == 0
+
+        mgr = SessionManager()
+        with mgr._lock:
+            mgr._sessions[session_id] = info
+
+        with patch("daemon.session_manager.Path") as MP:
+            MP.side_effect = Path
+            MP.home.return_value = tmp_path
+            mgr._prepopulate_tracked_files(info)
+
+        # Should have found the Edit and Write file paths, NOT the Read
+        assert abs_file1 in info.tracked_files
+        assert abs_file2 in info.tracked_files
+        assert len(info.tracked_files) == 2
+
+    def test_end_to_end_snapshot_then_timeline_then_rewind(self, tmp_path):
+        """Full round trip: create file -> snapshot -> load timeline ->
+        modify file -> rewind restores original. All real files, no mocks
+        except Path.home()."""
+        from daemon.session_manager import SessionManager, SessionInfo, SessionState
+        from app.sessions import load_session_timeline
+
+        session_id = "test-e2e"
+        cwd = str(tmp_path / "proj")
+        (tmp_path / "proj").mkdir()
+
+        # 1. Create a real source file
+        src = tmp_path / "proj" / "main.py"
+        src.write_text("original_content = True\n", encoding="utf-8")
+
+        # 2. Create JSONL with a user message and an assistant Edit
+        abs_src = str(src)
+        uid_user = _uuid()
+        uid_asst = _uuid()
+        lines = [
+            json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": "Fix the bug"},
+                "timestamp": _ts(0, 0),
+                "sessionId": session_id,
+                "uuid": uid_user,
+            }),
+            json.dumps({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "Fixed it"},
+                    {"type": "tool_use", "name": "Edit", "input": {
+                        "file_path": abs_src,
+                        "old_string": "original",
+                        "new_string": "modified",
+                    }},
+                ]},
+                "timestamp": _ts(0, 5),
+                "sessionId": session_id,
+                "uuid": uid_asst,
+            }),
+        ]
+        encoded = cwd.replace("\\", "/").replace(":", "-").replace("/", "-")
+        proj_dir = tmp_path / ".claude" / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+        jsonl = proj_dir / f"{session_id}.jsonl"
+        jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        # 3. Create SessionInfo with tracked file and call _write_file_snapshot
+        info = SessionInfo(
+            session_id=session_id,
+            cwd=cwd,
+            state=SessionState.IDLE,
+        )
+        info.tracked_files.add(abs_src)
+
+        mgr = SessionManager()
+        with mgr._lock:
+            mgr._sessions[session_id] = info
+
+        with patch("daemon.session_manager.Path") as MP:
+            MP.side_effect = Path
+            MP.home.return_value = tmp_path
+            mgr._write_file_snapshot(session_id)
+
+        # 4. Verify backup file was created
+        history_dir = tmp_path / ".claude" / "file-history" / session_id
+        assert history_dir.exists()
+        backup_files = list(history_dir.iterdir())
+        assert len(backup_files) == 1
+        assert backup_files[0].read_text() == "original_content = True\n"
+
+        # 5. Verify JSONL now has a snapshot entry
+        all_lines = jsonl.read_text().strip().split("\n")
+        assert len(all_lines) == 3  # user + assistant + snapshot
+        snap_entry = json.loads(all_lines[2])
+        assert snap_entry["type"] == "file-history-snapshot"
+
+        # 6. load_session_timeline should find the snapshot
+        result = load_session_timeline(jsonl)
+        assert result["has_snapshots"] is True
+        snap_msgs = [m for m in result["messages"] if m["has_snapshot"]]
+        assert len(snap_msgs) >= 1
+
+        # 7. Modify the source file (simulating further edits)
+        src.write_text("modified_content = True\n", encoding="utf-8")
+        assert src.read_text() == "modified_content = True\n"
+
+        # 8. Rewind should restore the original content
+        backup_name = snap_entry["snapshot"]["trackedFileBackups"][abs_src]["backupFileName"]
+        backup_path = history_dir / backup_name
+        assert backup_path.exists()
+        # Manually restore (same logic as the rewind API)
+        src.write_bytes(backup_path.read_bytes())
+        assert src.read_text() == "original_content = True\n"
+
+    def test_filesystem_change_detection_catches_agent_edits(self, tmp_path):
+        """When a file is modified by an Agent sub-agent (not a direct Edit),
+        the mtime-based change detection should still catch it and create a
+        snapshot. This is the key fix for the rewind feature."""
+        from daemon.session_manager import SessionManager, SessionInfo, SessionState
+        from app.sessions import load_session_timeline
+        import time
+
+        session_id = "test-fs-detect"
+        cwd = str(tmp_path / "proj")
+        (tmp_path / "proj").mkdir()
+
+        # Create a source file
+        src = tmp_path / "proj" / "config.py"
+        src.write_text("# original\n", encoding="utf-8")
+
+        # Create JSONL with a user message (NO Edit tool_use — simulates
+        # an Agent sub-agent doing the edit, which the daemon can't see)
+        uid_user = _uuid()
+        uid_asst = _uuid()
+        lines = [
+            json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": "Add a comment"},
+                "timestamp": _ts(0, 0),
+                "sessionId": session_id,
+                "uuid": uid_user,
+            }),
+            json.dumps({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "Done!"},
+                    {"type": "tool_use", "name": "Agent", "input": {
+                        "prompt": "add a comment to config.py",
+                        "description": "add comment",
+                    }},
+                ]},
+                "timestamp": _ts(0, 5),
+                "sessionId": session_id,
+                "uuid": uid_asst,
+            }),
+        ]
+        encoded = cwd.replace("\\", "/").replace(":", "-").replace("/", "-")
+        proj_dir = tmp_path / ".claude" / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+        jsonl = proj_dir / f"{session_id}.jsonl"
+        jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        # Create SessionInfo — tracked_files is EMPTY (daemon never saw Edit)
+        info = SessionInfo(
+            session_id=session_id,
+            cwd=cwd,
+            state=SessionState.WORKING,
+        )
+        assert len(info.tracked_files) == 0
+
+        mgr = SessionManager()
+        with mgr._lock:
+            mgr._sessions[session_id] = info
+
+        # Step 1: Record pre-turn mtimes
+        mgr._record_pre_turn_mtimes(info)
+        assert len(info._pre_turn_mtimes) > 0
+
+        # Step 2: Simulate the Agent sub-agent modifying the file
+        time.sleep(0.05)  # ensure mtime changes
+        src.write_text("# original\n# this comment means nothing\n", encoding="utf-8")
+
+        # Step 3: Call _write_file_snapshot (post-turn)
+        with patch("daemon.session_manager.Path") as MP:
+            MP.side_effect = Path
+            MP.home.return_value = tmp_path
+            mgr._write_file_snapshot(session_id, is_post_turn=True)
+
+        # The file MUST be detected and backed up
+        history_dir = tmp_path / ".claude" / "file-history" / session_id
+        assert history_dir.exists(), "file-history dir should be created"
+        backup_files = list(history_dir.iterdir())
+        assert len(backup_files) >= 1, "At least one backup file should exist"
+
+        # The JSONL MUST have a snapshot entry
+        all_lines = jsonl.read_text().strip().split("\n")
+        assert len(all_lines) == 3, "Should be: user + assistant + snapshot"
+        snap_entry = json.loads(all_lines[2])
+        assert snap_entry["type"] == "file-history-snapshot"
+        assert snap_entry["isSnapshotUpdate"] is True
+
+        # The snapshot should reference the assistant UUID (post-turn)
+        assert snap_entry["messageId"] == uid_asst
+
+        # The timeline loader should find the snapshot
+        result = load_session_timeline(jsonl)
+        assert result["has_snapshots"] is True
+
+    def test_pre_and_post_turn_snapshot_format(self, tmp_path):
+        """Pre-turn snapshots have isSnapshotUpdate=false, post-turn have true.
+        This matches the native CLI behavior."""
+        from daemon.session_manager import SessionManager, SessionInfo, SessionState
+        import time
+
+        session_id = "test-pre-post"
+        cwd = str(tmp_path / "proj")
+        (tmp_path / "proj").mkdir()
+
+        src = tmp_path / "proj" / "app.py"
+        src.write_text("v1\n", encoding="utf-8")
+
+        uid_user = _uuid()
+        uid_asst = _uuid()
+        lines = [
+            json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": "Fix it"},
+                "timestamp": _ts(0, 0),
+                "sessionId": session_id,
+                "uuid": uid_user,
+            }),
+            json.dumps({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": "Fixed"},
+                "timestamp": _ts(0, 5),
+                "sessionId": session_id,
+                "uuid": uid_asst,
+            }),
+        ]
+        encoded = cwd.replace("\\", "/").replace(":", "-").replace("/", "-")
+        proj_dir = tmp_path / ".claude" / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+        jsonl = proj_dir / f"{session_id}.jsonl"
+        jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        info = SessionInfo(
+            session_id=session_id,
+            cwd=cwd,
+            state=SessionState.WORKING,
+        )
+        info.tracked_files.add(str(src))
+
+        mgr = SessionManager()
+        with mgr._lock:
+            mgr._sessions[session_id] = info
+
+        with patch("daemon.session_manager.Path") as MP:
+            MP.side_effect = Path
+            MP.home.return_value = tmp_path
+
+            # Pre-turn snapshot
+            mgr._write_file_snapshot(session_id, is_post_turn=False)
+
+            # Simulate edit
+            time.sleep(0.05)
+            src.write_text("v2\n", encoding="utf-8")
+            info.tracked_files.add(str(src))
+
+            # Post-turn snapshot
+            mgr._write_file_snapshot(session_id, is_post_turn=True)
+
+        all_lines = jsonl.read_text().strip().split("\n")
+        # Should have: user + assistant + pre-snapshot + post-snapshot
+        assert len(all_lines) == 4
+
+        pre_snap = json.loads(all_lines[2])
+        post_snap = json.loads(all_lines[3])
+
+        assert pre_snap["type"] == "file-history-snapshot"
+        assert pre_snap["isSnapshotUpdate"] is False
+        assert pre_snap["messageId"] == uid_user  # linked to user msg
+
+        assert post_snap["type"] == "file-history-snapshot"
+        assert post_snap["isSnapshotUpdate"] is True
+        assert post_snap["messageId"] == uid_asst  # linked to assistant msg
+        # Inner messageId should reference the user message
+        assert post_snap["snapshot"]["messageId"] == uid_user

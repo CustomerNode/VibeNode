@@ -2,6 +2,8 @@
 Configuration, path helpers, and session-name persistence.
 """
 
+# this comment means nothing
+
 import json
 import time
 from pathlib import Path
@@ -179,6 +181,13 @@ def _remap_name(old_id: str, new_id: str):
 
 _TOMBSTONE_MAX_AGE = 7200  # seconds (2 hours)
 
+# Lock protects the read-modify-write cycle on the tombstone file.
+# Without this, _get_deleted_ids() (which prunes & saves) can race with
+# _mark_deleted() and overwrite a freshly-written tombstone, causing the
+# deleted session to reappear on the next page load.
+import threading as _threading
+_tombstone_lock = _threading.Lock()
+
 
 def _load_tombstones() -> dict:
     """Return {session_id: unix_timestamp} of deleted sessions."""
@@ -198,38 +207,52 @@ def _save_tombstones(tombstones: dict) -> None:
 
 
 def _prune_tombstones(tombstones: dict) -> dict:
-    """Remove entries older than _TOMBSTONE_MAX_AGE.  Returns pruned dict."""
+    """Remove entries older than _TOMBSTONE_MAX_AGE, but only when the
+    corresponding .jsonl file is also gone.  If the file still exists
+    (e.g. Windows couldn't delete it due to a lock), the tombstone must
+    stay so all_sessions() keeps hiding the zombie session."""
     now = time.time()
-    return {sid: ts for sid, ts in tombstones.items()
-            if now - ts < _TOMBSTONE_MAX_AGE}
+    sd = _sessions_dir()
+    result = {}
+    for sid, ts in tombstones.items():
+        if now - ts < _TOMBSTONE_MAX_AGE:
+            result[sid] = ts  # not expired yet — always keep
+        elif (sd / f"{sid}.jsonl").exists():
+            result[sid] = ts  # file still on disk — keep hiding it
+    return result
 
 
 def _mark_deleted(session_id: str) -> None:
     """Record a session as deleted (tombstone).  Must be called BEFORE
     unlinking the .jsonl file so the tombstone is in place before any race."""
-    tombstones = _load_tombstones()
-    tombstones[session_id] = time.time()
-    tombstones = _prune_tombstones(tombstones)
-    _save_tombstones(tombstones)
+    with _tombstone_lock:
+        tombstones = _load_tombstones()
+        tombstones[session_id] = time.time()
+        tombstones = _prune_tombstones(tombstones)
+        _save_tombstones(tombstones)
 
 
 def _mark_deleted_bulk(session_ids: list) -> None:
     """Record multiple sessions as deleted in a single write."""
-    tombstones = _load_tombstones()
-    now = time.time()
-    for sid in session_ids:
-        tombstones[sid] = now
-    tombstones = _prune_tombstones(tombstones)
-    _save_tombstones(tombstones)
+    with _tombstone_lock:
+        tombstones = _load_tombstones()
+        now = time.time()
+        for sid in session_ids:
+            tombstones[sid] = now
+        tombstones = _prune_tombstones(tombstones)
+        _save_tombstones(tombstones)
 
 
 def _get_deleted_ids() -> set:
     """Return the set of session IDs that are tombstoned (recently deleted).
-    Auto-prunes stale entries."""
+
+    This is a read-only helper — it never writes back to the tombstone file.
+    Pruning (removing expired entries) happens lazily inside _mark_deleted()
+    whenever a new tombstone is recorded.  Keeping _get_deleted_ids() write-free
+    avoids any possibility of a save here clobbering a concurrent _mark_deleted().
+    """
     tombstones = _load_tombstones()
     pruned = _prune_tombstones(tombstones)
-    if len(pruned) != len(tombstones):
-        _save_tombstones(pruned)
     return set(pruned.keys())
 
 

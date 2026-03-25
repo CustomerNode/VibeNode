@@ -804,6 +804,9 @@ async function _newSessionSubmit(sessionId) {
   if (!ta) return;
   const text = ta.value.trim();
   if (!text) { showToast('Type a message first'); return; }
+  if (typeof _interceptSlashCommand === 'function' && _interceptSlashCommand(text)) {
+    ta.value = ''; _resetTextareaHeight(ta); return;
+  }
   ta.value = '';  // clear immediately to prevent double-submit on key repeat
   _resetTextareaHeight(ta);
 
@@ -1255,19 +1258,58 @@ function openPreferences() {
       </div>
     </div>`;
   }
-  html += '</div><div class="pm-actions"><button class="pm-btn pm-btn-secondary" id="pm-pref-close">Close</button></div></div>';
+  html += '</div>';
+
+  // --- Sticky Chats toggle ---
+  const stickyOn = localStorage.getItem('stickyUserMsgs') !== 'off';
+  html += '<div class="pm-body" style="margin-top:8px;"><p style="margin-bottom:4px;font-weight:600;font-size:13px;">Sticky Chats</p>'
+    + '<p style="font-size:12px;color:var(--text-muted);">When scrolling through long responses, your most recent message stays pinned at the top so you can see what you sent.</p></div>'
+    + '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:20px;">';
+  const stickyOpts = [
+    {key: 'on',  name: 'Enabled',  desc: 'Pin your most recent chat at the top while scrolling.'},
+    {key: 'off', name: 'Disabled', desc: 'Normal scroll behavior \u2014 no pinned messages.'},
+  ];
+  for (const o of stickyOpts) {
+    const isActive = (o.key === 'on') === stickyOn;
+    html += `<div class="add-mode-card${isActive ? ' active' : ''}" data-sticky="${o.key}">
+      <div class="add-mode-info">
+        <div class="add-mode-title">${o.name}</div>
+        <div class="add-mode-desc">${o.desc}</div>
+      </div>
+    </div>`;
+  }
+  html += '</div>';
+
+  html += '<div class="pm-actions"><button class="pm-btn pm-btn-secondary" id="pm-pref-close">Close</button></div></div>';
   overlay.innerHTML = html;
   overlay.classList.add('show');
   requestAnimationFrame(() => overlay.querySelector('.pm-card').classList.remove('pm-enter'));
   document.getElementById('pm-pref-close').onclick = () => _closePm();
   overlay.onclick = e => { if (e.target === overlay) _closePm(); };
-  overlay.querySelectorAll('.add-mode-card').forEach(card => {
+  overlay.querySelectorAll('.add-mode-card[data-pref]').forEach(card => {
     card.onclick = () => {
       sendBehavior = card.dataset.pref;
       localStorage.setItem('sendBehavior', sendBehavior);
       _closePm();
       showToast('Send: ' + card.querySelector('.add-mode-title').textContent);
       _refreshSendHints();
+    };
+  });
+  overlay.querySelectorAll('.add-mode-card[data-sticky]').forEach(card => {
+    card.onclick = () => {
+      const val = card.dataset.sticky;
+      if (val === 'off') {
+        localStorage.setItem('stickyUserMsgs', 'off');
+        // Remove any active pin immediately
+        document.querySelectorAll('.msg.user.sticky-pinned').forEach(m => m.classList.remove('sticky-pinned'));
+      } else {
+        localStorage.removeItem('stickyUserMsgs');
+        // Re-init on current conversation
+        const c = document.getElementById('live-log') || document.getElementById('convo');
+        if (c && typeof initStickyUserMessages === 'function') initStickyUserMessages(c);
+      }
+      _closePm();
+      showToast('Sticky chats: ' + card.querySelector('.add-mode-title').textContent);
     };
   });
 }

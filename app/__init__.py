@@ -17,6 +17,7 @@ def create_app() -> Flask:
         template_folder=str(_VIBENODE_DIR / "templates"),
         static_folder=str(_VIBENODE_DIR / "static"),
     )
+    app.config["TEMPLATES_AUTO_RELOAD"] = True
 
     # Initialize SocketIO with threading mode (Flask's default)
     socketio.init_app(app, async_mode='threading', cors_allowed_origins='*')

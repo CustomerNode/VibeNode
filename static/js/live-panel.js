@@ -715,7 +715,7 @@ function _addOptimisticBubble(sid, text) {
   const timestamp = h + ':' + String(now.getMinutes()).padStart(2, '0') + ' ' + (now.getHours() >= 12 ? 'PM' : 'AM');
   const userMsg = document.createElement('div');
   userMsg.className = 'msg user msg-entering';
-  userMsg.innerHTML = '<div class="msg-role">me <span class="msg-time">' + timestamp + '</span></div><div class="msg-body msg-content">' + mdParse(text) + '</div>';
+  userMsg.innerHTML = '<div class="msg-role">me <span class="msg-time">' + timestamp + '</span></div><div class="msg-body msg-content"><pre style="white-space:pre-wrap;margin:0;">' + escHtml(text) + '</pre></div>';
   userMsg.addEventListener('animationend', () => userMsg.classList.remove('msg-entering'), {once: true});
   logEl.appendChild(userMsg);
   logEl.scrollTop = logEl.scrollHeight;
@@ -787,6 +787,10 @@ function liveSubmitWaiting() {
 
 function liveSubmitInterrupt() {
   if (!liveSessionId) return;
+  // Preserve any text the user typed into the queue textarea so it isn't
+  // lost when the input bar is rebuilt in idle mode.
+  const queueTa = document.getElementById('live-queue-ta');
+  const preservedText = queueTa ? queueTa.value : '';
   // Clear any queued commands — user is intentionally stopping, so we must
   // NOT auto-send queued text when the session goes idle.
   // Server-side clear ensures queue is emptied even if GUI disconnects.
@@ -798,6 +802,11 @@ function liveSubmitInterrupt() {
   sessionKinds[liveSessionId] = 'idle';
   liveBarState = null;
   updateLiveInputBar();
+  // Restore the preserved text into the new idle textarea
+  if (preservedText) {
+    const idleTa = document.getElementById('live-input-ta');
+    if (idleTa) { idleTa.value = preservedText; _initAutoResize(idleTa); }
+  }
 }
 
 function liveClearDisplay() {

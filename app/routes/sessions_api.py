@@ -194,9 +194,20 @@ def api_delete(session_id):
         sm._save_registry_now()
         return jsonify({"ok": True})  # Already gone or never created
 
-    path.unlink()
+    # On Windows the CLI process may still hold the .jsonl open even after
+    # Phase 1/2 — unlink raises PermissionError in that case.  Wrap in
+    # try/except so the endpoint still returns ok; the tombstone written
+    # above is the authoritative "this session is deleted" signal and
+    # all_sessions() will hide it regardless of whether the file is gone.
+    try:
+        path.unlink()
+    except PermissionError:
+        pass  # tombstone will hide it; Phase 4 retries below
     if folder.exists() and folder.is_dir():
-        shutil.rmtree(folder)
+        try:
+            shutil.rmtree(folder)
+        except (PermissionError, OSError):
+            pass
 
     # Phase 4: Sweep for file re-created by a dying process.
     # Without this, a subprocess that hasn't fully exited can write the
@@ -206,7 +217,13 @@ def api_delete(session_id):
         try:
             path.unlink()
         except Exception:
-            pass
+            # Last resort: truncate the file so even if the tombstone
+            # eventually expires, the session would appear empty and be
+            # auto-cleaned on the next "delete empty" sweep.
+            try:
+                path.write_bytes(b"")
+            except Exception:
+                pass
     if folder.exists() and folder.is_dir():
         try:
             shutil.rmtree(folder)
@@ -539,8 +556,10 @@ def api_rewind(session_id):
     if not up_to_line or not isinstance(up_to_line, int):
         return jsonify({"error": "up_to_line is required"}), 400
 
-    # Find the last snapshot at or before the target line
-    best_snapshot = None
+    # Merge all snapshots at or before the target line.  Later snapshots
+    # override earlier ones for the same file, giving us the most recent
+    # backup state for each tracked file.
+    merged_backups = {}
     line_num = 0
     with open(src, encoding="utf-8") as f:
         for line in f:
@@ -556,20 +575,26 @@ def api_rewind(session_id):
                 continue
             if obj.get("type") == "file-history-snapshot":
                 snap = obj.get("snapshot", {})
-                if snap.get("trackedFileBackups"):
-                    best_snapshot = snap
+                for fp, binfo in snap.get("trackedFileBackups", {}).items():
+                    # Only overwrite if the new entry has a real backup
+                    if isinstance(binfo, dict) and binfo.get("backupFileName"):
+                        merged_backups[fp] = binfo
+                    elif fp not in merged_backups:
+                        merged_backups[fp] = binfo
 
-    if not best_snapshot:
+    if not merged_backups:
         return jsonify({"error": "No file snapshot found at or before this message"}), 400
 
-    # Restore files from snapshot
+    # Restore files from merged snapshot
     active_project = get_active_project()
     proj_dir = _decode_project(active_project) if active_project else str(Path.home())
     history_dir = Path.home() / ".claude" / "file-history" / session_id
 
     restored = []
     skipped = []
-    for rel_path, backup_info in best_snapshot.get("trackedFileBackups", {}).items():
+    for rel_path, backup_info in merged_backups.items():
+        if not isinstance(backup_info, dict):
+            continue
         backup_name = backup_info.get("backupFileName", "")
         if not backup_name:
             continue
@@ -578,9 +603,12 @@ def api_rewind(session_id):
             skipped.append(rel_path)
             continue
 
-        # Resolve the target path relative to the project root
-        norm_rel = rel_path.replace("\\", "/")
-        target = Path(proj_dir) / norm_rel
+        # Resolve target path — handle both absolute and relative paths
+        norm = rel_path.replace("\\", "/")
+        if Path(norm).is_absolute():
+            target = Path(norm)
+        else:
+            target = Path(proj_dir) / norm
 
         try:
             backup_content = backup_path.read_bytes()
@@ -618,7 +646,7 @@ def api_fork_rewind(session_id):
     lines_out = []
     line_num = 0
     original_title = session_id[:8]
-    best_snapshot = None
+    merged_backups = {}
 
     with open(src, encoding="utf-8") as f:
         for line in f:
@@ -637,8 +665,11 @@ def api_fork_rewind(session_id):
                 original_title = obj.get("customTitle", original_title)
             if obj.get("type") == "file-history-snapshot":
                 snap = obj.get("snapshot", {})
-                if snap.get("trackedFileBackups"):
-                    best_snapshot = snap
+                for fp, binfo in snap.get("trackedFileBackups", {}).items():
+                    if isinstance(binfo, dict) and binfo.get("backupFileName"):
+                        merged_backups[fp] = binfo
+                    elif fp not in merged_backups:
+                        merged_backups[fp] = binfo
             if "sessionId" in obj:
                 obj["sessionId"] = new_id
             lines_out.append(json.dumps(obj))
@@ -656,12 +687,14 @@ def api_fork_rewind(session_id):
     # --- Rewind ---
     restored = []
     skipped = []
-    if best_snapshot:
+    if merged_backups:
         active_project = get_active_project()
         proj_dir = _decode_project(active_project) if active_project else str(Path.home())
         history_dir = Path.home() / ".claude" / "file-history" / session_id
 
-        for rel_path, backup_info in best_snapshot.get("trackedFileBackups", {}).items():
+        for rel_path, backup_info in merged_backups.items():
+            if not isinstance(backup_info, dict):
+                continue
             backup_name = backup_info.get("backupFileName", "")
             if not backup_name:
                 continue
@@ -669,8 +702,12 @@ def api_fork_rewind(session_id):
             if not backup_path.exists():
                 skipped.append(rel_path)
                 continue
-            norm_rel = rel_path.replace("\\", "/")
-            target = Path(proj_dir) / norm_rel
+            # Handle both absolute and relative paths
+            norm = rel_path.replace("\\", "/")
+            if Path(norm).is_absolute():
+                target = Path(norm)
+            else:
+                target = Path(proj_dir) / norm
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(backup_path.read_bytes())
