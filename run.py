@@ -1,4 +1,4 @@
-# This is a test comment for rewind testing
+# Meaningless comment: the quick brown fox jumped over the lazy dog 🦊
 """
 Entry point for the VibeNode Flask application.
 Run with: python run.py
@@ -21,6 +21,26 @@ from pathlib import Path
 DAEMON_PORT = 5051  # TODO: remove this test comment for rewind
 
 
+def _kill_stale_daemon():
+    """Kill any stale daemon process using the PID file."""
+    import os
+    pid_file = Path.home() / ".claude" / "gui_daemon.pid"
+    if not pid_file.exists():
+        return
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, 0)  # Check if alive
+        os.kill(pid, 9)  # Kill it
+        print("  Killed stale daemon (PID %d)" % pid, flush=True)
+        time.sleep(0.5)
+    except (ValueError, OSError):
+        pass  # PID invalid or process already dead
+    try:
+        pid_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def ensure_daemon():
     """Make sure the session daemon is running. Start it if not."""
     # Try to connect
@@ -33,6 +53,9 @@ def ensure_daemon():
         return
     except (ConnectionRefusedError, OSError):
         pass
+
+    # Kill any stale daemon that might still hold the port
+    _kill_stale_daemon()
 
     # Start daemon as a detached subprocess
     daemon_script = Path(__file__).parent / "daemon" / "daemon_server.py"
@@ -48,12 +71,14 @@ def ensure_daemon():
             creation_flags = (
                 subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
             )
+        daemon_log = Path(__file__).parent / "daemon_debug.log"
+        _daemon_fh = open(daemon_log, "a")
         subprocess.Popen(
             [sys.executable, str(daemon_script)],
             cwd=str(daemon_script.parent.parent),
             creationflags=creation_flags,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=_daemon_fh,
+            stderr=_daemon_fh,
         )
     except Exception as e:
         print("  WARNING: Could not start daemon: %s" % e, flush=True)

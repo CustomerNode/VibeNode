@@ -164,12 +164,18 @@ socket.on('session_state', (data) => {
         }
     }
 
-    // Auto-send queued input when Claude transitions from working -> idle
-    if (liveSessionId === session_id && liveQueuedText && state === 'idle') {
-        const textToSend = liveQueuedText;
-        liveQueuedText = '';
-        showToast('Sending queued command\u2026');
-        socket.emit('send_message', {session_id: session_id, text: textToSend});
+    // Auto-send queued input when Claude transitions to idle (works even if navigated away)
+    // Uses _shiftQueue for FIFO — sends first message, rest wait for next idle
+    if (_getQueue(session_id) && state === 'idle') {
+        const textToSend = _shiftQueue(session_id);
+        const remaining = _getQueueList(session_id).length;
+        showToast('Sending queued command\u2026' + (remaining ? ' (' + remaining + ' remaining)' : ''));
+        if (liveSessionId === session_id) {
+            _liveSubmitDirect(session_id, textToSend, {});
+        } else {
+            socket.emit('send_message', {session_id: session_id, text: textToSend});
+        }
+        _renderQueueBanner();
     }
 
     // Update sidebar row classes
@@ -212,20 +218,21 @@ socket.on('session_entry', (data) => {
         const skel = logEl.querySelector('.skel-bar, .skeleton-loader, .live-log-empty, .empty-state');
         if (skel) logEl.innerHTML = '';
     }
-    // Skip user entries that were already added as optimistic bubbles.
-    // The optimistic bubble is added immediately when the user sends a message,
-    // and the backend echoes it back as a session_entry. Deduplicate by checking
-    // if the last user message in the log matches the incoming text.
-    if (data.entry.kind === 'user' && _liveSending) {
-        const userMsgs = logEl.querySelectorAll('.msg.user');
-        const lastUserMsg = userMsgs.length ? userMsgs[userMsgs.length - 1] : null;
-        if (lastUserMsg) {
-            const bodyEl = lastUserMsg.querySelector('.msg-body');
-            if (bodyEl && bodyEl.textContent.trim() === (data.entry.text || '').trim()) {
-                liveLineCount = (data.index != null) ? data.index + 1 : liveLineCount + 1;
-                return;  // skip duplicate
-            }
+    // Hard dedup via shared Set + DOM check
+    if (data.entry.kind === 'user') {
+        const key = (data.entry.text || '').trim();
+        if (_renderedUserTexts.has(key)) {
+            liveLineCount = (data.index != null) ? data.index + 1 : liveLineCount + 1;
+            return;
         }
+        // DOM-level dedup: check if an optimistic bubble already shows this text
+        const _lu = logEl.querySelector('.msg.user:last-child .msg-body');
+        if (_lu && _lu.textContent.trim() === key) {
+            _renderedUserTexts.add(key);
+            liveLineCount = (data.index != null) ? data.index + 1 : liveLineCount + 1;
+            return;
+        }
+        _renderedUserTexts.add(key);
     }
     logEl.appendChild(renderLiveEntry(data.entry));
     liveLineCount = (data.index != null) ? data.index + 1 : liveLineCount + 1;
@@ -264,8 +271,11 @@ socket.on('session_permission', (data) => {
 socket.on('session_started', (data) => {
     if (data.session_id) {
         runningIds.add(data.session_id);
-        sessionKinds[data.session_id] = 'idle';
-        _updateRowState(data.session_id, 'idle');
+        // Don't overwrite optimistic 'working' state (set before start_session emit)
+        if (sessionKinds[data.session_id] !== 'working') {
+            sessionKinds[data.session_id] = 'idle';
+        }
+        _updateRowState(data.session_id, sessionKinds[data.session_id] || 'idle');
     }
 });
 
@@ -275,8 +285,15 @@ socket.on('session_log', (data) => {
     const logEl = document.getElementById('live-log');
     if (!logEl) return;
     logEl.innerHTML = '';
+    _renderedUserTexts.clear();
     if (data.entries && data.entries.length) {
         data.entries.forEach((entry, i) => {
+            // Register user texts so session_entry dedup stays in sync
+            if (entry.kind === 'user' && entry.text) {
+                const key = entry.text.trim();
+                if (_renderedUserTexts.has(key)) return; // skip dupe in log itself
+                _renderedUserTexts.add(key);
+            }
             logEl.appendChild(renderLiveEntry(entry));
         });
         liveLineCount = data.entries.length;

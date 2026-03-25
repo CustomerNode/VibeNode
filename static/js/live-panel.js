@@ -24,9 +24,102 @@ function _formatMsgTime(tsStr) {
 }
 
 let liveLineCount = 0;
-let _liveSending = false;  // blocks updateLiveInputBar while sending
+let _liveSending = false;
 let liveAutoScroll = true;
-let liveQueuedText = '';
+const _renderedUserTexts = new Set();
+// Per-session queue storage with localStorage persistence (array per session)
+const _sessionQueues = {};
+let _queueViewIndex = 0;
+(function _loadQueues() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('_sessionQueues') || '{}');
+    for (const k in raw) {
+      // Migrate old string format to array
+      _sessionQueues[k] = Array.isArray(raw[k]) ? raw[k] : (raw[k] ? [raw[k]] : []);
+    }
+  } catch(e) {}
+})();
+function _saveQueues() { localStorage.setItem('_sessionQueues', JSON.stringify(_sessionQueues)); }
+function _getQueueList(sid) { return (sid && _sessionQueues[sid]) || []; }
+function _getQueue(sid) { const q = _getQueueList(sid); return q.length ? q[0] : ''; }
+function _setQueue(sid, text) {
+  if (!sid) return;
+  if (text) _sessionQueues[sid] = [text]; else delete _sessionQueues[sid];
+  _queueViewIndex = 0;
+  _saveQueues();
+}
+function _addQueue(sid, text) {
+  if (!sid || !text) return;
+  if (!_sessionQueues[sid]) _sessionQueues[sid] = [];
+  _sessionQueues[sid].push(text);
+  _queueViewIndex = _sessionQueues[sid].length - 1;
+  _saveQueues();
+}
+function _removeQueueAt(sid, idx) {
+  if (!sid || !_sessionQueues[sid]) return;
+  _sessionQueues[sid].splice(idx, 1);
+  if (!_sessionQueues[sid].length) delete _sessionQueues[sid];
+  else if (_queueViewIndex >= _sessionQueues[sid].length) _queueViewIndex = _sessionQueues[sid].length - 1;
+  _saveQueues();
+}
+function _shiftQueue(sid) {
+  if (!sid || !_sessionQueues[sid] || !_sessionQueues[sid].length) return '';
+  const text = _sessionQueues[sid].shift();
+  if (!_sessionQueues[sid].length) delete _sessionQueues[sid];
+  _queueViewIndex = 0;
+  _saveQueues();
+  return text;
+}
+
+/** Render (or clear) the queue banner in the dedicated #live-queue-area div. */
+function _renderQueueBanner() {
+  const area = document.getElementById('live-queue-area');
+  if (!area) return;
+  const sid = liveSessionId;
+  const list = _getQueueList(sid);
+  if (!list.length) { area.innerHTML = ''; return; }
+  const idx = Math.min(_queueViewIndex, list.length - 1);
+  _queueViewIndex = idx;
+  const total = list.length;
+  const text = list[idx];
+
+  let navHtml = '';
+  if (total > 1) {
+    navHtml =
+      '<button class="live-queue-nav-btn" onclick="liveQueueNav(-1)" title="Previous"' + (idx === 0 ? ' disabled' : '') + '>' +
+      '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg></button>' +
+      '<span style="font-size:10px;color:var(--text-faint);min-width:28px;text-align:center;">' + (idx+1) + '/' + total + '</span>' +
+      '<button class="live-queue-nav-btn" onclick="liveQueueNav(1)" title="Next"' + (idx === total-1 ? ' disabled' : '') + '>' +
+      '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg></button>';
+  }
+
+  area.innerHTML =
+    '<div class="live-queue-banner">' +
+    '<div class="live-queue-banner-header">' +
+    '<span class="live-queue-banner-label">' +
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>' +
+    'Queued' + (total > 1 ? ' (' + total + ')' : '') + ' \u2014 will send when idle</span>' +
+    '<span style="display:flex;align-items:center;gap:4px;">' +
+    navHtml +
+    '<button class="live-queue-cancel-btn" onclick="liveEditQueue()" title="Edit this command">' +
+    '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:2px;"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>' +
+    'Edit</button>' +
+    '<button class="live-queue-cancel-btn" onclick="liveClearQueue()" title="Remove this command" style="color:var(--result-err,#c44);border-color:rgba(204,68,68,0.25);">' +
+    '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="vertical-align:middle;margin-right:2px;"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>' +
+    'Remove</button>' +
+    '</span>' +
+    '</div>' +
+    '<div class="live-queue-banner-text">' + escHtml(text) + '</div>' +
+    '</div>';
+}
+
+function liveQueueNav(dir) {
+  const list = _getQueueList(liveSessionId);
+  if (!list.length) return;
+  _queueViewIndex = Math.max(0, Math.min(list.length - 1, _queueViewIndex + dir));
+  _renderQueueBanner();
+}
+
 let liveBarState = null;   // 'ended' | 'question:<questionText>' | 'idle' | 'working'
 let _guiFocusPending = false;
 let _liveWorkingStart = null;  // timestamp when working state began
@@ -46,6 +139,7 @@ async function openInGUI(id) {
   closeAllGrpDropdowns();
   activeId = id;
   localStorage.setItem('activeSessionId', id || '');
+  _pushChatUrl(id);
   if (runningIds.has(id)) guiOpenAdd(id);
   if (liveSessionId && liveSessionId !== id) stopLivePanel();
   filterSessions();
@@ -69,9 +163,11 @@ async function openInGUI(id) {
         '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-faint)" stroke-width="1.5" stroke-linecap="round" style="margin-bottom:12px;opacity:0.4;"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
         '<div style="color:var(--text-faint);font-size:13px;">What should Claude work on?</div>' +
         '</div></div>' +
+        '<div id="live-queue-area"></div>' +
         '<div class="live-input-bar" id="live-input-bar"></div></div>';
       liveSessionId = id;
       liveBarState = null;
+      _renderedUserTexts.clear();
       const bar = document.getElementById('live-input-bar');
       if (bar) {
         bar.innerHTML =
@@ -83,7 +179,7 @@ async function openInGUI(id) {
           '<button class="live-send-btn" id="live-voice-btn"></button>' +
           '</div>';
         setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => _newSessionSubmit(id));
-        setTimeout(() => { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }, 50);
+        setTimeout(() => { const ta = document.getElementById('live-input-ta'); if (ta) { ta.focus(); _initAutoResize(ta); } }, 50);
       }
       return;
     }
@@ -98,22 +194,25 @@ async function openInGUI(id) {
   startLivePanel(id);
 }
 
-function startLivePanel(id) {
+function startLivePanel(id, opts) {
   stopLivePanel();
   liveSessionId = id;
   liveLineCount = 0;
   liveAutoScroll = true;
-  liveQueuedText = '';
+  if (!(opts && opts.skipLog)) _renderedUserTexts.clear();
+  // Queue is restored from per-session localStorage — no reset here
   // Restore working_since from the map (set by state_snapshot/session_state)
   if (window._workingSinceMap && window._workingSinceMap[id]) {
     _liveWorkingStart = window._workingSinceMap[id];
   }
   liveBarState = null;  // force fresh render
 
-  const skelHtml = _chatSkeleton().replace('<div class="conversation">', '').replace(/<\/div>$/, '');
+  const skipLog = opts && opts.skipLog;
+  const skelHtml = skipLog ? '' : _chatSkeleton().replace('<div class="conversation">', '').replace(/<\/div>$/, '');
   document.getElementById('main-body').innerHTML =
     '<div class="live-panel" id="live-panel">' +
     '<div class="conversation live-log" id="live-log">' + skelHtml + '</div>' +
+    '<div id="live-queue-area"></div>' +
     '<div class="live-input-bar" id="live-input-bar"></div></div>';
 
   const logEl = document.getElementById('live-log');
@@ -125,25 +224,28 @@ function startLivePanel(id) {
   const btnClose = document.getElementById('btn-close');
   if (btnClose) btnClose.disabled = false;
 
-  // Request the log via WebSocket instead of polling
-  socket.emit('get_session_log', {session_id: id, since: 0});
+  // Request the log via WebSocket (skip for brand-new sessions — optimistic bubble is enough)
+  if (!skipLog) {
+    socket.emit('get_session_log', {session_id: id, since: 0});
+  }
 
   // Render input bar immediately and schedule re-renders in case
   // state events arrived before the DOM was ready.
   // BUT: skip re-render if user has already started typing.
   liveBarState = null;
   updateLiveInputBar();
+  _renderQueueBanner();
   setTimeout(() => {
     const ta = document.getElementById('live-input-ta');
     if (ta && ta.value.trim()) return; // user is typing, don't clobber
-    liveBarState = null;
     updateLiveInputBar();
+    _renderQueueBanner();
   }, 500);
   setTimeout(() => {
     const ta = document.getElementById('live-input-ta');
     if (ta && ta.value.trim()) return;
-    liveBarState = null;
     updateLiveInputBar();
+    _renderQueueBanner();
   }, 2000);
 }
 
@@ -254,11 +356,14 @@ function renderLiveEntry(e) {
 }
 
 function updateLiveInputBar() {
-  if (_liveSending) return;  // don't overwrite while sending
   if (!liveSessionId) return;
   const id = liveSessionId;
   const bar = document.getElementById('live-input-bar');
   if (!bar) return;
+
+  // Track whether focus was inside this bar before re-render so we can
+  // restore it synchronously after innerHTML replacement (avoids focus flash).
+  const _barHadFocus = bar.contains(document.activeElement);
 
   // Don't touch the bar for sessions that haven't started on the server yet.
   // addNewAgent() renders its own input bar with _newSessionSubmit handler.
@@ -267,8 +372,10 @@ function updateLiveInputBar() {
   const kind = sessionKinds[id];  // 'question' | 'working' | 'idle' | undefined
   if (!isRunning && !kind && guiOpenSessions.has(id)) return;
 
-  // Don't clobber if user has typed/pasted content in the textarea
-  const existingTa = bar.querySelector('textarea');
+  // Don't clobber if user has typed/pasted content in the main input textarea.
+  // Only protect #live-input-ta (idle/question/ended states), NOT #live-queue-ta
+  // (working state) — queue textarea content must not block state transitions.
+  const existingTa = bar.querySelector('#live-input-ta');
   if (existingTa && existingTa.value.trim()) return;
   const wd = waitingData[id];     // {question, options, kind} or undefined
 
@@ -277,11 +384,11 @@ function updateLiveInputBar() {
   if (!isRunning) stateKey = 'ended';
   else if (kind === 'question') stateKey = 'question:' + (wd ? wd.question || '' : '');
   else if (kind === 'idle') stateKey = 'idle';
-  else stateKey = 'working';
+  else stateKey = 'working:' + _getQueueList(id).length;
 
   // Reset working timer when leaving working state — but only if we
   // have a definitive non-working state (not just 'ended' from missing data)
-  if (stateKey !== 'working' && kind) {
+  if (!stateKey.startsWith('working') && kind) {
     _liveWorkingStart = null;
     if (_liveWorkingTimer) { clearInterval(_liveWorkingTimer); _liveWorkingTimer = null; }
   }
@@ -289,7 +396,14 @@ function updateLiveInputBar() {
   // Don't re-render if the bar is already showing this exact state.
   // This is critical: prevents wiping user's in-progress typed text.
   if (stateKey === liveBarState) return;
+  const wasTransition = liveBarState !== null;  // true if switching between states
   liveBarState = stateKey;
+
+  // Animate the bar content when switching between states (not on initial render)
+  if (wasTransition) {
+    bar.classList.add('bar-transitioning');
+    setTimeout(() => bar.classList.remove('bar-transitioning'), 350);
+  }
 
   if (!isRunning) {
     bar.innerHTML =
@@ -307,17 +421,18 @@ function updateLiveInputBar() {
     if (btnClose) btnClose.disabled = true;
     _guiFocusPending = false;
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => liveSubmitContinue(id));
+    if (_barHadFocus) { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }
     setTimeout(() => {
       const logEl = document.getElementById('live-log');
       if (logEl) logEl.scrollTop = logEl.scrollHeight;
       const ta = document.getElementById('live-input-ta');
-      if (ta) ta.focus();
+      if (ta) { if (!_barHadFocus) ta.focus(); _initAutoResize(ta); }
     }, 50);
 
   } else if (kind === 'question') {
     // Claude is asking something — show question text + option buttons + free-form textarea
-    const prefill = liveQueuedText;
-    liveQueuedText = '';
+    const prefill = _shiftQueue(id);
+    _renderQueueBanner();
     const questionText = (wd && wd.question) ? wd.question : '';
     const options = (wd && wd.options) ? wd.options : null;
 
@@ -365,15 +480,14 @@ function updateLiveInputBar() {
     const ta = document.getElementById('live-input-ta');
     if (ta) {
       if (prefill) ta.value = prefill;
-      const shouldFocus = _guiFocusPending || true;
-      if (shouldFocus) {
-        _guiFocusPending = false;
-        setTimeout(() => {
-          const logEl = document.getElementById('live-log');
-          if (logEl) logEl.scrollTop = logEl.scrollHeight;
-          ta.focus();
-        }, 50);
-      }
+      _guiFocusPending = false;
+      if (_barHadFocus) ta.focus();
+      _initAutoResize(ta);
+      setTimeout(() => {
+        const logEl = document.getElementById('live-log');
+        if (logEl) logEl.scrollTop = logEl.scrollHeight;
+        if (!_barHadFocus) ta.focus();
+      }, 50);
     }
 
   } else if (kind === 'idle') {
@@ -386,65 +500,46 @@ function updateLiveInputBar() {
       '</div>';
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), liveSubmitIdle);
     _guiFocusPending = false;
+    if (_barHadFocus) { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }
     setTimeout(() => {
       const logEl = document.getElementById('live-log');
       if (logEl) logEl.scrollTop = logEl.scrollHeight;
       const ta = document.getElementById('live-input-ta');
-      if (ta) ta.focus();
+      if (ta) { if (!_barHadFocus) ta.focus(); _initAutoResize(ta); }
     }, 50);
 
   } else {
-    // Start elapsed timer
+    // Working state — banner is rendered separately in #live-queue-area
     if (!_liveWorkingStart) _liveWorkingStart = Date.now();
     const _elapsed = Math.round((Date.now() - _liveWorkingStart) / 1000);
     const _elapsedStr = _elapsed >= 60 ? Math.floor(_elapsed/60) + 'm ' + (_elapsed%60) + 's' : _elapsed + 's';
+    const qCount = _getQueueList(id).length;
+
     bar.innerHTML =
       '<div class="live-working-status">' +
       '<div class="live-working-indicator"><span class="spinner"></span> Working\u2026 <span id="live-elapsed" style="color:var(--text-faint);font-size:10px;margin-left:6px;">' + _elapsedStr + '</span></div>' +
       '<button class="live-stop-btn" onclick="liveSubmitInterrupt()" title="Interrupt session">\u25A0 Stop</button>' +
       '</div>' +
-      '<textarea id="live-queue-ta" class="live-textarea" rows="2" ' +
-      'style="opacity:0.6;" placeholder="Type your next command \u2014 will send when Claude finishes\u2026"' +
-      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveQueueSave()}">' +
-      (liveQueuedText ? escHtml(liveQueuedText) : '') +
-      '</textarea>' +
+      '<textarea id="live-queue-ta" class="live-textarea live-queue-ta" rows="2" ' +
+      'placeholder="' + (qCount ? 'Queue another command\u2026' : 'Type your next command \u2014 will send when Claude finishes\u2026') + '"' +
+      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveQueueSave()}"></textarea>' +
       '<div class="live-bar-row">' +
       '<span id="live-queue-hint" style="font-size:10px;color:var(--text-faint);">' +
-      (liveQueuedText ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Command queued' : 'Will send automatically when done') +
+      (qCount ? qCount + ' queued \u2022 will send in order when idle' : 'Will send automatically when done') +
       '</span>' +
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
-      (liveQueuedText ? '<button class="live-send-btn danger" id="live-queue-clear" style="margin-left:2px;" onclick="liveClearQueue()" title="Cancel queued command"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>' : '') +
       '</div>';
     setupVoiceButton(document.getElementById('live-queue-ta'), document.getElementById('live-voice-btn'), liveQueueSave);
-    const qta = document.getElementById('live-queue-ta');
-    if (qta) {
-      qta.addEventListener('input', () => {
-        liveQueuedText = qta.value;
-        const hint = document.getElementById('live-queue-hint');
-        if (hint) hint.innerHTML = qta.value.trim() ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Command queued' : 'Will send automatically when done';
-        // Show/hide clear button based on content
-        const clearBtn = document.getElementById('live-queue-clear');
-        if (clearBtn) clearBtn.style.display = qta.value.trim() ? '' : 'none';
-        if (!clearBtn && qta.value.trim()) {
-          // Add clear button dynamically
-          const row = qta.closest('.live-input-bar')?.querySelector('.live-bar-row');
-          if (row) {
-            const btn = document.createElement('button');
-            btn.className = 'live-send-btn danger';
-            btn.id = 'live-queue-clear';
-            btn.style.marginLeft = '2px';
-            btn.onclick = liveClearQueue;
-            btn.title = 'Cancel queued command';
-            btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
-            row.appendChild(btn);
-          }
-        }
-      });
-    }
+    if (_barHadFocus) { const ta = document.getElementById('live-queue-ta'); if (ta) ta.focus(); }
+    setTimeout(() => {
+      const ta = document.getElementById('live-queue-ta');
+      if (ta) { if (!_barHadFocus) ta.focus(); _initAutoResize(ta); }
+    }, 50);
+    _renderQueueBanner();
     // Start elapsed timer — update only the time span, NOT the whole bar
     if (!_liveWorkingTimer) {
       _liveWorkingTimer = setInterval(() => {
-        if (liveBarState !== 'working' || !_liveWorkingStart) return;
+        if (!liveBarState || !liveBarState.startsWith('working') || !_liveWorkingStart) return;
         const el = document.getElementById('live-elapsed');
         if (!el) return;
         const s = Math.round((Date.now() - _liveWorkingStart) / 1000);
@@ -466,19 +561,57 @@ function livePickOption(val) {
 
 function liveQueueSave() {
   const ta = document.getElementById('live-queue-ta');
-  if (ta) {
-    liveQueuedText = ta.value.trim();
-    showToast(liveQueuedText ? 'Command queued \u2014 will send when Claude finishes' : 'Queue cleared');
-  }
+  if (!ta || !liveSessionId) return;
+  const text = ta.value.trim();
+  if (!text) return;
+  _addQueue(liveSessionId, text);
+  ta.value = '';
+  _resetTextareaHeight(ta);
+  ta.placeholder = 'Queue another command\u2026';
+  const total = _getQueueList(liveSessionId).length;
+  showToast('Command queued (' + total + ')');
+  _renderQueueBanner();
+  const hint = document.getElementById('live-queue-hint');
+  if (hint) hint.textContent = total + ' queued \u2022 will send in order when idle';
+  // Scroll chat to bottom so banner is visible
+  const logEl = document.getElementById('live-log');
+  if (logEl) logEl.scrollTop = logEl.scrollHeight;
+  // Keep focus on textarea
+  ta.focus();
 }
 
 function liveClearQueue() {
-  liveQueuedText = '';
+  if (!liveSessionId) return;
+  const list = _getQueueList(liveSessionId);
+  if (!list.length) return;
+  _removeQueueAt(liveSessionId, _queueViewIndex);
+  const remaining = _getQueueList(liveSessionId).length;
+  showToast(remaining ? 'Removed \u2014 ' + remaining + ' remaining' : 'Queue cleared');
+  _renderQueueBanner();
   const ta = document.getElementById('live-queue-ta');
-  if (ta) ta.value = '';
+  if (ta) ta.placeholder = remaining ? 'Queue another command\u2026' : 'Type your next command \u2014 will send when Claude finishes\u2026';
   const hint = document.getElementById('live-queue-hint');
-  if (hint) hint.textContent = 'Will send automatically when done';
-  showToast('Queue cleared');
+  if (hint) hint.textContent = remaining ? remaining + ' queued \u2022 will send in order when idle' : 'Will send automatically when done';
+  if (ta) ta.focus();
+}
+
+function liveEditQueue() {
+  if (!liveSessionId) return;
+  const list = _getQueueList(liveSessionId);
+  if (!list.length) return;
+  const text = list[_queueViewIndex];
+  _removeQueueAt(liveSessionId, _queueViewIndex);
+  _renderQueueBanner();
+  const remaining = _getQueueList(liveSessionId).length;
+  const ta = document.getElementById('live-queue-ta');
+  if (ta) {
+    ta.value = text;
+    _autoResizeTextarea(ta);
+    ta.placeholder = remaining ? 'Queue another command\u2026' : 'Type your next command \u2014 will send when Claude finishes\u2026';
+    ta.focus();
+  }
+  const hint = document.getElementById('live-queue-hint');
+  if (hint) hint.textContent = remaining ? remaining + ' queued \u2022 Press Enter to re-queue' : 'Will send automatically when done';
 }
 
 function liveSubmitIdle() {
@@ -488,6 +621,7 @@ function liveSubmitIdle() {
   if (!text) return;
   _liveSubmitDirect(liveSessionId, text);
   ta.value = '';
+  _resetTextareaHeight(ta);
 }
 
 function _liveSubmitDirect(sid, text, opts) {
@@ -513,27 +647,48 @@ function _liveSubmitDirect(sid, text, opts) {
     _addOptimisticBubble(sid, text);
   }
 
-  // Reset sending flag after brief delay (let WebSocket events flow)
-  setTimeout(() => {
-    _liveSending = false;
-    liveBarState = null;
-    updateLiveInputBar();
-    // Scroll to bottom after bar re-renders
-    const logEl = document.getElementById('live-log');
-    if (logEl && liveAutoScroll) logEl.scrollTop = logEl.scrollHeight;
-  }, 500);
+  // Optimistically set working state and render the full working bar immediately
+  if (!wasPermission) {
+    sessionKinds[sid] = 'working';
+  }
+  liveBarState = null;
+  updateLiveInputBar();
+
+  // Reset sending flag after brief delay (keeps session_entry dedup working)
+  setTimeout(() => { _liveSending = false; }, 500);
 }
 
 function _addOptimisticBubble(sid, text) {
   if (sid !== liveSessionId) return;
   const logEl = document.getElementById('live-log');
   if (!logEl) return;
+
+  // Hard dedup: if this exact text is already tracked, bail out
+  const key = text.trim();
+  if (_renderedUserTexts.has(key)) return;
+  // DOM-level dedup: if the last user bubble has same text, skip
+  const _lu = logEl.querySelector('.msg.user:last-child .msg-body');
+  if (_lu && _lu.textContent.trim() === key) return;
+  _renderedUserTexts.add(key);
+
+  // Clear skeleton/placeholder on first message
+  const skel = logEl.querySelector('.skel-bar, .skeleton-loader, .skel-row');
+  if (skel) logEl.innerHTML = '';
+
+  // Fade out empty state if this is the first message
+  const emptyEl = logEl.querySelector('.empty-state');
+  if (emptyEl) {
+    emptyEl.classList.add('fading-out');
+    emptyEl.addEventListener('animationend', () => emptyEl.remove(), {once: true});
+  }
+
   const now = new Date();
   const h = now.getHours() % 12 || 12;
   const timestamp = h + ':' + String(now.getMinutes()).padStart(2, '0') + ' ' + (now.getHours() >= 12 ? 'PM' : 'AM');
   const userMsg = document.createElement('div');
-  userMsg.className = 'msg user';
+  userMsg.className = 'msg user msg-entering';
   userMsg.innerHTML = '<div class="msg-role">me <span class="msg-time">' + timestamp + '</span></div><div class="msg-body msg-content">' + mdParse(text) + '</div>';
+  userMsg.addEventListener('animationend', () => userMsg.classList.remove('msg-entering'), {once: true});
   logEl.appendChild(userMsg);
   logEl.scrollTop = logEl.scrollHeight;
 }
@@ -543,6 +698,7 @@ function liveSubmitContinue(fromId) {
   const text = ta ? ta.value.trim() : '';
   if (!text) return;
   ta.value = '';
+  _resetTextareaHeight(ta);
 
   const sid = typeof fromId === 'string' ? fromId : liveSessionId;
   if (!sid) return;
@@ -550,10 +706,7 @@ function liveSubmitContinue(fromId) {
   // Add optimistic user bubble
   _addOptimisticBubble(sid, text);
 
-  // Show sending indicator
   _liveSending = true;
-  const bar = document.getElementById('live-input-bar');
-  if (bar) bar.innerHTML = '<div class="live-working-status"><div class="live-working-indicator"><span class="spinner"></span> Sending\u2026</div></div>';
 
   // If session is not running, resume it via WebSocket
   if (!runningIds.has(sid)) {
@@ -563,21 +716,20 @@ function liveSubmitContinue(fromId) {
       cwd: _currentProjectDir(),
       resume: true,
     });
-    // Optimistic state
     runningIds.add(sid);
     guiOpenAdd(sid);
-    sessionKinds[sid] = 'working';
   } else {
     // Session is running — send message directly
     socket.emit('send_message', {session_id: sid, text: text});
   }
 
-  // Reset sending flag after brief delay
-  setTimeout(() => {
-    _liveSending = false;
-    liveBarState = null;
-    updateLiveInputBar();
-  }, 1000);
+  // Immediately render full working bar
+  sessionKinds[sid] = 'working';
+  liveBarState = null;
+  updateLiveInputBar();
+
+  // Reset sending flag after brief delay (keeps session_entry dedup working)
+  setTimeout(() => { _liveSending = false; }, 1000);
 }
 
 function liveSubmitWaiting() {
@@ -586,6 +738,7 @@ function liveSubmitWaiting() {
   const text = ta.value.trim();
   if (!text) return;
   ta.value = '';
+  _resetTextareaHeight(ta);
 
   // Use permission_response if there's an active permission request
   if (waitingData[liveSessionId]) {
@@ -606,7 +759,18 @@ function liveSubmitWaiting() {
 
 function liveSubmitInterrupt() {
   if (!liveSessionId) return;
+  // Clear any queued commands — user is intentionally stopping, so we must
+  // NOT auto-send queued text when the session_state(idle) event arrives.
+  // Without this, the auto-send in socket.js fires immediately, setting
+  // sessionKinds back to 'working' while _updateRowState shows 'idle',
+  // causing the left menu and chat UI to be out of sync.
+  _setQueue(liveSessionId, '');
+  _renderQueueBanner();
   socket.emit('interrupt_session', {session_id: liveSessionId});
+  // Optimistic: immediately show idle state in the chat UI
+  sessionKinds[liveSessionId] = 'idle';
+  liveBarState = null;
+  updateLiveInputBar();
 }
 
 function liveClearDisplay() {

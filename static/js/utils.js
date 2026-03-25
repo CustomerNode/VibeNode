@@ -1,5 +1,7 @@
 /* utils.js — shared helper functions and premium modal system */
 
+var _pmCloseTimer = null;
+
 function escHtml(str) {
   if (!str) return '';
   return String(str)
@@ -25,6 +27,37 @@ let sendBehavior = localStorage.getItem('sendBehavior') || 'ctrl-enter';
 function _shouldSend(e) {
   if (sendBehavior === 'enter') return e.key === 'Enter' && !e.shiftKey;
   return e.key === 'Enter' && (e.ctrlKey || e.metaKey);
+}
+
+// ---------------------------------------------------------------------------
+// Auto-resize textarea — grows with content up to CSS max-height, then scrolls
+// ---------------------------------------------------------------------------
+const _TEXTAREA_MAX_PX = 300; // must match .live-textarea max-height in CSS
+
+/** Resize a textarea to fit its content (up to max-height), then overflow-scroll */
+function _autoResizeTextarea(ta) {
+  if (!ta) return;
+  ta.style.height = 'auto';                       // shrink to content first
+  const scrollH = ta.scrollHeight;
+  ta.style.height = Math.min(scrollH, _TEXTAREA_MAX_PX) + 'px';
+  ta.style.overflowY = scrollH > _TEXTAREA_MAX_PX ? 'auto' : 'hidden';
+}
+
+/** Reset a textarea back to its default collapsed height */
+function _resetTextareaHeight(ta) {
+  if (!ta) return;
+  ta.style.height = '';
+  ta.style.overflowY = '';
+}
+
+/** Attach auto-resize listener to a textarea (safe to call multiple times) */
+function _initAutoResize(ta) {
+  if (!ta || ta._autoResizeBound) return;
+  ta._autoResizeBound = true;
+  ta.style.overflowY = 'hidden';                  // start with no scrollbar
+  ta.addEventListener('input', () => _autoResizeTextarea(ta));
+  // If textarea already has content (e.g. prefilled), resize immediately
+  if (ta.value) _autoResizeTextarea(ta);
 }
 
 /** Returns HTML for the current send hint + toggle button */
@@ -65,6 +98,7 @@ function _refreshSendHints() {
  */
 function showAlert(title, message, opts = {}) {
   return new Promise(resolve => {
+    if (_pmCloseTimer) { clearTimeout(_pmCloseTimer); _pmCloseTimer = null; }
     const overlay = document.getElementById('pm-overlay');
     const icon = opts.icon || '';
     const btnText = opts.buttonText || 'OK';
@@ -96,6 +130,7 @@ function showAlert(title, message, opts = {}) {
  */
 function showConfirm(title, message, opts = {}) {
   return new Promise(resolve => {
+    if (_pmCloseTimer) { clearTimeout(_pmCloseTimer); _pmCloseTimer = null; }
     const overlay = document.getElementById('pm-overlay');
     const icon = opts.icon || '';
     const confirmText = opts.confirmText || 'Confirm';
@@ -131,6 +166,7 @@ function showConfirm(title, message, opts = {}) {
  */
 function showPrompt(title, message, opts = {}) {
   return new Promise(resolve => {
+    if (_pmCloseTimer) { clearTimeout(_pmCloseTimer); _pmCloseTimer = null; }
     const overlay = document.getElementById('pm-overlay');
     const icon = opts.icon || '';
     const placeholder = opts.placeholder || '';
@@ -169,5 +205,6 @@ function _closePm() {
   const overlay = document.getElementById('pm-overlay');
   const card = overlay.querySelector('.pm-card');
   if (card) card.classList.add('pm-exit');
-  setTimeout(() => { overlay.classList.remove('show'); overlay.innerHTML = ''; }, 150);
+  if (_pmCloseTimer) clearTimeout(_pmCloseTimer);
+  _pmCloseTimer = setTimeout(() => { overlay.classList.remove('show'); overlay.innerHTML = ''; _pmCloseTimer = null; }, 150);
 }

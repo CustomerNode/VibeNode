@@ -617,27 +617,45 @@ function navigateToFolder(folderId, skipHistory) {
     } else {
       url.searchParams.delete('folder');
     }
-    history.pushState({ folder: folderId }, '', url);
+    history.pushState({ folder: folderId, chat: activeId || null }, '', url);
   }
   filterSessions();
 }
 
-// Restore folder from URL on load + handle back/forward
+// Restore folder + chat from URL on load + handle back/forward
 window.addEventListener('popstate', function(e) {
-  if (e.state && typeof e.state.folder !== 'undefined') {
-    navigateToFolder(e.state.folder, true);
-  } else {
-    // Check URL params
-    const url = new URL(window.location);
-    const f = url.searchParams.get('folder');
-    navigateToFolder(f || null, true);
+  const state = e.state || {};
+  const url = new URL(window.location);
+
+  // Handle folder
+  const folderId = (typeof state.folder !== 'undefined') ? state.folder : (url.searchParams.get('folder') || null);
+  navigateToFolder(folderId, true);
+
+  // Handle chat
+  const chatId = (typeof state.chat !== 'undefined') ? state.chat : (url.searchParams.get('chat') || null);
+  _skipChatHistory = true;
+  if (chatId && chatId !== activeId) {
+    if (workspaceActive && typeof expandWorkspaceCard === 'function') {
+      expandWorkspaceCard(chatId);
+    } else if (typeof openInGUI === 'function') {
+      openInGUI(chatId);
+    }
+  } else if (!chatId && activeId) {
+    if (workspaceActive) {
+      backToWorkspace();
+    } else {
+      deselectSession();
+    }
   }
+  _skipChatHistory = false;
 });
-// On initial load, restore from URL
+// On initial load, restore from URL and set initial history state
 (function() {
   const url = new URL(window.location);
   const f = url.searchParams.get('folder');
+  const c = url.searchParams.get('chat');
   if (f) _currentFolderId = f;
+  history.replaceState({ folder: f || null, chat: c || null }, '', url);
 })();
 
 // ---- Permission panel ----
@@ -940,6 +958,7 @@ function expandWorkspaceCard(id) {
   _wsExpandedId = id;
   activeId = id;
   localStorage.setItem('activeSessionId', id);
+  _pushChatUrl(id);
   if (runningIds.has(id)) guiOpenAdd(id);
 
   const cached = allSessions.find(x => x.id === id);
@@ -977,6 +996,7 @@ function backToWorkspace() {
   if (liveSessionId) stopLivePanel();
   activeId = null;
   localStorage.removeItem('activeSessionId');
+  _pushChatUrl(null);
 
   // Remove back button
   const btn = document.getElementById('ws-back-btn');

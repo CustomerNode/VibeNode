@@ -129,7 +129,11 @@ function openRespond(id) {
   setTimeout(() => {
     const qEl = document.getElementById('respond-question');
     qEl.scrollTop = qEl.scrollHeight;
-    document.getElementById('respond-input').focus();
+    const ri = document.getElementById('respond-input');
+    ri.value = '';
+    _resetTextareaHeight(ri);
+    _initAutoResize(ri);
+    ri.focus();
   }, 60);
 }
 
@@ -157,8 +161,12 @@ function sendRespond(text) {
 }
 
 async function submitRespond() {
-  const text = document.getElementById('respond-input').value.trim();
-  if (text) await sendRespond(text);
+  const ri = document.getElementById('respond-input');
+  const text = ri.value.trim();
+  if (text) {
+    _resetTextareaHeight(ri);
+    await sendRespond(text);
+  }
 }
 
 document.getElementById('respond-overlay').addEventListener('click', function(e) {

@@ -69,6 +69,15 @@ class DaemonClient:
 
     def _connect(self):
         """TCP connect to daemon."""
+        # Close old socket to avoid CLOSE_WAIT leaks
+        old = self._sock
+        if old:
+            try:
+                old.close()
+            except Exception:
+                pass
+            self._sock = None
+
         for attempt in range(50):
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -152,11 +161,15 @@ class DaemonClient:
                 time.sleep(0.5)
                 continue
 
+            # Snapshot the current socket so we can detect if reconnection
+            # happened while we were reading (prevents stale disconnect from
+            # overwriting a successful reconnect).
+            current_sock = self._sock
             buffer = ""
             try:
                 while self._should_run and self._connected:
                     try:
-                        data = self._sock.recv(65536)
+                        data = current_sock.recv(65536)
                     except (ConnectionResetError, ConnectionAbortedError, OSError):
                         break
                     if not data:
@@ -190,11 +203,14 @@ class DaemonClient:
             except Exception:
                 logger.debug("Reader loop error", exc_info=True)
 
-            # Connection lost
-            self._connected = False
-            logger.info("Lost connection to daemon")
-            if self._should_run:
-                self._start_reconnect()
+            # Only handle disconnect if our socket is still the current one.
+            # If self._sock changed, a reconnect already happened — don't
+            # overwrite _connected=True with False.
+            if self._sock is current_sock:
+                self._connected = False
+                logger.info("Lost connection to daemon")
+                if self._should_run:
+                    self._start_reconnect()
 
     def _emit_socketio(self, event_name, data):
         """Re-emit a daemon push event as a SocketIO event to browsers."""
@@ -248,6 +264,19 @@ class DaemonClient:
         return self._send_request("close_session", {
             "session_id": session_id,
         })
+
+    def close_session_sync(self, session_id, timeout=5.0):
+        return self._send_request("close_session_sync", {
+            "session_id": session_id, "timeout": timeout,
+        })
+
+    def remove_session(self, session_id):
+        return self._send_request("remove_session", {
+            "session_id": session_id,
+        })
+
+    def _save_registry_now(self):
+        return self._send_request("save_registry_now")
 
     def get_all_states(self):
         result = self._send_request("get_all_states")

@@ -412,7 +412,6 @@ def load_session_timeline(path: Path) -> dict:
 
                     ts_str = obj.get("timestamp", "")
                     uuid = obj.get("uuid", "")
-                    snap = snapshots.get(uuid, {})
 
                     messages.append({
                         "index": len(messages),
@@ -421,7 +420,7 @@ def load_session_timeline(path: Path) -> dict:
                         "preview": cleaned[:140],
                         "ts": ts_str,
                         "uuid": uuid,
-                        "has_snapshot": bool(snap.get("trackedFileBackups")),
+                        "has_snapshot": False,  # filled in post-pass below
                         "changes": {
                             "added": added,
                             "removed": removed,
@@ -431,6 +430,16 @@ def load_session_timeline(path: Path) -> dict:
 
     except Exception:
         return {"messages": [], "has_snapshots": False, "title": path.stem}
+
+    # Post-pass: mark messages that have an associated file-history snapshot.
+    # Snapshots appear AFTER the message they reference in the JSONL, so the
+    # single-pass lookup above always misses them.  Fix up now that all
+    # snapshot entries have been collected.
+    if snapshots:
+        for m in messages:
+            if m["uuid"] and m["uuid"] in snapshots:
+                snap = snapshots[m["uuid"]]
+                m["has_snapshot"] = bool(snap.get("trackedFileBackups"))
 
     return {
         "messages": messages,

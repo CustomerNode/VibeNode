@@ -529,6 +529,27 @@ class SessionManager:
         )
         return {"ok": True}
 
+    def close_session_sync(self, session_id: str, timeout: float = 5.0) -> dict:
+        """Close an SDK session and block until the disconnect finishes."""
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return {"ok": False, "error": "Session not found"}
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._close_session(session_id), self._loop
+        )
+        try:
+            future.result(timeout=timeout)
+        except Exception as e:
+            logger.warning("Timed-out or failed waiting for close of %s: %s", session_id, e)
+        return {"ok": True}
+
+    def remove_session(self, session_id: str) -> None:
+        """Remove a session from the in-memory dict entirely."""
+        with self._lock:
+            self._sessions.pop(session_id, None)
+
     def get_all_states(self) -> list:
         """Return snapshot of all session states for initial WebSocket connect."""
         with self._lock:

@@ -25,21 +25,24 @@ async function pollWaiting() {
       if (w.kind === 'question') newWaiting[w.id] = w;
     });
 
-    // Auto-send queued input when Claude transitions from working -> idle
-    // Snapshot the session ID to prevent race conditions if user switches sessions
-    const _qSid = liveSessionId;
-    const _qText = _qSid ? _ps(_qSid).queuedText : '';
-    if (_qSid && _qText && !_liveSending) {
+    // Auto-send queued input when any session transitions from working -> idle
+    // (works even if user navigated away from the session)
+    for (const _qSid of Object.keys(_sessionQueues)) {
+      const _qText = _getQueue(_qSid);
+      if (!_qText || _liveSending) continue;
       const wasWorking = (sessionKinds[_qSid] === 'working');
       const nowIdle    = (newKinds[_qSid] === 'idle');
-      if (wasWorking && nowIdle && liveSessionId === _qSid) {
-        _ps(_qSid).queuedText = '';
-        // Force UI refresh to clear the queue banner and textarea
-        liveBarState = null;
-        showToast('Sending queued command\u2026');
-        // Use _liveSubmitDirect so the queued message gets an optimistic
-        // bubble in the chat, working-state UI, and proper retry logic.
-        _liveSubmitDirect(_qSid, _qText, {});
+      if (wasWorking && nowIdle) {
+        _shiftQueue(_qSid);
+        const remaining = _getQueueList(_qSid).length;
+        showToast('Sending queued command\u2026' + (remaining ? ' (' + remaining + ' remaining)' : ''));
+        if (liveSessionId === _qSid) {
+          _renderQueueBanner();
+          liveBarState = null;
+          _liveSubmitDirect(_qSid, _qText, {});
+        } else {
+          socket.emit('send_message', {session_id: _qSid, text: _qText});
+        }
       }
     }
 

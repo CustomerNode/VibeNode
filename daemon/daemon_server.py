@@ -49,8 +49,16 @@ class SessionDaemon:
 
         # Listen for Web UI connections
         self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server_socket.bind(("127.0.0.1", self.port))
+        # Do NOT use SO_REUSEADDR on Windows — it allows multiple processes to
+        # bind the same port, causing connections to be split between daemons.
+        if sys.platform != "win32":
+            self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self._server_socket.bind(("127.0.0.1", self.port))
+        except OSError as e:
+            logger.error("Port %d already in use — another daemon is running? %s", self.port, e)
+            print(f"ERROR: Port {self.port} already in use. Kill the existing daemon first.", flush=True)
+            sys.exit(1)
         self._server_socket.listen(1)
         self._server_socket.settimeout(1.0)  # Allow periodic check for shutdown
 
@@ -129,9 +137,11 @@ class SessionDaemon:
             while self._running:
                 try:
                     data = sock.recv(65536)
-                except (ConnectionResetError, ConnectionAbortedError):
+                except (ConnectionResetError, ConnectionAbortedError) as e:
+                    logger.info("Client recv error: %s", e)
                     break
                 if not data:
+                    logger.info("Client sent EOF (empty recv)")
                     break
                 buffer += data.decode("utf-8")
                 while "\n" in buffer:
@@ -144,8 +154,8 @@ class SessionDaemon:
                         self._dispatch(sock, msg)
                     except json.JSONDecodeError:
                         logger.warning("Invalid JSON from client: %s", line[:200])
-        except Exception:
-            logger.debug("Client connection ended", exc_info=True)
+        except Exception as e:
+            logger.warning("Client connection ended with exception: %s", e, exc_info=True)
         finally:
             with self._client_lock:
                 if self._client_socket is sock:
@@ -181,6 +191,9 @@ class SessionDaemon:
             "resolve_permission": self.session_manager.resolve_permission_unified,
             "interrupt_session": self.session_manager.interrupt_session,
             "close_session": self.session_manager.close_session,
+            "close_session_sync": self.session_manager.close_session_sync,
+            "remove_session": lambda **kw: self.session_manager.remove_session(**kw) or {"ok": True},
+            "save_registry_now": lambda **kw: self.session_manager._save_registry_now() or {"ok": True},
             "get_all_states": lambda **kw: self.session_manager.get_all_states(),
             "get_entries": self.session_manager.get_entries,
             "has_session": self.session_manager.has_session,

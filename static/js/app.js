@@ -32,6 +32,19 @@ let _resendCount = {};
 let _lastSendTimePerSession = {};
 let _waitingPolledOnce = true;  // WebSocket push means we always have state
 
+// Browser URL navigation for chats (mirrors folder navigation pattern)
+let _skipChatHistory = false;
+function _pushChatUrl(chatId) {
+  if (_skipChatHistory) return;
+  const url = new URL(window.location);
+  if (chatId) url.searchParams.set('chat', chatId);
+  else url.searchParams.delete('chat');
+  history.pushState({
+    folder: (typeof _currentFolderId !== 'undefined' ? _currentFolderId : null),
+    chat: chatId || null
+  }, '', url);
+}
+
 async function loadProjects() {
   const res = await fetch('/api/projects');
   _allProjects = await res.json();
@@ -68,7 +81,7 @@ function _updateProjectLabel(project) {
 }
 
 async function setProject(encoded, reload = true) {
-  if (activeId) deselectSession();
+  if (activeId) { _skipChatHistory = true; deselectSession(); _skipChatHistory = false; }
   const p = _allProjects.find(x => x.encoded === encoded);
   _updateProjectLabel(p);
   localStorage.setItem('activeProject', encoded);
@@ -504,18 +517,13 @@ async function deleteAllSessions() {
   // Double confirm for safety
   const ok2 = await showConfirm('Are you sure?', '<p>This will permanently delete <strong>' + count + ' sessions</strong> and all their history.</p>', { danger: true, confirmText: 'Yes, delete everything' });
   if (!ok2) return;
-  let deleted = 0;
-  for (const s of [...allSessions]) {
-    try {
-      const r = await fetch('/api/delete/' + s.id, { method: 'DELETE' });
-      const d = await r.json();
-      if (d.ok) deleted++;
-    } catch(e) {}
-  }
+  showToast('Deleting ' + count + ' sessions…');
   if (liveSessionId) stopLivePanel();
   deselectSession();
+  const resp = await fetch('/api/delete-all', { method: 'DELETE' });
+  const data = await resp.json();
   await loadSessions();
-  showToast(deleted + ' sessions deleted');
+  showToast((data.deleted || count) + ' sessions deleted');
 }
 
 // --- Bulk Operations Modal ---
@@ -685,6 +693,9 @@ async function addNewAgent() {
     setToolbarSession(newId, 'New Session', true, '');
   }
 
+  // Update URL/history so back/forward and reload work the same as clicking a session
+  _pushChatUrl(newId);
+
   // Register session in current folder if in workplace hierarchy
   if (workspaceActive && typeof addSessionToFolder === 'function' && typeof _currentFolderId !== 'undefined' && _currentFolderId) {
     addSessionToFolder(newId, _currentFolderId);
@@ -705,6 +716,7 @@ async function addNewAgent() {
   liveLineCount = 0;
   liveAutoScroll = true;
   liveBarState = null;
+  _renderedUserTexts.clear();
 
   const bar = document.getElementById('live-input-bar');
   if (bar) {
@@ -787,6 +799,8 @@ async function _newSessionSubmit(sessionId) {
   if (!ta) return;
   const text = ta.value.trim();
   if (!text) { showToast('Type a message first'); return; }
+  ta.value = '';  // clear immediately to prevent double-submit on key repeat
+  _resetTextareaHeight(ta);
 
   // NOW seed as running (session will exist on server after this emit)
   runningIds.add(sessionId);
@@ -834,12 +848,16 @@ async function _newSessionSubmit(sessionId) {
     addSessionToFolder(sessionId, _currentFolderId);
   }
 
-  // Clear the empty state and show the user's message
-  const logEl = document.getElementById('live-log');
-  if (logEl) logEl.innerHTML = '';
+  // Switch to live panel mode — skip log fetch since this is a brand-new session
+  // Clear dedup set right before panel creation so stale entries from
+  // any prior session during the async await cannot block the bubble.
+  _renderedUserTexts.clear();
+  startLivePanel(sessionId, {skipLog: true});
 
-  // Switch to live panel mode
-  startLivePanel(sessionId);
+  // Add optimistic user bubble into the fresh log (after startLivePanel creates it)
+  _liveSending = true;
+  _addOptimisticBubble(sessionId, text);
+  setTimeout(() => { _liveSending = false; }, 500);
 
   // Auto-name after a delay. Silent retry if .jsonl not ready yet.
   setTimeout(() => {
@@ -1033,18 +1051,27 @@ async function loadSessions() {
   document.getElementById('search').placeholder = 'Search ' + allSessions.length + ' sessions\u2026';
   setViewMode(viewMode);
   // Template selector is handled by initFolderTree() — no duplicate call here
+  // Check URL ?chat= param first, then fall back to localStorage
+  const _urlChatId = new URL(window.location).searchParams.get('chat');
+
   // In workplace mode, the workspace canvas is already rendered by setViewMode->filterSessions.
-  // Don't restore an active session — the user can click a workspace card to expand it.
-  // Clear stale activeId so socket handlers don't get confused.
   if (viewMode === 'workplace') {
-    activeId = null;
-    localStorage.removeItem('activeSessionId');
+    if (_urlChatId && allSessions.find(s => s.id === _urlChatId)) {
+      _skipChatHistory = true;
+      expandWorkspaceCard(_urlChatId);
+      _skipChatHistory = false;
+    } else {
+      activeId = null;
+      localStorage.removeItem('activeSessionId');
+    }
     return;
   }
-  // Restore previously selected session or show dashboard
-  const savedSession = localStorage.getItem('activeSessionId');
-  if (savedSession && allSessions.find(s => s.id === savedSession)) {
-    openInGUI(savedSession);
+  // Restore session from URL, then localStorage, or show dashboard
+  const _restoreId = _urlChatId || localStorage.getItem('activeSessionId');
+  if (_restoreId && allSessions.find(s => s.id === _restoreId)) {
+    _skipChatHistory = true;
+    openInGUI(_restoreId);
+    _skipChatHistory = false;
   } else {
     document.getElementById('main-body').innerHTML = _buildDashboard();
   }

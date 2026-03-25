@@ -117,11 +117,6 @@ class TestStartSession:
             cwd='/home/user/project',
             name='My Session',
             resume=False,
-            model=None,
-            system_prompt=None,
-            max_turns=None,
-            allowed_tools=None,
-            permission_mode=None,
         )
 
         received = client.get_received()

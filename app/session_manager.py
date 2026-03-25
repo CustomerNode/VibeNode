@@ -527,10 +527,39 @@ class SessionManager:
         )
         return {"ok": True}
 
+    def close_session_sync(self, session_id: str, timeout: float = 5.0) -> dict:
+        """Close an SDK session and block until the disconnect finishes.
+
+        Used by delete endpoints so the CLI subprocess is fully dead before
+        we remove the .jsonl file (prevents the subprocess from recreating it).
+        """
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return {"ok": False, "error": "Session not found"}
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._close_session(session_id), self._loop
+        )
+        try:
+            future.result(timeout=timeout)
+        except Exception as e:
+            logger.warning("Timed-out or failed waiting for close of %s: %s", session_id, e)
+        return {"ok": True}
+
+    def remove_session(self, session_id: str) -> None:
+        """Remove a session from the in-memory dict entirely.
+
+        Called after deletion so recovery can never resurrect it.
+        """
+        with self._lock:
+            self._sessions.pop(session_id, None)
+
     def get_all_states(self) -> list:
         """Return snapshot of all session states for initial WebSocket connect."""
         with self._lock:
-            return [info.to_state_dict() for info in self._sessions.values()]
+            return [info.to_state_dict() for info in self._sessions.values()
+                    if info.state != SessionState.STOPPED]
 
     def get_entries(self, session_id: str, since: int = 0) -> list:
         """Return log entries for a session, optionally from an index."""
@@ -594,12 +623,12 @@ class SessionManager:
             self._emit_state(info)
 
             # Add user's message to the log and send
+            # Don't emit — frontend shows it as an optimistic bubble immediately.
+            # (Same pattern as send_message.)
             if prompt:
                 entry = LogEntry(kind="user", text=prompt[:2000])
                 with info._lock:
                     info.entries.append(entry)
-                    entry_index = len(info.entries) - 1
-                self._emit_entry(session_id, entry, entry_index)
                 await client.query(prompt)
 
             # Process messages (None = unknown types, skipped via monkey-patch)
@@ -828,9 +857,16 @@ class SessionManager:
                 info.pending_tool_name = ""
                 info.pending_tool_input = {}
 
-                # Back to working
-                info.state = SessionState.WORKING
-                manager._emit_state(info)
+                # Back to working — but NOT if this was an interrupt.
+                # The interrupt handler already set state to IDLE; emitting
+                # WORKING here would race with it and flip the UI back.
+                is_interrupt = (
+                    isinstance(permission_result, PermissionResultDeny)
+                    and getattr(permission_result, 'interrupt', False)
+                )
+                if not is_interrupt:
+                    info.state = SessionState.WORKING
+                    manager._emit_state(info)
 
                 return permission_result
 
@@ -1089,6 +1125,16 @@ class SessionManager:
                 name = meta.get("name", "")
                 cwd = meta.get("cwd", "")
                 model = meta.get("model", "")
+
+                # Guard: if the .jsonl file was deleted (user chose to delete
+                # the session), do NOT recover it — that would undo the delete.
+                from .config import _sessions_dir
+                jsonl_path = _sessions_dir() / f"{sid}.jsonl"
+                if not jsonl_path.exists():
+                    logger.info(
+                        "Skipping recovery of %s — .jsonl file was deleted", sid
+                    )
+                    continue
 
                 logger.info(
                     "Recovering session %s (%s) from registry", sid, name or "unnamed"

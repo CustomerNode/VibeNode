@@ -171,15 +171,18 @@ def rich_session(fake_project, tmp_path):
     (fh_dir / "backup_app_py_v1").write_text("print('hello')\n",
                                               encoding="utf-8")
 
+    # NOTE: In real Claude Code JSONL, file-history-snapshot entries appear
+    # AFTER the message they reference (the message is written first, then
+    # the snapshot is appended).  The fixture mirrors this real-world ordering.
     lines = [
-        _snapshot(uid1),  # line 1: empty snapshot (baseline)
-        _user_msg("Fix the login bug", _ts(0, 0), uid1, "sess-rich"),  # line 2
+        _user_msg("Fix the login bug", _ts(0, 0), uid1, "sess-rich"),  # line 1
+        _snapshot(uid1),  # line 2: empty snapshot (baseline) — after its message
         _asst_msg("I'll look at the code", _ts(0, 5), uid2, "sess-rich",
                   tool_uses=[
                       {"name": "Read", "input": {"file_path": "/app.py"}},
                   ]),  # line 3
-        _snapshot(uid3, {"app.py": "backup_app_py_v1"}),  # line 4: snapshot with backup
-        _user_msg("Now add tests", _ts(1, 0), uid3, "sess-rich"),  # line 5
+        _user_msg("Now add tests", _ts(1, 0), uid3, "sess-rich"),  # line 4
+        _snapshot(uid3, {"app.py": "backup_app_py_v1"}),  # line 5: snapshot with backup — after its message
         _asst_msg("Here are the changes", _ts(1, 10), uid4, "sess-rich",
                   tool_uses=[
                       {"name": "Edit", "input": {
@@ -266,6 +269,35 @@ class TestLoadSessionTimeline:
         # The message at uid3 should have has_snapshot=True
         snap_msgs = [m for m in result["messages"] if m["has_snapshot"]]
         assert len(snap_msgs) >= 1
+
+    def test_snapshot_after_message_detected(self, fake_project):
+        """Snapshots always appear AFTER the message they reference in real
+        Claude Code JSONL.  Verify the post-pass correctly links them."""
+        from app.sessions import load_session_timeline
+
+        uid_a = _uuid()
+        uid_b = _uuid()
+        lines = [
+            _user_msg("Hello", _ts(0, 0), uid_a, "sess-snap-order"),
+            _asst_msg("I edited the file", _ts(0, 5), uid_b, "sess-snap-order",
+                      tool_uses=[{"name": "Edit", "input": {
+                          "file_path": "/foo.py",
+                          "old_string": "old",
+                          "new_string": "new",
+                      }}]),
+            # Snapshot comes AFTER the assistant message it references
+            _snapshot(uid_b, {"foo.py": "backup_foo_py_v1"}),
+        ]
+        _write_session(fake_project, "sess-snap-order", lines)
+        result = load_session_timeline(fake_project / "sess-snap-order.jsonl")
+
+        assert result["has_snapshots"] is True
+
+        # The assistant message (uid_b) should have has_snapshot=True
+        asst_msgs = [m for m in result["messages"] if m["role"] == "assistant"]
+        assert len(asst_msgs) == 1
+        assert asst_msgs[0]["has_snapshot"] is True, \
+            "Snapshot appearing after its message should still be linked"
 
     def test_no_snapshots_flag(self, fake_project, simple_session):
         from app.sessions import load_session_timeline

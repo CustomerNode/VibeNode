@@ -27,6 +27,7 @@ function setToolbarSession(id, titleText, isUntitled, customTitle) {
 function deselectSession() {
   activeId = null;
   localStorage.removeItem('activeSessionId');
+  _pushChatUrl(null);
   if (liveSessionId) stopLivePanel();
   // In workspace mode, return to workspace canvas instead of dashboard
   if (workspaceActive) {
@@ -63,6 +64,7 @@ async function selectSession(id) {
 
   activeId = id;
   localStorage.setItem('activeSessionId', id || '');
+  _pushChatUrl(id);
   // Stop live panel for a different session
   if (liveSessionId && liveSessionId !== id) stopLivePanel();
   filterSessions();

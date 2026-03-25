@@ -16,6 +16,7 @@ from ..config import (
     _delete_name,
     _decode_project,
     get_active_project,
+    _summary_cache,
 )
 from ..sessions import load_session, load_session_timeline, all_sessions
 from ..titling import smart_title
@@ -118,39 +119,143 @@ def api_autoname(session_id):
 
 @bp.route("/api/delete/<session_id>", methods=["DELETE"])
 def api_delete(session_id):
+    import os
+    import signal
+
     path = _sessions_dir() / f"{session_id}.jsonl"
     folder = _sessions_dir() / session_id
 
-    # Close the SDK session if it's running
+    # Close the SDK session SYNCHRONOUSLY so the CLI subprocess is fully dead
+    # before we remove the file (prevents it from being recreated).
     sm = current_app.session_manager
     if sm.has_session(session_id):
-        sm.close_session(session_id)
+        sm.close_session_sync(session_id)
+        sm.remove_session(session_id)
+    else:
+        # Session not managed by SDK — might be an orphaned CLI process.
+        # Try to find and kill it so it doesn't re-create the file.
+        try:
+            from ..process_detection import _get_running_session_ids
+            running = _get_running_session_ids()
+            pid = running.get(session_id)
+            if pid and pid > 0:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (OSError, ProcessLookupError):
+                    pass
+                import time
+                time.sleep(0.3)
+        except Exception:
+            pass  # best-effort
 
     if not path.exists():
+        sm._save_registry_now()
         return jsonify({"ok": True})  # Already gone or never created
 
     path.unlink()
     if folder.exists() and folder.is_dir():
         shutil.rmtree(folder)
 
+    # Evict from summary cache (all keys whose path matches)
+    path_str = str(path)
+    for key in [k for k in _summary_cache if k[0] == path_str]:
+        del _summary_cache[key]
+
     # Clean up user-set name from persistent store
     _delete_name(session_id)
+
+    # Force immediate registry save so recovery can't resurrect this session
+    sm._save_registry_now()
 
     return jsonify({"ok": True})
 
 
+@bp.route("/api/delete-all", methods=["DELETE"])
+def api_delete_all():
+    """Delete every session in the active workspace in one shot."""
+    import os
+    import signal
+    import time
+    from ..process_detection import _get_running_session_ids
+
+    sd = _sessions_dir()
+    sm = current_app.session_manager
+    deleted = 0
+
+    # Phase 1: close all SDK-managed sessions synchronously
+    sids_to_delete = [f.stem for f in sd.glob("*.jsonl")]
+    for sid in sids_to_delete:
+        if sm.has_session(sid):
+            sm.close_session_sync(sid)
+            sm.remove_session(sid)
+
+    # Phase 2: kill orphaned claude.exe processes that the session manager
+    # doesn't know about (e.g. from previous server instances).  Without this,
+    # the CLI subprocess is still alive and will re-create the .jsonl file
+    # after we delete it.
+    try:
+        running = _get_running_session_ids()  # {sid: pid}
+        for sid, pid in running.items():
+            if pid > 0:  # positive PIDs are confirmed safe to kill
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (OSError, ProcessLookupError):
+                    pass
+        if running:
+            time.sleep(0.5)  # let processes die
+    except Exception:
+        pass  # process detection failed -- continue with best-effort deletion
+
+    # Phase 3: delete all files
+    for f in list(sd.glob("*.jsonl")):
+        sid = f.stem
+        f.unlink()
+        folder = sd / sid
+        if folder.exists() and folder.is_dir():
+            shutil.rmtree(folder)
+        _delete_name(sid)
+        deleted += 1
+
+    # Phase 4: sweep for files re-created by dying processes
+    time.sleep(0.3)
+    for f in list(sd.glob("*.jsonl")):
+        try:
+            f.unlink()
+            folder = sd / f.stem
+            if folder.exists() and folder.is_dir():
+                shutil.rmtree(folder)
+        except Exception:
+            pass
+
+    # Clear entire summary cache and force registry save
+    _summary_cache.clear()
+    sm._save_registry_now()
+
+    return jsonify({"ok": True, "deleted": deleted})
+
+
 @bp.route("/api/delete-empty", methods=["DELETE"])
 def api_delete_empty():
+    sm = current_app.session_manager
     deleted = []
     for f in _sessions_dir().glob("*.jsonl"):
         s = load_session(f)
         if s.get("message_count", 0) == 0:
-            folder = _sessions_dir() / f.stem
+            sid = f.stem
+            if sm.has_session(sid):
+                sm.close_session_sync(sid)
+                sm.remove_session(sid)
+            folder = _sessions_dir() / sid
+            path_str = str(f)
             f.unlink()
             if folder.exists() and folder.is_dir():
                 shutil.rmtree(folder)
-            _delete_name(f.stem)
-            deleted.append(f.stem)
+            for key in [k for k in _summary_cache if k[0] == path_str]:
+                del _summary_cache[key]
+            _delete_name(sid)
+            deleted.append(sid)
+    if deleted:
+        sm._save_registry_now()
     return jsonify({"ok": True, "deleted": len(deleted)})
 
 

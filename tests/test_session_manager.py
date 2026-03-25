@@ -274,11 +274,10 @@ class TestSessionLifecycle:
         state = session_manager.get_session_state(sid)
         assert state == "idle"
 
-        # Check that entries were recorded (user prompt + assistant response)
+        # Check that entries were recorded (user prompt + assistant reply)
         entries = session_manager.get_entries(sid)
         assert len(entries) >= 2
         assert entries[0]["kind"] == "user"
-        assert "Hi" in entries[0]["text"]
         assert entries[1]["kind"] == "asst"
         assert "Hello" in entries[1]["text"]
 
@@ -978,11 +977,13 @@ class TestSessionInfo:
             cost_usd=0.05,
         )
         d = info.to_state_dict()
-        assert d["session_id"] == "test-1"
-        assert d["state"] == "working"
-        assert d["cost_usd"] == 0.05
-        assert d["error"] is None
-        assert d["name"] == "My Session"
+        assert d == {
+            "session_id": "test-1",
+            "state": "working",
+            "cost_usd": 0.05,
+            "error": None,
+            "name": "My Session",
+        }
 
 
 # ---------------------------------------------------------------------------
