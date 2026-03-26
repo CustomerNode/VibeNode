@@ -713,6 +713,7 @@ async function addNewAgent() {
     '<div class="empty-state" style="padding:60px 0;text-align:center;">' +
     '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-faint)" stroke-width="1.5" stroke-linecap="round" style="margin-bottom:12px;opacity:0.4;"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
     '<div style="color:var(--text-faint);font-size:13px;">What should Claude work on?</div>' +
+    (typeof _renderTemplateGrid === 'function' ? _renderTemplateGrid(newId) : '') +
     '</div></div>' +
     '<div class="live-input-bar" id="live-input-bar"></div></div>';
 
@@ -736,7 +737,10 @@ async function addNewAgent() {
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => _newSessionSubmit(newId));
     setTimeout(() => {
       const ta = document.getElementById('live-input-ta');
-      if (ta) ta.focus();
+      if (ta) {
+        ta.focus();
+        ta.addEventListener('input', function() { if (typeof _hideTemplateGrid === 'function') _hideTemplateGrid(); });
+      }
     }, 50);
   }
 }
@@ -819,6 +823,14 @@ async function _newSessionSubmit(sessionId) {
   if (workspaceActive && typeof _currentFolderId !== 'undefined' && _currentFolderId) {
     const skill = (typeof getFolderSkill === 'function') ? getFolderSkill(_currentFolderId) : null;
     if (skill && skill.systemPrompt) systemPrompt = skill.systemPrompt;
+  }
+
+  // Layer in template system prompt if a template was selected
+  if (window._pendingTemplateSystemPrompt) {
+    systemPrompt = systemPrompt
+      ? systemPrompt + '\n\n' + window._pendingTemplateSystemPrompt
+      : window._pendingTemplateSystemPrompt;
+    window._pendingTemplateSystemPrompt = null;
   }
 
   // Ensure agent catalog temp file is written, then inject compact index
@@ -1241,8 +1253,8 @@ _updateThinkingLabel();
 function openPreferences() {
   const overlay = document.getElementById('pm-overlay');
   const options = [
-    {key: 'ctrl-enter', name: 'Ctrl+Enter to send', desc: 'Press Ctrl+Enter to send messages. Enter adds a new line.'},
-    {key: 'enter', name: 'Enter to send', desc: 'Press Enter to send messages. Shift+Enter adds a new line.'},
+    {key: 'ctrl-enter', name: 'Ctrl+Enter, Shift+Enter, or Alt+Enter to send', desc: 'Any modifier + Enter sends. Enter alone adds a new line.'},
+    {key: 'enter', name: 'Enter to send', desc: 'Press Enter to send. Ctrl+Enter, Shift+Enter, and Alt+Enter add a new line.'},
   ];
   let html = '<div class="pm-card pm-enter" style="width:420px;">'
     + '<h2 class="pm-title">Preferences</h2>'

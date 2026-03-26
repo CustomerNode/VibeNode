@@ -12,11 +12,13 @@ work with CLI 2.x.
 
 import json
 import os
+import shutil
 import tempfile
 import time
 from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, request
+from werkzeug.utils import secure_filename
 
 # Debug endpoint to test permission emit
 from .. import socketio as _app_socketio
@@ -500,3 +502,212 @@ def write_agent_catalog():
         return jsonify({"ok": True, "path": filepath})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# File-drop API — drag-and-drop file upload
+# ---------------------------------------------------------------------------
+
+def _is_within_home(p: Path) -> bool:
+    """Check that a resolved path is within the user's home directory."""
+    try:
+        p.resolve().relative_to(Path.home().resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _dedup_filename(directory: Path, name: str) -> str:
+    """Return a unique filename in directory, adding numeric suffix if needed."""
+    candidate = directory / name
+    if not candidate.exists():
+        return name
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    n = 1
+    while True:
+        new_name = f"{stem} ({n}){suffix}"
+        if not (directory / new_name).exists():
+            return new_name
+        n += 1
+
+
+@bp.route('/api/file-info')
+def api_file_info():
+    """Return name, human-readable size, and existence for a file path."""
+    raw = request.args.get('path', '')
+    if not raw:
+        return jsonify({"error": "No path provided"}), 400
+
+    p = Path(raw).resolve()
+    if not _is_within_home(p):
+        return jsonify({"error": "Path must be within home"}), 403
+
+    exists = p.is_file()
+    name = p.name
+    size = ""
+    if exists:
+        try:
+            n = p.stat().st_size
+            if n < 1024:
+                size = f"{n} B"
+            elif n < 1024 * 1024:
+                size = f"{n / 1024:.1f} KB"
+            else:
+                size = f"{n / (1024 * 1024):.1f} MB"
+        except OSError:
+            size = ""
+
+    return jsonify({"name": name, "size": size, "exists": exists})
+
+
+@bp.route('/api/open-file', methods=['POST'])
+def api_open_file():
+    """Open a file using the system default application (Windows os.startfile)."""
+    data = request.get_json(silent=True) or {}
+    raw = data.get('path', '')
+    if not raw:
+        return jsonify({"error": "No path provided"}), 400
+
+    p = Path(raw).resolve()
+    if not _is_within_home(p):
+        return jsonify({"error": "Path must be within home"}), 403
+
+    if not p.is_file():
+        return jsonify({"error": "File does not exist"}), 404
+
+    try:
+        os.startfile(str(p))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ok": True})
+
+
+@bp.route('/api/download-to-downloads', methods=['POST'])
+def api_download_to_downloads():
+    """Copy a file to the user's Downloads folder with dedup naming."""
+    data = request.get_json(silent=True) or {}
+    raw = data.get('path', '')
+    if not raw:
+        return jsonify({"error": "No path provided"}), 400
+
+    p = Path(raw).resolve()
+    if not _is_within_home(p):
+        return jsonify({"error": "Path must be within home"}), 403
+
+    if not p.is_file():
+        return jsonify({"error": "File does not exist"}), 404
+
+    downloads = Path.home() / "Downloads"
+    if not downloads.is_dir():
+        return jsonify({"error": "Downloads folder not found"}), 500
+
+    filename = _dedup_filename(downloads, p.name)
+    dest = downloads / filename
+    try:
+        shutil.copy2(str(p), str(dest))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ok": True, "filename": filename, "dest": str(dest)})
+
+
+@bp.route('/api/copy-file-to', methods=['POST'])
+def api_copy_file_to():
+    """Copy a file to a user-chosen directory with dedup naming."""
+    data = request.get_json(silent=True) or {}
+    source = data.get('source', '')
+    target_dir = data.get('target_dir', '')
+    if not source or not target_dir:
+        return jsonify({"error": "source and target_dir required"}), 400
+
+    src = Path(source).resolve()
+    dst_dir = Path(target_dir).resolve()
+
+    if not _is_within_home(src):
+        return jsonify({"error": "Source must be within home"}), 403
+    if not _is_within_home(dst_dir):
+        return jsonify({"error": "Target must be within home"}), 403
+    if not src.is_file():
+        return jsonify({"error": "Source file does not exist"}), 404
+    if not dst_dir.is_dir():
+        return jsonify({"error": "Target directory does not exist"}), 404
+
+    filename = _dedup_filename(dst_dir, src.name)
+    dest = dst_dir / filename
+    try:
+        shutil.copy2(str(src), str(dest))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ok": True, "filename": filename, "path": str(dest)})
+
+
+@bp.route('/api/file-drop', methods=['POST'])
+def api_file_drop():
+    """Accept a multipart file upload and save to target_dir."""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    f = request.files['file']
+    if not f.filename:
+        return jsonify({"error": "Empty filename"}), 400
+
+    target_dir = request.form.get('target_dir', '')
+    if not target_dir:
+        return jsonify({"error": "No target_dir provided"}), 400
+
+    target = Path(target_dir).resolve()
+    if not _is_within_home(target):
+        return jsonify({"error": "Target directory must be within home"}), 403
+
+    if not target.is_dir():
+        return jsonify({"error": "Target directory does not exist"}), 400
+
+    filename = secure_filename(f.filename) or f.filename
+    filename = _dedup_filename(target, filename)
+    dest = target / filename
+    f.save(str(dest))
+
+    return jsonify({"ok": True, "path": str(dest), "filename": filename})
+
+
+@bp.route('/api/browse-dir')
+def api_browse_dir():
+    """Return immediate subdirectory names for the given path."""
+    raw = request.args.get('path', '')
+    if not raw:
+        return jsonify({"error": "No path provided"}), 400
+
+    target = Path(raw).resolve()
+    if not _is_within_home(target):
+        return jsonify({"error": "Path must be within home"}), 403
+
+    if not target.is_dir():
+        return jsonify({"error": "Not a directory"}), 400
+
+    dirs = []
+    try:
+        for entry in sorted(target.iterdir()):
+            if entry.is_dir() and not entry.name.startswith('.'):
+                dirs.append(entry.name)
+    except PermissionError:
+        pass
+
+    return jsonify({"path": str(target), "dirs": dirs})
+
+
+@bp.route('/api/project-path')
+def api_project_path():
+    """Return the active project's filesystem path."""
+    return jsonify({"path": str(_get_project_path())})
+
+
+@bp.route('/api/default-save-dir')
+def api_default_save_dir():
+    """Return a sensible default save directory (Downloads)."""
+    downloads = Path.home() / "Downloads"
+    if downloads.is_dir():
+        return jsonify({"path": str(downloads)})
+    return jsonify({"path": str(Path.home())})

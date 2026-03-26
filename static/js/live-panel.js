@@ -140,6 +140,156 @@ function liveQueueNav(dir) {
   _renderQueueBanner();
 }
 
+// ---------------------------------------------------------------------------
+// Output shelf — file cards for output files created during the session
+// ---------------------------------------------------------------------------
+const _OUTPUT_EXTS = new Set([
+  'xlsx','xlsm','xls','docx','doc','pptx','ppt','pdf',
+  'png','jpg','jpeg','gif','svg','bmp',
+  'csv','json','zip','html','txt'
+]);
+const _outputShelfPaths = new Set();
+
+function _outputFileIcon(ext) {
+  ext = (ext || '').toLowerCase();
+  if (['xlsx','xlsm','xls','csv'].includes(ext)) return '<span style="color:#22a55b;">&#128203;</span>';
+  if (['docx','doc','txt'].includes(ext)) return '<span style="color:#4a90d9;">&#128196;</span>';
+  if (['pptx','ppt'].includes(ext)) return '<span style="color:#e07020;">&#128202;</span>';
+  if (ext === 'pdf') return '<span style="color:#cc3333;">&#128213;</span>';
+  if (['png','jpg','jpeg','gif','svg','bmp'].includes(ext)) return '<span style="color:#9b59b6;">&#128444;</span>';
+  if (ext === 'zip') return '<span style="color:#888;">&#128230;</span>';
+  if (ext === 'json') return '<span style="color:#e8a838;">&#123;&#125;</span>';
+  if (ext === 'html') return '<span style="color:#e06050;">&#9674;</span>';
+  return '<span style="color:#888;">&#128196;</span>';
+}
+
+function _tryAddOutputCard(entry) {
+  if (!entry) return;
+  // Strategy 1: Direct file tool (Write, Edit, etc.)
+  if (entry.kind === 'tool_use') {
+    const name = (entry.name || '').toLowerCase();
+    if (['write','edit','multiedit','notebookedit'].includes(name)) {
+      let filePath = entry.desc || '';
+      if (!filePath) return;
+      filePath = filePath.replace(/\s*\(write \d+ chars\)\s*$/, '');
+      filePath = filePath.replace(/^file_path:\s*/, '');
+      filePath = filePath.trim();
+      _addOutputCardForPath(filePath);
+      return;
+    }
+    // Strategy 1b: Bash commands that reference output files (e.g. python scripts saving xlsx)
+    if (name === 'bash') {
+      const desc = entry.desc || '';
+      _scanTextForOutputPaths(desc);
+      return;
+    }
+  }
+
+  // Strategy 2: Scan tool_result and asst text for file paths with output extensions
+  // Catches files created via Bash/python scripts (xlsx, docx, pptx, etc.)
+  if (entry.kind === 'tool_result' || entry.kind === 'asst') {
+    _scanTextForOutputPaths(entry.text || '');
+    return;
+  }
+}
+
+function _scanTextForOutputPaths(text) {
+  if (!text) return;
+  // Match Windows paths ending in known extensions (handles both \ and / separators)
+  // Also match paths inside quotes: r'C:\...\file.xlsx' or "C:\...\file.xlsx"
+  const pathPattern = /([A-Za-z]:[\\\/][^\s"'<>|*?\n]+\.(?:xlsx|xlsm|xls|docx|doc|pptx|ppt|pdf|png|jpg|jpeg|gif|svg|csv|json|html))\b/gi;
+  let match;
+  while ((match = pathPattern.exec(text)) !== null) {
+    let p = match[1];
+    // Clean up common wrapper chars
+    p = p.replace(/^['"]|['"]$/g, '');
+    _addOutputCardForPath(p);
+  }
+}
+
+function _addOutputCardForPath(filePath) {
+  if (!filePath) return;
+  filePath = filePath.trim();
+  // Check extension against allowlist
+  const dot = filePath.lastIndexOf('.');
+  if (dot < 0) return;
+  const ext = filePath.slice(dot + 1).toLowerCase();
+  if (!_OUTPUT_EXTS.has(ext)) return;
+  // Dedup
+  if (_outputShelfPaths.has(filePath)) return;
+  _outputShelfPaths.add(filePath);
+  const logEl = document.getElementById('live-log');
+  if (!logEl) return;
+  // Build card inline in conversation
+  const card = document.createElement('div');
+  card.className = 'live-output-card-inline';
+  const basename = filePath.split(/[/\\]/).pop() || filePath;
+  card.title = filePath;
+  card.innerHTML =
+    '<span class="live-output-card-icon">' + _outputFileIcon(ext) + '</span>' +
+    '<span class="live-output-card-name">' + escHtml(basename) + '</span>' +
+    '<span class="live-output-card-size" data-path="' + escHtml(filePath) + '"></span>' +
+    '<button class="live-output-card-open" title="Open file" onclick="event.stopPropagation();_openOutputFile(\'' + escHtml(filePath.replace(/\\/g,'\\\\').replace(/'/g,"\\'")) + '\')">' +
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>' +
+    '</button>' +
+    '<button class="live-output-card-dl" title="Save to..." onclick="event.stopPropagation();_downloadOutputFile(\'' + escHtml(filePath.replace(/\\/g,'\\\\').replace(/'/g,"\\'")) + '\')">' +
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
+    '</button>';
+  logEl.appendChild(card);
+  if (liveAutoScroll) logEl.scrollTop = logEl.scrollHeight;
+  // Fetch file size asynchronously
+  fetch('/api/file-info?path=' + encodeURIComponent(filePath))
+    .then(r => r.json())
+    .then(info => {
+      const sizeEl = card.querySelector('.live-output-card-size');
+      if (sizeEl && info.size) sizeEl.textContent = info.size;
+    })
+    .catch(() => {});
+}
+
+function _openOutputFile(filePath) {
+  fetch('/api/open-file', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({path: filePath})
+  }).then(r => r.json()).then(d => {
+    if (d.error) showToast(d.error, true);
+  }).catch(() => showToast('Failed to open file', true));
+}
+
+function _downloadOutputFile(filePath) {
+  // Open folder picker so user can choose where to save
+  if (typeof _fdShowPicker === 'function' && typeof _fdOnPickerDone !== 'undefined') {
+    _fdOnPickerDone = function(targetDir) {
+      fetch('/api/copy-file-to', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({source: filePath, target_dir: targetDir})
+      }).then(r => r.json()).then(d => {
+        if (d.ok) showToast('Saved to ' + d.path);
+        else showToast(d.error || 'Save failed', true);
+      }).catch(() => showToast('Save failed', true));
+    };
+    _fdShowPicker(null);  // null = no file upload, just pick a folder
+  } else {
+    // Fallback: save to Downloads directly
+    fetch('/api/download-to-downloads', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path: filePath})
+    }).then(r => r.json()).then(d => {
+      if (d.ok) showToast('Copied to Downloads: ' + d.filename);
+      else showToast(d.error || 'Download failed', true);
+    }).catch(() => showToast('Download failed', true));
+  }
+}
+
+function _clearOutputShelf() {
+  _outputShelfPaths.clear();
+  const shelf = document.getElementById('live-output-shelf');
+  if (shelf) shelf.innerHTML = '';
+}
+
 let liveBarState = null;   // 'ended' | 'question:<questionText>' | 'idle' | 'working'
 let _guiFocusPending = false;
 let _liveWorkingStart = null;  // timestamp when working state began
@@ -182,7 +332,9 @@ async function openInGUI(id) {
         '<div class="empty-state" style="padding:60px 0;text-align:center;">' +
         '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-faint)" stroke-width="1.5" stroke-linecap="round" style="margin-bottom:12px;opacity:0.4;"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>' +
         '<div style="color:var(--text-faint);font-size:13px;">What should Claude work on?</div>' +
+        (typeof _renderTemplateGrid === 'function' ? _renderTemplateGrid(id) : '') +
         '</div></div>' +
+        '<div class="live-output-shelf" id="live-output-shelf"></div>' +
         '<div id="live-queue-area"></div>' +
         '<div class="live-input-bar" id="live-input-bar"></div></div>';
       liveSessionId = id;
@@ -199,7 +351,7 @@ async function openInGUI(id) {
           '<button class="live-send-btn" id="live-voice-btn"></button>' +
           '</div>';
         setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => _newSessionSubmit(id));
-        setTimeout(() => { const ta = document.getElementById('live-input-ta'); if (ta) { ta.focus(); _initAutoResize(ta); } }, 50);
+        setTimeout(() => { const ta = document.getElementById('live-input-ta'); if (ta) { ta.focus(); _initAutoResize(ta); ta.addEventListener('input', function() { if (typeof _hideTemplateGrid === 'function') _hideTemplateGrid(); }); } }, 50);
       }
       return;
     }
@@ -232,9 +384,11 @@ function startLivePanel(id, opts) {
   document.getElementById('main-body').innerHTML =
     '<div class="live-panel" id="live-panel">' +
     '<div class="conversation live-log" id="live-log">' + skelHtml + '</div>' +
+    '<div class="live-output-shelf" id="live-output-shelf"></div>' +
     '<div id="live-queue-area"></div>' +
     '<div class="live-input-bar" id="live-input-bar"></div></div>';
 
+  _clearOutputShelf();
   const logEl = document.getElementById('live-log');
   logEl.addEventListener('scroll', () => {
     const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 60;
@@ -272,6 +426,7 @@ function startLivePanel(id, opts) {
 function stopLivePanel() {
   liveSessionId = null;
   liveBarState = null;
+  _clearOutputShelf();
   const btnClose = document.getElementById('btn-close');
   if (btnClose) btnClose.disabled = true;
 }

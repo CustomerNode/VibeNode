@@ -1264,6 +1264,11 @@ class SessionManager:
         """Extract a human-readable description from tool input."""
         if "command" in inp:
             return str(inp["command"])[:300]
+        elif "file_path" in inp:
+            desc = str(inp["file_path"])
+            if "content" in inp:
+                desc += f" (write {len(str(inp.get('content', '')))} chars)"
+            return desc
         elif "path" in inp:
             desc = str(inp["path"])
             if "content" in inp:

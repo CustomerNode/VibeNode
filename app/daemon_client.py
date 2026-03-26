@@ -32,6 +32,8 @@ class DaemonClient:
         self._pending_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._should_run = False
+        self._cached_policy = None       # last policy set by browser
+        self._cached_custom_rules = {}
 
     def start(self, socketio, app=None) -> None:
         """Connect to daemon and start the event reader.
@@ -86,6 +88,7 @@ class DaemonClient:
                 self._sock = sock
                 self._connected = True
                 logger.info("Connected to session daemon on port %d", DAEMON_PORT)
+                self._resync_policy()
                 return
             except ConnectionRefusedError:
                 time.sleep(0.1)
@@ -93,6 +96,18 @@ class DaemonClient:
                 logger.debug("Connect attempt %d failed: %s", attempt, e)
                 time.sleep(0.2)
         logger.warning("Could not connect to session daemon after 50 attempts")
+
+    def _resync_policy(self):
+        """Re-send cached permission policy to daemon after connect/reconnect."""
+        if self._cached_policy and self._connected:
+            try:
+                self._send_request("set_permission_policy", {
+                    "policy": self._cached_policy,
+                    "custom_rules": self._cached_custom_rules,
+                })
+                logger.info("Re-synced permission policy: %s", self._cached_policy)
+            except Exception as e:
+                logger.warning("Failed to re-sync policy: %s", e)
 
     def _reconnect_loop(self):
         """Background reconnection loop. Restarts daemon if it crashed."""
@@ -340,8 +355,10 @@ class DaemonClient:
         })
 
     def set_permission_policy(self, policy, custom_rules=None):
+        self._cached_policy = policy
+        self._cached_custom_rules = custom_rules or {}
         return self._send_request("set_permission_policy", {
-            "policy": policy, "custom_rules": custom_rules or {},
+            "policy": policy, "custom_rules": self._cached_custom_rules,
         })
 
     def hook_pre_tool(self, tool_name, tool_input, session_id):

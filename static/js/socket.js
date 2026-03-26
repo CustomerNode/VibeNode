@@ -257,6 +257,7 @@ socket.on('session_entry', (data) => {
         _renderedUserTexts.add(key);
     }
     logEl.appendChild(renderLiveEntry(data.entry));
+    if (typeof _tryAddOutputCard === 'function') _tryAddOutputCard(data.entry);
     liveLineCount = (data.index != null) ? data.index + 1 : liveLineCount + 1;
     if (typeof _updateLastMessageTimes === 'function') _updateLastMessageTimes();
     if (liveAutoScroll) {
@@ -425,6 +426,7 @@ socket.on('session_log', (data) => {
     if (!logEl) return;
     logEl.innerHTML = '';
     _renderedUserTexts.clear();
+    if (typeof _clearOutputShelf === 'function') _clearOutputShelf();
     if (data.entries && data.entries.length) {
         data.entries.forEach((entry, i) => {
             // Register user texts so session_entry dedup stays in sync
@@ -434,6 +436,7 @@ socket.on('session_log', (data) => {
                 _renderedUserTexts.add(key);
             }
             logEl.appendChild(renderLiveEntry(entry));
+            if (typeof _tryAddOutputCard === 'function') _tryAddOutputCard(entry);
         });
         liveLineCount = data.entries.length;
     } else {

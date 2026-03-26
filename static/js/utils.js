@@ -25,8 +25,9 @@ let sendBehavior = localStorage.getItem('sendBehavior') || 'ctrl-enter';
 
 /** Returns true if the keyboard event should trigger a send based on preference */
 function _shouldSend(e) {
-  if (sendBehavior === 'enter') return e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey;
-  return e.key === 'Enter' && (e.ctrlKey || e.metaKey);
+  if (e.key !== 'Enter') return false;
+  if (sendBehavior === 'enter') return !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
+  return e.ctrlKey || e.shiftKey || e.altKey || e.metaKey;
 }
 
 // ---------------------------------------------------------------------------
@@ -62,7 +63,7 @@ function _initAutoResize(ta) {
 
 /** Returns HTML for the current send hint + toggle button */
 function _sendHint() {
-  const text = sendBehavior === 'enter' ? 'Enter to send · Shift+Enter or Ctrl+Enter for new line' : 'Ctrl+Enter to send';
+  const text = sendBehavior === 'enter' ? 'Enter to send · Ctrl+Enter, Shift+Enter, or Alt+Enter for new line' : 'Ctrl+Enter, Shift+Enter, or Alt+Enter to send';
   return text + '<span class="send-hint-btn" onclick="_toggleSendBehavior(event)" title="Change send shortcut">'
     + '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">'
     + '<polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/>'

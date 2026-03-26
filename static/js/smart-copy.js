@@ -65,24 +65,36 @@ function _addEmailCopyButton(container, rawText) {
   const startEl = _findNodeContaining(container, firstLine);
   if (!startEl) return;
 
-  // Insert a small label+button before the email
+  // Create wrapper container for the email
+  const wrap = document.createElement('div');
+  wrap.className = 'smart-copy-email-wrap';
+
+  // Insert wrapper before the first email element
+  startEl.parentNode.insertBefore(wrap, startEl);
+
+  // Add label inside wrapper
   const label = document.createElement('div');
   label.className = 'smart-copy-email-label';
   label.innerHTML = '<span>Email</span>';
-  const btn = _makeCopyBtn(email, 'Copy email');
-  btn.classList.add('smart-copy-email-btn');
-  label.appendChild(btn);
-  startEl.parentNode.insertBefore(label, startEl);
+  wrap.appendChild(label);
 
-  // Add subtle left-border to email paragraphs
+  // Move email elements into wrapper
   const lastLine = email.split('\n').filter(l => l.trim()).pop() || '';
-  let el = startEl;
-  while (el && el.parentNode === label.parentNode) {
+  let el = wrap.nextSibling;
+  while (el && el.parentNode === wrap.parentNode) {
     const next = el.nextSibling;
-    if (el.nodeType === 1) el.classList.add('smart-copy-email-line');
+    const isTarget = el.nodeType === 1 || (el.nodeType === 3 && el.textContent.trim());
+    if (isTarget) wrap.appendChild(el);
+    else { wrap.appendChild(el); }
     if (el.textContent && el.textContent.includes(lastLine.trim())) break;
     el = next;
   }
+
+  // Add copy button (absolutely positioned in top-right of wrapper)
+  const btn = _makeCopyBtn(email, 'Copy email');
+  btn.style.top = '6px';
+  btn.style.right = '6px';
+  wrap.appendChild(btn);
 }
 
 function _extractEmail(rawText) {
@@ -179,9 +191,7 @@ function _addTableCopyButtons(container) {
     if (!tsv.trim()) return;
 
     const wrap = document.createElement('div');
-    wrap.style.position = 'relative';
-    wrap.style.display = 'inline-block';
-    wrap.style.width = '100%';
+    wrap.className = 'smart-copy-table-wrap';
     table.parentNode.insertBefore(wrap, table);
     wrap.appendChild(table);
 
