@@ -311,7 +311,7 @@ async function openInGUI(id) {
   localStorage.setItem('activeSessionId', id || '');
   _pushChatUrl(id);
   if (runningIds.has(id)) guiOpenAdd(id);
-  if (liveSessionId && liveSessionId !== id) stopLivePanel();
+  if (liveSessionId && liveSessionId !== id) { _autoSendPendingInput(); stopLivePanel(); }
   filterSessions();
 
   // Show title from sidebar data immediately (no mismatch)
@@ -429,6 +429,62 @@ function stopLivePanel() {
   _clearOutputShelf();
   const btnClose = document.getElementById('btn-close');
   if (btnClose) btnClose.disabled = true;
+}
+
+/**
+ * Auto-send any pending text in the live panel textareas before switching
+ * away from the current session.  Fires the appropriate socket event
+ * without heavy DOM manipulation (since the panel is about to be torn down).
+ */
+function _autoSendPendingInput() {
+  if (!liveSessionId) return;
+  const id = liveSessionId;
+
+  const inputTa = document.getElementById('live-input-ta');
+  const queueTa = document.getElementById('live-queue-ta');
+
+  if (inputTa && inputTa.value.trim()) {
+    const text = inputTa.value.trim();
+    inputTa.value = '';
+    const kind = sessionKinds[id];
+    const isRunning = runningIds.has(id);
+
+    if (!isRunning && guiOpenSessions.has(id) && !kind) {
+      // New session that hasn't been submitted yet — start it
+      runningIds.add(id);
+      sessionKinds[id] = 'working';
+      const startOpts = { session_id: id, prompt: text, cwd: _currentProjectDir(), name: '' };
+      if (typeof defaultModel !== 'undefined' && defaultModel) startOpts.model = defaultModel;
+      if (typeof defaultThinking !== 'undefined' && defaultThinking) startOpts.thinking_level = defaultThinking;
+      socket.emit('start_session', startOpts);
+      // Set placeholder title from message text
+      const s = allSessions.find(x => x.id === id);
+      const _ph = text.split('\n')[0].slice(0, 65) + (text.length > 65 ? '\u2026' : '');
+      if (s) s.display_title = _ph;
+      filterSessions();
+    } else if (!isRunning) {
+      // Ended session — resume with the typed text
+      socket.emit('start_session', { session_id: id, prompt: text, cwd: _currentProjectDir(), resume: true });
+      runningIds.add(id);
+      guiOpenAdd(id);
+    } else if (kind === 'question' && waitingData[id]) {
+      // Permission/question response
+      const actionMap = {yes: 'y', no: 'n', always: 'a', allow: 'y', deny: 'n'};
+      const action = actionMap[text.toLowerCase()] || text;
+      socket.emit('permission_response', {session_id: id, action: action});
+      delete waitingData[id];
+      sessionKinds[id] = 'working';
+    } else if (kind === 'idle' || kind === 'question') {
+      // Idle or question without waitingData — send as a message
+      socket.emit('send_message', {session_id: id, text: text});
+      sessionKinds[id] = 'working';
+    }
+  } else if (queueTa && queueTa.value.trim()) {
+    // Working state — queue the typed text
+    const text = queueTa.value.trim();
+    queueTa.value = '';
+    _addQueue(id, text);
+  }
 }
 
 function renderLiveEntry(e) {
@@ -555,11 +611,11 @@ function updateLiveInputBar() {
   const kind = sessionKinds[id];  // 'question' | 'working' | 'idle' | undefined
   if (!isRunning && !kind && guiOpenSessions.has(id)) return;
 
-  // Don't clobber if user has typed/pasted content in the main input textarea.
-  // Only protect #live-input-ta (idle/question/ended states), NOT #live-queue-ta
-  // (working state) — queue textarea content must not block state transitions.
-  const existingTa = bar.querySelector('#live-input-ta');
-  if (existingTa && existingTa.value.trim()) return;
+  // Capture any text the user has typed in either textarea so we can
+  // preserve it across state transitions (e.g. idle → working, working → idle).
+  // This replaces the old early-return that blocked state transitions entirely.
+  const _existingTa = bar.querySelector('#live-input-ta') || bar.querySelector('#live-queue-ta');
+  const _preservedText = _existingTa ? _existingTa.value : '';
   const wd = waitingData[id];     // {question, options, kind} or undefined
 
   // Compute a state key — for question state, include question text so we re-render if the question changed
@@ -729,6 +785,17 @@ function updateLiveInputBar() {
       }, 1000);
     }
   }
+
+  // ── Restore preserved text from the previous state's textarea ──
+  // When transitioning between states (idle↔working, new-chat↔q-chat, etc.)
+  // any text the user was typing/dictating is carried across into the new textarea.
+  if (_preservedText) {
+    const _newTa = document.getElementById('live-input-ta') || document.getElementById('live-queue-ta');
+    if (_newTa && !_newTa.value) {
+      _newTa.value = _preservedText;
+      _autoResizeTextarea(_newTa);
+    }
+  }
 }
 
 function livePickOption(val) {
@@ -801,9 +868,9 @@ function liveSubmitIdle() {
   if (!ta || !liveSessionId) return;
   const text = ta.value.trim();
   if (!text) return;
-  _liveSubmitDirect(liveSessionId, text);
   ta.value = '';
   _resetTextareaHeight(ta);
+  _liveSubmitDirect(liveSessionId, text);
 }
 
 function _liveSubmitDirect(sid, text, opts) {

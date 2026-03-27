@@ -28,7 +28,7 @@ function deselectSession() {
   activeId = null;
   localStorage.removeItem('activeSessionId');
   _pushChatUrl(null);
-  if (liveSessionId) stopLivePanel();
+  if (liveSessionId) { _autoSendPendingInput(); stopLivePanel(); }
   // In workspace mode, return to workspace canvas instead of dashboard
   if (workspaceActive) {
     _wsExpandedId = null;
