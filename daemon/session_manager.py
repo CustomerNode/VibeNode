@@ -286,9 +286,9 @@ class SessionManager:
         self._started = False
         self._registry_timer: Optional[threading.Timer] = None
         self._registry_dirty = False
-        # Permission policy (synced from browser)
-        self._permission_policy = "manual"     # 'manual' | 'auto' | 'custom'
-        self._custom_rules = {}                # dict of custom auto-approve rules
+        # Permission policy (synced from browser) — persisted to disk
+        self._policy_path = Path.home() / ".claude" / "gui_permission_policy.json"
+        self._permission_policy, self._custom_rules = self._load_policy()
         # Hook-based permission storage
         self._hook_pending = {}  # {req_id: {"event": threading.Event, "result": str}}
         self._hook_lock = threading.Lock()
@@ -483,13 +483,38 @@ class SessionManager:
 
         return {"ok": True}
 
+    def _load_policy(self):
+        """Load persisted permission policy from disk."""
+        try:
+            if self._policy_path.exists():
+                data = json.loads(self._policy_path.read_text())
+                policy = data.get("policy", "manual")
+                if policy in ("manual", "auto", "custom"):
+                    logger.info("Loaded persisted permission policy: %s", policy)
+                    return policy, data.get("custom_rules", {})
+        except Exception as e:
+            logger.warning("Failed to load permission policy: %s", e)
+        return "manual", {}
+
+    def _save_policy(self):
+        """Persist permission policy to disk."""
+        try:
+            self._policy_path.parent.mkdir(parents=True, exist_ok=True)
+            self._policy_path.write_text(json.dumps({
+                "policy": self._permission_policy,
+                "custom_rules": self._custom_rules,
+            }))
+        except Exception as e:
+            logger.warning("Failed to save permission policy: %s", e)
+
     def set_permission_policy(self, policy: str, custom_rules: dict = None) -> None:
         """Update the permission policy (synced from browser)."""
         if policy not in ("manual", "auto", "custom"):
             return
         self._permission_policy = policy
         self._custom_rules = custom_rules or {}
-        logger.info("Permission policy updated: %s", policy)
+        self._save_policy()
+        logger.info("Permission policy updated and saved: %s", policy)
 
     def _should_auto_approve(self, tool_name: str, tool_input: dict) -> bool:
         """Check if a tool use should be auto-approved based on the current policy."""
