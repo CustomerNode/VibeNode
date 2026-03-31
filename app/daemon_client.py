@@ -107,6 +107,7 @@ class DaemonClient:
                 self._sock = sock
                 self._connected = True
                 logger.info("Connected to session daemon on port %d", DAEMON_PORT)
+                self._resync_aliases()
                 self._resync_policy()
                 return
             except ConnectionRefusedError:
@@ -127,6 +128,15 @@ class DaemonClient:
                 logger.info("Re-synced permission policy: %s", self._cached_policy)
             except Exception as e:
                 logger.warning("Failed to re-sync policy: %s", e)
+
+    def _resync_aliases(self):
+        """Fetch accumulated ID aliases from daemon on connect/reconnect."""
+        try:
+            result = self._send_request("get_aliases")
+            if isinstance(result, dict):
+                self._id_aliases.update(result)
+        except Exception:
+            pass
 
     def _reconnect_loop(self):
         """Background reconnection loop. Restarts daemon if it crashed."""
@@ -308,8 +318,11 @@ class DaemonClient:
         # get_all_states filtering works after daemon assigns a new ID.
         if isinstance(data, dict) and event_name == "session_id_remapped":
             old_id = data.get("old_id", "")
+            new_id = data.get("new_id", "")
+            if old_id and new_id:
+                self._id_aliases[old_id] = new_id
             if old_id in self._planner_ids:
-                self._planner_ids.add(data.get("new_id", ""))
+                self._planner_ids.add(new_id)
         self._emit_queue.put((event_name, data))
 
     def _emitter_loop(self):
@@ -389,15 +402,20 @@ class DaemonClient:
             "session_id": session_id,
         })
 
+    def _resolve_id(self, session_id):
+        """Resolve a possibly-aliased session ID to its canonical form."""
+        return self._id_aliases.get(session_id, session_id)
+
     def _save_registry_now(self):
         return self._send_request("save_registry_now")
 
     def get_all_states(self):
         result = self._send_request("get_all_states")
         if isinstance(result, list):
-            # Filter out planner sessions so they never appear in the UI
             return [s for s in result
-                    if s.get("session_id", "") not in self._planner_ids]
+                    if s.get("session_id", "") not in self._planner_ids
+                    and s.get("session_type", "") not in ("planner", "title")
+                    and not s.get("session_id", "").startswith("_title_")]
         return []
 
     def get_entries(self, session_id, since=0):
