@@ -1109,8 +1109,27 @@ async function loadSessions() {
     }
     return;
   }
-  // Restore session from URL, then localStorage, or show dashboard
-  const _restoreId = _urlChatId || localStorage.getItem('activeSessionId');
+  // Restore session from URL, then localStorage, or show dashboard.
+  let _restoreId = _urlChatId || localStorage.getItem('activeSessionId');
+
+  // If the stored ID isn't in allSessions, it may have been remapped by the SDK.
+  // Ask the server to resolve the alias before giving up.
+  if (_restoreId && !allSessions.find(s => s.id === _restoreId)) {
+    try {
+      const resolveResp = await fetch('/api/resolve-session/' + _restoreId);
+      if (resolveResp.ok) {
+        const resolved = await resolveResp.json();
+        if (resolved.remapped && allSessions.find(s => s.id === resolved.id)) {
+          _restoreId = resolved.id;
+          localStorage.setItem('activeSessionId', _restoreId);
+          const _fixUrl = new URL(window.location);
+          _fixUrl.searchParams.set('chat', _restoreId);
+          history.replaceState(null, '', _fixUrl);
+        }
+      }
+    } catch(e) { /* resolve failed — fall through to dashboard */ }
+  }
+
   if (_restoreId && allSessions.find(s => s.id === _restoreId)) {
     _skipChatHistory = true;
     openInGUI(_restoreId);

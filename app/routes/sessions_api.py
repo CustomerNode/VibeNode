@@ -60,6 +60,18 @@ def api_sessions():
     return jsonify(sessions)
 
 
+@bp.route("/api/resolve-session/<session_id>")
+def api_resolve_session(session_id):
+    """Resolve a session ID through SDK aliases (old client UUID -> new server UUID).
+
+    Returns the canonical session ID. Used on page load to recover from
+    ID remaps that happened before the browser refreshed.
+    """
+    sm = current_app.session_manager
+    resolved = sm._resolve_id(session_id) if hasattr(sm, '_resolve_id') else session_id
+    return jsonify({"id": resolved, "remapped": resolved != session_id})
+
+
 @bp.route("/api/session/<session_id>")
 def api_session(session_id):
     meta_only = request.args.get("meta_only") == "1"
@@ -70,17 +82,19 @@ def api_session(session_id):
         sm = current_app.session_manager
         if sm.has_session(session_id):
             if meta_only:
+                saved_title = _load_names().get(session_id, "")
                 return jsonify({
                     "id": session_id,
-                    "display_title": "New Session",
-                    "custom_title": "",
+                    "display_title": saved_title or "New Session",
+                    "custom_title": saved_title,
                 })
             entries = sm.get_entries(session_id)
             state = sm.get_session_state(session_id) or "idle"
+            saved_title = _load_names().get(session_id, "")
             return jsonify({
                 "id": session_id,
-                "display_title": "New Session",
-                "custom_title": "",
+                "display_title": saved_title or "New Session",
+                "custom_title": saved_title,
                 "date": "",
                 "size": "0 B",
                 "message_count": len(entries),

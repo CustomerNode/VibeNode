@@ -3605,8 +3605,9 @@ function restoreFromHash() {
     const taskId = sessMatch[1];
     const sessionId = sessMatch[2];
     kanbanDetailTaskId = taskId;
-    renderTaskDetail(taskId);
-    setTimeout(() => _openSessionInKanban(sessionId), 500);
+    renderTaskDetail(taskId).then(() => {
+      _openSessionInKanban(sessionId);
+    });
     return;
   }
 
@@ -3662,11 +3663,9 @@ window.addEventListener('popstate', (e) => {
 
   if (e.state?.view === 'kanban') {
     if (e.state.session && e.state.taskId && e.state.sessionId) {
-      // Forward into a session
+      // Forward into a session — wait for drill-down to render first
       kanbanDetailTaskId = e.state.taskId;
-      goToTask(e.state.taskId);
-      // After drill-down renders, open the session
-      setTimeout(() => _openSessionInKanban(e.state.sessionId), 500);
+      renderTaskDetail(e.state.taskId).then(() => _openSessionInKanban(e.state.sessionId));
     } else if (e.state.taskId) {
       goToTask(e.state.taskId);
     } else {
@@ -3678,8 +3677,7 @@ window.addEventListener('popstate', (e) => {
     const sessMatch = hash.match(/^#kanban\/task\/([^/]+)\/session\/(.+)$/);
     if (sessMatch) {
       kanbanDetailTaskId = sessMatch[1];
-      goToTask(sessMatch[1]);
-      setTimeout(() => _openSessionInKanban(sessMatch[2]), 500);
+      renderTaskDetail(sessMatch[1]).then(() => _openSessionInKanban(sessMatch[2]));
     } else if (hash && hash.startsWith('#kanban/task/')) {
       const tid = hash.replace('#kanban/task/', '').replace('/session', '');
       if (tid) goToTask(tid);

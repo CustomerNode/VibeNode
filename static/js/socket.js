@@ -180,16 +180,22 @@ socket.on('state_snapshot', (data) => {
     // Re-render views
     filterSessions();
 
-    // If stubs were injected and there's no active session, try to restore
-    // the session from URL or localStorage (it was missed during loadSessions
-    // because the .jsonl didn't exist yet on disk).
-    if (_injectedStubs && !activeId) {
-        const _urlChatId = new URL(window.location).searchParams.get('chat');
-        let _restoreId = _urlChatId || localStorage.getItem('activeSessionId');
+    // Try to restore the active session if it's missing from the UI.
+    // This handles: (a) stubs injected for sessions with no .jsonl yet,
+    // (b) activeId set from localStorage but pointing to a remapped UUID,
+    // (c) activeId set but session wasn't found during loadSessions.
+    const _aliases = data.aliases || {};
+    const _urlChatId = new URL(window.location).searchParams.get('chat');
+    let _restoreId = _urlChatId || localStorage.getItem('activeSessionId');
+    // Check if we need to restore: either no active session displaying,
+    // or activeId doesn't match any session in the list (stale/remapped)
+    const _needsRestore = !activeId
+        || (activeId && !allSessions.find(x => x.id === activeId))
+        || (_restoreId && _aliases[_restoreId]);  // known remap pending
+    if (_needsRestore && _restoreId) {
         // Resolve through ID aliases — the stored ID may be the old client-generated
         // UUID that the SDK remapped to a new ID before the page refreshed
-        const _aliases = data.aliases || {};
-        if (_restoreId && _aliases[_restoreId]) {
+        if (_aliases[_restoreId]) {
             _restoreId = _aliases[_restoreId];
             // Update localStorage and URL to the canonical ID
             localStorage.setItem('activeSessionId', _restoreId);
@@ -197,7 +203,7 @@ socket.on('state_snapshot', (data) => {
             _fixUrl.searchParams.set('chat', _restoreId);
             history.replaceState(null, '', _fixUrl);
         }
-        if (_restoreId && allSessions.find(x => x.id === _restoreId)) {
+        if (allSessions.find(x => x.id === _restoreId)) {
             _skipChatHistory = true;
             openInGUI(_restoreId);
             _skipChatHistory = false;
@@ -573,6 +579,9 @@ socket.on('session_started', (data) => {
     }
 });
 
+// Track old→new ID remaps so in-flight autoname calls can save under the new ID
+if (!window._idRemaps) window._idRemaps = {};  // oldId -> newId
+
 // Session ID remapped — SDK assigned a different ID than the one we generated
 socket.on('session_id_remapped', (data) => {
     const oldId = data.old_id;
@@ -633,6 +642,7 @@ socket.on('session_id_remapped', (data) => {
     // Always remap the persisted name (covers both user-set AND auto-named titles).
     // Without this, auto-names saved under the old client-generated UUID are lost
     // when the SDK remaps to a new ID.
+    window._idRemaps[oldId] = newId;
     fetch('/api/remap-name', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({old_id:oldId, new_id:newId})}).catch(()=>{});
 
     // Update working since map

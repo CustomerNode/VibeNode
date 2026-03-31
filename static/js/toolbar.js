@@ -516,11 +516,22 @@ async function autoName(id, silent, reEvaluate, promptText) {
   if (_userNamedSessions.has(id)) return;
 
   if (data.ok) {
-    const s = allSessions.find(x => x.id === id);
+    // If the session ID was remapped while the autoname LLM call was in-flight,
+    // also save the name under the new ID so it isn't lost
+    const remappedId = (window._idRemaps && window._idRemaps[id]) || null;
+    const effectiveId = remappedId || id;
+
+    const s = allSessions.find(x => x.id === effectiveId) || allSessions.find(x => x.id === id);
     if (s) { s.custom_title = data.title; s.display_title = data.title; }
     filterSessions();
+
+    // Persist the name under the remapped ID too
+    if (remappedId) {
+      fetch('/api/remap-name', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({old_id:id, new_id:remappedId})}).catch(()=>{});
+    }
+
     // Update toolbar title if this is the active session
-    if (id === activeId) {
+    if (effectiveId === activeId || id === activeId) {
       const titleEl = document.getElementById('main-title');
       if (titleEl) { titleEl.textContent = data.title; titleEl.classList.remove('untitled'); titleEl.dataset.customTitle = data.title; }
       // Also update kanban session title bar if present
