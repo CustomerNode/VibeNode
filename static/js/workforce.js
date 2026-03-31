@@ -113,10 +113,12 @@ function setViewMode(mode) {
     // Hide main-toolbar unless a session is actively selected
     if (!activeId) document.getElementById('main-toolbar').style.display = 'none';
   } else if (mode === 'kanban') {
-    // Clean URL — remove ?chat= param, set kanban hash
+    // Clean URL — remove ?chat= param, preserve existing kanban hash
     const cleanUrl = new URL(window.location);
     cleanUrl.searchParams.delete('chat');
-    cleanUrl.hash = '#kanban';
+    if (!cleanUrl.hash || !cleanUrl.hash.startsWith('#kanban')) {
+      cleanUrl.hash = '#kanban';
+    }
     history.replaceState({}, '', cleanUrl.pathname + cleanUrl.search + cleanUrl.hash);
 
     listEl.style.display = 'none';
