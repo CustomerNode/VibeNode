@@ -742,6 +742,15 @@ function updateLiveInputBar() {
   // Don't re-render if the bar is already showing this exact state.
   // This is critical: prevents wiping user's in-progress typed text.
   if (stateKey === liveBarState) return;
+
+  // Don't rebuild bar while voice is actively recording inside it — innerHTML
+  // would destroy the textarea the recognition targets, cutting the user off.
+  // The bar catches up via deferred updateLiveInputBar() call in voice onend.
+  if (typeof _activeRecognition !== 'undefined' && _activeRecognition &&
+      _activeRecognition._target && bar.contains(_activeRecognition._target)) {
+    return;  // liveBarState NOT updated — so deferred call will still see a mismatch
+  }
+
   const wasTransition = liveBarState !== null;  // true if switching between states
   liveBarState = stateKey;
 
@@ -1106,7 +1115,9 @@ function _watchdogHttpCheck(sid, forceApply) {
     .then(data => {
       if (!data) return;
       const serverState = data.state;
-      console.log('[watchdog] HTTP state for', sid, '=', serverState, '(UI thinks: working)');
+      const serverEntryCount = data.entry_count || 0;
+      console.log('[watchdog] HTTP state for', sid, '=', serverState,
+        'entries:', serverEntryCount, '(UI: working, rendered:', liveLineCount, ')');
       if (serverState && serverState !== 'working') {
         // Server knows it's not working — force the UI to match
         console.warn('[watchdog] Forcing UI state to', serverState, 'for', sid);
@@ -1121,12 +1132,25 @@ function _watchdogHttpCheck(sid, forceApply) {
         if (sid === liveSessionId) {
           liveBarState = null;
           updateLiveInputBar();
+          // CRITICAL: re-fetch entries — the real-time session_entry events
+          // were silently lost, so the response text is missing from the DOM.
+          // Without this, the UI recovers state but the response never appears.
+          socket.emit('get_session_log', {session_id: sid, since: 0});
         }
         filterSessions();
-      } else if (forceApply && serverState === 'working') {
-        // Server also thinks working — request a fresh snapshot one last time
-        // to resync any other stale state
-        socket.emit('request_state_snapshot');
+      } else if (serverState === 'working') {
+        // Server also thinks working — check for missing entries even
+        // while the session is still active. If real-time events were
+        // lost mid-stream, we might have fewer entries than the server.
+        if (sid === liveSessionId && serverEntryCount > liveLineCount + 1) {
+          console.warn('[watchdog] Entry mismatch while working: server has', serverEntryCount,
+            'but frontend has', liveLineCount, '— re-fetching');
+          socket.emit('get_session_log', {session_id: sid, since: 0});
+        }
+        if (forceApply) {
+          // Request a fresh snapshot to resync any other stale state
+          socket.emit('request_state_snapshot');
+        }
       }
     })
     .catch(err => console.error('[watchdog] HTTP check failed:', err));

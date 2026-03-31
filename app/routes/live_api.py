@@ -104,16 +104,19 @@ def hook_pre_tool():
 
 @bp.route("/api/live/state/<session_id>")
 def api_live_state(session_id):
-    """Lightweight endpoint returning just the session state.
+    """Lightweight endpoint returning just the session state + entry count.
 
     Used by the frontend watchdog to bypass WebSocket and get ground truth
-    when the UI suspects it's stuck.
+    when the UI suspects it's stuck. The entry_count field lets the watchdog
+    detect missing entries even when the state is correct.
     """
     sm = current_app.session_manager
     state = sm.get_session_state(session_id)
     if state is None:
-        return jsonify({"state": "stopped", "managed": False})
-    return jsonify({"state": state, "managed": True})
+        return jsonify({"state": "stopped", "managed": False, "entry_count": 0})
+    # Include entry count so the watchdog can detect missing entries
+    entry_count = len(sm.get_entries(session_id)) if hasattr(sm, 'get_entries') else 0
+    return jsonify({"state": state, "managed": True, "entry_count": entry_count})
 
 
 @bp.route("/api/session-log/<session_id>")

@@ -8,6 +8,7 @@ daemon are re-emitted as SocketIO events to connected browsers.
 
 import json
 import logging
+import queue
 import socket
 import threading
 import time
@@ -28,6 +29,7 @@ class DaemonClient:
         self._app = None
         self._connected = False
         self._reader_thread = None
+        self._emitter_thread = None
         self._reconnect_thread = None
         self._pending = {}  # req_id -> (threading.Event, result_holder)
         self._pending_lock = threading.Lock()
@@ -35,6 +37,16 @@ class DaemonClient:
         self._should_run = False
         self._cached_policy = None       # last policy set by browser
         self._cached_custom_rules = {}
+        # Session IDs tagged as "planner" — hidden from all UI broadcasts.
+        # Tracked here so the daemon doesn't need to know about session_type.
+        self._planner_ids = set()
+        # Track old→new session ID remaps so /api/sessions can resolve
+        # aliased JSONL files to their canonical (SDK-assigned) IDs.
+        self._id_aliases: dict[str, str] = {}
+        # Queue for SocketIO emits — decouples the IPC reader from the
+        # potentially-blocking socketio.emit() call so that IPC response
+        # processing is never delayed by WebSocket write latency.
+        self._emit_queue = queue.Queue()
 
     def start(self, socketio, app=None) -> None:
         """Connect to daemon and start the event reader.
@@ -50,6 +62,12 @@ class DaemonClient:
             target=self._reader_loop, daemon=True, name="daemon-reader"
         )
         self._reader_thread.start()
+        # Dedicated thread for SocketIO emits so the reader loop is never
+        # blocked by WebSocket write latency
+        self._emitter_thread = threading.Thread(
+            target=self._emitter_loop, daemon=True, name="socketio-emitter"
+        )
+        self._emitter_thread.start()
 
     def stop(self) -> None:
         """Disconnect from daemon."""
@@ -279,13 +297,39 @@ class DaemonClient:
                     self._start_reconnect()
 
     def _emit_socketio(self, event_name, data):
-        """Re-emit a daemon push event as a SocketIO event to browsers."""
+        """Queue a daemon push event for SocketIO emission.
+
+        Called from the reader loop — must be non-blocking so IPC response
+        processing is never delayed by WebSocket write latency.
+        """
         if not self._socketio:
             return
-        try:
-            self._socketio.emit(event_name, data)
-        except Exception as e:
-            logger.warning("SocketIO emit FAILED for %s: %s", event_name, e)
+        # Track remapped utility session IDs (planner, title) so
+        # get_all_states filtering works after daemon assigns a new ID.
+        if isinstance(data, dict) and event_name == "session_id_remapped":
+            old_id = data.get("old_id", "")
+            if old_id in self._planner_ids:
+                self._planner_ids.add(data.get("new_id", ""))
+        self._emit_queue.put((event_name, data))
+
+    def _emitter_loop(self):
+        """Dedicated thread: drains the emit queue and sends to SocketIO.
+
+        This decouples IPC reading from WebSocket writing so that a slow
+        emit (e.g. WebSocket backpressure) never blocks the reader loop
+        and delays IPC request/response processing.
+        """
+        while self._should_run:
+            try:
+                event_name, data = self._emit_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if not self._socketio:
+                continue
+            try:
+                self._socketio.emit(event_name, data)
+            except Exception as e:
+                logger.warning("SocketIO emit FAILED for %s: %s", event_name, e)
 
     # ------------------------------------------------------------------
     # Public API — same signatures as SessionManager
@@ -309,6 +353,10 @@ class DaemonClient:
             params["allowed_tools"] = allowed_tools
         if permission_mode:
             params["permission_mode"] = permission_mode
+        # Track utility sessions at proxy layer — don't pass to daemon
+        # (the running daemon may not support the session_type param yet)
+        if kwargs.get("session_type") in ("planner", "title"):
+            self._planner_ids.add(session_id)
         return self._send_request("start_session", params)
 
     def send_message(self, session_id, text):
@@ -347,7 +395,9 @@ class DaemonClient:
     def get_all_states(self):
         result = self._send_request("get_all_states")
         if isinstance(result, list):
-            return result
+            # Filter out planner sessions so they never appear in the UI
+            return [s for s in result
+                    if s.get("session_id", "") not in self._planner_ids]
         return []
 
     def get_entries(self, session_id, since=0):

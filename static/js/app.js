@@ -1085,6 +1085,25 @@ async function loadSessions() {
     (typeof initFolderTree === 'function') ? initFolderTree().catch(function(){}) : Promise.resolve(),
   ]);
   allSessions = await resp.json();
+  // Deduplicate by ID — race between remap events and session list fetch
+  // can produce two entries with the same ID
+  {
+    const _seen = new Set();
+    allSessions = allSessions.filter(s => {
+      if (_seen.has(s.id)) return false;
+      _seen.add(s.id);
+      return true;
+    });
+  }
+  // Filter out hidden utility sessions (planner, auto-title, etc.)
+  allSessions = allSessions.filter(s =>
+    !s.id.startsWith('_title_') &&
+    !(window._plannerSessionIds && window._plannerSessionIds.has(s.id))
+  );
+  // Purge stale alias entries (old pre-remap IDs still on disk or in daemon)
+  if (window._idRemaps) {
+    allSessions = allSessions.filter(s => !window._idRemaps[s.id]);
+  }
   // Populate _userNamedSessions from server so manual names survive page refresh
   if (typeof _userNamedSessions !== 'undefined') {
     for (const s of allSessions) {

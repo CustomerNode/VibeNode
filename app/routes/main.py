@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 
-from flask import Blueprint, jsonify, render_template
+from flask import Blueprint, jsonify, render_template, request
 
 bp = Blueprint('main', __name__)
 
@@ -18,12 +18,29 @@ def index():
 
 @bp.route("/api/restart", methods=["POST"])
 def restart_server():
-    """Kill ports 5050/5051 and relaunch run.py in a detached process.
+    """Restart the web server, daemon, or both based on the `scope` param.
 
-    The current process will be killed by the port cleanup, so the
-    response may not arrive — the frontend should just wait and reload.
+    Body JSON (optional):
+      scope: "web" (default) | "daemon" | "both"
+
+    "web"    — kills only port 5050, leaves daemon alive
+    "daemon" — kills only port 5051, leaves web alive
+    "both"   — kills both 5050 and 5051
     """
     try:
+        data = request.get_json(silent=True) or {}
+        scope = data.get("scope", "web")
+
+        ports = []
+        if scope in ("web", "both"):
+            ports.append("5050")
+        if scope in ("daemon", "both"):
+            ports.append("5051")
+        if not ports:
+            ports = ["5050"]
+
+        port_list = ",".join(ports)
+
         run_py = os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "run.py")
         run_py = os.path.abspath(run_py)
         pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
@@ -33,14 +50,14 @@ def restart_server():
         project_dir = os.path.dirname(run_py)
 
         # PowerShell restart script that:
-        # 1. Loops to kill ALL processes on ports 5050/5051 until ports are clear
+        # 1. Kills processes on the specified port(s)
         # 2. Purges all __pycache__ so fresh code is loaded
-        # 3. Launches run.py
+        # 3. Launches run.py (which reconnects to existing daemon or starts new one)
         restart_cmd = (
             "powershell -NoProfile -Command \""
             "$maxTries = 10; "
             "for ($i = 0; $i -lt $maxTries; $i++) { "
-            "  $pids = @(Get-NetTCPConnection -LocalPort 5050,5051 -ErrorAction SilentlyContinue | "
+            f"  $pids = @(Get-NetTCPConnection -LocalPort {port_list} -ErrorAction SilentlyContinue | "
             "    Select-Object -ExpandProperty OwningProcess -Unique); "
             "  if ($pids.Count -eq 0) { break }; "
             "  $pids | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }; "
@@ -66,6 +83,6 @@ def restart_server():
             creationflags=creation_flags,
         )
 
-        return jsonify({"ok": True, "message": "Restarting..."})
+        return jsonify({"ok": True, "message": f"Restarting ({scope})..."})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500

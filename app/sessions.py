@@ -485,7 +485,8 @@ def all_sessions(summary_only: bool = False) -> list:
     # recreated by dying claude.exe processes never appear in the UI.
     deleted_ids = _get_deleted_ids()
     files = [f for f in _sessions_dir().glob("*.jsonl")
-             if f.stem not in deleted_ids]
+             if f.stem not in deleted_ids
+             and not f.stem.startswith("_title_")]
     loader = load_session_summary if summary_only else load_session
     if summary_only and len(files) > 10:
         with ThreadPoolExecutor(max_workers=min(16, len(files))) as pool:

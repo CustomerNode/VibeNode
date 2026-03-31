@@ -172,6 +172,7 @@ def register_ws_events(socketio, app):
         """Re-send full state snapshot on demand (e.g. after workspace switch)."""
         sm = app.session_manager
         if hasattr(sm, "is_connected") and not sm.is_connected:
+            emit("state_snapshot", {"sessions": [], "queues": {}, "aliases": {}})
             return
         sessions = sm.get_all_states()
         queues = {}
@@ -211,6 +212,7 @@ def register_ws_events(socketio, app):
         permission_mode = (data.get('permission_mode') or '').strip() or None
         if permission_mode and permission_mode not in ('default', 'plan', 'acceptEdits', 'bypassPermissions'):
             permission_mode = None
+        session_type = (data.get('session_type') or '').strip() or ""
 
         if not session_id:
             emit('error', {'message': 'session_id is required'})
@@ -228,6 +230,7 @@ def register_ws_events(socketio, app):
             max_turns=max_turns,
             allowed_tools=allowed_tools,
             permission_mode=permission_mode,
+            session_type=session_type,
         )
 
         if result.get('ok'):
@@ -258,12 +261,21 @@ def register_ws_events(socketio, app):
         sm = app.session_manager
         result = sm.send_message(session_id, text)
 
-        if not result.get('ok'):
+        if result.get('ok'):
+            # Acknowledge receipt so the client knows the message was accepted.
+            # Without this, the client has no confirmation that the server
+            # processed the message — if subsequent push events are lost
+            # (SocketIO transport hiccup), the client can't distinguish
+            # "processing but events lost" from "message never received".
+            emit('message_ack', {'session_id': session_id})
+        else:
             # If session isn't idle, auto-queue instead of erroring
             err = result.get('error', '')
             if 'not idle' in err:
                 q_result = sm.queue_message(session_id, text)
-                if not q_result.get('ok'):
+                if q_result.get('ok'):
+                    emit('message_ack', {'session_id': session_id, 'queued': True})
+                else:
                     emit('error', {
                         'message': q_result.get('error', 'Failed to queue message'),
                         'session_id': session_id,

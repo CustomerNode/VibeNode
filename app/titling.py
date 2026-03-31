@@ -260,6 +260,7 @@ def _daemon_title(messages: list) -> str | None:
         model="haiku",
         allowed_tools=[],
         permission_mode="plan",
+        session_type="title",
     )
     log.debug("_daemon_title: start_session result: %s", result)
     if not result or not result.get("ok"):
@@ -279,12 +280,25 @@ def _daemon_title(messages: list) -> str | None:
             entries = sm.get_entries(sid, since=0)
             title = _extract_title_from_entries(entries, texts)
             sm.remove_session(sid)
+            _cleanup_title_jsonl(sid)
             return title
 
     # Timeout — grab whatever we have
     entries = sm.get_entries(sid, since=0)
     sm.remove_session(sid)
+    _cleanup_title_jsonl(sid)
     return _extract_title_from_entries(entries, texts)
+
+
+def _cleanup_title_jsonl(sid: str):
+    """Delete leftover JSONL files created by title generation sessions."""
+    try:
+        from app.config import _sessions_dir
+        jsonl = _sessions_dir() / f"{sid}.jsonl"
+        if jsonl.exists():
+            jsonl.unlink()
+    except Exception as e:
+        log.debug("_cleanup_title_jsonl: %s", e)
 
 
 def _extract_title_from_entries(entries, texts):

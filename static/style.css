@@ -7034,35 +7034,73 @@ mark.find-match.current { background: var(--accent); color:#fff; }
 /* Planner status */
 .planner-status {
   display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  padding: 32px 16px;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
   color: var(--text-muted);
   font-size: 13px;
+  flex: 1;
+  overflow: hidden;
+}
+.planner-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
 }
 .planner-spinner {
-  width: 16px; height: 16px;
+  width: 14px; height: 14px;
   border: 2px solid var(--border);
   border-top-color: var(--accent);
   border-radius: 50%;
   animation: spin .6s linear infinite;
+  flex-shrink: 0;
 }
-.planner-progress-info {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  align-items: center;
-}
-.planner-progress-count {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--accent);
+.planner-stream {
+  flex: 1;
+  overflow-y: auto;
+  margin: 0;
+  padding: 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  font-family: var(--font-mono, monospace);
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--bg-deeper, var(--bg-secondary));
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
 }
 .planner-progress-timer {
   font-size: 11px;
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
+  margin-left: auto;
+}
+.planner-activity {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 4px;
+  overflow-y: auto;
+  flex: 1;
+}
+.planner-activity-line {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.planner-activity-line.planner-task-found {
+  color: var(--accent);
+  font-weight: 600;
+  margin-top: 6px;
+}
+.planner-activity-task {
+  font-size: 12px;
+  color: var(--text-secondary);
+  padding-left: 12px;
 }
 .planner-error { color: var(--danger, #f85149); font-size: 13px; text-align: center; padding: 20px; }
 

@@ -817,14 +817,6 @@ def planner_chat():
         if not message:
             return jsonify({"error": "Message is required"}), 400
 
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            return jsonify({"error": "ANTHROPIC_API_KEY not set. Add it to your environment to use AI planning."}), 500
-
-        try:
-            import anthropic
-        except ImportError:
-            return jsonify({"error": "anthropic package not installed. Run: pip install anthropic"}), 500
-
         # Build messages — include history for refinement
         messages = []
         for h in history:
@@ -832,24 +824,66 @@ def planner_chat():
                 messages.append({"role": h["role"], "content": h["content"]})
         messages.append({"role": "user", "content": message})
 
-        client = anthropic.Anthropic()
-        resp = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=4096,
-            system=PLANNER_CHAT_SYSTEM,
-            messages=messages,
-        )
-        result_text = resp.content[0].text if resp.content else ""
+        result_text = None
 
-        # Parse JSON from response
+        # Strategy 1: Direct Anthropic API (fast, needs ANTHROPIC_API_KEY)
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            try:
+                import anthropic
+                client = anthropic.Anthropic()
+                resp = client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=4096,
+                    system=PLANNER_CHAT_SYSTEM,
+                    messages=messages,
+                )
+                result_text = resp.content[0].text if resp.content else ""
+            except Exception as api_err:
+                import logging
+                logging.getLogger(__name__).warning("Planner API failed, trying CLI: %s", api_err)
+
+        # Strategy 2: Claude CLI fallback (uses CLI auth / OAuth — no key needed)
+        if not result_text:
+            import subprocess
+            import sys
+            prompt = PLANNER_CHAT_SYSTEM + "\n\n"
+            for m in messages:
+                prompt += "[" + m.get("role", "user").upper() + "]\n" + m["content"] + "\n\n"
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            r = subprocess.run(
+                ["claude", "-p", prompt, "--output-format", "text",
+                 "--max-turns", "1", "--model", "sonnet"],
+                capture_output=True, text=True, timeout=120,
+                creationflags=creationflags,
+            )
+            if r.returncode != 0:
+                return jsonify({"error": "AI planning failed: " + r.stderr[:300]}), 500
+            result_text = r.stdout.strip()
+
+        if not result_text:
+            return jsonify({"error": "No response from AI planner"}), 500
+
+        # Parse JSON from response — try ```json fences, then brace-balanced extraction
         response_text = result_text
         proposal = None
         json_match = re_mod.search(r'```json\s*([\s\S]*?)```', result_text)
-        if not json_match:
-            json_match = re_mod.search(r'\{[\s\S]*"tasks"\s*:\s*\[[\s\S]*\][\s\S]*\}', result_text)
         if json_match:
+            raw = json_match.group(1)
+        else:
+            # Brace-balanced extraction for first complete top-level {...}
+            raw = None
+            start = result_text.find('{')
+            if start >= 0:
+                depth, end = 0, -1
+                for i in range(start, len(result_text)):
+                    if result_text[i] == '{': depth += 1
+                    elif result_text[i] == '}':
+                        depth -= 1
+                        if depth == 0: end = i; break
+                if end > start:
+                    raw = result_text[start:end+1]
+        if raw:
             try:
-                raw = json_match.group(1) if json_match.lastindex else json_match.group(0)
                 parsed = json_mod.loads(raw)
                 if "tasks" in parsed:
                     proposal = {"tasks": parsed["tasks"]}

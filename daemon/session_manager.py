@@ -254,6 +254,7 @@ class SessionInfo:
     name: str = ""
     cwd: str = ""
     model: str = ""
+    session_type: str = ""  # "planner" for AI task planner sessions
     cost_usd: float = 0.0
     error: Optional[str] = None
     entries: list = field(default_factory=list)
@@ -282,6 +283,7 @@ class SessionInfo:
             "name": self.name,
             "cwd": self.cwd,
             "model": self.model,
+            "session_type": self.session_type,
             "working_since": self.working_since if self.state == SessionState.WORKING else 0,
         }
         if self.substatus:
@@ -295,7 +297,7 @@ class SessionInfo:
                 "tool_name": self.pending_tool_name,
                 "tool_input": self.pending_tool_input,
             }
-        # Queue data is included by _emit_state from SessionManager._queues
+        d["entry_count"] = len(self.entries)
         return d
 
 
@@ -454,6 +456,7 @@ class SessionManager:
         model: Optional[str] = None, system_prompt: Optional[str] = None,
         max_turns: Optional[int] = None, allowed_tools: Optional[list] = None,
         permission_mode: Optional[str] = None,
+        session_type: str = "",
     ) -> dict:
         """Start or resume an SDK session. Returns immediately."""
         with self._lock:
@@ -470,6 +473,7 @@ class SessionManager:
             cwd=cwd,
             model=model or "",
             state=SessionState.STARTING,
+            session_type=session_type or "",
         )
         with self._lock:
             self._sessions[session_id] = info
@@ -849,7 +853,8 @@ class SessionManager:
         clients can immediately display queued items.
         """
         with self._lock:
-            states = [info.to_state_dict() for info in self._sessions.values()]
+            states = [info.to_state_dict() for info in self._sessions.values()
+                      if info.session_type not in ("planner", "title")]
         # Merge queue data from _queues into state dicts
         with self._queue_lock:
             for s in states:
@@ -2018,6 +2023,7 @@ class SessionManager:
                         "name": info.name,
                         "cwd": info.cwd,
                         "model": info.model,
+                        "session_type": info.session_type,
                         "state": info.state.value,
                         "started_at": (
                             info.entries[0].timestamp if info.entries else time.time()
@@ -2083,6 +2089,10 @@ class SessionManager:
                 # Only recover sessions that were mid-task (working/waiting).
                 # Idle sessions were done — no need to resume them.
                 if state not in ("working", "waiting", "starting"):
+                    continue
+
+                # Never recover planner sessions
+                if meta.get("session_type") == "planner":
                     continue
 
                 last_activity = meta.get("last_activity", 0)
@@ -2164,7 +2174,7 @@ class SessionManager:
             info.working_since = time.time()
         elif info.state != SessionState.WORKING:
             info.working_since = 0.0
-        if self._push_callback:
+        if self._push_callback and info.session_type != "title":
             data = info.to_state_dict()
             # Include queue data from server-side store
             with self._queue_lock:

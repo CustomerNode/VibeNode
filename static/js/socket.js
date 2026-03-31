@@ -3,6 +3,19 @@
 const socket = io();
 let _wsConnected = false;
 
+/**
+ * Returns true if a session ID belongs to a hidden utility session
+ * (planner, auto-title, etc.) that must NEVER appear in the workspace.
+ * Called at every entry point where a session can enter the UI.
+ */
+function _isHiddenSession(id, data) {
+    if (!id) return false;
+    if (id.startsWith('_title_')) return true;
+    if (window._plannerSessionIds && window._plannerSessionIds.has(id)) return true;
+    if (data && (data.session_type === 'planner' || data.session_type === 'title')) return true;
+    return false;
+}
+
 socket.on('connect', () => {
     _wsConnected = true;
     console.log('[WS] Connected');
@@ -19,11 +32,18 @@ socket.on('connect', () => {
     }
     // Request full state snapshot to resync indicators
     socket.emit('request_state_snapshot');
+    // Retry after 3s in case the first snapshot was silently dropped
+    // (e.g. DaemonClient not yet reconnected when server just restarted)
+    setTimeout(() => {
+        if (socket.connected) socket.emit('request_state_snapshot');
+    }, 3000);
 });
 
 socket.on('disconnect', () => {
     _wsConnected = false;
     console.log('[WS] Disconnected');
+    // Clear staleness timestamps so reconnect snapshot is authoritative
+    window._sessionStateTs = {};
     // Update status bar connection indicator
     const sbConn = document.getElementById('sb-connection');
     if (sbConn) { sbConn.textContent = '\u25CF'; sbConn.style.color = 'var(--result-err)'; sbConn.title = 'Disconnected'; }
@@ -78,6 +98,7 @@ socket.on('state_snapshot', (data) => {
 
     (data.sessions || []).forEach(s => {
         const id = s.session_id;
+        if (_isHiddenSession(id, s)) return;
         // Skip this session if we got a fresher incremental update
         // in the last 5 seconds (avoids heartbeat snapshot reverting
         // a real-time session_state event that arrived after the
@@ -129,6 +150,19 @@ socket.on('state_snapshot', (data) => {
         if (s.state !== 'stopped') newRunning.add(id);
     });
 
+    // Detect working→idle transition for the live session before replacing
+    // state. If we missed the real-time session_state/session_entry events
+    // (SocketIO transport hiccup, tab sleeping, etc.), entries would be
+    // missing from the DOM. Re-fetch them so the response appears without
+    // requiring a manual page refresh.
+    if (liveSessionId && sessionKinds[liveSessionId] === 'working' &&
+        newKinds[liveSessionId] && newKinds[liveSessionId] !== 'working') {
+        console.warn('[state_snapshot] Live session', liveSessionId,
+            'transitioned from working →', newKinds[liveSessionId],
+            '— re-fetching entries in case real-time events were lost');
+        socket.emit('get_session_log', {session_id: liveSessionId, since: 0});
+    }
+
     waitingData = newWaiting;
     runningIds = newRunning;
     sessionKinds = newKinds;
@@ -142,6 +176,12 @@ socket.on('state_snapshot', (data) => {
         }
     }
 
+    // Purge stale alias entries — if a session was remapped (old→new), remove
+    // the old-ID entry so it doesn't duplicate the new-ID entry.
+    if (window._idRemaps) {
+        allSessions = allSessions.filter(s => !window._idRemaps[s.id]);
+    }
+
     // Inject stub entries into allSessions for SDK-managed sessions that
     // haven't written a .jsonl yet (e.g. first response still in progress).
     // Without this, sessions disappear from the sidebar on page refresh
@@ -150,7 +190,20 @@ socket.on('state_snapshot', (data) => {
     (data.sessions || []).forEach(s => {
         const id = s.session_id;
         if (s.state === 'stopped') return;
+        if (_isHiddenSession(id, s)) return;
+        // Skip old pre-remap IDs that have already been replaced
+        if (window._idRemaps && window._idRemaps[id]) return;
         if (!allSessions.find(x => x.id === id)) {
+            // Don't inject stub if an old alias for this ID still exists
+            if (window._idRemaps) {
+                let _hasOld = false;
+                for (const oldId in window._idRemaps) {
+                    if (window._idRemaps[oldId] === id && allSessions.find(x => x.id === oldId)) {
+                        _hasOld = true; break;
+                    }
+                }
+                if (_hasOld) return;
+            }
             allSessions.unshift({
                 id: id,
                 display_title: s.name || 'New Session',
@@ -166,6 +219,16 @@ socket.on('state_snapshot', (data) => {
             _injectedStubs = true;
         }
     });
+
+    // Final dedup — guarantee no two entries share the same ID
+    {
+        const _seen = new Set();
+        allSessions = allSessions.filter(s => {
+            if (_seen.has(s.id)) return false;
+            _seen.add(s.id);
+            return true;
+        });
+    }
 
     // Update sidebar row classes
     document.querySelectorAll('.session-item[data-sid]').forEach(row => {
@@ -238,6 +301,7 @@ socket.on('state_snapshot', (data) => {
 // Incremental state updates
 socket.on('session_state', (data) => {
     const {session_id, state, cost_usd, error, name, model, working_since} = data;
+    if (_isHiddenSession(session_id, data)) return;
     const substatus = data.substatus || '';
     const usage = data.usage || null;
 
@@ -349,6 +413,21 @@ socket.on('session_state', (data) => {
         // Scroll to bottom on state change (working bar appears/disappears)
         const _logEl = document.getElementById('live-log');
         if (_logEl && liveAutoScroll) setTimeout(() => { _logEl.scrollTop = _logEl.scrollHeight; }, 100);
+
+        // Self-healing: check if frontend is missing entries vs backend.
+        if (state === 'idle' || state === 'stopped') {
+            const sc = data.entry_count;
+            if (sc != null && sc > liveLineCount) {
+                console.warn('[entry-catchup] Backend has', sc, 'entries but frontend has', liveLineCount);
+                socket.emit('get_session_log', {session_id: session_id, since: 0});
+            } else {
+                setTimeout(() => {
+                    if (liveSessionId === session_id) {
+                        socket.emit('get_session_log', {session_id: session_id, since: 0});
+                    }
+                }, 500);
+            }
+        }
     }
 
     // Refresh dashboard if no session selected (skip in workplace mode)
@@ -398,6 +477,17 @@ socket.on('session_state', (data) => {
     }
 });
 
+// Server confirms it received and accepted our send_message.
+// This is the positive acknowledgment that the message pipeline is working.
+// Reset the watchdog — we know the server got it, so events should follow.
+socket.on('message_ack', (data) => {
+    if (!data || !data.session_id) return;
+    console.log('[WS] message_ack for', data.session_id, data.queued ? '(queued)' : '');
+    // Reset watchdog timer — server confirmed receipt, give it more time
+    // for the first response event to arrive
+    if (typeof _resetMessageWatchdog === 'function') _resetMessageWatchdog(data.session_id);
+});
+
 // Lightweight per-call token usage updates (from StreamEvent message_start).
 // This gives us the REAL context window size, not cumulative session totals.
 socket.on('session_usage', (data) => {
@@ -441,10 +531,21 @@ socket.on('session_entry', (data) => {
         }
     }
 
-    if (data.session_id !== liveSessionId) return;
+    // Track highest server entry index for periodic sync
+    if (data.session_id && data.index != null) {
+        if (!window._srvIdx) window._srvIdx = {};
+        window._srvIdx[data.session_id] = data.index;
+    }
+    if (data.session_id !== liveSessionId) {
+        console.debug('[entry] sid mismatch:', data.session_id, '!=', liveSessionId);
+        return;
+    }
     if (!data.entry) return;
     const logEl = document.getElementById('live-log');
-    if (!logEl) return;
+    if (!logEl) {
+        console.warn('[entry-drop] live-log not in DOM! kind:', data.entry.kind, 'idx:', data.index);
+        return;
+    }
     // Clear skeleton/placeholder on first real entry
     if (liveLineCount === 0) {
         const skel = logEl.querySelector('.skel-bar, .skeleton-loader, .live-log-empty, .empty-state');
@@ -452,6 +553,7 @@ socket.on('session_entry', (data) => {
     }
     // Index-based dedup: skip entries we've already rendered
     if (data.index != null && data.index < liveLineCount) {
+        console.debug('[entry-dedup] idx', data.index, '<', liveLineCount);
         return;
     }
     // DOM-level dedup for user messages: the frontend renders an optimistic
@@ -536,6 +638,7 @@ socket.on('system_message', (data) => {
 // Session started confirmation
 socket.on('session_started', (data) => {
     if (data.session_id) {
+        if (_isHiddenSession(data.session_id, data)) return;
         runningIds.add(data.session_id);
         // Don't overwrite optimistic 'working' state (set before start_session emit)
         if (sessionKinds[data.session_id] !== 'working') {
@@ -571,6 +674,8 @@ socket.on('session_id_remapped', (data) => {
     const newId = data.new_id;
     if (!oldId || !newId) return;
     console.log('[WS] Session ID remapped:', oldId, '->', newId);
+
+    if (_isHiddenSession(oldId, data)) return;
 
     // Update allSessions array
     const s = allSessions.find(x => x.id === oldId);
@@ -654,6 +759,12 @@ socket.on('session_id_remapped', (data) => {
         s ? (s.custom_title || s.display_title) : 'New Session',
         s ? !s.custom_title : true,
         s ? (s.custom_title || '') : '');
+
+    // Track remapped planner session ID so state/entry listeners match both IDs.
+    // Don't overwrite _plannerSessionId — entry events still use the original ID.
+    if (typeof _plannerSessionId !== 'undefined' && _plannerSessionId === oldId) {
+        _plannerRemappedId = newId;
+    }
 
     // Re-render sidebar
     filterSessions();
@@ -796,6 +907,10 @@ socket.on('kanban_board_refresh', (data) => {
 setInterval(() => {
     if (socket.connected) socket.emit('request_state_snapshot');
 }, 15000);
+
+
+// ---- Periodic entry sync (bulletproof fallback) ----
+setInterval(function(){if(!liveSessionId||!socket.connected)return;if(sessionKinds[liveSessionId]!=="working")return;var si=window._srvIdx&&window._srvIdx[liveSessionId];if(si!=null&&si>=liveLineCount+2){console.warn("[entry-sync] srv",si,"rendered",liveLineCount);socket.emit("get_session_log",{session_id:liveSessionId,since:0})}},5000);
 
 // ---- Continuous stuck-session watchdog ----
 // Catches sessions stuck in "working" that the per-submit watchdog missed

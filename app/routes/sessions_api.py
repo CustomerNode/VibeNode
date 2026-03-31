@@ -34,11 +34,35 @@ def api_sessions():
     # Merge in SDK-managed sessions that haven't written a .jsonl yet.
     # Without this, sessions started via the GUI disappear on page refresh
     # until their first .jsonl flush (i.e. first response completes).
-    existing_ids = {s["id"] for s in sessions}
     sm = current_app.session_manager
+
+    # Resolve aliased (pre-remap) session IDs so JSONL-based sessions
+    # appear under their canonical (SDK-assigned) ID, preventing duplicates
+    # with daemon stubs that use the new ID.
+    aliases = dict(sm._id_aliases) if hasattr(sm, '_id_aliases') else {}
+    if aliases:
+        _seen = set()
+        for s in sessions:
+            new_id = aliases.get(s["id"])
+            if new_id:
+                s["id"] = new_id
+            _seen.add(s["id"])
+        # Deduplicate — if both old JSONL and new stub existed, keep the
+        # richer JSONL-based entry (it comes first from all_sessions).
+        deduped = []
+        _final = set()
+        for s in sessions:
+            if s["id"] not in _final:
+                _final.add(s["id"])
+                deduped.append(s)
+        sessions = deduped
+
+    existing_ids = {s["id"] for s in sessions}
     names = _load_names()  # check _session_names.json for auto-named titles
     for state in sm.get_all_states():
         sid = state.get("session_id", "")
+        if state.get("session_type") in ("planner", "title"):
+            continue
         if sid and sid not in existing_ids and state.get("state") != "stopped":
             saved_name = names.get(sid, "")
             title = saved_name or state.get("name") or "New Session"

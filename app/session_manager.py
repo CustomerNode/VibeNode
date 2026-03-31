@@ -223,6 +223,7 @@ class SessionInfo:
     name: str = ""
     cwd: str = ""
     model: str = ""
+    session_type: str = ""  # "planner" for AI task planner sessions (hidden from UI)
     cost_usd: float = 0.0
     error: Optional[str] = None
     entries: list = field(default_factory=list)
@@ -246,7 +247,9 @@ class SessionInfo:
             "name": self.name,
             "cwd": self.cwd,
             "model": self.model,
+            "session_type": self.session_type,
             "working_since": self.working_since if self.state == SessionState.WORKING else 0,
+            "entry_count": len(self.entries),
         }
         if self.substatus:
             d["substatus"] = self.substatus
@@ -406,6 +409,7 @@ class SessionManager:
         model: Optional[str] = None, system_prompt: Optional[str] = None,
         max_turns: Optional[int] = None, allowed_tools: Optional[list] = None,
         permission_mode: Optional[str] = None,
+        session_type: str = "",
     ) -> dict:
         """Start or resume an SDK session. Returns immediately."""
         with self._lock:
@@ -422,6 +426,7 @@ class SessionManager:
             cwd=cwd,
             model=model or "",
             state=SessionState.STARTING,
+            session_type=session_type or "",
         )
         # Store the user prompt immediately so get_entries() returns it
         # before _drive_session starts. After a page refresh there's no
@@ -626,7 +631,8 @@ class SessionManager:
         """Return snapshot of all session states for initial WebSocket connect."""
         with self._lock:
             return [info.to_state_dict() for info in self._sessions.values()
-                    if info.state != SessionState.STOPPED]
+                    if info.state != SessionState.STOPPED
+                    and info.session_type not in ("planner", "title")]
 
     def get_entries(self, session_id: str, since: int = 0) -> list:
         """Return log entries for a session, optionally from an index."""
@@ -1203,14 +1209,13 @@ class SessionManager:
 
                 # Notify frontend to update its references (URL, activeId, etc.)
                 if self._socketio:
-                    import threading
-                    threading.Thread(
-                        target=lambda: self._socketio.emit(
+                    try:
+                        self._socketio.emit(
                             'session_id_remapped',
                             {'old_id': session_id, 'new_id': result_session_id}
-                        ),
-                        daemon=True,
-                    ).start()
+                        )
+                    except Exception as emit_err:
+                        logger.error("session_id_remapped emit failed: %s", emit_err)
 
             info.state = SessionState.IDLE
             self._emit_state(info)
@@ -1313,6 +1318,7 @@ class SessionManager:
                         "name": info.name,
                         "cwd": info.cwd,
                         "model": info.model,
+                        "session_type": info.session_type,
                         "state": info.state.value,
                         "started_at": (
                             info.entries[0].timestamp if info.entries else time.time()
@@ -1388,6 +1394,10 @@ class SessionManager:
                     )
                     continue
 
+                # Never recover planner sessions — they're disposable utility sessions
+                if meta.get("session_type") == "planner":
+                    continue
+
                 name = meta.get("name", "")
                 cwd = meta.get("cwd", "")
                 model = meta.get("model", "")
@@ -1440,8 +1450,7 @@ class SessionManager:
     def _emit_state(self, info: SessionInfo) -> None:
         """Push session state change to all connected WebSocket clients.
 
-        Uses a background thread to ensure cross-context compatibility
-        (works from both the main asyncio loop and anyio task groups).
+        Emits directly (synchronous, thread-safe) to guarantee ordering.
         Also schedules a registry save so crash recovery data stays fresh.
         """
         # Track when session entered WORKING state for elapsed timer
@@ -1451,30 +1460,31 @@ class SessionManager:
             info.working_since = 0.0
         if self._socketio:
             data = info.to_state_dict()
-            import threading
-            def _safe_emit():
-                try:
-                    self._socketio.emit('session_state', data)
-                except Exception as emit_err:
-                    logger.error("_emit_state socketio.emit failed for %s (state=%s): %s",
-                                 info.session_id, info.state, emit_err)
-            threading.Thread(target=_safe_emit, daemon=True).start()
+            try:
+                self._socketio.emit('session_state', data)
+            except Exception as emit_err:
+                logger.error("_emit_state socketio.emit failed for %s (state=%s): %s",
+                             info.session_id, info.state, emit_err)
         # Keep the persistent registry up to date
         self._schedule_registry_save()
 
     def _emit_entry(self, session_id: str, entry: LogEntry, index: int) -> None:
-        """Push a new log entry to all connected WebSocket clients."""
+        """Push a new log entry to all connected WebSocket clients.
+
+        Emits directly (synchronous, thread-safe) to guarantee ordering
+        and prevent entries from being dropped by client-side index dedup.
+        """
         if self._socketio:
             data = {
                 'session_id': session_id,
                 'entry': entry.to_dict(),
                 'index': index,
             }
-            import threading
-            threading.Thread(
-                target=lambda: self._socketio.emit('session_entry', data),
-                daemon=True
-            ).start()
+            try:
+                self._socketio.emit('session_entry', data)
+            except Exception as emit_err:
+                logger.error("_emit_entry socketio.emit failed for %s index=%d: %s",
+                             session_id, index, emit_err)
 
     def _emit_permission(self, session_id: str, tool_name: str, tool_input: dict) -> None:
         """Push a permission request to all connected WebSocket clients.

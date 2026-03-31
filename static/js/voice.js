@@ -70,6 +70,9 @@ function setupVoiceButton(textarea, button, onSubmit) {
       return;
     }
 
+    // Kill any stale recognition from a previous textarea (e.g. bar rebuild)
+    _stopActiveVoice();
+
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     const recognition = new SR();
     recognition.continuous = true;
@@ -126,6 +129,8 @@ function setupVoiceButton(textarea, button, onSubmit) {
       } else {
         textarea.focus();
       }
+      // Apply any bar updates that were deferred while voice was active
+      if (typeof updateLiveInputBar === 'function') setTimeout(updateLiveInputBar, 0);
     };
 
     recognition.onerror = (e) => {
