@@ -500,6 +500,7 @@ function startLivePanel(id, opts) {
 }
 
 function stopLivePanel() {
+  if (typeof _stopActiveVoice === 'function') _stopActiveVoice();
   liveSessionId = null;
   liveBarState = null;
   _clearOutputShelf();

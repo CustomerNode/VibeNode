@@ -6,6 +6,15 @@ const _sendSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" st
 
 let _activeRecognition = null;
 
+/** Stop any active voice recognition cleanly (called on session switch, etc.) */
+function _stopActiveVoice() {
+  if (_activeRecognition) {
+    _activeRecognition._intentionalStop = true;
+    try { _activeRecognition.stop(); } catch (_) {}
+    _activeRecognition = null;
+  }
+}
+
 function _hasVoiceSupport() {
   return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
 }
@@ -41,7 +50,8 @@ function setupVoiceButton(textarea, button, onSubmit) {
     const hasText = textarea.value.trim().length > 0;
 
     if (_activeRecognition && _activeRecognition._target === textarea) {
-      // Stop recording
+      // Stop recording (manual click)
+      _activeRecognition._intentionalStop = true;
       _activeRecognition.stop();
       _activeRecognition = null;
       updateIcon();
@@ -66,20 +76,24 @@ function setupVoiceButton(textarea, button, onSubmit) {
     recognition.interimResults = true;
     recognition.lang = 'en-US';
     recognition._target = textarea;
+    recognition._intentionalStop = false;
     _activeRecognition = recognition;
 
     let finalTranscript = '';
     let silenceTimer = null;
+    let restartCount = 0;
+    const MAX_RESTARTS = 5;
 
     const resetSilenceTimer = () => {
       if (silenceTimer) clearTimeout(silenceTimer);
       silenceTimer = setTimeout(() => {
-        // 3 seconds of silence — stop recording and send
+        recognition._intentionalStop = true;
         recognition.stop();
-      }, 3000);
+      }, 3000);  // 3s silence timeout — do NOT increase, causes premature cutoff feel
     };
 
     recognition.onresult = (e) => {
+      restartCount = 0;
       let interim = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
         if (e.results[i].isFinal) {
@@ -95,11 +109,18 @@ function setupVoiceButton(textarea, button, onSubmit) {
 
     recognition.onend = () => {
       if (silenceTimer) clearTimeout(silenceTimer);
+
+      // If the browser killed recognition unexpectedly (not silence / not manual),
+      // try to seamlessly restart and keep recording.
+      if (!recognition._intentionalStop && restartCount < MAX_RESTARTS && _activeRecognition === recognition) {
+        restartCount++;
+        try { recognition.start(); return; } catch (_) { /* fall through to normal end */ }
+      }
+
       if (_activeRecognition === recognition) _activeRecognition = null;
       textarea.value = finalTranscript;
       textarea.dispatchEvent(new Event('input'));
       updateIcon();
-      // Auto-send if we got text
       if (finalTranscript.trim() && onSubmit) {
         onSubmit();
       } else {
@@ -108,7 +129,11 @@ function setupVoiceButton(textarea, button, onSubmit) {
     };
 
     recognition.onerror = (e) => {
+      // Transient errors — let onend handle restart
+      const transient = ['network', 'aborted', 'audio-capture'];
+      if (transient.includes(e.error)) return;
       if (e.error !== 'no-speech') showToast('Voice error: ' + e.error, true);
+      recognition._intentionalStop = true;
       if (_activeRecognition === recognition) _activeRecognition = null;
       updateIcon();
     };
