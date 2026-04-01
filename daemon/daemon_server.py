@@ -268,7 +268,7 @@ def main():
     )
 
     # Singleton gate: only one daemon allowed system-wide
-    from singleton import acquire_daemon_singleton
+    from app.singleton import acquire_daemon_singleton
     if not acquire_daemon_singleton():
         # Double-check: is the port actually in use? If not, mutex is stale.
         try:

@@ -1489,3 +1489,152 @@ def migrate_status():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Cloud Backups
+# ---------------------------------------------------------------------------
+
+def _backups_dir():
+    """Return the backups directory, creating it if needed."""
+    from pathlib import Path
+    d = Path(__file__).resolve().parent.parent.parent / "backups"
+    d.mkdir(exist_ok=True)
+    return d
+
+
+@bp.route("/api/kanban/backup/download", methods=["POST"])
+def backup_download():
+    """Export current backend data to a timestamped JSON file in backups/."""
+    import json
+    try:
+        from ..db.migrator import BackendMigrator
+        repo = _get_repo()
+        migrator = BackendMigrator()
+        data = migrator.export_all(repo)
+
+        # Build a timestamped filename
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = f"backup_{ts}.json"
+        filepath = _backups_dir() / filename
+
+        # Add metadata
+        from ..config import get_kanban_config
+        cfg = get_kanban_config()
+        record_count = sum(len(v) for v in data.values() if isinstance(v, list))
+        payload = {
+            "meta": {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "backend": cfg.get("kanban_backend", "sqlite"),
+                "record_count": record_count,
+            },
+            "data": data,
+        }
+
+        filepath.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+
+        return jsonify({
+            "ok": True,
+            "filename": filename,
+            "record_count": record_count,
+            "path": str(filepath),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/api/kanban/backup/list")
+def backup_list():
+    """List all existing backup files."""
+    import json
+    try:
+        d = _backups_dir()
+        backups = []
+        for f in sorted(d.glob("backup_*.json"), reverse=True):
+            entry = {
+                "filename": f.name,
+                "size": f.stat().st_size,
+                "modified": datetime.fromtimestamp(
+                    f.stat().st_mtime, tz=timezone.utc
+                ).isoformat(),
+            }
+            # Try to read metadata from the file
+            try:
+                content = json.loads(f.read_text(encoding="utf-8"))
+                meta = content.get("meta", {})
+                entry["record_count"] = meta.get("record_count", "?")
+                entry["backend"] = meta.get("backend", "?")
+            except Exception:
+                entry["record_count"] = "?"
+                entry["backend"] = "?"
+            backups.append(entry)
+        return jsonify({"ok": True, "backups": backups})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/api/kanban/backup/restore", methods=["POST"])
+def backup_restore():
+    """Restore data from a backup file, replacing current backend data."""
+    import json
+    try:
+        req = request.get_json(silent=True) or {}
+        filename = req.get("filename", "").strip()
+        if not filename or ".." in filename or "/" in filename or "\\" in filename:
+            return jsonify({"ok": False, "error": "Invalid filename"}), 400
+
+        filepath = _backups_dir() / filename
+        if not filepath.is_file():
+            return jsonify({"ok": False, "error": "Backup file not found"}), 404
+
+        content = json.loads(filepath.read_text(encoding="utf-8"))
+        data = content.get("data", content)  # support with or without meta wrapper
+
+        from ..db.migrator import BackendMigrator
+        repo = _get_repo()
+        migrator = BackendMigrator()
+
+        # Clear current data, then import the backup
+        repo.clear_all_data()
+        migrator.import_all(repo, data)
+
+        # Verify
+        verify = migrator.export_all(repo)
+        restored_count = sum(len(v) for v in verify.values() if isinstance(v, list))
+        expected_count = sum(len(v) for v in data.values() if isinstance(v, list))
+
+        if restored_count != expected_count:
+            return jsonify({
+                "ok": False,
+                "error": f"Verification mismatch: expected {expected_count} records, got {restored_count}",
+            }), 500
+
+        return jsonify({
+            "ok": True,
+            "message": f"Restored {restored_count} records from {filename}",
+            "record_count": restored_count,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/api/kanban/backup/delete", methods=["POST"])
+def backup_delete():
+    """Delete a backup file."""
+    try:
+        req = request.get_json(silent=True) or {}
+        filename = req.get("filename", "").strip()
+        if not filename or ".." in filename or "/" in filename or "\\" in filename:
+            return jsonify({"ok": False, "error": "Invalid filename"}), 400
+
+        filepath = _backups_dir() / filename
+        if not filepath.is_file():
+            return jsonify({"ok": False, "error": "Backup file not found"}), 404
+
+        filepath.unlink()
+        return jsonify({"ok": True, "message": f"Deleted {filename}"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500

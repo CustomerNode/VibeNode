@@ -48,6 +48,7 @@
       <button onclick="_showHelpModal();closeHdrSys()">Keyboard Shortcuts</button>
       <div class="sys-separator"></div>
       <button onclick="restartServer();closeHdrSys()">Restart Server</button>
+      <button onclick="shutdownServer();closeHdrSys()" style="color:var(--danger,#e55)">Turn Off Server</button>
     </div>
   </div>
   <button id="btn-git-update" onclick="openGitUpdate()">Update App <span id="git-badge-pull"></span></button>
@@ -234,7 +235,7 @@
       <div class="actions-tabs">
         <button class="actions-tab active" onclick="switchActionsTab('organize')">Organize</button>
         <button class="actions-tab" onclick="switchActionsTab('branch')">Branch</button>
-        <button class="actions-tab" onclick="switchActionsTab('agent')">Agent</button>
+        <button class="actions-tab" onclick="switchActionsTab('session')">Session</button>
       </div>
       <div class="actions-status" id="actions-status"></div>
       <button class="btn" onclick="closeActionsPopup()" style="padding:3px 10px;">&#10005;</button>
@@ -273,8 +274,8 @@
         <div class="actions-item-text"><div class="actions-item-name">Fork + Rewind</div><div class="actions-item-desc">Fork conversation and restore files in one step</div></div>
       </button>
     </div>
-    <!-- Agent Controls tab -->
-    <div class="actions-body actions-tab-panel" data-tab="agent">
+    <!-- Session Controls tab -->
+    <div class="actions-body actions-tab-panel" data-tab="session">
       <button class="actions-item" id="btn-open" disabled onclick="openInClaude(activeId);closeActionsPopup()">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
         <div class="actions-item-text"><div class="actions-item-name">Open in Terminal</div><div class="actions-item-desc">Launch this session in the Claude CLI</div></div>
@@ -289,7 +290,7 @@
       </button>
       <button class="actions-item actions-danger" id="btn-close" disabled onclick="closeSession(activeId);closeActionsPopup()">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>
-        <div class="actions-item-text"><div class="actions-item-name">Stop Agent</div><div class="actions-item-desc">Shut down the running Claude process</div></div>
+        <div class="actions-item-text"><div class="actions-item-name">Stop Session</div><div class="actions-item-desc">Shut down the running session process</div></div>
       </button>
     </div>
   </div>

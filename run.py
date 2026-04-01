@@ -11,18 +11,41 @@ so running sessions continue uninterrupted when you restart the server.
 """
 
 import logging
+import os
 import shutil
 import socket
 import subprocess
 
 # ---------------------------------------------------------------------------
+# Boot-splash status helper (must be defined early — before any boot phases)
+# ---------------------------------------------------------------------------
+def _update_boot_status(msg):
+    """Write a status line for the boot splash window (if running).
+
+    The splash subprocess polls the status file for lines like:
+        STEP:cache      — activate a named step
+        DONE            — all steps complete, close splash
+        ERROR:<text>    — show error, keep splash open with dismiss button
+    """
+    _sf = os.environ.get("VIBENODE_BOOT_STATUS_FILE")
+    if not _sf:
+        return
+    try:
+        with open(_sf, "a", encoding="utf-8") as fh:
+            fh.write(msg + "\n")
+            fh.flush()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Purge __pycache__ on every boot so code changes always take effect
 # ---------------------------------------------------------------------------
+_update_boot_status("STEP:cache")
 for _cache_dir in __import__('pathlib').Path(__file__).parent.rglob('__pycache__'):
     shutil.rmtree(_cache_dir, ignore_errors=True)
 import sys
 import threading
-import os
 import time
 import webbrowser
 from pathlib import Path
@@ -33,7 +56,7 @@ _TEST_PORT = int(os.environ.get("VIBENODE_TEST_PORT", 0))
 
 DAEMON_PORT = int(os.environ.get("VIBENODE_DAEMON_PORT", 5051))
 
-from singleton import acquire_web_singleton
+from app.singleton import acquire_web_singleton
 
 
 def ensure_daemon():
@@ -63,7 +86,8 @@ def ensure_daemon():
             creation_flags = (
                 subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
             )
-        daemon_log = Path(__file__).parent / "daemon_debug.log"
+        daemon_log = Path(__file__).parent / "logs" / "daemon_debug.log"
+        daemon_log.parent.mkdir(exist_ok=True)
         _daemon_fh = open(daemon_log, "a")
         subprocess.Popen(
             [sys.executable, str(daemon_script)],
@@ -159,6 +183,7 @@ def _kill_port(port):
             break
 
 if not _TEST_PORT:
+    _update_boot_status("STEP:ports")
     _kill_port(5050)
     # Only kill the daemon port on a cold start.  When the web server is
     # restarted via /api/restart with scope="web", it sets
@@ -193,7 +218,7 @@ def _fix_shortcut():
         if not pythonw.exists():
             return
         script = Path(__file__).resolve().parent / "session_manager.py"
-        icon = Path(__file__).resolve().parent / "claudecodegui.ico"
+        icon = Path(__file__).resolve().parent / "static" / "claudecodegui.ico"
         # Read current shortcut target to see if it already points to pythonw
         # (avoid rewriting on every launch if already correct)
         ps_read = (
@@ -261,21 +286,36 @@ def _check_dependencies():
         except Exception as e:
             print("  WARNING: Could not install packages: %s" % e, flush=True)
 
+_update_boot_status("STEP:deps")
 _check_dependencies()
 
 # Ensure daemon is running before creating the Flask app (skip in test mode)
 if not _TEST_PORT:
+    _update_boot_status("STEP:daemon")
     ensure_daemon()
 
-from app import create_app, socketio
-
-app = create_app()
+_update_boot_status("STEP:server")
+try:
+    from app import create_app, socketio
+    app = create_app()
+except Exception as _init_err:
+    _update_boot_status("ERROR:Failed to initialize server: %s" % _init_err)
+    raise
 
 
 def open_browser():
     import time
-    time.sleep(0.8)
+    import urllib.request
     url = "http://localhost:5050"
+    # Wait until the server is actually accepting connections before opening
+    for _ in range(60):
+        try:
+            urllib.request.urlopen(url, timeout=1)
+            break
+        except Exception:
+            time.sleep(1)
+    else:
+        return  # server never came up, don't open a broken tab
     if sys.platform == "win32":
         chrome = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
         try:
@@ -325,5 +365,20 @@ if __name__ == "__main__":
 
     _port = _TEST_PORT or 5050
     if not _TEST_PORT:
-        threading.Thread(target=open_browser, daemon=True).start()
+        _update_boot_status("STEP:browser")
+        _update_boot_status("DONE")
+        # Clean up the status file after the splash has had time to read DONE
+        _sf = os.environ.get("VIBENODE_BOOT_STATUS_FILE")
+        if _sf:
+            def _cleanup_status_file(path):
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
+            threading.Timer(5.0, _cleanup_status_file, args=[_sf]).start()
+        # Only open browser on cold start. On web restarts
+        # (VIBENODE_PRESERVE_DAEMON=1) the user already has the tab open
+        # and Socket.IO will auto-reconnect — no duplicate window needed.
+        if os.environ.get("VIBENODE_PRESERVE_DAEMON") != "1":
+            threading.Thread(target=open_browser, daemon=True).start()
     socketio.run(app, host="0.0.0.0", port=_port, debug=False, allow_unsafe_werkzeug=True)

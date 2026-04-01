@@ -7001,28 +7001,26 @@ mark.find-match.current { background: var(--accent); color:#fff; }
 }
 .kanban-planner-panel.open { right: 0; }
 
-/* Minimized planner bubble — bottom-right like LinkedIn chat */
-.planner-minimized-bubble {
-  position: fixed;
-  bottom: 20px;
-  right: 20px;
-  z-index: 510;
-  background: var(--purple);
-  color: #fff;
-  padding: 10px 16px;
-  border-radius: 24px;
-  cursor: pointer;
-  font-size: 13px;
-  font-weight: 600;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
+/* Minimized planner — collapsed to just the header bar at bottom-right */
+.kanban-planner-panel.minimized {
+  right: 0 !important;
+  top: auto !important;
+  bottom: 0;
+  height: auto !important;
+  width: 320px;
+  border-radius: 10px 10px 0 0;
+  box-shadow: -2px -2px 16px rgba(0,0,0,0.25);
 }
-.planner-minimized-bubble:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+.kanban-planner-panel.minimized .planner-body,
+.kanban-planner-panel.minimized .planner-footer {
+  display: none;
+}
+.kanban-planner-panel.minimized .kanban-planner-header {
+  cursor: pointer;
+  border-bottom: none;
+}
+.kanban-planner-panel.minimized .kanban-planner-header:hover {
+  background: var(--bg-hover);
 }
 
 /* Highlight animation for newly created tasks */
@@ -7038,23 +7036,58 @@ mark.find-match.current { background: var(--accent); color:#fff; }
   border-radius: 8px;
 }
 
-/* AI plan button in drill-down subtasks header */
-.kanban-drill-ai-plan-btn {
-  font-size: 10px;
-  font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 4px;
-  border: 1px solid var(--purple);
-  color: var(--purple);
-  background: transparent;
+/* AI plan card in drill-down left column */
+.kanban-drill-ai-plan-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 20px;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--purple) 25%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--purple) 4%, transparent);
   cursor: pointer;
-  margin-left: auto;
-  white-space: nowrap;
-  transition: background 0.15s, color 0.15s;
+  transition: border-color 0.2s, background 0.2s, transform 0.15s, box-shadow 0.2s;
 }
-.kanban-drill-ai-plan-btn:hover {
-  background: var(--purple);
-  color: #fff;
+.kanban-drill-ai-plan-card:hover {
+  border-color: var(--purple);
+  background: color-mix(in srgb, var(--purple) 10%, transparent);
+  transform: translateY(-1px);
+  box-shadow: 0 3px 12px color-mix(in srgb, var(--purple) 15%, transparent);
+}
+.kanban-drill-ai-plan-card:active {
+  transform: translateY(0);
+  box-shadow: none;
+}
+.kanban-drill-ai-plan-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--purple) 12%, transparent);
+  color: var(--purple);
+  flex-shrink: 0;
+}
+.kanban-drill-ai-plan-icon svg { width: 15px; height: 15px; }
+.kanban-drill-ai-plan-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--purple);
+  letter-spacing: -0.1px;
+  flex: 1;
+}
+.kanban-drill-ai-plan-arrow {
+  color: var(--purple);
+  opacity: 0;
+  transform: translateX(-4px);
+  transition: opacity 0.2s, transform 0.2s;
+  flex-shrink: 0;
+}
+.kanban-drill-ai-plan-card:hover .kanban-drill-ai-plan-arrow {
+  opacity: 0.7;
+  transform: translateX(0);
 }
 
 .kanban-planner-header {

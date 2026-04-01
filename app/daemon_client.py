@@ -177,7 +177,8 @@ class DaemonClient:
                 creation_flags = (
                     subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
                 )
-            log_file = daemon_script.parent.parent / "daemon_debug.log"
+            log_file = daemon_script.parent.parent / "logs" / "daemon_debug.log"
+            log_file.parent.mkdir(exist_ok=True)
             fh = open(log_file, "a")
             try:
                 subprocess.Popen(
@@ -335,14 +336,10 @@ class DaemonClient:
             state = data.get("state", "")
             if state in ("idle", "stopped") and sid in self._planner_ids:
                 self._cleanup_utility_jsonl(sid)
-        # Suppress ALL push events (state, entry, permission) for hidden
-        # utility sessions so they never reach the browser.  The daemon
-        # already filters most of these, but this is a defence-in-depth
-        # backstop that also covers planners started before a daemon upgrade.
-        if isinstance(data, dict):
-            _evt_sid = data.get("session_id", "")
-            if _evt_sid and (_evt_sid in self._planner_ids or _evt_sid.startswith("_")):
-                return
+        # Utility session events (planner, title) are allowed through to the
+        # browser — the frontend's _isHiddenSession() prevents them from
+        # affecting the main UI, but the planner's dedicated listeners need
+        # session_entry and session_state events to function.
         self._emit_queue.put((event_name, data))
 
     def _emitter_loop(self):

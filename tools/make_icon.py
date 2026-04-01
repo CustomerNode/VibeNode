@@ -4,7 +4,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 import math, os
 
 SIZES = [256, 128, 64, 48, 32, 16]
-OUT = os.path.join(os.path.dirname(__file__), "claudecodegui.ico")
+OUT = os.path.join(os.path.dirname(__file__), "..", "static", "claudecodegui.ico")
 
 
 def draw_icon(size):

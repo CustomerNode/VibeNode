@@ -111,3 +111,45 @@ def restart_server():
         return jsonify({"ok": True, "message": f"Restarting ({scope})..."})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/api/shutdown", methods=["POST"])
+def shutdown_server():
+    """Shut down both the web server and daemon without restarting.
+
+    Sends the response first, then kills ports 5050 and 5051 after a
+    short delay so the client receives the acknowledgement.
+    """
+    try:
+        project_dir = os.path.abspath(
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "..")
+        )
+        ports = "5050,5051"
+
+        if sys.platform == "win32":
+            shutdown_cmd = (
+                'powershell -NoProfile -Command "'
+                "Start-Sleep -Seconds 2; "
+                f"$pids = @(Get-NetTCPConnection -LocalPort {ports} -ErrorAction SilentlyContinue | "
+                "Select-Object -ExpandProperty OwningProcess -Unique); "
+                "$pids | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }"
+                '"'
+            )
+            subprocess.Popen(
+                shutdown_cmd,
+                shell=True,
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+        else:
+            shutdown_cmd = (
+                "bash -c '"
+                "sleep 2; "
+                "lsof -ti :5050 | xargs kill -9 2>/dev/null; "
+                "lsof -ti :5051 | xargs kill -9 2>/dev/null"
+                "'"
+            )
+            subprocess.Popen(shutdown_cmd, shell=True)
+
+        return jsonify({"ok": True, "message": "Server shutting down..."})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500

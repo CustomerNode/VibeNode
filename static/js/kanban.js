@@ -304,6 +304,9 @@ async function _initKanbanImpl() {
       }
     }
 
+    // Restore minimized/open planner if persisted from previous page load
+    if (typeof _restorePlannerOnLoad === 'function') _restorePlannerOnLoad();
+
     // Render sidebar controls
     renderKanbanSidebar();
 
@@ -736,11 +739,11 @@ function _buildPlannerPanel() {
   panel.id = 'kanban-planner-panel';
   panel.className = 'kanban-planner-panel';
   panel.innerHTML = `
-    <div class="kanban-planner-header">
+    <div class="kanban-planner-header" onclick="if(document.getElementById('kanban-planner-panel')?.classList.contains('minimized')){event.stopPropagation();_restorePlanner();}">
       <span class="kanban-planner-title">${KI.plan} Plan with AI</span>
       <div style="display:flex;gap:4px;align-items:center;">
-        <button class="kanban-planner-close" onclick="_minimizePlanner()" title="Minimize" style="font-size:16px;">&#x2015;</button>
-        <button class="kanban-planner-close" onclick="_closePlannerSlideout()" title="Close">&times;</button>
+        <button class="kanban-planner-close" onclick="event.stopPropagation();_minimizePlanner()" title="Minimize" style="font-size:16px;">&#x2015;</button>
+        <button class="kanban-planner-close" onclick="event.stopPropagation();_closePlannerSlideout()" title="Close">&times;</button>
       </div>
     </div>
     <div class="planner-body" id="planner-body">
@@ -787,10 +790,11 @@ function _attachPlannerListeners() {
   }, 1000);
 
   _plannerEntryListener = (data) => {
+    console.log('[planner] entry event:', data.session_id, 'expected:', _plannerSessionId, 'kind:', data.entry?.kind, 'text:', (data.entry?.text || '').slice(0, 80));
     if (data.session_id !== _plannerSessionId) return;
     if (!data.entry || !data.entry.text) return;
-    // Only collect assistant text, not user echoes
-    if (data.entry.kind === 'user') return;
+    // Only collect assistant text — skip user echoes, tool calls, system msgs
+    if (data.entry.kind !== 'asst') return;
     _plannerAccumText += data.entry.text;
     _updatePlannerProgress();
 
@@ -800,6 +804,7 @@ function _attachPlannerListeners() {
   };
 
   _plannerStateListener = (data) => {
+    console.log('[planner] state event:', data.session_id, 'expected:', _plannerSessionId, 'state:', data.state);
     if (data.session_id !== _plannerSessionId) return;
     if (data.state === 'idle' || data.state === 'stopped') {
       _stopPlannerTimer();
@@ -891,6 +896,7 @@ function _openPlannerSlideout(prompt) {
   if (tb) tb.style.display = 'none';
   const inputBar = document.getElementById('live-input-bar');
   if (inputBar) inputBar.style.display = 'none';
+  _persistPlannerState('open');
 
   // Attach listeners BEFORE emitting
   _attachPlannerListeners();
@@ -924,6 +930,8 @@ function _showPlanResult(rawText) {
 
   if (parsed && parsed.tasks && parsed.tasks.length > 0) {
     _plannerProposal = parsed;
+    // Persist so it survives page refresh
+    try { localStorage.setItem('plannerStash', JSON.stringify(parsed)); } catch(_) {}
     const count = _countTasks(parsed.tasks);
     body.innerHTML =
       '<div class="planner-result">' +
@@ -938,6 +946,7 @@ function _showPlanResult(rawText) {
     body.innerHTML =
       '<div class="planner-result">' +
         '<div class="planner-error">Couldn\'t parse a task structure. Try rephrasing below.</div>' +
+        (rawText ? '<pre class="planner-stream" style="max-height:200px;overflow:auto;white-space:pre-wrap;font-size:11px;margin-top:8px;padding:8px;background:var(--bg-subtle);border-radius:6px;">' + escHtml(rawText.slice(0, 2000)) + '</pre>' : '') +
       '</div>';
   }
 }
@@ -1042,9 +1051,8 @@ function _closePlannerSlideout() {
     panel.classList.remove('open');
     setTimeout(() => panel.remove(), 300);
   }
-  // Remove minimized bubble too
-  const bubble = document.getElementById('planner-minimized-bubble');
-  if (bubble) bubble.remove();
+  // Clear persisted state
+  _persistPlannerState(null);
   // Restore main toolbar and input bar if a session was selected before
   const tb = document.getElementById('main-toolbar');
   if (tb && typeof activeId !== 'undefined' && activeId) tb.style.display = '';
@@ -1055,23 +1063,11 @@ function _closePlannerSlideout() {
 function _minimizePlanner() {
   const panel = document.getElementById('kanban-planner-panel');
   if (!panel) return;
-  panel.classList.remove('open');
-  setTimeout(() => { panel.style.display = 'none'; }, 300);
+  panel.classList.add('minimized');
   // Restore toolbar
   const tb = document.getElementById('main-toolbar');
   if (tb && typeof activeId !== 'undefined' && activeId) tb.style.display = '';
-  // Show bubble
-  let bubble = document.getElementById('planner-minimized-bubble');
-  if (!bubble) {
-    bubble = document.createElement('div');
-    bubble.id = 'planner-minimized-bubble';
-    bubble.className = 'planner-minimized-bubble';
-    bubble.onclick = _restorePlanner;
-    document.body.appendChild(bubble);
-  }
-  const taskCount = _plannerProposal ? _countTasks(_plannerProposal.tasks || []) : 0;
-  bubble.innerHTML = KI.plan + ' <span>AI Plan' + (taskCount ? ' \u00B7 ' + taskCount + ' tasks' : '') + '</span>';
-  bubble.style.display = '';
+  _persistPlannerState('minimized');
 }
 
 function _openScopedPlanner(parentId, existingCount) {
@@ -1093,14 +1089,60 @@ function _openScopedPlanner(parentId, existingCount) {
 function _restorePlanner() {
   const panel = document.getElementById('kanban-planner-panel');
   if (panel) {
-    panel.style.display = '';
-    requestAnimationFrame(() => panel.classList.add('open'));
+    panel.classList.remove('minimized');
   }
-  const bubble = document.getElementById('planner-minimized-bubble');
-  if (bubble) bubble.style.display = 'none';
   // Hide toolbar again
   const tb = document.getElementById('main-toolbar');
   if (tb) tb.style.display = 'none';
+  _persistPlannerState('open');
+}
+
+function _persistPlannerState(state) {
+  // state: 'open', 'minimized', or null (closed)
+  const url = new URL(window.location);
+  if (state) {
+    url.searchParams.set('planner', state);
+  } else {
+    url.searchParams.delete('planner');
+  }
+  history.replaceState(null, '', url);
+  if (state) {
+    localStorage.setItem('plannerState', state);
+  } else {
+    localStorage.removeItem('plannerState');
+    localStorage.removeItem('plannerStash');
+  }
+  // Stash proposal so it survives refresh
+  if (state && _plannerProposal) {
+    localStorage.setItem('plannerStash', JSON.stringify(_plannerProposal));
+  }
+}
+
+function _restorePlannerOnLoad() {
+  const state = new URL(window.location).searchParams.get('planner') || localStorage.getItem('plannerState');
+  if (!state) return;
+  const stash = localStorage.getItem('plannerStash');
+  if (stash) {
+    try { _plannerProposal = JSON.parse(stash); } catch (_) {}
+  }
+  if (!_plannerProposal && !_plannerStashed) return;  // nothing to show
+  if (!_plannerProposal && _plannerStashed) _plannerProposal = _plannerStashed;
+  // Rebuild panel with stashed results
+  const old = document.getElementById('kanban-planner-panel');
+  if (old) old.remove();
+  const panel = _buildPlannerPanel();
+  document.body.appendChild(panel);
+  if (_plannerProposal && _plannerProposal.tasks) {
+    _showPlanResult(JSON.stringify(_plannerProposal));
+  }
+  if (state === 'minimized') {
+    panel.classList.add('open');
+    requestAnimationFrame(() => panel.classList.add('minimized'));
+  } else {
+    requestAnimationFrame(() => panel.classList.add('open'));
+    const tb = document.getElementById('main-toolbar');
+    if (tb) tb.style.display = 'none';
+  }
 }
 
 function _resumePlan() {
@@ -1597,6 +1639,15 @@ async function renderTaskDetail(taskId) {
     html += '<div id="kanban-tag-suggestions" class="kanban-tag-suggestions"></div>';
     html += '</div>';
 
+    // AI Plan card — shown when task has subtasks
+    if (childCount > 0) {
+      html += `<div class="kanban-drill-ai-plan-card" onclick="_openScopedPlanner('${task.id}', ${childCount})">`;
+      html += `<div class="kanban-drill-ai-plan-icon">${KI.plan}</div>`;
+      html += `<div class="kanban-drill-ai-plan-label">Plan with AI</div>`;
+      html += `<svg class="kanban-drill-ai-plan-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/><path d="M12 5l7 7-7 7"/></svg>`;
+      html += `</div>`;
+    }
+
     html += '</div>'; // drill-left
 
     // ════════════ RIGHT: Chooser / Subtasks / Sessions ════════════
@@ -1626,7 +1677,6 @@ async function renderTaskDetail(taskId) {
       const pct = childCount > 0 ? Math.round((childDone / childCount) * 100) : 0;
       html += '<div class="kanban-drill-panel-header">';
       html += `<span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px;color:var(--text-dim);">Subtasks</span>`;
-      html += `<button class="kanban-drill-ai-plan-btn" onclick="_openScopedPlanner('${task.id}', ${childCount})" title="Plan subtasks with AI">${KI.plan} AI</button>`;
       html += `<span class="kanban-drill-switch-icon" onclick="confirmModeSwitch('${task.id}', 'sessions')" title="Switch to sessions">${KI.refresh || '&#8644;'}</span>`;
       html += `<span class="kanban-drill-inline-progress"><span class="kanban-drill-inline-bar"><span class="kanban-drill-inline-fill" style="width:${pct}%"></span></span><span class="kanban-drill-inline-pct">${pct}%</span></span>`;
       html += '</div>';
@@ -3337,6 +3387,7 @@ function selectBackend(backend) {
   if (sqliteOpt) sqliteOpt.classList.toggle('active', backend === 'sqlite');
   if (supaOpt) supaOpt.classList.toggle('active', backend === 'supabase');
   if (supaConfig) supaConfig.style.display = (backend === 'supabase') ? '' : 'none';
+  if (backend === 'supabase' && typeof loadBackupList === 'function') loadBackupList();
 }
 
 async function _closeKanbanSettings() {
@@ -3516,6 +3567,143 @@ async function switchToLocal() {
   } catch (e) {
     if (status) { status.style.color = 'var(--red, #f85149)'; status.textContent = '\u2717 ' + e.message; }
     if (btn) { btn.disabled = false; btn.textContent = 'Switch to Local'; }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cloud Backups
+// ---------------------------------------------------------------------------
+
+async function downloadCloudBackup() {
+  const btn = document.getElementById('kb-backup-dl-btn');
+  const status = document.getElementById('kb-backup-dl-status');
+
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving\u2026'; }
+  if (status) { status.style.color = 'var(--text-muted)'; status.textContent = ''; }
+
+  try {
+    const res = await fetch('/api/kanban/backup/download', { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      if (status) { status.style.color = 'var(--green)'; status.textContent = `\u2713 Saved ${data.filename} (${data.record_count} records)`; }
+      if (typeof showToast === 'function') showToast('Backup saved!');
+      loadBackupList();
+    } else {
+      if (status) { status.style.color = 'var(--red, #f85149)'; status.textContent = '\u2717 ' + (data.error || 'Backup failed'); }
+    }
+  } catch (e) {
+    if (status) { status.style.color = 'var(--red, #f85149)'; status.textContent = '\u2717 ' + e.message; }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Download Backup'; }
+  }
+}
+
+async function loadBackupList() {
+  const container = document.getElementById('kb-backup-list');
+  if (!container) return;
+
+  try {
+    const res = await fetch('/api/kanban/backup/list');
+    const data = await res.json();
+    if (!data.ok || !data.backups || data.backups.length === 0) {
+      container.innerHTML = '<span style="color:var(--text-faint);font-size:11px;">No backups yet.</span>';
+      return;
+    }
+
+    const rows = data.backups.map(b => {
+      const date = new Date(b.modified);
+      const dateStr = date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+      const timeStr = date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+      const sizeKB = (b.size / 1024).toFixed(1);
+      return `<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 8px;border-radius:6px;background:var(--bg-secondary);margin-bottom:4px;">
+        <div style="flex:1;min-width:0;">
+          <div style="font-size:12px;font-weight:500;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${dateStr} ${timeStr}</div>
+          <div style="font-size:10px;color:var(--text-faint);">${b.record_count} records &middot; ${sizeKB} KB</div>
+        </div>
+        <div style="display:flex;gap:4px;flex-shrink:0;margin-left:8px;">
+          <button class="kanban-settings-btn-accent" onclick="restoreCloudBackup('${b.filename}')" style="padding:4px 10px;font-size:11px;">Restore</button>
+          <button style="padding:4px 8px;font-size:11px;background:none;border:1px solid var(--border);border-radius:4px;color:var(--text-muted);cursor:pointer;" onclick="deleteCloudBackup('${b.filename}')">\u2717</button>
+        </div>
+      </div>`;
+    }).join('');
+
+    container.innerHTML = rows;
+  } catch (e) {
+    container.innerHTML = `<span style="color:var(--red,#f85149);font-size:11px;">${e.message}</span>`;
+  }
+}
+
+async function restoreCloudBackup(filename) {
+  const container = document.getElementById('kb-backup-list');
+
+  // Inline confirmation — find the row's restore button and swap it
+  const btns = container?.querySelectorAll('button.kanban-settings-btn-accent');
+  let targetBtn = null;
+  btns?.forEach(b => { if (b.getAttribute('onclick')?.includes(filename)) targetBtn = b; });
+
+  if (targetBtn && !targetBtn.dataset.confirmed) {
+    targetBtn.dataset.confirmed = '1';
+    targetBtn.textContent = 'Confirm?';
+    targetBtn.style.background = 'var(--orange)';
+    return;
+  }
+
+  if (targetBtn) { targetBtn.disabled = true; targetBtn.textContent = 'Restoring\u2026'; targetBtn.style.background = ''; }
+
+  try {
+    const res = await fetch('/api/kanban/backup/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      if (typeof showToast === 'function') showToast(`Restored ${data.record_count} records!`);
+      // Reload the board
+      setTimeout(async () => {
+        if (typeof _closePm === 'function') _closePm();
+        await initKanban(true);
+      }, 800);
+    } else {
+      if (typeof showToast === 'function') showToast('Restore failed: ' + (data.error || 'Unknown error'), true);
+      if (targetBtn) { targetBtn.disabled = false; targetBtn.textContent = 'Restore'; delete targetBtn.dataset.confirmed; }
+    }
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Restore failed: ' + e.message, true);
+    if (targetBtn) { targetBtn.disabled = false; targetBtn.textContent = 'Restore'; delete targetBtn.dataset.confirmed; }
+  }
+}
+
+async function deleteCloudBackup(filename) {
+  // Find and confirm
+  const container = document.getElementById('kb-backup-list');
+  const delBtns = container?.querySelectorAll('button:not(.kanban-settings-btn-accent)');
+  let targetBtn = null;
+  delBtns?.forEach(b => { if (b.getAttribute('onclick')?.includes(filename)) targetBtn = b; });
+
+  if (targetBtn && !targetBtn.dataset.confirmed) {
+    targetBtn.dataset.confirmed = '1';
+    targetBtn.textContent = '!!';
+    targetBtn.style.color = 'var(--red, #f85149)';
+    targetBtn.style.borderColor = 'var(--red, #f85149)';
+    return;
+  }
+
+  try {
+    const res = await fetch('/api/kanban/backup/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      if (typeof showToast === 'function') showToast('Backup deleted');
+      loadBackupList();
+    } else {
+      if (typeof showToast === 'function') showToast('Delete failed: ' + (data.error || ''), true);
+    }
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Delete failed: ' + e.message, true);
   }
 }
 

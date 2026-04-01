@@ -2,6 +2,8 @@
 
 A local development environment for Claude Code — session management, hierarchical task planning, and a workflow board where your task tree terminates in working Claude sessions. Built by [CustomerNode](https://customernode.com) and [Claude Code](https://claude.ai/download).
 
+![VibeNode workflow board showing tasks organized across status columns](docs/screenshots/workflow-board.png)
+
 ## Why we built this
 
 Two problems:
@@ -30,14 +32,19 @@ VibeNode is the result: a development system where the human is responsible for 
 
 - **Hierarchical tasks** — Arbitrary nesting depth. Break epics into tasks into subtasks. Each level tracks its own status independently, with completion propagating up automatically.
 - **Session scoping** — Sessions are integrated into the task tree itself. At any branch, a task can break into either subtasks or Claude Code sessions — so the leaf nodes of your hierarchy become actual working sessions instead of more tasks. Spawn a session from any task card and context (breadcrumb path, sibling tasks, parent description) is injected automatically. This is fundamentally different from tools that bolt sessions on as an afterthought — here the board structure *is* the session structure.
+
+![A task drilled down to show its subtask hierarchy branching across workflow columns](docs/screenshots/task-hierarchy.png)
+
 - **AI planner** — Describe work in natural language and Claude breaks it into a hierarchical task tree. Because it runs through Claude Code, it can read your codebase while planning — so the task breakdown reflects your actual architecture, not just your description. Iterate on the breakdown, then accept to bulk-create. Supports voice input.
 - **Dual storage backends** — SQLite (default, zero config, local file at `~/.claude/gui_kanban.db`) or Supabase (cloud PostgreSQL). Switch between them in System Settings with one-click migration.
 - **Collaborative with Supabase** — When using Supabase, multiple people can connect to the same board, making it a persistent and collaborative development roadmap. Task ownership tracking and per-user identity via git config.
+- **Cloud backups** — When using Supabase, download snapshots of your cloud data to local JSON files (`backups/` folder) with one click. Restore from any previous backup to roll back your board state. Backup files include full metadata and record counts for easy identification.
 - **Built for scale** — Paginated columns, indexed queries, recursive CTEs for tree traversal, gap-numbered positioning for drag reorder. Designed to handle thousands of tasks without degradation.
 - **Configurable columns** — Rename, reorder, recolor, add, or remove workflow columns per project. Per-column sort mode (manual drag, date entered, date created, alphabetical).
 - **Reports & analytics** — Velocity, cycle time, status breakdown, remediation rate, tag distribution, completion trends, workload analysis, and more.
 - **Multi-session coordination** — When a session launches from a task, it gets a briefing that includes sibling task statuses, which siblings have active sessions running (and for how long), open validation issues, and the full breadcrumb path up the task tree. Claude can see what's being worked on nearby and avoid conflicts — parallel sessions on related tasks are aware of each other.
 - **Tags, issues, and validation** — Tag tasks for filtering, log validation issues against tasks, track resolution status.
+
 
 **Workforce** *(experimental)* — Claude Code has two similar concepts — skills and agents — that don't translate naturally to a graphical environment. Workforce is our solution: a hierarchical knowledge base where each node has its own scoped instruction file (like a skill/agent MD file). Sessions launched from a node inherit that context, and Claude can see the full workforce tree to delegate work across it. You can scope tasks or sessions to any node in the hierarchy — clicking into a department to launch a session works like invoking a skill, while Claude autonomously dispatching work across the tree works like agents.
 
@@ -90,7 +97,7 @@ $Shortcut.WindowStyle = 7
 $Shortcut.Save()
 ```
 
-Uses `pythonw.exe` (windowless) so no console flashes on launch. The app self-heals this shortcut on every startup — if you created it with `python` instead, it will be silently upgraded to `pythonw` next time you run VibeNode.
+Uses `pythonw.exe` (windowless) so no console flashes on launch. When you click the shortcut, a boot splash window shows real-time startup progress (clearing caches, checking dependencies, starting the session daemon, etc.) and automatically dismisses once the browser opens. The app self-heals this shortcut on every startup — if you created it with `python` instead, it will be silently upgraded to `pythonw` next time you run VibeNode.
 
 ### 4. Desktop shortcut (macOS)
 
@@ -117,7 +124,7 @@ cat > ~/.local/share/applications/vibenode.desktop << 'EOF'
 [Desktop Entry]
 Name=VibeNode
 Exec=bash -c 'cd ~/Documents/VibeNode && ./launch.sh'
-Icon=~/Documents/VibeNode/claudecodegui.ico
+Icon=~/Documents/VibeNode/static/claudecodegui.ico
 Type=Application
 Terminal=false
 EOF
@@ -134,7 +141,7 @@ EOF
 | Server restart | PowerShell | `bash` + `nohup` | `bash` + `nohup` |
 | Browser launch | Chrome / fallback | `open` | `xdg-open` |
 | Auth login | `cmd` window | Terminal.app | `gnome-terminal` / `xterm` |
-| Desktop notification | PowerShell toast | `osascript` | `notify-send` |
+| Boot splash | tkinter window | tkinter window | tkinter (falls back to `notify-send`) |
 | Desktop shortcut | `.lnk` (auto-healed) | — | — |
 | Background launch | `pythonw.exe` | `nohup` | `nohup` |
 
@@ -148,4 +155,4 @@ If you run into a platform-specific bug, please submit a pull request with the f
 
 - Sessions are read from `~/.claude/projects/`
 - Session input is managed through the Claude Code SDK
-- No data leaves your machine (unless you enable Supabase cloud storage for tasks)
+- VibeNode itself stores everything locally. Claude Code sessions communicate with Anthropic's API as usual. Enabling Supabase cloud storage for tasks is optional.

@@ -691,6 +691,11 @@ socket.on('session_id_remapped', (data) => {
     if (!oldId || !newId) return;
     console.log('[WS] Session ID remapped:', oldId, '->', newId);
 
+    // Update planner session ID if it was remapped (before hidden check)
+    if (typeof _plannerSessionId !== 'undefined' && _plannerSessionId === oldId) {
+        _plannerSessionId = newId;
+    }
+
     if (_isHiddenSession(oldId, data)) return;
 
     // Update allSessions array

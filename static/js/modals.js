@@ -71,6 +71,40 @@ async function _doRestart(scope) {
   }, 1000);
 }
 
+// --- Shutdown server ---
+function shutdownServer() {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML = `
+    <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:10px;padding:24px 28px;min-width:340px;max-width:420px;color:var(--text-primary);font-family:inherit">
+      <h3 style="margin:0 0 14px;font-size:16px;color:var(--text-heading)">Turn Off Server</h3>
+      <p style="margin:0 0 18px;font-size:13px;color:var(--text-muted)">This will kill both the web server (5050) and session daemon (5051). All running sessions and agents will be terminated. You will need to manually restart VibeNode to use it again.</p>
+      <div style="display:flex;justify-content:flex-end;gap:8px">
+        <button id="shutdown-cancel" style="padding:8px 18px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-primary);cursor:pointer">Cancel</button>
+        <button id="shutdown-confirm" style="padding:8px 18px;border-radius:6px;border:1px solid transparent;background:var(--danger,#e55);color:#fff;cursor:pointer;font-weight:600">Turn Off</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  overlay.querySelector('#shutdown-cancel').onclick = () => overlay.remove();
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+
+  overlay.querySelector('#shutdown-confirm').onclick = async () => {
+    overlay.remove();
+    if (typeof showToast === 'function') showToast('Shutting down server...');
+    try {
+      await fetch('/api/shutdown', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+    } catch (e) { /* expected — server going down */ }
+    // Replace page content with a shutdown notice
+    setTimeout(() => {
+      document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:var(--bg-primary);color:var(--text-primary);font-family:inherit;flex-direction:column;gap:12px">'
+        + '<h2 style="margin:0;color:var(--text-heading)">Server has been turned off</h2>'
+        + '<p style="margin:0;color:var(--text-muted);font-size:14px">Restart VibeNode manually to continue.</p></div>';
+    }, 1500);
+  };
+}
+
 // --- Persistent Storage modal (System → Persistent Storage) ---
 async function openPersistentStorage() {
   let config = {};
@@ -130,6 +164,18 @@ async function openPersistentStorage() {
             <span id="kb-setup-status" style="font-size:12px;"></span>
           </div>
         </div>
+        <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border);">
+          <div style="font-size:13px;font-weight:600;margin-bottom:10px;color:var(--text-muted);">Backups</div>
+          <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">Save a snapshot of your cloud data locally, or restore from a previous backup.</div>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;">
+            <button class="kanban-settings-btn-accent" id="kb-backup-dl-btn" onclick="downloadCloudBackup()" style="padding:7px 16px;font-size:12px;">Download Backup</button>
+            <span id="kb-backup-dl-status" style="font-size:11px;"></span>
+          </div>
+          <div id="kb-backup-list-container">
+            <div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:6px;">Saved Backups</div>
+            <div id="kb-backup-list" style="font-size:12px;color:var(--text-muted);">Loading…</div>
+          </div>
+        </div>
       </div>
     </div>
     <div class="pm-actions">
@@ -141,6 +187,9 @@ async function openPersistentStorage() {
   overlay.classList.add('show');
   requestAnimationFrame(() => overlay.querySelector('.pm-card')?.classList.remove('pm-enter'));
   overlay.onclick = (e) => { if (e.target === overlay && typeof _closePm === 'function') _closePm(); };
+
+  // Auto-load backup list if Supabase section is visible
+  if (isSupa && typeof loadBackupList === 'function') loadBackupList();
 }
 
 // Update the storage label on page load (retry until element exists)

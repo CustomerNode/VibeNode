@@ -2238,7 +2238,7 @@ class SessionManager:
             info.working_since = time.time()
         elif info.state != SessionState.WORKING:
             info.working_since = 0.0
-        if self._push_callback and info.session_type not in ("planner", "title"):
+        if self._push_callback:
             data = info.to_state_dict()
             # Include queue data from server-side store
             with self._queue_lock:
@@ -2281,11 +2281,6 @@ class SessionManager:
 
     def _emit_entry(self, session_id: str, entry: LogEntry, index: int) -> None:
         """Push a new log entry to all connected WebSocket clients."""
-        # Never broadcast entries for hidden utility sessions (planner, title)
-        with self._lock:
-            info = self._sessions.get(session_id)
-        if info and info.session_type in ("planner", "title"):
-            return
         if self._push_callback:
             data = {
                 'session_id': session_id,
