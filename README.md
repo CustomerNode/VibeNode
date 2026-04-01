@@ -1,6 +1,16 @@
 # VibeNode
 
-A local web interface for managing Claude Code sessions — built by [CustomerNode](https://customernode.com) and [Claude Code](https://claude.ai/download).
+A local development environment for Claude Code — session management, hierarchical task planning, and a workflow board where your task tree terminates in working Claude sessions. Built by [CustomerNode](https://customernode.com) and [Claude Code](https://claude.ai/download).
+
+## Why we built this
+
+Two problems:
+
+1. **Session sprawl.** Running 8+ Claude Code sessions across terminal windows gets unwieldy fast — especially permission management. Even a three-monitor setup runs out of space. We needed a way to graphically manage sessions without sprawling terminals everywhere.
+
+2. **Velocity without direction.** Claude Code is powerful, but we noticed our roadmap wasn't actually moving faster. Sessions would drift, work would get duplicated, and there was no connection between what Claude was doing and what we needed delivered. We needed sessions tightly coupled to a task plan so every session is working toward a specific deliverable.
+
+VibeNode is the result: a development system where the human is responsible for planning, oversight, and validating outputs, while Claude handles execution — scoped to tasks, not left to wander. The session manager makes pure vibe coding better on its own, but the workflow board is where it becomes vibe *engineering* — structured planning and validation with a human in the loop.
 
 ## What it does
 
@@ -10,11 +20,32 @@ A local web interface for managing Claude Code sessions — built by [CustomerNo
 - Send commands to running sessions
 - Session tools: auto-name, duplicate, fork, rewind, delete, summarize, extract code, compare sessions
 
+### View modes
+
+**Grid** — Visual cards showing session status at a glance. The default view.
+
+**List** — Compact table with name, date, and size columns. Good for large session counts.
+
+**Workflow** — A full hierarchical task board for managing your development roadmap. Tasks are organized into configurable columns (Not Started, Working, Validating, Remediating, Complete by default) with drag-and-drop between them. Key capabilities:
+
+- **Hierarchical tasks** — Arbitrary nesting depth. Break epics into tasks into subtasks. Each level tracks its own status independently, with completion propagating up automatically.
+- **Session scoping** — Sessions are integrated into the task tree itself. At any branch, a task can break into either subtasks or Claude Code sessions — so the leaf nodes of your hierarchy become actual working sessions instead of more tasks. Spawn a session from any task card and context (breadcrumb path, sibling tasks, parent description) is injected automatically. This is fundamentally different from tools that bolt sessions on as an afterthought — here the board structure *is* the session structure.
+- **AI planner** — Describe work in natural language and Claude breaks it into a hierarchical task tree. Because it runs through Claude Code, it can read your codebase while planning — so the task breakdown reflects your actual architecture, not just your description. Iterate on the breakdown, then accept to bulk-create. Supports voice input.
+- **Dual storage backends** — SQLite (default, zero config, local file at `~/.claude/gui_kanban.db`) or Supabase (cloud PostgreSQL). Switch between them in System Settings with one-click migration.
+- **Collaborative with Supabase** — When using Supabase, multiple people can connect to the same board, making it a persistent and collaborative development roadmap. Task ownership tracking and per-user identity via git config.
+- **Built for scale** — Paginated columns, indexed queries, recursive CTEs for tree traversal, gap-numbered positioning for drag reorder. Designed to handle thousands of tasks without degradation.
+- **Configurable columns** — Rename, reorder, recolor, add, or remove workflow columns per project. Per-column sort mode (manual drag, date entered, date created, alphabetical).
+- **Reports & analytics** — Velocity, cycle time, status breakdown, remediation rate, tag distribution, completion trends, workload analysis, and more.
+- **Multi-session coordination** — When a session launches from a task, it gets a briefing that includes sibling task statuses, which siblings have active sessions running (and for how long), open validation issues, and the full breadcrumb path up the task tree. Claude can see what's being worked on nearby and avoid conflicts — parallel sessions on related tasks are aware of each other.
+- **Tags, issues, and validation** — Tag tasks for filtering, log validation issues against tasks, track resolution status.
+
+**Workforce** *(experimental)* — Claude Code has two similar concepts — skills and agents — that don't translate naturally to a graphical environment. Workforce is our solution: a hierarchical knowledge base where each node has its own scoped instruction file (like a skill/agent MD file). Sessions launched from a node inherit that context, and Claude can see the full workforce tree to delegate work across it. You can scope tasks or sessions to any node in the hierarchy — clicking into a department to launch a session works like invoking a skill, while Claude autonomously dispatching work across the tree works like agents.
+
 ## Requirements
 
 - Python 3.10+
 - Claude Code installed and at least one session created
-- Windows (uses PowerShell for process detection and input)
+- Windows, macOS, or Linux
 
 ## Setup (AI-assisted — recommended)
 
@@ -61,33 +92,60 @@ $Shortcut.Save()
 
 Uses `pythonw.exe` (windowless) so no console flashes on launch. The app self-heals this shortcut on every startup — if you created it with `python` instead, it will be silently upgraded to `pythonw` next time you run VibeNode.
 
+### 4. Desktop shortcut (macOS)
+
+Create an alias in your Applications folder:
+
+```bash
+ln -s ~/Documents/VibeNode/launch.sh /Applications/VibeNode
+```
+
+Or create a clickable `.command` file on your Desktop:
+
+```bash
+echo '#!/bin/bash
+cd ~/Documents/VibeNode && ./launch.sh' > ~/Desktop/VibeNode.command
+chmod +x ~/Desktop/VibeNode.command
+```
+
+### 5. Desktop shortcut (Linux)
+
+Create a `.desktop` file:
+
+```bash
+cat > ~/.local/share/applications/vibenode.desktop << 'EOF'
+[Desktop Entry]
+Name=VibeNode
+Exec=bash -c 'cd ~/Documents/VibeNode && ./launch.sh'
+Icon=~/Documents/VibeNode/claudecodegui.ico
+Type=Application
+Terminal=false
+EOF
+```
+
 ## Platform support
 
-**Currently Windows only.** VibeNode relies on Windows-specific features:
+**Windows, macOS, and Linux.** VibeNode was originally developed on Windows and has been adapted for cross-platform support. All session management is handled through the Claude Code SDK, so the core functionality is fully cross-platform.
 
-- **PowerShell SendKeys** for sending input to Claude terminal sessions
-- **`pythonw.exe`** for windowless background processes
-- **`netstat` / `taskkill`** for process management and port cleanup
-- **PowerShell COM objects** for desktop shortcut creation
+| Feature | Windows | macOS | Linux |
+|---|---|---|---|
+| Process detection | PowerShell WMI | `ps` | `ps` |
+| Port cleanup | `netstat` + `taskkill` | `lsof` + `kill` | `lsof` + `kill` |
+| Server restart | PowerShell | `bash` + `nohup` | `bash` + `nohup` |
+| Browser launch | Chrome / fallback | `open` | `xdg-open` |
+| Auth login | `cmd` window | Terminal.app | `gnome-terminal` / `xterm` |
+| Desktop notification | PowerShell toast | `osascript` | `notify-send` |
+| Desktop shortcut | `.lnk` (auto-healed) | — | — |
+| Background launch | `pythonw.exe` | `nohup` | `nohup` |
 
-### Running on macOS or Linux (not yet supported)
+### macOS and Linux users
 
-The core web UI (Flask + SocketIO) is cross-platform. The platform-specific parts that would need replacement:
+VibeNode was developed and primarily tested on Windows. macOS and Linux support has been added with explicit platform branching, but there may be minor setup bugs on your platform. The Claude Code self-setup flow should identify and patch most issues automatically.
 
-| Feature | Windows (current) | macOS / Linux (needed) |
-|---|---|---|
-| Send input to sessions | PowerShell SendKeys | `tmux send-keys`, `osascript`, or PTY pipes |
-| Background launch | `pythonw.exe` + `CREATE_NO_WINDOW` | `nohup` / `launchd` / `systemd` |
-| Process management | `netstat -ano` + `taskkill` | `lsof -i` + `kill` |
-| Desktop shortcut | PowerShell COM `.lnk` | `.desktop` file (Linux) / Automator (macOS) |
-| Port kill on restart | `Get-NetTCPConnection` | `lsof -ti :PORT \| xargs kill` |
-
-A macOS or Linux port would primarily need a platform adapter for `run.py`, `session_manager.py`, and the daemon's process detection. The web UI, kanban board, Supabase integration, and all frontend code work as-is.
-
-**Contributions welcome** — if you're interested in adding macOS or Linux support, see [CONTRIBUTING.md](CONTRIBUTING.md) or open an issue.
+If you run into a platform-specific bug, please submit a pull request with the fix — or ask your Claude to submit one — so we can support everyone. See [CONTRIBUTING.md](CONTRIBUTING.md) or open an issue.
 
 ## Notes
 
 - Sessions are read from `~/.claude/projects/`
-- Input is sent to Claude terminals via PowerShell SendKeys
+- Session input is managed through the Claude Code SDK
 - No data leaves your machine (unless you enable Supabase cloud storage for tasks)

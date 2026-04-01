@@ -52,12 +52,16 @@ DEFAULT_COLUMNS = [
 ]
 
 
+_ensured_projects = set()  # in-memory cache: skip get_columns after first check
+
+
 def ensure_project_columns(repo, project_id):
     """Create default columns for a project if none exist yet.
 
     This is called before rendering the board to guarantee the standard
     five-column layout is present. If the project already has columns
-    configured, this is a no-op.
+    configured, this is a no-op.  After the first successful check the
+    result is cached in-memory so subsequent calls are free.
 
     Args:
         repo: KanbanRepository instance.
@@ -66,6 +70,8 @@ def ensure_project_columns(repo, project_id):
     Returns:
         List of column dicts for the project.
     """
+    if project_id in _ensured_projects:
+        return None  # columns already confirmed, skip the query
     existing = repo.get_columns(project_id)
     if existing:
         # Migrate: auto-sort columns that are still on manual
@@ -89,9 +95,11 @@ def ensure_project_columns(repo, project_id):
         if needs_update:
             try:
                 repo.update_columns(project_id, patched)
+                _ensured_projects.add(project_id)
                 return repo.get_columns(project_id)
             except Exception:
                 pass
+        _ensured_projects.add(project_id)
         return existing
 
     for col_def in DEFAULT_COLUMNS:
@@ -105,4 +113,5 @@ def ensure_project_columns(repo, project_id):
             sort_direction=col_def['sort_direction'],
         )
 
+    _ensured_projects.add(project_id)
     return repo.get_columns(project_id)

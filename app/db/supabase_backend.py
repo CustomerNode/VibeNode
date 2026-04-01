@@ -9,6 +9,24 @@ dashboard or a migration script before first use.
 All methods are synchronous (the supabase-py ``create_client`` helper
 returns a sync ``Client``), matching the threading model used by the
 Flask app.
+
+Performance notes
+-----------------
+Every method call is an HTTPS round-trip (~50-150ms).  Avoid calling
+repo methods in loops.  Key optimizations:
+
+- **_row_to_task** does NOT compute depth.  Depth was previously
+  calculated by walking the parent chain with one query per ancestor —
+  for 30 tasks that meant 60-80 extra HTTP calls.  Now depth is computed
+  in Python via _compute_depths() from a flat list of rows.  get_board()
+  uses this automatically.  Callers that need depth on single tasks
+  (get_task) get depth=0; the API layer recomputes from the full list.
+
+- **get_session_counts_batch** and **get_children_counts_batch** exist
+  so the API layer can fetch counts for all tasks in one query instead
+  of calling get_task_sessions / get_children per task.
+
+Never add per-row Supabase queries back into _row_to_task.
 """
 
 import uuid
@@ -246,15 +264,7 @@ class SupabaseRepository(KanbanRepository):
     # Row → dataclass helpers
     # ------------------------------------------------------------------
 
-    def _row_to_task(self, row: dict) -> Task:
-        depth = 0
-        parent_id = row.get("parent_id")
-        if parent_id and self.client:
-            cur_pid = parent_id
-            while cur_pid:
-                depth += 1
-                r = self.client.table("tasks").select("parent_id").eq("id", cur_pid).limit(1).execute()
-                cur_pid = r.data[0]["parent_id"] if r.data else None
+    def _row_to_task(self, row: dict, depth: int = 0) -> Task:
         return Task(
             id=row["id"],
             project_id=row["project_id"],
@@ -269,6 +279,25 @@ class SupabaseRepository(KanbanRepository):
             updated_at=row["updated_at"],
             owner=row.get("owner"),
         )
+
+    @staticmethod
+    def _compute_depths(rows: list) -> dict:
+        """Compute depth for each task from a flat list of rows in Python.
+
+        Replaces the old per-row recursive Supabase queries.
+        """
+        parent_map = {r["id"]: r.get("parent_id") for r in rows}
+        cache = {}
+
+        def _depth(tid):
+            if tid in cache:
+                return cache[tid]
+            pid = parent_map.get(tid)
+            d = 0 if not pid else _depth(pid) + 1
+            cache[tid] = d
+            return d
+
+        return {r["id"]: _depth(r["id"]) for r in rows}
 
     @staticmethod
     def _row_to_column(row: dict) -> BoardColumn:
@@ -986,7 +1015,10 @@ class SupabaseRepository(KanbanRepository):
             .order("position")
             .execute()
         )
-        all_tasks = [self._row_to_task(row) for row in result.data]
+        # Compute depths in Python from the flat list — no extra queries
+        depths = self._compute_depths(result.data)
+        all_tasks = [self._row_to_task(row, depth=depths.get(row["id"], 0))
+                     for row in result.data]
 
         # Group tasks by status key
         tasks_by_status = {}

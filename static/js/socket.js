@@ -8,11 +8,22 @@ let _wsConnected = false;
  * (planner, auto-title, etc.) that must NEVER appear in the workspace.
  * Called at every entry point where a session can enter the UI.
  */
+// Persistent set of session IDs known to be hidden utilities.
+// Populated when _isHiddenSession detects one, so subsequent events
+// (e.g. session_entry which lacks session_type) can still filter them.
+const _hiddenSessionIds = new Set();
+
 function _isHiddenSession(id, data) {
     if (!id) return false;
-    if (id.startsWith('_title_')) return true;
-    if (window._plannerSessionIds && window._plannerSessionIds.has(id)) return true;
-    if (data && (data.session_type === 'planner' || data.session_type === 'title')) return true;
+    // Fast path: already known hidden
+    if (_hiddenSessionIds.has(id)) return true;
+    // Convention: any session ID starting with "_" is a system/utility session
+    // (_title_*, _planner_*, and any future utility sessions).
+    if (id.startsWith('_')) { _hiddenSessionIds.add(id); return true; }
+    if (data && (data.session_type === 'planner' || data.session_type === 'title')) {
+        _hiddenSessionIds.add(id);
+        return true;
+    }
     return false;
 }
 
@@ -398,6 +409,20 @@ socket.on('session_state', (data) => {
         _renderQueueBanner();
     }
 
+    // Safety net: if session is idle but still has queued messages, nudge
+    // the backend to dispatch after a short delay.  Catches edge cases
+    // where the server-side _try_dispatch_queue missed (race, reconnect).
+    if (state === 'idle' && data.queue && data.queue.length) {
+        const _nudgeSid = session_id;
+        setTimeout(() => {
+            // Re-check: only nudge if session is still idle with queue items
+            if (sessionKinds[_nudgeSid] === 'idle' && _getQueueList(_nudgeSid).length) {
+                console.warn('[queue-nudge] Session', _nudgeSid, 'idle with queued messages — nudging dispatch');
+                socket.emit('nudge_queue', {session_id: _nudgeSid});
+            }
+        }, 2000);
+    }
+
     // Update sidebar row classes
     _updateRowState(session_id, state);
 
@@ -506,6 +531,10 @@ socket.on('session_usage', (data) => {
 
 // Live log entries pushed in real-time
 socket.on('session_entry', (data) => {
+    // Never process entries for hidden utility sessions (planner, title).
+    // session_entry payloads lack session_type, so check the tracked Set.
+    if (_hiddenSessionIds.has(data.session_id)) return;
+
     // Reset (not cancel) watchdog — data is flowing but session hasn't
     // completed yet.  Keep the watchdog alive so a lost IDLE event triggers
     // recovery within 10s of the last streaming activity.
@@ -578,6 +607,7 @@ socket.on('session_entry', (data) => {
 
 // Permission requests
 socket.on('session_permission', (data) => {
+    if (_hiddenSessionIds.has(data.session_id)) return;
     waitingData[data.session_id] = {
         question: _formatPermissionQuestion(data.tool_name, data.tool_input),
         options: ['y', 'n', 'a'],

@@ -14,6 +14,8 @@ from .config import (
     _format_size,
     _summary_cache,
     _get_deleted_ids,
+    _get_utility_ids,
+    _cleanup_system_sessions,
 )
 
 
@@ -481,12 +483,16 @@ def _is_system_content(text: str) -> bool:
 
 
 def all_sessions(summary_only: bool = False) -> list:
+    # Prune stale utility session JSONL files (>24h) from the system project
+    _cleanup_system_sessions()
     # Filter out tombstoned (recently deleted) sessions so zombie .jsonl files
     # recreated by dying claude.exe processes never appear in the UI.
     deleted_ids = _get_deleted_ids()
+    utility_ids = _get_utility_ids()
     files = [f for f in _sessions_dir().glob("*.jsonl")
              if f.stem not in deleted_ids
-             and not f.stem.startswith("_title_")]
+             and f.stem not in utility_ids
+             and not f.stem.startswith("_")]
     loader = load_session_summary if summary_only else load_session
     if summary_only and len(files) > 10:
         with ThreadPoolExecutor(max_workers=min(16, len(files))) as pool:

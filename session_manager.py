@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """VibeNode -- thin entrypoint. All logic lives in app/.
 
-When launched via pythonw.exe (no console), stdout/stderr are None.
+On Windows, when launched via pythonw.exe (no console), stdout/stderr are None.
 We redirect them to a log file so nothing crashes on print().
-Shows a system tray balloon notification so the user knows it's starting.
+Shows a platform-specific notification so the user knows it's starting.
 """
 import os
 import sys
@@ -25,34 +25,36 @@ if sys.stdout is None or sys.stderr is None:
 
 
 def _show_notification(title, message, icon_path=None):
-    """Show a Windows balloon tip notification. Best-effort, never crashes."""
-    if sys.platform != "win32":
-        return
+    """Show a desktop notification. Best-effort, never crashes."""
     try:
-        import ctypes
-        import ctypes.wintypes as wt
-        import struct
+        import subprocess
         import threading
 
         def _notify():
             try:
-                # Use PowerShell for a reliable toast notification
-                import subprocess
-                ps = (
-                    "[void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms');"
-                    "$n = New-Object System.Windows.Forms.NotifyIcon;"
-                    "$n.Icon = [System.Drawing.SystemIcons]::Information;"
-                    f"$n.BalloonTipTitle = '{title}';"
-                    f"$n.BalloonTipText = '{message}';"
-                    "$n.Visible = $true;"
-                    "$n.ShowBalloonTip(3000);"
-                    "Start-Sleep -Milliseconds 3500;"
-                    "$n.Dispose();"
-                )
-                subprocess.Popen(
-                    ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
+                if sys.platform == "win32":
+                    ps = (
+                        "[void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms');"
+                        "$n = New-Object System.Windows.Forms.NotifyIcon;"
+                        "$n.Icon = [System.Drawing.SystemIcons]::Information;"
+                        f"$n.BalloonTipTitle = '{title}';"
+                        f"$n.BalloonTipText = '{message}';"
+                        "$n.Visible = $true;"
+                        "$n.ShowBalloonTip(3000);"
+                        "Start-Sleep -Milliseconds 3500;"
+                        "$n.Dispose();"
+                    )
+                    subprocess.Popen(
+                        ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                elif sys.platform == "darwin":
+                    subprocess.Popen([
+                        "osascript", "-e",
+                        f'display notification "{message}" with title "{title}"',
+                    ])
+                elif sys.platform == "linux":
+                    subprocess.Popen(["notify-send", title, message])
             except Exception:
                 pass
 

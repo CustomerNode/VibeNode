@@ -214,6 +214,12 @@ def register_ws_events(socketio, app):
             permission_mode = None
         session_type = (data.get('session_type') or '').strip() or ""
 
+        # Route utility sessions to a separate project so their JSONL files
+        # never appear in the user's project.
+        if session_type in ('planner', 'title'):
+            from ..config import _SYSTEM_UTILITY_CWD
+            cwd = _SYSTEM_UTILITY_CWD
+
         if not session_id:
             emit('error', {'message': 'session_id is required'})
             return
@@ -329,7 +335,13 @@ def register_ws_events(socketio, app):
             return
 
         sm = app.session_manager
-        result = sm.interrupt_session(session_id)
+        merge_queue = bool(data.get('merge_queue', False))
+        pending_text = (data.get('pending_text') or '').strip()
+        result = sm.interrupt_session(
+            session_id,
+            merge_queue=merge_queue,
+            pending_text=pending_text or None,
+        )
 
         if not result.get('ok'):
             emit('error', {
@@ -538,6 +550,17 @@ def register_ws_events(socketio, app):
         result = sm.clear_queue(session_id)
         if not result.get('ok'):
             emit('error', {'message': result.get('error', 'Failed to clear'), 'session_id': session_id})
+
+    @socketio.on('nudge_queue')
+    def handle_nudge_queue(data):
+        """Frontend safety net: retry queue dispatch for an idle session."""
+        if not isinstance(data, dict):
+            return
+        session_id = (data.get('session_id') or '').strip()
+        if not session_id:
+            return
+        sm = app.session_manager
+        sm.nudge_queue(session_id)
 
     @socketio.on('get_queue')
     def handle_get_queue(data):

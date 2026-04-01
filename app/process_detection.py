@@ -1,6 +1,6 @@
 """
-Windows process detection -- find running Claude sessions, detect waiting state,
-and send keystrokes to terminal windows.
+Process detection -- find running Claude sessions and detect waiting state.
+Cross-platform: Windows (WMI/PowerShell), macOS (ps), Linux (ps).
 """
 
 import json
@@ -15,6 +15,65 @@ from pathlib import Path
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 from .config import _sessions_dir
+
+
+def _enumerate_claude_processes():
+    """Return list of dicts with ProcessId, Name, CommandLine."""
+    if sys.platform == "win32":
+        return _enumerate_processes_windows()
+    elif sys.platform == "darwin":
+        return _enumerate_processes_macos()
+    elif sys.platform == "linux":
+        return _enumerate_processes_linux()
+    return []
+
+
+def _enumerate_processes_windows():
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-command",
+             "Get-WmiObject Win32_Process "
+             "| Where-Object { $_.Name -match 'claude|node' } "
+             "| Select-Object ProcessId,Name,CommandLine "
+             "| ConvertTo-Json -Compress"],
+            capture_output=True, text=True, timeout=12,
+            creationflags=_NO_WINDOW)
+        d = json.loads(result.stdout or "[]")
+        return [d] if isinstance(d, dict) else d
+    except Exception:
+        return []
+
+
+def _enumerate_processes_unix():
+    """Use ps to enumerate claude/node processes (macOS and Linux)."""
+    try:
+        r = subprocess.run(["ps", "axo", "pid,comm,args"],
+                           capture_output=True, text=True, timeout=10)
+        procs = []
+        for line in r.stdout.splitlines()[1:]:
+            parts = line.strip().split(None, 2)
+            if len(parts) < 2:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            comm = os.path.basename(parts[1])
+            cmdline = parts[2] if len(parts) > 2 else ""
+            if not re.search(r'claude|node', comm, re.I):
+                continue
+            procs.append({"ProcessId": pid, "Name": comm, "CommandLine": cmdline})
+        return procs
+    except Exception:
+        return []
+
+
+def _enumerate_processes_macos():
+    return _enumerate_processes_unix()
+
+
+def _enumerate_processes_linux():
+    return _enumerate_processes_unix()
 
 
 def _tail_read_lines(path: Path, tail_bytes: int = 65536) -> list:
@@ -53,110 +112,36 @@ def _get_running_session_ids():
                 except Exception:
                     continue
 
-        # Get running claude processes (to filter out stale registry entries)
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-command",
-             "Get-WmiObject Win32_Process | Where-Object { $_.Name -match 'claude|node' } | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress"],
-            capture_output=True, text=True, timeout=12, creationflags=_NO_WINDOW
-        )
-        try:
-            proc_data = json.loads(result.stdout or "[]")
-        except (json.JSONDecodeError, ValueError):
-            proc_data = []
-        if isinstance(proc_data, dict):
-            proc_data = [proc_data]
+        # Get running claude/node processes -- platform-specific enumeration
+        proc_data = _enumerate_claude_processes()
 
         live_pids = set()
-        proc_lookup = {}  # pid -> proc info, for parent-chain walking
         for proc in proc_data:
             cmdline = proc.get("CommandLine") or ""
             name = (proc.get("Name") or "").lower()
             pid = proc.get("ProcessId")
-            proc_lookup[pid] = proc
-            if name not in ("node.exe", "claude.exe", "claude"):
+            if name not in ("node.exe", "node", "claude.exe", "claude"):
                 continue
             if "--output-format" in cmdline:
                 continue
             live_pids.add(pid)
 
-        def _has_cmd_parent(start_pid):
-            """Return True if any ancestor of start_pid is cmd.exe.
-
-            Walks up the process tree using proc_lookup first (fast), then
-            falls back to a targeted WMI query for ancestors not in the
-            initial scan (which only contains claude/node processes).
-            """
-            cur = start_pid
-            visited = set()
-            while cur and cur > 4:
-                if cur in visited:
-                    break
-                visited.add(cur)
-                p = proc_lookup.get(cur)
-                if p:
-                    if (p.get("Name") or "").lower() == "cmd.exe":
-                        return True
-                    cur = int(p.get("ParentProcessId") or 0)
-                    continue
-                # Not in proc_lookup — do a targeted query for this single PID
-                try:
-                    r = subprocess.run(
-                        ["wmic", "process", "where", f"ProcessId={cur}",
-                         "get", "Name,ParentProcessId", "/format:csv"],
-                        capture_output=True, text=True, timeout=3, creationflags=_NO_WINDOW)
-                    found = False
-                    for line in r.stdout.strip().splitlines():
-                        parts = line.strip().split(",")
-                        if len(parts) < 3:
-                            continue
-                        name = parts[1].strip()
-                        # Skip CSV header row
-                        if name.lower() in ("name", ""):
-                            continue
-                        ppid_str = parts[2].strip()
-                        if name.lower() == "cmd.exe":
-                            return True
-                        try:
-                            cur = int(ppid_str)
-                        except ValueError:
-                            return False
-                        found = True
-                        break
-                    if not found:
-                        break  # no matching process found
-                except Exception:
-                    break
-            return False
-
         running = {}
-        cmd_parented = {}   # session_id -> pid, only for cmd.exe-rooted processes
         current_dir = _sessions_dir()
 
         # Match via registry: authoritative PID -> session ID mapping.
-        # When multiple PIDs map to the same session (e.g. external + GUI resume),
-        # prefer the cmd.exe-parented one — WriteConsoleInput only works there.
-        _registry_orphan_pids = []  # PIDs whose registry session doesn't exist here
+        _registry_orphan_pids = []
         for pid, info in registry.items():
             if pid not in live_pids:
-                continue  # stale registry entry
+                continue
             sid = info.get("sessionId")
             if not sid:
                 continue
-            # Only include if session belongs to current project
             if (current_dir / f"{sid}.jsonl").exists():
-                if _has_cmd_parent(pid):
-                    cmd_parented[sid] = pid
-                else:
-                    if sid not in running:
-                        running[sid] = pid  # fallback, only if no cmd.exe version yet
+                if sid not in running:
+                    running[sid] = pid
             else:
-                # Registry says this PID belongs to a session not in this project.
-                # The PID may actually be writing to a DIFFERENT session file here
-                # (Claude can create new session IDs that differ from the registry).
                 _registry_orphan_pids.append(pid)
-
-        # cmd.exe-parented processes win over external ones
-        running.update(cmd_parented)
 
         # Fallback: command-line UUID matching for sessions not in registry
         uuid_re = re.compile(r"(?:--resume|-r)\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
@@ -165,7 +150,7 @@ def _get_running_session_ids():
         for proc in proc_data:
             cmdline = proc.get("CommandLine") or ""
             name = (proc.get("Name") or "").lower()
-            if name not in ("node.exe", "claude.exe", "claude"):
+            if name not in ("node.exe", "node", "claude.exe", "claude"):
                 continue
             if "--output-format" in cmdline:
                 continue
@@ -178,14 +163,9 @@ def _get_running_session_ids():
                 unmatched_pids.append(pid)
 
         # Registry orphan matching: PIDs whose registered session ID doesn't
-        # exist in the current project directory.  Claude sometimes creates new
-        # session files with different IDs than what the registry records.
-        # Match these orphan PIDs to the most recently modified unclaimed files
-        # WITH POSITIVE PIDs (safe to send to — we trust the registry that this
-        # PID is a real Claude process, even if the session ID is wrong).
+        # exist in the current project directory.
         if _registry_orphan_pids:
-            import time as _time2
-            now2 = _time2.time()
+            now2 = time.time()
             orphan_candidates = []
             for f in current_dir.glob("*.jsonl"):
                 try:
@@ -197,17 +177,13 @@ def _get_running_session_ids():
             orphan_candidates.sort(reverse=True)
             for pid, (_, sid) in zip(_registry_orphan_pids, orphan_candidates):
                 if pid not in matched_pids:
-                    running[sid] = pid  # POSITIVE PID — safe to target
+                    running[sid] = pid
                     matched_pids.add(pid)
 
         # Fallback: match unmatched PIDs to most recently modified .jsonl files
-        # in the current project (for display only — negative PID = not killable).
-        # This is isolated in its own try/except so a FileNotFoundError here
-        # does NOT wipe out sessions already detected via the registry.
         try:
             if unmatched_pids:
-                import time as _time
-                now = _time.time()
+                now = time.time()
                 candidates = []
                 for f in current_dir.glob("*.jsonl"):
                     try:
@@ -215,22 +191,20 @@ def _get_running_session_ids():
                         if f.stem not in running and (now - mt) < 7200:
                             candidates.append((mt, f.stem))
                     except (FileNotFoundError, OSError):
-                        continue  # file deleted during scan — skip it
+                        continue
                 candidates.sort(reverse=True)
                 for pid, (_, sid) in zip(unmatched_pids, candidates):
                     running[sid] = -abs(pid)  # negative = display-only
         except Exception:
-            pass  # mtime fallback failed — return what we already have
+            pass
 
         return running
     except Exception:
-        # Return whatever we've found so far rather than losing everything.
-        # The `running` dict is built incrementally — if an error occurs late
-        # (e.g., during the mtime fallback), we still have registry+cmdline results.
         try:
             return running  # type: ignore[possibly-undefined]
         except NameError:
             return {}
+
 
 
 def _parse_waiting_state(path: Path, has_live_pid: bool = False) -> dict | None:
@@ -590,252 +564,3 @@ def _parse_session_kind(path: Path, has_live_pid: bool = False) -> str:
     return 'working'
 
 
-_SENDER_SCRIPT_PATH = None
-
-_SENDER_PS1 = r"""param(
-    [string]$targetPid,
-    [string]$b64Text,
-    [string]$sendEnter
-)
-$inputBytes = [System.Convert]::FromBase64String($b64Text)
-$inputText  = [System.Text.Encoding]::UTF8.GetString($inputBytes)
-
-Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-
-[StructLayout(LayoutKind.Explicit)]
-public struct KEY_EVENT_RECORD {
-    [FieldOffset(0)] public bool bKeyDown;
-    [FieldOffset(4)] public short wRepeatCount;
-    [FieldOffset(6)] public short wVirtualKeyCode;
-    [FieldOffset(8)] public short wVirtualScanCode;
-    [FieldOffset(10)] public char UnicodeChar;
-    [FieldOffset(12)] public int dwControlKeyState;
-}
-
-[StructLayout(LayoutKind.Explicit)]
-public struct INPUT_RECORD {
-    [FieldOffset(0)] public short EventType;
-    [FieldOffset(4)] public KEY_EVENT_RECORD KeyEvent;
-}
-
-public class ConsoleIO {
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool FreeConsole();
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool AttachConsole(uint dwProcessId);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern IntPtr GetStdHandle(int nStdHandle);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool WriteConsoleInput(
-        IntPtr hConsoleInput,
-        INPUT_RECORD[] lpBuffer,
-        uint nLength,
-        out uint lpNumberOfEventsWritten);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool FlushConsoleInputBuffer(IntPtr hConsoleInput);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool AllocConsole();
-
-    [DllImport("user32.dll")]
-    public static extern short VkKeyScan(char ch);
-
-    public static void SendString(uint pid, string text, bool sendEnter) {
-        Exception lastEx = null;
-        for (int attempt = 0; attempt < 3; attempt++) {
-            if (attempt > 0) System.Threading.Thread.Sleep(150);
-            try {
-                FreeConsole();
-                if (!AttachConsole(pid)) {
-                    int err = Marshal.GetLastWin32Error();
-                    AllocConsole();
-                    if (attempt == 2) throw new Exception("AttachConsole failed for pid " + pid + ", error " + err);
-                    lastEx = new Exception("AttachConsole failed, error " + err);
-                    continue;
-                }
-                try {
-                    System.Threading.Thread.Sleep(200);
-                    IntPtr hInput = GetStdHandle(-10);
-                    if (hInput == IntPtr.Zero || hInput == (IntPtr)(-1)) {
-                        if (attempt == 2) throw new Exception("GetStdHandle returned invalid handle");
-                        lastEx = new Exception("GetStdHandle returned invalid handle");
-                        continue;
-                    }
-
-                    // Note: do NOT flush the input buffer — it discards any
-                    // keystrokes the user may have typed in the terminal.
-
-                    int totalEvents = text.Length * 2 + (sendEnter ? 2 : 0);
-                    INPUT_RECORD[] allRecs = new INPUT_RECORD[totalEvents];
-                    int idx = 0;
-
-                    foreach (char ch in text) {
-                        short vk;
-                        if ((int)ch < 32) {
-                            vk = (short)(int)ch;
-                        } else {
-                            short vkResult = VkKeyScan(ch);
-                            vk = (vkResult == -1) ? (short)0 : (short)(vkResult & 0xFF);
-                        }
-
-                        allRecs[idx].EventType = 1;
-                        allRecs[idx].KeyEvent.bKeyDown = true;
-                        allRecs[idx].KeyEvent.wRepeatCount = 1;
-                        allRecs[idx].KeyEvent.wVirtualKeyCode = vk;
-                        allRecs[idx].KeyEvent.UnicodeChar = ch;
-                        idx++;
-                        allRecs[idx].EventType = 1;
-                        allRecs[idx].KeyEvent.bKeyDown = false;
-                        allRecs[idx].KeyEvent.wRepeatCount = 1;
-                        allRecs[idx].KeyEvent.wVirtualKeyCode = vk;
-                        allRecs[idx].KeyEvent.UnicodeChar = ch;
-                        idx++;
-                    }
-
-                    if (sendEnter) {
-                        allRecs[idx].EventType = 1;
-                        allRecs[idx].KeyEvent.bKeyDown = true;
-                        allRecs[idx].KeyEvent.wRepeatCount = 1;
-                        allRecs[idx].KeyEvent.wVirtualKeyCode = 0x0D;
-                        allRecs[idx].KeyEvent.UnicodeChar = (char)13;
-                        idx++;
-                        allRecs[idx].EventType = 1;
-                        allRecs[idx].KeyEvent.bKeyDown = false;
-                        allRecs[idx].KeyEvent.wRepeatCount = 1;
-                        allRecs[idx].KeyEvent.wVirtualKeyCode = 0x0D;
-                        allRecs[idx].KeyEvent.UnicodeChar = (char)13;
-                        idx++;
-                    }
-
-                    uint totalToWrite = (uint)totalEvents;
-                    uint totalWritten = 0;
-                    int writeRetries = 0;
-                    while (totalWritten < totalToWrite && writeRetries < 3) {
-                        uint remaining = totalToWrite - totalWritten;
-                        INPUT_RECORD[] slice;
-                        if (totalWritten == 0) {
-                            slice = allRecs;
-                        } else {
-                            slice = new INPUT_RECORD[remaining];
-                            Array.Copy(allRecs, totalWritten, slice, 0, remaining);
-                        }
-                        uint written;
-                        if (!WriteConsoleInput(hInput, slice, remaining, out written)) {
-                            int err = Marshal.GetLastWin32Error();
-                            throw new Exception("WriteConsoleInput failed, error " + err);
-                        }
-                        if (written == 0) {
-                            System.Threading.Thread.Sleep(50);
-                            writeRetries++;
-                            continue;
-                        }
-                        totalWritten += written;
-                        writeRetries = 0;
-                    }
-                    if (totalWritten < totalToWrite) {
-                        throw new Exception("WriteConsoleInput partial: wrote " + totalWritten + " of " + totalToWrite);
-                    }
-                    return;
-                } finally {
-                    FreeConsole();
-                    AllocConsole();
-                }
-            } catch (Exception ex) {
-                lastEx = ex;
-                if (attempt == 2) throw;
-            }
-        }
-        if (lastEx != null) throw lastEx;
-    }
-}
-'@
-
-# Find the cmd.exe parent (the console host)
-$cur = [int]$targetPid
-$consolePid = $null
-while ($cur -gt 4) {
-    try {
-        $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -EA Stop
-        if ($proc.Name -eq 'cmd.exe') { $consolePid = $cur; break }
-        $cur = [int]$proc.ParentProcessId
-    } catch { break }
-}
-if (-not $consolePid) {
-    throw "Session was not launched from a GUI terminal (no cmd.exe parent found). Cannot inject input directly."
-}
-
-[ConsoleIO]::SendString([uint32]$consolePid, $inputText, [bool][int]$sendEnter)
-"""
-
-
-def _ensure_sender_script():
-    """Write the console sender PS1 script once, return its path."""
-    global _SENDER_SCRIPT_PATH
-    if _SENDER_SCRIPT_PATH and os.path.exists(_SENDER_SCRIPT_PATH):
-        return _SENDER_SCRIPT_PATH
-    script_dir = Path(__file__).parent
-    path = script_dir / "_console_sender.ps1"
-    path.write_text(_SENDER_PS1, encoding='utf-8')
-    _SENDER_SCRIPT_PATH = str(path)
-    return _SENDER_SCRIPT_PATH
-
-
-import threading as _threading
-_send_lock = _threading.Lock()  # serialize console attach/detach across sessions
-
-
-def send_to_session(pid: int, text: str, skip_enter: bool = False) -> dict:
-    """
-    Send text to a running Claude session via WriteConsoleInput.
-    Uses a pre-written PS1 script invoked with arguments (no temp files).
-
-    IMPORTANT: Serialized with _send_lock because the PowerShell script does
-    FreeConsole/AttachConsole which affects the entire process.  Concurrent
-    sends to different sessions would corrupt each other's console state.
-    """
-    import base64 as _b64
-
-    script_path = _ensure_sender_script()
-    b64 = _b64.b64encode(text.encode("utf-8")).decode("ascii")
-    send_enter = "0" if skip_enter else "1"
-
-    si = subprocess.STARTUPINFO()
-    si.dwFlags = subprocess.STARTF_USESHOWWINDOW
-    si.wShowWindow = 0  # SW_HIDE
-
-    last_err = None
-    with _send_lock:
-        for py_attempt in range(3):  # 3 attempts, up from 2
-            if py_attempt > 0:
-                time.sleep(0.5)  # longer pause between retries
-            try:
-                res = subprocess.run(
-                    ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                     "-File", script_path, str(pid), b64, send_enter],
-                    capture_output=True, timeout=15,
-                    startupinfo=si,
-                    creationflags=0x08000000,  # CREATE_NO_WINDOW
-                )
-                if res.returncode == 0:
-                    return {"ok": True, "method": "sent"}
-                last_err = res.stderr.decode("utf-8", errors="ignore").strip()[:300]
-            except subprocess.TimeoutExpired:
-                last_err = "timeout"
-    if last_err == "timeout":
-        return {"ok": False, "method": "timeout"}
-    return {"ok": False, "method": "failed", "err": last_err}
-
-
-def send_to_clipboard(text: str) -> dict:
-    """Fallback: copy text to clipboard when session is not running."""
-    clip = text.replace("'", "''")
-    subprocess.run(["powershell", "-NoProfile", "-command", f"Set-Clipboard '{clip}'"],
-                   capture_output=True, timeout=5, creationflags=_NO_WINDOW)
-    return {"ok": True, "method": "clipboard",
-            "message": "Session not running \u2014 copied to clipboard."}

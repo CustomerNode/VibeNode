@@ -389,18 +389,22 @@ const _viewModes = {
     title: 'List',
     desc: 'Compact table with name, date, and size columns',
   },
+  kanban: {
+    icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="5" height="18" rx="1"/><rect x="10" y="3" width="5" height="12" rx="1"/><rect x="17" y="3" width="5" height="15" rx="1"/></svg>',
+    label: 'Workflow View',
+    title: 'Workflow',
+    desc: 'Task board with workflow columns and AI session orchestration',
+    badge: 'Professional',
+    badgeStyle: 'background:#7c3aed;color:#fff;',
+  },
   workplace: {
     icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><circle cx="7" cy="10" r="1.5"/><circle cx="17" cy="10" r="1.5"/><path d="M10 10h4"/></svg>',
     label: 'Workforce',
     title: 'Workforce',
     desc: 'Organize sessions by department with specialized skills',
     badge: 'Experimental',
-  },
-  kanban: {
-    icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="5" height="18" rx="1"/><rect x="10" y="3" width="5" height="12" rx="1"/><rect x="17" y="3" width="5" height="15" rx="1"/></svg>',
-    label: 'Workflow View',
-    title: 'Workflow',
-    desc: 'Task board with workflow columns and AI session orchestration',
+    badgeStyle: 'background:rgba(255,255,255,0.08);color:var(--text-muted);',
+    dimmed: true,
   },
 };
 
@@ -414,11 +418,12 @@ async function openViewModeSelector() {
 
   for (const [key, m] of Object.entries(_viewModes)) {
     const isActive = key === current;
-    const disabled = (m.badge === 'Coming Soon') ? ' style="opacity:0.5;cursor:default;"' : '';
-    html += `<div class="add-mode-card${isActive ? ' active' : ''}" data-mode="${key}"${disabled}>
+    const cardStyle = (m.badge === 'Coming Soon') ? ' style="opacity:0.5;cursor:default;"' : m.dimmed ? ' style="opacity:0.55;"' : '';
+    const badgeCss = m.badgeStyle || 'background:var(--accent);color:#fff;';
+    html += `<div class="add-mode-card${isActive ? ' active' : ''}" data-mode="${key}"${cardStyle}>
       <div class="add-mode-icon">${m.icon}</div>
       <div class="add-mode-info">
-        <div class="add-mode-title">${m.title}${m.badge ? ' <span style="font-size:9px;background:var(--accent);color:#fff;padding:2px 6px;border-radius:8px;font-weight:700;margin-left:6px;">' + m.badge + '</span>' : ''}</div>
+        <div class="add-mode-title">${m.title}${m.badge ? ' <span style="font-size:9px;' + badgeCss + 'padding:2px 6px;border-radius:8px;font-weight:700;margin-left:6px;">' + m.badge + '</span>' : ''}</div>
         <div class="add-mode-desc">${m.desc}</div>
       </div>
     </div>`;
@@ -1096,9 +1101,10 @@ async function loadSessions() {
     });
   }
   // Filter out hidden utility sessions (planner, auto-title, etc.)
+  // Convention: any session ID starting with "_" is a system/utility session.
   allSessions = allSessions.filter(s =>
-    !s.id.startsWith('_title_') &&
-    !(window._plannerSessionIds && window._plannerSessionIds.has(s.id))
+    !s.id.startsWith('_') &&
+    !(s.session_type && (s.session_type === 'planner' || s.session_type === 'title'))
   );
   // Purge stale alias entries (old pre-remap IDs still on disk or in daemon)
   if (window._idRemaps) {

@@ -1281,26 +1281,32 @@ function liveSubmitWaiting() {
 
 function liveSubmitInterrupt() {
   if (!liveSessionId) return;
-  // Preserve any text the user typed into the queue textarea so it isn't
-  // lost when the input bar is rebuilt in idle mode.
+  // Grab any text the user typed into the queue textarea (not yet queued).
   const queueTa = document.getElementById('live-queue-ta');
-  const preservedText = queueTa ? queueTa.value : '';
-  // Clear any queued commands — user is intentionally stopping, so we must
-  // NOT auto-send queued text when the session goes idle.
-  // Server-side clear ensures queue is emptied even if GUI disconnects.
-  socket.emit('clear_queue', {session_id: liveSessionId});
-  delete _sessionQueues[liveSessionId]; // optimistic local clear
+  const pendingText = queueTa ? queueTa.value.trim() : '';
+  // Collect already-queued messages
+  const queued = _getQueueList(liveSessionId);
+  const hasQueuedContent = queued.length > 0 || pendingText;
+
+  if (hasQueuedContent) {
+    // Merge all queued messages (+ pending textarea text) into a single
+    // message that will auto-send once the session goes idle after interrupt.
+    socket.emit('interrupt_session', {
+      session_id: liveSessionId,
+      merge_queue: true,
+      pending_text: pendingText,
+    });
+  } else {
+    // Nothing queued — plain interrupt, clear queue as before.
+    socket.emit('interrupt_session', {session_id: liveSessionId});
+  }
+  // Optimistic: clear local queue cache (server will push merged state via queue_updated)
+  delete _sessionQueues[liveSessionId];
   _renderQueueBanner();
-  socket.emit('interrupt_session', {session_id: liveSessionId});
   // Optimistic: immediately show idle state in the chat UI
   sessionKinds[liveSessionId] = 'idle';
   liveBarState = null;
   updateLiveInputBar();
-  // Restore the preserved text into the new idle textarea
-  if (preservedText) {
-    const idleTa = document.getElementById('live-input-ta');
-    if (idleTa) { idleTa.value = preservedText; _initAutoResize(idleTa); }
-  }
 }
 
 function liveClearDisplay() {

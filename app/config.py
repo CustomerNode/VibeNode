@@ -17,6 +17,28 @@ import os as _os
 _CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 _active_project: str = ""   # encoded dir name; empty = auto-detect
 _VIBENODE_DIR = Path(__file__).resolve().parent.parent  # always the VibeNode repo
+
+# Utility sessions (title gen, AI planner) use this cwd so their JSONL files
+# land in a separate project directory, never polluting the user's project.
+_SYSTEM_UTILITY_CWD = str(Path.home() / ".claude" / "_system")
+_SYSTEM_UTILITY_MAX_AGE = 86400  # 24 hours
+
+
+def _cleanup_system_sessions() -> None:
+    """Delete utility session JSONL files older than 24 hours."""
+    import time as _time
+    # The encoded project dir for _SYSTEM_UTILITY_CWD
+    encoded = _SYSTEM_UTILITY_CWD.replace("\\", "-").replace("/", "-").replace(":", "-")
+    sys_dir = _CLAUDE_PROJECTS / encoded
+    if not sys_dir.is_dir():
+        return
+    now = _time.time()
+    for f in sys_dir.glob("*.jsonl"):
+        try:
+            if now - f.stat().st_mtime > _SYSTEM_UTILITY_MAX_AGE:
+                f.unlink()
+        except Exception:
+            pass
 # Allow tests to override config path via env var
 _KANBAN_CONFIG_FILE = Path(_os.environ["VIBENODE_CONFIG"]) if _os.environ.get("VIBENODE_CONFIG") else _VIBENODE_DIR / "kanban_config.json"
 
@@ -105,7 +127,7 @@ def _sessions_dir() -> Path:
     # e.g. C:\Users\foo\Documents\ClaudeGUI -> C--Users-foo-Documents-ClaudeGUI
     repo_path = str(_VIBENODE_DIR).replace("\\", "-").replace("/", "-").replace(":", "-")
     for d in _CLAUDE_PROJECTS.iterdir():
-        if not d.is_dir() or d.name.startswith("subagents"):
+        if not d.is_dir() or d.name.startswith("subagents") or d.name.startswith("_"):
             continue
         # Case-insensitive match — Claude's encoding may differ in case
         if d.name.lower() == repo_path.lower():
@@ -117,7 +139,7 @@ def _sessions_dir() -> Path:
     if not _CLAUDE_PROJECTS.is_dir():
         return _CLAUDE_PROJECTS
     for d in _CLAUDE_PROJECTS.iterdir():
-        if not d.is_dir() or d.name.startswith("subagents"):
+        if not d.is_dir() or d.name.startswith("subagents") or d.name.startswith("_"):
             continue
         for f in d.glob("*.jsonl"):
             if f.stat().st_mtime > best_ts:
@@ -321,6 +343,65 @@ def _get_deleted_ids() -> set:
     tombstones = _load_tombstones()
     pruned = _prune_tombstones(tombstones)
     return set(pruned.keys())
+
+
+# ---------------------------------------------------------------------------
+# Utility session tracking -- hide system sessions (title, planner, etc.)
+# ---------------------------------------------------------------------------
+# When a utility session is spawned, its ID is recorded here.  When the SDK
+# remaps the ID, the new ID is also recorded.  all_sessions() filters out
+# any session whose ID appears in this set, so utility sessions never render
+# in the sidebar, grid, or list view — even after page refresh or restart.
+
+_UTILITY_MAX_AGE = 86400  # seconds (24 hours) — prune stale entries
+_utility_lock = _threading.Lock()
+
+
+def _utility_file() -> Path:
+    return _sessions_dir() / "_utility_sessions.json"
+
+
+def _load_utility() -> dict:
+    """Return {session_id: unix_timestamp} of utility sessions."""
+    uf = _utility_file()
+    try:
+        data = json.loads(uf.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_utility(data: dict) -> None:
+    _utility_file().write_text(
+        json.dumps(data, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _mark_utility(session_id: str) -> None:
+    """Record a session as a utility/system session (hidden from UI).
+
+    Called when starting title-generation, planner, or other ephemeral
+    system sessions.  Also called on ID remap so the new ID is tracked.
+    """
+    with _utility_lock:
+        data = _load_utility()
+        data[session_id] = time.time()
+        # Lazy prune — drop entries older than 24 h
+        now = time.time()
+        data = {
+            sid: ts for sid, ts in data.items()
+            if now - ts < _UTILITY_MAX_AGE
+        }
+        _save_utility(data)
+
+
+def _get_utility_ids() -> set:
+    """Return the set of session IDs marked as utility sessions."""
+    data = _load_utility()
+    now = time.time()
+    return {sid for sid, ts in data.items() if now - ts < _UTILITY_MAX_AGE}
 
 
 # ---------------------------------------------------------------------------

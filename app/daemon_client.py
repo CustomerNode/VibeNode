@@ -12,6 +12,8 @@ import queue
 import socket
 import threading
 import time
+
+from .config import _mark_utility, _get_utility_ids
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -39,7 +41,8 @@ class DaemonClient:
         self._cached_custom_rules = {}
         # Session IDs tagged as "planner" — hidden from all UI broadcasts.
         # Tracked here so the daemon doesn't need to know about session_type.
-        self._planner_ids = set()
+        # Seed from persistent file so utility sessions stay hidden after restart.
+        self._planner_ids = _get_utility_ids()
         # Track old→new session ID remaps so /api/sessions can resolve
         # aliased JSONL files to their canonical (SDK-assigned) IDs.
         self._id_aliases: dict[str, str] = {}
@@ -323,6 +326,23 @@ class DaemonClient:
                 self._id_aliases[old_id] = new_id
             if old_id in self._planner_ids:
                 self._planner_ids.add(new_id)
+                _mark_utility(new_id)
+        # When a utility session finishes, delete its JSONL so it never
+        # shows up on page refresh.  This catches both planner and title
+        # sessions regardless of ID remapping.
+        if isinstance(data, dict) and event_name == "session_state":
+            sid = data.get("session_id", "")
+            state = data.get("state", "")
+            if state in ("idle", "stopped") and sid in self._planner_ids:
+                self._cleanup_utility_jsonl(sid)
+        # Suppress ALL push events (state, entry, permission) for hidden
+        # utility sessions so they never reach the browser.  The daemon
+        # already filters most of these, but this is a defence-in-depth
+        # backstop that also covers planners started before a daemon upgrade.
+        if isinstance(data, dict):
+            _evt_sid = data.get("session_id", "")
+            if _evt_sid and (_evt_sid in self._planner_ids or _evt_sid.startswith("_")):
+                return
         self._emit_queue.put((event_name, data))
 
     def _emitter_loop(self):
@@ -370,6 +390,8 @@ class DaemonClient:
         # (the running daemon may not support the session_type param yet)
         if kwargs.get("session_type") in ("planner", "title"):
             self._planner_ids.add(session_id)
+            _mark_utility(session_id)
+            params["session_type"] = kwargs["session_type"]
         return self._send_request("start_session", params)
 
     def send_message(self, session_id, text):
@@ -382,10 +404,13 @@ class DaemonClient:
             "session_id": session_id, "allow": allow, "always": always,
         })
 
-    def interrupt_session(self, session_id):
-        return self._send_request("interrupt_session", {
-            "session_id": session_id,
-        })
+    def interrupt_session(self, session_id, merge_queue=False, pending_text=None):
+        params = {"session_id": session_id}
+        if merge_queue:
+            params["merge_queue"] = True
+        if pending_text:
+            params["pending_text"] = pending_text
+        return self._send_request("interrupt_session", params)
 
     def close_session(self, session_id):
         return self._send_request("close_session", {
@@ -406,16 +431,29 @@ class DaemonClient:
         """Resolve a possibly-aliased session ID to its canonical form."""
         return self._id_aliases.get(session_id, session_id)
 
+    def _cleanup_utility_jsonl(self, sid: str):
+        """Delete the JSONL file for a finished utility session."""
+        try:
+            from .config import _sessions_dir
+            sd = _sessions_dir()
+            jsonl = sd / f"{sid}.jsonl"
+            if jsonl.exists():
+                jsonl.unlink()
+                logger.debug("Cleaned up utility JSONL: %s", sid)
+        except Exception as e:
+            logger.debug("_cleanup_utility_jsonl(%s): %s", sid, e)
+
     def _save_registry_now(self):
         return self._send_request("save_registry_now")
 
     def get_all_states(self):
         result = self._send_request("get_all_states")
         if isinstance(result, list):
+            # Convention: underscore-prefixed IDs are system/utility sessions
             return [s for s in result
                     if s.get("session_id", "") not in self._planner_ids
                     and s.get("session_type", "") not in ("planner", "title")
-                    and not s.get("session_id", "").startswith("_title_")]
+                    and not s.get("session_id", "").startswith("_")]
         return []
 
     def get_entries(self, session_id, since=0):
@@ -480,5 +518,10 @@ class DaemonClient:
 
     def clear_queue(self, session_id):
         return self._send_request("clear_queue", {
+            "session_id": session_id,
+        })
+
+    def nudge_queue(self, session_id):
+        return self._send_request("nudge_queue", {
             "session_id": session_id,
         })

@@ -94,29 +94,64 @@ def ensure_daemon():
 # ---- Kill any stale processes on our ports before starting ----
 def _kill_port(port):
     """Kill ALL processes listening on a port. Retries until clear."""
-    if sys.platform != "win32":
-        return
     import subprocess as _sp
     for attempt in range(5):
         try:
-            r = _sp.run(
-                ["netstat", "-ano"],
-                capture_output=True, text=True, timeout=5,
-                creationflags=_sp.CREATE_NO_WINDOW,
-            )
             killed_any = False
             seen_pids = set()
-            for line in r.stdout.splitlines():
-                if (":%d " % port) in line and "LISTENING" in line:
-                    parts = line.split()
-                    pid = int(parts[-1])
+
+            if sys.platform == "win32":
+                r = _sp.run(
+                    ["netstat", "-ano"],
+                    capture_output=True, text=True, timeout=5,
+                    creationflags=_sp.CREATE_NO_WINDOW,
+                )
+                for line in r.stdout.splitlines():
+                    if (":%d " % port) in line and "LISTENING" in line:
+                        parts = line.split()
+                        pid = int(parts[-1])
+                        if pid > 0 and pid != os.getpid() and pid not in seen_pids:
+                            seen_pids.add(pid)
+                            _sp.run(["taskkill", "/PID", str(pid), "/F"],
+                                    capture_output=True, timeout=5,
+                                    creationflags=_sp.CREATE_NO_WINDOW)
+                            print("  Killed stale process %d on port %d" % (pid, port), flush=True)
+                            killed_any = True
+
+            elif sys.platform == "darwin":
+                r = _sp.run(
+                    ["lsof", "-ti", ":%d" % port],
+                    capture_output=True, text=True, timeout=5,
+                )
+                for pid_str in r.stdout.split():
+                    try:
+                        pid = int(pid_str)
+                    except ValueError:
+                        continue
                     if pid > 0 and pid != os.getpid() and pid not in seen_pids:
                         seen_pids.add(pid)
-                        _sp.run(["taskkill", "/PID", str(pid), "/F"],
-                                capture_output=True, timeout=5,
-                                creationflags=_sp.CREATE_NO_WINDOW)
+                        _sp.run(["kill", "-9", str(pid)],
+                                capture_output=True, timeout=5)
                         print("  Killed stale process %d on port %d" % (pid, port), flush=True)
                         killed_any = True
+
+            elif sys.platform == "linux":
+                r = _sp.run(
+                    ["lsof", "-ti", ":%d" % port],
+                    capture_output=True, text=True, timeout=5,
+                )
+                for pid_str in r.stdout.split():
+                    try:
+                        pid = int(pid_str)
+                    except ValueError:
+                        continue
+                    if pid > 0 and pid != os.getpid() and pid not in seen_pids:
+                        seen_pids.add(pid)
+                        _sp.run(["kill", "-9", str(pid)],
+                                capture_output=True, timeout=5)
+                        print("  Killed stale process %d on port %d" % (pid, port), flush=True)
+                        killed_any = True
+
             if not killed_any:
                 break
             time.sleep(0.5)
@@ -125,7 +160,14 @@ def _kill_port(port):
 
 if not _TEST_PORT:
     _kill_port(5050)
-    _kill_port(DAEMON_PORT)
+    # Only kill the daemon port on a cold start.  When the web server is
+    # restarted via /api/restart with scope="web", it sets
+    # VIBENODE_PRESERVE_DAEMON=1 so the living daemon (and all its active
+    # sessions/CLI subprocesses) survive the restart.
+    if os.environ.get("VIBENODE_PRESERVE_DAEMON") != "1":
+        _kill_port(DAEMON_PORT)
+    else:
+        print("  VIBENODE_PRESERVE_DAEMON=1 -- skipping daemon port kill", flush=True)
     time.sleep(0.3)  # brief pause for ports to release
 
     # ---- Singleton gate: only one web server allowed ----
@@ -233,12 +275,25 @@ app = create_app()
 def open_browser():
     import time
     time.sleep(0.8)
-    # Use Chrome explicitly (Firefox doesn't handle WebSockets well)
-    chrome = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-    try:
-        subprocess.Popen([chrome, "http://localhost:5050"])
-    except FileNotFoundError:
-        webbrowser.open("http://localhost:5050")
+    url = "http://localhost:5050"
+    if sys.platform == "win32":
+        chrome = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        try:
+            subprocess.Popen([chrome, url])
+        except FileNotFoundError:
+            webbrowser.open(url)
+    elif sys.platform == "darwin":
+        try:
+            subprocess.Popen(["open", url])
+        except FileNotFoundError:
+            webbrowser.open(url)
+    elif sys.platform == "linux":
+        try:
+            subprocess.Popen(["xdg-open", url])
+        except FileNotFoundError:
+            webbrowser.open(url)
+    else:
+        webbrowser.open(url)
 
 
 if __name__ == "__main__":

@@ -18,20 +18,20 @@ function restartServer() {
   overlay.className = 'modal-overlay';
   overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
   overlay.innerHTML = `
-    <div style="background:var(--bg-secondary,#1e1e2e);border:1px solid var(--border,#444);border-radius:10px;padding:24px 28px;min-width:340px;max-width:420px;color:var(--text,#cdd6f4);font-family:inherit">
-      <h3 style="margin:0 0 14px;font-size:16px">Restart — choose scope</h3>
+    <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:10px;padding:24px 28px;min-width:340px;max-width:420px;color:var(--text-primary);font-family:inherit">
+      <h3 style="margin:0 0 14px;font-size:16px;color:var(--text-heading)">Restart — choose scope</h3>
       <div style="display:flex;flex-direction:column;gap:8px">
-        <button class="restart-opt" data-scope="web" style="padding:10px 14px;border-radius:6px;border:1px solid var(--border,#444);background:var(--bg-tertiary,#313244);color:var(--text,#cdd6f4);cursor:pointer;text-align:left">
-          <strong>Web Server</strong> (port 5050)<br><span style="font-size:12px;opacity:.7">Reloads Python code. Running agents stay alive.</span>
+        <button class="restart-opt" data-scope="web" style="padding:10px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-primary);cursor:pointer;text-align:left">
+          <strong>Web Server</strong> (port 5050)<br><span style="font-size:12px;color:var(--text-muted)">Reloads Python code. Running agents stay alive.</span>
         </button>
-        <button class="restart-opt" data-scope="daemon" style="padding:10px 14px;border-radius:6px;border:1px solid var(--border,#444);background:var(--bg-tertiary,#313244);color:var(--text,#cdd6f4);cursor:pointer;text-align:left">
-          <strong>Session Daemon</strong> (port 5051)<br><span style="font-size:12px;opacity:.7">Restarts Claude SDK daemon. All running sessions will be killed.</span>
+        <button class="restart-opt" data-scope="daemon" style="padding:10px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-primary);cursor:pointer;text-align:left">
+          <strong>Session Daemon</strong> (port 5051)<br><span style="font-size:12px;color:var(--text-muted)">Restarts Claude SDK daemon. All running sessions will be killed.</span>
         </button>
-        <button class="restart-opt" data-scope="both" style="padding:10px 14px;border-radius:6px;border:1px solid var(--border,#444);background:var(--bg-tertiary,#313244);color:var(--text,#cdd6f4);cursor:pointer;text-align:left">
-          <strong>Both</strong> (5050 + 5051)<br><span style="font-size:12px;opacity:.7">Full restart. All sessions will be killed.</span>
+        <button class="restart-opt" data-scope="both" style="padding:10px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-primary);cursor:pointer;text-align:left">
+          <strong>Both</strong> (5050 + 5051)<br><span style="font-size:12px;color:var(--text-muted)">Full restart. All sessions will be killed.</span>
         </button>
       </div>
-      <button id="restart-cancel" style="margin-top:14px;padding:6px 16px;border-radius:6px;border:1px solid var(--border,#444);background:transparent;color:var(--text,#cdd6f4);cursor:pointer;float:right">Cancel</button>
+      <button id="restart-cancel" style="margin-top:14px;padding:6px 16px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-primary);cursor:pointer;float:right">Cancel</button>
     </div>`;
   document.body.appendChild(overlay);
 
@@ -39,8 +39,8 @@ function restartServer() {
   overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
 
   overlay.querySelectorAll('.restart-opt').forEach(btn => {
-    btn.onmouseenter = () => { btn.style.borderColor = 'var(--accent,#89b4fa)'; };
-    btn.onmouseleave = () => { btn.style.borderColor = 'var(--border,#444)'; };
+    btn.onmouseenter = () => { btn.style.borderColor = 'var(--accent)'; };
+    btn.onmouseleave = () => { btn.style.borderColor = 'var(--border)'; };
     btn.onclick = () => {
       const scope = btn.dataset.scope;
       overlay.remove();

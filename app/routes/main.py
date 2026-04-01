@@ -33,55 +33,80 @@ def restart_server():
 
         ports = []
         if scope in ("web", "both"):
-            ports.append("5050")
+            ports.append(5050)
         if scope in ("daemon", "both"):
-            ports.append("5051")
+            ports.append(5051)
         if not ports:
-            ports = ["5050"]
-
-        port_list = ",".join(ports)
+            ports = [5050]
 
         run_py = os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "run.py")
         run_py = os.path.abspath(run_py)
-        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-        if not os.path.exists(pythonw):
-            pythonw = sys.executable
-
         project_dir = os.path.dirname(run_py)
 
-        # PowerShell restart script that:
-        # 1. Kills processes on the specified port(s)
-        # 2. Purges all __pycache__ so fresh code is loaded
-        # 3. Launches run.py (which reconnects to existing daemon or starts new one)
-        restart_cmd = (
-            "powershell -NoProfile -Command \""
-            "$maxTries = 10; "
-            "for ($i = 0; $i -lt $maxTries; $i++) { "
-            f"  $pids = @(Get-NetTCPConnection -LocalPort {port_list} -ErrorAction SilentlyContinue | "
-            "    Select-Object -ExpandProperty OwningProcess -Unique); "
-            "  if ($pids.Count -eq 0) { break }; "
-            "  $pids | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }; "
-            "  Start-Sleep -Milliseconds 500 "
-            "}; "
-            f"Get-ChildItem -Path '{project_dir}' -Recurse -Directory -Filter '__pycache__' | "
-            "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue; "
-            "Start-Sleep -Seconds 1; "
-            f"Start-Process -FilePath '{pythonw}' -ArgumentList '\"{run_py}\"' "
-            f"-WorkingDirectory '{project_dir}'"
-            "\""
-        )
+        # When doing a web-only restart, tell run.py to preserve the daemon
+        # so active sessions and their CLI subprocesses are not killed.
+        preserve_daemon = scope == "web"
 
-        creation_flags = 0
         if sys.platform == "win32":
-            creation_flags = (
-                subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+            pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+            if not os.path.exists(pythonw):
+                pythonw = sys.executable
+
+            port_list = ",".join(str(p) for p in ports)
+            env_set = "$env:VIBENODE_PRESERVE_DAEMON='1'; " if preserve_daemon else ""
+            restart_cmd = (
+                "powershell -NoProfile -Command \""
+                "$maxTries = 10; "
+                "for ($i = 0; $i -lt $maxTries; $i++) { "
+                f"  $pids = @(Get-NetTCPConnection -LocalPort {port_list} -ErrorAction SilentlyContinue | "
+                "    Select-Object -ExpandProperty OwningProcess -Unique); "
+                "  if ($pids.Count -eq 0) { break }; "
+                "  $pids | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }; "
+                "  Start-Sleep -Milliseconds 500 "
+                "}; "
+                f"Get-ChildItem -Path '{project_dir}' -Recurse -Directory -Filter '__pycache__' | "
+                "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue; "
+                "Start-Sleep -Seconds 1; "
+                f"{env_set}"
+                f"Start-Process -FilePath '{pythonw}' -ArgumentList '\"{run_py}\"' "
+                f"-WorkingDirectory '{project_dir}'"
+                "\""
+            )
+            subprocess.Popen(
+                restart_cmd,
+                shell=True,
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
             )
 
-        subprocess.Popen(
-            restart_cmd,
-            shell=True,
-            creationflags=creation_flags,
-        )
+        elif sys.platform == "darwin":
+            kill_cmds = " ".join(
+                f"lsof -ti :{p} | xargs kill -9 2>/dev/null;" for p in ports
+            )
+            env_prefix = "VIBENODE_PRESERVE_DAEMON=1 " if preserve_daemon else ""
+            restart_cmd = (
+                f"bash -c '"
+                f"for i in $(seq 1 10); do {kill_cmds} sleep 0.5; done; "
+                f"find \"{project_dir}\" -type d -name __pycache__ -exec rm -rf {{}} + 2>/dev/null; "
+                f"sleep 1; "
+                f"nohup {env_prefix}\"{sys.executable}\" \"{run_py}\" "
+                f"> /dev/null 2>&1 &'"
+            )
+            subprocess.Popen(restart_cmd, shell=True)
+
+        elif sys.platform == "linux":
+            kill_cmds = " ".join(
+                f"lsof -ti :{p} | xargs kill -9 2>/dev/null;" for p in ports
+            )
+            env_prefix = "VIBENODE_PRESERVE_DAEMON=1 " if preserve_daemon else ""
+            restart_cmd = (
+                f"bash -c '"
+                f"for i in $(seq 1 10); do {kill_cmds} sleep 0.5; done; "
+                f"find \"{project_dir}\" -type d -name __pycache__ -exec rm -rf {{}} + 2>/dev/null; "
+                f"sleep 1; "
+                f"nohup {env_prefix}\"{sys.executable}\" \"{run_py}\" "
+                f"> /dev/null 2>&1 &'"
+            )
+            subprocess.Popen(restart_cmd, shell=True)
 
         return jsonify({"ok": True, "message": f"Restarting ({scope})..."})
     except Exception as e:

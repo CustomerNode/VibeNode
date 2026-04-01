@@ -252,9 +252,11 @@ def _daemon_title(messages: list) -> str | None:
     msg_block = "\n".join(f"- {t}" for t in texts)
     sid = f"_title_{uuid.uuid4().hex[:8]}"
 
+    from .config import _SYSTEM_UTILITY_CWD
     result = sm.start_session(
         session_id=sid,
         prompt=msg_block,
+        cwd=_SYSTEM_UTILITY_CWD,
         system_prompt=_TITLE_SYSTEM_PROMPT + "\n\nIMPORTANT: Do NOT use any tools. Just reply with the title text directly.",
         max_turns=1,
         model="haiku",
@@ -280,23 +282,48 @@ def _daemon_title(messages: list) -> str | None:
             entries = sm.get_entries(sid, since=0)
             title = _extract_title_from_entries(entries, texts)
             sm.remove_session(sid)
-            _cleanup_title_jsonl(sid)
+            _cleanup_title_jsonl(sid, sm)
             return title
 
     # Timeout — grab whatever we have
     entries = sm.get_entries(sid, since=0)
     sm.remove_session(sid)
-    _cleanup_title_jsonl(sid)
+    _cleanup_title_jsonl(sid, sm)
     return _extract_title_from_entries(entries, texts)
 
 
-def _cleanup_title_jsonl(sid: str):
-    """Delete leftover JSONL files created by title generation sessions."""
+def _cleanup_title_jsonl(sid: str, sm=None):
+    """Delete leftover JSONL files created by title generation sessions.
+
+    The SDK remaps session IDs, so the JSONL may be under a different name
+    than the original sid.  Check both the original and remapped ID.
+    """
     try:
         from app.config import _sessions_dir
-        jsonl = _sessions_dir() / f"{sid}.jsonl"
+        sd = _sessions_dir()
+        # Try original ID
+        jsonl = sd / f"{sid}.jsonl"
         if jsonl.exists():
             jsonl.unlink()
+        # Try remapped ID
+        if sm and hasattr(sm, '_id_aliases'):
+            remapped = sm._id_aliases.get(sid)
+            if remapped:
+                rjsonl = sd / f"{remapped}.jsonl"
+                if rjsonl.exists():
+                    rjsonl.unlink()
+                    return
+        # Fallback: title sessions are tiny (<5KB), scan and match by content
+        import json as _json
+        for f in sd.glob("*.jsonl"):
+            if f.stat().st_size > 5000:
+                continue
+            try:
+                first = _json.loads(f.read_text(encoding="utf-8").split("\n", 1)[0])
+                if "You generate short titles" in first.get("content", ""):
+                    f.unlink()
+            except Exception:
+                pass
     except Exception as e:
         log.debug("_cleanup_title_jsonl: %s", e)
 
@@ -466,18 +493,22 @@ def _heuristic_title(messages: list) -> str:
 def smart_title(messages: list) -> str:
     """Generate a session title.
 
-    Tries three strategies in order:
-      1. Direct Anthropic API  (needs ANTHROPIC_API_KEY)
-      2. Claude CLI             (uses CLI auth / OAuth)
-      3. Local heuristic        (instant, no API)
+    Tries strategies in order:
+      1. Session daemon          (uses existing daemon connection, isolated cwd)
+      2. Direct Anthropic API    (needs ANTHROPIC_API_KEY)
+      3. Local heuristic         (instant, no API)
+
+    NOTE: _cli_title is intentionally excluded — spawning `claude -p` writes
+    a JSONL into the user's project directory with no way to control the path,
+    causing phantom sessions to appear on page refresh.
     """
+    title = _daemon_title(messages)
+    if title:
+        log.debug("Title from daemon: %r", title)
+        return title
     title = _llm_title(messages)
     if title:
         log.debug("Title from API: %r", title)
-        return title
-    title = _cli_title(messages)
-    if title:
-        log.debug("Title from CLI: %r", title)
         return title
     title = _heuristic_title(messages)
     log.debug("Title from heuristic: %r", title)

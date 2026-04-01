@@ -287,14 +287,8 @@ async function _initKanbanImpl() {
     kanbanColumns = data.columns || [];
     kanbanTasks = data.tasks || [];
 
-    // Fetch all tags for the project
-    try {
-      const tagRes = await fetch('/api/kanban/tags?project_id=' + encodeURIComponent(data.columns?.[0]?.project_id || ''));
-      if (tagRes.ok) {
-        const tagData = await tagRes.json();
-        kanbanAllTags = tagData.tags || [];
-      }
-    } catch (e) { /* ignore tag fetch errors */ }
+    // Tags are included in the board response — no separate fetch needed
+    if (data.tags) kanbanAllTags = data.tags;
 
     renderKanbanBoard(data);
     _kanbanHasLoaded = true;
@@ -720,6 +714,7 @@ function _submitPlanWithAi() {
 }
 
 let _plannerProposal = null;
+let _plannerScopeParentId = null;  // non-null = scoped plan (drill-down subtree)
 
 let _plannerSessionId = null;
 let _plannerStashed = null;
@@ -743,7 +738,10 @@ function _buildPlannerPanel() {
   panel.innerHTML = `
     <div class="kanban-planner-header">
       <span class="kanban-planner-title">${KI.plan} Plan with AI</span>
-      <button class="kanban-planner-close" onclick="_closePlannerSlideout()" title="Close">&times;</button>
+      <div style="display:flex;gap:4px;align-items:center;">
+        <button class="kanban-planner-close" onclick="_minimizePlanner()" title="Minimize" style="font-size:16px;">&#x2015;</button>
+        <button class="kanban-planner-close" onclick="_closePlannerSlideout()" title="Close">&times;</button>
+      </div>
     </div>
     <div class="planner-body" id="planner-body">
       <div class="planner-status" id="planner-status">
@@ -880,6 +878,7 @@ function _openPlannerSlideout(prompt) {
   _plannerSessionId = newId;
 
   // Don't add to allSessions — planner is a utility session, not user-visible
+  if (typeof _hiddenSessionIds !== 'undefined') _hiddenSessionIds.add(newId);
 
   // Build and show panel
   const panel = _buildPlannerPanel();
@@ -887,9 +886,11 @@ function _openPlannerSlideout(prompt) {
   requestAnimationFrame(() => panel.classList.add('open'));
   setTimeout(_wirePlannerVoice, 350);
 
-  // Hide main toolbar
+  // Hide main toolbar and any live panel input bar
   const tb = document.getElementById('main-toolbar');
   if (tb) tb.style.display = 'none';
+  const inputBar = document.getElementById('live-input-bar');
+  if (inputBar) inputBar.style.display = 'none';
 
   // Attach listeners BEFORE emitting
   _attachPlannerListeners();
@@ -904,6 +905,7 @@ function _openPlannerSlideout(prompt) {
     cwd: typeof _currentProjectDir === 'function' ? _currentProjectDir() : '',
     system_prompt: _PLANNER_SYSTEM,
     max_turns: 1,
+    session_type: 'planner',
   });
 }
 
@@ -970,11 +972,12 @@ function _renderPlanTree(tasks, depth) {
   for (let i = 0; i < tasks.length; i++) {
     const t = tasks[i];
     const hasSubs = t.subtasks && t.subtasks.length > 0;
-    html += `<div class="planner-node" data-depth="${depth}">
+    const totalSubs = hasSubs ? _countTasks(t.subtasks) : 0;
+    html += `<div class="planner-node${hasSubs && depth > 0 ? ' collapsed' : ''}" data-depth="${depth}">
       <div class="planner-node-row" onclick="${hasSubs ? 'this.parentElement.classList.toggle(\'collapsed\')' : ''}">
         ${hasSubs ? '<span class="planner-chevron">' + KI.chevronR + '</span>' : '<span class="planner-bullet">' + KI.bullet + '</span>'}
         <span class="planner-node-title">${escHtml(t.title)}</span>
-        ${hasSubs ? '<span class="planner-sub-count">' + t.subtasks.length + '</span>' : ''}
+        ${hasSubs ? '<span class="planner-sub-count">' + totalSubs + '</span>' : ''}
       </div>
       ${t.description ? '<div class="planner-node-desc">' + escHtml(t.description) + '</div>' : ''}
       ${hasSubs ? _renderPlanTree(t.subtasks, depth + 1) : ''}
@@ -999,15 +1002,28 @@ async function _acceptPlan() {
     const res = await fetch('/api/kanban/planner/accept', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ proposal: _plannerProposal, insert_position: _insertPosition }),
+      body: JSON.stringify({ proposal: _plannerProposal, insert_position: _insertPosition, parent_id: _plannerScopeParentId || null }),
     });
     if (!res.ok) throw new Error('Failed to create tasks');
     const data = await res.json();
     const count = data.created_count || 0;
+    const createdIds = data.created_ids || [];
     if (typeof showToast === 'function') showToast('Created ' + count + ' task' + (count !== 1 ? 's' : ''));
     _plannerStashed = null;
+    _plannerScopeParentId = null;
     _closePlannerSlideout();
-    if (typeof initKanban === 'function') initKanban(true);
+    // Re-render board then highlight new tasks
+    setTimeout(async () => {
+      if (typeof initKanban === 'function') await initKanban(true);
+      // Brief highlight on newly created root tasks
+      for (const id of createdIds) {
+        const el = document.querySelector('[data-task-id="' + id + '"]');
+        if (el) {
+          el.classList.add('kanban-task-highlight');
+          setTimeout(() => el.classList.remove('kanban-task-highlight'), 2500);
+        }
+      }
+    }, 350);
   } catch (e) {
     if (typeof showToast === 'function') showToast('Failed: ' + e.message, true);
     if (btn) { btn.disabled = false; btn.textContent = 'Add to Board'; }
@@ -1026,9 +1042,65 @@ function _closePlannerSlideout() {
     panel.classList.remove('open');
     setTimeout(() => panel.remove(), 300);
   }
-  // Restore main toolbar if a session was selected before
+  // Remove minimized bubble too
+  const bubble = document.getElementById('planner-minimized-bubble');
+  if (bubble) bubble.remove();
+  // Restore main toolbar and input bar if a session was selected before
   const tb = document.getElementById('main-toolbar');
   if (tb && typeof activeId !== 'undefined' && activeId) tb.style.display = '';
+  const inputBar = document.getElementById('live-input-bar');
+  if (inputBar && typeof activeId !== 'undefined' && activeId) inputBar.style.display = '';
+}
+
+function _minimizePlanner() {
+  const panel = document.getElementById('kanban-planner-panel');
+  if (!panel) return;
+  panel.classList.remove('open');
+  setTimeout(() => { panel.style.display = 'none'; }, 300);
+  // Restore toolbar
+  const tb = document.getElementById('main-toolbar');
+  if (tb && typeof activeId !== 'undefined' && activeId) tb.style.display = '';
+  // Show bubble
+  let bubble = document.getElementById('planner-minimized-bubble');
+  if (!bubble) {
+    bubble = document.createElement('div');
+    bubble.id = 'planner-minimized-bubble';
+    bubble.className = 'planner-minimized-bubble';
+    bubble.onclick = _restorePlanner;
+    document.body.appendChild(bubble);
+  }
+  const taskCount = _plannerProposal ? _countTasks(_plannerProposal.tasks || []) : 0;
+  bubble.innerHTML = KI.plan + ' <span>AI Plan' + (taskCount ? ' \u00B7 ' + taskCount + ' tasks' : '') + '</span>';
+  bubble.style.display = '';
+}
+
+function _openScopedPlanner(parentId, existingCount) {
+  if (existingCount > 0) {
+    if (!confirm('This will replace the ' + existingCount + ' existing subtask' + (existingCount !== 1 ? 's' : '') + ' with AI-generated ones. Continue?')) return;
+  }
+  _plannerScopeParentId = parentId;
+  // Fetch the parent task title to give AI context
+  fetch('/api/kanban/tasks/' + parentId).then(r => r.json()).then(data => {
+    const title = data.title || 'this task';
+    const desc = data.description || '';
+    const prompt = 'Break down the following task into subtasks:\n\nTask: ' + title + (desc ? '\nDescription: ' + desc : '');
+    _openPlannerSlideout(prompt);
+  }).catch(() => {
+    _openPlannerSlideout('Break down this task into subtasks.');
+  });
+}
+
+function _restorePlanner() {
+  const panel = document.getElementById('kanban-planner-panel');
+  if (panel) {
+    panel.style.display = '';
+    requestAnimationFrame(() => panel.classList.add('open'));
+  }
+  const bubble = document.getElementById('planner-minimized-bubble');
+  if (bubble) bubble.style.display = 'none';
+  // Hide toolbar again
+  const tb = document.getElementById('main-toolbar');
+  if (tb) tb.style.display = 'none';
 }
 
 function _resumePlan() {
@@ -1554,6 +1626,7 @@ async function renderTaskDetail(taskId) {
       const pct = childCount > 0 ? Math.round((childDone / childCount) * 100) : 0;
       html += '<div class="kanban-drill-panel-header">';
       html += `<span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px;color:var(--text-dim);">Subtasks</span>`;
+      html += `<button class="kanban-drill-ai-plan-btn" onclick="_openScopedPlanner('${task.id}', ${childCount})" title="Plan subtasks with AI">${KI.plan} AI</button>`;
       html += `<span class="kanban-drill-switch-icon" onclick="confirmModeSwitch('${task.id}', 'sessions')" title="Switch to sessions">${KI.refresh || '&#8644;'}</span>`;
       html += `<span class="kanban-drill-inline-progress"><span class="kanban-drill-inline-bar"><span class="kanban-drill-inline-fill" style="width:${pct}%"></span></span><span class="kanban-drill-inline-pct">${pct}%</span></span>`;
       html += '</div>';

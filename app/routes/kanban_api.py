@@ -1,6 +1,37 @@
 """
 Kanban board REST API -- task CRUD, status transitions, session linking,
 column configuration, and issue tracking.
+
+Performance notes (Supabase)
+----------------------------
+Every Supabase call is an HTTPS round-trip (~50-150ms).  The board and
+drill-down endpoints are optimized to minimize these:
+
+1. **ensure_project_columns** is cached in-memory after the first call
+   (_ensured_projects set in defaults.py).  Cost: 0ms after first request.
+
+2. **get_board** fetches columns + all tasks in 2 queries.  Depth is
+   computed in Python from the flat task list (see _compute_depths in
+   supabase_backend.py) — the old code walked the parent chain per-row
+   which caused 60-80 extra queries for ~30 tasks.
+
+3. **_build_recursive_counts** computes children counts and session
+   counts from the already-fetched task list + one batch session query.
+   The old code did recursive per-task get_children + get_task_sessions
+   calls (N+1 pattern).
+
+4. **Tags are merged into the board response** so the frontend doesn't
+   need a second fetch to /api/kanban/tags.
+
+5. **Task detail (drill-down)** reuses get_board to fetch all tasks in
+   one shot, then filters/enriches in Python.  The old code did per-child
+   get_children + recursive _count_descendant_sessions calls.
+
+6. **Task move** emits only kanban_task_moved (not kanban_task_updated
+   too), avoiding a double board refresh on the frontend.
+
+Rule of thumb: never call repo.get_children / repo.get_task_sessions /
+repo.get_ancestors in a loop.  Fetch all tasks once, compute in Python.
 """
 
 import os
@@ -36,6 +67,65 @@ def _count_descendant_sessions(repo, task_id):
     for child in repo.get_children(task_id):
         count += _count_descendant_sessions(repo, child.id)
     return count
+
+
+def _build_recursive_counts(all_tasks, repo):
+    """Build children counts and session counts from already-fetched task list.
+
+    Returns (child_counts, session_counts) dicts keyed by task_id.
+    child_counts[id] = (total_children, completed_children) — recursive
+    session_counts[id] = total_sessions — recursive (direct only for now)
+
+    Does all computation in Python from the flat task list + one batch
+    session query instead of N+1 recursive DB calls.
+    """
+    # Build parent -> children index
+    children_by_parent = {}
+    for t in all_tasks:
+        pid = t.parent_id
+        if pid:
+            children_by_parent.setdefault(pid, []).append(t)
+
+    # Batch-fetch session counts for ALL tasks in one query
+    all_ids = [t.id for t in all_tasks]
+    if hasattr(repo, 'get_session_counts_batch') and all_ids:
+        direct_sessions = repo.get_session_counts_batch(all_ids)
+    else:
+        direct_sessions = {}
+
+    # Recursive count caches
+    _child_cache = {}
+    _session_cache = {}
+
+    def _recurse_children(tid):
+        if tid in _child_cache:
+            return _child_cache[tid]
+        kids = children_by_parent.get(tid, [])
+        total = len(kids)
+        done = sum(1 for c in kids if c.status.value == 'complete')
+        for c in kids:
+            sub_total, sub_done = _recurse_children(c.id)
+            total += sub_total
+            done += sub_done
+        _child_cache[tid] = (total, done)
+        return (total, done)
+
+    def _recurse_sessions(tid):
+        if tid in _session_cache:
+            return _session_cache[tid]
+        count = direct_sessions.get(tid, 0)
+        for c in children_by_parent.get(tid, []):
+            count += _recurse_sessions(c.id)
+        _session_cache[tid] = count
+        return count
+
+    child_counts = {}
+    session_counts = {}
+    for t in all_tasks:
+        child_counts[t.id] = _recurse_children(t.id)
+        session_counts[t.id] = _recurse_sessions(t.id)
+
+    return child_counts, session_counts
 
 
 def _get_project_id():
@@ -79,9 +169,12 @@ def get_board():
         parent_id – scope to a parent task's children
     """
     try:
+        import time as _t, logging as _lg
+        _bt = [_t.perf_counter()]
         repo = _get_repo()
         project_id = _get_project_id()
         ensure_project_columns(repo, project_id)
+        _bt.append(_t.perf_counter())  # [1] after ensure_cols
 
         # Pagination params
         page = max(1, int(request.args.get("page", 1)))
@@ -95,16 +188,33 @@ def get_board():
         scope_parent_id = request.args.get("parent_id", "").strip() or None
 
         board = repo.get_board(project_id)
+        _bt.append(_t.perf_counter())  # [2] after get_board
         columns = board.get("columns", [])
         tasks = board.get("tasks", {})
 
-        # If scoped to a parent, filter to only show that parent's children
+        # Collect ALL tasks (flat) for recursive count computation
+        all_tasks_flat = []
+        for v in (tasks.values() if isinstance(tasks, dict) else []):
+            all_tasks_flat.extend(v)
+
+        # Build recursive counts in Python from the flat list + one batch
+        # session query — replaces the old N+1 _count_descendant_sessions.
+        child_counts, session_counts = _build_recursive_counts(all_tasks_flat, repo)
+        _bt.append(_t.perf_counter())  # [3] after counts
+
+        # Filter to the requested level — no extra DB queries needed,
+        # all_tasks_flat already has every task in the project.
         if scope_parent_id:
-            children = repo.get_children(scope_parent_id)
-            child_ids = {c.id for c in children}
+            # Drill-down: show direct children of the scoped parent
             filtered = {}
             for k, v in (tasks.items() if isinstance(tasks, dict) else []):
-                filtered[k] = [t for t in v if t.id in child_ids]
+                filtered[k] = [t for t in v if t.parent_id == scope_parent_id]
+            tasks = filtered
+        else:
+            # Default: show only root tasks (no parent)
+            filtered = {}
+            for k, v in (tasks.items() if isinstance(tasks, dict) else []):
+                filtered[k] = [t for t in v if not t.parent_id]
             tasks = filtered
 
         # Apply tag filter — keep only tasks that have ALL requested tags
@@ -138,26 +248,6 @@ def get_board():
             col_dict['has_more'] = end < total_count
             column_dicts.append(col_dict)
 
-            # Batch children/session counts using repo methods
-            # Uses get_children_counts if available, falls back to per-task
-            child_counts = {}
-            session_counts = {}
-            task_ids = [t.id for t in page_tasks]
-
-            if hasattr(repo, 'get_children_counts_batch'):
-                child_counts = repo.get_children_counts_batch(task_ids)
-                # Always use recursive count for sessions (batch only counts direct)
-                for tid in task_ids:
-                    session_counts[tid] = _count_descendant_sessions(repo, tid)
-            else:
-                for tid in task_ids:
-                    children = repo.get_children(tid)
-                    child_counts[tid] = (
-                        len(children),
-                        sum(1 for c in children if c.status.value == 'complete'),
-                    )
-                    session_counts[tid] = _count_descendant_sessions(repo, tid)
-
             for t in page_tasks:
                 td = t.to_dict() if hasattr(t, 'to_dict') else t
                 cc = child_counts.get(td['id'], (0, 0))
@@ -167,10 +257,26 @@ def get_board():
                 td['active_sessions'] = 0
                 enriched_flat.append(td)
 
+        _bt.append(_t.perf_counter())  # [4] after enrichment
+        _lg.getLogger("kanban_api").warning(
+            "BOARD ensure=%.0fms board=%.0fms counts=%.0fms enrich=%.0fms TOTAL=%.0fms tasks=%d",
+            (_bt[1]-_bt[0])*1000, (_bt[2]-_bt[1])*1000, (_bt[3]-_bt[2])*1000,
+            (_bt[4]-_bt[3])*1000, (_bt[4]-_bt[0])*1000, len(all_tasks_flat))
+        # Include all tags so the frontend doesn't need a second fetch
+        try:
+            all_tags = repo.get_all_tags(project_id)
+        except Exception:
+            all_tags = []
+
+        _timing = {"ensure": int((_bt[1]-_bt[0])*1000), "board": int((_bt[2]-_bt[1])*1000),
+                   "counts": int((_bt[3]-_bt[2])*1000), "enrich": int((_bt[4]-_bt[3])*1000),
+                   "total": int((_bt[4]-_bt[0])*1000), "tasks": len(all_tasks_flat)}
         return jsonify({
             "columns": column_dicts,
             "tasks": enriched_flat,
+            "tags": all_tags,
             "active_tag_filter": active_tag_filter,
+            "_timing": _timing,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -245,32 +351,43 @@ def get_task(task_id):
         if task is None:
             return jsonify({"error": "Task not found"}), 404
 
-        children = repo.get_children(task_id)
+        # Fetch all project tasks in ONE query, compute counts in Python.
+        # This replaces N+1 get_children + recursive _count_descendant_sessions
+        # calls that were causing 8s+ response times on Supabase.
+        project_id = _get_project_id()
+        board = repo.get_board(project_id)
+        all_tasks_flat = []
+        for v in board.get("tasks", {}).values():
+            all_tasks_flat.extend(v)
+        child_counts, session_counts = _build_recursive_counts(all_tasks_flat, repo)
+
+        # Build parent->children index from flat list
+        children_by_parent = {}
+        for t in all_tasks_flat:
+            if t.parent_id:
+                children_by_parent.setdefault(t.parent_id, []).append(t)
+
+        children = children_by_parent.get(task_id, [])
         sessions = repo.get_task_sessions(task_id)
         issues = repo.get_open_issues(task_id)
         result = _task_response(task)
 
-        # Enrich children with computed fields (children_count, etc.)
+        # Enrich children with precomputed counts (no extra queries)
         enriched_children = []
         for c in children:
             cd = _task_response(c)
-            grandchildren = repo.get_children(c.id)
-            cd['children_count'] = len(grandchildren)
-            cd['children_complete'] = sum(
-                1 for gc in grandchildren if gc.status.value == 'complete'
-            )
-            cd['session_count'] = _count_descendant_sessions(repo, c.id)
+            cc = child_counts.get(c.id, (0, 0))
+            cd['children_count'] = cc[0]
+            cd['children_complete'] = cc[1]
+            cd['session_count'] = session_counts.get(c.id, 0)
             cd['active_sessions'] = 0
             enriched_children.append(cd)
 
-        # Enrich parent task too
-        result['children_count'] = len(children)
-        result['children_complete'] = sum(
-            1 for c in children if c.status.value == 'complete'
-        )
-        result['session_count'] = len(sessions) + sum(
-            _count_descendant_sessions(repo, c.id) for c in children
-        )
+        # Enrich parent task with precomputed counts
+        parent_cc = child_counts.get(task_id, (0, 0))
+        result['children_count'] = parent_cc[0]
+        result['children_complete'] = parent_cc[1]
+        result['session_count'] = session_counts.get(task_id, 0)
         result['active_sessions'] = 0
 
         result["children"] = enriched_children
@@ -375,8 +492,7 @@ def move_task(task_id):
         repo = _get_repo()
         updated = transition_task(repo, task_id, new_status, force=force)
 
-        _emit("kanban_task_updated", updated)
-        # Plan line 2281: emit kanban_task_moved with old/new column + position
+        # Only emit moved (not updated too — both trigger full board refresh)
         _emit("kanban_task_moved", {
             "task_id": task_id,
             "old_status": old_status,
@@ -922,19 +1038,34 @@ def planner_accept():
         project_id = _get_project_id()
         now = datetime.now(timezone.utc).isoformat()
         insert_position = data.get("insert_position", "bottom")
+        scope_parent_id = data.get("parent_id")  # scoped plan: insert under this parent
         count = [0]
+        root_ids = []  # track top-level created task IDs for highlight
 
-        def _insert_recursive(items, parent_id=None):
+        from ..db.repository import Task, TaskStatus
+
+        # If scoped to a parent, delete existing subtree first
+        if scope_parent_id:
+            existing_children = repo.get_children(scope_parent_id)
+            for child in existing_children:
+                try:
+                    repo.delete_task(child.id)
+                except Exception:
+                    pass
+
+        # Flatten the tree into a list of (task_obj) for bulk insert
+        flat_tasks = []
+
+        def _flatten(items, parent_id=None):
             for i, item in enumerate(items):
                 task_id = str(uuid_mod.uuid4())
-                # Top: use negative positions so they sort before existing tasks
-                # Bottom: use large positions after existing tasks
+                if parent_id is None:
+                    root_ids.append(task_id)
                 if insert_position == "top" and parent_id is None:
                     position = -(len(items) - i) * 1000
                 else:
                     position = (i + 1) * 1000
-                from ..db.repository import Task, TaskStatus
-                task_obj = Task(
+                flat_tasks.append(Task(
                     id=task_id,
                     project_id=project_id,
                     parent_id=parent_id,
@@ -946,16 +1077,56 @@ def planner_accept():
                     depth=0,
                     created_at=now,
                     updated_at=now,
-                )
-                repo.create_task(task_obj)
+                ))
                 count[0] += 1
                 subtasks = item.get("subtasks", [])
                 if subtasks:
-                    _insert_recursive(subtasks, task_id)
+                    _flatten(subtasks, task_id)
 
-        _insert_recursive(tasks)
+        _flatten(tasks, parent_id=scope_parent_id)
+
+        # Batch insert for speed — single transaction (SQLite) or
+        # single bulk API call (Supabase) instead of N round-trips.
+        if hasattr(repo, '_get_conn'):
+            # SQLite: all inserts in one transaction, one commit
+            conn = repo._get_conn()
+            for t in flat_tasks:
+                conn.execute(
+                    "INSERT INTO tasks "
+                    "(id, project_id, parent_id, title, description, verification_url, "
+                    " status, position, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (t.id, t.project_id, t.parent_id, t.title, t.description,
+                     t.verification_url, t.status.value, t.position, now, now),
+                )
+                conn.execute(
+                    "INSERT INTO task_status_history (id, task_id, old_status, new_status, changed_by, changed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (str(uuid_mod.uuid4()), t.id, None, t.status.value, None, now),
+                )
+            conn.commit()
+        elif hasattr(repo, 'client'):
+            # Supabase: bulk insert with single API call each
+            task_rows = [{
+                "id": t.id, "project_id": t.project_id,
+                "parent_id": t.parent_id, "title": t.title,
+                "description": t.description,
+                "verification_url": t.verification_url,
+                "status": t.status.value, "position": t.position,
+                "created_at": now, "updated_at": now,
+            } for t in flat_tasks]
+            history_rows = [{
+                "id": str(uuid_mod.uuid4()), "task_id": t.id,
+                "old_status": None, "new_status": t.status.value,
+                "changed_at": now,
+            } for t in flat_tasks]
+            repo.client.table("tasks").insert(task_rows).execute()
+            repo.client.table("task_status_history").insert(history_rows).execute()
+        else:
+            for t in flat_tasks:
+                repo.create_task(t)
         _emit("kanban_board_refresh", {"reason": "plan_accepted"})
-        return jsonify({"created_count": count[0]})
+        return jsonify({"created_count": count[0], "created_ids": root_ids})
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500

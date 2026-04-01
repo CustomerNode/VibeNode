@@ -36,11 +36,30 @@ def api_auth_status():
 def api_auth_login():
     """Kick off `claude auth login` in a visible terminal so the user can complete OAuth."""
     try:
-        # Open login in a new visible terminal window so the user can interact
-        subprocess.Popen(
-            ["start", "cmd", "/c", _claude_bin, "auth", "login"],
-            shell=True,
-        )
+        if sys.platform == "win32":
+            subprocess.Popen(
+                ["start", "cmd", "/c", _claude_bin, "auth", "login"],
+                shell=True,
+            )
+        elif sys.platform == "darwin":
+            subprocess.Popen([
+                "osascript", "-e",
+                f'tell app "Terminal" to do script "{_claude_bin} auth login"',
+            ])
+        elif sys.platform == "linux":
+            # Try common terminal emulators in order of popularity
+            for term_cmd in [
+                ["x-terminal-emulator", "-e", f"{_claude_bin} auth login"],
+                ["gnome-terminal", "--", _claude_bin, "auth", "login"],
+                ["xterm", "-e", _claude_bin, "auth", "login"],
+            ]:
+                try:
+                    subprocess.Popen(term_cmd)
+                    break
+                except FileNotFoundError:
+                    continue
+            else:
+                return jsonify({"ok": False, "error": "No terminal emulator found. Run 'claude auth login' manually."}), 500
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500

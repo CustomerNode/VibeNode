@@ -222,6 +222,7 @@ class SessionDaemon:
             "remove_queue_item": self.session_manager.remove_queue_item,
             "edit_queue_item": self.session_manager.edit_queue_item,
             "clear_queue": self.session_manager.clear_queue,
+            "nudge_queue": self.session_manager.nudge_queue,
             "get_aliases": lambda **kw: dict(self.session_manager._id_aliases),
             "ping": lambda **kw: {"ok": True, "pid": os.getpid()},
         }

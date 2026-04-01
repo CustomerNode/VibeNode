@@ -108,8 +108,9 @@ try:
             # request_id is on the OUTER object, not inside request_data
             request_id = request.get("request_id")
             import json as _json
+
+            from claude_code_sdk.types import ToolPermissionContext as _TPC2
             try:
-                from claude_code_sdk.types import ToolPermissionContext as _TPC2
                 context = _TPC2(
                     signal=None,
                     suggestions=request_data.get("permission_suggestions", []) or [],
@@ -132,23 +133,22 @@ try:
                     }
                 else:
                     raise TypeError(f"Unexpected: {type(response)}")
-
-                success_response = {
-                    "type": "control_response",
-                    "response": {
-                        "subtype": "success",
-                        "request_id": request_id,
-                        "response": response_data,
-                    },
-                }
-                await self.transport.write(_json.dumps(success_response) + "\n")
             except Exception as e:
-                logger.exception("Permission error: %s", e)
-                err = {
-                    "type": "control_response",
-                    "response": {"subtype": "error", "request_id": request_id, "error": str(e)},
+                logger.exception("Permission callback error: %s", e)
+                response_data = {
+                    "behavior": "deny",
+                    "message": str(e) or "Permission callback failed",
                 }
-                await self.transport.write(_json.dumps(err) + "\n")
+
+            ctrl_response = {
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request_id,
+                    "response": response_data,
+                },
+            }
+            await self.transport.write(_json.dumps(ctrl_response) + "\n")
         else:
             await _real_original_handle(self, request)
 
@@ -741,6 +741,23 @@ class SessionManager:
         self._emit_queue_update(session_id)
         return {"ok": True}
 
+    def nudge_queue(self, session_id: str) -> dict:
+        """Frontend safety net: retry queue dispatch for an idle session.
+
+        Called when the frontend detects a session is idle but still has
+        queued messages — indicates the automatic dispatch was missed.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return {"ok": False, "error": "Session not found"}
+        if info.state != SessionState.IDLE:
+            return {"ok": False, "error": "Session not idle"}
+        logger.info("Queue nudge for %s — retrying dispatch", session_id)
+        self._try_dispatch_queue(session_id)
+        return {"ok": True}
+
     def _try_dispatch_queue(self, session_id: str) -> None:
         """If session is IDLE and queue has items, dispatch the first one.
 
@@ -783,11 +800,17 @@ class SessionManager:
             self._save_queues()
             self._emit_queue_update(session_id)
 
-    def interrupt_session(self, session_id: str, clear_queue: bool = True) -> dict:
+    def interrupt_session(self, session_id: str, clear_queue: bool = True,
+                           merge_queue: bool = False,
+                           pending_text: str = None) -> dict:
         """Interrupt a running session.
 
-        When clear_queue is True (default), also clears any queued messages
-        to prevent auto-dispatch when the session goes idle after interrupt.
+        When merge_queue is True, all queued messages (plus optional
+        pending_text from the queue textarea) are merged into a single
+        message that will auto-dispatch when the session goes idle.
+
+        When clear_queue is True and merge_queue is False (default),
+        clears any queued messages to prevent auto-dispatch.
         """
         session_id = self._resolve_id(session_id)
         with self._lock:
@@ -797,9 +820,22 @@ class SessionManager:
         if info.state == SessionState.STOPPED:
             return {"ok": False, "error": "Session already stopped"}
 
-        # Clear queue atomically BEFORE the interrupt so _emit_state(IDLE)
-        # won't auto-dispatch a queued message after the interrupt completes.
-        if clear_queue:
+        if merge_queue:
+            # Merge all queued messages (+ pending textarea text) into one
+            # so _try_dispatch_queue sends a single combined message on IDLE.
+            with self._queue_lock:
+                q = list(self._queues.get(session_id, []))
+                if pending_text and pending_text.strip():
+                    q.append(pending_text.strip())
+                if q:
+                    merged = "\n\n".join(q)
+                    self._queues[session_id] = [merged]
+                    self._save_queues()
+                    self._emit_queue_update(session_id)
+                # If nothing to merge, leave queue empty — normal interrupt.
+        elif clear_queue:
+            # Clear queue atomically BEFORE the interrupt so _emit_state(IDLE)
+            # won't auto-dispatch a queued message after the interrupt completes.
             with self._queue_lock:
                 if session_id in self._queues:
                     self._queues.pop(session_id)
@@ -893,6 +929,41 @@ class SessionManager:
     # Async internals (run on the event loop thread)
     # ------------------------------------------------------------------
 
+    async def _reconnect_client(self, session_id: str, info) -> bool:
+        """Reconnect a session whose SDK stream died.
+
+        Creates a fresh ClaudeSDKClient with resume=session_id, connects it,
+        and replaces info.client.  Returns True on success.
+        """
+        resolved = self._resolve_id(session_id)
+        logger.info("Reconnecting SDK client for %s (resolved: %s)", session_id, resolved)
+
+        # Tear down the dead client
+        if info.client:
+            try:
+                await info.client.disconnect()
+            except Exception:
+                pass
+            info.client = None
+
+        try:
+            options = ClaudeCodeOptions(
+                cwd=info.cwd or None,
+                resume=resolved,
+                can_use_tool=self._make_permission_callback(session_id),
+                model=info.model or None,
+                permission_mode="default",
+                include_partial_messages=True,
+            )
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+            info.client = client
+            logger.info("Reconnected SDK client for %s", session_id)
+            return True
+        except Exception as e:
+            logger.exception("Failed to reconnect SDK client for %s: %s", session_id, e)
+            return False
+
     async def _drive_session(
         self, session_id: str, prompt: str, cwd: str, resume: bool,
         model: Optional[str] = None, system_prompt: Optional[str] = None,
@@ -983,15 +1054,31 @@ class SessionManager:
             info.state = SessionState.STOPPED
             self._emit_state(info)
         except Exception as e:
-            logger.exception("Session %s error: %s", session_id, e)
-            info.error = str(e)
-            info.state = SessionState.STOPPED
-            entry = LogEntry(kind="system", text=f"Error: {e}", is_error=True)
+            logger.exception("Session %s stream error: %s — attempting reconnect", session_id, e)
+            entry = LogEntry(kind="system", text=f"Stream lost — reconnecting...", is_error=True)
             with info._lock:
                 info.entries.append(entry)
                 entry_index = len(info.entries) - 1
             self._emit_entry(session_id, entry, entry_index)
-            self._emit_state(info)
+
+            if await self._reconnect_client(session_id, info):
+                info.state = SessionState.IDLE
+                info.error = ""
+                entry = LogEntry(kind="system", text="Reconnected successfully")
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(session_id, entry, entry_index)
+                self._emit_state(info)
+            else:
+                info.error = str(e)
+                info.state = SessionState.STOPPED
+                entry = LogEntry(kind="system", text=f"Reconnect failed: {e}", is_error=True)
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(session_id, entry, entry_index)
+                self._emit_state(info)
         finally:
             # Catch-all: force IDLE if stuck in WORKING. Skip if
             # ResultMessage was processed -- _try_dispatch_queue may
@@ -1088,18 +1175,31 @@ class SessionManager:
                 info.state = SessionState.IDLE
                 self._emit_state(info)
         except Exception as e:
-            logger.exception("Send query error for %s: %s", session_id, e)
-            info.error = str(e)
-            # Emit error entry so the user sees what happened
-            entry = LogEntry(kind="system", text=f"Error: {e}", is_error=True)
+            logger.exception("Send query stream error for %s: %s — attempting reconnect", session_id, e)
+            entry = LogEntry(kind="system", text="Stream lost — reconnecting...")
             with info._lock:
                 info.entries.append(entry)
                 entry_index = len(info.entries) - 1
             self._emit_entry(session_id, entry, entry_index)
-            # Transition to IDLE (not STOPPED) so the session stays usable.
-            # The error is visible in the log — no need to brick the session.
-            info.state = SessionState.IDLE
-            self._emit_state(info)
+
+            if await self._reconnect_client(session_id, info):
+                info.state = SessionState.IDLE
+                info.error = ""
+                entry = LogEntry(kind="system", text="Reconnected successfully")
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(session_id, entry, entry_index)
+                self._emit_state(info)
+            else:
+                info.error = str(e)
+                entry = LogEntry(kind="system", text=f"Reconnect failed: {e}", is_error=True)
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(session_id, entry, entry_index)
+                info.state = SessionState.IDLE
+                self._emit_state(info)
         finally:
             # Catch-all: force IDLE if stuck in WORKING. Skip if
             # ResultMessage was processed -- _try_dispatch_queue may
@@ -2174,7 +2274,7 @@ class SessionManager:
             info.working_since = time.time()
         elif info.state != SessionState.WORKING:
             info.working_since = 0.0
-        if self._push_callback and info.session_type != "title":
+        if self._push_callback and info.session_type not in ("planner", "title"):
             data = info.to_state_dict()
             # Include queue data from server-side store
             with self._queue_lock:
@@ -2201,7 +2301,13 @@ class SessionManager:
                     recheck = self._sessions.get(sid)
                 if recheck and recheck.state == SessionState.IDLE:
                     logger.debug("Deferred IDLE re-emit for %s", sid)
-                    if self._push_callback:
+                    # Retry queue dispatch — catches races where the queue
+                    # was populated after the initial _try_dispatch_queue.
+                    self._try_dispatch_queue(sid)
+                    # Re-check: _try_dispatch_queue may have set WORKING
+                    with self._lock:
+                        recheck = self._sessions.get(sid)
+                    if recheck and recheck.state == SessionState.IDLE and self._push_callback:
                         data = recheck.to_state_dict()
                         with self._queue_lock:
                             q = self._queues.get(sid, [])
@@ -2217,6 +2323,11 @@ class SessionManager:
 
     def _emit_entry(self, session_id: str, entry: LogEntry, index: int) -> None:
         """Push a new log entry to all connected WebSocket clients."""
+        # Never broadcast entries for hidden utility sessions (planner, title)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if info and info.session_type in ("planner", "title"):
+            return
         if self._push_callback:
             data = {
                 'session_id': session_id,
@@ -2235,6 +2346,11 @@ class SessionManager:
         This is called from inside an anyio task group (the SDK's control
         handler), so we use push_callback to ensure it reaches the clients.
         """
+        # Never broadcast permission requests for hidden utility sessions
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if info and info.session_type in ("planner", "title"):
+            return
         if self._push_callback:
             data = {
                 'session_id': session_id,

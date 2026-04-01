@@ -7000,6 +7000,63 @@ mark.find-match.current { background: var(--accent); color:#fff; }
   overflow-x: hidden;
 }
 .kanban-planner-panel.open { right: 0; }
+
+/* Minimized planner bubble — bottom-right like LinkedIn chat */
+.planner-minimized-bubble {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 510;
+  background: var(--purple);
+  color: #fff;
+  padding: 10px 16px;
+  border-radius: 24px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+.planner-minimized-bubble:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+}
+
+/* Highlight animation for newly created tasks */
+@keyframes kanban-highlight-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(var(--accent-rgb, 130,80,223), 0.5); }
+  50%  { box-shadow: 0 0 0 6px rgba(var(--accent-rgb, 130,80,223), 0.15); }
+  100% { box-shadow: 0 0 0 0 rgba(var(--accent-rgb, 130,80,223), 0); }
+}
+.kanban-task-highlight {
+  animation: kanban-highlight-pulse 0.8s ease 3;
+  outline: 2px solid var(--purple);
+  outline-offset: -1px;
+  border-radius: 8px;
+}
+
+/* AI plan button in drill-down subtasks header */
+.kanban-drill-ai-plan-btn {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--purple);
+  color: var(--purple);
+  background: transparent;
+  cursor: pointer;
+  margin-left: auto;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s;
+}
+.kanban-drill-ai-plan-btn:hover {
+  background: var(--purple);
+  color: #fff;
+}
+
 .kanban-planner-header {
   display: flex;
   align-items: center;

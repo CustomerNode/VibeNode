@@ -20,6 +20,7 @@ from ..config import (
     _summary_cache,
     _mark_deleted,
     _mark_deleted_bulk,
+    _get_utility_ids,
 )
 from ..sessions import load_session, load_session_timeline, all_sessions
 from ..titling import smart_title
@@ -57,11 +58,17 @@ def api_sessions():
                 deduped.append(s)
         sessions = deduped
 
+    # Final pass: filter out any sessions whose resolved ID is a utility session
+    utility_ids = _get_utility_ids()
+    sessions = [s for s in sessions if s["id"] not in utility_ids]
+
     existing_ids = {s["id"] for s in sessions}
     names = _load_names()  # check _session_names.json for auto-named titles
     for state in sm.get_all_states():
         sid = state.get("session_id", "")
         if state.get("session_type") in ("planner", "title"):
+            continue
+        if sid.startswith("_"):
             continue
         if sid and sid not in existing_ids and state.get("state") != "stopped":
             saved_name = names.get(sid, "")

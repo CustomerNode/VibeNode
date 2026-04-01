@@ -105,8 +105,9 @@ try:
             # request_id is on the OUTER object, not inside request_data
             request_id = request.get("request_id")
             import json as _json
+
+            from claude_code_sdk.types import ToolPermissionContext as _TPC2
             try:
-                from claude_code_sdk.types import ToolPermissionContext as _TPC2
                 context = _TPC2(
                     signal=None,
                     suggestions=request_data.get("permission_suggestions", []) or [],
@@ -129,23 +130,22 @@ try:
                     }
                 else:
                     raise TypeError(f"Unexpected: {type(response)}")
-
-                success_response = {
-                    "type": "control_response",
-                    "response": {
-                        "subtype": "success",
-                        "request_id": request_id,
-                        "response": response_data,
-                    },
-                }
-                await self.transport.write(_json.dumps(success_response) + "\n")
             except Exception as e:
-                logger.exception("Permission error: %s", e)
-                err = {
-                    "type": "control_response",
-                    "response": {"subtype": "error", "request_id": request_id, "error": str(e)},
+                logger.exception("Permission callback error: %s", e)
+                response_data = {
+                    "behavior": "deny",
+                    "message": str(e) or "Permission callback failed",
                 }
-                await self.transport.write(_json.dumps(err) + "\n")
+
+            ctrl_response = {
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request_id,
+                    "response": response_data,
+                },
+            }
+            await self.transport.write(_json.dumps(ctrl_response) + "\n")
         else:
             await _real_original_handle(self, request)
 
@@ -428,6 +428,10 @@ class SessionManager:
             state=SessionState.STARTING,
             session_type=session_type or "",
         )
+        # Persist utility session IDs so they stay hidden after restart
+        if session_type in ("planner", "title"):
+            from .config import _mark_utility
+            _mark_utility(session_id)
         # Store the user prompt immediately so get_entries() returns it
         # before _drive_session starts. After a page refresh there's no
         # optimistic bubble, so the log fetch must find this entry.
@@ -632,7 +636,8 @@ class SessionManager:
         with self._lock:
             return [info.to_state_dict() for info in self._sessions.values()
                     if info.state != SessionState.STOPPED
-                    and info.session_type not in ("planner", "title")]
+                    and info.session_type not in ("planner", "title")
+                    and not info.session_id.startswith("_")]
 
     def get_entries(self, session_id: str, since: int = 0) -> list:
         """Return log entries for a session, optionally from an index."""
@@ -1198,6 +1203,11 @@ class SessionManager:
                         del self._sessions[session_id]
                     self._id_aliases[session_id] = result_session_id
 
+                # If this was a utility session, track the new ID too
+                if info.session_type in ("planner", "title"):
+                    from .config import _mark_utility
+                    _mark_utility(result_session_id)
+
                 # Remap kanban task-session links so the board
                 # still references the correct session after the ID change
                 try:
@@ -1394,8 +1404,9 @@ class SessionManager:
                     )
                     continue
 
-                # Never recover planner sessions — they're disposable utility sessions
-                if meta.get("session_type") == "planner":
+                # Never recover utility sessions — they're disposable
+                # (planners, title generators, any _-prefixed system session)
+                if meta.get("session_type") in ("planner", "title") or sid.startswith("_"):
                     continue
 
                 name = meta.get("name", "")
