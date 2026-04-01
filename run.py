@@ -193,7 +193,7 @@ if not _TEST_PORT:
         _kill_port(DAEMON_PORT)
     else:
         print("  VIBENODE_PRESERVE_DAEMON=1 -- skipping daemon port kill", flush=True)
-    time.sleep(0.3)  # brief pause for ports to release
+    time.sleep(0.05)  # brief pause for ports to release
 
     # ---- Singleton gate: only one web server allowed ----
     if not acquire_web_singleton():
@@ -252,7 +252,9 @@ def _fix_shortcut():
     except Exception:
         pass  # Best effort — never block startup
 
-_fix_shortcut()
+# Run shortcut repair in background — it's best-effort and involves
+# slow PowerShell calls that shouldn't block startup.
+threading.Thread(target=_fix_shortcut, daemon=True).start()
 
 # ---------------------------------------------------------------------------
 # Dependency health check — auto-install missing packages at boot

@@ -60,7 +60,11 @@ class DaemonClient:
         self._socketio = socketio
         self._app = app
         self._should_run = True
-        self._connect()
+        # Connect WITHOUT resync — the reader thread must be running first
+        # so that _send_request() responses can be processed.  Without this,
+        # _resync_aliases() blocks for 30 seconds waiting for a response
+        # that the (not-yet-started) reader thread never delivers.
+        self._connect(resync=False)
         self._reader_thread = threading.Thread(
             target=self._reader_loop, daemon=True, name="daemon-reader"
         )
@@ -71,6 +75,14 @@ class DaemonClient:
             target=self._emitter_loop, daemon=True, name="socketio-emitter"
         )
         self._emitter_thread.start()
+        # Now that the reader thread is running, resync aliases/policy.
+        # Do this in a background thread so start() returns immediately
+        # and doesn't block Flask app creation.
+        if self._connected:
+            threading.Thread(
+                target=self._deferred_resync, daemon=True,
+                name="daemon-resync"
+            ).start()
 
     def stop(self) -> None:
         """Disconnect from daemon."""
@@ -91,8 +103,15 @@ class DaemonClient:
     # Connection management
     # ------------------------------------------------------------------
 
-    def _connect(self):
-        """TCP connect to daemon."""
+    def _connect(self, resync=True):
+        """TCP connect to daemon.
+
+        Args:
+            resync: If True, re-send cached aliases/policy after connecting.
+                    Set to False during initial start() so the reader thread
+                    can be started first (resync requires the reader thread
+                    to process daemon responses).
+        """
         # Close old socket to avoid CLOSE_WAIT leaks
         old = self._sock
         if old:
@@ -110,8 +129,9 @@ class DaemonClient:
                 self._sock = sock
                 self._connected = True
                 logger.info("Connected to session daemon on port %d", DAEMON_PORT)
-                self._resync_aliases()
-                self._resync_policy()
+                if resync:
+                    self._resync_aliases()
+                    self._resync_policy()
                 return
             except ConnectionRefusedError:
                 time.sleep(0.1)
@@ -119,6 +139,18 @@ class DaemonClient:
                 logger.debug("Connect attempt %d failed: %s", attempt, e)
                 time.sleep(0.2)
         logger.warning("Could not connect to session daemon after 50 attempts")
+
+    def _deferred_resync(self):
+        """Resync aliases and policy after reader thread is running.
+
+        Called from a background thread during start() to avoid blocking
+        Flask app creation while still ensuring the reader thread is
+        available to process daemon responses.
+        """
+        # Brief pause to let the reader thread enter its recv() loop
+        time.sleep(0.05)
+        self._resync_aliases()
+        self._resync_policy()
 
     def _resync_policy(self):
         """Re-send cached permission policy to daemon after connect/reconnect."""
@@ -144,21 +176,50 @@ class DaemonClient:
     def _reconnect_loop(self):
         """Background reconnection loop. Restarts daemon if it crashed."""
         attempts = 0
+        max_display = 10
         while self._should_run and not self._connected:
             time.sleep(2)
             if not self._should_run:
                 break
             attempts += 1
+            # Push reconnect progress to frontend
+            if self._socketio and attempts <= max_display:
+                try:
+                    self._socketio.emit('daemon_reconnect', {
+                        'status': 'connecting',
+                        'attempt': attempts,
+                        'message': f'Reconnecting to daemon (attempt {attempts})...',
+                    })
+                except Exception:
+                    pass
             try:
                 self._connect()
                 if self._connected:
                     logger.info("Reconnected to daemon")
+                    if self._socketio:
+                        try:
+                            self._socketio.emit('daemon_reconnect', {
+                                'status': 'connected',
+                                'attempt': attempts,
+                                'message': 'Reconnected to daemon',
+                            })
+                        except Exception:
+                            pass
                     break
             except Exception:
                 pass
             # After 5 failed reconnect rounds (~10s), the daemon is probably dead.
             # Try to restart it.
             if attempts == 5:
+                if self._socketio:
+                    try:
+                        self._socketio.emit('daemon_reconnect', {
+                            'status': 'restarting',
+                            'attempt': attempts,
+                            'message': 'Daemon unresponsive — restarting it...',
+                        })
+                    except Exception:
+                        pass
                 self._restart_daemon()
 
     @staticmethod
@@ -197,6 +258,16 @@ class DaemonClient:
         """Start reconnection in background if not already running."""
         if self._reconnect_thread and self._reconnect_thread.is_alive():
             return
+        # Immediately tell frontend we lost the connection
+        if self._socketio:
+            try:
+                self._socketio.emit('daemon_reconnect', {
+                    'status': 'disconnected',
+                    'attempt': 0,
+                    'message': 'Lost connection to daemon — reconnecting...',
+                })
+            except Exception:
+                pass
         self._reconnect_thread = threading.Thread(
             target=self._reconnect_loop, daemon=True, name="daemon-reconnect"
         )
@@ -209,7 +280,8 @@ class DaemonClient:
     def _send_request(self, method, params=None, timeout=30):
         """Send a request to daemon and block until response."""
         if not self._connected:
-            return {"ok": False, "error": "Not connected to session daemon"}
+            return {"ok": False, "error": "Not connected to session daemon",
+                    "disconnected": True}
 
         req_id = uuid.uuid4().hex[:8]
         event = threading.Event()

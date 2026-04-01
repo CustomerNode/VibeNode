@@ -147,20 +147,20 @@ def _has_word_overlap(title: str, source_texts: list) -> bool:
 
 
 _TITLE_SYSTEM_PROMPT = (
-    "You generate short titles for coding chat sessions. "
-    "Rules: 3-8 words, describe the task/goal, use words from the messages, "
+    "You generate very short titles for coding chat sessions. "
+    "Rules: 3-4 words MAX, describe the core task, use words from the messages, "
     "never include file paths or URLs.\n\n"
     "Examples:\n"
     "Input: 'can you look at the incoming git changes and see whether its trivial to pull them?'\n"
-    "Title: Review incoming git changes\n\n"
+    "Title: Review git changes\n\n"
     "Input: 'I'm hitting issues where it goes into idle state after messaging'\n"
-    "Title: Debug idle state after messaging\n\n"
+    "Title: Debug idle state\n\n"
     "Input: 'take a look at the front end and identify polish opportunities'\n"
-    "Title: Frontend polish opportunities\n\n"
+    "Title: Frontend polish pass\n\n"
     "Input: 'audit my test suite and identify gaps then patch them'\n"
-    "Title: Test suite gap analysis and fixes\n\n"
+    "Title: Test suite gaps\n\n"
     "Input: 'in prod i keep getting random 502 errors'\n"
-    "Title: Intermittent 502 errors in production\n\n"
+    "Title: Fix 502 errors\n\n"
     "Reply with ONLY the title, nothing else."
 )
 
@@ -320,7 +320,7 @@ def _cleanup_title_jsonl(sid: str, sm=None):
                 continue
             try:
                 first = _json.loads(f.read_text(encoding="utf-8").split("\n", 1)[0])
-                if "You generate short titles" in first.get("content", ""):
+                if "You generate very short titles" in first.get("content", ""):
                     f.unlink()
             except Exception:
                 pass

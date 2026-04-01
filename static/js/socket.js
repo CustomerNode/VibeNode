@@ -50,6 +50,32 @@ socket.on('connect', () => {
     }, 3000);
 });
 
+// Daemon reconnection status — live toasts showing recovery progress
+socket.on('daemon_reconnect', (data) => {
+    const status = data.status;
+    const msg = data.message || 'Daemon connection issue';
+    if (status === 'connected') {
+        showToast(msg);
+        // Resync state after reconnect
+        setTimeout(() => {
+            if (socket.connected) socket.emit('request_state_snapshot');
+        }, 500);
+    } else if (status === 'disconnected' || status === 'connecting' || status === 'restarting') {
+        showToast(msg, true);
+    }
+    // Update status bar indicator
+    const sbConn = document.getElementById('sb-connection');
+    if (sbConn) {
+        if (status === 'connected') {
+            sbConn.style.color = 'var(--accent)';
+            sbConn.title = 'Connected';
+        } else {
+            sbConn.style.color = 'var(--warning, orange)';
+            sbConn.title = msg;
+        }
+    }
+});
+
 socket.on('disconnect', () => {
     _wsConnected = false;
     console.log('[WS] Disconnected');

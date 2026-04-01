@@ -122,7 +122,7 @@ class BootSplash:
         self._finish_frame = 0
 
         # Total estimated boot time (seconds) for linear countdown
-        self._eta_total = 60
+        self._eta_total = 8
 
         # Platform font
         if sys.platform == "win32":
@@ -250,7 +250,9 @@ class BootSplash:
             total = logo_w + gap + title_w
             group_left = (W - total) // 2
 
-            self.cv.create_image(group_left, brand_y,
+            # Anchor logo center-left; nudge up 2px to visually align
+            # with text baseline (logo has bottom-right handshake circle)
+            self.cv.create_image(group_left, brand_y + 8,
                                  image=self._logo_img, anchor="w")
             title_x = group_left + logo_w + gap + title_w // 2
         else:
@@ -270,35 +272,36 @@ class BootSplash:
 
         # Subtitle
         self._sub = self.cv.create_text(
-            cx, brand_y + 36, text="Starting up\u2026",
+            cx, brand_y + 34, text="Starting up\u2026",
             font=(self._ff, 10), fill=C["overlay"])
 
-        # CTA link
+        # CTA — tagline + underlined link on separate lines
+        self.cv.create_text(
+            cx, H - 120,
+            text="Building something complex? Need to sell it?",
+            font=(self._ff, 9), fill=C["subtext"])
         self._cta = self.cv.create_text(
-            cx, H - 74,
-            text="Building something complex? Need to sell it? \u2192 customernode.com",
-            font=(self._ff, 9, "bold"), fill=C["overlay"], tags="cta")
-
-        # Footer branding (copyright at very bottom)
-        self.cv.create_text(
-            cx, H - 40,
-            text="by CustomerNode\u2122 and Claude Code",
-            font=(self._ff, 8), fill=C["surface2"])
-        self.cv.create_text(
-            cx, H - 16,
-            text="\u00a9 2026 CustomerNode LLC  \u2022  v1.0",
-            font=(self._ff, 8), fill=C["surface1"])
+            cx, H - 102,
+            text="customernode.com",
+            font=(self._ff, 10, "bold underline"), fill=C["lavender"],
+            tags="cta")
         self.cv.tag_bind("cta", "<Button-1>",
                          lambda _: __import__("webbrowser").open(
                              "https://customernode.com"))
         self.cv.tag_bind("cta", "<Enter>",
                          lambda _: (self.cv.itemconfigure(self._cta,
-                                                          fill=C["lavender"]),
+                                                          fill=C["text"]),
                                     self.cv.configure(cursor="hand2")))
         self.cv.tag_bind("cta", "<Leave>",
                          lambda _: (self.cv.itemconfigure(self._cta,
-                                                          fill=C["overlay"]),
+                                                          fill=C["lavender"]),
                                     self.cv.configure(cursor="")))
+
+        # Single-line footer
+        self.cv.create_text(
+            cx, H - 18,
+            text="CustomerNode\u2122  \u2022  Claude Code  \u2022  \u00a9 2026 CustomerNode LLC",
+            font=(self._ff, 8), fill=C["surface1"])
 
         # Error text + dismiss button (hidden until error)
         self._err = self.cv.create_text(
@@ -315,7 +318,7 @@ class BootSplash:
     # ── Progress bar ──────────────────────────────────────────────────
     def _create_progress_bar(self):
         cx = W // 2
-        self._bx, self._by = 50, 125
+        self._bx, self._by = 50, 114
         self._bw, self._bh = W - 100, 6
 
         # Track background
@@ -341,52 +344,33 @@ class BootSplash:
 
         # Percentage (big, bold, center)
         self._pct = self.cv.create_text(
-            cx, 153, text="0%",
+            cx, 138, text="0%",
             font=(self._ff, 18, "bold"), fill=C["blue"])
 
-        # Time / ETA
+        # Time / ETA — subtle secondary info below percentage
         self._time = self.cv.create_text(
-            cx, 177, text="",
-            font=(self._ff, 9), fill=C["overlay"])
+            cx, 156, text="",
+            font=(self._ff, 8), fill=C["surface2"])
 
-    # ── Steps + vertical timeline ─────────────────────────────────────
+    # ── Steps — 3D cylinder carousel (shows ~3 at a time) ────────────
     def _create_steps(self):
-        self._sy0 = 212          # first step y
-        self._ssp = 32           # step spacing
-        self._tlx = 62           # timeline x
+        self._step_cy = 260          # vertical center of carousel
+        self._step_radius = 55       # cylinder radius in pixels
+        self._step_angle = math.pi / 3   # 60° per step slot
+        self._scroll_current = 0.0   # smoothly animated scroll position
+        self._scroll_target = 0.0
 
-        # Timeline track (dim full-length line)
-        self._tl_bg = self.cv.create_rectangle(
-            self._tlx - 1, self._sy0,
-            self._tlx + 1, self._sy0 + (len(STEPS) - 1) * self._ssp,
-            fill=C["surface0"], outline="")
-
-        # Timeline active segment (grows with progress)
-        self._tl_active = self.cv.create_rectangle(
-            self._tlx - 1, self._sy0,
-            self._tlx + 1, self._sy0,
-            fill=C["blue"], outline="")
-
-        self._si = {}   # step items keyed by step_id
+        self._si = {}
         for i, (sid, label) in enumerate(STEPS):
-            y = self._sy0 + i * self._ssp
-
-            # Completion ring burst (hidden until triggered)
-            ring = self.cv.create_oval(
-                self._tlx - 8, y - 8, self._tlx + 8, y + 8,
-                outline="", fill="", width=2)
-
-            # Indicator symbol
             sym = self.cv.create_text(
-                self._tlx, y, text="\u25CB",
-                font=(self._ff, 14), fill=C["surface2"], anchor="center")
-
-            # Label
+                0, -100, text="\u25CB",
+                font=(self._ff, 12), fill=C["surface2"], anchor="center")
             txt = self.cv.create_text(
-                self._tlx + 25, y, text=label,
+                0, -100, text=label,
                 font=(self._ff, 11), fill=C["surface2"], anchor="w")
-
-            self._si[sid] = dict(sym=sym, txt=txt, ring=ring, y=y, idx=i)
+            ring = self.cv.create_oval(0, 0, 0, 0,
+                                       outline="", fill="", width=2)
+            self._si[sid] = dict(sym=sym, txt=txt, ring=ring, idx=i)
 
     # ── Drag ──────────────────────────────────────────────────────────
     def _on_press(self, e):
@@ -526,72 +510,94 @@ class BootSplash:
         for g in self._tglow:
             self.cv.itemconfigure(g, fill=glow)
 
-    # ── Step indicators, completion rings, timeline ───────────────────
+    # ── 3D cylinder carousel renderer ─────────────────────────────────
     def _r_steps(self):
+        # Smooth scroll interpolation
+        diff = self._scroll_target - self._scroll_current
+        self._scroll_current += diff * 0.08
+        if abs(diff) < 0.005:
+            self._scroll_current = self._scroll_target
+
+        cy = self._step_cy
+        R = self._step_radius
+        sa = self._step_angle
+        cx = W // 2
         pulse_syms = ["\u25CF", "\u25C9", "\u25CB", "\u25C9"]
-        active_y = self._sy0
 
         for sid, s in self._si.items():
+            idx = s["idx"]
+            angle = (idx - self._scroll_current) * sa
+
+            # facing = how much this slot faces the viewer (1=front, 0=edge)
+            facing = math.cos(angle)
+
+            if facing <= 0.05:
+                # Behind the cylinder — hide offscreen
+                self.cv.coords(s["sym"], -100, -100)
+                self.cv.coords(s["txt"], -100, -100)
+                self.cv.itemconfigure(s["ring"], outline="")
+                continue
+
+            # 3D position on cylinder surface
+            y = cy + math.sin(angle) * R
+
+            sym_x = cx - 70
+            txt_x = cx - 45
+
+            self.cv.coords(s["sym"], sym_x, y)
+            self.cv.coords(s["txt"], txt_x, y)
+
+            # Font sizes scale with facing (bigger = closer)
+            sf = int(10 + facing * 4)    # sym: 10–14
+            tf = int(9 + facing * 3)     # txt: 9–12
+
+            # ── Determine state + base color ──────────────────────
             if sid in self.completed:
-                # ── Completed step ────────────────────────────────────
-                col = C["green"]
+                base_col = C["green"]
+                sym_text = "\u2713"
+                sym_font = (self._ff, sf, "bold")
+
+                # Completion flash + ring burst
                 if sid in self._completion_flash:
                     age = self._frame - self._completion_flash[sid]
                     if age < 0:
-                        # Staggered cascade -- not yet visible
-                        self.cv.itemconfigure(s["sym"], text="\u25CB",
-                                              fill=C["surface2"],
-                                              font=(self._ff, 14))
-                        self.cv.itemconfigure(s["txt"], fill=C["surface2"])
-                        continue
-                    if age < 20:
+                        base_col = C["surface2"]
+                        sym_text = "\u25CB"
+                        sym_font = (self._ff, sf)
+                    elif age < 20:
                         t = ease_out_cubic(age / 20)
-                        col = lerp_color("#ffffff", C["green"], t)
-                        # Expanding ring burst
+                        base_col = lerp_color("#ffffff", C["green"], t)
                         ring_r = 8 + age * 0.8
                         self.cv.coords(s["ring"],
-                                       self._tlx - ring_r, s["y"] - ring_r,
-                                       self._tlx + ring_r, s["y"] + ring_r)
-                        ring_alpha = 1.0 - t
+                                       sym_x - ring_r, y - ring_r,
+                                       sym_x + ring_r, y + ring_r)
                         self.cv.itemconfigure(
                             s["ring"],
                             outline=lerp_color(C["base"], C["green"],
-                                               ring_alpha * 0.6),
+                                               (1 - t) * 0.6),
                             width=2)
                     else:
                         self.cv.itemconfigure(s["ring"], outline="")
 
-                self.cv.itemconfigure(s["sym"], text="\u2713", fill=col,
-                                      font=(self._ff, 14, "bold"))
-                self.cv.itemconfigure(s["txt"], fill=col)
-                active_y = s["y"]
-
             elif sid == self.current_step:
-                # ── Active step (pulsing indicator) ───────────────────
                 ci = (self._frame // 10) % len(pulse_syms)
                 gp = 0.5 + 0.5 * math.sin(self._frame * 0.08)
-                tc = lerp_color(C["blue"], C["lavender"], gp * 0.5)
-                self.cv.itemconfigure(s["sym"], text=pulse_syms[ci],
-                                      fill=tc, font=(self._ff, 14))
-                self.cv.itemconfigure(s["txt"], fill=C["text"])
-                active_y = s["y"]
+                base_col = lerp_color(C["blue"], C["lavender"], gp * 0.5)
+                sym_text = pulse_syms[ci]
+                sym_font = (self._ff, sf)
 
             else:
-                # ── Pending step ──────────────────────────────────────
-                self.cv.itemconfigure(s["sym"], text="\u25CB",
-                                      fill=C["surface2"],
-                                      font=(self._ff, 14))
-                self.cv.itemconfigure(s["txt"], fill=C["surface2"])
+                base_col = C["surface2"]
+                sym_text = "\u25CB"
+                sym_font = (self._ff, sf)
                 self.cv.itemconfigure(s["ring"], outline="")
 
-        # Timeline active segment
-        tl_col = C["green"] if self.done else C["blue"]
-        if self.done:
-            active_y = self._sy0 + (len(STEPS) - 1) * self._ssp
-        self.cv.coords(self._tl_active,
-                       self._tlx - 1, self._sy0,
-                       self._tlx + 1, active_y)
-        self.cv.itemconfigure(self._tl_active, fill=tl_col)
+            # Apply facing as depth fade
+            col = lerp_color(C["base"], base_col, facing * 0.85 + 0.15)
+
+            self.cv.itemconfigure(s["sym"], text=sym_text, fill=col,
+                                  font=sym_font)
+            self.cv.itemconfigure(s["txt"], fill=col, font=(self._ff, tf))
 
     # ── Elapsed / ETA timer ───────────────────────────────────────────
     def _r_time(self):
@@ -600,19 +606,16 @@ class BootSplash:
         if self.done:
             self.cv.itemconfigure(
                 self._time,
-                text=f"Completed in {elapsed:.1f}s", fill=C["green"])
+                text=f"{elapsed:.1f}s", fill=C["green"])
             return
 
-        # Simple linear countdown from total estimate
+        es = int(elapsed)
         remaining = max(0, self._eta_total - elapsed)
         if remaining > 0:
             rem = max(1, int(remaining))
-            self.cv.itemconfigure(
-                self._time,
-                text=f"{elapsed:.1f}s elapsed  \u2022  ~{rem}s remaining")
+            self.cv.itemconfigure(self._time, text=f"{es}s \u2022 ~{rem}s left")
         else:
-            self.cv.itemconfigure(
-                self._time, text=f"{elapsed:.1f}s elapsed")
+            self.cv.itemconfigure(self._time, text=f"{es}s")
 
     # ── Animated gradient border sweep ────────────────────────────────
     def _r_border(self):
@@ -670,6 +673,9 @@ class BootSplash:
         if self.current_step and self.current_step != step_id:
             self._mark_done(self.current_step)
         self.current_step = step_id
+        # Scroll carousel to center this step
+        if step_id in self._si:
+            self._scroll_target = self._si[step_id]["idx"]
         self._recalc_target()
 
     def _mark_done(self, step_id):
@@ -699,7 +705,8 @@ class BootSplash:
         self._finish_frame = self._frame
         self.current_step = None
         self._target_progress = 1.0
-        # Staggered completion cascade (4 frames apart per step)
+        # Scroll to last step and staggered completion cascade
+        self._scroll_target = len(STEPS) - 1
         for i, (sid, _) in enumerate(STEPS):
             if sid not in self.completed:
                 self.completed.add(sid)

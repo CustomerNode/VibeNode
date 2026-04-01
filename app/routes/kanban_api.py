@@ -418,6 +418,9 @@ def get_task(task_id):
         result['active_sessions'] = active_count
         result["sessions"] = enriched_sessions
         result["issues"] = [i.to_dict() if hasattr(i, 'to_dict') else i for i in issues]
+        # Include tags
+        tags = repo.get_task_tags(task_id)
+        result["tags"] = [t.tag if hasattr(t, 'tag') else t for t in tags]
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1053,78 +1056,99 @@ def planner_accept():
                 except Exception:
                     pass
 
-        # Flatten the tree into a list of (task_obj) for bulk insert
+        # Flatten the tree into creates and updates
         flat_tasks = []
+        update_items = []  # (existing_id, {fields}) for edits
 
         def _flatten(items, parent_id=None):
             for i, item in enumerate(items):
-                task_id = str(uuid_mod.uuid4())
-                if parent_id is None:
-                    root_ids.append(task_id)
-                if insert_position == "top" and parent_id is None:
-                    position = -(len(items) - i) * 1000
+                existing_id = item.get("id")
+                # If AI returned an id AND that task exists, update it
+                if existing_id and repo.get_task(existing_id):
+                    updates = {}
+                    if "title" in item:
+                        updates["title"] = item["title"]
+                    if "description" in item:
+                        updates["description"] = item["description"]
+                    if updates:
+                        updates["updated_at"] = now
+                        update_items.append((existing_id, updates))
+                    if parent_id is None:
+                        root_ids.append(existing_id)
+                    count[0] += 1
+                    subtasks = item.get("subtasks", [])
+                    if subtasks:
+                        _flatten(subtasks, existing_id)
                 else:
-                    position = (i + 1) * 1000
-                flat_tasks.append(Task(
-                    id=task_id,
-                    project_id=project_id,
-                    parent_id=parent_id,
-                    title=item.get("title", "Untitled"),
-                    description=item.get("description", ""),
-                    verification_url=item.get("verification_url"),
-                    status=TaskStatus.NOT_STARTED,
-                    position=position,
-                    depth=0,
-                    created_at=now,
-                    updated_at=now,
-                ))
-                count[0] += 1
-                subtasks = item.get("subtasks", [])
-                if subtasks:
-                    _flatten(subtasks, task_id)
+                    task_id = str(uuid_mod.uuid4())
+                    if parent_id is None:
+                        root_ids.append(task_id)
+                    if insert_position == "top" and parent_id is None:
+                        position = -(len(items) - i) * 1000
+                    else:
+                        position = (i + 1) * 1000
+                    flat_tasks.append(Task(
+                        id=task_id,
+                        project_id=project_id,
+                        parent_id=parent_id,
+                        title=item.get("title", "Untitled"),
+                        description=item.get("description", ""),
+                        verification_url=item.get("verification_url"),
+                        status=TaskStatus.NOT_STARTED,
+                        position=position,
+                        depth=0,
+                        created_at=now,
+                        updated_at=now,
+                    ))
+                    count[0] += 1
+                    subtasks = item.get("subtasks", [])
+                    if subtasks:
+                        _flatten(subtasks, task_id)
 
         _flatten(tasks, parent_id=scope_parent_id)
 
-        # Batch insert for speed — single transaction (SQLite) or
-        # single bulk API call (Supabase) instead of N round-trips.
-        if hasattr(repo, '_get_conn'):
-            # SQLite: all inserts in one transaction, one commit
-            conn = repo._get_conn()
-            for t in flat_tasks:
-                conn.execute(
-                    "INSERT INTO tasks "
-                    "(id, project_id, parent_id, title, description, verification_url, "
-                    " status, position, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (t.id, t.project_id, t.parent_id, t.title, t.description,
-                     t.verification_url, t.status.value, t.position, now, now),
-                )
-                conn.execute(
-                    "INSERT INTO task_status_history (id, task_id, old_status, new_status, changed_by, changed_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (str(uuid_mod.uuid4()), t.id, None, t.status.value, None, now),
-                )
-            conn.commit()
-        elif hasattr(repo, 'client'):
-            # Supabase: bulk insert with single API call each
-            task_rows = [{
-                "id": t.id, "project_id": t.project_id,
-                "parent_id": t.parent_id, "title": t.title,
-                "description": t.description,
-                "verification_url": t.verification_url,
-                "status": t.status.value, "position": t.position,
-                "created_at": now, "updated_at": now,
-            } for t in flat_tasks]
-            history_rows = [{
-                "id": str(uuid_mod.uuid4()), "task_id": t.id,
-                "old_status": None, "new_status": t.status.value,
-                "changed_at": now,
-            } for t in flat_tasks]
-            repo.client.table("tasks").insert(task_rows).execute()
-            repo.client.table("task_status_history").insert(history_rows).execute()
-        else:
-            for t in flat_tasks:
-                repo.create_task(t)
+        # Apply updates to existing tasks
+        for tid, fields in update_items:
+            repo.update_task(tid, **fields)
+
+        # Batch insert new tasks
+        if flat_tasks:
+            if hasattr(repo, '_get_conn'):
+                conn = repo._get_conn()
+                for t in flat_tasks:
+                    conn.execute(
+                        "INSERT INTO tasks "
+                        "(id, project_id, parent_id, title, description, verification_url, "
+                        " status, position, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (t.id, t.project_id, t.parent_id, t.title, t.description,
+                         t.verification_url, t.status.value, t.position, now, now),
+                    )
+                    conn.execute(
+                        "INSERT INTO task_status_history (id, task_id, old_status, new_status, changed_by, changed_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (str(uuid_mod.uuid4()), t.id, None, t.status.value, None, now),
+                    )
+                conn.commit()
+            elif hasattr(repo, 'client'):
+                task_rows = [{
+                    "id": t.id, "project_id": t.project_id,
+                    "parent_id": t.parent_id, "title": t.title,
+                    "description": t.description,
+                    "verification_url": t.verification_url,
+                    "status": t.status.value, "position": t.position,
+                    "created_at": now, "updated_at": now,
+                } for t in flat_tasks]
+                history_rows = [{
+                    "id": str(uuid_mod.uuid4()), "task_id": t.id,
+                    "old_status": None, "new_status": t.status.value,
+                    "changed_at": now,
+                } for t in flat_tasks]
+                repo.client.table("tasks").insert(task_rows).execute()
+                repo.client.table("task_status_history").insert(history_rows).execute()
+            else:
+                for t in flat_tasks:
+                    repo.create_task(t)
         _emit("kanban_board_refresh", {"reason": "plan_accepted"})
         return jsonify({"created_count": count[0], "created_ids": root_ids})
 

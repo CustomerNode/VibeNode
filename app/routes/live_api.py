@@ -85,20 +85,40 @@ def hook_pre_tool():
 
     Proxies the request to the session daemon, which blocks until the
     user responds via the WebSocket permission_response event.
+    Auto-retries on transient daemon IPC failures.
     """
+    import time as _time
+
     data = request.get_json(silent=True) or {}
     tool_name = data.get("tool_name", "unknown")
     tool_input = data.get("tool_input", {})
     session_id = data.get("session_id", "")
 
     sm = current_app.session_manager
-    result = sm.hook_pre_tool(
-        tool_name=tool_name,
-        tool_input=tool_input,
-        session_id=session_id,
-    )
-    if isinstance(result, dict):
-        return jsonify(result)
+
+    # Retry up to 3 times on IPC errors (daemon reconnecting)
+    for _attempt in range(3):
+        try:
+            result = sm.hook_pre_tool(
+                tool_name=tool_name,
+                tool_input=tool_input,
+                session_id=session_id,
+            )
+        except Exception:
+            result = {"ok": False, "error": "exception"}
+
+        if isinstance(result, dict):
+            # If daemon returned an IPC error, retry after brief wait
+            if not result.get("ok", True) and result.get("error") and _attempt < 2:
+                _time.sleep(1)
+                continue
+            # Success or final attempt — check for action
+            if "action" in result:
+                return jsonify(result)
+        # No action key means IPC error — allow by default on final attempt
+        if _attempt == 2:
+            return jsonify({"action": "allow"})
+
     return jsonify({"action": "allow"})
 
 

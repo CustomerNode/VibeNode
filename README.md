@@ -28,12 +28,14 @@ VibeNode is the result: a development system where the human is responsible for 
 
 **List** — Compact table with name, date, and size columns. Good for large session counts.
 
+![Session list view with conversation panel](docs/screenshots/session-list.png)
+
 **Workflow** — A full hierarchical task board for managing your development roadmap. Tasks are organized into configurable columns (Not Started, Working, Validating, Remediating, Complete by default) with drag-and-drop between them. Key capabilities:
 
 - **Hierarchical tasks** — Arbitrary nesting depth. Break epics into tasks into subtasks. Each level tracks its own status independently, with completion propagating up automatically.
 - **Session scoping** — Sessions are integrated into the task tree itself. At any branch, a task can break into either subtasks or Claude Code sessions — so the leaf nodes of your hierarchy become actual working sessions instead of more tasks. Spawn a session from any task card and context (breadcrumb path, sibling tasks, parent description) is injected automatically. This is fundamentally different from tools that bolt sessions on as an afterthought — here the board structure *is* the session structure.
 
-![A task drilled down to show its subtask hierarchy branching across workflow columns](docs/screenshots/task-hierarchy.png)
+![A task drilled down to show its subtask hierarchy — an epic branching into subtasks across different statuses with linked sessions](docs/screenshots/task-hierarchy.png)
 
 - **AI planner** — Describe work in natural language and Claude breaks it into a hierarchical task tree. Because it runs through Claude Code, it can read your codebase while planning — so the task breakdown reflects your actual architecture, not just your description. Iterate on the breakdown, then accept to bulk-create. Supports voice input.
 - **Dual storage backends** — SQLite (default, zero config, local file at `~/.claude/gui_kanban.db`) or Supabase (cloud PostgreSQL). Switch between them in System Settings with one-click migration.
@@ -45,8 +47,13 @@ VibeNode is the result: a development system where the human is responsible for 
 - **Multi-session coordination** — When a session launches from a task, it gets a briefing that includes sibling task statuses, which siblings have active sessions running (and for how long), open validation issues, and the full breadcrumb path up the task tree. Claude can see what's being worked on nearby and avoid conflicts — parallel sessions on related tasks are aware of each other.
 - **Tags, issues, and validation** — Tag tasks for filtering, log validation issues against tasks, track resolution status.
 
-
 **Workforce** *(experimental)* — Claude Code has two similar concepts — skills and agents — that don't translate naturally to a graphical environment. Workforce is our solution: a hierarchical knowledge base where each node has its own scoped instruction file (like a skill/agent MD file). Sessions launched from a node inherit that context, and Claude can see the full workforce tree to delegate work across it. You can scope tasks or sessions to any node in the hierarchy — clicking into a department to launch a session works like invoking a skill, while Claude autonomously dispatching work across the tree works like agents.
+
+### Live session panel
+
+Watch Claude work in real time, answer questions, and send follow-up commands — all from the browser.
+
+![Live session panel showing Claude Code terminal output and conversation in real time](docs/screenshots/live-session.png)
 
 ## Requirements
 

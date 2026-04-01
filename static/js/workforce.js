@@ -47,8 +47,10 @@ function setViewMode(mode) {
     if (sessionBar) sessionBar.remove();
     // Hide kanban elements
     if (kanbanEl) { kanbanEl.style.display = 'none'; kanbanEl.innerHTML = ''; }
-    // Restore main UI
+    // Restore main UI — reset main-body to dashboard so stale chat content
+    // from a previous session doesn't linger when returning to grid/list
     document.getElementById('main-body').style.display = '';
+    document.getElementById('main-body').innerHTML = _buildDashboard();
     document.getElementById('main-toolbar').style.display = 'none';
     const kanbanSidebar = document.getElementById('kanban-sidebar');
     if (kanbanSidebar) { kanbanSidebar.style.display = 'none'; kanbanSidebar.innerHTML = ''; }

@@ -148,7 +148,17 @@ try:
                     "response": response_data,
                 },
             }
-            await self.transport.write(_json.dumps(ctrl_response) + "\n")
+            try:
+                await self.transport.write(_json.dumps(ctrl_response) + "\n")
+            except Exception as _write_err:
+                # Transport closed mid-permission (e.g. CLI subprocess died).
+                # Swallow so it doesn't kill the SDK stream — the CLI is
+                # already gone.  Reconnect logic handles recovery.
+                logger.warning(
+                    "Transport write failed for permission response "
+                    "(tool=%s, req=%s): %s — stream likely closed",
+                    request_data.get("tool_name", "?"), request_id, _write_err,
+                )
         else:
             await _real_original_handle(self, request)
 
@@ -166,7 +176,11 @@ try:
             async for message in stream:
                 if self._closed:
                     break
-                await self.transport.write(_json2.dumps(message) + "\n")
+                try:
+                    await self.transport.write(_json2.dumps(message) + "\n")
+                except Exception as _sw_err:
+                    logger.warning("stream_input: transport write failed: %s", _sw_err)
+                    break
             # DON'T call end_input() — keep stdin open for queries and control
             # The original code does: await self.transport.end_input()
             # We skip this so the CLI stays alive
@@ -1053,6 +1067,65 @@ class SessionManager:
                 info.state = SessionState.IDLE
                 self._emit_state(info)
 
+            # ── Self-healing: reconnect + retry if "Stream closed" errors
+            # were detected during the initial turn.
+            if info and getattr(info, '_stream_heal_needed', False):
+                info._stream_heal_needed = False
+                heal_count = getattr(info, '_stream_heal_count', 0)
+                if heal_count <= 3:
+                    logger.info(
+                        "Self-healing (drive): reconnecting %s after %d Stream closed errors",
+                        session_id, heal_count,
+                    )
+                    entry = LogEntry(kind="system", text="Reconnecting session...")
+                    with info._lock:
+                        info.entries.append(entry)
+                        entry_index = len(info.entries) - 1
+                    self._emit_entry(session_id, entry, entry_index)
+
+                    if await self._reconnect_client(session_id, info):
+                        info._stream_heal_count = 0
+                        last_user_text = None
+                        with info._lock:
+                            for e in reversed(info.entries):
+                                if e.kind == "user":
+                                    last_user_text = e.text
+                                    break
+                        if last_user_text:
+                            entry = LogEntry(
+                                kind="system",
+                                text="Reconnected — retrying last message automatically",
+                            )
+                            with info._lock:
+                                info.entries.append(entry)
+                                entry_index = len(info.entries) - 1
+                            self._emit_entry(session_id, entry, entry_index)
+                            info.state = SessionState.IDLE
+                            self._emit_state(info)
+                            self.send_message(session_id, last_user_text)
+                        else:
+                            entry = LogEntry(kind="system", text="Reconnected successfully")
+                            with info._lock:
+                                info.entries.append(entry)
+                                entry_index = len(info.entries) - 1
+                            self._emit_entry(session_id, entry, entry_index)
+                            info.state = SessionState.IDLE
+                            self._emit_state(info)
+                    else:
+                        entry = LogEntry(
+                            kind="system",
+                            text="Reconnect failed — please resend your message",
+                            is_error=True,
+                        )
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
+                        info.state = SessionState.IDLE
+                        self._emit_state(info)
+                else:
+                    info._stream_heal_count = 0
+
             # Post-turn snapshot: captures file state AFTER Claude's edits.
             # By now the SDK remap has occurred (ResultMessage was processed
             # in the message loop), so _resolve_id will find the correct
@@ -1173,6 +1246,80 @@ class SessionManager:
                              "handlers — forcing IDLE as catch-all", session_id)
                 info.state = SessionState.IDLE
                 self._emit_state(info)
+
+            # ── Self-healing: reconnect + retry if "Stream closed" errors
+            # were detected during this turn.  We wait until the turn fully
+            # ends so we don't interrupt in-flight SDK processing.
+            if info and getattr(info, '_stream_heal_needed', False):
+                info._stream_heal_needed = False
+                heal_count = getattr(info, '_stream_heal_count', 0)
+                # Only auto-retry once to prevent infinite loops
+                if heal_count <= 3:
+                    logger.info(
+                        "Self-healing: reconnecting %s after %d Stream closed errors",
+                        session_id, heal_count,
+                    )
+                    entry = LogEntry(kind="system", text="Reconnecting session...")
+                    with info._lock:
+                        info.entries.append(entry)
+                        entry_index = len(info.entries) - 1
+                    self._emit_entry(session_id, entry, entry_index)
+
+                    if await self._reconnect_client(session_id, info):
+                        info._stream_heal_count = 0
+                        # Find the last user message to resend
+                        last_user_text = None
+                        with info._lock:
+                            for e in reversed(info.entries):
+                                if e.kind == "user":
+                                    last_user_text = e.text
+                                    break
+                        if last_user_text:
+                            entry = LogEntry(
+                                kind="system",
+                                text="Reconnected — retrying last message automatically",
+                            )
+                            with info._lock:
+                                info.entries.append(entry)
+                                entry_index = len(info.entries) - 1
+                            self._emit_entry(session_id, entry, entry_index)
+                            logger.info("Self-heal: resending last user message for %s", session_id)
+                            # Set IDLE so send_message can pick it up
+                            info.state = SessionState.IDLE
+                            self._emit_state(info)
+                            # Resend via the normal send_message path
+                            self.send_message(session_id, last_user_text)
+                        else:
+                            entry = LogEntry(kind="system", text="Reconnected successfully")
+                            with info._lock:
+                                info.entries.append(entry)
+                                entry_index = len(info.entries) - 1
+                            self._emit_entry(session_id, entry, entry_index)
+                            info.state = SessionState.IDLE
+                            self._emit_state(info)
+                    else:
+                        entry = LogEntry(
+                            kind="system",
+                            text="Reconnect failed — please resend your message",
+                            is_error=True,
+                        )
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
+                        info.state = SessionState.IDLE
+                        self._emit_state(info)
+                else:
+                    info._stream_heal_count = 0
+                    entry = LogEntry(
+                        kind="system",
+                        text="Too many stream errors — please resend your message",
+                        is_error=True,
+                    )
+                    with info._lock:
+                        info.entries.append(entry)
+                        entry_index = len(info.entries) - 1
+                    self._emit_entry(session_id, entry, entry_index)
 
             # Post-turn snapshot (isSnapshotUpdate=true, linked to assistant UUID)
             try:
@@ -1322,6 +1469,21 @@ class SessionManager:
                 for _poll_i in range(36000):  # 1 hour max
                     if perm_event.is_set():
                         break
+                    # Early bail: if client disconnected while we're waiting
+                    # for permission, auto-allow so the tool runs instead of
+                    # failing with "Stream closed".
+                    if not info.client:
+                        logger.warning(
+                            "Permission poll: client gone for %s — "
+                            "auto-allowing %s to avoid Stream closed",
+                            resolved_id, tool_name,
+                        )
+                        info.pending_permission = None
+                        info.pending_tool_name = ""
+                        info.pending_tool_input = {}
+                        info.state = SessionState.WORKING
+                        manager._emit_state(info)
+                        return PermissionResultAllow()
                     try:
                         await anyio.sleep(0.1)
                     except Exception:
@@ -1452,11 +1614,41 @@ class SessionManager:
                     else:
                         rt = str(rc)
 
+                    is_err = bool(getattr(block, 'is_error', False))
+
+                    # Detect "Stream closed" permission failures and flag session
+                    # for auto-retry after the current turn ends.  The turn will
+                    # finish (ResultMessage), then _send_query / _drive_session
+                    # will reconnect the client and resend the last user message
+                    # so the failed tools actually execute.
+                    if is_err and "Stream closed" in rt:
+                        if not getattr(info, '_stream_heal_count', 0):
+                            info._stream_heal_count = 0
+                        info._stream_heal_count += 1
+                        info._stream_heal_needed = True
+                        logger.warning(
+                            "Stream closed error #%d for session %s — "
+                            "will auto-reconnect and retry after turn ends",
+                            info._stream_heal_count, session_id,
+                        )
+                        # Show the user what's happening (not an error, a status)
+                        entry = LogEntry(
+                            kind="system",
+                            text=f"Stream error detected — will auto-reconnect and retry",
+                        )
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
+                        # Still emit the original error for transparency but
+                        # continue processing — the retry will happen after the
+                        # turn ends.
+
                     entry = LogEntry(
                         kind="tool_result",
                         text=rt[:20000],
                         tool_use_id=getattr(block, 'tool_use_id', '') or '',
-                        is_error=bool(getattr(block, 'is_error', False)),
+                        is_error=is_err,
                     )
                     with info._lock:
                         info.entries.append(entry)
