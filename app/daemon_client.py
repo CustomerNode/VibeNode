@@ -404,13 +404,10 @@ class DaemonClient:
             "session_id": session_id, "allow": allow, "always": always,
         })
 
-    def interrupt_session(self, session_id, merge_queue=False, pending_text=None):
-        params = {"session_id": session_id}
-        if merge_queue:
-            params["merge_queue"] = True
-        if pending_text:
-            params["pending_text"] = pending_text
-        return self._send_request("interrupt_session", params)
+    def interrupt_session(self, session_id):
+        return self._send_request("interrupt_session", {
+            "session_id": session_id,
+        })
 
     def close_session(self, session_id):
         return self._send_request("close_session", {
@@ -518,10 +515,5 @@ class DaemonClient:
 
     def clear_queue(self, session_id):
         return self._send_request("clear_queue", {
-            "session_id": session_id,
-        })
-
-    def nudge_queue(self, session_id):
-        return self._send_request("nudge_queue", {
             "session_id": session_id,
         })

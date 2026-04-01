@@ -1,4 +1,4 @@
-# Contributing to ClaudeCodeGUI
+# Contributing to VibeNode
 
 Thanks for your interest in contributing! This guide covers everything you need to get started.
 
@@ -13,8 +13,8 @@ Thanks for your interest in contributing! This guide covers everything you need 
 ### Setup
 
 ```bash
-git clone https://github.com/CustomerNode/ClaudeCodeGUI.git
-cd ClaudeCodeGUI
+git clone https://github.com/CustomerNode/VibeNode.git
+cd VibeNode
 pip install flask pytest pytest-cov
 ```
 

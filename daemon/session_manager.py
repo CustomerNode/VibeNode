@@ -741,23 +741,6 @@ class SessionManager:
         self._emit_queue_update(session_id)
         return {"ok": True}
 
-    def nudge_queue(self, session_id: str) -> dict:
-        """Frontend safety net: retry queue dispatch for an idle session.
-
-        Called when the frontend detects a session is idle but still has
-        queued messages — indicates the automatic dispatch was missed.
-        """
-        session_id = self._resolve_id(session_id)
-        with self._lock:
-            info = self._sessions.get(session_id)
-        if not info:
-            return {"ok": False, "error": "Session not found"}
-        if info.state != SessionState.IDLE:
-            return {"ok": False, "error": "Session not idle"}
-        logger.info("Queue nudge for %s — retrying dispatch", session_id)
-        self._try_dispatch_queue(session_id)
-        return {"ok": True}
-
     def _try_dispatch_queue(self, session_id: str) -> None:
         """If session is IDLE and queue has items, dispatch the first one.
 
@@ -800,17 +783,11 @@ class SessionManager:
             self._save_queues()
             self._emit_queue_update(session_id)
 
-    def interrupt_session(self, session_id: str, clear_queue: bool = True,
-                           merge_queue: bool = False,
-                           pending_text: str = None) -> dict:
+    def interrupt_session(self, session_id: str, clear_queue: bool = True) -> dict:
         """Interrupt a running session.
 
-        When merge_queue is True, all queued messages (plus optional
-        pending_text from the queue textarea) are merged into a single
-        message that will auto-dispatch when the session goes idle.
-
-        When clear_queue is True and merge_queue is False (default),
-        clears any queued messages to prevent auto-dispatch.
+        When clear_queue is True (default), also clears any queued messages
+        to prevent auto-dispatch when the session goes idle after interrupt.
         """
         session_id = self._resolve_id(session_id)
         with self._lock:
@@ -820,22 +797,9 @@ class SessionManager:
         if info.state == SessionState.STOPPED:
             return {"ok": False, "error": "Session already stopped"}
 
-        if merge_queue:
-            # Merge all queued messages (+ pending textarea text) into one
-            # so _try_dispatch_queue sends a single combined message on IDLE.
-            with self._queue_lock:
-                q = list(self._queues.get(session_id, []))
-                if pending_text and pending_text.strip():
-                    q.append(pending_text.strip())
-                if q:
-                    merged = "\n\n".join(q)
-                    self._queues[session_id] = [merged]
-                    self._save_queues()
-                    self._emit_queue_update(session_id)
-                # If nothing to merge, leave queue empty — normal interrupt.
-        elif clear_queue:
-            # Clear queue atomically BEFORE the interrupt so _emit_state(IDLE)
-            # won't auto-dispatch a queued message after the interrupt completes.
+        # Clear queue atomically BEFORE the interrupt so _emit_state(IDLE)
+        # won't auto-dispatch a queued message after the interrupt completes.
+        if clear_queue:
             with self._queue_lock:
                 if session_id in self._queues:
                     self._queues.pop(session_id)
@@ -2301,13 +2265,7 @@ class SessionManager:
                     recheck = self._sessions.get(sid)
                 if recheck and recheck.state == SessionState.IDLE:
                     logger.debug("Deferred IDLE re-emit for %s", sid)
-                    # Retry queue dispatch — catches races where the queue
-                    # was populated after the initial _try_dispatch_queue.
-                    self._try_dispatch_queue(sid)
-                    # Re-check: _try_dispatch_queue may have set WORKING
-                    with self._lock:
-                        recheck = self._sessions.get(sid)
-                    if recheck and recheck.state == SessionState.IDLE and self._push_callback:
+                    if self._push_callback:
                         data = recheck.to_state_dict()
                         with self._queue_lock:
                             q = self._queues.get(sid, [])

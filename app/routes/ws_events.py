@@ -335,13 +335,7 @@ def register_ws_events(socketio, app):
             return
 
         sm = app.session_manager
-        merge_queue = bool(data.get('merge_queue', False))
-        pending_text = (data.get('pending_text') or '').strip()
-        result = sm.interrupt_session(
-            session_id,
-            merge_queue=merge_queue,
-            pending_text=pending_text or None,
-        )
+        result = sm.interrupt_session(session_id)
 
         if not result.get('ok'):
             emit('error', {
@@ -550,17 +544,6 @@ def register_ws_events(socketio, app):
         result = sm.clear_queue(session_id)
         if not result.get('ok'):
             emit('error', {'message': result.get('error', 'Failed to clear'), 'session_id': session_id})
-
-    @socketio.on('nudge_queue')
-    def handle_nudge_queue(data):
-        """Frontend safety net: retry queue dispatch for an idle session."""
-        if not isinstance(data, dict):
-            return
-        session_id = (data.get('session_id') or '').strip()
-        if not session_id:
-            return
-        sm = app.session_manager
-        sm.nudge_queue(session_id)
 
     @socketio.on('get_queue')
     def handle_get_queue(data):

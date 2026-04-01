@@ -1284,29 +1284,26 @@ function liveSubmitInterrupt() {
   // Grab any text the user typed into the queue textarea (not yet queued).
   const queueTa = document.getElementById('live-queue-ta');
   const pendingText = queueTa ? queueTa.value.trim() : '';
-  // Collect already-queued messages
+  // Collect already-queued messages and merge with pending textarea text.
+  // The merged text is placed in the idle input so the user can send it.
   const queued = _getQueueList(liveSessionId);
-  const hasQueuedContent = queued.length > 0 || pendingText;
-
-  if (hasQueuedContent) {
-    // Merge all queued messages (+ pending textarea text) into a single
-    // message that will auto-send once the session goes idle after interrupt.
-    socket.emit('interrupt_session', {
-      session_id: liveSessionId,
-      merge_queue: true,
-      pending_text: pendingText,
-    });
-  } else {
-    // Nothing queued — plain interrupt, clear queue as before.
-    socket.emit('interrupt_session', {session_id: liveSessionId});
-  }
-  // Optimistic: clear local queue cache (server will push merged state via queue_updated)
+  const parts = [...queued];
+  if (pendingText) parts.push(pendingText);
+  const mergedText = parts.join('\n\n');
+  // Clear queue and interrupt normally
+  socket.emit('clear_queue', {session_id: liveSessionId});
   delete _sessionQueues[liveSessionId];
   _renderQueueBanner();
+  socket.emit('interrupt_session', {session_id: liveSessionId});
   // Optimistic: immediately show idle state in the chat UI
   sessionKinds[liveSessionId] = 'idle';
   liveBarState = null;
   updateLiveInputBar();
+  // Place merged text into the idle textarea so user can send it
+  if (mergedText) {
+    const idleTa = document.getElementById('live-input-ta');
+    if (idleTa) { idleTa.value = mergedText; _initAutoResize(idleTa); }
+  }
 }
 
 function liveClearDisplay() {

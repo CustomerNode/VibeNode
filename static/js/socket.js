@@ -409,20 +409,6 @@ socket.on('session_state', (data) => {
         _renderQueueBanner();
     }
 
-    // Safety net: if session is idle but still has queued messages, nudge
-    // the backend to dispatch after a short delay.  Catches edge cases
-    // where the server-side _try_dispatch_queue missed (race, reconnect).
-    if (state === 'idle' && data.queue && data.queue.length) {
-        const _nudgeSid = session_id;
-        setTimeout(() => {
-            // Re-check: only nudge if session is still idle with queue items
-            if (sessionKinds[_nudgeSid] === 'idle' && _getQueueList(_nudgeSid).length) {
-                console.warn('[queue-nudge] Session', _nudgeSid, 'idle with queued messages — nudging dispatch');
-                socket.emit('nudge_queue', {session_id: _nudgeSid});
-            }
-        }, 2000);
-    }
-
     // Update sidebar row classes
     _updateRowState(session_id, state);
 
