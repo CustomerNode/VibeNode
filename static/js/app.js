@@ -1099,7 +1099,11 @@ function showSkeletonLoader() {
 
 async function loadSessions() {
   showSkeletonLoader();
-  // Load sessions and folder tree in parallel
+  // Load workforce assets from disk first (replaces FOLDER_SUPERSET before folder tree reads it)
+  // Then load sessions and folder tree in parallel
+  if (typeof _loadWorkforceFromDisk === 'function') {
+    try { await _loadWorkforceFromDisk(); } catch(e) {}
+  }
   const [resp] = await Promise.all([
     fetch('/api/sessions'),
     (typeof initFolderTree === 'function') ? initFolderTree().catch(function(){}) : Promise.resolve(),

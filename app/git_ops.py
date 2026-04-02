@@ -145,26 +145,34 @@ def do_git_sync(action: str) -> dict:
         else:
             messages.append("Your VibeNode changes have been pushed to remote.")
 
-    # Update git cache immediately so the next pollGitStatus gets fresh data.
-    # Acquire the fetch lock so a concurrent _bg_git_fetch can't overwrite us,
-    # and set a cooldown so refresh_if_idle() won't start a new one right away.
+    # Update git cache immediately. After a successful push we know ahead=0
+    # and uncommitted=False — don't re-check status --porcelain because a
+    # concurrent process (e.g. an active agent session) can dirty the tree
+    # between our commit and the check, making the button stick.
     global _sync_cooldown_until
+    pushed_ok = ok and action in ("push", "both")
     with _git_fetch_lock:
-        try:
-            r = subprocess.run(
-                ["git", "-C", str(proj), "rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
-                capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW)
-            a = b = 0
-            if r.returncode == 0:
-                parts = r.stdout.strip().split()
-                if len(parts) == 2:
-                    a, b = int(parts[0]), int(parts[1])
-            d = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"],
-                               capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW)
-            _git_cache.update({"has_git": True, "ahead": a, "behind": b,
-                               "uncommitted": bool(d.stdout.strip()), "ready": True})
-        except Exception:
-            pass
+        if pushed_ok:
+            # Trust the result: commit+push succeeded → clean state
+            _git_cache.update({"has_git": True, "ahead": 0, "behind": 0,
+                               "uncommitted": False, "ready": True})
+        else:
+            # Pull-only or error: re-check actual state
+            try:
+                r = subprocess.run(
+                    ["git", "-C", str(proj), "rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+                    capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW)
+                a = b = 0
+                if r.returncode == 0:
+                    parts = r.stdout.strip().split()
+                    if len(parts) == 2:
+                        a, b = int(parts[0]), int(parts[1])
+                d = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"],
+                                   capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW)
+                _git_cache.update({"has_git": True, "ahead": a, "behind": b,
+                                   "uncommitted": bool(d.stdout.strip()), "ready": True})
+            except Exception:
+                pass
         _sync_cooldown_until = time.time() + 10  # suppress bg refresh for 10s
 
     return {"ok": ok, "messages": messages}

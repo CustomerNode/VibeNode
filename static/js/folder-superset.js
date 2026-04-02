@@ -1,6 +1,12 @@
 /* folder-superset.js — Complete folder definitions and skills for all departments */
 
-const FOLDER_SUPERSET = {
+/* FOLDER_SUPERSET is the runtime data structure used everywhere.
+ * On startup, _loadWorkforceFromDisk() tries to populate it from the
+ * on-disk .md files via /api/workforce/assets.  If that fails or returns
+ * no data, the hardcoded fallback below is used unchanged.                */
+
+// Use 'let' so we can replace from disk-loaded data
+let FOLDER_SUPERSET = {
 
   // ── Engineering ──────────────────────────────────────────────────────
   'engineering': {
@@ -713,3 +719,81 @@ const FOLDER_TEMPLATES = {
     keys: [],
   },
 };
+
+/**
+ * Load workforce assets from on-disk .md files via the backend API.
+ * Converts the flat asset list + hierarchy map into the FOLDER_SUPERSET
+ * object format so all existing code continues to work.
+ * Returns true if disk data was loaded, false if using hardcoded fallback.
+ */
+async function _loadWorkforceFromDisk() {
+  try {
+    const resp = await fetch('/api/workforce/assets');
+    if (!resp.ok) return false;
+    const data = await resp.json();
+    if (!data.ok || !data.assets || !data.assets.length) return false;
+
+    // Build the hierarchy from the map file
+    const hierarchy = {};  // parentId -> [childId, ...]
+    const rootIds = [];
+    if (data.map && data.map.body) {
+      // Parse indentation-based hierarchy: "- id: name" and "  - id: name"
+      const lines = data.map.body.split('\n');
+      let currentParent = null;
+      for (const line of lines) {
+        const m2 = line.match(/^  - (\S+):/);
+        const m1 = line.match(/^- (\S+):/);
+        if (m2) {
+          // Child
+          if (currentParent) {
+            if (!hierarchy[currentParent]) hierarchy[currentParent] = [];
+            hierarchy[currentParent].push(m2[1]);
+          }
+        } else if (m1) {
+          // Root
+          currentParent = m1[1];
+          rootIds.push(m1[1]);
+        }
+      }
+    }
+
+    // Build FOLDER_SUPERSET-compatible object
+    const newSuperset = {};
+    const assetMap = {};
+    for (const a of data.assets) { assetMap[a.id] = a; }
+
+    for (const a of data.assets) {
+      const children = hierarchy[a.id] || [];
+      const isRoot = rootIds.includes(a.id);
+      // Find parent from hierarchy
+      let parentId = null;
+      if (!isRoot) {
+        for (const [pid, kids] of Object.entries(hierarchy)) {
+          if (kids.includes(a.id)) { parentId = pid; break; }
+        }
+      }
+
+      newSuperset[a.id] = {
+        name: a.name,
+        parentId: parentId,
+        children: children,
+        skill: {
+          label: a.name,
+          systemPrompt: a.systemPrompt,
+        },
+      };
+    }
+
+    // Only replace if we got a meaningful result
+    if (Object.keys(newSuperset).length > 0) {
+      FOLDER_SUPERSET = newSuperset;
+      // Invalidate agent catalog cache so it gets re-written with disk data
+      if (typeof _agentCatalogPath !== 'undefined') { _agentCatalogPath = null; _agentCatalogPromise = null; }
+      console.log(`[workforce] Loaded ${Object.keys(newSuperset).length} assets from disk`);
+      return true;
+    }
+  } catch (e) {
+    console.warn('[workforce] Failed to load from disk, using hardcoded fallback:', e);
+  }
+  return false;
+}

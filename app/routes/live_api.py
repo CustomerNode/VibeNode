@@ -514,9 +514,10 @@ def write_agent_catalog():
     """
     proj = get_active_project() or "default"
 
-    # Fast path: already written for this project
+    # Fast path: already written for this project (skip if ?force=1)
+    force = request.args.get('force') == '1'
     cached = _agent_catalog_paths.get(proj)
-    if cached and os.path.isfile(cached):
+    if cached and os.path.isfile(cached) and not force:
         return jsonify({"ok": True, "path": cached})
 
     data = request.get_json(silent=True) or {}
@@ -581,6 +582,85 @@ def write_agent_catalog():
         return jsonify({"ok": True, "path": filepath})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Workforce — read .md assets from disk
+# ---------------------------------------------------------------------------
+
+_WORKFORCE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'workforce')
+
+
+@bp.route('/api/workforce/assets', methods=['GET'])
+def get_workforce_assets():
+    """Read all .md files from the workforce directory and return parsed assets."""
+    if not os.path.isdir(_WORKFORCE_DIR):
+        return jsonify({"ok": True, "assets": [], "map": None, "source": "none"})
+
+    assets = []
+    wf_map = None
+
+    for fname in os.listdir(_WORKFORCE_DIR):
+        if not fname.endswith('.md'):
+            continue
+        fpath = os.path.join(_WORKFORCE_DIR, fname)
+        if not os.path.isfile(fpath):
+            continue
+
+        try:
+            with open(fpath, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception:
+            continue
+
+        # Parse YAML frontmatter (simple key: value pairs, no PyYAML needed)
+        frontmatter = {}
+        body = content
+        if content.startswith('---'):
+            parts = content.split('---', 2)
+            if len(parts) >= 3:
+                for line in parts[1].strip().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if ':' in line:
+                        k, v = line.split(':', 1)
+                        k = k.strip()
+                        v = v.strip()
+                        # Handle simple arrays: [a, b, c]
+                        if v.startswith('[') and v.endswith(']'):
+                            v = [x.strip().strip("'\"") for x in v[1:-1].split(',') if x.strip()]
+                        # Handle booleans
+                        elif v.lower() == 'true':
+                            v = True
+                        elif v.lower() == 'false':
+                            v = False
+                        elif v.lower() == 'null' or v == '':
+                            v = None
+                        else:
+                            v = v.strip("'\"")
+                        frontmatter[k] = v
+                body = parts[2].strip()
+
+        # workforce-map.md is special
+        if frontmatter.get('type') == 'workforce-map':
+            wf_map = {"frontmatter": frontmatter, "body": body}
+            continue
+
+        asset_id = frontmatter.get('id', fname.replace('.md', ''))
+        assets.append({
+            "id": asset_id,
+            "name": frontmatter.get('name', asset_id),
+            "department": frontmatter.get('department', ''),
+            "tags": frontmatter.get('tags', []),
+            "active": frontmatter.get('active', True),
+            "version": frontmatter.get('version'),
+            "allowed_tools": frontmatter.get('allowed-tools'),
+            "source": frontmatter.get('source'),
+            "systemPrompt": body,
+        })
+
+    return jsonify({"ok": True, "assets": assets, "map": wf_map, "source": "disk"})
 
 
 # ---------------------------------------------------------------------------
