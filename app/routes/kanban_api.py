@@ -903,8 +903,9 @@ Respond with a JSON structure wrapped in ```json code fences:
     {
       "title": "...",
       "description": "...",
+      "verification_url": null,
       "subtasks": [
-        { "title": "...", "description": "", "subtasks": [] }
+        { "title": "...", "description": "", "verification_url": null, "subtasks": [] }
       ]
     }
   ]
@@ -917,6 +918,17 @@ Guidelines:
 - Use 2-4 levels of nesting max unless the user asks for more
 - Include descriptions only when the title isn't self-explanatory
 - The "response" field should be a friendly conversational explanation
+
+Verification URLs:
+- Each task/subtask has an optional "verification_url" field — an absolute URL the developer
+  can click to manually validate the feature or behavior that task implements.
+- ONLY set a verification_url if you can determine the REAL dev server address and route from
+  the actual project code (e.g. by reading config files, route definitions, app entry points).
+- Do NOT guess or assume a default port. Do NOT use generic examples like localhost:8000.
+- If you have not seen evidence of the dev server address in the project, set verification_url
+  to null. When in doubt, null.
+- URLs MUST be absolute (start with http:// or https://). Never use relative paths.
+- If a task is not verifiable via a URL (e.g. refactoring, config changes), set to null.
 """
 
 
@@ -948,6 +960,26 @@ def planner_chat():
 
         result_text = None
 
+        # Build system prompt — enrich with validation base URL if configured
+        from ..config import get_kanban_config as _get_plan_cfg
+        _plan_cfg = _get_plan_cfg()
+        sys_prompt = PLANNER_CHAT_SYSTEM
+        if _plan_cfg.get("validation_url_enabled") and _plan_cfg.get("validation_base_url"):
+            base = _plan_cfg["validation_base_url"]
+            sys_prompt += (
+                "\n\nVALIDATION URLS ENABLED. Dev server base URL: " + base + ". "
+                "You MUST set verification_url on EVERY task and subtask by constructing "
+                "absolute URLs from this base URL. Read the project code to find real "
+                "route paths, page URLs, and API endpoints. Build verification_url as "
+                "base URL + the route path (e.g. " + base + "/dashboard). Every task "
+                "MUST have a verification_url unless it is purely non-visual work like "
+                "refactoring or config with no observable endpoint. Try hard to find a "
+                "relevant URL for each task. For tasks that CREATE new endpoints or pages "
+                "that do not exist yet, you may still set verification_url to the planned "
+                "URL — but add a note in the task description like '(new endpoint)' so the "
+                "developer knows it will only work after implementation."
+            )
+
         # Strategy 1: Direct Anthropic API (fast, needs ANTHROPIC_API_KEY)
         if os.environ.get("ANTHROPIC_API_KEY"):
             try:
@@ -956,7 +988,7 @@ def planner_chat():
                 resp = client.messages.create(
                     model="claude-sonnet-4-20250514",
                     max_tokens=4096,
-                    system=PLANNER_CHAT_SYSTEM,
+                    system=sys_prompt,
                     messages=messages,
                 )
                 result_text = resp.content[0].text if resp.content else ""
@@ -968,7 +1000,7 @@ def planner_chat():
         if not result_text:
             import subprocess
             import sys
-            prompt = PLANNER_CHAT_SYSTEM + "\n\n"
+            prompt = sys_prompt + "\n\n"
             for m in messages:
                 prompt += "[" + m.get("role", "user").upper() + "]\n" + m["content"] + "\n\n"
             creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -992,14 +1024,24 @@ def planner_chat():
         if json_match:
             raw = json_match.group(1)
         else:
-            # Brace-balanced extraction for first complete top-level {...}
+            # Brace-balanced extraction (string-aware) for first complete top-level {...}
             raw = None
             start = result_text.find('{')
             if start >= 0:
                 depth, end = 0, -1
+                in_str, esc = False, False
                 for i in range(start, len(result_text)):
-                    if result_text[i] == '{': depth += 1
-                    elif result_text[i] == '}':
+                    c = result_text[i]
+                    if esc:
+                        esc = False; continue
+                    if c == '\\' and in_str:
+                        esc = True; continue
+                    if c == '"':
+                        in_str = not in_str; continue
+                    if in_str:
+                        continue
+                    if c == '{': depth += 1
+                    elif c == '}':
                         depth -= 1
                         if depth == 0: end = i; break
                 if end > start:
@@ -1089,6 +1131,8 @@ def planner_accept():
                         updates["title"] = item["title"]
                     if "description" in item:
                         updates["description"] = item["description"]
+                    if "verification_url" in item:
+                        updates["verification_url"] = item["verification_url"]
                     if updates:
                         updates["updated_at"] = now
                         update_items.append((existing_id, updates))
@@ -1191,6 +1235,9 @@ def get_kanban_config():
         "auto_advance": cfg.get("kanban_auto_advance", False),
         "kanban_auto_advance": cfg.get("kanban_auto_advance", False),
         "kanban_page_size": cfg.get("kanban_page_size", 50),
+        "validation_url_enabled": cfg.get("validation_url_enabled", False),
+        "validation_base_url": cfg.get("validation_base_url", ""),
+        "validation_url_dismissed": cfg.get("validation_url_dismissed", False),
     })
 
 
@@ -1215,9 +1262,12 @@ def update_kanban_config():
         cfg["kanban_depth_limit"] = int(data["depth_limit"])
     # Behavior preferences
     for pref_key in ("auto_start_on_session", "auto_parent_working",
-                     "auto_parent_reopen", "auto_advance_to_validating"):
+                     "auto_parent_reopen", "auto_advance_to_validating",
+                     "validation_url_enabled", "validation_url_dismissed"):
         if pref_key in data:
             cfg[pref_key] = bool(data[pref_key])
+    if "validation_base_url" in data:
+        cfg["validation_base_url"] = str(data["validation_base_url"]).strip()
     # Legacy key migration
     if "auto_advance" in data and "auto_advance_to_validating" not in data:
         cfg["auto_advance_to_validating"] = bool(data["auto_advance"])

@@ -477,14 +477,8 @@ function renderTaskCard(task, depth) {
 
   // Expand arrow removed — drill-down handles subtask/session viewing
 
-  // Verification URL icon + truncated path text (plan line 714)
-  let verIcon = '';
-  if (verUrl) {
-    let verLabel = task.verification_url || verUrl;
-    try { verLabel = new URL(verUrl).pathname; } catch(_) {}
-    if (verLabel.length > 22) verLabel = verLabel.slice(0, 20) + '\u2026';
-    verIcon = `<a class="kanban-ver-link" href="${escHtml(verUrl)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="${escHtml(verUrl)}">${KI.link} ${escHtml(verLabel)}</a>`;
-  }
+  // Verification URL — only shown in drill-down view, not on board cards
+  const verIcon = '';
 
   // Context menu button (⋮)
   const contextBtn = `<button class="kanban-context-btn" onclick="event.stopPropagation();showCardContextMenu('${task.id}', event)" title="Actions">${KI.dots}</button>`;
@@ -715,13 +709,91 @@ function createTask(status, parentId) {
   overlay.onclick = (e) => { if (e.target === overlay) _closePm(); };
 }
 
-function _submitPlanWithAi() {
+async function _submitPlanWithAi() {
   const ta = document.getElementById('kanban-plan-input');
   const text = ta ? ta.value.trim() : '';
   if (!text) { if (ta) ta.focus(); return; }
   _closePm();
 
+  // Check if validation URL config has been set or dismissed
+  try {
+    const cfg = await fetch('/api/kanban/config').then(r => r.ok ? r.json() : {});
+    if (!cfg.validation_url_enabled && !cfg.validation_url_dismissed && !cfg.validation_base_url) {
+      // Wait for the previous modal close animation to finish
+      await new Promise(r => setTimeout(r, 220));
+      const result = await _showValidationUrlSetupModal();
+      if (result === 'never') {
+        await fetch('/api/kanban/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ validation_url_dismissed: true }) });
+      }
+      // 'skipped' (click-away / Not Now) = ask again next time
+      // 'never' = don't ask again
+      // 'enabled' = saved URL, proceed
+    }
+  } catch (_) { /* config fetch failed, proceed anyway */ }
+
   _openPlannerSlideout(text);
+}
+
+function _showValidationUrlSetupModal() {
+  return new Promise((resolve) => {
+    const overlay = document.getElementById('pm-overlay');
+    if (!overlay) { resolve('skipped'); return; }
+
+    let _resolved = false;
+    const _finish = (val) => { if (_resolved) return; _resolved = true; resolve(val); };
+
+    // Ensure overlay is clean before building
+    overlay.innerHTML = '';
+    overlay.classList.remove('show');
+
+    overlay.innerHTML = `<div class="pm-card pm-enter" style="max-width:480px;">
+      <h2 class="pm-title">Validation URLs</h2>
+      <div class="pm-body">
+        <div style="font-size:13px;color:var(--text-secondary);margin-bottom:16px;">
+          The AI planner can generate clickable validation URLs on each task so you can quickly verify features in your browser. Where does your development server run?
+        </div>
+        <input type="url" id="_val-setup-url" class="pm-input" placeholder="http://localhost:8000" style="width:100%;margin-bottom:8px;" onkeydown="if(event.key==='Enter'){event.preventDefault();document.getElementById('_val-setup-save')?.click();}">
+        <div style="font-size:11px;color:var(--text-faint);">You can change this later in Workflow Settings → Validation.</div>
+      </div>
+      <div class="pm-actions" style="gap:8px;">
+        <button class="pm-btn pm-btn-secondary" id="_val-setup-never" style="margin-right:auto;font-size:12px;opacity:0.7;">Don't ask again</button>
+        <button class="pm-btn pm-btn-secondary" id="_val-setup-skip">Not now</button>
+        <button class="pm-btn pm-btn-primary" id="_val-setup-save">Enable</button>
+      </div>
+    </div>`;
+    overlay.classList.add('show');
+    requestAnimationFrame(() => overlay.querySelector('.pm-card')?.classList.remove('pm-enter'));
+
+    const _close = () => {
+      const card = overlay.querySelector('.pm-card');
+      if (card) card.classList.add('pm-exit');
+      setTimeout(() => { overlay.classList.remove('show'); overlay.innerHTML = ''; }, 180);
+    };
+
+    // "Not now" = skip this time, ask again next time
+    document.getElementById('_val-setup-skip').onclick = () => { _close(); _finish('skipped'); };
+
+    // "Don't ask again" = persist dismissal
+    document.getElementById('_val-setup-never').onclick = () => { _close(); _finish('never'); };
+
+    // "Enable" = save URL
+    document.getElementById('_val-setup-save').onclick = async () => {
+      const url = document.getElementById('_val-setup-url')?.value?.trim() || '';
+      if (!url) { document.getElementById('_val-setup-url')?.focus(); return; }
+      try {
+        await fetch('/api/kanban/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ validation_url_enabled: true, validation_base_url: url }) });
+      } catch (_) {}
+      _close();
+      if (typeof showToast === 'function') showToast('Validation URLs enabled');
+      _finish('enabled');
+    };
+
+    // Click outside = same as "Not now" (will ask again)
+    overlay.onclick = (e) => { if (e.target === overlay) { _close(); _finish('skipped'); } };
+
+    // Focus input after animation
+    setTimeout(() => document.getElementById('_val-setup-url')?.focus(), 250);
+  });
 }
 
 let _plannerProposal = null;
@@ -738,10 +810,11 @@ const _PLANNER_SYSTEM = [
   'You MUST respond with ONLY valid JSON. No explanation, no prose, no apologies, no refusals.',
   'Even for trivial, nonsensical, or test inputs, you MUST produce a valid task tree.',
   'NEVER refuse. NEVER explain. NEVER output anything except the JSON object.',
-  'Format: {"tasks":[{"title":"...","description":"...","subtasks":[]}]}',
+  'Format: {"tasks":[{"title":"...","description":"...","verification_url":null,"subtasks":[]}]}',
   'To edit existing tasks include "id": {"tasks":[{"id":"existing-id","title":"New Title"}]}. Tasks without "id" are new.',
   'Prefer breaking work into subtasks over writing long descriptions. Descriptions should be brief (1-2 sentences max). Use subtasks to express detail.',
   'Rules: concrete actionable tasks, 2-4 nesting levels.',
+  'verification_url: absolute URL (http:// or https://) the developer can click to validate the task. Default is null unless a dev server base URL is provided in this prompt.',
 ].join(' ');
 let _plannerTimeout = null;
 
@@ -754,7 +827,7 @@ function _buildPlannerPanel() {
     <div class="kanban-planner-header" onclick="if(document.getElementById('kanban-planner-panel')?.classList.contains('minimized')){event.stopPropagation();_restorePlanner();}">
       <span class="kanban-planner-title">${KI.plan} Plan with AI</span>
       <div style="display:flex;gap:4px;align-items:center;">
-        <button class="kanban-planner-close" onclick="event.stopPropagation();_minimizePlanner()" title="Minimize" style="font-size:16px;">&#x2015;</button>
+        <button class="kanban-planner-close planner-minimize-btn" onclick="event.stopPropagation();_minimizePlanner()" title="Minimize" style="font-size:16px;">&#x2015;</button>
         <button class="kanban-planner-close" onclick="event.stopPropagation();_closePlannerSlideout()" title="Close">&times;</button>
       </div>
     </div>
@@ -804,14 +877,23 @@ function _attachPlannerListeners() {
   _plannerEntryListener = (data) => {
     console.log('[planner] entry event:', data.session_id, 'expected:', _plannerSessionId, 'kind:', data.entry?.kind, 'text:', (data.entry?.text || '').slice(0, 80));
     if (data.session_id !== _plannerSessionId) return;
-    if (!data.entry || !data.entry.text) return;
-    // Only collect assistant text — skip user echoes, tool calls, system msgs
-    if (data.entry.kind !== 'asst') return;
-    _plannerAccumText += data.entry.text;
+    if (!data.entry) return;
+    const kind = data.entry.kind;
+    const text = data.entry.text || '';
+
+    // Show tool activity as steps in the progress UI
+    if (kind === 'tool_use') {
+      const desc = data.entry.desc || data.entry.name || 'Working\u2026';
+      _addPlannerStep(desc);
+      return;
+    }
+    if (kind === 'tool_result') return;
+
+    if (!text || kind !== 'asst') return;
+    _plannerAccumText += text;
     _updatePlannerProgress();
 
     // Try to detect complete JSON without waiting for idle
-    // (session may never go idle if max_turns isn't respected)
     _tryEarlyParse();
   };
 
@@ -831,22 +913,17 @@ function _attachPlannerListeners() {
   socket.on('session_entry', _plannerEntryListener);
   socket.on('session_state', _plannerStateListener);
 
-  // Safety timeout — if no result after 45s, show whatever we have
-  if (_plannerTimeout) clearTimeout(_plannerTimeout);
-  _plannerTimeout = setTimeout(() => {
-    if (!_plannerProposal && _plannerSessionId) {
-      _stopPlannerTimer();
-      _showPlanResult(_plannerAccumText || '');
-      _plannerAccumText = '';
-    }
-  }, 45000);
 }
 
 function _stopPlannerTimer() {
   if (_plannerTimerInterval) { clearInterval(_plannerTimerInterval); _plannerTimerInterval = null; }
-  if (_plannerTimeout) { clearTimeout(_plannerTimeout); _plannerTimeout = null; }
 }
 
+let _plannerSteps = [];
+function _addPlannerStep(desc) {
+  _plannerSteps.push(desc);
+  _updatePlannerProgress();
+}
 function _updatePlannerProgress() {
   const body = document.getElementById('planner-body');
   if (!body) return;
@@ -859,12 +936,30 @@ function _updatePlannerProgress() {
   let statusHtml = '<div class="planner-status">';
   statusHtml += '<div class="planner-spinner"></div>';
   statusHtml += '<div class="planner-progress-info">';
-  statusHtml += '<span>Building task breakdown\u2026</span>';
   if (taskCount > 0) {
+    statusHtml += '<span>Building task breakdown\u2026</span>';
     statusHtml += '<span class="planner-progress-count">' + taskCount + ' task' + (taskCount !== 1 ? 's' : '') + ' so far</span>';
+  } else if (_plannerSteps.length > 0) {
+    statusHtml += '<span>Exploring project\u2026</span>';
+  } else {
+    statusHtml += '<span>Building task breakdown\u2026</span>';
   }
   statusHtml += '<span class="planner-progress-timer" id="planner-timer">' + secs + 's</span>';
-  statusHtml += '</div></div>';
+  statusHtml += '</div>';
+  // Render tool step log
+  if (_plannerSteps.length > 0) {
+    statusHtml += '<div class="planner-steps">';
+    const show = _plannerSteps.slice(-6);
+    const offset = Math.max(0, _plannerSteps.length - 6);
+    show.forEach((s, i) => {
+      const isLatest = (offset + i) === _plannerSteps.length - 1;
+      statusHtml += '<div class="planner-step' + (isLatest ? ' latest' : '') + '">' +
+        '<span class="planner-step-dot">\u2022</span> ' + escHtml(s) + '</div>';
+    });
+    statusHtml += '</div>';
+    statusHtml += '<div class="planner-minimize-hint">Tip: minimize to keep working \u2014 it\u2019ll notify you when complete</div>';
+  }
+  statusHtml += '</div>';
 
   body.innerHTML = statusHtml;
 }
@@ -873,13 +968,18 @@ let _earlyParseAttempted = false;
 function _tryEarlyParse() {
   if (_earlyParseAttempted) return;
   const text = _plannerAccumText;
-  // Check if we have a complete JSON object (opening { and matching closing })
+  // Find first { then walk forward respecting strings so braces inside "..." are ignored
   const start = text.indexOf('{');
   if (start < 0) return;
-  let depth = 0, end = -1;
+  let depth = 0, end = -1, inStr = false, esc = false;
   for (let i = start; i < text.length; i++) {
-    if (text[i] === '{') depth++;
-    else if (text[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+    const c = text[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\' && inStr) { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === '{') depth++;
+    else if (c === '}') { depth--; if (depth === 0) { end = i; break; } }
   }
   if (end < 0) return; // JSON not complete yet
   const jsonStr = text.slice(start, end + 1);
@@ -900,7 +1000,7 @@ function _detachPlannerListeners() {
 }
 
 // ── Open slide-out and start a planning session ──
-function _openPlannerSlideout(prompt) {
+async function _openPlannerSlideout(prompt) {
   const old = document.getElementById('kanban-planner-panel');
   if (old) old.remove();
   _plannerProposal = null;
@@ -917,22 +1017,27 @@ function _openPlannerSlideout(prompt) {
   requestAnimationFrame(() => panel.classList.add('open'));
   setTimeout(_wirePlannerVoice, 350);
 
-  // Hide main toolbar and any live panel input bar
-  const tb = document.getElementById('main-toolbar');
-  if (tb) tb.style.display = 'none';
-  const inputBar = document.getElementById('live-input-bar');
-  if (inputBar) inputBar.style.display = 'none';
   _persistPlannerState('open');
 
   // Attach listeners BEFORE emitting
   _attachPlannerListeners();
 
+  // Fetch validation config to enrich the system prompt
+  let valUrlSnippet = '';
+  try {
+    const cfg = await fetch('/api/kanban/config').then(r => r.ok ? r.json() : {});
+    if (cfg.validation_url_enabled && cfg.validation_base_url) {
+      valUrlSnippet = ' VALIDATION URLS ENABLED. Dev server base URL: ' + cfg.validation_base_url + '. You MUST set verification_url on EVERY task and subtask by constructing absolute URLs from this base URL. Read the project code to find real route paths, page URLs, and API endpoints. Build verification_url as base URL + the route path (e.g. ' + cfg.validation_base_url + '/dashboard). Every task MUST have a verification_url unless it is purely non-visual work like refactoring or config with no observable endpoint. Try hard to find a relevant URL for each task. For tasks that CREATE new endpoints or pages that do not exist yet, you may still set verification_url to the planned URL — but add a note in the task description like "(new endpoint)" so the developer knows it will only work after implementation.';
+    }
+  } catch (_) {}
+
   // Start session via daemon
   _earlyParseAttempted = false;
+  _plannerSteps = [];
   runningIds.add(newId);
   sessionKinds[newId] = 'working';
   // For scoped plans (subtree editing), add explicit instruction to NOT include the parent
-  let sysPrompt = _PLANNER_SYSTEM;
+  let sysPrompt = _PLANNER_SYSTEM + valUrlSnippet;
   if (_plannerScopeParentId) {
     sysPrompt += ' IMPORTANT: You are editing an EXISTING task and its subtree. Return EXACTLY ONE top-level task in your "tasks" array — this is the parent task being edited. Include its updated title, description, and subtasks. The parent will be updated in place and its old subtree will be replaced.';
   }
@@ -941,33 +1046,65 @@ function _openPlannerSlideout(prompt) {
     prompt: prompt,
     cwd: typeof _currentProjectDir === 'function' ? _currentProjectDir() : '',
     system_prompt: sysPrompt,
-    max_turns: 1,
+    max_turns: 0,
     session_type: 'planner',
   });
 }
 
 // ── Show parsed plan result in the panel body ──
 function _showPlanResult(rawText) {
+  // Auto-expand if minimized — results are ready
+  const panel = document.getElementById('kanban-planner-panel');
+  if (panel && panel.classList.contains('minimized')) _restorePlanner();
   const body = document.getElementById('planner-body');
   if (!body) return;
   // If the plan was already accepted, don't overwrite the UI with stale results
   if (!_plannerSessionId && !rawText) return;
   console.log('[planner] rawText (' + rawText.length + '):', rawText.slice(0, 500));
   let parsed = null;
-  // Try 1: ```json ... ```
-  const m1 = rawText.match(/```json\s*([\s\S]*?)```/);
+  // Try 1: ```json ... ``` or ``` ... ```
+  const m1 = rawText.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (m1) { try { parsed = JSON.parse(m1[1]); } catch (_) {} }
-  // Try 2: raw JSON with "tasks" array
-  if (!parsed) {
-    const m2 = rawText.match(/\{[\s\S]*"tasks"\s*:\s*\[[\s\S]*\]\s*\}/);
-    if (m2) { try { parsed = JSON.parse(m2[0]); } catch (_) {} }
-  }
-  // Try 3: whole text as JSON
+  // Try 2: whole text as JSON
   if (!parsed) { try { parsed = JSON.parse(rawText.trim()); } catch (_) {} }
-  // Try 4: first { to last }
+  // Try 3: string-aware brace extraction (handles braces inside JSON strings)
   if (!parsed) {
-    const s = rawText.indexOf('{'), e = rawText.lastIndexOf('}');
-    if (s >= 0 && e > s) { try { parsed = JSON.parse(rawText.slice(s, e + 1)); } catch (_) {} }
+    const s = rawText.indexOf('{');
+    if (s >= 0) {
+      let depth = 0, end = -1, inStr = false, esc = false;
+      for (let i = s; i < rawText.length; i++) {
+        const c = rawText[i];
+        if (esc) { esc = false; continue; }
+        if (c === '\\' && inStr) { esc = true; continue; }
+        if (c === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (c === '{') depth++;
+        else if (c === '}') { depth--; if (depth === 0) { end = i; break; } }
+      }
+      if (end > s) { try { parsed = JSON.parse(rawText.slice(s, end + 1)); } catch (_) {} }
+    }
+  }
+  // Try 4: bare array — wrap in {tasks: [...]}
+  if (!parsed) {
+    const aStart = rawText.indexOf('[');
+    if (aStart >= 0) {
+      let depth = 0, end = -1, inStr = false, esc = false;
+      for (let i = aStart; i < rawText.length; i++) {
+        const c = rawText[i];
+        if (esc) { esc = false; continue; }
+        if (c === '\\' && inStr) { esc = true; continue; }
+        if (c === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (c === '[') depth++;
+        else if (c === ']') { depth--; if (depth === 0) { end = i; break; } }
+      }
+      if (end > aStart) {
+        try {
+          const arr = JSON.parse(rawText.slice(aStart, end + 1));
+          if (Array.isArray(arr) && arr.length && arr[0].title) parsed = { tasks: arr };
+        } catch (_) {}
+      }
+    }
   }
 
   if (parsed && parsed.tasks && parsed.tasks.length > 0) {
@@ -985,6 +1122,9 @@ function _showPlanResult(rawText) {
         '<div class="planner-hint">Want changes? Type below and send.</div>' +
       '</div>';
   } else {
+    // Stash failed raw text for debugging
+    console.error('[planner] PARSE FAILED. rawText:', rawText);
+    try { localStorage.setItem('plannerDebugRaw', rawText); } catch(_) {}
     body.innerHTML =
       '<div class="planner-result">' +
         '<div class="planner-error">Couldn\'t parse a task structure. Try rephrasing below.</div>' +
@@ -1037,6 +1177,7 @@ function _renderPlanTree(tasks, depth) {
         ${hasSubs ? '<span class="planner-sub-count">' + totalSubs + '</span>' : ''}
       </div>
       ${t.description ? '<div class="planner-node-desc">' + (typeof mdParse === 'function' ? mdParse(t.description) : escHtml(t.description)) + '</div>' : ''}
+      ${t.verification_url ? '<div class="planner-node-ver">' + KI.link + ' <a href="' + escHtml(t.verification_url) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()">' + escHtml(t.verification_url) + '</a></div>' : ''}
       ${hasSubs ? _renderPlanTree(t.subtasks, depth + 1) : ''}
     </div>`;
   }
@@ -1107,11 +1248,6 @@ function _closePlannerSlideout() {
   }
   // Clear persisted state
   _persistPlannerState(null);
-  // Restore main toolbar and input bar if a session was selected before
-  const tb = document.getElementById('main-toolbar');
-  if (tb && typeof activeId !== 'undefined' && activeId) tb.style.display = '';
-  const inputBar = document.getElementById('live-input-bar');
-  if (inputBar && typeof activeId !== 'undefined' && activeId) inputBar.style.display = '';
   // Re-render drill-down so chooser cards reset from spinning state
   if (kanbanDetailTaskId) {
     setTimeout(() => renderTaskDetail(kanbanDetailTaskId), 320);
@@ -1122,9 +1258,6 @@ function _minimizePlanner() {
   const panel = document.getElementById('kanban-planner-panel');
   if (!panel) return;
   panel.classList.add('minimized');
-  // Restore toolbar
-  const tb = document.getElementById('main-toolbar');
-  if (tb && typeof activeId !== 'undefined' && activeId) tb.style.display = '';
   _persistPlannerState('minimized');
 }
 
@@ -1187,9 +1320,6 @@ function _restorePlanner() {
   if (panel) {
     panel.classList.remove('minimized');
   }
-  // Hide toolbar again
-  const tb = document.getElementById('main-toolbar');
-  if (tb) tb.style.display = 'none';
   _persistPlannerState('open');
 }
 
@@ -1212,6 +1342,12 @@ function _persistPlannerState(state) {
   if (state && _plannerProposal) {
     localStorage.setItem('plannerStash', JSON.stringify(_plannerProposal));
   }
+  // Persist session ID so we can reconnect after refresh
+  if (state && _plannerSessionId) {
+    localStorage.setItem('plannerSessionId', _plannerSessionId);
+  } else if (!state) {
+    localStorage.removeItem('plannerSessionId');
+  }
 }
 
 function _restorePlannerOnLoad() {
@@ -1221,24 +1357,54 @@ function _restorePlannerOnLoad() {
   if (stash) {
     try { _plannerProposal = JSON.parse(stash); } catch (_) {}
   }
-  if (!_plannerProposal && !_plannerStashed) return;  // nothing to show
+  const savedSessionId = localStorage.getItem('plannerSessionId');
+  const hasProposal = _plannerProposal || _plannerStashed;
+  const hasRunningSession = savedSessionId && !hasProposal;
+
+  if (!hasProposal && !hasRunningSession) return;  // nothing to show or reconnect to
   if (!_plannerProposal && _plannerStashed) _plannerProposal = _plannerStashed;
-  // Rebuild panel with stashed results
+
+  // Rebuild panel
   const old = document.getElementById('kanban-planner-panel');
   if (old) old.remove();
   const panel = _buildPlannerPanel();
   document.body.appendChild(panel);
+
   if (_plannerProposal && _plannerProposal.tasks) {
     _showPlanResult(JSON.stringify(_plannerProposal));
+  } else if (hasRunningSession) {
+    // Reconnect to the in-progress planner session
+    _plannerSessionId = savedSessionId;
+    if (typeof _hiddenSessionIds !== 'undefined') _hiddenSessionIds.add(savedSessionId);
+    _plannerAccumText = '';
+    _plannerSteps = [];
+    _earlyParseAttempted = false;
+    _plannerStartTime = Date.now();
+    _attachPlannerListeners();
+
+    // Backfill: fetch existing session log to recover steps and any text so far
+    fetch('/api/session-log/' + savedSessionId).then(r => r.ok ? r.json() : []).then(entries => {
+      if (!Array.isArray(entries)) entries = entries.entries || [];
+      for (const e of entries) {
+        if (e.kind === 'tool_use') {
+          _plannerSteps.push(e.desc || e.name || 'Working\u2026');
+        } else if (e.kind === 'asst' && e.text) {
+          _plannerAccumText += e.text;
+        }
+      }
+      // If the session already finished while we were refreshing, show result
+      if (_plannerAccumText) _tryEarlyParse();
+      _updatePlannerProgress();
+    }).catch(() => { _updatePlannerProgress(); });
   }
+
   if (state === 'minimized') {
     panel.classList.add('open');
     requestAnimationFrame(() => panel.classList.add('minimized'));
   } else {
     requestAnimationFrame(() => panel.classList.add('open'));
-    const tb = document.getElementById('main-toolbar');
-    if (tb) tb.style.display = 'none';
   }
+  setTimeout(_wirePlannerVoice, 350);
 }
 
 function _resumePlan() {
@@ -1726,6 +1892,24 @@ async function renderTaskDetail(taskId) {
     const _descHtml = _descIsHtml ? _rawDesc : (typeof mdParse === 'function' ? mdParse(_rawDesc) : escHtml(_rawDesc));
     html += `<div id="kanban-drill-desc-editor" class="kanban-drill-desc">${_descHtml}</div>`;
     html += '</div>';
+
+    // Verification URL field (between description and tags)
+    const _verUrl = resolveVerificationUrl(task.verification_url);
+    html += `<div class="kanban-drill-ver-section" id="kanban-drill-ver-section">`;
+    if (_verUrl) {
+      html += `<div class="kanban-drill-ver-row">`;
+      html += `<span class="kanban-drill-ver-icon">${KI.link}</span>`;
+      html += `<a class="kanban-drill-ver-link" href="${escHtml(_verUrl)}" target="_blank" rel="noopener" title="${escHtml(_verUrl)}">${escHtml(_verUrl)}</a>`;
+      html += `<button class="kanban-drill-ver-action" data-ver-url="${escHtml(task.verification_url || '')}" onclick="event.stopPropagation();_editVerificationUrl('${task.id}', this.dataset.verUrl)" title="Edit URL"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>`;
+      html += `<button class="kanban-drill-ver-action kanban-drill-ver-action-danger" onclick="event.stopPropagation();_clearVerificationUrl('${task.id}')" title="Remove URL"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>`;
+      html += `</div>`;
+    } else {
+      html += `<div class="kanban-drill-ver-empty" onclick="_editVerificationUrl('${task.id}', '')">`;
+      html += `<span class="kanban-drill-ver-icon" style="opacity:0.4">${KI.link}</span>`;
+      html += `<span style="color:var(--text-dim);font-size:12px;">Add validation URL\u2026</span>`;
+      html += `</div>`;
+    }
+    html += `</div>`;
 
     // Tags (with tag icon)
     const taskTags = task.tags || [];
@@ -2247,6 +2431,50 @@ function _startTitleEdit(taskId, el) {
     if (e.key === 'Enter') { e.preventDefault(); el.blur(); }
     if (e.key === 'Escape') { el.textContent = current; el.blur(); }
   };
+}
+
+/**
+ * _editVerificationUrl(taskId, current) — Inline edit for verification URL.
+ * Replaces the ver section with an input field.
+ */
+function _editVerificationUrl(taskId, current) {
+  const section = document.getElementById('kanban-drill-ver-section');
+  if (!section) return;
+  section.innerHTML = `<div class="kanban-drill-ver-edit-row">
+    <span class="kanban-drill-ver-icon">${KI.link}</span>
+    <input type="url" id="kanban-drill-ver-input" class="kanban-drill-ver-input"
+      value="${escHtml(current || '')}" placeholder="https://localhost:8000/page"
+      autocomplete="off" spellcheck="false">
+    <button class="kanban-drill-ver-save-btn" onclick="_saveVerificationUrl('${taskId}')">Save</button>
+    <button class="kanban-drill-ver-cancel-btn" onclick="renderTaskDetail('${taskId}')">Cancel</button>
+  </div>`;
+  const inp = document.getElementById('kanban-drill-ver-input');
+  if (inp) { inp.focus(); inp.select(); }
+  inp?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); _saveVerificationUrl(taskId); }
+    if (e.key === 'Escape') { e.preventDefault(); renderTaskDetail(taskId); }
+  });
+}
+
+async function _saveVerificationUrl(taskId) {
+  const inp = document.getElementById('kanban-drill-ver-input');
+  if (!inp) return;
+  const url = inp.value.trim();
+  // Basic validation — must be absolute URL or empty
+  if (url && !url.match(/^https?:\/\//i)) {
+    if (typeof showToast === 'function') showToast('Please enter an absolute URL (http:// or https://)', true);
+    inp.focus();
+    return;
+  }
+  await updateTask(taskId, { verification_url: url || null });
+  if (typeof showToast === 'function') showToast(url ? 'Validation URL saved' : 'Validation URL removed');
+  renderTaskDetail(taskId);
+}
+
+async function _clearVerificationUrl(taskId) {
+  await updateTask(taskId, { verification_url: null });
+  if (typeof showToast === 'function') showToast('Validation URL removed');
+  renderTaskDetail(taskId);
 }
 
 /**
@@ -3311,6 +3539,7 @@ async function openKanbanSettings(initialTab) {
     <div class="kanban-settings-tabs">
       <button class="kanban-settings-tab${tab === 'columns' ? ' active' : ''}" onclick="switchSettingsTab('columns')">Columns</button>
       <button class="kanban-settings-tab${tab === 'preferences' ? ' active' : ''}" onclick="switchSettingsTab('preferences')">Preferences</button>
+      <button class="kanban-settings-tab${tab === 'validation' ? ' active' : ''}" onclick="switchSettingsTab('validation')">Validation</button>
     </div>
     <div class="pm-body">`;
 
@@ -3367,6 +3596,23 @@ async function openKanbanSettings(initialTab) {
       <div class="kanban-settings-row">
         <div><div style="font-size:13px;font-weight:500;">Column page size</div><div style="font-size:12px;color:var(--text-dim);">Max tasks per column before pagination</div></div>
         <input type="number" id="kb-page-size" value="${config.kanban_page_size || 50}" style="width:60px;text-align:center;" class="kanban-settings-input">
+      </div>
+    </div>`;
+
+  // ── Validation tab ──
+  const _valEnabled = config.validation_url_enabled === true || config.validation_url_enabled === 'true';
+  const _valBaseUrl = config.validation_base_url || '';
+  html += `<div id="kb-tab-validation" class="kanban-settings-tab-content" style="${tab !== 'validation' ? 'display:none;' : ''}">
+      <div style="font-size:14px;font-weight:600;margin-bottom:12px;">Validation URLs</div>
+      <div style="font-size:12px;color:var(--text-dim);margin-bottom:16px;">When enabled, the AI planner will generate clickable validation URLs on tasks so you can quickly verify features in your browser.</div>
+      <div class="kanban-settings-row">
+        <div><div style="font-size:13px;font-weight:500;">Enable validation URLs</div><div style="font-size:12px;color:var(--text-dim);">AI planner will include URLs on proposed tasks</div></div>
+        <label class="kanban-toggle"><input type="checkbox" id="kb-val-enabled" ${_valEnabled ? 'checked' : ''} onchange="document.getElementById('kb-val-base-row').style.opacity=this.checked?'1':'0.4'"><span class="kanban-toggle-slider"></span></label>
+      </div>
+      <div id="kb-val-base-row" style="margin-top:12px;opacity:${_valEnabled ? '1' : '0.4'}">
+        <div style="font-size:13px;font-weight:500;margin-bottom:6px;">Dev server base URL</div>
+        <div style="font-size:12px;color:var(--text-dim);margin-bottom:8px;">The address where your development server runs (e.g. http://localhost:3000)</div>
+        <input type="url" id="kb-val-base-url" class="pm-input" placeholder="http://localhost:8000" value="${escHtml(_valBaseUrl)}" style="width:100%;">
       </div>
     </div>`;
 
@@ -3466,6 +3712,8 @@ async function openKanbanSettings(initialTab) {
         auto_parent_reopen: document.getElementById('kb-auto-parent-reopen')?.checked ?? true,
         auto_advance_to_validating: document.getElementById('kb-auto-advance')?.checked ?? false,
         kanban_page_size: parseInt(pageSize, 10),
+        validation_url_enabled: document.getElementById('kb-val-enabled')?.checked ?? false,
+        validation_base_url: document.getElementById('kb-val-base-url')?.value?.trim() || '',
       };
       if (supaUrl) cfgBody.supabase_url = supaUrl;
       if (supaKey) cfgBody.supabase_secret_key = supaKey;

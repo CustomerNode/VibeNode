@@ -353,6 +353,7 @@ _SYSTEM_CONTENT_MARKERS = (
     "<command-name>",
     "<command-message>",
     "<command-args>",
+    "[Request interrupted by user]",
 )
 
 def _is_system_content(text: str) -> bool:
@@ -364,6 +365,8 @@ def _is_system_content(text: str) -> bool:
 
 def _system_content_label(text: str) -> str:
     """Extract a short human-readable label for system content."""
+    if "[Request interrupted by user]" in text:
+        return "Session interrupted by user"
     if "This session is being continued from a previous conversation" in text:
         return "Session continued from previous conversation"
     if "<command-name>" in text:

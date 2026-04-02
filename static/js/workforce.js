@@ -91,6 +91,13 @@ function setViewMode(mode) {
     if (sidebar) sidebar.style.display = '';
     const resizeHandle = document.querySelector('.resize-handle');
     if (resizeHandle) resizeHandle.style.display = '';
+    // Restore expand button if sidebar was collapsed
+    const expandBtn = document.getElementById('btn-sidebar-expand');
+    if (expandBtn) {
+      const isCollapsed = sidebar && sidebar.classList.contains('collapsed');
+      expandBtn.style.display = '';
+      expandBtn.classList.toggle('visible', isCollapsed);
+    }
   }
 
   // --- Set new mode state ---
@@ -171,6 +178,8 @@ function setViewMode(mode) {
     const btnAdd = document.getElementById('btn-add-agent');
     if (btnAdd) btnAdd.style.display = 'none';
     if (homepageEl) homepageEl.style.display = 'none';
+    document.getElementById('main-body').style.display = '';
+    document.getElementById('main-toolbar').style.display = 'none';
   }
   filterSessions();
 }

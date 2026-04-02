@@ -4,6 +4,10 @@
 let _wsDragId = null;
 let _wsFolderDragId = null;
 let _archivedExpanded = false;
+let _wsConfigMode = false;
+let _wsConfigTab = 'departments'; // 'departments' | 'available' | 'discovery'
+let _wsDiscoveryCache = null;
+let _wsConfigAssistantId = null;
 
 const _statusMiniSvg = {
   working: '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
@@ -31,8 +35,10 @@ function renderWorkspace(sessions) {
 
   // Check if folder tree exists — if so, render hierarchical view
   const tree = (typeof getFolderTree === 'function') ? getFolderTree() : null;
-  if (tree) {
-    _renderHierarchicalWorkspace(mainBody, sessions, tree);
+  // In config mode, always render hierarchical (use empty tree if needed)
+  const effectiveTree = tree || (_wsConfigMode ? { version: 1, folders: {}, rootChildren: [] } : null);
+  if (effectiveTree) {
+    _renderHierarchicalWorkspace(mainBody, sessions, effectiveTree);
   } else {
     _renderFlatWorkspace(mainBody, sessions);  // existing behavior
   }
@@ -158,6 +164,14 @@ function _renderHierarchicalWorkspace(mainBody, sessions, tree) {
 
   let html = '<div class="ws-container">';
 
+  // ---- CONFIG MODE: Department Manager ----
+  if (isRoot && _wsConfigMode) {
+    html += _renderConfigMode(tree);
+    html += '</div>';
+    mainBody.innerHTML = html;
+    return;
+  }
+
   // ---- ROOT: Command Center Dashboard ----
   if (isRoot) {
     // Aggregate stats across ALL sessions
@@ -173,9 +187,15 @@ function _renderHierarchicalWorkspace(mainBody, sessions, tree) {
     const totalDepts = (tree.rootChildren || []).length;
     html += '<div class="wf-command-center">';
 
-    // Header
+    // Header with Work/Configure toggle
     html += '<div class="wf-cc-header">';
+    html += '<div style="display:flex;align-items:center;justify-content:space-between;">';
     html += '<div class="wf-cc-title">Workforce</div>';
+    html += '<div class="wf-mode-toggle">';
+    html += '<button class="wf-mode-btn' + (_wsConfigMode ? '' : ' active') + '" onclick="_setWsConfigMode(false)">Work</button>';
+    html += '<button class="wf-mode-btn' + (_wsConfigMode ? ' active' : '') + '" onclick="_setWsConfigMode(true)">Configure</button>';
+    html += '</div>';
+    html += '</div>';
     let totalSubDepts = 0;
     const _countSubs = (fids) => { for (const fid of fids) { const f = tree.folders[typeof fid === 'string' ? fid : fid.id]; if (f) { totalSubDepts += (f.children || []).length; _countSubs(f.children || []); } } };
     _countSubs(tree.rootChildren || []);
@@ -1476,4 +1496,1000 @@ function wsShowAll() {
   workspaceHiddenSessions.clear();
   localStorage.setItem('wsHiddenSessions', '[]');
   filterSessions();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// CONFIG MODE — Department Manager
+// ═══════════════════════════════════════════════════════════════════════
+
+function _setWsConfigMode(enabled) {
+  _wsConfigMode = enabled;
+  filterSessions();
+}
+
+function _setWsConfigTab(tab) {
+  _wsConfigTab = tab;
+  filterSessions();
+}
+
+function _renderConfigMode(tree) {
+  let h = '';
+  h += '<div class="wf-config-container">';
+
+  // Header with toggle
+  h += '<div class="wf-config-header">';
+  h += '<div style="display:flex;align-items:center;justify-content:space-between;">';
+  h += '<div class="wf-cc-title">Configure Departments</div>';
+  h += '<div class="wf-mode-toggle">';
+  h += '<button class="wf-mode-btn" onclick="_setWsConfigMode(false)">Work</button>';
+  h += '<button class="wf-mode-btn active" onclick="_setWsConfigMode(true)">Configure</button>';
+  h += '</div>';
+  h += '</div>';
+  h += '<div class="wf-cc-subtitle" style="margin-top:4px;">Manage your department hierarchy, browse available assets, and discover what\'s installed on your system.</div>';
+  h += '</div>';
+
+  // Tab bar
+  h += '<div class="wf-config-tabs">';
+  h += '<button class="wf-config-tab' + (_wsConfigTab === 'departments' ? ' active' : '') + '" onclick="_setWsConfigTab(\'departments\')">My Departments</button>';
+  h += '<button class="wf-config-tab' + (_wsConfigTab === 'available' ? ' active' : '') + '" onclick="_setWsConfigTab(\'available\')">Available</button>';
+  h += '<button class="wf-config-tab' + (_wsConfigTab === 'discovery' ? ' active' : '') + '" onclick="_setWsConfigTab(\'discovery\')">Discovery</button>';
+  h += '<div style="flex:1;"></div>';
+  // AI Assistant button removed — organize and finder AIs live on their respective tabs
+  h += '</div>';
+
+  // Tab content
+  h += '<div class="wf-config-body">';
+  if (_wsConfigTab === 'departments') {
+    h += _renderConfigDepartments(tree);
+  } else if (_wsConfigTab === 'available') {
+    h += _renderConfigAvailable();
+  } else if (_wsConfigTab === 'discovery') {
+    h += _renderConfigDiscovery();
+  }
+  h += '</div>';
+
+  h += '</div>';
+  return h;
+}
+
+// ---- Tab 1: My Departments ----
+let _configExpandedDepts = new Set(); // track which departments are expanded
+
+function _toggleConfigDept(fid) {
+  if (_configExpandedDepts.has(fid)) _configExpandedDepts.delete(fid);
+  else _configExpandedDepts.add(fid);
+  filterSessions();
+}
+
+function _renderConfigDepartments(tree) {
+  let h = '';
+  const roots = tree.rootChildren || [];
+
+  // Action bar pinned at top
+  h += '<div class="wf-config-action-bar">';
+  h += '<button class="wf-config-action-btn wf-config-action-primary" onclick="wsCreateSubfolder(null)">';
+  h += '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>';
+  h += ' New Department</button>';
+  h += '<button class="wf-config-action-btn wf-config-action-ai" onclick="_openOrganizeAI()">';
+  h += '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 16.8l-6.2 4.5 2.4-7.4L2 9.4h7.6z"/></svg>';
+  h += ' Organize with AI</button>';
+  h += '<div class="wf-config-action-bar-summary">' + roots.length + ' department' + (roots.length !== 1 ? 's' : '');
+  // Count total agents
+  let totalAgents = 0;
+  for (const rf of roots) {
+    const fid = typeof rf === 'string' ? rf : rf.id;
+    totalAgents += _countAgentsRecursive(tree, fid);
+  }
+  h += ' &middot; ' + totalAgents + ' asset' + (totalAgents !== 1 ? 's' : '') + '</div>';
+  h += '</div>';
+
+  if (!roots.length) {
+    h += '<div class="wf-config-empty-state">';
+    h += '<div class="wf-config-empty-title">No departments configured yet</div>';
+    h += '<div class="wf-config-empty-desc">Pick a starter template to get going instantly, or add departments one at a time.</div>';
+    h += '<div class="wf-config-templates">';
+    h += '<div class="wf-config-template-card" onclick="_applyQuickTemplate(\'personal\')">';
+    h += '<div class="wf-config-template-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5"><circle cx="12" cy="8" r="5"/><path d="M20 21a8 8 0 0 0-16 0"/></svg></div>';
+    h += '<div class="wf-config-template-name">Personal</div>';
+    h += '<div class="wf-config-template-meta">5 departments &middot; Coding, writing, docs, research</div>';
+    h += '</div>';
+    h += '<div class="wf-config-template-card" onclick="_applyQuickTemplate(\'small-team\')">';
+    h += '<div class="wf-config-template-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#3fb950" stroke-width="1.5"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></div>';
+    h += '<div class="wf-config-template-name">Small Team</div>';
+    h += '<div class="wf-config-template-meta">17 departments &middot; Eng, product, QA, docs, marketing</div>';
+    h += '</div>';
+    h += '<div class="wf-config-template-card" onclick="_applyQuickTemplate(\'enterprise\')">';
+    h += '<div class="wf-config-template-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#bc8cff" stroke-width="1.5"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/></svg></div>';
+    h += '<div class="wf-config-template-name">Enterprise</div>';
+    h += '<div class="wf-config-template-meta">72 assets &middot; Full org chart across 17 departments</div>';
+    h += '</div>';
+    h += '</div>';
+    h += '</div>';
+    return h;
+  }
+
+  // Department tree
+  h += '<div class="wf-config-tree">';
+  for (const rf of roots) {
+    const fid = typeof rf === 'string' ? rf : rf.id;
+    h += _renderConfigNode(tree, fid, 0);
+  }
+  h += '</div>';
+
+  return h;
+}
+
+function _countAgentsRecursive(tree, fid) {
+  const folder = tree.folders[fid];
+  if (!folder) return 0;
+  const children = folder.children || [];
+  let count = 0;
+  for (const ck of children) {
+    const cid = typeof ck === 'string' ? ck : ck.id;
+    const cfolder = tree.folders[cid];
+    if (cfolder && (cfolder.children || []).length > 0) {
+      count += _countAgentsRecursive(tree, cid);
+    } else {
+      count++;
+    }
+  }
+  return count;
+}
+
+function _renderConfigNode(tree, fid, depth) {
+  const folder = tree.folders[fid];
+  if (!folder) return '';
+  const def = (typeof FOLDER_SUPERSET !== 'undefined' && FOLDER_SUPERSET[fid]) ? FOLDER_SUPERSET[fid] : null;
+  const label = def ? (def.skill ? def.skill.label : def.name) : fid;
+  const children = folder.children || [];
+  const hasChildren = children.length > 0;
+  const isExpanded = _configExpandedDepts.has(fid);
+  const tier = _detectTierFromDef(def);
+  const indent = depth * 20;
+
+  // Check if children are departments (have their own children) or leaf agents
+  let childDepts = 0, childAgents = 0;
+  for (const ck of children) {
+    const cid = typeof ck === 'string' ? ck : ck.id;
+    const cf = tree.folders[cid];
+    if (cf && (cf.children || []).length > 0) childDepts++;
+    else childAgents++;
+  }
+
+  let h = '';
+  h += '<div class="wf-config-node' + (depth === 0 ? ' wf-config-node-root' : '') + '" style="padding-left:' + indent + 'px;">';
+
+  // Row — departments expand/collapse, leaf assets toggle detail view
+  h += '<div class="wf-config-node-row' + (hasChildren ? ' wf-config-node-expandable' : ' wf-config-node-leaf') + '" onclick="' + (hasChildren ? '_toggleConfigDept(\'' + fid + '\')' : '_toggleConfigDetail(\'' + fid + '\')') + '">';
+
+  // Expand chevron or bullet
+  if (hasChildren) {
+    h += '<svg class="wf-config-chevron' + (isExpanded ? ' expanded' : '') + '" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 6 15 12 9 18"/></svg>';
+  } else {
+    h += '<span class="wf-config-bullet"></span>';
+  }
+
+  // Icon based on depth
+  if (depth === 0) {
+    h += '<svg class="wf-config-node-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
+  } else {
+    h += '<svg class="wf-config-node-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--text-faint)" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/></svg>';
+  }
+
+  // Name + meta
+  h += '<span class="wf-config-node-name">' + _esc(label) + '</span>';
+  h += '<span class="wf-config-tier-badge wf-tier-' + tier + '">' + tier + '</span>';
+
+  if (hasChildren) {
+    const parts = [];
+    if (childDepts) parts.push(childDepts + ' sub-dept' + (childDepts !== 1 ? 's' : ''));
+    if (childAgents) parts.push(childAgents + ' asset' + (childAgents !== 1 ? 's' : ''));
+    h += '<span class="wf-config-node-count">' + parts.join(', ') + '</span>';
+  }
+
+  h += '</div>'; // end row
+
+  // Detail panel for leaf assets (shown when clicked)
+  if (!hasChildren && _configExpandedDepts.has(fid) && def && def.skill) {
+    h += '<div class="wf-config-detail" style="padding-left:' + (indent + 28) + 'px;">';
+    const prompt = def.skill.systemPrompt || '';
+    h += '<div class="wf-config-detail-preview">' + _esc(prompt.substring(0, 300)) + (prompt.length > 300 ? '...' : '') + '</div>';
+    h += '<div class="wf-config-detail-actions">';
+    h += '<button class="wf-config-detail-btn" onclick="event.stopPropagation();_editConfigAsset(\'' + fid + '\')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg> Edit</button>';
+    h += '<button class="wf-config-detail-btn wf-config-detail-btn-danger" onclick="event.stopPropagation();_deleteConfigAsset(\'' + fid + '\')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> Delete</button>';
+    h += '</div>';
+    h += '</div>';
+  }
+
+  // Children (if expanded)
+  if (hasChildren && isExpanded) {
+    h += '<div class="wf-config-node-children">';
+    for (const ck of children) {
+      const cid = typeof ck === 'string' ? ck : ck.id;
+      h += _renderConfigNode(tree, cid, depth + 1);
+    }
+    h += '</div>';
+  }
+
+  h += '</div>'; // end node
+  return h;
+}
+
+function _toggleConfigDetail(fid) {
+  if (_configExpandedDepts.has(fid)) _configExpandedDepts.delete(fid);
+  else _configExpandedDepts.add(fid);
+  filterSessions();
+}
+
+function _editConfigAsset(fid) {
+  // TODO: open inline editor for the asset's system prompt
+  showToast('Editing coming soon — edit workforce/' + fid + '.md directly for now');
+}
+
+async function _deleteConfigAsset(fid) {
+  if (!confirm('Delete "' + fid + '"? This removes the .md file from your workforce directory.')) return;
+  try {
+    const resp = await fetch('/api/workforce/delete-asset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: fid }),
+    });
+    if (resp.ok) {
+      // Remove from folder tree
+      const tree = (typeof getFolderTree === 'function') ? getFolderTree() : null;
+      if (tree && tree.folders) {
+        // Find parent and remove from its children
+        for (const [pid, folder] of Object.entries(tree.folders)) {
+          if (folder.children) {
+            folder.children = folder.children.filter(c => (typeof c === 'string' ? c : c.id) !== fid);
+          }
+        }
+        delete tree.folders[fid];
+        // Remove from rootChildren if there
+        if (tree.rootChildren) {
+          tree.rootChildren = tree.rootChildren.filter(c => (typeof c === 'string' ? c : c.id) !== fid);
+        }
+        await fetch('/api/folder-tree', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(tree),
+        });
+        _folderTreeCache = tree;
+      }
+      if (typeof _agentCatalogPath !== 'undefined') { _agentCatalogPath = null; _agentCatalogPromise = null; }
+      if (typeof _loadWorkforceFromDisk === 'function') await _loadWorkforceFromDisk();
+      showToast('Deleted: ' + fid);
+      filterSessions();
+    } else {
+      showToast('Delete failed');
+    }
+  } catch (e) {
+    showToast('Delete failed: ' + e.message);
+  }
+}
+
+function _detectTierFromDef(def) {
+  if (!def || !def.skill) return 'role';
+  // TODO: detect from frontmatter when available
+  return 'role';
+}
+
+function _esc(s) {
+  if (!s) return '';
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ---- Tab 2: Available ----
+function _renderConfigAvailable() {
+  let h = '';
+
+  const packs = [
+    { id: 'gstack', name: 'garrytan/gstack', stars: '62K', count: '23 skills', desc: 'Full dev team — code review, QA with real browser, security audit (OWASP + STRIDE), shipping, deploy, retros. By Garry Tan (YC).', url: 'https://github.com/garrytan/gstack', git: 'https://github.com/garrytan/gstack.git', setup: './setup', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#bc8cff" stroke-width="1.5" stroke-linecap="round"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 16.8l-6.2 4.5 2.4-7.4L2 9.4h7.6z"/></svg>' },
+    { id: 'anthropic-skills', name: 'anthropics/skills', stars: '109K', count: '17 skills', desc: 'Anthropic\'s official reference skills — PDF generation, PPTX, frontend design, data analysis, and more.', url: 'https://github.com/anthropics/skills', git: 'https://github.com/anthropics/skills.git', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="1.5" stroke-linecap="round"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>' },
+    { id: 'everything-cc', name: 'affaan-m/everything-claude-code', stars: '120K', count: '40+ skills, 13 agents', desc: 'Comprehensive agent harness — parallel execution, performance monitoring, structured output pipelines.', url: 'https://github.com/affaan-m/everything-claude-code', git: 'https://github.com/affaan-m/everything-claude-code.git', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#3fb950" stroke-width="1.5" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>' },
+    { id: 'wshobson-agents', name: 'wshobson/agents', stars: '31K', count: '112 agents, 146 skills', desc: 'Massive collection — 72 plugins covering every dev workflow. Agents + skills + dev tools.', url: 'https://github.com/wshobson/agents', git: 'https://github.com/wshobson/agents.git', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#e3b341" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="8" r="5"/><path d="M20 21a8 8 0 0 0-16 0"/></svg>' },
+    { id: 'antigravity', name: 'sickn33/antigravity-awesome-skills', stars: '29K', count: '1,340+ skills', desc: 'Curated mega-list of installable skills for Claude Code, Cursor, and Codex.', url: 'https://github.com/sickn33/antigravity-awesome-skills', git: 'https://github.com/sickn33/antigravity-awesome-skills.git', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#ff7b72" stroke-width="1.5" stroke-linecap="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>' },
+    { id: 'alirezarezvani-skills', name: 'alirezarezvani/claude-skills', stars: '5.2K', count: '220+ skills', desc: 'Multi-domain skills with Python tool integrations.', url: 'https://github.com/alirezarezvani/claude-skills', git: 'https://github.com/alirezarezvani/claude-skills.git', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#39d2c0" stroke-width="1.5" stroke-linecap="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>' },
+  ];
+
+  // Built-in tiers — count only built-in departments (not community packs)
+  const tree = (typeof getFolderTree === 'function') ? getFolderTree() : null;
+  // Built-in keys are ones that exist in the hardcoded FOLDER_SUPERSET fallback (no source field)
+  const _builtinKeys = typeof FOLDER_TEMPLATES !== 'undefined' && FOLDER_TEMPLATES.enterprise && FOLDER_TEMPLATES.enterprise.keys === null
+    ? new Set(Object.keys(typeof _HARDCODED_SUPERSET !== 'undefined' ? _HARDCODED_SUPERSET : {}))
+    : null;
+  const installedCount = tree && tree.rootChildren
+    ? tree.rootChildren.filter(rc => {
+        const fid = typeof rc === 'string' ? rc : rc.id;
+        // If we have FOLDER_SUPERSET, check if this dept's assets have source field (=community pack)
+        if (typeof FOLDER_SUPERSET === 'object' && FOLDER_SUPERSET && FOLDER_SUPERSET[fid]) {
+          // Community packs are imported with source in their systemPrompt frontmatter
+          // Simplest check: built-in departments don't start with known pack prefixes
+          const knownPacks = ['gstack','anthropic-skills','everything-cc','wshobson-agents','antigravity','alirezarezvani-skills'];
+          return !knownPacks.includes(fid);
+        }
+        return true;
+      }).length
+    : 0;
+
+  h += '<div class="wf-avail-section-title">VibeNode Built-in Library</div>';
+  h += '<div class="wf-avail-section-desc">Role-based assets organized into departments. Pick a size or uninstall to start fresh.</div>';
+  h += '<div class="wf-avail-tiers">';
+
+  // Tiers are supersets: enterprise > small-team > personal
+  // tierLevel: 0=none, 1=personal, 2=small-team, 3=enterprise
+  const tiers = [
+    { key: 'personal', level: 1, name: 'Personal', count: '5 depts', desc: 'Coding, writing, docs, research, learning', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5"><circle cx="12" cy="8" r="5"/><path d="M20 21a8 8 0 0 0-16 0"/></svg>' },
+    { key: 'small-team', level: 2, name: 'Small Team', count: '17 depts', desc: 'Engineering, product, QA, docs, marketing', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#3fb950" stroke-width="1.5"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>' },
+    { key: 'enterprise', level: 3, name: 'Enterprise', count: '17 depts, 72 assets', desc: 'Full org chart — eng, QA, product, data, security, legal, marketing, sales, CS, HR, finance, ops', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#bc8cff" stroke-width="1.5"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/></svg>' },
+  ];
+
+  // Detect current tier from installed count
+  let currentLevel = 0;
+  if (installedCount >= 15) currentLevel = 3;       // enterprise
+  else if (installedCount >= 5) currentLevel = 2;   // small-team
+  else if (installedCount > 0) currentLevel = 1;    // personal
+
+  for (const t of tiers) {
+    const isActive = t.level === currentLevel;
+    const isSubset = t.level < currentLevel;  // below current — grayed out
+    const isUpgrade = t.level > currentLevel; // above current — clickable upgrade
+
+    h += '<div class="wf-avail-tier-card' + (isActive ? ' active' : '') + (isSubset ? ' subset' : '') + '">';
+    h += '<div class="wf-avail-tier-top">';
+    h += '<div class="wf-avail-card-icon">' + t.icon + '</div>';
+    h += '<div style="flex:1;min-width:0;">';
+    h += '<div class="wf-avail-tier-name">' + t.name + '</div>';
+    h += '<div class="wf-avail-tier-count">' + t.count + '</div>';
+    h += '</div>';
+    if (isActive) {
+      h += '<span class="wf-config-source-badge">Active</span>';
+    } else if (isSubset) {
+      h += '<span class="wf-config-source-badge" style="opacity:0.4;">Included</span>';
+    }
+    h += '</div>';
+    h += '<div class="wf-avail-tier-desc">' + t.desc + '</div>';
+    h += '<div class="wf-avail-card-actions">';
+    if (isActive) {
+      h += '<button class="wf-avail-uninstall-btn" onclick="_uninstallBuiltin()">Uninstall</button>';
+    } else if (isUpgrade) {
+      h += '<button class="wf-avail-install-btn" onclick="_applyQuickTemplate(\'' + t.key + '\')">Install</button>';
+    }
+    // subsets get no button — they're already included
+    h += '</div>';
+    h += '</div>';
+  }
+  h += '</div>';
+
+  // Community packs
+  h += '<div class="wf-avail-section-title">Community Skill Packs</div>';
+  h += '<div class="wf-avail-section-desc">Install a pack to clone it to your system and import its skills into your departments.</div>';
+
+  h += '<div class="wf-avail-grid">';
+  for (const p of packs) {
+    h += '<div class="wf-avail-card">';
+    h += '<div class="wf-avail-card-top">';
+    h += '<div class="wf-avail-card-icon">' + p.icon + '</div>';
+    h += '<div class="wf-avail-card-info">';
+    h += '<a href="' + p.url + '" target="_blank" class="wf-avail-card-name">' + _esc(p.name) + '</a>';
+    h += '<div class="wf-avail-card-meta">';
+    h += '<span class="wf-avail-card-stars"><svg width="11" height="11" viewBox="0 0 24 24" fill="#e3b341" stroke="none"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 16.8l-6.2 4.5 2.4-7.4L2 9.4h7.6z"/></svg> ' + p.stars + '</span>';
+    h += '<span class="wf-avail-card-count">' + p.count + '</span>';
+    h += '</div>';
+    h += '</div>';
+    h += '</div>';
+    h += '<div class="wf-avail-card-desc">' + _esc(p.desc) + '</div>';
+    // Check if pack is already installed (assets with this pack prefix exist)
+    const packInstalled = typeof FOLDER_SUPERSET === 'object' && FOLDER_SUPERSET && Object.keys(FOLDER_SUPERSET).some(k => k.startsWith(p.id + '-'));
+    h += '<div class="wf-avail-card-actions">';
+    if (packInstalled) {
+      h += '<span class="wf-config-source-badge">Installed</span>';
+      h += '<button class="wf-avail-uninstall-btn" onclick="_uninstallPack(\'' + _esc(p.id) + '\')">Uninstall</button>';
+    } else {
+      h += '<button class="wf-avail-install-btn" onclick="_installPack(\'' + _esc(p.id) + '\')">';
+      h += '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
+      h += ' Install</button>';
+    }
+    h += '<a href="' + p.url + '" target="_blank" class="wf-avail-view-btn">View on GitHub</a>';
+    h += '</div>';
+    h += '</div>';
+  }
+  h += '</div>';
+
+  // System scan CTA
+  h += '<div class="wf-avail-system-cta">';
+  h += '<div>';
+  h += '<div class="wf-avail-system-cta-title">Already have agents or skills installed?</div>';
+  h += '<div class="wf-avail-system-cta-desc">Scan <code>~/.claude/agents/</code> and <code>~/.claude/skills/</code> for definitions to import into your departments.</div>';
+  h += '</div>';
+  h += '<button class="wf-avail-scan-btn" onclick="_setWsConfigTab(\'discovery\')">';
+  h += '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>';
+  h += ' Scan &amp; Import</button>';
+  h += '</div>';
+
+  return h;
+}
+
+// ---- Tab 3: Discovery ----
+function _renderConfigDiscovery() {
+  let h = '';
+
+  h += '<div class="wf-avail-section-desc" style="margin-bottom:16px;">Scans your system for agent and skill definitions in <code>~/.claude/agents/</code> and <code>~/.claude/skills/</code>. Use this tab to import custom skill packs or agent files you\'ve installed manually.</div>';
+
+  if (!_wsDiscoveryCache) {
+    h += '<div class="wf-config-discovery-loading">';
+    h += '<div class="planner-spinner"></div>';
+    h += '<span>Scanning filesystem for agent and skill definitions...</span>';
+    h += '</div>';
+    _runDiscoveryScan();
+    return h;
+  }
+
+  const discovered = _wsDiscoveryCache;
+  if (!discovered.length) {
+    h += '<div class="wf-config-empty">No agent or skill definitions found on your system. Install a skill pack (like gstack) or create agents in <code>~/.claude/agents/</code>.</div>';
+    return h;
+  }
+
+  // Group by source/pack
+  const groups = {};
+  for (const d of discovered) {
+    const key = d.pack || d.source || 'unknown';
+    if (!groups[key]) groups[key] = { label: d.pack || d.source, items: [] };
+    groups[key].items.push(d);
+  }
+
+  for (const [key, group] of Object.entries(groups)) {
+    h += '<div class="wf-config-section">';
+    h += '<div class="wf-config-section-title">' + _esc(group.label) + ' <span class="wf-config-section-count">' + group.items.length + ' asset' + (group.items.length !== 1 ? 's' : '') + '</span></div>';
+    h += '<div class="wf-config-discovery-list">';
+    for (const item of group.items) {
+      const imported = item.already_imported;
+      h += '<div class="wf-config-discovery-item' + (imported ? ' imported' : '') + '">';
+      h += '<div class="wf-config-discovery-item-header">';
+      h += '<span class="wf-config-agent-name">' + _esc(item.name) + '</span>';
+      h += '<span class="wf-config-tier-badge wf-tier-' + item.tier + '">' + item.tier + '</span>';
+      if (imported) {
+        h += '<span class="wf-config-imported-badge">&#10003; Imported</span>';
+        h += '<button class="wf-avail-uninstall-btn" style="padding:3px 8px;font-size:11px;" onclick="_removeDiscoveredAsset(\'' + _esc(item.id) + '\')">Remove</button>';
+      } else {
+        h += '<button class="wf-config-import-btn" onclick="_importDiscoveredAsset(\'' + _esc(item.id) + '\')">Import</button>';
+      }
+      h += '</div>';
+      if (item.systemPrompt) {
+        h += '<div class="wf-config-discovery-preview">' + _esc(item.systemPrompt.substring(0, 120)) + (item.systemPrompt.length > 120 ? '...' : '') + '</div>';
+      }
+      h += '</div>';
+    }
+    h += '</div>';
+    h += '</div>';
+  }
+
+  h += '<div style="display:flex;gap:8px;margin-top:16px;padding:0 16px;">';
+  h += '<button class="wf-config-add-dept" onclick="_runDiscoveryScan(true)">&#8635; Rescan</button>';
+  h += '<button class="wf-config-organize-btn" onclick="_openFinderAI()"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Find More with AI</button>';
+  h += '</div>';
+  return h;
+}
+
+async function _runDiscoveryScan(force) {
+  if (force) _wsDiscoveryCache = null;
+  try {
+    const resp = await fetch('/api/workforce/discover');
+    if (!resp.ok) { _wsDiscoveryCache = []; filterSessions(); return; }
+    const data = await resp.json();
+    _wsDiscoveryCache = data.ok ? (data.discovered || []) : [];
+  } catch (e) {
+    console.warn('[workforce] Discovery scan failed:', e);
+    _wsDiscoveryCache = [];
+  }
+  filterSessions();
+}
+
+async function _importDiscoveredAsset(id) {
+  const item = (_wsDiscoveryCache || []).find(d => d.id === id);
+  if (!item) { showToast('Asset not found'); return; }
+
+  // Write the .md file to workforce/
+  const fm = item.frontmatter || {};
+  let content = '---\n';
+  content += 'id: ' + item.id + '\n';
+  content += 'name: ' + (fm.name || item.name) + '\n';
+  content += 'department: ' + (item.pack || 'Imported')+ '\n';
+  if (fm['allowed-tools']) content += 'allowed-tools: ' + JSON.stringify(fm['allowed-tools']) + '\n';
+  if (fm.version) content += 'version: ' + fm.version + '\n';
+  if (item.pack) content += 'source: ' + item.pack + '\n';
+  content += '---\n\n' + (item.systemPrompt || '');
+
+  try {
+    const resp = await fetch('/api/workforce/write-asset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: item.id, content: content }),
+    });
+    if (resp.ok) {
+      item.already_imported = true;
+      showToast('Imported: ' + item.name);
+      filterSessions();
+    } else {
+      showToast('Import failed');
+    }
+  } catch (e) {
+    showToast('Import failed: ' + e.message);
+  }
+}
+
+// ---- Remove single imported asset ----
+async function _removeDiscoveredAsset(id) {
+  const safe = id.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!safe) return;
+  try {
+    const resp = await fetch('/api/workforce/delete-asset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: safe }),
+    });
+    if (resp.ok) {
+      const item = (_wsDiscoveryCache || []).find(d => d.id === id);
+      if (item) item.already_imported = false;
+      showToast('Removed: ' + safe);
+      filterSessions();
+    }
+  } catch (e) {
+    showToast('Remove failed: ' + e.message);
+  }
+}
+
+// ---- Uninstall community pack ----
+async function _uninstallPack(packId) {
+  if (!confirm('Remove all imported assets from "' + packId + '" and delete the cloned directory?')) return;
+  try {
+    const resp = await fetch('/api/workforce/uninstall-pack', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pack_id: packId }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      if (typeof _agentCatalogPath !== 'undefined') { _agentCatalogPath = null; _agentCatalogPromise = null; }
+      _wsDiscoveryCache = null;
+      showToast('Uninstalled: ' + packId + ' (' + (data.assets_deleted || 0) + ' assets, ' + (data.dir_deleted ? 'directory removed' : 'no directory found') + ')');
+      filterSessions();
+    } else {
+      showToast('Uninstall failed: ' + (data.error || 'unknown'));
+    }
+  } catch (e) {
+    showToast('Uninstall failed: ' + e.message);
+  }
+}
+
+// ---- Quick template install (deterministic, instant) ----
+function _applyQuickTemplate(templateKey) {
+  if (typeof FOLDER_TEMPLATES === 'undefined') { showToast('Templates not available'); return; }
+  const tmpl = FOLDER_TEMPLATES[templateKey];
+  if (!tmpl) { showToast('Template not found'); return; }
+  if (typeof initFolderTreeFromTemplate === 'function') {
+    initFolderTreeFromTemplate(templateKey);
+    showToast('Installed: ' + tmpl.name);
+    filterSessions();
+  } else {
+    showToast('Template system not loaded');
+  }
+}
+
+// ---- Uninstall built-in library ----
+async function _uninstallBuiltin() {
+  if (!confirm('Remove all built-in departments and assets? You can reinstall anytime from the Available tab.')) return;
+  try {
+    const resp = await fetch('/api/workforce/uninstall-builtin', { method: 'POST' });
+    if (resp.ok) {
+      // Clear folder tree
+      await fetch('/api/folder-tree', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ version: 1, folders: {}, rootChildren: [] }),
+      });
+      _folderTreeCache = { version: 1, folders: {}, rootChildren: [] };
+      if (typeof _agentCatalogPath !== 'undefined') { _agentCatalogPath = null; _agentCatalogPromise = null; }
+      _wsConfigMode = true; // Stay in config mode so user sees empty state
+      showToast('Built-in library removed');
+      filterSessions();
+    } else {
+      showToast('Uninstall failed');
+    }
+  } catch (e) {
+    showToast('Uninstall failed: ' + e.message);
+  }
+}
+
+// ---- Organize AI (My Departments tab) ----
+function _openOrganizeAI() {
+  _openWfSlideout('organize', 'Organize Departments',
+    'Propose a department hierarchy that makes sense for my current setup. Look at what agents I have and suggest how to reorganize them.',
+    [
+      'You are a department organization assistant for VibeNode.',
+      'The user wants you to propose a better hierarchy for their departments.',
+      'Read the workforce/ directory and workforce-map.md to understand what exists.',
+      'Propose changes to the hierarchy by editing workforce-map.md.',
+      'You can also create new .md agent files or reorganize existing ones.',
+      'Be concise. Propose the structure, explain why, then make the changes if the user agrees.',
+    ].join('\n')
+  );
+}
+
+// ---- Install Pack (Available tab) ----
+async function _installPack(packId) {
+  // Find the pack definition
+  const packDefs = {
+    'gstack': { git: 'https://github.com/garrytan/gstack.git', setup: './setup' },
+    'anthropic-skills': { git: 'https://github.com/anthropics/skills.git' },
+    'everything-cc': { git: 'https://github.com/affaan-m/everything-claude-code.git' },
+    'wshobson-agents': { git: 'https://github.com/wshobson/agents.git' },
+    'antigravity': { git: 'https://github.com/sickn33/antigravity-awesome-skills.git' },
+    'alirezarezvani-skills': { git: 'https://github.com/alirezarezvani/claude-skills.git' },
+  };
+  const def = packDefs[packId];
+  if (!def) { showToast('Unknown pack: ' + packId); return; }
+
+  // Show inline progress
+  const btn = event && event.target ? event.target : null;
+  const origText = btn ? btn.innerHTML : '';
+  if (btn) { btn.innerHTML = 'Installing...'; btn.disabled = true; }
+
+  try {
+    const resp = await fetch('/api/workforce/install-pack', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pack_id: packId, git_url: def.git, setup_cmd: def.setup || null }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      if (typeof _agentCatalogPath !== 'undefined') { _agentCatalogPath = null; _agentCatalogPromise = null; }
+      _wsDiscoveryCache = null;
+      // Add pack as a department in the folder tree + reload FOLDER_SUPERSET from disk
+      await _addPackToFolderTree(packId, data.imported || 0);
+      if (typeof _loadWorkforceFromDisk === 'function') await _loadWorkforceFromDisk();
+      showToast('Installed ' + packId + ': ' + (data.imported || 0) + ' assets imported');
+      filterSessions();
+    } else {
+      showToast('Install failed: ' + (data.error || 'unknown'));
+      if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+    }
+  } catch (e) {
+    showToast('Install failed: ' + e.message);
+    if (btn) { btn.innerHTML = origText; btn.disabled = false; }
+  }
+}
+
+// ---- Add imported pack to folder tree ----
+async function _addPackToFolderTree(packId) {
+  // Get current tree
+  let tree;
+  try {
+    const resp = await fetch('/api/folder-tree');
+    if (resp.ok) tree = await resp.json();
+  } catch(e) {}
+  if (!tree || !tree.folders) tree = { version: 1, folders: {}, rootChildren: [] };
+
+  // Find all FOLDER_SUPERSET keys that start with packId-
+  // (they were just loaded by _loadWorkforceFromDisk or will be)
+  // For now, read from the workforce assets API
+  let packAssetIds = [];
+  try {
+    const resp = await fetch('/api/workforce/assets');
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.ok && data.assets) {
+        packAssetIds = data.assets
+          .filter(a => a.source === packId || a.id.startsWith(packId + '-'))
+          .map(a => a.id);
+      }
+    }
+  } catch(e) {}
+
+  if (!packAssetIds.length) return;
+
+  // Create pack department if it doesn't exist
+  if (!tree.folders[packId]) {
+    tree.folders[packId] = { id: packId, name: packId, children: [], sessions: [] };
+    if (!tree.rootChildren) tree.rootChildren = [];
+    tree.rootChildren.push(packId);
+  }
+
+  // Add child assets
+  const existing = new Set((tree.folders[packId].children || []).map(c => typeof c === 'string' ? c : c.id));
+  for (const aid of packAssetIds) {
+    if (aid === packId) continue; // skip the department itself
+    if (existing.has(aid)) continue;
+    if (!tree.folders[aid]) {
+      tree.folders[aid] = { id: aid, name: aid, children: [], sessions: [] };
+    }
+    tree.folders[packId].children.push(aid);
+  }
+
+  // Save
+  try {
+    await fetch('/api/folder-tree', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(tree),
+    });
+    _folderTreeCache = tree;
+  } catch(e) {}
+}
+
+// ---- Discovery AI Finder (Discovery tab) ----
+function _openFinderAI() {
+  _openWfSlideout('finder', 'Find Skills',
+    'Help me find agent and skill definitions that aren\'t currently on my system. I\'m looking for useful skills to add to my departments.',
+    [
+      'You are a skill discovery assistant for VibeNode.',
+      'The user wants to find new agent/skill definitions to import.',
+      'You can:',
+      '- Search GitHub for repos with Claude Code skills or agent definitions',
+      '- Clone repos and scan for .md skill files',
+      '- Import found skills into the workforce/ directory',
+      '- Help the user understand what skills are available',
+      'The workforce directory is at: ' + (typeof _currentProjectDir === 'function' ? _currentProjectDir() : '') + '/workforce/',
+      'When importing, create .md files with frontmatter (id, name, department) and update workforce-map.md.',
+    ].join('\n')
+  );
+}
+
+// ---- Shared slide-out panel builder ----
+function _openWfSlideout(mode, title, initialPrompt, sysPromptExtra) {
+  const existing = document.getElementById('workforce-assistant-panel');
+  if (existing) existing.remove();
+
+  const panel = document.createElement('div');
+  panel.id = 'workforce-assistant-panel';
+  panel.className = 'kanban-planner-panel';
+
+  panel.innerHTML =
+    '<div class="kanban-planner-header" onclick="_expandWfAssistantIfMinimized()">' +
+      '<span class="kanban-planner-title"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:-2px;margin-right:4px;"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 16.8l-6.2 4.5 2.4-7.4L2 9.4h7.6z"/></svg>' + _esc(title) + '</span>' +
+      '<div style="display:flex;gap:4px;align-items:center;">' +
+        '<button class="kanban-planner-close wf-minimize-btn" onclick="event.stopPropagation();_minimizeWfAssistant()">&#x2015;</button>' +
+        '<button class="kanban-planner-close" onclick="event.stopPropagation();_closeWfAssistant()">&#215;</button>' +
+      '</div>' +
+    '</div>' +
+    '<div class="planner-body" id="wf-assistant-body">' +
+      '<div class="planner-status" id="wf-assistant-status">' +
+        '<div class="planner-spinner"></div><span>Working...</span>' +
+      '</div>' +
+    '</div>' +
+    '<div class="planner-footer" id="wf-assistant-footer">' +
+      '<div class="planner-refine-row">' +
+        '<textarea id="wf-assistant-input" class="kanban-create-textarea" placeholder="Follow up..." rows="2" onkeydown="if(event.key===\'Enter\'&&!event.shiftKey){event.preventDefault();_sendWfAssistantMsg();}"></textarea>' +
+        '<button class="live-send-btn" onclick="_sendWfAssistantMsg()" title="Send">' +
+          '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>' +
+        '</button>' +
+      '</div>' +
+    '</div>';
+
+  document.body.appendChild(panel);
+  requestAnimationFrame(() => requestAnimationFrame(() => panel.classList.add('open')));
+
+  // Build system prompt with department context
+  const tree = (typeof getFolderTree === 'function') ? getFolderTree() : null;
+  const deptInfo = [];
+  if (tree && tree.rootChildren) {
+    for (const rf of tree.rootChildren) {
+      const fid = typeof rf === 'string' ? rf : rf.id;
+      const folder = tree.folders[fid];
+      const def = FOLDER_SUPERSET[fid];
+      if (!folder || !def) continue;
+      const label = def.skill ? def.skill.label : def.name;
+      const kids = (folder.children || []).map(c => {
+        const cid = typeof c === 'string' ? c : c.id;
+        const cd = FOLDER_SUPERSET[cid];
+        return cd ? (cd.skill ? cd.skill.label : cd.name) : cid;
+      });
+      deptInfo.push(label + ': ' + (kids.length ? kids.join(', ') : '(empty)'));
+    }
+  }
+
+  const sysPrompt = 'Current departments:\n' + (deptInfo.length ? deptInfo.join('\n') : '(none)') + '\n\n' + sysPromptExtra;
+
+  const newId = crypto.randomUUID();
+  _wsConfigAssistantId = newId;
+  if (typeof _hiddenSessionIds !== 'undefined') _hiddenSessionIds.add(newId);
+
+  socket.emit('start_session', {
+    session_id: newId,
+    prompt: initialPrompt,
+    cwd: typeof _currentProjectDir === 'function' ? _currentProjectDir() : '',
+    system_prompt: sysPrompt,
+    max_turns: 5,
+    session_type: 'planner',
+  });
+
+  _attachWfAssistantListeners();
+}
+
+function _closeWfAssistant() {
+  const panel = document.getElementById('workforce-assistant-panel');
+  if (!panel) return;
+  panel.classList.remove('open');
+  setTimeout(() => panel.remove(), 300);
+  _wsConfigAssistantId = null;
+}
+
+function _minimizeWfAssistant() {
+  const panel = document.getElementById('workforce-assistant-panel');
+  if (!panel) return;
+  panel.classList.add('minimized');
+  const minBtn = panel.querySelector('.wf-minimize-btn');
+  if (minBtn) minBtn.style.display = 'none';
+}
+
+function _expandWfAssistantIfMinimized() {
+  const panel = document.getElementById('workforce-assistant-panel');
+  if (!panel || !panel.classList.contains('minimized')) return;
+  panel.classList.remove('minimized');
+  const minBtn = panel.querySelector('.wf-minimize-btn');
+  if (minBtn) minBtn.style.display = '';
+}
+
+function _startWfAssistantSession() {
+  const newId = crypto.randomUUID();
+  _wsConfigAssistantId = newId;
+  if (typeof _hiddenSessionIds !== 'undefined') _hiddenSessionIds.add(newId);
+
+  // Build contextual system prompt
+  const tree = (typeof getFolderTree === 'function') ? getFolderTree() : null;
+  const deptInfo = [];
+  if (tree && tree.rootChildren) {
+    for (const rf of tree.rootChildren) {
+      const fid = typeof rf === 'string' ? rf : rf.id;
+      const folder = tree.folders[fid];
+      const def = FOLDER_SUPERSET[fid];
+      if (!folder || !def) continue;
+      const label = def.skill ? def.skill.label : def.name;
+      const kids = (folder.children || []).map(c => {
+        const cid = typeof c === 'string' ? c : c.id;
+        const cd = FOLDER_SUPERSET[cid];
+        return cd ? (cd.skill ? cd.skill.label : cd.name) : cid;
+      });
+      deptInfo.push(label + ': ' + (kids.length ? kids.join(', ') : '(empty)'));
+    }
+  }
+
+  const sysPrompt = [
+    'You are a workforce configuration assistant for VibeNode.',
+    'You help the user manage their department hierarchy and knowledge assets.',
+    'Departments contain agents (markdown files with system prompts).',
+    'The user\'s current departments:\n' + (deptInfo.length ? deptInfo.join('\n') : '(none configured)'),
+    '',
+    'You can:',
+    '- Create new departments and agents by writing .md files to the workforce/ directory',
+    '- Edit the workforce-map.md hierarchy file',
+    '- Explain what existing agents do',
+    '- Suggest department structures',
+    '- Import skills from GitHub repos the user mentions',
+    '',
+    'The current tab is: ' + _wsConfigTab,
+    'When creating agents, use this format for .md files:',
+    '---',
+    'id: agent-id',
+    'name: Agent Name',
+    'department: Department Name',
+    '---',
+    '',
+    'Agent instructions here...',
+    '',
+    'Always respond conversationally. After making changes, tell the user to refresh the view.',
+  ].join('\n');
+
+  socket.emit('start_session', {
+    session_id: newId,
+    prompt: 'Ready to help configure your departments. What would you like to do?',
+    cwd: typeof _currentProjectDir === 'function' ? _currentProjectDir() : '',
+    system_prompt: sysPrompt,
+    max_turns: 3,
+    session_type: 'planner',
+  });
+
+  // Listen for responses
+  _attachWfAssistantListeners();
+}
+
+let _wfAssistantEntryListener = null;
+let _wfAssistantStateListener = null;
+let _wfAssistantAccum = '';
+let _wfAssistantTimeout = null;
+
+function _attachWfAssistantListeners() {
+  if (_wfAssistantEntryListener) socket.off('session_entry', _wfAssistantEntryListener);
+  if (_wfAssistantStateListener) socket.off('session_state', _wfAssistantStateListener);
+  if (_wfAssistantTimeout) clearTimeout(_wfAssistantTimeout);
+
+  // Hide spinner once first text arrives
+  let _gotFirstText = false;
+
+  _wfAssistantEntryListener = function(data) {
+    if (data.session_id !== _wsConfigAssistantId) return;
+    if (data.type === 'assistant' && data.message) {
+      _wfAssistantAccum += data.message;
+      // Hide spinner on first text
+      if (!_gotFirstText) {
+        _gotFirstText = true;
+        const status = document.getElementById('wf-assistant-status');
+        if (status) status.style.display = 'none';
+      }
+      const body = document.getElementById('wf-assistant-body');
+      if (body) {
+        let respDiv = body.querySelector('.wf-assistant-response:last-child');
+        if (!respDiv || respDiv.dataset.final === 'true') {
+          respDiv = document.createElement('div');
+          respDiv.className = 'wf-assistant-response';
+          body.appendChild(respDiv);
+        }
+        respDiv.innerHTML = '<div style="padding:12px 16px;font-size:13px;color:var(--text-primary);white-space:pre-wrap;line-height:1.5;">' + _esc(_wfAssistantAccum) + '</div>';
+        body.scrollTop = body.scrollHeight;
+      }
+    }
+  };
+
+  _wfAssistantStateListener = function(data) {
+    if (data.session_id !== _wsConfigAssistantId) return;
+    if (data.state === 'idle' || data.state === 'sleeping') {
+      // Session finished — hide spinner, show completion
+      const status = document.getElementById('wf-assistant-status');
+      if (status) status.style.display = 'none';
+      if (!_wfAssistantAccum) {
+        // No text received — show error
+        const body = document.getElementById('wf-assistant-body');
+        if (body) {
+          body.innerHTML = '<div style="padding:16px;color:var(--text-faint);font-size:13px;">Session completed but no response was received. The assistant may have timed out. Try again or use a simpler request.</div>';
+        }
+      }
+    }
+  };
+
+  socket.on('session_entry', _wfAssistantEntryListener);
+  socket.on('session_state', _wfAssistantStateListener);
+
+  // Timeout fallback — if nothing happens in 30s, show error
+  _wfAssistantTimeout = setTimeout(function() {
+    if (!_wfAssistantAccum && _wsConfigAssistantId) {
+      const status = document.getElementById('wf-assistant-status');
+      if (status) {
+        status.innerHTML = '<span style="color:var(--text-faint);">Taking longer than expected. The assistant is still working — you can wait or close and try again.</span>';
+      }
+    }
+  }, 30000);
+}
+
+function _sendWfAssistantMsg() {
+  const input = document.getElementById('wf-assistant-input');
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+
+  // Mark previous response as final
+  const body = document.getElementById('wf-assistant-body');
+  if (body) {
+    const lastResp = body.querySelector('.wf-assistant-response:last-child');
+    if (lastResp) lastResp.dataset.final = 'true';
+    // Add user message bubble
+    const userDiv = document.createElement('div');
+    userDiv.className = 'wf-assistant-user-msg';
+    userDiv.innerHTML = '<div style="padding:8px 16px;font-size:13px;color:var(--accent);font-weight:500;">' + _esc(text) + '</div>';
+    body.appendChild(userDiv);
+    body.scrollTop = body.scrollHeight;
+  }
+
+  _wfAssistantAccum = '';
+
+  if (!_wsConfigAssistantId) {
+    _startWfAssistantSession();
+    // Wait a beat then send
+    setTimeout(() => {
+      socket.emit('send_message', { session_id: _wsConfigAssistantId, message: text });
+    }, 500);
+  } else {
+    socket.emit('send_message', { session_id: _wsConfigAssistantId, message: text });
+  }
 }

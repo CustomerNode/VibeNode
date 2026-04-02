@@ -1,5 +1,6 @@
 /* toolbar.js — toolbar session management, inline rename, message rendering, session actions */
 let _hpBoardFetching = false;
+let _hpBoardLoaded = false;
 
 function setToolbarSession(id, titleText, isUntitled, customTitle) {
   const titleEl = document.getElementById('main-title');
@@ -281,6 +282,7 @@ function _buildHomepageContent() {
     _hpBoardFetching = true;
     fetch('/api/kanban/board').then(r => r.ok ? r.json() : null).then(data => {
       _hpBoardFetching = false;
+      _hpBoardLoaded = true;
       if (data) {
         kanbanColumns = data.columns || [];
         kanbanTasks = data.tasks || [];
@@ -288,7 +290,11 @@ function _buildHomepageContent() {
         // Re-render homepage if still visible
         if (typeof _updateHomepageStats === 'function') _updateHomepageStats();
       }
-    }).catch(() => { _hpBoardFetching = false; });
+    }).catch(() => { _hpBoardFetching = false; _hpBoardLoaded = true; });
+  }
+  // If kanban data was already loaded (e.g. user visited board first), mark as loaded
+  if (!_hpBoardLoaded && typeof kanbanTasks !== 'undefined' && (kanbanTasks.length > 0 || typeof _kanbanHasLoaded !== 'undefined' && _kanbanHasLoaded)) {
+    _hpBoardLoaded = true;
   }
   const cols = (typeof kanbanColumns !== 'undefined') ? kanbanColumns : [];
   const tasks = (typeof kanbanTasks !== 'undefined') ? kanbanTasks : [];
@@ -301,24 +307,36 @@ function _buildHomepageContent() {
     if (count > maxColCount) maxColCount = count;
   }
   // Build column bar viz
+  const _wfStillLoading = !_hpBoardLoaded && (taskTotal === 0);
   let colBarsHtml = '';
-  if (colCounts.length && taskTotal > 0) {
+  if (_wfStillLoading) {
+    // Shimmer skeleton while data is loading
+    colBarsHtml = '<div class="hp-col skel-shimmer" style="height:60%;"></div>'
+      + '<div class="hp-col skel-shimmer" style="height:40%;animation-delay:0.15s;"></div>'
+      + '<div class="hp-col skel-shimmer" style="height:75%;animation-delay:0.3s;"></div>'
+      + '<div class="hp-col skel-shimmer" style="height:30%;animation-delay:0.45s;"></div>'
+      + '<div class="hp-col skel-shimmer" style="height:55%;animation-delay:0.6s;"></div>';
+  } else if (colCounts.length && taskTotal > 0) {
     for (const c of colCounts) {
       const pct = maxColCount > 0 ? Math.max(8, (c.count / maxColCount) * 100) : 8;
       colBarsHtml += `<div class="hp-col" style="height:${pct}%;background:${c.color};opacity:0.8;" title="${c.name}: ${c.count}"></div>`;
     }
   } else {
-    // Placeholder columns when no data
+    // Placeholder columns when genuinely no data
     colBarsHtml = '<div class="hp-col" style="height:60%;background:var(--border);opacity:0.3;"></div>'
       + '<div class="hp-col" style="height:40%;background:var(--border);opacity:0.3;"></div>'
       + '<div class="hp-col" style="height:20%;background:var(--border);opacity:0.3;"></div>'
       + '<div class="hp-col" style="height:50%;background:var(--border);opacity:0.3;"></div>';
   }
   // Build workflow stat line
-  let wfStatLine = 'No tasks yet';
-  if (taskTotal > 0) {
+  let wfStatLine = '';
+  if (_wfStillLoading) {
+    wfStatLine = '<span class="skel-shimmer" style="display:inline-block;width:120px;height:13px;border-radius:4px;vertical-align:middle;"></span>';
+  } else if (taskTotal > 0) {
     const parts = colCounts.filter(c => c.count > 0).map(c => `${c.count} ${c.name.toLowerCase()}`);
     wfStatLine = `${taskTotal} task${taskTotal !== 1 ? 's' : ''} &middot; ${parts.join(', ')}`;
+  } else {
+    wfStatLine = 'No tasks yet';
   }
 
   // Workforce stats

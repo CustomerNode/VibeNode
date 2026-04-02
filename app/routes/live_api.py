@@ -664,6 +664,415 @@ def get_workforce_assets():
 
 
 # ---------------------------------------------------------------------------
+# Workforce — discover agents/skills from Claude config directories
+# ---------------------------------------------------------------------------
+
+def _parse_frontmatter(content):
+    """Parse YAML frontmatter from .md content (simple key:value, no PyYAML)."""
+    frontmatter = {}
+    body = content
+    if content.startswith('---'):
+        parts = content.split('---', 2)
+        if len(parts) >= 3:
+            for line in parts[1].strip().splitlines():
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if ':' in line:
+                    k, v = line.split(':', 1)
+                    k = k.strip()
+                    v = v.strip()
+                    if v.startswith('[') and v.endswith(']'):
+                        v = [x.strip().strip("'\"") for x in v[1:-1].split(',') if x.strip()]
+                    elif v.lower() == 'true':
+                        v = True
+                    elif v.lower() == 'false':
+                        v = False
+                    elif v.lower() == 'null' or v == '':
+                        v = None
+                    else:
+                        v = v.strip("'\"")
+                    frontmatter[k] = v
+            body = parts[2].strip()
+    return frontmatter, body
+
+
+def _detect_tier(frontmatter):
+    """Detect asset tier from frontmatter fields."""
+    if frontmatter.get('preamble-tier') or frontmatter.get('source'):
+        return 'pipeline'
+    if frontmatter.get('allowed-tools') or frontmatter.get('version'):
+        return 'skill'
+    return 'role'
+
+
+def _scan_md_files(directory, source_type, pack_name=None, prefix=None):
+    """Scan a directory for .md files and return parsed asset dicts."""
+    results = []
+    d = Path(directory)
+    if not d.is_dir():
+        return results
+    for fpath in sorted(d.iterdir()):
+        if not fpath.suffix == '.md' or not fpath.is_file():
+            continue
+        try:
+            content = fpath.read_text(encoding='utf-8')
+        except Exception:
+            continue
+        frontmatter, body = _parse_frontmatter(content)
+        raw_id = frontmatter.get('id', fpath.stem)
+        if prefix:
+            raw_id = f"{prefix}-{raw_id}"
+        name = frontmatter.get('name')
+        if not name:
+            name = fpath.stem.replace('-', ' ').replace('_', ' ').title()
+            if prefix:
+                name = f"{prefix.title()}: {name}"
+        tier = _detect_tier(frontmatter) if frontmatter else 'role'
+        results.append({
+            "id": raw_id,
+            "name": name,
+            "tier": tier,
+            "source": source_type,
+            "pack": pack_name,
+            "path": str(fpath.resolve()),
+            "systemPrompt": body,
+            "frontmatter": frontmatter,
+            "already_imported": False,  # filled in later
+        })
+    return results
+
+
+@bp.route('/api/workforce/discover', methods=['GET'])
+def discover_workforce():
+    """Scan filesystem for existing Claude agent/skill definitions."""
+    home = Path(os.path.expanduser('~'))
+    discovered = []
+
+    # Collect IDs already present in workforce/ dir for already_imported check
+    existing_ids = set()
+    if os.path.isdir(_WORKFORCE_DIR):
+        for fname in os.listdir(_WORKFORCE_DIR):
+            if fname.endswith('.md') and os.path.isfile(os.path.join(_WORKFORCE_DIR, fname)):
+                try:
+                    with open(os.path.join(_WORKFORCE_DIR, fname), 'r', encoding='utf-8') as f:
+                        c = f.read()
+                    fm, _ = _parse_frontmatter(c)
+                    existing_ids.add(fm.get('id', fname.replace('.md', '')))
+                except Exception:
+                    existing_ids.add(fname.replace('.md', ''))
+
+    # 1. Global agents: ~/.claude/agents/
+    global_agents_dir = home / '.claude' / 'agents'
+    discovered.extend(_scan_md_files(global_agents_dir, 'global_agent'))
+
+    # 2. Project-scoped agents: {active_project}/.claude/agents/
+    try:
+        proj = get_active_project()
+        if proj:
+            proj_agents_dir = Path(proj) / '.claude' / 'agents'
+            discovered.extend(_scan_md_files(proj_agents_dir, 'project_agent'))
+    except Exception:
+        pass
+
+    # 3. Skill packs: ~/.claude/skills/*/
+    skills_dir = home / '.claude' / 'skills'
+    if skills_dir.is_dir():
+        for pack_dir in sorted(skills_dir.iterdir()):
+            if not pack_dir.is_dir():
+                continue
+            pack_name = pack_dir.name
+            # Check if this is a multi-skill pack (has subdirectories with SKILL.md)
+            sub_skills = [sd for sd in pack_dir.iterdir()
+                          if sd.is_dir() and (sd / 'SKILL.md').is_file()]
+            if sub_skills:
+                # It's a pack with sub-skills
+                for sub_dir in sorted(sub_skills):
+                    skill_file = sub_dir / 'SKILL.md'
+                    try:
+                        content = skill_file.read_text(encoding='utf-8')
+                    except Exception:
+                        continue
+                    frontmatter, body = _parse_frontmatter(content)
+                    raw_id = frontmatter.get('id', f"{pack_name}-{sub_dir.name}")
+                    name = frontmatter.get('name')
+                    if not name:
+                        name = f"{pack_name.title()}: {sub_dir.name.replace('-', ' ').replace('_', ' ').title()}"
+                    tier = _detect_tier(frontmatter) if frontmatter else 'skill'
+                    discovered.append({
+                        "id": raw_id,
+                        "name": name,
+                        "tier": tier,
+                        "source": "skill_pack",
+                        "pack": pack_name,
+                        "path": str(skill_file.resolve()),
+                        "systemPrompt": body,
+                        "frontmatter": frontmatter,
+                        "already_imported": False,
+                    })
+            else:
+                # Single skill or flat .md files in the pack dir
+                # Check for SKILL.md at the pack root
+                root_skill = pack_dir / 'SKILL.md'
+                if root_skill.is_file():
+                    try:
+                        content = root_skill.read_text(encoding='utf-8')
+                    except Exception:
+                        content = None
+                    if content:
+                        frontmatter, body = _parse_frontmatter(content)
+                        raw_id = frontmatter.get('id', pack_name)
+                        name = frontmatter.get('name', pack_name.replace('-', ' ').replace('_', ' ').title())
+                        tier = _detect_tier(frontmatter) if frontmatter else 'skill'
+                        discovered.append({
+                            "id": raw_id,
+                            "name": name,
+                            "tier": tier,
+                            "source": "skill_pack",
+                            "pack": pack_name,
+                            "path": str(root_skill.resolve()),
+                            "systemPrompt": body,
+                            "frontmatter": frontmatter,
+                            "already_imported": False,
+                        })
+                # Also scan any loose .md files
+                discovered.extend(_scan_md_files(pack_dir, 'skill_pack', pack_name=pack_name, prefix=pack_name))
+
+    # 4. Plugins: ~/.claude/plugins/*/  (with agents/ and skills/ subdirs)
+    plugins_dir = home / '.claude' / 'plugins'
+    if plugins_dir.is_dir():
+        for plugin_dir in sorted(plugins_dir.iterdir()):
+            if not plugin_dir.is_dir():
+                continue
+            plugin_agents = plugin_dir / 'agents'
+            discovered.extend(_scan_md_files(plugin_agents, 'plugin', pack_name=plugin_dir.name))
+            plugin_skills = plugin_dir / 'skills'
+            discovered.extend(_scan_md_files(plugin_skills, 'plugin', pack_name=plugin_dir.name))
+
+    # Set already_imported flags
+    for item in discovered:
+        item['already_imported'] = item['id'] in existing_ids
+
+    return jsonify({"ok": True, "discovered": discovered})
+
+
+@bp.route('/api/workforce/write-asset', methods=['POST'])
+def write_workforce_asset():
+    """Write a .md asset file to the workforce directory."""
+    data = request.get_json(silent=True) or {}
+    asset_id = data.get('id', '')
+    content = data.get('content', '')
+    if not asset_id or not content:
+        return jsonify({"ok": False, "error": "Missing id or content"}), 400
+
+    # Sanitize filename
+    safe_id = re.sub(r'[^a-zA-Z0-9_-]', '', asset_id)
+    if not safe_id:
+        return jsonify({"ok": False, "error": "Invalid id"}), 400
+
+    filepath = os.path.join(_WORKFORCE_DIR, safe_id + '.md')
+    try:
+        os.makedirs(_WORKFORCE_DIR, exist_ok=True)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(content)
+        # Invalidate catalog cache
+        proj = get_active_project() or "default"
+        _agent_catalog_paths.pop(proj, None)
+        return jsonify({"ok": True, "path": filepath})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route('/api/workforce/install-pack', methods=['POST'])
+def install_pack():
+    """Clone a skill pack repo, scan for .md/SKILL.md files, import as workforce assets."""
+    import subprocess, shutil
+
+    data = request.get_json(silent=True) or {}
+    pack_id = data.get('pack_id', '')
+    git_url = data.get('git_url', '')
+    setup_cmd = data.get('setup_cmd')
+
+    if not pack_id or not git_url:
+        return jsonify({"ok": False, "error": "Missing pack_id or git_url"}), 400
+
+    safe_id = re.sub(r'[^a-zA-Z0-9_-]', '', pack_id)
+    skills_dir = Path.home() / '.claude' / 'skills' / safe_id
+
+    # Step 1: Clone if not already present
+    cloned = False
+    if not skills_dir.is_dir():
+        try:
+            result = subprocess.run(
+                ['git', 'clone', '--single-branch', '--depth', '1', git_url, str(skills_dir)],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode != 0:
+                return jsonify({"ok": False, "error": f"git clone failed: {result.stderr[:200]}"}), 500
+            cloned = True
+        except subprocess.TimeoutExpired:
+            return jsonify({"ok": False, "error": "git clone timed out (120s)"}), 500
+        except FileNotFoundError:
+            return jsonify({"ok": False, "error": "git not found on system"}), 500
+
+    # Step 2: Run setup if specified (non-blocking, best-effort)
+    if setup_cmd and cloned:
+        try:
+            subprocess.Popen(
+                setup_cmd, shell=True, cwd=str(skills_dir),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            pass  # setup is optional
+
+    # Step 3: Scan for .md and SKILL.md files
+    imported = 0
+    os.makedirs(_WORKFORCE_DIR, exist_ok=True)
+
+    for root_dir, dirs, files in os.walk(str(skills_dir)):
+        # Skip hidden dirs, node_modules, dist, .git
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', 'dist', 'bin', 'test', 'tests')]
+
+        for fname in files:
+            # STRICT: Only import SKILL.md files (the standard skill definition format)
+            # Everything else (README, docs, templates, reference material) is not a skill
+            if fname != 'SKILL.md':
+                continue
+
+            # Use parent directory name as skill name
+            parent_dir = os.path.basename(root_dir)
+            if parent_dir == safe_id:
+                continue  # Top-level SKILL.md is the pack index, not a skill
+
+            fpath = os.path.join(root_dir, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            except Exception:
+                continue
+
+            # Parse frontmatter
+            frontmatter = {}
+            body = content
+            if content.startswith('---'):
+                parts = content.split('---', 2)
+                if len(parts) >= 3:
+                    frontmatter, body = _parse_frontmatter(content)
+
+            if not body or len(body) < 20:
+                continue
+
+            asset_id = safe_id + '-' + re.sub(r'[^a-zA-Z0-9_-]', '', parent_dir)
+            asset_name = frontmatter.get('name', parent_dir.replace('-', ' ').title())
+
+            # Write workforce .md file
+            out = '---\n'
+            out += f'id: {asset_id}\n'
+            out += f'name: {asset_name}\n'
+            out += f'department: {safe_id}\n'
+            out += f'source: {safe_id}\n'
+            if frontmatter.get('allowed-tools'):
+                out += f'allowed-tools: {frontmatter["allowed-tools"]}\n'
+            if frontmatter.get('version'):
+                out += f'version: {frontmatter["version"]}\n'
+            out += '---\n\n' + body
+
+            out_path = os.path.join(_WORKFORCE_DIR, asset_id + '.md')
+            try:
+                with open(out_path, 'w', encoding='utf-8') as f:
+                    f.write(out)
+                imported += 1
+            except Exception:
+                pass
+
+    # Invalidate catalog
+    proj = get_active_project() or "default"
+    _agent_catalog_paths.pop(proj, None)
+
+    return jsonify({"ok": True, "cloned": cloned, "imported": imported, "path": str(skills_dir)})
+
+
+@bp.route('/api/workforce/delete-asset', methods=['POST'])
+def delete_workforce_asset():
+    """Delete a single .md asset from the workforce directory."""
+    data = request.get_json(silent=True) or {}
+    asset_id = data.get('id', '')
+    if not asset_id:
+        return jsonify({"ok": False, "error": "Missing id"}), 400
+    safe_id = re.sub(r'[^a-zA-Z0-9_-]', '', asset_id)
+    filepath = os.path.join(_WORKFORCE_DIR, safe_id + '.md')
+    if os.path.isfile(filepath):
+        os.remove(filepath)
+        proj = get_active_project() or "default"
+        _agent_catalog_paths.pop(proj, None)
+        return jsonify({"ok": True})
+    return jsonify({"ok": False, "error": "File not found"}), 404
+
+
+@bp.route('/api/workforce/uninstall-pack', methods=['POST'])
+def uninstall_pack():
+    """Uninstall a community skill pack — delete imported assets and the cloned directory."""
+    data = request.get_json(silent=True) or {}
+    pack_id = data.get('pack_id', '')
+    if not pack_id:
+        return jsonify({"ok": False, "error": "Missing pack_id"}), 400
+
+    safe_id = re.sub(r'[^a-zA-Z0-9_-]', '', pack_id)
+    assets_deleted = 0
+    dir_deleted = False
+
+    # 1. Remove imported .md files from workforce/ that have source: pack_id
+    if os.path.isdir(_WORKFORCE_DIR):
+        for fname in os.listdir(_WORKFORCE_DIR):
+            if not fname.endswith('.md'):
+                continue
+            fpath = os.path.join(_WORKFORCE_DIR, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    head = f.read(500)
+                if f'source: {safe_id}' in head or fname.startswith(safe_id + '-'):
+                    os.remove(fpath)
+                    assets_deleted += 1
+            except Exception:
+                pass
+
+    # 2. Remove cloned directory from ~/.claude/skills/
+    skills_dir = Path.home() / '.claude' / 'skills' / safe_id
+    if skills_dir.is_dir():
+        import shutil
+        try:
+            shutil.rmtree(skills_dir)
+            dir_deleted = True
+        except Exception:
+            pass
+
+    # Invalidate catalog cache
+    proj = get_active_project() or "default"
+    _agent_catalog_paths.pop(proj, None)
+
+    return jsonify({"ok": True, "assets_deleted": assets_deleted, "dir_deleted": dir_deleted})
+
+
+@bp.route('/api/workforce/uninstall-builtin', methods=['POST'])
+def uninstall_builtin_workforce():
+    """Delete all .md files from the workforce directory."""
+    if not os.path.isdir(_WORKFORCE_DIR):
+        return jsonify({"ok": True, "deleted": 0})
+    deleted = 0
+    for fname in os.listdir(_WORKFORCE_DIR):
+        if fname.endswith('.md'):
+            try:
+                os.remove(os.path.join(_WORKFORCE_DIR, fname))
+                deleted += 1
+            except Exception:
+                pass
+    # Invalidate catalog cache
+    proj = get_active_project() or "default"
+    _agent_catalog_paths.pop(proj, None)
+    return jsonify({"ok": True, "deleted": deleted})
+
+
+# ---------------------------------------------------------------------------
 # File-drop API — drag-and-drop file upload
 # ---------------------------------------------------------------------------
 

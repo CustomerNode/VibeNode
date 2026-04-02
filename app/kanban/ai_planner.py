@@ -68,12 +68,18 @@ Given a task title and description, break it down into concrete, actionable subt
 
 Rules:
 - Each subtask should be independently completable by a single AI coding session
-- Include verification URLs where possible (relative paths like /api/... or /page)
 - Order subtasks logically (dependencies first)
 - Keep subtask titles concise but descriptive
 - Aim for 3-8 subtasks unless the task is very large
 
-Available route URLs in this project (use these for verification_url):
+Verification URLs:
+- Each subtask has an optional verification_url field — an absolute URL (http:// or https://)
+  the developer can click to manually validate the feature.
+- Default is null unless a dev server base URL is provided below.
+- When a base URL is provided, you MUST set verification_url on every task by constructing
+  absolute URLs from that base URL + real route paths from the project code.
+- Only set to null for purely non-visual tasks (refactoring, config) with no observable endpoint.
+
 {available_urls}
 
 Respond with a JSON array of objects:
@@ -81,7 +87,7 @@ Respond with a JSON array of objects:
   {{
     "title": "subtask title",
     "description": "what needs to be done",
-    "verification_url": "/path/to/check" or null
+    "verification_url": null
   }}
 ]
 
@@ -219,12 +225,10 @@ def apply_plan(repo, parent_task_id, subtasks, project_id):
         task_id = str(uuid_mod.uuid4())
         position = (i + 1) * 1000
 
-        # Resolve verification URL
+        # Only accept absolute URLs — discard anything relative
         ver_url = sub.get("verification_url")
-        if ver_url and not ver_url.startswith("http"):
-            if not ver_url.startswith("/"):
-                ver_url = "/" + ver_url
-            ver_url = f"http://localhost:5050{ver_url}"
+        if ver_url and not ver_url.startswith(("http://", "https://")):
+            ver_url = None
 
         from ..db.repository import Task, TaskStatus
         task_obj = Task(

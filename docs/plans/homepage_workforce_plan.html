@@ -712,56 +712,137 @@ dependencies: [bun, playwright]     # External runtime dependencies
 
   <!-- PHASE 3 -->
   <div class="phase">
-    <div class="phase-header"><div class="phase-num">3</div><h3>Unified File Format + On-Disk Storage</h3><span class="phase-status status-pending">Pending</span></div>
+    <div class="phase-header"><div class="phase-num">3</div><h3>Unified File Format + On-Disk Storage</h3><span class="phase-status status-done">Done</span></div>
     <p class="scope">Frontend + one backend endpoint. Creates files on disk. No database, no daemon.</p>
     <div class="cl-label">Implementation</div>
     <ul class="cl">
-      <li>Define .md asset file format spec (id, name, department required; rest optional)</li>
-      <li>Write 72 built-in agents as individual .md files with frontmatter</li>
-      <li>Write default <code>workforce-map.md</code> hierarchy file</li>
-      <li>Create <code>~/.claude/workforce/</code> and populate with defaults on first run</li>
-      <li>Build file reader (backend endpoint) that parses .md + YAML frontmatter</li>
-      <li>Replace <code>FOLDER_SUPERSET</code> with data from on-disk files (keep as fallback)</li>
-      <li>Update <code>folders.js</code> skill inheritance to use file-backed store</li>
-      <li>Update <code>write-catalog</code> endpoint to read from disk</li>
+      <li class="done">Define .md asset file format spec (id, name, department required; rest optional)</li>
+      <li class="done">Write 72 built-in agents as individual .md files with frontmatter</li>
+      <li class="done">Write default <code>workforce-map.md</code> hierarchy file</li>
+      <li class="done">Create <code>workforce/</code> directory and populate with defaults via generation script</li>
+      <li class="done">Build file reader (backend endpoint <code>/api/workforce/assets</code>) that parses .md + YAML frontmatter</li>
+      <li class="done">Replace <code>FOLDER_SUPERSET</code> with data from on-disk files via <code>_loadWorkforceFromDisk()</code> (hardcoded kept as fallback)</li>
+      <li class="done">folders.js skill inheritance works unchanged — reads from FOLDER_SUPERSET which is now disk-backed</li>
+      <li class="done">Agent catalog cache invalidated when disk data loads; <code>write-catalog</code> supports <code>?force=1</code> to bypass cache</li>
     </ul>
     <div class="cl-label cl-validate">Validation</div>
     <ul class="cl">
-      <li><code>~/.claude/workforce/</code> created with .md files on first run</li>
-      <li>Workforce view renders correctly from on-disk files</li>
-      <li>Editing .md on disk and refreshing shows the change</li>
-      <li>Agent catalog injection still works in sessions</li>
-      <li>Launching session from Workforce injects correct skill prompt</li>
-      <li>Missing/empty workforce dir falls back to FOLDER_SUPERSET</li>
+      <li class="done"><code>workforce/</code> directory created with 72 .md files + workforce-map.md</li>
+      <li class="done"><code>/api/workforce/assets</code> returns 72 assets with hierarchy map from disk</li>
+      <li class="done">Workforce view renders correctly from on-disk files</li>
+      <li class="done">Editing .md on disk and refreshing shows the change (verified: endpoint reflects edits immediately)</li>
+      <li class="done">Agent catalog injection still works (verified: write-catalog accepts disk-backed data, force refresh works)</li>
+      <li class="done">Missing/empty workforce dir falls back to hardcoded FOLDER_SUPERSET</li>
     </ul>
   </div>
 
   <!-- PHASE 4 -->
   <div class="phase">
-    <div class="phase-header"><div class="phase-num">4</div><h3>Discovery Engine</h3><span class="phase-status status-pending">Pending</span></div>
-    <p class="scope">Backend endpoint + frontend. Reads multiple directories. Does not modify external files.</p>
-    <div class="cl-label">Implementation</div>
+    <div class="phase-header"><div class="phase-num">4</div><h3>Department Manager — Shared Utility Component</h3><span class="phase-status status-pending">Pending</span></div>
+    <p class="scope">Major UI component. Backend discovery endpoint + frontend utility rendered in two modes. AI assistant uses hidden session (same pattern as auto-naming and kanban AI planner — scoped to avoid project bleed).</p>
+
+    <div class="cl-label">Architecture</div>
     <ul class="cl">
-      <li>Build discovery endpoint scanning: workforce dirs, <code>~/.claude/agents/</code>, <code>{project}/.claude/agents/</code>, <code>~/.claude/skills/*/SKILL.md</code></li>
+      <li><strong>Shared utility component</strong> — one component, two rendering modes:
+        <ul style="margin-top:6px;">
+          <li><strong>Config Mode</strong> — full editing, three sub-tabs, AI assistant. Rendered inside Workforce view when user toggles "Configure" at top of Workforce.</li>
+          <li><strong>View Mode</strong> — browse-only, no tabs, no inline editing. Rendered inside the mid-session invocation picker and new-session quick-pick. Same hierarchy, same data, stripped-down UI.</li>
+        </ul>
+      </li>
+      <li><strong>Workforce view gets a toggle</strong> at the top: <strong>Work</strong> (current session-launching behavior) | <strong>Configure</strong> (opens the department manager in config mode)</li>
+    </ul>
+
+    <div class="cl-label">Config Mode — Three Sub-Tabs</div>
+    <ul class="cl">
+      <li><strong>Tab 1: My Departments</strong> — shows your current hierarchy, which departments you have, which agents are in each. Edit department names, reorder, create/delete departments, drag assets between them. This is your active configuration.</li>
+      <li><strong>Tab 2: Available</strong> — browse what's available to add. Three sources:
+        <ul style="margin-top:6px;">
+          <li><strong>Built-in (CustomerNode defaults)</strong> — the 72 role agents we ship</li>
+          <li><strong>Community skill packs</strong> — popular repos that ship importable .md files:
+            <ul style="margin-top:4px;">
+              <li><a href="https://github.com/anthropics/skills" style="color:var(--accent)">anthropics/skills</a> (109K stars) — Anthropic's official 17 reference skills</li>
+              <li><a href="https://github.com/garrytan/gstack" style="color:var(--accent)">garrytan/gstack</a> (62K stars) — 23 dev team skills (review, QA, ship, security)</li>
+              <li><a href="https://github.com/affaan-m/everything-claude-code" style="color:var(--accent)">everything-claude-code</a> (120K stars) — 40+ skills, 13 agents</li>
+              <li><a href="https://github.com/wshobson/agents" style="color:var(--accent)">wshobson/agents</a> (31K stars) — 112 agents + 146 skills</li>
+              <li><a href="https://github.com/sickn33/antigravity-awesome-skills" style="color:var(--accent)">antigravity-awesome-skills</a> (29K stars) — 1,340+ skills</li>
+              <li><a href="https://github.com/alirezarezvani/claude-skills" style="color:var(--accent)">alirezarezvani/claude-skills</a> (5.2K stars) — 220+ multi-domain skills</li>
+            </ul>
+          </li>
+          <li><strong>Installed on system</strong> — anything already in <code>~/.claude/skills/</code> or <code>~/.claude/agents/</code></li>
+        </ul>
+        Each source shows assets with one-click "Add to department" action.
+      </li>
+      <li><strong>Tab 3: Discovery</strong> — scans the local filesystem for existing agent and skill definitions:
+        <ul style="margin-top:6px;">
+          <li>Scans <code>~/.claude/agents/</code>, <code>{project}/.claude/agents/</code></li>
+          <li>Scans <code>~/.claude/skills/*/SKILL.md</code> (gstack, etc.)</li>
+          <li>Scans <code>~/.claude/plugins/*/</code></li>
+          <li>Shows found assets with source badges, tier detection, frontmatter preview</li>
+          <li>"Import" button to pull into a department</li>
+        </ul>
+      </li>
+    </ul>
+
+    <div class="cl-label">AI Assistant — Slide-In Panel</div>
+    <ul class="cl">
+      <li><strong>Same UI component as the kanban AI planner</strong> — slide-in panel from the side, same look and feel, same hidden-session pattern. Not a purpose-built tool per tab — a general-purpose assistant that adapts to context.</li>
+      <li><strong>Contextual system prompt</strong> — dynamically updated based on:
+        <ul style="margin-top:6px;">
+          <li>Which tab the user is on (My Departments / Available / Discovery)</li>
+          <li>Current department hierarchy and asset inventory</li>
+          <li>What's available to import (installed packs, community repos)</li>
+          <li>What's been discovered on the filesystem</li>
+        </ul>
+        The assistant always knows the current state and can act on it.
+      </li>
+      <li><strong>Scoped to workforce config</strong> — session runs against VibeNode's own project dir. Must NOT bleed into the user's active project (same isolation as kanban planner).</li>
+      <li><strong>Fully manages everything</strong> — the assistant is not limited to specific actions. It can:
+        <ul style="margin-top:6px;">
+          <li>Create departments, rename them, reorganize the hierarchy</li>
+          <li>Write custom agent .md files from a description</li>
+          <li>Import skills from a GitHub URL the user pastes in — fetches the repo, figures out the .md files, turns them into departments</li>
+          <li>Explain what any asset does in plain language</li>
+          <li>Help with discovery — "scan my system and tell me what I have"</li>
+          <li>Suggest department structures — "I'm a solo fullstack dev, what departments make sense for me?"</li>
+          <li>Handle anything else the user throws at it related to workforce config</li>
+        </ul>
+      </li>
+      <li>Writes directly to <code>workforce/</code> directory and updates <code>workforce-map.md</code>. UI refreshes after each AI action.</li>
+    </ul>
+
+    <div class="cl-label">Backend — Discovery Endpoint</div>
+    <ul class="cl">
+      <li>Build <code>/api/workforce/discover</code> endpoint scanning: <code>~/.claude/agents/</code>, <code>{project}/.claude/agents/</code>, <code>~/.claude/skills/*/SKILL.md</code>, <code>~/.claude/plugins/*/</code></li>
       <li>Parse frontmatter from all discovered files — handle YAML and no-frontmatter</li>
       <li>Detect asset tier (Role / Skill / Pipeline) from frontmatter</li>
       <li>Normalize formats: Claude Code agents, skills, gstack, plain .md</li>
       <li>Auto-assign department for assets without one</li>
-      <li>Detect skill packs and auto-group under pack branch</li>
-      <li>Build <code>workforce-discovery.js</code> — call endpoint, merge with hierarchy</li>
-      <li>Add source badges (built-in, user, project, gstack, plugin)</li>
-      <li>Add tier badges (Role, Skill, Pipeline)</li>
-      <li>Mark external assets as read-only</li>
+      <li>Detect skill packs and auto-group</li>
+      <li>Return discovered assets with source badges, tier indicators, import status (already imported or not)</li>
     </ul>
+
+    <div class="cl-label">View Mode (for invocation picker)</div>
+    <ul class="cl">
+      <li>Same component, stripped down: no tabs, no editing, no AI chat</li>
+      <li>Shows department hierarchy, assets within departments, search/filter</li>
+      <li>Click an asset to invoke it (inject into current session or select for new session)</li>
+      <li>Recently used assets pinned at top</li>
+      <li>Rendered inside: mid-session hierarchy picker flyout, new-session quick-pick dropdown</li>
+    </ul>
+
     <div class="cl-label cl-validate">Validation</div>
     <ul class="cl">
-      <li>Assets from <code>~/.claude/agents/</code> appear with source badge</li>
-      <li>gstack skills (if installed) appear under "gstack" department</li>
-      <li>Plain .md without frontmatter discovered and displayed</li>
-      <li>Tier badges render correctly</li>
-      <li>Source badges distinguish built-in vs user vs external</li>
-      <li>External assets show as read-only</li>
-      <li>Refresh re-scans and picks up new files</li>
+      <li>Work/Configure toggle in Workforce view switches between session launcher and department manager</li>
+      <li>Config Mode Tab 1: shows current departments and assets, supports edit/reorder/create/delete</li>
+      <li>Config Mode Tab 2: shows built-in, community packs, and installed system assets. One-click add works.</li>
+      <li>Config Mode Tab 3: scans filesystem, finds <code>.claude/agents/</code> and <code>.claude/skills/</code> assets, import works</li>
+      <li>AI assistant can create a new department via chat (writes .md files + updates map)</li>
+      <li>AI assistant can create a custom agent via chat (writes .md file)</li>
+      <li>AI session is scoped — does NOT bleed into user's active project</li>
+      <li>View Mode renders same hierarchy in mid-session picker without edit controls</li>
+      <li>Clicking an asset in View Mode invokes it correctly</li>
+      <li>Assets from <code>~/.claude/agents/</code> appear with source badge in Discovery tab</li>
+      <li>gstack skills (if installed) appear under discovery with correct tier badge</li>
       <li>Duplicate IDs: project overrides global</li>
     </ul>
   </div>

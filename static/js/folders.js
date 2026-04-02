@@ -58,9 +58,8 @@ async function initFolderTree() {
   } catch (e) {
     console.error('Failed to load folder tree from server', e);
   }
-  // No tree on server — show template selector
+  // No tree on server — start with empty tree (templates available in Configure mode)
   _folderTreeCache = null;
-  _showTemplateSelector();
   return null;
 }
 

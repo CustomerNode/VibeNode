@@ -80,6 +80,10 @@ def _kanban_config_defaults() -> dict:
         "auto_parent_reopen": True,
         # All children/sessions done → task moves to Validating
         "auto_advance_to_validating": False,
+        # ── Validation URL preferences ──
+        "validation_url_enabled": False,
+        "validation_base_url": "",
+        "validation_url_dismissed": False,
     }
 
 

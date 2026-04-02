@@ -650,8 +650,22 @@ function renderLiveEntry(e) {
     div.appendChild(detail);
 
   } else if (e.kind === 'system') {
-    div.className = 'live-entry live-entry-result';
     const text = e.text || e.message || '';
+
+    /* ── Special: interrupted by user ── */
+    if (/interrupted by user/i.test(text)) {
+      div.className = 'live-entry live-interrupted';
+      div.innerHTML =
+        '<div class="live-interrupted-pill">' +
+          '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">' +
+            '<rect x="6" y="6" width="12" height="12" rx="2"/>' +
+          '</svg>' +
+          '<span>Request stopped by user</span>' +
+        '</div>';
+      return div;
+    }
+
+    div.className = 'live-entry live-entry-result';
     const isErr = !!e.is_error;
     const line = document.createElement('div');
     line.className = isErr ? 'live-result-line live-result-err' : 'live-result-line';
