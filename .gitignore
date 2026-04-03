@@ -212,6 +212,9 @@ __marimo__/
 # Runtime logs
 logs/
 
+# Backups
+backups/
+
 # Secrets - contains Supabase keys
 kanban_config.json
 kanban_config.json.test_backup
