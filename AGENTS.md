@@ -1,13 +1,13 @@
-# ClaudeCodeGUI — Agent Standards & Guidelines
+# VibeNode — Agent Standards & Guidelines
 
-This document defines the standards for any agent (human or AI) working on ClaudeCodeGUI. Follow these rules for every change.
+This document defines the standards for any agent (human or AI) working on VibeNode. Follow these rules for every change.
 
 ---
 
 ## Architecture
 
 ```
-ClaudeCodeGUI/
+VibeNode/
   session_manager.py          # Entrypoint — creates app, starts server
   app/
     __init__.py               # App factory, blueprint registration
@@ -70,7 +70,7 @@ ClaudeCodeGUI/
 
 ### Theming
 
-ClaudeCodeGUI supports three theme modes: **dark**, **light**, and **auto** (adaptive).
+VibeNode supports three theme modes: **dark**, **light**, and **auto** (adaptive).
 
 #### CSS Custom Properties
 
