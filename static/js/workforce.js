@@ -12,7 +12,53 @@ function getSessionStatus(id) {
 }
 
 function setViewMode(mode) {
-  const prevMode = viewMode;
+  // Skip transition if same mode, or if project-switch loader is covering everything
+  const _skipTransition = (viewMode === mode) || !!document.getElementById('project-switch-loader');
+  if (!_skipTransition) {
+    return _viewTransition(viewMode, mode);
+  }
+  _setViewModeImmediate(mode, viewMode);
+}
+
+function _viewTransition(prevMode, mode) {
+  // Set viewMode immediately to prevent double-triggers during animation
+  viewMode = mode;
+  // Fade out all view containers, then switch, then fade in
+  const targets = ['homepage-container', 'main-body', 'kanban-board', 'main-toolbar'].map(id => document.getElementById(id)).filter(Boolean);
+  const sidebar = document.querySelector('.sidebar');
+  if (sidebar) targets.push(sidebar);
+
+  // Apply fade-out
+  for (const el of targets) {
+    el.style.transition = 'opacity 0.15s ease';
+    el.style.opacity = '0';
+  }
+
+  setTimeout(() => {
+    _setViewModeImmediate(mode, prevMode);
+
+    // Gather the NOW-visible containers and fade them in
+    const freshTargets = ['homepage-container', 'main-body', 'kanban-board', 'main-toolbar'].map(id => document.getElementById(id)).filter(Boolean);
+    if (sidebar) freshTargets.push(sidebar);
+    for (const el of freshTargets) {
+      el.style.opacity = '0';
+      el.style.transition = 'opacity 0.2s ease';
+    }
+    requestAnimationFrame(() => {
+      for (const el of freshTargets) el.style.opacity = '1';
+    });
+    // Clean up inline transition styles after animation
+    setTimeout(() => {
+      for (const el of freshTargets) {
+        el.style.removeProperty('transition');
+        el.style.removeProperty('opacity');
+      }
+    }, 250);
+  }, 150);
+}
+
+function _setViewModeImmediate(mode, prevMode) {
+  prevMode = prevMode != null ? prevMode : null;
   viewMode = mode;
   localStorage.setItem('viewMode', mode);
   if (typeof _updateViewModeButton === 'function') _updateViewModeButton(mode);

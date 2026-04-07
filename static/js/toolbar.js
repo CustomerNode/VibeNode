@@ -383,8 +383,18 @@ function _buildHomepageContent() {
     }
   }
 
+  // Project selector for homepage
+  const _hpProject = _allProjects ? _allProjects.find(p => p.encoded === localStorage.getItem('activeProject')) : null;
+  const _hpProjectName = _hpProject ? _projectShortName(_hpProject) : 'No project';
+
   return `
   <div class="homepage">
+    <div class="hp-project-trigger" onclick="openProjectOverlay()">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+      <span class="hp-project-label">Project:</span>
+      <span class="hp-project-name">${escHtml(_hpProjectName)}</span>
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="opacity:0.35;"><polyline points="6 9 12 15 18 9"/></svg>
+    </div>
     <div class="homepage-cards">
 
       <div class="homepage-card hp-sessions" onclick="setViewMode('sessions')">

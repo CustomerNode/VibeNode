@@ -2870,6 +2870,8 @@ async function openSessionSpawner(taskId) {
   activeId = newId;
   liveSessionId = newId;
   localStorage.setItem('activeSessionId', newId);
+  // Track in recent history so new sessions appear in the Recents dropdown immediately
+  _kanbanHistoryPush({ type: 'session', id: newId, title: 'New Session', taskId: taskId || '' });
   filterSessions();
 
   // Push history

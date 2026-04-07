@@ -678,8 +678,9 @@ class BootSplash:
         if self.current_step and self.current_step != step_id:
             self._mark_done(self.current_step)
         self.current_step = step_id
-        # Scroll carousel to center this step
+        # Record when this step started for intra-step decay
         if step_id in self._si:
+            self._si[step_id]["_started"] = time.time()
             self._scroll_target = self._si[step_id]["idx"]
         self._recalc_target()
 
@@ -690,18 +691,35 @@ class BootSplash:
         self._recalc_target()
 
     def _recalc_target(self):
-        """Time-based progress: linear to 95% over _eta_total seconds,
-        then exponential decay towards 100% for overflow. Never hits
-        100% until DONE is received."""
+        """Step-capped continuous progress.
+
+        A slow global time-based curve keeps the bar always moving, but it
+        is capped so it can never get more than one step ahead of reality.
+        This means: floor (completed steps) + current step's slice is the
+        ceiling.  The time curve fills up to that ceiling naturally, so
+        there's constant motion without overshooting what's actually done."""
         if self.done:
             return
+        n = len(STEPS)
+        slice_size = 0.95 / n
+
+        # Ceiling: completed steps + the active step's full slice
+        done_count = len(self.completed)
+        if self.current_step and self.current_step not in self.completed:
+            ceiling = (done_count + 1) * slice_size
+        else:
+            ceiling = done_count * slice_size
+
+        # Global time curve: always moving, asymptotes toward 95%
         elapsed = time.time() - self._start_time
         T = self._eta_total
         if elapsed <= T:
-            p = 0.95 * (elapsed / T)
+            time_p = 0.95 * (elapsed / T)
         else:
-            p = 0.95 + 0.05 * (1 - math.exp(-(elapsed - T) / 20))
-        self._target_progress = min(p, 0.99)
+            time_p = 0.95 + 0.04 * (1 - math.exp(-(elapsed - T) / 10))
+
+        # Take the lesser of the time curve and the step ceiling
+        self._target_progress = min(time_p, ceiling, 0.99)
 
     # ── Finish states ─────────────────────────────────────────────────
     def _finish_ok(self):

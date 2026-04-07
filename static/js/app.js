@@ -251,9 +251,53 @@ function closeProjectOverlay() {
 async function selectProjectFromOverlay(encoded) {
   closeProjectOverlay();
   const p = _allProjects.find(x => x.encoded === encoded);
-  showToast('Switching workspace\u2026');
+  const name = p ? _projectShortName(p) : 'project';
+
+  // Show full-screen loading overlay — enforce a minimum display time
+  // so the animation feels intentional, not just a flash.
+  _showProjectSwitchLoader(name);
+  const _minDisplay = new Promise(r => setTimeout(r, 1800));
+
   await setProject(encoded, true);
-  showToast('Switched to ' + (p ? _projectShortName(p) : 'project'));
+
+  // Navigate to homepage after switch
+  if (typeof setViewMode === 'function') setViewMode('homepage');
+
+  // Wait for minimum display time before dismissing
+  await _minDisplay;
+  _hideProjectSwitchLoader();
+}
+
+function _showProjectSwitchLoader(projectName) {
+  let overlay = document.getElementById('project-switch-loader');
+  if (overlay) overlay.remove();
+
+  overlay = document.createElement('div');
+  overlay.id = 'project-switch-loader';
+  overlay.innerHTML = `
+    <div class="psl-content">
+      <div class="psl-orb-wrap">
+        <div class="psl-orb"></div>
+        <div class="psl-ring"></div>
+        <div class="psl-ring psl-ring-2"></div>
+      </div>
+      <div class="psl-text">
+        <div class="psl-label">Switching to</div>
+        <div class="psl-name">${escHtml(projectName)}</div>
+      </div>
+      <div class="psl-dots"><span></span><span></span><span></span></div>
+    </div>`;
+  document.body.appendChild(overlay);
+  // Force reflow then add .visible for transition
+  overlay.offsetHeight;
+  overlay.classList.add('visible');
+}
+
+function _hideProjectSwitchLoader() {
+  const overlay = document.getElementById('project-switch-loader');
+  if (!overlay) return;
+  overlay.classList.add('done');
+  setTimeout(() => overlay.remove(), 900);
 }
 
 async function renameProjectOverlay(encoded, currentName) {

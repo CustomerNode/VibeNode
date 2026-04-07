@@ -773,6 +773,22 @@ def scene_sessions(dur):
         page.route("**/socket.io/**", lambda r: r.abort())
         page.route("**/api/sessions", _handle_sessions_route)
         page.route("**/api/sessions?*", _handle_sessions_route)
+        # Intercept individual session detail to prevent "session not found"
+        def _handle_session_detail(route):
+            url = route.request.url
+            sid = url.split("/api/sessions/")[-1].split("?")[0].split("/")[0] if "/api/sessions/" in url else ""
+            match = next((s for s in fake_sessions_json if s["id"] == sid), None)
+            if match:
+                detail = dict(match)
+                detail["messages"] = [
+                    {"role":"user","text":"Implement the payment webhook handler with idempotency keys","ts":"2026-04-04T14:30:00Z"},
+                    {"role":"assistant","text":"I will implement the Stripe webhook handler. Let me start by reading the existing code.","ts":"2026-04-04T14:30:05Z"},
+                ]
+                detail["cost"] = {"total_cost": 0.42, "input_tokens": 28500, "output_tokens": 12300}
+                route.fulfill(status=200, content_type="application/json", body=_json.dumps(detail))
+            else:
+                route.fulfill(status=200, content_type="application/json", body=_json.dumps(fake_sessions_json[0]))
+        page.route("**/api/sessions/fake-*", _handle_session_detail)
 
         page.goto("http://localhost:5050", wait_until="networkidle")
         _time.sleep(2)
@@ -780,6 +796,15 @@ def scene_sessions(dur):
         # Dark theme + branding
         page.evaluate("document.documentElement.setAttribute('data-theme','dark')")
         page.evaluate('() => { var pl=document.getElementById("project-label");if(pl)pl.textContent="VibeNode"; }')
+
+        
+        # Hide admin/sync/publish buttons from topnav
+        page.evaluate('''() => {
+            document.querySelectorAll('[onclick*=publish], [onclick*=sync], [onclick*=pullUpdate], [onclick*=pushUpdate]').forEach(el => el.style.display='none');
+            document.querySelectorAll('.toolbar-btn').forEach(btn => {
+                if(btn.textContent.match(/publish|sync|pull|push|update/i)) btn.style.display='none';
+            });
+        }''')
 
         # Switch to sessions grid view -- real app renders the 10 fake sessions
         page.evaluate("if(typeof setViewMode==='function')setViewMode('sessions')")
@@ -1002,96 +1027,144 @@ def scene_workflow(dur):
         page.evaluate("document.documentElement.setAttribute('data-theme','dark')")
         page.evaluate('() => { var pl=document.getElementById("project-label");if(pl)pl.textContent="VibeNode"; }')
 
+        
+        # Hide admin/sync/publish buttons from topnav
+        page.evaluate('''() => {
+            document.querySelectorAll('[onclick*=publish], [onclick*=sync], [onclick*=pullUpdate], [onclick*=pushUpdate]').forEach(el => el.style.display='none');
+            document.querySelectorAll('.toolbar-btn').forEach(btn => {
+                if(btn.textContent.match(/publish|sync|pull|push|update/i)) btn.style.display='none';
+            });
+        }''')
+
         # Navigate straight to kanban -- real app fetches from intercepted API
         page.evaluate("if(typeof setViewMode==='function')setViewMode('kanban')")
         _time.sleep(1.5)
 
-        detail_open = False
-        subtask_clicked = False
-        returned_to_board = False
-        detail_open_time = 0.0
-        subtask_click_time = 0.0
-        return_time = 0.0
+        # VOICE-SYNCED TIMING:
+        # 0-6.5s: "Hierarchical task board..." -> show the board
+        # 6.5-16s: "Break epics, drill subtasks" -> DRILL DOWN
+        # 16-23.5s: "AI planner" -> show AI planner
+        # 23.5-end: "Vibe engineering" -> board view
+
+        phase = "board"
+        phase_t = 0.0
 
         for i in range(total):
             t = i / FPS
 
-            # 0-4s: Pan across the kanban board columns
-            if t < 4.0 and not detail_open:
-                progress = t / 4.0
-                mx = 200 + int(progress * 1400)
-                my = 300 + int(40 * math.sin(t * 0.4))
+            # Phase 1: 0-6.5s - Show the board
+            if t < 6.5 and phase == "board":
+                progress = t / 6.5
+                mx = 200 + int(progress * 1500)
+                my = 300 + int(30 * math.sin(t * 0.5))
                 page.mouse.move(mx, my)
 
-            # 4s: Click a Working card -- real app navigates to full-page drill-down
-            elif not detail_open and t >= 4.0:
-                detail_open = True
-                detail_open_time = t
+            # Phase 2: 6.5s - Click Stripe integration to drill down
+            elif phase == "board" and t >= 6.5:
+                phase = "drilldown"
+                phase_t = t
                 try:
-                    working_cards = page.query_selector_all('.kanban-column:nth-child(2) .kanban-card')
-                    if working_cards:
-                        working_cards[0].click()
-                    else:
-                        card = page.query_selector('.kanban-card')
-                        if card:
+                    cards = page.query_selector_all('.kanban-card')
+                    clicked = False
+                    for card in cards:
+                        text = card.inner_text()
+                        if "Stripe" in text:
                             card.click()
+                            clicked = True
+                            break
+                    if not clicked and len(cards) > 3:
+                        cards[3].click()
                 except Exception:
                     pass
                 _time.sleep(1.0)
 
-            # 4-8s: Explore the real drill-down view (breadcrumbs, subtask panel, Plan with AI)
-            elif detail_open and not subtask_clicked and t < 8.0:
-                elapsed = t - detail_open_time
-                mx = 800 + int(120 * math.sin(elapsed * 0.35))
-                my = 300 + int(100 * math.sin(elapsed * 0.25))
+            # 6.5-10s: Explore drill-down (subtasks visible)
+            elif phase == "drilldown" and t < 10.0:
+                elapsed = t - phase_t
+                mx = 600 + int(150 * math.sin(elapsed * 0.3))
+                my = 300 + int(80 * math.sin(elapsed * 0.25))
                 page.mouse.move(mx, my)
 
-            # 8s: Click a subtask to drill deeper
-            elif detail_open and not subtask_clicked and t >= 8.0:
-                subtask_clicked = True
-                subtask_click_time = t
+            # 10s: Click subtask to drill deeper
+            elif phase == "drilldown" and t >= 10.0:
+                phase = "subtask"
+                phase_t = t
                 try:
-                    subtask = page.query_selector('.kanban-drill-subtask-title')
-                    if subtask:
-                        subtask.click()
-                    else:
-                        # Fallback: try any clickable subtask element
-                        sub_el = page.query_selector('.kanban-drill-subtask-row')
-                        if sub_el:
-                            sub_el.click()
+                    sub = page.query_selector('.kanban-drill-subtask-title, .kanban-drill-subtask-row')
+                    if sub:
+                        sub.click()
+                        _time.sleep(0.8)
                 except Exception:
                     pass
-                _time.sleep(0.8)
 
-            # 8-11s: View subtask detail
-            elif subtask_clicked and not returned_to_board and t < 11.0:
-                elapsed = t - subtask_click_time
-                mx = 700 + int(80 * math.sin(elapsed * 0.3))
+            # 10-14s: View subtask detail
+            elif phase == "subtask" and t < 14.0:
+                elapsed = t - phase_t
+                mx = 700 + int(100 * math.sin(elapsed * 0.3))
                 my = 350 + int(60 * math.sin(elapsed * 0.2))
                 page.mouse.move(mx, my)
 
-            # 11s: Click "Board" breadcrumb to go back to board view
-            elif subtask_clicked and not returned_to_board and t >= 11.0:
-                returned_to_board = True
-                return_time = t
+            # 14s: Back to board
+            elif phase == "subtask" and t >= 14.0:
+                phase = "back_to_board"
+                phase_t = t
                 try:
-                    # The breadcrumb "Board" is a clickable crumb that calls navigateToBoard()
-                    board_crumb = page.query_selector('.kanban-drill-crumb-board')
-                    if board_crumb:
-                        board_crumb.click()
+                    crumb = page.query_selector('.kanban-drill-crumb-board')
+                    if crumb:
+                        crumb.click()
                     else:
-                        # Fallback: use browser back or call navigateToBoard directly
                         page.evaluate("if(typeof navigateToBoard==='function')navigateToBoard()")
                 except Exception:
                     pass
                 _time.sleep(1.0)
 
-            # 11+: Slow pan across the board after returning
-            else:
-                elapsed = t - return_time if returned_to_board else t - 11.0
-                progress = min(elapsed / max(dur - 11.0, 1), 1)
-                mx = 1500 - int(progress * 1200)
-                my = 350 + int(50 * math.sin(t * 0.3))
+            # 14-16s: Board back
+            elif phase == "back_to_board" and t < 16.0:
+                mx = 500 + int(60 * math.sin((t - phase_t) * 0.4))
+                my = 300
+                page.mouse.move(mx, my)
+
+            # 16s: Click Plan with AI
+            elif phase == "back_to_board" and t >= 16.0:
+                phase = "planner"
+                phase_t = t
+                try:
+                    plan_btn = page.query_selector('button:has-text("Plan"), button:has-text("AI"), [onclick*=plan], .plan-btn')
+                    if plan_btn:
+                        plan_btn.click()
+                        _time.sleep(1.0)
+                    else:
+                        btns = page.query_selector_all('button, .toolbar-btn')
+                        for btn in btns:
+                            txt = btn.inner_text().lower()
+                            if "plan" in txt or "ai" in txt:
+                                btn.click()
+                                _time.sleep(1.0)
+                                break
+                except Exception:
+                    pass
+
+            # 16-23.5s: AI planner UI
+            elif phase == "planner" and t < 23.5:
+                elapsed = t - phase_t
+                mx = 700 + int(100 * math.sin(elapsed * 0.2))
+                my = 400 + int(60 * math.sin(elapsed * 0.15))
+                page.mouse.move(mx, my)
+
+            # 23.5s: Back to board for finale
+            elif phase == "planner" and t >= 23.5:
+                phase = "final"
+                phase_t = t
+                try:
+                    page.evaluate("if(typeof navigateToBoard==='function')navigateToBoard()")
+                except Exception:
+                    pass
+                _time.sleep(0.5)
+
+            elif phase == "final":
+                elapsed = t - phase_t
+                mx = 900 + int(200 * math.sin(elapsed * 0.2))
+                my = 350
                 page.mouse.move(mx, my)
 
             frame_bytes = page.screenshot(type="jpeg", quality=92)

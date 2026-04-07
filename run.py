@@ -10,6 +10,7 @@ that manages Claude Code SDK sessions. The daemon survives Web UI restarts,
 so running sessions continue uninterrupted when you restart the server.
 """
 
+import importlib.util
 import logging
 import os
 import shutil
@@ -224,15 +225,19 @@ def _fix_shortcut():
         ps_read = (
             "$ws = New-Object -ComObject WScript.Shell;"
             f"$lnk = $ws.CreateShortcut('{lnk_path}');"
-            "Write-Output $lnk.TargetPath"
+            "Write-Output $lnk.TargetPath;"
+            "Write-Output $lnk.IconLocation"
         )
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps_read],
             capture_output=True, text=True, timeout=5,
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
-        current_target = r.stdout.strip().lower()
-        if "pythonw" in current_target:
+        lines = r.stdout.strip().splitlines()
+        current_target = (lines[0] if lines else "").lower()
+        current_icon = (lines[1] if len(lines) > 1 else "").lower()
+        expected_icon = str(icon).lower()
+        if "pythonw" in current_target and expected_icon in current_icon:
             return  # Already correct
         # Rewrite the shortcut
         ps_write = (
@@ -271,9 +276,7 @@ def _check_dependencies():
     ]
     missing = []
     for import_name, pip_name in required:
-        try:
-            __import__(import_name)
-        except ImportError:
+        if importlib.util.find_spec(import_name) is None:
             missing.append(pip_name)
 
     if missing:
