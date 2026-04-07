@@ -222,6 +222,7 @@ class SessionDaemon:
             "get_entries": self.session_manager.get_entries,
             "has_session": self.session_manager.has_session,
             "get_session_state": self.session_manager.get_session_state,
+            "get_permission_policy": lambda **kw: self.session_manager.get_permission_policy(),
             "set_permission_policy": self.session_manager.set_permission_policy,
             "resolve_hook_permission": self.session_manager.resolve_hook_permission,
             "queue_message": self.session_manager.queue_message,

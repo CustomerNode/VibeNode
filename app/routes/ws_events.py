@@ -491,6 +491,17 @@ def register_ws_events(socketio, app):
                 'has_more': False,
             })
 
+    @socketio.on('get_permission_policy')
+    def handle_get_permission_policy():
+        """Return the persisted permission policy to the browser."""
+        sm = app.session_manager
+        try:
+            result = sm.get_permission_policy()
+            emit('permission_policy_loaded', result)
+        except Exception as e:
+            logger.warning("Failed to get permission policy: %s", e)
+            emit('permission_policy_loaded', {'policy': 'manual', 'custom_rules': {}})
+
     @socketio.on('set_permission_policy')
     def handle_set_permission_policy(data):
         """Sync permission policy from browser to server."""

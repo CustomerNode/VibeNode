@@ -66,10 +66,8 @@ socket.on('connect', () => {
     // Update status bar connection indicator
     const sbConn = document.getElementById('sb-connection');
     if (sbConn) { sbConn.textContent = '\u25CF'; sbConn.style.color = 'var(--idle-label)'; sbConn.title = 'Connected'; }
-    // Sync permission policy to backend on connect
-    if (typeof permissionPolicy !== 'undefined') {
-        socket.emit('set_permission_policy', { policy: permissionPolicy, customRules: customPolicies || {} });
-    }
+    // Fetch persisted permission policy from backend (don't push localStorage defaults)
+    socket.emit('get_permission_policy');
     // Refresh session list on reconnect — but only AFTER initial load
     // is complete.  On first connect, loadProjects() handles session loading
     // (with proper project sync).  Calling loadSessions() here too causes
@@ -87,6 +85,20 @@ socket.on('connect', () => {
     setTimeout(() => {
         if (socket.connected) socket.emit('request_state_snapshot', {project: _ap});
     }, 3000);
+});
+
+// Restore persisted permission policy from backend on connect
+socket.on('permission_policy_loaded', (data) => {
+    if (data && data.policy && ['manual', 'auto', 'custom'].includes(data.policy)) {
+        permissionPolicy = data.policy;
+        localStorage.setItem('permPolicy', data.policy);
+        if (data.custom_rules && typeof data.custom_rules === 'object') {
+            customPolicies = data.custom_rules;
+            localStorage.setItem('customPolicies', JSON.stringify(data.custom_rules));
+        }
+        // Refresh permission UI if it exists
+        if (typeof renderPermissionPanel === 'function') renderPermissionPanel();
+    }
 });
 
 // Daemon reconnection status — live toasts showing recovery progress

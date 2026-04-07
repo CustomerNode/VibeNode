@@ -153,16 +153,16 @@ class DaemonClient:
         self._resync_policy()
 
     def _resync_policy(self):
-        """Re-send cached permission policy to daemon after connect/reconnect."""
-        if self._cached_policy and self._connected:
+        """Fetch permission policy from daemon after connect/reconnect."""
+        if self._connected:
             try:
-                self._send_request("set_permission_policy", {
-                    "policy": self._cached_policy,
-                    "custom_rules": self._cached_custom_rules,
-                })
-                logger.info("Re-synced permission policy: %s", self._cached_policy)
+                result = self._send_request("get_permission_policy", {})
+                if isinstance(result, dict) and result.get("policy"):
+                    self._cached_policy = result["policy"]
+                    self._cached_custom_rules = result.get("custom_rules", {})
+                    logger.info("Loaded permission policy from daemon: %s", self._cached_policy)
             except Exception as e:
-                logger.warning("Failed to re-sync policy: %s", e)
+                logger.warning("Failed to fetch policy from daemon: %s", e)
 
     def _resync_aliases(self):
         """Fetch accumulated ID aliases from daemon on connect/reconnect."""
@@ -545,6 +545,14 @@ class DaemonClient:
         return self._send_request("get_session_state", {
             "session_id": session_id,
         })
+
+    def get_permission_policy(self):
+        """Fetch current permission policy from the daemon."""
+        result = self._send_request("get_permission_policy", {})
+        if isinstance(result, dict) and result.get("policy"):
+            self._cached_policy = result["policy"]
+            self._cached_custom_rules = result.get("custom_rules", {})
+        return result
 
     def set_permission_policy(self, policy, custom_rules=None):
         self._cached_policy = policy

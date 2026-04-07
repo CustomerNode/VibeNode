@@ -667,6 +667,13 @@ class SessionManager:
         except Exception as e:
             logger.warning("Failed to save permission policy: %s", e)
 
+    def get_permission_policy(self) -> dict:
+        """Return the current permission policy and custom rules."""
+        return {
+            "policy": self._permission_policy,
+            "custom_rules": self._custom_rules,
+        }
+
     def set_permission_policy(self, policy: str, custom_rules: dict = None) -> None:
         """Update the permission policy (synced from browser)."""
         if policy not in ("manual", "auto", "custom"):
