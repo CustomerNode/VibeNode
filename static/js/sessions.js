@@ -69,7 +69,7 @@ function renderList(sessions) {
       ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#44aa66" stroke-width="2" stroke-linecap="round" title="Idle"><polyline points="20 6 9 17 4 12"/></svg>'
       : '';
     return `
-    <div class="session-item${activeClass}${stateClass}" data-sid="${s.id}">
+    <div class="session-item${activeClass}${stateClass}" data-sid="${s.id}" oncontextmenu="sessionContextMenu(event,'${s.id}')">
       <div class="session-col-name" onclick="handleNameClick('${s.id}')" style="cursor:text;" title="Click to rename">
         ${icon}${escHtml(s.display_title)}${_autoNamingInFlight.has(s.id) ? '<span class="naming-badge"><span class="naming-dot"></span>Naming\u2026</span>' : ''}
       </div>
@@ -194,4 +194,134 @@ let _lastClickTime = 0;
 
 function singleOrDouble(id, e) {
   openInGUI(id);
+}
+
+/* ---- Right-click context menu ---- */
+function sessionContextMenu(e, sessionId) {
+  e.preventDefault();
+  e.stopPropagation();
+
+  // Hide tooltip if visible
+  const tip = document.getElementById('session-tooltip');
+  if (tip) tip.classList.remove('visible');
+
+  // Remove any existing context menu
+  var old = document.querySelector('.session-ctx-menu');
+  if (old) old.remove();
+
+  const isActive = sessionId === activeId;
+  const isRunning = runningIds.has(sessionId);
+  const isOpenInGui = guiOpenSessions.has(sessionId);
+
+  var menu = document.createElement('div');
+  menu.className = 'session-ctx-menu ws-ctx-menu';
+
+  // Build menu items
+  var items = '';
+
+  // Open (if not already active)
+  if (!isActive) {
+    items += '<div class="ws-ctx-item" onclick="_sessCtx(\'open\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg> Open</div>';
+  }
+
+  // Auto-name
+  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'autoname\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg> Auto-name</div>';
+
+  // Rename
+  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'rename\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg> Rename</div>';
+
+  items += '<div class="ws-ctx-divider"></div>';
+
+  // Continue
+  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'continue\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/></svg> Continue</div>';
+
+  // Duplicate
+  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'duplicate\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Duplicate</div>';
+
+  // Open in Terminal
+  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'terminal\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg> Open in Terminal</div>';
+
+  // Active-session-only actions
+  if (isActive) {
+    items += '<div class="ws-ctx-divider"></div>';
+    items += '<div class="ws-ctx-item" onclick="_sessCtx(\'compact\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg> Compact Context</div>';
+  }
+
+  // Stop (if running or open in GUI)
+  if (isRunning || isOpenInGui) {
+    items += '<div class="ws-ctx-divider"></div>';
+    items += '<div class="ws-ctx-item danger" onclick="_sessCtx(\'stop\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/></svg> Stop Session</div>';
+  }
+
+  // Delete (always available)
+  items += '<div class="ws-ctx-divider"></div>';
+  items += '<div class="ws-ctx-item danger" onclick="_sessCtx(\'delete\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> Delete</div>';
+
+  menu.innerHTML = items;
+  menu.style.left = e.clientX + 'px';
+  menu.style.top = e.clientY + 'px';
+  document.body.appendChild(menu);
+
+  // Ensure menu stays within viewport
+  requestAnimationFrame(function() {
+    var rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth) {
+      menu.style.left = (window.innerWidth - rect.width - 8) + 'px';
+    }
+    if (rect.bottom > window.innerHeight) {
+      menu.style.top = (window.innerHeight - rect.height - 8) + 'px';
+    }
+  });
+
+  // Close on click outside
+  var closer = function(ev) {
+    if (!menu.contains(ev.target)) {
+      menu.remove();
+      document.removeEventListener('click', closer);
+    }
+  };
+  setTimeout(function() { document.addEventListener('click', closer); }, 0);
+}
+
+function _sessCtx(action, sessionId) {
+  // Remove context menu
+  var menu = document.querySelector('.session-ctx-menu');
+  if (menu) menu.remove();
+
+  switch (action) {
+    case 'open':
+      openInGUI(sessionId);
+      break;
+    case 'autoname':
+      autoName(sessionId);
+      break;
+    case 'rename':
+      // Open the session first if not active, then trigger inline rename
+      if (sessionId !== activeId) {
+        openInGUI(sessionId).then(function() {
+          setTimeout(function() { handleNameClick(sessionId); }, 200);
+        });
+      } else {
+        handleNameClick(sessionId);
+      }
+      break;
+    case 'continue':
+      continueSession(sessionId);
+      break;
+    case 'duplicate':
+      duplicateSession(sessionId);
+      break;
+    case 'terminal':
+      openInClaude(sessionId);
+      break;
+    case 'compact':
+      liveCompact();
+      break;
+    case 'stop':
+      closeSession(sessionId);
+      break;
+    case 'delete':
+      deleteSession(sessionId);
+      break;
+  }
 }
