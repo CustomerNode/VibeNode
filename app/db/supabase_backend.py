@@ -165,6 +165,17 @@ class SupabaseRepository(KanbanRepository):
         )""",
         "CREATE INDEX IF NOT EXISTS idx_task_tags_tag ON task_tags(tag)",
         "INSERT INTO schema_version (version) VALUES (1) ON CONFLICT (version) DO NOTHING",
+        # Enable Row Level Security on all tables.
+        # The server uses the service-role key which bypasses RLS, so this
+        # only blocks unauthorized access via the public/anon API.
+        "ALTER TABLE schema_version      ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE preferences          ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE board_columns        ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE tasks                ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE task_sessions        ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE task_issues          ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE task_status_history  ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE task_tags            ENABLE ROW LEVEL SECURITY",
         # RPC: recursive ancestor lookup (contains $$ so must be a single statement)
         """CREATE OR REPLACE FUNCTION get_ancestors(task_id_param TEXT)
         RETURNS SETOF tasks AS $$

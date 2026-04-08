@@ -27,10 +27,5 @@ RETURNS SETOF status_history AS $$
   ORDER BY sh.changed_at DESC;
 $$ LANGUAGE SQL STABLE;
 
--- Enable Row Level Security (optional — for multi-user scenarios)
--- ALTER TABLE tasks ENABLE ROW LEVEL SECURITY;
--- ALTER TABLE board_columns ENABLE ROW LEVEL SECURITY;
--- ALTER TABLE task_sessions ENABLE ROW LEVEL SECURITY;
--- ALTER TABLE task_issues ENABLE ROW LEVEL SECURITY;
--- ALTER TABLE status_history ENABLE ROW LEVEL SECURITY;
--- ALTER TABLE task_tags ENABLE ROW LEVEL SECURITY;
+-- RLS is now enabled by migration 004_enable_rls.sql on all tables.
+-- See that file for details.

@@ -2882,6 +2882,12 @@ class SessionManager:
                 with self._lock:
                     recheck = self._sessions.get(sid)
                 if recheck and recheck.state == SessionState.IDLE:
+                    # Safety net for race condition: if a message was queued
+                    # right as the session went idle, dispatch it now.
+                    self._try_dispatch_queue(sid)
+                    # Re-check state — dispatch may have moved it to WORKING
+                    if recheck.state != SessionState.IDLE:
+                        return
                     logger.debug("Deferred IDLE re-emit for %s", sid)
                     if self._push_callback:
                         data = recheck.to_state_dict()
