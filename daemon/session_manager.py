@@ -311,6 +311,9 @@ class SessionInfo:
     _last_hashes: dict = field(default_factory=dict)     # file_path -> last backed-up content hash
     _pre_turn_mtimes: dict = field(default_factory=dict) # file_path -> mtime before turn
     _turn_had_direct_edit: bool = False                  # True if streaming saw Edit/Write this turn
+    _tracked_files_populated: bool = False               # True after first _prepopulate_tracked_files
+    _last_user_uuid: str = ""                            # cached from JSONL, updated by _process_message
+    _last_asst_uuid: str = ""                            # cached from JSONL, updated by _process_message
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def to_state_dict(self) -> dict:
@@ -1097,7 +1100,7 @@ class SessionManager:
         try:
             projects_dir = Path.home() / ".claude" / "projects"
             if info.cwd:
-                encoded = info.cwd.replace("\\", "/").replace(":", "-").replace("/", "-")
+                encoded = info.cwd.replace("\\", "/").replace(":", "-").replace("/", "-").replace("_", "-")
                 jsonl_candidate = projects_dir / encoded / f"{resolved}.jsonl"
                 if jsonl_candidate.exists():
                     _repair_incomplete_jsonl(jsonl_candidate)
@@ -1172,7 +1175,8 @@ class SessionManager:
             # snapshots are deferred to _send_query (follow-up turns), where
             # the remap has already occurred.
             info._turn_had_direct_edit = False
-            self._record_pre_turn_mtimes(info)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._record_pre_turn_mtimes, info)
 
             # Add user's message to the log and send
             if prompt:
@@ -1403,9 +1407,12 @@ class SessionManager:
                 resolved = self._resolve_id(session_id)
                 with self._lock:
                     finfo = self._sessions.get(resolved)
+                loop = asyncio.get_event_loop()
                 if finfo:
-                    self._prepopulate_tracked_files(finfo)
-                self._write_file_snapshot(session_id, is_post_turn=True)
+                    await loop.run_in_executor(
+                        None, self._prepopulate_tracked_files, finfo)
+                await loop.run_in_executor(
+                    None, self._write_file_snapshot, session_id, True)
             except Exception as snap_err:
                 logger.warning("Snapshot in finally for %s failed: %s", session_id, snap_err)
 
@@ -1436,16 +1443,20 @@ class SessionManager:
 
         # Pre-populate tracked_files on follow-up turns (covers daemon
         # restart scenarios where tracked_files was lost).
-        self._prepopulate_tracked_files(info)
+        # Runs in a thread so large JSONL parses don't block the event loop.
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._prepopulate_tracked_files, info)
 
         # Pre-turn snapshot (isSnapshotUpdate=false, linked to user UUID)
         # Safe here because the SDK remap has already happened by the time
         # _send_query is called (remap occurs on first turn's ResultMessage).
-        self._write_file_snapshot(session_id, is_post_turn=False)
+        # Runs in a thread — reads JSONL tail + file contents + writes backups.
+        await loop.run_in_executor(None, self._write_file_snapshot, session_id, False)
 
         # Reset per-turn state and record mtimes for fallback detection
+        # rglob over the project directory runs in a thread to avoid blocking.
         info._turn_had_direct_edit = False
-        self._record_pre_turn_mtimes(info)
+        await loop.run_in_executor(None, self._record_pre_turn_mtimes, info)
 
         got_result = False
         result_handled = False
@@ -1648,7 +1659,9 @@ class SessionManager:
 
             # Post-turn snapshot (isSnapshotUpdate=true, linked to assistant UUID)
             try:
-                self._write_file_snapshot(session_id, is_post_turn=True)
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None, self._write_file_snapshot, session_id, True)
             except Exception as snap_err:
                 logger.warning("Snapshot in finally for %s failed: %s", session_id, snap_err)
 
@@ -2383,7 +2396,14 @@ class SessionManager:
 
         This ensures snapshots work after daemon restart or for resumed
         sessions.
+
+        Only runs ONCE per session — after the initial scan, real-time
+        tracking in _process_message keeps tracked_files up to date.
+        Re-parsing a 38MB JSONL on every follow-up message was blocking
+        the asyncio event loop and starving all other sessions.
         """
+        if info._tracked_files_populated:
+            return
         try:
             jsonl_path = self._find_session_jsonl(info)
             if not jsonl_path or not jsonl_path.exists():
@@ -2405,6 +2425,15 @@ class SessionManager:
                         continue
 
                     t = obj.get("type", "")
+
+                    # Cache user/assistant UUIDs so _write_file_snapshot
+                    # doesn't have to re-parse the entire JSONL every turn.
+                    uid = obj.get("uuid", "")
+                    if uid:
+                        if t == "user":
+                            info._last_user_uuid = uid
+                        elif t == "assistant":
+                            info._last_asst_uuid = uid
 
                     # Source 1: tool_use blocks in assistant messages
                     if t == "assistant":
@@ -2445,8 +2474,12 @@ class SessionManager:
                     "_prepopulate_tracked_files(%s): found %d files from JSONL",
                     info.session_id, len(found),
                 )
+            info._tracked_files_populated = True
         except Exception as e:
             logger.warning("_prepopulate_tracked_files failed for %s: %s", info.session_id, e)
+            # Mark as populated even on failure — don't retry on every message.
+            # Real-time tracking in _process_message will catch new edits.
+            info._tracked_files_populated = True
 
     def _write_file_snapshot(self, session_id: str, is_post_turn: bool = False) -> None:
         """Create file backups and append a file-history-snapshot to the JSONL.
@@ -2542,25 +2575,30 @@ class SessionManager:
                                info.cwd, info.session_id)
                 return
 
-            # Read the latest user and assistant UUIDs from the JSONL.
+            # Read UUIDs from the TAIL of the JSONL only (last 64KB).
+            # Previous approach re-read the entire 38MB file on every turn.
             last_user_uuid = ""
             last_asst_uuid = ""
             try:
-                with open(jsonl_path, "r", encoding="utf-8", errors="replace") as rf:
-                    for raw_line in rf:
-                        raw_line = raw_line.strip()
-                        if not raw_line:
-                            continue
-                        try:
-                            obj = json.loads(raw_line)
-                        except Exception:
-                            continue
-                        t = obj.get("type", "")
-                        uid = obj.get("uuid", "")
-                        if t == "user" and uid:
-                            last_user_uuid = uid
-                        elif t == "assistant" and uid:
-                            last_asst_uuid = uid
+                file_size = jsonl_path.stat().st_size
+                tail_size = min(file_size, 65536)
+                with open(jsonl_path, "rb") as rf:
+                    rf.seek(max(0, file_size - tail_size))
+                    tail = rf.read().decode("utf-8", errors="replace")
+                for raw_line in tail.splitlines():
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        obj = json.loads(raw_line)
+                    except Exception:
+                        continue
+                    t = obj.get("type", "")
+                    uid = obj.get("uuid", "")
+                    if t == "user" and uid:
+                        last_user_uuid = uid
+                    elif t == "assistant" and uid:
+                        last_asst_uuid = uid
             except Exception:
                 pass
 
@@ -2611,7 +2649,7 @@ class SessionManager:
         # Try the encoded cwd first (fastest path)
         cwd = info.cwd or ""
         if cwd:
-            encoded = cwd.replace("\\", "/").replace(":", "-").replace("/", "-")
+            encoded = cwd.replace("\\", "/").replace(":", "-").replace("/", "-").replace("_", "-")
             candidate = projects_dir / encoded / f"{sid}.jsonl"
             if candidate.exists():
                 return candidate
@@ -2746,7 +2784,7 @@ class SessionManager:
                 jsonl_path = None
                 projects_dir = Path.home() / ".claude" / "projects"
                 if cwd:
-                    encoded = cwd.replace("\\", "/").replace(":", "-").replace("/", "-")
+                    encoded = cwd.replace("\\", "/").replace(":", "-").replace("/", "-").replace("_", "-")
                     candidate = projects_dir / encoded / f"{sid}.jsonl"
                     if candidate.exists():
                         jsonl_path = candidate

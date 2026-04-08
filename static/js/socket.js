@@ -243,12 +243,25 @@ socket.on('state_snapshot', (data) => {
     // (SocketIO transport hiccup, tab sleeping, etc.), entries would be
     // missing from the DOM. Re-fetch them so the response appears without
     // requiring a manual page refresh.
+    //
+    // BUT: only re-fetch if the DOM looks empty or stale. If real-time
+    // streaming already populated the log, a re-fetch would destructively
+    // wipe the DOM and re-render with pagination (LIVE_PAGE_SIZE), slicing
+    // off the tail of the response the user just watched stream in.
     if (liveSessionId && sessionKinds[liveSessionId] === 'working' &&
         newKinds[liveSessionId] && newKinds[liveSessionId] !== 'working') {
-        console.warn('[state_snapshot] Live session', liveSessionId,
-            'transitioned from working →', newKinds[liveSessionId],
-            '— re-fetching entries in case real-time events were lost');
-        socket.emit('get_session_log', {session_id: liveSessionId, since: 0, project: localStorage.getItem('activeProject') || ''});
+        const logEl = document.getElementById('live-log');
+        const domHasEntries = logEl && logEl.querySelectorAll('.msg').length > 0;
+        if (!domHasEntries) {
+            console.warn('[state_snapshot] Live session', liveSessionId,
+                'transitioned from working →', newKinds[liveSessionId],
+                '— DOM is empty, re-fetching entries');
+            socket.emit('get_session_log', {session_id: liveSessionId, since: 0, project: localStorage.getItem('activeProject') || ''});
+        } else {
+            console.log('[state_snapshot] Live session', liveSessionId,
+                'transitioned from working →', newKinds[liveSessionId],
+                '— DOM already has entries, skipping destructive re-fetch');
+        }
     }
 
     // Preserve optimistic state for sessions the frontend knows are running
@@ -533,18 +546,16 @@ socket.on('session_state', (data) => {
         if (_logEl && liveAutoScroll) setTimeout(() => { _logEl.scrollTop = _logEl.scrollHeight; }, 100);
 
         // Self-healing: check if frontend is missing entries vs backend.
+        // Only re-fetch if the backend genuinely has MORE entries than the
+        // DOM. Never do a blind re-fetch — it wipes the DOM and re-renders
+        // with pagination, slicing off the tail of the response.
         if (state === 'idle' || state === 'stopped') {
             const sc = data.entry_count;
             if (sc != null && sc > liveLineCount) {
-                console.warn('[entry-catchup] Backend has', sc, 'entries but frontend has', liveLineCount);
+                console.warn('[entry-catchup] Backend has', sc, 'entries but frontend has', liveLineCount, '— re-fetching');
                 socket.emit('get_session_log', {session_id: session_id, since: 0, project: localStorage.getItem('activeProject') || ''});
-            } else {
-                setTimeout(() => {
-                    if (liveSessionId === session_id) {
-                        socket.emit('get_session_log', {session_id: session_id, since: 0, project: localStorage.getItem('activeProject') || ''});
-                    }
-                }, 500);
             }
+            // No blind 500ms re-fetch — it destroys already-rendered content
         }
     }
 
@@ -604,6 +615,59 @@ socket.on('message_ack', (data) => {
     // Reset watchdog timer — server confirmed receipt, give it more time
     // for the first response event to arrive
     if (typeof _resetMessageWatchdog === 'function') _resetMessageWatchdog(data.session_id);
+});
+
+// Message send failed — show a clear inline error with the user's text
+// preserved so they can copy/paste and retry. This happens when the daemon
+// is overloaded (e.g. multiple long sessions doing heavy I/O).
+socket.on('send_failed', (data) => {
+    if (!data || !data.session_id) return;
+    const sid = data.session_id;
+    console.error('[WS] send_failed for', sid, data.error);
+
+    // Cancel watchdog — we know it failed
+    if (typeof _cancelMessageWatchdog === 'function') _cancelMessageWatchdog(sid);
+
+    // Revert session to idle so user can retry
+    sessionKinds[sid] = 'idle';
+    runningIds.delete(sid);
+    if (sid === liveSessionId) {
+        liveBarState = null;
+        if (typeof updateLiveInputBar === 'function') updateLiveInputBar();
+
+        // Put the message text back in the input box so it's not lost
+        const ta = document.getElementById('live-input-ta');
+        if (ta && data.text && !ta.value.trim()) {
+            ta.value = data.text;
+            if (typeof _resetTextareaHeight === 'function') _resetTextareaHeight(ta);
+        }
+
+        // Remove the optimistic bubble — it didn't go through
+        const logEl = document.getElementById('live-log');
+        if (logEl) {
+            const optimistic = logEl.querySelector('.msg.user.optimistic-bubble:last-child');
+            if (optimistic) optimistic.remove();
+        }
+
+        // Show an inline system message explaining what happened,
+        // including the user's original text so it's never truly lost
+        if (logEl && typeof renderLiveEntry === 'function') {
+            const isTimeout = (data.error || '').includes('timeout');
+            let hint = isTimeout
+                ? '⚠️ Message not delivered — the server was busy processing other sessions. This can happen when running many long sessions at once. Try closing some idle sessions or sending again in a moment.'
+                : '⚠️ Message not delivered. Error: ' + (data.error || 'unknown');
+            if (data.text) {
+                hint += '\n\nYour message (also restored to the input box):\n> ' + data.text;
+            }
+            logEl.appendChild(renderLiveEntry({
+                kind: 'system',
+                text: hint,
+                is_error: true,
+            }));
+            if (liveAutoScroll) logEl.scrollTop = logEl.scrollHeight;
+        }
+    }
+    _updateRowState(sid, 'idle');
 });
 
 // Lightweight per-call token usage updates (from StreamEvent message_start).
@@ -796,15 +860,17 @@ socket.on('session_entry', (data) => {
         const skel = logEl.querySelector('.skel-bar, .skeleton-loader, .live-log-empty, .empty-state');
         if (skel) logEl.innerHTML = '';
     }
-    // DOM-level dedup for user messages: the frontend renders an optimistic
-    // bubble immediately on send. When the server echoes it back, check if
-    // the last user bubble already shows this text to avoid a double-bubble.
+    // Optimistic bubble dedup: if this is a user entry echoed back by the
+    // server, check if we already have an optimistic bubble for it. Remove
+    // the optimistic bubble and render the server-confirmed version instead.
+    // Uses position (last optimistic bubble), NOT text matching — so
+    // legitimate duplicate messages ("yes", "ok") always render.
     if (data.entry.kind === 'user') {
-        const key = (data.entry.text || '').trim();
-        const _lu = logEl.querySelector('.msg.user:last-child .msg-body');
-        if (_lu && _lu.textContent.trim() === key) {
-            liveLineCount = (data.index != null) ? data.index + 1 : liveLineCount + 1;
-            return;
+        const optimistic = logEl.querySelector('.msg.user.optimistic-bubble:last-child');
+        if (optimistic) {
+            // The last element is our optimistic bubble — replace it with
+            // the server-confirmed entry (which has correct formatting/index).
+            optimistic.remove();
         }
     }
     logEl.appendChild(renderLiveEntry(data.entry));
@@ -1044,11 +1110,22 @@ socket.on('session_log', (data) => {
     const allEntries = data.entries || [];
     console.log('[WS] session_log: received ' + allEntries.length + ' entries, will render last ' + LIVE_PAGE_SIZE);
 
+    // Guard: if the DOM already has MORE entries than this re-fetch returned
+    // (e.g. daemon restarted and hasn't fully re-read the JSONL yet), do NOT
+    // wipe the DOM — we'd be destroying data the user can already see.
+    if (allEntries.length < liveLineCount && liveLineCount > 0) {
+        console.warn('[WS] session_log has fewer entries (' + allEntries.length +
+            ') than DOM (' + liveLineCount + ') — skipping destructive re-render');
+        // Still update the stash so "Load older" has fresh data if it's bigger
+        if (allEntries.length > _liveEntryStash.length) _liveEntryStash = allEntries;
+        return;
+    }
+
     // Stash all entries in memory for "Load older" to pull from
     _liveEntryStash = allEntries;
 
     logEl.innerHTML = '';
-    _renderedUserTexts.clear();
+    _optimisticMsgId = 0;
     if (typeof _clearOutputShelf === 'function') _clearOutputShelf();
 
     // Only render the last LIVE_PAGE_SIZE entries, but always extend back
@@ -1075,24 +1152,12 @@ socket.on('session_log', (data) => {
 
     if (visible.length) {
         visible.forEach((entry) => {
-            if (entry.kind === 'user' && entry.text) {
-                const key = entry.text.trim();
-                if (_renderedUserTexts.has(key)) return;
-                _renderedUserTexts.add(key);
-            }
             logEl.appendChild(renderLiveEntry(entry));
             if (typeof _tryAddOutputCard === 'function') _tryAddOutputCard(entry);
         });
         liveLineCount = allEntries.length;
     } else {
         liveLineCount = 0;
-    }
-
-    // Also register user texts from the stashed (non-rendered) entries
-    // so real-time session_entry dedup still works correctly
-    for (let i = 0; i < start; i++) {
-        const e = allEntries[i];
-        if (e.kind === 'user' && e.text) _renderedUserTexts.add(e.text.trim());
     }
 
     if (typeof _updateLastMessageTimes === 'function') _updateLastMessageTimes();

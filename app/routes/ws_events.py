@@ -299,28 +299,21 @@ def register_ws_events(socketio, app):
 
         if result.get('ok'):
             # Acknowledge receipt so the client knows the message was accepted.
-            # Without this, the client has no confirmation that the server
-            # processed the message — if subsequent push events are lost
-            # (SocketIO transport hiccup), the client can't distinguish
-            # "processing but events lost" from "message never received".
             emit('message_ack', {'session_id': session_id})
+        elif result.get('queued'):
+            # Daemon auto-queued because session wasn't idle
+            emit('message_ack', {'session_id': session_id, 'queued': True})
         else:
-            # If session isn't idle, auto-queue instead of erroring
-            err = result.get('error', '')
-            if 'not idle' in err:
-                q_result = sm.queue_message(session_id, text)
-                if q_result.get('ok'):
-                    emit('message_ack', {'session_id': session_id, 'queued': True})
-                else:
-                    emit('error', {
-                        'message': q_result.get('error', 'Failed to queue message'),
-                        'session_id': session_id,
-                    })
-            else:
-                emit('error', {
-                    'message': err or 'Failed to send message',
-                    'session_id': session_id,
-                })
+            # Send failed (IPC timeout, daemon busy, etc).
+            # Emit a send_failed event so the frontend can show the user
+            # exactly what happened and preserve their message text inline.
+            err = result.get('error', 'Unknown error')
+            logger.warning("send_message failed for %s: %s", session_id, err)
+            emit('send_failed', {
+                'session_id': session_id,
+                'error': err,
+                'text': text,
+            })
 
     @socketio.on('permission_response')
     def handle_permission_response(data):
@@ -439,40 +432,23 @@ def register_ws_events(socketio, app):
 
         sm = app.session_manager
 
-        # Load from .jsonl first, then SDK entries for anything not yet on disk
-        jsonl_entries = _parse_jsonl_entries(app, session_id, since, project=project)
-        sdk_entries = sm.get_entries(session_id, since=0) if sm.has_session(session_id) else []
-
-        if jsonl_entries and not sdk_entries:
-            # Historical session — only .jsonl
-            entries = jsonl_entries
-        elif sdk_entries and not jsonl_entries:
-            # SDK-only session (no .jsonl yet)
-            entries = sdk_entries
-        elif sdk_entries and jsonl_entries:
-            # After recovery/reconnect, SDK entries reset to only the
-            # current turn while .jsonl has full history.  Picking the
-            # longer list drops the latest user message (the SDK entry
-            # the .jsonl hasn't flushed yet).  Fix: use .jsonl as the
-            # base and append any SDK entries not yet on disk.
-            if len(sdk_entries) >= len(jsonl_entries):
+        # JSONL is the single source of truth — the SDK writes it and
+        # it's complete for any idle session.
+        #
+        # For WORKING sessions, the SDK hasn't flushed the current turn
+        # yet, so the JSONL is missing the latest entries. In that case
+        # the daemon's in-memory entries (which include the current turn)
+        # are more complete — use those instead.  No merge, no
+        # fingerprinting: just pick the source that has more data.
+        entries = _parse_jsonl_entries(app, session_id, since, project=project)
+        if sm.has_session(session_id):
+            sdk_entries = sm.get_entries(session_id, since=0)
+            if len(sdk_entries) > len(entries):
+                # Daemon has current-turn data not yet on disk — use it
                 entries = sdk_entries
-            else:
-                # Merge: .jsonl base + SDK tail that's newer
-                # SDK entries from current turn won't be in .jsonl yet.
-                # Use entry text+kind as a fingerprint to avoid dupes.
-                jsonl_tail_keys = set()
-                for e in jsonl_entries[-20:]:
-                    k = (e.get('kind', ''), (e.get('text') or '')[:200])
-                    jsonl_tail_keys.add(k)
-                merged = list(jsonl_entries)
-                for e in sdk_entries:
-                    k = (e.get('kind', ''), (e.get('text') or '')[:200])
-                    if k not in jsonl_tail_keys:
-                        merged.append(e)
-                entries = merged
-        else:
-            entries = []
+        if not entries:
+            # Fallback: brand-new session with no JSONL file yet
+            entries = sm.get_entries(session_id, since=0) if sm.has_session(session_id) else []
 
         total = len(entries)
 

@@ -225,9 +225,12 @@ def apply_plan(repo, parent_task_id, subtasks, project_id):
         task_id = str(uuid_mod.uuid4())
         position = (i + 1) * 1000
 
-        # Only accept absolute URLs — discard anything relative
+        # Accept absolute URLs, file:// URIs, and local file paths
         ver_url = sub.get("verification_url")
-        if ver_url and not ver_url.startswith(("http://", "https://")):
+        if ver_url and not (
+            ver_url.startswith(("http://", "https://", "file://", "/"))
+            or (len(ver_url) >= 3 and ver_url[1:3] == ":\\")
+        ):
             ver_url = None
 
         from ..db.repository import Task, TaskStatus

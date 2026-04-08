@@ -222,11 +222,31 @@ function _kanbanConfirm(title, message, onConfirm, opts) {
 // VERIFICATION URL RESOLVER (plan Section 16)
 // ═══════════════════════════════════════════════════════════════
 
+function _isLocalPath(url) {
+  if (!url) return false;
+  return /^[A-Z]:\\/i.test(url) || url.startsWith('/') || url.startsWith('file://');
+}
+
+function _openLocalFile(path) {
+  fetch('/api/open-file', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }) })
+    .then(r => { if (!r.ok) return r.json().then(d => { throw new Error(d.error || 'Failed to open'); }); })
+    .catch(e => { if (typeof showToast === 'function') showToast('Could not open file: ' + e.message, true); });
+}
+
 function resolveVerificationUrl(url) {
   if (!url) return null;
   if (url.startsWith('http://') || url.startsWith('https://')) return url;
+  if (_isLocalPath(url)) return url;
   const base = 'http://localhost:5050';
   return base + (url.startsWith('/') ? url : '/' + url);
+}
+
+function _verLinkHtml(url, cssClass) {
+  const cls = cssClass ? ` class="${cssClass}"` : '';
+  if (_isLocalPath(url)) {
+    return `<a${cls} href="#" data-local-path="${escHtml(url)}" onclick="event.preventDefault();event.stopPropagation();_openLocalFile(this.dataset.localPath)" title="${escHtml(url)}">${escHtml(url)}</a>`;
+  }
+  return `<a${cls} href="${escHtml(url)}" target="_blank" rel="noopener" title="${escHtml(url)}">${escHtml(url)}</a>`;
 }
 
 
@@ -1251,7 +1271,7 @@ function _renderPlanTree(tasks, depth) {
         ${hasSubs ? '<span class="planner-sub-count">' + totalSubs + '</span>' : ''}
       </div>
       ${t.description ? '<div class="planner-node-desc">' + (typeof mdParse === 'function' ? mdParse(t.description) : escHtml(t.description)) + '</div>' : ''}
-      ${t.verification_url ? '<div class="planner-node-ver">' + KI.link + ' <a href="' + escHtml(t.verification_url) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()">' + escHtml(t.verification_url) + '</a></div>' : ''}
+      ${t.verification_url ? '<div class="planner-node-ver">' + KI.link + ' ' + _verLinkHtml(t.verification_url) + '</div>' : ''}
       ${hasSubs ? _renderPlanTree(t.subtasks, depth + 1) : ''}
     </div>`;
   }
@@ -1979,7 +1999,7 @@ async function renderTaskDetail(taskId, opts) {
     if (_verUrl) {
       html += `<div class="kanban-drill-ver-row">`;
       html += `<span class="kanban-drill-ver-icon">${KI.link}</span>`;
-      html += `<a class="kanban-drill-ver-link" href="${escHtml(_verUrl)}" target="_blank" rel="noopener" title="${escHtml(_verUrl)}">${escHtml(_verUrl)}</a>`;
+      html += _verLinkHtml(_verUrl, 'kanban-drill-ver-link');
       html += `<button class="kanban-drill-ver-action" data-ver-url="${escHtml(task.verification_url || '')}" onclick="event.stopPropagation();_editVerificationUrl('${task.id}', this.dataset.verUrl)" title="Edit URL"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>`;
       html += `<button class="kanban-drill-ver-action kanban-drill-ver-action-danger" onclick="event.stopPropagation();_clearVerificationUrl('${task.id}')" title="Remove URL"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>`;
       html += `</div>`;
@@ -2530,8 +2550,8 @@ function _editVerificationUrl(taskId, current) {
   if (!section) return;
   section.innerHTML = `<div class="kanban-drill-ver-edit-row">
     <span class="kanban-drill-ver-icon">${KI.link}</span>
-    <input type="url" id="kanban-drill-ver-input" class="kanban-drill-ver-input"
-      value="${escHtml(current || '')}" placeholder="https://localhost:8000/page"
+    <input type="text" id="kanban-drill-ver-input" class="kanban-drill-ver-input"
+      value="${escHtml(current || '')}" placeholder="https://localhost:8000/page or local file path"
       autocomplete="off" spellcheck="false">
     <button class="kanban-drill-ver-save-btn" onclick="_saveVerificationUrl('${taskId}')">Save</button>
     <button class="kanban-drill-ver-cancel-btn" onclick="renderTaskDetail('${taskId}')">Cancel</button>
@@ -2548,9 +2568,13 @@ async function _saveVerificationUrl(taskId) {
   const inp = document.getElementById('kanban-drill-ver-input');
   if (!inp) return;
   const url = inp.value.trim();
-  // Basic validation — must be absolute URL or empty
-  if (url && !url.match(/^https?:\/\//i)) {
-    if (typeof showToast === 'function') showToast('Please enter an absolute URL (http:// or https://)', true);
+  // Basic validation — must be absolute URL, file:// URI, or local file path (or empty)
+  const isHttpUrl = /^https?:\/\//i.test(url);
+  const isFileUri = /^file:\/\//i.test(url);
+  const isWinPath = /^[A-Z]:\\/i.test(url);
+  const isUnixPath = url.startsWith('/');
+  if (url && !isHttpUrl && !isFileUri && !isWinPath && !isUnixPath) {
+    if (typeof showToast === 'function') showToast('Please enter a URL (http/https/file) or a local file path', true);
     inp.focus();
     return;
   }
@@ -2890,7 +2914,7 @@ async function openSessionSpawner(taskId) {
   liveLineCount = 0;
   liveAutoScroll = true;
   liveBarState = null;
-  if (typeof _renderedUserTexts !== 'undefined') _renderedUserTexts.clear();
+  _optimisticMsgId = 0;
   const bar = document.getElementById('live-input-bar');
   if (bar) {
     bar.innerHTML =
@@ -3133,7 +3157,7 @@ async function showValidationCeremony(taskId) {
     <div class="pm-card pm-enter kanban-validation-modal">
       <h2 class="pm-title">Validation Ceremony</h2>
       <div class="pm-body"><p>Review <strong>${escHtml(task.title)}</strong> before marking as complete:</p></div>
-      ${verUrl ? `<div class="kanban-val-section"><h4>Verification URL</h4><div class="kanban-val-ver-row"><code>${escHtml(verUrl)}</code><a href="${escHtml(verUrl)}" target="_blank" rel="noopener" class="kanban-val-open-btn">Open</a></div></div>` : ''}
+      ${verUrl ? `<div class="kanban-val-section"><h4>Verification URL</h4><div class="kanban-val-ver-row"><code>${escHtml(verUrl)}</code>${_isLocalPath(verUrl) ? `<a href="#" data-local-path="${escHtml(verUrl)}" onclick="event.preventDefault();event.stopPropagation();_openLocalFile(this.dataset.localPath)" class="kanban-val-open-btn">Open</a>` : `<a href="${escHtml(verUrl)}" target="_blank" rel="noopener" class="kanban-val-open-btn">Open</a>`}</div></div>` : ''}
       ${children.length > 0 ? `<div class="kanban-val-section"><h4>Subtask Checklist</h4><div class="kanban-val-checklist">${subtaskHtml}</div></div>` : ''}
       <div class="kanban-val-section"><h4>Issues Found (optional)</h4><textarea id="kanban-val-issues" class="kanban-val-textarea" rows="3" placeholder="Describe any issues found..."></textarea></div>
       <div class="pm-actions">

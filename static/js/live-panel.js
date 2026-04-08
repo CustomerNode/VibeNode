@@ -26,7 +26,10 @@ function _formatMsgTime(tsStr) {
 let liveLineCount = 0;
 let _liveSending = false;
 let liveAutoScroll = true;
-const _renderedUserTexts = new Set();
+// Monotonic counter used to tag optimistic user bubbles so they can be
+// matched/replaced when the server echoes the entry back — without any
+// text-based comparison that would eat legitimate duplicate messages.
+let _optimisticMsgId = 0;
 
 // Client-side pagination for long chat threads.
 // The server sends ALL entries; we stash them in memory and only render
@@ -70,9 +73,6 @@ function liveLoadMore() {
     frag.appendChild(_createLoadMoreButton());
   }
   batch.forEach((entry) => {
-    if (entry.kind === 'user' && entry.text) {
-      _renderedUserTexts.add(entry.text.trim());
-    }
     frag.appendChild(renderLiveEntry(entry));
   });
 
@@ -403,7 +403,7 @@ async function openInGUI(id) {
         '<div class="live-input-bar" id="live-input-bar"></div></div>';
       liveSessionId = id;
       liveBarState = null;
-      _renderedUserTexts.clear();
+      _optimisticMsgId = 0;
       const bar = document.getElementById('live-input-bar');
       if (bar) {
         bar.innerHTML =
@@ -440,7 +440,7 @@ function startLivePanel(id, opts) {
   liveSessionId = id;
   liveLineCount = 0;
   liveAutoScroll = true;
-  if (!(opts && opts.skipLog)) _renderedUserTexts.clear();
+  if (!(opts && opts.skipLog)) _optimisticMsgId = 0;
   // Queue is restored from per-session localStorage — no reset here
   // Restore working_since from the map (set by state_snapshot/session_state)
   if (window._workingSinceMap && window._workingSinceMap[id]) {
@@ -1258,10 +1258,14 @@ function _watchdogHttpCheck(sid, forceApply) {
         if (sid === liveSessionId) {
           liveBarState = null;
           updateLiveInputBar();
-          // CRITICAL: re-fetch entries — the real-time session_entry events
-          // were silently lost, so the response text is missing from the DOM.
-          // Without this, the UI recovers state but the response never appears.
-          socket.emit('get_session_log', {session_id: sid, since: 0, project: localStorage.getItem('activeProject') || ''});
+          // Re-fetch entries ONLY if DOM is empty — if entries are already
+          // rendered from real-time streaming, a re-fetch would wipe them
+          // and re-render with pagination, slicing off the response tail.
+          const _wdLog = document.getElementById('live-log');
+          const _wdHasEntries = _wdLog && _wdLog.querySelectorAll('.msg').length > 0;
+          if (!_wdHasEntries) {
+            socket.emit('get_session_log', {session_id: sid, since: 0, project: localStorage.getItem('activeProject') || ''});
+          }
         }
         filterSessions();
       } else if (serverState === 'working') {
@@ -1307,14 +1311,6 @@ function _addOptimisticBubble(sid, text) {
   const logEl = document.getElementById('live-log');
   if (!logEl) return;
 
-  // Hard dedup: if this exact text is already tracked, bail out
-  const key = text.trim();
-  if (_renderedUserTexts.has(key)) return;
-  // DOM-level dedup: if the last user bubble has same text, skip
-  const _lu = logEl.querySelector('.msg.user:last-child .msg-body');
-  if (_lu && _lu.textContent.trim() === key) return;
-  _renderedUserTexts.add(key);
-
   // Clear skeleton/placeholder on first message
   const skel = logEl.querySelector('.skel-bar, .skeleton-loader, .skel-row');
   if (skel) logEl.innerHTML = '';
@@ -1329,8 +1325,10 @@ function _addOptimisticBubble(sid, text) {
   const now = new Date();
   const h = now.getHours() % 12 || 12;
   const timestamp = h + ':' + String(now.getMinutes()).padStart(2, '0') + ' ' + (now.getHours() >= 12 ? 'PM' : 'AM');
+  const msgId = ++_optimisticMsgId;
   const userMsg = document.createElement('div');
-  userMsg.className = 'msg user msg-entering';
+  userMsg.className = 'msg user msg-entering optimistic-bubble';
+  userMsg.dataset.optimisticId = msgId;
   userMsg.innerHTML = '<div class="msg-role">me <span class="msg-time">' + timestamp + '</span></div><div class="msg-body msg-content"><pre style="white-space:pre-wrap;margin:0;">' + escHtml(text) + '</pre></div>';
   userMsg.addEventListener('animationend', () => userMsg.classList.remove('msg-entering'), {once: true});
   logEl.appendChild(userMsg);

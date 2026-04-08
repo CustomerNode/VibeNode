@@ -848,7 +848,7 @@ async function addNewAgent() {
   liveLineCount = 0;
   liveAutoScroll = true;
   liveBarState = null;
-  _renderedUserTexts.clear();
+  _optimisticMsgId = 0;
 
   const bar = document.getElementById('live-input-bar');
   if (bar) {
@@ -1003,7 +1003,7 @@ async function _newSessionSubmit(sessionId) {
   // Switch to live panel mode — skip log fetch since this is a brand-new session
   // Clear dedup set right before panel creation so stale entries from
   // any prior session during the async await cannot block the bubble.
-  _renderedUserTexts.clear();
+  _optimisticMsgId = 0;
   startLivePanel(sessionId, {skipLog: true});
 
   // Add optimistic user bubble into the fresh log (after startLivePanel creates it)
