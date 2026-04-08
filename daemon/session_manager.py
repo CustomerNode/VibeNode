@@ -863,6 +863,14 @@ class SessionManager:
         self._emit_queue_update(session_id)
         logger.info("Queued message for %s (%d in queue)", session_id,
                      len(self._queues.get(session_id, [])))
+
+        # If the session is already idle (e.g. voice recording finished after
+        # the session went idle), dispatch immediately instead of waiting for
+        # the next idle transition which will never come.
+        info = self._sessions.get(session_id)
+        if info and info.state == SessionState.IDLE:
+            self._try_dispatch_queue(session_id)
+
         return {"ok": True, "queued": True}
 
     def get_queue(self, session_id: str) -> list:

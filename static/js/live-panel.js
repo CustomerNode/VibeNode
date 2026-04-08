@@ -1002,6 +1002,19 @@ function liveQueueSave() {
   if (!ta || !liveSessionId) return;
   const text = ta.value.trim();
   if (!text) return;
+
+  // If the session went idle while we were recording (e.g. voice dictation
+  // started during 'working' but Claude finished before we stopped talking),
+  // send directly instead of queuing — it would just sit in the queue until
+  // the next idle transition otherwise.
+  const kind = sessionKinds[liveSessionId];
+  if (kind === 'idle' || kind === 'question') {
+    ta.value = '';
+    _resetTextareaHeight(ta);
+    _liveSubmitDirect(liveSessionId, text);
+    return;
+  }
+
   _addQueue(liveSessionId, text);
   ta.value = '';
   _resetTextareaHeight(ta);

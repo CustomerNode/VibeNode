@@ -129,8 +129,14 @@ function setupVoiceButton(textarea, button, onSubmit) {
       } else {
         textarea.focus();
       }
-      // Apply any bar updates that were deferred while voice was active
-      if (typeof updateLiveInputBar === 'function') setTimeout(updateLiveInputBar, 0);
+      // Apply any bar updates that were deferred while voice was active.
+      // Force liveBarState=null so the re-render isn't skipped by the
+      // stateKey===liveBarState guard — the bar HTML is stale because
+      // updateLiveInputBar returned early while we were recording.
+      if (typeof updateLiveInputBar === 'function') {
+        if (typeof liveBarState !== 'undefined') liveBarState = null;
+        setTimeout(updateLiveInputBar, 0);
+      }
     };
 
     recognition.onerror = (e) => {
