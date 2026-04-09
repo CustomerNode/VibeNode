@@ -8615,3 +8615,136 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
 .lp-btn-link:disabled {
   opacity: 0.4; cursor: not-allowed;
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   COMPOSE ROOT ORCHESTRATOR — Header Bar, Input Target, Sidebar
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Root Orchestrator Header Bar — persistent at top of compose board */
+.compose-root-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  background: linear-gradient(135deg, rgba(78, 205, 196, 0.08) 0%, rgba(78, 205, 196, 0.03) 100%);
+  border-bottom: 1px solid rgba(78, 205, 196, 0.15);
+  min-height: 40px;
+  flex-shrink: 0;
+  z-index: 5;
+}
+[data-theme="light"] .compose-root-header {
+  background: linear-gradient(135deg, rgba(43, 168, 158, 0.08) 0%, rgba(43, 168, 158, 0.03) 100%);
+  border-bottom-color: rgba(43, 168, 158, 0.15);
+}
+.compose-root-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.compose-root-icon {
+  color: #4ecdc4;
+  display: flex;
+  align-items: center;
+}
+.compose-root-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary, #c9d1d9);
+  cursor: pointer;
+  transition: color 0.15s;
+}
+.compose-root-name:hover {
+  color: #4ecdc4;
+}
+.compose-root-header-center {
+  display: flex;
+  align-items: center;
+}
+.compose-root-status {
+  font-size: 12px;
+  color: var(--text-muted, #8b949e);
+  font-weight: 500;
+}
+.compose-root-header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.compose-root-conflicts {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #f0883e;
+  background: rgba(240, 136, 62, 0.1);
+  padding: 2px 8px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+.compose-root-conflicts:hover {
+  background: rgba(240, 136, 62, 0.18);
+}
+
+/* Input target label — shows who you're talking to */
+.compose-input-target {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 16px;
+  background: rgba(78, 205, 196, 0.04);
+  border-bottom: 1px solid rgba(78, 205, 196, 0.06);
+  flex-shrink: 0;
+}
+.compose-input-target-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim, #6e7681);
+  font-weight: 600;
+}
+.compose-input-target-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: #4ecdc4;
+}
+
+/* Sidebar compose session grouping */
+.compose-session-group {
+  margin-bottom: 4px;
+}
+.compose-session-group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #4ecdc4;
+  cursor: pointer;
+  user-select: none;
+}
+.compose-session-group-header:hover {
+  color: #6ed8d1;
+}
+.compose-session-group-header svg {
+  color: #4ecdc4;
+  flex-shrink: 0;
+}
+.compose-session-root {
+  border-left: 2px solid rgba(78, 205, 196, 0.3);
+  margin-left: 12px;
+}
+.compose-session-root .session-item {
+  padding-left: 10px;
+}
+.compose-session-section {
+  border-left: 1px solid rgba(78, 205, 196, 0.12);
+  margin-left: 20px;
+}
+.compose-session-section .session-item {
+  padding-left: 10px;
+  font-size: 12px;
+}

@@ -1641,3 +1641,198 @@ function openAddDepartment() {
     };
   });
 }
+
+
+// ═══════════════════════════════════════════════════════════════
+// COMPOSE ROOT ORCHESTRATOR — Header, Input Target, State
+// ═══════════════════════════════════════════════════════════════
+
+// Current compose state
+let _composeProject = null;       // active ComposeProject object
+let _composeSections = [];        // section list
+let _composeConflicts = [];       // pending conflicts
+let composeDetailTaskId = null;   // compose_task_id for session start
+let _composeSelectedSection = null; // currently selected section id (null = root)
+
+/**
+ * Initialize the compose board — fetch project data and render header.
+ * Called by setViewMode('compose') in workforce.js.
+ */
+async function initCompose() {
+  const header = document.getElementById('compose-root-header');
+  const target = document.getElementById('compose-input-target');
+  if (header) header.style.display = 'flex';
+  if (target) target.style.display = 'flex';
+
+  try {
+    const resp = await fetch('/api/compose/board');
+    const data = await resp.json();
+    if (!data || !data.project) {
+      _renderComposeEmpty();
+      return;
+    }
+    _composeProject = data.project;
+    _composeSections = data.sections || [];
+    _composeConflicts = (data.conflicts || []).filter(c => c.status === 'pending');
+
+    _updateComposeRootHeader();
+    _updateComposeInputTarget();
+
+    // Set default compose_task_id to root
+    composeDetailTaskId = 'root:' + _composeProject.id;
+
+  } catch (e) {
+    console.error('Failed to init compose:', e);
+    _renderComposeEmpty();
+  }
+}
+
+function _renderComposeEmpty() {
+  const nameEl = document.getElementById('compose-root-name');
+  if (nameEl) nameEl.textContent = 'No composition yet';
+  const statusEl = document.getElementById('compose-root-status');
+  if (statusEl) statusEl.textContent = 'Create a project to start';
+}
+
+function _updateComposeRootHeader() {
+  if (!_composeProject) return;
+
+  const nameEl = document.getElementById('compose-root-name');
+  if (nameEl) {
+    nameEl.textContent = _composeProject.name;
+    nameEl.onclick = () => {
+      // Open root session
+      if (_composeProject.root_session_id) {
+        selectSession(_composeProject.root_session_id);
+      }
+    };
+  }
+
+  const statusEl = document.getElementById('compose-root-status');
+  if (statusEl) {
+    const total = _composeSections.length;
+    const complete = _composeSections.filter(s => s.status === 'complete').length;
+    const working = _composeSections.filter(s => s.status === 'working').length;
+    let parts = [total + ' section' + (total !== 1 ? 's' : '')];
+    if (complete > 0) parts.push(complete + ' complete');
+    if (working > 0) parts.push(working + ' in progress');
+    statusEl.textContent = parts.join(', ');
+  }
+
+  const conflictsEl = document.getElementById('compose-root-conflicts');
+  const countEl = document.getElementById('compose-root-conflict-count');
+  if (conflictsEl && countEl) {
+    if (_composeConflicts.length > 0) {
+      conflictsEl.style.display = 'inline-flex';
+      countEl.textContent = _composeConflicts.length;
+    } else {
+      conflictsEl.style.display = 'none';
+    }
+  }
+}
+
+function _updateComposeInputTarget() {
+  const nameEl = document.getElementById('compose-input-target-name');
+  if (!nameEl) return;
+
+  if (_composeSelectedSection) {
+    const section = _composeSections.find(s => s.id === _composeSelectedSection);
+    nameEl.textContent = section ? section.name : 'unknown section';
+    composeDetailTaskId = 'section:' + _composeProject.id + ':' + _composeSelectedSection;
+  } else {
+    nameEl.textContent = _composeProject ? _composeProject.name + ' (root)' : 'composition';
+    composeDetailTaskId = _composeProject ? 'root:' + _composeProject.id : null;
+  }
+}
+
+/**
+ * Select a compose section (updates input target and compose_task_id).
+ * Pass null to target the root orchestrator.
+ */
+function composeSelectSection(sectionId) {
+  _composeSelectedSection = sectionId;
+  _updateComposeInputTarget();
+}
+
+/**
+ * Reset compose state — called when switching away from compose view.
+ */
+function resetComposeState() {
+  _composeProject = null;
+  _composeSections = [];
+  _composeConflicts = [];
+  composeDetailTaskId = null;
+  _composeSelectedSection = null;
+  const header = document.getElementById('compose-root-header');
+  const target = document.getElementById('compose-input-target');
+  if (header) header.style.display = 'none';
+  if (target) target.style.display = 'none';
+}
+
+/**
+ * Group compose sessions in the sidebar under composition name.
+ * Called during session list rendering when in compose mode.
+ */
+// Socket event handlers for compose updates
+function _composeOnBoardRefresh(data) {
+  if (viewMode === 'compose') initCompose();
+}
+
+function _composeOnContextUpdated(data) {
+  if (viewMode !== 'compose') return;
+  if (!_composeProject || !data) return;
+  const ctx = data.context;
+  if (!ctx) return;
+  // Update sections from context
+  if (ctx.sections) {
+    _composeSections = ctx.sections;
+  }
+  if (ctx.conflicts) {
+    _composeConflicts = ctx.conflicts.filter(c => c.status === 'pending');
+  }
+  _updateComposeRootHeader();
+}
+
+function _composeOnChanging(data) {
+  if (viewMode !== 'compose') return;
+  // Update the section in local state
+  if (data && data.section_id) {
+    const sec = _composeSections.find(s => s.id === data.section_id);
+    if (sec) {
+      sec.changing = data.changing;
+      sec.change_note = data.change_note || null;
+    }
+  }
+}
+
+function getComposeSessionGroups(sessions) {
+  if (!_composeProject) return null;
+
+  const groups = [];
+  const rootSessionId = _composeProject.root_session_id;
+  const sectionSessionIds = new Set(
+    _composeSections
+      .filter(s => s.session_id)
+      .map(s => s.session_id)
+  );
+
+  const composeSessions = sessions.filter(s =>
+    s.id === rootSessionId || sectionSessionIds.has(s.id)
+  );
+  const otherSessions = sessions.filter(s =>
+    s.id !== rootSessionId && !sectionSessionIds.has(s.id)
+  );
+
+  if (composeSessions.length > 0) {
+    // Root session first
+    const root = composeSessions.find(s => s.id === rootSessionId);
+    const sections = composeSessions.filter(s => s.id !== rootSessionId);
+    groups.push({
+      name: _composeProject.name,
+      root: root || null,
+      sections: sections,
+    });
+  }
+
+  return { groups, other: otherSessions };
+}

@@ -263,6 +263,29 @@
       </script>
     </div>
     <div id="compose-board" style="display:none;">
+      <!-- Root Orchestrator Header Bar -->
+      <div id="compose-root-header" class="compose-root-header" style="display:none;">
+        <div class="compose-root-header-left">
+          <span class="compose-root-icon">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+          </span>
+          <span id="compose-root-name" class="compose-root-name" title="Click to open root session">No composition</span>
+        </div>
+        <div class="compose-root-header-center">
+          <span id="compose-root-status" class="compose-root-status">0 sections</span>
+        </div>
+        <div class="compose-root-header-right">
+          <span id="compose-root-conflicts" class="compose-root-conflicts" style="display:none;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+            <span id="compose-root-conflict-count">0</span> conflicts
+          </span>
+        </div>
+      </div>
+      <!-- Input target label -->
+      <div id="compose-input-target" class="compose-input-target" style="display:none;">
+        <span class="compose-input-target-label">Talking to:</span>
+        <span id="compose-input-target-name" class="compose-input-target-name">composition</span>
+      </div>
       <script>
       (function(){
         if ((localStorage.getItem('viewMode') || '') === 'compose') {
@@ -278,7 +301,10 @@
             h += '</div></div>';
           }
           h += '</div>';
-          b.innerHTML = h;
+          // Don't overwrite the header — insert after it
+          var wrapper = document.createElement('div');
+          wrapper.innerHTML = h;
+          b.appendChild(wrapper);
         }
       })();
       </script>
