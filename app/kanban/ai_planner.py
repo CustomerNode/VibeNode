@@ -17,44 +17,122 @@ from ..db.repository import KanbanRepository, Task
 
 
 # ---------------------------------------------------------------------------
-# URL Detection — scans route files for verification URL candidates
+# URL Detection — scans ALL source files for route/URL patterns
 # ---------------------------------------------------------------------------
 
-def detect_verification_urls(project_root=None):
-    """Scan Flask route files for URL patterns.
+_SKIP_DIRS = {"node_modules", "dist", "build", ".git", ".claude",
+              "__pycache__", ".venv", "venv", ".next", ".nuxt",
+              "coverage", ".tox", ".mypy_cache", ".pytest_cache"}
+_SOURCE_EXTS = {".py", ".js", ".ts", ".jsx", ".tsx", ".rb", ".go",
+                ".java", ".php", ".rs", ".ex", ".exs"}
 
-    Returns a dict mapping route paths to descriptions, e.g.:
-        {"/api/kanban/board": "GET — get_board", "/login": "GET — login_page"}
+# Generic patterns that match URL paths across any framework/language.
+# Each tuple: (compiled_regex, group_index_for_path, label_func)
+_URL_PATTERNS = [
+    # --- Decorator / attribute routes (Flask, FastAPI, Bottle, Starlette, etc.) ---
+    # @app.route("/path"), @router.get("/path"), @app.api_route("/path")
+    (re.compile(
+        r'@\w+\.'
+        r'(?:route|get|post|put|patch|delete|head|options|api_route|websocket)'
+        r'\(\s*["\']([^"\']+)["\']'
+    ), 1, lambda m: "route"),
+
+    # --- Function-call route registration (Express, Koa, Hono, etc.) ---
+    # app.get("/path"), router.post("/path"), server.route("/path")
+    (re.compile(
+        r'(?:app|router|server|api)\.'
+        r'(get|post|put|patch|delete|all|head|options|route|use)'
+        r'\(\s*["\'](/[^"\']*)["\']'
+    ), 2, lambda m: m.group(1).upper()),
+
+    # --- URL config patterns (Django, Rails, PHP, etc.) ---
+    # path("route/", ...), re_path(r"^route/", ...), Route::get("/path", ...)
+    (re.compile(
+        r'(?:path|re_path|url)\(\s*[r]?["\']([^"\']+)["\']'
+    ), 1, lambda m: "URL pattern"),
+    # Rails/Laravel: Route::get("/path", ...), get "/path" => ...
+    (re.compile(
+        r'Route::\w+\(\s*["\']([^"\']+)["\']'
+    ), 1, lambda m: "route"),
+
+    # --- JSX/HTML route components ---
+    # <Route path="/path">, <Link to="/path">, <a href="/path">
+    (re.compile(
+        r'<(?:Route|Link|NavLink|Redirect)\s+(?:path|to|href)\s*=\s*[{]?\s*["\'](/[^"\']*)["\']'
+    ), 1, lambda m: "page"),
+
+    # --- String-literal URL paths (fetch, axios, http calls) ---
+    # fetch("/api/..."), axios.get("/api/..."), http.get("/api/...")
+    (re.compile(
+        r'(?:fetch|axios|http|request|got|ky|ofetch|useFetch|\$fetch)\s*'
+        r'(?:\.\w+)?\s*\(\s*[`"\'](/[^`"\']+)[`"\']'
+    ), 1, lambda m: "API call"),
+
+    # --- Go / Rust / Java style ---
+    # http.HandleFunc("/path", ...), HandleFunc("/path", ...)
+    # .route("/path"), #[get("/path")]
+    (re.compile(
+        r'(?:HandleFunc|Handle|ServeMux|route|Mount)\s*\(\s*["\'](/[^"\']+)["\']'
+    ), 1, lambda m: "handler"),
+    (re.compile(
+        r'#\[(get|post|put|patch|delete)\(\s*["\']([^"\']+)["\']'
+    ), 2, lambda m: m.group(1).upper()),
+]
+
+
+def detect_verification_urls(project_root=None):
+    """Scan all source files for URL/route patterns, framework-agnostic.
+
+    Walks the project tree, reads every source file (skipping vendored dirs),
+    and applies generic regex patterns that catch routes across Python, JS/TS,
+    Go, Rust, Ruby, PHP, Java, and others.
+
+    Returns a dict mapping route paths to short descriptions.
     """
     if project_root is None:
         project_root = os.getcwd()
 
     urls = {}
-    route_patterns = [
-        os.path.join(project_root, "app", "routes", "*.py"),
-        os.path.join(project_root, "app", "**", "*.py"),
-        os.path.join(project_root, "routes", "*.py"),
-    ]
 
-    for pattern in route_patterns:
-        for filepath in glob.glob(pattern, recursive=True):
+    for dirpath, dirnames, filenames in os.walk(project_root):
+        # Prune skipped directories in-place so os.walk doesn't descend
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+
+        for fname in filenames:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in _SOURCE_EXTS:
+                continue
+            filepath = os.path.join(dirpath, fname)
             try:
                 with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
-                for match in re.finditer(
-                    r'@\w+\.route\(\s*["\']([^"\']+)["\']'
-                    r'(?:.*?methods\s*=\s*\[([^\]]+)\])?',
-                    content,
-                ):
-                    path = match.group(1)
-                    methods = match.group(2) or '"GET"'
-                    method = methods.strip().strip("'\"").split(",")[0].strip().strip("'\"")
-                    pos = match.end()
-                    func_match = re.search(r'def\s+(\w+)', content[pos:pos + 200])
-                    func_name = func_match.group(1) if func_match else "handler"
-                    urls[path] = f"{method} — {func_name}"
             except Exception:
                 continue
+
+            rel = os.path.relpath(filepath, project_root).replace("\\", "/")
+
+            for pattern, group_idx, label_fn in _URL_PATTERNS:
+                for match in pattern.finditer(content):
+                    path = match.group(group_idx)
+                    # Normalize: ensure leading slash
+                    if path and not path.startswith("/"):
+                        path = "/" + path
+                    # Clean template variables: /api/tasks/${id} → /api/tasks/:id
+                    path = re.sub(r'\$\{[^}]+\}', ':param', path)
+                    # Clean angle-bracket params: /api/tasks/<task_id> → /api/tasks/:task_id
+                    path = re.sub(r'<(?:\w+:)?(\w+)>', r':\1', path)
+                    # Clean curly-brace params: /api/tasks/{id} → /api/tasks/:id
+                    path = re.sub(r'\{(\w+)\}', r':\1', path)
+                    # Skip noise: too short, too long, regex fragments, wildcards
+                    if not path or path == "/" or len(path) > 120:
+                        continue
+                    if re.search(r'[\^$*+?\\()\[\]|]', path):
+                        continue  # regex metacharacters = not a real URL
+                    if path.endswith('...') or '..' in path:
+                        continue
+                    if path not in urls:
+                        label = label_fn(match)
+                        urls[path] = f"{label} ({rel})"
 
     return urls
 

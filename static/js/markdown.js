@@ -6,6 +6,11 @@ function _escapeHtmlForCode(str) {
 
 function highlightCode(code, lang) {
     // Minimal syntax highlighting - keywords, strings, comments, numbers
+    //
+    // Strategy: use invisible placeholder tokens (\x01T…\x02) during all regex
+    // passes so that earlier replacements (e.g. strings) don't inject HTML that
+    // later regexes (e.g. keywords matching "class") would corrupt.  After every
+    // regex pass is done we swap the tokens for real <span> tags in one shot.
     if (!lang) {
         // Auto-detect: look for common patterns
         if (code.includes('def ') || code.includes('import ') || /^\s*class\s/.test(code)) lang = 'python';
@@ -19,14 +24,18 @@ function highlightCode(code, lang) {
     // Order matters: strings first, then comments, then keywords, then numbers
     let html = _escapeHtmlForCode(code);
 
+    // Placeholder helpers — \x01S … \x02  (S=str, C=cmt, N=num, K=kw)
+    const _O = (t) => '\x01' + t;  // open marker
+    const _C = '\x02';              // close marker
+
     // Strings (double and single quoted) — but avoid breaking HTML entities
-    html = html.replace(/(["'])(?:(?!\1|\\).|\\.)*?\1/g, '<span class="hl-str">$&</span>');
+    html = html.replace(/(["'])(?:(?!\1|\\).|\\.)*?\1/g, _O('S') + '$&' + _C);
 
     // Single-line comments
-    html = html.replace(/(\/\/.*$|#(?!include).*$)/gm, '<span class="hl-cmt">$&</span>');
+    html = html.replace(/(\/\/.*$|#(?!include).*$)/gm, _O('C') + '$&' + _C);
 
-    // Numbers (not inside already-highlighted spans)
-    html = html.replace(/\b(\d+\.?\d*)\b/g, '<span class="hl-num">$&</span>');
+    // Numbers
+    html = html.replace(/\b(\d+\.?\d*)\b/g, _O('N') + '$&' + _C);
 
     // Keywords (language-specific)
     const kwMap = {
@@ -44,7 +53,12 @@ function highlightCode(code, lang) {
     if (lang === 'rs') lang = 'rust';
     if (lang === 'c' || lang === 'cc' || lang === 'h') lang = 'cpp';
     const kw = kwMap[lang];
-    if (kw) html = html.replace(kw, '<span class="hl-kw">$&</span>');
+    if (kw) html = html.replace(kw, _O('K') + '$&' + _C);
+
+    // Now swap placeholders for real HTML spans (single pass, no regex-on-regex)
+    const spanMap = { S: 'hl-str', C: 'hl-cmt', N: 'hl-num', K: 'hl-kw' };
+    html = html.replace(/\x01([SCNK])([\s\S]*?)\x02/g, (_, t, inner) =>
+        '<span class="' + spanMap[t] + '">' + inner + '</span>');
 
     return html;
 }

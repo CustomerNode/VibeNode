@@ -154,6 +154,65 @@ def _task_response(task):
     return task
 
 
+def _build_task_tree_summary(repo, project_id, max_depth=4):
+    """Build a compact text summary of the current task tree.
+
+    Returns a string like:
+      - [not_started] Build login page (3 subtasks)
+        - [done] Create login form HTML
+        - [in_progress] Add authentication logic
+        - [not_started] Write login tests
+
+    Keeps output under ~2000 chars to stay within token budget.
+    """
+    board = repo.get_board(project_id)
+    tasks_by_status = board.get("tasks", {})
+
+    # Flatten all tasks and index by id / parent_id
+    all_tasks = []
+    for v in (tasks_by_status.values() if isinstance(tasks_by_status, dict) else []):
+        all_tasks.extend(v)
+
+    if not all_tasks:
+        return ""
+
+    by_parent = {}
+    by_id = {}
+    for t in all_tasks:
+        by_id[t.id] = t
+        pid = t.parent_id or "__root__"
+        by_parent.setdefault(pid, []).append(t)
+
+    lines = []
+    char_count = 0
+    truncated = False
+
+    def _walk(parent_id, depth):
+        nonlocal char_count, truncated
+        if depth > max_depth or truncated:
+            return
+        children = by_parent.get(parent_id, [])
+        # Sort by position if available
+        children.sort(key=lambda t: getattr(t, 'position', 0) or 0)
+        for t in children:
+            status = t.status.value if hasattr(t.status, 'value') else str(t.status)
+            child_count = len(by_parent.get(t.id, []))
+            suffix = f" ({child_count} subtasks)" if child_count else ""
+            indent = "  " * depth
+            line = f"{indent}- [{status}] {t.title}{suffix}"
+            if char_count + len(line) > 2000:
+                lines.append(f"{indent}  ... (truncated)")
+                truncated = True
+                return
+            lines.append(line)
+            char_count += len(line)
+            _walk(t.id, depth + 1)
+
+    _walk("__root__", 0)
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Board
 # ---------------------------------------------------------------------------
@@ -280,6 +339,32 @@ def get_board():
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@bp.route("/api/kanban/task-tree-summary")
+def task_tree_summary():
+    """Return a compact text summary of the full task tree for AI context."""
+    try:
+        repo = _get_repo()
+        project_id = _get_project_id()
+        summary = _build_task_tree_summary(repo, project_id)
+        return jsonify({"summary": summary})
+    except Exception as e:
+        return jsonify({"summary": "", "error": str(e)})
+
+
+@bp.route("/api/kanban/detected-urls")
+def detected_urls():
+    """Return real URL routes detected from the project's source code."""
+    try:
+        from ..kanban.ai_planner import detect_verification_urls
+        project_dir = request.args.get("cwd", "").strip() or None
+        urls = detect_verification_urls(project_dir)
+        # Format as a compact list for prompt injection
+        lines = [f"  {path}: {desc}" for path, desc in sorted(urls.items())]
+        return jsonify({"urls": urls, "formatted": "\n".join(lines)})
+    except Exception as e:
+        return jsonify({"urls": {}, "formatted": "", "error": str(e)})
 
 
 # ---------------------------------------------------------------------------
@@ -972,10 +1057,14 @@ def apply_task_plan(task_id):
 PLANNER_CHAT_SYSTEM = """You are a task planning assistant. The user will describe
 what they want to accomplish. Break it down into a hierarchical task tree.
 
+CRITICAL: NEVER ask the user questions. NEVER ask for clarification. NEVER request more
+information. If the request is ambiguous, use your best judgment and produce a task tree
+immediately. Your ONLY job is to output a proposed task tree — nothing else.
+
 Respond with a JSON structure wrapped in ```json code fences:
 ```json
 {
-  "response": "Your conversational response explaining the breakdown",
+  "response": "Brief explanation of the breakdown (NOT a question)",
   "tasks": [
     {
       "title": "...",
@@ -990,11 +1079,12 @@ Respond with a JSON structure wrapped in ```json code fences:
 ```
 
 Guidelines:
+- Always produce a task tree, no matter what. Never respond with only text or questions.
 - Each task should be a concrete, actionable unit of work
 - Aim for tasks completable in 1-3 sessions
 - Use 2-4 levels of nesting max unless the user asks for more
 - Include descriptions only when the title isn't self-explanatory
-- The "response" field should be a friendly conversational explanation
+- The "response" field should be a brief explanation, never a question
 
 Verification URLs:
 - Each task/subtask has an optional "verification_url" field — an absolute URL the developer
@@ -1037,24 +1127,45 @@ def planner_chat():
 
         result_text = None
 
-        # Build system prompt — enrich with validation base URL if configured
+        # Inject existing task tree so the planner can see what's already on the board
+        try:
+            repo = _get_repo()
+            project_id = _get_project_id()
+            tree_summary = _build_task_tree_summary(repo, project_id)
+        except Exception:
+            tree_summary = ""
+
+        # Detect real URLs from project source code
+        try:
+            from ..kanban.ai_planner import detect_verification_urls as _detect_urls
+            detected = _detect_urls()
+            url_lines = "\n".join(f"  {p}: {d}" for p, d in sorted(detected.items()))
+        except Exception:
+            url_lines = ""
+
+        # Build system prompt — enrich with context
         from ..config import get_kanban_config as _get_plan_cfg
         _plan_cfg = _get_plan_cfg()
         sys_prompt = PLANNER_CHAT_SYSTEM
+        if tree_summary:
+            sys_prompt += (
+                "\n\nEXISTING TASK TREE (current board state):\n" + tree_summary +
+                "\n\nConsider these existing tasks when planning. Avoid duplicating work "
+                "that already exists. You may reference existing tasks or plan complementary work."
+            )
+        if url_lines:
+            sys_prompt += (
+                "\n\nDETECTED ROUTES (real URLs from project source code — use ONLY these):\n"
+                + url_lines +
+                "\n\nIMPORTANT: ONLY use routes from the list above for verification_url. "
+                "NEVER invent or guess URLs. If no route matches a task, set verification_url to null."
+            )
         if _plan_cfg.get("validation_url_enabled") and _plan_cfg.get("validation_base_url"):
             base = _plan_cfg["validation_base_url"]
             sys_prompt += (
                 "\n\nVALIDATION URLS ENABLED. Dev server base URL: " + base + ". "
-                "You MUST set verification_url on EVERY task and subtask by constructing "
-                "absolute URLs from this base URL. Read the project code to find real "
-                "route paths, page URLs, and API endpoints. Build verification_url as "
-                "base URL + the route path (e.g. " + base + "/dashboard). Every task "
-                "MUST have a verification_url unless it is purely non-visual work like "
-                "refactoring or config with no observable endpoint. Try hard to find a "
-                "relevant URL for each task. For tasks that CREATE new endpoints or pages "
-                "that do not exist yet, you may still set verification_url to the planned "
-                "URL — but add a note in the task description like '(new endpoint)' so the "
-                "developer knows it will only work after implementation."
+                "Construct verification_url as base URL + a route from the DETECTED ROUTES list above. "
+                "NEVER invent URLs that aren't in the detected list."
             )
 
         # Strategy 1: Direct Anthropic API (fast, needs ANTHROPIC_API_KEY)

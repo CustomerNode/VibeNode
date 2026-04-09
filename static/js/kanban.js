@@ -904,7 +904,8 @@ const _PLANNER_SYSTEM = [
   'You are a task planning assistant for a Kanban board.',
   'You MUST respond with ONLY valid JSON. No explanation, no prose, no apologies, no refusals.',
   'Even for trivial, nonsensical, or test inputs, you MUST produce a valid task tree.',
-  'NEVER refuse. NEVER explain. NEVER output anything except the JSON object.',
+  'NEVER refuse. NEVER explain. NEVER ask questions. NEVER ask for clarification.',
+  'NEVER output anything except the JSON object. If the request is ambiguous, make your best judgment and produce a task tree.',
   'Format: {"tasks":[{"title":"...","description":"...","verification_url":null,"subtasks":[]}]}',
   'To edit existing tasks include "id": {"tasks":[{"id":"existing-id","title":"New Title"}]}. Tasks without "id" are new.',
   'Prefer breaking work into subtasks over writing long descriptions. Descriptions should be brief (1-2 sentences max). Use subtasks to express detail.',
@@ -1117,12 +1118,65 @@ async function _openPlannerSlideout(prompt) {
   // Attach listeners BEFORE emitting
   _attachPlannerListeners();
 
-  // Fetch validation config to enrich the system prompt
+  // Fetch validation config, task tree, detected URLs, and drill-down context in parallel
   let valUrlSnippet = '';
+  let taskTreeSnippet = '';
+  let drillDownSnippet = '';
+  let detectedUrlSnippet = '';
+  const contextTaskId = _plannerScopeParentId || kanbanDetailTaskId;
+  const projectDir = typeof _currentProjectDir === 'function' ? _currentProjectDir() : '';
   try {
-    const cfg = await fetch('/api/kanban/config').then(r => r.ok ? r.json() : {});
-    if (cfg.validation_url_enabled && cfg.validation_base_url) {
-      valUrlSnippet = ' VALIDATION URLS ENABLED. Dev server base URL: ' + cfg.validation_base_url + '. You MUST set verification_url on EVERY task and subtask by constructing absolute URLs from this base URL. Read the project code to find real route paths, page URLs, and API endpoints. Build verification_url as base URL + the route path (e.g. ' + cfg.validation_base_url + '/dashboard). Every task MUST have a verification_url unless it is purely non-visual work like refactoring or config with no observable endpoint. Try hard to find a relevant URL for each task. For tasks that CREATE new endpoints or pages that do not exist yet, you may still set verification_url to the planned URL — but add a note in the task description like "(new endpoint)" so the developer knows it will only work after implementation.';
+    const fetches = [
+      fetch('/api/kanban/config').then(r => r.ok ? r.json() : {}),
+      fetch('/api/kanban/task-tree-summary').then(r => r.ok ? r.json() : {}),
+      fetch('/api/kanban/detected-urls' + (projectDir ? '?cwd=' + encodeURIComponent(projectDir) : '')).then(r => r.ok ? r.json() : {}),
+    ];
+    // If we're inside a drill-down, fetch the ancestor chain + task detail
+    if (contextTaskId) {
+      fetches.push(
+        fetch('/api/kanban/tasks/' + contextTaskId + '/ancestors').then(r => r.ok ? r.json() : null)
+      );
+      fetches.push(
+        fetch('/api/kanban/tasks/' + contextTaskId).then(r => r.ok ? r.json() : null)
+      );
+    }
+    const results = await Promise.all(fetches);
+    const cfgRes = results[0];
+    const treeRes = results[1];
+    const urlsRes = results[2] || {};
+    const ancestorRes = results[3] || null;
+    const taskDetail = results[4] || null;
+
+    if (cfgRes.validation_url_enabled && cfgRes.validation_base_url) {
+      valUrlSnippet = ' VALIDATION URLS ENABLED. Dev server base URL: ' + cfgRes.validation_base_url + '. You MUST set verification_url on EVERY task and subtask by constructing absolute URLs from this base URL + one of the DETECTED ROUTES below. NEVER invent URLs — only use routes from the detected list. Every task MUST have a verification_url unless it is purely non-visual work like refactoring or config with no observable endpoint.';
+    }
+    if (urlsRes.formatted) {
+      detectedUrlSnippet = '\n\nDETECTED ROUTES (real URLs from project source code — use ONLY these):\n' + urlsRes.formatted + '\n\nIMPORTANT: ONLY use routes from the list above. NEVER invent or guess URLs. If no route matches a task, set verification_url to null.';
+    }
+    if (treeRes.summary) {
+      taskTreeSnippet = '\n\nEXISTING TASK TREE (current board state):\n' + treeRes.summary + '\n\nConsider these existing tasks when planning. Avoid duplicating work that already exists. You may reference existing tasks or plan complementary work.';
+    }
+    // Build drill-down position context: breadcrumb + current task + its children
+    if (contextTaskId && (ancestorRes || taskDetail)) {
+      let parts = [];
+      if (ancestorRes && ancestorRes.ancestors && ancestorRes.ancestors.length) {
+        const breadcrumb = ancestorRes.ancestors.map(a => a.title).join(' → ');
+        const currentTitle = ancestorRes.task ? ancestorRes.task.title : '';
+        parts.push('CURRENT POSITION IN TREE: ' + breadcrumb + (currentTitle ? ' → ' + currentTitle : ''));
+      }
+      if (taskDetail) {
+        parts.push('CURRENT TASK (id: ' + contextTaskId + '): "' + (taskDetail.title || '') + '"');
+        if (taskDetail.description) parts.push('Description: ' + taskDetail.description);
+        if (taskDetail.status) parts.push('Status: ' + taskDetail.status);
+        if (taskDetail.children && taskDetail.children.length) {
+          const childLines = taskDetail.children.map(c => '  - [' + c.status + '] ' + c.title + ' (id: ' + c.id + ')');
+          parts.push('EXISTING SUBTASKS:\n' + childLines.join('\n'));
+        }
+      }
+      if (parts.length) {
+        drillDownSnippet = '\n\nDRILL-DOWN CONTEXT (the user is currently viewing this task):\n' + parts.join('\n');
+        drillDownSnippet += '\n\nYou may edit the parent task itself by including its id. To edit existing subtasks include their id. New tasks (no id) will be added as children. Avoid duplicating existing subtasks.';
+      }
     }
   } catch (_) {}
 
@@ -1132,7 +1186,7 @@ async function _openPlannerSlideout(prompt) {
   runningIds.add(newId);
   sessionKinds[newId] = 'working';
   // For scoped plans (subtree editing), add explicit instruction to NOT include the parent
-  let sysPrompt = _PLANNER_SYSTEM + valUrlSnippet;
+  let sysPrompt = _PLANNER_SYSTEM + valUrlSnippet + detectedUrlSnippet + taskTreeSnippet + drillDownSnippet;
   if (_plannerScopeParentId) {
     sysPrompt += ' IMPORTANT: You are editing an EXISTING task and its subtree. Return EXACTLY ONE top-level task in your "tasks" array — this is the parent task being edited. Include its updated title, description, and subtasks. The parent will be updated in place and its old subtree will be replaced.';
   }
