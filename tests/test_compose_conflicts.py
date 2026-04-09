@@ -144,6 +144,30 @@ class TestResolveConflict:
         d1_data = next(d for d in dirs if d["id"] == d1.id)
         assert d1_data["status"] == "superseded"
 
+    def test_scope(self, project):
+        d1 = ComposeDirective.create("global", "Target audience is executives")
+        d1 = add_directive(project.id, d1)
+        d2 = ComposeDirective.create("global", "Target audience is engineers")
+        d2 = add_directive(project.id, d2)
+
+        conflicts = detect_conflicts(project.id, d2)
+        assert len(conflicts) == 1
+
+        result = resolve_conflict(project.id, conflicts[0].id, "scope")
+        assert result["resolved"] is True
+        assert result["action"] == "scope"
+
+        # Both directives should remain active (scope keeps both active)
+        dirs = get_directives(project.id)
+        d1_data = next(d for d in dirs if d["id"] == d1.id)
+        d2_data = next(d for d in dirs if d["id"] == d2.id)
+        assert d1_data["status"] == "active"
+        assert d2_data["status"] == "active"
+
+        # Conflict should be resolved
+        pending = get_pending_conflicts(project.id)
+        assert len(pending) == 0
+
     def test_keep_both(self, project):
         d1 = ComposeDirective.create("global", "Target audience is executives")
         d1 = add_directive(project.id, d1)

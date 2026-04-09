@@ -6,8 +6,9 @@ SocketIO event emission for real-time updates.
 """
 
 import logging
+import uuid
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 
 from ..compose.models import (
     ComposeProject, ComposeSection, ComposeConflict, ComposeDirective,
@@ -113,9 +114,52 @@ def create_project():
     pdir = scaffold_project(project)
 
     logger.info("Created compose project %s at %s", project.id, pdir)
+
+    # --- NB-7: Auto-create root session ---
+    try:
+        from ..compose.prompt_builder import build_compose_prompt, link_session
+
+        compose_task_id = f"root:{project.id}"
+        session_id = uuid.uuid4().hex
+
+        prompt_result = build_compose_prompt(compose_task_id)
+        root_system_prompt = None
+        if prompt_result.get('ok'):
+            root_system_prompt = prompt_result.get('system_prompt')
+
+        sm = current_app.session_manager
+        result = sm.start_session(
+            session_id=session_id,
+            prompt="",
+            cwd=str(pdir),
+            name=name + " (root)",
+            system_prompt=root_system_prompt,
+        )
+
+        if result and not (isinstance(result, dict) and result.get('error')):
+            link_session(compose_task_id, session_id)
+            logger.info(
+                "Auto-created root session %s for project %s",
+                session_id, project.id,
+            )
+        else:
+            logger.warning(
+                "Root session start returned error for project %s: %s",
+                project.id, result,
+            )
+    except Exception:
+        logger.warning(
+            "Failed to auto-create root session for project %s (non-blocking)",
+            project.id, exc_info=True,
+        )
+    # --- End NB-7 ---
+
+    # Re-read project to include root_session_id if link_session updated it
+    updated_project = get_project(project.id) or project
+
     _emit('compose_board_refresh', {'project_id': project.id})
 
-    return jsonify({'ok': True, 'project': project.to_dict()}), 201
+    return jsonify({'ok': True, 'project': updated_project.to_dict()}), 201
 
 
 @bp.route('/projects', methods=['GET'])

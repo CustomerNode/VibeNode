@@ -286,6 +286,8 @@
         <span class="compose-input-target-label">Talking to:</span>
         <span id="compose-input-target-name" class="compose-input-target-name">composition</span>
       </div>
+      <!-- NB-11: Section cards board area -->
+      <div id="compose-sections-board" class="compose-sections-board"></div>
       <script>
       (function(){
         if ((localStorage.getItem('viewMode') || '') === 'compose') {
@@ -542,8 +544,7 @@
 <script src="{{ versioned_static('js/kanban.js') }}"></script>
 <script src="{{ versioned_static('js/kanban-report.js') }}"></script>
 <script src="{{ versioned_static('js/kanban-planner.js') }}"></script>
-<script src="{{ versioned_static('js/compose.js') }}"></script>
-<script src="{{ versioned_static('js/compose-planner.js') }}"></script>
+<!-- compose.js and compose-planner.js: compose logic currently lives in app.js -->
 <script src="{{ versioned_static('js/link-picker.js') }}"></script>
 <script src="{{ versioned_static('js/sessions.js') }}"></script>
 <script src="{{ versioned_static('js/toolbar.js') }}"></script>

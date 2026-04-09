@@ -8709,6 +8709,28 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
   color: #4ecdc4;
 }
 
+/* --- NB-11: Compose sections board --- */
+.compose-sections-board {
+  flex: 1;
+  overflow: auto;
+  min-height: 0;
+}
+.compose-empty-board {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60px 20px;
+  text-align: center;
+}
+.compose-card-selected {
+  outline: 1.5px solid #4ecdc4;
+  outline-offset: -1px;
+}
+[data-theme="light"] .compose-card-selected {
+  outline-color: #2ba89e;
+}
+
 /* Sidebar compose session grouping */
 .compose-session-group {
   margin-bottom: 4px;

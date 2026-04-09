@@ -65,7 +65,7 @@
 - **Senior Coder:** PASS. compose_task_id format is clean and parseable. Prompt templates inject current context (sections, facts, directives, conflicts).
 
 ### Non-blocking issues logged:
-- NB-7: Root session does not auto-create when project is created (spec says it should). Would require daemon_client integration to spawn a session programmatically. Deferred.
+- ~~NB-7: Root session does not auto-create when project is created.~~ **RESOLVED** — create_project() now auto-spawns root session via daemon_client. Failure is non-blocking.
 
 ## Step 6: Directive Conflict Detection & Resolution
 **Files modified:** `app/compose/conflict_detector.py` (replaced stub with full implementation)
@@ -102,8 +102,8 @@
 - **Senior Coder:** PASS. Follows existing patterns (socket event handlers, viewMode checks). No circular dependencies. CSS uses teal accent consistently.
 
 ### Non-blocking issues logged:
-- NB-10: Sidebar session grouping (getComposeSessionGroups) is defined but not yet called from renderList. The session list renderer would need modification to use it when in compose mode.
-- NB-11: initCompose could pre-populate the skeleton board with real section cards. Currently only fetches data and renders the header.
+- ~~NB-10: Sidebar session grouping (getComposeSessionGroups) is defined but not yet called from renderList.~~ **RESOLVED** — renderList now uses compose grouping when viewMode === 'compose'.
+- ~~NB-11: initCompose could pre-populate the skeleton board with real section cards.~~ **RESOLVED** — _renderComposeSectionCards() renders status-column cards with click selection.
 
 ## Step 9: Tests
 **Files created:** `tests/test_compose_models.py`, `tests/test_compose_context.py`, `tests/test_compose_conflicts.py`, `tests/test_compose_api.py`
@@ -143,13 +143,13 @@ Full end-to-end flow verified:
 | NB-1 | project_dir() scans folders linearly. Add caching for >100 projects. | Low |
 | NB-2 | No file locking on project.json writes (only context gets locked). | Low |
 | NB-3 | Board endpoint falls back to most recent project. Add explicit active-project tracking. | Medium |
-| NB-7 | Root session does not auto-create on project creation. Needs daemon_client integration. | High |
+| NB-7 | ~~Root session does not auto-create on project creation.~~ **RESOLVED** — auto-creates via daemon_client in create_project(). | ~~High~~ Done |
 | NB-5 | Watcher polls at 1s. Could use watchdog for lower latency. | Low |
 | NB-6 | Watcher emits compose_changing on every poll cycle for flagged sections. | Low |
 | NB-8 | Conflict detection heuristic (word overlap) may produce false positives. Refine with LLM. | Medium |
 | NB-9 | Resolution directive has predictable id format. | Low |
-| NB-10 | Sidebar session grouping defined but not wired into renderList. | Medium |
-| NB-11 | initCompose doesn't populate section cards in the board yet. | Medium |
+| NB-10 | ~~Sidebar session grouping defined but not wired into renderList.~~ **RESOLVED** — renderList calls getComposeSessionGroups in compose mode. | ~~Medium~~ Done |
+| NB-11 | ~~initCompose doesn't populate section cards in the board yet.~~ **RESOLVED** — _renderComposeSectionCards() renders cards in status columns. | ~~Medium~~ Done |
 
 ## Files Created/Modified
 
@@ -165,8 +165,10 @@ Full end-to-end flow verified:
 - `tests/test_compose_api.py` - 26 API endpoint tests
 
 ### Modified
-- `app/routes/compose_api.py` - Replaced stub with 15 real endpoints
+- `app/routes/compose_api.py` - Replaced stub with 15 real endpoints; NB-7: added root session auto-creation in create_project()
 - `app/compose_watcher.py` - Replaced stub with real file watcher
-- `templates/index.html` - Added root header bar and input target HTML
-- `static/js/app.js` - Added initCompose, compose state management, socket handlers
-- `static/style.css` - Added root header, input target, sidebar grouping styles
+- `templates/index.html` - Added root header bar, input target HTML, NB-11: compose-sections-board container
+- `static/js/app.js` - Added initCompose, compose state management, socket handlers; NB-11: _renderComposeSectionCards()
+- `static/js/sessions.js` - NB-10: extracted _renderSessionRow(), added compose grouping to renderList()
+- `static/style.css` - Added root header, input target, sidebar grouping styles; NB-11: compose-sections-board, compose-card-selected
+- `tests/test_compose_deferred.py` - 5 NB-7 tests for root session auto-creation

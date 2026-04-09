@@ -1677,6 +1677,7 @@ async function initCompose() {
 
     _updateComposeRootHeader();
     _updateComposeInputTarget();
+    _renderComposeSectionCards();
 
     // Set default compose_task_id to root
     composeDetailTaskId = 'root:' + _composeProject.id;
@@ -1730,6 +1731,84 @@ function _updateComposeRootHeader() {
     }
   }
 }
+
+// --- NB-11: Render section cards in compose board ---
+
+const COMPOSE_STATUS_COLUMNS = [
+  { key: 'not_started', label: 'Not Started', color: '#8b949e' },
+  { key: 'working',     label: 'Working',     color: '#4ecdc4' },
+  { key: 'complete',    label: 'Complete',     color: '#3fb950' },
+];
+
+const COMPOSE_ARTIFACT_ICONS = {
+  text:    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>',
+  code:    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>',
+  data:    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
+  default: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>',
+};
+
+function _renderComposeSectionCards() {
+  const board = document.getElementById('compose-sections-board');
+  if (!board) return;
+
+  if (!_composeSections || _composeSections.length === 0) {
+    board.innerHTML = `
+      <div class="compose-empty-board">
+        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.5" stroke-linecap="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
+        </svg>
+        <div style="font-size:14px;font-weight:500;color:var(--text);margin:8px 0 4px;">No sections yet</div>
+        <div style="font-size:12px;color:var(--text-muted);">Create one to get started.</div>
+      </div>`;
+    return;
+  }
+
+  let html = '<div class="kanban-columns-wrapper compose-columns-wrapper">';
+
+  for (const col of COMPOSE_STATUS_COLUMNS) {
+    const colSections = _composeSections.filter(s => s.status === col.key);
+    html += `<div class="kanban-column compose-column" data-status="${col.key}">
+      <div class="kanban-column-header">
+        <div class="kanban-column-color-bar" style="background:${col.color};"></div>
+        <span class="kanban-column-name">${col.label}</span>
+        <span class="kanban-column-count">${colSections.length}</span>
+      </div>
+      <div class="kanban-column-body" data-status="${col.key}">`;
+
+    for (const sec of colSections) {
+      const artifactIcon = COMPOSE_ARTIFACT_ICONS[sec.artifact_type] || COMPOSE_ARTIFACT_ICONS.default;
+      const changingDot = sec.changing
+        ? `<span class="compose-changing-dot" title="${typeof escHtml === 'function' ? escHtml(sec.change_note || 'Change in progress') : (sec.change_note || 'Change in progress')}"></span>`
+        : '';
+      const summary = sec.summary
+        ? `<div class="compose-card-summary">${typeof escHtml === 'function' ? escHtml(sec.summary) : sec.summary}</div>`
+        : '';
+      const selectedClass = (_composeSelectedSection === sec.id) ? ' compose-card-selected' : '';
+
+      html += `<div class="kanban-card compose-card${selectedClass}" data-section-id="${sec.id}" onclick="composeSelectSection('${sec.id}')">
+        <div class="compose-card-header">
+          <span class="compose-card-artifact-icon">${artifactIcon}</span>
+          <div class="compose-card-title-row">
+            <span class="compose-card-title">${typeof escHtml === 'function' ? escHtml(sec.name) : sec.name}</span>
+            ${changingDot}
+          </div>
+        </div>
+        <div class="compose-card-meta">
+          <span class="compose-card-status" style="background:${col.color}22;color:${col.color};">${col.label}</span>
+          ${sec.artifact_type ? '<span class="compose-card-time">' + sec.artifact_type + '</span>' : ''}
+        </div>
+        ${summary}
+      </div>`;
+    }
+
+    html += '</div></div>';
+  }
+
+  html += '</div>';
+  board.innerHTML = html;
+}
+
+// --- End NB-11 ---
 
 function _updateComposeInputTarget() {
   const nameEl = document.getElementById('compose-input-target-name');
@@ -1790,18 +1869,25 @@ function _composeOnContextUpdated(data) {
   if (ctx.conflicts) {
     _composeConflicts = ctx.conflicts.filter(c => c.status === 'pending');
   }
+  // If the selected section was deleted, fall back to root
+  if (_composeSelectedSection && !_composeSections.find(s => s.id === _composeSelectedSection)) {
+    _composeSelectedSection = null;
+  }
   _updateComposeRootHeader();
+  _updateComposeInputTarget();
+  _renderComposeSectionCards();
 }
 
 function _composeOnChanging(data) {
   if (viewMode !== 'compose') return;
-  // Update the section in local state
+  // Update the section in local state and re-render cards
   if (data && data.section_id) {
     const sec = _composeSections.find(s => s.id === data.section_id);
     if (sec) {
       sec.changing = data.changing;
       sec.change_note = data.change_note || null;
     }
+    _renderComposeSectionCards();
   }
 }
 

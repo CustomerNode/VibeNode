@@ -9,6 +9,7 @@ for deserialization.
 import json
 import os
 import shutil
+import tempfile
 import uuid
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
@@ -442,14 +443,23 @@ def get_project(project_id: str) -> Optional[ComposeProject]:
 
 
 def save_project(project: ComposeProject) -> None:
-    """Persist project metadata to project.json."""
+    """Persist project metadata to project.json (atomic write)."""
     pdir = project_dir(project.id)
     pf = pdir / "project.json"
     if pf.parent.is_dir():
-        pf.write_text(
-            json.dumps(project.to_dict(), indent=2, ensure_ascii=False),
-            encoding="utf-8",
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(pdir), suffix=".tmp", prefix=".proj-"
         )
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(project.to_dict(), f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, str(pf))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
 
 def get_sections(project_id: str) -> list:

@@ -27,6 +27,34 @@ function sortedSessions(sessions) {
   return copy;
 }
 
+function _renderSessionRow(s, extraClass) {
+  const status = getSessionStatus(s.id);
+  const isWaiting = status === 'question';
+  const isRunning = status === 'working';
+  const isIdle = status === 'idle';
+  const stateClass = isWaiting ? ' waiting' : (isRunning || isIdle ? ' running' : '');
+  const activeClass = s.id === activeId ? ' active' : '';
+  const colClick = `onclick="singleOrDouble('${s.id}',event)" style="cursor:pointer;"`;
+  const _isCompacting = isRunning && window._sessionSubstatus && window._sessionSubstatus[s.id] === 'compacting';
+  const icon = isWaiting
+    ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2" stroke-linecap="round" title="Waiting for input"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>'
+    : _isCompacting
+    ? '<svg class="state-icon compacting-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#aa88ff" stroke-width="2" stroke-linecap="round" title="Compacting context"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>'
+    : isRunning
+    ? '<img class="state-icon" src="/static/svg/pickaxe.svg" width="12" height="12" style="filter:brightness(0) saturate(100%) invert(55%) sepia(78%) saturate(1000%) hue-rotate(215deg);" title="Working">'
+    : isIdle
+    ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#44aa66" stroke-width="2" stroke-linecap="round" title="Idle"><polyline points="20 6 9 17 4 12"/></svg>'
+    : '';
+  return `
+  <div class="session-item${activeClass}${stateClass}${extraClass || ''}" data-sid="${s.id}" oncontextmenu="sessionContextMenu(event,'${s.id}')">
+    <div class="session-col-name" onclick="handleNameClick('${s.id}')" style="cursor:text;" title="Click to rename">
+      ${icon}${escHtml(s.display_title)}${_autoNamingInFlight.has(s.id) ? '<span class="naming-badge"><span class="naming-dot"></span>Naming\u2026</span>' : ''}
+    </div>
+    <div class="session-col-date" ${colClick} title="${escHtml(s.last_activity)}">${escHtml(_shortDate(s.last_activity))}</div>
+    <div class="session-col-size" ${colClick}>${escHtml(s.size)}</div>
+  </div>`;
+}
+
 function renderList(sessions) {
   const el = document.getElementById('session-list');
   if (!sessions.length) {
@@ -50,33 +78,42 @@ function renderList(sessions) {
       </div>
     </div>`;
 
-  const rows = sessions.map(s => {
-    const status = getSessionStatus(s.id);
-    const isWaiting = status === 'question';
-    const isRunning = status === 'working';
-    const isIdle = status === 'idle';
-    const stateClass = isWaiting ? ' waiting' : (isRunning || isIdle ? ' running' : '');
-    const activeClass = s.id === activeId ? ' active' : '';
-    const colClick = `onclick="singleOrDouble('${s.id}',event)" style="cursor:pointer;"`;
-    const _isCompacting = isRunning && window._sessionSubstatus && window._sessionSubstatus[s.id] === 'compacting';
-    const icon = isWaiting
-      ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2" stroke-linecap="round" title="Waiting for input"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>'
-      : _isCompacting
-      ? '<svg class="state-icon compacting-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#aa88ff" stroke-width="2" stroke-linecap="round" title="Compacting context"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>'
-      : isRunning
-      ? '<img class="state-icon" src="/static/svg/pickaxe.svg" width="12" height="12" style="filter:brightness(0) saturate(100%) invert(55%) sepia(78%) saturate(1000%) hue-rotate(215deg);" title="Working">'
-      : isIdle
-      ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#44aa66" stroke-width="2" stroke-linecap="round" title="Idle"><polyline points="20 6 9 17 4 12"/></svg>'
-      : '';
-    return `
-    <div class="session-item${activeClass}${stateClass}" data-sid="${s.id}" oncontextmenu="sessionContextMenu(event,'${s.id}')">
-      <div class="session-col-name" onclick="handleNameClick('${s.id}')" style="cursor:text;" title="Click to rename">
-        ${icon}${escHtml(s.display_title)}${_autoNamingInFlight.has(s.id) ? '<span class="naming-badge"><span class="naming-dot"></span>Naming\u2026</span>' : ''}
-      </div>
-      <div class="session-col-date" ${colClick} title="${escHtml(s.last_activity)}">${escHtml(_shortDate(s.last_activity))}</div>
-      <div class="session-col-size" ${colClick}>${escHtml(s.size)}</div>
-    </div>`;
-  }).join('');
+  // --- NB-10: Compose session grouping ---
+  if (typeof viewMode !== 'undefined' && viewMode === 'compose' && typeof getComposeSessionGroups === 'function') {
+    const grouped = getComposeSessionGroups(sessions);
+    if (grouped && grouped.groups && grouped.groups.length > 0) {
+      let rows = '';
+      for (const group of grouped.groups) {
+        // Group header (uses existing CSS class)
+        rows += `<div class="compose-session-group-header">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+          ${escHtml(group.name)}
+        </div>`;
+        // Root session first with left border accent
+        if (group.root) {
+          rows += _renderSessionRow(group.root, ' compose-session-root');
+        }
+        // Section sessions indented
+        for (const s of group.sections) {
+          rows += _renderSessionRow(s, ' compose-session-section');
+        }
+      }
+      // Other sessions below with separator
+      if (grouped.other && grouped.other.length > 0) {
+        rows += '<div class="compose-session-other-sep" style="height:1px;background:var(--border,#30363d);margin:6px 12px;opacity:0.5;"></div>';
+        for (const s of grouped.other) {
+          rows += _renderSessionRow(s, '');
+        }
+      }
+      el.innerHTML = header + rows;
+      initColResize();
+      attachTooltipListeners();
+      return;
+    }
+  }
+  // --- End NB-10 ---
+
+  const rows = sessions.map(s => _renderSessionRow(s, '')).join('');
 
   el.innerHTML = header + rows;
   initColResize();
