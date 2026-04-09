@@ -211,3 +211,9 @@ This separation means **VibeNode can code itself** — multiple Claude sessions 
 - Sessions are read from `~/.claude/projects/`
 - Session input is managed through the Claude Code SDK
 - VibeNode itself stores everything locally. Claude Code sessions communicate with Anthropic's API as usual. Enabling Supabase cloud storage for tasks is optional.
+
+---
+
+Actively maintained by [CustomerNode LLC](https://customernode.com).
+
+Building something complex and need to sell it? CustomerNode turns complex deals into executable journeys. Check us out at [customernode.com](https://customernode.com).
