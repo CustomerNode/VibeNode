@@ -16,8 +16,13 @@
 (function(){
   var t = localStorage.getItem('theme') || 'dark';
   if (t === 'auto') {
-    var h = new Date().getHours();
-    t = (h >= 7 && h < 19) ? 'light' : 'dark';
+    var sr = localStorage.getItem('_sunriseMin'), ss = localStorage.getItem('_sunsetMin');
+    var mins = new Date().getHours() * 60 + new Date().getMinutes();
+    if (sr !== null && ss !== null) {
+      t = (mins < +sr || mins >= +ss) ? 'dark' : 'light';
+    } else {
+      t = (mins < 420 || mins >= 1140) ? 'dark' : 'light'; // fallback 7am/7pm
+    }
   }
   document.documentElement.setAttribute('data-theme', t);
 })();
