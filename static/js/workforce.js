@@ -154,9 +154,9 @@ function _setViewModeImmediate(mode, prevMode) {
     liveSessionId = null;
     localStorage.removeItem('activeSessionId');
     if (typeof resetComposeState === 'function') resetComposeState();
-    if (composeEl) { composeEl.style.display = 'none'; composeEl.innerHTML = ''; }
+    if (composeEl) { composeEl.style.display = 'none'; }
     const composeSidebar = document.getElementById('compose-sidebar');
-    if (composeSidebar) { composeSidebar.style.display = 'none'; composeSidebar.innerHTML = ''; }
+    if (composeSidebar) { composeSidebar.style.display = 'none'; }
     const csPermPanel = document.getElementById('sidebar-perm-panel');
     if (csPermPanel) { csPermPanel.style.display = 'none'; csPermPanel.innerHTML = ''; }
     document.getElementById('main-body').style.display = '';
