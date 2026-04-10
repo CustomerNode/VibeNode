@@ -110,7 +110,7 @@ See [FileTaskNode](https://github.com/CustomerNode/FileTaskNode) for an example 
 ```bash
 git clone https://github.com/CustomerNode/VibeNode.git
 cd VibeNode
-pip install flask
+pip install -r requirements.txt
 ```
 
 ### 2. Run
