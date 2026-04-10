@@ -52,11 +52,15 @@ def get_board():
     """
     try:
         project_id = request.args.get('project_id', '').strip()
+        parent = request.args.get('project', '').strip()
 
         if project_id:
             project = get_project(project_id)
         else:
             projects = list_projects()
+            # Filter by parent VibeNode project if specified
+            if parent:
+                projects = [p for p in projects if p.parent_project == parent]
             project = projects[-1] if projects else None
 
         if not project:
@@ -110,7 +114,9 @@ def create_project():
     if not name:
         return jsonify({'ok': False, 'error': 'name is required'}), 400
 
-    project = ComposeProject.create(name)
+    from ..config import get_active_project
+    parent_project = data.get('parent_project') or get_active_project() or None
+    project = ComposeProject.create(name, parent_project=parent_project)
     pdir = scaffold_project(project)
 
     logger.info("Created compose project %s at %s", project.id, pdir)

@@ -1720,7 +1720,9 @@ let _composeSelectedSection = null; // currently selected section id (null = roo
  */
 async function initCompose() {
   try {
-    const resp = await fetch('/api/compose/board');
+    const _proj = localStorage.getItem('activeProject') || '';
+    const _projQ = _proj ? '?project=' + encodeURIComponent(_proj) : '';
+    const resp = await fetch('/api/compose/board' + _projQ);
     const data = await resp.json();
     if (!data || !data.project) {
       _renderComposeEmpty();
@@ -1819,7 +1821,7 @@ async function _submitComposeProject() {
     const resp = await fetch('/api/compose/projects', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({name}),
+      body: JSON.stringify({name, parent_project: localStorage.getItem('activeProject') || ''}),
     });
     if (!resp.ok) throw new Error('Server error (' + resp.status + ')');
     const data = await resp.json();

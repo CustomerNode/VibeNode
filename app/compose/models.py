@@ -77,6 +77,7 @@ class ComposeProject:
     created_at: str
     root_session_id: Optional[str] = None
     shared_prompts_enabled: bool = True
+    parent_project: Optional[str] = None  # VibeNode project path this belongs to
 
     def to_dict(self):
         return asdict(self)
@@ -89,15 +90,17 @@ class ComposeProject:
             created_at=d["created_at"],
             root_session_id=d.get("root_session_id"),
             shared_prompts_enabled=d.get("shared_prompts_enabled", True),
+            parent_project=d.get("parent_project"),
         )
 
     @classmethod
-    def create(cls, name):
+    def create(cls, name, parent_project=None):
         """Factory: create a new project with generated id and timestamp."""
         return cls(
             id=str(uuid.uuid4()),
             name=name,
             created_at=datetime.now(timezone.utc).isoformat(),
+            parent_project=parent_project,
         )
 
 

@@ -354,13 +354,13 @@ function _sessCtx(action, sessionId) {
       openTaskPickerModal(sessionId, 'workflow');
       break;
     case 'link-compose':
-      openTaskPickerModal(sessionId, 'compose');
+      _composeLinkPicker(sessionId);
       break;
     case 'create-workflow':
       createWorkflowTaskFromSession(sessionId);
       break;
     case 'create-compose':
-      createComposeSectionFromSession(sessionId);
+      _composePickerFromSession(sessionId);
       break;
     case 'continue':
       continueSession(sessionId);
@@ -380,5 +380,184 @@ function _sessCtx(action, sessionId) {
     case 'delete':
       deleteSession(sessionId);
       break;
+  }
+}
+
+// --- Create Compose Section from Session ---
+
+async function _composePickerFromSession(sessionId) {
+  const overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+
+  // Fetch available compose projects for the active VibeNode project
+  const _proj = localStorage.getItem('activeProject') || '';
+  let projects = [];
+  try {
+    const resp = await fetch('/api/compose/projects');
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.ok) {
+        projects = (data.projects || []).filter(function(p) {
+          return !_proj || !p.parent_project || p.parent_project === _proj;
+        });
+      }
+    }
+  } catch (e) {}
+
+  if (projects.length === 0) {
+    if (typeof showToast === 'function') showToast('No compositions yet. Create one in the Compose view first.', 'error');
+    return;
+  }
+
+  // Build picker modal
+  let html = '<div class="pm-card pm-enter" style="max-width:480px;">';
+  html += '<h2 class="pm-title">Add to Composition</h2>';
+  html += '<div class="pm-body" style="padding:0;">';
+
+  html += '<div class="kanban-create-section">';
+  html += '<div class="kanban-create-section-label">Choose composition</div>';
+
+  for (var i = 0; i < projects.length; i++) {
+    var p = projects[i];
+    html += '<div class="kanban-drill-chooser-card" style="cursor:pointer;" data-project-id="' + p.id + '" onclick="_composePickerSelectProject(\'' + sessionId + '\',\'' + p.id + '\',this)">';
+    html += '<div class="kanban-drill-chooser-icon" style="color:var(--accent);"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg></div>';
+    html += '<div><div class="kanban-drill-chooser-title">' + (typeof escHtml === 'function' ? escHtml(p.name) : p.name) + '</div>';
+    html += '<div class="kanban-drill-chooser-desc">Add a new section and link this session to it</div></div>';
+    html += '</div>';
+  }
+
+  html += '</div>';
+  html += '</div></div>';
+
+  overlay.innerHTML = html;
+  overlay.classList.add('show');
+  requestAnimationFrame(function() {
+    var card = overlay.querySelector('.pm-card');
+    if (card) card.classList.remove('pm-enter');
+  });
+  overlay.onclick = function(e) { if (e.target === overlay) _closePm(); };
+}
+
+async function _composePickerSelectProject(sessionId, projectId, el) {
+  // Get session info for default name
+  var sess = (typeof allSessions !== 'undefined') ? allSessions.find(function(s) { return s.id === sessionId; }) : null;
+  var defaultName = sess ? (sess.custom_title || sess.display_title || 'New Section') : 'New Section';
+
+  var name = prompt('Section name:', defaultName);
+  if (!name || !name.trim()) return;
+
+  _closePm();
+
+  try {
+    var resp = await fetch('/api/compose/projects/' + projectId + '/sections', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name.trim(), artifact_type: 'text'}),
+    });
+    if (!resp.ok) throw new Error('Failed to create section');
+    var data = await resp.json();
+    if (!data || !data.ok) throw new Error(data.error || 'Failed');
+
+    var sectionId = data.section.id;
+
+    // Link the session to the new section
+    await fetch('/api/compose/projects/' + projectId + '/sections/' + sectionId, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({session_id: sessionId}),
+    });
+
+    if (typeof showToast === 'function') showToast('Created section "' + name.trim() + '" and linked session');
+  } catch (e) {
+    console.error('Failed to create compose section from session:', e);
+    if (typeof showToast === 'function') showToast('Failed to create section', 'error');
+  }
+}
+
+// --- Link session to existing compose section ---
+
+async function _composeLinkPicker(sessionId) {
+  const overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+
+  // Fetch compose projects and their sections
+  const _proj = localStorage.getItem('activeProject') || '';
+  let projects = [];
+  try {
+    const resp = await fetch('/api/compose/projects');
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.ok) {
+        projects = (data.projects || []).filter(function(p) {
+          return !_proj || !p.parent_project || p.parent_project === _proj;
+        });
+      }
+    }
+  } catch (e) {}
+
+  if (projects.length === 0) {
+    if (typeof showToast === 'function') showToast('No compositions yet. Create one in the Compose view first.', 'error');
+    return;
+  }
+
+  // For each project, fetch its sections
+  let allEntries = [];
+  for (const p of projects) {
+    try {
+      const bResp = await fetch('/api/compose/board?project_id=' + encodeURIComponent(p.id));
+      if (bResp.ok) {
+        const bData = await bResp.json();
+        if (bData && bData.sections) {
+          for (const sec of bData.sections) {
+            allEntries.push({project: p, section: sec});
+          }
+        }
+      }
+    } catch (e) {}
+  }
+
+  if (allEntries.length === 0) {
+    if (typeof showToast === 'function') showToast('No sections found. Use "Create Compose Section" instead.', 'error');
+    return;
+  }
+
+  let html = '<div class="pm-card pm-enter" style="max-width:480px;">';
+  html += '<h2 class="pm-title">Link to Compose Section</h2>';
+  html += '<div class="pm-body" style="padding:0;">';
+  html += '<div class="kanban-create-section">';
+  html += '<div class="kanban-create-section-label">Choose section</div>';
+
+  for (const entry of allEntries) {
+    const sec = entry.section;
+    const pName = entry.project.name;
+    html += '<div class="kanban-drill-chooser-card" style="cursor:pointer;" onclick="_composeLinkSession(\'' + sessionId + '\',\'' + entry.project.id + '\',\'' + sec.id + '\')">';
+    html += '<div style="display:flex;flex-direction:column;gap:2px;"><div class="kanban-drill-chooser-title">' + (typeof escHtml === 'function' ? escHtml(sec.name) : sec.name) + '</div>';
+    html += '<div class="kanban-drill-chooser-desc">' + (typeof escHtml === 'function' ? escHtml(pName) : pName) + ' &middot; ' + (sec.status || 'not_started') + (sec.session_id ? ' &middot; has session' : '') + '</div></div>';
+    html += '</div>';
+  }
+
+  html += '</div></div></div>';
+
+  overlay.innerHTML = html;
+  overlay.classList.add('show');
+  requestAnimationFrame(function() {
+    var card = overlay.querySelector('.pm-card');
+    if (card) card.classList.remove('pm-enter');
+  });
+  overlay.onclick = function(e) { if (e.target === overlay) _closePm(); };
+}
+
+async function _composeLinkSession(sessionId, projectId, sectionId) {
+  _closePm();
+  try {
+    await fetch('/api/compose/projects/' + projectId + '/sections/' + sectionId, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({session_id: sessionId}),
+    });
+    if (typeof showToast === 'function') showToast('Session linked to section');
+  } catch (e) {
+    console.error('Failed to link session:', e);
+    if (typeof showToast === 'function') showToast('Failed to link session', 'error');
   }
 }
