@@ -12,7 +12,7 @@ from selenium.webdriver.chrome.options import Options
 
 BASE = "http://localhost:5050"
 SCREENSHOT_DIR = "docs/screenshots"
-PROJECT = "C--Users-15512-Documents-VibeNode"
+PROJECT = str(os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))).replace("\\", "-").replace("/", "-").replace(":", "-")
 
 # ---------------------------------------------------------------------------
 # Reusable SVG icons (match KI in kanban.js)

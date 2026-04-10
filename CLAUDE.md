@@ -1,5 +1,19 @@
 # VibeNode Project Rules
 
+## PUBLIC REPOSITORY — CRITICAL
+
+VibeNode is an **open-source public repository on GitHub**. Everything you commit will be published to the web. Some developers working on this project are non-technical and use a one-click "Update" button in the UI that commits and pushes — they will not manually review diffs before publishing.
+
+**You must treat every file change as if it will be immediately visible to the entire internet.**
+
+- **NEVER** put secrets, API keys, tokens, passwords, or credentials in any tracked file. Use environment variables or gitignored config files (`kanban_config.json`, `.env`).
+- **NEVER** hardcode personal paths, usernames, emails, or any personally identifiable information. Derive paths dynamically (e.g. `Path(__file__).resolve().parents[1]`, `os.getcwd()`).
+- **NEVER** commit user data, runtime artifacts, logs, database files, test screenshots, or local state. These belong in gitignored directories.
+- **NEVER** commit planning docs, specs, implementation notes, or working documents to tracked directories. Use `docs/plans/` which is gitignored.
+- **If it's even borderline** — if you're not 100% sure something is safe to publish — **ASK the user before committing it.** Do not guess. Do not assume. Ask.
+
+Review the `.gitignore` before creating new files in unfamiliar directories. If a new category of file doesn't have a gitignore rule, add one.
+
 ## Server restarts — CRITICAL RULES
 
 ### You must have explicit permission FIRST

@@ -23,8 +23,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 BASE_URL = "http://127.0.0.1:5050"
-PROJECT_DIR = Path("C:/Users/15512/Documents/VibeNode")
-SESSIONS_DIR = Path.home() / ".claude" / "projects" / "C--Users-15512-Documents-VibeNode"
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+_ENCODED_PROJECT = str(PROJECT_DIR).replace("\\", "-").replace("/", "-").replace(":", "-")
+SESSIONS_DIR = Path.home() / ".claude" / "projects" / _ENCODED_PROJECT
 
 SCRATCH_FILE = PROJECT_DIR / "tests" / "_scratch_rewind_test.py"
 SCRATCH_ORIGINAL = "# scratch file for rewind E2E test\nx = 1\n"
@@ -159,7 +160,7 @@ class TestRewindE2E:
             EC.presence_of_element_located((By.TAG_NAME, "header"))
         )
         driver.execute_script(
-            "localStorage.setItem('activeProject', 'C--Users-15512-Documents-VibeNode')"
+            f"localStorage.setItem('activeProject', '{_ENCODED_PROJECT}')"
         )
         driver.get(BASE_URL)
         WebDriverWait(driver, 15).until(
@@ -263,7 +264,7 @@ class TestRewindE2E:
 
         # Navigate to that session
         driver.execute_script(
-            f"localStorage.setItem('activeProject', 'C--Users-15512-Documents-VibeNode');"
+            f"localStorage.setItem('activeProject', '{_ENCODED_PROJECT}');"
             f"localStorage.setItem('activeSessionId', '{sid}')"
         )
         driver.get(BASE_URL)

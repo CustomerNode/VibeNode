@@ -873,7 +873,7 @@ def scene_workflow(dur):
         "complete":    "beac1603-a80c-4f93-8e32-49c167114dfb",
     }
 
-    PROJECT_ID = "C--Users-15512-Documents-VibeNode"
+    PROJECT_ID = str(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))).replace("\\", "-").replace("/", "-").replace(":", "-")
     TS = "2026-04-04T14:00:00+00:00"
 
     def _task(tid, title, status, desc="", parent_id=None, depth=0,

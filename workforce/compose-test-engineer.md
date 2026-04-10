@@ -60,7 +60,7 @@ Tests: pytest in `tests/`. Flask test client for API tests. No Selenium/browser 
 
 1. **Read the spec or change description** you're reviewing. Understand what "done" means.
 2. **Read the actual code** that was written. Every file modified, in full. Do not trust summaries.
-3. **Run existing tests** first: `cd C:/Users/donca/Documents/VibeNode && python -m pytest tests/test_compose*.py -v`
+3. **Run existing tests** first: `python -m pytest tests/test_compose*.py -v`
 4. **For each requirement**, determine how to verify it:
    - If a test exists, confirm it actually tests what it claims
    - If no test exists, write one and save it to `tests/`

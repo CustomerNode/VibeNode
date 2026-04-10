@@ -1,4 +1,4 @@
-import sys, io, time
+import sys, io, time, os
 sys.stdout=io.TextIOWrapper(sys.stdout.buffer,encoding="utf-8",errors="replace")
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -8,7 +8,8 @@ driver=webdriver.Chrome(options=opts)
 try:
  driver.get("http://localhost:5050")
  time.sleep(2)
- driver.execute_script("localStorage.setItem(\"activeProject\",\"C--Users-15512-Documents-VibeNode\");localStorage.setItem(\"theme\",\"dark\");localStorage.setItem(\"viewMode\",\"grid\");")
+ _proj = str(os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))).replace("\\","-").replace("/","-").replace(":","-")
+ driver.execute_script(f"localStorage.setItem(\"activeProject\",\"{_proj}\");localStorage.setItem(\"theme\",\"dark\");localStorage.setItem(\"viewMode\",\"grid\");")
  driver.get("http://localhost:5050")
  time.sleep(5)
  ci=driver.execute_script("var el=document.elementFromPoint(960,540);if(!el)return\"none\";var c=[];var cur=el;while(cur&&cur!==document.documentElement){var cs=getComputedStyle(cur);c.push({t:cur.tagName,i:cur.id||\"_\",cn:(cur.className&&typeof cur.className===\"string\")?cur.className.substring(0,100):\"_\",z:cs.zIndex,p:cs.position,d:cs.display,w:cur.offsetWidth,h:cur.offsetHeight});cur=cur.parentElement;}return c;")

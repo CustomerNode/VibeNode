@@ -58,7 +58,8 @@ def _ttl(t, sid="t"):
     return json.dumps({"type":"custom-title","customTitle":t,"sessionId":sid})
 
 def _fsd():
-    return CP / "C--Users-15512-Documents-VibeNode"
+    _proj = str(Path(__file__).resolve().parents[1]).replace("\\", "-").replace("/", "-").replace(":", "-")
+    return CP / _proj
 
 
 # ---------------------------------------------------------------------------

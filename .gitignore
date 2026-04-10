@@ -1,3 +1,7 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
 # Claude Code local state (personal permissions, worktrees, memory)
 .claude/
 
