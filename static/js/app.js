@@ -1715,24 +1715,55 @@ let _composeSections = [];        // section list
 let _composeConflicts = [];       // pending conflicts
 let composeDetailTaskId = null;   // compose_task_id for session start
 let _composeSelectedSection = null; // currently selected section id (null = root)
+let _activeComposeProjectId = null; // selected composition ID (null = auto-select most recent)
+let _composeProjectsList = [];     // all compositions for the active project
+let _composeInitToken = 0;         // concurrency guard for initCompose()
 
 /**
  * Initialize the compose board — fetch project data and render header.
  * Called by setViewMode('compose') in workforce.js.
  */
 async function initCompose() {
+  const _initToken = ++_composeInitToken;
   try {
     const _proj = localStorage.getItem('activeProject') || '';
-    const _projQ = _proj ? '?project=' + encodeURIComponent(_proj) : '';
-    const resp = await fetch('/api/compose/board' + _projQ);
+
+    // Restore composition selection from localStorage if not already set
+    if (!_activeComposeProjectId && _proj) {
+      _activeComposeProjectId = localStorage.getItem('activeComposition:' + _proj) || null;
+    }
+
+    // Single fetch — board endpoint returns sibling_projects for the sidebar
+    let query = '';
+    if (_activeComposeProjectId) {
+      query = '?project_id=' + encodeURIComponent(_activeComposeProjectId);
+    } else if (_proj) {
+      query = '?project=' + encodeURIComponent(_proj);
+    }
+    const resp = await fetch('/api/compose/board' + query);
+    if (_initToken !== _composeInitToken) return;
     const data = await resp.json();
+
+    // Populate sidebar list from sibling_projects (included in board response)
+    _composeProjectsList = (data && data.sibling_projects) ? data.sibling_projects : [];
+
     if (!data || !data.project) {
+      _activeComposeProjectId = null;
       _renderComposeEmpty();
+      _renderComposeSidebar();
+      attachComposeShortcuts();
       return;
     }
+
     _composeProject = data.project;
+    _activeComposeProjectId = data.project.id;
     _composeSections = data.sections || [];
     _composeConflicts = (data.conflicts || []).filter(c => c.status === 'pending');
+
+    // Persist selection
+    if (_proj) {
+      localStorage.setItem('activeComposition:' + _proj, _activeComposeProjectId);
+    }
 
     // Check if we should restore a section drill-down from URL hash
     if (_restoreComposeSectionFromHash()) {
@@ -1784,7 +1815,6 @@ function _renderComposeEmpty() {
       </div>`;
   }
 
-  _renderComposeSidebar();
 }
 
 function composeCreateProject() {
@@ -1829,6 +1859,10 @@ async function _submitComposeProject() {
     const data = await resp.json();
     if (data && data.ok) {
       showToast('Created composition: ' + name);
+      // Auto-switch to the newly created composition
+      if (data.project && data.project.id) {
+        _activeComposeProjectId = data.project.id;
+      }
       initCompose();
     } else {
       showToast(data.error || 'Failed to create composition', 'error');
@@ -1954,17 +1988,35 @@ function _renderComposeSidebar() {
   const sidebar = document.getElementById('compose-sidebar');
   if (!sidebar) return;
 
-  let html = '<div class="kanban-sidebar-section">';
-  html += '<div class="kanban-sidebar-label">Compose</div>';
+  const _penIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/><rect x="12" y="19" width="9" height="2" rx="1"/></svg>';
+  const _plusIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>';
+  const _refreshIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>';
 
-  if (_composeProject) {
-    html += '<button class="kanban-sidebar-btn" onclick="composeAddSection()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> New Section</button>';
-    html += '<button class="kanban-sidebar-btn" onclick="initCompose()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Refresh</button>';
-  } else {
-    html += '<button class="kanban-sidebar-btn" onclick="composeCreateProject()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> New Composition</button>';
+  // ── Compositions list ──
+  let html = '<div class="kanban-sidebar-section">';
+  html += '<div class="kanban-sidebar-label">Compositions</div>';
+
+  if (_composeProjectsList.length > 0) {
+    for (const cp of _composeProjectsList) {
+      const isActive = cp.id === _activeComposeProjectId;
+      const cls = 'kanban-sidebar-btn' + (isActive ? ' compose-sidebar-active' : '');
+      const name = typeof escHtml === 'function' ? escHtml(cp.name) : cp.name;
+      html += '<button class="' + cls + '" onclick="switchComposition(\'' + cp.id + '\')" oncontextmenu="event.preventDefault();_composeCtxMenu(event,\'' + cp.id + '\')">' + _penIcon + ' ' + name + '</button>';
+    }
   }
 
+  html += '<button class="kanban-sidebar-btn" onclick="composeCreateProject()">' + _plusIcon + ' New Composition</button>';
   html += '</div>';
+
+  // ── Actions ──
+  if (_composeProject) {
+    html += '<div class="kanban-sidebar-section">';
+    html += '<div class="kanban-sidebar-label">Actions</div>';
+    html += '<button class="kanban-sidebar-btn" onclick="composeAddSection()">' + _plusIcon + ' New Section</button>';
+    html += '<button class="kanban-sidebar-btn" onclick="initCompose()">' + _refreshIcon + ' Refresh</button>';
+    html += '</div>';
+  }
+
   sidebar.innerHTML = html;
 
   // Permission aggregator
@@ -1972,6 +2024,118 @@ function _renderComposeSidebar() {
   if (permPanel && typeof _buildPermissionPanel === 'function') {
     permPanel.innerHTML = _buildPermissionPanel();
     permPanel.style.display = '';
+  }
+}
+
+// --- Switch composition ---
+
+function switchComposition(projectId) {
+  if (projectId === _activeComposeProjectId) return;
+  _activeComposeProjectId = projectId;
+  _composeSelectedSection = null;
+  // Persist selection
+  const _proj = localStorage.getItem('activeProject') || '';
+  if (_proj) localStorage.setItem('activeComposition:' + _proj, projectId);
+  // Clear drill-down hash if present
+  const url = new URL(window.location);
+  if (url.hash.startsWith('#compose/')) {
+    url.hash = '#compose';
+    history.replaceState({ view: 'compose' }, '', url.pathname + url.search + '#compose');
+  }
+  initCompose();
+}
+
+// --- Compose context menu (right-click on composition) ---
+
+function _composeCtxMenu(event, projectId) {
+  // Remove any existing context menu
+  const existing = document.getElementById('compose-ctx-menu');
+  if (existing) existing.remove();
+
+  const menu = document.createElement('div');
+  menu.id = 'compose-ctx-menu';
+  menu.className = 'compose-ctx-menu';
+  menu.style.left = event.clientX + 'px';
+  menu.style.top = event.clientY + 'px';
+
+  const renameIcon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>';
+  const deleteIcon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
+
+  menu.innerHTML =
+    '<div class="compose-ctx-item" onclick="_composeRename(\'' + projectId + '\')">' + renameIcon + ' Rename</div>' +
+    '<div class="compose-ctx-item compose-ctx-danger" onclick="_composeDelete(\'' + projectId + '\')">' + deleteIcon + ' Delete</div>';
+
+  document.body.appendChild(menu);
+
+  // Close on click anywhere else
+  const _close = (e) => {
+    if (!menu.contains(e.target)) {
+      menu.remove();
+      document.removeEventListener('click', _close, true);
+    }
+  };
+  setTimeout(() => document.addEventListener('click', _close, true), 0);
+}
+
+async function _composeRename(projectId) {
+  const existing = document.getElementById('compose-ctx-menu');
+  if (existing) existing.remove();
+
+  const cp = _composeProjectsList.find(p => p.id === projectId);
+  const oldName = cp ? cp.name : '';
+  const newName = prompt('Rename composition:', oldName);
+  if (!newName || !newName.trim() || newName.trim() === oldName) return;
+
+  try {
+    const resp = await fetch('/api/compose/projects/' + projectId, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: newName.trim()}),
+    });
+    if (!resp.ok) throw new Error('Rename failed');
+    const data = await resp.json();
+    if (data && data.ok) {
+      showToast('Renamed to "' + newName.trim() + '"');
+      initCompose();
+    } else {
+      showToast(data.error || 'Rename failed', 'error');
+    }
+  } catch (e) {
+    console.error('Failed to rename composition:', e);
+    showToast('Failed to rename composition', 'error');
+  }
+}
+
+async function _composeDelete(projectId) {
+  const existing = document.getElementById('compose-ctx-menu');
+  if (existing) existing.remove();
+
+  const cp = _composeProjectsList.find(p => p.id === projectId);
+  const name = cp ? cp.name : 'this composition';
+  if (!confirm('Delete "' + name + '"? This cannot be undone.')) return;
+
+  try {
+    const resp = await fetch('/api/compose/projects/' + projectId, {
+      method: 'DELETE',
+    });
+    if (!resp.ok) throw new Error('Delete failed');
+    const data = await resp.json();
+    if (data && data.ok) {
+      showToast('Deleted "' + name + '"');
+      // If we deleted the active composition, clear selection
+      if (_activeComposeProjectId === projectId) {
+        _activeComposeProjectId = null;
+        _composeSelectedSection = null;
+        const _proj = localStorage.getItem('activeProject') || '';
+        if (_proj) localStorage.removeItem('activeComposition:' + _proj);
+      }
+      initCompose();
+    } else {
+      showToast(data.error || 'Delete failed', 'error');
+    }
+  } catch (e) {
+    console.error('Failed to delete composition:', e);
+    showToast('Failed to delete composition', 'error');
   }
 }
 
@@ -2574,6 +2738,9 @@ function resetComposeState() {
   _composeConflicts = [];
   composeDetailTaskId = null;
   _composeSelectedSection = null;
+  _activeComposeProjectId = null;
+  _composeProjectsList = [];
+  _composeInitToken++;  // cancel any in-flight initCompose()
   const header = document.getElementById('compose-root-header');
   const target = document.getElementById('compose-input-target');
   if (header) header.style.display = 'none';

@@ -54,10 +54,13 @@ def get_board():
         project_id = request.args.get('project_id', '').strip()
         parent = request.args.get('project', '').strip()
 
+        # Fetch project list once — reused for both project lookup and siblings
+        all_projects = None
         if project_id:
             project = get_project(project_id)
         else:
-            projects = list_projects()
+            all_projects = list_projects()
+            projects = all_projects
             # Filter by parent VibeNode project if specified
             if parent:
                 projects = [p for p in projects if p.parent_project == parent]
@@ -83,6 +86,17 @@ def get_board():
         except Exception:
             conflicts = []
 
+        # Include sibling compositions for the sidebar picker
+        sibling_projects = []
+        effective_parent = parent or (project.parent_project if project else None)
+        if effective_parent:
+            if all_projects is None:
+                all_projects = list_projects()
+            sibling_projects = [p.to_dict() for p in all_projects
+                                if p.parent_project == effective_parent]
+        else:
+            sibling_projects = [project.to_dict()]
+
         return jsonify({
             'project': project.to_dict(),
             'sections': section_dicts,
@@ -93,6 +107,7 @@ def get_board():
                 'not_started': not_started,
             },
             'conflicts': conflicts,
+            'sibling_projects': sibling_projects,
         })
     except Exception:
         logger.exception("Error loading compose board")
@@ -170,8 +185,14 @@ def create_project():
 
 @bp.route('/projects', methods=['GET'])
 def list_all_projects():
-    """List all composition projects."""
+    """List all composition projects.
+
+    Optional query param ``?project=`` filters by parent_project.
+    """
     projects = list_projects()
+    parent = request.args.get('project', '').strip()
+    if parent:
+        projects = [p for p in projects if p.parent_project == parent]
     return jsonify({'ok': True, 'projects': [p.to_dict() for p in projects]})
 
 

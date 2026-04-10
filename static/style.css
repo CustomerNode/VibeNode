@@ -6743,6 +6743,38 @@ mark.find-match.current { background: var(--accent); color:#fff; }
   background: var(--bg-hover);
   color: var(--accent);
 }
+.compose-sidebar-active {
+  background: var(--bg-hover);
+  color: var(--accent);
+  font-weight: 600;
+}
+.compose-ctx-menu {
+  position: fixed;
+  z-index: 9999;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 0;
+  min-width: 150px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+}
+.compose-ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.compose-ctx-item:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.compose-ctx-danger:hover {
+  color: var(--result-err);
+}
 .kanban-sidebar-section {
   padding: 10px 12px;
   display: flex;
