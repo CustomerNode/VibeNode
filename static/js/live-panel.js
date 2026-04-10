@@ -1277,6 +1277,7 @@ function updateLiveInputBar() {
     if (_newTa && !_newTa.value) {
       _newTa.value = _restoreText;
       _autoResizeTextarea(_newTa);
+      _newTa.dispatchEvent(new Event('input'));
     }
   }
 }
