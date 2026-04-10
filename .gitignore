@@ -215,6 +215,12 @@ logs/
 # Backups
 backups/
 
+# Plans, specs, and implementation notes (local working docs)
+docs/plans/
+
+# Compose user data (created at runtime)
+compose-projects/
+
 # Secrets - contains Supabase keys
 kanban_config.json
 kanban_config.json.test_backup
