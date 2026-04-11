@@ -32,8 +32,6 @@ Run and interact with your Claude Code sessions. This is the full interactive te
 - Display as visual grid cards or compact list — switch anytime from the sidebar menu
 - **Cross-session awareness** — Every session in a project knows what the other sessions are doing. At session start, each session's system prompt is injected with a live snapshot of all other active sessions in the same project: their auto-generated names, current status, how long they've been running, and the last few files they've edited. When sessions are touching the same files, the overlap is flagged explicitly — the AI sees the conflict, re-reads the file before editing, and if the file is unstable mid-refactor, backs off and surfaces the incomplete work to the user instead of creating merge conflicts. No inter-session messaging, no coordination protocol — just awareness and smart avoidance. Toggle it on or off in System Preferences.
 
-![Cross-session awareness — sessions see each other's status and files, with automatic conflict avoidance](docs/cross-session-awareness.svg)
-
 Sessions can be displayed as visual grid cards or a compact list — switch anytime from the sidebar menu.
 
 ![Session grid with live conversation panel](docs/screenshots/session-grid.png)
@@ -41,6 +39,8 @@ Sessions can be displayed as visual grid cards or a compact list — switch anyt
 Or switch to a compact list view:
 
 ![Session list view](docs/screenshots/session-list.png)
+
+![Cross-session awareness — sessions see each other's status and files, with automatic conflict avoidance](docs/cross-session-awareness.svg)
 
 ### Workflow
 
