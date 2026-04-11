@@ -490,6 +490,9 @@ class SessionManager:
         # Permission policy (synced from browser) — persisted to disk
         self._policy_path = Path.home() / ".claude" / "gui_permission_policy.json"
         self._permission_policy, self._custom_rules = self._load_policy()
+        # UI preferences (send behavior, etc.) — persisted to disk
+        self._ui_prefs_path = Path.home() / ".claude" / "gui_ui_prefs.json"
+        self._ui_prefs = self._load_ui_prefs()
         # Hook-based permission storage
         self._hook_pending = {}  # {req_id: {"event": threading.Event, "result": str}}
         self._hook_lock = threading.Lock()
@@ -802,6 +805,42 @@ class SessionManager:
         self._custom_rules = custom_rules or {}
         self._save_policy()
         logger.info("Permission policy updated and saved: %s", policy)
+
+    # ------------------------------------------------------------------
+    # UI Preferences persistence
+    # ------------------------------------------------------------------
+
+    def _load_ui_prefs(self) -> dict:
+        """Load persisted UI preferences from disk."""
+        try:
+            if self._ui_prefs_path.exists():
+                data = json.loads(self._ui_prefs_path.read_text())
+                if isinstance(data, dict):
+                    logger.info("Loaded persisted UI prefs: %s", list(data.keys()))
+                    return data
+        except Exception as e:
+            logger.warning("Failed to load UI prefs: %s", e)
+        return {}
+
+    def _save_ui_prefs(self):
+        """Persist UI preferences to disk."""
+        try:
+            self._ui_prefs_path.parent.mkdir(parents=True, exist_ok=True)
+            self._ui_prefs_path.write_text(json.dumps(self._ui_prefs))
+        except Exception as e:
+            logger.warning("Failed to save UI prefs: %s", e)
+
+    def get_ui_prefs(self) -> dict:
+        """Return all persisted UI preferences."""
+        return dict(self._ui_prefs)
+
+    def set_ui_prefs(self, prefs: dict) -> None:
+        """Merge new preferences into saved UI prefs and persist."""
+        if not isinstance(prefs, dict):
+            return
+        self._ui_prefs.update(prefs)
+        self._save_ui_prefs()
+        logger.info("UI prefs updated and saved: %s", list(prefs.keys()))
 
     def _should_auto_approve(self, tool_name: str, tool_input: dict) -> bool:
         """Check if a tool use should be auto-approved based on the current policy."""

@@ -581,6 +581,26 @@ def register_ws_events(socketio, app):
         sm.set_permission_policy(policy, custom_rules)
         logger.debug("Permission policy synced: %s", policy)
 
+    @socketio.on('get_ui_prefs')
+    def handle_get_ui_prefs():
+        """Return persisted UI preferences to the browser."""
+        sm = app.session_manager
+        try:
+            result = sm.get_ui_prefs()
+            emit('ui_prefs_loaded', result)
+        except Exception as e:
+            logger.warning("Failed to get UI prefs: %s", e)
+            emit('ui_prefs_loaded', {})
+
+    @socketio.on('set_ui_prefs')
+    def handle_set_ui_prefs(data):
+        """Persist UI preferences from browser."""
+        if not isinstance(data, dict):
+            return
+        sm = app.session_manager
+        sm.set_ui_prefs(data)
+        logger.debug("UI prefs synced: %s", list(data.keys()))
+
     # ------------------------------------------------------------------
     # Server-side message queue events
     # ------------------------------------------------------------------

@@ -389,7 +389,7 @@ async function _composePickerFromSession(sessionId) {
   const overlay = document.getElementById('pm-overlay');
   if (!overlay) return;
 
-  // Fetch available compose projects for the active VibeNode project
+  // Fetch all compose projects — show current-project ones first, others dimmed
   const _proj = localStorage.getItem('activeProject') || '';
   let projects = [];
   try {
@@ -397,8 +397,16 @@ async function _composePickerFromSession(sessionId) {
     if (resp.ok) {
       const data = await resp.json();
       if (data.ok) {
-        projects = (data.projects || []).filter(function(p) {
-          return !_proj || !p.parent_project || p.parent_project === _proj;
+        projects = (data.projects || []);
+        // Sort: current project first, then others
+        projects.sort(function(a, b) {
+          const aMatch = (!_proj || !a.parent_project || a.parent_project === _proj) ? 0 : 1;
+          const bMatch = (!_proj || !b.parent_project || b.parent_project === _proj) ? 0 : 1;
+          return aMatch - bMatch;
+        });
+        // Mark each project with whether it belongs to the active project
+        projects.forEach(function(p) {
+          p._isCurrentProject = !_proj || !p.parent_project || p.parent_project === _proj;
         });
       }
     }
@@ -419,9 +427,11 @@ async function _composePickerFromSession(sessionId) {
 
   for (var i = 0; i < projects.length; i++) {
     var p = projects[i];
-    html += '<div class="kanban-drill-chooser-card" style="cursor:pointer;" data-project-id="' + p.id + '" onclick="_composePickerSelectProject(\'' + sessionId + '\',\'' + p.id + '\',this)">';
+    var dimStyle = p._isCurrentProject ? '' : ' opacity:0.5;';
+    var projLabel = p._isCurrentProject ? '' : ' <span style="font-size:10px;color:var(--text-faint);">(other project)</span>';
+    html += '<div class="kanban-drill-chooser-card" style="cursor:pointer;' + dimStyle + '" data-project-id="' + p.id + '" onclick="_composePickerSelectProject(\'' + sessionId + '\',\'' + p.id + '\',this)">';
     html += '<div class="kanban-drill-chooser-icon" style="color:var(--accent);"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg></div>';
-    html += '<div><div class="kanban-drill-chooser-title">' + (typeof escHtml === 'function' ? escHtml(p.name) : p.name) + '</div>';
+    html += '<div><div class="kanban-drill-chooser-title">' + (typeof escHtml === 'function' ? escHtml(p.name) : p.name) + projLabel + '</div>';
     html += '<div class="kanban-drill-chooser-desc">Add a new section and link this session to it</div></div>';
     html += '</div>';
   }
@@ -480,7 +490,7 @@ async function _composeLinkPicker(sessionId) {
   const overlay = document.getElementById('pm-overlay');
   if (!overlay) return;
 
-  // Fetch compose projects and their sections
+  // Fetch all compose projects — show current-project ones first, others dimmed
   const _proj = localStorage.getItem('activeProject') || '';
   let projects = [];
   try {
@@ -488,8 +498,14 @@ async function _composeLinkPicker(sessionId) {
     if (resp.ok) {
       const data = await resp.json();
       if (data.ok) {
-        projects = (data.projects || []).filter(function(p) {
-          return !_proj || !p.parent_project || p.parent_project === _proj;
+        projects = (data.projects || []);
+        projects.sort(function(a, b) {
+          const aMatch = (!_proj || !a.parent_project || a.parent_project === _proj) ? 0 : 1;
+          const bMatch = (!_proj || !b.parent_project || b.parent_project === _proj) ? 0 : 1;
+          return aMatch - bMatch;
+        });
+        projects.forEach(function(p) {
+          p._isCurrentProject = !_proj || !p.parent_project || p.parent_project === _proj;
         });
       }
     }
@@ -530,9 +546,12 @@ async function _composeLinkPicker(sessionId) {
   for (const entry of allEntries) {
     const sec = entry.section;
     const pName = entry.project.name;
-    html += '<div class="kanban-drill-chooser-card" style="cursor:pointer;" onclick="_composeLinkSession(\'' + sessionId + '\',\'' + entry.project.id + '\',\'' + sec.id + '\')">';
+    const isCurrent = entry.project._isCurrentProject;
+    const dimStyle = isCurrent ? '' : ' opacity:0.5;';
+    const projLabel = isCurrent ? '' : ' (other project)';
+    html += '<div class="kanban-drill-chooser-card" style="cursor:pointer;' + dimStyle + '" onclick="_composeLinkSession(\'' + sessionId + '\',\'' + entry.project.id + '\',\'' + sec.id + '\')">';
     html += '<div style="display:flex;flex-direction:column;gap:2px;"><div class="kanban-drill-chooser-title">' + (typeof escHtml === 'function' ? escHtml(sec.name) : sec.name) + '</div>';
-    html += '<div class="kanban-drill-chooser-desc">' + (typeof escHtml === 'function' ? escHtml(pName) : pName) + ' &middot; ' + (sec.status || 'not_started') + (sec.session_id ? ' &middot; has session' : '') + '</div></div>';
+    html += '<div class="kanban-drill-chooser-desc">' + (typeof escHtml === 'function' ? escHtml(pName) : pName) + projLabel + ' &middot; ' + (sec.status || 'not_started') + (sec.session_id ? ' &middot; has session' : '') + '</div></div>';
     html += '</div>';
   }
 

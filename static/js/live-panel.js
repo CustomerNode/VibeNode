@@ -1,7 +1,20 @@
 /* live-panel.js — live terminal panel, input bar state machine, GUI session management */
 
-// ── Draft persistence: preserve unsent text across session/view switches ──
-const _drafts = {};  // { sessionId: string }
+// ── Draft persistence: preserve unsent text across session/view switches AND page reloads ──
+const _LS_DRAFTS_KEY = 'vibenode_drafts';
+
+function _loadDraftsFromStorage() {
+  try {
+    const raw = localStorage.getItem(_LS_DRAFTS_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch (_) { return {}; }
+}
+
+function _persistDraftsToStorage(drafts) {
+  try { localStorage.setItem(_LS_DRAFTS_KEY, JSON.stringify(drafts)); } catch (_) {}
+}
+
+const _drafts = _loadDraftsFromStorage();  // { sessionId: string }
 
 function _saveDraft(sessionId, text) {
   if (!sessionId) return;
@@ -10,6 +23,7 @@ function _saveDraft(sessionId, text) {
   } else {
     delete _drafts[sessionId];
   }
+  _persistDraftsToStorage(_drafts);
 }
 
 function _getDraft(sessionId) {
@@ -18,6 +32,7 @@ function _getDraft(sessionId) {
 
 function _clearDraft(sessionId) {
   delete _drafts[sessionId];
+  _persistDraftsToStorage(_drafts);
 }
 
 function _saveDraftFromDOM() {
@@ -29,6 +44,9 @@ function _saveDraftFromDOM() {
     _clearDraft(liveSessionId);
   }
 }
+
+// Save drafts before page unload (server restart, refresh, tab close)
+window.addEventListener('beforeunload', _saveDraftFromDOM);
 
 function _updateLastMessageTimes() {
   const log = document.getElementById('live-log');

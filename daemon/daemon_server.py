@@ -224,6 +224,8 @@ class SessionDaemon:
             "get_session_state": self.session_manager.get_session_state,
             "get_permission_policy": lambda **kw: self.session_manager.get_permission_policy(),
             "set_permission_policy": self.session_manager.set_permission_policy,
+            "get_ui_prefs": lambda **kw: self.session_manager.get_ui_prefs(),
+            "set_ui_prefs": lambda **kw: self.session_manager.set_ui_prefs(kw.get("prefs", {})),
             "resolve_hook_permission": self.session_manager.resolve_hook_permission,
             "queue_message": self.session_manager.queue_message,
             "get_queue": lambda **kw: self.session_manager.get_queue(**kw),

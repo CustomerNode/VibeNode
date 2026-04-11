@@ -68,6 +68,8 @@ socket.on('connect', () => {
     if (sbConn) { sbConn.textContent = '\u25CF'; sbConn.style.color = 'var(--idle-label)'; sbConn.title = 'Connected'; }
     // Fetch persisted permission policy from backend (don't push localStorage defaults)
     socket.emit('get_permission_policy');
+    // Fetch persisted UI preferences (sendBehavior, etc.) from backend
+    socket.emit('get_ui_prefs');
     // Refresh session list on reconnect — but only AFTER initial load
     // is complete.  On first connect, loadProjects() handles session loading
     // (with proper project sync).  Calling loadSessions() here too causes
@@ -98,6 +100,25 @@ socket.on('permission_policy_loaded', (data) => {
         }
         // Refresh permission UI if it exists
         if (typeof renderPermissionPanel === 'function') renderPermissionPanel();
+    }
+});
+
+// Restore persisted UI preferences (sendBehavior, etc.) from backend on connect.
+// If the server has no prefs yet, seed it from localStorage so existing
+// preferences are captured immediately.
+socket.on('ui_prefs_loaded', (data) => {
+    if (!data || typeof data !== 'object') return;
+    if (data.sendBehavior && ['enter', 'ctrl-enter'].includes(data.sendBehavior)) {
+        // Server has a saved preference — apply it
+        sendBehavior = data.sendBehavior;
+        localStorage.setItem('sendBehavior', data.sendBehavior);
+        if (typeof _refreshSendHints === 'function') _refreshSendHints();
+    } else {
+        // Server has no saved sendBehavior — seed it from current localStorage
+        const local = localStorage.getItem('sendBehavior');
+        if (local && ['enter', 'ctrl-enter'].includes(local)) {
+            socket.emit('set_ui_prefs', { sendBehavior: local });
+        }
     }
 });
 

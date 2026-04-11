@@ -22,24 +22,43 @@ function _hasVoiceSupport() {
 function setupVoiceButton(textarea, button, onSubmit) {
   if (!textarea || !button) return;
 
+  // Create a separate send button next to the voice button
+  let sendBtn = button.nextElementSibling;
+  if (!sendBtn || !sendBtn.classList.contains('live-send-btn-send')) {
+    sendBtn = document.createElement('button');
+    sendBtn.className = 'live-send-btn live-send-btn-send';
+    // Carry over the waiting class if the voice button has it
+    if (button.classList.contains('waiting')) sendBtn.classList.add('waiting');
+    sendBtn.innerHTML = _sendSvg;
+    sendBtn.title = 'Send (Ctrl+Enter)';
+    sendBtn.style.display = 'none';
+    button.parentNode.insertBefore(sendBtn, button.nextSibling);
+  }
+
+  sendBtn.onclick = () => {
+    if (onSubmit) onSubmit();
+  };
+
   const updateIcon = () => {
     const hasText = textarea.value.trim().length > 0;
-    if (_activeRecognition && _activeRecognition._target === textarea) {
+    const isRecording = _activeRecognition && _activeRecognition._target === textarea;
+
+    if (isRecording) {
       button.innerHTML = _micActiveSvg;
       button.title = 'Stop recording';
       button.classList.add('recording');
-    } else if (hasText) {
-      button.innerHTML = _sendSvg;
-      button.title = 'Send (Ctrl+Enter)';
-      button.classList.remove('recording');
+      sendBtn.style.display = 'none';
     } else if (_hasVoiceSupport()) {
       button.innerHTML = _micSvg;
       button.title = 'Voice input';
       button.classList.remove('recording');
+      sendBtn.style.display = hasText ? '' : 'none';
     } else {
+      // No voice support — button acts as send
       button.innerHTML = _sendSvg;
       button.title = 'Send (Ctrl+Enter)';
       button.classList.remove('recording');
+      sendBtn.style.display = 'none';
     }
   };
 
@@ -47,8 +66,6 @@ function setupVoiceButton(textarea, button, onSubmit) {
   updateIcon();
 
   button.onclick = () => {
-    const hasText = textarea.value.trim().length > 0;
-
     if (_activeRecognition && _activeRecognition._target === textarea) {
       // Stop recording (manual click)
       _activeRecognition._intentionalStop = true;
@@ -58,19 +75,13 @@ function setupVoiceButton(textarea, button, onSubmit) {
       return;
     }
 
-    if (hasText) {
-      // Send
-      if (onSubmit) onSubmit();
-      return;
-    }
-
-    // Start voice input
+    // No voice support fallback — act as send button
     if (!_hasVoiceSupport()) {
-      showToast('Voice input not supported in this browser', true);
+      if (textarea.value.trim().length > 0 && onSubmit) onSubmit();
       return;
     }
 
-    // Kill any stale recognition from a previous textarea (e.g. bar rebuild)
+    // Start voice input — kill any stale recognition from a previous textarea (e.g. bar rebuild)
     _stopActiveVoice();
 
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -82,7 +93,9 @@ function setupVoiceButton(textarea, button, onSubmit) {
     recognition._intentionalStop = false;
     _activeRecognition = recognition;
 
-    let finalTranscript = '';
+    // Preserve any existing text so voice appends to it
+    const existingText = textarea.value;
+    let finalTranscript = existingText ? existingText + ' ' : '';
     let silenceTimer = null;
     let restartCount = 0;
     const MAX_RESTARTS = 5;

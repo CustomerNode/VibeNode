@@ -77,6 +77,10 @@ function _toggleSendBehavior(e) {
   if (e) e.stopPropagation();
   sendBehavior = sendBehavior === 'enter' ? 'ctrl-enter' : 'enter';
   localStorage.setItem('sendBehavior', sendBehavior);
+  // Persist to server so it survives browser/localStorage resets
+  if (typeof socket !== 'undefined' && socket.connected) {
+    socket.emit('set_ui_prefs', { sendBehavior: sendBehavior });
+  }
   _refreshSendHints();
   showToast('Send: ' + (sendBehavior === 'enter' ? 'Enter to send' : 'Ctrl+Enter to send'));
 }

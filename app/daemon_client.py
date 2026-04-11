@@ -562,6 +562,15 @@ class DaemonClient:
             "policy": policy, "custom_rules": self._cached_custom_rules,
         })
 
+    def get_ui_prefs(self):
+        """Fetch persisted UI preferences from daemon."""
+        result = self._send_request("get_ui_prefs", {})
+        return result if isinstance(result, dict) else {}
+
+    def set_ui_prefs(self, prefs):
+        """Persist UI preferences via daemon."""
+        return self._send_request("set_ui_prefs", {"prefs": prefs})
+
     def hook_pre_tool(self, tool_name, tool_input, session_id):
         """Proxy for hook_pre_tool — blocks up to 1 hour."""
         return self._send_request("hook_pre_tool", {

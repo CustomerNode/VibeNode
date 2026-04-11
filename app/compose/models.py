@@ -547,6 +547,31 @@ def list_projects() -> list:
                 projects.append(ComposeProject.from_dict(data))
             except Exception:
                 pass
+        else:
+            # Legacy/orphan folder: no project.json but has compose-context.json.
+            # Reconstruct a ComposeProject from context and persist project.json
+            # so it is found normally on subsequent scans.
+            ctx_file = d / "compose-context.json"
+            if ctx_file.is_file():
+                try:
+                    ctx = json.loads(ctx_file.read_text(encoding="utf-8"))
+                    proj_id = ctx.get("project_id") or d.name
+                    proj_name = ctx.get("project_name") or d.name
+                    from ..config import get_active_project
+                    proj = ComposeProject(
+                        id=proj_id,
+                        name=proj_name,
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                        parent_project=get_active_project() or None,
+                    )
+                    # Persist so this only happens once
+                    pf.write_text(
+                        json.dumps(proj.to_dict(), indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    projects.append(proj)
+                except Exception:
+                    pass
     # Sort by position (lower first), then by created_at as tiebreaker
     projects.sort(key=lambda p: (p.position, p.created_at))
     return projects
