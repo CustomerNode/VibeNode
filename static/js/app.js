@@ -1987,8 +1987,8 @@ async function _submitComposeSection() {
   const artifactType = _composeArtifactType;
   _closePm();
 
-  // Optimistic: insert a ghost card into the not_started column
-  const col = document.querySelector('.compose-column[data-status="not_started"] .kanban-column-body');
+  // Optimistic: insert a ghost card into the drafting column
+  const col = document.querySelector('.compose-column[data-status="drafting"] .kanban-column-body');
   let ghostCard = null;
   if (col) {
     ghostCard = document.createElement('div');
@@ -2092,7 +2092,7 @@ function _renderComposeSidebar() {
           dotTitle = st.in_progress + ' in progress';
         } else {
           dotCls += ' compose-status-idle';
-          dotTitle = st.not_started + ' not started';
+          dotTitle = (st.total_sections - st.complete - st.in_progress) + ' idle';
         }
         const fraction = st.total_sections > 0 ? st.complete + '/' + st.total_sections : '';
         html += '<span class="compose-status-badge" title="' + dotTitle + '" data-fraction="' + fraction + '" data-compose-id="' + cp.id + '"><span class="' + dotCls + '"></span>' + fraction + '</span>';
@@ -2744,10 +2744,12 @@ function _updateComposeRootHeader() {
   if (statusEl) {
     const total = _composeSections.length;
     const complete = _composeSections.filter(s => s.status === 'complete').length;
-    const working = _composeSections.filter(s => s.status === 'working').length;
+    const drafting = _composeSections.filter(s => s.status === 'drafting').length;
+    const reviewing = _composeSections.filter(s => s.status === 'reviewing').length;
     let parts = [total + ' section' + (total !== 1 ? 's' : '')];
     if (complete > 0) parts.push(complete + ' complete');
-    if (working > 0) parts.push(working + ' in progress');
+    if (reviewing > 0) parts.push(reviewing + ' reviewing');
+    if (drafting > 0) parts.push(drafting + ' drafting');
     statusEl.textContent = parts.join(', ');
   }
 
@@ -2766,8 +2768,8 @@ function _updateComposeRootHeader() {
 // --- NB-11: Render section cards in compose board ---
 
 const COMPOSE_STATUS_COLUMNS = [
-  { key: 'not_started', label: 'Not Started', color: '#8b949e' },
-  { key: 'working',     label: 'Working',     color: '#4ecdc4' },
+  { key: 'drafting',    label: 'Drafting',    color: '#4ecdc4' },
+  { key: 'reviewing',   label: 'Reviewing',   color: '#f0ad4e' },
   { key: 'complete',    label: 'Complete',     color: '#3fb950' },
 ];
 
@@ -2805,7 +2807,9 @@ function _renderComposeSectionCards() {
         <span class="kanban-column-name">${col.label}</span>
         <span class="kanban-column-count">${colSections.length}</span>
       </div>
-      <div class="kanban-column-body" data-status="${col.key}">`;
+      <div class="kanban-column-body" data-status="${col.key}"
+           ondragover="_composeDragOver(event)" ondragleave="_composeDragLeave(event)"
+           ondrop="_composeDrop(event, '${col.key}')">`;
 
     for (const sec of colSections) {
       const artifactIcon = COMPOSE_ARTIFACT_ICONS[sec.artifact_type] || COMPOSE_ARTIFACT_ICONS.default;
@@ -2818,6 +2822,9 @@ function _renderComposeSectionCards() {
       const selectedClass = (_composeSelectedSection === sec.id) ? ' compose-card-selected' : '';
 
       html += `<div class="kanban-card compose-card${selectedClass}" data-section-id="${sec.id}"
+                   draggable="true"
+                   ondragstart="_composeDragStart(event, '${sec.id}', '${col.key}')"
+                   ondragend="_composeDragEnd(event)"
                    onclick="navigateToSection('${sec.id}')"
                    oncontextmenu="event.preventDefault();event.stopPropagation();_composeCardContextMenu('${sec.id}', event)">
         <div class="compose-card-header">
@@ -2846,12 +2853,78 @@ function _renderComposeSectionCards() {
 // --- End NB-11 ---
 
 // ═══════════════════════════════════════════════════════════════
+// COMPOSE BOARD DRAG-AND-DROP — mirrors kanban card drag between columns
+// ═══════════════════════════════════════════════════════════════
+
+let _composeDragState = null; // {sectionId, sourceStatus}
+
+function _composeDragStart(event, sectionId, sourceStatus) {
+  _composeDragState = { sectionId, sourceStatus };
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', sectionId);
+  const card = event.currentTarget;
+  requestAnimationFrame(() => card.classList.add('dragging'));
+}
+
+function _composeDragOver(event) {
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'move';
+  const col = event.currentTarget.closest('.compose-column');
+  if (col) col.classList.add('kanban-drop-target');
+}
+
+function _composeDragLeave(event) {
+  const col = event.currentTarget.closest('.compose-column');
+  if (col && !col.contains(event.relatedTarget)) {
+    col.classList.remove('kanban-drop-target');
+  }
+}
+
+function _composeDrop(event, targetStatus) {
+  event.preventDefault();
+  const col = event.currentTarget.closest('.compose-column');
+  if (col) col.classList.remove('kanban-drop-target');
+  if (!_composeDragState) return;
+  const { sectionId, sourceStatus } = _composeDragState;
+  _composeDragState = null;
+  if (sourceStatus === targetStatus) return;
+  // Optimistic local update
+  const sec = _composeSections.find(s => s.id === sectionId);
+  if (sec) sec.status = targetStatus;
+  _renderComposeSectionCards();
+  // Persist to server
+  const projId = _composeProject ? _composeProject.id : '';
+  fetch('/api/compose/projects/' + encodeURIComponent(projId) + '/sections/' + sectionId, {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ status: targetStatus }),
+  }).then(r => r.json()).then(data => {
+    if (!data.ok && !data.section) {
+      // Revert on failure
+      if (sec) sec.status = sourceStatus;
+      _renderComposeSectionCards();
+      if (typeof showToast === 'function') showToast('Move failed', true);
+    }
+  }).catch(() => {
+    if (sec) sec.status = sourceStatus;
+    _renderComposeSectionCards();
+    if (typeof showToast === 'function') showToast('Move failed', true);
+  });
+}
+
+function _composeDragEnd(event) {
+  _composeDragState = null;
+  event.currentTarget.classList.remove('dragging');
+  document.querySelectorAll('.kanban-drop-target').forEach(el => el.classList.remove('kanban-drop-target'));
+}
+
+// ═══════════════════════════════════════════════════════════════
 // COMPOSE SECTION DETAIL — Drill-down view (mirrors kanban task detail)
 // ═══════════════════════════════════════════════════════════════
 
 const COMPOSE_STATUS_OPTIONS = [
-  { key: 'not_started', label: 'Not Started', color: '#8b949e' },
-  { key: 'working',     label: 'Working',     color: '#4ecdc4' },
+  { key: 'drafting',    label: 'Drafting',    color: '#4ecdc4' },
+  { key: 'reviewing',   label: 'Reviewing',   color: '#f0ad4e' },
   { key: 'complete',    label: 'Complete',     color: '#3fb950' },
 ];
 
@@ -3200,7 +3273,7 @@ function _composeRenameSession(sessionId) {
 function _composeUnlinkSession(sectionId, sessionId) {
   if (!confirm('Unlink this session from the section? The session will still exist in the sessions view.')) return;
   const projId = _composeProject ? _composeProject.id : '';
-  fetch('/api/compose/sections/' + sectionId + '?project_id=' + encodeURIComponent(projId), {
+  fetch('/api/compose/projects/' + encodeURIComponent(projId) + '/sections/' + sectionId, {
     method: 'PUT',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({session_id: ''})
@@ -3232,7 +3305,7 @@ function _composeSessionClose(target) {
   if (cb) cb.style.display = '';
   // Navigate back
   if (target === 'board') {
-    renderComposeBoard();
+    navigateToComposeBoard();
   } else {
     renderSectionDetail(target);
   }
@@ -3441,6 +3514,18 @@ function resetComposeState() {
  */
 // Socket event handlers for compose updates
 function _composeOnBoardRefresh(data) {
+  if (viewMode === 'compose') initCompose();
+}
+
+function _composeOnTaskCreated(data) {
+  if (viewMode === 'compose') initCompose();
+}
+
+function _composeOnTaskUpdated(data) {
+  if (viewMode === 'compose') initCompose();
+}
+
+function _composeOnTaskMoved(data) {
   if (viewMode === 'compose') initCompose();
 }
 

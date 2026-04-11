@@ -43,7 +43,8 @@ DEFAULT_CONTEXT = {
         "total_sections": 0,
         "complete": 0,
         "in_progress": 0,
-        "not_started": 0,
+        "drafting": 0,
+        "reviewing": 0,
     },
 }
 
@@ -54,8 +55,8 @@ DEFAULT_CONTEXT = {
 
 class SectionStatus(Enum):
     """Lifecycle states a compose section can occupy."""
-    NOT_STARTED = "not_started"
-    WORKING = "working"
+    DRAFTING = "drafting"
+    REVIEWING = "reviewing"
     COMPLETE = "complete"
 
 
@@ -129,10 +130,14 @@ class ComposeSection:
         d["status"] = self.status.value
         return d
 
+    # Migration map for old status values
+    _STATUS_MIGRATION = {"not_started": "drafting", "working": "drafting"}
+
     @classmethod
     def from_dict(cls, d):
-        status = d.get("status", "not_started")
+        status = d.get("status", "drafting")
         if isinstance(status, str):
+            status = cls._STATUS_MIGRATION.get(status, status)
             status = SectionStatus(status)
         return cls(
             id=d["id"],
@@ -157,7 +162,7 @@ class ComposeSection:
             project_id=project_id,
             parent_id=parent_id,
             name=name,
-            status=SectionStatus.NOT_STARTED,
+            status=SectionStatus.DRAFTING,
             order=order,
             artifact_type=artifact_type,
         )

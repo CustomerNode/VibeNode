@@ -61,21 +61,21 @@ class TestComposeSection:
     def test_create(self):
         s = ComposeSection.create("proj-1", "Introduction", order=0)
         assert s.project_id == "proj-1"
-        assert s.status == SectionStatus.NOT_STARTED
+        assert s.status == SectionStatus.DRAFTING
         assert s.changing is False
 
     def test_round_trip(self):
         s = ComposeSection.create("proj-1", "Chapter", parent_id="parent-1", order=2)
         d = s.to_dict()
-        assert d["status"] == "not_started"  # enum serialized to string
+        assert d["status"] == "drafting"  # enum serialized to string
         s2 = ComposeSection.from_dict(d)
-        assert s2.status == SectionStatus.NOT_STARTED
+        assert s2.status == SectionStatus.DRAFTING
         assert s2.parent_id == "parent-1"
 
     def test_status_enum_from_string(self):
-        d = {"id": "x", "project_id": "p", "name": "N", "status": "working", "order": 0}
+        d = {"id": "x", "project_id": "p", "name": "N", "status": "reviewing", "order": 0}
         s = ComposeSection.from_dict(d)
-        assert s.status == SectionStatus.WORKING
+        assert s.status == SectionStatus.REVIEWING
 
 
 class TestComposeConflict:

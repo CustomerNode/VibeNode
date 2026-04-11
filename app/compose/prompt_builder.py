@@ -235,7 +235,7 @@ def _build_root_prompt(project: ComposeProject) -> str:
     if sections:
         section_lines = []
         for s in sections:
-            status = s.get("status", "not_started")
+            status = s.get("status", "drafting")
             changing = " [CHANGING]" if s.get("changing") else ""
             summary = f" -- {s.get('summary')}" if s.get("summary") else ""
             section_lines.append(f"- [{status}] {s.get('name')}{changing}{summary}")

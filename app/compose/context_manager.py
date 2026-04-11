@@ -333,10 +333,12 @@ def _update_status_counts(ctx: dict) -> None:
     sections = ctx.get("sections", [])
     total = len(sections)
     complete = sum(1 for s in sections if s.get("status") == "complete")
-    working = sum(1 for s in sections if s.get("status") == "working")
+    reviewing = sum(1 for s in sections if s.get("status") == "reviewing")
+    drafting = sum(1 for s in sections if s.get("status") == "drafting")
     ctx["status"] = {
         "total_sections": total,
         "complete": complete,
-        "in_progress": working,
-        "not_started": total - complete - working,
+        "in_progress": drafting + reviewing,
+        "drafting": drafting,
+        "reviewing": reviewing,
     }

@@ -114,12 +114,13 @@ class TestSectionManagement:
 
         ctx = read_context(project.id)
         assert ctx["status"]["total_sections"] == 2
-        assert ctx["status"]["not_started"] == 2
+        assert ctx["status"]["drafting"] == 2
 
-        update_section_status(project.id, s1.id, status="working")
+        update_section_status(project.id, s1.id, status="reviewing")
         ctx = read_context(project.id)
-        assert ctx["status"]["in_progress"] == 1
-        assert ctx["status"]["not_started"] == 1
+        assert ctx["status"]["reviewing"] == 1
+        assert ctx["status"]["drafting"] == 1
+        assert ctx["status"]["in_progress"] == 2  # drafting + reviewing
 
 
 class TestFacts:

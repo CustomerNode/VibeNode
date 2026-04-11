@@ -127,28 +127,10 @@ def detect_conflicts(project_id: str, new_directive: ComposeDirective) -> list:
         if not _directives_conflict(existing_d.get("content", ""), new_directive.content):
             continue
 
-        # Found a potential conflict. Determine resolution path.
+        # Found a potential conflict. Always surface to user for resolution.
         new_content = new_directive.content
         old_content = existing_d.get("content", "")
 
-        # Path 1: Clearly global — new directive overrides old
-        if _has_global_signal(new_content):
-            logger.info(
-                "Auto-resolving conflict: new directive '%s' supersedes '%s' (global signal)",
-                new_content[:50], old_content[:50],
-            )
-            _supersede_directive(project_id, existing_d.get("id"))
-            continue
-
-        # Path 2: Clearly contextual — scope both
-        if _has_contextual_signal(new_content):
-            logger.info(
-                "Auto-resolving conflict: scoping both directives (contextual signal)",
-            )
-            # Both remain active but with explicit scope
-            continue
-
-        # Path 3: Ambiguous — create conflict for user resolution
         recommendation = generate_recommendation(old_content, new_content)
         conflict = ComposeConflict.create(
             project_id=project_id,

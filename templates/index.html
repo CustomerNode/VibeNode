@@ -313,8 +313,8 @@
         if ((localStorage.getItem('viewMode') || '') === 'compose') {
           var b = document.getElementById('compose-board');
           var h = '<div class="kanban-columns-wrapper compose-columns-wrapper">';
-          var names = ['Drafts','In Progress','In Review','Published','Archived'];
-          for (var c = 0; c < 5; c++) {
+          var names = ['Drafting','Reviewing','Complete'];
+          for (var c = 0; c < 3; c++) {
             h += '<div class="kanban-column compose-column kanban-skel-col"><div class="kanban-column-header"><div class="skel-shimmer skel-col-title"></div><div class="skel-shimmer skel-col-count"></div></div><div class="kanban-column-body">';
             var n = 2 + Math.floor(Math.random() * 3);
             for (var i = 0; i < n; i++) {

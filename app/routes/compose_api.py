@@ -75,8 +75,8 @@ def get_board():
         # Compute status summary
         total = len(sections)
         complete = sum(1 for s in sections if s.status == SectionStatus.COMPLETE)
-        working = sum(1 for s in sections if s.status == SectionStatus.WORKING)
-        not_started = total - complete - working
+        reviewing = sum(1 for s in sections if s.status == SectionStatus.REVIEWING)
+        drafting = sum(1 for s in sections if s.status == SectionStatus.DRAFTING)
 
         # Load conflicts from context
         from ..compose.context_manager import read_context
@@ -99,13 +99,14 @@ def get_board():
                 secs = [ComposeSection.from_dict(s) for s in ctx.get('sections', [])]
                 t = len(secs)
                 c = sum(1 for s in secs if s.status == SectionStatus.COMPLETE)
-                w = sum(1 for s in secs if s.status == SectionStatus.WORKING)
+                r = sum(1 for s in secs if s.status == SectionStatus.REVIEWING)
+                dr = sum(1 for s in secs if s.status == SectionStatus.DRAFTING)
                 d['status'] = {
                     'total_sections': t, 'complete': c,
-                    'in_progress': w, 'not_started': t - c - w,
+                    'in_progress': dr + r, 'drafting': dr, 'reviewing': r,
                 }
             except Exception:
-                d['status'] = {'total_sections': 0, 'complete': 0, 'in_progress': 0, 'not_started': 0}
+                d['status'] = {'total_sections': 0, 'complete': 0, 'in_progress': 0, 'drafting': 0, 'reviewing': 0}
             d['has_conflicts'] = any(
                 cf.get('status') == 'pending' for cf in ctx.get('conflicts', [])
             )
@@ -136,8 +137,9 @@ def get_board():
             'status': {
                 'total_sections': total,
                 'complete': complete,
-                'in_progress': working,
-                'not_started': not_started,
+                'in_progress': drafting + reviewing,
+                'drafting': drafting,
+                'reviewing': reviewing,
             },
             'conflicts': conflicts,
             'sibling_projects': sibling_projects,

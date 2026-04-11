@@ -111,7 +111,7 @@ class TestSectionCRUD:
         assert resp.status_code == 201
         assert data['ok'] is True
         assert data['section']['name'] == 'Introduction'
-        assert data['section']['status'] == 'not_started'
+        assert data['section']['status'] == 'drafting'
 
     def test_create_section_no_name(self, client):
         pid = self._create_project(client)
@@ -125,11 +125,11 @@ class TestSectionCRUD:
         sid = create_resp.get_json()['section']['id']
 
         resp = client.put(f'/api/compose/projects/{pid}/sections/{sid}',
-                         json={'name': 'Chapter One', 'status': 'working'})
+                         json={'name': 'Chapter One', 'status': 'reviewing'})
         data = resp.get_json()
         assert data['ok'] is True
         assert data['section']['name'] == 'Chapter One'
-        assert data['section']['status'] == 'working'
+        assert data['section']['status'] == 'reviewing'
 
     def test_delete_section(self, client):
         pid = self._create_project(client)
@@ -192,7 +192,7 @@ class TestContextEndpoints:
                          json={'name': 'S1'}).get_json()['section']
 
         resp = client.put(f'/api/compose/projects/{pid}/sections/{sec["id"]}/status',
-                         json={'status': 'working', 'summary': 'In progress'})
+                         json={'status': 'drafting', 'summary': 'In progress'})
         assert resp.get_json()['ok'] is True
 
 

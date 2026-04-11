@@ -64,7 +64,8 @@ class TestDirectiveConflict:
 
 
 class TestDetectConflicts:
-    def test_global_auto_resolve(self, project):
+    def test_global_keywords_still_create_conflict(self, project):
+        """Even with global signal keywords, conflicts always surface to user."""
         d1 = ComposeDirective.create("global", "Use formal tone throughout")
         d1 = add_directive(project.id, d1)
 
@@ -72,14 +73,15 @@ class TestDetectConflicts:
         d2 = add_directive(project.id, d2)
 
         conflicts = detect_conflicts(project.id, d2)
-        assert len(conflicts) == 0  # auto-resolved
+        assert len(conflicts) == 1  # always ask user
 
-        # d1 should be superseded
+        # d1 should NOT be auto-superseded
         dirs = get_directives(project.id)
         d1_data = next(d for d in dirs if d["id"] == d1.id)
-        assert d1_data["status"] == "superseded"
+        assert d1_data["status"] == "active"
 
-    def test_contextual_auto_resolve(self, project):
+    def test_contextual_keywords_still_create_conflict(self, project):
+        """Even with contextual signal keywords, conflicts always surface to user."""
         d1 = ComposeDirective.create("global", "Use bullet points for formatting")
         d1 = add_directive(project.id, d1)
 
@@ -87,7 +89,7 @@ class TestDetectConflicts:
         d2 = add_directive(project.id, d2)
 
         conflicts = detect_conflicts(project.id, d2)
-        assert len(conflicts) == 0  # auto-scoped
+        assert len(conflicts) == 1  # always ask user
 
     def test_ambiguous_creates_conflict(self, project):
         d1 = ComposeDirective.create("global", "Target audience is executives")
