@@ -1286,41 +1286,53 @@ function updateLiveInputBar() {
     // Build sub-agent team strip
     const _agents = (window._subAgents && window._subAgents[id]) || {};
     const _agentEntries = Object.entries(_agents);
+    const _workingCount = _agentEntries.length > 0 ? _agentEntries.filter(([, a]) => a.status === 'working').length : 0;
+    const _doneCount = _agentEntries.length > 0 ? _agentEntries.filter(([, a]) => a.status === 'done').length : 0;
+    const _allDone = _agentEntries.length > 0 && _workingCount === 0;
     let _agentStripHtml = '';
+    let _agentFooterHtml = '';
+
     if (_agentEntries.length > 0) {
-      const _workingCount = _agentEntries.filter(([, a]) => a.status === 'working').length;
-      const _doneCount = _agentEntries.filter(([, a]) => a.status === 'done').length;
-      const _teamLabel = _workingCount > 0
-        ? _workingCount + ' agent' + (_workingCount > 1 ? 's' : '') + ' active' + (_doneCount > 0 ? ' \u00b7 ' + _doneCount + ' done' : '')
-        : _doneCount + ' agent' + (_doneCount > 1 ? 's' : '') + ' completed';
-      _agentStripHtml = '<div class="sub-agent-strip">' +
-        '<div class="sub-agent-header">' +
-        '<svg class="sub-agent-team-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>' +
-        '<span class="sub-agent-team-label">' + _teamLabel + '</span>' +
-        '</div>' +
-        '<div class="sub-agent-pills">';
-      _agentEntries.forEach(([tuId, ag], idx) => {
-        const isDone = ag.status === 'done';
-        const agentElapsed = isDone && ag.endTime
-          ? Math.round((ag.endTime - ag.startTime) / 1000)
-          : Math.round((Date.now() - ag.startTime) / 1000);
-        const agentTimeStr = agentElapsed >= 60 ? Math.floor(agentElapsed/60) + 'm ' + (agentElapsed%60) + 's' : agentElapsed + 's';
-        const statusIcon = isDone
-          ? '<svg class="sub-agent-check" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>'
-          : '<span class="sub-agent-spinner"></span>';
-        const pillClass = 'sub-agent-pill' + (isDone ? ' done' : ' active');
-        _agentStripHtml += '<div class="' + pillClass + '" style="animation-delay:' + (idx * 0.06) + 's" data-agent-id="' + escHtml(tuId) + '">' +
-          statusIcon +
-          '<span class="sub-agent-label">' + escHtml(ag.desc || 'Agent') + '</span>' +
-          '<span class="sub-agent-time">' + agentTimeStr + '</span>' +
+      if (_allDone) {
+        // All agents finished — collapse to minimal footer inside the working bar
+        _agentFooterHtml = '<div class="sub-agent-footer">' +
+          '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>' +
+          '<span>' + _doneCount + ' agent' + (_doneCount > 1 ? 's' : '') + ' completed</span>' +
           '</div>';
-      });
-      _agentStripHtml += '</div></div>';
+      } else {
+        // Some agents still working — show full strip with pills
+        const _teamLabel = _workingCount + ' agent' + (_workingCount > 1 ? 's' : '') + ' active' + (_doneCount > 0 ? ' \u00b7 ' + _doneCount + ' done' : '');
+        _agentStripHtml = '<div class="sub-agent-strip">' +
+          '<div class="sub-agent-header">' +
+          '<svg class="sub-agent-team-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>' +
+          '<span class="sub-agent-team-label">' + _teamLabel + '</span>' +
+          '</div>' +
+          '<div class="sub-agent-pills">';
+        _agentEntries.forEach(([tuId, ag], idx) => {
+          const isDone = ag.status === 'done';
+          const agentElapsed = isDone && ag.endTime
+            ? Math.round((ag.endTime - ag.startTime) / 1000)
+            : Math.round((Date.now() - ag.startTime) / 1000);
+          const agentTimeStr = agentElapsed >= 60 ? Math.floor(agentElapsed/60) + 'm ' + (agentElapsed%60) + 's' : agentElapsed + 's';
+          const statusIcon = isDone
+            ? '<svg class="sub-agent-check" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>'
+            : '<span class="sub-agent-spinner"></span>';
+          const pillClass = 'sub-agent-pill' + (isDone ? ' done' : ' active');
+          _agentStripHtml += '<div class="' + pillClass + '" style="animation-delay:' + (idx * 0.06) + 's" data-agent-id="' + escHtml(tuId) + '">' +
+            statusIcon +
+            '<span class="sub-agent-label">' + escHtml(ag.desc || 'Agent') + '</span>' +
+            '<span class="sub-agent-time">' + agentTimeStr + '</span>' +
+            '</div>';
+        });
+        _agentStripHtml += '</div></div>';
+      }
     }
 
+    const _hasActiveAgents = _agentEntries.length > 0 && !_allDone;
     bar.innerHTML =
-      '<div class="live-working-status' + (_agentEntries.length > 0 ? ' has-agents' : '') + '">' +
+      '<div class="live-working-status' + (_hasActiveAgents ? ' has-agents' : '') + '">' +
       '<div class="live-working-indicator"><span class="' + _spinnerClass + '"></span> ' + _statusLabel + ' <span id="live-elapsed" style="color:var(--text-faint);font-size:10px;margin-left:6px;">' + _elapsedStr + '</span></div>' +
+      (_agentFooterHtml ? _agentFooterHtml : '') +
       '<button class="live-stop-btn" onclick="liveSubmitInterrupt()" title="Interrupt session">\u25A0 Stop</button>' +
       '</div>' +
       _agentStripHtml +

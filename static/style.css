@@ -2634,6 +2634,32 @@ mark.find-match.current { background: var(--accent); color:#fff; }
   color: #16a34a;
 }
 
+/* ── Sub-agent completed footer (minimal collapsed state) ── */
+.sub-agent-footer {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  font-weight: 500;
+  color: #22c55e;
+  opacity: 0.8;
+  position: relative;
+  z-index: 1;
+  animation: agentFooterIn 0.35s ease-out both;
+  margin-left: auto;
+  margin-right: 12px;
+}
+@keyframes agentFooterIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 0.8; transform: translateY(0); }
+}
+.sub-agent-footer svg {
+  flex-shrink: 0;
+}
+[data-theme="light"] .sub-agent-footer {
+  color: #16a34a;
+}
+
 .live-textarea {
   width: 100%;
   background: var(--bg-input-alt);
