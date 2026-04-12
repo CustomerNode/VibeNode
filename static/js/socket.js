@@ -846,6 +846,25 @@ socket.on('session_entry', (data) => {
     // stale pre-remap alias) kept resetting the watchdog without rendering,
     // permanently defeating the recovery safety net.
 
+    // Performance: measure time from submit to first entry (once per turn)
+    if (performance.getEntriesByName('submit-' + data.session_id).length) {
+        performance.mark('first-entry-' + data.session_id);
+        try {
+            performance.measure(
+                'time-to-first-entry-' + data.session_id,
+                'submit-' + data.session_id,
+                'first-entry-' + data.session_id
+            );
+            var _perfMeasure = performance.getEntriesByName('time-to-first-entry-' + data.session_id)[0];
+            if (_perfMeasure) {
+                console.debug('[PERF] Time to first entry for %s: %dms', data.session_id.slice(0, 12), Math.round(_perfMeasure.duration));
+            }
+        } catch (_e) { /* ignore measurement errors */ }
+        performance.clearMarks('submit-' + data.session_id);
+        performance.clearMarks('first-entry-' + data.session_id);
+        performance.clearMeasures('time-to-first-entry-' + data.session_id);
+    }
+
     // Consistency check: if we're getting entries for a session the UI
     // thinks is idle/stopped, our state is stale — request a refresh.
     // This catches the case where the WORKING event was silently lost.
@@ -1249,6 +1268,26 @@ socket.on('session_log', (data) => {
 
     if (typeof _updateLastMessageTimes === 'function') _updateLastMessageTimes();
     if (liveAutoScroll) logEl.scrollTop = logEl.scrollHeight;
+
+    // Performance: measure session switch time (from get_session_log emit to render complete)
+    if (performance.getEntriesByName('switch-' + data.session_id).length) {
+        performance.mark('switch-rendered-' + data.session_id);
+        try {
+            performance.measure(
+                'session-switch-' + data.session_id,
+                'switch-' + data.session_id,
+                'switch-rendered-' + data.session_id
+            );
+            var _switchMeasure = performance.getEntriesByName('session-switch-' + data.session_id)[0];
+            if (_switchMeasure) {
+                console.debug('[PERF] Session switch for %s: %dms (%d entries)',
+                    data.session_id.slice(0, 12), Math.round(_switchMeasure.duration), allEntries.length);
+            }
+        } catch (_e) { /* ignore measurement errors */ }
+        performance.clearMarks('switch-' + data.session_id);
+        performance.clearMarks('switch-rendered-' + data.session_id);
+        performance.clearMeasures('session-switch-' + data.session_id);
+    }
 });
 
 // Helper: format permission question for display

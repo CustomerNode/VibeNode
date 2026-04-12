@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 import os as _os
 DAEMON_PORT = int(_os.environ.get("VIBENODE_DAEMON_PORT", 5051))
 
+# Conditional profiling flag — matches daemon's _PROFILE_PIPELINE pattern.
+# Set to False to disable IPC round-trip timing logs.
+_PROFILE_IPC = True
+
 
 class DaemonClient:
     """Proxy for the SessionManager running in the daemon process."""
@@ -284,6 +288,8 @@ class DaemonClient:
                     "disconnected": True}
 
         req_id = uuid.uuid4().hex[:8]
+        if _PROFILE_IPC:
+            _t0 = time.perf_counter()
         event = threading.Event()
         result_holder = [None]
 
@@ -307,7 +313,12 @@ class DaemonClient:
             self._pending.pop(req_id, None)
 
         if result_holder[0] is None:
+            if _PROFILE_IPC:
+                logger.info("PROFILE ipc [%s] %s: %.3fs (TIMEOUT)", req_id, method, time.perf_counter() - _t0)
             return {"ok": False, "error": f"Daemon did not respond to {method} (timeout)"}
+
+        if _PROFILE_IPC:
+            logger.info("PROFILE ipc [%s] %s: %.3fs", req_id, method, time.perf_counter() - _t0)
 
         return result_holder[0]
 

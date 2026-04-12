@@ -13,12 +13,17 @@ Client -> Server events:
 import json
 import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from flask import request as flask_request
 from flask_socketio import emit
 
 logger = logging.getLogger(__name__)
+
+# Conditional profiling flag — matches daemon's _PROFILE_PIPELINE pattern.
+# Set to False to disable WebSocket handler timing logs.
+_PROFILE_WS = True
 
 # Module-level thread pool for parallelizing independent setup work
 # (e.g. compose resolution + cross-session awareness).  A single
@@ -222,6 +227,8 @@ def register_ws_events(socketio, app):
     @socketio.on('start_session')
     def handle_start_session(data):
         """Start a new or resumed SDK session."""
+        if _PROFILE_WS:
+            _t0_start = time.perf_counter()
         if not isinstance(data, dict):
             emit('error', {'message': 'Invalid data'})
             return
@@ -336,6 +343,10 @@ def register_ws_events(socketio, app):
         elif want_awareness:
             cross_ctx = _resolve_awareness()
 
+        if _PROFILE_WS:
+            logger.info("PROFILE start_session [%s] compose+awareness resolved: %.3fs",
+                        session_id[:12], time.perf_counter() - _t0_start)
+
         # Apply results to system_prompt (order: compose first, awareness second)
         if compose_prompt:
             system_prompt = (
@@ -358,6 +369,9 @@ def register_ws_events(socketio, app):
             prompt = prompt + _ts_tag
 
         sm = app.session_manager
+        if _PROFILE_WS:
+            logger.info("PROFILE start_session [%s] pre-processing done: %.3fs",
+                        session_id[:12], time.perf_counter() - _t0_start)
         result = sm.start_session(
             session_id=session_id,
             prompt=prompt,
@@ -375,6 +389,9 @@ def register_ws_events(socketio, app):
         if result.get('ok'):
             # Emit immediately so the client isn't blocked
             emit('session_started', {'session_id': session_id})
+            if _PROFILE_WS:
+                logger.info("PROFILE start_session [%s] session_started emitted: %.3fs",
+                            session_id[:12], time.perf_counter() - _t0_start)
             # Link session to compose task after emitting (non-blocking)
             if compose_task_id:
                 try:
@@ -547,6 +564,9 @@ def register_ws_events(socketio, app):
             emit('error', {'message': 'session_id is required'})
             return
 
+        if _PROFILE_WS:
+            _t0 = time.perf_counter()
+
         sm = app.session_manager
 
         # JSONL is the single source of truth — the SDK writes it and
@@ -558,16 +578,27 @@ def register_ws_events(socketio, app):
         # are more complete — use those instead.  No merge, no
         # fingerprinting: just pick the source that has more data.
         entries = _parse_jsonl_entries(app, session_id, since, project=project)
+        if _PROFILE_WS:
+            logger.info("PROFILE get_session_log [%s] jsonl_parsed: %.3fs (%d entries)",
+                        session_id[:12], time.perf_counter() - _t0, len(entries))
+
         if sm.has_session(session_id):
             sdk_entries = sm.get_entries(session_id, since=0)
             if len(sdk_entries) > len(entries):
                 # Daemon has current-turn data not yet on disk — use it
                 entries = sdk_entries
+            if _PROFILE_WS:
+                logger.info("PROFILE get_session_log [%s] daemon_ipc: %.3fs",
+                            session_id[:12], time.perf_counter() - _t0)
         if not entries:
             # Fallback: brand-new session with no JSONL file yet
             entries = sm.get_entries(session_id, since=0) if sm.has_session(session_id) else []
 
         total = len(entries)
+
+        if _PROFILE_WS:
+            logger.info("PROFILE get_session_log [%s] total: %.3fs (%d entries returned)",
+                        session_id[:12], time.perf_counter() - _t0, total)
 
         if before is not None:
             # Loading older entries: return entries ending before `before` index

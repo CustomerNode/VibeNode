@@ -557,6 +557,7 @@ function startLivePanel(id, opts) {
 
   // Request the log via WebSocket (skip for brand-new sessions — optimistic bubble is enough)
   if (!skipLog) {
+    performance.mark('switch-' + id);
     socket.emit('get_session_log', {session_id: id, since: 0, project: localStorage.getItem('activeProject') || ''});
   }
 
@@ -1502,6 +1503,7 @@ function liveSubmitIdle() {
 
 function _liveSubmitDirect(sid, text, opts) {
   if (!sid) return;
+  performance.mark('submit-' + sid);
   _liveSending = true;
   _clearDraft(sid);
   const _isVoice = opts && opts.voice;
@@ -1801,6 +1803,7 @@ function liveSubmitContinue(fromId) {
   _addOptimisticBubble(sid, text, wasVoice);
 
   _liveSending = true;
+  performance.mark('submit-' + sid);
 
   // Clear any stale client-side queue from a previous interrupt —
   // the message is being sent directly, not queued.
