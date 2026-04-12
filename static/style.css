@@ -6029,6 +6029,57 @@ mark.find-match.current { background: var(--accent); color:#fff; }
   pointer-events: none;  /* click handled by parent pill */
 }
 
+/* Compose Plan with AI button */
+.compose-plan-btn {
+  display: inline-flex; align-items: center; gap: 5px; padding: 4px 12px;
+  font-size: 12px; font-weight: 500; border: 1px solid var(--accent); border-radius: 6px; cursor: pointer;
+  background: transparent; color: var(--accent); transition: all .15s;
+}
+.compose-plan-btn:hover { background: var(--accent); color: #fff; }
+
+/* Compose Launch All button */
+.compose-launch-btn {
+  display: inline-flex; align-items: center; gap: 5px; padding: 4px 12px;
+  font-size: 12px; font-weight: 500; border: none; border-radius: 6px; cursor: pointer;
+  background: var(--green, #3fb950); color: #fff; transition: opacity .15s;
+}
+.compose-launch-btn:hover { opacity: .85; }
+.compose-launch-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* Compose settings popover & gear button */
+.compose-settings-btn {
+  background: none; border: none; color: var(--text-muted); cursor: pointer;
+  padding: 4px; border-radius: 4px; display: inline-flex; align-items: center;
+}
+.compose-settings-btn:hover { color: var(--text); background: var(--bg-subtle); }
+.compose-settings-popover {
+  position: fixed; z-index: 9999; background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 16px; min-width: 240px; box-shadow: 0 8px 24px rgba(0,0,0,.18);
+}
+.compose-settings-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.compose-settings-label { font-size: 12px; font-weight: 500; color: var(--text); }
+.compose-settings-input {
+  flex: 1; font-size: 12px; padding: 4px 8px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg-subtle); color: var(--text);
+  outline: none; max-width: 150px;
+}
+.compose-settings-input:focus { border-color: var(--accent); }
+.compose-settings-hint { font-size: 11px; color: var(--text-muted); margin-top: 8px; line-height: 1.4; }
+.compose-settings-toggle {
+  position: relative; width: 36px; height: 20px; border-radius: 10px; border: none; cursor: pointer;
+  background: var(--bg-subtle); transition: background .2s;
+}
+.compose-settings-toggle.active { background: var(--green, #3fb950); }
+.compose-settings-toggle-knob {
+  position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+  background: #fff; transition: transform .2s; box-shadow: 0 1px 3px rgba(0,0,0,.2);
+}
+.compose-settings-toggle.active .compose-settings-toggle-knob { transform: translateX(16px); }
+.compose-shared-badge {
+  font-size: 10px; font-weight: 600; color: var(--green, #3fb950); background: rgba(63,185,80,.12);
+  padding: 1px 6px; border-radius: 4px; margin-left: 6px; vertical-align: middle;
+}
+
 /* ════════════════════════════════════════════════════════════════
    CARD ELEMENTS — progress, sessions, owner, inline edit
    ════════════════════════════════════════════════════════════════ */

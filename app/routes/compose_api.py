@@ -17,6 +17,7 @@ from ..compose.models import (
     delete_project_folder, delete_section_folder,
     list_projects, get_project, save_project,
     get_sections, get_section,
+    project_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -466,6 +467,59 @@ def delete_section(project_id, section_id):
     return jsonify({'ok': True})
 
 
+@bp.route('/projects/<project_id>/sections/<section_id>/launch', methods=['POST'])
+def launch_section_session(project_id, section_id):
+    """Create and link a new session for a section.
+
+    Used by "Launch All" to programmatically start section agents
+    without opening the session spawner UI.
+    """
+    project = get_project(project_id)
+    if not project:
+        return jsonify({'ok': False, 'error': 'Project not found'}), 404
+
+    section = get_section(project_id, section_id)
+    if not section:
+        return jsonify({'ok': False, 'error': 'Section not found'}), 404
+
+    if section.session_id:
+        return jsonify({'ok': False, 'error': 'Section already has a session', 'session_id': section.session_id}), 409
+
+    try:
+        from ..compose.prompt_builder import build_compose_prompt, link_session
+        from ..compose.context_manager import update_section_in_context
+
+        compose_task_id = f"section:{project_id}:{section_id}"
+        session_id = uuid.uuid4().hex
+
+        prompt_result = build_compose_prompt(compose_task_id)
+        system_prompt = prompt_result.get('system_prompt') if prompt_result.get('ok') else None
+
+        sm = current_app.session_manager
+        result = sm.start_session(
+            session_id=session_id,
+            prompt="",
+            cwd=str(project_dir(project_id)),
+            name=f"{section.name} ({project.name})",
+            system_prompt=system_prompt,
+        )
+
+        if result and not (isinstance(result, dict) and result.get('error')):
+            link_session(compose_task_id, session_id)
+            section.session_id = session_id
+            update_section_in_context(project_id, section)
+            _emit('compose_task_updated', {
+                'project_id': project_id,
+                'section': section.to_dict(),
+            })
+            return jsonify({'ok': True, 'session_id': session_id, 'section': section.to_dict()})
+        else:
+            return jsonify({'ok': False, 'error': 'Session daemon did not respond', 'detail': str(result)}), 503
+    except Exception:
+        logger.exception("Failed to launch session for section %s", section_id)
+        return jsonify({'ok': False, 'error': 'Internal error'}), 500
+
+
 @bp.route('/projects/<project_id>/sections/add-and-link', methods=['POST'])
 def add_and_link_section(project_id):
     """Atomic create-section + link-session.
@@ -603,7 +657,7 @@ def update_facts(project_id):
 def update_section_status(project_id, section_id):
     """Update a section's status and summary.
 
-    JSON body: { "status": "working", "summary": "...", "changing": false, "change_note": "..." }
+    JSON body: { "status": "drafting", "summary": "...", "changing": false, "change_note": "..." }
     """
     from ..compose.context_manager import update_section_status as _update_status
     data = request.get_json(force=True, silent=True) or {}
@@ -754,6 +808,80 @@ def update_changing(project_id, section_id):
     except Exception:
         logger.exception("Failed to update changing flag")
         return jsonify({'ok': False, 'error': 'Failed to update changing flag'}), 500
+
+
+# ---------------------------------------------------------------------------
+# Planner accept — create sections from AI-proposed plan
+# ---------------------------------------------------------------------------
+
+@bp.route('/projects/<project_id>/planner/accept', methods=['POST'])
+def accept_compose_plan(project_id):
+    """Accept an AI-proposed content plan and create sections.
+
+    JSON body: {
+        "sections": [
+            {
+                "name": "Section Name",
+                "artifact_type": "text",
+                "subsections": [
+                    {"name": "Sub Name", "artifact_type": "data"}
+                ]
+            }
+        ],
+        "parent_id": null  // optional — scope plan under a parent section
+    }
+    """
+    project = get_project(project_id)
+    if not project:
+        return jsonify({'ok': False, 'error': 'Project not found'}), 404
+
+    data = request.get_json(force=True, silent=True) or {}
+    plan_sections = data.get('sections', [])
+    scope_parent_id = data.get('parent_id') or None
+
+    if not plan_sections:
+        return jsonify({'ok': False, 'error': 'No sections in plan'}), 400
+
+    from ..compose.context_manager import add_section_to_context
+
+    created = []
+    order_base = len(get_sections(project_id))
+
+    def _create_recursive(items, parent_id, order_start):
+        nonlocal created
+        for i, item in enumerate(items):
+            name = (item.get('name') or '').strip()
+            if not name:
+                continue
+            artifact = item.get('artifact_type', 'text')
+            section = ComposeSection.create(
+                project_id=project_id,
+                name=name,
+                parent_id=parent_id,
+                order=order_start + i,
+                artifact_type=artifact,
+            )
+            scaffold_section(project_id, section)
+            try:
+                add_section_to_context(project_id, section)
+                created.append(section)
+            except Exception:
+                logger.exception("Failed to add planned section %s", name)
+
+            # Recurse into subsections
+            subs = item.get('subsections', [])
+            if subs:
+                _create_recursive(subs, section.id, 0)
+
+    _create_recursive(plan_sections, scope_parent_id, order_base)
+
+    _emit('compose_board_refresh', {'project_id': project_id})
+
+    return jsonify({
+        'ok': True,
+        'created_count': len(created),
+        'sections': [s.to_dict() for s in created],
+    })
 
 
 # ---------------------------------------------------------------------------

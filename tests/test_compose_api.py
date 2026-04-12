@@ -341,3 +341,66 @@ class TestBoardEndpoint:
         assert data['project']['id'] == pid
         assert 'sections' in data
         assert 'status' in data
+
+
+class TestPlannerAcceptEndpoint:
+    """Tests for POST /api/compose/projects/{id}/planner/accept."""
+
+    def _create_project(self, client):
+        resp = client.post('/api/compose/projects', json={'name': 'test-planner-proj'})
+        return resp.get_json()['project']['id']
+
+    def test_accept_flat_plan(self, client):
+        pid = self._create_project(client)
+        plan = {
+            'sections': [
+                {'name': 'Executive Summary', 'artifact_type': 'text'},
+                {'name': 'Revenue Data', 'artifact_type': 'data'},
+            ]
+        }
+        resp = client.post(f'/api/compose/projects/{pid}/planner/accept', json=plan)
+        data = resp.get_json()
+        assert resp.status_code == 200
+        assert data['ok'] is True
+        assert data['created_count'] == 2
+
+    def test_accept_nested_plan(self, client):
+        pid = self._create_project(client)
+        plan = {
+            'sections': [
+                {
+                    'name': 'Financials',
+                    'artifact_type': 'text',
+                    'subsections': [
+                        {'name': 'Q1 Revenue', 'artifact_type': 'data'},
+                        {'name': 'Q2 Revenue', 'artifact_type': 'data'},
+                    ]
+                }
+            ]
+        }
+        resp = client.post(f'/api/compose/projects/{pid}/planner/accept', json=plan)
+        data = resp.get_json()
+        assert data['ok'] is True
+        assert data['created_count'] == 3  # parent + 2 children
+
+    def test_accept_empty_plan(self, client):
+        pid = self._create_project(client)
+        resp = client.post(f'/api/compose/projects/{pid}/planner/accept', json={'sections': []})
+        assert resp.status_code == 400
+
+    def test_accept_scoped_plan(self, client):
+        pid = self._create_project(client)
+        # Create a parent section first
+        sec_resp = client.post(f'/api/compose/projects/{pid}/sections', json={'name': 'Parent'})
+        parent_id = sec_resp.get_json()['section']['id']
+        plan = {
+            'sections': [{'name': 'Child A', 'artifact_type': 'text'}],
+            'parent_id': parent_id,
+        }
+        resp = client.post(f'/api/compose/projects/{pid}/planner/accept', json=plan)
+        data = resp.get_json()
+        assert data['ok'] is True
+        assert data['created_count'] == 1
+        # Verify the child has the correct parent
+        child = data['sections'][0]
+        assert child['parent_id'] == parent_id

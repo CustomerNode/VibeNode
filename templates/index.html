@@ -294,6 +294,9 @@
           <span id="compose-root-status" class="compose-root-status">0 sections</span>
         </div>
         <div class="compose-root-header-right">
+          <button class="compose-settings-btn" onclick="_composeToggleSettings(event)" title="Composition settings"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+          <button class="compose-plan-btn" onclick="_openComposePlanner()" title="Plan with AI"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg> Plan with AI</button>
+          <button id="compose-launch-all-btn" class="compose-launch-btn" onclick="_composeLaunchAll()" title="Launch sessions for all sections without one" style="display:none;"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Launch All</button>
           <button class="kanban-create-first-btn" onclick="composeAddSection()" style="padding:4px 12px;font-size:12px;margin:0;">+ Add Section</button>
           <span id="compose-root-conflicts" class="compose-root-conflicts" style="display:none;">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
@@ -305,6 +308,7 @@
       <div id="compose-input-target" class="compose-input-target" style="display:none;">
         <span class="compose-input-target-label">Talking to:</span>
         <span id="compose-input-target-name" class="compose-input-target-name">composition</span>
+        <span id="compose-shared-badge" class="compose-shared-badge" style="display:none;">Shared</span>
       </div>
       <!-- NB-11: Section cards board area -->
       <div id="compose-sections-board" class="compose-sections-board"></div>

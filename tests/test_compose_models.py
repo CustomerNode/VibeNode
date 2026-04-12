@@ -77,6 +77,16 @@ class TestComposeSection:
         s = ComposeSection.from_dict(d)
         assert s.status == SectionStatus.REVIEWING
 
+    def test_status_migration_not_started(self):
+        d = {"id": "x", "project_id": "p", "name": "N", "status": "not_started", "order": 0}
+        s = ComposeSection.from_dict(d)
+        assert s.status == SectionStatus.DRAFTING
+
+    def test_status_migration_working(self):
+        d = {"id": "x", "project_id": "p", "name": "N", "status": "working", "order": 0}
+        s = ComposeSection.from_dict(d)
+        assert s.status == SectionStatus.DRAFTING
+
 
 class TestComposeConflict:
     def test_create(self):

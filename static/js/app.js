@@ -1914,17 +1914,20 @@ async function _submitComposeProject() {
 }
 
 let _composeInsertPosition = 'top';
+let _composeAddParentId = null;
 
-function composeAddSection() {
+function composeAddSection(parentId) {
   if (!_composeProject) return;
   const overlay = document.getElementById('pm-overlay');
   if (!overlay) return;
   _composeInsertPosition = 'top';
   _composeArtifactType = 'text';
+  _composeAddParentId = parentId || null;
 
+  const _modalTitle = parentId ? 'Add Subsection' : 'Add Section';
   overlay.innerHTML = `<div class="pm-card pm-enter" style="max-width:480px;">
     <h2 class="pm-title" style="display:flex;align-items:center;justify-content:space-between;">
-      <span>Add Section</span>
+      <span>${_modalTitle}</span>
       <div class="kanban-create-position-row" style="margin:0;">
         <span style="font-size:11px;color:var(--text-dim);">Insert</span>
         <button class="kanban-create-pos-btn active" id="cs-pos-top" onclick="_setComposeInsertPos('top')">Top</button>
@@ -2004,7 +2007,7 @@ async function _submitComposeSection() {
     const resp = await fetch('/api/compose/projects/' + _composeProject.id + '/sections', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({name, artifact_type: artifactType, insert_position: insertPos}),
+      body: JSON.stringify({name, artifact_type: artifactType, insert_position: insertPos, parent_id: _composeAddParentId || undefined}),
     });
     if (!resp.ok) throw new Error('Server error (' + resp.status + ')');
     const data = await resp.json();
@@ -2763,6 +2766,475 @@ function _updateComposeRootHeader() {
       conflictsEl.style.display = 'none';
     }
   }
+
+  _composeUpdateSharedBadge();
+  _composeUpdateLaunchBtn();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// COMPOSE LAUNCH ALL — start sessions for all unlinked sections
+// ═══════════════════════════════════════════════════════════════
+
+let _composeLaunching = false;
+
+function _composeUpdateLaunchBtn() {
+  const btn = document.getElementById('compose-launch-all-btn');
+  if (!btn) return;
+  const unlinked = _composeSections.filter(s => !s.session_id);
+  btn.style.display = (unlinked.length > 0 && !_composeLaunching) ? 'inline-flex' : 'none';
+}
+
+async function _composeLaunchAll() {
+  if (!_composeProject || _composeLaunching) return;
+  const unlinked = _composeSections.filter(s => !s.session_id);
+  if (unlinked.length === 0) {
+    if (typeof showToast === 'function') showToast('All sections already have sessions');
+    return;
+  }
+
+  _composeLaunching = true;
+  _composeUpdateLaunchBtn();
+  const total = unlinked.length;
+  if (typeof showToast === 'function') showToast('Launching ' + total + ' section agent' + (total !== 1 ? 's' : '') + '...');
+
+  let succeeded = 0;
+  let failed = 0;
+  const projId = _composeProject.id;
+
+  for (const sec of unlinked) {
+    try {
+      const resp = await fetch('/api/compose/projects/' + encodeURIComponent(projId) + '/sections/' + sec.id + '/launch', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        sec.session_id = data.session_id;
+        succeeded++;
+      } else {
+        failed++;
+      }
+    } catch (e) {
+      failed++;
+    }
+  }
+
+  _composeLaunching = false;
+  _composeUpdateLaunchBtn();
+  _renderComposeSectionCards();
+  _updateComposeRootHeader();
+
+  let msg = succeeded + ' agent' + (succeeded !== 1 ? 's' : '') + ' launched';
+  if (failed > 0) msg += ', ' + failed + ' failed';
+  if (typeof showToast === 'function') showToast(msg, failed > 0);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// COMPOSE AI PLANNER — slideout panel for content planning
+// ═══════════════════════════════════════════════════════════════
+
+const _COMPOSE_PLANNER_SYSTEM = [
+  'You are a content planner for a composition project.',
+  'You MUST respond with ONLY valid JSON. No explanation, no prose, no apologies, no refusals.',
+  'Even for trivial or vague inputs, you MUST produce a valid section structure.',
+  'NEVER refuse. NEVER explain. NEVER ask questions.',
+  'NEVER output anything except the JSON object.',
+  'Format: {"sections":[{"name":"...","artifact_type":"text","subsections":[]}]}',
+  'artifact_type must be one of: "text", "code", "data".',
+  'Break the content into logical sections for parallel AI agents.',
+  'Each section should be independently writeable by an agent.',
+  'Use subsections for deeper breakdown. 1-3 nesting levels typical.',
+  'Names should be descriptive content section names, not generic labels.',
+].join(' ');
+
+let _composePlannerSessionId = null;
+let _composePlannerProposal = null;
+let _composePlannerAccumText = '';
+let _composePlannerEntryListener = null;
+let _composePlannerStateListener = null;
+let _composePlannerStartTime = 0;
+let _composePlannerTimerInterval = null;
+let _composePlannerScopeParentId = null;
+
+function _openComposePlanner(parentId) {
+  const old = document.getElementById('compose-planner-panel');
+  if (old) old.remove();
+  _composePlannerProposal = null;
+  _composePlannerScopeParentId = parentId || null;
+
+  // Prompt modal
+  const overlay = document.createElement('div');
+  overlay.className = 'pm-overlay';
+  overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+  overlay.innerHTML = `
+    <div class="pm-card" style="max-width:480px;">
+      <div class="pm-title">Plan with AI</div>
+      <div class="pm-body">
+        <textarea id="compose-planner-prompt" class="kanban-create-textarea" rows="3"
+          placeholder="Describe what you want to compose\u2026 e.g. 'A quarterly business review with financials, product updates, and team highlights'"
+          onkeydown="if(_shouldSend&&_shouldSend(event)){event.preventDefault();_submitComposePlanPrompt();}"></textarea>
+      </div>
+      <div class="pm-actions">
+        <button class="pm-btn" onclick="this.closest('.pm-overlay').remove()">Cancel</button>
+        <button class="pm-btn pm-btn-primary" onclick="_submitComposePlanPrompt()">Plan</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  setTimeout(() => { const ta = document.getElementById('compose-planner-prompt'); if (ta) ta.focus(); }, 100);
+}
+
+async function _submitComposePlanPrompt() {
+  const ta = document.getElementById('compose-planner-prompt');
+  const prompt = ta ? ta.value.trim() : '';
+  if (!prompt) return;
+  const overlay = ta.closest('.pm-overlay');
+  if (overlay) overlay.remove();
+
+  _openComposePlannerSlideout(prompt);
+}
+
+function _buildComposePlannerPanel() {
+  const panel = document.createElement('div');
+  panel.id = 'compose-planner-panel';
+  panel.className = 'kanban-planner-panel';
+  panel.innerHTML = `
+    <div class="kanban-planner-header">
+      <span class="kanban-planner-title"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg> Plan Composition</span>
+      <div style="display:flex;gap:4px;align-items:center;">
+        <button class="kanban-planner-close" onclick="_closeComposePlanner()" title="Close">&times;</button>
+      </div>
+    </div>
+    <div class="planner-body" id="compose-planner-body">
+      <div class="planner-status">
+        <div class="planner-spinner"></div><span>Building content plan\u2026</span>
+      </div>
+    </div>
+    <div class="planner-footer">
+      <div class="planner-refine-row">
+        <textarea id="compose-planner-refine" class="kanban-create-textarea" rows="2" placeholder="Ask for changes\u2026"
+          onkeydown="if(_shouldSend&&_shouldSend(event)){event.preventDefault();_refineComposePlan();}"></textarea>
+      </div>
+    </div>`;
+  return panel;
+}
+
+async function _openComposePlannerSlideout(prompt) {
+  const old = document.getElementById('compose-planner-panel');
+  if (old) old.remove();
+
+  const newId = crypto.randomUUID();
+  _composePlannerSessionId = newId;
+  if (typeof _hiddenSessionIds !== 'undefined') _hiddenSessionIds.add(newId);
+
+  const panel = _buildComposePlannerPanel();
+  document.body.appendChild(panel);
+  requestAnimationFrame(() => panel.classList.add('open'));
+
+  _attachComposePlannerListeners();
+
+  // Build context snippet
+  let contextSnippet = '';
+  if (_composeProject && _composeSections.length > 0) {
+    const lines = _composeSections.map(s => '- [' + s.status + '] ' + s.name + (s.artifact_type ? ' (' + s.artifact_type + ')' : ''));
+    contextSnippet = '\n\nEXISTING SECTIONS:\n' + lines.join('\n') + '\n\nConsider these existing sections. Avoid duplicating them. You may plan additional sections or reorganize.';
+  }
+
+  let scopeSnippet = '';
+  if (_composePlannerScopeParentId) {
+    const parent = _composeSections.find(s => s.id === _composePlannerScopeParentId);
+    if (parent) {
+      scopeSnippet = '\n\nSCOPED PLANNING: You are planning subsections for "' + parent.name + '". Return sections that will be children of this parent.';
+    }
+  }
+
+  const sysPrompt = _COMPOSE_PLANNER_SYSTEM + contextSnippet + scopeSnippet;
+
+  _composePlannerAccumText = '';
+  _composePlannerStartTime = Date.now();
+  if (typeof runningIds !== 'undefined') runningIds.add(newId);
+  if (typeof sessionKinds !== 'undefined') sessionKinds[newId] = 'working';
+
+  socket.emit('start_session', {
+    session_id: newId,
+    prompt: prompt,
+    cwd: typeof _currentProjectDir === 'function' ? _currentProjectDir() : '',
+    system_prompt: sysPrompt,
+    max_turns: 0,
+    session_type: 'planner',
+  });
+}
+
+function _attachComposePlannerListeners() {
+  _detachComposePlannerListeners();
+  _composePlannerAccumText = '';
+  _composePlannerStartTime = Date.now();
+
+  _composePlannerTimerInterval = setInterval(() => {
+    const body = document.getElementById('compose-planner-body');
+    if (!body) return;
+    const status = body.querySelector('.planner-status span');
+    if (status) {
+      const secs = Math.floor((Date.now() - _composePlannerStartTime) / 1000);
+      const titleMatches = _composePlannerAccumText.match(/"name"\s*:\s*"[^"]+"/g);
+      const count = titleMatches ? titleMatches.length : 0;
+      status.textContent = count > 0
+        ? 'Building plan\u2026 ' + count + ' section' + (count !== 1 ? 's' : '') + ' so far (' + secs + 's)'
+        : 'Building content plan\u2026 ' + secs + 's';
+    }
+  }, 1000);
+
+  _composePlannerEntryListener = (data) => {
+    if (data.session_id !== _composePlannerSessionId) return;
+    if (!data.entry) return;
+    const text = data.entry.text || '';
+    if (!text || data.entry.kind !== 'asst') return;
+    _composePlannerAccumText += text;
+  };
+
+  _composePlannerStateListener = (data) => {
+    if (data.session_id !== _composePlannerSessionId) return;
+    if (data.state === 'idle' || data.state === 'stopped') {
+      if (_composePlannerTimerInterval) { clearInterval(_composePlannerTimerInterval); _composePlannerTimerInterval = null; }
+      if (_composePlannerProposal) return;
+      _showComposePlanResult(_composePlannerAccumText);
+      _composePlannerAccumText = '';
+    }
+  };
+
+  socket.on('session_entry', _composePlannerEntryListener);
+  socket.on('session_state', _composePlannerStateListener);
+}
+
+function _detachComposePlannerListeners() {
+  if (_composePlannerEntryListener) { socket.off('session_entry', _composePlannerEntryListener); _composePlannerEntryListener = null; }
+  if (_composePlannerStateListener) { socket.off('session_state', _composePlannerStateListener); _composePlannerStateListener = null; }
+  if (_composePlannerTimerInterval) { clearInterval(_composePlannerTimerInterval); _composePlannerTimerInterval = null; }
+}
+
+function _showComposePlanResult(rawText) {
+  const body = document.getElementById('compose-planner-body');
+  if (!body) return;
+
+  let parsed = null;
+  // Try 1: ```json ... ```
+  const m1 = rawText.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (m1) { try { parsed = JSON.parse(m1[1]); } catch (_) {} }
+  // Try 2: whole text as JSON
+  if (!parsed) { try { parsed = JSON.parse(rawText.trim()); } catch (_) {} }
+  // Try 3: brace extraction
+  if (!parsed) {
+    const s = rawText.indexOf('{');
+    if (s >= 0) {
+      let depth = 0, end = -1, inStr = false, esc = false;
+      for (let i = s; i < rawText.length; i++) {
+        const c = rawText[i];
+        if (esc) { esc = false; continue; }
+        if (c === '\\' && inStr) { esc = true; continue; }
+        if (c === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (c === '{') depth++;
+        else if (c === '}') { depth--; if (depth === 0) { end = i; break; } }
+      }
+      if (end > s) { try { parsed = JSON.parse(rawText.slice(s, end + 1)); } catch (_) {} }
+    }
+  }
+
+  if (parsed && parsed.sections && parsed.sections.length > 0) {
+    _composePlannerProposal = parsed;
+    const count = _countComposePlanSections(parsed.sections);
+    body.innerHTML =
+      '<div class="planner-result">' +
+        '<div class="planner-result-header"><strong>' + count + ' sections</strong> proposed</div>' +
+        _renderComposePlanTree(parsed.sections) +
+        '<div class="planner-actions">' +
+          '<button class="planner-accept-btn" id="compose-planner-accept" onclick="_acceptComposePlan()">Add ' + count + ' sections to Board</button>' +
+        '</div>' +
+        '<div class="planner-hint">Want changes? Type below and send.</div>' +
+      '</div>';
+  } else {
+    body.innerHTML =
+      '<div class="planner-result">' +
+        '<div class="planner-error">Couldn\'t parse a section structure. Try rephrasing below.</div>' +
+        (rawText ? '<pre style="max-height:200px;overflow:auto;white-space:pre-wrap;font-size:11px;margin-top:8px;padding:8px;background:var(--bg-subtle);border-radius:6px;">' + (typeof escHtml === 'function' ? escHtml(rawText.slice(0, 2000)) : rawText.slice(0, 2000)) + '</pre>' : '') +
+      '</div>';
+  }
+}
+
+function _renderComposePlanTree(sections, depth) {
+  depth = depth || 0;
+  let html = '<div class="planner-tree' + (depth === 0 ? ' planner-tree-root' : '') + '">';
+  for (const sec of sections) {
+    const hasSubs = sec.subsections && sec.subsections.length > 0;
+    const typeLabel = sec.artifact_type || 'text';
+    html += '<div class="planner-node" data-depth="' + depth + '">';
+    html += '<div class="planner-node-row">';
+    html += hasSubs ? '<span class="planner-chevron" onclick="this.parentElement.parentElement.classList.toggle(\'collapsed\')"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></span>'
+                    : '<span class="planner-bullet">&bull;</span>';
+    html += '<span class="planner-node-title">' + (typeof escHtml === 'function' ? escHtml(sec.name) : sec.name) + '</span>';
+    html += '<span style="font-size:10px;color:var(--text-muted);margin-left:6px;">' + typeLabel + '</span>';
+    if (hasSubs) html += '<span class="planner-sub-count">' + sec.subsections.length + '</span>';
+    html += '</div>';
+    if (hasSubs) html += _renderComposePlanTree(sec.subsections, depth + 1);
+    html += '</div>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function _countComposePlanSections(sections) {
+  let c = 0;
+  for (const s of sections) { c++; if (s.subsections) c += _countComposePlanSections(s.subsections); }
+  return c;
+}
+
+async function _acceptComposePlan() {
+  if (!_composePlannerProposal || !_composePlannerProposal.sections || !_composeProject) return;
+  const btn = document.getElementById('compose-planner-accept');
+  if (btn) { btn.disabled = true; btn.textContent = 'Creating\u2026'; }
+
+  try {
+    const res = await fetch('/api/compose/projects/' + encodeURIComponent(_composeProject.id) + '/planner/accept', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        sections: _composePlannerProposal.sections,
+        parent_id: _composePlannerScopeParentId || null,
+      }),
+    });
+    if (!res.ok) throw new Error('Failed to create sections');
+    const data = await res.json();
+    const count = data.created_count || 0;
+    if (typeof showToast === 'function') showToast('Created ' + count + ' section' + (count !== 1 ? 's' : ''));
+    _closeComposePlanner();
+    initCompose();
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Failed: ' + e.message, true);
+    if (btn) { btn.disabled = false; btn.textContent = 'Add to Board'; }
+  }
+}
+
+function _refineComposePlan() {
+  const ta = document.getElementById('compose-planner-refine');
+  const text = ta ? ta.value.trim() : '';
+  if (!text || !_composePlannerSessionId) return;
+  ta.value = '';
+
+  _composePlannerProposal = null;
+  const body = document.getElementById('compose-planner-body');
+  if (body) {
+    body.innerHTML = '<div class="planner-status"><div class="planner-spinner"></div><span>Refining plan\u2026</span></div>';
+  }
+
+  _composePlannerAccumText = '';
+  _composePlannerStartTime = Date.now();
+
+  socket.emit('send_message', {
+    session_id: _composePlannerSessionId,
+    text: text,
+  });
+}
+
+function _closeComposePlanner() {
+  _composePlannerProposal = null;
+  _detachComposePlannerListeners();
+  _composePlannerSessionId = null;
+  _composePlannerScopeParentId = null;
+  const panel = document.getElementById('compose-planner-panel');
+  if (panel) {
+    panel.classList.remove('open');
+    setTimeout(() => panel.remove(), 300);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// COMPOSE SETTINGS POPOVER — gear icon opens name + shared prompts toggle
+// ═══════════════════════════════════════════════════════════════
+
+function _composeToggleSettings(event) {
+  event.stopPropagation();
+  const existing = document.getElementById('compose-settings-popover');
+  if (existing) { existing.remove(); return; }
+  if (!_composeProject) return;
+
+  const btn = event.currentTarget;
+  const rect = btn.getBoundingClientRect();
+
+  const pop = document.createElement('div');
+  pop.id = 'compose-settings-popover';
+  pop.className = 'compose-settings-popover';
+  pop.style.top = (rect.bottom + 6) + 'px';
+  pop.style.right = (window.innerWidth - rect.right) + 'px';
+
+  const isOn = !!_composeProject.shared_prompts_enabled;
+  pop.innerHTML = `
+    <div class="compose-settings-row">
+      <label class="compose-settings-label">Name</label>
+      <input id="compose-settings-name" class="compose-settings-input" value="${typeof escHtml === 'function' ? escHtml(_composeProject.name) : _composeProject.name}" />
+    </div>
+    <div class="compose-settings-row" style="margin-top:10px;">
+      <label class="compose-settings-label">Shared Prompts</label>
+      <button id="compose-settings-shared-toggle" class="compose-settings-toggle ${isOn ? 'active' : ''}"
+              onclick="_composeToggleSharedPrompts()" title="When on, user prompts are shared across all agents">
+        <span class="compose-settings-toggle-knob"></span>
+      </button>
+    </div>
+    <div class="compose-settings-hint">When on, user prompts are logged and shared across all section agents.</div>
+  `;
+
+  document.body.appendChild(pop);
+
+  // Name input — save on blur or Enter
+  const nameInput = document.getElementById('compose-settings-name');
+  const saveName = () => {
+    const newName = nameInput.value.trim();
+    if (newName && newName !== _composeProject.name) {
+      _composeProject.name = newName;
+      fetch('/api/compose/projects/' + encodeURIComponent(_composeProject.id), {
+        method: 'PUT', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: newName}),
+      });
+      _updateComposeRootHeader();
+      _renderComposeSidebar();
+    }
+  };
+  nameInput.addEventListener('blur', saveName);
+  nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); saveName(); nameInput.blur(); } });
+
+  // Click outside closes
+  setTimeout(() => {
+    const closer = (e) => {
+      if (!pop.contains(e.target) && e.target !== btn && !btn.contains(e.target)) {
+        pop.remove();
+        document.removeEventListener('mousedown', closer);
+      }
+    };
+    document.addEventListener('mousedown', closer);
+  }, 0);
+}
+
+function _composeToggleSharedPrompts() {
+  if (!_composeProject) return;
+  const newVal = !_composeProject.shared_prompts_enabled;
+  _composeProject.shared_prompts_enabled = newVal;
+
+  // Update toggle button state
+  const toggle = document.getElementById('compose-settings-shared-toggle');
+  if (toggle) toggle.classList.toggle('active', newVal);
+
+  // Persist
+  fetch('/api/compose/projects/' + encodeURIComponent(_composeProject.id), {
+    method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({shared_prompts_enabled: newVal}),
+  });
+
+  _composeUpdateSharedBadge();
+}
+
+function _composeUpdateSharedBadge() {
+  const badge = document.getElementById('compose-shared-badge');
+  if (badge) {
+    badge.style.display = (_composeProject && _composeProject.shared_prompts_enabled) ? 'inline' : 'none';
+  }
 }
 
 // --- NB-11: Render section cards in compose board ---
@@ -2797,10 +3269,13 @@ function _renderComposeSectionCards() {
     return;
   }
 
+  // Only show root sections (no parent) on the board
+  const rootSections = _composeSections.filter(s => !s.parent_id);
+
   let html = '<div class="kanban-columns-wrapper compose-columns-wrapper">';
 
   for (const col of COMPOSE_STATUS_COLUMNS) {
-    const colSections = _composeSections.filter(s => s.status === col.key);
+    const colSections = rootSections.filter(s => s.status === col.key);
     html += `<div class="kanban-column compose-column" data-status="${col.key}">
       <div class="kanban-column-header">
         <div class="kanban-column-color-bar" style="background:${col.color};"></div>
@@ -2840,6 +3315,12 @@ function _renderComposeSectionCards() {
           ${sec.artifact_type ? '<span class="compose-card-time">' + sec.artifact_type + '</span>' : ''}
         </div>
         ${summary}
+        ${(() => {
+          const children = _composeSections.filter(c => c.parent_id === sec.id);
+          if (children.length === 0) return '';
+          const done = children.filter(c => c.status === 'complete').length;
+          return '<div class="compose-card-subsection-count" style="font-size:11px;color:var(--text-dim);padding:4px 12px 6px;display:flex;align-items:center;gap:4px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg> ' + done + '/' + children.length + ' subsection' + (children.length !== 1 ? 's' : '') + '</div>';
+        })()}
       </div>`;
     }
 
@@ -3012,10 +3493,18 @@ function renderSectionDetail(sectionId) {
   const projectName = _composeProject ? _composeProject.name : 'Composition';
 
   // ── Breadcrumb ──
+  const _bcSep = '<span class="kanban-drill-sep"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg></span>';
   let html = '<div class="kanban-drill-titlebar">';
   html += '<div class="kanban-drill-breadcrumb">';
   html += '<span class="kanban-drill-crumb kanban-board-crumb" onclick="navigateToComposeBoard()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg> Board</span>';
-  html += '<span class="kanban-drill-sep"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg></span>';
+  if (section.parent_id) {
+    const parentSec = _composeSections.find(s => s.id === section.parent_id);
+    if (parentSec) {
+      html += _bcSep;
+      html += '<span class="kanban-drill-crumb" onclick="navigateToSection(\'' + parentSec.id + '\')" style="cursor:pointer;">' + (typeof escHtml === 'function' ? escHtml(parentSec.name) : parentSec.name) + '</span>';
+    }
+  }
+  html += _bcSep;
   html += '<span class="kanban-drill-crumb current">' + (typeof escHtml === 'function' ? escHtml(section.name) : section.name) + '</span>';
   html += '</div></div>';
 
@@ -3049,6 +3538,40 @@ function renderSectionDetail(sectionId) {
     html += '<div class="kanban-drill-desc" style="min-height:60px;color:var(--text-dim);font-style:italic;">No summary yet. The AI agent will update this as it works.</div>';
   }
   html += '</div>';
+
+  // ── Subsections list (children of this section) ──
+  const _childSections = _composeSections.filter(c => c.parent_id === sectionId);
+  if (_childSections.length > 0 || !section.parent_id) {
+    html += '<div style="margin-top:20px;">';
+    html += '<div class="kanban-drill-panel-header" style="display:flex;align-items:center;justify-content:space-between;">';
+    html += '<span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px;color:var(--text-dim);">Subsections</span>';
+    const _childDone = _childSections.filter(c => c.status === 'complete').length;
+    if (_childSections.length > 0) {
+      const _childPct = Math.round((_childDone / _childSections.length) * 100);
+      html += '<span class="kanban-drill-inline-progress"><span class="kanban-drill-inline-bar"><span class="kanban-drill-inline-fill" style="width:' + _childPct + '%"></span></span><span class="kanban-drill-inline-pct">' + _childPct + '%</span></span>';
+    }
+    html += '</div>';
+    html += '<div class="kanban-drill-panel"><div class="kanban-drill-panel-body">';
+    for (const child of _childSections) {
+      const _cStatus = COMPOSE_STATUS_OPTIONS.find(o => o.key === child.status) || COMPOSE_STATUS_OPTIONS[0];
+      html += '<div class="kanban-drill-subtask-row" data-section-id="' + child.id + '" style="cursor:pointer;" onclick="navigateToSection(\'' + child.id + '\')">';
+      html += '<div class="kanban-drill-subtask-status" style="background:' + _cStatus.color + '26;color:' + _cStatus.color + ';">' + _cStatus.label + '</div>';
+      html += '<span class="kanban-drill-subtask-title">' + (typeof escHtml === 'function' ? escHtml(child.name) : child.name) + '</span>';
+      // Grandchild count
+      const _gcCount = _composeSections.filter(gc => gc.parent_id === child.id).length;
+      if (_gcCount > 0) {
+        html += '<span class="kanban-drill-subtask-meta">' + _gcCount + ' subsection' + (_gcCount !== 1 ? 's' : '') + '</span>';
+      }
+      html += '<span class="kanban-drill-subtask-chevron"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg></span>';
+      html += '</div>';
+    }
+    // Add Subsection button
+    html += '<div class="kanban-drill-subtask-row kanban-drill-ghost-row" onclick="composeAddSection(\'' + sectionId + '\')" style="cursor:pointer;justify-content:center;">';
+    html += '<span style="font-size:12px;color:var(--text-dim);">+ Add Subsection</span>';
+    html += '</div>';
+    html += '</div></div>';
+    html += '</div>';
+  }
 
   html += '</div>'; // drill-left
 
