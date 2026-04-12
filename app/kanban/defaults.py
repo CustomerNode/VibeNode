@@ -52,6 +52,17 @@ DEFAULT_COLUMNS = [
 ]
 
 
+_ensured_projects: set = set()
+
+
+def invalidate_ensured_cache(project_id: str | None = None):
+    """Clear the ensure-columns cache for *project_id*, or all projects."""
+    if project_id is None:
+        _ensured_projects.clear()
+    else:
+        _ensured_projects.discard(project_id)
+
+
 def ensure_project_columns(repo, project_id):
     """Create default columns for a project if none exist yet.
 
@@ -59,13 +70,20 @@ def ensure_project_columns(repo, project_id):
     five-column layout is present.  If some columns are missing (e.g. after
     a data corruption), the missing ones are recreated.
 
+    Results are cached in ``_ensured_projects`` so subsequent calls for the
+    same project skip the DB entirely.  Use ``invalidate_ensured_cache()``
+    after column mutations to bust the cache.
+
     Args:
         repo: KanbanRepository instance.
         project_id: The encoded project path string.
 
     Returns:
-        List of column dicts for the project.
+        List of column dicts for the project (or *None* on cache hit).
     """
+    if project_id in _ensured_projects:
+        return None
+
     existing = repo.get_columns(project_id)
     if existing:
         existing_keys = {(c.status_key if hasattr(c, 'status_key') else c.get('status_key', '')) for c in existing}
@@ -109,9 +127,11 @@ def ensure_project_columns(repo, project_id):
         if needs_update:
             try:
                 repo.update_columns(project_id, patched)
+                _ensured_projects.add(project_id)
                 return repo.get_columns(project_id)
             except Exception:
                 pass
+        _ensured_projects.add(project_id)
         return existing
 
     for col_def in DEFAULT_COLUMNS:
@@ -125,4 +145,5 @@ def ensure_project_columns(repo, project_id):
             sort_direction=col_def['sort_direction'],
         )
 
+    _ensured_projects.add(project_id)
     return repo.get_columns(project_id)

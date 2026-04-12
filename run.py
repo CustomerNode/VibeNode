@@ -414,6 +414,20 @@ if __name__ == "__main__":
     sys.stdout = _TeeWriter(sys.stdout, _web_log_fh)
     sys.stderr = _TeeWriter(sys.stderr, _web_log_fh)
 
+    # Route PROFILE logs (and any INFO+) from the web process to the
+    # tee'd stdout so they land in web_server.log alongside BOARD timing.
+    # Format mirrors the daemon's "HH:MM:SS [web] LEVEL message" style.
+    _root = logging.getLogger()
+    _root.setLevel(logging.INFO)
+    _sh = logging.StreamHandler(sys.stdout)  # stdout is already tee'd
+    _sh.setLevel(logging.INFO)
+    _sh.setFormatter(logging.Formatter("%(asctime)s [web] %(levelname)s %(message)s",
+                                       datefmt="%H:%M:%S"))
+    # Only attach to app.routes loggers — avoid flooding from libraries
+    for _ns in ("app.routes",):
+        logging.getLogger(_ns).addHandler(_sh)
+        logging.getLogger(_ns).setLevel(logging.INFO)
+
     # Suppress Flask/Werkzeug request logging and startup banner
     log = logging.getLogger("werkzeug")
     log.setLevel(logging.ERROR)

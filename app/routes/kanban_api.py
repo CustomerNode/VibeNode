@@ -45,7 +45,7 @@ from ..config import get_active_project
 from ..db import create_repository, reset_repository
 from ..db.repository import Task, TaskStatus
 from ..kanban.state_machine import transition_task, handle_session_start, handle_session_complete
-from ..kanban.defaults import ensure_project_columns
+from ..kanban.defaults import ensure_project_columns, invalidate_ensured_cache
 from ..kanban.context_builder import build_task_context
 from ..kanban.ai_planner import plan_subtasks, apply_plan, run_planner
 
@@ -317,7 +317,7 @@ def get_board():
                 enriched_flat.append(td)
 
         _bt.append(_t.perf_counter())  # [4] after enrichment
-        _lg.getLogger("kanban_api").warning(
+        _lg.getLogger(__name__).info(
             "BOARD ensure=%.0fms board=%.0fms counts=%.0fms enrich=%.0fms TOTAL=%.0fms tasks=%d",
             (_bt[1]-_bt[0])*1000, (_bt[2]-_bt[1])*1000, (_bt[3]-_bt[2])*1000,
             (_bt[4]-_bt[3])*1000, (_bt[4]-_bt[0])*1000, len(all_tasks_flat))
@@ -854,6 +854,7 @@ def update_columns():
 
         repo = _get_repo()
         project_id = _get_project_id()
+        invalidate_ensured_cache(project_id)
         columns = repo.update_columns(project_id, data)
 
         _emit("kanban_board_refresh", {"reason": "columns_updated"})
@@ -1488,6 +1489,7 @@ def update_kanban_config():
     # If backend changed, reset the cached repository singleton
     if cfg.get("kanban_backend", "sqlite") != old_backend:
         reset_repository()
+        invalidate_ensured_cache()  # new backend needs fresh ensure
 
     return jsonify({"ok": True})
 
@@ -1749,6 +1751,7 @@ def migrate_backend():
 
         # Clear cached singleton so subsequent requests use the new backend
         reset_repository()
+        invalidate_ensured_cache()  # new backend needs fresh ensure
 
         return jsonify({"ok": True, "message": f"Migrated to {target_backend}"})
     except Exception as e:
