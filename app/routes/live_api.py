@@ -423,8 +423,7 @@ def get_models():
     try:
         import subprocess
         # Query the CLI for its init message which includes the current model
-        import sys as _sys
-        _nw = subprocess.CREATE_NO_WINDOW if _sys.platform == "win32" else 0
+        from ..platform_utils import NO_WINDOW as _nw
         r = subprocess.run(
             ["claude", "-p", "hi", "--output-format", "stream-json",
              "--verbose", "--max-turns", "1"],

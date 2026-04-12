@@ -399,7 +399,8 @@ def _cli_title(messages: list) -> str | None:
     )
 
     try:
-        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        from .platform_utils import NO_WINDOW
+        creationflags = NO_WINDOW
         r = subprocess.run(
             ["claude", "-p", prompt, "--output-format", "text",
              "--max-turns", "1", "--model", "haiku",

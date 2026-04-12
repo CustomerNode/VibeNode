@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 from flask import Blueprint, jsonify, render_template, request
+from ..platform_utils import NO_WINDOW as _NO_WINDOW
 
 bp = Blueprint('main', __name__)
 
@@ -76,7 +77,7 @@ def restart_server():
             subprocess.Popen(
                 restart_cmd,
                 shell=True,
-                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+                creationflags=_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
             )
 
         elif sys.platform == "darwin":
@@ -139,7 +140,7 @@ def shutdown_server():
             subprocess.Popen(
                 shutdown_cmd,
                 shell=True,
-                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+                creationflags=_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
             )
         else:
             shutdown_cmd = (

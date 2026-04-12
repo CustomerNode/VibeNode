@@ -1207,7 +1207,8 @@ def planner_chat():
             prompt = sys_prompt + "\n\n"
             for m in messages:
                 prompt += "[" + m.get("role", "user").upper() + "]\n" + m["content"] + "\n\n"
-            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            from ..platform_utils import NO_WINDOW
+            creationflags = NO_WINDOW
             r = subprocess.run(
                 ["claude", "-p", prompt, "--output-format", "text",
                  "--max-turns", "1", "--model", "sonnet"],

@@ -14,6 +14,7 @@ import threading
 import time
 
 from .config import _mark_utility, _get_utility_ids
+from .platform_utils import NO_WINDOW as _NO_WINDOW
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -237,10 +238,10 @@ class DaemonClient:
             return
         logger.info("Daemon appears dead — restarting it")
         try:
-            creation_flags = 0
+            creation_flags = _NO_WINDOW
             if sys.platform == "win32":
                 creation_flags = (
-                    subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+                    _NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
                 )
             log_file = daemon_script.parent.parent / "logs" / "daemon_debug.log"
             log_file.parent.mkdir(exist_ok=True)
