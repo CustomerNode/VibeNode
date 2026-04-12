@@ -463,7 +463,10 @@ function _launchRemediationSession(scan) {
     preview: 'Fixing security scan violations...',
   };
 
-  if (typeof allSessions !== 'undefined') allSessions.unshift(optimistic);
+  if (typeof allSessions !== 'undefined') {
+    allSessions.unshift(optimistic);
+    if (typeof allSessionIds !== 'undefined') allSessionIds.add(optimistic.id);
+  }
   if (typeof filterSessions === 'function') filterSessions();
   if (typeof guiOpenAdd === 'function') guiOpenAdd(newId);
 

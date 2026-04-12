@@ -491,6 +491,7 @@ class SessionManager:
         self._started = False
         self._registry_timer: Optional[threading.Timer] = None
         self._registry_dirty = False
+        self._queue_save_timer: Optional[threading.Timer] = None
         # Permission policy (synced from browser) — persisted to disk
         self._policy_path = Path.home() / ".claude" / "gui_permission_policy.json"
         self._permission_policy, self._custom_rules = self._load_policy()
@@ -542,6 +543,11 @@ class SessionManager:
         if self._registry_timer:
             self._registry_timer.cancel()
             self._registry_timer = None
+        # Cancel any pending queue save timer and flush to disk
+        if self._queue_save_timer:
+            self._queue_save_timer.cancel()
+            self._queue_save_timer = None
+        self._save_queues_now()
         # Close all sessions
         with self._lock:
             session_ids = list(self._sessions.keys())
@@ -968,8 +974,8 @@ class SessionManager:
         except Exception as e:
             logger.warning("Failed to load queues: %s", e)
 
-    def _save_queues(self) -> None:
-        """Persist queues to disk."""
+    def _save_queues_now(self) -> None:
+        """Persist queues to disk immediately."""
         try:
             self._queue_path.parent.mkdir(parents=True, exist_ok=True)
             with self._queue_lock:
@@ -977,6 +983,21 @@ class SessionManager:
             self._queue_path.write_text(json.dumps(data), encoding="utf-8")
         except Exception as e:
             logger.debug("Failed to save queues: %s", e)
+
+    def _save_queues(self) -> None:
+        """Debounced queue save -- batches writes so rapid-fire queue
+        operations don't hammer the disk.
+
+        Uses the same pattern as _schedule_registry_save(): if a timer
+        is already pending, skip (the pending save will capture the
+        latest state).  Otherwise set a 1-second timer.
+        """
+        if self._queue_save_timer and self._queue_save_timer.is_alive():
+            # A save is already scheduled; it will pick up the newest state
+            return
+        self._queue_save_timer = threading.Timer(1.0, self._save_queues_now)
+        self._queue_save_timer.daemon = True
+        self._queue_save_timer.start()
 
     def _emit_queue_update(self, session_id: str) -> None:
         """Push queue state to connected clients."""

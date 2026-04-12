@@ -1,6 +1,11 @@
 /* app.js — global state, project loading, session loading */
 
 let allSessions = [];
+/** O(1) lookup set kept in sync with allSessions — avoids O(n) .find()
+ *  on every session_entry/session_permission/session_started event. */
+let allSessionIds = new Set();
+/** Rebuild allSessionIds from allSessions. Call after any reassignment of allSessions. */
+function _rebuildSessionIds() { allSessionIds = new Set(allSessions.map(s => s.id)); }
 let activeId = localStorage.getItem('activeSessionId') || null;
 let renameTarget = null;
 let sortMode = localStorage.getItem('sortMode') || 'date';
@@ -168,6 +173,7 @@ async function setProject(encoded, reload = true) {
   // Clear allSessions so old-project sessions don't remain visible in the
   // sidebar/grid during the gap between project switch and loadSessions().
   allSessions = [];
+  allSessionIds.clear();
   // Clear per-session state maps that would otherwise carry stale data from
   // the old project into the new one (timestamps, substatus, usage, timers).
   window._sessionStateTs = {};
@@ -886,6 +892,7 @@ async function addNewAgent() {
     preview: '',
   };
   allSessions.unshift(optimistic);
+  allSessionIds.add(optimistic.id);
   filterSessions();
 
   // Mark as GUI-opened but DON'T add to runningIds or sessionKinds yet.
@@ -1344,6 +1351,7 @@ async function loadSessions() {
   if (window._idRemaps) {
     allSessions = allSessions.filter(s => !window._idRemaps[s.id]);
   }
+  _rebuildSessionIds();
   // Populate _userNamedSessions from server so manual names survive page refresh
   if (typeof _userNamedSessions !== 'undefined') {
     for (const s of allSessions) {

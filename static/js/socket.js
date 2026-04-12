@@ -291,7 +291,7 @@ socket.on('state_snapshot', (data) => {
             console.warn('[state_snapshot] Live session', liveSessionId,
                 'transitioned from working →', newKinds[liveSessionId],
                 '— DOM is empty, re-fetching entries');
-            socket.emit('get_session_log', {session_id: liveSessionId, since: 0, project: localStorage.getItem('activeProject') || ''});
+            socket.emit('get_session_log', {session_id: liveSessionId, since: 0, project: localStorage.getItem('activeProject') || '', is_working: newKinds[liveSessionId] === 'working' || newKinds[liveSessionId] === 'question'});
         } else {
             console.log('[state_snapshot] Live session', liveSessionId,
                 'transitioned from working →', newKinds[liveSessionId],
@@ -309,7 +309,7 @@ socket.on('state_snapshot', (data) => {
     for (const id in sessionKinds) {
         if (sessionKinds[id] === 'working' && !newKinds[id]) {
             if (_hiddenSessionIds.has(id)) continue;
-            if (!allSessions.find(x => x.id === id) && id !== liveSessionId) continue;
+            if (!allSessionIds.has(id) && id !== liveSessionId) continue;
             newKinds[id] = 'working';
             newRunning.add(id);
         }
@@ -353,12 +353,12 @@ socket.on('state_snapshot', (data) => {
         if (_isHiddenSession(id, s)) return;
         // Skip old pre-remap IDs that have already been replaced
         if (window._idRemaps && window._idRemaps[id]) return;
-        if (!allSessions.find(x => x.id === id)) {
+        if (!allSessionIds.has(id)) {
             // Don't inject stub if an old alias for this ID still exists
             if (window._idRemaps) {
                 let _hasOld = false;
                 for (const oldId in window._idRemaps) {
-                    if (window._idRemaps[oldId] === id && allSessions.find(x => x.id === oldId)) {
+                    if (window._idRemaps[oldId] === id && allSessionIds.has(oldId)) {
                         _hasOld = true; break;
                     }
                 }
@@ -389,6 +389,7 @@ socket.on('state_snapshot', (data) => {
             return true;
         });
     }
+    _rebuildSessionIds();
 
     // Update sidebar row classes
     document.querySelectorAll('.session-item[data-sid]').forEach(row => {
@@ -603,7 +604,7 @@ socket.on('session_state', (data) => {
             const sc = data.entry_count;
             if (sc != null && sc > liveLineCount) {
                 console.warn('[entry-catchup] Backend has', sc, 'entries but frontend has', liveLineCount, '— re-fetching');
-                socket.emit('get_session_log', {session_id: session_id, since: 0, project: localStorage.getItem('activeProject') || ''});
+                socket.emit('get_session_log', {session_id: session_id, since: 0, project: localStorage.getItem('activeProject') || '', is_working: false});
             }
             // No blind 500ms re-fetch — it destroys already-rendered content
         }
@@ -837,7 +838,7 @@ socket.on('session_entry', (data) => {
     // session_entry lacks cwd, but if this session_id isn't the live session
     // and isn't in allSessions, it's cross-project — drop it entirely so the
     // consistency check below doesn't inject it into the sidebar.
-    if (data.session_id !== liveSessionId && !allSessions.find(x => x.id === data.session_id)) return;
+    if (data.session_id !== liveSessionId && !allSessionIds.has(data.session_id)) return;
 
     // NOTE: Watchdog reset moved AFTER session_id match check below.
     // Previously it was here, so entries for a mismatched session_id (e.g.
@@ -969,7 +970,7 @@ socket.on('session_permission', (data) => {
     // but if this session_id isn't in allSessions and isn't the live session,
     // it belongs to another project — drop it so permission prompts from
     // other projects don't appear in the current project's UI.
-    if (data.session_id !== liveSessionId && !allSessions.find(x => x.id === data.session_id)) return;
+    if (data.session_id !== liveSessionId && !allSessionIds.has(data.session_id)) return;
     waitingData[data.session_id] = {
         question: _formatPermissionQuestion(data.tool_name, data.tool_input),
         options: ['y', 'n', 'aa', 'a'],
@@ -1044,7 +1045,7 @@ socket.on('session_started', (data) => {
         // Only inject stub into allSessions if this session belongs to the
         // current project. Otherwise it bleeds into the sidebar.
         const _isSameProject = !data.cwd || _sessionBelongsToActiveProject(data.cwd);
-        if (_isSameProject && !allSessions.find(x => x.id === data.session_id)) {
+        if (_isSameProject && !allSessionIds.has(data.session_id)) {
             allSessions.unshift({
                 id: data.session_id,
                 display_title: data.name || 'New Session',
@@ -1057,6 +1058,7 @@ socket.on('session_started', (data) => {
                 message_count: 0,
                 preview: '',
             });
+            allSessionIds.add(data.session_id);
             filterSessions();
         }
         if (_isSameProject) _updateRowState(data.session_id, sessionKinds[data.session_id] || 'idle');
@@ -1080,9 +1082,13 @@ socket.on('session_id_remapped', (data) => {
 
     if (_isHiddenSession(oldId, data)) return;
 
-    // Update allSessions array
+    // Update allSessions array and ID set
     const s = allSessions.find(x => x.id === oldId);
-    if (s) s.id = newId;
+    if (s) {
+        s.id = newId;
+        allSessionIds.delete(oldId);
+        allSessionIds.add(newId);
+    }
 
     // Update activeId and URL — use replaceState (not pushState) so the
     // temporary client-generated UUID does not linger in browser history

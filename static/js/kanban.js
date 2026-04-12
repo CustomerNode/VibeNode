@@ -3053,6 +3053,7 @@ async function openSessionSpawner(taskId) {
     id: newId, display_title: 'New Session', custom_title: '',
     last_activity: '', size: '', message_count: 0, preview: '',
   });
+  allSessionIds.add(newId);
   if (typeof guiOpenAdd === 'function') guiOpenAdd(newId);
 
   // ── Build crumb bar (same as _openSessionInKanban) ──

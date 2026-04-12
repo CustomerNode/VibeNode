@@ -865,6 +865,7 @@ async function deleteSession(id) {
 
   if (deleteOk) {
     allSessions = allSessions.filter(x => x.id !== id);
+    allSessionIds.delete(id);
     // Clean up draft text for deleted session
     if (typeof _clearDraft === 'function') _clearDraft(id);
     // Remove from folder tree
@@ -900,6 +901,7 @@ async function deleteEmptySessions() {
 
   if (data.ok) {
     allSessions = allSessions.filter(s => s.message_count > 0);
+    _rebuildSessionIds();
     if (empty.find(s => s.id === activeId)) {
       if (workspaceActive) {
         _wsExpandedId = null;

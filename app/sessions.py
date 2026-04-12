@@ -16,7 +16,6 @@ from .config import (
     _get_deleted_ids,
     _get_utility_ids,
     _get_remapped_ids,
-    _cleanup_system_sessions,
 )
 
 
@@ -486,8 +485,6 @@ def _is_system_content(text: str) -> bool:
 
 
 def all_sessions(summary_only: bool = False, project: str = "") -> list:
-    # Prune stale utility session JSONL files (>24h) from the system project
-    _cleanup_system_sessions()
     # Filter out tombstoned (recently deleted) sessions so zombie .jsonl files
     # recreated by dying claude.exe processes never appear in the UI.
     deleted_ids = _get_deleted_ids(project)

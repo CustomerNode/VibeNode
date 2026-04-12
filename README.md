@@ -211,6 +211,14 @@ This separation means **VibeNode can code itself** — multiple Claude sessions 
 - **Heavy I/O offloaded.** File snapshots, JSONL parsing, and directory scans run in a ThreadPoolExecutor so they don't block the event loop and stall other sessions.
 - **Four SDK monkey-patches.** The Claude Code SDK was designed for single-turn CLI usage. VibeNode patches it at runtime for multi-turn sessions (keep stdin open), permission protocol compatibility (CLI 2.x format), unknown message tolerance, and Windows no-window subprocess spawning.
 
+**Performance:**
+
+- **Pipeline profiling.** Set `_PROFILE_PIPELINE = True` in `daemon/session_manager.py` to log per-stage timing for `_drive_session` and `_send_query`. Logs go to `logs/daemon_debug.log` with cumulative elapsed times — subtract adjacent stages to get individual durations.
+- **Caching layers.** `get_all_states` responses and `get_kanban_config` are cached with TTLs (2s and 10s respectively) to avoid redundant IPC and disk reads on high-frequency endpoints like sidebar refresh.
+- **Parallelized session setup.** Compose task resolution and cross-session awareness injection run in parallel via a shared `ThreadPoolExecutor` when both are needed, cutting session start latency.
+- **Debounced persistence.** Registry saves and queue saves are debounced with timers (3s and 1s respectively) so rapid state changes batch into single disk writes instead of hammering I/O.
+- **Conditional IPC.** Session log retrieval skips daemon IPC round-trips for idle sessions where the JSONL on disk is already complete, using a client-provided `is_working` hint.
+
 ## Notes
 
 - Sessions are read from `~/.claude/projects/`

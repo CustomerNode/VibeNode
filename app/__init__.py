@@ -54,6 +54,11 @@ def create_app() -> Flask:
     app.register_blueprint(kanban_reports_bp)
     app.register_blueprint(compose_bp)
 
+    # Prune stale utility session JSONL files (>24h) — once at startup,
+    # not on every /api/sessions request.
+    from .config import _cleanup_system_sessions
+    _cleanup_system_sessions()
+
     # Start background git fetch at startup
     from .git_ops import start_bg_fetch
     start_bg_fetch()
