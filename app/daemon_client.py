@@ -466,7 +466,7 @@ class DaemonClient:
             params["session_type"] = kwargs["session_type"]
         return self._send_request("start_session", params)
 
-    def send_message(self, session_id, text):
+    def send_message(self, session_id, text, voice=False):
         return self._send_request("send_message", {
             "session_id": session_id, "text": text,
         })
