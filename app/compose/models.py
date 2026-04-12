@@ -124,6 +124,7 @@ class ComposeSection:
     change_note: Optional[str] = None
     changing_set_by: Optional[str] = None
     summary: Optional[str] = None
+    updated_at: Optional[str] = None
 
     def to_dict(self):
         d = asdict(self)
@@ -152,6 +153,7 @@ class ComposeSection:
             change_note=d.get("change_note"),
             changing_set_by=d.get("changing_set_by"),
             summary=d.get("summary"),
+            updated_at=d.get("updated_at"),
         )
 
     @classmethod

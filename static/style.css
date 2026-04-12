@@ -9645,3 +9645,210 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
   padding-left: 10px;
   font-size: 12px;
 }
+
+/* ── P2: Drag handle on compose cards ── */
+.compose-drag-handle {
+  position: absolute;
+  left: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  opacity: 0;
+  color: var(--text-muted);
+  font-size: 10px;
+  cursor: grab;
+  letter-spacing: -2px;
+}
+.compose-card:hover .compose-drag-handle { opacity: 0.5; }
+.compose-card { position: relative; padding-left: 18px; }
+
+/* ── P2: Session status dot on cards ── */
+.compose-session-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-left: 5px;
+  vertical-align: middle;
+}
+.compose-session-dot.running {
+  background: var(--green, #3fb950);
+  animation: compose-pulse 2s infinite;
+}
+.compose-session-dot.idle { background: var(--text-muted); }
+
+/* ── P2: Conflict banner ── */
+.compose-conflict-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  margin-bottom: 10px;
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  border-radius: 8px;
+  font-size: 13px;
+  color: #f59e0b;
+}
+.compose-conflict-banner button {
+  margin-left: auto;
+  background: rgba(245, 158, 11, 0.2);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  color: #f59e0b;
+  padding: 3px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.compose-conflict-banner button:hover { background: rgba(245, 158, 11, 0.3); }
+
+/* ── P2: Conflict resolution modal ── */
+.compose-conflict-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border, rgba(255,255,255,0.08));
+  border-radius: 10px;
+  padding: 14px;
+  margin-bottom: 10px;
+}
+.compose-conflict-card .conflict-directive {
+  background: var(--bg-input);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 6px 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.compose-conflict-card .conflict-directive .conflict-time {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 3px;
+}
+.compose-conflict-card .conflict-recommendation {
+  font-size: 12px;
+  color: var(--accent);
+  margin: 8px 0 6px;
+  font-style: italic;
+}
+.compose-conflict-action-btn {
+  background: var(--bg-btn);
+  border: 1px solid var(--border, rgba(255,255,255,0.08));
+  color: var(--text-primary);
+  padding: 4px 12px;
+  border-radius: 6px;
+  font-size: 11px;
+  cursor: pointer;
+  margin-right: 6px;
+}
+.compose-conflict-action-btn:hover { background: var(--bg-btn-hover); }
+.compose-conflict-action-btn.danger { color: #ef4444; border-color: rgba(239,68,68,0.3); }
+.compose-conflict-action-btn.danger:hover { background: rgba(239,68,68,0.15); }
+
+/* ── P2: Link session modal ── */
+.compose-link-session-modal {
+  width: 420px;
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+}
+.compose-link-session-list {
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+  max-height: 50vh;
+}
+.compose-link-session-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+.compose-link-session-row:hover { background: var(--bg-hover); }
+
+/* ── P2: Output preview panel ── */
+.compose-preview-panel {
+  margin-top: 16px;
+  border: 1px solid var(--border, rgba(255,255,255,0.08));
+  border-radius: 8px;
+  overflow: hidden;
+}
+.compose-preview-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+}
+.compose-preview-header:hover { background: var(--bg-hover); }
+.compose-preview-body {
+  padding: 0 12px 12px;
+  max-height: 400px;
+  overflow-y: auto;
+}
+.compose-preview-file {
+  margin-bottom: 12px;
+}
+.compose-preview-file-name {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border, rgba(255,255,255,0.06));
+}
+.compose-preview-file pre {
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--bg-code, #0d0d1a);
+  padding: 8px 10px;
+  border-radius: 6px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.compose-preview-file table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+.compose-preview-file table th,
+.compose-preview-file table td {
+  border: 1px solid var(--border, rgba(255,255,255,0.08));
+  padding: 3px 6px;
+  text-align: left;
+}
+.compose-preview-file table th {
+  background: var(--bg-input);
+  font-weight: 600;
+}
+
+/* ── P2: Cascade delete modal ── */
+.compose-cascade-modal {
+  max-width: 440px;
+}
+.compose-cascade-modal .cascade-children-list {
+  max-height: 200px;
+  overflow-y: auto;
+  margin: 8px 0 12px;
+  padding: 0;
+  list-style: none;
+}
+.compose-cascade-modal .cascade-children-list li {
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border, rgba(255,255,255,0.05));
+}
+.compose-cascade-modal .cascade-warning {
+  font-size: 12px;
+  color: #ef4444;
+  margin: 8px 0;
+}

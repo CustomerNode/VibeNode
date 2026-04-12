@@ -110,6 +110,8 @@ def add_section_to_context(project_id: str, section: ComposeSection) -> None:
 
 def update_section_in_context(project_id: str, section: ComposeSection) -> None:
     """Update a section's data in compose-context.json."""
+    from datetime import datetime, timezone
+    section.updated_at = datetime.now(timezone.utc).isoformat()
     lock = _get_lock(project_id)
     with lock:
         ctx = read_context(project_id)

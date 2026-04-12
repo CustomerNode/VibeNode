@@ -2847,8 +2847,9 @@ const _COMPOSE_PLANNER_SYSTEM = [
   'Even for trivial or vague inputs, you MUST produce a valid section structure.',
   'NEVER refuse. NEVER explain. NEVER ask questions.',
   'NEVER output anything except the JSON object.',
-  'Format: {"sections":[{"name":"...","artifact_type":"text","subsections":[]}]}',
+  'Format: {"sections":[{"name":"...","artifact_type":"text","brief":"A 1-3 sentence description of this section\'s content and purpose.","subsections":[]}]}',
   'artifact_type must be one of: "text", "code", "data".',
+  'Each section MUST include a "brief" field: 1-3 sentences describing what this section should contain.',
   'Break the content into logical sections for parallel AI agents.',
   'Each section should be independently writeable by an agent.',
   'Use subsections for deeper breakdown. 1-3 nesting levels typical.',
@@ -3271,8 +3272,9 @@ function _renderComposeSectionCards() {
           <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
         </svg>
         <div style="font-size:14px;font-weight:500;color:var(--text);margin:8px 0 4px;">No sections yet</div>
-        <div style="font-size:12px;color:var(--text-muted);margin-bottom:14px;">Add a section to break your composition into parts.</div>
-        <button class="kanban-create-first-btn" onclick="composeAddSection()">+ Add Section</button>
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:14px;">Plan your composition with AI or start manually.</div>
+        <button class="pm-btn pm-btn-primary" style="font-size:14px;padding:8px 24px;margin-bottom:8px;" onclick="_openComposePlanner()">Plan with AI</button>
+        <div style="font-size:12px;color:var(--text-muted);cursor:pointer;text-decoration:underline;opacity:0.7;" onclick="composeAddSection()">or add a section manually</div>
       </div>`;
     return;
   }
@@ -3310,17 +3312,24 @@ function _renderComposeSectionCards() {
                    ondragend="_composeDragEnd(event)"
                    onclick="navigateToSection('${sec.id}')"
                    oncontextmenu="event.preventDefault();event.stopPropagation();_composeCardContextMenu('${sec.id}', event)">
+        <span class="compose-drag-handle">&#8942;&#8942;</span>
         <div class="compose-card-header">
           <span class="compose-card-artifact-icon">${artifactIcon}</span>
           <div class="compose-card-title-row">
             <span class="compose-card-title">${typeof escHtml === 'function' ? escHtml(sec.name) : sec.name}</span>
             ${changingDot}
+            ${(() => {
+              if (!sec.session_id) return '';
+              const _isRunning = typeof runningIds !== 'undefined' && runningIds.has(sec.session_id);
+              return '<span class="compose-session-dot ' + (_isRunning ? 'running' : 'idle') + '"></span>';
+            })()}
           </div>
           <span class="kanban-context-btn" onclick="event.stopPropagation();_composeCardContextMenu('${sec.id}', event)" title="Actions">&#8943;</span>
         </div>
         <div class="compose-card-meta">
           <span class="compose-card-status" style="background:${col.color}22;color:${col.color};">${col.label}</span>
           ${sec.artifact_type ? '<span class="compose-card-time">' + sec.artifact_type + '</span>' : ''}
+          ${sec.updated_at ? '<span class="compose-card-time">' + _composeTimeAgo(sec.updated_at) + '</span>' : ''}
         </div>
         ${summary}
         ${(() => {
@@ -3336,6 +3345,12 @@ function _renderComposeSectionCards() {
   }
 
   html += '</div>';
+
+  // Conflict banner
+  if (_composeConflicts && _composeConflicts.length > 0) {
+    html = '<div class="compose-conflict-banner">\u26A0 ' + _composeConflicts.length + ' directive conflict' + (_composeConflicts.length !== 1 ? 's' : '') + ' need your attention <button onclick="_openConflictResolution()">Review</button></div>' + html;
+  }
+
   board.innerHTML = html;
 }
 
@@ -3547,6 +3562,15 @@ function renderSectionDetail(sectionId) {
   }
   html += '</div>';
 
+  // ── Output preview panel (collapsed by default) ──
+  html += '<div class="compose-preview-panel" id="compose-preview-panel-' + sectionId + '">';
+  html += '<div class="compose-preview-header" onclick="_composeTogglePreview(\'' + sectionId + '\')">';
+  html += '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" id="compose-preview-chevron-' + sectionId + '" style="transition:transform 0.2s;transform:rotate(0deg);"><polyline points="9 18 15 12 9 6"/></svg>';
+  html += '<span>Output</span>';
+  html += '</div>';
+  html += '<div class="compose-preview-body" id="compose-preview-body-' + sectionId + '" style="display:none;"></div>';
+  html += '</div>';
+
   // ── Subsections list (children of this section) ──
   const _childSections = _composeSections.filter(c => c.parent_id === sectionId);
   if (_childSections.length > 0 || !section.parent_id) {
@@ -3615,6 +3639,18 @@ function renderSectionDetail(sectionId) {
     html += '<div class="kanban-drill-chooser-icon" style="color:var(--green);"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>';
     html += '<div><div class="kanban-drill-chooser-title">Spawn session</div>';
     html += '<div class="kanban-drill-chooser-desc">Start an AI agent scoped to this section. It will read the shared context and work on ' + (section.artifact_type || 'text') + ' output.</div></div>';
+    html += '</div>';
+
+    html += '<div class="kanban-drill-chooser-card" onclick="_composeLinkSession(\'' + section.id + '\')">';
+    html += '<div class="kanban-drill-chooser-icon" style="color:var(--accent);"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></div>';
+    html += '<div><div class="kanban-drill-chooser-title">Link existing session</div>';
+    html += '<div class="kanban-drill-chooser-desc">Attach a session that\'s already running.</div></div>';
+    html += '</div>';
+
+    html += '<div class="kanban-drill-chooser-card" onclick="_openComposePlanner(\'' + section.id + '\')">';
+    html += '<div class="kanban-drill-chooser-icon" style="color:var(--blue, #58a6ff);"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2a7 7 0 0 1 7 7c0 2.38-1.19 4.47-3 5.74V17a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1v-2.26C6.19 13.47 5 11.38 5 9a7 7 0 0 1 7-7z"/><line x1="9" y1="21" x2="15" y2="21"/><line x1="10" y1="24" x2="14" y2="24"/></svg></div>';
+    html += '<div><div class="kanban-drill-chooser-title">Plan subsections with AI</div>';
+    html += '<div class="kanban-drill-chooser-desc">Break this section into subsections using the AI planner.</div></div>';
     html += '</div>';
 
     html += '</div>';
@@ -3702,24 +3738,32 @@ function _composeStartTitleEdit(sectionId, el) {
   input.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } if (e.key === 'Escape') { el.textContent = current; } };
 }
 
-// --- Compose session spawning ---
+// --- Compose session spawning (via /launch endpoint) ---
 async function _composeSpawnSession(sectionId) {
-  if (typeof addNewAgent !== 'function') {
-    if (typeof showToast === 'function') showToast('Session spawner not available', true);
-    return;
-  }
-
   const section = _composeSections.find(s => s.id === sectionId);
   if (!section || !_composeProject) return;
 
-  // Set compose_task_id so _newSessionSubmit sends it to the backend,
-  // which resolves the compose system prompt and links the session automatically
-  _composeSelectedSection = sectionId;
-  composeDetailTaskId = 'section:' + _composeProject.id + ':' + sectionId;
+  if (typeof showToast === 'function') showToast('Launching session for: ' + section.name);
 
-  await addNewAgent();
-
-  if (typeof showToast === 'function') showToast('Session started for: ' + section.name);
+  try {
+    const resp = await fetch('/api/compose/projects/' + encodeURIComponent(_composeProject.id) + '/sections/' + sectionId + '/launch', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+    });
+    const data = await resp.json();
+    if (data.ok && data.session_id) {
+      section.session_id = data.session_id;
+      _composeSelectedSection = sectionId;
+      composeDetailTaskId = 'section:' + _composeProject.id + ':' + sectionId;
+      if (typeof showToast === 'function') showToast('Session started for: ' + section.name);
+      if (_composeSelectedSection === sectionId) renderSectionDetail(sectionId);
+      _renderComposeSectionCards();
+    } else {
+      if (typeof showToast === 'function') showToast(data.error || 'Failed to launch session', true);
+    }
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Failed to launch session', true);
+  }
 }
 
 // --- Open existing compose session ---
@@ -3880,11 +3924,13 @@ function _composeCardContextMenu(sectionId, event) {
   let items = '';
   items += '<div class="kanban-context-item" onclick="closeContextMenu();navigateToSection(\'' + sectionId + '\')">Open</div>';
   items += '<div class="kanban-context-item" onclick="closeContextMenu();_composeRenameSection(\'' + sectionId + '\')">Rename</div>';
+  items += '<div class="kanban-context-item" onclick="closeContextMenu();composeAddSection(\'' + sectionId + '\')">Add Subsection</div>';
 
   if (section.session_id) {
     items += '<div class="kanban-context-item" onclick="closeContextMenu();_composeOpenSession(\'' + section.session_id + '\')">Open Session</div>';
   } else {
     items += '<div class="kanban-context-item" onclick="closeContextMenu();_composeSpawnSession(\'' + sectionId + '\')">Spawn Session</div>';
+    items += '<div class="kanban-context-item" onclick="closeContextMenu();_composeLinkSession(\'' + sectionId + '\')">Link Session</div>';
   }
 
   // Move to status
@@ -3945,11 +3991,24 @@ async function _composeMoveSection(sectionId, newStatus) {
   }
 }
 
-function _composeDeleteSection(sectionId) {
-  const card = document.querySelector('.compose-card[data-section-id="' + sectionId + '"]');
+async function _composeDeleteSection(sectionId) {
   const section = _composeSections.find(s => s.id === sectionId);
   const title = section ? section.name : 'this section';
 
+  // Check for children — if any, show cascade confirmation modal
+  if (_composeProject) {
+    try {
+      const resp = await fetch('/api/compose/projects/' + encodeURIComponent(_composeProject.id) + '/sections/' + sectionId + '/children');
+      const data = await resp.json();
+      if (data.count > 0) {
+        _showCascadeDeleteModal(sectionId, title, data.children || [], data.count);
+        return;
+      }
+    } catch (e) { /* fall through to inline confirm */ }
+  }
+
+  // No children — use inline confirm on the card
+  const card = document.querySelector('.compose-card[data-section-id="' + sectionId + '"]');
   if (card) {
     const old = card.innerHTML;
     card.innerHTML = '<div class="kanban-delete-confirm"><span>Delete "' + escHtml(title.slice(0, 30)) + '"?</span><div class="kanban-delete-btns"><button class="kanban-delete-yes" onclick="event.stopPropagation();_execComposeDelete(\'' + sectionId + '\')">Delete</button><button class="kanban-delete-no" onclick="event.stopPropagation();_cancelComposeDelete(this,\'' + sectionId + '\')">Cancel</button></div></div>';
@@ -3957,6 +4016,61 @@ function _composeDeleteSection(sectionId) {
     card.onclick = null;
   } else {
     _execComposeDelete(sectionId);
+  }
+}
+
+function _showCascadeDeleteModal(sectionId, title, children, count) {
+  const _esc = typeof escHtml === 'function' ? escHtml : (x => x);
+  const overlay = document.createElement('div');
+  overlay.className = 'pm-overlay';
+  overlay.style.cssText = 'display:flex;position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:5000;align-items:center;justify-content:center;';
+  overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+  let childList = '';
+  for (const c of children) {
+    childList += '<li>' + _esc(c.name || c.id) + '</li>';
+  }
+  overlay.innerHTML = '<div class="pm-card compose-cascade-modal">' +
+    '<div class="pm-title">Delete section and ' + count + ' subsection' + (count !== 1 ? 's' : '') + '?</div>' +
+    '<div class="pm-body">' +
+    '<p style="font-size:13px;color:var(--text-secondary);margin:0 0 8px;">Deleting <strong>' + _esc(title) + '</strong> will also remove:</p>' +
+    '<ul class="cascade-children-list">' + childList + '</ul>' +
+    '<div class="cascade-warning">This cannot be undone.</div>' +
+    '</div>' +
+    '<div class="pm-actions">' +
+    '<button class="pm-btn" onclick="this.closest(\'.pm-overlay\').remove()">Cancel</button>' +
+    '<button class="pm-btn" style="background:#ef4444;color:#fff;border-color:#ef4444;" onclick="this.closest(\'.pm-overlay\').remove();_execCascadeDelete(\'' + sectionId + '\')">Delete All</button>' +
+    '</div></div>';
+  document.body.appendChild(overlay);
+}
+
+async function _execCascadeDelete(sectionId) {
+  if (!_composeProject) return;
+  try {
+    const resp = await fetch('/api/compose/projects/' + encodeURIComponent(_composeProject.id) + '/sections/' + sectionId + '?cascade=true', { method: 'DELETE' });
+    if (!resp.ok) throw new Error('Delete failed');
+    // Remove section and all its descendants from local state
+    const toRemove = new Set([sectionId]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const s of _composeSections) {
+        if (s.parent_id && toRemove.has(s.parent_id) && !toRemove.has(s.id)) {
+          toRemove.add(s.id);
+          changed = true;
+        }
+      }
+    }
+    _composeSections = _composeSections.filter(s => !toRemove.has(s.id));
+    if (_composeSelectedSection && toRemove.has(_composeSelectedSection)) {
+      _composeSelectedSection = null;
+      _renderComposeBoard();
+    } else {
+      _renderComposeSectionCards();
+    }
+    _updateComposeRootHeader();
+    showToast('Section and subsections deleted');
+  } catch (e) {
+    showToast('Failed to delete section', true);
   }
 }
 

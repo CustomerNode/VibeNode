@@ -448,13 +448,43 @@ def update_section(project_id, section_id):
 
 @bp.route('/projects/<project_id>/sections/<section_id>', methods=['DELETE'])
 def delete_section(project_id, section_id):
-    """Delete a section and its folder."""
+    """Delete a section and its folder. With ?cascade=true, also deletes all descendants."""
     section = get_section(project_id, section_id)
     if not section:
         return jsonify({'ok': False, 'error': 'Section not found'}), 404
 
-    # Remove from context
-    from ..compose.context_manager import remove_section_from_context
+    cascade = request.args.get('cascade', 'false').lower() == 'true'
+    from ..compose.context_manager import remove_section_from_context, read_context
+
+    deleted_names = [section.name]
+
+    if cascade:
+        # Find all descendants recursively
+        try:
+            ctx = read_context(project_id)
+            all_sections = ctx.get("sections", [])
+
+            def _find_descendants(parent_id):
+                children = [s for s in all_sections if s.get("parent_id") == parent_id]
+                result = []
+                for child in children:
+                    result.append(child)
+                    result.extend(_find_descendants(child["id"]))
+                return result
+
+            descendants = _find_descendants(section_id)
+            # Delete descendants (deepest first to avoid orphan issues)
+            for desc in reversed(descendants):
+                try:
+                    remove_section_from_context(project_id, desc["id"])
+                    delete_section_folder(project_id, desc.get("name", ""))
+                    deleted_names.append(desc.get("name", ""))
+                except Exception:
+                    logger.exception("Failed to delete descendant %s", desc.get("id"))
+        except Exception:
+            logger.exception("Failed to find descendants for cascade delete")
+
+    # Delete the section itself
     try:
         remove_section_from_context(project_id, section_id)
     except Exception:
@@ -464,7 +494,7 @@ def delete_section(project_id, section_id):
 
     _emit('compose_board_refresh', {'project_id': project_id})
 
-    return jsonify({'ok': True})
+    return jsonify({'ok': True, 'deleted_count': len(deleted_names), 'deleted_sections': deleted_names})
 
 
 @bp.route('/projects/<project_id>/sections/<section_id>/launch', methods=['POST'])
@@ -594,6 +624,55 @@ def add_and_link_section(project_id):
     })
 
     return jsonify({'ok': True, 'section': section.to_dict()}), 201
+
+
+@bp.route('/projects/<project_id>/sections/<section_id>/preview', methods=['GET'])
+def preview_section(project_id, section_id):
+    """Return the source file contents for a section's output preview."""
+    section = get_section(project_id, section_id)
+    if not section:
+        return jsonify({'ok': False, 'error': 'Section not found'}), 404
+
+    from pathlib import Path
+    section_dir = project_dir(project_id) / "sections" / section.name / "content"
+    files = []
+    if section_dir.is_dir():
+        for fp in sorted(section_dir.iterdir()):
+            if fp.is_file() and fp.suffix in ('.md', '.csv', '.yaml', '.yml', '.json', '.html', '.mmd', '.puml', '.txt'):
+                try:
+                    content = fp.read_text(encoding='utf-8')
+                    files.append({
+                        'name': fp.name,
+                        'type': fp.suffix.lstrip('.'),
+                        'content': content[:50000],  # Cap at 50KB per file
+                    })
+                except Exception:
+                    files.append({'name': fp.name, 'type': fp.suffix.lstrip('.'), 'content': '', 'error': 'Could not read'})
+
+    return jsonify({'ok': True, 'files': files})
+
+
+@bp.route('/projects/<project_id>/sections/<section_id>/children', methods=['GET'])
+def list_section_children(project_id, section_id):
+    """List all descendant sections for cascade delete confirmation."""
+    from ..compose.context_manager import read_context
+
+    try:
+        ctx = read_context(project_id)
+        all_sections = ctx.get("sections", [])
+
+        def _find_descendants(parent_id):
+            children = [s for s in all_sections if s.get("parent_id") == parent_id]
+            result = []
+            for child in children:
+                result.append({'id': child['id'], 'name': child.get('name', ''), 'status': child.get('status', '')})
+                result.extend(_find_descendants(child['id']))
+            return result
+
+        descendants = _find_descendants(section_id)
+        return jsonify({'ok': True, 'children': descendants, 'count': len(descendants)})
+    except Exception:
+        return jsonify({'ok': True, 'children': [], 'count': 0})
 
 
 @bp.route('/projects/<project_id>/sections/reorder', methods=['POST'])
@@ -861,7 +940,21 @@ def accept_compose_plan(project_id):
                 order=order_start + i,
                 artifact_type=artifact,
             )
+            # Set brief as summary if provided by planner
+            brief = (item.get('brief') or '').strip()
+            if brief:
+                section.summary = brief
+
             scaffold_section(project_id, section)
+
+            # Write brief to section folder if provided
+            if brief:
+                try:
+                    brief_path = project_dir(project_id) / "sections" / section.name / "brief.md"
+                    brief_path.write_text(brief, encoding='utf-8')
+                except Exception:
+                    logger.warning("Failed to write brief for section %s", name)
+
             try:
                 add_section_to_context(project_id, section)
                 created.append(section)
