@@ -291,7 +291,7 @@ socket.on('state_snapshot', (data) => {
             console.warn('[state_snapshot] Live session', liveSessionId,
                 'transitioned from working →', newKinds[liveSessionId],
                 '— DOM is empty, re-fetching entries');
-            socket.emit('get_session_log', {session_id: liveSessionId, since: 0, project: localStorage.getItem('activeProject') || '', is_working: newKinds[liveSessionId] === 'working' || newKinds[liveSessionId] === 'question'});
+            socket.emit('get_session_log', {session_id: liveSessionId, since: 0, project: localStorage.getItem('activeProject') || ''});
         } else {
             console.log('[state_snapshot] Live session', liveSessionId,
                 'transitioned from working →', newKinds[liveSessionId],
@@ -340,6 +340,7 @@ socket.on('state_snapshot', (data) => {
     // the old-ID entry so it doesn't duplicate the new-ID entry.
     if (window._idRemaps) {
         allSessions = allSessions.filter(s => !window._idRemaps[s.id]);
+        _rebuildSessionIds();  // keep Set in sync after filter
     }
 
     // Inject stub entries into allSessions for SDK-managed sessions that
@@ -604,7 +605,7 @@ socket.on('session_state', (data) => {
             const sc = data.entry_count;
             if (sc != null && sc > liveLineCount) {
                 console.warn('[entry-catchup] Backend has', sc, 'entries but frontend has', liveLineCount, '— re-fetching');
-                socket.emit('get_session_log', {session_id: session_id, since: 0, project: localStorage.getItem('activeProject') || '', is_working: false});
+                socket.emit('get_session_log', {session_id: session_id, since: 0, project: localStorage.getItem('activeProject') || ''});
             }
             // No blind 500ms re-fetch — it destroys already-rendered content
         }

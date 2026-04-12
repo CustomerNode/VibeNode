@@ -557,25 +557,15 @@ def register_ws_events(socketio, app):
         # the daemon's in-memory entries (which include the current turn)
         # are more complete — use those instead.  No merge, no
         # fingerprinting: just pick the source that has more data.
-        #
-        # Optimization: skip daemon IPC (has_session + get_entries) when
-        # the session has JSONL data and isn't actively streaming. The
-        # client passes an `is_working` hint based on its sessionKinds
-        # state. Each IPC call is a blocking TCP round-trip, so skipping
-        # both saves ~2x the IPC latency on session switch/resume.
-        is_working = bool(data.get('is_working', False))
         entries = _parse_jsonl_entries(app, session_id, since, project=project)
-
-        if entries and not is_working:
-            # JSONL has data and session isn't actively streaming —
-            # disk is the complete source of truth, skip IPC entirely.
-            pass
-        elif sm.has_session(session_id):
-            # Session is working (unflushed entries) or no JSONL yet —
-            # daemon may have more data than disk.
+        if sm.has_session(session_id):
             sdk_entries = sm.get_entries(session_id, since=0)
             if len(sdk_entries) > len(entries):
+                # Daemon has current-turn data not yet on disk — use it
                 entries = sdk_entries
+        if not entries:
+            # Fallback: brand-new session with no JSONL file yet
+            entries = sm.get_entries(session_id, since=0) if sm.has_session(session_id) else []
 
         total = len(entries)
 

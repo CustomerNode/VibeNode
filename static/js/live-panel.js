@@ -557,7 +557,7 @@ function startLivePanel(id, opts) {
 
   // Request the log via WebSocket (skip for brand-new sessions — optimistic bubble is enough)
   if (!skipLog) {
-    socket.emit('get_session_log', {session_id: id, since: 0, project: localStorage.getItem('activeProject') || '', is_working: sessionKinds[id] === 'working' || sessionKinds[id] === 'question'});
+    socket.emit('get_session_log', {session_id: id, since: 0, project: localStorage.getItem('activeProject') || ''});
   }
 
 
@@ -1704,7 +1704,7 @@ function _watchdogHttpCheck(sid, forceApply) {
           const _wdLog = document.getElementById('live-log');
           const _wdHasEntries = _wdLog && _wdLog.querySelectorAll('.msg').length > 0;
           if (!_wdHasEntries) {
-            socket.emit('get_session_log', {session_id: sid, since: 0, project: localStorage.getItem('activeProject') || '', is_working: sessionKinds[sid] === 'working' || sessionKinds[sid] === 'question'});
+            socket.emit('get_session_log', {session_id: sid, since: 0, project: localStorage.getItem('activeProject') || ''});
           }
         }
         filterSessions();
@@ -1715,7 +1715,7 @@ function _watchdogHttpCheck(sid, forceApply) {
         if (sid === liveSessionId && serverEntryCount > liveLineCount + 1) {
           console.warn('[watchdog] Entry mismatch while working: server has', serverEntryCount,
             'but frontend has', liveLineCount, '— re-fetching');
-          socket.emit('get_session_log', {session_id: sid, since: 0, project: localStorage.getItem('activeProject') || '', is_working: true});
+          socket.emit('get_session_log', {session_id: sid, since: 0, project: localStorage.getItem('activeProject') || ''});
         }
         if (forceApply) {
           // Request a fresh snapshot to resync any other stale state
