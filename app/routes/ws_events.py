@@ -30,36 +30,9 @@ _PROFILE_WS = True
 # shared executor avoids creating/destroying threads on every session start.
 _setup_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ws-setup")
 
-# Markers that indicate a UserMessage is SDK/CLI system content, not human input
-_SYSTEM_USER_MARKERS = (
-    "This session is being continued from a previous conversation",
-    "<system-reminder>",
-    "<local-command-stdout>",
-    "<local-command-caveat>",
-    "<command-name>",
-    "<command-message>",
-    "<command-args>",
-)
-
-def _is_system_user_content(text: str) -> bool:
-    for marker in _SYSTEM_USER_MARKERS:
-        if marker in text:
-            return True
-    return False
-
-def _system_user_label(text: str) -> str:
-    if "This session is being continued from a previous conversation" in text:
-        return "Session continued from previous conversation"
-    m = re.search(r'<command-name>(/?\w+)</command-name>', text)
-    if m:
-        cmd = m.group(1)
-        m2 = re.search(r'<local-command-stdout>(.*?)</local-command-stdout>', text, re.DOTALL)
-        stdout = m2.group(1).strip() if m2 else ""
-        return f"{cmd}: {stdout[:100]}" if stdout else f"Local command: {cmd}"
-    m = re.search(r'<local-command-stdout>(.*?)</local-command-stdout>', text, re.DOTALL)
-    if m:
-        return f"Command output: {m.group(1).strip()[:100]}"
-    return "System message"
+# System-user message classification — shared with live_api.py
+from ..platform_utils import is_system_user_content as _is_system_user_content
+from ..platform_utils import system_user_label as _system_user_label
 
 
 # ---- Entry cache for fast repeated loads ----------------------------------

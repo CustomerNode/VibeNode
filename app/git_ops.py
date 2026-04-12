@@ -9,8 +9,7 @@ import time
 
 from .config import _VIBENODE_DIR
 
-# On Windows, prevent subprocess from flashing a console window
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+from .platform_utils import NO_WINDOW as _NO_WINDOW
 
 # ---------------------------------------------------------------------------
 # Git cache and lock

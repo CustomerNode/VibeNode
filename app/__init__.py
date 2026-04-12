@@ -10,8 +10,14 @@ from .config import _VIBENODE_DIR
 socketio = SocketIO()
 
 
-def create_app() -> Flask:
-    """Create and configure the Flask application."""
+def create_app(testing=False) -> Flask:
+    """Create and configure the Flask application.
+
+    Args:
+        testing: If True, skip all background services (daemon, git fetch,
+                 compose watcher, session cleanup). Used by pytest so tests
+                 don't spawn hundreds of threads and daemon connections.
+    """
     app = Flask(
         __name__,
         template_folder=str(_VIBENODE_DIR / "templates"),
@@ -19,17 +25,26 @@ def create_app() -> Flask:
     )
     app.config["TEMPLATES_AUTO_RELOAD"] = True
 
+    if testing:
+        app.config["TESTING"] = True
+
     # Initialize SocketIO with threading mode (Flask's default)
     socketio.init_app(app, async_mode='threading', cors_allowed_origins='*')
 
-    # Connect to the session daemon (runs in a separate process)
-    from .daemon_client import DaemonClient
-    app.session_manager = DaemonClient()
-    app.session_manager.start(socketio, app=app)
+    if not testing:
+        # Connect to the session daemon (runs in a separate process)
+        from .daemon_client import DaemonClient
+        app.session_manager = DaemonClient()
+        app.session_manager.start(socketio, app=app)
 
-    # Register WebSocket event handlers
-    from .routes.ws_events import register_ws_events
-    register_ws_events(socketio, app)
+        # Register WebSocket event handlers
+        from .routes.ws_events import register_ws_events
+        register_ws_events(socketio, app)
+    else:
+        # In test mode, provide a no-op session manager stub so routes
+        # that reference app.session_manager don't crash on attribute access.
+        from unittest.mock import MagicMock
+        app.session_manager = MagicMock()
 
     # Register blueprints
     from .routes.main import bp as main_bp
@@ -56,18 +71,19 @@ def create_app() -> Flask:
     app.register_blueprint(compose_bp)
     app.register_blueprint(test_bp)
 
-    # Prune stale utility session JSONL files (>24h) — once at startup,
-    # not on every /api/sessions request.
-    from .config import _cleanup_system_sessions
-    _cleanup_system_sessions()
+    if not testing:
+        # Prune stale utility session JSONL files (>24h) — once at startup,
+        # not on every /api/sessions request.
+        from .config import _cleanup_system_sessions
+        _cleanup_system_sessions()
 
-    # Start background git fetch at startup
-    from .git_ops import start_bg_fetch
-    start_bg_fetch()
+        # Start background git fetch at startup
+        from .git_ops import start_bg_fetch
+        start_bg_fetch()
 
-    # Start compose-context.json file watcher for real-time board pushes
-    from .compose_watcher import start_compose_watcher
-    start_compose_watcher(socketio, app)
+        # Start compose-context.json file watcher for real-time board pushes
+        from .compose.watcher import start_compose_watcher
+        start_compose_watcher(socketio, app)
 
     # Auto cache-busting: {{ versioned_static('js/app.js') }} → /static/js/app.js?v=<mtime>
     import os as _os

@@ -14,7 +14,7 @@ from typing import Dict
 
 from .config import _VIBENODE_DIR
 
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+from .platform_utils import NO_WINDOW as _NO_WINDOW
 
 # ── Secret patterns (compiled regexes) ──
 # Each entry: (label, regex, description)

@@ -11,8 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-# On Windows, prevent subprocess from flashing a console window
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+from .platform_utils import NO_WINDOW as _NO_WINDOW
 
 from .config import _sessions_dir
 

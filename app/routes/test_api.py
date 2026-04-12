@@ -19,7 +19,7 @@ bp = Blueprint('test_api', __name__)
 log = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+from ..platform_utils import NO_WINDOW as _NO_WINDOW
 
 # Track running test process so we can cancel
 _test_proc = None

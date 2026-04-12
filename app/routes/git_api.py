@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+from ..platform_utils import NO_WINDOW as _NO_WINDOW
 
 from flask import Blueprint, jsonify, request, Response
 

@@ -13,8 +13,7 @@ bp = Blueprint('auth_api', __name__)
 
 _claude_bin = shutil.which("claude") or "claude"
 
-# On Windows, prevent subprocess from flashing a console window
-_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+from ..platform_utils import NO_WINDOW as _NO_WINDOW
 
 
 @bp.route("/api/auth-status")
