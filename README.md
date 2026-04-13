@@ -195,6 +195,17 @@ VibeNode was developed and primarily tested on Windows. macOS and Linux support 
 
 If you run into a platform-specific bug, please submit a pull request with the fix — or ask your Claude to submit one — so we can support everyone. See [CONTRIBUTING.md](CONTRIBUTING.md) or open an issue.
 
+## API Documentation
+
+Full API reference for all 146 REST endpoints, 33 SocketIO events, and 27 daemon IPC methods — browsable and searchable.
+
+- **Live in the app:** [http://localhost:5050/api/docs](http://localhost:5050/api/docs) (when VibeNode is running)
+- **On disk:** Open `docs/api/index.html` in any browser
+- **SocketIO events:** `docs/api/socketio-events.md`
+- **Daemon IPC (internal):** `docs/api/daemon-ipc.md`
+
+The API has no authentication — it's a localhost-only development tool. All endpoints are available without credentials.
+
 ## Architecture
 
 VibeNode runs as two processes on your machine: a Flask web server (port 5050) serving the UI, and a session daemon (port 5051) that owns all Claude sessions. The daemon survives web server restarts so active sessions are never interrupted. Each Claude session is an asyncio task on a single shared event loop, with its own CLI subprocess communicating via stdio. The web server proxies all session operations to the daemon over a TCP/JSON-lines IPC channel.
