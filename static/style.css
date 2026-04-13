@@ -6038,6 +6038,16 @@ mark.find-match.current { background: var(--accent); color:#fff; }
 }
 .compose-plan-btn:hover { background: var(--accent); color: #fff; }
 
+/* Compose type picker dropdown */
+.compose-type-select {
+  width: 100%; padding: 6px 10px; font-size: 12px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg-subtle); color: var(--text);
+  outline: none; cursor: pointer;
+}
+.compose-type-select:focus { border-color: var(--accent); }
+.compose-type-select optgroup { font-weight: 600; color: var(--text); }
+.compose-type-select option { font-weight: 400; padding: 2px 0; }
+
 /* Compose Launch All button */
 .compose-launch-btn {
   display: inline-flex; align-items: center; gap: 5px; padding: 4px 12px;

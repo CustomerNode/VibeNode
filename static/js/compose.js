@@ -447,7 +447,7 @@ function composeAddSection(parentId) {
   const overlay = document.getElementById('pm-overlay');
   if (!overlay) return;
   _composeInsertPosition = 'top';
-  _composeArtifactType = 'text';
+  _composeArtifactType = 'report';
   _composeAddParentId = parentId || null;
 
   const _modalTitle = parentId ? 'Add Subsection' : 'Add Section';
@@ -475,11 +475,13 @@ function composeAddSection(parentId) {
 
       <div class="kanban-create-section">
         <div class="kanban-create-section-label">Type</div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap;">
-          <button class="kanban-create-pos-btn active" data-atype="text" onclick="_setComposeArtifactType(this,'text')">Text</button>
-          <button class="kanban-create-pos-btn" data-atype="code" onclick="_setComposeArtifactType(this,'code')">Code</button>
-          <button class="kanban-create-pos-btn" data-atype="data" onclick="_setComposeArtifactType(this,'data')">Data</button>
-        </div>
+        <select id="compose-type-picker" class="compose-type-select" onchange="_composeArtifactType=this.value;">
+          ${Object.entries(COMPOSE_ARTIFACT_TYPES).map(([cat, types]) =>
+            '<optgroup label="' + cat + '">' + types.map(t =>
+              '<option value="' + t.key + '"' + (t.key === 'report' ? ' selected' : '') + '>' + t.label + '</option>'
+            ).join('') + '</optgroup>'
+          ).join('')}
+        </select>
       </div>
 
     </div>
@@ -1452,7 +1454,7 @@ const _COMPOSE_PLANNER_SYSTEM = [
   'NEVER refuse. NEVER explain. NEVER ask questions.',
   'NEVER output anything except the JSON object.',
   'Format: {"sections":[{"name":"...","artifact_type":"text","brief":"A 1-3 sentence description of this section\'s content and purpose.","subsections":[]}]}',
-  'artifact_type must be one of: "text", "code", "data".',
+  'artifact_type must be one of: report, proposal, memo, whitepaper, letter, blog, sop, contract, script, copy, press, newsletter, faq, meeting-notes, case-study, resume, legal-brief, exec-summary, spreadsheet, financial-model, budget, forecast, survey, comparison, scorecard, inventory, dataset, pitch-deck, board-deck, training, sales-deck, webinar, flowchart, org-chart, architecture, timeline, mind-map, wireframe, infographic, process-map, er-diagram, code, config, html, plan, checklist, questionnaire, rubric, email, social, talking-points. Choose the most specific type that matches the content.',
   'Each section MUST include a "brief" field: 1-3 sentences describing what this section should contain.',
   'Break the content into logical sections for parallel AI agents.',
   'Each section should be independently writeable by an agent.',
@@ -1858,12 +1860,99 @@ const COMPOSE_STATUS_COLUMNS = [
   { key: 'complete',    label: 'Complete',     color: '#3fb950' },
 ];
 
-const COMPOSE_ARTIFACT_ICONS = {
-  text:    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>',
-  code:    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>',
-  data:    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
-  default: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>',
+// Category-level SVG icons (8 categories covering 48+ artifact types)
+const _COMPOSE_CATEGORY_SVGS = {
+  doc:        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>',
+  data:       '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
+  slides:     '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>',
+  diagram:    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><path d="M10 7h4v4"/><path d="M14 17h-4v-4"/></svg>',
+  code:       '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>',
+  structured: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>',
+  comm:       '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>',
+  default:    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>',
 };
+
+// Map every artifact type key to its icon category
+const _COMPOSE_TYPE_TO_CATEGORY = {
+  // Documents
+  report:'doc', proposal:'doc', memo:'doc', whitepaper:'doc', letter:'doc', blog:'doc',
+  sop:'doc', contract:'doc', script:'doc', copy:'doc', press:'doc', newsletter:'doc',
+  faq:'doc', 'meeting-notes':'doc', 'case-study':'doc', resume:'doc', 'legal-brief':'doc', 'exec-summary':'doc',
+  // Data
+  spreadsheet:'data', 'financial-model':'data', budget:'data', forecast:'data',
+  survey:'data', comparison:'data', scorecard:'data', inventory:'data', dataset:'data',
+  // Presentations
+  'pitch-deck':'slides', 'board-deck':'slides', training:'slides', 'sales-deck':'slides', webinar:'slides',
+  // Diagrams
+  flowchart:'diagram', 'org-chart':'diagram', architecture:'diagram', timeline:'diagram',
+  'mind-map':'diagram', wireframe:'diagram', infographic:'diagram', 'process-map':'diagram', 'er-diagram':'diagram',
+  // Code
+  code:'code', config:'code', html:'code',
+  // Structured
+  plan:'structured', checklist:'structured', questionnaire:'structured', rubric:'structured',
+  // Communication
+  email:'comm', social:'comm', 'talking-points':'comm',
+  // Legacy fallbacks
+  text:'doc', data:'data',
+};
+
+// Grouped artifact types for the type picker UI
+const COMPOSE_ARTIFACT_TYPES = {
+  'Documents': [
+    {key:'report', label:'Report'}, {key:'proposal', label:'Proposal'}, {key:'memo', label:'Memo'},
+    {key:'whitepaper', label:'White Paper'}, {key:'letter', label:'Letter'}, {key:'blog', label:'Blog Post'},
+    {key:'sop', label:'SOP / Manual'}, {key:'contract', label:'Contract'}, {key:'script', label:'Script'},
+    {key:'copy', label:'Marketing Copy'}, {key:'press', label:'Press Release'}, {key:'newsletter', label:'Newsletter'},
+    {key:'faq', label:'FAQ'}, {key:'meeting-notes', label:'Meeting Notes'}, {key:'case-study', label:'Case Study'},
+    {key:'resume', label:'Resume / CV'}, {key:'legal-brief', label:'Legal Brief'}, {key:'exec-summary', label:'Executive Summary'},
+  ],
+  'Data': [
+    {key:'spreadsheet', label:'Spreadsheet'}, {key:'financial-model', label:'Financial Model'},
+    {key:'budget', label:'Budget'}, {key:'forecast', label:'Forecast'}, {key:'survey', label:'Survey Results'},
+    {key:'comparison', label:'Comparison Matrix'}, {key:'scorecard', label:'Scorecard'},
+    {key:'inventory', label:'Inventory / Catalog'}, {key:'dataset', label:'Dataset'},
+  ],
+  'Presentations': [
+    {key:'pitch-deck', label:'Pitch Deck'}, {key:'board-deck', label:'Board Deck'},
+    {key:'training', label:'Training Material'}, {key:'sales-deck', label:'Sales Deck'}, {key:'webinar', label:'Webinar Slides'},
+  ],
+  'Diagrams': [
+    {key:'flowchart', label:'Flowchart'}, {key:'org-chart', label:'Org Chart'},
+    {key:'architecture', label:'Architecture Diagram'}, {key:'timeline', label:'Timeline'},
+    {key:'mind-map', label:'Mind Map'}, {key:'wireframe', label:'Wireframe'},
+    {key:'infographic', label:'Infographic'}, {key:'process-map', label:'Process Map'}, {key:'er-diagram', label:'ER Diagram'},
+  ],
+  'Code': [
+    {key:'code', label:'Code / Script'}, {key:'config', label:'Configuration'}, {key:'html', label:'HTML / Web'},
+  ],
+  'Structured': [
+    {key:'plan', label:'Project Plan'}, {key:'checklist', label:'Checklist'},
+    {key:'questionnaire', label:'Questionnaire / Form'}, {key:'rubric', label:'Rubric / Scorecard'},
+  ],
+  'Communication': [
+    {key:'email', label:'Email'}, {key:'social', label:'Social Media'}, {key:'talking-points', label:'Talking Points'},
+  ],
+};
+
+// Resolve artifact icon for any type key
+function _composeArtifactIcon(type) {
+  const cat = _COMPOSE_TYPE_TO_CATEGORY[type] || 'default';
+  return _COMPOSE_CATEGORY_SVGS[cat] || _COMPOSE_CATEGORY_SVGS.default;
+}
+
+// Label for any artifact type key
+function _composeArtifactLabel(type) {
+  for (const cat of Object.values(COMPOSE_ARTIFACT_TYPES)) {
+    const found = cat.find(t => t.key === type);
+    if (found) return found.label;
+  }
+  return type || 'Document';
+}
+
+// Legacy compat — old code references COMPOSE_ARTIFACT_ICONS[type]
+const COMPOSE_ARTIFACT_ICONS = new Proxy({}, {
+  get(_, key) { return _composeArtifactIcon(key); }
+});
 
 function _renderComposeSectionCards() {
   const board = document.getElementById('compose-sections-board');
@@ -1965,7 +2054,7 @@ function _renderComposeSectionCards() {
         </div>
         <div class="compose-card-meta">
           <span class="compose-card-status" style="background:${col.color}22;color:${col.color};">${col.label}</span>
-          ${sec.artifact_type ? '<span class="compose-card-time">' + sec.artifact_type + '</span>' : ''}
+          ${sec.artifact_type ? '<span class="compose-card-time">' + _composeArtifactLabel(sec.artifact_type) + '</span>' : ''}
           ${sec.updated_at ? '<span class="compose-card-time">' + _composeTimeAgo(Date.parse(sec.updated_at)) + '</span>' : ''}
           ${readyBadge}
         </div>
