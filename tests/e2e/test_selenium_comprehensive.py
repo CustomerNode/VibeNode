@@ -5,27 +5,16 @@ Tests every user-facing flow via headless Chrome against the live server.
 
 import time
 import pytest
-from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 
-from tests.conftest import TEST_BASE_URL as BASE_URL
+from tests.e2e.conftest import TEST_BASE_URL as BASE_URL
 LONG_WAIT = 90  # seconds for Claude to respond
 
 
-@pytest.fixture(scope="module")
-def driver():
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1400,900")
-    d = webdriver.Chrome(options=options)
-    yield d
-    d.quit()
 
 
 def _wait_for_idle(driver, timeout=LONG_WAIT):

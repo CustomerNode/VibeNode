@@ -7,6 +7,26 @@ SAFETY:
 - The user's Supabase is NEVER touched.
 - The user's tasks are NEVER touched.
 - Test cleanup only deletes task IDs the tests created.
+
+Running E2E Tests
+=================
+Prerequisites:
+  pip install -r requirements-test.txt
+  Chrome browser installed (chromedriver managed automatically by webdriver-manager)
+
+Run all E2E tests:
+  pytest tests/e2e -m e2e -v --timeout=300
+
+Run a single test file:
+  pytest tests/e2e/test_selenium_kanban.py -m e2e -v
+
+Test server:
+  The E2E conftest automatically starts an isolated VibeNode server on port 5099
+  with its own SQLite DB in a temp directory. Your running instance on :5050 is
+  never touched.
+
+Artifacts:
+  Screenshots on failure are saved to tests/screenshots/ (gitignored).
 """
 
 import json
@@ -17,13 +37,67 @@ import tempfile
 import time
 import pytest
 from pathlib import Path
+from selenium import webdriver
 
 TEST_PORT = 5099
 TEST_DAEMON_PORT = 5098
 TEST_BASE_URL = f"http://localhost:{TEST_PORT}"
+SCREENSHOT_DIR = Path(__file__).resolve().parent.parent / "screenshots"
 
 _test_server_proc = None
 _test_tmpdir = None
+
+
+# ------------------------------------------------------------------
+# Shared driver fixture — all E2E test files use this (no duplicates)
+# ------------------------------------------------------------------
+
+@pytest.fixture(scope="class")
+def driver():
+    """Shared headless Chrome driver for E2E tests.
+
+    Scope is 'class' so each test class gets a fresh browser — one class
+    failing cannot cascade to another.  Individual test files should NOT
+    define their own driver() fixture.
+    """
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1400,900")
+    d = webdriver.Chrome(options=options)
+    yield d
+    d.quit()
+
+
+# ------------------------------------------------------------------
+# Screenshot capture on failure
+# ------------------------------------------------------------------
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Capture screenshot and browser console logs on test failure."""
+    outcome = yield
+    report = outcome.get_result()
+    if report.when == "call" and report.failed:
+        driver = item.funcargs.get("driver")
+        if driver:
+            SCREENSHOT_DIR.mkdir(exist_ok=True)
+            name = item.nodeid.replace("::", "_").replace("/", "_").replace("\\", "_")
+            path = SCREENSHOT_DIR / f"{name}.png"
+            try:
+                driver.save_screenshot(str(path))
+            except Exception:
+                pass  # Don't fail the test because screenshot failed
+            try:
+                log_path = path.with_suffix(".log")
+                logs = driver.get_log("browser")
+                log_path.write_text(
+                    "\n".join(f"[{e['level']}] {e['message']}" for e in logs),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
 
 
 def pytest_configure(config):

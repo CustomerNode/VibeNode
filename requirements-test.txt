@@ -1,0 +1,6 @@
+# Test dependencies — install with: pip install -r requirements-test.txt
+-r requirements.txt
+selenium>=4.15
+webdriver-manager>=4.0
+pytest-html>=4.0
+pytest-rerunfailures>=13.0

@@ -5,27 +5,22 @@ import pytest
 from selenium import webdriver
 from selenium.webdriver.support.ui import WebDriverWait
 
-from tests.conftest import TEST_BASE_URL as BASE_URL
+from tests.e2e.conftest import TEST_BASE_URL as BASE_URL
 LONG_WAIT = 90
 
 
 TEST_PROJECT = "__selenium_test__"
 
 
-@pytest.fixture(scope="module")
-def driver():
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1400,900")
-    d = webdriver.Chrome(options=options)
-    d.get(BASE_URL)
-    WebDriverWait(d, LONG_WAIT).until(
+@pytest.fixture(scope="class", autouse=True)
+def kanban_nav_setup(driver):
+    """Navigate, switch to test project, track task IDs for cleanup."""
+    driver.get(BASE_URL)
+    WebDriverWait(driver, LONG_WAIT).until(
         lambda drv: drv.execute_script('return typeof setViewMode === "function"')
     )
     time.sleep(2)
-    d.execute_script('''
+    driver.execute_script('''
         fetch("/api/set-project", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
@@ -33,19 +28,18 @@ def driver():
         });
     ''', TEST_PROJECT)
     time.sleep(2)
-    d.execute_script('document.querySelectorAll(".show").forEach(function(e){e.classList.remove("show")})')
-    d.execute_script('window.__test_created_ids = [];')
+    driver.execute_script('document.querySelectorAll(".show").forEach(function(e){e.classList.remove("show")})')
+    driver.execute_script('window.__test_created_ids = [];')
     time.sleep(1)
-    yield d
+    yield
     # Only delete tasks we created
-    d.execute_script('''
+    driver.execute_script('''
         var ids = window.__test_created_ids || [];
         Promise.all(ids.map(function(id) {
             return fetch("/api/kanban/tasks/" + id, {method: "DELETE"});
         }));
     ''')
     time.sleep(2)
-    d.quit()
 
 
 def _to_kanban(driver):

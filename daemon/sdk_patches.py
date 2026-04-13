@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 
 _SDK_VERSION = getattr(claude_code_sdk, "__version__", "0.0.0")
 
+# Guard against double-application (e.g. tests + session_manager both import)
+_patches_applied = False
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -51,7 +54,14 @@ def apply_patches() -> list[str]:
     """Apply all SDK patches. Call once at module load.
 
     Returns a list of patch names that were successfully applied.
+    Idempotent — safe to call multiple times.
     """
+    global _patches_applied
+    if _patches_applied:
+        logger.debug("SDK patches already applied, skipping")
+        return []
+    _patches_applied = True
+
     logger.info("Applying SDK patches for claude-code-sdk %s", _SDK_VERSION)
 
     applied: list[str] = []
@@ -155,16 +165,19 @@ def _assert_patch_transport_adapter_preconditions() -> None:
     from claude_code_sdk._internal.query import Query
     from claude_code_sdk._internal.transport import Transport  # noqa: F401
 
-    # Query.__init__ must accept 'transport' and 'can_use_tool'
-    sig = inspect.signature(Query.__init__)
-    params = list(sig.parameters.keys())
-    assert "transport" in params, f"Query.__init__ missing 'transport' param: {params}"
-    assert "can_use_tool" in params, f"Query.__init__ missing 'can_use_tool' param: {params}"
+    # Query.__init__ must accept 'transport' and 'can_use_tool'.
+    # If our patch has already been applied, the signature will be
+    # (self, *args, **kwargs) — in that case check the wrapped original.
+    init_fn = Query.__init__
+    wrapped = getattr(init_fn, "__wrapped__", None)
+    check_fn = wrapped if wrapped is not None else init_fn
 
-    # Query must store transport as self.transport after init
-    # (We verify this by checking the source — looking for self.transport assignment)
-    src = inspect.getsource(Query.__init__)
-    assert "self.transport" in src, "Query.__init__ doesn't set self.transport"
+    sig = inspect.signature(check_fn)
+    params = list(sig.parameters.keys())
+    # If already patched, params will be ['self', 'args', 'kwargs'] — that's OK
+    if "args" not in params:
+        assert "transport" in params, f"Query.__init__ missing 'transport' param: {params}"
+        assert "can_use_tool" in params, f"Query.__init__ missing 'can_use_tool' param: {params}"
 
     # Verify the permission response format we're fixing still uses {"allow": ...}
     handle_src = inspect.getsource(Query._handle_control_request)

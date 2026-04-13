@@ -16,7 +16,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-BASE_URL = "http://127.0.0.1:5050"
+from tests.e2e.conftest import TEST_BASE_URL as BASE_URL
 CP = Path.home() / ".claude" / "projects"
 
 
@@ -66,12 +66,7 @@ def _fsd():
 # Fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(scope="module")
-def driver():
-    o = webdriver.ChromeOptions()
-    o.add_argument("--headless=new"); o.add_argument("--no-sandbox")
-    o.add_argument("--disable-gpu"); o.add_argument("--window-size=1400,900")
-    d = webdriver.Chrome(options=o); yield d; d.quit()
+# Uses shared driver fixture from tests/e2e/conftest.py
 
 @pytest.fixture(scope="module")
 def sdir(): return _fsd()

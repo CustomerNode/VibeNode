@@ -23,7 +23,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-from tests.conftest import TEST_BASE_URL as BASE_URL
+from tests.e2e.conftest import TEST_BASE_URL as BASE_URL
 LONG_WAIT = 90
 API = BASE_URL + "/api/kanban"
 
@@ -31,21 +31,16 @@ API = BASE_URL + "/api/kanban"
 TEST_PROJECT = "__selenium_test__"
 
 
-@pytest.fixture(scope="module")
-def driver():
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1400,900")
-    d = webdriver.Chrome(options=options)
-    d.get(BASE_URL)
-    WebDriverWait(d, LONG_WAIT).until(
+@pytest.fixture(scope="class", autouse=True)
+def kanban_fixes_setup(driver):
+    """Navigate, switch to test project, track task IDs for cleanup."""
+    driver.get(BASE_URL)
+    WebDriverWait(driver, LONG_WAIT).until(
         lambda drv: drv.execute_script('return typeof setViewMode === "function"')
     )
     time.sleep(2)
     # Switch to isolated test project
-    d.execute_script('''
+    driver.execute_script('''
         fetch("/api/set-project", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
@@ -53,29 +48,19 @@ def driver():
         });
     ''', TEST_PROJECT)
     time.sleep(2)
-    # VERIFY the switch worked — abort if still on a real project
-    active_project = d.execute_script('''
-        return fetch("/api/kanban/board").then(r => r.json()).then(data => {
-            var cols = data.columns || [];
-            return cols.length > 0 ? cols[0].project_id : "";
-        });
-    ''')
-    time.sleep(1)
-    active_project = d.execute_script('return window._lastProjectId || ""')
-    d.execute_script('document.querySelectorAll(".show").forEach(function(e){e.classList.remove("show")})')
+    driver.execute_script('document.querySelectorAll(".show").forEach(function(e){e.classList.remove("show")})')
     time.sleep(1)
     # Track created task IDs for safe cleanup
-    d.execute_script('window.__test_created_ids = [];')
-    yield d
+    driver.execute_script('window.__test_created_ids = [];')
+    yield
     # Cleanup: ONLY delete tasks we created
-    d.execute_script('''
+    driver.execute_script('''
         var ids = window.__test_created_ids || [];
         Promise.all(ids.map(function(id) {
             return fetch("/api/kanban/tasks/" + id, {method: "DELETE"});
         }));
     ''')
     time.sleep(2)
-    d.quit()
 
 
 def _to_kanban(driver):

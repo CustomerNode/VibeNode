@@ -31,7 +31,7 @@ def _enumerate_processes_windows():
     try:
         result = subprocess.run(
             ["powershell", "-NoProfile", "-command",
-             "Get-WmiObject Win32_Process "
+             "Get-CimInstance Win32_Process "
              "| Where-Object { $_.Name -match 'claude|node' } "
              "| Select-Object ProcessId,Name,CommandLine "
              "| ConvertTo-Json -Compress"],

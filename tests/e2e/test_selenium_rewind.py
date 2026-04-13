@@ -22,7 +22,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-BASE_URL = "http://127.0.0.1:5050"
+from tests.e2e.conftest import TEST_BASE_URL as BASE_URL, TEST_DAEMON_PORT
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 _ENCODED_PROJECT = str(PROJECT_DIR).replace("\\", "-").replace("/", "-").replace(":", "-")
 SESSIONS_DIR = Path.home() / ".claude" / "projects" / _ENCODED_PROJECT
@@ -53,7 +53,7 @@ def _daemon_alive():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(3)
-        s.connect(("127.0.0.1", 5051))
+        s.connect(("127.0.0.1", TEST_DAEMON_PORT))
         s.close()
         return True
     except Exception:
@@ -116,17 +116,7 @@ def _wait_for_idle(driver, timeout=120):
 # Fixtures
 # ------------------------------------------------------------------
 
-@pytest.fixture(scope="module")
-def driver():
-    o = webdriver.ChromeOptions()
-    o.add_argument("--headless=new")
-    o.add_argument("--no-sandbox")
-    o.add_argument("--disable-gpu")
-    o.add_argument("--window-size=1400,900")
-    d = webdriver.Chrome(options=o)
-    yield d
-    d.quit()
-
+# Uses shared driver fixture from tests/e2e/conftest.py
 
 @pytest.fixture(scope="module")
 def scratch_file():

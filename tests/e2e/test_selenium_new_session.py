@@ -6,26 +6,12 @@ submits, and verifies Claude responds in the chat panel.
 
 import time
 import pytest
-from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 
-from tests.conftest import TEST_BASE_URL as BASE_URL
-
-
-@pytest.fixture(scope="module")
-def driver():
-    """Launch headless Chrome, yield the driver, then quit."""
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1400,900")
-    d = webdriver.Chrome(options=options)
-    yield d
-    d.quit()
+from tests.e2e.conftest import TEST_BASE_URL as BASE_URL
 
 
 class TestNewSessionFlow:

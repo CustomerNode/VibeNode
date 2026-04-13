@@ -128,7 +128,10 @@ def api_add_project():
         name = data.get("name", "").strip()
         if not name:
             return jsonify({"ok": False, "error": "No name provided"}), 400
-        path = str(Path.home() / "Documents" / name)
+        if sys.platform == "linux":
+            path = str(Path.home() / name)
+        else:
+            path = str(Path.home() / "Documents" / name)
         Path(path).mkdir(parents=True, exist_ok=True)
 
     else:

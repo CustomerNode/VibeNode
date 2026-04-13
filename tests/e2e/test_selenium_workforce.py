@@ -13,20 +13,11 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 
-from tests.conftest import TEST_BASE_URL as BASE_URL
+from tests.e2e.conftest import TEST_BASE_URL as BASE_URL
 LONG_WAIT = 90
 
 
-@pytest.fixture(scope="module")
-def driver():
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1400,900")
-    d = webdriver.Chrome(options=options)
-    yield d
-    d.quit()
+# Uses shared driver fixture from tests/e2e/conftest.py
 
 
 def _setup_project(driver):

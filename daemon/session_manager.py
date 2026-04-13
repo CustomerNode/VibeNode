@@ -1099,9 +1099,10 @@ class SessionManager:
         # died mid-response, the last entry has stop_reason=null and
         # --resume will choke on it immediately.
         try:
+            from app.config import _encode_cwd
             projects_dir = Path.home() / ".claude" / "projects"
             if info.cwd:
-                encoded = info.cwd.replace("\\", "/").replace(":", "-").replace("/", "-").replace("_", "-")
+                encoded = _encode_cwd(info.cwd)
                 jsonl_candidate = projects_dir / encoded / f"{resolved}.jsonl"
                 if jsonl_candidate.exists():
                     _repair_incomplete_jsonl(jsonl_candidate)
@@ -3032,13 +3033,14 @@ class SessionManager:
     @staticmethod
     def _find_session_jsonl(info: SessionInfo) -> Optional[Path]:
         """Locate the .jsonl file for a session on disk."""
+        from app.config import _encode_cwd
         projects_dir = Path.home() / ".claude" / "projects"
         sid = info.session_id
 
         # Try the encoded cwd first (fastest path)
         cwd = info.cwd or ""
         if cwd:
-            encoded = cwd.replace("\\", "/").replace(":", "-").replace("/", "-").replace("_", "-")
+            encoded = _encode_cwd(cwd)
             candidate = projects_dir / encoded / f"{sid}.jsonl"
             if candidate.exists():
                 return candidate
@@ -3136,6 +3138,7 @@ class SessionManager:
         filters out stale or stopped entries, and resumes each one via the
         SDK's --resume flag.
         """
+        from app.config import _encode_cwd
         try:
             registry = self._load_registry()
             sessions = registry.get("sessions", {})
@@ -3173,7 +3176,7 @@ class SessionManager:
                 jsonl_path = None
                 projects_dir = Path.home() / ".claude" / "projects"
                 if cwd:
-                    encoded = cwd.replace("\\", "/").replace(":", "-").replace("/", "-").replace("_", "-")
+                    encoded = _encode_cwd(cwd)
                     candidate = projects_dir / encoded / f"{sid}.jsonl"
                     if candidate.exists():
                         jsonl_path = candidate

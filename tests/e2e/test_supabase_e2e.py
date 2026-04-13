@@ -22,7 +22,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-from tests.conftest import TEST_BASE_URL as SERVER_URL
+from tests.e2e.conftest import TEST_BASE_URL as SERVER_URL
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kanban_config.json")
 
 

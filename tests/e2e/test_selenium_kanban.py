@@ -33,34 +33,25 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-from tests.conftest import TEST_BASE_URL as BASE_URL
+from tests.e2e.conftest import TEST_BASE_URL as BASE_URL
 LONG_WAIT = 90
 API = BASE_URL + "/api/kanban"
 
 
-@pytest.fixture(scope="module")
-def driver():
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1400,900")
-    d = webdriver.Chrome(options=options)
-    # Navigate to app and wait for JS bundles to load
-    d.get(BASE_URL)
-    WebDriverWait(d, LONG_WAIT).until(
+@pytest.fixture(scope="class", autouse=True)
+def kanban_setup(driver):
+    """Navigate to the app, wait for JS, select project, dismiss modals."""
+    driver.get(BASE_URL)
+    WebDriverWait(driver, LONG_WAIT).until(
         lambda drv: drv.execute_script('return typeof setViewMode === "function"')
     )
     time.sleep(2)
-    # Select first project and dismiss modals
-    d.execute_script('''
+    driver.execute_script('''
         if(typeof _allProjects!=="undefined"&&_allProjects.length>0)
             setProject(_allProjects[0].encoded,true);
         document.querySelectorAll(".show").forEach(function(e){e.classList.remove("show")});
     ''')
     time.sleep(2)
-    yield d
-    d.quit()
 
 
 def _ensure_page_loaded(driver):

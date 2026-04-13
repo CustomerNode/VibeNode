@@ -8,6 +8,7 @@ Validates that:
 5. Transport adapter delegates all other methods unchanged
 """
 
+import asyncio
 import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,6 +16,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 # Apply patches before any tests run (mirrors what session_manager does at import)
 from daemon.sdk_patches import apply_patches as _apply_patches
 _apply_patches()
+
+
+def _run(coro):
+    """Helper to run async code in sync tests."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            return pool.submit(asyncio.run, coro).result()
+    return asyncio.run(coro)
 
 
 # ── Structural Assertion Tests ──────────────────────────���────────────────
@@ -151,8 +165,7 @@ class TestTransportAdapter:
 
     # -- Permission response reformatting --
 
-    @pytest.mark.asyncio
-    async def test_reformat_allow_response(self, adapter, mock_transport):
+    def test_reformat_allow_response(self, adapter, mock_transport):
         """SDK allow format should be converted to CLI 2.x format."""
         sdk_response = {
             "type": "control_response",
@@ -165,15 +178,14 @@ class TestTransportAdapter:
                 },
             },
         }
-        await adapter.write(json.dumps(sdk_response) + "\n")
+        _run(adapter.write(json.dumps(sdk_response) + "\n"))
 
         assert len(mock_transport.written) == 1
         written = json.loads(mock_transport.written[0])
         inner = written["response"]["response"]
         assert inner == {"behavior": "allow", "updatedInput": {"command": "ls"}}
 
-    @pytest.mark.asyncio
-    async def test_reformat_allow_no_input(self, adapter, mock_transport):
+    def test_reformat_allow_no_input(self, adapter, mock_transport):
         """Allow without input should default to empty updatedInput."""
         sdk_response = {
             "type": "control_response",
@@ -183,14 +195,13 @@ class TestTransportAdapter:
                 "response": {"allow": True},
             },
         }
-        await adapter.write(json.dumps(sdk_response) + "\n")
+        _run(adapter.write(json.dumps(sdk_response) + "\n"))
 
         written = json.loads(mock_transport.written[0])
         inner = written["response"]["response"]
         assert inner == {"behavior": "allow", "updatedInput": {}}
 
-    @pytest.mark.asyncio
-    async def test_reformat_deny_response(self, adapter, mock_transport):
+    def test_reformat_deny_response(self, adapter, mock_transport):
         """SDK deny format should be converted to CLI 2.x format."""
         sdk_response = {
             "type": "control_response",
@@ -203,14 +214,13 @@ class TestTransportAdapter:
                 },
             },
         }
-        await adapter.write(json.dumps(sdk_response) + "\n")
+        _run(adapter.write(json.dumps(sdk_response) + "\n"))
 
         written = json.loads(mock_transport.written[0])
         inner = written["response"]["response"]
         assert inner == {"behavior": "deny", "message": "User denied"}
 
-    @pytest.mark.asyncio
-    async def test_deny_default_message(self, adapter, mock_transport):
+    def test_deny_default_message(self, adapter, mock_transport):
         """Deny without reason should default to 'Denied'."""
         sdk_response = {
             "type": "control_response",
@@ -220,23 +230,21 @@ class TestTransportAdapter:
                 "response": {"allow": False},
             },
         }
-        await adapter.write(json.dumps(sdk_response) + "\n")
+        _run(adapter.write(json.dumps(sdk_response) + "\n"))
 
         written = json.loads(mock_transport.written[0])
         inner = written["response"]["response"]
         assert inner == {"behavior": "deny", "message": "Denied"}
 
-    @pytest.mark.asyncio
-    async def test_non_permission_passthrough(self, adapter, mock_transport):
+    def test_non_permission_passthrough(self, adapter, mock_transport):
         """Non-permission messages should pass through unchanged."""
         msg = {"type": "user", "message": {"role": "user", "content": "hello"}}
         data = json.dumps(msg) + "\n"
-        await adapter.write(data)
+        _run(adapter.write(data))
 
         assert mock_transport.written[0] == data
 
-    @pytest.mark.asyncio
-    async def test_error_response_passthrough(self, adapter, mock_transport):
+    def test_error_response_passthrough(self, adapter, mock_transport):
         """Error control responses should pass through (no 'allow' key)."""
         error_response = {
             "type": "control_response",
@@ -247,43 +255,38 @@ class TestTransportAdapter:
             },
         }
         data = json.dumps(error_response) + "\n"
-        await adapter.write(data)
+        _run(adapter.write(data))
 
         assert mock_transport.written[0] == data
 
-    @pytest.mark.asyncio
-    async def test_malformed_json_passthrough(self, adapter, mock_transport):
+    def test_malformed_json_passthrough(self, adapter, mock_transport):
         """Malformed JSON should pass through unchanged."""
         data = "not json at all\n"
-        await adapter.write(data)
+        _run(adapter.write(data))
         assert mock_transport.written[0] == data
 
     # -- end_input behavior --
 
-    @pytest.mark.asyncio
-    async def test_end_input_passes_through_by_default(self, adapter, mock_transport):
+    def test_end_input_passes_through_by_default(self, adapter, mock_transport):
         """Without keep_stdin_open, end_input should delegate."""
-        await adapter.end_input()
+        _run(adapter.end_input())
         assert mock_transport.input_ended is True
 
-    @pytest.mark.asyncio
-    async def test_end_input_suppressed_when_keep_open(
+    def test_end_input_suppressed_when_keep_open(
         self, adapter_keep_open, mock_transport
     ):
         """With keep_stdin_open=True, end_input should be suppressed."""
-        await adapter_keep_open.end_input()
+        _run(adapter_keep_open.end_input())
         assert mock_transport.input_ended is False
 
     # -- delegation --
 
-    @pytest.mark.asyncio
-    async def test_connect_delegates(self, adapter, mock_transport):
-        await adapter.connect()
+    def test_connect_delegates(self, adapter, mock_transport):
+        _run(adapter.connect())
         assert mock_transport.connected is True
 
-    @pytest.mark.asyncio
-    async def test_close_delegates(self, adapter, mock_transport):
-        await adapter.close()
+    def test_close_delegates(self, adapter, mock_transport):
+        _run(adapter.close())
         assert mock_transport.closed is True
 
     def test_is_ready_delegates(self, adapter, mock_transport):

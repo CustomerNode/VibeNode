@@ -41,5 +41,29 @@ Do NOT use subprocess, os.system, taskkill, or any other method to start, stop, 
 ## File organization — keep the root clean
 All planning documents, implementation notes, design specs, task breakdowns, and working docs belong in `docs/plans/` — NEVER in the project root. The root directory is for code, config, and the README only. If you need to create a spec, plan, or notes file, put it in `docs/plans/`. This folder is gitignored and is not shipped to users.
 
+## Performance-critical patterns — DO NOT MODIFY without profiling
+
+VibeNode underwent a measurement-driven performance overhaul. The patterns below were profiled and validated with real instrumentation. Reverting any of them causes measurable regression. Look for `PERF-CRITICAL` markers in the code.
+
+**Before modifying any code near a `PERF-CRITICAL` marker, you MUST understand the performance reason documented there. If you think the code can be "simplified" or "cleaned up," that is almost certainly a regression. ASK the user before changing it.**
+
+1. **`is_post_turn` guard on `_detect_changed_files`** — `daemon/session_manager.py`. Pre-turn runs cause a 199-file scan per message (+2-138ms). Do NOT call `_detect_changed_files` unconditionally.
+2. **`asyncio.gather()` in `_send_query`** — `daemon/session_manager.py`. `_write_file_snapshot` and `_record_pre_turn_mtimes` run in parallel. Sequential awaits add 60-70ms. Do NOT replace with sequential calls.
+3. **`_turn_had_direct_edit = False` placement** — `daemon/session_manager.py`. Must reset BEFORE the gather, not between/after. Moving it creates a race condition.
+4. **Mtime carry-forward in `_record_pre_turn_mtimes`** — `daemon/session_manager.py`. Carries forward `_post_turn_mtimes` from the previous turn. Removing forces a full `git ls-files` + stat every turn.
+5. **First-turn mtime overlapped with `client.connect()`** — `daemon/session_manager.py` `_drive_session`. `run_in_executor` starts before `await client.connect()`. Moving it after adds 70-90ms.
+6. **`get_entry_count` method** — `daemon/session_manager.py`. Returns `len(info.entries)` without serialization. Do NOT replace with `get_entries` (25-32ms vs 0-1ms).
+7. **`tracked_files` snowball prevention** — `daemon/session_manager.py` `_write_file_snapshot`. `fs_changed` from `_detect_changed_files` are snapshot extras only, NOT added to `tracked_files`. Adding causes 20-55s turns with 1400+ entries.
+8. **Debounced `_save_queues()`** — `daemon/session_manager.py`. 1-second timer batches disk writes. Do NOT call `_save_queues_now()` directly from queue operations.
+9. **`_GIT_LS_FILES_CACHE_TTL`** — `daemon/session_manager.py`. Currently 180s. Do NOT reduce below 120s.
+10. **`get_all_states()` cache** — `app/session_awareness.py`. 2s TTL. Do NOT remove or bypass.
+11. **`get_kanban_config()` cache** — `app/config.py`. 10s TTL with invalidation on save. Do NOT remove.
+12. **Module-level `_setup_executor`** — `app/routes/ws_events.py`. Do NOT create per-request.
+13. **`_cleanup_system_sessions()` at startup only** — `app/__init__.py`. Do NOT call from `all_sessions()` or any per-request path.
+14. **IPC profiling logger namespace** — `run.py`. `"app.daemon_client"` must be in the logger namespace list. Removing silences IPC profiling.
+15. **`allSessionIds` Set** — `static/js/app.js`. Must stay in sync with `allSessions` at all mutation sites. Do NOT replace `.has()` with `.find()`.
+16. **Watchdog dedup** — `static/js/live-panel.js`. `window._watchdogSid`/`window._watchdogTimer` enable cross-script dedup. Do NOT remove the `window.` assignments.
+17. **`performance.mark()`/`performance.measure()` instrumentation** — `static/js/socket.js`. Submit timing and session switch timing. Do NOT remove.
+
 ## Slash commands are intercepted client-side
 Claude CLI slash commands (e.g. `/compact`, `/rewind`, `/clear`) are NOT sent to the SDK. They get silently eaten with no response, leaving the session stuck idle. Instead, `_interceptSlashCommand()` in `live-panel.js` catches them at every submit path and either triggers the GUI equivalent (e.g. `/rewind` clicks the Rewind toolbar button, `/compact` fires `liveCompact()`) or shows a toast explaining the command isn't supported in the GUI. The command map lives in `_slashCommandMap`. Messages with `/` that aren't bare commands (e.g. "fix /etc/config") pass through normally.

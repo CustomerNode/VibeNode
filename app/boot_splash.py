@@ -131,6 +131,15 @@ class BootSplash:
             self._ff = "SF Pro Display"
         else:
             self._ff = "sans-serif"
+            try:
+                import tkinter.font as _tkfont
+                _available = set(_tkfont.families())
+                for _candidate in ("Ubuntu", "Noto Sans", "DejaVu Sans", "Liberation Sans"):
+                    if _candidate in _available:
+                        self._ff = _candidate
+                        break
+            except Exception:
+                pass
 
         # Title font: prefer Space Grotesk (matches web UI header)
         self._tf = "Space Grotesk"
