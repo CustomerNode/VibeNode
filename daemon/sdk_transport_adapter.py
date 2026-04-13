@@ -8,6 +8,33 @@ at the ABC boundary — intercepting write() to reformat permission responses
 and suppressing end_input() to keep stdin open for the control protocol.
 
 See docs/plans/sdk-monkey-patching-plan.md for full context.
+
+── CRITICAL: updatedInput must never be null ──────────────────────────────
+
+The CLI 2.x permission protocol requires `updatedInput` to be a dict
+containing the tool's input (command, file_path, etc.). If it receives
+`null`, the CLI's sandbox validator crashes:
+
+    undefined is not an object (evaluating 'H.includes')
+
+This happens because:
+  1. PermissionResultAllow() defaults to updated_input=None
+  2. The SDK serializes this as {"allow": true, "input": null}
+  3. dict.get("input", {}) returns None (key exists, value is None)
+     — it does NOT return the default {}
+  4. We send {"updatedInput": null} to the CLI
+  5. CLI tries to read tool input properties from null → crash
+
+The fix has TWO layers (belt and suspenders):
+  - session_manager.py: Every PermissionResultAllow() must pass
+    updated_input=tool_input to echo back the original tool input.
+  - This adapter: isinstance() check on the "input" value as a
+    safety net — if it's not a dict, fall back to {}.
+
+If you refactor permission handling, make sure updatedInput is always
+a dict with the original tool input. Never send null or undefined.
+
+See: https://github.com/anthropics/claude-code/issues/XXXX (internal)
 """
 
 import json
@@ -76,9 +103,15 @@ class VibeNodeTransportAdapter(Transport):
         inner = response["response"]
 
         if inner.get("allow"):
+            # inner["input"] may be None when the permission callback didn't
+            # modify the tool input (PermissionResultAllow with updated_input=None).
+            # The CLI expects updatedInput to be a dict (the original tool input)
+            # — sending null crashes the sandbox validator (H.includes(undefined)).
+            # Fall back to {} which tells the CLI "no changes, use original input".
+            updated = inner.get("input")
             inner_reformatted = {
                 "behavior": "allow",
-                "updatedInput": inner.get("input", {}),
+                "updatedInput": updated if isinstance(updated, dict) else {},
             }
         else:
             inner_reformatted = {

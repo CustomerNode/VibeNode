@@ -587,7 +587,12 @@ class SessionManager:
             return {"ok": False, "error": "No pending permission"}
 
         if allow:
-            result = PermissionResultAllow(updated_input=None, updated_permissions=None)
+            # Echo back the original tool input — CLI expects updatedInput
+            # to be the full input dict, not null (causes H.includes crash).
+            # See _make_permission_callback() and sdk_transport_adapter.py
+            # for the full explanation of this requirement.
+            original_input = info.pending_tool_input if isinstance(info.pending_tool_input, dict) else {}
+            result = PermissionResultAllow(updated_input=original_input, updated_permissions=None)
         else:
             result = PermissionResultDeny(message="User denied permission", interrupt=False)
 
@@ -2065,12 +2070,20 @@ class SessionManager:
                     interrupt=True,
                 )
 
+            # ── CRITICAL: PermissionResultAllow must always include tool_input ──
+            # Every PermissionResultAllow() MUST pass updated_input=tool_input.
+            # The CLI 2.x expects updatedInput to be the full tool input dict.
+            # Sending None/null crashes the CLI sandbox validator with:
+            #   "undefined is not an object (evaluating 'H.includes')"
+            # See sdk_transport_adapter.py module docstring for full explanation.
+            # ─────────────────────────────────────────────────────────────────
+
             # Auto-approve if user previously clicked "Always" for this tool
             if tool_name in info.always_allowed_tools:
                 manager._log_auto_approved(
                     resolved_id, info, tool_name, tool_input, "always-allow"
                 )
-                return PermissionResultAllow()
+                return PermissionResultAllow(updated_input=tool_input if isinstance(tool_input, dict) else {})
 
             # "Almost Always" — auto-approve unless the command looks dangerous
             if tool_name in info.almost_always_allowed_tools:
@@ -2089,7 +2102,7 @@ class SessionManager:
                     manager._log_auto_approved(
                         resolved_id, info, tool_name, tool_input, "almost-always"
                     )
-                    return PermissionResultAllow()
+                    return PermissionResultAllow(updated_input=tool_input if isinstance(tool_input, dict) else {})
 
             # Server-side policy check -- resolve without browser round-trip
             if manager._should_auto_approve(tool_name, tool_input if isinstance(tool_input, dict) else {}):
@@ -2097,7 +2110,7 @@ class SessionManager:
                 manager._log_auto_approved(
                     resolved_id, info, tool_name, tool_input, "server-policy"
                 )
-                return PermissionResultAllow()
+                return PermissionResultAllow(updated_input=tool_input if isinstance(tool_input, dict) else {})
 
             # Use threading.Event (fully thread-safe) with anyio.sleep polling.
             # anyio.Event + call_soon_threadsafe doesn't reliably wake the waiter.
@@ -2144,7 +2157,7 @@ class SessionManager:
                         info.pending_tool_input = {}
                         info.state = SessionState.WORKING
                         manager._emit_state(info)
-                        return PermissionResultAllow()
+                        return PermissionResultAllow(updated_input=tool_input if isinstance(tool_input, dict) else {})
                     try:
                         await anyio.sleep(0.1)
                     except Exception:
