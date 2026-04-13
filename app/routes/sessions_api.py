@@ -4,6 +4,7 @@ Session CRUD routes -- list, view, rename, auto-name, delete, duplicate, continu
 
 import json
 import shutil
+import sys
 from datetime import datetime, timezone as tz
 from pathlib import Path
 
@@ -628,7 +629,7 @@ def api_continue(session_id):
                 "isSnapshotUpdate": False}
     active_project = get_active_project()
     user_entry = {"parentUuid": None, "isSidechain": False, "userType": "external",
-                  "cwd": _decode_project(active_project).replace("/", "\\"),
+                  "cwd": _decode_project(active_project).replace("/", "\\") if sys.platform == "win32" else _decode_project(active_project),
                   "sessionId": new_id, "version": "2.1.71", "gitBranch": "main",
                   "type": "user", "message": {"role": "user", "content": handoff},
                   "uuid": msg_uuid, "timestamp": now}

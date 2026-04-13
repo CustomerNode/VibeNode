@@ -5,10 +5,13 @@ Project picker routes -- list, switch, rename, delete, add, find, chat, new-sess
 import re
 import shutil
 import subprocess
+import sys
 import uuid as uuid_mod
 from pathlib import Path
 
 from flask import Blueprint, current_app, jsonify, request
+
+from ..platform_utils import native_folder_picker, default_project_roots
 
 from ..config import (
     _CLAUDE_PROJECTS,
@@ -26,7 +29,12 @@ bp = Blueprint('project_api', __name__)
 
 @bp.route("/api/projects")
 def api_projects():
-    docs = str(Path.home() / "Documents").replace("\\", "/").lower()
+    # On Windows, only show projects under ~/Documents.
+    # On Mac/Linux, show all projects under ~/ (Documents may not exist).
+    if sys.platform == "win32":
+        filter_base = str(Path.home() / "Documents").replace("\\", "/").lower()
+    else:
+        filter_base = str(Path.home()).replace("\\", "/").lower()
     active_project = get_active_project()
     project_names = _load_project_names()
     results = []
@@ -36,8 +44,8 @@ def api_projects():
         if not d.is_dir() or d.name.startswith("subagents"):
             continue
         display = _decode_project(d.name)
-        # Only show projects that live inside the user's Documents folder
-        if not display.replace("\\", "/").lower().startswith(docs + "/"):
+        # Only show projects that live under the platform-appropriate base
+        if not display.replace("\\", "/").lower().startswith(filter_base + "/"):
             continue
         count = sum(1 for _ in d.glob("*.jsonl"))
         results.append({
@@ -104,28 +112,11 @@ def api_add_project():
     mode = data.get("mode", "browse")
 
     if mode == "browse":
-        ps_script = r'''
-Add-Type -AssemblyName System.Windows.Forms
-$fb = New-Object System.Windows.Forms.FolderBrowserDialog
-$fb.Description = "Select a project folder"
-$fb.RootFolder = [System.Environment+SpecialFolder]::MyComputer
-$fb.ShowNewFolderButton = $true
-$result = $fb.ShowDialog()
-if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-    Write-Output $fb.SelectedPath
-} else {
-    Write-Output "::CANCELLED::"
-}
-'''
-        try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_script],
-                capture_output=True, text=True, timeout=120)
-            chosen = r.stdout.strip()
-            if not chosen or chosen == "::CANCELLED::":
-                return jsonify({"ok": False, "cancelled": True})
-        except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 500
+        chosen, err = native_folder_picker()
+        if err == "cancelled" or (err is None and chosen is None):
+            return jsonify({"ok": False, "cancelled": True})
+        if err:
+            return jsonify({"ok": False, "error": err}), 500
         path = chosen
 
     elif mode == "path":
@@ -156,11 +147,7 @@ def api_find_projects():
     indicators = [".git", "package.json", "Cargo.toml", "go.mod", "pyproject.toml",
                   "requirements.txt", "pom.xml", "build.gradle", "Makefile",
                   ".sln", ".csproj", "CMakeLists.txt", "Gemfile", "composer.json"]
-    scan_roots = [
-        Path.home() / "Documents",
-        Path.home() / "Desktop",
-        Path.home() / "source" / "repos",  # Visual Studio default
-    ]
+    scan_roots = default_project_roots()
     found = []
     seen_paths = set()
     for root in scan_roots:
@@ -204,12 +191,7 @@ def api_project_chat():
         return jsonify({"content": "Tell me what kind of project you're looking for.", "suggestions": []})
 
     # Search for projects matching the description
-    search_roots = [
-        Path.home() / "Documents",
-        Path.home() / "Desktop",
-        Path.home() / "source" / "repos",
-        Path.home(),
-    ]
+    search_roots = default_project_roots() + [Path.home()]
     indicators = {
         ".git": "Git",
         "package.json": "Node.js",
@@ -314,9 +296,8 @@ def api_new_session():
                                 proj_dir = str(sub)
                                 break
 
-        proj_dir_win = proj_dir.replace("/", "\\")
-        if not Path(proj_dir_win).is_dir():
-            return jsonify({"error": f"Project directory not found: {proj_dir_win}"}), 400
+        if not Path(proj_dir).is_dir():
+            return jsonify({"error": f"Project directory not found: {proj_dir}"}), 400
 
         sm = current_app.session_manager
 

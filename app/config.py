@@ -8,6 +8,7 @@ persistence, and format utilities.
 """
 
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -235,57 +236,100 @@ def cwd_matches_active_project(cwd: str, project: str = "") -> bool:
 def _decode_project(encoded: str) -> str:
     """Convert encoded project name back to filesystem path.
     Handles ambiguity where '-' could be '/' or '_' or '-' in the original."""
-    if "--" not in encoded:
-        return encoded
-    drive, rest = encoded.split("--", 1)
-    simple = drive + ":/" + rest.replace("-", "/")
-    if Path(simple).is_dir():
-        return simple
-    # Rebuild path segment by segment, checking which variant exists
-    parts = rest.split("-")
-    path = drive + ":/"
-    i = 0
-    while i < len(parts):
-        found = False
-        for lookahead in range(min(4, len(parts) - i), 0, -1):
-            for sep in ['_', '-', '/']:
-                candidate = sep.join(parts[i:i+lookahead])
-                test_path = path + candidate
-                if Path(test_path).is_dir():
-                    path = test_path + "/"
-                    i += lookahead
-                    found = True
+
+    # ---- Windows-style encoding: contains "--" for drive letter (e.g. "C--Users-foo") ----
+    if "--" in encoded:
+        drive, rest = encoded.split("--", 1)
+        simple = drive + ":/" + rest.replace("-", "/")
+        if Path(simple).is_dir():
+            return simple
+        # Rebuild path segment by segment, checking which variant exists
+        parts = rest.split("-")
+        path = drive + ":/"
+        i = 0
+        while i < len(parts):
+            found = False
+            for lookahead in range(min(4, len(parts) - i), 0, -1):
+                for sep in ['_', '-', '/']:
+                    candidate = sep.join(parts[i:i+lookahead])
+                    test_path = path + candidate
+                    if Path(test_path).is_dir():
+                        path = test_path + "/"
+                        i += lookahead
+                        found = True
+                        break
+                if found:
                     break
-            if found:
-                break
-        if not found:
-            path += parts[i] + "/"
-            i += 1
-    result = path.rstrip("/")
+            if not found:
+                path += parts[i] + "/"
+                i += 1
+        result = path.rstrip("/")
+        if Path(result).is_dir():
+            return result
+    elif sys.platform != "win32":
+        # ---- Unix-style encoding: no drive letter, starts with "-" (e.g. "-home-user-proj") ----
+        # Try simple reconstruction: replace all dashes with "/"
+        simple = "/" + encoded.lstrip("-").replace("-", "/")
+        if Path(simple).is_dir():
+            return simple
+        # Rebuild segment by segment with ambiguity resolution
+        parts = encoded.lstrip("-").split("-")
+        path = "/"
+        i = 0
+        while i < len(parts):
+            found = False
+            for lookahead in range(min(4, len(parts) - i), 0, -1):
+                for sep in ['_', '-', '/']:
+                    candidate = sep.join(parts[i:i+lookahead])
+                    test_path = path + candidate
+                    if Path(test_path).is_dir():
+                        path = test_path + "/"
+                        i += lookahead
+                        found = True
+                        break
+                if found:
+                    break
+            if not found:
+                path += parts[i] + "/"
+                i += 1
+        result = path.rstrip("/")
+        if Path(result).is_dir():
+            return result
+    else:
+        # Windows but no "--" — return as-is
+        return encoded
+
     # Final validation: if the reconstructed path isn't a real directory,
-    # fall back to scanning Documents for a matching encoded name
-    if not Path(result).is_dir():
-        docs = Path.home() / "Documents"
-        if docs.is_dir():
-            try:
-                for child in docs.iterdir():
-                    if not child.is_dir():
-                        continue
-                    enc = str(child).replace("\\", "/").replace(":", "-").replace("/", "-")
-                    if enc == encoded:
-                        return str(child)
-                    try:
-                        for sub in child.iterdir():
-                            if not sub.is_dir():
-                                continue
-                            enc2 = str(sub).replace("\\", "/").replace(":", "-").replace("/", "-")
-                            if enc2 == encoded:
-                                return str(sub)
-                    except (PermissionError, OSError):
-                        continue
-            except (PermissionError, OSError):
-                pass
-    return result
+    # fall back to scanning common directories for a matching encoded name
+    _fallback_scan_dirs = [Path.home() / "Documents"]
+    if sys.platform == "darwin":
+        _fallback_scan_dirs.append(Path.home() / "Developer")
+    elif sys.platform != "win32":
+        for name in ("projects", "src", "code", "dev", "repos"):
+            _fallback_scan_dirs.append(Path.home() / name)
+
+    for scan_dir in _fallback_scan_dirs:
+        if not scan_dir.is_dir():
+            continue
+        try:
+            for child in scan_dir.iterdir():
+                if not child.is_dir():
+                    continue
+                enc = str(child).replace("\\", "/").replace(":", "-").replace("/", "-")
+                if enc == encoded:
+                    return str(child)
+                try:
+                    for sub in child.iterdir():
+                        if not sub.is_dir():
+                            continue
+                        enc2 = str(sub).replace("\\", "/").replace(":", "-").replace("/", "-")
+                        if enc2 == encoded:
+                            return str(sub)
+                except (PermissionError, OSError):
+                    continue
+        except (PermissionError, OSError):
+            pass
+    return result if '--' in encoded or sys.platform != "win32" else encoded
 
 
 # ---------------------------------------------------------------------------

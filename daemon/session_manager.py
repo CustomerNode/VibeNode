@@ -48,207 +48,25 @@ logger = logging.getLogger(__name__)
 # When the daemon is spawned with CREATE_NO_WINDOW the PATH may be stripped.
 # Add the standard install location so shutil.which("claude") always works.
 # ---------------------------------------------------------------------------
-_local_bin = str(Path.home() / ".local" / "bin")
-if _local_bin not in os.environ.get("PATH", ""):
-    os.environ["PATH"] = _local_bin + os.pathsep + os.environ.get("PATH", "")
+_extra_path_dirs = [
+    str(Path.home() / ".local" / "bin"),
+    "/opt/homebrew/bin",    # macOS Apple Silicon (Homebrew)
+    "/usr/local/bin",       # macOS Intel (Homebrew) / Linux common
+]
+_current_path = os.environ.get("PATH", "")
+_dirs_to_add = [d for d in _extra_path_dirs if d not in _current_path]
+if _dirs_to_add:
+    os.environ["PATH"] = os.pathsep.join(_dirs_to_add) + os.pathsep + _current_path
 
 # ---------------------------------------------------------------------------
-# Monkey-patch: make the SDK tolerant of unknown message types.
-# The SDK raises MessageParseError for types like "rate_limit_event" which
-# kills the entire receive_messages() generator. Patch parse_message to
-# return None for unknown types so the generator survives.
+# SDK Patches — isolated in daemon/sdk_patches.py
+# See docs/plans/sdk-monkey-patching-plan.md for full context.
 # ---------------------------------------------------------------------------
 try:
-    import claude_code_sdk.client as _sdk_client_mod
-    import claude_code_sdk._internal.message_parser as _sdk_parser_mod
-    import claude_code_sdk._internal.query as _sdk_query_mod
-
-    # Patch 1: Skip unknown message types (e.g. rate_limit_event)
-    _original_parse_message = _sdk_parser_mod.parse_message
-
-    def _safe_parse_message(data):
-        try:
-            return _original_parse_message(data)
-        except Exception as e:
-            if "Unknown message type" in str(e):
-                logger.debug("Skipping unknown SDK message type: %s", e)
-                return None
-            raise
-
-    _sdk_parser_mod.parse_message = _safe_parse_message
-    _sdk_client_mod.parse_message = _safe_parse_message
-
-    # Patch 2: Fix permission response format for CLI 2.x
-    # The SDK sends {"allow": true} but CLI 2.x expects
-    # {"behavior": "allow", "updatedInput": {}} (TypeScript PermissionResult)
-    _original_handle_control = _sdk_query_mod.Query._handle_control_request
-
-    async def _patched_handle_control(self, request):
-        """Intercept permission responses to use CLI 2.x format."""
-        request_data = request.get("request", {})
-        subtype = request_data.get("subtype")
-
-        await _original_handle_control(self, request)
-
-    _sdk_query_mod.Query._handle_control_request = _patched_handle_control
-
-    # Patch 2b: Fix permission response format in the original handler.
-    # The SDK sends {"allow": true} but CLI 2.x expects {"behavior": "allow", "updatedInput": {}}.
-    # Monkey-patch the PermissionResultAllow class to produce the right format
-    # when the original _handle_control_request converts it.
-    # We do this by patching the response_data construction inside the handler.
-    # Since we can't easily patch just that part, we patch the entire handler
-    # to fix the format but use the same flow.
-    _real_original_handle = _original_handle_control
-
-    async def _format_fixing_handle(self, request):
-        """Wrap the original handler to fix the permission response format."""
-        request_data = request.get("request", {})
-        subtype = request_data.get("subtype")
-
-        if subtype == "can_use_tool" and self.can_use_tool:
-            # request_id is on the OUTER object, not inside request_data
-            request_id = request.get("request_id")
-            import json as _json
-
-            from claude_code_sdk.types import ToolPermissionContext as _TPC2
-            try:
-                context = _TPC2(
-                    signal=None,
-                    suggestions=request_data.get("permission_suggestions", []) or [],
-                )
-                response = await self.can_use_tool(
-                    request_data["tool_name"],
-                    request_data["input"],
-                    context,
-                )
-                # Use CLI 2.x format
-                if isinstance(response, PermissionResultAllow):
-                    response_data = {
-                        "behavior": "allow",
-                        "updatedInput": response.updated_input if response.updated_input is not None else request_data.get("input", {}),
-                    }
-                elif isinstance(response, PermissionResultDeny):
-                    response_data = {
-                        "behavior": "deny",
-                        "message": response.message or "Denied",
-                    }
-                else:
-                    raise TypeError(f"Unexpected: {type(response)}")
-            except Exception as e:
-                logger.exception("Permission callback error: %s", e)
-                response_data = {
-                    "behavior": "deny",
-                    "message": str(e) or "Permission callback failed",
-                }
-
-            ctrl_response = {
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": request_id,
-                    "response": response_data,
-                },
-            }
-            try:
-                await self.transport.write(_json.dumps(ctrl_response) + "\n")
-            except Exception as _write_err:
-                # Transport closed mid-permission (e.g. CLI subprocess died).
-                # We MUST kill the CLI process AND close stdout here.  If we
-                # just swallow the error, the CLI may still be alive waiting
-                # for our response on stdin while the SDK waits for messages
-                # on stdout — creating a deadlock that prevents the stream
-                # from ending and the self-healing finally block from running.
-                logger.warning(
-                    "Transport write failed for permission response "
-                    "(tool=%s, req=%s): %s — killing CLI + closing transport",
-                    request_data.get("tool_name", "?"), request_id, _write_err,
-                )
-                try:
-                    proc = getattr(self.transport, '_process', None)
-                    if proc and proc.returncode is None:
-                        # Kill the entire process tree so children
-                        # (test runners, etc.) don't linger as orphans.
-                        SessionManager._kill_process_tree(proc.pid)
-                        proc.terminate()
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-                    # Mark transport as dead so no further writes are attempted
-                    self.transport._ready = False
-                    # Close stdout to unblock the read loop immediately.
-                    # Without this, the _read_messages task may hang on Windows
-                    # waiting for the pipe to close after process termination.
-                    _stdout = getattr(self.transport, '_stdout_stream', None)
-                    if _stdout:
-                        try:
-                            await _stdout.aclose()
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-        else:
-            await _real_original_handle(self, request)
-
-    _sdk_query_mod.Query._handle_control_request = _format_fixing_handle
-
-    # Patch 3: Don't close stdin after empty stream when can_use_tool is set.
-    # The SDK calls end_input() after iterating the prompt stream, which closes
-    # stdin and makes the CLI exit. We need stdin to stay open for the control
-    # protocol (permission prompts) and for query() to send follow-up messages.
-    _original_stream_input = _sdk_query_mod.Query.stream_input
-
-    async def _patched_stream_input(self, stream):
-        import json as _json2
-        try:
-            async for message in stream:
-                if self._closed:
-                    break
-                try:
-                    await self.transport.write(_json2.dumps(message) + "\n")
-                except Exception as _sw_err:
-                    logger.warning("stream_input: transport write failed: %s", _sw_err)
-                    break
-            # DON'T call end_input() — keep stdin open for queries and control
-            # The original code does: await self.transport.end_input()
-            # We skip this so the CLI stays alive
-            logger.debug("stream_input: finished iterating, keeping stdin open")
-        except Exception as e:
-            logger.debug(f"Error streaming input: {e}")
-
-    _sdk_query_mod.Query.stream_input = _patched_stream_input
-
+    from daemon.sdk_patches import apply_patches as _apply_sdk_patches
+    _applied_patches = _apply_sdk_patches()
 except Exception as _patch_err:
-    logger.warning("Could not patch SDK: %s", _patch_err)
-
-# ---------------------------------------------------------------------------
-# Monkey-patch: prevent Claude CLI subprocesses from flashing a console window.
-# Patch subprocess.Popen at the lowest level so every subprocess spawned by
-# the SDK (or anything else) gets CREATE_NO_WINDOW automatically.
-# This is safe for concurrent use since it doesn't swap globals per-call.
-#
-# DO NOT change this to patch anyio.open_process or wrap the SDK's connect().
-# That approach was tried and broke everything: it races when multiple sessions
-# connect concurrently (they fight over the global anyio.open_process ref),
-# and it breaks the SDK's control protocol initialization (60s timeout → crash).
-# Patching Popen.__init__ once at import time is the only approach that works.
-# ---------------------------------------------------------------------------
-if os.name == "nt":
-    import subprocess as _subprocess
-    try:
-        _original_Popen_init = _subprocess.Popen.__init__
-
-        def _no_window_Popen_init(self, *args, **kwargs):
-            # Only inject if creationflags wasn't explicitly set
-            if "creationflags" not in kwargs or kwargs["creationflags"] == 0:
-                kwargs["creationflags"] = kwargs.get("creationflags", 0) | _subprocess.CREATE_NO_WINDOW
-            return _original_Popen_init(self, *args, **kwargs)
-
-        _subprocess.Popen.__init__ = _no_window_Popen_init
-        logger.info("Patched subprocess.Popen to suppress console windows")
-    except Exception as _e:
-        logger.warning("Could not patch Popen for no-window: %s", _e)
+    logger.warning("Could not apply SDK patches: %s", _patch_err)
 
 
 class SessionState(str, Enum):

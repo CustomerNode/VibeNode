@@ -36,6 +36,107 @@ SYSTEM_USER_MARKERS = (
 )
 
 
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Native folder picker (cross-platform)
+# ---------------------------------------------------------------------------
+
+def native_folder_picker() -> tuple:
+    """Open a native folder-picker dialog and return (path, error).
+
+    Returns:
+        (chosen_path, None)   on success
+        (None, "cancelled")   if the user cancelled
+        (None, error_string)  on failure / unsupported platform
+    """
+    if sys.platform == "win32":
+        ps_script = r'''
+Add-Type -AssemblyName System.Windows.Forms
+$fb = New-Object System.Windows.Forms.FolderBrowserDialog
+$fb.Description = "Select a project folder"
+$fb.RootFolder = [System.Environment+SpecialFolder]::MyComputer
+$fb.ShowNewFolderButton = $true
+$result = $fb.ShowDialog()
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+    Write-Output $fb.SelectedPath
+} else {
+    Write-Output "::CANCELLED::"
+}
+'''
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                capture_output=True, text=True, timeout=120,
+                creationflags=NO_WINDOW,
+            )
+            chosen = r.stdout.strip()
+            if not chosen or chosen == "::CANCELLED::":
+                return (None, "cancelled")
+            return (chosen, None)
+        except Exception as e:
+            return (None, str(e))
+
+    elif sys.platform == "darwin":
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", "POSIX path of (choose folder)"],
+                capture_output=True, text=True, timeout=120,
+            )
+            chosen = r.stdout.strip()
+            if r.returncode != 0 or not chosen:
+                return (None, "cancelled")
+            return (chosen.rstrip("/"), None)
+        except Exception as e:
+            return (None, str(e))
+
+    else:
+        # Linux: try zenity, then kdialog
+        for cmd in [
+            ["zenity", "--file-selection", "--directory"],
+            ["kdialog", "--getexistingdirectory", str(Path.home())],
+        ]:
+            try:
+                r = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=120,
+                )
+                chosen = r.stdout.strip()
+                if r.returncode != 0 or not chosen:
+                    return (None, "cancelled")
+                return (chosen, None)
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                return (None, str(e))
+        return (None, "No folder picker available — install zenity or kdialog, or use the Path tab")
+
+
+# ---------------------------------------------------------------------------
+# Default project scan roots (platform-aware)
+# ---------------------------------------------------------------------------
+
+def default_project_roots() -> list:
+    """Return a list of Path objects for directories to scan for projects.
+
+    Only includes directories that actually exist on disk.
+    """
+    home = Path.home()
+    candidates = [
+        home / "Documents",
+        home / "Desktop",
+    ]
+    if sys.platform == "win32":
+        candidates.append(home / "source" / "repos")  # Visual Studio default
+    elif sys.platform == "darwin":
+        candidates.append(home / "Developer")
+    else:
+        # Linux common project directories
+        for name in ("projects", "src", "code", "dev", "repos"):
+            candidates.append(home / name)
+    return [p for p in candidates if p.is_dir()]
+
+
 def is_system_user_content(text: str) -> bool:
     """Return True if *text* contains any system-user marker."""
     for marker in SYSTEM_USER_MARKERS:

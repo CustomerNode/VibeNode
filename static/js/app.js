@@ -1178,8 +1178,8 @@ function _showHelpModal() {
           <tr><td><kbd>\u2193</kbd> / <kbd>J</kbd></td><td>Next session</td></tr>
           <tr><td><kbd>Enter</kbd></td><td>Open live panel</td></tr>
           <tr><td><kbd>Esc</kbd></td><td>Close panel / Interrupt</td></tr>
-          <tr><td><kbd>Ctrl+F</kbd></td><td>Find in session</td></tr>
-          <tr><td><kbd>Ctrl+Enter</kbd></td><td>Send message</td></tr>
+          <tr><td><kbd>${_MOD}+F</kbd></td><td>Find in session</td></tr>
+          <tr><td><kbd>${_MOD}+Enter</kbd></td><td>Send message</td></tr>
           <tr><td><kbd>?</kbd></td><td>This help</td></tr>
         </table>
       </div>
@@ -1600,8 +1600,8 @@ _updateThinkingLabel();
 function openPreferences() {
   const overlay = document.getElementById('pm-overlay');
   const options = [
-    {key: 'ctrl-enter', name: 'Ctrl+Enter, Shift+Enter, or Alt+Enter to send', desc: 'Any modifier + Enter sends. Enter alone adds a new line.'},
-    {key: 'enter', name: 'Enter to send', desc: 'Press Enter to send. Ctrl+Enter, Shift+Enter, and Alt+Enter add a new line.'},
+    {key: 'ctrl-enter', name: _MOD + '+Enter, Shift+Enter, or Alt+Enter to send', desc: 'Any modifier + Enter sends. Enter alone adds a new line.'},
+    {key: 'enter', name: 'Enter to send', desc: 'Press Enter to send. ' + _MOD + '+Enter, Shift+Enter, and Alt+Enter add a new line.'},
   ];
   let html = '<div class="pm-card pm-enter" style="width:420px;">'
     + '<h2 class="pm-title">Preferences</h2>'

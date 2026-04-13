@@ -33,7 +33,7 @@ function setupVoiceButton(textarea, button, onSubmit) {
     // Carry over the waiting class if the voice button has it
     if (button.classList.contains('waiting')) sendBtn.classList.add('waiting');
     sendBtn.innerHTML = _sendSvg;
-    sendBtn.title = 'Send (Ctrl+Enter)';
+    sendBtn.title = 'Send (' + _MOD + '+Enter)';
     sendBtn.style.display = 'none';
     button.parentNode.insertBefore(sendBtn, button.nextSibling);
   }
@@ -88,7 +88,7 @@ function setupVoiceButton(textarea, button, onSubmit) {
     } else {
       // No voice support — button acts as send
       button.innerHTML = _sendSvg;
-      button.title = 'Send (Ctrl+Enter)';
+      button.title = 'Send (' + _MOD + '+Enter)';
       button.classList.remove('recording');
       sendBtn.style.display = 'none';
       cancelBtn.style.display = 'none';
