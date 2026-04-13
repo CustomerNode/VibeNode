@@ -141,17 +141,28 @@ class TestNoAccidentalSessionStarts:
             "CRITICAL REGRESSION: _savePendingInputAsDraft must NEVER send messages"
 
     def test_auto_send_not_called_from_any_switch_path(self):
-        """_autoSendPendingInput must have ZERO call sites.
+        """_autoSendPendingInput must have ZERO call sites in actual code.
         It was replaced by _savePendingInputAsDraft at all switch points."""
         toolbar_src = _read(_JS / "toolbar.js")
         live_src = _read(_JS / "live-panel.js")
-        # Count calls (not the definition, not comments)
-        toolbar_calls = len(re.findall(r'(?<!function )_autoSendPendingInput\(\)', toolbar_src))
-        # In live-panel, exclude the function definition line
-        live_calls = len(re.findall(r'(?<!function )_autoSendPendingInput\(\)', live_src))
+        # Count actual code calls — exclude comments (lines starting with //)
+        # and the function definition itself
+        def _count_code_calls(src):
+            count = 0
+            for line in src.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("//") or stripped.startswith("*"):
+                    continue
+                if "function _autoSendPendingInput" in stripped:
+                    continue
+                if "_autoSendPendingInput()" in stripped:
+                    count += 1
+            return count
+        toolbar_calls = _count_code_calls(toolbar_src)
+        live_calls = _count_code_calls(live_src)
         total = toolbar_calls + live_calls
         assert total == 0, \
-            f"CRITICAL REGRESSION: _autoSendPendingInput() has {total} call site(s). " \
+            f"CRITICAL REGRESSION: _autoSendPendingInput() has {total} CODE call site(s). " \
             "It must have ZERO — all switch paths must use _savePendingInputAsDraft(). " \
             "Calling _autoSendPendingInput on session switch SENDS text instead of " \
             "saving it, causing the cascade-of-unwanted-sessions bug."
