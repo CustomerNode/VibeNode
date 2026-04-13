@@ -162,8 +162,9 @@ class SessionInfo:
             "created_ts": self.created_ts,
             "tracked_files": list(self.tracked_files)[-5:],
         }
-        if self.substatus:
-            d["substatus"] = self.substatus
+        # Always include substatus so the frontend can distinguish
+        # "cleared" (empty string) from "not provided" (key absent).
+        d["substatus"] = self.substatus
         if self.usage:
             d["usage"] = self.usage
         # Include permission details for WAITING sessions so reconnecting
