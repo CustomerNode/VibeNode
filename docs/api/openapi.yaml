@@ -9,6 +9,9 @@ info:
 
     **Base URL:** `http://localhost:5050`
 
+    **Authentication:** None. VibeNode is a localhost-only development tool.
+    All endpoints are available without credentials.
+
     VibeNode also uses SocketIO for real-time push events. Those are documented
     separately in `socketio-events.md`.
   license:
