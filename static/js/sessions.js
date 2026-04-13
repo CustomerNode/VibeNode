@@ -408,7 +408,7 @@ async function _addToCompose(sessionId) {
   const _proj = localStorage.getItem('activeProject') || '';
   let projects = [];
   try {
-    const resp = await fetch('/api/compose/projects');
+    const resp = await fetch('/api/compose/projects' + (_proj ? '?project=' + encodeURIComponent(_proj) : ''));
     if (resp.ok) {
       const data = await resp.json();
       if (data.ok) projects = data.projects || [];
