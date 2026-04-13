@@ -26,6 +26,79 @@ let _composePendingDeletes = [];   // [{ids: [...], timer: timeoutId, toastEl: e
 let _composeFocusedId = null;      // keyboard-focused composition ID
 let _composeActionHistory = [];    // [{label: '...', time: Date.now()}] — last 5 actions
 let _composeColumnSorts = {};      // {columnKey: 'manual'|'alpha-asc'|'alpha-desc'|'updated-new'|'updated-old'}
+let _composeActiveTagFilter = [];  // active tag filters — sections must match ALL
+let _composeBoardSelected = new Set(); // multi-select for board cards (P4-D)
+let _composeBoardLastClicked = null;   // for shift-click range on board cards
+
+// ── P4-B: Composition Templates ──
+const COMPOSE_TEMPLATES = [
+  {
+    name: 'Business Proposal',
+    icon: '\uD83D\uDCBC',
+    sections: [
+      { name: 'Executive Summary', artifact_type: 'exec-summary', brief: 'High-level overview of the proposal, key value proposition, and expected outcomes.' },
+      { name: 'Problem Statement', artifact_type: 'report', brief: 'Detailed description of the problem or opportunity being addressed.' },
+      { name: 'Proposed Solution', artifact_type: 'report', brief: 'The solution approach, methodology, and deliverables.' },
+      { name: 'Pricing & Timeline', artifact_type: 'spreadsheet', brief: 'Cost breakdown, payment terms, and project timeline with milestones.' },
+      { name: 'Team & Qualifications', artifact_type: 'report', brief: 'Team bios, relevant experience, and case studies.' },
+    ]
+  },
+  {
+    name: 'Annual Report',
+    icon: '\uD83D\uDCCA',
+    sections: [
+      { name: 'CEO Letter', artifact_type: 'letter', brief: 'Letter from the CEO summarizing the year, key achievements, and outlook.' },
+      { name: 'Financial Summary', artifact_type: 'financial-model', brief: 'Revenue, expenses, profit/loss, and key financial metrics for the year.' },
+      { name: 'Market Position', artifact_type: 'report', brief: 'Competitive landscape, market share, and strategic positioning.' },
+      { name: 'Product & Innovation', artifact_type: 'report', brief: 'New products, R&D highlights, and technology initiatives.' },
+      { name: 'Outlook', artifact_type: 'forecast', brief: 'Forward-looking projections, strategic priorities, and growth targets.' },
+    ]
+  },
+  {
+    name: 'Product Launch',
+    icon: '\uD83D\uDE80',
+    sections: [
+      { name: 'Product Overview', artifact_type: 'report', brief: 'Product description, features, specifications, and target audience.' },
+      { name: 'Market Analysis', artifact_type: 'report', brief: 'Market size, customer segments, competitive analysis, and positioning.' },
+      { name: 'Go-to-Market Strategy', artifact_type: 'plan', brief: 'Launch timeline, marketing channels, messaging, and distribution strategy.' },
+      { name: 'Pricing & Revenue Model', artifact_type: 'financial-model', brief: 'Pricing strategy, revenue projections, and unit economics.' },
+      { name: 'Launch Budget', artifact_type: 'budget', brief: 'Itemized budget for marketing, development, and operations.' },
+    ]
+  },
+  {
+    name: 'Research Paper',
+    icon: '\uD83D\uDD2C',
+    sections: [
+      { name: 'Abstract', artifact_type: 'exec-summary', brief: 'Concise summary of research question, methodology, key findings, and conclusions.' },
+      { name: 'Literature Review', artifact_type: 'report', brief: 'Survey of existing research, theoretical framework, and identified gaps.' },
+      { name: 'Methodology', artifact_type: 'report', brief: 'Research design, data collection methods, sample, and analytical approach.' },
+      { name: 'Results', artifact_type: 'report', brief: 'Data analysis findings, statistical results, tables, and figures.' },
+      { name: 'Discussion & Conclusion', artifact_type: 'report', brief: 'Interpretation of results, implications, limitations, and future directions.' },
+    ]
+  },
+  {
+    name: 'Pitch Deck',
+    icon: '\uD83C\uDFAF',
+    sections: [
+      { name: 'Problem', artifact_type: 'pitch-deck', brief: 'The problem you are solving and why it matters.' },
+      { name: 'Solution', artifact_type: 'pitch-deck', brief: 'Your product/service and how it solves the problem.' },
+      { name: 'Market Opportunity', artifact_type: 'pitch-deck', brief: 'Total addressable market, growth trends, and target segments.' },
+      { name: 'Business Model', artifact_type: 'pitch-deck', brief: 'Revenue model, pricing, and unit economics.' },
+      { name: 'Traction', artifact_type: 'pitch-deck', brief: 'Key metrics, milestones achieved, customer testimonials.' },
+      { name: 'Team', artifact_type: 'pitch-deck', brief: 'Founding team, key hires, advisors, and relevant experience.' },
+      { name: 'The Ask', artifact_type: 'pitch-deck', brief: 'Funding amount, use of proceeds, and timeline to next milestone.' },
+    ]
+  },
+  {
+    name: 'Meeting Notes',
+    icon: '\uD83D\uDCDD',
+    sections: [
+      { name: 'Agenda', artifact_type: 'checklist', brief: 'Meeting agenda items and time allocations.' },
+      { name: 'Discussion Notes', artifact_type: 'meeting-notes', brief: 'Key discussion points, decisions made, and rationale.' },
+      { name: 'Action Items', artifact_type: 'checklist', brief: 'Assigned tasks with owners, deadlines, and priority.' },
+    ]
+  },
+];
 
 function _composeLoadColumnSorts() {
   try {
@@ -84,6 +157,36 @@ function _composeApplySort(colKey, mode) {
   const m = document.getElementById('compose-sort-menu');
   if (m) m.remove();
   _renderComposeSectionCards();
+}
+
+// ── P4-A: Tag color hash (matches kanban's tagColorHash) ──
+function _composeTagColor(tag) {
+  if (typeof tagColorHash === 'function') return tagColorHash(tag);
+  let hash = 0;
+  for (let i = 0; i < tag.length; i++) hash = tag.charCodeAt(i) + ((hash << 5) - hash);
+  const colors = ['#58a6ff', '#3fb950', '#d29922', '#f85149', '#bc8cff', '#39d2c0', '#e3b341', '#f778ba'];
+  return colors[Math.abs(hash) % colors.length];
+}
+
+function _composeToggleTagFilter(tag) {
+  const idx = _composeActiveTagFilter.indexOf(tag);
+  if (idx === -1) { _composeActiveTagFilter.push(tag); } else { _composeActiveTagFilter.splice(idx, 1); }
+  _renderComposeSectionCards();
+  _renderComposeSidebar();
+}
+
+function _composeClearTagFilter() {
+  _composeActiveTagFilter = [];
+  _renderComposeSectionCards();
+  _renderComposeSidebar();
+}
+
+function _composeGetAllTags() {
+  const tags = new Set();
+  for (const sec of _composeSections) {
+    if (sec.tags) for (const t of sec.tags) tags.add(t);
+  }
+  return [...tags].sort();
 }
 
 /**
@@ -440,6 +543,26 @@ function _renderComposeSidebar() {
 
   html += '<button class="kanban-sidebar-btn" onclick="composeCreateProject()">' + _plusIcon + ' New Composition</button>';
   html += '</div>';
+
+  // ── Tag filter bar (P4-A) ──
+  if (_composeProject) {
+    const allTags = _composeGetAllTags();
+    if (allTags.length > 0) {
+      html += '<div class="kanban-sidebar-section">';
+      html += '<div class="kanban-sidebar-label">Tags</div>';
+      html += '<div class="compose-tag-filter-bar">';
+      for (const tag of allTags) {
+        const tc = _composeTagColor(tag);
+        const active = _composeActiveTagFilter.includes(tag) ? ' compose-tag-filter-active' : '';
+        html += '<span class="compose-tag-pill compose-tag-filter-pill' + active + '" style="background:' + tc + '22;color:' + tc + ';border-color:' + tc + '44;" onclick="_composeToggleTagFilter(\'' + (typeof escHtml === 'function' ? escHtml(tag) : tag) + '\')">' + (typeof escHtml === 'function' ? escHtml(tag) : tag) + '</span>';
+      }
+      if (_composeActiveTagFilter.length > 0) {
+        html += '<span class="compose-tag-pill compose-tag-filter-pill" style="background:none;color:var(--text-faint);border-color:var(--border);" onclick="_composeClearTagFilter()">clear</span>';
+      }
+      html += '</div>';
+      html += '</div>';
+    }
+  }
 
   // ── Actions ──
   if (_composeProject) {
@@ -1670,8 +1793,14 @@ function _renderComposeSectionCards() {
     return;
   }
 
-  // Only show root sections (no parent) on the board
-  const rootSections = _composeSections.filter(s => !s.parent_id);
+  // Only show root sections (no parent) on the board, applying tag filter
+  let rootSections = _composeSections.filter(s => !s.parent_id);
+  if (_composeActiveTagFilter.length > 0) {
+    rootSections = rootSections.filter(s => {
+      const tags = s.tags || [];
+      return _composeActiveTagFilter.every(t => tags.includes(t));
+    });
+  }
 
   let html = '<div class="kanban-columns-wrapper compose-columns-wrapper">';
 

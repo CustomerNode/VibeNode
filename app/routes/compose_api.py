@@ -423,6 +423,8 @@ def update_section(project_id, section_id):
         section.summary = data['summary']
     if 'ready_for_review' in data:
         section.ready_for_review = bool(data['ready_for_review'])
+    if 'tags' in data:
+        section.tags = list(data['tags']) if isinstance(data['tags'], list) else []
 
     try:
         update_section_in_context(project_id, section)
@@ -935,6 +937,65 @@ def update_changing(project_id, section_id):
     except Exception:
         logger.exception("Failed to update changing flag")
         return jsonify({'ok': False, 'error': 'Failed to update changing flag'}), 500
+
+
+# ---------------------------------------------------------------------------
+# Tags — add/remove tags on sections
+# ---------------------------------------------------------------------------
+
+@bp.route('/projects/<project_id>/sections/<section_id>/tags', methods=['POST'])
+def add_section_tag(project_id, section_id):
+    """Add a tag to a section.
+
+    JSON body: { "tag": "finance" }
+    """
+    from ..compose.context_manager import update_section_in_context
+    section = get_section(project_id, section_id)
+    if not section:
+        return jsonify({'ok': False, 'error': 'Section not found'}), 404
+
+    data = request.get_json(force=True, silent=True) or {}
+    tag = (data.get('tag') or '').strip().lower()
+    if not tag:
+        return jsonify({'ok': False, 'error': 'tag is required'}), 400
+
+    if tag not in section.tags:
+        section.tags.append(tag)
+        try:
+            update_section_in_context(project_id, section)
+        except Exception:
+            logger.exception("Failed to add tag to section")
+            return jsonify({'ok': False, 'error': 'Failed to save'}), 500
+
+    _emit('compose_task_updated', {
+        'project_id': project_id,
+        'section': section.to_dict(),
+    })
+    return jsonify({'ok': True, 'tags': section.tags})
+
+
+@bp.route('/projects/<project_id>/sections/<section_id>/tags/<tag>', methods=['DELETE'])
+def remove_section_tag(project_id, section_id, tag):
+    """Remove a tag from a section."""
+    from ..compose.context_manager import update_section_in_context
+    section = get_section(project_id, section_id)
+    if not section:
+        return jsonify({'ok': False, 'error': 'Section not found'}), 404
+
+    tag = tag.strip().lower()
+    if tag in section.tags:
+        section.tags.remove(tag)
+        try:
+            update_section_in_context(project_id, section)
+        except Exception:
+            logger.exception("Failed to remove tag from section")
+            return jsonify({'ok': False, 'error': 'Failed to save'}), 500
+
+    _emit('compose_task_updated', {
+        'project_id': project_id,
+        'section': section.to_dict(),
+    })
+    return jsonify({'ok': True, 'tags': section.tags})
 
 
 # ---------------------------------------------------------------------------
