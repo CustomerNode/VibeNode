@@ -1966,7 +1966,7 @@ function _renderComposeSectionCards() {
         <div class="compose-card-meta">
           <span class="compose-card-status" style="background:${col.color}22;color:${col.color};">${col.label}</span>
           ${sec.artifact_type ? '<span class="compose-card-time">' + sec.artifact_type + '</span>' : ''}
-          ${sec.updated_at ? '<span class="compose-card-time">' + _composeTimeAgo(sec.updated_at) + '</span>' : ''}
+          ${sec.updated_at ? '<span class="compose-card-time">' + _composeTimeAgo(Date.parse(sec.updated_at)) + '</span>' : ''}
           ${readyBadge}
         </div>
         ${tagPillsHtml}
@@ -2694,7 +2694,7 @@ function _openSessionInCompose(sessionId) {
   const sessionName = s ? (s.custom_title || s.display_title || 'Session') : 'Session';
   const sectionId = _composeSelectedSection || null;
   const section = sectionId ? _composeSections.find(x => x.id === sectionId) : null;
-  const sectionTitle = section ? (section.title || 'Section') : '';
+  const sectionTitle = section ? (section.name || 'Section') : '';
 
   // Hide compose board, show main-body
   const cb = document.getElementById('compose-board');

@@ -1030,6 +1030,8 @@ def accept_compose_plan(project_id):
     if not plan_sections:
         return jsonify({'ok': False, 'error': 'No sections in plan'}), 400
 
+    from ..compose.models import _sanitize_folder_name
+
     from ..compose.context_manager import add_section_to_context
 
     created = []
@@ -1059,7 +1061,7 @@ def accept_compose_plan(project_id):
             # Write brief to section folder if provided
             if brief:
                 try:
-                    brief_path = project_dir(project_id) / "sections" / section.name / "brief.md"
+                    brief_path = project_dir(project_id) / "sections" / _sanitize_folder_name(section.name) / "brief.md"
                     brief_path.write_text(brief, encoding='utf-8')
                 except Exception:
                     logger.warning("Failed to write brief for section %s", name)
