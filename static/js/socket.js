@@ -508,10 +508,13 @@ socket.on('session_state', (data) => {
     // Track substatus (e.g. "compacting") per session.
     // Don't clear an optimistic "compacting" substatus when a WORKING
     // state event arrives without substatus — compact_boundary confirms it.
+    // But if the server explicitly sends substatus="" (key present, empty),
+    // that means compaction finished — always honour it.
     if (!window._sessionSubstatus) window._sessionSubstatus = {};
+    const substatusExplicit = data.hasOwnProperty('substatus');
     if (substatus) {
         window._sessionSubstatus[session_id] = substatus;
-    } else if (state !== 'working' || window._sessionSubstatus[session_id] !== 'compacting') {
+    } else if (substatusExplicit || state !== 'working' || window._sessionSubstatus[session_id] !== 'compacting') {
         delete window._sessionSubstatus[session_id];
     }
 
