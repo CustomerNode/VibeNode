@@ -5,7 +5,7 @@ types a prompt in the textarea, waits for Claude to edit a file, opens the
 rewind picker via the toolbar button, clicks a snapshot row, clicks Confirm,
 and verifies the file is restored to its original content on disk.
 
-Requires: daemon (5051) + web UI (5050) running, Claude API key configured.
+Requires: test daemon (5098) + test web UI (5099) running, Claude API key configured.
 """
 import json
 import os
