@@ -4,7 +4,6 @@ Project picker routes -- list, switch, rename, delete, add, find, chat, new-sess
 
 import re
 import shutil
-import subprocess
 import sys
 import uuid as uuid_mod
 from pathlib import Path
@@ -138,7 +137,7 @@ def api_add_project():
     else:
         return jsonify({"ok": False, "error": "Unknown mode"}), 400
 
-    encoded = path.replace("\\", "/").replace(":", "-").replace("/", "-")
+    encoded = _encode_cwd(path)
     target = _CLAUDE_PROJECTS / encoded
     target.mkdir(parents=True, exist_ok=True)
     return jsonify({"ok": True, "encoded": encoded, "path": path})
@@ -161,7 +160,7 @@ def api_find_projects():
             for child in sorted(root.iterdir()):
                 if not child.is_dir() or child.name.startswith("."):
                     continue
-                encoded = str(child).replace("\\", "/").replace(":", "-").replace("/", "-")
+                encoded = _encode_cwd(str(child))
                 if encoded in existing or str(child) in seen_paths:
                     continue
                 # Check for code project indicators
@@ -229,7 +228,7 @@ def api_project_chat():
                 name_match = any(kw in name_lower for kw in keywords)
                 # Check for project indicators
                 detected = [ind for ind, label in indicators.items() if (child / ind).exists()]
-                encoded = str(child).replace("\\", "/").replace(":", "-").replace("/", "-")
+                encoded = _encode_cwd(str(child))
 
                 if (name_match or detected) and encoded not in existing:
                     tech = ", ".join(indicators[d] for d in detected if d in indicators) or "Folder"
@@ -283,22 +282,28 @@ def api_new_session():
             if Path(decoded).is_dir():
                 proj_dir = decoded
             else:
-                docs = Path.home() / "Documents"
-                if docs.is_dir():
-                    for p in docs.iterdir():
+                for scan_root in default_project_roots():
+                    found = False
+                    for p in scan_root.iterdir():
                         if not p.is_dir():
                             continue
-                        enc = str(p).replace("\\", "/").replace(":", "-").replace("/", "-")
+                        enc = _encode_cwd(str(p))
                         if enc == active_project:
                             proj_dir = str(p)
+                            found = True
                             break
                         for sub in p.iterdir():
                             if not sub.is_dir():
                                 continue
-                            enc2 = str(sub).replace("\\", "/").replace(":", "-").replace("/", "-")
+                            enc2 = _encode_cwd(str(sub))
                             if enc2 == active_project:
                                 proj_dir = str(sub)
+                                found = True
                                 break
+                        if found:
+                            break
+                    if found:
+                        break
 
         if not Path(proj_dir).is_dir():
             return jsonify({"error": f"Project directory not found: {proj_dir}"}), 400

@@ -72,6 +72,7 @@ def create_app(testing=False) -> Flask:
     app.register_blueprint(test_bp)
 
     if not testing:
+        # PERF-CRITICAL: Startup-only cleanup — do NOT call from all_sessions() or per-request paths. See CLAUDE.md #13.
         # Prune stale utility session JSONL files (>24h) — once at startup,
         # not on every /api/sessions request.
         from .config import _cleanup_system_sessions

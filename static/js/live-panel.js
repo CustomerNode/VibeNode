@@ -1632,6 +1632,7 @@ function _liveSubmitDirect(sid, text, opts) {
 //   10s — request_state_snapshot via WebSocket (fast, covers most hiccups)
 //   16s — direct HTTP fetch of /api/live/state/<sid> to get ground truth
 //   22s — force UI to idle if server says idle/stopped but WS event was lost
+// PERF-CRITICAL: Watchdog dedup — window._ assignments enable cross-script dedup. Do NOT remove. See CLAUDE.md #16.
 let _watchdogTimer = null;
 let _watchdogSid = null;
 // Expose to other scripts (socket.js) for dedup of background watchdog polls

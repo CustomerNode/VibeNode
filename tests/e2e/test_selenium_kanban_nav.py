@@ -8,6 +8,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from tests.e2e.conftest import TEST_BASE_URL as BASE_URL
 LONG_WAIT = 90
 
+pytestmark = pytest.mark.e2e
+
 
 TEST_PROJECT = "__selenium_test__"
 

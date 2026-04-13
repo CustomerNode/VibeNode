@@ -1,6 +1,7 @@
 /* app.js — global state, project loading, session loading */
 
 let allSessions = [];
+// PERF-CRITICAL: O(1) Set lookup — must stay in sync with allSessions. Do NOT replace .has() with .find(). See CLAUDE.md #15.
 /** O(1) lookup set kept in sync with allSessions — avoids O(n) .find()
  *  on every session_entry/session_permission/session_started event. */
 let allSessionIds = new Set();

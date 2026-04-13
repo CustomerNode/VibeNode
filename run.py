@@ -423,6 +423,7 @@ if __name__ == "__main__":
     _sh.setLevel(logging.INFO)
     _sh.setFormatter(logging.Formatter("%(asctime)s [web] %(levelname)s %(message)s",
                                        datefmt="%H:%M:%S"))
+    # PERF-CRITICAL: "app.daemon_client" must stay in this list — removing silences IPC profiling. See CLAUDE.md #14.
     # Only attach to app.routes loggers — avoid flooding from libraries
     for _ns in ("app.routes", "app.daemon_client"):
         logging.getLogger(_ns).addHandler(_sh)

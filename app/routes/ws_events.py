@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 # Set to False to disable WebSocket handler timing logs.
 _PROFILE_WS = True
 
+# PERF-CRITICAL: Module-level executor — do NOT create per-request. See CLAUDE.md #12.
 # Module-level thread pool for parallelizing independent setup work
 # (e.g. compose resolution + cross-session awareness).  A single
 # shared executor avoids creating/destroying threads on every session start.

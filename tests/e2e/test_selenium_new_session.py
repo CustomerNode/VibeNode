@@ -13,6 +13,8 @@ from selenium.webdriver.common.keys import Keys
 
 from tests.e2e.conftest import TEST_BASE_URL as BASE_URL
 
+pytestmark = pytest.mark.e2e
+
 
 class TestNewSessionFlow:
     """The #1 user flow: click New Session, type a message, get a response."""

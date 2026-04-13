@@ -16,6 +16,7 @@ from selenium.webdriver.common.keys import Keys
 from tests.e2e.conftest import TEST_BASE_URL as BASE_URL
 LONG_WAIT = 90
 
+pytestmark = pytest.mark.e2e
 
 # Uses shared driver fixture from tests/e2e/conftest.py
 

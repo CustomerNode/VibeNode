@@ -32,7 +32,7 @@ def _cleanup_system_sessions() -> None:
     """Delete utility session JSONL files older than 24 hours."""
     import time as _time
     # The encoded project dir for _SYSTEM_UTILITY_CWD
-    encoded = _SYSTEM_UTILITY_CWD.replace("\\", "-").replace("/", "-").replace(":", "-")
+    encoded = _encode_cwd(_SYSTEM_UTILITY_CWD)
     sys_dir = _CLAUDE_PROJECTS / encoded
     if not sys_dir.is_dir():
         return
@@ -47,6 +47,7 @@ def _cleanup_system_sessions() -> None:
 _KANBAN_CONFIG_FILE = Path(_os.environ["VIBENODE_CONFIG"]) if _os.environ.get("VIBENODE_CONFIG") else _VIBENODE_DIR / "kanban_config.json"
 
 
+# PERF-CRITICAL: Kanban config cache with 10s TTL + invalidation on save — do NOT remove. See CLAUDE.md #11.
 # ---------------------------------------------------------------------------
 # Kanban config store
 # ---------------------------------------------------------------------------
@@ -179,7 +180,7 @@ def _sessions_dir(project: str = "") -> Path:
     if not _CLAUDE_PROJECTS.is_dir():
         _CLAUDE_PROJECTS.mkdir(parents=True, exist_ok=True)
         return _CLAUDE_PROJECTS
-    repo_path = str(_VIBENODE_DIR).replace("\\", "-").replace("/", "-").replace(":", "-")
+    repo_path = _encode_cwd(str(_VIBENODE_DIR))
     for d in _CLAUDE_PROJECTS.iterdir():
         if not d.is_dir() or d.name.startswith("subagents") or d.name.startswith("_"):
             continue
@@ -315,14 +316,14 @@ def _decode_project(encoded: str) -> str:
             for child in scan_dir.iterdir():
                 if not child.is_dir():
                     continue
-                enc = str(child).replace("\\", "/").replace(":", "-").replace("/", "-")
+                enc = _encode_cwd(str(child))
                 if enc == encoded:
                     return str(child)
                 try:
                     for sub in child.iterdir():
                         if not sub.is_dir():
                             continue
-                        enc2 = str(sub).replace("\\", "/").replace(":", "-").replace("/", "-")
+                        enc2 = _encode_cwd(str(sub))
                         if enc2 == encoded:
                             return str(sub)
                 except (PermissionError, OSError):

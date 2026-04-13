@@ -46,7 +46,7 @@ class VibeNodeTransportAdapter(Transport):
             msg = json.loads(data.rstrip("\n"))
             if self._is_permission_response(msg):
                 data = self._reformat_permission_response(msg)
-        except (json.JSONDecodeError, KeyError, TypeError):
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
             pass  # Pass through unmodified on any parse failure
 
         await self._inner.write(data)

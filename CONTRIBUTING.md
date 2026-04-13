@@ -93,6 +93,18 @@ Read [agents.md](agents.md) for the full architecture reference. Key points:
 4. **CSS:** Add styles to `static/style.css` using CSS variables
 5. **Tests:** Add unit tests for the backend logic and integration tests for the route
 6. **Update agents.md** if you're adding a new architectural component
+7. **Update API docs** if you added or changed a route (see below)
+
+### Maintaining API Documentation
+
+VibeNode has a comprehensive API reference at `docs/api/`. When you add or modify routes:
+
+1. **Add the endpoint to `docs/api/openapi.yaml`** — include path, method, summary, parameters, request body, response schema, and tags. Use the existing entries as a template.
+2. **If you added SocketIO events**, update `docs/api/socketio-events.md` with the event name, direction, payload schema, and example.
+3. **Run the coverage test** to verify nothing is missing: `pytest tests/test_api_docs_coverage.py -v`
+4. **View the docs locally** at http://localhost:5050/api/docs (Redoc renders the spec automatically).
+
+The `test_api_docs_coverage.py` test compares all registered Flask routes against the OpenAPI spec and will fail if any route is undocumented.
 
 ### Adding a New Theme Color
 

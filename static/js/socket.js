@@ -846,6 +846,7 @@ socket.on('session_entry', (data) => {
     // stale pre-remap alias) kept resetting the watchdog without rendering,
     // permanently defeating the recovery safety net.
 
+    // PERF-CRITICAL: performance.mark/measure instrumentation — do NOT remove. See CLAUDE.md #17.
     // Performance: measure time from submit to first entry (once per turn)
     if (performance.getEntriesByName('submit-' + data.session_id).length) {
         performance.mark('first-entry-' + data.session_id);

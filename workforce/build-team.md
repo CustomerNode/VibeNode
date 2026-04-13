@@ -25,6 +25,7 @@ After each step, run the Review Team and evaluate:
 - whether it follows sound architecture, design, maintainability, and coding practices,
 - whether it remains consistent with the full spec and prior completed steps,
 - whether there is sufficient test coverage or validation to prove the step works as intended.
+- whether any changes touch code near a `PERF-CRITICAL` marker, and if so, whether the performance optimization is preserved (see CLAUDE.md performance section).
 
 Additionally, for any optimization that skips, caches, or defers work that the old code always performed, the Review Team must answer these questions before approving:
 - What guarantee did the old code provide that the new code no longer provides?
@@ -46,6 +47,7 @@ Then run the Review Team on the full implementation and evaluate:
 - whether the overall solution follows strong architecture, design, maintainability, and coding practices,
 - whether the final implementation is coherent, complete, and production-ready,
 - whether there is sufficient test coverage or validation to prove the full solution works as intended.
+- whether any changes touch code near a `PERF-CRITICAL` marker, and if so, whether the performance optimization is preserved (see CLAUDE.md performance section).
 
 For the full-solution review, also run the "stale state adversarial pass": for every place where the implementation skips, caches, defers, or short-circuits work, trace the fast-switching scenario (user acts on object A, immediately switches to object B, immediately switches back to A). If any code path returns stale data, loses entries, or silently drops work in that scenario, it is a blocking bug.
 

@@ -628,8 +628,11 @@ def api_continue(session_id):
                 "snapshot": {"messageId": msg_uuid, "trackedFileBackups": {}, "timestamp": now},
                 "isSnapshotUpdate": False}
     active_project = get_active_project()
+    _cwd = _decode_project(active_project)
+    if sys.platform == "win32":
+        _cwd = _cwd.replace("/", "\\")
     user_entry = {"parentUuid": None, "isSidechain": False, "userType": "external",
-                  "cwd": _decode_project(active_project).replace("/", "\\") if sys.platform == "win32" else _decode_project(active_project),
+                  "cwd": _cwd,
                   "sessionId": new_id, "version": "2.1.71", "gitBranch": "main",
                   "type": "user", "message": {"role": "user", "content": handoff},
                   "uuid": msg_uuid, "timestamp": now}

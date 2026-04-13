@@ -265,6 +265,23 @@ class TestTransportAdapter:
         _run(adapter.write(data))
         assert mock_transport.written[0] == data
 
+    def test_non_dict_response_field_passthrough(self, adapter, mock_transport):
+        """Messages where 'response' is not a dict should pass through."""
+        msg = {"type": "control_response", "response": "not a dict"}
+        data = json.dumps(msg) + "\n"
+        _run(adapter.write(data))
+        assert mock_transport.written[0] == data
+
+    def test_nested_non_dict_response_passthrough(self, adapter, mock_transport):
+        """Messages where nested 'response' is not a dict should pass through."""
+        msg = {
+            "type": "control_response",
+            "response": {"subtype": "success", "request_id": "r1", "response": 42},
+        }
+        data = json.dumps(msg) + "\n"
+        _run(adapter.write(data))
+        assert mock_transport.written[0] == data
+
     # -- end_input behavior --
 
     def test_end_input_passes_through_by_default(self, adapter, mock_transport):
@@ -376,3 +393,29 @@ class TestPatchApplication:
 
         assert isinstance(q.transport, VibeNodeTransportAdapter)
         assert q.transport._keep_stdin_open is False
+
+    def test_no_double_wrapping(self):
+        """If transport is already a VibeNodeTransportAdapter, don't wrap again."""
+        from claude_code_sdk._internal.query import Query
+        from daemon.sdk_transport_adapter import VibeNodeTransportAdapter
+
+        mock = MagicMock()
+        mock.connect = AsyncMock()
+        mock.write = AsyncMock()
+        mock.close = AsyncMock()
+        mock.end_input = AsyncMock()
+        mock.is_ready = MagicMock(return_value=True)
+        mock.read_messages = MagicMock()
+
+        # Pre-wrap in adapter
+        pre_wrapped = VibeNodeTransportAdapter(mock, keep_stdin_open=True)
+
+        q = Query(
+            transport=pre_wrapped,
+            is_streaming_mode=True,
+            can_use_tool=None,
+        )
+
+        # Should still be the same adapter, not double-wrapped
+        assert q.transport is pre_wrapped
+        assert q.transport.inner is mock

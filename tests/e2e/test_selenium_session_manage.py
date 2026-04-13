@@ -17,6 +17,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 from tests.e2e.conftest import TEST_BASE_URL as BASE_URL
+
+pytestmark = pytest.mark.e2e
+
 CP = Path.home() / ".claude" / "projects"
 
 

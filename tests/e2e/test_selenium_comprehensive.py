@@ -14,6 +14,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from tests.e2e.conftest import TEST_BASE_URL as BASE_URL
 LONG_WAIT = 90  # seconds for Claude to respond
 
+pytestmark = pytest.mark.e2e
 
 
 

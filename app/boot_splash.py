@@ -131,6 +131,16 @@ class BootSplash:
             self._ff = "SF Pro Display"
         else:
             self._ff = "sans-serif"
+
+        # Title font: prefer Space Grotesk (matches web UI header)
+        self._tf = "Space Grotesk"
+
+        # ── Window ────────────────────────────────────────────────────
+        self.root = tk.Tk()
+
+        # Linux font detection — must happen after Tk root is created
+        # because tkinter.font.families() requires a running Tk instance.
+        if sys.platform not in ("win32", "darwin"):
             try:
                 import tkinter.font as _tkfont
                 _available = set(_tkfont.families())
@@ -140,12 +150,6 @@ class BootSplash:
                         break
             except Exception:
                 pass
-
-        # Title font: prefer Space Grotesk (matches web UI header)
-        self._tf = "Space Grotesk"
-
-        # ── Window ────────────────────────────────────────────────────
-        self.root = tk.Tk()
         self.root.title("VibeNode")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)

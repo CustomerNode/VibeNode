@@ -22,6 +22,7 @@ from .config import cwd_matches_active_project, _encode_cwd
 _MAX_SESSIONS = 12
 _MAX_FILES_PER_SESSION = 3
 
+# PERF-CRITICAL: get_all_states() cache with 2s TTL — do NOT remove or bypass. See CLAUDE.md #10.
 # ---------------------------------------------------------------------------
 # get_all_states() cache — avoids blocking IPC round-trip on every call
 # ---------------------------------------------------------------------------

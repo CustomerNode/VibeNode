@@ -33,9 +33,11 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-from tests.e2e.conftest import TEST_BASE_URL as BASE_URL
+from tests.e2e.conftest import TEST_BASE_URL as BASE_URL, TEST_PORT
 LONG_WAIT = 90
 API = BASE_URL + "/api/kanban"
+
+pytestmark = pytest.mark.e2e
 
 
 @pytest.fixture(scope="class", autouse=True)

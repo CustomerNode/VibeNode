@@ -200,7 +200,7 @@ def _apply_patch_transport_adapter() -> bool:
         _original_init(self, *args, **kwargs)
         # Wrap transport if it was set by __init__
         transport = getattr(self, "transport", None)
-        if transport is not None:
+        if transport is not None and not isinstance(transport, VibeNodeTransportAdapter):
             has_permission_handler = getattr(self, "can_use_tool", None) is not None
             self.transport = VibeNodeTransportAdapter(
                 transport,

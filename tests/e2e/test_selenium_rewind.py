@@ -23,6 +23,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 from tests.e2e.conftest import TEST_BASE_URL as BASE_URL, TEST_DAEMON_PORT
+
+pytestmark = pytest.mark.e2e
+
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 _ENCODED_PROJECT = str(PROJECT_DIR).replace("\\", "-").replace("/", "-").replace(":", "-")
 SESSIONS_DIR = Path.home() / ".claude" / "projects" / _ENCODED_PROJECT

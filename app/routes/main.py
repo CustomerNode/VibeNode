@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 
-from flask import Blueprint, jsonify, render_template, request
+from flask import Blueprint, jsonify, render_template, request, send_from_directory
 from ..platform_utils import NO_WINDOW as _NO_WINDOW
 
 bp = Blueprint('main', __name__)
@@ -15,6 +15,20 @@ bp = Blueprint('main', __name__)
 @bp.route("/")
 def index():
     return render_template('index.html')
+
+
+@bp.route("/api/docs")
+def api_docs():
+    """Serve the API documentation page (Redoc)."""
+    docs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'docs', 'api')
+    return send_from_directory(docs_dir, 'index.html')
+
+
+@bp.route("/api/docs/<path:filename>")
+def api_docs_assets(filename):
+    """Serve supporting API doc files (openapi.yaml, etc.)."""
+    docs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'docs', 'api')
+    return send_from_directory(docs_dir, filename)
 
 
 @bp.route("/api/restart", methods=["POST"])

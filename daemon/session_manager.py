@@ -806,6 +806,7 @@ class SessionManager:
         except Exception as e:
             logger.debug("Failed to save queues: %s", e)
 
+    # PERF-CRITICAL: Debounced 1s timer batches disk writes — do NOT call _save_queues_now() directly. See CLAUDE.md #8.
     def _save_queues(self) -> None:
         """Debounced queue save -- batches writes so rapid-fire queue
         operations don't hammer the disk.
@@ -1050,6 +1051,7 @@ class SessionManager:
         with info._lock:
             return [e.to_dict() for e in info.entries[since:]]
 
+    # PERF-CRITICAL: Returns len(entries) without serialization (0-1ms vs 25-32ms). See CLAUDE.md #6.
     def get_entry_count(self, session_id: str) -> int:
         """Return the number of log entries without serializing them."""
         session_id = self._resolve_id(session_id)
@@ -1168,6 +1170,7 @@ class SessionManager:
             # Connect with no prompt. The SDK auto-sets permission_prompt_tool_name="stdio"
             # when can_use_tool is set. Prompt=None becomes _empty_stream() which is an
             # AsyncIterator, so the streaming mode check passes.
+            # PERF-CRITICAL: Mtime scan overlapped with client.connect() — moving after adds 70-90ms. See CLAUDE.md #5.
             # Start mtime scan concurrently with client.connect() — the scan
             # only reads info.cwd and doesn't depend on the SDK connection.
             loop = asyncio.get_event_loop()
@@ -1502,6 +1505,8 @@ class SessionManager:
         # Safe here because the SDK remap has already happened by the time
         # _send_query is called (remap occurs on first turn's ResultMessage).
         # Runs in a thread — reads JSONL tail + file contents + writes backups.
+        # PERF-CRITICAL: _turn_had_direct_edit reset BEFORE gather — moving it creates a race. See CLAUDE.md #3.
+        # PERF-CRITICAL: asyncio.gather runs snapshot+mtimes in parallel — sequential adds 60-70ms. See CLAUDE.md #2.
         # Reset per-turn state BEFORE both executor calls run concurrently.
         # These two functions access disjoint fields on SessionInfo:
         #   _write_file_snapshot: tracked_files, _turn_had_direct_edit, _last_hashes, file_versions
@@ -1918,8 +1923,15 @@ class SessionManager:
             # runners, etc.) survive a plain terminate()/disconnect().
             cli_pid = None
             if info.client:
-                transport = getattr(info.client, 'transport', None)
-                proc = getattr(transport, '_process', None) if transport else None
+                # Traverse: client._transport (raw) or client._query.transport
+                # (may be wrapped in VibeNodeTransportAdapter — use .inner)
+                transport = getattr(info.client, '_transport', None)
+                if transport is None:
+                    query = getattr(info.client, '_query', None)
+                    transport = getattr(query, 'transport', None) if query else None
+                # Unwrap adapter if present
+                inner = getattr(transport, 'inner', transport) if transport else None
+                proc = getattr(inner, '_process', None) if inner else None
                 if proc and proc.returncode is None:
                     cli_pid = proc.pid
 
@@ -2570,6 +2582,7 @@ class SessionManager:
     # Set True to log per-step timing in _drive_session / _send_query
     _PROFILE_PIPELINE = True
 
+    # PERF-CRITICAL: git ls-files cache TTL — do NOT reduce below 120s. See CLAUDE.md #9.
     # TTL for cached git ls-files results (seconds).  File additions during
     # a turn are tracked via Edit/Write tool events, so this cache only needs
     # refreshing to catch external changes.  180s keeps the subprocess from
@@ -2662,6 +2675,7 @@ class SessionManager:
         if not cwd_path.is_dir():
             return
 
+        # PERF-CRITICAL: Mtime carry-forward avoids full git ls-files + stat every turn. See CLAUDE.md #4.
         # ── Fast path: carry forward from previous turn ──
         info._mtime_turn_count += 1
         force_rescan = (self._MTIME_FULL_RESCAN_INTERVAL > 0
@@ -2889,6 +2903,8 @@ class SessionManager:
         # This avoids scanning the entire project directory on every turn —
         # only needed when something opaque (Agent, Bash) may have edited files.
         #
+        # PERF-CRITICAL: tracked_files snowball prevention — fs_changed are snapshot extras only. See CLAUDE.md #7.
+        # PERF-CRITICAL: is_post_turn guard — skips _detect_changed_files on pre-turn. See CLAUDE.md #1.
         # IMPORTANT: fs_changed files are used for the CURRENT snapshot only,
         # NOT added to tracked_files permanently.  Adding them caused tracked_files
         # to snowball to 1400+ entries when test suites touched many project files,

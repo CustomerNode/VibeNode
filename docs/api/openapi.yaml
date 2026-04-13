@@ -1,0 +1,4909 @@
+openapi: 3.1.0
+info:
+  title: VibeNode API
+  version: 1.0.0
+  description: |
+    VibeNode is a GUI application for managing Claude Code sessions, projects,
+    kanban boards, composition workflows, and more. This spec documents all
+    REST endpoints served by the Flask web server on port 5050.
+
+    **Base URL:** `http://localhost:5050`
+
+    VibeNode also uses SocketIO for real-time push events. Those are documented
+    separately in `socketio-events.md`.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:5050
+    description: Local development server
+
+tags:
+  - name: App
+    description: Application shell, restart, shutdown
+  - name: Sessions
+    description: Session CRUD — list, view, rename, delete, duplicate, fork, rewind
+  - name: Projects
+    description: Project management — list, switch, add, find, chat, new session
+  - name: Live
+    description: Live session state, log streaming, hooks, CLAUDE.md, config, file ops
+  - name: Models
+    description: Available Claude models
+  - name: Workforce
+    description: Agent/skill asset management, discovery, install
+  - name: Kanban
+    description: Kanban board — task CRUD, status transitions, session linking, columns
+  - name: Kanban Planner
+    description: AI-powered task planning and decomposition
+  - name: Kanban Config
+    description: Kanban configuration and backend migration
+  - name: Kanban Backups
+    description: Kanban data backup and restore
+  - name: Kanban Reports
+    description: Kanban analytics — velocity, cycle time, distribution, etc.
+  - name: Compose
+    description: Composition projects, sections, export, directives, conflict resolution
+  - name: Analysis
+    description: Session summary, code extraction, export, compare
+  - name: Git
+    description: Git status, sync, security scanning
+  - name: Auth
+    description: Claude Code authentication status and login
+  - name: Tests
+    description: Test runner (SSE stream) and cancellation
+
+paths:
+  # ==========================================================================
+  # App (main.py)
+  # ==========================================================================
+  /:
+    get:
+      tags: [App]
+      summary: Serve the single-page application
+      operationId: index
+      responses:
+        "200":
+          description: HTML page
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /api/restart:
+    post:
+      tags: [App]
+      summary: Restart the web server, daemon, or both
+      operationId: restartServer
+      description: |
+        **WARNING:** Restarting the daemon (`scope: "daemon"` or `"both"`) will
+        terminate ALL active Claude sessions and agents across the entire
+        application. Use `scope: "web"` (the default) for safe restarts.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                scope:
+                  type: string
+                  enum: [web, daemon, both]
+                  default: web
+                  description: Which component to restart
+      responses:
+        "200":
+          description: Restart initiated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkMessage"
+              example:
+                ok: true
+                message: "Restarting (web)..."
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/shutdown:
+    post:
+      tags: [App]
+      summary: Shut down both web server and daemon
+      operationId: shutdownServer
+      description: |
+        Sends acknowledgement first, then kills ports 5050 and 5051 after a
+        short delay so the client receives the response.
+      responses:
+        "200":
+          description: Shutdown initiated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkMessage"
+              example:
+                ok: true
+                message: "Server shutting down..."
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  # ==========================================================================
+  # Sessions (sessions_api.py)
+  # ==========================================================================
+  /api/sessions:
+    get:
+      tags: [Sessions]
+      summary: List all sessions for a project
+      operationId: listSessions
+      parameters:
+        - name: project
+          in: query
+          schema:
+            type: string
+          description: Encoded project identifier. Defaults to active project.
+      responses:
+        "200":
+          description: Array of session summaries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SessionSummary"
+
+  /api/resolve-session/{session_id}:
+    get:
+      tags: [Sessions]
+      summary: Resolve a session ID through SDK aliases
+      operationId: resolveSession
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Resolved session ID
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  remapped:
+                    type: boolean
+
+  /api/session/{session_id}:
+    get:
+      tags: [Sessions]
+      summary: Get full session data
+      operationId: getSession
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: meta_only
+          in: query
+          schema:
+            type: string
+            enum: ["0", "1"]
+          description: If "1", return only metadata (id, title)
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session data (full or meta-only)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionDetail"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/rename/{session_id}:
+    post:
+      tags: [Sessions]
+      summary: Rename a session
+      operationId: renameSession
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title:
+                  type: string
+                project:
+                  type: string
+      responses:
+        "200":
+          description: Renamed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  title:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/remap-name:
+    post:
+      tags: [Sessions]
+      summary: Re-persist a user-set name under a new session ID after SDK remaps
+      operationId: remapName
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [old_id, new_id]
+              properties:
+                old_id:
+                  type: string
+                new_id:
+                  type: string
+                project:
+                  type: string
+      responses:
+        "200":
+          description: Name remapped
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  title:
+                    type: string
+                  skipped:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/autonname/{session_id}:
+    post:
+      tags: [Sessions]
+      summary: Auto-generate a title for a session using AI
+      operationId: autoNameSession
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                project:
+                  type: string
+                prompt:
+                  type: string
+                  description: Direct prompt text for immediate naming
+                re_evaluate:
+                  type: boolean
+                  description: Re-evaluate an existing auto-title
+      responses:
+        "200":
+          description: Title generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  title:
+                    type: string
+                  skipped:
+                    type: boolean
+                  reason:
+                    type: string
+                  renamed:
+                    type: boolean
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/delete/{session_id}:
+    delete:
+      tags: [Sessions]
+      summary: Delete a session
+      operationId: deleteSession
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+
+  /api/delete-all:
+    delete:
+      tags: [Sessions]
+      summary: Delete all sessions in the active workspace
+      operationId: deleteAllSessions
+      parameters:
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: All sessions deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  deleted:
+                    type: integer
+
+  /api/delete-empty:
+    delete:
+      tags: [Sessions]
+      summary: Delete all empty sessions (zero messages)
+      operationId: deleteEmptySessions
+      parameters:
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Empty sessions deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  deleted:
+                    type: integer
+
+  /api/duplicate/{session_id}:
+    post:
+      tags: [Sessions]
+      summary: Duplicate a session
+      operationId: duplicateSession
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Duplicated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  new_id:
+                    type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/continue/{session_id}:
+    post:
+      tags: [Sessions]
+      summary: Continue a long session by creating a new one with context handoff
+      operationId: continueSession
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Continuation created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  new_id:
+                    type: string
+                  title:
+                    type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/session-timeline/{session_id}:
+    get:
+      tags: [Sessions]
+      summary: Get lightweight message timeline for fork/rewind picker
+      operationId: getSessionTimeline
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Timeline data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  messages:
+                    type: array
+                    items:
+                      type: object
+                  has_snapshots:
+                    type: boolean
+                  title:
+                    type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/fork/{session_id}:
+    post:
+      tags: [Sessions]
+      summary: Fork a session at a given line number
+      operationId: forkSession
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [up_to_line]
+              properties:
+                up_to_line:
+                  type: integer
+                  description: JSONL line number to fork up to
+      responses:
+        "200":
+          description: Forked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  new_id:
+                    type: string
+                  title:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/rewind/{session_id}:
+    post:
+      tags: [Sessions]
+      summary: Rewind tracked files to state at a given message
+      operationId: rewindSession
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [up_to_line]
+              properties:
+                up_to_line:
+                  type: integer
+      responses:
+        "200":
+          description: Files rewound
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  files_restored:
+                    type: array
+                    items:
+                      type: string
+                  files_skipped:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/fork-rewind/{session_id}:
+    post:
+      tags: [Sessions]
+      summary: Fork conversation AND rewind code to a given message
+      operationId: forkRewindSession
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [up_to_line]
+              properties:
+                up_to_line:
+                  type: integer
+      responses:
+        "200":
+          description: Fork + rewind completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  new_id:
+                    type: string
+                  title:
+                    type: string
+                  files_restored:
+                    type: array
+                    items:
+                      type: string
+                  files_skipped:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/open/{session_id}:
+    post:
+      tags: [Sessions]
+      summary: Open/resume a session via the SDK SessionManager
+      operationId: openSession
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session opened
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  already_running:
+                    type: boolean
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  # ==========================================================================
+  # Projects (project_api.py)
+  # ==========================================================================
+  /api/projects:
+    get:
+      tags: [Projects]
+      summary: List all registered projects
+      operationId: listProjects
+      responses:
+        "200":
+          description: Array of project objects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Project"
+
+  /api/set-project:
+    post:
+      tags: [Projects]
+      summary: Switch the active project
+      operationId: setProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [project]
+              properties:
+                project:
+                  type: string
+                  description: Encoded project identifier
+      responses:
+        "200":
+          description: Project switched
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  project:
+                    type: string
+                  display:
+                    type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/rename-project:
+    post:
+      tags: [Projects]
+      summary: Set a custom display name for a project
+      operationId: renameProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [encoded]
+              properties:
+                encoded:
+                  type: string
+                name:
+                  type: string
+                  description: Custom name (empty to clear)
+      responses:
+        "200":
+          description: Renamed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/delete-project:
+    post:
+      tags: [Projects]
+      summary: Delete a project and all its sessions
+      operationId: deleteProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [encoded]
+              properties:
+                encoded:
+                  type: string
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/add-project:
+    post:
+      tags: [Projects]
+      summary: Add a project via browse, path, or create new
+      operationId: addProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mode:
+                  type: string
+                  enum: [browse, path, create]
+                  default: browse
+                path:
+                  type: string
+                  description: Required for mode=path
+                name:
+                  type: string
+                  description: Required for mode=create
+      responses:
+        "200":
+          description: Project added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  encoded:
+                    type: string
+                  path:
+                    type: string
+                  cancelled:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/find-projects:
+    get:
+      tags: [Projects]
+      summary: Scan common directories for unregistered code projects
+      operationId: findProjects
+      responses:
+        "200":
+          description: Discovered projects
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  projects:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        path:
+                          type: string
+                        name:
+                          type: string
+                        encoded:
+                          type: string
+                        type:
+                          type: string
+                        indicators:
+                          type: array
+                          items:
+                            type: string
+
+  /api/project-chat:
+    post:
+      tags: [Projects]
+      summary: AI-assisted project finder
+      operationId: projectChat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message:
+                  type: string
+      responses:
+        "200":
+          description: Chat response with suggestions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  content:
+                    type: string
+                  suggestions:
+                    type: array
+                    items:
+                      type: string
+                  matches:
+                    type: array
+                    items:
+                      type: object
+
+  /api/new-session:
+    post:
+      tags: [Projects]
+      summary: Launch a new Claude SDK session (or resume existing)
+      operationId: newSession
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                resume_id:
+                  type: string
+                  description: If provided, resume this session instead of creating new
+                prompt:
+                  type: string
+      responses:
+        "200":
+          description: Session started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  new_id:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  # ==========================================================================
+  # Live (live_api.py)
+  # ==========================================================================
+  /api/_emit-permission:
+    post:
+      tags: [Live]
+      summary: Internal — emit session_permission via SocketIO (legacy)
+      operationId: internalEmitPermission
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                session_id:
+                  type: string
+                tool_name:
+                  type: string
+                tool_input:
+                  type: object
+      responses:
+        "200":
+          description: Emitted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+
+  /api/hook/pre-tool:
+    post:
+      tags: [Live]
+      summary: Handle PreToolUse hook callback from Claude CLI
+      operationId: hookPreTool
+      description: |
+        Proxies the request to the session daemon, which blocks until the
+        user responds via the WebSocket permission_response event.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tool_name:
+                  type: string
+                tool_input:
+                  type: object
+                session_id:
+                  type: string
+      responses:
+        "200":
+          description: Permission decision
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  action:
+                    type: string
+                    enum: [allow, deny]
+
+  /api/live/state/{session_id}:
+    get:
+      tags: [Live]
+      summary: Get lightweight session state (for watchdog polling)
+      operationId: getLiveState
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: Session state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state:
+                    type: string
+                    enum: [idle, working, waiting, stopped]
+                  managed:
+                    type: boolean
+                  entry_count:
+                    type: integer
+
+  /api/session-log/{session_id}:
+    get:
+      tags: [Live]
+      summary: Get structured log entries for the live terminal panel
+      operationId: getSessionLog
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: since
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Return entries after this index
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Log entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/LogEntry"
+                  total_lines:
+                    type: integer
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/claude-md:
+    get:
+      tags: [Live]
+      summary: Read CLAUDE.md from active project directory
+      operationId: getClaudeMd
+      responses:
+        "200":
+          description: File content
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  content:
+                    type: string
+                  path:
+                    type: string
+                  exists:
+                    type: boolean
+        "500":
+          $ref: "#/components/responses/ServerError"
+    put:
+      tags: [Live]
+      summary: Write CLAUDE.md to active project directory
+      operationId: putClaudeMd
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+      responses:
+        "200":
+          description: Written
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  path:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/claude-md-global:
+    get:
+      tags: [Live]
+      summary: Read ~/.claude/CLAUDE.md
+      operationId: getClaudeMdGlobal
+      responses:
+        "200":
+          description: File content
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  content:
+                    type: string
+                  path:
+                    type: string
+                  exists:
+                    type: boolean
+        "500":
+          $ref: "#/components/responses/ServerError"
+    put:
+      tags: [Live]
+      summary: Write ~/.claude/CLAUDE.md
+      operationId: putClaudeMdGlobal
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+      responses:
+        "200":
+          description: Written
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  path:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/config:
+    get:
+      tags: [Live]
+      summary: Read ~/.claude/settings.json
+      operationId: getConfig
+      responses:
+        "200":
+          description: Settings object
+          content:
+            application/json:
+              schema:
+                type: object
+        "500":
+          $ref: "#/components/responses/ServerError"
+    put:
+      tags: [Live]
+      summary: Write ~/.claude/settings.json
+      operationId: putConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/folder-tree:
+    get:
+      tags: [Live]
+      summary: Read persisted folder tree state
+      operationId: getFolderTree
+      responses:
+        "200":
+          description: Folder tree JSON
+          content:
+            application/json:
+              schema:
+                type: object
+    put:
+      tags: [Live]
+      summary: Write persisted folder tree state
+      operationId: putFolderTree
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/models:
+    get:
+      tags: [Models]
+      summary: Return available Claude models
+      operationId: getModels
+      description: Dynamically queries the CLI for available models. Cached for 10 minutes.
+      responses:
+        "200":
+          description: Array of model objects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    name:
+                      type: string
+                    desc:
+                      type: string
+                    context_window:
+                      type: integer
+                    max_output:
+                      type: integer
+                    current:
+                      type: boolean
+                    default:
+                      type: boolean
+                    alias:
+                      type: boolean
+
+  /api/agents/write-catalog:
+    post:
+      tags: [Workforce]
+      summary: Write agent definitions to a per-project temp file
+      operationId: writeAgentCatalog
+      parameters:
+        - name: force
+          in: query
+          schema:
+            type: string
+            enum: ["0", "1"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agents]
+              properties:
+                agents:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      label:
+                        type: string
+                      systemPrompt:
+                        type: string
+      responses:
+        "200":
+          description: Catalog written
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  path:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/workforce/assets:
+    get:
+      tags: [Workforce]
+      summary: Read all .md files from the workforce directory
+      operationId: getWorkforceAssets
+      responses:
+        "200":
+          description: Parsed workforce assets
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  assets:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/WorkforceAsset"
+                  map:
+                    type: object
+                    nullable: true
+                  source:
+                    type: string
+
+  /api/workforce/discover:
+    get:
+      tags: [Workforce]
+      summary: Scan filesystem for existing Claude agent/skill definitions
+      operationId: discoverWorkforce
+      responses:
+        "200":
+          description: Discovered agents and skills
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  discovered:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string
+                        tier:
+                          type: string
+                        source:
+                          type: string
+                        pack:
+                          type: string
+                          nullable: true
+                        path:
+                          type: string
+                        systemPrompt:
+                          type: string
+                        already_imported:
+                          type: boolean
+
+  /api/workforce/write-asset:
+    post:
+      tags: [Workforce]
+      summary: Write a .md asset file to the workforce directory
+      operationId: writeWorkforceAsset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, content]
+              properties:
+                id:
+                  type: string
+                content:
+                  type: string
+      responses:
+        "200":
+          description: Written
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  path:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/workforce/install-pack:
+    post:
+      tags: [Workforce]
+      summary: Clone a skill pack repo and import assets
+      operationId: installPack
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pack_id, git_url]
+              properties:
+                pack_id:
+                  type: string
+                git_url:
+                  type: string
+                setup_cmd:
+                  type: string
+                  nullable: true
+      responses:
+        "200":
+          description: Pack installed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  cloned:
+                    type: boolean
+                  imported:
+                    type: integer
+                  path:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/workforce/delete-asset:
+    post:
+      tags: [Workforce]
+      summary: Delete a single workforce asset
+      operationId: deleteWorkforceAsset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id:
+                  type: string
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/workforce/uninstall-pack:
+    post:
+      tags: [Workforce]
+      summary: Uninstall a community skill pack
+      operationId: uninstallPack
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pack_id]
+              properties:
+                pack_id:
+                  type: string
+      responses:
+        "200":
+          description: Uninstalled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  assets_deleted:
+                    type: integer
+                  dir_deleted:
+                    type: boolean
+
+  /api/workforce/uninstall-builtin:
+    post:
+      tags: [Workforce]
+      summary: Delete all built-in workforce assets
+      operationId: uninstallBuiltinWorkforce
+      responses:
+        "200":
+          description: All deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  deleted:
+                    type: integer
+
+  /api/file-info:
+    get:
+      tags: [Live]
+      summary: Get file name, size, and existence for a path
+      operationId: getFileInfo
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: File info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  size:
+                    type: string
+                  exists:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Path not within home directory
+
+  /api/open-file:
+    post:
+      tags: [Live]
+      summary: Open a file with the system default application
+      operationId: openFile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path:
+                  type: string
+      responses:
+        "200":
+          description: Opened
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Path not within home directory
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/download-to-downloads:
+    post:
+      tags: [Live]
+      summary: Copy a file to the user's Downloads folder
+      operationId: downloadToDownloads
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path:
+                  type: string
+      responses:
+        "200":
+          description: Copied
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  filename:
+                    type: string
+                  dest:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/copy-file-to:
+    post:
+      tags: [Live]
+      summary: Copy a file to a user-chosen directory
+      operationId: copyFileTo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source, target_dir]
+              properties:
+                source:
+                  type: string
+                target_dir:
+                  type: string
+      responses:
+        "200":
+          description: Copied
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  filename:
+                    type: string
+                  path:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/file-drop:
+    post:
+      tags: [Live]
+      summary: Accept a multipart file upload
+      operationId: fileDrop
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, target_dir]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                target_dir:
+                  type: string
+      responses:
+        "200":
+          description: Uploaded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  path:
+                    type: string
+                  filename:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/browse-dir:
+    get:
+      tags: [Live]
+      summary: List immediate subdirectories for a path
+      operationId: browseDir
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Directory listing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path:
+                    type: string
+                  dirs:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/project-path:
+    get:
+      tags: [Live]
+      summary: Return the active project's filesystem path
+      operationId: getProjectPath
+      responses:
+        "200":
+          description: Project path
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path:
+                    type: string
+
+  /api/default-save-dir:
+    get:
+      tags: [Live]
+      summary: Return default save directory (Downloads)
+      operationId: getDefaultSaveDir
+      responses:
+        "200":
+          description: Default save directory
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path:
+                    type: string
+
+  # ==========================================================================
+  # Kanban (kanban_api.py)
+  # ==========================================================================
+  /api/kanban/board:
+    get:
+      tags: [Kanban]
+      summary: Get full board state with columns, tasks, and tags
+      operationId: getKanbanBoard
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: tags
+          in: query
+          schema:
+            type: string
+          description: Comma-separated tag filter
+        - name: parent_id
+          in: query
+          schema:
+            type: string
+          description: Scope to a parent task's children
+      responses:
+        "200":
+          description: Board data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  columns:
+                    type: array
+                    items:
+                      type: object
+                  tasks:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/KanbanTask"
+                  tags:
+                    type: array
+                    items:
+                      type: string
+                  active_tag_filter:
+                    type: array
+                    items:
+                      type: string
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/kanban/task-tree-summary:
+    get:
+      tags: [Kanban]
+      summary: Get compact text summary of the full task tree
+      operationId: getTaskTreeSummary
+      responses:
+        "200":
+          description: Summary text
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  summary:
+                    type: string
+
+  /api/kanban/detected-urls:
+    get:
+      tags: [Kanban]
+      summary: Get real URL routes detected from project source code
+      operationId: getDetectedUrls
+      parameters:
+        - name: cwd
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Detected URLs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  urls:
+                    type: object
+                  formatted:
+                    type: string
+
+  /api/kanban/tasks:
+    post:
+      tags: [Kanban]
+      summary: Create a new task
+      operationId: createKanbanTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title:
+                  type: string
+                parent_id:
+                  type: string
+                  nullable: true
+                description:
+                  type: string
+                verification_url:
+                  type: string
+                status:
+                  type: string
+                  enum: [not_started, working, validating, remediating, complete]
+                  default: not_started
+                insert_position:
+                  type: string
+                  enum: [top, bottom]
+                  default: bottom
+      responses:
+        "200":
+          description: Created task
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KanbanTask"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/kanban/tasks/{task_id}:
+    get:
+      tags: [Kanban]
+      summary: Get a single task with children, sessions, and issues
+      operationId: getKanbanTask
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      responses:
+        "200":
+          description: Task detail
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/KanbanTask"
+                  - type: object
+                    properties:
+                      children:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/KanbanTask"
+                      sessions:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            session_id:
+                              type: string
+                            status:
+                              type: string
+                            session_type:
+                              type: string
+                      issues:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/KanbanIssue"
+                      tags:
+                        type: array
+                        items:
+                          type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Kanban]
+      summary: Update task fields
+      operationId: updateKanbanTask
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                description:
+                  type: string
+                verification_url:
+                  type: string
+                status:
+                  type: string
+                owner:
+                  type: string
+      responses:
+        "200":
+          description: Updated task
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KanbanTask"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Kanban]
+      summary: Delete a task and all its children
+      operationId: deleteKanbanTask
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/kanban/tasks/{task_id}/move:
+    post:
+      tags: [Kanban]
+      summary: Move a task to a new status column
+      operationId: moveKanbanTask
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                force:
+                  type: boolean
+                  default: false
+                old_status:
+                  type: string
+      responses:
+        "200":
+          description: Moved task
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KanbanTask"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/kanban/tasks/{task_id}/reorder:
+    post:
+      tags: [Kanban]
+      summary: Reorder a task within its column
+      operationId: reorderKanbanTask
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                after_id:
+                  type: string
+                  nullable: true
+                before_id:
+                  type: string
+                  nullable: true
+      responses:
+        "200":
+          description: Reordered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+
+  /api/kanban/tasks/{task_id}/sessions:
+    post:
+      tags: [Kanban]
+      summary: Link a session to a task
+      operationId: linkSession
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id]
+              properties:
+                session_id:
+                  type: string
+                session_type:
+                  type: string
+                  enum: [session, planner]
+                  default: session
+      responses:
+        "200":
+          description: Session linked
+          content:
+            application/json:
+              schema:
+                type: object
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/kanban/sessions/{session_id}/unlink-all:
+    delete:
+      tags: [Kanban]
+      summary: Unlink a session from all tasks
+      operationId: unlinkSessionFromAll
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: Unlinked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+
+  /api/kanban/tasks/{task_id}/sessions/{session_id}:
+    delete:
+      tags: [Kanban]
+      summary: Unlink a session from a task
+      operationId: unlinkSession
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: Unlinked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+
+  /api/kanban/unlinked-sessions:
+    get:
+      tags: [Kanban]
+      summary: Get sessions not linked to any workflow task
+      operationId: getUnlinkedSessions
+      responses:
+        "200":
+          description: Unlinked sessions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    display_title:
+                      type: string
+                    state:
+                      type: string
+
+  /api/kanban/tasks/from-session:
+    post:
+      tags: [Kanban]
+      summary: Quick-create a task and link a session to it
+      operationId: createTaskFromSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id]
+              properties:
+                session_id:
+                  type: string
+                title:
+                  type: string
+      responses:
+        "200":
+          description: Task created and linked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task:
+                    $ref: "#/components/schemas/KanbanTask"
+                  linked:
+                    type: boolean
+
+  /api/kanban/tasks/{task_id}/issues:
+    post:
+      tags: [Kanban]
+      summary: Create a validation issue on a task
+      operationId: createIssue
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [description]
+              properties:
+                description:
+                  type: string
+      responses:
+        "200":
+          description: Issue created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KanbanIssue"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/kanban/issues/{issue_id}:
+    patch:
+      tags: [Kanban]
+      summary: Resolve an issue
+      operationId: resolveIssue
+      parameters:
+        - name: issue_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Resolved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+
+  /api/kanban/columns:
+    get:
+      tags: [Kanban]
+      summary: Get column configuration
+      operationId: getKanbanColumns
+      responses:
+        "200":
+          description: Array of column objects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+    put:
+      tags: [Kanban]
+      summary: Replace column configuration
+      operationId: updateKanbanColumns
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  status_key:
+                    type: string
+                  position:
+                    type: integer
+                  color:
+                    type: string
+                  sort_mode:
+                    type: string
+                  sort_direction:
+                    type: string
+      responses:
+        "200":
+          description: Updated columns
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/kanban/tasks/{task_id}/tags:
+    get:
+      tags: [Kanban]
+      summary: Get all tags for a task
+      operationId: getTaskTags
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      responses:
+        "200":
+          description: Tags
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tags:
+                    type: array
+                    items:
+                      type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [Kanban]
+      summary: Add a tag to a task
+      operationId: addTag
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tag]
+              properties:
+                tag:
+                  type: string
+      responses:
+        "200":
+          description: Tag added
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/kanban/tasks/{task_id}/tags/{tag}:
+    delete:
+      tags: [Kanban]
+      summary: Remove a tag from a task
+      operationId: removeTag
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Tag removed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/kanban/tags:
+    get:
+      tags: [Kanban]
+      summary: List all distinct tags for the current project
+      operationId: getAllTags
+      responses:
+        "200":
+          description: Tags
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tags:
+                    type: array
+                    items:
+                      type: string
+
+  /api/kanban/tags/{tag}/tasks:
+    get:
+      tags: [Kanban]
+      summary: Get all tasks with a specific tag
+      operationId: getTasksByTag
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Array of tasks
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/KanbanTask"
+
+  /api/kanban/tags/suggest:
+    get:
+      tags: [Kanban]
+      summary: Autocomplete tag suggestions ranked by usage
+      operationId: suggestTags
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Prefix filter
+      responses:
+        "200":
+          description: Tag suggestions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tags:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        tag:
+                          type: string
+                        usage_count:
+                          type: integer
+
+  /api/kanban/tasks/{task_id}/ancestors:
+    get:
+      tags: [Kanban]
+      summary: Get the ancestor chain for breadcrumb navigation
+      operationId: getAncestors
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      responses:
+        "200":
+          description: Ancestor chain
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ancestors:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/KanbanTask"
+                  task:
+                    $ref: "#/components/schemas/KanbanTask"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/kanban/tasks/{task_id}/bulk:
+    post:
+      tags: [Kanban]
+      summary: Bulk operations on a task's children
+      operationId: bulkAction
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action:
+                  type: string
+                  enum: [complete_all, reset_all]
+      responses:
+        "200":
+          description: Bulk action completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  updated:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/kanban/tasks/{task_id}/plan:
+    post:
+      tags: [Kanban Planner]
+      summary: Generate AI subtask suggestions for a task
+      operationId: planTask
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      responses:
+        "200":
+          description: Proposed subtasks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subtasks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        title:
+                          type: string
+                        description:
+                          type: string
+                        verification_url:
+                          type: string
+                          nullable: true
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/kanban/tasks/{task_id}/plan/apply:
+    post:
+      tags: [Kanban Planner]
+      summary: Accept AI-generated subtasks and create them
+      operationId: applyTaskPlan
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subtasks]
+              properties:
+                subtasks:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      title:
+                        type: string
+                      description:
+                        type: string
+                      verification_url:
+                        type: string
+      responses:
+        "200":
+          description: Created subtasks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  created:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/KanbanTask"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/kanban/planner/chat:
+    post:
+      tags: [Kanban Planner]
+      summary: Chat with AI planner to propose task trees
+      operationId: plannerChat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message:
+                  type: string
+                history:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      role:
+                        type: string
+                        enum: [user, assistant]
+                      content:
+                        type: string
+      responses:
+        "200":
+          description: Planner response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  response:
+                    type: string
+                  proposal:
+                    type: object
+                    nullable: true
+                    properties:
+                      tasks:
+                        type: array
+                        items:
+                          type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/kanban/planner/accept:
+    post:
+      tags: [Kanban Planner]
+      summary: Accept AI planner proposal and batch-create tasks
+      operationId: plannerAccept
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [proposal]
+              properties:
+                proposal:
+                  type: object
+                  properties:
+                    tasks:
+                      type: array
+                      items:
+                        type: object
+                insert_position:
+                  type: string
+                  enum: [top, bottom]
+                  default: bottom
+                parent_id:
+                  type: string
+                  nullable: true
+      responses:
+        "200":
+          description: Tasks created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  created_count:
+                    type: integer
+                  created_ids:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/kanban/config:
+    get:
+      tags: [Kanban Config]
+      summary: Get kanban configuration
+      operationId: getKanbanConfig
+      responses:
+        "200":
+          description: Kanban config
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KanbanConfig"
+    put:
+      tags: [Kanban Config]
+      summary: Update kanban configuration
+      operationId: updateKanbanConfig
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/KanbanConfig"
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+
+  /api/kanban/session-state-change:
+    post:
+      tags: [Kanban]
+      summary: Bridge — update linked kanban task when session state changes
+      operationId: sessionStateChange
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, state]
+              properties:
+                session_id:
+                  type: string
+                state:
+                  type: string
+      responses:
+        "200":
+          description: Result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  linked:
+                    type: boolean
+                  task_id:
+                    type: string
+
+  /api/kanban/tasks/{task_id}/ai-status:
+    post:
+      tags: [Kanban]
+      summary: AI-initiated status change for a task
+      operationId: aiStatusChange
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_status]
+              properties:
+                new_status:
+                  type: string
+                session_id:
+                  type: string
+      responses:
+        "200":
+          description: Status changed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  task:
+                    $ref: "#/components/schemas/KanbanTask"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: AI status modification disabled
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/kanban/tasks/{task_id}/context:
+    get:
+      tags: [Kanban]
+      summary: Get the context injection string for a task-scoped session
+      operationId: getTaskContext
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      responses:
+        "200":
+          description: Context string
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  context:
+                    type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/kanban/tasks/{task_id}/claim:
+    post:
+      tags: [Kanban]
+      summary: Claim a task — set owner to current user
+      operationId: claimTask
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      responses:
+        "200":
+          description: Claimed task
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KanbanTask"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/kanban/tasks/{task_id}/unclaim:
+    post:
+      tags: [Kanban]
+      summary: Unclaim a task — set owner to null
+      operationId: unclaimTask
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+      responses:
+        "200":
+          description: Unclaimed task
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KanbanTask"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/kanban/tasks/{task_id}/history:
+    get:
+      tags: [Kanban]
+      summary: Paginated status history for a task
+      operationId: getTaskHistory
+      parameters:
+        - $ref: "#/components/parameters/taskId"
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: Status history
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  history:
+                    type: array
+                    items:
+                      type: object
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  has_more:
+                    type: boolean
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/kanban/migrate:
+    post:
+      tags: [Kanban Config]
+      summary: Switch database backend (SQLite or Supabase)
+      operationId: migrateBackend
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target]
+              properties:
+                target:
+                  type: string
+                  enum: [sqlite, supabase]
+                supabase_url:
+                  type: string
+                supabase_secret_key:
+                  type: string
+      responses:
+        "200":
+          description: Migration complete
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/kanban/migrate/test:
+    post:
+      tags: [Kanban Config]
+      summary: Test connection to target backend without migrating
+      operationId: migrateTest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target]
+              properties:
+                target:
+                  type: string
+                  enum: [sqlite, supabase]
+                supabase_url:
+                  type: string
+                supabase_secret_key:
+                  type: string
+      responses:
+        "200":
+          description: Connection result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  message:
+                    type: string
+                  needs_schema:
+                    type: boolean
+                  setup_sql:
+                    type: string
+
+  /api/kanban/setup-schema:
+    post:
+      tags: [Kanban Config]
+      summary: Auto-create kanban tables in Supabase
+      operationId: setupSchema
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [supabase_url, access_token]
+              properties:
+                supabase_url:
+                  type: string
+                access_token:
+                  type: string
+      responses:
+        "200":
+          description: Schema created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/kanban/migrate/status:
+    get:
+      tags: [Kanban Config]
+      summary: Get current backend, record counts, migration status
+      operationId: getMigrateStatus
+      responses:
+        "200":
+          description: Migration status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  backend:
+                    type: string
+                  task_count:
+                    type: integer
+                  tag_count:
+                    type: integer
+                  last_migration:
+                    type: string
+                    nullable: true
+
+  /api/kanban/backup/download:
+    post:
+      tags: [Kanban Backups]
+      summary: Export current backend data to a backup JSON file
+      operationId: backupDownload
+      responses:
+        "200":
+          description: Backup created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  filename:
+                    type: string
+                  record_count:
+                    type: integer
+                  path:
+                    type: string
+
+  /api/kanban/backup/list:
+    get:
+      tags: [Kanban Backups]
+      summary: List all existing backup files
+      operationId: backupList
+      responses:
+        "200":
+          description: Backup list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  backups:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        filename:
+                          type: string
+                        size:
+                          type: integer
+                        modified:
+                          type: string
+                        record_count:
+                          type: string
+                        backend:
+                          type: string
+
+  /api/kanban/backup/restore:
+    post:
+      tags: [Kanban Backups]
+      summary: Restore data from a backup file
+      operationId: backupRestore
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filename]
+              properties:
+                filename:
+                  type: string
+      responses:
+        "200":
+          description: Restored
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/kanban/backup/delete:
+    post:
+      tags: [Kanban Backups]
+      summary: Delete a backup file
+      operationId: backupDelete
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filename]
+              properties:
+                filename:
+                  type: string
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ==========================================================================
+  # Kanban Reports (kanban_report_api.py)
+  # ==========================================================================
+  /api/kanban/report/velocity:
+    get:
+      tags: [Kanban Reports]
+      summary: Tasks completed per day/week
+      operationId: reportVelocity
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+        - $ref: "#/components/parameters/startDate"
+        - $ref: "#/components/parameters/endDate"
+      responses:
+        "200":
+          description: Velocity data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  daily:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        day:
+                          type: string
+                        completed:
+                          type: integer
+                  weekly:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        week:
+                          type: string
+                        completed:
+                          type: integer
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/kanban/report/cycle-time:
+    get:
+      tags: [Kanban Reports]
+      summary: Cycle time and lead time statistics
+      operationId: reportCycleTime
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+        - $ref: "#/components/parameters/startDate"
+        - $ref: "#/components/parameters/endDate"
+      responses:
+        "200":
+          description: Cycle time data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tasks:
+                    type: array
+                    items:
+                      type: object
+                  average_hours:
+                    type: number
+                  median_hours:
+                    type: number
+                  p75_hours:
+                    type: number
+                  p90_hours:
+                    type: number
+                  count:
+                    type: integer
+
+  /api/kanban/report/distribution:
+    get:
+      tags: [Kanban Reports]
+      summary: Count of tasks per status
+      operationId: reportDistribution
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+      responses:
+        "200":
+          description: Status distribution
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  breakdown:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        status:
+                          type: string
+                        count:
+                          type: integer
+                        percent:
+                          type: number
+                  total:
+                    type: integer
+
+  /api/kanban/report/stale:
+    get:
+      tags: [Kanban Reports]
+      summary: Tasks not updated in more than N days
+      operationId: reportStale
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+        - name: days
+          in: query
+          schema:
+            type: integer
+            default: 3
+      responses:
+        "200":
+          description: Stale tasks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stale:
+                    type: array
+                    items:
+                      type: object
+                  threshold_days:
+                    type: integer
+
+  /api/kanban/report/remediation:
+    get:
+      tags: [Kanban Reports]
+      summary: Percentage of tasks that went through remediating
+      operationId: reportRemediation
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+      responses:
+        "200":
+          description: Remediation rate
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_tasks:
+                    type: integer
+                  remediated_tasks:
+                    type: integer
+                  rate_percent:
+                    type: number
+
+  /api/kanban/report/tags:
+    get:
+      tags: [Kanban Reports]
+      summary: Task counts per tag
+      operationId: reportTagDistribution
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+      responses:
+        "200":
+          description: Tag distribution
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tags:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        tag:
+                          type: string
+                        count:
+                          type: integer
+
+  /api/kanban/report/session-activity:
+    get:
+      tags: [Kanban Reports]
+      summary: Sessions linked per task
+      operationId: reportSessionActivity
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+      responses:
+        "200":
+          description: Session activity
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tasks:
+                    type: array
+                    items:
+                      type: object
+
+  /api/kanban/report/subtask-depth:
+    get:
+      tags: [Kanban Reports]
+      summary: Distribution of subtask nesting depths
+      operationId: reportSubtaskDepth
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+      responses:
+        "200":
+          description: Depth distribution
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  depths:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        depth:
+                          type: integer
+                        count:
+                          type: integer
+
+  /api/kanban/report/blockers:
+    get:
+      tags: [Kanban Reports]
+      summary: Tasks with unresolved issues
+      operationId: reportBlockers
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+      responses:
+        "200":
+          description: Blocker tasks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  blockers:
+                    type: array
+                    items:
+                      type: object
+
+  /api/kanban/report/cumulative-flow:
+    get:
+      tags: [Kanban Reports]
+      summary: Cumulative created and completed over time
+      operationId: reportCumulativeFlow
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+        - $ref: "#/components/parameters/startDate"
+        - $ref: "#/components/parameters/endDate"
+      responses:
+        "200":
+          description: Cumulative flow data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  trend:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        day:
+                          type: string
+                        cumulative:
+                          type: integer
+                        cumulative_created:
+                          type: integer
+
+  /api/kanban/report/owner-activity:
+    get:
+      tags: [Kanban Reports]
+      summary: Per-owner stats and activity heatmap
+      operationId: reportOwnerActivity
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+        - $ref: "#/components/parameters/startDate"
+        - $ref: "#/components/parameters/endDate"
+      responses:
+        "200":
+          description: Owner workload data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  workload:
+                    type: array
+                    items:
+                      type: object
+                  heatmap:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        day_of_week:
+                          type: integer
+                        hour:
+                          type: integer
+                        count:
+                          type: integer
+
+  /api/kanban/report/throughput:
+    get:
+      tags: [Kanban Reports]
+      summary: Current task count per status
+      operationId: reportThroughput
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+      responses:
+        "200":
+          description: Throughput data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  throughput:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        status:
+                          type: string
+                        count:
+                          type: integer
+
+  /api/kanban/report/session-efficiency:
+    get:
+      tags: [Kanban Reports]
+      summary: Tasks with vs without linked sessions
+      operationId: reportSessionEfficiency
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+      responses:
+        "200":
+          description: Session utilization
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                  with_sessions:
+                    type: integer
+                  without_sessions:
+                    type: integer
+                  utilization_percent:
+                    type: number
+
+  /api/kanban/report/issue-frequency:
+    get:
+      tags: [Kanban Reports]
+      summary: Tasks ranked by number of validation issues
+      operationId: reportIssueFrequency
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: Issue frequency data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tasks:
+                    type: array
+                    items:
+                      type: object
+
+  /api/kanban/report/wip-limits:
+    get:
+      tags: [Kanban Reports]
+      summary: Current work-in-progress count vs limit
+      operationId: reportWipLimits
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 5
+      responses:
+        "200":
+          description: WIP data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  wip_count:
+                    type: integer
+                  wip_limit:
+                    type: integer
+                  over_limit:
+                    type: boolean
+
+  /api/kanban/report/time-in-status:
+    get:
+      tags: [Kanban Reports]
+      summary: Average, median, and max time in each status
+      operationId: reportTimeInStatus
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+      responses:
+        "200":
+          description: Time in status data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  statuses:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        status:
+                          type: string
+                        avg_days:
+                          type: number
+                        median_days:
+                          type: number
+                        max_days:
+                          type: number
+                        transitions:
+                          type: integer
+
+  /api/kanban/report/activity-log:
+    get:
+      tags: [Kanban Reports]
+      summary: Chronological timeline of status changes
+      operationId: reportActivityLog
+      parameters:
+        - $ref: "#/components/parameters/projectIdQuery"
+        - $ref: "#/components/parameters/startDate"
+        - $ref: "#/components/parameters/endDate"
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: ISO datetime cursor for pagination
+      responses:
+        "200":
+          description: Activity log entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      type: object
+                  has_more:
+                    type: boolean
+                  next_cursor:
+                    type: string
+                    nullable: true
+
+  # ==========================================================================
+  # Compose (compose_api.py)
+  # ==========================================================================
+  /api/compose/board:
+    get:
+      tags: [Compose]
+      summary: Get board data for the active composition
+      operationId: getComposeBoard
+      parameters:
+        - name: project_id
+          in: query
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+          description: Parent VibeNode project filter
+      responses:
+        "200":
+          description: Compose board data (or null if no projects)
+          content:
+            application/json:
+              schema:
+                type: object
+                nullable: true
+                properties:
+                  project:
+                    type: object
+                  sections:
+                    type: array
+                    items:
+                      type: object
+                  status:
+                    type: object
+                  conflicts:
+                    type: array
+                  sibling_projects:
+                    type: array
+
+  /api/compose/projects:
+    post:
+      tags: [Compose]
+      summary: Create a new composition project
+      operationId: createComposeProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                parent_project:
+                  type: string
+      responses:
+        "201":
+          description: Project created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  project:
+                    type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+    get:
+      tags: [Compose]
+      summary: List all composition projects
+      operationId: listComposeProjects
+      parameters:
+        - name: project
+          in: query
+          schema:
+            type: string
+          description: Filter by parent project
+      responses:
+        "200":
+          description: Project list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  projects:
+                    type: array
+                    items:
+                      type: object
+
+  /api/compose/projects/{project_id}:
+    get:
+      tags: [Compose]
+      summary: Get project detail with sections and context
+      operationId: getComposeProject
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+      responses:
+        "200":
+          description: Project detail
+          content:
+            application/json:
+              schema:
+                type: object
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [Compose]
+      summary: Update project settings
+      operationId: updateComposeProject
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                shared_prompts_enabled:
+                  type: boolean
+                root_session_id:
+                  type: string
+                position:
+                  type: integer
+                pinned:
+                  type: boolean
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  project:
+                    type: object
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Compose]
+      summary: Delete a composition project and its folder
+      operationId: deleteComposeProject
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  deleted:
+                    type: boolean
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/compose/projects/reorder:
+    post:
+      tags: [Compose]
+      summary: Reorder composition projects
+      operationId: reorderComposeProjects
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order]
+              properties:
+                order:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: Reordered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/compose/projects/{project_id}/clone:
+    post:
+      tags: [Compose]
+      summary: Clone a composition project
+      operationId: cloneComposeProject
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+      responses:
+        "201":
+          description: Cloned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  project:
+                    type: object
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/compose/projects/{project_id}/sections:
+    post:
+      tags: [Compose]
+      summary: Create a new section in a project
+      operationId: createComposeSection
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                parent_id:
+                  type: string
+                  nullable: true
+                artifact_type:
+                  type: string
+                insert_position:
+                  type: string
+                  enum: [top, bottom]
+      responses:
+        "201":
+          description: Section created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  section:
+                    type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/compose/projects/{project_id}/sections/{section_id}:
+    put:
+      tags: [Compose]
+      summary: Update a section's properties
+      operationId: updateComposeSection
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+        - $ref: "#/components/parameters/sectionId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                status:
+                  type: string
+                artifact_type:
+                  type: string
+                session_id:
+                  type: string
+                parent_id:
+                  type: string
+                summary:
+                  type: string
+                ready_for_review:
+                  type: boolean
+                tags:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  section:
+                    type: object
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Compose]
+      summary: Delete a section (optionally cascade children)
+      operationId: deleteComposeSection
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+        - $ref: "#/components/parameters/sectionId"
+        - name: cascade
+          in: query
+          schema:
+            type: string
+            enum: ["true", "false"]
+            default: "false"
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  deleted_count:
+                    type: integer
+                  deleted_sections:
+                    type: array
+                    items:
+                      type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/compose/projects/{project_id}/sections/{section_id}/launch:
+    post:
+      tags: [Compose]
+      summary: Create and link a new session for a section
+      operationId: launchSectionSession
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+        - $ref: "#/components/parameters/sectionId"
+      responses:
+        "200":
+          description: Session launched
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  session_id:
+                    type: string
+                  section:
+                    type: object
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Section already has a session
+
+  /api/compose/projects/{project_id}/sections/add-and-link:
+    post:
+      tags: [Compose]
+      summary: Atomic create-section + link-session
+      operationId: addAndLinkSection
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, session_id]
+              properties:
+                name:
+                  type: string
+                session_id:
+                  type: string
+                parent_id:
+                  type: string
+                  nullable: true
+                order:
+                  type: integer
+                  nullable: true
+                artifact_type:
+                  type: string
+      responses:
+        "201":
+          description: Section created and linked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  section:
+                    type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Session already linked to another section
+
+  /api/compose/projects/{project_id}/sections/{section_id}/preview:
+    get:
+      tags: [Compose]
+      summary: Get source file contents for section output preview
+      operationId: previewSection
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+        - $ref: "#/components/parameters/sectionId"
+      responses:
+        "200":
+          description: Preview files
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  files:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        type:
+                          type: string
+                        content:
+                          type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/compose/projects/{project_id}/sections/{section_id}/children:
+    get:
+      tags: [Compose]
+      summary: List descendant sections for cascade delete confirmation
+      operationId: listSectionChildren
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+        - $ref: "#/components/parameters/sectionId"
+      responses:
+        "200":
+          description: Children
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  children:
+                    type: array
+                    items:
+                      type: object
+                  count:
+                    type: integer
+
+  /api/compose/projects/{project_id}/sections/reorder:
+    post:
+      tags: [Compose]
+      summary: Reorder sections
+      operationId: reorderSections
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order]
+              properties:
+                order:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: Reordered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/compose/projects/{project_id}/export:
+    post:
+      tags: [Compose]
+      summary: Export composition content as markdown or zip
+      operationId: exportComposeProject
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                format:
+                  type: string
+                  enum: [markdown, zip]
+                  default: markdown
+      responses:
+        "200":
+          description: File download
+          content:
+            text/markdown:
+              schema:
+                type: string
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/compose/projects/{project_id}/context:
+    get:
+      tags: [Compose]
+      summary: Read compose-context.json for a project
+      operationId: getComposeContext
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+      responses:
+        "200":
+          description: Context data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  context:
+                    type: object
+
+  /api/compose/projects/{project_id}/context/facts:
+    put:
+      tags: [Compose]
+      summary: Update facts in compose-context.json
+      operationId: updateComposeFacts
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [facts]
+              properties:
+                facts:
+                  type: object
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+
+  /api/compose/projects/{project_id}/sections/{section_id}/status:
+    put:
+      tags: [Compose]
+      summary: Update section status and summary
+      operationId: updateSectionStatus
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+        - $ref: "#/components/parameters/sectionId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: string
+                summary:
+                  type: string
+                changing:
+                  type: boolean
+                change_note:
+                  type: string
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+
+  /api/compose/projects/{project_id}/directives:
+    post:
+      tags: [Compose]
+      summary: Add a directive with conflict detection
+      operationId: createDirective
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                scope:
+                  type: string
+                  default: global
+                source:
+                  type: string
+                  default: user
+      responses:
+        "201":
+          description: Directive added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  directive:
+                    type: object
+                  conflicts:
+                    type: array
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/compose/projects/{project_id}/directives/resolve:
+    post:
+      tags: [Compose]
+      summary: Resolve a directive conflict
+      operationId: resolveDirective
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [conflict_id, action]
+              properties:
+                conflict_id:
+                  type: string
+                action:
+                  type: string
+                  enum: [supersede, scope, keep_both]
+      responses:
+        "200":
+          description: Resolved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  result:
+                    type: object
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/compose/projects/{project_id}/sections/{section_id}/changing:
+    put:
+      tags: [Compose]
+      summary: Set or clear the changing flag on a section
+      operationId: updateChanging
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+        - $ref: "#/components/parameters/sectionId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                changing:
+                  type: boolean
+                change_note:
+                  type: string
+                set_by:
+                  type: string
+                cleared_by:
+                  type: string
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "403":
+          description: Cannot clear changing flag (not the setter)
+
+  /api/compose/projects/{project_id}/sections/{section_id}/tags:
+    post:
+      tags: [Compose]
+      summary: Add a tag to a section
+      operationId: addSectionTag
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+        - $ref: "#/components/parameters/sectionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tag]
+              properties:
+                tag:
+                  type: string
+      responses:
+        "200":
+          description: Tag added
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  tags:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/compose/projects/{project_id}/sections/{section_id}/tags/{tag}:
+    delete:
+      tags: [Compose]
+      summary: Remove a tag from a section
+      operationId: removeSectionTag
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+        - $ref: "#/components/parameters/sectionId"
+        - name: tag
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Tag removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  tags:
+                    type: array
+                    items:
+                      type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/compose/projects/{project_id}/planner/accept:
+    post:
+      tags: [Compose]
+      summary: Accept an AI-proposed content plan and create sections
+      operationId: acceptComposePlan
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sections]
+              properties:
+                sections:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      artifact_type:
+                        type: string
+                      brief:
+                        type: string
+                      subsections:
+                        type: array
+                        items:
+                          type: object
+                parent_id:
+                  type: string
+                  nullable: true
+      responses:
+        "200":
+          description: Plan accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  created_count:
+                    type: integer
+                  sections:
+                    type: array
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ==========================================================================
+  # Analysis (analysis_api.py)
+  # ==========================================================================
+  /api/summary/{session_id}:
+    get:
+      tags: [Analysis]
+      summary: Generate an HTML summary of a session
+      operationId: getSessionSummary
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: HTML summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  html:
+                    type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/extract-code/{session_id}:
+    get:
+      tags: [Analysis]
+      summary: Extract code blocks from a session
+      operationId: extractCode
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Extracted code blocks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  blocks:
+                    type: array
+                    items:
+                      type: object
+                  count:
+                    type: integer
+                  languages:
+                    type: array
+                    items:
+                      type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/export-project/{session_id}:
+    get:
+      tags: [Analysis]
+      summary: Export code blocks as a zip file
+      operationId: exportProject
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Zip file download
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/compare/{id1}/{id2}:
+    get:
+      tags: [Analysis]
+      summary: Compare code blocks between two sessions
+      operationId: compareSessions
+      parameters:
+        - name: id1
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id2
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Comparison result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  session1:
+                    type: object
+                  session2:
+                    type: object
+                  code_diff:
+                    type: array
+                    items:
+                      type: object
+                  stats:
+                    type: object
+                    properties:
+                      s1_blocks:
+                        type: integer
+                      s2_blocks:
+                        type: integer
+                      added:
+                        type: integer
+                      removed:
+                        type: integer
+                      changed:
+                        type: integer
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ==========================================================================
+  # Git (git_api.py)
+  # ==========================================================================
+  /api/git-status:
+    get:
+      tags: [Git]
+      summary: Get cached git status for the VibeNode repository
+      operationId: getGitStatus
+      responses:
+        "200":
+          description: Git status
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/git-sync:
+    post:
+      tags: [Git]
+      summary: Git sync (pull, push, or both)
+      operationId: gitSync
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                action:
+                  type: string
+                  enum: [pull, push, both]
+                  default: both
+      responses:
+        "200":
+          description: Sync result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  git_status:
+                    type: object
+
+  /api/git-scan:
+    get:
+      tags: [Git]
+      summary: Run deterministic security scan on uncommitted files
+      operationId: gitScan
+      responses:
+        "200":
+          description: Scan results
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/git-scan-stream:
+    get:
+      tags: [Git]
+      summary: SSE endpoint — stream real-time file-by-file scan progress
+      operationId: gitScanStream
+      description: |
+        Returns a Server-Sent Events stream. Each event is a JSON line with
+        scan progress data. The stream ends with a final summary event.
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /api/project-git-status:
+    get:
+      tags: [Git]
+      summary: Get git status for the active project directory
+      operationId: getProjectGitStatus
+      responses:
+        "200":
+          description: Project git status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  is_git:
+                    type: boolean
+                  branch:
+                    type: string
+                  dirty_count:
+                    type: integer
+                  recent_commits:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        hash:
+                          type: string
+                        message:
+                          type: string
+                  project_path:
+                    type: string
+
+  # ==========================================================================
+  # Auth (auth_api.py)
+  # ==========================================================================
+  /api/auth-status:
+    get:
+      tags: [Auth]
+      summary: Get Claude Code authentication status
+      operationId: getAuthStatus
+      responses:
+        "200":
+          description: Auth status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  loggedIn:
+                    type: boolean
+                  error:
+                    type: string
+
+  /api/auth-login:
+    post:
+      tags: [Auth]
+      summary: Launch Claude Code auth login in a visible terminal
+      operationId: authLogin
+      responses:
+        "200":
+          description: Login launched
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  # ==========================================================================
+  # Tests (test_api.py)
+  # ==========================================================================
+  /api/run-tests:
+    post:
+      tags: [Tests]
+      summary: Run pytest and stream results via SSE
+      operationId: runTests
+      description: |
+        Returns a Server-Sent Events stream. Each event is JSON with
+        `type: "line"` for output or `type: "done"` for the final summary.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mode:
+                  type: string
+                  enum: [fast, full]
+                  default: fast
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /api/cancel-tests:
+    post:
+      tags: [Tests]
+      summary: Cancel a running test process
+      operationId: cancelTests
+      responses:
+        "200":
+          description: Cancellation result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  message:
+                    type: string
+
+  # ==========================================================================
+  # API Docs (served from the app)
+  # ==========================================================================
+  /api/docs:
+    get:
+      tags: [App]
+      summary: Serve the API documentation page (Redoc)
+      operationId: apiDocs
+      responses:
+        "200":
+          description: HTML documentation page
+          content:
+            text/html:
+              schema:
+                type: string
+
+components:
+  parameters:
+    sessionId:
+      name: session_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Session UUID
+    taskId:
+      name: task_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Task UUID
+    composeProjectId:
+      name: project_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Compose project UUID
+    sectionId:
+      name: section_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Compose section UUID
+    projectIdQuery:
+      name: project_id
+      in: query
+      schema:
+        type: string
+      description: Project identifier (defaults to active project)
+    startDate:
+      name: start_date
+      in: query
+      schema:
+        type: string
+        format: date
+      description: Start date (ISO format, defaults to 30 days ago)
+    endDate:
+      name: end_date
+      in: query
+      schema:
+        type: string
+        format: date
+      description: End date (ISO format, defaults to today)
+
+  schemas:
+    OkResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: true
+
+    OkMessage:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        ok:
+          type: boolean
+          example: false
+
+    SessionSummary:
+      type: object
+      properties:
+        id:
+          type: string
+        display_title:
+          type: string
+        custom_title:
+          type: string
+        user_named:
+          type: boolean
+        date:
+          type: string
+        last_activity:
+          type: string
+        last_activity_ts:
+          type: number
+        sort_ts:
+          type: number
+        size:
+          type: string
+        file_bytes:
+          type: integer
+        message_count:
+          type: integer
+        preview:
+          type: string
+
+    SessionDetail:
+      type: object
+      properties:
+        id:
+          type: string
+        display_title:
+          type: string
+        custom_title:
+          type: string
+        date:
+          type: string
+        size:
+          type: string
+        message_count:
+          type: integer
+        messages:
+          type: array
+          items:
+            type: object
+            properties:
+              role:
+                type: string
+              content:
+                type: string
+              type:
+                type: string
+        preview:
+          type: string
+
+    Project:
+      type: object
+      properties:
+        encoded:
+          type: string
+        display:
+          type: string
+        custom_name:
+          type: string
+        session_count:
+          type: integer
+        active:
+          type: boolean
+
+    LogEntry:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [user, asst, tool_use, tool_result, system]
+        text:
+          type: string
+        id:
+          type: string
+        name:
+          type: string
+        desc:
+          type: string
+        tool_use_id:
+          type: string
+        is_error:
+          type: boolean
+
+    KanbanTask:
+      type: object
+      properties:
+        id:
+          type: string
+        project_id:
+          type: string
+        parent_id:
+          type: string
+          nullable: true
+        title:
+          type: string
+        description:
+          type: string
+        verification_url:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [not_started, working, validating, remediating, complete]
+        position:
+          type: integer
+        depth:
+          type: integer
+        owner:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+        updated_at:
+          type: string
+        children_count:
+          type: integer
+        children_complete:
+          type: integer
+        session_count:
+          type: integer
+        active_sessions:
+          type: integer
+        tags:
+          type: array
+          items:
+            type: string
+
+    KanbanIssue:
+      type: object
+      properties:
+        id:
+          type: string
+        task_id:
+          type: string
+        description:
+          type: string
+        created_at:
+          type: string
+        resolved_at:
+          type: string
+          nullable: true
+
+    KanbanConfig:
+      type: object
+      properties:
+        backend:
+          type: string
+          enum: [sqlite, supabase]
+        kanban_backend:
+          type: string
+        supabase_url:
+          type: string
+        supabase_connected:
+          type: boolean
+        depth_limit:
+          type: integer
+        auto_advance:
+          type: boolean
+        kanban_auto_advance:
+          type: boolean
+        kanban_page_size:
+          type: integer
+        validation_url_enabled:
+          type: boolean
+        validation_base_url:
+          type: string
+        validation_url_dismissed:
+          type: boolean
+        file_tracking_enabled:
+          type: boolean
+
+    WorkforceAsset:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        department:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        active:
+          type: boolean
+        version:
+          type: string
+          nullable: true
+        allowed_tools:
+          type: string
+          nullable: true
+        source:
+          type: string
+          nullable: true
+        systemPrompt:
+          type: string
+
+  responses:
+    BadRequest:
+      description: Bad request — missing or invalid parameters
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"

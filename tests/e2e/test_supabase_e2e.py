@@ -11,10 +11,10 @@ import json
 import time
 import sys
 import os
+import pytest
 
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -23,6 +23,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 from tests.e2e.conftest import TEST_BASE_URL as SERVER_URL
+
+pytestmark = pytest.mark.e2e
+
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kanban_config.json")
 
 

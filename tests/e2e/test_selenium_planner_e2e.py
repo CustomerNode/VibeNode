@@ -14,6 +14,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from tests.e2e.conftest import TEST_BASE_URL as BASE_URL
 LONG_WAIT = 90
 
+pytestmark = pytest.mark.e2e
+
 
 @pytest.fixture(scope="class", autouse=True)
 def planner_setup(driver):
