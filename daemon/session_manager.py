@@ -462,6 +462,10 @@ class SessionManager:
         if _forward_to_send:
             return self.send_message(session_id, prompt)
 
+
+        # Normalize cwd to OS-native path separators (cross-platform)
+        if cwd:
+            cwd = os.path.normpath(cwd)
         info = SessionInfo(
             session_id=session_id,
             name=name,
@@ -1129,7 +1133,7 @@ class SessionManager:
 
         try:
             options = ClaudeCodeOptions(
-                cwd=info.cwd or None,
+                cwd=os.path.normpath(info.cwd) if info.cwd else None,
                 resume=resolved,
                 can_use_tool=self._make_permission_callback(session_id),
                 model=info.model or None,
@@ -1168,7 +1172,7 @@ class SessionManager:
         result_handled = False
         try:
             options = ClaudeCodeOptions(
-                cwd=cwd or None,
+                cwd=os.path.normpath(cwd) if cwd else None,
                 resume=session_id if resume else None,
                 can_use_tool=self._make_permission_callback(session_id),
                 model=model or None,
@@ -3248,6 +3252,8 @@ class SessionManager:
 
                 name = meta.get("name", "")
                 cwd = meta.get("cwd", "")
+                if cwd:
+                    cwd = os.path.normpath(cwd)
                 model = meta.get("model", "")
 
                 # Guard: if the .jsonl file was deleted (user chose to delete

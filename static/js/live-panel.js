@@ -1219,8 +1219,7 @@ function updateLiveInputBar() {
       '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="Type a message to continue\u2026"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitContinue(\'' + id + '\')}"></textarea>' +
       '<div class="live-bar-row">' +
-      (typeof _buildInvokeBtn === 'function' ? _buildInvokeBtn() : '') +
-      _buildCtxBarCompact(id) +
+      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id)) : _buildCtxBarCompact(id)) +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>';
@@ -1281,8 +1280,7 @@ function updateLiveInputBar() {
       '<textarea id="live-input-ta" class="live-textarea waiting-focus" rows="2" placeholder="Type your response\u2026 (or click an option above)"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitWaiting()}"></textarea>' +
       '<div class="live-bar-row">' +
-      (typeof _buildInvokeBtn === 'function' ? _buildInvokeBtn() : '') +
-      _buildCtxBarCompact(id) +
+      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id)) : _buildCtxBarCompact(id)) +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
       '<button class="live-send-btn waiting" id="live-voice-btn"></button>' +
       '</div>';
@@ -1304,8 +1302,7 @@ function updateLiveInputBar() {
       '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="Type your next command\u2026"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitIdle()}"></textarea>' +
       '<div class="live-bar-row">' +
-      (typeof _buildInvokeBtn === 'function' ? _buildInvokeBtn() : '') +
-      _buildCtxBarCompact(id) +
+      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id)) : _buildCtxBarCompact(id)) +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>';
@@ -1389,8 +1386,7 @@ function updateLiveInputBar() {
       'placeholder="' + (qCount ? 'Queue another command\u2026' : 'Type your next command \u2014 will send when Claude finishes\u2026') + '"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveQueueSave()}"></textarea>' +
       '<div class="live-bar-row">' +
-      (typeof _buildInvokeBtn === 'function' ? _buildInvokeBtn() : '') +
-      _buildCtxBarCompact(id, true) +
+      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id, true)) : _buildCtxBarCompact(id, true)) +
       '<span id="live-queue-hint" style="font-size:10px;color:var(--text-faint);">' +
       (qCount ? qCount + ' queued \u2022 will send in order when idle' : 'Will send automatically when done') +
       '</span>' +

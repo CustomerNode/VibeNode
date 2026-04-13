@@ -1505,17 +1505,11 @@ setInterval(() => {
 // ---- Startup ----
 window._initialLoadDone = false;
 loadProjects().then(() => { window._initialLoadDone = true; }).catch(() => { window._initialLoadDone = true; });
-<<<<<<< Updated upstream
-// Git status polling (was in polling.js which is no longer loaded)
-pollGitStatus();
-setInterval(pollGitStatus, 60000);
-=======
 // Git status polling — initial check + 60s interval
 if (typeof pollGitStatus === 'function') {
   pollGitStatus();
   setInterval(pollGitStatus, 60000);
 }
->>>>>>> Stashed changes
 // Initialize folder tree from server (shows template selector on first run)
 if (typeof initFolderTree === 'function') {
   initFolderTree().catch(function(e) { console.error('initFolderTree failed', e); });

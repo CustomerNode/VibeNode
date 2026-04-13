@@ -3951,7 +3951,6 @@ mark.find-match.current { background: var(--accent); color:#fff; }
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  margin-right: auto;
   border-radius: 50%;
   padding: 2px;
 }
@@ -9934,6 +9933,14 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
    ═══════════════════════════════════════════════════════════════════════ */
 
 /* ── Invoke Button (in input bar) ── */
+/* Left group: invoke + context circle pinned left in bar row */
+.bar-left-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: auto;
+}
+
 .invoke-btn {
   display: inline-flex;
   align-items: center;

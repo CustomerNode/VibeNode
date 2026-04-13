@@ -82,6 +82,14 @@ function _buildInvokeBtn() {
     '</button>';
 }
 
+/** Wrap invoke button + context circle in a left-pinned group */
+function _buildBarLeftGroup(ctxHtml) {
+  return '<div class="bar-left-group">' +
+    (typeof _buildInvokeBtn === 'function' ? _buildInvokeBtn() : '') +
+    (ctxHtml || '') +
+    '</div>';
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // FETCH LOCAL SKILLS / AGENTS
 // ═══════════════════════════════════════════════════════════════════════
@@ -163,7 +171,7 @@ async function _openInvokeModal() {
       h += '<div class="invoke-item" data-search="' + escHtml(name.toLowerCase()) + '" onclick="_selectInvokeByIdx(' + idx + ')">';
       h += '<div class="invoke-item-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></div>';
       h += '<div class="invoke-item-info"><div class="invoke-item-name">' + escHtml(name) + '</div>';
-      if (sk.relativePath) h += '<div class="invoke-item-path">skills/' + escHtml(sk.relativePath) + '</div>';
+      if (sk.relativePath) h += '<div class="invoke-item-path">' + escHtml(sk.relativePath) + '</div>';
       h += '</div></div>';
     }
   } else {
@@ -183,7 +191,7 @@ async function _openInvokeModal() {
       h += '<div class="invoke-item" data-search="' + escHtml(name.toLowerCase()) + '" onclick="_selectInvokeByIdx(' + idx + ')">';
       h += '<div class="invoke-item-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><line x1="12" y1="7" x2="12" y2="11"/><circle cx="8" cy="16" r="1" fill="currentColor"/><circle cx="16" cy="16" r="1" fill="currentColor"/></svg></div>';
       h += '<div class="invoke-item-info"><div class="invoke-item-name">' + escHtml(name) + '</div>';
-      if (ag.relativePath) h += '<div class="invoke-item-path">agents/' + escHtml(ag.relativePath) + '</div>';
+      if (ag.relativePath) h += '<div class="invoke-item-path">' + escHtml(ag.relativePath) + '</div>';
       h += '</div></div>';
     }
   } else {
