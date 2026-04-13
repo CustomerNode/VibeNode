@@ -40,8 +40,6 @@ Or switch to a compact list view:
 
 ![Session list view](docs/screenshots/session-list.png)
 
-![Cross-session awareness — sessions see each other's status and files, with automatic conflict avoidance](docs/cross-session-awareness.svg)
-
 ### Workflow
 
 A full hierarchical task board for managing your development roadmap. Tasks are organized into configurable columns (Not Started, Working, Validating, Remediating, Complete by default) with drag-and-drop between them. Key capabilities:
@@ -88,7 +86,8 @@ Claude Code has two similar concepts — skills and agents — that are really t
 - **Departments, not file types** — The organizing unit is the department (Engineering, QA, Security, gstack, etc.), not whether something is a "skill" or an "agent." Import a skill file, an agent file, or a full pipeline into any department. VibeNode treats them all the same.
 - **Dual invocation** — Every asset can be used two ways from the same definition. As an **agent**: the full catalog is injected into every session's system prompt so Claude can spawn specialists autonomously. As a **skill**: you invoke on demand via the UI or slash commands, and the asset's instructions are injected into your current session. You don't pick — VibeNode decides based on context.
 - **Import anything** — Drop in Claude Code agent files (from `.claude/agents/`), skill packs (from `.claude/skills/`), or full execution pipelines like [gstack](https://github.com/garrytan/gstack). They all land in departments. gstack's 23+ skills become a "gstack" department with sub-departments for review, QA, security, shipping, and more.
-- **Auto-discovery** — VibeNode scans your `.claude/agents/`, `.claude/skills/` (including installed skill packs), and its own workforce directories on startup. Everything appears in one unified view with source badges and tier indicators. Install a skill pack and it shows up in your departments automatically.
+- **Invoke Workforce** — A button in the chat input bar opens a modal where you pick any workforce asset and attach it to your next message. The selected asset's instructions are injected into the session's system prompt, so Claude executes with that context without you copy-pasting anything. Works from any session state — idle, working, or waiting for input.
+- **Auto-discovery** — VibeNode scans your `.claude/agents/`, `.claude/skills/` (including installed skill packs), and its own workforce directories on startup. It also scans the active project's tree for any `skills/` or `agents/` folders, so project-scoped assets show up automatically alongside global ones. Everything appears in one unified view with source badges and tier indicators. Install a skill pack or drop a `.md` file into your project's `skills/` folder and it shows up in your departments automatically.
 - **Three complexity tiers** — Simple role prompts (one paragraph persona), structured skills (step-by-step workflows with tool permissions), and full pipelines (multi-phase execution with shell blocks, specialist dispatch, and external dependencies). All three tiers live in the same department tree and use the same invocation paths.
 - **Portable .md format** — Every asset is a markdown file with optional YAML frontmatter. Download them, share them, upload them, edit them in any text editor. The file format is a superset that accommodates everything from Claude Code's native agent format to gstack's SKILL.md pipeline format.
 
@@ -213,6 +212,8 @@ VibeNode runs as two processes on your machine: a Flask web server (port 5050) s
 This separation means **VibeNode can code itself** — multiple Claude sessions can edit VibeNode's own source files simultaneously, restart the web server to pick up changes, and keep working without interrupting each other. The daemon holds all active sessions in memory while the web server restarts around it. Most of VibeNode was built this way: from inside VibeNode.
 
 ![VibeNode system architecture diagram](docs/architecture.svg)
+
+![Cross-session awareness — sessions see each other's status and files, with automatic conflict avoidance](docs/cross-session-awareness.svg)
 
 **Key design decisions:**
 
