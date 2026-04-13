@@ -26,11 +26,12 @@ from tests.e2e.conftest import TEST_BASE_URL as BASE_URL, TEST_DAEMON_PORT
 
 pytestmark = pytest.mark.e2e
 
-PROJECT_DIR = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]        # VibeNode/
+PROJECT_DIR = REPO_ROOT                                 # Claude project dir
 _ENCODED_PROJECT = str(PROJECT_DIR).replace("\\", "-").replace("/", "-").replace(":", "-")
 SESSIONS_DIR = Path.home() / ".claude" / "projects" / _ENCODED_PROJECT
 
-SCRATCH_FILE = PROJECT_DIR / "tests" / "_scratch_rewind_test.py"
+SCRATCH_FILE = REPO_ROOT / "tests" / "_scratch_rewind_test.py"
 SCRATCH_ORIGINAL = "# scratch file for rewind E2E test\nx = 1\n"
 
 PROMPT = (
