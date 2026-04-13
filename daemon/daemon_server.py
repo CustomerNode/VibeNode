@@ -220,6 +220,7 @@ class SessionDaemon:
             "save_registry_now": lambda **kw: self.session_manager._save_registry_now() or {"ok": True},
             "get_all_states": lambda **kw: self.session_manager.get_all_states(),
             "get_entries": self.session_manager.get_entries,
+            "get_entry_count": lambda **kw: self.session_manager.get_entry_count(kw["session_id"]),
             "has_session": self.session_manager.has_session,
             "get_session_state": self.session_manager.get_session_state,
             "get_permission_policy": lambda **kw: self.session_manager.get_permission_policy(),

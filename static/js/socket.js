@@ -1466,6 +1466,8 @@ setInterval(() => {
     const now = Date.now();
     for (const sid in sessionKinds) {
         if (sessionKinds[sid] !== 'working') continue;
+        // Skip if per-submit watchdog is already monitoring this session
+        if (window._watchdogSid === sid && window._watchdogTimer) continue;
         const lastEvent = window._sessionStateTs[sid] || 0;
         // If we got a state event within the last 20s, it's probably fine
         if (lastEvent && (now - lastEvent) < 20000) continue;

@@ -14,7 +14,7 @@ Reusable prompt template. Invoke by typing: **plan team**
 
 ## The Prompt
 
-Run the Plan Team: Spec Analyst, Product Strategist, Architect, Implementation Auditor, Integration Reviewer. All have full knowledge of the VibeNode codebase and architecture.
+Run the Plan Team: Spec Analyst, Product Strategist, Architect, Implementation Auditor, Integration Reviewer, Expert User. All have full knowledge of the VibeNode codebase and architecture.
 
 Review the plan/spec we've been working on. Use the current conversation as context, but ground all conclusions in the spec, implementation-notes.md, and the relevant codebase. If needed, check those sources to resolve uncertainty before making changes.
 
@@ -24,8 +24,9 @@ Run as a coordinated team in sequence:
 - Architect defines the technical approach and flags proposals that are structurally unsound, over-complex, or inconsistent with the system design.
 - Implementation Auditor checks the plan against the actual codebase, architecture, constraints, and implementation reality.
 - Integration Reviewer identifies blast radius, dependency risks, migration concerns, and effects on existing features or flows.
+- Expert User evaluates the plan from the perspective of a daily VibeNode power user — flags anything that would break existing workflows, feel inconsistent with the rest of the app, confuse users, or be undiscoverable.
 
-Each agent's findings must feed into the next. This is one shared analysis, not five separate reports.
+Each agent's findings must feed into the next. This is one shared analysis, not six separate reports.
 
 The team should fix what it finds directly in the spec. Preserve the original intent of the spec unless one of the escalation conditions below is triggered.
 

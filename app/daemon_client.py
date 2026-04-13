@@ -546,6 +546,15 @@ class DaemonClient:
             return result
         return []
 
+    def get_entry_count(self, session_id):
+        """Return the number of log entries without fetching them all."""
+        result = self._send_request("get_entry_count", {"session_id": session_id})
+        if isinstance(result, int):
+            return result
+        if isinstance(result, dict) and result.get("ok") is False:
+            return 0
+        return result if isinstance(result, int) else 0
+
     def has_session(self, session_id):
         result = self._send_request("has_session", {
             "session_id": session_id,

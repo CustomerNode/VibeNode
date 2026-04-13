@@ -1634,13 +1634,18 @@ function _liveSubmitDirect(sid, text, opts) {
 //   22s — force UI to idle if server says idle/stopped but WS event was lost
 let _watchdogTimer = null;
 let _watchdogSid = null;
+// Expose to other scripts (socket.js) for dedup of background watchdog polls
+window._watchdogTimer = null;
+window._watchdogSid = null;
 
 function _startMessageWatchdog(sid) {
   // Clear any previous watchdog
   if (_watchdogTimer) clearTimeout(_watchdogTimer);
   _watchdogSid = sid;
+  window._watchdogSid = sid;
   _watchdogTimer = setTimeout(() => {
     _watchdogTimer = null;
+    window._watchdogTimer = null;
     if (_watchdogSid !== sid || sessionKinds[sid] !== 'working') return;
 
     // Tier 1: WS snapshot resync
@@ -1661,6 +1666,7 @@ function _startMessageWatchdog(sid) {
       _watchdogHttpCheck(sid, true);
     }, 12000);
   }, 10000);
+  window._watchdogTimer = _watchdogTimer;
 }
 
 function _watchdogHttpCheck(sid, forceApply) {
@@ -1721,6 +1727,8 @@ function _cancelMessageWatchdog(sid) {
     clearTimeout(_watchdogTimer);
     _watchdogTimer = null;
     _watchdogSid = null;
+    window._watchdogTimer = null;
+    window._watchdogSid = null;
   }
 }
 

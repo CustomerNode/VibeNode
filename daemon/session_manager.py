@@ -1232,6 +1232,15 @@ class SessionManager:
         with info._lock:
             return [e.to_dict() for e in info.entries[since:]]
 
+    def get_entry_count(self, session_id: str) -> int:
+        """Return the number of log entries without serializing them."""
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return 0
+        return len(info.entries)
+
     def has_session(self, session_id: str) -> bool:
         """Check if a session is managed by the SDK."""
         session_id = self._resolve_id(session_id)
@@ -1340,6 +1349,11 @@ class SessionManager:
             # Connect with no prompt. The SDK auto-sets permission_prompt_tool_name="stdio"
             # when can_use_tool is set. Prompt=None becomes _empty_stream() which is an
             # AsyncIterator, so the streaming mode check passes.
+            # Start mtime scan concurrently with client.connect() — the scan
+            # only reads info.cwd and doesn't depend on the SDK connection.
+            loop = asyncio.get_event_loop()
+            mtime_task = loop.run_in_executor(None, self._record_pre_turn_mtimes, info)
+
             await client.connect()
             _profile_log("client_connected")
 
@@ -1357,8 +1371,7 @@ class SessionManager:
             # snapshots are deferred to _send_query (follow-up turns), where
             # the remap has already occurred.
             info._turn_had_direct_edit = False
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._record_pre_turn_mtimes, info)
+            await mtime_task
             _profile_log("pre_turn_mtimes_done")
 
             # Add user's message to the log and send

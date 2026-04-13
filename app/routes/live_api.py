@@ -108,7 +108,7 @@ def api_live_state(session_id):
     if state is None:
         return jsonify({"state": "stopped", "managed": False, "entry_count": 0})
     # Include entry count so the watchdog can detect missing entries
-    entry_count = len(sm.get_entries(session_id)) if hasattr(sm, 'get_entries') else 0
+    entry_count = sm.get_entry_count(session_id) if hasattr(sm, 'get_entry_count') else 0
     return jsonify({"state": state, "managed": True, "entry_count": entry_count})
 
 
