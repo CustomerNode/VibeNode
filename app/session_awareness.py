@@ -23,6 +23,17 @@ _MAX_SESSIONS = 12
 _MAX_FILES_PER_SESSION = 3
 
 # PERF-CRITICAL: get_all_states() cache with 2s TTL — do NOT remove or bypass. See CLAUDE.md #10.
+#
+# LESSON LEARNED (2026-04-12): build_cross_session_context() is called on every
+# session start.  It calls daemon_client.get_all_states() which is a blocking
+# TCP IPC round-trip — the Flask-SocketIO worker thread is blocked via
+# event.wait(timeout=30) until the daemon responds.  With 5-10 concurrent
+# sessions starting, each triggers its own round-trip, serializing all session
+# state each time (20-100ms per call under load).  The 2-second cache eliminates
+# repeated IPC during burst session starts.  Staleness is negligible — this data
+# is advisory (injected into system prompts once at session creation) and sessions
+# run for minutes/hours.  The IPC call runs OUTSIDE the lock so cache-hit threads
+# are never blocked by a concurrent cache-miss thread doing the actual IPC.
 # ---------------------------------------------------------------------------
 # get_all_states() cache — avoids blocking IPC round-trip on every call
 # ---------------------------------------------------------------------------

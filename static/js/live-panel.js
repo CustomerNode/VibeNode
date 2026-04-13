@@ -1633,6 +1633,14 @@ function _liveSubmitDirect(sid, text, opts) {
 //   16s — direct HTTP fetch of /api/live/state/<sid> to get ground truth
 //   22s — force UI to idle if server says idle/stopped but WS event was lost
 // PERF-CRITICAL: Watchdog dedup — window._ assignments enable cross-script dedup. Do NOT remove. See CLAUDE.md #16.
+//
+// LESSON LEARNED (2026-04-12): Two independent watchdog systems were both polling
+// /api/live/state/<sid> — the per-submit watchdog (here) and the continuous
+// background watchdog (socket.js setInterval).  Profiling showed both firing within
+// 1 second of each other, doubling the IPC load.  The window._ assignments let
+// socket.js check whether this per-submit watchdog is already monitoring a session,
+// and skip its own poll for that session.  When the per-submit timer fires,
+// window._watchdogTimer becomes null, and the background watchdog resumes coverage.
 let _watchdogTimer = null;
 let _watchdogSid = null;
 // Expose to other scripts (socket.js) for dedup of background watchdog polls

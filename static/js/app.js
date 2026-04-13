@@ -2,8 +2,15 @@
 
 let allSessions = [];
 // PERF-CRITICAL: O(1) Set lookup — must stay in sync with allSessions. Do NOT replace .has() with .find(). See CLAUDE.md #15.
-/** O(1) lookup set kept in sync with allSessions — avoids O(n) .find()
- *  on every session_entry/session_permission/session_started event. */
+//
+// LESSON LEARNED (2026-04-12): The session_entry handler ran
+// allSessions.find(x => x.id === data.session_id) on EVERY streaming token
+// to filter cross-project events.  With 50 sessions and 100 entries per turn,
+// that was 5,000 linear scans per response.  This Set is maintained at all 12
+// mutation sites across app.js, socket.js, toolbar.js, kanban.js, and
+// git-sync.js.  _rebuildSessionIds() handles bulk mutations (filter,
+// reassignment); individual add()/delete() handle single-item changes.
+/** O(1) lookup set kept in sync with allSessions. */
 let allSessionIds = new Set();
 /** Rebuild allSessionIds from allSessions. Call after any reassignment of allSessions. */
 function _rebuildSessionIds() { allSessionIds = new Set(allSessions.map(s => s.id)); }

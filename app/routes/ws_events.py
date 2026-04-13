@@ -26,9 +26,14 @@ logger = logging.getLogger(__name__)
 _PROFILE_WS = True
 
 # PERF-CRITICAL: Module-level executor — do NOT create per-request. See CLAUDE.md #12.
-# Module-level thread pool for parallelizing independent setup work
-# (e.g. compose resolution + cross-session awareness).  A single
-# shared executor avoids creating/destroying threads on every session start.
+#
+# LESSON LEARNED (2026-04-12): Compose prompt resolution and cross-session
+# awareness injection are independent operations that both modify system_prompt
+# before start_session.  They were originally sequential, adding up to 200ms
+# for compose sessions.  This module-level ThreadPoolExecutor runs them in
+# parallel.  Creating it per-request would defeat the purpose — thread pool
+# startup overhead would exceed the parallelization benefit.  When only one
+# operation is needed (the common case), it runs directly without the executor.
 _setup_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ws-setup")
 
 # System-user message classification — shared with live_api.py
@@ -578,6 +583,20 @@ def register_ws_events(socketio, app):
 
         First checks the SDK SessionManager for live entries, then falls
         back to parsing the .jsonl file on disk for historical sessions.
+
+        LESSON LEARNED (2026-04-12): An optimization attempted to skip the
+        daemon IPC calls (has_session + get_entries) when the client passed
+        an ``is_working`` flag indicating the session was idle.  This caused
+        a race condition: when the user sent a command to Session A and
+        quickly switched to Session B, then back to A, the client's
+        ``sessionKinds`` state could be stale.  The server would skip the
+        daemon check and return old JSONL data, losing the new command's
+        entries from view.  The optimization was reverted.
+
+        KEY PRINCIPLE: Never use client-side state (sessionKinds, is_working
+        flags) to make server-side correctness decisions about data freshness.
+        Client state is ALWAYS eventually stale during fast switching.  The
+        daemon is the source of truth for live session entries.
 
         Supports pagination via ``limit`` and ``before`` parameters:
         - ``limit``: max entries to return (omit for all — backwards compat)

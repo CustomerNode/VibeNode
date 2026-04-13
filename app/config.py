@@ -48,6 +48,15 @@ _KANBAN_CONFIG_FILE = Path(_os.environ["VIBENODE_CONFIG"]) if _os.environ.get("V
 
 
 # PERF-CRITICAL: Kanban config cache with 10s TTL + invalidation on save — do NOT remove. See CLAUDE.md #11.
+#
+# LESSON LEARNED (2026-04-12): get_kanban_config() is called on every session
+# start (to check cross_session_awareness preference) and from many API routes.
+# It reads kanban_config.json from disk via read_text() + json.loads() every
+# time.  The cache eliminates redundant disk reads.  save_kanban_config() sets
+# _kanban_config_cache = None so writes are immediately visible.  Returns
+# dict(cached) shallow copies because callers in kanban_api.py mutate the
+# returned dict (e.g., cfg["kanban_backend"] = ...) — without the copy, they'd
+# corrupt the cache.
 # ---------------------------------------------------------------------------
 # Kanban config store
 # ---------------------------------------------------------------------------
