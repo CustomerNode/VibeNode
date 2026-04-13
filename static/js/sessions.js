@@ -404,7 +404,10 @@ async function _addToCompose(sessionId) {
 
   _atcSessionId = sessionId;
 
-  // Fetch all compositions
+  // Fetch compositions filtered to the active project.
+  // MUST pass ?project= so the API only returns compositions belonging to
+  // this project (+ pinned). Without it every composition across all projects
+  // is returned and the picker shows unrelated items. (fix: 2026-04-13)
   const _proj = localStorage.getItem('activeProject') || '';
   let projects = [];
   try {
