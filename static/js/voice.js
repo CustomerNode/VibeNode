@@ -70,7 +70,7 @@ function setupVoiceButton(textarea, button, onSubmit) {
   };
 
   const updateIcon = () => {
-    const hasText = textarea.value.trim().length > 0;
+    const hasText = textarea.value.trim().length > 0 || !!window._pendingInvoke;
     const isRecording = _activeRecognition && _activeRecognition._target === textarea;
 
     if (isRecording) {

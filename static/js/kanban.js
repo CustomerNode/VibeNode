@@ -3140,6 +3140,7 @@ async function openSessionSpawner(taskId) {
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();_newSessionSubmit(\'' + newId + '\')}">' +
       '</textarea>' +
       '<div class="live-bar-row">' +
+      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup('') : '') +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + (typeof _sendHint === 'function' ? _sendHint() : '') + '</span>' +
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>' +

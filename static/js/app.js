@@ -958,6 +958,15 @@ async function addNewAgent() {
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();_newSessionSubmit(\'' + newId + '\')}">' +
       '</textarea>' +
       '<div class="live-bar-row">' +
+      '<div class="bar-left-group">' +
+      '<button class="invoke-btn" id="invoke-btn" onclick="_openInvokeModal()" title="Invoke Workforce">' +
+      '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="url(#invoke-grad-ns)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">' +
+      '<defs><linearGradient id="invoke-grad-ns" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#a855f7"/><stop offset="100%" stop-color="#3b82f6"/></linearGradient></defs>' +
+      '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>' +
+      '</svg>' +
+      '<span class="invoke-btn-label">/invoke</span>' +
+      '</button>' +
+      '</div>' +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>';
@@ -1127,7 +1136,12 @@ async function _newSessionSubmit(sessionId) {
     // User already named this session — keep their title
     setToolbarSession(sessionId, s.custom_title, false, s.custom_title);
   } else {
-    const _placeholder = text.split('\n')[0].slice(0, 65) + (text.length > 65 ? '\u2026' : '');
+    let _placeholder;
+    if (/\[\[invoke\]\]/.test(text)) {
+      _placeholder = 'Invoke Workforce';
+    } else {
+      _placeholder = text.split('\n')[0].slice(0, 65) + (text.length > 65 ? '\u2026' : '');
+    }
     if (s) { s.display_title = _placeholder; }
     setToolbarSession(sessionId, _placeholder, true, '');
   }

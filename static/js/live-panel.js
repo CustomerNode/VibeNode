@@ -470,6 +470,15 @@ async function openInGUI(id) {
           ' onkeydown="if(_shouldSend(event)){event.preventDefault();_newSessionSubmit(\'' + id + '\')}">' +
           '</textarea>' +
           '<div class="live-bar-row">' +
+          '<div class="bar-left-group">' +
+          '<button class="invoke-btn" id="invoke-btn" onclick="_openInvokeModal()" title="Invoke Workforce">' +
+          '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="url(#invoke-grad-ns2)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">' +
+          '<defs><linearGradient id="invoke-grad-ns2" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#a855f7"/><stop offset="100%" stop-color="#3b82f6"/></linearGradient></defs>' +
+          '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>' +
+          '</svg>' +
+          '<span class="invoke-btn-label">/invoke</span>' +
+          '</button>' +
+          '</div>' +
           '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
           '<button class="live-send-btn" id="live-voice-btn"></button>' +
           '</div>';
@@ -641,7 +650,7 @@ function _autoSendPendingInput() {
       socket.emit('start_session', startOpts);
       // Set placeholder title from message text
       const s = allSessions.find(x => x.id === id);
-      const _ph = text.split('\n')[0].slice(0, 65) + (text.length > 65 ? '\u2026' : '');
+      const _ph = /\[\[invoke\]\]/.test(text) ? 'Invoke Workforce' : text.split('\n')[0].slice(0, 65) + (text.length > 65 ? '\u2026' : '');
       if (s) s.display_title = _ph;
       filterSessions();
     } else if (!isRunning) {
@@ -1847,7 +1856,21 @@ function _addOptimisticBubble(sid, text, isVoice) {
   const userMsg = document.createElement('div');
   userMsg.className = 'msg user msg-entering optimistic-bubble';
   userMsg.dataset.optimisticId = msgId;
-  userMsg.innerHTML = '<div class="msg-role">me <span class="msg-time">' + timestamp + '</span></div><div class="msg-body msg-content"><pre style="white-space:pre-wrap;margin:0;">' + escHtml(text) + '</pre></div>';
+  // Strip [[invoke]]...[[/invoke]] tags and render as premium pill (same as server-rendered messages)
+  let _displayText = text;
+  let _invokePill = '';
+  const _invokeRx = /\[\[invoke\]\]([\s\S]*?)\[\[\/invoke\]\]/;
+  const _invokeMatch = _displayText.match(_invokeRx);
+  if (_invokeMatch) {
+    // Extract invoke name from first line (e.g. "# Skill Name")
+    const _invLines = _invokeMatch[1].trim().split('\n');
+    let _invName = _invLines[0].replace(/^#+\s*/, '').trim() || 'Workforce';
+    if (typeof _prettifyName === 'function') _invName = _prettifyName(_invName);
+    _invokePill = '<span class="invoke-pill">' + escHtml(_invName) + '</span> ';
+    _displayText = _displayText.replace(_invokeRx, '').trim();
+  }
+  const _bodyHtml = _invokePill + (_displayText ? '<pre style="white-space:pre-wrap;margin:0;display:inline;">' + escHtml(_displayText) + '</pre>' : '');
+  userMsg.innerHTML = '<div class="msg-role">me <span class="msg-time">' + timestamp + '</span></div><div class="msg-body msg-content">' + _bodyHtml + '</div>';
   // Add VN metadata footer
   const vnFooter = document.createElement('div');
   vnFooter.className = 'vn-msg-footer';
