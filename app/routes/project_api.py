@@ -116,7 +116,9 @@ def api_add_project():
         if err == "cancelled" or (err is None and chosen is None):
             return jsonify({"ok": False, "cancelled": True})
         if err:
-            return jsonify({"ok": False, "error": err}), 500
+            # "No folder picker available" is a client env issue, not a server error
+            status = 400 if "No folder picker" in err else 500
+            return jsonify({"ok": False, "error": err}), status
         path = chosen
 
     elif mode == "path":
