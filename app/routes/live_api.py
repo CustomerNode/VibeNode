@@ -425,8 +425,8 @@ def get_models():
         # Query the CLI for its init message which includes the current model
         from ..platform_utils import NO_WINDOW as _nw
         r = subprocess.run(
-            ["claude", "-p", "hi", "--output-format", "stream-json",
-             "--verbose", "--max-turns", "1"],
+            ["claude", "-p", ".", "--output-format", "stream-json",
+             "--verbose", "--max-turns", "1", "--no-session-persistence"],
             capture_output=True, text=True, timeout=15, creationflags=_nw
         )
         current_model = None

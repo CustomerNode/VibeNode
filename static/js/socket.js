@@ -1481,8 +1481,9 @@ setInterval(() => {
 // ---- Startup ----
 window._initialLoadDone = false;
 loadProjects().then(() => { window._initialLoadDone = true; }).catch(() => { window._initialLoadDone = true; });
-// NOTE: pollGitStatus() and its 60s interval are registered in polling.js.
-// Do NOT duplicate them here — double polling spawns 6 git subprocesses/min.
+// Git status polling (was in polling.js which is no longer loaded)
+pollGitStatus();
+setInterval(pollGitStatus, 60000);
 // Initialize folder tree from server (shows template selector on first run)
 if (typeof initFolderTree === 'function') {
   initFolderTree().catch(function(e) { console.error('initFolderTree failed', e); });

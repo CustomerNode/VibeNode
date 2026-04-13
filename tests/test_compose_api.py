@@ -403,3 +403,135 @@ class TestPlannerAcceptEndpoint:
         # Verify the child has the correct parent
         child = data['sections'][0]
         assert child['parent_id'] == parent_id
+
+
+class TestComposeBoard:
+    """Tests for the compose board endpoint."""
+
+    def test_board_returns_200(self, client):
+        resp = client.get('/api/compose/board')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert isinstance(data, dict)
+
+
+class TestProjectClone:
+
+    def _create_project(self, client):
+        resp = client.post('/api/compose/projects', json={'name': 'test-clone-src'})
+        return resp.get_json()['project']['id']
+
+    def test_clone_project(self, client):
+        pid = self._create_project(client)
+        resp = client.post(f'/api/compose/projects/{pid}/clone')
+        assert resp.status_code in (200, 201)
+        data = resp.get_json()
+        assert data['ok'] is True
+
+
+class TestProjectContext:
+
+    def _create_project(self, client):
+        resp = client.post('/api/compose/projects', json={'name': 'test-ctx-proj'})
+        return resp.get_json()['project']['id']
+
+    def test_get_context(self, client):
+        pid = self._create_project(client)
+        resp = client.get(f'/api/compose/projects/{pid}/context')
+        assert resp.status_code == 200
+
+
+class TestSectionPreview:
+
+    def _setup(self, client):
+        resp = client.post('/api/compose/projects', json={'name': 'test-preview-proj'})
+        pid = resp.get_json()['project']['id']
+        sec = client.post(f'/api/compose/projects/{pid}/sections',
+                          json={'name': 'Preview Sec'})
+        sid = sec.get_json()['section']['id']
+        return pid, sid
+
+    def test_section_preview(self, client):
+        pid, sid = self._setup(client)
+        resp = client.get(f'/api/compose/projects/{pid}/sections/{sid}/preview')
+        assert resp.status_code == 200
+
+
+class TestSectionChildren:
+
+    def _setup(self, client):
+        resp = client.post('/api/compose/projects', json={'name': 'test-children-proj'})
+        pid = resp.get_json()['project']['id']
+        parent = client.post(f'/api/compose/projects/{pid}/sections',
+                             json={'name': 'Parent Section'})
+        parent_id = parent.get_json()['section']['id']
+        return pid, parent_id
+
+    def test_get_children(self, client):
+        pid, parent_id = self._setup(client)
+        resp = client.get(f'/api/compose/projects/{pid}/sections/{parent_id}/children')
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert isinstance(data, dict) or isinstance(data, list)
+
+
+class TestSectionReorder:
+
+    def _setup(self, client):
+        resp = client.post('/api/compose/projects', json={'name': 'test-reorder-proj'})
+        pid = resp.get_json()['project']['id']
+        s1 = client.post(f'/api/compose/projects/{pid}/sections',
+                         json={'name': 'Sec A'}).get_json()['section']['id']
+        s2 = client.post(f'/api/compose/projects/{pid}/sections',
+                         json={'name': 'Sec B'}).get_json()['section']['id']
+        return pid, s1, s2
+
+    def test_reorder_sections(self, client):
+        pid, s1, s2 = self._setup(client)
+        resp = client.post(f'/api/compose/projects/{pid}/sections/reorder',
+                           json={'order': [s2, s1]})
+        assert resp.status_code == 200
+
+
+class TestSectionStatus:
+
+    def _setup(self, client):
+        resp = client.post('/api/compose/projects', json={'name': 'test-status-proj'})
+        pid = resp.get_json()['project']['id']
+        sec = client.post(f'/api/compose/projects/{pid}/sections',
+                          json={'name': 'Status Sec'})
+        sid = sec.get_json()['section']['id']
+        return pid, sid
+
+    def test_update_section_status(self, client):
+        pid, sid = self._setup(client)
+        resp = client.put(f'/api/compose/projects/{pid}/sections/{sid}/status',
+                          json={'status': 'complete'})
+        assert resp.status_code == 200
+
+
+class TestProjectUpdate:
+
+    def _create_project(self, client):
+        resp = client.post('/api/compose/projects', json={'name': 'test-update-proj'})
+        return resp.get_json()['project']['id']
+
+    def test_update_project(self, client):
+        pid = self._create_project(client)
+        resp = client.put(f'/api/compose/projects/{pid}',
+                          json={'name': 'renamed-proj'})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['ok'] is True
+
+
+class TestProjectsReorder:
+
+    def test_reorder_projects(self, client):
+        p1 = client.post('/api/compose/projects',
+                         json={'name': 'test-reorder-a'}).get_json()['project']['id']
+        p2 = client.post('/api/compose/projects',
+                         json={'name': 'test-reorder-b'}).get_json()['project']['id']
+        resp = client.post('/api/compose/projects/reorder',
+                           json={'order': [p2, p1]})
+        assert resp.status_code == 200
