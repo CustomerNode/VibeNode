@@ -42,7 +42,8 @@ function deselectSession() {
   activeId = null;
   localStorage.removeItem('activeSessionId');
   _pushChatUrl(null);
-  if (liveSessionId) { _autoSendPendingInput(); stopLivePanel(); }
+  // IMPORTANT: save draft, do NOT auto-send (see live-panel.js warning block)
+  if (liveSessionId) { _savePendingInputAsDraft(); stopLivePanel(); }
   // In workspace mode, return to workspace canvas instead of dashboard
   if (workspaceActive) {
     _wsExpandedId = null;
@@ -109,9 +110,9 @@ async function selectSession(id) {
   activeId = id;
   localStorage.setItem('activeSessionId', id || '');
   _pushChatUrl(id);
-  // Save draft and stop live panel for a different session
+  // IMPORTANT: save draft, do NOT auto-send (see live-panel.js warning block)
   if (liveSessionId && liveSessionId !== id) {
-    _autoSendPendingInput();
+    _savePendingInputAsDraft();
     stopLivePanel();
   }
   filterSessions();

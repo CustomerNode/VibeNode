@@ -431,7 +431,7 @@ async function openInGUI(id) {
   }
   _pushChatUrl(id);
   if (runningIds.has(id)) guiOpenAdd(id);
-  if (liveSessionId && liveSessionId !== id) { _autoSendPendingInput(); stopLivePanel(); }
+  if (liveSessionId && liveSessionId !== id) { _savePendingInputAsDraft(); stopLivePanel(); }
   filterSessions();
 
   // Show title from sidebar data immediately (no mismatch)
@@ -591,11 +591,27 @@ function stopLivePanel() {
   if (btnClose) btnClose.disabled = true;
 }
 
-/**
- * Auto-send any pending text in the live panel textareas before switching
- * away from the current session.  Fires the appropriate socket event
- * without heavy DOM manipulation (since the panel is about to be torn down).
- */
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  WARNING — DO NOT CALL _autoSendPendingInput() FROM SESSION SWITCHES  ║
+// ║                                                                        ║
+// ║  This function SENDS text (starts sessions, emits socket events).      ║
+// ║  It must NEVER be called when the user switches between sessions.      ║
+// ║                                                                        ║
+// ║  Session switches must use _savePendingInputAsDraft() instead, which   ║
+// ║  saves the text to localStorage for when the user switches back.       ║
+// ║                                                                        ║
+// ║  THE BUG THIS PREVENTS:                                                ║
+// ║  User types "hello" → clicks different session → _autoSendPendingInput ║
+// ║  fires → "hello" gets submitted → unwanted session starts → user       ║
+// ║  switches again → cascade of unwanted sessions with random text.       ║
+// ║  This has broken MULTIPLE TIMES. The regression test in                ║
+// ║  test_auto_send_and_text_preserve.py enforces this.                    ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+//
+// CURRENTLY UNUSED — kept for reference. All session-switch paths now call
+// _savePendingInputAsDraft() instead. Explicit submit paths (Enter key,
+// send button) use liveSubmitIdle/liveSubmitContinue/liveSubmitWaiting
+// which handle their own socket.emit calls directly.
 function _autoSendPendingInput() {
   if (!liveSessionId) return;
   const id = liveSessionId;
@@ -606,6 +622,7 @@ function _autoSendPendingInput() {
   if (inputTa && inputTa.value.trim()) {
     const text = inputTa.value.trim();
     inputTa.value = '';
+    _clearDraft(id);
     const kind = sessionKinds[id];
     const isRunning = runningIds.has(id);
 
@@ -645,6 +662,26 @@ function _autoSendPendingInput() {
     queueTa.value = '';
     _addQueue(id, text);
   }
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  _savePendingInputAsDraft — THE CORRECT function for session switches  ║
+// ║                                                                        ║
+// ║  Called from: selectSession(), deselectSession(), openInGUI()           ║
+// ║  Does: saves typed text to localStorage as a draft                     ║
+// ║  Does NOT: send text, start sessions, emit socket events               ║
+// ║  Restored by: updateLiveInputBar() → _getDraft() on line ~1400        ║
+// ║                                                                        ║
+// ║  If you need to change session-switch behavior, modify THIS function.  ║
+// ║  Do NOT replace it with _autoSendPendingInput(). See warning above.    ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+function _savePendingInputAsDraft() {
+  if (!liveSessionId) return;
+  const id = liveSessionId;
+  const inputTa = document.getElementById('live-input-ta');
+  const queueTa = document.getElementById('live-queue-ta');
+  const text = (inputTa && inputTa.value) || (queueTa && queueTa.value) || '';
+  _saveDraft(id, text);
 }
 
 function renderLiveEntry(e) {

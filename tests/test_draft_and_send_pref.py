@@ -111,6 +111,76 @@ class TestDraftRestorationOnSessionSwitch:
             "Must save drafts on page unload events — typed text lost on refresh otherwise"
 
 
+class TestNoAccidentalSessionStarts:
+    """Session switches must NEVER start sessions or send messages.
+
+    THE BUG: User types text, switches to a different session, the typed text
+    gets auto-submitted as a message or used to start a new session. This
+    causes a cascade of unwanted "hi" sessions.
+
+    THE FIX: Session switches call _savePendingInputAsDraft() which only
+    saves to localStorage. The old _autoSendPendingInput() which emitted
+    socket events is no longer called from any switch path.
+    """
+
+    def test_save_pending_input_has_no_socket_emit(self):
+        """_savePendingInputAsDraft must NEVER emit socket events."""
+        src = _read(_JS / "live-panel.js")
+        match = re.search(
+            r"function _savePendingInputAsDraft\(\)\s*\{([\s\S]*?)\n\}",
+            src
+        )
+        assert match, "Could not find _savePendingInputAsDraft function"
+        body = match.group(1)
+        assert "socket.emit" not in body, \
+            "CRITICAL REGRESSION: _savePendingInputAsDraft must NEVER call " \
+            "socket.emit — it causes unwanted session starts when switching"
+        assert "start_session" not in body, \
+            "CRITICAL REGRESSION: _savePendingInputAsDraft must NEVER start sessions"
+        assert "send_message" not in body, \
+            "CRITICAL REGRESSION: _savePendingInputAsDraft must NEVER send messages"
+
+    def test_auto_send_not_called_from_any_switch_path(self):
+        """_autoSendPendingInput must have ZERO call sites.
+        It was replaced by _savePendingInputAsDraft at all switch points."""
+        toolbar_src = _read(_JS / "toolbar.js")
+        live_src = _read(_JS / "live-panel.js")
+        # Count calls (not the definition, not comments)
+        toolbar_calls = len(re.findall(r'(?<!function )_autoSendPendingInput\(\)', toolbar_src))
+        # In live-panel, exclude the function definition line
+        live_calls = len(re.findall(r'(?<!function )_autoSendPendingInput\(\)', live_src))
+        total = toolbar_calls + live_calls
+        assert total == 0, \
+            f"CRITICAL REGRESSION: _autoSendPendingInput() has {total} call site(s). " \
+            "It must have ZERO — all switch paths must use _savePendingInputAsDraft(). " \
+            "Calling _autoSendPendingInput on session switch SENDS text instead of " \
+            "saving it, causing the cascade-of-unwanted-sessions bug."
+
+    def test_select_session_uses_draft_save(self):
+        """selectSession in toolbar.js must use _savePendingInputAsDraft."""
+        src = _read(_JS / "toolbar.js")
+        fn = re.search(
+            r"function selectSession\([^)]*\)\s*\{([\s\S]*?)^function ",
+            src, re.MULTILINE
+        )
+        assert fn, "Could not find selectSession"
+        body = fn.group(1)
+        assert "_savePendingInputAsDraft()" in body, \
+            "selectSession must call _savePendingInputAsDraft"
+
+    def test_deselect_session_uses_draft_save(self):
+        """deselectSession in toolbar.js must use _savePendingInputAsDraft."""
+        src = _read(_JS / "toolbar.js")
+        fn = re.search(
+            r"function deselectSession\(\)\s*\{([\s\S]*?)^function ",
+            src, re.MULTILINE
+        )
+        assert fn, "Could not find deselectSession"
+        body = fn.group(1)
+        assert "_savePendingInputAsDraft()" in body, \
+            "deselectSession must call _savePendingInputAsDraft"
+
+
 # ===========================================================================
 # SEND BEHAVIOR PREFERENCE — Enter vs Ctrl+Enter must persist
 # ===========================================================================

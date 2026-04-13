@@ -93,47 +93,80 @@ class TestSourceGuardAutoSendFunction:
         assert "live-queue-ta" in body, "Must check #live-queue-ta"
 
 
-class TestSourceGuardAutoSendCallSites:
-    """_autoSendPendingInput() must be CALLED before stopLivePanel in all
-    session-switching paths."""
+class TestSourceGuardSessionSwitchSavesDraft:
+    """Session switches must call _savePendingInputAsDraft() (NOT _autoSendPendingInput).
 
-    def test_called_in_selectSession(self):
+    _autoSendPendingInput SENDS the text, which causes the "cascade of hi sessions"
+    bug: user types text, switches sessions, text gets auto-submitted.
+    _savePendingInputAsDraft SAVES the text as a draft for when the user returns.
+    """
+
+    def test_select_session_saves_draft(self):
         src = _read(_TOOLBAR)
         assert re.search(
-            r"_autoSendPendingInput\(\);\s*\n?\s*stopLivePanel\(\)",
+            r"_savePendingInputAsDraft\(\);\s*\n?\s*stopLivePanel\(\)",
             src
-        ), "selectSession must call _autoSendPendingInput() before stopLivePanel()"
+        ), "selectSession must call _savePendingInputAsDraft() before stopLivePanel()"
 
-    def test_called_in_openInGUI(self):
+    def test_select_session_does_NOT_auto_send(self):
+        """selectSession must NOT call _autoSendPendingInput — that submits the text."""
+        src = _read(_TOOLBAR)
+        fn_match = re.search(
+            r"function selectSession\([^)]*\)\s*\{([\s\S]*?)^function ",
+            src, re.MULTILINE
+        )
+        assert fn_match, "Could not find selectSession function"
+        body = fn_match.group(1)
+        assert "_autoSendPendingInput()" not in body, (
+            "REGRESSION: selectSession calls _autoSendPendingInput() which SENDS text. "
+            "Must use _savePendingInputAsDraft() to SAVE text as a draft instead."
+        )
+
+    def test_open_in_gui_saves_draft(self):
         src = _read(_LIVE_PANEL)
         assert re.search(
-            r"_autoSendPendingInput\(\);\s*stopLivePanel\(\)",
+            r"_savePendingInputAsDraft\(\);\s*stopLivePanel\(\)",
             src
-        ), "openInGUI must call _autoSendPendingInput() before stopLivePanel()"
+        ), "openInGUI must call _savePendingInputAsDraft() before stopLivePanel()"
 
-    def test_called_in_deselectSession(self):
+    def test_deselect_session_saves_draft(self):
         src = _read(_TOOLBAR)
-        # deselectSession is the first function — look for the pattern specifically
-        # in the deselectSession function
         fn_match = re.search(
             r"function deselectSession\(\)\s*\{([\s\S]*?)^function ",
             src, re.MULTILINE
         )
         assert fn_match, "Could not find deselectSession function"
         body = fn_match.group(1)
-        assert "_autoSendPendingInput()" in body, (
-            "deselectSession must call _autoSendPendingInput()"
+        assert "_savePendingInputAsDraft()" in body, (
+            "deselectSession must call _savePendingInputAsDraft()"
+        )
+        assert "_autoSendPendingInput()" not in body, (
+            "REGRESSION: deselectSession calls _autoSendPendingInput() which SENDS text"
         )
 
-    def test_at_least_three_call_sites(self):
-        """There must be at least 3 call sites across toolbar.js and live-panel.js."""
-        toolbar_src = _read(_TOOLBAR)
-        live_src = _read(_LIVE_PANEL)
-        combined = toolbar_src + live_src
-        call_count = combined.count("_autoSendPendingInput()")
-        # Subtract 1 for the function definition itself (which doesn't count as a call)
-        assert call_count >= 4, (  # 1 definition + 3 calls = 4 occurrences
-            f"Expected at least 3 call sites + 1 definition (4 total), found {call_count}"
+    def test_save_pending_input_as_draft_exists(self):
+        """The _savePendingInputAsDraft function must exist in live-panel.js."""
+        src = _read(_LIVE_PANEL)
+        assert "function _savePendingInputAsDraft()" in src, (
+            "_savePendingInputAsDraft must be defined — it saves typed text as a draft "
+            "instead of auto-sending it when switching sessions"
+        )
+
+    def test_save_pending_input_calls_save_draft(self):
+        """_savePendingInputAsDraft must call _saveDraft, not emit socket events."""
+        src = _read(_LIVE_PANEL)
+        fn_match = re.search(
+            r"function _savePendingInputAsDraft\(\)\s*\{([\s\S]*?)\n\}",
+            src
+        )
+        assert fn_match, "Could not find _savePendingInputAsDraft function"
+        body = fn_match.group(1)
+        assert "_saveDraft" in body, (
+            "_savePendingInputAsDraft must call _saveDraft to persist text"
+        )
+        assert "socket.emit" not in body, (
+            "REGRESSION: _savePendingInputAsDraft must NOT emit socket events — "
+            "it should only save the draft, not send the text"
         )
 
 
