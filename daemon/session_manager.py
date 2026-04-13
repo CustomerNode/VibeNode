@@ -807,6 +807,15 @@ class SessionManager:
             logger.debug("Failed to save queues: %s", e)
 
     # PERF-CRITICAL: Debounced 1s timer batches disk writes — do NOT call _save_queues_now() directly. See CLAUDE.md #8.
+    #
+    # LESSON LEARNED (2026-04-12): _save_queues was originally synchronous —
+    # every queue_message, remove_queue_item, edit_queue_item, clear_queue,
+    # and auto-dispatch called it, each writing the ENTIRE queue state to disk.
+    # Under rapid-fire operations (auto-dispatch chains processing multiple
+    # queued messages), this created I/O contention.  The debounce timer
+    # collapses N writes within 1 second into a single disk write.  The
+    # shutdown path (stop()) cancels the timer and calls _save_queues_now()
+    # directly to ensure no data loss on clean exit.
     def _save_queues(self) -> None:
         """Debounced queue save -- batches writes so rapid-fire queue
         operations don't hammer the disk.
@@ -1052,6 +1061,13 @@ class SessionManager:
             return [e.to_dict() for e in info.entries[since:]]
 
     # PERF-CRITICAL: Returns len(entries) without serialization (0-1ms vs 25-32ms). See CLAUDE.md #6.
+    #
+    # LESSON LEARNED (2026-04-12): The watchdog endpoint (/api/live/state)
+    # polled every 10 seconds and used len(get_entries(session_id)) to count
+    # entries.  get_entries() serializes EVERY LogEntry to a dict, JSON-encodes
+    # the list, sends it over TCP IPC, deserializes — then Python counts len().
+    # For a 300-entry session: 25-32ms to return the integer 300.  This method
+    # returns len(info.entries) directly — O(1), no serialization, 0-1ms.
     def get_entry_count(self, session_id: str) -> int:
         """Return the number of log entries without serializing them."""
         session_id = self._resolve_id(session_id)
@@ -1171,8 +1187,14 @@ class SessionManager:
             # when can_use_tool is set. Prompt=None becomes _empty_stream() which is an
             # AsyncIterator, so the streaming mode check passes.
             # PERF-CRITICAL: Mtime scan overlapped with client.connect() — moving after adds 70-90ms. See CLAUDE.md #5.
-            # Start mtime scan concurrently with client.connect() — the scan
-            # only reads info.cwd and doesn't depend on the SDK connection.
+            #
+            # LESSON LEARNED (2026-04-12): client.connect() takes 700-1000ms
+            # (Claude CLI subprocess spawn).  _record_pre_turn_mtimes takes
+            # 70-90ms (git ls-files + stat).  They're independent — mtime scan
+            # only reads info.cwd, doesn't need the SDK connection.  Starting
+            # the scan before await connect() hides it completely behind the
+            # 900ms startup.  Measured result: pre_turn_mtimes_done equals
+            # client_connected timestamp (0ms additional wait).
             loop = asyncio.get_event_loop()
             mtime_task = loop.run_in_executor(None, self._record_pre_turn_mtimes, info)
 
@@ -1505,12 +1527,26 @@ class SessionManager:
         # Safe here because the SDK remap has already happened by the time
         # _send_query is called (remap occurs on first turn's ResultMessage).
         # Runs in a thread — reads JSONL tail + file contents + writes backups.
+        # ── Parallel pre-turn file operations ──
+        #
         # PERF-CRITICAL: _turn_had_direct_edit reset BEFORE gather — moving it creates a race. See CLAUDE.md #3.
         # PERF-CRITICAL: asyncio.gather runs snapshot+mtimes in parallel — sequential adds 60-70ms. See CLAUDE.md #2.
-        # Reset per-turn state BEFORE both executor calls run concurrently.
-        # These two functions access disjoint fields on SessionInfo:
+        #
+        # LESSON LEARNED (2026-04-12 performance overhaul):
+        #
+        # These two operations were originally sequential await calls, adding
+        # 66-139ms to every follow-up message before the query reached Claude.
+        # Profiling proved they access disjoint SessionInfo fields:
         #   _write_file_snapshot: tracked_files, _turn_had_direct_edit, _last_hashes, file_versions
         #   _record_pre_turn_mtimes: _pre_turn_mtimes, _post_turn_mtimes, _mtime_turn_count, _cached_git_files
+        # Running them via asyncio.gather() cut the measured pre-work from
+        # 66-139ms to 10ms (with carry-forward hitting on most turns).
+        #
+        # The _turn_had_direct_edit reset MUST happen before BOTH functions
+        # start.  It was originally between the two sequential awaits.  When
+        # we parallelized, we moved it above the gather.  If it were moved
+        # back between or after, _write_file_snapshot could read the stale
+        # True value from the previous turn and skip the snapshot.
         info._turn_had_direct_edit = False
         await asyncio.gather(
             loop.run_in_executor(None, self._write_file_snapshot, session_id, False),
@@ -2676,6 +2712,17 @@ class SessionManager:
             return
 
         # PERF-CRITICAL: Mtime carry-forward avoids full git ls-files + stat every turn. See CLAUDE.md #4.
+        #
+        # LESSON LEARNED (2026-04-12): Every follow-up turn used to do a full
+        # git ls-files + stat() on every source file in the project.  With a
+        # typical project of 200+ files, this took 60-80ms per turn.  The
+        # carry-forward pattern reuses the mtime snapshot from the previous
+        # turn's post-turn _detect_changed_files (which already scanned
+        # everything).  The chain: post-turn populates _post_turn_mtimes →
+        # next pre-turn carries it to _pre_turn_mtimes → next post-turn
+        # compares against it.  A full rescan is forced every
+        # _MTIME_FULL_RESCAN_INTERVAL turns to pick up newly added files.
+        #
         # ── Fast path: carry forward from previous turn ──
         info._mtime_turn_count += 1
         force_rescan = (self._MTIME_FULL_RESCAN_INTERVAL > 0
@@ -2898,17 +2945,33 @@ class SessionManager:
             logger.info("_write_file_snapshot(%s): skipped (no session info)", session_id)
             return
 
-        # Only fall back to filesystem mtime scanning when the streaming
-        # message handler didn't see any direct Edit/Write tool uses.
-        # This avoids scanning the entire project directory on every turn —
-        # only needed when something opaque (Agent, Bash) may have edited files.
+        # ── Filesystem fallback for change detection ──
         #
         # PERF-CRITICAL: tracked_files snowball prevention — fs_changed are snapshot extras only. See CLAUDE.md #7.
         # PERF-CRITICAL: is_post_turn guard — skips _detect_changed_files on pre-turn. See CLAUDE.md #1.
-        # IMPORTANT: fs_changed files are used for the CURRENT snapshot only,
-        # NOT added to tracked_files permanently.  Adding them caused tracked_files
-        # to snowball to 1400+ entries when test suites touched many project files,
-        # making write_file_snapshot and record_pre_turn_mtimes take 20-55s per turn.
+        #
+        # LESSON LEARNED (2026-04-12 performance overhaul):
+        #
+        # Problem 1 — tracked_files snowball:
+        #   We used to add fs_changed files to info.tracked_files permanently.
+        #   When test suites or Agent sub-agents touched many project files,
+        #   tracked_files grew to 1,400+ entries.  Every subsequent turn then
+        #   read, hashed, and backed up all 1,400 files — turns took 20-55s.
+        #   Fix: fs_changed is used for the CURRENT snapshot only (fs_snapshot_extras),
+        #   never added to tracked_files.  tracked_files only grows via direct
+        #   Edit/Write tool uses seen in the streaming message handler.
+        #
+        # Problem 2 — pre-turn filesystem scan was waste:
+        #   _detect_changed_files runs git ls-files + stat() + file read + MD5
+        #   on ~200 files to find what changed since last turn.  On pre-turn,
+        #   _turn_had_direct_edit is ALWAYS False (the turn hasn't started yet),
+        #   so the fallback triggered every time — scanning 199 files for 2-138ms.
+        #   But the pre-turn snapshot only needs files THIS session edited
+        #   (tracked_files), not changes from other sessions.  Other sessions'
+        #   edits are noise — this session didn't cause them, Rewind doesn't
+        #   need to undo them.  Fix: guard with is_post_turn.  The filesystem
+        #   fallback now only runs post-turn, where it catches Agent/Bash edits
+        #   that bypassed the Edit/Write tool tracking.
         fs_snapshot_extras = set()
         if is_post_turn and not info._turn_had_direct_edit:
             fs_changed = self._detect_changed_files(info)
