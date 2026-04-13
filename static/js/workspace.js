@@ -205,6 +205,10 @@ function _renderHierarchicalWorkspace(mainBody, sessions, tree) {
       + 'VibeNode organizes your knowledge assets into <strong>departments</strong> &mdash; not skills, not agents. '
       + 'Drop any .md file into a department and invoke it as either. We handle both.'
       + '</div>';
+    html += '<div class="wf-local-notice">'
+      + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="flex-shrink:0;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>'
+      + '<span>Local project <code>skills/</code> and <code>agents/</code> folders are dynamically aggregated into the Invoke Workforce menu and included in session context.</span>'
+      + '</div>';
     html += '</div>';
 
     // Stat cards with icons

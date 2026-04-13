@@ -651,12 +651,18 @@ class SupabaseRepository(KanbanRepository):
             session_type: 'session' (work session) or 'planner'.
         """
         now = datetime.now(timezone.utc).isoformat()
-        self.client.table("task_sessions").upsert({
+        row = {
             "task_id": task_id,
             "session_id": session_id,
             "created_at": now,
             "session_type": session_type,
-        }).execute()
+        }
+        try:
+            self.client.table("task_sessions").upsert(row).execute()
+        except Exception:
+            # Fallback: session_type column may not exist yet in the DB
+            row.pop("session_type", None)
+            self.client.table("task_sessions").upsert(row).execute()
         return TaskSession(task_id=task_id, session_id=session_id, created_at=now, session_type=session_type)
 
     def unlink_session(self, task_id, session_id):
@@ -676,14 +682,23 @@ class SupabaseRepository(KanbanRepository):
             task_id: The task to query.
             session_type: Optional filter — 'session', 'planner', or None for all.
         """
-        q = (
-            self.client.table("task_sessions")
-            .select("task_id, session_id, created_at, session_type")
-            .eq("task_id", task_id)
-        )
-        if session_type:
-            q = q.eq("session_type", session_type)
-        result = q.order("created_at").execute()
+        try:
+            q = (
+                self.client.table("task_sessions")
+                .select("task_id, session_id, created_at, session_type")
+                .eq("task_id", task_id)
+            )
+            if session_type:
+                q = q.eq("session_type", session_type)
+            result = q.order("created_at").execute()
+        except Exception:
+            # Fallback: session_type column may not exist yet in the DB
+            q = (
+                self.client.table("task_sessions")
+                .select("task_id, session_id, created_at")
+                .eq("task_id", task_id)
+            )
+            result = q.order("created_at").execute()
         return [
             TaskSession(
                 task_id=r["task_id"],

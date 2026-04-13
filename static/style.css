@@ -9928,6 +9928,420 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
   color: var(--text-secondary);
   border-bottom: 1px solid var(--border, rgba(255,255,255,0.05));
 }
+
+/* ═══════════════════════════════════════════════════════════════════════
+   INVOKE WORKFORCE — button, modal, visual state, pills
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── Invoke Button (in input bar) ── */
+.invoke-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px 3px 7px;
+  border: none;
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(168,85,247,0.15), rgba(59,130,246,0.15));
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  letter-spacing: 0.03em;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  white-space: nowrap;
+}
+.invoke-btn:hover {
+  background: linear-gradient(135deg, rgba(168,85,247,0.3), rgba(59,130,246,0.3));
+  color: var(--text-primary);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 12px rgba(139,92,246,0.25);
+}
+.invoke-btn:active {
+  transform: translateY(0);
+}
+.invoke-btn-label {
+  background: linear-gradient(135deg, #a855f7, #3b82f6);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+[data-theme="light"] .invoke-btn {
+  background: linear-gradient(135deg, rgba(168,85,247,0.1), rgba(59,130,246,0.1));
+}
+[data-theme="light"] .invoke-btn:hover {
+  background: linear-gradient(135deg, rgba(168,85,247,0.2), rgba(59,130,246,0.2));
+}
+
+/* ── Invoke Modal Overlay ── */
+.invoke-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,0);
+  backdrop-filter: blur(0);
+  transition: background 0.25s ease, backdrop-filter 0.25s ease;
+  opacity: 0;
+}
+.invoke-overlay.show {
+  background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(20px) saturate(1.4);
+  -webkit-backdrop-filter: blur(20px) saturate(1.4);
+  opacity: 1;
+}
+[data-theme="light"] .invoke-overlay.show {
+  background: rgba(0,0,0,0.25);
+}
+
+/* ── Invoke Modal Card ── */
+.invoke-modal {
+  width: 520px;
+  max-width: 92vw;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-modal, #1a1a1a);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 18px;
+  box-shadow: 0 24px 80px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.04);
+  overflow: hidden;
+  transform: scale(0.95);
+  transition: transform 0.25s ease;
+}
+.invoke-overlay.show .invoke-modal {
+  transform: scale(1);
+}
+[data-theme="light"] .invoke-modal {
+  border-color: rgba(0,0,0,0.1);
+  box-shadow: 0 24px 80px rgba(0,0,0,0.15);
+}
+
+.invoke-modal-loading {
+  padding: 40px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+/* ── Modal Header ── */
+.invoke-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 24px 0;
+}
+.invoke-modal-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  background: linear-gradient(135deg, #a855f7, #3b82f6);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.invoke-modal-close {
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 20px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+.invoke-modal-close:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* ── Search ── */
+.invoke-search {
+  margin: 12px 24px 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--bg-input-alt, var(--bg-input));
+  color: var(--text-primary);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+.invoke-search:focus {
+  border-color: var(--accent);
+}
+.invoke-search::placeholder {
+  color: var(--text-faint);
+}
+
+/* ── Sections Container ── */
+.invoke-sections {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+/* ── Section ── */
+.invoke-section {
+  margin: 4px 0;
+}
+.invoke-section-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+  padding: 8px 24px 4px;
+  position: sticky;
+  top: 0;
+  background: var(--bg-modal, #1a1a1a);
+  z-index: 1;
+}
+.invoke-section-scroll {
+  max-height: 200px;
+  overflow-y: auto;
+  padding: 0 12px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.08) transparent;
+}
+.invoke-section-scroll::-webkit-scrollbar { width: 4px; }
+.invoke-section-scroll::-webkit-scrollbar-track { background: transparent; }
+.invoke-section-scroll::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
+
+/* ── Items ── */
+.invoke-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.invoke-item:hover {
+  background: linear-gradient(135deg, rgba(168,85,247,0.08), rgba(59,130,246,0.08));
+}
+.invoke-item-icon {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.04);
+  color: var(--text-muted);
+}
+.invoke-item-info { flex: 1; min-width: 0; }
+.invoke-item-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.invoke-item-path {
+  font-size: 10px;
+  color: var(--text-faint);
+  font-family: 'SF Mono', monospace;
+  margin-top: 1px;
+}
+.invoke-empty {
+  padding: 12px 16px;
+  font-size: 12px;
+  color: var(--text-faint);
+  line-height: 1.5;
+}
+.invoke-empty code {
+  background: rgba(255,255,255,0.06);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 11px;
+}
+
+/* ── Department tree nodes ── */
+.invoke-dept-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  transition: background 0.15s;
+}
+.invoke-dept-header:hover {
+  background: rgba(255,255,255,0.04);
+}
+.invoke-dept-chevron {
+  transition: transform 0.2s ease;
+  flex-shrink: 0;
+}
+.invoke-dept-use {
+  margin-left: auto;
+  padding: 2px 8px;
+  border: 1px solid rgba(168,85,247,0.3);
+  border-radius: 6px;
+  background: transparent;
+  color: #a855f7;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s;
+}
+.invoke-dept-header:hover .invoke-dept-use { opacity: 1; }
+.invoke-dept-use:hover {
+  background: rgba(168,85,247,0.15);
+}
+.invoke-dept-children {
+  overflow: hidden;
+  transition: max-height 0.2s ease;
+}
+.invoke-dept-children.collapsed {
+  max-height: 0 !important;
+  overflow: hidden;
+}
+.invoke-dept-children:not(.collapsed) {
+  max-height: 2000px;
+}
+
+/* ── Modal Footer ── */
+.invoke-modal-footer {
+  padding: 12px 24px 16px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+  display: flex;
+  justify-content: center;
+}
+.invoke-manage-btn {
+  padding: 6px 20px;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.invoke-manage-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  border-color: rgba(255,255,255,0.15);
+}
+
+/* ── Invoke Active State — gradient textarea outline ── */
+.live-textarea.invoke-active {
+  border-color: transparent !important;
+  background-image: linear-gradient(var(--bg-input-alt, #111), var(--bg-input-alt, #111)),
+                     linear-gradient(135deg, #a855f7, #6366f1, #3b82f6);
+  background-origin: border-box;
+  background-clip: padding-box, border-box;
+  border: 2px solid transparent !important;
+  box-shadow: 0 0 0 2px rgba(139,92,246,0.15), 0 0 20px rgba(139,92,246,0.1) !important;
+}
+[data-theme="light"] .live-textarea.invoke-active {
+  background-image: linear-gradient(var(--bg-input-alt, #fff), var(--bg-input-alt, #fff)),
+                     linear-gradient(135deg, #a855f7, #6366f1, #3b82f6);
+  box-shadow: 0 0 0 2px rgba(139,92,246,0.12), 0 0 20px rgba(139,92,246,0.08) !important;
+}
+
+/* ── Floating Label (when invoke is selected) ── */
+.invoke-float-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  padding: 3px 8px 3px 10px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(168,85,247,0.2), rgba(59,130,246,0.2));
+  border: 1px solid rgba(168,85,247,0.3);
+  font-size: 12px;
+  font-weight: 700;
+  animation: invokeFloat 0.25s ease;
+}
+@keyframes invokeFloat {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.invoke-float-name {
+  background: linear-gradient(135deg, #a855f7, #3b82f6);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.invoke-float-cancel {
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.08);
+  color: var(--text-faint);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, color 0.15s;
+  padding: 0;
+}
+.invoke-float-cancel:hover {
+  background: rgba(239,68,68,0.2);
+  color: #ef4444;
+}
+
+/* ── Invoke Pill (in rendered messages) ── */
+.invoke-pill {
+  display: inline-block;
+  padding: 4px 14px;
+  border-radius: 20px;
+  background: linear-gradient(135deg, #a855f7, #6366f1, #3b82f6);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  margin-bottom: 4px;
+  box-shadow: 0 2px 8px rgba(139,92,246,0.3);
+}
+[data-theme="light"] .invoke-pill {
+  box-shadow: 0 2px 8px rgba(139,92,246,0.2);
+}
+
+/* ── Workforce Local Notice ── */
+.wf-local-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(168,85,247,0.06), rgba(59,130,246,0.06));
+  border: 1px solid rgba(168,85,247,0.12);
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+.wf-local-notice code {
+  background: rgba(255,255,255,0.06);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+}
+[data-theme="light"] .wf-local-notice {
+  background: linear-gradient(135deg, rgba(168,85,247,0.04), rgba(59,130,246,0.04));
+  border-color: rgba(168,85,247,0.1);
+}
 .compose-cascade-modal .cascade-warning {
   font-size: 12px;
   color: #ef4444;

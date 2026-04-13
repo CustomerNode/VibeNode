@@ -1999,7 +1999,11 @@ async function renderTaskDetail(taskId, opts) {
       fetch('/api/kanban/tasks/' + taskId),
       fetch('/api/kanban/tasks/' + taskId + '/ancestors'),
     ]);
-    if (!taskRes.ok) throw new Error('Failed to load task');
+    if (!taskRes.ok) {
+      const err = new Error('Failed to load task');
+      err.status = taskRes.status;
+      throw err;
+    }
     const task = await taskRes.json();
     // Store title for breadcrumb use by session opener
     window._kanbanDetailTaskTitle = task.title || '';
@@ -2117,7 +2121,7 @@ async function renderTaskDetail(taskId, opts) {
       html += '<div class="kanban-drill-panel"><div class="kanban-drill-panel-body">';
 
       // Session row
-      const sessStatus = existingSession ? (existingSession.status || 'sleeping') : 'not_started';
+      const sessStatus = existingSession ? (typeof existingSession.status === 'string' ? existingSession.status : 'sleeping') : 'not_started';
       const sessColor = existingSession
         ? (sessStatus === 'working' ? 'var(--status-working)' : sessStatus === 'idle' ? 'var(--status-complete)' : 'var(--text-dim)')
         : 'var(--text-dim)';
@@ -2140,7 +2144,7 @@ async function renderTaskDetail(taskId, opts) {
       html += '</div>';
 
       // Planner row
-      const planStatus = existingPlanner ? (existingPlanner.status || 'sleeping') : 'not_started';
+      const planStatus = existingPlanner ? (typeof existingPlanner.status === 'string' ? existingPlanner.status : 'sleeping') : 'not_started';
       const planColor = existingPlanner
         ? (planStatus === 'working' ? 'var(--purple)' : planStatus === 'idle' ? 'var(--status-complete)' : 'var(--text-dim)')
         : 'var(--text-dim)';
@@ -2317,6 +2321,17 @@ async function renderTaskDetail(taskId, opts) {
 
   } catch (e) {
     console.error('[Kanban] Detail load failed:', e);
+    // Task genuinely doesn't exist (404) — don't retry, go straight to board.
+    // Clear the saved kanban path so we don't keep trying to restore it.
+    if (e.status === 404) {
+      renderTaskDetail._retries = 0;
+      kanbanDetailTaskId = null;
+      const _proj = localStorage.getItem('activeProject') || '';
+      if (_proj) localStorage.removeItem('pvs_' + _proj + '_kanban');
+      if (typeof showToast === 'function') showToast('Task no longer exists — returned to board');
+      navigateToBoard();
+      return;
+    }
     // Auto-retry up to 3 times with increasing delay (task may still be syncing)
     const retryCount = (renderTaskDetail._retries || 0);
     if (retryCount < 3) {
