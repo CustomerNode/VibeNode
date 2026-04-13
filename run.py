@@ -304,6 +304,42 @@ except Exception as _init_err:
     raise
 
 
+## ── CRITICAL: Chrome-first browser launch ──────────────────────────────────
+## DO NOT replace this with os.startfile(url) or webbrowser.open(url) alone.
+## The Web Speech API (voice input) is Chromium-only. Firefox does not support
+## it. If the default browser is Firefox, os.startfile silently breaks voice
+## with zero error messages — the mic button just disappears.
+## This exact regression already happened once and shipped to users.
+## The correct pattern: _find_chrome() → ShellExecuteW(chrome, url) → fallback.
+## Tests in tests/test_browser_launch.py enforce this — run them before changing.
+## ────────────────────────────────────────────────────────────────────────────
+
+def _find_chrome():
+    """Return the path to chrome.exe on Windows, or None."""
+    import winreg
+    # Check registry first (most reliable — works for all install types)
+    for hive, key in [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"),
+    ]:
+        try:
+            with winreg.OpenKey(hive, key) as k:
+                p = winreg.QueryValue(k, None)
+                if p and os.path.isfile(p):
+                    return p
+        except OSError:
+            pass
+    # Fallback: common install paths
+    for base in [os.environ.get("PROGRAMFILES", ""), os.environ.get("PROGRAMFILES(X86)", ""),
+                 os.path.expandvars(r"%LOCALAPPDATA%")]:
+        if not base:
+            continue
+        p = os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
 def open_browser():
     import time
     import urllib.request
@@ -333,15 +369,31 @@ def open_browser():
 
     opened = False
     if sys.platform == "win32":
-        # Use os.startfile which goes through the Windows shell URL handler.
-        # This reliably brings the browser to the foreground even when the
-        # parent process is minimized (launch.bat uses start /min).
-        try:
-            os.startfile(url)
-            _log("Opened via os.startfile (Windows shell URL handler)")
-            opened = True
-        except Exception as e:
-            _log("os.startfile failed: %s" % e)
+        # CRITICAL: Must open Chrome, NOT the default browser. See comment
+        # block above _find_chrome() for full explanation and history.
+        # ShellExecuteW is focus-safe even when parent is minimized
+        # (launch.bat uses start /min). os.startfile is ONLY a fallback
+        # for systems where Chrome is genuinely not installed.
+        chrome_path = _find_chrome()
+        if chrome_path:
+            try:
+                import ctypes
+                result = ctypes.windll.shell32.ShellExecuteW(
+                    None, "open", chrome_path, url, None, 1)
+                if result > 32:
+                    _log("Opened Chrome via ShellExecuteW: %s" % chrome_path)
+                    opened = True
+                else:
+                    _log("ShellExecuteW returned %s for Chrome" % result)
+            except Exception as e:
+                _log("Chrome ShellExecuteW failed: %s" % e)
+        if not opened:
+            try:
+                os.startfile(url)
+                _log("Chrome not found — opened default browser via os.startfile")
+                opened = True
+            except Exception as e:
+                _log("os.startfile failed: %s" % e)
     elif sys.platform == "darwin":
         try:
             subprocess.Popen(["open", url])
