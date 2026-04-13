@@ -293,8 +293,13 @@ class TestRewindE2E:
         WebDriverWait(driver, 10).until(
             EC.visibility_of_element_located((By.ID, "pm-overlay"))
         )
-        title = driver.find_element(By.CSS_SELECTOR, "#pm-overlay .pm-title").text
-        assert "Rewind" in title
+        # Wait for the title to actually render (animation / innerHTML timing)
+        title_el = WebDriverWait(driver, 10).until(
+            lambda d: d.find_element(By.CSS_SELECTOR, "#pm-overlay .pm-title")
+            if d.find_element(By.CSS_SELECTOR, "#pm-overlay .pm-title").text
+            else False
+        )
+        assert "Rewind" in title_el.text
 
     def test_06_timeline_has_rows(self, driver):
         """The timeline must show message rows with snapshot indicators."""
@@ -308,30 +313,59 @@ class TestRewindE2E:
         assert len(snaps) >= 1, "No snapshot indicators"
 
     def test_07_click_rewind_and_verify(self, driver, scratch_file):
-        """Select a snapshot row, click Confirm, verify file is restored."""
-        rows = driver.find_elements(By.CSS_SELECTOR, "#msg-timeline .tl-row")
-        snap_row = None
-        for r in rows:
-            if r.find_elements(By.CSS_SELECTOR, ".tl-snap"):
-                snap_row = r
-                break
-        assert snap_row is not None, "No row with snapshot indicator"
+        """Select a row BEFORE the edit, click Confirm, verify file is restored.
 
-        snap_row.click()
-        time.sleep(0.5)
-        assert "selected" in snap_row.get_attribute("class")
+        The rewind API reverses all edits AFTER the selected line.  So we need
+        to pick a message that precedes the assistant turn where Claude edited
+        the file.  Strategy: find the row BEFORE the first snapshot row —
+        that's the user prompt, and everything after it (the edit) gets undone.
+        If the first row itself has a snapshot, fall back to the very first row.
+        """
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "#msg-timeline .tl-row"))
+        )
+
+        rows = driver.find_elements(By.CSS_SELECTOR, "#msg-timeline .tl-row")
+        assert len(rows) >= 1, "No timeline rows"
+
+        # Find the first row with a snapshot indicator (the Edit turn)
+        snap_idx = None
+        for i, r in enumerate(rows):
+            if r.find_elements(By.CSS_SELECTOR, ".tl-snap"):
+                snap_idx = i
+                break
+
+        # Pick the row BEFORE the first snapshot (the user prompt).
+        # If the first row has the snapshot, use the first row itself and
+        # rely on the edit-reversal logic (up_to_line is the start of that
+        # assistant message, so the edit tool_use blocks inside it are AFTER
+        # the line and will be reversed).  But ideally we pick one row earlier.
+        if snap_idx is not None and snap_idx > 0:
+            target_row = rows[snap_idx - 1]
+        elif snap_idx is not None:
+            target_row = rows[snap_idx]
+        else:
+            # No snapshot — just pick the first row
+            target_row = rows[0]
+
+        target_row.click()
+        time.sleep(1)
+        assert "selected" in target_row.get_attribute("class")
 
         confirm = driver.find_element(By.ID, "pm-confirm")
-        assert confirm.is_enabled(), "Confirm button not enabled"
+        WebDriverWait(driver, 5).until(lambda d: confirm.is_enabled())
         confirm.click()
 
-        # Wait for restore to complete
-        time.sleep(5)
+        # Poll for restore to complete (up to 30s)
+        for _ in range(60):
+            content = scratch_file.read_text(encoding="utf-8")
+            if content == SCRATCH_ORIGINAL:
+                break
+            time.sleep(0.5)
 
-        # THE MONEY CHECK: file must be back to original content
         content = scratch_file.read_text(encoding="utf-8")
         assert content == SCRATCH_ORIGINAL, (
-            f"File was NOT restored.\n"
+            f"File was NOT restored after 30 seconds.\n"
             f"Expected:\n{SCRATCH_ORIGINAL}\n"
             f"Got:\n{content}"
         )
@@ -339,4 +373,7 @@ class TestRewindE2E:
     def test_08_modal_closed(self, driver):
         """Modal should close after rewind completes."""
         overlay = driver.find_element(By.ID, "pm-overlay")
-        assert not overlay.is_displayed()
+        # The modal closes asynchronously after the API returns — wait for it
+        WebDriverWait(driver, 10).until(
+            lambda d: not overlay.is_displayed()
+        )

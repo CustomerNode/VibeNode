@@ -48,6 +48,7 @@ TEST_BASE_URL = f"http://localhost:{TEST_PORT}"
 SCREENSHOT_DIR = Path(__file__).resolve().parent.parent / "screenshots"
 
 _test_server_proc = None
+_test_daemon_proc = None
 _test_tmpdir = None
 
 
@@ -125,8 +126,9 @@ def pytest_runtest_makereport(item, call):
 
 
 def pytest_configure(config):
-    """Spin up an isolated test server. Touches NOTHING on the user's instance."""
-    global _test_server_proc, _test_tmpdir
+    """Spin up an isolated test server + daemon. Touches NOTHING on the user's instance."""
+    global _test_server_proc, _test_daemon_proc, _test_tmpdir
+    import socket as _sock
 
     # Create temp dir with its own config
     _test_tmpdir = tempfile.mkdtemp(prefix="vibenode_test_")
@@ -136,23 +138,49 @@ def pytest_configure(config):
         "kanban_depth_limit": 5,
     }, indent=2), encoding="utf-8")
 
-    # Start test server on a separate port with its own config
     repo_root = Path(__file__).resolve().parent.parent.parent
     env = os.environ.copy()
     env["VIBENODE_CONFIG"] = str(test_config)
     env["VIBENODE_TEST_PORT"] = str(TEST_PORT)
     env["VIBENODE_DAEMON_PORT"] = str(TEST_DAEMON_PORT)
 
+    _creation_flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
+    # --- Start test daemon on TEST_DAEMON_PORT ---
+    daemon_script = repo_root / "daemon" / "daemon_server.py"
+    _test_daemon_proc = subprocess.Popen(
+        ["python", str(daemon_script)],
+        cwd=str(repo_root),
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=_creation_flags,
+    )
+
+    # Wait for daemon to be ready
+    for _ in range(30):
+        try:
+            s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+            s.settimeout(1)
+            s.connect(("127.0.0.1", TEST_DAEMON_PORT))
+            s.close()
+            break
+        except (ConnectionRefusedError, OSError):
+            time.sleep(0.5)
+    else:
+        pytest.exit("Test daemon failed to start on port %d" % TEST_DAEMON_PORT)
+
+    # --- Start test web server on TEST_PORT ---
     _test_server_proc = subprocess.Popen(
         ["python", str(repo_root / "run.py")],
         cwd=str(repo_root),
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        creationflags=_creation_flags,
     )
 
-    # Wait for it
+    # Wait for web server
     import urllib.request
     for _ in range(30):
         try:
@@ -165,24 +193,16 @@ def pytest_configure(config):
 
 def pytest_unconfigure(config):
     """Kill test server, test daemon, and clean up temp files."""
-    global _test_server_proc, _test_tmpdir
-    if _test_server_proc:
-        _test_server_proc.terminate()
-        try:
-            _test_server_proc.wait(timeout=5)
-        except Exception:
-            _test_server_proc.kill()
-        _test_server_proc = None
-    # Kill the test daemon on TEST_DAEMON_PORT
-    try:
-        import socket as _sock
-        s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-        s.settimeout(1)
-        s.connect(("127.0.0.1", TEST_DAEMON_PORT))
-        s.sendall(b'{"method":"shutdown"}\n')
-        s.close()
-    except Exception:
-        pass
+    global _test_server_proc, _test_daemon_proc, _test_tmpdir
+    for proc_name, proc in [("web", _test_server_proc), ("daemon", _test_daemon_proc)]:
+        if proc:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+    _test_server_proc = None
+    _test_daemon_proc = None
     if _test_tmpdir:
         shutil.rmtree(_test_tmpdir, ignore_errors=True)
         _test_tmpdir = None
