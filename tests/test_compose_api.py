@@ -535,3 +535,51 @@ class TestProjectsReorder:
         resp = client.post('/api/compose/projects/reorder',
                            json={'order': [p2, p1]})
         assert resp.status_code == 200
+
+
+class TestListProjectsFiltering:
+    """Regression: right-click → Add to Compose must filter by active project.
+
+    Without the ``?project=`` query param the API returns every composition
+    across all VibeNode projects, so the picker shows unrelated items.
+    Fixed 2026-04-13.
+    """
+
+    def test_filter_by_parent_project(self, client):
+        """Only compositions belonging to the requested project are returned."""
+        client.post('/api/compose/projects',
+                    json={'name': 'test-filter-altium', 'parent_project': 'altium'})
+        client.post('/api/compose/projects',
+                    json={'name': 'test-filter-other', 'parent_project': 'other-proj'})
+
+        resp = client.get('/api/compose/projects?project=altium')
+        data = resp.get_json()
+        assert data['ok'] is True
+        names = [p['name'] for p in data['projects']]
+        assert 'test-filter-altium' in names
+        assert 'test-filter-other' not in names
+
+    def test_pinned_projects_always_returned(self, client):
+        """Pinned compositions appear regardless of active project filter."""
+        resp = client.post('/api/compose/projects',
+                           json={'name': 'test-filter-pinned', 'parent_project': 'other-proj'})
+        pid = resp.get_json()['project']['id']
+        client.put(f'/api/compose/projects/{pid}', json={'pinned': True})
+
+        resp = client.get('/api/compose/projects?project=altium')
+        data = resp.get_json()
+        names = [p['name'] for p in data['projects']]
+        assert 'test-filter-pinned' in names
+
+    def test_no_filter_returns_all(self, client):
+        """Without ?project= all compositions are returned (backward compat)."""
+        client.post('/api/compose/projects',
+                    json={'name': 'test-filter-a', 'parent_project': 'proj-a'})
+        client.post('/api/compose/projects',
+                    json={'name': 'test-filter-b', 'parent_project': 'proj-b'})
+
+        resp = client.get('/api/compose/projects')
+        data = resp.get_json()
+        names = [p['name'] for p in data['projects']]
+        assert 'test-filter-a' in names
+        assert 'test-filter-b' in names
