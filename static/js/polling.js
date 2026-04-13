@@ -1,9 +1,9 @@
 /* polling.js — waiting-for-input polling and initial startup calls */
 
 // --- Auto-name tracking ---
-// Prevents hammering the auto-name endpoint for the same session on every poll.
-// Cleared every ~2 min to allow retries for sessions whose first attempt was too early.
-const _autoNamePending = new Set();
+// Maps session_id → attempt count.  Max 2 attempts per session, ever.
+// Never cleared — once a session hits 2 attempts we stop trying.
+const _autoNameAttempts = {};
 let _autoNamePollCount = 0;
 
 async function pollWaiting() {
@@ -46,33 +46,40 @@ async function pollWaiting() {
     }
 
     // --- Auto-name untitled sessions reactively ---
+    // Hard cap: max 2 attempts per session.  If it didn't work twice, the
+    // heuristic fallback already ran — stop spawning CLI processes.
     _autoNamePollCount++;
+
+    function _tryAutoName(id) {
+      if (_userNamedSessions.has(id)) return;
+      const attempts = _autoNameAttempts[id] || 0;
+      if (attempts >= 2) return;
+      _autoNameAttempts[id] = attempts + 1;
+      autoName(id, true);
+    }
 
     // 1. State-transition trigger: when a session leaves "working" state,
     //    it has likely just produced content — perfect moment to auto-name.
     for (const id in sessionKinds) {
       if (sessionKinds[id] === 'working' && newKinds[id] !== 'working') {
         const s = allSessions.find(x => x.id === id);
-        if (s && !s.custom_title && !_autoNamePending.has(id) && !_userNamedSessions.has(id)) {
-          _autoNamePending.add(id);
+        if (s && !s.custom_title) {
           // Small delay lets the .jsonl flush to disk before we read it
-          setTimeout(() => autoName(id, true), 1500);
+          setTimeout(() => _tryAutoName(id), 1500);
         }
       }
     }
 
-    // 2. Sweep for untitled sessions.  Runs every poll cycle when unnamed
-    //    sessions exist, otherwise backs off to every ~30 s as a background check.
-    const _untitled = allSessions.filter(s => !s.custom_title && !_autoNamePending.has(s.id) && !_userNamedSessions.has(s.id));
-    if (_untitled.length > 0 || _autoNamePollCount % 15 === 0) {
+    // 2. Sweep for untitled sessions — only on every 15th poll (~30s)
+    //    to avoid hammering during high-concurrency bursts.
+    if (_autoNamePollCount % 15 === 0) {
+      const _untitled = allSessions.filter(s =>
+        !s.custom_title && !_userNamedSessions.has(s.id) && (_autoNameAttempts[s.id] || 0) < 2
+      );
       for (const s of _untitled) {
-        _autoNamePending.add(s.id);
-        autoName(s.id, true);
+        _tryAutoName(s.id);
       }
     }
-
-    // 3. Clear pending set every ~20 s so failed attempts retry quickly
-    if (_autoNamePollCount % 10 === 0) _autoNamePending.clear();
 
     waitingData = newWaiting;
     runningIds  = newRunning;
