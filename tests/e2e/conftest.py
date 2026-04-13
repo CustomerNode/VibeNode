@@ -31,13 +31,16 @@ Artifacts:
 
 import json
 import os
+import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import pytest
 from pathlib import Path
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 
 TEST_PORT = 5099
 TEST_DAEMON_PORT = 5098
@@ -65,7 +68,28 @@ def driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1400,900")
-    d = webdriver.Chrome(options=options)
+
+    # Selenium Manager doesn't support win32/arm64.  If we're on ARM Windows,
+    # look for a manually-installed chromedriver in well-known locations.
+    service = None
+    if sys.platform == "win32" and platform.machine().lower() in ("arm64", "aarch64"):
+        _candidates = [
+            Path.home() / "chromedriver" / "chromedriver-win64" / "chromedriver.exe",
+            Path.home() / "chromedriver" / "chromedriver.exe",
+            Path.home() / "chromedriver.exe",
+        ]
+        for p in _candidates:
+            if p.is_file():
+                service = Service(executable_path=str(p))
+                break
+        if service is None:
+            pytest.skip(
+                "ARM64 Windows detected but no chromedriver found. "
+                "Download from https://googlechromelabs.github.io/chrome-for-testing/ "
+                f"and place in one of: {[str(c) for c in _candidates]}"
+            )
+
+    d = webdriver.Chrome(service=service, options=options) if service else webdriver.Chrome(options=options)
     yield d
     d.quit()
 
