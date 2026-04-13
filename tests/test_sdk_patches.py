@@ -315,6 +315,123 @@ class TestTransportAdapter:
         """inner property should expose the underlying transport."""
         assert adapter.inner is mock_transport
 
+    # -- error propagation --
+
+    def test_write_error_propagates(self, mock_transport):
+        """If inner transport write() raises, adapter must propagate it."""
+        from daemon.sdk_transport_adapter import VibeNodeTransportAdapter
+
+        async def failing_write(data):
+            raise ConnectionError("pipe broken")
+
+        mock_transport.write = failing_write
+        adapter = VibeNodeTransportAdapter(mock_transport, keep_stdin_open=False)
+
+        with pytest.raises(ConnectionError, match="pipe broken"):
+            _run(adapter.write('{"type": "user"}\n'))
+
+    def test_write_error_propagates_during_reformat(self, mock_transport):
+        """If inner write() fails AFTER reformatting, error still propagates."""
+        from daemon.sdk_transport_adapter import VibeNodeTransportAdapter
+
+        async def failing_write(data):
+            raise ConnectionError("transport dead")
+
+        mock_transport.write = failing_write
+        adapter = VibeNodeTransportAdapter(mock_transport, keep_stdin_open=False)
+
+        sdk_response = {
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "req-err",
+                "response": {"allow": True},
+            },
+        }
+        with pytest.raises(ConnectionError, match="transport dead"):
+            _run(adapter.write(json.dumps(sdk_response) + "\n"))
+
+    # -- non-permission success responses --
+
+    def test_hook_callback_response_passthrough(self, adapter, mock_transport):
+        """Hook callback success responses should NOT be reformatted."""
+        hook_response = {
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "req-hook",
+                "response": {"some_hook_data": True},
+            },
+        }
+        data = json.dumps(hook_response) + "\n"
+        _run(adapter.write(data))
+
+        # Should pass through unchanged — no "allow" key in inner response
+        assert mock_transport.written[0] == data
+
+    def test_mcp_response_passthrough(self, adapter, mock_transport):
+        """MCP success responses should NOT be reformatted."""
+        mcp_response = {
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "req-mcp",
+                "response": {"mcp_response": {"result": "ok"}},
+            },
+        }
+        data = json.dumps(mcp_response) + "\n"
+        _run(adapter.write(data))
+
+        assert mock_transport.written[0] == data
+
+    # -- outer field preservation --
+
+    def test_reformat_preserves_outer_fields(self, adapter, mock_transport):
+        """Reformatting should preserve request_id, subtype, and other outer fields."""
+        sdk_response = {
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "req-preserve",
+                "response": {"allow": True, "input": {"file": "test.py"}},
+            },
+        }
+        _run(adapter.write(json.dumps(sdk_response) + "\n"))
+
+        written = json.loads(mock_transport.written[0])
+        assert written["type"] == "control_response"
+        assert written["response"]["subtype"] == "success"
+        assert written["response"]["request_id"] == "req-preserve"
+        # Inner response should be reformatted
+        assert written["response"]["response"]["behavior"] == "allow"
+
+
+# ── Idempotency Tests ───────────────────────────────────────────────────
+
+
+class TestIdempotency:
+    """Test that apply_patches() is safe to call multiple times."""
+
+    def test_apply_patches_idempotent(self):
+        """Second call to apply_patches() should return empty list (already applied)."""
+        from daemon.sdk_patches import apply_patches
+        # Patches were already applied at module load. Calling again should no-op.
+        result = apply_patches()
+        assert result == []
+
+    def test_parse_message_not_double_wrapped(self):
+        """parse_message should be wrapped exactly once, not nested."""
+        from claude_code_sdk._internal.message_parser import parse_message
+
+        # Call with an unknown type — should return None (one wrap)
+        result = parse_message({"type": "unknown_test_type_xyz"})
+        assert result is None
+
+        # Call with a known type — should parse normally (not broken by stacking)
+        from claude_code_sdk.types import SystemMessage
+        result = parse_message({"type": "system", "subtype": "init", "data": {}})
+        assert isinstance(result, SystemMessage)
+
 
 # ── Patch Application Tests ──────────────────────────────────────────────
 

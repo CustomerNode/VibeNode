@@ -14,6 +14,81 @@ info:
 
     VibeNode also uses SocketIO for real-time push events. Those are documented
     separately in `socketio-events.md`.
+
+    ---
+
+    ## Getting Started
+
+    The typical workflow for driving VibeNode programmatically:
+
+    ### 1. List projects
+
+    ```http
+    GET /api/projects
+    ```
+
+    Returns an array of project objects. Each has `encoded` (the internal key),
+    `display` (the filesystem path), `custom_name`, `session_count`, and
+    `active` (boolean).
+
+    ### 2. Switch to a project
+
+    ```http
+    POST /api/set-project
+    Content-Type: application/json
+
+    { "project": "my-project" }
+    ```
+
+    Pass the `encoded` value from step 1. Returns `{ "ok": true, "project": "...", "display": "..." }`.
+
+    ### 3. Start a session (SocketIO)
+
+    Connect to `ws://localhost:5050` with Socket.IO, then emit:
+
+    ```json
+    {
+      "session_id": "session_abc123",
+      "cwd": "/path/to/project",
+      "prompt": "Refactor the auth module",
+      "name": "Auth refactor"
+    }
+    ```
+
+    The server confirms with a `session_started` event: `{ "session_id": "session_abc123" }`.
+
+    ### 4. Send a follow-up message (SocketIO)
+
+    Once the session is idle, emit `send_message`:
+
+    ```json
+    { "session_id": "session_abc123", "text": "Now add unit tests" }
+    ```
+
+    The server replies with `message_ack`: `{ "session_id": "session_abc123" }`.
+
+    ### 5. Watch for responses (SocketIO)
+
+    Listen for `session_entry` events — the server pushes each new entry as it
+    arrives:
+
+    ```json
+    {
+      "session_id": "session_abc123",
+      "entry": { "kind": "asst", "text": "Here is the refactored module..." }
+    }
+    ```
+
+    Entry `kind` values: `user`, `asst`, `tool_use`, `tool_result`, `system`.
+
+    ### 6. List sessions
+
+    ```http
+    GET /api/sessions?project=my-project
+    ```
+
+    Returns an array of session summary objects, each with `id`, `display_title`,
+    `date`, `last_activity`, `message_count`, and `preview`.
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT
@@ -150,6 +225,31 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/SessionSummary"
+              example:
+                - id: "session_abc123"
+                  display_title: "Refactor authentication module"
+                  custom_title: "Refactor authentication module"
+                  user_named: true
+                  date: "Apr 12, 2026"
+                  last_activity: "2 hours ago"
+                  last_activity_ts: 1744444800
+                  sort_ts: 1744444800
+                  size: "24.5 KB"
+                  file_bytes: 25088
+                  message_count: 18
+                  preview: "Can you help me refactor the auth module to use JWT tokens?"
+                - id: "session_def456"
+                  display_title: "New Session"
+                  custom_title: ""
+                  user_named: false
+                  date: ""
+                  last_activity: ""
+                  last_activity_ts: 0
+                  sort_ts: 0
+                  size: ""
+                  file_bytes: 0
+                  message_count: 0
+                  preview: ""
 
   /api/resolve-session/{session_id}:
     get:
@@ -199,6 +299,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SessionDetail"
+              example:
+                id: "session_abc123"
+                display_title: "Refactor authentication module"
+                custom_title: "Refactor authentication module"
+                date: "Apr 12, 2026"
+                size: "24.5 KB"
+                message_count: 3
+                messages:
+                  - role: "user"
+                    content: "Can you help me refactor the auth module?"
+                    type: "user"
+                  - role: "assistant"
+                    content: "Sure! I'll start by reviewing the current authentication flow."
+                    type: "assistant"
+                  - role: "user"
+                    content: "Great, let's use JWT tokens instead of session cookies."
+                    type: "user"
+                preview: "Can you help me refactor the auth module?"
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -233,6 +351,9 @@ paths:
                     type: boolean
                   title:
                     type: string
+              example:
+                ok: true
+                title: "Auth module refactor v2"
         "400":
           $ref: "#/components/responses/BadRequest"
 
@@ -501,6 +622,10 @@ paths:
                     type: string
                   title:
                     type: string
+              example:
+                ok: true
+                new_id: "session_fork_ghi012"
+                title: "Refactor authentication module (fork)"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
@@ -643,6 +768,17 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Project"
+              example:
+                - encoded: "C-Users-dev-Documents-my-project"
+                  display: "C:/Users/dev/Documents/my-project"
+                  custom_name: "My Project"
+                  session_count: 12
+                  active: true
+                - encoded: "C-Users-dev-Documents-another-app"
+                  display: "C:/Users/dev/Documents/another-app"
+                  custom_name: ""
+                  session_count: 3
+                  active: false
 
   /api/set-project:
     post:
@@ -1012,6 +1148,10 @@ paths:
                     type: string
                   exists:
                     type: boolean
+              example:
+                content: "# Project Rules\n\n## Code Style\n- Use 4-space indentation\n- Follow PEP 8 for Python\n"
+                path: "CLAUDE.md"
+                exists: true
         "500":
           $ref: "#/components/responses/ServerError"
     put:
@@ -1271,6 +1411,29 @@ paths:
                     nullable: true
                   source:
                     type: string
+              example:
+                ok: true
+                assets:
+                  - id: "code-reviewer"
+                    name: "Code Reviewer"
+                    department: "Engineering"
+                    tags: ["review", "quality"]
+                    active: true
+                    version: "1.0"
+                    allowed_tools: null
+                    source: null
+                    systemPrompt: "You are an expert code reviewer. Review code for bugs, style issues, and security vulnerabilities."
+                  - id: "test-writer"
+                    name: "Test Writer"
+                    department: "QA"
+                    tags: ["testing", "automation"]
+                    active: true
+                    version: "1.0"
+                    allowed_tools: null
+                    source: null
+                    systemPrompt: "You are a test automation specialist. Write comprehensive unit and integration tests."
+                map: null
+                source: "disk"
 
   /api/workforce/discover:
     get:
@@ -1814,6 +1977,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/KanbanTask"
+              example:
+                id: "task_xyz789"
+                project_id: "C-Users-dev-Documents-my-project"
+                parent_id: null
+                title: "Implement user login page"
+                description: "Create a login form with email and password fields"
+                verification_url: null
+                status: "not_started"
+                position: 1000
+                depth: 0
+                owner: null
+                created_at: "2026-04-12T18:30:00+00:00"
+                updated_at: "2026-04-12T18:30:00+00:00"
+                children_count: 0
+                children_complete: 0
+                session_count: 0
+                active_sessions: 0
+                tags: []
         "400":
           $ref: "#/components/responses/BadRequest"
         "500":
@@ -1859,6 +2040,54 @@ paths:
                         type: array
                         items:
                           type: string
+              example:
+                id: "task_xyz789"
+                project_id: "C-Users-dev-Documents-my-project"
+                parent_id: null
+                title: "Implement user login page"
+                description: "Create a login form with email and password fields"
+                verification_url: "http://localhost:3000/login"
+                status: "working"
+                position: 1000
+                depth: 0
+                owner: null
+                created_at: "2026-04-12T18:30:00+00:00"
+                updated_at: "2026-04-12T19:15:00+00:00"
+                children_count: 2
+                children_complete: 1
+                session_count: 1
+                active_sessions: 1
+                children:
+                  - id: "task_child001"
+                    project_id: "C-Users-dev-Documents-my-project"
+                    parent_id: "task_xyz789"
+                    title: "Create login form HTML"
+                    description: ""
+                    status: "complete"
+                    position: 1000
+                    depth: 1
+                    children_count: 0
+                    children_complete: 0
+                    session_count: 0
+                    active_sessions: 0
+                  - id: "task_child002"
+                    project_id: "C-Users-dev-Documents-my-project"
+                    parent_id: "task_xyz789"
+                    title: "Add authentication logic"
+                    description: ""
+                    status: "working"
+                    position: 2000
+                    depth: 1
+                    children_count: 0
+                    children_complete: 0
+                    session_count: 1
+                    active_sessions: 1
+                sessions:
+                  - session_id: "session_abc123"
+                    status: "working"
+                    session_type: "session"
+                issues: []
+                tags: ["frontend", "auth"]
         "404":
           $ref: "#/components/responses/NotFound"
     patch:
@@ -1940,6 +2169,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/KanbanTask"
+              example:
+                id: "task_xyz789"
+                project_id: "C-Users-dev-Documents-my-project"
+                parent_id: null
+                title: "Implement user login page"
+                description: "Create a login form with email and password fields"
+                verification_url: null
+                status: "validating"
+                position: 1000
+                depth: 0
+                owner: null
+                created_at: "2026-04-12T18:30:00+00:00"
+                updated_at: "2026-04-12T20:00:00+00:00"
+                children_count: 2
+                children_complete: 1
+                session_count: 1
+                active_sessions: 0
+                tags: []
         "400":
           $ref: "#/components/responses/BadRequest"
 
@@ -4422,6 +4669,12 @@ paths:
             application/json:
               schema:
                 type: object
+              example:
+                has_git: true
+                ahead: 2
+                behind: 0
+                uncommitted: true
+                ready: true
 
   /api/git-sync:
     post:
