@@ -188,6 +188,7 @@ async function setProject(encoded, reload = true) {
   window._workingSinceMap = {};
   if (window._sessionSubstatus) window._sessionSubstatus = {};
   if (window._sessionUsage) window._sessionUsage = {};
+  window._subAgents = {};
   // --- Clear view-specific state from the old project ---
   // Folder tree: stale folder IDs / cached tree from old project
   if (typeof _currentFolderId !== 'undefined') _currentFolderId = null;
@@ -998,6 +999,20 @@ async function _ensureAgentCatalog() {
           label: def.skill.label || def.name,
           systemPrompt: def.skill.systemPrompt,
         }));
+
+      // Include local project skills and agents in the catalog
+      if (typeof _fetchLocalWorkforce === 'function') {
+        try {
+          const local = await _fetchLocalWorkforce();
+          for (const sk of (local.skills || [])) {
+            agents.push({ id: 'local-skill-' + sk.id, label: '[Local Skill] ' + (sk.name || sk.id), systemPrompt: sk.systemPrompt || '' });
+          }
+          for (const ag of (local.agents || [])) {
+            agents.push({ id: 'local-agent-' + ag.id, label: '[Local Agent] ' + (ag.name || ag.id), systemPrompt: ag.systemPrompt || '' });
+          }
+        } catch (_) { /* non-fatal */ }
+      }
+
       if (!agents.length) return null;
 
       const resp = await fetch('/api/agents/write-catalog', {
@@ -1032,14 +1047,21 @@ function _buildAgentDefinitions() {
 async function _newSessionSubmit(sessionId) {
   const ta = document.getElementById('live-input-ta');
   if (!ta) return;
-  const text = ta.value.trim();
-  if (!text) { showToast('Type a message first'); return; }
+  let text = ta.value.trim();
+  if (!text && !window._pendingInvoke) { showToast('Type a message first'); return; }
   if (typeof _interceptSlashCommand === 'function' && _interceptSlashCommand(text)) {
     ta.value = ''; _resetTextareaHeight(ta); return;
   }
   ta.value = '';  // clear immediately to prevent double-submit on key repeat
   _resetTextareaHeight(ta);
   if (typeof _clearDraft === 'function') _clearDraft(sessionId);
+
+  // Wrap with invoke if pending
+  const _hasInvoke = !!window._pendingInvoke;
+  const _invokeNotice = (window._pendingInvoke && typeof _buildInvokeNotice === 'function') ? _buildInvokeNotice() : '';
+  if (window._pendingInvoke && typeof _wrapInvokeMessage === 'function') {
+    text = _wrapInvokeMessage(text || '');
+  }
 
   // NOW seed as running (session will exist on server after this emit)
   runningIds.add(sessionId);
@@ -1071,6 +1093,13 @@ async function _newSessionSubmit(sessionId) {
         ? systemPrompt + '\n\n' + agentBlock
         : agentBlock;
     }
+  }
+
+  // Inject invoke skill notice into system prompt
+  if (_invokeNotice) {
+    systemPrompt = systemPrompt
+      ? systemPrompt + _invokeNotice
+      : _invokeNotice.trim();
   }
 
   const startOpts = {

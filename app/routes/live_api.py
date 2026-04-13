@@ -831,6 +831,155 @@ def discover_workforce():
     return jsonify({"ok": True, "discovered": discovered})
 
 
+# ---------------------------------------------------------------------------
+# Local project skills/agents discovery (for Invoke Workforce modal)
+# ---------------------------------------------------------------------------
+
+_local_wf_cache: dict[str, tuple] = {}  # proj → (mtime, result)
+
+# ── Hyperparameters ──
+_SCAN_CHILD_DEPTH = 2       # max depth INSIDE a found skills/agents folder
+_FIND_FOLDER_DEPTH = 4      # max depth to SEARCH for skills/agents folders in the project
+_SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', 'env',
+              '.tox', '.mypy_cache', '.pytest_cache', 'dist', 'build',
+              '.next', '.nuxt', 'coverage', '.eggs'}
+
+
+def _prettify_name(stem: str) -> str:
+    """Convert filename stem to pretty Title Case.
+    Handles dash-case, snake_case, and camelCase."""
+    import re as _re
+    name = _re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', stem)
+    name = name.replace('-', ' ').replace('_', ' ')
+    return name.title()
+
+
+def _find_named_dirs(root: Path, target_name: str, max_depth: int) -> list[Path]:
+    """Walk the project tree up to max_depth to find all directories named target_name.
+    Skips common heavy/irrelevant directories for performance."""
+    found = []
+
+    def _walk(d: Path, depth: int):
+        if depth > max_depth:
+            return
+        try:
+            entries = sorted(d.iterdir())
+        except (PermissionError, OSError):
+            return
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            if entry.name in _SKIP_DIRS:
+                continue
+            if entry.name == target_name:
+                found.append(entry)
+                # Don't recurse INTO a matched dir looking for nested skills/skills/
+                continue
+            _walk(entry, depth + 1)
+
+    _walk(root, 1)
+    return found
+
+
+def _scan_local_md(directory: Path, source_type: str, project_root: Path,
+                   max_depth: int = _SCAN_CHILD_DEPTH):
+    """Scan a skills/ or agents/ directory for .md files up to max_depth levels deep."""
+    results = []
+    if not directory.is_dir():
+        return results
+
+    def _walk(d: Path, depth: int):
+        if depth > max_depth:
+            return
+        try:
+            entries = sorted(d.iterdir())
+        except PermissionError:
+            return
+        for entry in entries:
+            if entry.is_file() and entry.suffix == '.md':
+                try:
+                    content = entry.read_text(encoding='utf-8')
+                except Exception:
+                    continue
+                frontmatter, body = _parse_frontmatter(content)
+                raw_id = frontmatter.get('id', entry.stem)
+                name = frontmatter.get('name') or _prettify_name(entry.stem)
+                # Show path relative to project root for context
+                try:
+                    rel = str(entry.relative_to(project_root))
+                except ValueError:
+                    rel = str(entry.relative_to(directory))
+                results.append({
+                    "id": raw_id,
+                    "name": name,
+                    "source": source_type,
+                    "path": str(entry.resolve()),
+                    "systemPrompt": body,
+                    "relativePath": rel.replace('\\', '/'),
+                })
+            elif entry.is_dir() and depth < max_depth:
+                _walk(entry, depth + 1)
+
+    _walk(directory, 1)
+    return results
+
+
+@bp.route('/api/invoke/discover', methods=['GET'])
+def discover_local_workforce():
+    """Smart-scan the active project for any folders named skills/ or agents/
+    anywhere in the tree, then read .md files from each."""
+    # Resolve the real filesystem path for the active project.
+    proj_config = _sessions_dir()
+    if not proj_config or not Path(proj_config).is_dir():
+        return jsonify({"ok": True, "local_skills": [], "local_agents": []})
+
+    proj = _decode_project(Path(proj_config).name)
+    if not proj or not os.path.isdir(proj):
+        return jsonify({"ok": True, "local_skills": [], "local_agents": []})
+
+    proj_root = Path(proj)
+    scan_depth = int(request.args.get('depth', _SCAN_CHILD_DEPTH))
+    find_depth = int(request.args.get('find_depth', _FIND_FOLDER_DEPTH))
+
+    # Cache keyed on project path — invalidated when any found dir is newer
+    cache_key = proj
+    cached = _local_wf_cache.get(cache_key)
+
+    # Find all skills/ and agents/ folders in the project
+    skills_dirs = _find_named_dirs(proj_root, 'skills', find_depth)
+    agents_dirs = _find_named_dirs(proj_root, 'agents', find_depth)
+
+    # Compute combined mtime for cache validation
+    try:
+        all_dirs = skills_dirs + agents_dirs
+        combined_mt = max((d.stat().st_mtime for d in all_dirs), default=0)
+    except OSError:
+        combined_mt = 0
+
+    if cached and combined_mt > 0 and cached[0] >= combined_mt:
+        return jsonify(cached[1])
+
+    # Scan all discovered directories
+    local_skills = []
+    for sd in skills_dirs:
+        local_skills.extend(_scan_local_md(sd, 'local_skill', proj_root, scan_depth))
+
+    local_agents = []
+    for ad in agents_dirs:
+        local_agents.extend(_scan_local_md(ad, 'local_agent', proj_root, scan_depth))
+
+    result = {
+        "ok": True,
+        "local_skills": local_skills,
+        "local_agents": local_agents,
+        "project_root": str(proj_root),
+    }
+    if combined_mt > 0:
+        _local_wf_cache[cache_key] = (combined_mt, result)
+
+    return jsonify(result)
+
+
 @bp.route('/api/workforce/write-asset', methods=['POST'])
 def write_workforce_asset():
     """Write a .md asset file to the workforce directory."""

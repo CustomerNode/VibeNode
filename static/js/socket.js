@@ -327,6 +327,18 @@ socket.on('state_snapshot', (data) => {
     runningIds = newRunning;
     sessionKinds = newKinds;
 
+    // Purge stale sub-agents for sessions that are no longer working.
+    // The real-time session_state handler clears on idle, but if that
+    // event was missed (tab sleeping, transport hiccup), old agents
+    // would persist and reappear when the session starts a new turn.
+    if (window._subAgents) {
+        for (const _saId in window._subAgents) {
+            if (newKinds[_saId] !== 'working') {
+                delete window._subAgents[_saId];
+            }
+        }
+    }
+
     // Populate _idRemaps from server aliases so kanban and other code
     // can resolve old→new session IDs even after a page refresh
     if (data.aliases) {
@@ -523,6 +535,11 @@ socket.on('session_state', (data) => {
     if (state === 'waiting') {
         sessionKinds[session_id] = 'question';
     } else if (state === 'working' || state === 'starting') {
+        // Clear sub-agents from previous turns when starting a new turn
+        // (idle/question → working transition means old agents are stale)
+        if (sessionKinds[session_id] && sessionKinds[session_id] !== 'working') {
+            delete window._subAgents[session_id];
+        }
         sessionKinds[session_id] = 'working';
     } else if (state === 'idle') {
         sessionKinds[session_id] = 'idle';
@@ -1266,6 +1283,10 @@ socket.on('session_log', (data) => {
     _liveEntryStash = [];  // server pagination — no client stash needed
     _liveRenderedFrom = offset;
 
+    // Clear stale sub-agent tracking — the full reload replaces everything
+    // and historical entries should NOT re-populate the agent bar.
+    delete window._subAgents[data.session_id];
+
     logEl.innerHTML = '';
     _optimisticMsgId = 0;
     if (typeof _clearOutputShelf === 'function') _clearOutputShelf();
@@ -1484,9 +1505,17 @@ setInterval(() => {
 // ---- Startup ----
 window._initialLoadDone = false;
 loadProjects().then(() => { window._initialLoadDone = true; }).catch(() => { window._initialLoadDone = true; });
+<<<<<<< Updated upstream
 // Git status polling (was in polling.js which is no longer loaded)
 pollGitStatus();
 setInterval(pollGitStatus, 60000);
+=======
+// Git status polling — initial check + 60s interval
+if (typeof pollGitStatus === 'function') {
+  pollGitStatus();
+  setInterval(pollGitStatus, 60000);
+}
+>>>>>>> Stashed changes
 // Initialize folder tree from server (shows template selector on first run)
 if (typeof initFolderTree === 'function') {
   initFolderTree().catch(function(e) { console.error('initFolderTree failed', e); });

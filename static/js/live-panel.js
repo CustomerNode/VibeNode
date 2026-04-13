@@ -500,6 +500,11 @@ function startLivePanel(id, opts) {
   liveLineCount = 0;
   liveAutoScroll = true;
   if (!(opts && opts.skipLog)) _optimisticMsgId = 0;
+  // Clear any pending invoke from a different session
+  if (window._pendingInvoke) {
+    window._pendingInvoke = null;
+    if (typeof _removeInvokeVisual === 'function') _removeInvokeVisual();
+  }
   // Queue is restored from per-session localStorage — no reset here
   // Restore working_since from the map (set by state_snapshot/session_state)
   if (window._workingSinceMap && window._workingSinceMap[id]) {
@@ -698,6 +703,23 @@ function renderLiveEntry(e) {
       text = vnMeta.clean;
       vnSentAt = vnMeta.sentAt;
       vnIsVoice = vnMeta.voice;
+    }
+
+    // Render [[invoke]] blocks as gradient pills instead of full markdown
+    if (e.kind === 'user' && typeof _renderInvokePills === 'function') {
+      const invokeResult = _renderInvokePills(text);
+      if (invokeResult) {
+        div.className = 'msg user';
+        const roleLabel = 'me';
+        const ts = e.timestamp ? _formatMsgTime(e.timestamp) : '';
+        let body = invokeResult.pillHtml;
+        if (invokeResult.remainder) {
+          body += '<pre style="white-space:pre-wrap;margin:8px 0 0;">' + escHtml(invokeResult.remainder) + '</pre>';
+        }
+        div.innerHTML = '<div class="msg-role">' + roleLabel + (ts ? ' <span class="msg-time">' + ts + '</span>' : '') + '</div>' +
+          '<div class="msg-body msg-content">' + body + '</div>';
+        return div;
+      }
     }
 
     // Render bracketed messages like [Request interrupted by user] as centered pills
@@ -1197,6 +1219,7 @@ function updateLiveInputBar() {
       '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="Type a message to continue\u2026"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitContinue(\'' + id + '\')}"></textarea>' +
       '<div class="live-bar-row">' +
+      (typeof _buildInvokeBtn === 'function' ? _buildInvokeBtn() : '') +
       _buildCtxBarCompact(id) +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
@@ -1258,6 +1281,7 @@ function updateLiveInputBar() {
       '<textarea id="live-input-ta" class="live-textarea waiting-focus" rows="2" placeholder="Type your response\u2026 (or click an option above)"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitWaiting()}"></textarea>' +
       '<div class="live-bar-row">' +
+      (typeof _buildInvokeBtn === 'function' ? _buildInvokeBtn() : '') +
       _buildCtxBarCompact(id) +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
       '<button class="live-send-btn waiting" id="live-voice-btn"></button>' +
@@ -1280,6 +1304,7 @@ function updateLiveInputBar() {
       '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="Type your next command\u2026"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitIdle()}"></textarea>' +
       '<div class="live-bar-row">' +
+      (typeof _buildInvokeBtn === 'function' ? _buildInvokeBtn() : '') +
       _buildCtxBarCompact(id) +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
@@ -1364,6 +1389,7 @@ function updateLiveInputBar() {
       'placeholder="' + (qCount ? 'Queue another command\u2026' : 'Type your next command \u2014 will send when Claude finishes\u2026') + '"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveQueueSave()}"></textarea>' +
       '<div class="live-bar-row">' +
+      (typeof _buildInvokeBtn === 'function' ? _buildInvokeBtn() : '') +
       _buildCtxBarCompact(id, true) +
       '<span id="live-queue-hint" style="font-size:10px;color:var(--text-faint);">' +
       (qCount ? qCount + ' queued \u2022 will send in order when idle' : 'Will send automatically when done') +
@@ -1431,6 +1457,11 @@ function updateLiveInputBar() {
       _newTa.dispatchEvent(new Event('input'));
     }
   }
+
+  // ── Re-apply invoke visual if pending ──
+  if (window._pendingInvoke && typeof _applyInvokeVisual === 'function') {
+    _applyInvokeVisual();
+  }
 }
 
 function livePickOption(val) {
@@ -1446,8 +1477,12 @@ function livePickOption(val) {
 function liveQueueSave() {
   const ta = document.getElementById('live-queue-ta');
   if (!ta || !liveSessionId) return;
-  const text = ta.value.trim();
-  if (!text) return;
+  let text = ta.value.trim();
+  if (!text && !window._pendingInvoke) return;
+  // Wrap with invoke if pending
+  if (window._pendingInvoke && typeof _wrapInvokeMessage === 'function') {
+    text = _wrapInvokeMessage(text);
+  }
 
   // If the session went idle while we were recording (e.g. voice dictation
   // started during 'working' but Claude finished before we stopped talking),
@@ -1514,10 +1549,15 @@ function liveEditQueue() {
 function liveSubmitIdle() {
   const ta = document.getElementById('live-input-ta');
   if (!ta || !liveSessionId) return;
-  const text = ta.value.trim();
-  if (!text) return;
+  let text = ta.value.trim();
+  // Allow empty text if we have a pending invoke (send just the invoke)
+  if (!text && !window._pendingInvoke) return;
   ta.value = '';
   _resetTextareaHeight(ta);
+  // Wrap with invoke if pending
+  if (window._pendingInvoke && typeof _wrapInvokeMessage === 'function') {
+    text = _wrapInvokeMessage(text);
+  }
   // Check and consume voice flag
   const wasVoice = (typeof _lastSubmitWasVoice !== 'undefined' && _lastSubmitWasVoice);
   if (wasVoice) _lastSubmitWasVoice = false;
@@ -1826,10 +1866,13 @@ function _addOptimisticBubble(sid, text, isVoice) {
 
 function liveSubmitContinue(fromId) {
   const ta = document.getElementById('live-input-ta');
-  const text = ta ? ta.value.trim() : '';
-  if (!text) return;
+  let text = ta ? ta.value.trim() : '';
+  if (!text && !window._pendingInvoke) return;
   ta.value = '';
   _resetTextareaHeight(ta);
+  if (window._pendingInvoke && typeof _wrapInvokeMessage === 'function') {
+    text = _wrapInvokeMessage(text);
+  }
 
   const sid = typeof fromId === 'string' ? fromId : liveSessionId;
   if (!sid) return;
@@ -1881,10 +1924,13 @@ function liveSubmitContinue(fromId) {
 function liveSubmitWaiting() {
   const ta = document.getElementById('live-input-ta');
   if (!ta || !liveSessionId) return;
-  const text = ta.value.trim();
-  if (!text) return;
+  let text = ta.value.trim();
+  if (!text && !window._pendingInvoke) return;
   ta.value = '';
   _resetTextareaHeight(ta);
+  if (window._pendingInvoke && typeof _wrapInvokeMessage === 'function') {
+    text = _wrapInvokeMessage(text);
+  }
   _clearDraft(liveSessionId);
 
   // Use permission_response if there's an active permission request
