@@ -63,6 +63,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 from tests.e2e.conftest import TEST_BASE_URL as BASE_URL, TEST_DAEMON_PORT
+from tests.e2e.wait_helpers import wait_for_js_ready
 
 pytestmark = pytest.mark.e2e
 
@@ -72,6 +73,9 @@ pytestmark = pytest.mark.e2e
 
 REPO_ROOT = Path(__file__).resolve().parents[2]     # VibeNode/
 PROJECT_DIR = REPO_ROOT                              # Claude project directory
+# Claude Code encodes project paths into directory-safe names by replacing
+# all path separators and colons with hyphens.  This must match the naming
+# convention used in ~/.claude/projects/ so we can find the session JSONL.
 _ENCODED_PROJECT = (
     str(PROJECT_DIR)
     .replace("\\", "-")
@@ -88,6 +92,12 @@ SCRATCH_ORIGINAL = "# scratch file for rewind E2E test\nx = 1\n"
 # The prompt is very specific: exactly one edit, no Agent tool, no ambiguity.
 # This makes the rewind reversal deterministic — there's exactly one Edit to
 # undo, so we know exactly what the file should look like after rewind.
+#
+# "Do not use the Agent tool" is CRITICAL: the Agent tool wraps edits in a
+# subprocess and may use Write instead of Edit.  The rewind API can reverse
+# Edit tool_use blocks (old_string → new_string swap) but cannot reverse
+# Write tool_use without a daemon file-history snapshot on disk.  Forcing
+# Edit keeps the test deterministic.
 PROMPT = (
     f"Add a single-line comment '# REWIND_TEST_MARKER' at the very top of "
     f"the file {SCRATCH_FILE}. Do not change anything else. Do not use "
@@ -124,7 +134,9 @@ def _wait_for_file_change(filepath, original, timeout=180):
     """Poll until the file content differs from *original*.
 
     Returns True if the file changed, False if we timed out.
-    Polls every 3 seconds — Claude typically edits within 10-30s.
+    Polls every 3 seconds — a shorter interval would waste CPU on stat()
+    calls while Claude is still thinking, and a longer one adds unnecessary
+    latency to the test.  Claude typically edits within 10-30s.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -211,6 +223,10 @@ class TestRewindE2E:
         If this fails, nothing else can work.  The error message tells you
         exactly which component is down.
         """
+        # Reset class state from any prior run (prevents bleed-over if
+        # pytest reuses the class object across parameterised invocations)
+        self.__class__._existing_jsonls = set()
+        self.__class__._rewind_session_id = None
         assert _web_alive(), (
             f"Web UI not running on {BASE_URL}. "
             "The E2E conftest should auto-start it — check logs."
@@ -245,7 +261,9 @@ class TestRewindE2E:
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.TAG_NAME, "header"))
         )
-        time.sleep(2)  # Let WebSocket connect and session list load
+        # Wait for the JS app to fully initialise (WebSocket, session list)
+        # rather than a blind sleep.
+        wait_for_js_ready(driver, timeout=10)
 
     # --- Step 2: Create a new session and send the edit prompt ---
 
@@ -293,19 +311,8 @@ class TestRewindE2E:
                 'return document.getElementById("main-body")'
                 '?.innerHTML?.substring(0,500) || "EMPTY"'
             )
-            # Last resort: inject the textarea directly so we can proceed
-            driver.execute_script("""
-                const bar = document.getElementById('live-input-bar');
-                if (bar && !document.getElementById('live-input-ta')) {
-                    bar.innerHTML = '<textarea id="live-input-ta" rows="3">'
-                                  + '</textarea>';
-                }
-            """)
-            time.sleep(1)
-            try:
-                ta = driver.find_element(By.ID, "live-input-ta")
-            except Exception:
-                pass
+            # Do NOT inject a synthetic textarea — that masks real failures.
+            # If the textarea doesn't appear, the session creation is broken.
             assert ta is not None, (
                 f"Textarea never appeared after 30s. main-body: {body_html}"
             )
@@ -324,7 +331,19 @@ class TestRewindE2E:
             const match = handler.match(/_newSessionSubmit\\('([^']+)'\\)/);
             if (match) _newSessionSubmit(match[1]);
         """, PROMPT)
-        time.sleep(3)  # Give the session a moment to initialize
+        time.sleep(3)  # Give the session a moment to initialize on the daemon
+
+        # Verify submission took effect — the textarea should clear or a
+        # spinner should appear.
+        submitted = driver.execute_script("""
+            const ta = document.getElementById('live-input-ta');
+            // If submit worked, the textarea is either cleared, disabled, or replaced
+            return !ta || !ta.value.trim() || ta.disabled ||
+                   !!document.querySelector('.live-spinner');
+        """)
+        # Note: not asserting here because some UI paths don't immediately
+        # clear the textarea.  The real proof is test_03 — if Claude edits
+        # the file, the submit worked.
 
     # --- Step 3: Wait for Claude to edit the scratch file ---
 
@@ -382,7 +401,8 @@ class TestRewindE2E:
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.TAG_NAME, "header"))
         )
-        time.sleep(3)  # Let the session panel render
+        # Wait for the session panel to render instead of a blind sleep
+        wait_for_js_ready(driver, timeout=15)
 
     # --- Step 5: Open the Rewind Code picker ---
 

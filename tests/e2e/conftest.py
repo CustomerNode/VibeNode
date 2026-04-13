@@ -73,6 +73,8 @@ SCREENSHOT_DIR = Path(__file__).resolve().parent.parent / "screenshots"
 _test_server_proc = None
 _test_daemon_proc = None
 _test_tmpdir = None
+_daemon_fh = None
+_server_fh = None
 
 
 # ===========================================================================
@@ -224,7 +226,7 @@ def pytest_configure(config):
     4. Starts the test web server on port 5099
     5. Waits for both to be ready before letting tests run
     """
-    global _test_server_proc, _test_daemon_proc, _test_tmpdir
+    global _test_server_proc, _test_daemon_proc, _test_tmpdir, _daemon_fh, _server_fh
     import socket as _sock
 
     SCREENSHOT_DIR.mkdir(exist_ok=True)
@@ -313,7 +315,7 @@ def pytest_unconfigure(config):
     This runs after ALL tests finish (pass or fail).  We terminate
     gracefully first, then force-kill if needed.
     """
-    global _test_server_proc, _test_daemon_proc, _test_tmpdir
+    global _test_server_proc, _test_daemon_proc, _test_tmpdir, _daemon_fh, _server_fh
 
     for label, proc in [("web", _test_server_proc), ("daemon", _test_daemon_proc)]:
         if proc:
@@ -328,6 +330,16 @@ def pytest_unconfigure(config):
 
     _test_server_proc = None
     _test_daemon_proc = None
+
+    # Close log file handles so we don't leak descriptors
+    for fh in (_server_fh, _daemon_fh):
+        if fh:
+            try:
+                fh.close()
+            except Exception:
+                pass
+    _server_fh = None
+    _daemon_fh = None
 
     if _test_tmpdir:
         shutil.rmtree(_test_tmpdir, ignore_errors=True)

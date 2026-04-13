@@ -809,7 +809,13 @@ def api_rewind(session_id):
                     target.write_text(content, encoding="utf-8")
                     files_reversed.add(fp)
             elif tname == "Write":
-                # For Write, we need a backup or git — can't reverse
+                # Write overwrites the entire file — we can't reverse it by
+                # string replacement like Edit.  The only way to restore is
+                # via a file-history snapshot (handled in the snapshot
+                # fallback below).  We skip it here so that the snapshot
+                # loop gets a chance to find a backup.  If no snapshot
+                # exists on disk, the catch-all at the end of this function
+                # will add the file to 'skipped'.
                 pass
         except Exception:
             pass
@@ -852,6 +858,16 @@ def api_rewind(session_id):
                 restored.append(rel_path)
             except Exception:
                 skipped.append(rel_path)
+
+    # Catch any files from edits_after that weren't handled by either
+    # the Edit reversal or the snapshot fallback.  This ensures Write
+    # tool_use files without a snapshot don't silently vanish from the
+    # response — they appear in files_skipped so the caller knows.
+    _all_edit_files = set(fp for fp, _, _, _ in edits_after)
+    _handled = set(restored) | set(skipped)
+    for fp in _all_edit_files:
+        if fp not in _handled:
+            skipped.append(fp)
 
     return jsonify({
         "ok": True,
