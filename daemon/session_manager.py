@@ -1599,6 +1599,29 @@ class SessionManager:
                     self._emit_state(info)
                 return
 
+        # Pre-flight liveness check: the client object exists but the
+        # underlying CLI process may have exited between turns.  Silently
+        # reconnect before sending so the user never sees "Stream lost".
+        if info.client:
+            cli_pid = self._extract_cli_pid(info)
+            if cli_pid == 0:
+                # Process already exited — silent reconnect
+                logger.info("_send_query: %s CLI process dead before send — "
+                            "silent reconnect", session_id)
+                if await self._reconnect_client(session_id, info):
+                    logger.info("_send_query: silent reconnect succeeded for %s", session_id)
+                else:
+                    if info.state == SessionState.WORKING:
+                        info.state = SessionState.IDLE
+                        info.error = "Session disconnected — reconnect failed"
+                        entry = LogEntry(kind="system",
+                                         text="Could not reconnect — please try again",
+                                         is_error=True)
+                        with info._lock:
+                            info.entries.append(entry)
+                        self._emit_state(info)
+                    return
+
         # Pre-populate tracked_files on follow-up turns (covers daemon
         # restart scenarios where tracked_files was lost).
         # Runs in a thread so large JSONL parses don't block the event loop.
