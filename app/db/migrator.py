@@ -52,6 +52,7 @@ class BackendMigrator:
                 sh["new_status"],
                 sh.get("changed_by"),
                 sh.get("changed_at"),
+                session_id=sh.get("session_id"),
             )
 
     def switch_backend(self, current, target):

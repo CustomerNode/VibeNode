@@ -898,7 +898,7 @@ class SqliteRepository(KanbanRepository):
         """Return all status history rows (for migration export)."""
         conn = self._get_conn()
         cur = conn.execute(
-            "SELECT id, task_id, old_status, new_status, changed_by, changed_at "
+            "SELECT id, task_id, old_status, new_status, changed_by, changed_at, session_id "
             "FROM task_status_history ORDER BY changed_at"
         )
         return [dict(row) for row in cur.fetchall()]
