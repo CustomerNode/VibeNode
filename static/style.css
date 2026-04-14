@@ -7134,6 +7134,44 @@ mark.find-match.current { background: var(--accent); color:#fff; }
 .kanban-tag-suggestion:hover { background:var(--bg-secondary); }
 .kanban-tag-usage-count { font-size:10px; opacity:0.6; margin-left:4px; }
 
+/* ── Status history timeline ── */
+.kanban-drill-history-section { margin:16px 0 0; padding-top:12px; border-top:1px solid var(--border); }
+.kanban-history-timeline { display:flex; flex-direction:column; gap:0; }
+.kanban-history-entry {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+  position: relative;
+}
+.kanban-history-entry:not(:last-child)::before {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 18px;
+  bottom: -6px;
+  width: 1px;
+  background: var(--border);
+}
+.kanban-history-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+.kanban-history-body { flex:1; min-width:0; }
+.kanban-history-transition { font-size:12px; color:var(--text-secondary); }
+.kanban-history-time { font-size:11px; color:var(--text-dim); margin-top:1px; }
+.kanban-history-session-link {
+  font-size: 11px;
+  color: var(--accent);
+  text-decoration: none;
+  margin-left: 4px;
+  opacity: 0.8;
+}
+.kanban-history-session-link:hover { opacity:1; text-decoration:underline; }
+
 /* Quill RTE — plain text until focused, then editor chrome appears */
 .kanban-drill-desc-wrap {
   flex-shrink: 0;

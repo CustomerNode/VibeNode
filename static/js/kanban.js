@@ -218,6 +218,27 @@ function _kanbanConfirm(title, message, onConfirm, opts) {
   document.getElementById('kanban-confirm-btn').onclick = () => { _closePm(); if (onConfirm) onConfirm(); };
 }
 
+/**
+ * _kanbanConfirmAsync(title, message, opts) — Promise-based wrapper around _kanbanConfirm.
+ * Resolves to true (confirmed) or false (cancelled).
+ */
+function _kanbanConfirmAsync(title, message, opts) {
+  return new Promise(resolve => {
+    _kanbanConfirm(title, message, () => resolve(true), opts);
+    // If user cancels (clicks Cancel or overlay), the onConfirm callback is never called.
+    // Hook into _closePm to detect cancellation — the confirm button sets its own handler,
+    // so we override the overlay close to also resolve(false).
+    const overlay = document.getElementById('pm-overlay');
+    if (!overlay) { resolve(true); return; }
+    const origClick = overlay.onclick;
+    overlay.onclick = (e) => { if (e.target === overlay) { _closePm(); resolve(false); } };
+    const cancelBtn = overlay.querySelector('.pm-btn-secondary');
+    if (cancelBtn) {
+      cancelBtn.onclick = () => { _closePm(); resolve(false); };
+    }
+  });
+}
+
 // ═══════════════════════════════════════════════════════════════
 // VERIFICATION URL RESOLVER (plan Section 16)
 // ═══════════════════════════════════════════════════════════════
@@ -1795,8 +1816,14 @@ function showCardContextMenu(taskId, event) {
   items += `<div class="kanban-context-item" onclick="closeContextMenu();openTaskDetail('${taskId}')">Edit</div>`;
   items += `<div class="kanban-context-item" onclick="closeContextMenu();createTask('not_started','${taskId}')">Add Subtask</div>`;
   items += `<div class="kanban-context-item" onclick="closeContextMenu();openSessionSpawner('${taskId}')">Spawn Session</div>`;
-  items += `<div class="kanban-context-item" onclick="closeContextMenu();executeTask('${taskId}','quick')">${KI.play} Execute Task</div>`;
-  items += `<div class="kanban-context-item" onclick="closeContextMenu();executeTask('${taskId}','validate')">${KI.play} Execute + Validate</div>`;
+  // Only show Execute options for leaf tasks with actionable statuses
+  const _ctxTask = kanbanTasks.find(t => t.id === taskId);
+  const _ctxIsLeaf = !_ctxTask || (_ctxTask.children_count || 0) === 0;
+  const _ctxActionable = !_ctxTask || ['not_started', 'working', 'remediating'].includes(_ctxTask.status);
+  if (_ctxIsLeaf && _ctxActionable) {
+    items += `<div class="kanban-context-item" onclick="closeContextMenu();executeTask('${taskId}','quick')">${KI.play} Execute Task</div>`;
+    items += `<div class="kanban-context-item" onclick="closeContextMenu();executeTask('${taskId}','validate')">${KI.play} Execute + Validate</div>`;
+  }
 
   // Move to submenu
   items += '<div class="kanban-context-separator"></div>';
@@ -3310,8 +3337,13 @@ async function executeTask(taskId, mode, opts) {
       const activeSessions = (sessData.sessions || []).filter(s =>
         (s.session_type || 'session') === 'session'
       );
-      if (activeSessions.length > 0) {
-        if (!confirm('This task already has an active session. Launch another?')) return;
+      if (activeSessions.length > 0 && !opts._skipSessionCheck) {
+        const ok = await _kanbanConfirmAsync(
+          'Active Session Exists',
+          'This task already has an active session. Launch another?',
+          { btnLabel: 'Launch', btnStyle: 'background:var(--purple);border-color:var(--purple);' }
+        );
+        if (!ok) return;
       }
     }
   } catch (e) { /* proceed anyway */ }
@@ -3519,10 +3551,43 @@ async function _batchExecute(mode) {
     return;
   }
 
-  if (taskIds.length > 10) {
-    if (!confirm('Launch ' + taskIds.length + ' sessions simultaneously? This may be slow.')) return;
-  } else {
-    if (!confirm('Execute ' + taskIds.length + ' task(s)? This will create ' + taskIds.length + ' session(s) and start them all immediately.')) return;
+  // Upfront confirmation — use themed modal
+  const confirmMsg = taskIds.length > 10
+    ? 'Launch ' + taskIds.length + ' sessions simultaneously? This may be slow.'
+    : 'Execute ' + taskIds.length + ' task(s)? This will create ' + taskIds.length + ' session(s) and start them all immediately.';
+  const ok = await _kanbanConfirmAsync('Batch Execute', confirmMsg, {
+    btnLabel: 'Launch All',
+    btnStyle: 'background:var(--purple);border-color:var(--purple);',
+  });
+  if (!ok) return;
+
+  // Upfront check: which tasks already have active sessions? (Issue #3)
+  let tasksWithSessions = [];
+  try {
+    const checks = await Promise.all(taskIds.map(async tid => {
+      try {
+        const r = await fetch('/api/kanban/tasks/' + tid + '/sessions');
+        if (r.ok) {
+          const d = await r.json();
+          const active = (d.sessions || []).filter(s => (s.session_type || 'session') === 'session');
+          return active.length > 0 ? tid : null;
+        }
+      } catch (_) {}
+      return null;
+    }));
+    tasksWithSessions = checks.filter(Boolean);
+  } catch (_) {}
+
+  let skipSessionCheckIds = new Set();
+  if (tasksWithSessions.length > 0) {
+    const sessionOk = await _kanbanConfirmAsync(
+      'Active Sessions Detected',
+      tasksWithSessions.length + ' of ' + taskIds.length + ' selected task(s) already have active sessions. Launch additional sessions for all?',
+      { btnLabel: 'Launch All', btnStyle: 'background:var(--purple);border-color:var(--purple);' }
+    );
+    if (!sessionOk) return;
+    // User confirmed — skip per-task session checks
+    skipSessionCheckIds = new Set(tasksWithSessions);
   }
 
   showToast('Launching ' + taskIds.length + ' sessions...');
@@ -3549,6 +3614,7 @@ async function _batchExecute(mode) {
       await executeTask(tid, mode, {
         navigate: false,
         systemPrompt: batchContexts[tid] || '',
+        _skipSessionCheck: skipSessionCheckIds.has(tid),
       });
       succeeded++;
     } catch (e) {
