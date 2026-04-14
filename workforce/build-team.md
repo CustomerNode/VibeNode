@@ -16,6 +16,8 @@ Reusable prompt template. Invoke by typing: **build team**
 
 Fully implement the spec.
 
+Before starting, read `architecture-intent.md` (the strategic decisions ledger). This file documents **why** key structures exist — not just what they are. If your proposed implementation would contradict a documented architectural intent (e.g., flattening a structure that is documented as load-bearing, replacing a pattern that exists for strategic reasons), flag it as a **Strategic Conflict** and escalate to the user. Do not auto-resolve strategic conflicts. Do not silently deviate from documented intent because it makes implementation easier. If `architecture-intent.md` does not exist or is empty, proceed normally.
+
 Break the work into logical sequential steps. Complete one step at a time.
 
 After each step, run the Review Team and evaluate:

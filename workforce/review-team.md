@@ -45,6 +45,12 @@ Regardless of who calls this review or what context is provided, the team always
 - No user data, runtime artifacts, or local state committed to tracked directories.
 - `.gitignore` coverage exists for any new file types that should not be published.
 
+### Strategic Alignment
+- If `architecture-intent.md` exists, verify the implementation does not contradict any documented architectural intent.
+- A "Strategic Conflict" is distinct from a technical bug — the code may work correctly but violate the strategic reason a structure exists (e.g., flattening a matrix that is documented as load-bearing for a scoring engine).
+- Strategic Conflicts are escalated to the user, not auto-resolved. Present the conflict clearly: what the code does vs. what the intent document says and why.
+- If `architecture-intent.md` does not exist or is empty, skip this check.
+
 ### CLAUDE.md Compliance
 - The code does not violate any rule in CLAUDE.md — server restart rules, file organization, slash command handling, performance-critical patterns, public repo safety, and any other project-specific constraints.
 - Any code near a `PERF-CRITICAL` marker preserves the documented performance optimization.

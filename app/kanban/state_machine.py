@@ -34,7 +34,7 @@ VALID_TRANSITIONS = {
 }
 
 
-def transition_task(repo, task_id, new_status, force=False):
+def transition_task(repo, task_id, new_status, force=False, session_id=None):
     """Validate and execute a status transition for a task.
 
     Args:
@@ -42,6 +42,7 @@ def transition_task(repo, task_id, new_status, force=False):
         task_id: UUID string of the task to transition.
         new_status: Target TaskStatus (or string that maps to one).
         force: If True, skip transition validation (for admin overrides).
+        session_id: Optional session ID that triggered this transition.
 
     Returns:
         The updated Task object.
@@ -81,7 +82,8 @@ def transition_task(repo, task_id, new_status, force=False):
     updated = repo.update_task(task_id, status=new_status.value, updated_at=now)
 
     # Record in status history
-    repo.add_status_history(task_id, current_status.value, new_status.value, now)
+    repo.add_status_history(task_id, current_status.value, new_status.value, now,
+                            session_id=session_id)
 
     # Propagate status change up the hierarchy
     propagate_up(repo, task_id)
@@ -145,11 +147,14 @@ def propagate_up(repo, task_id):
         propagate_up(repo, parent_id)
 
 
-def handle_session_start(repo, task_id):
+def handle_session_start(repo, task_id, session_id=None):
     """Handle a session starting on a task.
 
     Controlled by auto_start_on_session preference.
-    Transitions NOT_STARTED or REMEDIATING → WORKING.
+    Transitions NOT_STARTED or REMEDIATING -> WORKING.
+
+    Args:
+        session_id: Optional session ID that triggered this transition.
     """
     if not _get_pref("auto_start_on_session", True):
         task = repo.get_task(task_id)
@@ -162,21 +167,24 @@ def handle_session_start(repo, task_id):
         raise ValueError(f"Task not found: {task_id}")
 
     if task.status == TaskStatus.NOT_STARTED:
-        return transition_task(repo, task_id, TaskStatus.WORKING)
+        return transition_task(repo, task_id, TaskStatus.WORKING, session_id=session_id)
 
     if task.status == TaskStatus.REMEDIATING:
-        return transition_task(repo, task_id, TaskStatus.WORKING)
+        return transition_task(repo, task_id, TaskStatus.WORKING, session_id=session_id)
 
     return task
 
 
-def handle_session_complete(repo, task_id):
+def handle_session_complete(repo, task_id, session_id=None):
     """Handle a session completing / being unlinked from a task.
 
     Checks if all linked sessions are done and all subtasks are
     validating/complete. If so, and if auto_advance is enabled in config,
     auto-pushes the task to 'validating'.
     NEVER auto-pushes to 'complete' -- that requires manual validation.
+
+    Args:
+        session_id: Optional session ID that triggered this transition.
 
     Returns:
         The updated Task object, or the unchanged task if no transition needed.
@@ -205,4 +213,4 @@ def handle_session_complete(repo, task_id):
                 return task
 
     # All sessions done, all children done (or no children) -> validating
-    return transition_task(repo, task_id, TaskStatus.VALIDATING)
+    return transition_task(repo, task_id, TaskStatus.VALIDATING, session_id=session_id)

@@ -917,6 +917,17 @@ class SupabaseRepository(KanbanRepository):
             row["session_id"] = session_id
         self.client.table("task_status_history").insert(row).execute()
 
+    def get_status_history(self, task_id):
+        """Return status history for a task, newest first."""
+        result = (
+            self.client.table("task_status_history")
+            .select("id, task_id, old_status, new_status, changed_by, changed_at, session_id")
+            .eq("task_id", task_id)
+            .order("changed_at", desc=True)
+            .execute()
+        )
+        return result.data if result.data else []
+
     def _create_default_columns(self, project_id):
         """Insert the five default columns for a new project."""
         for name, status_key, position, color in _DEFAULT_COLUMNS:

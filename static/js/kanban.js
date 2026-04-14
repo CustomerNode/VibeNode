@@ -2099,6 +2099,12 @@ async function renderTaskDetail(taskId, opts) {
     html += '<div id="kanban-tag-suggestions" class="kanban-tag-suggestions"></div>';
     html += '</div>';
 
+    // ── Status history timeline (loaded async) ──
+    html += '<div class="kanban-drill-history-section" id="kanban-drill-history">';
+    html += '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px;color:var(--text-dim);margin-bottom:8px;">Status History</div>';
+    html += '<div id="kanban-history-content" style="color:var(--text-dim);font-size:12px;">Loading...</div>';
+    html += '</div>';
+
     html += '</div>'; // drill-left
 
     // ════════════ RIGHT: Chooser / Subtasks / Sessions / Leaf ════════════
@@ -2338,6 +2344,9 @@ async function renderTaskDetail(taskId, opts) {
       }
     }
 
+    // Fetch and render status history (non-blocking)
+    _loadStatusHistory(task.id);
+
   } catch (e) {
     console.error('[Kanban] Detail load failed:', e);
     // Task genuinely doesn't exist (404) — don't retry, go straight to board.
@@ -2368,6 +2377,62 @@ async function renderTaskDetail(taskId, opts) {
       '<button class="kanban-create-first-btn" onclick="renderTaskDetail._retries=0;renderTaskDetail(\'' + escHtml(taskId) + '\')">Retry</button>' +
       '<button class="kanban-create-first-btn" style="background:var(--bg-btn);color:var(--text-secondary);border:1px solid var(--border);" onclick="navigateToBoard()">Back to Board</button>' +
       '</div></div>';
+  }
+}
+
+/**
+ * _loadStatusHistory(taskId) — Fetch and render status history timeline
+ * in the task detail view. Called asynchronously after the detail renders.
+ */
+async function _loadStatusHistory(taskId) {
+  const container = document.getElementById('kanban-history-content');
+  if (!container) return;
+
+  try {
+    const res = await fetch('/api/kanban/tasks/' + taskId + '/history?page_size=50');
+    if (!res.ok) {
+      container.textContent = 'Failed to load history';
+      return;
+    }
+    const data = await res.json();
+    const history = data.history || [];
+
+    if (history.length === 0) {
+      container.textContent = 'No status changes recorded';
+      return;
+    }
+
+    let html = '<div class="kanban-history-timeline">';
+    for (const entry of history) {
+      const oldLabel = KANBAN_STATUS_LABELS[entry.old_status] || entry.old_status || '(created)';
+      const newLabel = KANBAN_STATUS_LABELS[entry.new_status] || entry.new_status;
+      const newColor = KANBAN_STATUS_COLORS[entry.new_status] || 'var(--text-dim)';
+      const time = entry.changed_at ? _shortDate(entry.changed_at) : '';
+
+      html += '<div class="kanban-history-entry">';
+      html += '<div class="kanban-history-dot" style="background:' + newColor + ';"></div>';
+      html += '<div class="kanban-history-body">';
+      html += '<span class="kanban-history-transition">';
+      html += escHtml(oldLabel) + ' &rarr; <strong style="color:' + newColor + ';">' + escHtml(newLabel) + '</strong>';
+      html += '</span>';
+
+      // Session link (if transition was triggered by a session)
+      if (entry.session_id) {
+        const sessName = _resolveSessionName(entry.session_id);
+        html += ' <a class="kanban-history-session-link" href="#" onclick="event.preventDefault();event.stopPropagation();_kanbanOpenSession(\'' + escHtml(taskId) + '\',\'' + escHtml(entry.session_id) + '\')" title="Open session">';
+        html += escHtml(sessName);
+        html += '</a>';
+      }
+
+      html += '<div class="kanban-history-time">' + escHtml(time) + '</div>';
+      html += '</div></div>';
+    }
+    html += '</div>';
+
+    container.innerHTML = html;
+  } catch (e) {
+    console.error('[Kanban] History load failed:', e);
+    container.textContent = 'Failed to load history';
   }
 }
 

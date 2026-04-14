@@ -662,7 +662,7 @@ def link_session(task_id):
         link = repo.link_session(task_id, session_id, session_type=session_type)
         # Only auto-transition status for work sessions, not planners
         if session_type == 'session':
-            updated = handle_session_start(repo, task_id)
+            updated = handle_session_start(repo, task_id, session_id=session_id)
         else:
             updated = task
 
@@ -697,7 +697,7 @@ def unlink_session(task_id, session_id):
     try:
         repo = _get_repo()
         repo.unlink_session(task_id, session_id)
-        updated = handle_session_complete(repo, task_id)
+        updated = handle_session_complete(repo, task_id, session_id=session_id)
 
         _emit("kanban_task_updated", updated)
         return jsonify({"ok": True})
@@ -775,7 +775,7 @@ def create_task_from_session():
         )
         task = repo.create_task(task_obj)
         repo.link_session(task_id, session_id)
-        updated = handle_session_start(repo, task_id)
+        updated = handle_session_start(repo, task_id, session_id=session_id)
 
         _emit("kanban_task_created", updated or task)
         return jsonify({"task": _task_response(updated or task), "linked": True})
@@ -1519,11 +1519,11 @@ def session_state_change():
 
         if state in ("working",):
             # Session became active -> task should be Working
-            updated = handle_session_start(repo, task_id)
+            updated = handle_session_start(repo, task_id, session_id=session_id)
             _emit("kanban_task_updated", updated)
         elif state in ("idle", "stopped"):
             # Session went idle/stopped -> check if auto-advance needed
-            updated = handle_session_complete(repo, task_id)
+            updated = handle_session_complete(repo, task_id, session_id=session_id)
             _emit("kanban_task_updated", updated)
 
         return jsonify({"ok": True, "linked": True, "task_id": task_id})
