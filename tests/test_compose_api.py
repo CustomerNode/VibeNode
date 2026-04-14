@@ -649,3 +649,83 @@ class TestBoardStaleProjectFallback:
         assert data is not None
         assert data['project']['name'] == 'test-fallback-sibling'
         assert len(data['sibling_projects']) >= 1
+
+
+class TestBoardProjectSwitchRegression:
+    """Regression: compose board must return full data after a project switch.
+
+    When the user switches projects while in compose view, the JS cleanup code
+    resets compose state and re-calls initCompose().  A previous bug set
+    ``compose-board.innerHTML = ''`` which destroyed the static DOM skeleton
+    (compose-root-header, compose-input-target, compose-sections-board),
+    causing initCompose() to silently write into null elements → blank panel
+    even though the API returned valid data.  Fixed 2026-04-14.
+
+    These tests verify the API contract that initCompose() depends on:
+    the board endpoint MUST return a project dict with sections and
+    sibling_projects when a valid composition exists for the parent filter.
+    """
+
+    def test_board_returns_project_and_sections_for_parent(self, client):
+        """Board with ?project= returns project, sections, and sibling list."""
+        resp = client.post('/api/compose/projects',
+                           json={'name': 'test-switch-proj',
+                                 'parent_project': 'proj-A'})
+        pid = resp.get_json()['project']['id']
+
+        # Add a section so the board has content
+        client.post(f'/api/compose/projects/{pid}/sections',
+                    json={'name': 'Section One'})
+
+        board = client.get('/api/compose/board?project=proj-A').get_json()
+        assert board is not None, 'Board must not be null when a composition exists'
+        assert board['project']['id'] == pid
+        assert board['project']['parent_project'] == 'proj-A'
+        assert len(board['sections']) == 1
+        assert board['sections'][0]['name'] == 'Section One'
+        assert any(s['id'] == pid for s in board['sibling_projects'])
+
+    def test_board_excludes_other_parent_projects(self, client):
+        """Board for project-A must not return project-B's compositions."""
+        client.post('/api/compose/projects',
+                    json={'name': 'test-switch-A', 'parent_project': 'proj-A'})
+        client.post('/api/compose/projects',
+                    json={'name': 'test-switch-B', 'parent_project': 'proj-B'})
+
+        board_a = client.get('/api/compose/board?project=proj-A').get_json()
+        assert board_a is not None
+        assert board_a['project']['parent_project'] == 'proj-A'
+        # Siblings must not include proj-B's composition (unless pinned)
+        sibling_parents = {s['parent_project'] for s in board_a['sibling_projects']
+                           if not s.get('pinned')}
+        assert 'proj-B' not in sibling_parents
+
+    def test_board_returns_status_summary(self, client):
+        """Board response includes status dict that the header bar renders."""
+        resp = client.post('/api/compose/projects',
+                           json={'name': 'test-switch-status',
+                                 'parent_project': 'proj-C'})
+        pid = resp.get_json()['project']['id']
+        client.post(f'/api/compose/projects/{pid}/sections',
+                    json={'name': 'Sec 1'})
+        client.post(f'/api/compose/projects/{pid}/sections',
+                    json={'name': 'Sec 2'})
+
+        board = client.get('/api/compose/board?project=proj-C').get_json()
+        assert 'status' in board
+        assert board['status']['total_sections'] == 2
+
+    def test_consecutive_parent_switches_return_correct_data(self, client):
+        """Simulates rapid project switches — each parent returns its own data."""
+        client.post('/api/compose/projects',
+                    json={'name': 'switch-X', 'parent_project': 'proj-X'})
+        client.post('/api/compose/projects',
+                    json={'name': 'switch-Y', 'parent_project': 'proj-Y'})
+
+        bx = client.get('/api/compose/board?project=proj-X').get_json()
+        by = client.get('/api/compose/board?project=proj-Y').get_json()
+        bx2 = client.get('/api/compose/board?project=proj-X').get_json()
+
+        assert bx['project']['name'] == 'switch-X'
+        assert by['project']['name'] == 'switch-Y'
+        assert bx2['project']['name'] == 'switch-X'

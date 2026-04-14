@@ -216,8 +216,14 @@ async function setProject(encoded, reload = true) {
   // Compose: reset board state if we're currently in compose view
   if (viewMode === 'compose') {
     if (typeof resetComposeState === 'function') resetComposeState();
-    const _composeEl = document.getElementById('compose-board');
-    if (_composeEl) { _composeEl.innerHTML = ''; }
+    // DOM-CRITICAL: Only clear the dynamic card area, NOT the parent
+    // compose-board.  The parent holds static children from index.html
+    // (compose-root-header, compose-input-target, compose-sections-board)
+    // that initCompose() looks up by ID.  Setting compose-board.innerHTML=''
+    // destroys them and initCompose() silently writes to null → blank panel.
+    // See CLAUDE.md "Compose project-scoping" item 4.  (fix: 2026-04-14)
+    const _composeSectionsBoard = document.getElementById('compose-sections-board');
+    if (_composeSectionsBoard) { _composeSectionsBoard.innerHTML = ''; }
     // Scrub any compose sub-route hash back to base
     const _cUrl = new URL(window.location);
     if (_cUrl.hash.startsWith('#compose/')) {

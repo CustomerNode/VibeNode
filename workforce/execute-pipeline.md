@@ -71,14 +71,49 @@ Strengthen regression coverage where gaps are found.
 When validation passes, proceed to Final Verification.
 If testing reveals a design-level problem, loop back to Plan Team or Build Team as appropriate.
 
-5. Final Verification
-This is not a re-review. Review and Test already did their jobs. This phase answers one question: does the finished result actually deliver the original intent?
-Confirm:
-- The original request is fully addressed — not just the spec, but the actual user need behind it.
-- Tests pass.
-- No unintended regressions were introduced.
-- Any deferred items, tradeoffs, or residual risks are explicitly called out.
-Produce the final report.
+5. Final Audit
+This is not a re-review. Review and Test already did their jobs. This is a whole-system skeptical audit that asks whether the finished result actually does what was intended, works end to end, and did not create new problems.
+
+Before auditing, scope the work:
+- Identify the original request and its actual goal — not the literal words, but what the user wanted to achieve.
+- Identify every file that was created or modified.
+- Identify the blast radius: what other files, systems, or workflows could be affected.
+
+Then audit against these areas:
+
+Whole-system behavior:
+- Does the result fully achieve the original objective, not just a literal interpretation?
+- Does the full workflow make sense end to end from user action to final outcome?
+- Are there gaps between what was requested and what was delivered?
+- Would a user testing this in practice encounter any surprise, friction, or failure?
+
+Unintended consequences and regressions:
+- Did anything break outside the immediate change area? Check callers, imports, consumers, and downstream dependencies of every modified function, class, route, event, or contract.
+- Are there behavior changes that were not part of the original intent?
+- Are there stale state issues, race conditions, or error recovery gaps introduced by the changes?
+- Is backward compatibility preserved where it should be?
+
+Implementation quality:
+- Is there a mismatch between the spec and the actual implementation?
+- Are there weak assumptions, partial fixes, hidden risks, or fragile logic?
+- Does the code overfit to tests while missing real-world behavior?
+- Is the regression protection strong enough for the actual blast radius?
+
+Project rules compliance:
+- No violations of CLAUDE.md rules.
+- Code near PERF-CRITICAL markers preserves the documented optimization.
+- No secrets, hardcoded paths, PII, or user data in tracked files.
+- No dead code, unused imports, debug prints, or temporary scaffolding.
+
+Edge cases and operational risk:
+- Missing edge case handling that could cause production failures.
+- Error handling gaps — silent failures, unhelpful messages, missing logging.
+- Performance or stability issues missed in earlier passes.
+- User experience issues — confusing states, missing feedback, broken flows.
+
+Fix problems that are clear, low-risk, and unambiguous. For anything that requires a judgment call, changes user-facing behavior, or has broader risk — do not fix it. Explain it clearly and recommend the next action.
+
+Produce the final report with confidence level.
 
 ROUTING RULES:
 - New feature or major change: begin with Plan Team.
