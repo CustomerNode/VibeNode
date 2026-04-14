@@ -142,6 +142,7 @@ class SessionInfo:
     _last_user_uuid: str = ""                            # cached from JSONL, updated by _process_message
     _last_asst_uuid: str = ""                            # cached from JSONL, updated by _process_message
     created_ts: float = 0.0  # time.time() when session was created
+    _cli_pid: int = 0  # PID of the CLI subprocess, for orphan cleanup
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self):
@@ -353,6 +354,11 @@ class SessionManager:
             name="session-recovery"
         ).start()
 
+        # Periodic orphan process cleanup (Windows-critical: child processes
+        # survive when parent claude.exe crashes).  Runs every 60s.
+        self._orphan_sweep_timer: Optional[threading.Timer] = None
+        self._schedule_orphan_sweep()
+
     def _run_loop(self) -> None:
         """Entry point for the background thread."""
         asyncio.set_event_loop(self._loop)
@@ -366,6 +372,10 @@ class SessionManager:
         if self._registry_timer:
             self._registry_timer.cancel()
             self._registry_timer = None
+        # Cancel orphan sweep timer
+        if getattr(self, '_orphan_sweep_timer', None):
+            self._orphan_sweep_timer.cancel()
+            self._orphan_sweep_timer = None
         # Cancel any pending queue save timer and flush to disk
         if self._queue_save_timer:
             self._queue_save_timer.cancel()
@@ -1211,6 +1221,12 @@ class SessionManager:
             await client.connect()
             _profile_log("client_connected")
 
+            # Capture the CLI subprocess PID for orphan cleanup.
+            # If _drive_session exits (crash, cancel, normal end) without
+            # going through _close_session, the finally block uses this to
+            # kill the process tree so child node.exe workers don't linger.
+            info._cli_pid = self._extract_cli_pid(info)
+
             info.state = SessionState.WORKING
             self._emit_state(info)
 
@@ -1475,6 +1491,7 @@ class SessionManager:
             # By now the SDK remap has occurred (ResultMessage was processed
             # in the message loop), so _resolve_id will find the correct
             # session JSONL.
+            # Post-turn snapshot
             try:
                 resolved = self._resolve_id(session_id)
                 with self._lock:
@@ -1487,6 +1504,27 @@ class SessionManager:
                     None, self._write_file_snapshot, session_id, True)
             except Exception as snap_err:
                 logger.warning("Snapshot in finally for %s failed: %s", session_id, snap_err)
+
+            # Orphan cleanup: if the CLI process died (crash, OOM, etc.),
+            # kill its child process tree.  On Windows, child node.exe
+            # workers survive when the parent dies — they become orphans
+            # eating CPU/RAM until the machine is rebooted.
+            if info and info._cli_pid:
+                try:
+                    # Check if the CLI process is actually dead
+                    proc_alive = True
+                    try:
+                        os.kill(info._cli_pid, 0)  # signal 0 = existence check
+                    except (OSError, ProcessLookupError):
+                        proc_alive = False
+                    if not proc_alive:
+                        logger.info("CLI process %d for %s is dead — "
+                                    "cleaning up orphaned child processes",
+                                    info._cli_pid, session_id)
+                        self._kill_process_tree(info._cli_pid)
+                        info._cli_pid = 0
+                except Exception as cleanup_err:
+                    logger.debug("Orphan cleanup for %s: %s", session_id, cleanup_err)
 
     async def _send_query(self, session_id: str, text: str) -> None:
         """Send a follow-up query to an already-connected session."""
@@ -1916,18 +1954,68 @@ class SessionManager:
             logger.exception("Interrupt error for %s: %s", session_id, e)
 
     @staticmethod
+    def _extract_cli_pid(info: "SessionInfo") -> int:
+        """Extract the CLI subprocess PID from a SessionInfo, or 0."""
+        if not info.client:
+            return 0
+        transport = getattr(info.client, '_transport', None)
+        if transport is None:
+            query = getattr(info.client, '_query', None)
+            transport = getattr(query, 'transport', None) if query else None
+        inner = getattr(transport, 'inner', transport) if transport else None
+        proc = getattr(inner, '_process', None) if inner else None
+        if proc and proc.returncode is None:
+            return proc.pid or 0
+        return 0
+
+    @staticmethod
     def _kill_process_tree(pid: int) -> None:
-        """Kill a process and all its children.  Cross-platform."""
+        """Kill a process and all its children.  Cross-platform.
+
+        On Windows, ``taskkill /T`` only works while the parent is alive.
+        If the parent already died, we fall back to WMI to find orphaned
+        children by ParentProcessId and kill them individually.
+        """
         try:
             if os.name == "nt":
-                # taskkill /T kills the entire tree, /F forces it
-                _subprocess.run(
+                # Try taskkill /T first (works when parent is alive)
+                result = _subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(pid)],
-                    stdout=_subprocess.DEVNULL,
-                    stderr=_subprocess.DEVNULL,
+                    stdout=_subprocess.PIPE,
+                    stderr=_subprocess.PIPE,
                     timeout=10,
                     creationflags=_subprocess.CREATE_NO_WINDOW,
                 )
+                # If taskkill failed (parent already dead), find orphans
+                # by ParentProcessId via WMIC and kill them with /T so
+                # their own children are also cleaned up recursively.
+                if result.returncode != 0:
+                    try:
+                        wmic = _subprocess.run(
+                            ["wmic", "process", "where",
+                             f"ParentProcessId={pid}", "get",
+                             "ProcessId", "/value"],
+                            capture_output=True, text=True, timeout=10,
+                            creationflags=_subprocess.CREATE_NO_WINDOW,
+                        )
+                        for line in wmic.stdout.splitlines():
+                            line = line.strip()
+                            if line.startswith("ProcessId="):
+                                child_pid = line.split("=", 1)[1].strip()
+                                if child_pid.isdigit():
+                                    # Use /T to kill the child AND its
+                                    # descendants (e.g. node → workers)
+                                    _subprocess.run(
+                                        ["taskkill", "/F", "/T", "/PID",
+                                         child_pid],
+                                        stdout=_subprocess.DEVNULL,
+                                        stderr=_subprocess.DEVNULL,
+                                        timeout=5,
+                                        creationflags=_subprocess.CREATE_NO_WINDOW,
+                                    )
+                    except Exception as wmic_err:
+                        logger.debug("WMIC orphan cleanup for PID %d: %s",
+                                     pid, wmic_err)
             else:
                 # Send SIGTERM to the process group, then SIGKILL
                 try:
@@ -1941,6 +2029,51 @@ class SessionManager:
                     pass
         except Exception as e:
             logger.debug("_kill_process_tree(%d) best-effort: %s", pid, e)
+
+    def _schedule_orphan_sweep(self) -> None:
+        """Schedule the next orphan process sweep (every 60s)."""
+        self._orphan_sweep_timer = threading.Timer(60.0, self._orphan_sweep)
+        self._orphan_sweep_timer.daemon = True
+        self._orphan_sweep_timer.start()
+
+    def _orphan_sweep(self) -> None:
+        """Check all tracked sessions for dead CLI processes with live children.
+
+        On Windows, when claude.exe crashes or is killed externally, its child
+        node.exe workers survive as orphans eating CPU and RAM.  This sweep
+        detects that and kills the orphaned tree.
+        """
+        try:
+            with self._lock:
+                sessions = list(self._sessions.values())
+            cleaned = 0
+            for info in sessions:
+                pid = info._cli_pid
+                if not pid:
+                    continue
+                # Check if the CLI process is still alive
+                try:
+                    os.kill(pid, 0)  # signal 0 = existence check
+                    continue  # still alive, nothing to do
+                except (OSError, ProcessLookupError):
+                    pass
+                # CLI is dead but we still have a PID recorded — kill orphans
+                logger.warning(
+                    "Orphan sweep: CLI PID %d for session %s is dead — "
+                    "killing child process tree",
+                    pid, info.session_id,
+                )
+                self._kill_process_tree(pid)
+                info._cli_pid = 0
+                cleaned += 1
+            if cleaned:
+                logger.info("Orphan sweep cleaned up %d dead session(s)", cleaned)
+        except Exception as e:
+            logger.debug("Orphan sweep error: %s", e)
+        finally:
+            # Reschedule regardless of success/failure
+            if getattr(self, '_started', False):
+                self._schedule_orphan_sweep()
 
     async def _close_session(self, session_id: str) -> None:
         """Disconnect and clean up a session."""
@@ -1965,21 +2098,7 @@ class SessionManager:
                 info.task.cancel()
 
             # Grab the CLI subprocess PID *before* disconnect() cleans it up.
-            # The SDK client wraps a subprocess whose children (Node.js test
-            # runners, etc.) survive a plain terminate()/disconnect().
-            cli_pid = None
-            if info.client:
-                # Traverse: client._transport (raw) or client._query.transport
-                # (may be wrapped in VibeNodeTransportAdapter — use .inner)
-                transport = getattr(info.client, '_transport', None)
-                if transport is None:
-                    query = getattr(info.client, '_query', None)
-                    transport = getattr(query, 'transport', None) if query else None
-                # Unwrap adapter if present
-                inner = getattr(transport, 'inner', transport) if transport else None
-                proc = getattr(inner, '_process', None) if inner else None
-                if proc and proc.returncode is None:
-                    cli_pid = proc.pid
+            cli_pid = self._extract_cli_pid(info) or info._cli_pid
 
             # Disconnect the client (terminates the direct CLI process)
             if info.client:
@@ -1990,8 +2109,9 @@ class SessionManager:
 
             # Kill the full process tree so child processes (test runners,
             # build tools, etc.) don't linger as orphans eating CPU/RAM.
-            if cli_pid is not None:
+            if cli_pid:
                 self._kill_process_tree(cli_pid)
+            info._cli_pid = 0
 
             info.state = SessionState.STOPPED
             info.client = None
