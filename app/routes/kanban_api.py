@@ -1584,6 +1584,59 @@ def get_task_context(task_id):
         return jsonify({"error": str(e)}), 500
 
 
+@bp.route("/api/kanban/tasks/batch-context", methods=["POST"])
+def batch_task_context():
+    """Build context for batch-launched sessions with cross-awareness.
+
+    Each task gets its normal context plus a section listing all sibling
+    tasks being executed simultaneously, so sessions can coordinate.
+
+    Body: {task_ids: [uuid, ...]}
+    Response: {contexts: {task_id: context_string, ...}}
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        task_ids = data.get("task_ids", [])
+        if not task_ids or not isinstance(task_ids, list):
+            return jsonify({"error": "task_ids is required"}), 400
+        if len(task_ids) > 20:
+            return jsonify({"error": "Maximum 20 tasks per batch"}), 400
+
+        from flask import current_app
+
+        repo = _get_repo()
+        daemon_client = getattr(current_app, "session_manager", None)
+
+        # Fetch all task titles for the batch awareness section
+        batch_tasks = []
+        for tid in task_ids:
+            t = repo.get_task(tid)
+            if t:
+                batch_tasks.append(t)
+
+        batch_section = "\n\n## Batch Execution -- Sibling Sessions\n\n"
+        batch_section += "The following tasks are being executed simultaneously:\n"
+        for t in batch_tasks:
+            batch_section += f"- {t.title}\n"
+        batch_section += (
+            "\nCoordinate carefully to avoid file conflicts. "
+            "Re-read any file before editing if another batch session "
+            "may have modified it."
+        )
+
+        contexts = {}
+        for tid in task_ids:
+            try:
+                ctx = build_task_context(repo, tid, daemon_client=daemon_client)
+                contexts[tid] = ctx + batch_section
+            except ValueError:
+                contexts[tid] = ""
+
+        return jsonify({"contexts": contexts})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ---------------------------------------------------------------------------
 # User identity helper
 # ---------------------------------------------------------------------------
