@@ -4630,6 +4630,84 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /api/compose/projects/{project_id}/launch-all:
+    post:
+      tags: [Compose]
+      summary: Bulk launch all unlinked section agents with initial prompts
+      operationId: launchAllSections
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                orchestrate_only:
+                  type: boolean
+                  default: false
+                  description: If true, only send coordination message to root orchestrator without launching section agents
+      responses:
+        "200":
+          description: Launch results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  launched:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        section_id:
+                          type: string
+                        session_id:
+                          type: string
+                  failed:
+                    type: integer
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/compose/projects/{project_id}/direct-all:
+    post:
+      tags: [Compose]
+      summary: Fan-out a directive to all sections via the root orchestrator
+      operationId: directAllSections
+      parameters:
+        - $ref: "#/components/parameters/composeProjectId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message:
+                  type: string
+                  description: The directive text to send to all sections
+      responses:
+        "200":
+          description: Directive delivered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  directive_id:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Failed to deliver directive to root orchestrator
+
   # ==========================================================================
   # Analysis (analysis_api.py)
   # ==========================================================================
