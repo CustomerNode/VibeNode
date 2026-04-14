@@ -222,6 +222,30 @@ async function initCompose() {
     _composeProjectsList = (data && data.sibling_projects) ? data.sibling_projects : [];
 
     if (!data || !data.project) {
+      // If we had a saved project_id that no longer exists (e.g. deleted),
+      // clear it and retry with just the parent project filter so we fall
+      // back to the most recent valid composition.  (fix: 2026-04-13)
+      if (_activeComposeProjectId) {
+        _activeComposeProjectId = null;
+        if (_proj) localStorage.removeItem('activeComposition:' + _proj);
+        const fallbackQ = _proj ? '?project=' + encodeURIComponent(_proj) : '';
+        try {
+          const fbResp = await fetch('/api/compose/board' + fallbackQ);
+          if (_initToken !== _composeInitToken) return;
+          const fbData = await fbResp.json();
+          if (fbData && fbData.project) {
+            _composeProjectsList = fbData.sibling_projects || [];
+            _composeProject = fbData.project;
+            _activeComposeProjectId = fbData.project.id;
+            _composeSections = fbData.sections || [];
+            _composeConflicts = (fbData.conflicts || []).filter(c => c.status === 'pending');
+            if (_proj) localStorage.setItem('activeComposition:' + _proj, _activeComposeProjectId);
+            _renderComposeBoard();
+            attachComposeShortcuts();
+            return;
+          }
+        } catch (_) {}
+      }
       _activeComposeProjectId = null;
       _composeSelectedSection = null;
       _composeProject = null;

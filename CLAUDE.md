@@ -66,5 +66,15 @@ VibeNode underwent a measurement-driven performance overhaul. The patterns below
 17. **`performance.mark()`/`performance.measure()` instrumentation** — `static/js/socket.js`. Submit timing and session switch timing. Do NOT remove.
 18. **Chrome-first browser launch** — `run.py` `_find_chrome()` + `open_browser()`. The Web Speech API (voice input) is Chromium-only. `open_browser()` MUST find and launch Chrome via `ShellExecuteW`, NOT use `os.startfile(url)` as the primary method (that opens the default browser which may be Firefox). `os.startfile` is ONLY the fallback when Chrome is not installed. Do NOT "simplify" by removing `_find_chrome()` or replacing `ShellExecuteW` with `os.startfile` — this exact regression already broke voice input in production.
 
+## Compose project-scoping — DO NOT REMOVE (fixed 2026-04-13)
+
+Three bugs combined to make the Compose feature unusable across multiple VibeNode projects. All three fixes are load-bearing — reverting any one of them re-breaks Compose.
+
+1. **`?project=` filter in `_addToCompose()`** — `static/js/sessions.js`. The right-click → Add to Compose fetch MUST pass `?project=<activeProject>` so the API only returns compositions belonging to the current project. Without it every composition across all projects is returned and the picker shows unrelated items. Do NOT remove the query param from the fetch call.
+
+2. **Stale-project fallback in `initCompose()`** — `static/js/compose.js`. When the saved `_activeComposeProjectId` (from localStorage) points to a deleted or missing composition, `initCompose` MUST clear the stale ID and retry with just the `?project=` parent filter. Without this fallback the compose view renders completely empty even when valid compositions exist. Do NOT remove the `if (_activeComposeProjectId)` retry block inside the `if (!data || !data.project)` guard.
+
+3. **Snapshot-based test cleanup** — `tests/test_compose_api.py`. The `cleanup_projects` fixture MUST snapshot `COMPOSE_PROJECTS_DIR` before each test and remove anything new after. The old `startswith("test-")` check missed cloned projects (directory names like `copy-of-test-clone-src-*` and UUIDs), which leaked 52 orphan projects into production data. Do NOT revert to name-prefix cleanup.
+
 ## Slash commands are intercepted client-side
 Claude CLI slash commands (e.g. `/compact`, `/rewind`, `/clear`) are NOT sent to the SDK. They get silently eaten with no response, leaving the session stuck idle. Instead, `_interceptSlashCommand()` in `live-panel.js` catches them at every submit path and either triggers the GUI equivalent (e.g. `/rewind` clicks the Rewind toolbar button, `/compact` fires `liveCompact()`) or shows a toast explaining the command isn't supported in the GUI. The command map lives in `_slashCommandMap`. Messages with `/` that aren't bare commands (e.g. "fix /etc/config") pass through normally.
