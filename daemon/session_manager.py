@@ -325,6 +325,10 @@ class SessionManager:
         # Hook-based permission storage
         self._hook_pending = {}  # {req_id: {"event": threading.Event, "result": str}}
         self._hook_lock = threading.Lock()
+        # Reconnect throttle: limit concurrent CLI process spawns to prevent
+        # thundering-herd failures when multiple sessions die simultaneously.
+        # Created lazily on the event loop (asyncio.Semaphore is loop-bound).
+        self._reconnect_semaphore: Optional[asyncio.Semaphore] = None
         # Server-side message queue (per-session, FIFO)
         self._queues: dict[str, list[str]] = {}
         self._queue_lock = threading.Lock()
@@ -1121,48 +1125,75 @@ class SessionManager:
 
         Creates a fresh ClaudeSDKClient with resume=session_id, connects it,
         and replaces info.client.  Returns True on success.
+
+        Uses a semaphore to limit concurrent reconnects — when multiple
+        sessions die simultaneously (e.g. network blip), spawning too many
+        CLI processes at once overwhelms the system and they all timeout on
+        the "initialize" control request.
         """
+        # Lazy-init the semaphore on the event loop (can't create in __init__
+        # because the loop doesn't exist yet).
+        if self._reconnect_semaphore is None:
+            self._reconnect_semaphore = asyncio.Semaphore(2)
+
         resolved = self._resolve_id(session_id)
-        logger.info("Reconnecting SDK client for %s (resolved: %s)", session_id, resolved)
-
-        # Tear down the dead client
-        if info.client:
-            try:
-                await info.client.disconnect()
-            except Exception:
-                pass
-            info.client = None
-
-        # Repair incomplete .jsonl before reconnecting — if the stream
-        # died mid-response, the last entry has stop_reason=null and
-        # --resume will choke on it immediately.
-        try:
-            from app.config import _encode_cwd
-            projects_dir = Path.home() / ".claude" / "projects"
-            if info.cwd:
-                encoded = _encode_cwd(info.cwd)
-                jsonl_candidate = projects_dir / encoded / f"{resolved}.jsonl"
-                if jsonl_candidate.exists():
-                    _repair_incomplete_jsonl(jsonl_candidate)
-        except Exception as _rep_err:
-            logger.warning("_reconnect_client: jsonl repair failed: %s", _rep_err)
+        logger.info("Reconnecting SDK client for %s (resolved: %s) — "
+                     "waiting for reconnect slot", session_id, resolved)
 
         try:
-            options = ClaudeCodeOptions(
-                cwd=os.path.normpath(info.cwd) if info.cwd else None,
-                resume=resolved,
-                can_use_tool=self._make_permission_callback(session_id),
-                model=info.model or None,
-                permission_mode="default",
-                include_partial_messages=True,
-            )
-            client = ClaudeSDKClient(options=options)
-            await client.connect()
-            info.client = client
-            logger.info("Reconnected SDK client for %s", session_id)
-            return True
+            async with self._reconnect_semaphore:
+                logger.info("Reconnecting SDK client for %s — got slot", session_id)
+
+                # Tear down the dead client
+                if info.client:
+                    try:
+                        await info.client.disconnect()
+                    except Exception:
+                        pass
+                    info.client = None
+
+                # Repair incomplete .jsonl before reconnecting — if the stream
+                # died mid-response, the last entry has stop_reason=null and
+                # --resume will choke on it immediately.
+                try:
+                    from app.config import _encode_cwd
+                    projects_dir = Path.home() / ".claude" / "projects"
+                    if info.cwd:
+                        encoded = _encode_cwd(info.cwd)
+                        jsonl_candidate = projects_dir / encoded / f"{resolved}.jsonl"
+                        if jsonl_candidate.exists():
+                            _repair_incomplete_jsonl(jsonl_candidate)
+                except Exception as _rep_err:
+                    logger.warning("_reconnect_client: jsonl repair failed: %s", _rep_err)
+
+                # Small stagger to avoid slamming the system when multiple
+                # sessions are queued behind the semaphore.
+                await asyncio.sleep(0.5)
+
+                try:
+                    options = ClaudeCodeOptions(
+                        cwd=os.path.normpath(info.cwd) if info.cwd else None,
+                        resume=resolved,
+                        can_use_tool=self._make_permission_callback(session_id),
+                        model=info.model or None,
+                        permission_mode="default",
+                        include_partial_messages=True,
+                    )
+                    client = ClaudeSDKClient(options=options)
+                    await client.connect()
+                    info.client = client
+                    # Update tracked PID so orphan sweep doesn't kill the new process
+                    info._cli_pid = self._extract_cli_pid(info)
+                    logger.info("Reconnected SDK client for %s (new PID %d)",
+                                session_id, info._cli_pid)
+                    return True
+                except Exception as e:
+                    logger.exception("Failed to reconnect SDK client for %s: %s", session_id, e)
+                    return False
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.exception("Failed to reconnect SDK client for %s: %s", session_id, e)
+            logger.exception("_reconnect_client semaphore error for %s: %s", session_id, e)
             return False
 
     async def _drive_session(
@@ -1412,15 +1443,19 @@ class SessionManager:
                     info._stream_heal_needed = False
                     heal_count = getattr(info, '_stream_heal_count', 0)
                     if heal_count <= 3:
+                        # Exponential backoff: 2s, 4s, 8s between retries
+                        backoff = 2 ** heal_count
                         logger.info(
-                            "Self-healing (drive): reconnecting %s after %d stream errors",
-                            session_id, heal_count,
+                            "Self-healing (drive): reconnecting %s after %d stream errors "
+                            "(backoff %ds)",
+                            session_id, heal_count, backoff,
                         )
                         entry = LogEntry(kind="system", text="Reconnecting session...")
                         with info._lock:
                             info.entries.append(entry)
                             entry_index = len(info.entries) - 1
                         self._emit_entry(session_id, entry, entry_index)
+                        await asyncio.sleep(backoff)
 
                         if await self._reconnect_client(session_id, info):
                             # Do NOT reset _stream_heal_count here.  Let it
@@ -1802,15 +1837,19 @@ class SessionManager:
                     info._stream_heal_needed = False
                     heal_count = getattr(info, '_stream_heal_count', 0)
                     if heal_count <= 3:
+                        # Exponential backoff: 2s, 4s, 8s between retries
+                        backoff = 2 ** heal_count
                         logger.info(
-                            "Self-healing (query): reconnecting %s after %d stream errors",
-                            session_id, heal_count,
+                            "Self-healing (query): reconnecting %s after %d stream errors "
+                            "(backoff %ds)",
+                            session_id, heal_count, backoff,
                         )
                         entry = LogEntry(kind="system", text="Reconnecting session...")
                         with info._lock:
                             info.entries.append(entry)
                             entry_index = len(info.entries) - 1
                         self._emit_entry(session_id, entry, entry_index)
+                        await asyncio.sleep(backoff)
 
                         if await self._reconnect_client(session_id, info):
                             # Do NOT reset _stream_heal_count here.  Let it
@@ -2050,6 +2089,20 @@ class SessionManager:
             for info in sessions:
                 pid = info._cli_pid
                 if not pid:
+                    continue
+                # Skip sessions that are actively working — their CLI
+                # process may have been replaced by a reconnect and
+                # _cli_pid may be stale.  Only clean up IDLE/STOPPED.
+                if info.state in (SessionState.WORKING, SessionState.WAITING):
+                    continue
+                # Verify _cli_pid matches the current client's process.
+                # After reconnect, _cli_pid is updated, but belt-and-
+                # suspenders: if the client has a live process with a
+                # DIFFERENT PID, our recorded PID is stale — skip it.
+                current_pid = self._extract_cli_pid(info)
+                if current_pid and current_pid != pid:
+                    # Stale PID — update and skip
+                    info._cli_pid = current_pid
                     continue
                 # Check if the CLI process is still alive
                 try:

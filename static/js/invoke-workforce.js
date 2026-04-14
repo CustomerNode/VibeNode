@@ -352,9 +352,12 @@ function _selectInvokeFromModal(item) {
 function _selectInvoke(item) {
   window._pendingInvoke = item;
   _applyInvokeVisual();
-  // Focus the textarea
+  // Focus the textarea and trigger input event so voice.js updateIcon() shows the send button
   const ta = document.getElementById('live-input-ta') || document.getElementById('live-queue-ta');
-  if (ta) ta.focus();
+  if (ta) {
+    ta.focus();
+    ta.dispatchEvent(new Event('input', {bubbles: true}));
+  }
 }
 
 function _applyInvokeVisual() {
@@ -391,6 +394,9 @@ function _removeInvokeVisual() {
 function _cancelInvoke() {
   window._pendingInvoke = null;
   _removeInvokeVisual();
+  // Trigger input event so voice.js updateIcon() re-evaluates send button visibility
+  const ta = document.getElementById('live-input-ta') || document.getElementById('live-queue-ta');
+  if (ta) ta.dispatchEvent(new Event('input', {bubbles: true}));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
