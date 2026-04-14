@@ -28,6 +28,37 @@ Run as a coordinated team in sequence:
 
 Each agent's findings must feed into the next. This is one shared analysis, not six separate reports.
 
+## Standing Plan Criteria
+
+In addition to each agent's lane-specific analysis, the team always evaluates the plan against the following:
+
+### CLAUDE.md Constraint Awareness
+- Verify the plan does not propose anything that violates CLAUDE.md rules — server restart restrictions, file organization, slash command handling, performance-critical patterns, or any other project constraint.
+- If the plan touches code near a `PERF-CRITICAL` marker, it must acknowledge the optimization and describe how it will be preserved.
+- Catching rule violations at plan time is mandatory. Do not defer them to build or review.
+
+### Security & Public Repo Safety
+- Flag any feature that could introduce secrets, API keys, tokens, credentials, PII, or hardcoded personal paths into tracked files.
+- If the feature requires sensitive data, the plan must specify how it will be handled (environment variables, gitignored config, etc.) — do not leave this for the builder to figure out.
+
+### Documentation Expectations
+- The plan must specify what documentation is expected for the implementation: docstrings, module-level comments, inline explanations for complex logic, and any user-facing documentation.
+- If the spec is silent on documentation, add a documentation section so the Build Team knows what's expected.
+
+### Testability
+- The plan must consider how the proposed work will be tested — unit tests, regression tests, and any manual verification needed.
+- If a proposed design is inherently difficult to test, that is a planning problem. Redesign for testability before passing to Build.
+
+### Error Handling Strategy
+- The plan must define how errors and edge cases are handled, especially for user-facing features.
+- Do not leave error handling unspecified for the builder to guess. Specify expected behavior for failure paths, invalid input, and degraded conditions.
+
+### Backward Compatibility
+- If the plan touches APIs, config formats, data structures, IPC contracts, or WebSocket events, it must explicitly address what happens to existing consumers.
+- If a breaking change is required, the plan must include the migration path — not just note that one is needed.
+
+## Fix Policy
+
 The team should fix what it finds directly in the spec. Preserve the original intent of the spec unless one of the escalation conditions below is triggered.
 
 Fix contradictions, ambiguities, vague areas, missing sections, sequencing problems, codebase mismatches, and integration gaps. Add necessary detail where needed. Do not invent new scope unless it is required to make the spec coherent, complete, and implementable.

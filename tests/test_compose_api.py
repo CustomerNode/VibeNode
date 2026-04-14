@@ -23,13 +23,21 @@ def client():
 
 @pytest.fixture(autouse=True)
 def cleanup_projects():
-    """Clean up any test projects after each test."""
+    """Clean up any test projects after each test.
+
+    Snapshots the compose-projects directory before the test and removes
+    anything new afterwards.  This catches cloned projects (directory names
+    like ``copy-of-test-…`` or UUIDs) that the old ``startswith("test-")``
+    check missed — the leak that created 52 orphaned projects.
+    """
+    import shutil
+    before = set()
+    if COMPOSE_PROJECTS_DIR.is_dir():
+        before = {d.name for d in COMPOSE_PROJECTS_DIR.iterdir() if d.is_dir()}
     yield
-    # Clean up compose-projects created during tests
     if COMPOSE_PROJECTS_DIR.is_dir():
         for d in COMPOSE_PROJECTS_DIR.iterdir():
-            if d.is_dir() and d.name.startswith("test-"):
-                import shutil
+            if d.is_dir() and d.name not in before:
                 shutil.rmtree(d, ignore_errors=True)
 
 
@@ -583,3 +591,61 @@ class TestListProjectsFiltering:
         names = [p['name'] for p in data['projects']]
         assert 'test-filter-a' in names
         assert 'test-filter-b' in names
+
+
+class TestBoardStaleProjectFallback:
+    """Regression: compose view must not go blank when saved project is deleted.
+
+    If localStorage holds a ``project_id`` for a composition that has since
+    been deleted, the ``/api/compose/board`` endpoint returns ``null``.  The JS
+    fallback retries with just ``?project=`` to find the next valid composition.
+
+    These tests verify the API side: a deleted project_id must return null so
+    the client knows to retry, and the parent-only fallback must return the
+    correct composition.  Fixed 2026-04-13.
+    """
+
+    def test_deleted_project_id_returns_null(self, client):
+        """Board returns null for a project_id that doesn't exist."""
+        resp = client.get('/api/compose/board?project_id=nonexistent-id')
+        assert resp.get_json() is None
+
+    def test_parent_fallback_finds_valid_project(self, client):
+        """Board with only ?project= returns the most recent matching composition."""
+        client.post('/api/compose/projects',
+                    json={'name': 'test-fallback-real', 'parent_project': 'test-proj'})
+
+        resp = client.get('/api/compose/board?project=test-proj')
+        data = resp.get_json()
+        assert data is not None
+        assert data['project']['name'] == 'test-fallback-real'
+
+    def test_parent_fallback_ignores_other_projects(self, client):
+        """Board with ?project= doesn't return compositions from other projects."""
+        client.post('/api/compose/projects',
+                    json={'name': 'test-fallback-other', 'parent_project': 'other-proj'})
+
+        resp = client.get('/api/compose/board?project=test-proj')
+        data = resp.get_json()
+        # Should be null — no compositions for test-proj
+        assert data is None
+
+    def test_board_with_deleted_id_and_parent_still_has_siblings(self, client):
+        """Even when project_id is invalid, ?project= in sibling query still works.
+
+        The JS fallback retries without project_id.  Verify the retry path
+        returns sibling_projects so the sidebar renders.
+        """
+        client.post('/api/compose/projects',
+                    json={'name': 'test-fallback-sibling', 'parent_project': 'test-proj'})
+
+        # First call with bad ID — null
+        resp1 = client.get('/api/compose/board?project_id=deleted-id&project=test-proj')
+        assert resp1.get_json() is None
+
+        # Retry without project_id — finds the composition + siblings
+        resp2 = client.get('/api/compose/board?project=test-proj')
+        data = resp2.get_json()
+        assert data is not None
+        assert data['project']['name'] == 'test-fallback-sibling'
+        assert len(data['sibling_projects']) >= 1
