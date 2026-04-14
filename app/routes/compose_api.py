@@ -670,14 +670,10 @@ def direct_all_sections(project_id):
     from ..compose.context_manager import add_directive as _add_directive
     from ..compose.models import ComposeDirective
 
-    directive = ComposeDirective(
-        id=uuid.uuid4().hex,
-        project_id=project_id,
-        gen=0,  # auto-incremented by add_directive
+    directive = ComposeDirective.create(
         scope="global",
         content=message,
         source="user",
-        status="active",
     )
     _add_directive(project_id, directive)
 
@@ -861,11 +857,11 @@ def reorder_sections(project_id):
 def export_project(project_id):
     """Export composition content.
 
-    JSON body: { "format": "markdown" | "zip" }
+    JSON body: { "format": "markdown" | "zip" | "docx" | "pdf" }
     Returns the file as a download.
     """
     from flask import Response
-    from ..compose.exporter import export_markdown, export_zip
+    from ..compose.exporter import export_markdown, export_zip, export_docx, export_pdf
 
     project = get_project(project_id)
     if not project:
@@ -873,12 +869,12 @@ def export_project(project_id):
 
     data = request.get_json(force=True, silent=True) or {}
     fmt = (data.get('format') or 'markdown').strip().lower()
+    safe_name = project.name.replace(' ', '-').lower()[:40]
 
     if fmt == 'markdown':
         content = export_markdown(project_id)
         if content is None:
             return jsonify({'ok': False, 'error': 'No content to export'}), 404
-        safe_name = project.name.replace(' ', '-').lower()[:40]
         return Response(
             content,
             mimetype='text/markdown; charset=utf-8',
@@ -888,11 +884,31 @@ def export_project(project_id):
         content = export_zip(project_id)
         if content is None:
             return jsonify({'ok': False, 'error': 'No content to export'}), 404
-        safe_name = project.name.replace(' ', '-').lower()[:40]
         return Response(
             content,
             mimetype='application/zip',
             headers={'Content-Disposition': f'attachment; filename="{safe_name}.zip"'},
+        )
+    elif fmt == 'docx':
+        content = export_docx(project_id)
+        if content is None:
+            return jsonify({'ok': False, 'error': 'No content to export (is python-docx installed?)'}), 404
+        return Response(
+            content,
+            mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            headers={'Content-Disposition': f'attachment; filename="{safe_name}.docx"'},
+        )
+    elif fmt == 'pdf':
+        content = export_pdf(project_id)
+        if content is None:
+            return jsonify({
+                'ok': False,
+                'error': 'PDF export requires docx2pdf or LibreOffice. Try DOCX format instead.',
+            }), 400
+        return Response(
+            content,
+            mimetype='application/pdf',
+            headers={'Content-Disposition': f'attachment; filename="{safe_name}.pdf"'},
         )
     else:
         return jsonify({'ok': False, 'error': f'Unsupported format: {fmt}'}), 400
