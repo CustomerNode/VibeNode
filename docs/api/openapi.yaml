@@ -2961,6 +2961,40 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /api/kanban/tasks/batch-context:
+    post:
+      tags: [Kanban]
+      summary: Build context for batch-launched sessions with cross-awareness
+      operationId: batchTaskContext
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_ids]
+              properties:
+                task_ids:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  maxItems: 20
+      responses:
+        "200":
+          description: Batch contexts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  contexts:
+                    type: object
+                    additionalProperties:
+                      type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
   /api/kanban/tasks/{task_id}/claim:
     post:
       tags: [Kanban]
@@ -4939,6 +4973,43 @@ paths:
             text/html:
               schema:
                 type: string
+
+  /api/invoke/discover:
+    get:
+      tags: [Invoke]
+      summary: Discover local workforce skills and agents in the active project
+      operationId: discoverLocalWorkforce
+      parameters:
+        - name: depth
+          in: query
+          schema:
+            type: integer
+            default: 3
+          description: Child scan depth
+        - name: find_depth
+          in: query
+          schema:
+            type: integer
+            default: 4
+          description: Folder find depth
+      responses:
+        "200":
+          description: Discovered local skills and agents
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  local_skills:
+                    type: array
+                    items:
+                      type: object
+                  local_agents:
+                    type: array
+                    items:
+                      type: object
 
 components:
   parameters:

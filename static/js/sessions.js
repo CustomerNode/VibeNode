@@ -282,6 +282,9 @@ function sessionContextMenu(e, sessionId) {
   // Duplicate
   items += '<div class="ws-ctx-item" onclick="_sessCtx(\'duplicate\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Duplicate</div>';
 
+  // Save as Template
+  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'save-template\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg> Save as Template</div>';
+
   // Open in Terminal
   items += '<div class="ws-ctx-item" onclick="_sessCtx(\'terminal\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg> Open in Terminal</div>';
 
@@ -363,6 +366,13 @@ function _sessCtx(action, sessionId) {
       break;
     case 'duplicate':
       duplicateSession(sessionId);
+      break;
+    case 'save-template':
+      if (typeof _saveSessionAsTemplate === 'function') {
+        _saveSessionAsTemplate(sessionId);
+      } else {
+        showToast('Template system not available', true);
+      }
       break;
     case 'terminal':
       openInClaude(sessionId);

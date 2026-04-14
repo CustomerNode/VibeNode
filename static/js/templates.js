@@ -336,3 +336,53 @@ function _resetTemplateForm() {
   el = document.getElementById('te-edit-index'); if (el) el.value = '-1';
   el = document.getElementById('te-form-title'); if (el) el.textContent = 'Add Template';
 }
+
+/**
+ * Save a session as a reusable template.
+ * Fetches the session timeline to extract the first user message,
+ * then opens the template editor pre-filled with that data.
+ *
+ * @param {string} sessionId  The session ID to extract from
+ */
+async function _saveSessionAsTemplate(sessionId) {
+  let firstPrompt = '';
+
+  try {
+    const res = await fetch('/api/sessions/' + sessionId + '/timeline');
+    if (res.ok) {
+      const timeline = await res.json();
+      // Find first user message
+      for (const entry of timeline) {
+        if (entry.type === 'user' || entry.role === 'user') {
+          firstPrompt = entry.text || entry.content || '';
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[Templates] Failed to fetch session timeline:', e);
+  }
+
+  if (!firstPrompt) {
+    if (typeof showToast === 'function') showToast('Session has no messages to save');
+  }
+
+  // Get session title for template name
+  var sess = (typeof allSessions !== 'undefined')
+    ? allSessions.find(function(s) { return s.id === sessionId; })
+    : null;
+  var title = sess ? (sess.custom_title || sess.display_title || 'Untitled') : 'Untitled';
+
+  // Open template editor with pre-filled values
+  _showManageTemplates();
+
+  // Pre-fill the form after render
+  setTimeout(function() {
+    var labelEl = document.getElementById('te-label');
+    var starterEl = document.getElementById('te-starter');
+    var titleEl = document.getElementById('te-form-title');
+    if (labelEl) labelEl.value = title;
+    if (starterEl) starterEl.value = firstPrompt;
+    if (titleEl) titleEl.textContent = 'New Template from Session';
+  }, 100);
+}

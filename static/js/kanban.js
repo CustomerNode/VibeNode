@@ -1795,6 +1795,8 @@ function showCardContextMenu(taskId, event) {
   items += `<div class="kanban-context-item" onclick="closeContextMenu();openTaskDetail('${taskId}')">Edit</div>`;
   items += `<div class="kanban-context-item" onclick="closeContextMenu();createTask('not_started','${taskId}')">Add Subtask</div>`;
   items += `<div class="kanban-context-item" onclick="closeContextMenu();openSessionSpawner('${taskId}')">Spawn Session</div>`;
+  items += `<div class="kanban-context-item" onclick="closeContextMenu();executeTask('${taskId}','quick')">${KI.play} Execute Task</div>`;
+  items += `<div class="kanban-context-item" onclick="closeContextMenu();executeTask('${taskId}','validate')">${KI.play} Execute + Validate</div>`;
 
   // Move to submenu
   items += '<div class="kanban-context-separator"></div>';
@@ -2120,6 +2122,14 @@ async function renderTaskDetail(taskId, opts) {
       html += '</div>';
       html += '<div class="kanban-drill-panel"><div class="kanban-drill-panel-body">';
 
+      // Execute buttons — only for actionable statuses
+      if (task.status !== 'complete') {
+        html += '<div class="kanban-execute-row">';
+        html += `<button class="kanban-execute-btn" onclick="event.stopPropagation();executeTask('${task.id}','quick')" title="Create session, inject task context, and auto-submit">${KI.play} Execute</button>`;
+        html += `<button class="kanban-execute-btn kanban-execute-validate" onclick="event.stopPropagation();executeTask('${task.id}','validate')" title="Execute with QA agent validation">${KI.play} Execute + Validate</button>`;
+        html += '</div>';
+      }
+
       // Session row
       const sessStatus = existingSession ? (typeof existingSession.status === 'string' ? existingSession.status : 'sleeping') : 'not_started';
       const sessColor = existingSession
@@ -2202,6 +2212,12 @@ async function renderTaskDetail(taskId, opts) {
         const childStatusLabel = KANBAN_STATUS_LABELS[child.status] || child.status;
 
         html += `<div class="kanban-drill-subtask-row" draggable="true" data-task-id="${child.id}" data-idx="${si}" ondragstart="_subtaskDragStart(event)" ondragover="_subtaskDragOver(event)" ondrop="_subtaskDrop(event,'${task.id}')" ondragend="_subtaskDragEnd(event)">`;
+        // Batch selection checkbox (leaf tasks only)
+        if ((child.children_count || 0) === 0 && child.status !== 'complete') {
+          html += `<input type="checkbox" class="kanban-batch-check" data-task-id="${child.id}" onclick="event.stopPropagation();_updateBatchSelection()" title="Select for batch execute">`;
+        } else {
+          html += `<input type="checkbox" class="kanban-batch-check" disabled title="${(child.children_count || 0) > 0 ? 'Only leaf tasks can be executed' : 'Completed tasks cannot be executed'}" style="opacity:0.3;">`;
+        }
         // Drag handle
         html += `<span class="kanban-drill-subtask-grip" title="Drag to reorder">${KI.drag || '<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>'}</span>`;
         // Status badge
@@ -2222,6 +2238,9 @@ async function renderTaskDetail(taskId, opts) {
         html += `<div class="kanban-drill-subtask-actions">`;
         html += `<button class="kanban-subtask-action-btn" onclick="event.stopPropagation();_inlineRenameSubtask('${child.id}', this.closest('.kanban-drill-subtask-row').querySelector('.kanban-drill-subtask-title'))" title="Rename"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>`;
         html += `<button class="kanban-subtask-action-btn kanban-subtask-action-danger" onclick="event.stopPropagation();_deleteSubtask('${task.id}','${child.id}')" title="Delete"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>`;
+        if ((child.children_count || 0) === 0 && child.status !== 'complete') {
+          html += `<button class="kanban-subtask-action-btn" onclick="event.stopPropagation();executeTask('${child.id}','quick')" title="Execute">${KI.play}</button>`;
+        }
         html += `</div>`;
         // Drill chevron
         html += `<span class="kanban-drill-subtask-chevron" onclick="navigateToTask('${child.id}')" title="Open">${KI.chevronR}</span>`;
@@ -3164,6 +3183,326 @@ async function openSessionSpawner(taskId) {
       delete window._kanbanPendingTaskLink;
     }
   }, 500);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ONE-CLICK TASK EXECUTION
+// Combines session creation + task context injection + auto-submit
+// into a single zero-interaction launch.
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Execute a task in one click: create session, inject context, auto-submit.
+ *
+ * @param {string} taskId  UUID of the task to execute
+ * @param {'quick'|'validate'} mode  'quick' = implement, 'validate' = implement + QA agent
+ * @param {object} [opts]  Options for batch mode
+ * @param {string} [opts.systemPrompt]  Override system prompt (used by batch execute with cross-awareness)
+ * @param {boolean} [opts.navigate=true]  Whether to navigate to the session view
+ */
+async function executeTask(taskId, mode, opts) {
+  opts = opts || {};
+  const navigate = opts.navigate !== false;
+
+  if (typeof showToast !== 'function') return;
+
+  // 1. Fetch task info + context
+  let taskTitle = '';
+  let systemPrompt = opts.systemPrompt || '';
+  try {
+    const [taskRes, ctxRes] = await Promise.all([
+      fetch('/api/kanban/tasks/' + taskId),
+      !systemPrompt ? fetch('/api/kanban/tasks/' + taskId + '/context') : Promise.resolve(null),
+    ]);
+    if (taskRes.ok) {
+      const taskData = await taskRes.json();
+      taskTitle = taskData.title || '';
+      // Guard: don't execute completed tasks
+      if (taskData.status === 'complete') {
+        showToast('Task is already complete', true);
+        return;
+      }
+      // Guard: don't execute parent tasks (has children)
+      if ((taskData.children_count || 0) > 0) {
+        showToast('Cannot execute a parent task — execute its subtasks instead', true);
+        return;
+      }
+    }
+    if (ctxRes && ctxRes.ok) {
+      const ctxData = await ctxRes.json();
+      if (ctxData.context) systemPrompt = ctxData.context;
+    }
+  } catch (e) {
+    console.warn('[Kanban] executeTask: context fetch failed, proceeding without', e);
+    if (!systemPrompt) showToast('Launched without task context (fetch failed)');
+  }
+
+  // 2. Check for existing active session and confirm
+  try {
+    const sessRes = await fetch('/api/kanban/tasks/' + taskId + '/sessions');
+    if (sessRes.ok) {
+      const sessData = await sessRes.json();
+      const activeSessions = (sessData.sessions || []).filter(s =>
+        (s.session_type || 'session') === 'session'
+      );
+      if (activeSessions.length > 0) {
+        if (!confirm('This task already has an active session. Launch another?')) return;
+      }
+    }
+  } catch (e) { /* proceed anyway */ }
+
+  // 3. Generate session ID + register in allSessions + allSessionIds
+  // PERF-CRITICAL #15: must add to BOTH allSessions array AND allSessionIds Set
+  const newId = crypto.randomUUID();
+  allSessions.unshift({
+    id: newId,
+    display_title: taskTitle || 'Executing task...',
+    custom_title: '',
+    last_activity: '',
+    size: '',
+    message_count: 0,
+    preview: '',
+  });
+  allSessionIds.add(newId);
+  if (typeof guiOpenAdd === 'function') guiOpenAdd(newId);
+
+  // 4. Build prompt text based on mode
+  let promptText;
+  if (mode === 'validate') {
+    promptText = 'Implement this task. You already have the full context of what needs to be done \u2014 go ahead and do it.\n\n' +
+      'After you finish the implementation, spin up an independent stickler QA agent (using the Agent tool) whose sole job is to evaluate your work against the task requirements. ' +
+      'The QA agent should:\n' +
+      '1. Review all changes made against the original task spec\n' +
+      '2. Send a report to the human with a recommended APPROVE or DENY\n' +
+      '3. Categorize any identified issues as Critical, High, Medium, or Low risk\n' +
+      '4. Give a realistic, honest recommendation \u2014 not a rubber stamp\n\n' +
+      'If the QA agent identifies issues and recommends DENY, iterate on its feedback and fix the problems, then have it review again. ' +
+      'Keep iterating until the QA agent approves your work.';
+  } else {
+    promptText = 'Implement this task. You already have the full context of what needs to be done \u2014 go ahead and do it.';
+  }
+
+  // 5. Inject agent catalog if available (mirrors _newSessionSubmit behavior)
+  if (typeof FOLDER_SUPERSET === 'object' && FOLDER_SUPERSET) {
+    if (typeof _ensureAgentCatalog === 'function') await _ensureAgentCatalog();
+    if (typeof _buildAgentDefinitions === 'function') {
+      const agentBlock = _buildAgentDefinitions();
+      if (agentBlock) {
+        systemPrompt = systemPrompt
+          ? systemPrompt + '\n\n' + agentBlock
+          : agentBlock;
+      }
+    }
+  }
+
+  // 6. Emit start_session via socket (mirrors _newSessionSubmit)
+  runningIds.add(newId);
+  sessionKinds[newId] = 'working';
+
+  const startOpts = {
+    session_id: newId,
+    prompt: promptText,
+    cwd: typeof _currentProjectDir === 'function' ? _currentProjectDir() : '',
+    name: '',
+  };
+  if (typeof defaultModel !== 'undefined' && defaultModel) startOpts.model = defaultModel;
+  if (typeof defaultThinking !== 'undefined' && defaultThinking) startOpts.thinking_level = defaultThinking;
+  if (systemPrompt) startOpts.system_prompt = systemPrompt;
+
+  socket.emit('start_session', startOpts);
+
+  // 7. Link session to task immediately
+  window._kanbanPendingTaskLink = taskId;
+  window._kanbanSessionTaskId = taskId;
+  try {
+    await onSessionCreatedForTask(taskId, newId);
+  } catch (e) {
+    console.warn('[Kanban] executeTask: task link failed', e);
+  }
+
+  // 8. Set display title
+  const s = allSessions.find(x => x.id === newId);
+  if (s) s.display_title = taskTitle || promptText.slice(0, 65);
+  if (typeof setToolbarSession === 'function') {
+    setToolbarSession(newId, taskTitle || promptText.slice(0, 65), true, '');
+  }
+  filterSessions();
+
+  // 9. Track in history
+  _kanbanHistoryPush({ type: 'session', id: newId, title: taskTitle || 'Task Session', taskId: taskId });
+
+  // 10. Auto-name the session
+  if (typeof autoName === 'function' && typeof _userNamedSessions !== 'undefined' && !_userNamedSessions.has(newId)) {
+    autoName(newId, true, false, promptText);
+  }
+
+  if (navigate) {
+    // Navigate to session view with breadcrumb
+    activeId = newId;
+    liveSessionId = newId;
+    localStorage.setItem('activeSessionId', newId);
+
+    const kb = document.getElementById('kanban-board');
+
+    // Build crumb bar
+    const existingBreadcrumb = kb ? kb.querySelector('.kanban-drill-breadcrumb') : null;
+    const _isSkel = existingBreadcrumb && existingBreadcrumb.querySelector('.skel-shimmer');
+    let crumbInnerHtml = '';
+    if (existingBreadcrumb && !_isSkel) {
+      const clone = existingBreadcrumb.cloneNode(true);
+      const oldTrigger = clone.querySelector('.kanban-history-trigger');
+      if (oldTrigger) oldTrigger.remove();
+      const current = clone.querySelector('.kanban-drill-crumb.current');
+      if (current && taskId) {
+        current.classList.remove('current');
+        current.setAttribute('onclick', "_kanbanSessionClose('" + escHtml(taskId) + "')");
+      }
+      crumbInnerHtml = clone.innerHTML;
+    } else {
+      crumbInnerHtml = '<span class="kanban-drill-crumb kanban-board-crumb" onclick="_kanbanSessionClose(\'board\')" onmouseenter="_showKanbanHistory(this)" onmouseleave="_hideKanbanHistory()">' + KI.menu + ' Board</span>';
+      if (taskTitle) {
+        crumbInnerHtml += '<span class="kanban-drill-sep">' + KI.chevronR + '</span>';
+        crumbInnerHtml += '<span class="kanban-drill-crumb" onclick="_kanbanSessionClose(\'' + escHtml(taskId) + '\')">' + escHtml(taskTitle) + '</span>';
+      }
+    }
+
+    if (kb) kb.style.display = 'none';
+    const mb = document.getElementById('main-body');
+    if (mb) mb.style.display = '';
+    const oldBar = document.getElementById('kanban-session-bar');
+    if (oldBar) oldBar.remove();
+    let crumbHtml = '<div class="kanban-drill-titlebar" id="kanban-session-bar"><div class="kanban-drill-breadcrumb">' + _kanbanHistoryIcon() + crumbInnerHtml
+      + '<span class="kanban-drill-sep">' + KI.chevronR + '</span><span class="kanban-drill-crumb current">Session</span></div>'
+      + '<div class="kanban-drill-actions"><span class="btn-group-label" onclick="openActionsPopup()">Actions</span>'
+      + '<div class="btn-group-divider"></div><span class="btn-group-label" onclick="toggleGrpDropdown(\'grp-analyze\')">Analyze &#9662;</span></div></div>';
+    if (mb) mb.insertAdjacentHTML('beforebegin', crumbHtml);
+
+    history.pushState({ view: 'kanban', taskId: taskId, session: true, sessionId: newId }, '', window.location.pathname + '#kanban/task/' + taskId + '/session/' + newId);
+
+    // Clear dedup and start live panel
+    _optimisticMsgId = 0;
+    startLivePanel(newId, { skipLog: true });
+
+    // Add optimistic user bubble
+    _liveSending = true;
+    if (typeof _addOptimisticBubble === 'function') _addOptimisticBubble(newId, promptText);
+    setTimeout(() => { _liveSending = false; }, 500);
+
+    document.getElementById('main-toolbar').style.display = 'none';
+  }
+
+  showToast('Executing task: ' + (taskTitle || 'Untitled'));
+}
+
+// Batch execution state
+let _batchSelectedTasks = new Set();
+
+/**
+ * Update the batch selection set from checkboxes in the subtask list.
+ */
+function _updateBatchSelection() {
+  _batchSelectedTasks.clear();
+  document.querySelectorAll('.kanban-batch-check:checked').forEach(cb => {
+    _batchSelectedTasks.add(cb.dataset.taskId);
+  });
+  _renderBatchBar();
+}
+
+/**
+ * Render or remove the floating batch action bar based on current selection.
+ */
+function _renderBatchBar() {
+  let bar = document.getElementById('kanban-batch-bar');
+  if (_batchSelectedTasks.size === 0) {
+    if (bar) bar.remove();
+    return;
+  }
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'kanban-batch-bar';
+    bar.className = 'kanban-batch-bar';
+    const panel = document.querySelector('.kanban-drill-panel');
+    if (panel) panel.parentElement.appendChild(bar);
+    else document.body.appendChild(bar);
+  }
+  bar.innerHTML = '<span>' + _batchSelectedTasks.size + ' task(s) selected</span>' +
+    '<button class="kanban-execute-btn" onclick="_batchExecute(\'quick\')">Execute Selected</button>' +
+    '<button class="kanban-execute-btn kanban-execute-validate" onclick="_batchExecute(\'validate\')">Execute + Validate</button>' +
+    '<button class="btn" onclick="_clearBatchSelection()">Clear</button>';
+}
+
+/**
+ * Clear all batch selection checkboxes and remove the batch bar.
+ */
+function _clearBatchSelection() {
+  _batchSelectedTasks.clear();
+  document.querySelectorAll('.kanban-batch-check:checked').forEach(cb => cb.checked = false);
+  _renderBatchBar();
+}
+
+/**
+ * Execute all selected tasks in batch mode with cross-awareness injection.
+ *
+ * @param {'quick'|'validate'} mode
+ */
+async function _batchExecute(mode) {
+  const taskIds = [..._batchSelectedTasks];
+  if (taskIds.length === 0) return;
+
+  if (taskIds.length > 20) {
+    showToast('Maximum 20 tasks per batch', true);
+    return;
+  }
+
+  if (taskIds.length > 10) {
+    if (!confirm('Launch ' + taskIds.length + ' sessions simultaneously? This may be slow.')) return;
+  } else {
+    if (!confirm('Execute ' + taskIds.length + ' task(s)? This will create ' + taskIds.length + ' session(s) and start them all immediately.')) return;
+  }
+
+  showToast('Launching ' + taskIds.length + ' sessions...');
+  _clearBatchSelection();
+
+  // Fetch batch context for cross-awareness
+  let batchContexts = {};
+  try {
+    const res = await fetch('/api/kanban/tasks/batch-context', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task_ids: taskIds }),
+    });
+    if (res.ok) batchContexts = (await res.json()).contexts || {};
+  } catch (e) {
+    console.warn('[Kanban] Batch context fetch failed, falling back to individual contexts', e);
+  }
+
+  // Launch sessions sequentially to avoid overwhelming the daemon
+  let succeeded = 0;
+  let failed = 0;
+  for (const tid of taskIds) {
+    try {
+      await executeTask(tid, mode, {
+        navigate: false,
+        systemPrompt: batchContexts[tid] || '',
+      });
+      succeeded++;
+    } catch (e) {
+      console.error('[Kanban] Batch execute failed for', tid, e);
+      failed++;
+    }
+  }
+
+  if (failed > 0) {
+    showToast(succeeded + '/' + taskIds.length + ' sessions launched (' + failed + ' failed)', true);
+  } else {
+    showToast(succeeded + ' sessions launched');
+  }
+
+  // Refresh the current view to show updated session links
+  if (kanbanDetailTaskId) {
+    renderTaskDetail._retries = 0;
+    renderTaskDetail(kanbanDetailTaskId);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
