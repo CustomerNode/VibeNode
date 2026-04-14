@@ -643,6 +643,28 @@ socket.on('session_state', (data) => {
         btnClose.disabled = state === 'stopped' && !guiOpenSessions.has(session_id);
     }
 
+    // ── Compose session-dot live update ──
+    // When a session changes state, find any compose card linked to it
+    // and update just the dot (no full board re-render).
+    if (typeof _composeSections !== 'undefined' && _composeSections) {
+        const _cSec = _composeSections.find(s => s.session_id === session_id);
+        if (_cSec) {
+            const _cCard = document.querySelector('.compose-card[data-section-id="' + _cSec.id + '"]');
+            if (_cCard) {
+                const _dot = _cCard.querySelector('.compose-session-dot');
+                if (_dot) {
+                    if (state === 'working' || state === 'starting') {
+                        _dot.className = 'compose-session-dot running';
+                    } else if (state === 'stopped') {
+                        _dot.className = 'compose-session-dot idle';
+                    } else {
+                        _dot.className = 'compose-session-dot idle';
+                    }
+                }
+            }
+        }
+    }
+
     // ── Kanban task-session state bridge ──
     // When a session changes state, check if it's linked to a kanban task
     // and trigger the appropriate task state machine transition.

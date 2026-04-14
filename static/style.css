@@ -9692,6 +9692,94 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
   padding: 60px 20px;
   text-align: center;
 }
+/* ── Hero empty board (Plan with AI CTA) ── */
+.compose-empty-hero-input {
+  width: 100%;
+  max-width: 460px;
+  padding: 12px 16px;
+  border: 1px solid var(--border, rgba(255,255,255,0.1));
+  border-radius: 10px;
+  background: var(--bg-input, #1e1e1e);
+  color: var(--text-primary, #e8e8e8);
+  font-size: 14px;
+  resize: vertical;
+  min-height: 60px;
+  margin-bottom: 12px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+.compose-empty-hero-input:focus {
+  border-color: var(--accent, #58a6ff);
+}
+.compose-empty-hero-input::placeholder {
+  color: var(--text-muted, #888);
+}
+/* ── Progress bar in compose header ── */
+.compose-progress-bar {
+  display: flex;
+  width: 100%;
+  max-width: 240px;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--bg-input, #1e1e1e);
+  margin-top: 4px;
+  gap: 1px;
+}
+.compose-progress-segment {
+  height: 100%;
+  transition: width 0.3s ease;
+}
+.compose-progress-segment.complete { background: var(--green, #3fb950); }
+.compose-progress-segment.reviewing { background: #f0883e; }
+.compose-progress-segment.drafting { background: var(--accent, #58a6ff); }
+.compose-progress-text {
+  font-size: 11px;
+  color: var(--text-muted, #888);
+  margin-top: 2px;
+}
+/* ── Direct All modal ── */
+.compose-direct-all-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.5);
+  z-index: 9998;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.compose-direct-all-modal {
+  background: var(--bg-modal, #1a1a1a);
+  border: 1px solid var(--border, rgba(255,255,255,0.1));
+  border-radius: 12px;
+  padding: 20px;
+  width: 460px;
+  max-width: 90vw;
+}
+.compose-direct-all-modal h3 {
+  margin: 0 0 12px;
+  font-size: 15px;
+  color: var(--text-heading, #fff);
+}
+.compose-direct-all-textarea {
+  width: 100%;
+  min-height: 80px;
+  padding: 10px 14px;
+  border: 1px solid var(--border, rgba(255,255,255,0.1));
+  border-radius: 8px;
+  background: var(--bg-input, #1e1e1e);
+  color: var(--text-primary, #e8e8e8);
+  font-size: 13px;
+  resize: vertical;
+  outline: none;
+  margin-bottom: 12px;
+}
+.compose-direct-all-textarea:focus { border-color: var(--accent, #58a6ff); }
+.compose-direct-all-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
 .compose-card-selected {
   outline: 1.5px solid #4ecdc4;
   outline-offset: -1px;

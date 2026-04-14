@@ -1326,6 +1326,36 @@ function _updateComposeRootHeader() {
     if (reviewing > 0) parts.push(reviewing + ' reviewing');
     if (drafting > 0) parts.push(drafting + ' drafting');
     statusEl.textContent = parts.join(', ');
+
+    // ── Progress bar ──
+    let barEl = document.getElementById('compose-progress-bar');
+    if (total > 0) {
+      if (!barEl) {
+        barEl = document.createElement('div');
+        barEl.id = 'compose-progress-bar';
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'display:flex;flex-direction:column;align-items:center;';
+        wrap.appendChild(barEl);
+        const txt = document.createElement('div');
+        txt.id = 'compose-progress-text';
+        txt.className = 'compose-progress-text';
+        wrap.appendChild(txt);
+        statusEl.parentNode.insertBefore(wrap, statusEl.nextSibling);
+      }
+      barEl.className = 'compose-progress-bar';
+      const pctComplete = (complete / total * 100).toFixed(1);
+      const pctReviewing = (reviewing / total * 100).toFixed(1);
+      const pctDrafting = (drafting / total * 100).toFixed(1);
+      barEl.innerHTML =
+        (complete > 0 ? '<div class="compose-progress-segment complete" style="width:' + pctComplete + '%"></div>' : '') +
+        (reviewing > 0 ? '<div class="compose-progress-segment reviewing" style="width:' + pctReviewing + '%"></div>' : '') +
+        (drafting > 0 ? '<div class="compose-progress-segment drafting" style="width:' + pctDrafting + '%"></div>' : '');
+      const txtEl = document.getElementById('compose-progress-text');
+      if (txtEl) txtEl.textContent = complete + '/' + total + ' complete';
+    } else if (barEl) {
+      const wrap = barEl.parentNode;
+      if (wrap && wrap.parentNode) wrap.parentNode.removeChild(wrap);
+    }
   }
 
   const conflictsEl = document.getElementById('compose-root-conflicts');
@@ -1351,16 +1381,49 @@ let _composeLaunching = false;
 
 function _composeUpdateLaunchBtn() {
   const btn = document.getElementById('compose-launch-all-btn');
-  if (!btn) return;
-  const unlinked = _composeSections.filter(s => !s.session_id);
-  btn.style.display = (unlinked.length > 0 && !_composeLaunching) ? 'inline-flex' : 'none';
+  if (btn) {
+    const unlinked = _composeSections.filter(s => !s.session_id);
+    if (unlinked.length > 0 && !_composeLaunching) {
+      btn.style.display = 'inline-flex';
+      btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Launch All';
+    } else if (_composeSections.length > 0 && unlinked.length === 0 && !_composeLaunching) {
+      // All sections have sessions — offer re-orchestrate
+      btn.style.display = 'inline-flex';
+      btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Re-orchestrate';
+    } else {
+      btn.style.display = 'none';
+    }
+  }
+  // Show Direct All when sections exist
+  const directBtn = document.getElementById('compose-direct-all-btn');
+  if (directBtn) {
+    directBtn.style.display = (_composeSections.length > 0) ? 'inline-flex' : 'none';
+  }
 }
 
 async function _composeLaunchAll() {
   if (!_composeProject || _composeLaunching) return;
   const unlinked = _composeSections.filter(s => !s.session_id);
+  const projId = _composeProject.id;
+
+  // If all sections already have sessions, just re-orchestrate root
   if (unlinked.length === 0) {
-    if (typeof showToast === 'function') showToast('All sections already have sessions');
+    if (typeof showToast === 'function') showToast('Sending coordination message to root orchestrator...');
+    try {
+      const resp = await fetch('/api/compose/projects/' + encodeURIComponent(projId) + '/launch-all', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({orchestrate_only: true}),
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        showToast(data.root_message ? 'Root orchestrator is coordinating' : 'No root session to coordinate');
+      } else {
+        showToast(data.error || 'Failed', 'error');
+      }
+    } catch (e) {
+      showToast('Failed to contact root', 'error');
+    }
     return;
   }
 
@@ -1369,36 +1432,101 @@ async function _composeLaunchAll() {
   const total = unlinked.length;
   if (typeof showToast === 'function') showToast('Launching ' + total + ' section agent' + (total !== 1 ? 's' : '') + '...');
 
-  let succeeded = 0;
-  let failed = 0;
-  const projId = _composeProject.id;
-
-  for (const sec of unlinked) {
-    try {
-      const resp = await fetch('/api/compose/projects/' + encodeURIComponent(projId) + '/sections/' + sec.id + '/launch', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-      });
-      const data = await resp.json();
-      if (data.ok) {
-        sec.session_id = data.session_id;
-        succeeded++;
-      } else {
-        failed++;
+  try {
+    const resp = await fetch('/api/compose/projects/' + encodeURIComponent(projId) + '/launch-all', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      // Update local section data with new session IDs
+      if (data.launched) {
+        for (const item of data.launched) {
+          const sec = _composeSections.find(s => s.id === item.section_id);
+          if (sec) sec.session_id = item.session_id;
+        }
       }
-    } catch (e) {
-      failed++;
+      let msg = (data.succeeded || 0) + ' agent' + ((data.succeeded || 0) !== 1 ? 's' : '') + ' launched';
+      if (data.failed > 0) msg += ', ' + data.failed + ' failed';
+      if (data.root_message) msg += '. Root orchestrator is coordinating.';
+      if (typeof showToast === 'function') showToast(msg, data.failed > 0);
+    } else {
+      if (typeof showToast === 'function') showToast(data.error || 'Launch failed', 'error');
     }
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Launch failed', 'error');
   }
 
   _composeLaunching = false;
   _composeUpdateLaunchBtn();
   _renderComposeSectionCards();
   _updateComposeRootHeader();
+}
 
-  let msg = succeeded + ' agent' + (succeeded !== 1 ? 's' : '') + ' launched';
-  if (failed > 0) msg += ', ' + failed + ' failed';
-  if (typeof showToast === 'function') showToast(msg, failed > 0);
+// ═══════════════════════════════════════════════════════════════
+// COMPOSE DIRECT ALL — fan-out directives through root orchestrator
+// ═══════════════════════════════════════════════════════════════
+
+function _composeDirectAll() {
+  if (!_composeProject) return;
+  // Check root session exists
+  if (!_composeProject.root_session_id) {
+    if (typeof showToast === 'function') showToast('Root orchestrator is not running. Launch it first.', 'error');
+    return;
+  }
+
+  const overlay = document.createElement('div');
+  overlay.className = 'compose-direct-all-overlay';
+  overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+  overlay.innerHTML = `
+    <div class="compose-direct-all-modal">
+      <h3>Direct All Sections</h3>
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">This instruction will be sent to the root orchestrator, which will distribute it to all section agents with context-appropriate guidance.</div>
+      <textarea id="compose-direct-all-input" class="compose-direct-all-textarea" placeholder="Type an instruction for all sections... e.g. 'Change the tone to formal throughout' or 'Update the company name from Acme to Nexus everywhere'"></textarea>
+      <div class="compose-direct-all-actions">
+        <button class="pm-btn" onclick="this.closest('.compose-direct-all-overlay').remove()">Cancel</button>
+        <button id="compose-direct-all-send" class="pm-btn pm-btn-primary" onclick="_composeDirectAllSend()">Send Directive</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  setTimeout(() => {
+    const ta = document.getElementById('compose-direct-all-input');
+    if (ta) {
+      ta.focus();
+      ta.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); _composeDirectAllSend(); }
+      });
+    }
+  }, 50);
+}
+
+async function _composeDirectAllSend() {
+  const ta = document.getElementById('compose-direct-all-input');
+  const message = ta ? ta.value.trim() : '';
+  if (!message || !_composeProject) return;
+
+  const sendBtn = document.getElementById('compose-direct-all-send');
+  if (sendBtn) { sendBtn.disabled = true; sendBtn.textContent = 'Sending...'; }
+
+  try {
+    const resp = await fetch('/api/compose/projects/' + encodeURIComponent(_composeProject.id) + '/direct-all', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: message}),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      if (typeof showToast === 'function') showToast('Directive sent to root orchestrator for distribution');
+      const overlay = ta ? ta.closest('.compose-direct-all-overlay') : null;
+      if (overlay) overlay.remove();
+    } else {
+      if (typeof showToast === 'function') showToast(data.error || 'Failed to send directive', 'error');
+      if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = 'Send Directive'; }
+    }
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Failed to send directive', 'error');
+    if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = 'Send Directive'; }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1419,6 +1547,8 @@ function _composeExportMenu(event) {
   menu.style.top = (rect.bottom + 4) + 'px';
   menu.style.left = rect.left + 'px';
   menu.innerHTML =
+    '<div class="compose-sort-item" onclick="_composeExport(\'docx\')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:6px;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>Word document (.docx)</div>' +
+    '<div class="compose-sort-item" onclick="_composeExport(\'pdf\')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:6px;"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>PDF document</div>' +
     '<div class="compose-sort-item" onclick="_composeExport(\'markdown\')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:6px;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>Markdown bundle</div>' +
     '<div class="compose-sort-item" onclick="_composeExport(\'zip\')"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:6px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Zip archive</div>';
   document.body.appendChild(menu);
@@ -1449,7 +1579,8 @@ async function _composeExport(format) {
     const blob = await resp.blob();
     const disposition = resp.headers.get('Content-Disposition') || '';
     const match = disposition.match(/filename="?([^"]+)"?/);
-    const filename = match ? match[1] : ('export.' + (format === 'zip' ? 'zip' : 'md'));
+    const extMap = {zip: 'zip', docx: 'docx', pdf: 'pdf', markdown: 'md'};
+    const filename = match ? match[1] : ('export.' + (extMap[format] || 'md'));
 
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1465,6 +1596,19 @@ async function _composeExport(format) {
     console.error('Export failed:', e);
     if (typeof showToast === 'function') showToast('Export failed', 'error');
   }
+}
+
+// ── Hero empty board → Plan with AI shortcut ──
+function _composeHeroPlan() {
+  const ta = document.getElementById('compose-hero-input');
+  const prompt = ta ? ta.value.trim() : '';
+  if (!prompt) {
+    // No text → fall back to the modal planner
+    _openComposePlanner();
+    return;
+  }
+  // Skip the modal, go straight to the slideout with the user's prompt
+  _openComposePlannerSlideout(prompt);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1985,15 +2129,32 @@ function _renderComposeSectionCards() {
   if (!_composeSections || _composeSections.length === 0) {
     board.innerHTML = `
       <div class="compose-empty-board">
-        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.5" stroke-linecap="round">
-          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--accent, #58a6ff)" stroke-width="1.5" stroke-linecap="round" style="margin-bottom:8px;">
+          <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/>
         </svg>
-        <div style="font-size:14px;font-weight:500;color:var(--text);margin:8px 0 4px;">No sections yet</div>
-        <div style="font-size:12px;color:var(--text-muted);margin-bottom:14px;">Plan your composition with AI or start manually.</div>
-        <button class="pm-btn pm-btn-primary" style="font-size:14px;padding:8px 24px;margin-bottom:8px;" onclick="_openComposePlanner()">Plan with AI</button>
-        <button class="pm-btn" style="font-size:13px;padding:7px 20px;margin-bottom:8px;" onclick="_composeShowTemplates()">Use a Template</button>
-        <div style="font-size:12px;color:var(--text-muted);cursor:pointer;text-decoration:underline;opacity:0.7;" onclick="composeAddSection()">or add a section manually</div>
+        <div style="font-size:18px;font-weight:600;color:var(--text-heading, #fff);margin:4px 0 6px;">What would you like to create?</div>
+        <div style="font-size:13px;color:var(--text-muted);margin-bottom:16px;max-width:400px;">Describe your project and AI will plan the sections, assign artifact types, and write briefs for each agent.</div>
+        <textarea id="compose-hero-input" class="compose-empty-hero-input" placeholder="e.g. A quarterly business review with financial summary, market analysis, product updates, and next-quarter goals..." rows="3"></textarea>
+        <button id="compose-hero-plan-btn" class="pm-btn pm-btn-primary" style="font-size:14px;padding:10px 32px;margin-bottom:14px;" onclick="_composeHeroPlan()">Plan with AI</button>
+        <div style="display:flex;gap:16px;align-items:center;">
+          <span style="font-size:12px;color:var(--text-muted);cursor:pointer;text-decoration:underline;opacity:0.8;" onclick="_composeShowTemplates()">Start from a template</span>
+          <span style="font-size:12px;color:var(--text-faint);">&middot;</span>
+          <span style="font-size:12px;color:var(--text-muted);cursor:pointer;text-decoration:underline;opacity:0.8;" onclick="composeAddSection()">Add a section manually</span>
+        </div>
       </div>`;
+    // Auto-focus the text area
+    setTimeout(() => {
+      const inp = document.getElementById('compose-hero-input');
+      if (inp) {
+        inp.focus();
+        inp.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+            e.preventDefault();
+            _composeHeroPlan();
+          }
+        });
+      }
+    }, 50);
     return;
   }
 
@@ -2953,19 +3114,27 @@ function _composeCardContextMenu(sectionId, event) {
   items += '<div class="kanban-context-item" onclick="closeContextMenu();composeAddSection(\'' + sectionId + '\')">Add Subsection</div>';
 
   if (section.session_id) {
-    items += '<div class="kanban-context-item" onclick="closeContextMenu();_composeOpenSession(\'' + section.session_id + '\')">Open Session</div>';
+    const _isActive = typeof runningIds !== 'undefined' && runningIds.has(section.session_id);
+    items += '<div class="kanban-context-item" onclick="closeContextMenu();_composeOpenSession(\'' + section.session_id + '\')">' +
+      '<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:' + (_isActive ? 'var(--green,#3fb950)' : 'var(--text-muted)') + ';margin-right:6px;vertical-align:middle;"></span>Open Session</div>';
   } else {
-    items += '<div class="kanban-context-item" onclick="closeContextMenu();_composeSpawnSession(\'' + sectionId + '\')">Spawn Session</div>';
+    items += '<div class="kanban-context-item" onclick="closeContextMenu();_composeSpawnSession(\'' + sectionId + '\')">Launch Session</div>';
     items += '<div class="kanban-context-item" onclick="closeContextMenu();_composeLinkSession(\'' + sectionId + '\')">Link Session</div>';
   }
 
   // Move to status
   items += '<div class="kanban-context-separator"></div>';
   for (const opt of COMPOSE_STATUS_OPTIONS) {
-    if (opt.key !== section.status) {
+    if (opt.key === section.status) {
+      items += '<div class="kanban-context-item" style="opacity:0.4;cursor:default;pointer-events:none;">\u2713 ' + opt.label + ' (current)</div>';
+    } else {
       items += '<div class="kanban-context-item kanban-context-move" onclick="closeContextMenu();_composeMoveSection(\'' + sectionId + '\',\'' + opt.key + '\')">Move to ' + opt.label + '</div>';
     }
   }
+
+  // Add Tag
+  items += '<div class="kanban-context-separator"></div>';
+  items += '<div class="kanban-context-item" onclick="event.stopPropagation();_composeCtxAddTag(\'' + sectionId + '\', this)">Add Tag\u2026</div>';
 
   items += '<div class="kanban-context-separator"></div>';
   items += '<div class="kanban-context-item kanban-context-danger" onclick="closeContextMenu();_composeDeleteSection(\'' + sectionId + '\')">Delete</div>';
@@ -2976,6 +3145,39 @@ function _composeCardContextMenu(sectionId, event) {
   setTimeout(() => {
     document.addEventListener('click', closeContextMenu, { once: true });
   }, 0);
+}
+
+function _composeCtxAddTag(sectionId, menuItem) {
+  // Replace the menu item with an inline input
+  const inp = document.createElement('input');
+  inp.type = 'text';
+  inp.placeholder = 'Tag name...';
+  inp.style.cssText = 'width:120px;padding:3px 8px;font-size:12px;border:1px solid var(--border,rgba(255,255,255,0.1));border-radius:4px;background:var(--bg-input,#1e1e1e);color:var(--text-primary,#e8e8e8);outline:none;';
+  menuItem.textContent = '';
+  menuItem.style.pointerEvents = 'auto';
+  menuItem.appendChild(inp);
+  inp.focus();
+  const commit = () => {
+    const tag = inp.value.trim();
+    if (!tag || !_composeProject) { closeContextMenu(); return; }
+    fetch('/api/compose/projects/' + encodeURIComponent(_composeProject.id) + '/sections/' + sectionId + '/tags', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({tag: tag}),
+    }).then(r => r.json()).then(d => {
+      if (d && d.ok) {
+        const sec = _composeSections.find(s => s.id === sectionId);
+        if (sec) { if (!sec.tags) sec.tags = []; if (!sec.tags.includes(tag)) sec.tags.push(tag); }
+        _renderComposeSectionCards();
+        showToast('Tag added');
+      } else {
+        showToast(d.error || 'Failed', 'error');
+      }
+    }).catch(() => showToast('Failed to add tag', 'error'));
+    closeContextMenu();
+  };
+  inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); commit(); } if (e.key === 'Escape') closeContextMenu(); });
+  inp.addEventListener('blur', commit);
 }
 
 function _composeRenameSection(sectionId) {
