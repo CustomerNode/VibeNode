@@ -898,16 +898,24 @@ class SupabaseRepository(KanbanRepository):
             }).execute()
         return self.get_columns(project_id)
 
-    def add_status_history(self, task_id, old_status, new_status, changed_by=None, changed_at=None):
-        """Record a status transition in the history table."""
-        self.client.table("task_status_history").insert({
+    def add_status_history(self, task_id, old_status, new_status, changed_by=None,
+                           changed_at=None, session_id=None):
+        """Record a status transition in the history table.
+
+        Args:
+            session_id: Optional session ID that triggered this transition.
+        """
+        row = {
             "id": str(uuid.uuid4()),
             "task_id": task_id,
             "old_status": old_status,
             "new_status": new_status,
             "changed_by": changed_by,
             "changed_at": changed_at or datetime.now(timezone.utc).isoformat(),
-        }).execute()
+        }
+        if session_id is not None:
+            row["session_id"] = session_id
+        self.client.table("task_status_history").insert(row).execute()
 
     def _create_default_columns(self, project_id):
         """Insert the five default columns for a new project."""

@@ -112,6 +112,7 @@ class SqliteRepository(KanbanRepository):
                 # Apply any newer migrations that may not have run yet
                 self._apply_migration_002(conn)
                 self._apply_migration_005(conn)
+                self._apply_migration_006(conn)
                 self._schema_applied = True
                 return
 
@@ -131,6 +132,8 @@ class SqliteRepository(KanbanRepository):
         self._apply_migration_002(conn)
         # Apply migration 005 — session_type column
         self._apply_migration_005(conn)
+        # Apply migration 006 — session_id in status history
+        self._apply_migration_006(conn)
 
         self._schema_applied = True
 
@@ -204,6 +207,21 @@ class SqliteRepository(KanbanRepository):
             conn.execute(
                 "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
                 (5, now),
+            )
+            conn.commit()
+
+    def _apply_migration_006(self, conn):
+        """Add optional session_id column to task_status_history (idempotent)."""
+        info = conn.execute("PRAGMA table_info(task_status_history)").fetchall()
+        col_names = [row[1] if isinstance(row, tuple) else row["name"] for row in info]
+        if "session_id" not in col_names:
+            conn.execute(
+                "ALTER TABLE task_status_history ADD COLUMN session_id TEXT"
+            )
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (6, now),
             )
             conn.commit()
 
@@ -847,15 +865,22 @@ class SqliteRepository(KanbanRepository):
         conn.commit()
         return self.get_columns(project_id)
 
-    def add_status_history(self, task_id, old_status, new_status, changed_by=None, changed_at=None):
-        """Record a status transition in the history table."""
+    def add_status_history(self, task_id, old_status, new_status, changed_by=None,
+                           changed_at=None, session_id=None):
+        """Record a status transition in the history table.
+
+        Args:
+            session_id: Optional session ID that triggered this transition.
+        """
         conn = self._get_conn()
         if changed_at is None:
             changed_at = datetime.now(timezone.utc).isoformat()
         conn.execute(
-            "INSERT INTO task_status_history (id, task_id, old_status, new_status, changed_by, changed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), task_id, old_status, new_status, changed_by, changed_at),
+            "INSERT INTO task_status_history "
+            "(id, task_id, old_status, new_status, changed_by, changed_at, session_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), task_id, old_status, new_status, changed_by,
+             changed_at, session_id),
         )
         conn.commit()
 
@@ -863,7 +888,7 @@ class SqliteRepository(KanbanRepository):
         """Return status history for a task, newest first."""
         conn = self._get_conn()
         cur = conn.execute(
-            "SELECT id, task_id, old_status, new_status, changed_by, changed_at "
+            "SELECT id, task_id, old_status, new_status, changed_by, changed_at, session_id "
             "FROM task_status_history WHERE task_id = ? ORDER BY changed_at DESC",
             (task_id,),
         )
