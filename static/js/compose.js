@@ -1495,6 +1495,7 @@ function _composeDirectAll() {
       ta.focus();
       ta.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); _composeDirectAllSend(); }
+        if (e.key === 'Escape') { e.preventDefault(); const ov = ta.closest('.compose-direct-all-overlay'); if (ov) ov.remove(); }
       });
     }
   }, 50);
@@ -3157,7 +3158,10 @@ function _composeCtxAddTag(sectionId, menuItem) {
   menuItem.style.pointerEvents = 'auto';
   menuItem.appendChild(inp);
   inp.focus();
+  let _committed = false;
   const commit = () => {
+    if (_committed) return;
+    _committed = true;
     const tag = inp.value.trim();
     if (!tag || !_composeProject) { closeContextMenu(); return; }
     fetch('/api/compose/projects/' + encodeURIComponent(_composeProject.id) + '/sections/' + sectionId + '/tags', {
