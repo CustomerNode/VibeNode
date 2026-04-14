@@ -554,6 +554,155 @@ def launch_section_session(project_id, section_id):
         return jsonify({'ok': False, 'error': 'Internal error'}), 500
 
 
+@bp.route('/projects/<project_id>/launch-all', methods=['POST'])
+def launch_all_sections(project_id):
+    """Bulk launch all unlinked section agents with initial prompts,
+    then send a coordination message to the root orchestrator.
+
+    JSON body: { "orchestrate_only": false }  (optional)
+    """
+    project = get_project(project_id)
+    if not project:
+        return jsonify({'ok': False, 'error': 'Project not found'}), 404
+
+    data = request.get_json(force=True, silent=True) or {}
+    orchestrate_only = data.get('orchestrate_only', False)
+
+    sections = get_sections(project_id)
+    sm = current_app.session_manager
+    launched = []
+    failed_count = 0
+
+    if not orchestrate_only:
+        from ..compose.prompt_builder import build_compose_prompt, link_session
+        from ..compose.context_manager import update_section_in_context
+
+        unlinked = [s for s in sections if not s.session_id]
+        for section in unlinked:
+            try:
+                compose_task_id = f"section:{project_id}:{section.id}"
+                session_id = uuid.uuid4().hex
+
+                prompt_result = build_compose_prompt(compose_task_id)
+                system_prompt = prompt_result.get('system_prompt') if prompt_result.get('ok') else None
+
+                # Build initial prompt from section summary/brief
+                initial_prompt = ""
+                if section.summary:
+                    initial_prompt = f"Begin working on this section. Your brief: {section.summary}"
+                else:
+                    initial_prompt = f"Begin drafting content for the '{section.name}' section based on your system prompt."
+
+                result = sm.start_session(
+                    session_id=session_id,
+                    prompt=initial_prompt,
+                    cwd=str(project_dir(project_id)),
+                    name=f"{section.name} ({project.name})",
+                    system_prompt=system_prompt,
+                )
+
+                if result and not (isinstance(result, dict) and result.get('error')):
+                    link_session(compose_task_id, session_id)
+                    section.session_id = session_id
+                    update_section_in_context(project_id, section)
+                    launched.append({'section_id': section.id, 'session_id': session_id})
+                else:
+                    failed_count += 1
+            except Exception:
+                logger.exception("Failed to launch section %s", section.id)
+                failed_count += 1
+
+    # Send coordination message to root orchestrator
+    root_message_sent = False
+    if project.root_session_id:
+        try:
+            # Build a summary of all sections for the root
+            sec_list = get_sections(project_id)
+            sec_descriptions = []
+            for s in sec_list:
+                desc = f"- {s.name}"
+                if s.artifact_type:
+                    desc += f" ({s.artifact_type})"
+                if s.summary:
+                    desc += f": {s.summary[:80]}"
+                sec_descriptions.append(desc)
+
+            coord_msg = (
+                "All section agents have been launched. Begin coordinating: "
+                "review each section's brief, ensure coherence across sections, "
+                "and monitor progress. The composition has "
+                f"{len(sec_list)} sections:\n" + "\n".join(sec_descriptions)
+            )
+            sm.send_message(project.root_session_id, coord_msg)
+            root_message_sent = True
+        except Exception:
+            logger.warning("Failed to send coordination message to root %s",
+                           project.root_session_id)
+
+    return jsonify({
+        'ok': True,
+        'succeeded': len(launched),
+        'failed': failed_count,
+        'launched': launched,
+        'root_message': root_message_sent,
+    })
+
+
+@bp.route('/projects/<project_id>/direct-all', methods=['POST'])
+def direct_all_sections(project_id):
+    """Fan-out a directive to all sections via the root orchestrator.
+
+    JSON body: { "message": "Change tone to formal throughout" }
+    """
+    project = get_project(project_id)
+    if not project:
+        return jsonify({'ok': False, 'error': 'Project not found'}), 404
+
+    data = request.get_json(force=True, silent=True) or {}
+    message = (data.get('message') or '').strip()
+    if not message:
+        return jsonify({'ok': False, 'error': 'message is required'}), 400
+
+    if not project.root_session_id:
+        return jsonify({'ok': False, 'error': 'Root orchestrator is not running. Launch it first.'}), 400
+
+    # Store as a global directive
+    from ..compose.context_manager import add_directive as _add_directive
+    from ..compose.models import ComposeDirective
+
+    directive = ComposeDirective(
+        id=uuid.uuid4().hex,
+        project_id=project_id,
+        gen=0,  # auto-incremented by add_directive
+        scope="global",
+        content=message,
+        source="user",
+        status="active",
+    )
+    _add_directive(project_id, directive)
+
+    # Send to root orchestrator
+    try:
+        sm = current_app.session_manager
+        root_msg = (
+            f"The user has issued a directive for all sections: '{message}'. "
+            "Review this directive, add any section-specific context needed, "
+            "and ensure all section agents receive and follow it. "
+            "Set the 'changing' flag on each section that needs to act on this directive."
+        )
+        sm.send_message(project.root_session_id, root_msg)
+    except Exception:
+        logger.exception("Failed to send directive to root %s", project.root_session_id)
+        return jsonify({'ok': False, 'error': 'Failed to deliver directive to root orchestrator'}), 500
+
+    _emit('compose_directive_logged', {
+        'project_id': project_id,
+        'directive': directive.to_dict(),
+    })
+
+    return jsonify({'ok': True, 'directive_id': directive.id})
+
+
 @bp.route('/projects/<project_id>/sections/add-and-link', methods=['POST'])
 def add_and_link_section(project_id):
     """Atomic create-section + link-session.
