@@ -25,21 +25,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from claude_code_sdk import ClaudeSDKClient, ClaudeCodeOptions
-from claude_code_sdk.types import (
-    AssistantMessage,
-    UserMessage,
-    ResultMessage,
-    SystemMessage,
-    StreamEvent,
-    TextBlock,
-    ThinkingBlock,
-    ToolUseBlock,
-    ToolResultBlock,
-    PermissionResultAllow,
-    PermissionResultDeny,
-    ContentBlock,
+from daemon.backends.base import (
+    AgentSDK,
+    SessionOptions,
+    PermissionResult,
+    PermissionAction,
 )
+from daemon.backends.messages import VibeNodeMessage, MessageKind, BlockKind
+from daemon.backends.chat_store import ChatStore
 
 logger = logging.getLogger(__name__)
 
