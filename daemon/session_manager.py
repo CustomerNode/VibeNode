@@ -51,15 +51,8 @@ _dirs_to_add = [d for d in _extra_path_dirs if d not in _current_path]
 if _dirs_to_add:
     os.environ["PATH"] = os.pathsep.join(_dirs_to_add) + os.pathsep + _current_path
 
-# ---------------------------------------------------------------------------
-# SDK Patches — isolated in daemon/sdk_patches.py
-# See docs/plans/sdk-monkey-patching-plan.md for full context.
-# ---------------------------------------------------------------------------
-try:
-    from daemon.sdk_patches import apply_patches as _apply_sdk_patches
-    _applied_patches = _apply_sdk_patches()
-except Exception as _patch_err:
-    logger.warning("Could not apply SDK patches: %s", _patch_err)
+# SDK Patches — now applied by AgentSDK.apply_patches() in SessionManager.__init__().
+# See daemon/backends/claude.py for the Claude implementation.
 
 
 class SessionState(str, Enum):
@@ -112,7 +105,7 @@ class SessionInfo:
     cost_usd: float = 0.0
     error: Optional[str] = None
     entries: list = field(default_factory=list)
-    client: Optional[ClaudeSDKClient] = None
+    client: Optional[object] = None  # Opaque handle from AgentSDK.create_session()
     task: Optional[asyncio.Task] = None
     pending_permission: Optional[tuple] = None  # (anyio.Event, result_holder_list)
     pending_tool_name: str = ""
@@ -298,7 +291,26 @@ def _repair_incomplete_jsonl(jsonl_path: Path) -> bool:
 class SessionManager:
     """Manages all Claude Code SDK sessions on a dedicated asyncio event loop."""
 
-    def __init__(self):
+    def __init__(self, sdk: AgentSDK = None, store: ChatStore = None):
+        # ── Backend abstraction (Phase 2 OOP refactor) ──
+        # Dependency injection: defaults to Claude backend if not specified.
+        # This is backward-compatible — no callers need to change.
+        if sdk is None:
+            from daemon.backends.claude import ClaudeAgentSDK
+            sdk = ClaudeAgentSDK()
+        if store is None:
+            from daemon.backends.claude_store import ClaudeJsonlStore
+            store = ClaudeJsonlStore()
+        self._sdk: AgentSDK = sdk
+        self._store: ChatStore = store
+
+        # Apply SDK-specific patches (moved from module-level L66-69)
+        try:
+            self._applied_patches = self._sdk.apply_patches()
+        except Exception as _patch_err:
+            logger.warning("Could not apply SDK patches: %s", _patch_err)
+            self._applied_patches = []
+
         self._sessions: dict[str, SessionInfo] = {}
         self._id_aliases: dict[str, str] = {}  # old_id -> new_id for SDK remaps
         self._lock = threading.Lock()
@@ -600,9 +612,11 @@ class SessionManager:
             # See _make_permission_callback() and sdk_transport_adapter.py
             # for the full explanation of this requirement.
             original_input = info.pending_tool_input if isinstance(info.pending_tool_input, dict) else {}
-            result = PermissionResultAllow(updated_input=original_input, updated_permissions=None)
+            result = self._sdk.make_permission_result_allow(original_input)
         else:
-            result = PermissionResultDeny(message="User denied permission", interrupt=False)
+            result = self._sdk.make_permission_result_deny(
+                message="User denied permission", interrupt=False
+            )
 
         # Resolve the permission by setting the anyio Event.
         perm_tuple = info.pending_permission  # (anyio.Event, result_holder)
@@ -1149,13 +1163,7 @@ class SessionManager:
                 # died mid-response, the last entry has stop_reason=null and
                 # --resume will choke on it immediately.
                 try:
-                    from app.config import _encode_cwd
-                    projects_dir = Path.home() / ".claude" / "projects"
-                    if info.cwd:
-                        encoded = _encode_cwd(info.cwd)
-                        jsonl_candidate = projects_dir / encoded / f"{resolved}.jsonl"
-                        if jsonl_candidate.exists():
-                            _repair_incomplete_jsonl(jsonl_candidate)
+                    self._store.repair_incomplete_turn(resolved, cwd=info.cwd or "")
                 except Exception as _rep_err:
                     logger.warning("_reconnect_client: jsonl repair failed: %s", _rep_err)
 
@@ -1164,19 +1172,19 @@ class SessionManager:
                 await asyncio.sleep(0.5)
 
                 try:
-                    options = ClaudeCodeOptions(
-                        cwd=os.path.normpath(info.cwd) if info.cwd else None,
+                    options = SessionOptions(
+                        cwd=info.cwd or None,
                         resume=resolved,
-                        can_use_tool=self._make_permission_callback(session_id),
+                        permission_callback=self._make_permission_callback(session_id),
                         model=info.model or None,
                         permission_mode="default",
                         include_partial_messages=True,
                     )
-                    client = ClaudeSDKClient(options=options)
-                    await client.connect()
+                    client = await self._sdk.create_session(options)
+                    await self._sdk.connect(client)
                     info.client = client
                     # Update tracked PID so orphan sweep doesn't kill the new process
-                    info._cli_pid = self._extract_cli_pid(info)
+                    info._cli_pid = self._sdk.extract_process_pid(info.client)
                     logger.info("Reconnected SDK client for %s (new PID %d)",
                                 session_id, info._cli_pid)
                     return True
@@ -1211,10 +1219,10 @@ class SessionManager:
         got_result = False
         result_handled = False
         try:
-            options = ClaudeCodeOptions(
-                cwd=os.path.normpath(cwd) if cwd else None,
+            options = SessionOptions(
+                cwd=cwd or None,
                 resume=session_id if resume else None,
-                can_use_tool=self._make_permission_callback(session_id),
+                permission_callback=self._make_permission_callback(session_id),
                 model=model or None,
                 system_prompt=system_prompt or None,
                 max_turns=max_turns or None,
@@ -1224,7 +1232,7 @@ class SessionManager:
                 extra_args=extra_args or {},
             )
             _profile_log("options_built")
-            client = ClaudeSDKClient(options=options)
+            client = await self._sdk.create_session(options)
             info.client = client
 
             # Connect with no prompt. The SDK auto-sets permission_prompt_tool_name="stdio"
@@ -1242,14 +1250,14 @@ class SessionManager:
             loop = asyncio.get_event_loop()
             mtime_task = loop.run_in_executor(None, self._record_pre_turn_mtimes, info)
 
-            await client.connect()
+            await self._sdk.connect(client)
             _profile_log("client_connected")
 
             # Capture the CLI subprocess PID for orphan cleanup.
             # If _drive_session exits (crash, cancel, normal end) without
             # going through _close_session, the finally block uses this to
             # kill the process tree so child node.exe workers don't linger.
-            info._cli_pid = self._extract_cli_pid(info)
+            info._cli_pid = self._sdk.extract_process_pid(info.client)
 
             info.state = SessionState.WORKING
             self._emit_state(info)
@@ -1275,44 +1283,40 @@ class SessionManager:
                     info.entries.append(entry)
                     entry_index = len(info.entries) - 1
                 self._emit_entry(session_id, entry, entry_index)
-                await client.query(prompt)
+                await self._sdk.send_query(client, prompt)
                 _profile_log("query_sent")
 
-            # Process messages (None = unknown types, skipped via monkey-patch)
+            # Process messages — the SDK backend normalizes all messages to
+            # VibeNodeMessage before yielding them.  None/unknown types are
+            # filtered out by the backend's receive_response().
             #
-            # IMPORTANT: use receive_response() (not receive_messages()) so the
-            # iterator terminates after ResultMessage.  receive_messages() keeps
-            # the generator alive for the entire subprocess lifetime, which
-            # means _drive_session would never exit after the first turn.  When
-            # _send_query later calls receive_response() on the same client,
-            # BOTH generators compete for messages from the same underlying
-            # stream — causing ResultMessages to be consumed by the wrong
-            # handler and leaving sessions stuck in WORKING forever.
+            # IMPORTANT: receive_response() terminates after the equivalent
+            # of a ResultMessage (turn complete).  See comment in
+            # ClaudeAgentSDK.receive_response() for details.
             info._stream_evt_logged = False
             _first_msg_logged = False
             if prompt:
-                async for message in client.receive_response():
+                async for message in self._sdk.receive_response(client):
                     # If a newer task has replaced us, stop processing —
                     # our stream is stale and we must not touch state.
                     if info.task is not asyncio.current_task():
                         break
-                    if message is not None:
-                        if not _first_msg_logged:
-                            _profile_log("first_stream_message (%s)" % type(message).__name__)
-                            _first_msg_logged = True
-                        if isinstance(message, ResultMessage):
-                            got_result = True
-                            _profile_log("result_message")
-                        try:
-                            await self._process_message(session_id, message)
-                            if isinstance(message, ResultMessage):
-                                result_handled = True
-                        except Exception as pm_err:
-                            # Don't let one bad message kill the entire stream.
-                            logger.exception(
-                                "_process_message error for %s (msg type %s): %s",
-                                session_id, type(message).__name__, pm_err
-                            )
+                    if not _first_msg_logged:
+                        _profile_log("first_stream_message (%s)" % message.kind.value)
+                        _first_msg_logged = True
+                    if message.kind == MessageKind.RESULT:
+                        got_result = True
+                        _profile_log("result_message")
+                    try:
+                        await self._process_message(session_id, message)
+                        if message.kind == MessageKind.RESULT:
+                            result_handled = True
+                    except Exception as pm_err:
+                        # Don't let one bad message kill the entire stream.
+                        logger.exception(
+                            "_process_message error for %s (msg kind %s): %s",
+                            session_id, message.kind.value, pm_err
+                        )
             else:
                 # No prompt (empty session or bare resume) — nothing to receive.
                 # Go straight to IDLE so send_message() can dispatch follow-ups.
@@ -1596,7 +1600,7 @@ class SessionManager:
         # underlying CLI process may have exited between turns.  Silently
         # reconnect before sending so the user never sees "Stream lost".
         if info.client:
-            cli_pid = self._extract_cli_pid(info)
+            cli_pid = self._sdk.extract_process_pid(info.client)
             if cli_pid == 0:
                 # Process already exited — silent reconnect
                 logger.info("_send_query: %s CLI process dead before send — "
@@ -1711,36 +1715,35 @@ class SessionManager:
         result_handled = False
         _first_msg_logged = False
         try:
-            await info.client.query(text)
+            await self._sdk.send_query(info.client, text)
             _profile_log("query_sent")
 
-            # Process response messages (None = unknown types, skipped)
+            # Process response messages — normalized to VibeNodeMessage by backend
             info.usage.pop('_per_call', None)  # clear stale per-call marker from previous turn
             info._stream_evt_logged = False  # re-enable diagnostic log for this turn
-            async for message in info.client.receive_response():
+            async for message in self._sdk.receive_response(info.client):
                 # If a newer task has replaced us, stop processing —
                 # our stream is stale and we must not touch state.
                 if info.task is not asyncio.current_task():
                     break
-                if message is not None:
-                    if not _first_msg_logged:
-                        _profile_log("first_stream_message (%s)" % type(message).__name__)
-                        _first_msg_logged = True
-                    if isinstance(message, ResultMessage):
-                        got_result = True
-                        _profile_log("result_message")
-                    try:
-                        await self._process_message(session_id, message)
-                        if isinstance(message, ResultMessage):
-                            result_handled = True
-                    except Exception as pm_err:
-                        # Don't let one bad message kill the entire stream.
-                        # Log the error and continue processing remaining
-                        # messages so ResultMessage can still arrive and set IDLE.
-                        logger.exception(
-                            "_process_message error for %s (msg type %s): %s",
-                            session_id, type(message).__name__, pm_err
-                        )
+                if not _first_msg_logged:
+                    _profile_log("first_stream_message (%s)" % message.kind.value)
+                    _first_msg_logged = True
+                if message.kind == MessageKind.RESULT:
+                    got_result = True
+                    _profile_log("result_message")
+                try:
+                    await self._process_message(session_id, message)
+                    if message.kind == MessageKind.RESULT:
+                        result_handled = True
+                except Exception as pm_err:
+                    # Don't let one bad message kill the entire stream.
+                    # Log the error and continue processing remaining
+                    # messages so ResultMessage can still arrive and set IDLE.
+                    logger.exception(
+                        "_process_message error for %s (msg kind %s): %s",
+                        session_id, message.kind.value, pm_err
+                    )
 
             # Safety net: if the stream ended without a ResultMessage,
             # force IDLE so the session isn't stuck forever.  Skip if we
@@ -1961,7 +1964,9 @@ class SessionManager:
                 info.pending_permission = None
                 if isinstance(perm_tuple, tuple) and len(perm_tuple) == 2:
                     perm_event, result_holder = perm_tuple
-                    deny = PermissionResultDeny(message="Interrupted by user", interrupt=True)
+                    deny = self._sdk.make_permission_result_deny(
+                        message="Interrupted by user", interrupt=True
+                    )
                     result_holder[0] = (deny, False, False)
                     perm_event.set()
 
@@ -1987,7 +1992,7 @@ class SessionManager:
             )
             if not _new_task_started:
                 try:
-                    await info.client.interrupt()
+                    await self._sdk.interrupt(info.client)
                 except Exception:
                     pass
 
@@ -2007,21 +2012,6 @@ class SessionManager:
                 self._emit_entry(session_id, entry, entry_index)
         except Exception as e:
             logger.exception("Interrupt error for %s: %s", session_id, e)
-
-    @staticmethod
-    def _extract_cli_pid(info: "SessionInfo") -> int:
-        """Extract the CLI subprocess PID from a SessionInfo, or 0."""
-        if not info.client:
-            return 0
-        transport = getattr(info.client, '_transport', None)
-        if transport is None:
-            query = getattr(info.client, '_query', None)
-            transport = getattr(query, 'transport', None) if query else None
-        inner = getattr(transport, 'inner', transport) if transport else None
-        proc = getattr(inner, '_process', None) if inner else None
-        if proc and proc.returncode is None:
-            return proc.pid or 0
-        return 0
 
     @staticmethod
     def _kill_process_tree(pid: int) -> None:
@@ -2115,7 +2105,7 @@ class SessionManager:
                 # After reconnect, _cli_pid is updated, but belt-and-
                 # suspenders: if the client has a live process with a
                 # DIFFERENT PID, our recorded PID is stale — skip it.
-                current_pid = self._extract_cli_pid(info)
+                current_pid = self._sdk.extract_process_pid(info.client)
                 if current_pid and current_pid != pid:
                     # Stale PID — update and skip
                     info._cli_pid = current_pid
@@ -2158,7 +2148,9 @@ class SessionManager:
                 info.pending_permission = None
                 if isinstance(perm_tuple, tuple) and len(perm_tuple) == 2:
                     perm_event, result_holder = perm_tuple
-                    deny = PermissionResultDeny(message="Session closed", interrupt=True)
+                    deny = self._sdk.make_permission_result_deny(
+                        message="Session closed", interrupt=True
+                    )
                     result_holder[0] = (deny, False, False)
                     perm_event.set()
 
@@ -2167,12 +2159,12 @@ class SessionManager:
                 info.task.cancel()
 
             # Grab the CLI subprocess PID *before* disconnect() cleans it up.
-            cli_pid = self._extract_cli_pid(info) or info._cli_pid
+            cli_pid = self._sdk.extract_process_pid(info.client) or info._cli_pid
 
             # Disconnect the client (terminates the direct CLI process)
             if info.client:
                 try:
-                    await info.client.disconnect()
+                    await self._sdk.disconnect(info.client)
                 except Exception:
                     pass
 
@@ -2216,7 +2208,9 @@ class SessionManager:
             with manager._lock:
                 info = manager._sessions.get(resolved_id)
             if not info:
-                return PermissionResultDeny(message="Session not found", interrupt=True)
+                return manager._sdk.make_permission_result_deny(
+                    message="Session not found", interrupt=True
+                )
 
             # ── Early abort: if the CLI subprocess transport is dead,
             # every tool use will fail with "Stream closed".  Instead of
@@ -2224,15 +2218,7 @@ class SessionManager:
             # interrupt=True to end the turn immediately.  The finally
             # block in _drive_session / _send_query will reconnect and
             # retry the whole message on a fresh CLI process.
-            try:
-                _transport_alive = (
-                    info.client
-                    and info.client._query
-                    and info.client._query.transport
-                    and info.client._query.transport.is_ready()
-                )
-            except Exception:
-                _transport_alive = False
+            _transport_alive = manager._sdk.is_transport_alive(info.client)
             if not _transport_alive:
                 logger.warning(
                     "Transport dead for %s — aborting turn for tool %s "
@@ -2255,13 +2241,12 @@ class SessionManager:
                         info.entries.append(_heal_entry)
                         _heal_idx = len(info.entries) - 1
                     manager._emit_entry(resolved_id, _heal_entry, _heal_idx)
-                return PermissionResultDeny(
+                return manager._sdk.make_permission_result_deny(
                     message="Transport disconnected — reconnecting",
                     interrupt=True,
                 )
 
-            # ── CRITICAL: PermissionResultAllow must always include tool_input ──
-            # Every PermissionResultAllow() MUST pass updated_input=tool_input.
+            # ── CRITICAL: make_permission_result_allow always includes tool_input ──
             # The CLI 2.x expects updatedInput to be the full tool input dict.
             # Sending None/null crashes the CLI sandbox validator with:
             #   "undefined is not an object (evaluating 'H.includes')"
@@ -2273,7 +2258,9 @@ class SessionManager:
                 manager._log_auto_approved(
                     resolved_id, info, tool_name, tool_input, "always-allow"
                 )
-                return PermissionResultAllow(updated_input=tool_input if isinstance(tool_input, dict) else {})
+                return manager._sdk.make_permission_result_allow(
+                    tool_input if isinstance(tool_input, dict) else {}
+                )
 
             # "Almost Always" — auto-approve unless the command looks dangerous
             if tool_name in info.almost_always_allowed_tools:
@@ -2292,7 +2279,9 @@ class SessionManager:
                     manager._log_auto_approved(
                         resolved_id, info, tool_name, tool_input, "almost-always"
                     )
-                    return PermissionResultAllow(updated_input=tool_input if isinstance(tool_input, dict) else {})
+                    return manager._sdk.make_permission_result_allow(
+                        tool_input if isinstance(tool_input, dict) else {}
+                    )
 
             # Server-side policy check -- resolve without browser round-trip
             if manager._should_auto_approve(tool_name, tool_input if isinstance(tool_input, dict) else {}):
@@ -2300,7 +2289,9 @@ class SessionManager:
                 manager._log_auto_approved(
                     resolved_id, info, tool_name, tool_input, "server-policy"
                 )
-                return PermissionResultAllow(updated_input=tool_input if isinstance(tool_input, dict) else {})
+                return manager._sdk.make_permission_result_allow(
+                    tool_input if isinstance(tool_input, dict) else {}
+                )
 
             # Use threading.Event (fully thread-safe) with anyio.sleep polling.
             # anyio.Event + call_soon_threadsafe doesn't reliably wake the waiter.
@@ -2347,7 +2338,9 @@ class SessionManager:
                         info.pending_tool_input = {}
                         info.state = SessionState.WORKING
                         manager._emit_state(info)
-                        return PermissionResultAllow(updated_input=tool_input if isinstance(tool_input, dict) else {})
+                        return manager._sdk.make_permission_result_allow(
+                            tool_input if isinstance(tool_input, dict) else {}
+                        )
                     try:
                         await anyio.sleep(0.1)
                     except Exception:
@@ -2355,7 +2348,7 @@ class SessionManager:
 
                 result_tuple = perm_result_holder[0]
                 if result_tuple is None:
-                    result_tuple = (PermissionResultDeny(message="No result"), False, False)
+                    result_tuple = (manager._sdk.make_permission_result_deny(message="No result"), False, False)
                 # Support both 2-tuple (legacy) and 3-tuple
                 if len(result_tuple) == 2:
                     permission_result, always = result_tuple
@@ -2364,7 +2357,7 @@ class SessionManager:
                     permission_result, always, almost_always = result_tuple
 
                 # Remember "Always Allow" for this tool for the rest of the session
-                if isinstance(permission_result, PermissionResultAllow):
+                if isinstance(permission_result, PermissionResult) and permission_result.action == PermissionAction.ALLOW:
                     if always:
                         info.always_allowed_tools.add(tool_name)
                     elif almost_always:
@@ -2379,8 +2372,9 @@ class SessionManager:
                 # The interrupt handler already set state to IDLE; emitting
                 # WORKING here would race with it and flip the UI back.
                 is_interrupt = (
-                    isinstance(permission_result, PermissionResultDeny)
-                    and getattr(permission_result, 'interrupt', False)
+                    isinstance(permission_result, PermissionResult)
+                    and permission_result.action == PermissionAction.DENY
+                    and permission_result.interrupt
                 )
                 if not is_interrupt:
                     info.state = SessionState.WORKING
@@ -2395,7 +2389,7 @@ class SessionManager:
                 info.pending_tool_input = {}
                 info.state = prev_state
                 manager._emit_state(info)
-                return PermissionResultDeny(
+                return manager._sdk.make_permission_result_deny(
                     message="Permission request cancelled", interrupt=True
                 )
 
@@ -2405,34 +2399,43 @@ class SessionManager:
     # Message processing
     # ------------------------------------------------------------------
 
-    async def _process_message(self, session_id: str, message) -> None:
-        """Convert an SDK Message into log entries and emit them."""
+    async def _process_message(self, session_id: str, message: VibeNodeMessage) -> None:
+        """Convert a VibeNodeMessage into log entries and emit them.
+
+        All SDK-specific isinstance() checks have been replaced with
+        message.kind and block dict lookups.  The normalization from raw
+        SDK types to VibeNodeMessage happens in AgentSDK.receive_response().
+        """
         with self._lock:
             info = self._sessions.get(session_id)
         if not info:
             return
 
-        if isinstance(message, AssistantMessage):
-            # Don't clear compacting substatus here — only ResultMessage or
-            # init SystemMessage should clear it. AssistantMessage can arrive
+        if message.kind == MessageKind.ASSISTANT:
+            # Don't clear compacting substatus here — only RESULT or
+            # init SYSTEM should clear it. ASSISTANT can arrive
             # mid-compact (e.g. partial streaming) and clearing here causes
             # the UI to flash back to "Working" during compaction.
-            for block in (message.content if hasattr(message, 'content') else []):
-                if isinstance(block, TextBlock):
-                    entry = LogEntry(kind="asst", text=(block.text or "")[:50000])
+            for block in message.blocks:
+                bk = block.get("kind", "")
+
+                if bk == BlockKind.TEXT.value:
+                    entry = LogEntry(kind="asst", text=(block.get("text", "") or "")[:50000])
                     with info._lock:
                         info.entries.append(entry)
                         entry_index = len(info.entries) - 1
                     self._emit_entry(session_id, entry, entry_index)
 
-                elif isinstance(block, ToolUseBlock):
-                    inp = block.input if hasattr(block, 'input') and isinstance(block.input, dict) else {}
+                elif bk == BlockKind.TOOL_USE.value:
+                    inp = block.get("input", {})
+                    if not isinstance(inp, dict):
+                        inp = {}
                     desc = self._extract_tool_desc(inp)
                     entry = LogEntry(
                         kind="tool_use",
-                        name=getattr(block, 'name', '') or '',
+                        name=block.get("name", "") or "",
                         desc=desc,
-                        id=getattr(block, 'id', '') or '',
+                        id=block.get("id", "") or "",
                     )
                     with info._lock:
                         info.entries.append(entry)
@@ -2450,43 +2453,22 @@ class SessionManager:
                             info._turn_had_direct_edit = True
                             logger.info("  tracked_files now has %d entries", len(info.tracked_files))
 
-                elif isinstance(block, ThinkingBlock):
+                elif bk == BlockKind.THINKING.value:
                     # Skip thinking blocks -- they're internal reasoning
                     pass
 
-        elif isinstance(message, UserMessage):
-            # Messages with parent_tool_use_id are sub-agent / nested tool
-            # context — not from the human user. Skip text blocks for those.
-            is_sub_agent = bool(getattr(message, 'parent_tool_use_id', None))
+        elif message.kind == MessageKind.USER:
+            # Sub-agent detection: VibeNodeMessage.is_sub_agent is set by
+            # the normalization layer based on parent_tool_use_id.
+            is_sub_agent = message.is_sub_agent
 
-            # Normalize content: SDK can send str | list[ContentBlock].
-            # Wrap plain strings in a TextBlock so the block loop works.
-            raw_content = getattr(message, 'content', None) or []
-            if isinstance(raw_content, str):
-                blocks = [TextBlock(text=raw_content)] if raw_content.strip() else []
-            elif isinstance(raw_content, list):
-                blocks = raw_content
-            else:
-                blocks = []
+            # Blocks are already normalized to dicts by receive_response().
+            for block in message.blocks:
+                bk = block.get("kind", "")
 
-            for block in blocks:
-                if isinstance(block, ToolResultBlock):
-                    # Extract text content from tool result
-                    rc = getattr(block, 'content', '') or ''
-                    if isinstance(rc, list):
-                        text_parts = []
-                        for b in rc:
-                            if isinstance(b, dict) and b.get("type") == "text":
-                                text_parts.append(b.get("text", ""))
-                            elif hasattr(b, 'text'):
-                                text_parts.append(b.text or "")
-                        rt = " ".join(text_parts)
-                    elif isinstance(rc, str):
-                        rt = rc
-                    else:
-                        rt = str(rc)
-
-                    is_err = bool(getattr(block, 'is_error', False))
+                if bk == BlockKind.TOOL_RESULT.value:
+                    rt = (block.get("text", "") or "")[:20000]
+                    is_err = bool(block.get("is_error", False))
 
                     # Detect "Stream closed" permission failures and flag session
                     # for auto-retry after the current turn ends.  The turn will
@@ -2506,7 +2488,7 @@ class SessionManager:
                         # Show the user what's happening (not an error, a status)
                         entry = LogEntry(
                             kind="system",
-                            text=f"Stream error detected — will auto-reconnect and retry",
+                            text="Stream error detected — will auto-reconnect and retry",
                         )
                         with info._lock:
                             info.entries.append(entry)
@@ -2518,8 +2500,8 @@ class SessionManager:
 
                     entry = LogEntry(
                         kind="tool_result",
-                        text=rt[:20000],
-                        tool_use_id=getattr(block, 'tool_use_id', '') or '',
+                        text=rt,
+                        tool_use_id=block.get("tool_use_id", "") or "",
                         is_error=is_err,
                     )
                     with info._lock:
@@ -2527,8 +2509,8 @@ class SessionManager:
                         entry_index = len(info.entries) - 1
                     self._emit_entry(session_id, entry, entry_index)
 
-                elif isinstance(block, TextBlock):
-                    user_text = (block.text or "")[:20000]
+                elif bk == BlockKind.TEXT.value:
+                    user_text = (block.get("text", "") or "")[:20000]
 
                     # Skip internal/sub-agent user messages — they're not
                     # from the human and shouldn't show as user bubbles
@@ -2581,9 +2563,9 @@ class SessionManager:
                         if not last_user or last_user.text.strip() != stripped:
                             info.entries.append(LogEntry(kind="user", text=user_text))
 
-        elif isinstance(message, SystemMessage):
-            subtype = getattr(message, 'subtype', '') or ''
-            data = getattr(message, 'data', {}) or {}
+        elif message.kind == MessageKind.SYSTEM:
+            subtype = message.subtype or ""
+            data = message.data or {}
             logger.info("SystemMessage subtype=%s keys=%s", subtype, list(data.keys())[:10])
 
             # Detect compaction events — CLI sends "compact_boundary" subtype
@@ -2631,17 +2613,17 @@ class SessionManager:
                         'data': data,
                     })
 
-        elif isinstance(message, ResultMessage):
+        elif message.kind == MessageKind.RESULT:
             # Clear substatus on result (compaction is done if it was in progress)
             if info.substatus:
                 info.substatus = ""
 
-            info.cost_usd = getattr(message, 'total_cost_usd', 0.0) or 0.0
+            info.cost_usd = message.cost_usd or 0.0
 
             # Extract token usage from ResultMessage.
             # ResultMessage.usage is cumulative across the session — if we have
             # per-call data from a message_start StreamEvent, keep it.
-            raw_usage = getattr(message, 'usage', None)
+            raw_usage = message.usage
             if raw_usage and isinstance(raw_usage, dict):
                 prev_pct = info.usage.get('pre_compact_tokens')
                 if not info.usage.get('_per_call'):
@@ -2653,13 +2635,13 @@ class SessionManager:
                             bool(info.usage.get('_per_call')))
 
             # Extract session timing metadata
-            duration_ms = getattr(message, 'duration_ms', 0) or 0
-            num_turns = getattr(message, 'num_turns', 0) or 0
+            duration_ms = message.duration_ms or 0
+            num_turns = message.num_turns or 0
             if duration_ms or num_turns:
                 info.usage['duration_ms'] = duration_ms
                 info.usage['num_turns'] = num_turns
 
-            is_error = getattr(message, 'is_error', False)
+            is_error = message.is_error
             if is_error:
                 info.error = "Session ended with error"
                 entry = LogEntry(kind="system", text="Session ended with error", is_error=True)
@@ -2669,7 +2651,7 @@ class SessionManager:
                 self._emit_entry(session_id, entry, entry_index)
 
             # Remap session ID if the SDK assigned a different one
-            result_session_id = getattr(message, 'session_id', None)
+            result_session_id = message.session_id
             if result_session_id and result_session_id != session_id:
                 logger.info(
                     "SDK assigned session_id %s (we used %s) — remapping",
@@ -2722,19 +2704,15 @@ class SessionManager:
             info.state = SessionState.IDLE
             self._emit_state(info)
 
-        elif isinstance(message, StreamEvent):
+        elif message.kind == MessageKind.STREAM_EVENT:
             # Forward raw streaming events for partial message display
-            event_data = {}
-            if hasattr(message, 'event'):
-                event_data['event'] = message.event
-            if hasattr(message, 'data'):
-                event_data['data'] = message.data
+            event_data = message.data or {}
 
             # Extract per-call context usage from message_start events.
             # This is the AUTHORITATIVE context window size — unlike
             # ResultMessage.usage which is cumulative across the session.
-            # NOTE: message.event is a STRING like "message_start", while
-            # message.data is the dict payload with the actual content.
+            # NOTE: event is a STRING like "message_start", while
+            # data is the dict payload with the actual content.
             evt_type = event_data.get('event', '')
             evt_data = event_data.get('data') or {}
             is_message_start = (
