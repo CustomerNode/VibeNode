@@ -201,8 +201,8 @@ def session_manager(mock_socketio, sm_module, tmp_path):
     # Use a temp queue file so tests don't interfere with each other
     # or with real queue data.  _load_queues runs in __init__, so we
     # need to reset path AND clear loaded data.
-    manager._queue_path = tmp_path / "test_queues.json"
-    manager._queues = {}
+    manager._mq._queue_path = tmp_path / "test_queues.json"
+    manager._mq._queues = {}
     manager.start(mock_socketio)
     yield manager
     manager.stop()
@@ -368,8 +368,8 @@ class TestRapidQueueAndInterrupt:
         session_manager.queue_message(sid, "Msg 3")
 
         # Simulate that Msg 1 was dispatched (remove from front)
-        with session_manager._queue_lock:
-            q = session_manager._queues.get(sid, [])
+        with session_manager._mq._queue_lock:
+            q = session_manager._mq._queues.get(sid, [])
             if q:
                 q.pop(0)
 
