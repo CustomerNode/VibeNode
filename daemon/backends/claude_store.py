@@ -82,6 +82,9 @@ class ClaudeJsonlStore(ChatStore):
         if not jsonl_path or not jsonl_path.exists():
             return set(), {}, "", ""
 
+        # The set of tool names whose file_path/path input indicates a tracked
+        # file.  These are the tools that create or modify files -- their
+        # targets need file-history snapshots for the rewind feature.
         edit_tools = {'Edit', 'Write', 'MultiEdit', 'NotebookEdit'}
         found = set()
         max_version = {}
@@ -89,6 +92,9 @@ class ClaudeJsonlStore(ChatStore):
         last_asst_uuid = ""
 
         try:
+            # UTF-8 with errors="replace" prevents crashes on sessions that
+            # contain binary data or truncated multi-byte sequences (which
+            # can happen if the daemon was killed mid-write).
             with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
                     line = line.strip()
@@ -101,7 +107,11 @@ class ClaudeJsonlStore(ChatStore):
 
                     t = obj.get("type", "")
 
-                    # Cache user/assistant UUIDs
+                    # Cache user/assistant UUIDs as we scan.  We overwrite on
+                    # each occurrence so at the end of the scan we have the
+                    # LAST user and assistant UUIDs -- needed for inserting
+                    # file-history-snapshot entries at the correct position
+                    # in the JSONL conversation flow.
                     uid = obj.get("uuid", "")
                     if uid:
                         if t == "user":
@@ -162,6 +172,12 @@ class ClaudeJsonlStore(ChatStore):
         last_asst_uuid = ""
         try:
             file_size = jsonl_path.stat().st_size
+            # Read only the last 64KB of the file instead of the entire thing.
+            # Session JSONL files can grow to tens of megabytes.  The UUIDs
+            # we need are in the most recent entries, so reading the tail is
+            # sufficient and avoids a full-file scan that would add latency
+            # to every turn.  64KB is enough to contain several complete
+            # JSON lines even for large tool results.
             tail_size = min(file_size, 65536)
             with open(jsonl_path, "rb") as rf:
                 rf.seek(max(0, file_size - tail_size))

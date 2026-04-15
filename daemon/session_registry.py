@@ -28,6 +28,16 @@ class SessionRegistry:
     """Persistent session registry for crash recovery."""
 
     def __init__(self):
+        """Initialize the SessionRegistry.
+
+        The registry uses a debounced save pattern: state changes mark
+        the registry dirty and schedule a timer.  When the timer fires,
+        it snapshots the current state and writes it atomically.  This
+        avoids hammering disk on every state transition.
+
+        No arguments -- the registry path is module-level (REGISTRY_PATH)
+        to keep the class stateless with respect to configuration.
+        """
         self._registry_timer: Optional[threading.Timer] = None
         self._registry_dirty = False
 
@@ -52,20 +62,39 @@ class SessionRegistry:
         sessions_snapshot is a dict of {sid: {name, cwd, model, ...}} already
         prepared by SessionManager (under its lock). This avoids the registry
         module needing to know about SessionInfo or SessionState.
+
+        Snapshot format on disk:
+            {
+              "sessions": {
+                "<session_id>": {
+                  "name": str,       # user-visible session name
+                  "state": str,      # "working", "waiting", "idle", etc.
+                  "cwd": str,        # working directory path
+                  "model": str,      # model identifier
+                  "last_activity": float,  # time.time() of last state change
+                  "session_type": str,     # "normal" or "planner"
+                },
+                ...
+              }
+            }
         """
         try:
             REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
             registry = {"sessions": sessions_snapshot}
             payload = json.dumps(registry, indent=2, ensure_ascii=False)
 
-            # Atomic write: write to a temp file then rename
+            # Atomic write pattern: write to a temp file in the same
+            # directory, then os.replace() to atomically swap.  This
+            # ensures that a crash mid-write never leaves a half-written
+            # registry file that would prevent recovery of ALL sessions.
             tmp_fd, tmp_path = tempfile.mkstemp(
                 dir=str(REGISTRY_PATH.parent), suffix=".tmp"
             )
             try:
                 os.write(tmp_fd, payload.encode("utf-8"))
                 os.close(tmp_fd)
-                # On Windows, os.rename fails if destination exists; use os.replace
+                # os.replace is used instead of os.rename because on Windows,
+                # os.rename fails if the destination already exists.
                 os.replace(tmp_path, str(REGISTRY_PATH))
             except Exception:
                 try:
@@ -90,8 +119,12 @@ class SessionRegistry:
         save_registry_now(). This avoids the registry needing to know
         about SessionManager internals.
         """
+        # Debounce pattern: if a timer is already running, skip this call.
+        # The already-scheduled timer will capture the latest state when it
+        # fires (since save_fn reads state at execution time, not at schedule
+        # time).  This collapses N rapid state changes into a single disk
+        # write, preventing I/O contention during burst activity.
         if self._registry_timer and self._registry_timer.is_alive():
-            # A save is already scheduled; it will pick up the newest state
             return
         self._registry_timer = threading.Timer(3.0, save_fn)
         self._registry_timer.daemon = True

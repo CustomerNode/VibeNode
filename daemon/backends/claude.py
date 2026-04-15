@@ -200,11 +200,18 @@ class ClaudeAgentSDK(AgentSDK):
         blocks = []
         for block in (msg.content if hasattr(msg, 'content') else []):
             if isinstance(block, TextBlock):
+                # Truncate text to 50KB to prevent memory bloat from extremely
+                # long responses.  This limit protects both server memory and
+                # the WebSocket transport to the browser.
                 blocks.append({
                     "kind": BlockKind.TEXT.value,
                     "text": (block.text or "")[:50000],
                 })
             elif isinstance(block, ToolUseBlock):
+                # Defensive: block.input can be a non-dict in edge cases
+                # (malformed SDK responses, partial streaming).  Downstream
+                # code calls input.get(), so we must guarantee a dict here
+                # to avoid TypeError.
                 inp = (block.input if hasattr(block, 'input')
                        and isinstance(block.input, dict) else {})
                 blocks.append({
@@ -214,6 +221,11 @@ class ClaudeAgentSDK(AgentSDK):
                     "input": inp,
                 })
             elif isinstance(block, ThinkingBlock):
+                # ThinkingBlock is included in the normalized output (not
+                # discarded) so the UI can show/hide thinking based on user
+                # preference.  The actual thinking text is NOT forwarded --
+                # only the kind marker -- to avoid leaking chain-of-thought
+                # details that could confuse the user or bloat the log.
                 blocks.append({
                     "kind": BlockKind.THINKING.value,
                 })
@@ -224,10 +236,17 @@ class ClaudeAgentSDK(AgentSDK):
 
         Moved from session_manager.py L2464-2589.
         """
+        # Sub-agent detection: if parent_tool_use_id is set, this message
+        # comes from a sub-agent (e.g. a tool that spawned its own Claude
+        # session).  Sub-agent messages skip the user bubble in the UI to
+        # avoid confusing the user with messages they didn't send.
         is_sub_agent = bool(getattr(msg, 'parent_tool_use_id', None))
         raw_content = getattr(msg, 'content', None) or []
 
         blocks = []
+        # Content can be either a plain string (older SDK versions) or a
+        # list of typed content blocks (current SDK).  Both formats must
+        # be handled for backward compatibility.
         if isinstance(raw_content, str):
             if raw_content.strip():
                 blocks.append({
@@ -237,8 +256,15 @@ class ClaudeAgentSDK(AgentSDK):
         elif isinstance(raw_content, list):
             for block in raw_content:
                 if isinstance(block, ToolResultBlock):
+                    # ToolResultBlock.content can be EITHER a string (simple
+                    # tool output like bash stdout) OR a list of typed dicts
+                    # (complex output with multiple parts).  We must handle
+                    # both formats and extract the text content from each.
                     rc = getattr(block, 'content', '') or ''
                     if isinstance(rc, list):
+                        # List content: each element is either a dict with
+                        # {"type": "text", "text": "..."} or an object with
+                        # a .text attribute.  Extract and join all text parts.
                         text_parts = []
                         for b in rc:
                             if isinstance(b, dict) and b.get("type") == "text":

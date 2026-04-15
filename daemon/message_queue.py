@@ -17,6 +17,16 @@ class MessageQueue:
     """Server-side per-session FIFO message queue with persistence."""
 
     def __init__(self, push_callback=None):
+        """Initialize the MessageQueue.
+
+        Args:
+            push_callback: Optional callback for pushing queue state changes
+                to connected WebSocket clients.  Signature:
+                ``(event_name: str, data: dict) -> None``.
+                Typically set to ``socketio.emit`` or a wrapper.  If None,
+                queue operations still work but clients are not notified
+                of changes in real time.
+        """
         self._queues: dict[str, list[str]] = {}
         self._queue_lock = threading.Lock()
         self._queue_path = Path.home() / ".claude" / "gui_message_queues.json"
@@ -152,10 +162,15 @@ class MessageQueue:
                            send_fn: Callable[[str, str], dict]) -> None:
         """If session has queued items, dispatch the first one.
 
-        Called from _emit_state on IDLE transitions. send_fn is typically
-        SessionManager.send_message. This avoids a circular dependency:
-        MessageQueue doesn't know about SessionManager, it just calls
-        the function it's given.
+        Called from _emit_state on IDLE transitions.
+
+        send_fn is a callback (typically SessionManager.send_message)
+        that accepts (session_id, text) and returns a result dict with
+        at least an "ok" key.  This callback pattern avoids a circular
+        dependency: MessageQueue is owned by SessionManager, so it
+        cannot import or reference SessionManager directly.  Instead,
+        SessionManager passes its own send_message method as send_fn
+        at the call site, keeping the dependency one-directional.
         """
         with self._queue_lock:
             q = self._queues.get(session_id, [])

@@ -61,6 +61,16 @@ class PermissionManager:
     _DANGEROUS_RE = None  # lazily compiled
 
     def __init__(self, emit_entry_fn=None):
+        """Initialize the PermissionManager.
+
+        Args:
+            emit_entry_fn: Optional callback for pushing audit log entries
+                to connected WebSocket clients.  Signature:
+                ``(session_id: str, entry: LogEntry, index: int) -> None``.
+                Set by SessionManager after construction.  If None, audit
+                entries are still appended to the session info but not
+                pushed to the UI in real time.
+        """
         # Permission policy (synced from browser) — persisted to disk
         self._policy_path = Path.home() / ".claude" / "gui_permission_policy.json"
         self._permission_policy, self._custom_rules = self._load_policy()
@@ -171,24 +181,39 @@ class PermissionManager:
             rules = self._custom_rules
             tool_lower = (tool_name or "").lower()
 
+            # Each custom rule is evaluated independently.  Rules are OR'd:
+            # if ANY rule matches, the tool is auto-approved.  The evaluation
+            # order matches the UI checkbox order for consistency.
+
+            # Rule 1: Auto-approve all file reads (safe -- no data modified)
             if rules.get("approveAllReads") and tool_lower == "read":
                 return True
+            # Rule 2: Auto-approve project-scoped reads (client-side scope
+            # check -- server just checks the flag)
             if rules.get("approveProjectReads") and tool_lower == "read":
                 return True
+            # Rule 3: Auto-approve all bash commands (risky -- user accepts
+            # full responsibility for shell command safety)
             if rules.get("approveAllBash") and tool_lower == "bash":
                 return True
+            # Rule 4: Auto-approve file writes and edits (moderate risk --
+            # files can be reverted via git)
             if rules.get("approveProjectWrites") and tool_lower in ("write", "edit"):
                 return True
+            # Rule 5: Auto-approve glob searches (safe -- read-only)
             if rules.get("approveGlob") and tool_lower == "glob":
                 return True
+            # Rule 6: Auto-approve grep searches (safe -- read-only)
             if rules.get("approveGrep") and tool_lower == "grep":
                 return True
 
-            # Custom regex pattern
+            # Rule 7: Custom regex pattern.  Builds a "question" string
+            # that mirrors what the frontend shows the user, then matches
+            # the user's regex against it.  This allows arbitrary approval
+            # rules (e.g. "pytest" to auto-approve all test runs).
             custom_pattern = rules.get("customPattern", "")
             if custom_pattern:
                 try:
-                    # Build a question string similar to the frontend
                     desc = ""
                     if isinstance(tool_input, dict):
                         desc = tool_input.get("command", "") or tool_input.get("file_path", "") or tool_input.get("path", "") or tool_input.get("pattern", "")
@@ -196,6 +221,9 @@ class PermissionManager:
                     if re.search(custom_pattern, question, re.IGNORECASE):
                         return True
                 except re.error:
+                    # Invalid regex -- silently ignore rather than crashing
+                    # the permission flow.  The user will see that their
+                    # pattern isn't matching and can fix it in the UI.
                     pass
 
         return False
