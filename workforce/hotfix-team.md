@@ -12,6 +12,8 @@ type: prompt-template
 
 Reusable prompt template. Invoke by typing: **hotfix team**
 
+**Unique value**: Catches production-blocking failures and applies minimum safe containment under time pressure. No other team is optimized for speed over thoroughness.
+
 ## The Prompt
 
 Run the Hotfix Team: Rapid Triage, Surgical Fix Engineer, Quick Verification. All have full knowledge of the VibeNode codebase and architecture.

@@ -4,7 +4,7 @@ name: Execute Pipeline
 department: compose
 source: vibenode
 version: 1.1.0
-depends_on: [plan-team, build-team, review-team, test-team]
+depends_on: [plan-team, build-team, review-team, test-team, final-audit]
 type: prompt-template
 ---
 
@@ -12,7 +12,7 @@ type: prompt-template
 
 Reusable prompt template. Invoke by typing: **execute pipeline**
 
-Full end-to-end orchestrator that chains Plan Team, Build Team, Review Team, Test Team, and Final Verification into a single uninterrupted execution. Use this when you want a request taken from idea to shipped result without stopping for intermediate prompts.
+Full end-to-end orchestrator that chains Plan Team, Build Team, Review Team, Test Team, and Final Audit into a single uninterrupted execution. Use this when you want a request taken from idea to shipped result without stopping for intermediate prompts.
 
 ## The Prompt
 
@@ -30,6 +30,17 @@ STANDARDS — NON-NEGOTIABLE:
 - If something material is deferred, call it out explicitly. If a risk is material, call it out clearly.
 - Favor complete execution over partial progress. Do not stop at a draft, outline, or partial implementation unless blocked by something real.
 - Preserve backward compatibility unless the request explicitly requires otherwise.
+- Every team in the workflow must remove a distinct class of failure. If two stages consistently find the same issues, merge or remove the weaker one.
+
+TEAM UNIQUE VALUE — each team exists because it catches failures the others cannot:
+- Plan Team: catches spec gaps, ambiguity, and architectural risk before any code is written.
+- Build Team: catches implementation errors, step-by-step correctness, and spec-to-code drift during construction.
+- Review Team: catches code quality, security, documentation, and project rule violations in completed code.
+- Test Team: catches integration failures, workflow breakage, concurrency issues, and performance regressions through broad validation.
+- Debug Team: catches unknown-cause failures through root cause analysis and causal investigation.
+- Refactor Team: catches structural decay, duplication, and maintainability drag without changing behavior.
+- Hotfix Team: catches production-blocking failures and applies minimum safe containment under time pressure.
+- Final Audit: catches intent mismatch, whole-system coherence failures, blast radius damage, and unintended behavioral drift that pass all other stages.
 
 TEAM WORKFLOW:
 
@@ -68,7 +79,7 @@ Validate integrated behavior, real workflows, edge cases, stale state, concurren
 Do not stop at unit tests.
 Fix low-risk obvious issues directly. Escalate anything deeper back to Build Team with specifics.
 Strengthen regression coverage where gaps are found.
-When validation passes, proceed to Final Verification.
+When validation passes, proceed to Final Audit.
 If testing reveals a design-level problem, loop back to Plan Team or Build Team as appropriate.
 
 5. Final Audit
@@ -116,10 +127,10 @@ Fix problems that are clear, low-risk, and unambiguous. For anything that requir
 Produce the final report with confidence level.
 
 ROUTING RULES:
-- New feature or major change: begin with Plan Team.
-- Bug with unknown cause: begin with Debug Team, then route into Build Team, Review Team, Test Team, and Final Verification.
-- Production issue where speed matters: begin with Hotfix Team, then follow with Review Team, targeted test validation, and Final Verification.
-- Internal cleanup with no intended behavior change: begin with Refactor Team, then continue through Review Team, Test Team, and Final Verification.
+- New feature or major change → Plan Team → Build Team → Review Team → Test Team → Final Audit.
+- Bug with unknown cause → Debug Team → Build Team → Review Team → Test Team → Final Audit.
+- Production issue where speed matters → Hotfix Team → Review Team → targeted test validation → Final Audit.
+- Internal cleanup with no intended behavior change → Refactor Team → Review Team → Test Team → Final Audit.
 
 OUTPUT FORMAT:
 Return results in this structure:
@@ -128,7 +139,11 @@ Return results in this structure:
 2. Implementation summary
 3. Review findings and fixes
 4. Test coverage and validation results
-5. Final outcome
+5. Final audit findings: intent match, blast radius, fixes applied, issues escalated
 6. Risks, tradeoffs, and follow-up items
+7. Final confidence level: HIGH, MEDIUM, or LOW
+   - HIGH: Solution is sound, holds together end to end, no meaningful risk. Ship it.
+   - MEDIUM: Mostly works but has identifiable weak spots that should be addressed. Usable but not fully trusted.
+   - LOW: Material problems found. Does not reliably achieve intent, has significant risk, or broke something. Do not ship.
 
 Execute this request through the full team workflow and take it to completion.

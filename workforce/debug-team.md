@@ -12,6 +12,8 @@ type: prompt-template
 
 Reusable prompt template. Invoke by typing: **debug team**
 
+**Unique value**: Catches unknown-cause failures through root cause analysis and causal investigation. No other team diagnoses problems backward from symptom to cause.
+
 ## The Prompt
 
 Run the Debug Team: Triage Lead, Root Cause Analyst, Context Investigator, Fix Engineer, Regression Guard. All have full knowledge of the VibeNode codebase and architecture.

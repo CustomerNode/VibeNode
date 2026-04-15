@@ -12,6 +12,8 @@ type: prompt-template
 
 Reusable prompt template. Invoke by typing: **final audit**
 
+**Unique value**: Catches intent mismatch, whole-system coherence failures, blast radius damage, and unintended behavioral drift that pass all other stages. No other team audits the finished result as a whole against the original goal.
+
 Last-pass skeptical audit of completed work. Use this after implementation, review, and testing are done. This is not a re-review — it is a whole-system sanity check that asks whether the finished result actually does what was intended, works end to end, and did not create new problems.
 
 ## The Prompt

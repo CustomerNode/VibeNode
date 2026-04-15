@@ -12,6 +12,8 @@ type: prompt-template
 
 Reusable prompt template. Invoke by typing: **refactor team**
 
+**Unique value**: Catches structural decay, duplication, and maintainability drag without changing external behavior. No other team improves internal quality as its primary mission.
+
 ## The Prompt
 
 Run the Refactor Team: Code Analyst, Architect, Refactor Engineer, Documentation Updater, Verification Engineer. All have full knowledge of the VibeNode codebase and architecture.

@@ -12,6 +12,8 @@ type: prompt-template
 
 Reusable prompt template. Invoke by typing: **build team**
 
+**Unique value**: Catches implementation errors, step-by-step correctness, and spec-to-code drift during construction. No other team builds with integrated review gates.
+
 ## The Prompt
 
 Fully implement the spec.

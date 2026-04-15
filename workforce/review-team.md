@@ -12,6 +12,8 @@ type: prompt-template
 
 Reusable prompt template. Invoke by typing: **review team**
 
+**Unique value**: Catches code quality, security, documentation, and project rule violations in completed code. No other team does deep code-level quality and compliance review.
+
 ## The Prompt
 
 Run the review team: Test Engineer, Quality Engineer, Product Manager, Senior Software Engineer, Expert User. All have full knowledge of the product spec and VibeNode architecture.

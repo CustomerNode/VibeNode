@@ -12,6 +12,8 @@ type: prompt-template
 
 Reusable prompt template. Invoke by typing: **test team**
 
+**Unique value**: Catches integration failures, workflow breakage, concurrency issues, and performance regressions through broad validation. No other team tests the system as a user would experience it.
+
 ## The Prompt
 
 Run the Test Team: Integration Test Engineer, E2E Workflow Tester, Stress and Edge Case Tester, Performance Validator, Browser and Platform Tester. All have full knowledge of the VibeNode codebase and architecture.

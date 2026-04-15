@@ -12,6 +12,8 @@ type: prompt-template
 
 Reusable prompt template. Invoke by typing: **plan team**
 
+**Unique value**: Catches spec gaps, ambiguity, and architectural risk before any code is written. No other team operates before implementation begins.
+
 ## The Prompt
 
 Run the Plan Team: Spec Analyst, Product Strategist, Architect, Implementation Auditor, Integration Reviewer, Expert User. All have full knowledge of the VibeNode codebase and architecture.
