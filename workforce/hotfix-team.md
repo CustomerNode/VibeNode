@@ -78,3 +78,4 @@ Return one combined team report:
 - Verification
 - Blast radius
 - Follow-up needed
+- What was not validated or could not be fully verified

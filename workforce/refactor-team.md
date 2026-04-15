@@ -69,3 +69,4 @@ Return one combined team report:
 - Documentation updated
 - Risks
 - Recommendations not implemented
+- What was not validated or could not be fully verified

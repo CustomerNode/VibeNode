@@ -73,7 +73,8 @@ OUTPUT FORMAT:
 4. **Gaps, weaknesses, or risks** — Anything weak, incomplete, fragile, or misleading?
 5. **Fixes applied in this pass** — What was fixed directly, with file paths and brief explanation.
 6. **Issues escalated** — What needs the user's attention or a judgment call, and why.
-7. **Confidence level** — HIGH, MEDIUM, or LOW:
+7. **What was not validated or could not be fully verified** — Blind spots, skipped areas, and anything this audit could not confirm.
+8. **Confidence level** — HIGH, MEDIUM, or LOW:
    - **HIGH**: The solution is sound. It does what was intended, holds together end to end, and introduced no meaningful risk. Ship it. Do not assign HIGH unless there is no meaningful unresolved risk.
    - **MEDIUM**: The solution mostly works but has identifiable weak spots or gaps that should be addressed. Usable but not fully trusted yet.
    - **LOW**: Material problems found. The solution does not reliably achieve the intent, has significant risk, or broke something. Do not ship without further work.

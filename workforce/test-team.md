@@ -77,4 +77,5 @@ Return one combined team report:
 - Issues fixed
 - Issues escalated
 - Regression tests added
+- What was not validated or could not be fully verified
 - Confidence: HIGH, MEDIUM, or LOW with explanation

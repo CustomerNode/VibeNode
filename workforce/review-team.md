@@ -68,4 +68,4 @@ The team fixes what it finds. Don't report problems back to me unless:
 - The fix has a meaningful tradeoff that needs a judgment call
 - The issue is ambiguous enough that two reasonable people would disagree on the right answer
 
-Everything else, just fix it. Update the code, update the tests, update implementation-notes.md. When done, give me one combined team report: what you found, what you fixed, what (if anything) needs my input. Keep it short.
+Everything else, just fix it. Update the code, update the tests, update implementation-notes.md. When done, give me one combined team report: what you found, what you fixed, what (if anything) needs my input, and what you did not validate or could not fully verify. Keep it short.

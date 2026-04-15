@@ -66,4 +66,5 @@ Return one combined team report:
 - Blast radius
 - Regression test
 - Related issues found
+- What was not validated or could not be fully verified
 - Confidence: HIGH, MEDIUM, or LOW

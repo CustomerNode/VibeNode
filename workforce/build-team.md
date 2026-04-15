@@ -102,7 +102,8 @@ At the end, provide a final report with:
 - the steps completed,
 - the issues found and corrected,
 - any remaining assumptions, tradeoffs, or risks,
-- the top 3 suggested enhancements.
+- the top 3 suggested enhancements,
+- what was not validated or could not be fully verified.
 
 Enhancement suggestions must be plain English only. Do not implement them. Keep them aligned with the spec's intent or use them to highlight important unknown unknowns.
 

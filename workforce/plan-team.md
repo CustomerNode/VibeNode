@@ -81,4 +81,5 @@ Everything else, just fix directly in the spec.
 When complete, give me one short combined team report covering:
 - what you found,
 - what you fixed,
-- what, if anything, needs my input.
+- what, if anything, needs my input,
+- what you did not validate or could not fully verify.

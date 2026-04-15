@@ -33,6 +33,7 @@ from daemon.backends.base import (
 )
 from daemon.backends.messages import VibeNodeMessage, MessageKind, BlockKind
 from daemon.backends.chat_store import ChatStore
+from daemon.message_queue import MessageQueue
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +259,6 @@ class SessionManager:
         self._started = False
         self._registry_timer: Optional[threading.Timer] = None
         self._registry_dirty = False
-        self._queue_save_timer: Optional[threading.Timer] = None
         # Permission policy (synced from browser) — persisted to disk
         self._policy_path = Path.home() / ".claude" / "gui_permission_policy.json"
         self._permission_policy, self._custom_rules = self._load_policy()
@@ -272,11 +272,8 @@ class SessionManager:
         # thundering-herd failures when multiple sessions die simultaneously.
         # Created lazily on the event loop (asyncio.Semaphore is loop-bound).
         self._reconnect_semaphore: Optional[asyncio.Semaphore] = None
-        # Server-side message queue (per-session, FIFO)
-        self._queues: dict[str, list[str]] = {}
-        self._queue_lock = threading.Lock()
-        self._queue_path = Path.home() / ".claude" / "gui_message_queues.json"
-        self._load_queues()
+        # Server-side message queue (per-session, FIFO) — delegated to MessageQueue
+        self._mq = MessageQueue()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -287,6 +284,7 @@ class SessionManager:
         if self._started:
             return
         self._push_callback = push_callback
+        self._mq.set_push_callback(push_callback)
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="session-manager-loop"
@@ -323,11 +321,8 @@ class SessionManager:
         if getattr(self, '_orphan_sweep_timer', None):
             self._orphan_sweep_timer.cancel()
             self._orphan_sweep_timer = None
-        # Cancel any pending queue save timer and flush to disk
-        if self._queue_save_timer:
-            self._queue_save_timer.cancel()
-            self._queue_save_timer = None
-        self._save_queues_now()
+        # Flush queue to disk
+        self._mq.flush()
         # Close all sessions
         with self._lock:
             session_ids = list(self._sessions.keys())
@@ -753,168 +748,45 @@ class SessionManager:
     # Server-side message queue
     # ------------------------------------------------------------------
 
-    def _load_queues(self) -> None:
-        """Load persisted queues from disk."""
-        try:
-            if self._queue_path.exists():
-                raw = json.loads(self._queue_path.read_text(encoding="utf-8"))
-                if isinstance(raw, dict):
-                    for k, v in raw.items():
-                        if isinstance(v, list) and all(isinstance(x, str) for x in v):
-                            self._queues[k] = v
-        except Exception as e:
-            logger.warning("Failed to load queues: %s", e)
+    # ------------------------------------------------------------------
+    # Queue methods — thin wrappers delegating to MessageQueue
+    # PERF-CRITICAL #8: Debounced saves preserved in daemon/message_queue.py
+    # ------------------------------------------------------------------
 
-    def _save_queues_now(self) -> None:
-        """Persist queues to disk immediately."""
-        try:
-            self._queue_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._queue_lock:
-                data = {k: v for k, v in self._queues.items() if v}
-            self._queue_path.write_text(json.dumps(data), encoding="utf-8")
-        except Exception as e:
-            logger.debug("Failed to save queues: %s", e)
-
-    # PERF-CRITICAL: Debounced 1s timer batches disk writes — do NOT call _save_queues_now() directly. See CLAUDE.md #8.
-    #
-    # LESSON LEARNED (2026-04-12): _save_queues was originally synchronous —
-    # every queue_message, remove_queue_item, edit_queue_item, clear_queue,
-    # and auto-dispatch called it, each writing the ENTIRE queue state to disk.
-    # Under rapid-fire operations (auto-dispatch chains processing multiple
-    # queued messages), this created I/O contention.  The debounce timer
-    # collapses N writes within 1 second into a single disk write.  The
-    # shutdown path (stop()) cancels the timer and calls _save_queues_now()
-    # directly to ensure no data loss on clean exit.
     def _save_queues(self) -> None:
-        """Debounced queue save -- batches writes so rapid-fire queue
-        operations don't hammer the disk.
-
-        Uses the same pattern as _schedule_registry_save(): if a timer
-        is already pending, skip (the pending save will capture the
-        latest state).  Otherwise set a 1-second timer.
-        """
-        if self._queue_save_timer and self._queue_save_timer.is_alive():
-            # A save is already scheduled; it will pick up the newest state
-            return
-        self._queue_save_timer = threading.Timer(1.0, self._save_queues_now)
-        self._queue_save_timer.daemon = True
-        self._queue_save_timer.start()
+        """Debounced queue save — delegates to MessageQueue. See CLAUDE.md #8."""
+        self._mq.save_queues()
 
     def _emit_queue_update(self, session_id: str) -> None:
-        """Push queue state to connected clients."""
-        with self._queue_lock:
-            items = list(self._queues.get(session_id, []))
-        if self._push_callback:
-            self._push_callback('queue_updated', {
-                'session_id': session_id,
-                'queue': items,
-            })
+        self._mq.emit_queue_update(session_id)
 
     def queue_message(self, session_id: str, text: str) -> dict:
         """Add a message to a session's queue."""
         session_id = self._resolve_id(session_id)
-        with self._queue_lock:
-            if session_id not in self._queues:
-                self._queues[session_id] = []
-            self._queues[session_id].append(text)
-        self._save_queues()
-        self._emit_queue_update(session_id)
-        logger.info("Queued message for %s (%d in queue)", session_id,
-                     len(self._queues.get(session_id, [])))
+        result = self._mq.queue_message(session_id, text)
 
-        # If the session is already idle (e.g. voice recording finished after
-        # the session went idle), dispatch immediately instead of waiting for
-        # the next idle transition which will never come.
+        # If the session is already idle, dispatch immediately
         info = self._sessions.get(session_id)
         if info and info.state == SessionState.IDLE:
             self._try_dispatch_queue(session_id)
 
-        return {"ok": True, "queued": True}
+        return result
 
     def get_queue(self, session_id: str) -> list:
-        """Return the queue for a session."""
-        session_id = self._resolve_id(session_id)
-        with self._queue_lock:
-            return list(self._queues.get(session_id, []))
+        return self._mq.get_queue(self._resolve_id(session_id))
 
     def remove_queue_item(self, session_id: str, index: int) -> dict:
-        """Remove one item from a session's queue by index."""
-        session_id = self._resolve_id(session_id)
-        with self._queue_lock:
-            q = self._queues.get(session_id, [])
-            if 0 <= index < len(q):
-                q.pop(index)
-                if not q:
-                    self._queues.pop(session_id, None)
-            else:
-                return {"ok": False, "error": "Index out of range"}
-        self._save_queues()
-        self._emit_queue_update(session_id)
-        return {"ok": True}
+        return self._mq.remove_queue_item(self._resolve_id(session_id), index)
 
     def edit_queue_item(self, session_id: str, index: int, text: str) -> dict:
-        """Edit one item in a session's queue by index."""
-        session_id = self._resolve_id(session_id)
-        with self._queue_lock:
-            q = self._queues.get(session_id, [])
-            if 0 <= index < len(q):
-                q[index] = text
-            else:
-                return {"ok": False, "error": "Index out of range"}
-        self._save_queues()
-        self._emit_queue_update(session_id)
-        return {"ok": True}
+        return self._mq.edit_queue_item(self._resolve_id(session_id), index, text)
 
     def clear_queue(self, session_id: str) -> dict:
-        """Clear all queued messages for a session."""
-        session_id = self._resolve_id(session_id)
-        with self._queue_lock:
-            self._queues.pop(session_id, None)
-        self._save_queues()
-        self._emit_queue_update(session_id)
-        return {"ok": True}
+        return self._mq.clear_queue(self._resolve_id(session_id))
 
     def _try_dispatch_queue(self, session_id: str) -> None:
-        """If session is IDLE and queue has items, dispatch the first one.
-
-        Called from _emit_state on IDLE transitions. Runs send_message
-        which sets state to WORKING and submits the query asynchronously.
-        """
-        with self._queue_lock:
-            q = self._queues.get(session_id, [])
-            if not q:
-                return
-            text = q.pop(0)
-            remaining = len(q)
-            if not q:
-                self._queues.pop(session_id, None)
-
-        self._save_queues()
-        self._emit_queue_update(session_id)
-
-        logger.info("Auto-dispatching queued message for %s (%d remaining)",
-                     session_id, remaining)
-
-        # Notify frontend that a queued message is being sent
-        if self._push_callback:
-            self._push_callback('queue_dispatched', {
-                'session_id': session_id,
-                'text': text,
-                'remaining': remaining,
-            })
-
-        # send_message checks state==IDLE and sets WORKING atomically
-        result = self.send_message(session_id, text)
-        if not result.get("ok") and not result.get("queued"):
-            # Send failed (race condition) — re-queue at front
-            logger.warning("Queue dispatch failed for %s: %s — re-queuing",
-                          session_id, result.get("error"))
-            with self._queue_lock:
-                if session_id not in self._queues:
-                    self._queues[session_id] = []
-                self._queues[session_id].insert(0, text)
-            self._save_queues()
-            self._emit_queue_update(session_id)
+        """Dispatch next queued message — delegates to MessageQueue with send_fn callback."""
+        self._mq.try_dispatch_queue(session_id, self.send_message)
 
     def interrupt_session(self, session_id: str, clear_queue: bool = True) -> dict:
         """Interrupt a running session.
@@ -933,11 +805,7 @@ class SessionManager:
         # Clear queue atomically BEFORE the interrupt so _emit_state(IDLE)
         # won't auto-dispatch a queued message after the interrupt completes.
         if clear_queue:
-            with self._queue_lock:
-                if session_id in self._queues:
-                    self._queues.pop(session_id)
-                    self._save_queues()
-                    self._emit_queue_update(session_id)
+            self._mq.pop_queue(session_id)
 
         # Set IDLE synchronously so send_message sees it immediately.
         # Without this, there's a race: the async _interrupt_session hasn't
@@ -1010,13 +878,12 @@ class SessionManager:
         with self._lock:
             states = [info.to_state_dict() for info in self._sessions.values()
                       if info.session_type not in ("planner", "title")]
-        # Merge queue data from _queues into state dicts
-        with self._queue_lock:
-            for s in states:
-                sid = s.get("session_id", "")
-                q = self._queues.get(sid, [])
-                if q:
-                    s["queue"] = list(q)
+        # Merge queue data into state dicts
+        for s in states:
+            sid = s.get("session_id", "")
+            q = self._mq.get_queue_data(sid)
+            if q:
+                s["queue"] = q
         return states
 
     def get_entries(self, session_id: str, since: int = 0) -> list:
@@ -2604,10 +2471,7 @@ class SessionManager:
                     self._id_aliases[session_id] = result_session_id
 
                 # Remap queue to new session ID
-                with self._queue_lock:
-                    if session_id in self._queues:
-                        self._queues[result_session_id] = self._queues.pop(session_id)
-                self._save_queues()
+                self._mq.remap_session_id(session_id, result_session_id)
 
                 # Remap user-set name to the new ID (server-side, no race)
                 try:
@@ -3343,10 +3207,9 @@ class SessionManager:
         if self._push_callback:
             data = info.to_state_dict()
             # Include queue data from server-side store
-            with self._queue_lock:
-                q = self._queues.get(info.session_id, [])
-                if q:
-                    data["queue"] = list(q)
+            q = self._mq.get_queue_data(info.session_id)
+            if q:
+                data["queue"] = q
             try:
                 self._push_callback('session_state', data)
             except Exception as cb_err:
@@ -3404,10 +3267,9 @@ class SessionManager:
                     logger.debug("Deferred IDLE re-emit for %s", sid)
                     if self._push_callback:
                         data = recheck.to_state_dict()
-                        with self._queue_lock:
-                            q = self._queues.get(sid, [])
-                            if q:
-                                data["queue"] = list(q)
+                        q = self._mq.get_queue_data(sid)
+                        if q:
+                            data["queue"] = q
                         try:
                             self._push_callback('session_state', data)
                         except Exception:
