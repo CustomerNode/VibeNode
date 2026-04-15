@@ -320,7 +320,9 @@ class TestQueueAutoDispatchesOnIdle:
     def test_queue_dispatch_re_queues_on_failure(self, sm_module):
         """If send_message fails during dispatch, the message should be
         re-queued at the front."""
-        src = inspect.getsource(sm_module.SessionManager._try_dispatch_queue)
+        # After Phase 3 extraction, dispatch logic lives in MessageQueue.
+        from daemon.message_queue import MessageQueue
+        src = inspect.getsource(MessageQueue.try_dispatch_queue)
         assert "re-queue" in src.lower() or "insert(0" in src
 
 

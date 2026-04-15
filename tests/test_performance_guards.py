@@ -83,8 +83,10 @@ class TestSaveQueuesIsDebounced:
     """CLAUDE.md #8 — _save_queues uses a timer to debounce."""
 
     def test_save_queues_is_debounced(self):
-        from daemon.session_manager import SessionManager
-        src = inspect.getsource(SessionManager._save_queues)
+        # After Phase 3 extraction, debounce logic lives in MessageQueue.
+        # Check the actual implementation, not the thin wrapper.
+        from daemon.message_queue import MessageQueue
+        src = inspect.getsource(MessageQueue.save_queues)
         # Must reference the timer mechanism, not call _save_queues_now directly
         assert "Timer" in src or "_queue_save_timer" in src
 
