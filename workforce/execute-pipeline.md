@@ -18,6 +18,9 @@ Full end-to-end orchestrator that chains Plan Team, Build Team, Review Team, Tes
 
 I want you to execute this request from start to finish using the team workflow below. This task is not complete after planning. Continue through all required teams until the work is fully implemented, reviewed, tested, documented where needed, and verified.
 
+OPERATING TEMPO:
+VibeNode operates at compressed timescales. A typical feature goes from idea to shipped in 15-60 minutes. A bug fix ships in 5-15 minutes. A full Execute Pipeline run completes in one sitting. Tradeoff decisions must account for this velocity. A contained fix that ships now and gets refined next pass is usually better than a perfect fix that delays three stages. But speed is not an excuse for skipping regression protection, ignoring blast radius, or shipping known-broken behavior. The question is not "is this perfect" — it is "is this safe to ship now and improvable later."
+
 STANDARDS — NON-NEGOTIABLE:
 - Do no harm. Existing functionality, workflows, and external behavior must not regress unless explicitly intended.
 - Any meaningful fix or change must include regression protection through tests or equivalent validation.
@@ -30,7 +33,7 @@ STANDARDS — NON-NEGOTIABLE:
 - If something material is deferred, call it out explicitly. If a risk is material, call it out clearly.
 - Favor complete execution over partial progress. Do not stop at a draft, outline, or partial implementation unless blocked by something real.
 - Preserve backward compatibility unless the request explicitly requires otherwise.
-- Every team in the workflow must remove a distinct class of failure. If two stages consistently find the same issues, merge or remove the weaker one.
+- Every team in the workflow must remove a distinct class of failure. If two stages repeatedly find the same issues without adding unique value, merge, narrow, or remove the weaker one.
 
 TEAM UNIQUE VALUE — each team exists because it catches failures the others cannot:
 - Plan Team: catches spec gaps, ambiguity, and architectural risk before any code is written.
@@ -122,7 +125,7 @@ Edge cases and operational risk:
 - Performance or stability issues missed in earlier passes.
 - User experience issues — confusing states, missing feedback, broken flows.
 
-Fix problems that are clear, low-risk, and unambiguous. For anything that requires a judgment call, changes user-facing behavior, or has broader risk — do not fix it. Explain it clearly and recommend the next action.
+Fix problems that are clear, low-risk, and unambiguous. Do not expand scope — only fix issues directly related to the completed work. For anything that requires a judgment call, changes user-facing behavior, or has broader risk — do not fix it. Explain it clearly and recommend the next action.
 
 Produce the final report with confidence level.
 
@@ -142,7 +145,7 @@ Return results in this structure:
 5. Final audit findings: intent match, blast radius, fixes applied, issues escalated
 6. Risks, tradeoffs, and follow-up items
 7. Final confidence level: HIGH, MEDIUM, or LOW
-   - HIGH: Solution is sound, holds together end to end, no meaningful risk. Ship it.
+   - HIGH: Solution is sound, holds together end to end, no meaningful risk. Ship it. Do not assign HIGH unless there is no meaningful unresolved risk.
    - MEDIUM: Mostly works but has identifiable weak spots that should be addressed. Usable but not fully trusted.
    - LOW: Material problems found. Does not reliably achieve intent, has significant risk, or broke something. Do not ship.
 

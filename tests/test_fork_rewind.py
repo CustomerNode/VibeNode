@@ -972,9 +972,12 @@ class TestDaemonSnapshotCreation:
             mgr._sessions[session_id] = info
 
         # Patch Path.home to use our tmp_path
-        with patch("daemon.session_manager.Path") as MP:
+        with patch("daemon.session_manager.Path") as MP, \
+             patch("daemon.backends.claude_store.Path") as SP:
             MP.side_effect = Path
             MP.home.return_value = tmp_path
+            SP.side_effect = Path
+            SP.home.return_value = tmp_path
             mgr._write_file_snapshot(session_id)
 
         # Verify backup was created
@@ -1056,9 +1059,12 @@ class TestDaemonSnapshotCreation:
         with mgr._lock:
             mgr._sessions[session_id] = info
 
-        with patch("daemon.session_manager.Path") as MP:
+        with patch("daemon.session_manager.Path") as MP, \
+             patch("daemon.backends.claude_store.Path") as SP:
             MP.side_effect = Path
             MP.home.return_value = tmp_path
+            SP.side_effect = Path
+            SP.home.return_value = tmp_path
             mgr._write_file_snapshot(session_id)
 
         # JSONL should NOT have a snapshot (all files had null backups)
@@ -1113,9 +1119,12 @@ class TestDaemonSnapshotCreation:
         with mgr._lock:
             mgr._sessions[session_id] = info
 
-        with patch("daemon.session_manager.Path") as MP:
+        with patch("daemon.session_manager.Path") as MP, \
+             patch("daemon.backends.claude_store.Path") as SP:
             MP.side_effect = Path
             MP.home.return_value = tmp_path
+            SP.side_effect = Path
+            SP.home.return_value = tmp_path
             mgr._prepopulate_tracked_files(info)
 
         # Should have found the Edit and Write file paths, NOT the Read
@@ -1183,9 +1192,12 @@ class TestDaemonSnapshotCreation:
         with mgr._lock:
             mgr._sessions[session_id] = info
 
-        with patch("daemon.session_manager.Path") as MP:
+        with patch("daemon.session_manager.Path") as MP, \
+             patch("daemon.backends.claude_store.Path") as SP:
             MP.side_effect = Path
             MP.home.return_value = tmp_path
+            SP.side_effect = Path
+            SP.home.return_value = tmp_path
             mgr._write_file_snapshot(session_id)
 
         # 4. Verify backup file was created
@@ -1288,9 +1300,12 @@ class TestDaemonSnapshotCreation:
         src.write_text("# original\n# this comment means nothing\n", encoding="utf-8")
 
         # Step 3: Call _write_file_snapshot (post-turn)
-        with patch("daemon.session_manager.Path") as MP:
+        with patch("daemon.session_manager.Path") as MP, \
+             patch("daemon.backends.claude_store.Path") as SP:
             MP.side_effect = Path
             MP.home.return_value = tmp_path
+            SP.side_effect = Path
+            SP.home.return_value = tmp_path
             mgr._write_file_snapshot(session_id, is_post_turn=True)
 
         # The file MUST be detected and backed up
@@ -1361,9 +1376,12 @@ class TestDaemonSnapshotCreation:
         with mgr._lock:
             mgr._sessions[session_id] = info
 
-        with patch("daemon.session_manager.Path") as MP:
+        with patch("daemon.session_manager.Path") as MP, \
+             patch("daemon.backends.claude_store.Path") as SP:
             MP.side_effect = Path
             MP.home.return_value = tmp_path
+            SP.side_effect = Path
+            SP.home.return_value = tmp_path
 
             # Pre-turn snapshot
             mgr._write_file_snapshot(session_id, is_post_turn=False)

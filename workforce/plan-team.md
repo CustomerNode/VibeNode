@@ -34,6 +34,9 @@ Each agent's findings must feed into the next. This is one shared analysis, not 
 
 In addition to each agent's lane-specific analysis, the team always evaluates the plan against the following:
 
+### Time Estimates
+- Time estimates must reflect VibeNode's actual execution velocity, not traditional development timelines. A phase that would take a human team 6-8 hours typically completes in 30-60 minutes. Estimate in minutes, not hours.
+
 ### CLAUDE.md Constraint Awareness
 - Verify the plan does not propose anything that violates CLAUDE.md rules — server restart restrictions, file organization, slash command handling, performance-critical patterns, or any other project constraint.
 - If the plan touches code near a `PERF-CRITICAL` marker, it must acknowledge the optimization and describe how it will be preserved.

@@ -222,70 +222,8 @@ _MAX_RECOVERY_AGE = 3600  # 1 hour
 
 
 # ── Stream Closed on Recovery Bug ──────────────────────────────────────
-# When the daemon process is killed (taskkill, crash, port recycle) while
-# a session is mid-response, the .jsonl file is left with an incomplete
-# assistant entry: stop_reason=null, partial content, no ResultMessage.
-#
-# On restart, _recover_sessions tries --resume on these .jsonl files.
-# The CLI sees the dangling assistant turn, can't figure out where to
-# pick up, and immediately closes the stream → "Stream closed" error.
-# The self-healing logic then reconnects and retries, but every retry
-# hits the same corrupt .jsonl → infinite reconnect loop, session stuck
-# in "working" forever.
-#
-# Fix: before any --resume (recovery or mid-session reconnect), patch the
-# last .jsonl entry so stop_reason="end_turn".  The CLI then sees a clean
-# conversation and resumes normally.  Never skip recovery — always repair.
-# ───────────────────────────────────────────────────────────────────────
-def _repair_incomplete_jsonl(jsonl_path: Path) -> bool:
-    """Patch a .jsonl that ends with an incomplete assistant turn.
-
-    When the daemon is killed mid-response, the last entry in the .jsonl
-    is an assistant message with stop_reason=null.  The CLI's --resume
-    chokes on this and immediately closes the stream.
-
-    This function detects that case and patches the last line so
-    stop_reason="end_turn" and a text block is appended saying the
-    session was interrupted.  Returns True if the file was modified.
-    """
-    try:
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        if not lines:
-            return False
-
-        last_line = lines[-1].strip()
-        if not last_line:
-            return False
-
-        obj = json.loads(last_line)
-        if obj.get("type") != "assistant":
-            return False
-
-        msg = obj.get("message", {})
-        if msg.get("stop_reason") is not None:
-            return False  # already complete
-
-        # Patch the incomplete assistant turn
-        logger.info("Repairing incomplete assistant turn in %s", jsonl_path.name)
-        msg["stop_reason"] = "end_turn"
-        msg["stop_sequence"] = None
-
-        # Append an interruption notice to content so the model knows
-        content = msg.get("content", [])
-        content.append({
-            "type": "text",
-            "text": "\n\n[Session interrupted — resuming from last checkpoint]",
-        })
-        msg["content"] = content
-
-        lines[-1] = json.dumps(obj) + "\n"
-        with open(jsonl_path, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-        return True
-    except Exception as e:
-        logger.warning("_repair_incomplete_jsonl(%s) failed: %s", jsonl_path, e)
-        return False
+# JSONL repair logic has been moved to ClaudeJsonlStore.repair_incomplete_turn()
+# in daemon/backends/claude_store.py.  See that class for the implementation.
 
 
 class SessionManager:
@@ -1154,7 +1092,7 @@ class SessionManager:
                 # Tear down the dead client
                 if info.client:
                     try:
-                        await info.client.disconnect()
+                        await self._sdk.disconnect(info.client)
                     except Exception:
                         pass
                     info.client = None
@@ -1699,7 +1637,7 @@ class SessionManager:
             info._drain_stale = False
             try:
                 async def _drain():
-                    async for _msg in info.client.receive_response():
+                    async for _msg in self._sdk.receive_response(info.client):
                         logger.debug("Drained stale msg after interrupt for %s: %s",
                                      session_id, type(_msg).__name__)
                 await asyncio.wait_for(_drain(), timeout=5.0)
@@ -3014,7 +2952,7 @@ class SessionManager:
         return changed
 
     def _prepopulate_tracked_files(self, info: SessionInfo) -> None:
-        """Scan the session JSONL for tracked files from two sources:
+        """Scan the session storage for tracked files from two sources:
 
         1. Past Edit/Write/MultiEdit/NotebookEdit tool_use blocks
         2. Existing file-history-snapshot entries (catches files tracked
@@ -3027,68 +2965,21 @@ class SessionManager:
         tracking in _process_message keeps tracked_files up to date.
         Re-parsing a 38MB JSONL on every follow-up message was blocking
         the asyncio event loop and starving all other sessions.
+
+        Delegates the actual JSONL scanning to self._store.read_tracked_files().
         """
         if info._tracked_files_populated:
             return
         try:
-            jsonl_path = self._find_session_jsonl(info)
-            if not jsonl_path or not jsonl_path.exists():
-                logger.info("_prepopulate_tracked_files: no JSONL for %s", info.session_id)
-                return
+            found, max_version, last_user_uuid, last_asst_uuid = \
+                self._store.read_tracked_files(info.session_id, cwd=info.cwd or "")
 
-            edit_tools = {'Edit', 'Write', 'MultiEdit', 'NotebookEdit'}
-            found = set()
-            max_version = {}  # track highest version per file for file_versions
-
-            with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-
-                    t = obj.get("type", "")
-
-                    # Cache user/assistant UUIDs so _write_file_snapshot
-                    # doesn't have to re-parse the entire JSONL every turn.
-                    uid = obj.get("uuid", "")
-                    if uid:
-                        if t == "user":
-                            info._last_user_uuid = uid
-                        elif t == "assistant":
-                            info._last_asst_uuid = uid
-
-                    # Source 1: tool_use blocks in assistant messages
-                    if t == "assistant":
-                        msg = obj.get("message", {})
-                        content = msg.get("content", [])
-                        if not isinstance(content, list):
-                            continue
-                        for block in content:
-                            if not isinstance(block, dict):
-                                continue
-                            if block.get("type") != "tool_use":
-                                continue
-                            if block.get("name") not in edit_tools:
-                                continue
-                            inp = block.get("input", {})
-                            fp = inp.get("file_path", "") or inp.get("path", "")
-                            if fp:
-                                found.add(fp)
-
-                    # Source 2: existing file-history-snapshot entries
-                    elif t == "file-history-snapshot":
-                        snap = obj.get("snapshot", {})
-                        for fp, binfo in snap.get("trackedFileBackups", {}).items():
-                            if fp:
-                                found.add(fp)
-                            if isinstance(binfo, dict):
-                                v = binfo.get("version", 0)
-                                if v > max_version.get(fp, 0):
-                                    max_version[fp] = v
+            # Cache user/assistant UUIDs so _write_file_snapshot
+            # doesn't have to re-parse the entire JSONL every turn.
+            if last_user_uuid:
+                info._last_user_uuid = last_user_uuid
+            if last_asst_uuid:
+                info._last_asst_uuid = last_asst_uuid
 
             if found:
                 info.tracked_files.update(found)
@@ -3097,7 +2988,7 @@ class SessionManager:
                     if v > info.file_versions.get(fp, 0):
                         info.file_versions[fp] = v
                 logger.info(
-                    "_prepopulate_tracked_files(%s): found %d files from JSONL",
+                    "_prepopulate_tracked_files(%s): found %d files from store",
                     info.session_id, len(found),
                 )
             info._tracked_files_populated = True
@@ -3223,38 +3114,11 @@ class SessionManager:
                 logger.info("_write_file_snapshot: no valid backups, skipping")
                 return
 
-            jsonl_path = self._find_session_jsonl(info)
-            if not jsonl_path or not jsonl_path.exists():
-                logger.warning("_write_file_snapshot: JSONL not found (cwd=%s, sid=%s)",
-                               info.cwd, info.session_id)
-                return
-
-            # Read UUIDs from the TAIL of the JSONL only (last 64KB).
-            # Previous approach re-read the entire 38MB file on every turn.
-            last_user_uuid = ""
-            last_asst_uuid = ""
-            try:
-                file_size = jsonl_path.stat().st_size
-                tail_size = min(file_size, 65536)
-                with open(jsonl_path, "rb") as rf:
-                    rf.seek(max(0, file_size - tail_size))
-                    tail = rf.read().decode("utf-8", errors="replace")
-                for raw_line in tail.splitlines():
-                    raw_line = raw_line.strip()
-                    if not raw_line:
-                        continue
-                    try:
-                        obj = json.loads(raw_line)
-                    except Exception:
-                        continue
-                    t = obj.get("type", "")
-                    uid = obj.get("uuid", "")
-                    if t == "user" and uid:
-                        last_user_uuid = uid
-                    elif t == "assistant" and uid:
-                        last_asst_uuid = uid
-            except Exception:
-                pass
+            # Read UUIDs from the tail of the session storage.
+            # Delegated to ChatStore — reads only the last 64KB for performance.
+            last_user_uuid, last_asst_uuid = self._store.read_tail_uuids(
+                info.session_id, cwd=info.cwd or ""
+            )
 
             # CLI pattern:
             #   pre-turn:  outer=user_uuid, inner=user_uuid, isSnapshotUpdate=false
@@ -3281,8 +3145,10 @@ class SessionManager:
                 "isSnapshotUpdate": is_update,
             }
 
-            with open(jsonl_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(snapshot_entry) + "\n")
+            # Append snapshot to session storage via ChatStore
+            self._store.write_snapshot(
+                info.session_id, snapshot_entry, cwd=info.cwd or ""
+            )
 
             logger.info(
                 "Wrote file-history-snapshot for %s (update=%s, %d files, outer=%s inner=%s)",
@@ -3293,30 +3159,6 @@ class SessionManager:
             )
         except Exception as e:
             logger.warning("Failed to write file snapshot for %s: %s", session_id, e)
-
-    @staticmethod
-    def _find_session_jsonl(info: SessionInfo) -> Optional[Path]:
-        """Locate the .jsonl file for a session on disk."""
-        from app.config import _encode_cwd
-        projects_dir = Path.home() / ".claude" / "projects"
-        sid = info.session_id
-
-        # Try the encoded cwd first (fastest path)
-        cwd = info.cwd or ""
-        if cwd:
-            encoded = _encode_cwd(cwd)
-            candidate = projects_dir / encoded / f"{sid}.jsonl"
-            if candidate.exists():
-                return candidate
-
-        # Fallback: scan project directories
-        if projects_dir.is_dir():
-            for d in projects_dir.iterdir():
-                if d.is_dir() and not d.name.startswith("subagents"):
-                    candidate = d / f"{sid}.jsonl"
-                    if candidate.exists():
-                        return candidate
-        return None
 
     # ------------------------------------------------------------------
     # Persistent session registry (crash recovery)
@@ -3402,7 +3244,6 @@ class SessionManager:
         filters out stale or stopped entries, and resumes each one via the
         SDK's --resume flag.
         """
-        from app.config import _encode_cwd
         try:
             registry = self._load_registry()
             sessions = registry.get("sessions", {})
@@ -3439,20 +3280,7 @@ class SessionManager:
 
                 # Guard: if the .jsonl file was deleted (user chose to delete
                 # the session), do NOT recover it — that would undo the delete.
-                jsonl_path = None
-                projects_dir = Path.home() / ".claude" / "projects"
-                if cwd:
-                    encoded = _encode_cwd(cwd)
-                    candidate = projects_dir / encoded / f"{sid}.jsonl"
-                    if candidate.exists():
-                        jsonl_path = candidate
-                if not jsonl_path and projects_dir.is_dir():
-                    for d in projects_dir.iterdir():
-                        if d.is_dir() and not d.name.startswith("subagents"):
-                            candidate = d / f"{sid}.jsonl"
-                            if candidate.exists():
-                                jsonl_path = candidate
-                                break
+                jsonl_path = self._store.find_session_path(sid, cwd=cwd)
                 if not jsonl_path:
                     logger.info(
                         "Skipping recovery of %s — .jsonl file was deleted", sid
@@ -3463,7 +3291,7 @@ class SessionManager:
                 # If the daemon was killed mid-response, the last .jsonl entry
                 # is an assistant message with stop_reason=null — the CLI can't
                 # resume from that state and the stream dies immediately.
-                _repair_incomplete_jsonl(jsonl_path)
+                self._store.repair_incomplete_turn(sid, cwd=cwd)
 
                 logger.info(
                     "Recovering session %s (%s) from registry", sid, name or "unnamed"

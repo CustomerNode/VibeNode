@@ -301,15 +301,17 @@ class TestJsonlRepairBeforeReconnect:
     """Verify _reconnect_client calls jsonl repair before --resume."""
 
     def test_repair_called_in_reconnect(self, sm_module):
-        """_reconnect_client must call _repair_incomplete_jsonl."""
+        """_reconnect_client must call repair_incomplete_turn via store."""
         src = inspect.getsource(sm_module.SessionManager._reconnect_client)
-        assert "_repair_incomplete_jsonl" in src
+        assert "repair_incomplete_turn" in src
 
     def test_repair_happens_before_connect(self, sm_module):
         """jsonl repair must happen BEFORE creating the new client."""
         src = inspect.getsource(sm_module.SessionManager._reconnect_client)
-        repair_pos = src.find("_repair_incomplete_jsonl")
-        connect_pos = src.find("await client.connect()")
+        repair_pos = src.find("repair_incomplete_turn")
+        connect_pos = src.find("self._sdk.connect")
+        assert repair_pos >= 0, "repair_incomplete_turn not found in _reconnect_client"
+        assert connect_pos >= 0, "self._sdk.connect not found in _reconnect_client"
         assert repair_pos < connect_pos, (
             "jsonl repair must happen before client.connect()"
         )
@@ -407,7 +409,8 @@ class TestSelfHealingBehavior:
         """_reconnect_client should create options with resume=session_id."""
         src = inspect.getsource(sm_module.SessionManager._reconnect_client)
         assert "resume=" in src
-        assert "ClaudeCodeOptions" in src
+        # After OOP abstraction, uses SessionOptions + self._sdk.create_session
+        assert "SessionOptions" in src or "create_session" in src
 
     def test_drive_session_state_recovery_after_heal_failure(self, sm_module):
         """If self-healing fails entirely, state should end up IDLE
