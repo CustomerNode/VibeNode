@@ -62,6 +62,17 @@ In addition to each agent's lane-specific analysis, the team always evaluates th
 - If the plan touches APIs, config formats, data structures, IPC contracts, or WebSocket events, it must explicitly address what happens to existing consumers.
 - If a breaking change is required, the plan must include the migration path — not just note that one is needed.
 
+### Lifecycle States
+- For any user-facing feature or change, the plan must explicitly address what the user sees and what the system does at each of these moments. Silent assumptions here are the #1 source of startup bugs, race conditions, and "it works on my machine" failures.
+- **First-ever launch**: no config, no cache, no favorites, no auth. What does the user see? What does the system fetch? Is there a welcome state?
+- **Second launch (warm start)**: config exists, cache may be fresh or stale. Does the UI show cached data immediately? Does it revalidate in the background?
+- **Cold start with stale cache**: cache exists but is older than TTL. Show stale with a refresh indicator? Block on fresh data?
+- **Launch during daemon/backend startup race**: the backend is still initializing when the UI asks for data. What does the UI show during the wait? Does it retry? Does it respond to push events?
+- **Offline launch**: no network. Does the app degrade gracefully? Show cached data? Show clear error state?
+- **Launch after corrupted cache/config**: JSON parse fails. Does the app recover? Fall back to defaults? Surface the problem?
+- **Cache miss mid-session**: user adds a new location and the cache hasn't fetched yet. What do they see in the sidebar/main panel during the fetch?
+- If any of these states is unspecified, the plan is incomplete. Each must have a defined UX and data flow, even if the answer is "show loading spinner" or "fall back to defaults."
+
 ## Fix Policy
 
 The team should fix what it finds directly in the spec. Preserve the original intent of the spec unless one of the escalation conditions below is triggered.
