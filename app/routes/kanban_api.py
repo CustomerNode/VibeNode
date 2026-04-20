@@ -1472,6 +1472,7 @@ def update_kanban_config():
                      "auto_parent_reopen", "auto_advance_to_validating",
                      "ai_can_modify_status", "ai_can_mark_complete",
                      "cross_session_awareness",
+                     "wrong_session_detection",
                      "validation_url_enabled", "validation_url_dismissed",
                      "file_tracking_enabled"):
         if pref_key in data:

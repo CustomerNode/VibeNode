@@ -1696,6 +1696,26 @@ function openPreferences() {
   }
   html += '</div>';
 
+  // --- Wrong-Session Detection toggle ---
+  const wsdOn = window._wrongSessionDetectionEnabled !== false;
+  html += '<div class="pm-body" style="margin-top:8px;"><p style="margin-bottom:4px;font-weight:600;font-size:13px;">Wrong-Session Detection</p>'
+    + '<p style="font-size:12px;color:var(--text-muted);">When you have multiple sessions running, warns before sending a prompt that seems unrelated to the current session.</p></div>'
+    + '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:20px;">';
+  const wsdOpts = [
+    {key: 'on',  name: 'Enabled',  desc: 'Show a confirmation dialog when a prompt looks like it belongs to a different session.'},
+    {key: 'off', name: 'Disabled', desc: 'Send prompts without checking which session they belong to.'},
+  ];
+  for (const o of wsdOpts) {
+    const isActive = (o.key === 'on') === wsdOn;
+    html += `<div class="add-mode-card${isActive ? ' active' : ''}" data-wsd="${o.key}">
+      <div class="add-mode-info">
+        <div class="add-mode-title">${o.name}</div>
+        <div class="add-mode-desc">${o.desc}</div>
+      </div>
+    </div>`;
+  }
+  html += '</div>';
+
   html += '<div class="pm-actions"><button class="pm-btn pm-btn-secondary" id="pm-pref-close">Close</button></div></div>';
   overlay.innerHTML = html;
   overlay.classList.add('show');
@@ -1726,6 +1746,22 @@ function openPreferences() {
       }
       _closePm();
       showToast('Sticky chats: ' + card.querySelector('.add-mode-title').textContent);
+    };
+  });
+  // --- Wrong-Session Detection click handler ---
+  // Persists to kanban_config.json via API and updates the in-memory flag immediately
+  overlay.querySelectorAll('.add-mode-card[data-wsd]').forEach(card => {
+    card.onclick = () => {
+      const enabled = card.dataset.wsd === 'on';
+      window._wrongSessionDetectionEnabled = enabled;
+      // Persist to kanban config on the server (PUT merges into existing config)
+      fetch('/api/kanban/config', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({wrong_session_detection: enabled})
+      }).catch(() => { /* fail-open: in-memory flag is already set */ });
+      _closePm();
+      showToast('Wrong-session detection: ' + (enabled ? 'Enabled' : 'Disabled'));
     };
   });
 }
