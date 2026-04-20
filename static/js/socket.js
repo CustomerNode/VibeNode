@@ -1529,7 +1529,14 @@ setInterval(() => {
 
 // ---- Startup ----
 window._initialLoadDone = false;
+// Default wrong-session detection to true; overwritten once kanban config loads
+window._wrongSessionDetectionEnabled = true;
 loadProjects().then(() => { window._initialLoadDone = true; }).catch(() => { window._initialLoadDone = true; });
+// Load wrong-session detection preference from kanban config.
+// Fail-open: defaults to true on error.
+fetch('/api/kanban/config').then(r => r.ok ? r.json() : {}).then(cfg => {
+  window._wrongSessionDetectionEnabled = cfg.wrong_session_detection !== false;
+}).catch(() => { /* fail-open: keep default true */ });
 // Git status polling — initial check + 60s interval
 if (typeof pollGitStatus === 'function') {
   pollGitStatus();

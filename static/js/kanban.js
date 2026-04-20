@@ -4887,6 +4887,10 @@ async function openKanbanSettings(initialTab) {
         <div><div style="font-size:13px;font-weight:500;">Cross-session awareness</div><div style="font-size:12px;color:var(--text-dim);">Tell AI sessions what other sessions are doing — names, status, and recently edited files</div></div>
         <label class="kanban-toggle"><input type="checkbox" id="kb-cross-session" ${_chk('cross_session_awareness', true)}><span class="kanban-toggle-slider"></span></label>
       </div>
+      <div class="kanban-settings-row">
+        <div><div style="font-size:13px;font-weight:500;">Wrong-session detection</div><div style="font-size:12px;color:var(--text-dim);">Warn before sending a prompt that seems unrelated to the current session's conversation</div></div>
+        <label class="kanban-toggle"><input type="checkbox" id="kb-wrong-session" ${_chk('wrong_session_detection', true)}><span class="kanban-toggle-slider"></span></label>
+      </div>
       <div style="font-size:14px;font-weight:600;margin:16px 0 12px;">Performance</div>
       <div class="kanban-settings-row">
         <div><div style="font-size:13px;font-weight:500;">File tracking</div><div style="font-size:12px;color:var(--text-dim);">Track file changes each turn for undo/rewind. Disable to speed up sessions on large repos.</div></div>
@@ -5015,6 +5019,7 @@ async function openKanbanSettings(initialTab) {
         ai_can_mark_complete: document.getElementById('kb-ai-mark-complete')?.checked ?? true,
         kanban_page_size: parseInt(pageSize, 10),
         cross_session_awareness: document.getElementById('kb-cross-session')?.checked ?? true,
+        wrong_session_detection: document.getElementById('kb-wrong-session')?.checked ?? true,
         file_tracking_enabled: document.getElementById('kb-file-tracking')?.checked ?? true,
         validation_url_enabled: document.getElementById('kb-val-enabled')?.checked ?? false,
         validation_base_url: document.getElementById('kb-val-base-url')?.value?.trim() || '',
@@ -5027,6 +5032,9 @@ async function openKanbanSettings(initialTab) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(cfgBody),
       });
+
+      // Sync wrong-session detection toggle immediately (no page refresh needed)
+      window._wrongSessionDetectionEnabled = cfgBody.wrong_session_detection !== false;
 
       if (!quiet) await initKanban(true);
     } catch (e) {

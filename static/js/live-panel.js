@@ -1569,8 +1569,197 @@ function liveSubmitIdle() {
   _liveSubmitDirect(liveSessionId, text, wasVoice ? {voice: true} : undefined);
 }
 
-function _liveSubmitDirect(sid, text, opts) {
+// ═══════════════════════════════════════════════════════════════
+// WRONG-SESSION DETECTION
+// Lightweight client-side heuristic that warns when a prompt seems
+// more related to a different active session. Runs synchronously
+// (< 1ms) — only the confirmation dialog is async.
+// Fail-open: any error in detection silently allows the send.
+// ═══════════════════════════════════════════════════════════════
+
+/** Common English stopwords removed during keyword extraction. */
+const _STOP_WORDS = new Set([
+  'the','a','an','is','are','it','this','that','in','on','for','to','of',
+  'with','and','or','but','not','from','be','have','has','do','does','did',
+  'will','would','can','could','should','was','were','been','being','at',
+  'by','as','so','if','then','than','just','also','about','up','out','its',
+  'my','your','we','they','them','our','all','any','some','no','like','make',
+  'get','go','use','let','me','you','he','she','please','want','need',
+  'think','know','sure','ok','okay','yes','yeah','thanks','hi','hello','hey'
+]);
+
+/**
+ * Extract topic keywords from text for wrong-session comparison.
+ * Returns a Set of lowercase words after removing stopwords,
+ * short words (< 3 chars), and pure numbers.
+ * @param {string} text
+ * @returns {Set<string>}
+ */
+function _extractTopicKeywords(text) {
+  if (!text) return new Set();
+  const words = text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/);
+  const result = new Set();
+  for (const w of words) {
+    if (w.length < 3) continue;          // too short
+    if (/^\d+$/.test(w)) continue;       // pure number
+    if (_STOP_WORDS.has(w)) continue;    // stopword
+    result.add(w);
+  }
+  return result;
+}
+
+/**
+ * Get topic keywords for a session by reading DOM messages (if current)
+ * and the session title from allSessions.
+ * @param {string} sessionId
+ * @returns {Set<string>}
+ */
+function _getSessionTopicKeywords(sessionId) {
+  try {
+    let text = '';
+    // For the currently rendered session, read recent messages from the DOM
+    if (sessionId === liveSessionId) {
+      const log = document.getElementById('live-log');
+      if (log) {
+        const msgs = log.querySelectorAll('.msg.user, .msg.assistant');
+        // Take the last 6 messages
+        const recent = Array.from(msgs).slice(-6);
+        for (const el of recent) {
+          text += ' ' + (el.textContent || '');
+        }
+      }
+    }
+    // Always include the session title
+    const s = (typeof allSessions !== 'undefined' && Array.isArray(allSessions))
+      ? allSessions.find(x => x.id === sessionId)
+      : null;
+    if (s) {
+      text += ' ' + (s.custom_title || s.display_title || '');
+    }
+    return _extractTopicKeywords(text);
+  } catch (e) {
+    // Fail-open: return empty set so detection doesn't trigger
+    return new Set();
+  }
+}
+
+/**
+ * Check whether a prompt seems more related to a different active session.
+ * Returns { suspect: boolean, betterSessionName: string|null }.
+ *
+ * Trigger condition (conservative to avoid false positives):
+ *   - bestOtherOverlap >= 3 keywords match another session
+ *   - bestOtherOverlap > currentOverlap
+ *   - currentOverlap <= 1 (prompt barely matches current session)
+ *
+ * @param {string} promptText
+ * @param {string} currentSessionId
+ * @returns {{ suspect: boolean, betterSessionName: string|null }}
+ */
+function _checkWrongSession(promptText, currentSessionId) {
+  try {
+    const promptKw = _extractTopicKeywords(promptText);
+    // Too few keywords to judge — skip
+    if (promptKw.size < 2) return { suspect: false, betterSessionName: null };
+
+    // Need allSessions and runningIds to compare
+    if (typeof allSessions === 'undefined' || typeof runningIds === 'undefined') {
+      return { suspect: false, betterSessionName: null };
+    }
+
+    // Only compare if there are at least 2 active sessions
+    const activeSessions = allSessions.filter(s =>
+      runningIds.has(s.id) && s.id !== currentSessionId && s.message_count > 0
+    );
+    if (activeSessions.length === 0) return { suspect: false, betterSessionName: null };
+
+    // Current session keywords (includes DOM messages + title)
+    const currentKw = _getSessionTopicKeywords(currentSessionId);
+    let currentOverlap = 0;
+    for (const w of promptKw) {
+      if (currentKw.has(w)) currentOverlap++;
+    }
+
+    // Find the best-matching other session
+    let bestOverlap = 0;
+    let bestName = null;
+    for (const s of activeSessions) {
+      // For non-rendered sessions, use title-only keywords
+      const otherKw = _extractTopicKeywords(s.custom_title || s.display_title || '');
+      let overlap = 0;
+      for (const w of promptKw) {
+        if (otherKw.has(w)) overlap++;
+      }
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        bestName = s.custom_title || s.display_title || s.id.slice(0, 8);
+      }
+    }
+
+    // Trigger: strong match elsewhere AND weak match here
+    if (bestOverlap >= 3 && bestOverlap > currentOverlap && currentOverlap <= 1) {
+      return { suspect: true, betterSessionName: bestName };
+    }
+    return { suspect: false, betterSessionName: null };
+  } catch (e) {
+    // Fail-open: never block a send due to detection failure
+    console.warn('[wrong-session] detection error (fail-open):', e);
+    return { suspect: false, betterSessionName: null };
+  }
+}
+
+/**
+ * Get display name for a session by ID (for the confirmation dialog).
+ * @param {string} sid
+ * @returns {string}
+ */
+function _getSessionDisplayName(sid) {
+  if (typeof allSessions !== 'undefined' && Array.isArray(allSessions)) {
+    const s = allSessions.find(x => x.id === sid);
+    if (s) return s.custom_title || s.display_title || sid.slice(0, 8);
+  }
+  return sid ? sid.slice(0, 8) : 'Unknown';
+}
+
+/**
+ * SVG icon for the wrong-session confirmation dialog (two crossing arrows).
+ * @returns {string}
+ */
+function _wrongSessionIcon() {
+  return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>';
+}
+
+async function _liveSubmitDirect(sid, text, opts) {
   if (!sid) return;
+
+  // ── Wrong-session detection gate ──
+  // Runs before any socket.emit. The _checkWrongSession() call is synchronous
+  // (< 1ms). Only the showConfirm dialog is async, and it only appears when
+  // a mismatch is detected (rare). Fail-open: errors never block sends.
+  if (window._wrongSessionDetectionEnabled && !(opts && opts.skipWrongSessionCheck) && !(opts && opts.isPermission)) {
+    try {
+      const _wsCheck = _checkWrongSession(text, sid);
+      if (_wsCheck.suspect) {
+        const _wsConfirmed = await showConfirm(
+          'Wrong session?',
+          'This prompt seems more related to <strong>' + escHtml(_wsCheck.betterSessionName) +
+          '</strong>.<br><br>Send to <strong>' + escHtml(_getSessionDisplayName(sid)) + '</strong> anyway?',
+          { confirmText: 'Send anyway', cancelText: 'Cancel', icon: _wrongSessionIcon() }
+        );
+        if (!_wsConfirmed) {
+          // Restore text to textarea so the user doesn't lose their message
+          const _wsTa = document.getElementById('live-input-ta') || document.getElementById('live-queue-ta');
+          if (_wsTa) _wsTa.value = text;
+          _liveSending = false;
+          return;
+        }
+      }
+    } catch (_wsErr) {
+      // Fail-open: detection error must never block a legitimate send
+      console.warn('[wrong-session] gate error (fail-open):', _wsErr);
+    }
+  }
+
   performance.mark('submit-' + sid);
   _liveSending = true;
   _clearDraft(sid);

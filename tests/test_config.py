@@ -58,3 +58,41 @@ class TestNameOperations:
         names_path = tmp_path / "_session_names.json"
         self._patch_names_file(monkeypatch, lambda project="": names_path)
         config._delete_name("does_not_exist")  # should not raise
+
+
+class TestKanbanConfigDefaults:
+    """Regression tests for kanban config defaults — new keys must always appear."""
+
+    def test_wrong_session_detection_default_is_true(self):
+        """wrong_session_detection must default to True (added 2026-04-19)."""
+        from app.config import _kanban_config_defaults
+        defaults = _kanban_config_defaults()
+        assert "wrong_session_detection" in defaults
+        assert defaults["wrong_session_detection"] is True
+
+    def test_get_kanban_config_includes_wrong_session_detection(self, tmp_path, monkeypatch):
+        """get_kanban_config() fills missing keys from defaults, including wrong_session_detection."""
+        import json
+        from app import config
+
+        cfg_file = tmp_path / "kanban_config.json"
+        cfg_file.write_text(json.dumps({"kanban_backend": "sqlite"}), encoding="utf-8")
+        monkeypatch.setattr(config, "_KANBAN_CONFIG_FILE", cfg_file)
+        # Invalidate cache
+        config._kanban_config_cache = None
+
+        result = config.get_kanban_config()
+        assert result["wrong_session_detection"] is True
+
+    def test_get_kanban_config_respects_explicit_false(self, tmp_path, monkeypatch):
+        """User can disable wrong_session_detection by setting it to false."""
+        import json
+        from app import config
+
+        cfg_file = tmp_path / "kanban_config.json"
+        cfg_file.write_text(json.dumps({"wrong_session_detection": False}), encoding="utf-8")
+        monkeypatch.setattr(config, "_KANBAN_CONFIG_FILE", cfg_file)
+        config._kanban_config_cache = None
+
+        result = config.get_kanban_config()
+        assert result["wrong_session_detection"] is False

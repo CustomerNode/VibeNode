@@ -118,6 +118,8 @@ def _kanban_config_defaults() -> dict:
         # ── Cross-session awareness ──
         # Inject other active sessions' names/status/files into system prompts
         "cross_session_awareness": True,
+        # Warn before sending a prompt that seems unrelated to the current session
+        "wrong_session_detection": True,
         # ── Validation URL preferences ──
         "validation_url_enabled": False,
         "validation_base_url": "",
