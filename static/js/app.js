@@ -1534,7 +1534,7 @@ function filterSessions() {
 // ===== Model / Thinking / Template / Department selectors =====
 
 // --- Model Selector ---
-let defaultModel = localStorage.getItem('defaultModel') || '';
+let defaultModel = localStorage.getItem('defaultModel') || 'claude-opus-4-7';
 
 async function openModelSelector() {
   const overlay = document.getElementById('pm-overlay');
@@ -1552,9 +1552,9 @@ async function openModelSelector() {
     models = await resp.json();
   } catch (e) {
     models = [
-      {id: '', name: 'Default', desc: 'Uses your Claude Code settings', default: true},
+      {id: 'claude-opus-4-7', name: 'Opus 4.7', desc: '1M context, deepest reasoning'},
+      {id: 'opus', name: 'Opus 4.6', desc: 'Deep reasoning, 200K context'},
       {id: 'sonnet', name: 'Sonnet', desc: 'Fast, capable, balanced'},
-      {id: 'opus', name: 'Opus', desc: 'Most capable, deeper reasoning'},
       {id: 'haiku', name: 'Haiku', desc: 'Fastest, most cost-efficient'},
     ];
   }
@@ -1562,14 +1562,12 @@ async function openModelSelector() {
   let cardsHtml = '';
   for (const m of models) {
     const key = m.id || '';
-    const isActive = key === defaultModel || (m.default && !defaultModel);
+    const isActive = key === defaultModel;
     const name = m.name || key;
     const desc = m.desc || '';
-    const extra = m.context_window ? ' (' + Math.round(m.context_window/1000) + 'K context)' : '';
-    const current = m.current ? ' <span style="font-size:9px;background:var(--accent);color:#fff;padding:2px 6px;border-radius:8px;font-weight:700;">Current</span>' : '';
     cardsHtml += '<div class="add-mode-card' + (isActive ? ' active' : '') + '" data-model="' + escHtml(key) + '">'
       + '<div class="add-mode-info">'
-      + '<div class="add-mode-title">' + escHtml(name) + extra + current + '</div>'
+      + '<div class="add-mode-title">' + escHtml(name) + '</div>'
       + '<div class="add-mode-desc">' + escHtml(desc) + '</div>'
       + '</div></div>';
   }
@@ -1596,11 +1594,11 @@ async function openModelSelector() {
 function _updateModelLabel() {
   const el = document.getElementById('sys-model-label');
   if (!el) return;
-  if (!defaultModel) { el.textContent = 'Default'; return; }
-  if (defaultModel.includes('sonnet')) el.textContent = 'Sonnet 4';
-  else if (defaultModel.includes('opus')) el.textContent = 'Opus 4';
-  else if (defaultModel.includes('haiku')) el.textContent = 'Haiku 4.5';
-  else el.textContent = defaultModel.split('-').pop();
+  if (defaultModel.includes('opus-4-7')) el.textContent = 'Opus 4.7';
+  else if (defaultModel === 'opus') el.textContent = 'Opus 4.6';
+  else if (defaultModel.includes('sonnet')) el.textContent = 'Sonnet';
+  else if (defaultModel.includes('haiku')) el.textContent = 'Haiku';
+  else el.textContent = defaultModel || 'Opus 4.7';
 }
 _updateModelLabel();
 

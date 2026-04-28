@@ -455,15 +455,16 @@ def get_models():
     except Exception:
         pass
 
-    # Always include the alias shortcuts the CLI accepts
     aliases = [
-        {"id": "", "name": "Default", "desc": "Uses your Claude Code settings", "default": True},
-        {"id": "sonnet", "name": "Sonnet", "desc": "Fast, capable, balanced", "alias": True},
-        {"id": "opus", "name": "Opus", "desc": "Most capable, deeper reasoning", "alias": True},
-        {"id": "haiku", "name": "Haiku", "desc": "Fastest, most cost-efficient", "alias": True},
+        {"id": "claude-opus-4-7", "name": "Opus 4.7", "desc": "1M context, deepest reasoning"},
+        {"id": "opus", "name": "Opus 4.6", "desc": "Deep reasoning, 200K context"},
+        {"id": "sonnet", "name": "Sonnet", "desc": "Fast, capable, balanced"},
+        {"id": "haiku", "name": "Haiku", "desc": "Fastest, most cost-efficient"},
     ]
 
-    result = aliases + models
+    # Don't show dynamically detected models — aliases cover all options
+    # and the "Current" badge on detected models creates confusion
+    result = aliases
     _models_cache["data"] = result
     _models_cache["ts"] = _time.time()
     return jsonify(result)
