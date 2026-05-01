@@ -69,6 +69,243 @@ function _invokeAssetById(assetId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// PER-SESSION MODEL OVERRIDE
+// A lightweight per-session model+thinking override stored in memory.
+// Only applies to the *next* session start (cleared after use).
+// Separate from the system-level defaultModel / defaultThinking that are
+// persisted in localStorage.
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Current per-session model override — null means "use system default". */
+// Persist overrides in localStorage so they survive page refresh
+window._sessionModelOverride = localStorage.getItem('_sessionModelOverride') || null;
+window._sessionThinkingOverride = localStorage.getItem('_sessionThinkingOverride') || null;
+
+/**
+ * Return the effective model for the next session:
+ * per-session override if set, otherwise the system default.
+ */
+function _effectiveModel() {
+  return window._sessionModelOverride || (typeof defaultModel !== 'undefined' ? defaultModel : 'claude-opus-4-7');
+}
+
+/**
+ * Return the effective thinking level for the next session:
+ * per-session override if set, otherwise the system default.
+ */
+function _effectiveThinking() {
+  return window._sessionThinkingOverride !== null ? window._sessionThinkingOverride
+    : (typeof defaultThinking !== 'undefined' ? defaultThinking : '');
+}
+
+/**
+ * Clear per-session overrides.  Called by _newSessionSubmit after the
+ * session is dispatched so the next session reverts to system defaults.
+ */
+function _clearSessionModelOverride() {
+  window._sessionModelOverride = null;
+  window._sessionThinkingOverride = null;
+  localStorage.removeItem('_sessionModelOverride');
+  localStorage.removeItem('_sessionThinkingOverride');
+}
+
+/**
+ * Build the model badge button shown next to /invoke in the input bar.
+ * Displays the effective model label; clicking opens the per-session
+ * model + thinking selector popup.
+ *
+ * @param {boolean} [isNewSession=false] — true for brand-new sessions
+ *   (button is clickable).  For already-running sessions the button is
+ *   informational only (shows the session's current model).
+ * @param {string}  [sessionModel=''] — model of the current live session,
+ *   used in the running/idle bars to show what model is active.
+ */
+function _buildSessionModelBtn(isNewSession, sessionModel) {
+  const isOverridden = window._sessionModelOverride !== null;
+  // Always show override if one is set (applies to next session started), else show session/default
+  const label = isOverridden
+    ? _modelLabel(window._sessionModelOverride)
+    : _modelLabel(sessionModel || (typeof defaultModel !== 'undefined' ? defaultModel : ''));
+
+  if (isNewSession) {
+    return '<button class="session-model-btn' + (isOverridden ? ' session-model-overridden' : '') + '" ' +
+      'id="session-model-btn" onclick="_openSessionModelSelector()" ' +
+      'title="' + (isOverridden ? 'Model overridden — click to change' : 'Click to choose model for this session') + '">' +
+      label + '</button>';
+  } else {
+    return '<button class="session-model-badge' + (isOverridden ? ' session-model-overridden' : '') + '" ' +
+      'onclick="_openSessionModelSelector()" ' +
+      'title="' + (isOverridden ? 'Model overridden — click to change' : 'Click to change model') + '">' +
+      label + '</button>';
+  }
+}
+
+/**
+ * Open a per-session model + thinking level selector popup.
+ * Uses the existing pm-overlay.  Selecting a model/thinking level sets
+ * the per-session override WITHOUT affecting the system-level defaults
+ * stored in localStorage.
+ */
+async function _openSessionModelSelector() {
+  const overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+
+  overlay.innerHTML = '<div class="pm-card pm-enter" style="width:400px;">' +
+    '<h2 class="pm-title">Session Model</h2>' +
+    '<div class="pm-body"><p>Choose model and thinking level for <strong>this session</strong>. System default is unchanged.</p></div>' +
+    '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;" id="sm-model-list">' +
+    '<span class="spinner"></span></div>' +
+    '<div id="sm-thinking-section" style="display:none;margin-bottom:16px;">' +
+    '<div style="font-size:11px;font-weight:600;color:var(--text-faint);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;">Thinking Level</div>' +
+    '<div style="display:flex;flex-direction:column;gap:6px;" id="sm-thinking-list"></div>' +
+    '</div>' +
+    '<div class="pm-actions">' +
+    '<button class="pm-btn pm-btn-secondary" onclick="_clearSessionModelOverrideAndClose()">Reset to Default</button>' +
+    '<button class="pm-btn pm-btn-primary" id="sm-apply-btn" disabled onclick="_applySessionModelOverride()">Apply</button>' +
+    '</div></div>';
+  overlay.classList.add('show');
+  requestAnimationFrame(() => { const c = overlay.querySelector('.pm-card'); if (c) c.classList.remove('pm-enter'); });
+  overlay.onclick = e => { if (e.target === overlay) _closePm(); };
+
+  // Fetch models
+  let models;
+  try {
+    const resp = await fetch('/api/models');
+    models = await resp.json();
+  } catch (e) {
+    models = [
+      {id: 'claude-opus-4-7',  name: 'Opus 4.7',   desc: '1M context, deepest reasoning'},
+      {id: 'claude-opus-4-6',  name: 'Opus 4.6',   desc: 'Deep reasoning, 200K context'},
+      {id: 'claude-sonnet-4-6',name: 'Sonnet 4.6', desc: 'Fast, capable, balanced'},
+      {id: 'claude-haiku-4-5', name: 'Haiku 4.5',  desc: 'Fastest, most cost-efficient'},
+    ];
+  }
+
+  // Track pending selections
+  let pendingModel = window._sessionModelOverride || _effectiveModel();
+  let pendingThinking = window._sessionThinkingOverride !== null
+    ? window._sessionThinkingOverride
+    : (typeof defaultThinking !== 'undefined' ? defaultThinking : '');
+
+  function _renderModels() {
+    const list = document.getElementById('sm-model-list');
+    if (!list) return;
+    let html = '';
+    for (const m of models) {
+      const active = m.id === pendingModel;
+      html += '<div class="add-mode-card' + (active ? ' active' : '') + '" data-model="' + (m.id || '') + '" ' +
+        'onclick="_smSelectModel(this)">' +
+        '<div class="add-mode-info">' +
+        '<div class="add-mode-title">' + (m.name || m.id) + '</div>' +
+        (m.desc ? '<div class="add-mode-desc">' + m.desc + '</div>' : '') +
+        '</div></div>';
+    }
+    list.innerHTML = html;
+  }
+
+  function _renderThinking() {
+    const section = document.getElementById('sm-thinking-section');
+    const list = document.getElementById('sm-thinking-list');
+    if (!section || !list) return;
+    section.style.display = '';
+    const levels = [
+      {key: '', label: 'Default', desc: 'Model default'},
+      {key: 'none', label: 'None', desc: 'No extended thinking'},
+      {key: 'low', label: 'Low', desc: 'Brief reasoning'},
+      {key: 'medium', label: 'Medium', desc: 'Moderate reasoning'},
+      {key: 'high', label: 'High', desc: 'Deep reasoning'},
+    ];
+    let html = '';
+    for (const l of levels) {
+      const active = l.key === pendingThinking;
+      html += '<div class="add-mode-card' + (active ? ' active' : '') + '" style="padding:8px 12px;" data-level="' + l.key + '" ' +
+        'onclick="_smSelectThinking(this)">' +
+        '<div class="add-mode-info">' +
+        '<div class="add-mode-title" style="font-size:12px;">' + l.label + '</div>' +
+        '<div class="add-mode-desc" style="font-size:11px;">' + l.desc + '</div>' +
+        '</div></div>';
+    }
+    list.innerHTML = html;
+  }
+
+  _renderModels();
+  _renderThinking();
+
+  // Enable apply only when a selection differs from current state
+  function _refreshApply() {
+    const btn = document.getElementById('sm-apply-btn');
+    if (btn) btn.disabled = false; // always allow apply after any interaction
+  }
+
+  // Expose helpers to inline onclick handlers
+  window._smSelectModel = function(card) {
+    document.querySelectorAll('#sm-model-list .add-mode-card').forEach(c => c.classList.remove('active'));
+    card.classList.add('active');
+    pendingModel = card.dataset.model;
+    _refreshApply();
+  };
+  window._smSelectThinking = function(card) {
+    document.querySelectorAll('#sm-thinking-list .add-mode-card').forEach(c => c.classList.remove('active'));
+    card.classList.add('active');
+    pendingThinking = card.dataset.level;
+    _refreshApply();
+  };
+  window._applySessionModelOverride = function() {
+    window._sessionModelOverride = pendingModel;
+    window._sessionThinkingOverride = pendingThinking;
+    if (pendingModel) localStorage.setItem('_sessionModelOverride', pendingModel);
+    else localStorage.removeItem('_sessionModelOverride');
+    if (pendingThinking) localStorage.setItem('_sessionThinkingOverride', pendingThinking);
+    else localStorage.removeItem('_sessionThinkingOverride');
+    _closePm();
+    // Refresh any visible session-model-btn to show updated label
+    _refreshSessionModelBtn();
+    const label = _modelLabel(pendingModel);
+    const thinking = pendingThinking
+      ? ' + ' + pendingThinking.charAt(0).toUpperCase() + pendingThinking.slice(1) + ' thinking'
+      : '';
+    if (typeof showToast === 'function') showToast('Session: ' + label + thinking);
+  };
+  window._clearSessionModelOverrideAndClose = function() {
+    window._sessionModelOverride = null;
+    window._sessionThinkingOverride = null;
+    localStorage.removeItem('_sessionModelOverride');
+    localStorage.removeItem('_sessionThinkingOverride');
+    _closePm();
+    _refreshSessionModelBtn();
+    if (typeof showToast === 'function') showToast('Session model reset to system default');
+  };
+}
+
+/**
+ * Refresh the session-model-btn in the current input bar after
+ * an override is applied or cleared, without re-rendering the full bar.
+ */
+function _refreshSessionModelBtn() {
+  const label = _modelLabel(_effectiveModel());
+  const isOverridden = window._sessionModelOverride !== null;
+
+  // New-session button (has id)
+  const btn = document.getElementById('session-model-btn');
+  if (btn) {
+    btn.textContent = label;
+    btn.classList.toggle('session-model-overridden', isOverridden);
+    btn.title = isOverridden
+      ? 'Model overridden — click to change'
+      : 'Click to choose model for this session';
+  }
+
+  // Running-session badge (no id, use class)
+  const badge = document.querySelector('.session-model-badge');
+  if (badge) {
+    badge.textContent = label;
+    badge.title = isOverridden
+      ? 'Next session: ' + label + ' — click to change'
+      : 'Click to set model for next session';
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // INVOKE BUTTON BUILDER (for the input bar)
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -82,10 +319,19 @@ function _buildInvokeBtn() {
     '</button>';
 }
 
-/** Wrap invoke button + context circle in a left-pinned group */
-function _buildBarLeftGroup(ctxHtml) {
+/**
+ * Wrap invoke button + model badge + context circle in a left-pinned group.
+ *
+ * @param {string}  ctxHtml       - Context bar HTML (from _buildCtxBarCompact).
+ * @param {boolean} [isNewSession=false] - true only for brand-new sessions
+ *   where the model button is interactive.
+ * @param {string}  [sessionModel=''] - model of the current live session
+ *   (used in idle/waiting/working bars for display purposes).
+ */
+function _buildBarLeftGroup(ctxHtml, isNewSession, sessionModel) {
   return '<div class="bar-left-group">' +
     (typeof _buildInvokeBtn === 'function' ? _buildInvokeBtn() : '') +
+    _buildSessionModelBtn(isNewSession || false, sessionModel || '') +
     (ctxHtml || '') +
     '</div>';
 }

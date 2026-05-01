@@ -410,61 +410,159 @@ def put_folder_tree():
 # Available models API
 # ---------------------------------------------------------------------------
 
-_models_cache = {"data": None, "ts": 0}
+_models_cache: dict = {"data": None, "ts": 0}
 
-@bp.route('/api/models')
-def get_models():
-    """Return available Claude models dynamically from the Anthropic API."""
-    import time as _time
+# Persistent confirmed-models cache: grows as users run sessions with different models.
+# Stored next to kanban_config so it survives restarts.
+_CONFIRMED_MODELS_FILE = Path(__file__).resolve().parents[2] / "confirmed_models.json"
 
-    # Cache for 10 minutes
-    if _models_cache["data"] and _time.time() - _models_cache["ts"] < 600:
-        return jsonify(_models_cache["data"])
 
-    models = []
+def _invalidate_models_cache() -> None:
+    """Force the models list to be rebuilt on the next /api/models request."""
+    _models_cache["data"] = None
+    _models_cache["ts"] = 0
+
+
+def _load_confirmed_models() -> dict:
+    """Load the confirmed-models cache from disk.  Returns {model_id: display_name}."""
+    try:
+        if _CONFIRMED_MODELS_FILE.exists():
+            return json.loads(_CONFIRMED_MODELS_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def record_confirmed_model(model_id: str) -> None:
+    """Called by session_manager when a session init message arrives with a model ID.
+    Adds the model to the persistent confirmed list so it always shows in the UI."""
+    if not model_id or not model_id.startswith("claude-"):
+        return
+    confirmed = _load_confirmed_models()
+    if model_id not in confirmed:
+        confirmed[model_id] = _model_id_to_display_name(model_id)
+        try:
+            _CONFIRMED_MODELS_FILE.write_text(json.dumps(confirmed, indent=2))
+        except Exception:
+            pass
+        _invalidate_models_cache()
+
+
+def _model_id_to_display_name(model_id: str) -> str:
+    """Convert a raw model ID like claude-sonnet-4-6-20251022 to 'Sonnet 4.6'."""
+    import re as _re
+    # Strip 8-digit date suffix (e.g. -20251001)
+    name = _re.sub(r"-\d{8}$", "", model_id)
+    # Remove 'claude-' prefix
+    name = name.replace("claude-", "")
+    # Split on '-': first part is family name, rest are version components
+    parts = name.split("-")
+    family = parts[0].capitalize()           # e.g. "Sonnet"
+    version = ".".join(parts[1:]) if len(parts) > 1 else ""  # e.g. "4.6"
+    return f"{family} {version}".strip()
+
+
+def _fetch_models_from_anthropic_api() -> list:
+    """Try calling /v1/models with ANTHROPIC_API_KEY if set. Returns [] on failure."""
+    import os as _os
+    api_key = _os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        return []
+    try:
+        import urllib.request as _urlreq
+        req = _urlreq.Request(
+            "https://api.anthropic.com/v1/models?limit=100",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+        )
+        with _urlreq.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+        result = []
+        for m in data.get("data", []):
+            mid = m.get("id", "")
+            if mid.startswith("claude-"):
+                result.append({"id": mid, "name": m.get("display_name") or _model_id_to_display_name(mid)})
+        # Sort: newest/most capable first (opus > sonnet > haiku, higher version first)
+        def _sort_key(m):
+            mid = m["id"]
+            family = 0 if "opus" in mid else (1 if "sonnet" in mid else 2)
+            return (family, [-int(x) for x in mid.replace("claude-", "").split("-") if x.isdigit()])
+        result.sort(key=_sort_key)
+        return result
+    except Exception:
+        return []
+
+
+def _fetch_current_model_from_cli() -> str:
+    """Run a quick claude invocation and parse the init message to find the current model."""
     try:
         import subprocess
-        # Query the CLI for its init message which includes the current model
         from ..platform_utils import NO_WINDOW as _nw
         r = subprocess.run(
-            ["claude", "-p", ".", "--output-format", "stream-json",
+            ["claude", "-p", "x", "--output-format", "stream-json",
              "--verbose", "--max-turns", "1", "--no-session-persistence"],
-            capture_output=True, text=True, timeout=15, creationflags=_nw
+            capture_output=True, text=True, timeout=20, creationflags=_nw
         )
-        current_model = None
         for line in r.stdout.strip().split("\n"):
             try:
                 d = json.loads(line)
                 if d.get("type") == "system" and d.get("subtype") == "init":
-                    current_model = d.get("model", "")
-                if d.get("type") == "result":
-                    model_usage = d.get("modelUsage", {})
-                    for mid in model_usage:
-                        info = model_usage[mid]
-                        # Extract clean name from model ID
-                        clean = mid.split("[")[0]  # remove [1m] suffix
-                        models.append({
-                            "id": clean,
-                            "name": clean.replace("claude-", "Claude ").replace("-", " ").title(),
-                            "context_window": info.get("contextWindow", 0),
-                            "max_output": info.get("maxOutputTokens", 0),
-                            "current": mid == current_model,
-                        })
-            except (json.JSONDecodeError, KeyError):
+                    return d.get("model", "")
+            except Exception:
                 continue
     except Exception:
         pass
+    return ""
 
-    aliases = [
-        {"id": "claude-opus-4-7", "name": "Opus 4.7", "desc": "1M context, deepest reasoning"},
-        {"id": "opus", "name": "Opus 4.6", "desc": "Deep reasoning, 200K context"},
-        {"id": "sonnet", "name": "Sonnet", "desc": "Fast, capable, balanced"},
-        {"id": "haiku", "name": "Haiku", "desc": "Fastest, most cost-efficient"},
-    ]
 
-    # Don't show dynamically detected models — aliases cover all options
-    # and the "Current" badge on detected models creates confusion
-    result = aliases
+@bp.route('/api/models')
+def get_models():
+    """Return available Claude models. Sources in priority order:
+    1. Anthropic /v1/models API (if ANTHROPIC_API_KEY is set)
+    2. Persistent confirmed-models cache (grows as sessions run)
+    3. Current model from a quick CLI init call
+    Results are cached for 10 minutes.
+    """
+    import time as _time
+
+    if _models_cache["data"] and _time.time() - _models_cache["ts"] < 600:
+        return jsonify(_models_cache["data"])
+
+    # 1. Try Anthropic API (best source — always up to date)
+    result = _fetch_models_from_anthropic_api()
+
+    if not result:
+        # 2. Use the confirmed-models persistent cache
+        confirmed = _load_confirmed_models()
+
+        # 3. Also fetch the current default model from the CLI and add it
+        cli_model = _fetch_current_model_from_cli()
+        if cli_model and cli_model.startswith("claude-"):
+            if cli_model not in confirmed:
+                confirmed[cli_model] = _model_id_to_display_name(cli_model)
+                try:
+                    _CONFIRMED_MODELS_FILE.write_text(json.dumps(confirmed, indent=2))
+                except Exception:
+                    pass
+
+        if confirmed:
+            result = [{"id": mid, "name": name} for mid, name in confirmed.items()]
+            # Sort: opus first, then sonnet, then haiku; within family highest version first
+            import re as _re
+            def _sort_key(m):
+                mid = m["id"]
+                family = 0 if "opus" in mid else (1 if "sonnet" in mid else 2)
+                nums = [-int(x) for x in _re.findall(r"\d+", mid)]
+                return (family, nums)
+            result.sort(key=_sort_key)
+            # Dedup by display name — keep the first (shortest/cleanest ID per name)
+            seen_names: set = set()
+            deduped = []
+            for m in result:
+                if m["name"] not in seen_names:
+                    seen_names.add(m["name"])
+                    deduped.append(m)
+            result = deduped
+
     _models_cache["data"] = result
     _models_cache["ts"] = _time.time()
     return jsonify(result)

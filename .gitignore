@@ -240,4 +240,5 @@ tests/_scratch_*
 # Secrets - contains Supabase keys
 kanban_config.json
 kanban_config.json.test_backup
+confirmed_models.json
 .gstack/

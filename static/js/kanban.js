@@ -3251,7 +3251,7 @@ async function openSessionSpawner(taskId) {
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();_newSessionSubmit(\'' + newId + '\')}">' +
       '</textarea>' +
       '<div class="live-bar-row">' +
-      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup('') : '') +
+      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup('', true, '') : '') +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + (typeof _sendHint === 'function' ? _sendHint() : '') + '</span>' +
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>' +
@@ -3396,14 +3396,20 @@ async function executeTask(taskId, mode, opts) {
   runningIds.add(newId);
   sessionKinds[newId] = 'working';
 
+  // Resolve model/thinking: per-session override wins over system default.
+  const _kb_model = (typeof _effectiveModel === 'function') ? _effectiveModel()
+    : (typeof defaultModel !== 'undefined' ? defaultModel : '');
+  const _kb_thinking = (typeof _effectiveThinking === 'function') ? _effectiveThinking()
+    : (typeof defaultThinking !== 'undefined' ? defaultThinking : '');
+
   const startOpts = {
     session_id: newId,
     prompt: promptText,
     cwd: typeof _currentProjectDir === 'function' ? _currentProjectDir() : '',
     name: '',
   };
-  if (typeof defaultModel !== 'undefined' && defaultModel) startOpts.model = defaultModel;
-  if (typeof defaultThinking !== 'undefined' && defaultThinking) startOpts.thinking_level = defaultThinking;
+  if (_kb_model) startOpts.model = _kb_model;
+  if (_kb_thinking) startOpts.thinking_level = _kb_thinking;
   if (systemPrompt) startOpts.system_prompt = systemPrompt;
 
   socket.emit('start_session', startOpts);

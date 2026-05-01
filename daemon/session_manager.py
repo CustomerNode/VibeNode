@@ -124,6 +124,8 @@ class SessionInfo:
     _pre_turn_mtimes: dict = field(default_factory=dict) # file_path -> mtime before turn
     _post_turn_mtimes: dict = field(default_factory=dict) # carried forward from _detect_changed_files
     _turn_had_direct_edit: bool = False                  # True if streaming saw Edit/Write this turn
+    _turn_content_started: bool = False                  # True once first ASSISTANT message arrives this turn
+    _awaiting_compact_drain: bool = False                # True when RESULT seen but IDLE emit deferred for post-turn compact check
     _tracked_files_populated: bool = False               # True after first _prepopulate_tracked_files
     _cached_git_files: list = field(default_factory=list) # cached git ls-files result
     _cached_git_files_ts: float = 0.0                     # time.time() when _cached_git_files was set
@@ -503,7 +505,9 @@ class SessionManager:
                     self._emit_entry(info.session_id, entry, entry_index)
             # Set state to WORKING before submitting query
             info.state = SessionState.WORKING
-            # Set compacting substatus immediately so the state event carries it
+            # Reset any stale substatus from the previous turn, then re-set
+            # if this turn is a /compact command.
+            info.substatus = ""
             if _stripped == '/compact':
                 info.substatus = "compacting"
 
@@ -974,14 +978,24 @@ class SessionManager:
                 info.state = SessionState.IDLE
                 self._emit_state(info)
 
+            # Post-turn compact drain (same as _send_query — see comment there).
+            if result_handled and info._awaiting_compact_drain \
+                    and info.task is asyncio.current_task():
+                await self._post_turn_compact_drain(session_id, info)
+                info._awaiting_compact_drain = False
+                if info.task is asyncio.current_task() \
+                        and info.state == SessionState.IDLE:
+                    self._emit_state(info)
+
             # Safety net: if the stream ended without a ResultMessage,
             # force IDLE so the session isn't stuck.  Skip if we already
-            # got a ResultMessage (which handles IDLE + queue dispatch).
+            # got a ResultMessage (drain above handled IDLE + queue dispatch).
             # Also skip if superseded — the new task owns state.
             if not got_result and info.state == SessionState.WORKING \
                     and info.task is asyncio.current_task():
                 logger.warning("_drive_session for %s: stream ended without "
                                "ResultMessage, forcing IDLE", session_id)
+                info._awaiting_compact_drain = False
                 info.state = SessionState.IDLE
                 self._emit_state(info)
 
@@ -1300,6 +1314,8 @@ class SessionManager:
         # back between or after, _write_file_snapshot could read the stale
         # True value from the previous turn and skip the snapshot.
         info._turn_had_direct_edit = False
+        info._turn_content_started = False
+        info._awaiting_compact_drain = False
         await asyncio.gather(
             loop.run_in_executor(None, self._write_file_snapshot, session_id, False),
             loop.run_in_executor(None, self._record_pre_turn_mtimes, info),
@@ -1394,15 +1410,28 @@ class SessionManager:
                         session_id, message.kind.value, pm_err
                     )
 
+            # Post-turn compact drain: pick up compact_boundary/init buffered
+            # after ResultMessage so auto-compaction shows "Compacting…" status
+            # rather than silently hanging IDLE for 1-2 minutes.
+            if result_handled and info._awaiting_compact_drain \
+                    and info.task is asyncio.current_task():
+                await self._post_turn_compact_drain(session_id, info)
+                info._awaiting_compact_drain = False
+                # Emit IDLE if drain didn't already transition state (no compaction
+                # found, or compaction already completed inside the drain).
+                if info.task is asyncio.current_task() \
+                        and info.state == SessionState.IDLE:
+                    self._emit_state(info)
+
             # Safety net: if the stream ended without a ResultMessage,
             # force IDLE so the session isn't stuck forever.  Skip if we
-            # got a ResultMessage — _process_message already handled the
-            # IDLE transition (and may have dispatched a queued message
-            # which set state back to WORKING).  Also skip if superseded.
+            # got a ResultMessage — the drain above handled IDLE transition.
+            # Also skip if superseded.
             if not got_result and info.state == SessionState.WORKING \
                     and info.task is asyncio.current_task():
                 logger.warning("_send_query for %s: stream ended without "
                                "ResultMessage, forcing IDLE", session_id)
+                info._awaiting_compact_drain = False
                 info.state = SessionState.IDLE
                 self._emit_state(info)
 
@@ -2065,6 +2094,7 @@ class SessionManager:
             # init SYSTEM should clear it. ASSISTANT can arrive
             # mid-compact (e.g. partial streaming) and clearing here causes
             # the UI to flash back to "Working" during compaction.
+            info._turn_content_started = True
             for block in message.blocks:
                 bk = block.get("kind", "")
 
@@ -2219,11 +2249,26 @@ class SessionManager:
 
             # Detect compaction events — CLI sends "compact_boundary" subtype
             if subtype == 'compact_boundary':
+                # Guard against stale SDK-buffered compact_boundary messages.
+                # The SDK delivers compact_boundary AFTER ResultMessage, so it
+                # stays in the internal MemoryObjectStream buffer and gets
+                # picked up at the START of the next turn before any content.
+                # A legitimate compact_boundary always arrives either:
+                #   (a) after some assistant content (auto-compact mid-task), or
+                #   (b) at the start of a /compact turn (substatus already set).
+                # If neither is true, this is a stale leftover — discard it.
+                if not info._turn_content_started and info.substatus != 'compacting':
+                    logger.info("Discarding stale compact_boundary for %s (buffered from prior turn)", session_id)
+                    return
                 compact_meta = data.get('compactMetadata', {})
                 pre_tokens = compact_meta.get('preTokens', 0)
                 trigger = compact_meta.get('trigger', 'auto')
                 logger.info("Compact boundary: trigger=%s preTokens=%d", trigger, pre_tokens)
 
+                # Set WORKING so _emit_state won't auto-clear the substatus
+                # (the substatus-clear guard fires on IDLE/STOPPED only).
+                # This covers both mid-turn and post-turn (deferred IDLE) cases.
+                info.state = SessionState.WORKING
                 info.substatus = "compacting"
                 # Store pre-compaction token count for UI display
                 if pre_tokens:
@@ -2244,15 +2289,38 @@ class SessionManager:
                 logger.info("Turn duration for %s: %s", session_id,
                             {k: v for k, v in data.items() if k != 'type'})
 
-            elif subtype == 'init' and info.substatus == 'compacting':
-                # End of compaction — session re-initialized
+            elif subtype == 'init':
+                # Record the resolved model ID so /api/models always knows
+                # which models this installation has actually used.
+                resolved_model = data.get("model", "")
+                if resolved_model and resolved_model.startswith("claude-"):
+                    if info.model != resolved_model:
+                        info.model = resolved_model
+                    try:
+                        from app.routes.live_api import record_confirmed_model
+                        record_confirmed_model(resolved_model)
+                    except Exception:
+                        pass
+
+                # End of compaction (or session re-init) — always clear substatus.
+                # Only add the "Context compacted" log entry if we were actually
+                # compacting; avoids spurious entries on a plain session restart.
+                was_compacting = info.substatus == 'compacting'
                 info.substatus = ""
+                # Restore IDLE only if we're in post-turn context
+                # (_awaiting_compact_drain=True means RESULT already came and
+                # we're draining the buffer — safe to go IDLE now).
+                # Mid-turn compaction must NOT set IDLE here — the session is
+                # still generating a response and will reach RESULT normally.
+                if was_compacting and info._awaiting_compact_drain:
+                    info.state = SessionState.IDLE
                 self._emit_state(info)
-                entry = LogEntry(kind="system", text="Context compacted")
-                with info._lock:
-                    info.entries.append(entry)
-                    entry_index = len(info.entries) - 1
-                self._emit_entry(session_id, entry, entry_index)
+                if was_compacting:
+                    entry = LogEntry(kind="system", text="Context compacted")
+                    with info._lock:
+                        info.entries.append(entry)
+                        entry_index = len(info.entries) - 1
+                    self._emit_entry(session_id, entry, entry_index)
             else:
                 # Forward any other system message as a push event for debugging
                 if self._push_callback:
@@ -2348,7 +2416,12 @@ class SessionManager:
                     )
 
             info.state = SessionState.IDLE
-            self._emit_state(info)
+            # Defer the IDLE emit: compact_boundary may be buffered immediately
+            # after this ResultMessage (auto-compaction post-turn notification).
+            # _post_turn_compact_drain() in _send_query/_drive_session will pick
+            # it up and emit WORKING+compacting instead; only if no compact_boundary
+            # is found does it fall through to emit IDLE normally.
+            info._awaiting_compact_drain = True
 
         elif message.kind == MessageKind.STREAM_EVENT:
             # Forward raw streaming events for partial message display
@@ -2900,6 +2973,78 @@ class SessionManager:
     # WebSocket emission helpers
     # ------------------------------------------------------------------
 
+    async def _post_turn_compact_drain(self, session_id: str, info: SessionInfo) -> None:
+        """Drain the SDK buffer after RESULT to detect auto-compaction.
+
+        The SDK sends compact_boundary AFTER ResultMessage as a post-turn
+        notification.  The main receive_response() loop terminates at RESULT,
+        so compact_boundary (and init) are left in the SDK's MemoryObjectStream
+        buffer.  This method peeks at the buffer for up to 100 ms — fast enough
+        to be imperceptible on normal turns, but enough to catch a buffered
+        compact_boundary.  If one is found, we wait up to 5 minutes for init
+        so the session shows "Compacting…" for the true compaction duration.
+        """
+        compact_seen = False
+
+        # Phase 1: short peek for compact_boundary (already buffered if present)
+        try:
+            async def _peek():
+                nonlocal compact_seen
+                async for msg in self._sdk.receive_response(info.client):
+                    if info.task is not asyncio.current_task():
+                        return
+                    await self._process_message(session_id, msg)
+                    if msg.kind == MessageKind.SYSTEM:
+                        sub = msg.subtype or ''
+                        if sub == 'compact_boundary':
+                            compact_seen = True
+                            return  # Confirmed — move to Phase 2
+                        elif sub == 'init':
+                            return  # Already done (fast compaction)
+                        # Other system messages (e.g. turn_duration) — keep draining
+                    else:
+                        # Non-system in post-turn buffer — unexpected, stop
+                        logger.warning("Unexpected post-turn msg kind=%s for %s",
+                                       msg.kind.value, session_id)
+                        return
+            await asyncio.wait_for(_peek(), timeout=0.1)
+        except asyncio.TimeoutError:
+            pass  # Normal — no buffered messages means no compaction
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("_post_turn_compact_drain peek error for %s: %s", session_id, e)
+
+        if not compact_seen or info.task is not asyncio.current_task():
+            return
+
+        # Phase 2: compact_boundary confirmed — wait for init (actual compaction)
+        logger.info("Auto-compaction detected for %s — waiting for init", session_id)
+        try:
+            async def _wait_init():
+                async for msg in self._sdk.receive_response(info.client):
+                    if info.task is not asyncio.current_task():
+                        return
+                    await self._process_message(session_id, msg)
+                    if msg.kind == MessageKind.SYSTEM and (msg.subtype or '') == 'init':
+                        return  # Compaction complete
+                    elif msg.kind == MessageKind.RESULT:
+                        return  # Unexpected second RESULT — stop
+                    elif msg.kind != MessageKind.SYSTEM:
+                        logger.warning("Unexpected post-compact msg kind=%s for %s",
+                                       msg.kind.value, session_id)
+                        return
+            await asyncio.wait_for(_wait_init(), timeout=300.0)
+        except asyncio.TimeoutError:
+            logger.warning("Auto-compact timed out waiting for init on %s (5 min)", session_id)
+            if info.task is asyncio.current_task() and info.substatus:
+                info.substatus = ""
+                self._emit_state(info)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("_post_turn_compact_drain wait-init error for %s: %s", session_id, e)
+
     def _emit_state(self, info: SessionInfo) -> None:
         """Push session state change to all connected WebSocket clients.
 
@@ -2912,6 +3057,11 @@ class SessionManager:
             info.working_since = time.time()
         elif info.state != SessionState.WORKING:
             info.working_since = 0.0
+        # Auto-clear stale substatus when session is no longer actively working.
+        # This ensures safety-net IDLE transitions don't carry "compacting" forward
+        # into the next turn's WORKING state emission.
+        if info.state in (SessionState.IDLE, SessionState.STOPPED) and info.substatus:
+            info.substatus = ""
         if self._push_callback:
             data = info.to_state_dict()
             # Include queue data from server-side store

@@ -506,15 +506,24 @@ socket.on('session_state', (data) => {
     window._sessionStateTs[session_id] = Date.now();
 
     // Track substatus (e.g. "compacting") per session.
-    // Don't clear an optimistic "compacting" substatus when a WORKING
-    // state event arrives without substatus — compact_boundary confirms it.
-    // But if the server explicitly sends substatus="" (key present, empty),
-    // that means compaction finished — always honour it.
+    // Rules:
+    //   • Only store a substatus for sessions that are actively WORKING —
+    //     idle/stopped/waiting sessions must never carry a stale substatus.
+    //   • For working sessions: preserve an optimistic "compacting" value if
+    //     the server sends a working event without an explicit substatus field
+    //     (compact_boundary is the authoritative confirmation that arrives
+    //     shortly after the optimistic set in liveCompact()).
+    //   • Any explicit substatus="" from the server always wins (clears it).
     if (!window._sessionSubstatus) window._sessionSubstatus = {};
     const substatusExplicit = data.hasOwnProperty('substatus');
-    if (substatus) {
+    if (substatus && state === 'working') {
+        // Server says "compacting" (or future substatus) and session is working
         window._sessionSubstatus[session_id] = substatus;
-    } else if (substatusExplicit || state !== 'working' || window._sessionSubstatus[session_id] !== 'compacting') {
+    } else if (state !== 'working') {
+        // Non-working state (idle/stopped/waiting) — always clear substatus
+        delete window._sessionSubstatus[session_id];
+    } else if (substatusExplicit || window._sessionSubstatus[session_id] !== 'compacting') {
+        // Working state, no substatus: clear unless we're preserving optimistic "compacting"
         delete window._sessionSubstatus[session_id];
     }
 

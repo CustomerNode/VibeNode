@@ -424,6 +424,15 @@ def register_ws_events(socketio, app):
                 _ts_tag += ' (transcribed from voice \u2014 may contain transcription errors)'
             prompt = prompt + _ts_tag
 
+        # Build extra_args from thinking_level — maps to --effort CLI flag.
+        # Values: 'low', 'medium', 'high', 'auto', 'max' are forwarded;
+        # '' or 'none' mean "no explicit effort setting" (use model default).
+        extra_args: dict = {}
+        if thinking_level and thinking_level not in ('', 'none'):
+            valid_effort = ('low', 'medium', 'high', 'auto', 'max')
+            if thinking_level in valid_effort:
+                extra_args['effort'] = thinking_level
+
         sm = app.session_manager
         if _PROFILE_WS:
             logger.info("PROFILE start_session [%s] pre-processing done: %.3fs",
@@ -440,6 +449,7 @@ def register_ws_events(socketio, app):
             allowed_tools=allowed_tools,
             permission_mode=permission_mode,
             session_type=session_type,
+            extra_args=extra_args or None,
         )
 
         if result.get('ok'):

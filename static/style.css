@@ -10141,6 +10141,75 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
   background: linear-gradient(135deg, rgba(168,85,247,0.2), rgba(59,130,246,0.2));
 }
 
+/* ── Per-session model button (interactive, new sessions) ── */
+.session-model-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+  letter-spacing: .03em;
+}
+.session-model-btn:hover {
+  border-color: var(--border-focus);
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+/* Highlighted when the user has overridden the system default for this session */
+.session-model-btn.session-model-overridden {
+  border-color: #3b82f6;
+  color: #3b82f6;
+  background: rgba(59,130,246,0.08);
+}
+.session-model-btn.session-model-overridden:hover {
+  background: rgba(59,130,246,0.15);
+}
+
+/* ── Per-session model badge (running sessions) ── */
+.session-model-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  font-size: 10px;
+  font-weight: 600;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-faint);
+  white-space: nowrap;
+  letter-spacing: .03em;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.session-model-badge:hover {
+  border-color: var(--border-focus);
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+.session-model-badge.session-model-overridden {
+  border-color: #3b82f6;
+  color: #3b82f6;
+  background: rgba(59,130,246,0.08);
+}
+
+[data-theme="light"] .session-model-btn {
+  background: var(--bg-input);
+  border-color: var(--border);
+}
+[data-theme="light"] .session-model-btn.session-model-overridden {
+  border-color: #2563eb;
+  color: #2563eb;
+  background: rgba(37,99,235,0.07);
+}
+
 /* ── Invoke Modal Overlay ── */
 .invoke-overlay {
   position: fixed;

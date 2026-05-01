@@ -964,15 +964,7 @@ async function addNewAgent() {
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();_newSessionSubmit(\'' + newId + '\')}">' +
       '</textarea>' +
       '<div class="live-bar-row">' +
-      '<div class="bar-left-group">' +
-      '<button class="invoke-btn" id="invoke-btn" onclick="_openInvokeModal()" title="Invoke Workforce">' +
-      '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="url(#invoke-grad-ns)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">' +
-      '<defs><linearGradient id="invoke-grad-ns" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#a855f7"/><stop offset="100%" stop-color="#3b82f6"/></linearGradient></defs>' +
-      '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>' +
-      '</svg>' +
-      '<span class="invoke-btn-label">/invoke</span>' +
-      '</button>' +
-      '</div>' +
+      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup('', true, '') : '<div class="bar-left-group"></div>') +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>';
@@ -1117,15 +1109,22 @@ async function _newSessionSubmit(sessionId) {
       : _invokeNotice.trim();
   }
 
+  // Resolve model and thinking level: per-session override wins over system default.
+  const _modelToUse = (typeof _effectiveModel === 'function') ? _effectiveModel() : defaultModel;
+  const _thinkingToUse = (typeof _effectiveThinking === 'function') ? _effectiveThinking() : defaultThinking;
+
   const startOpts = {
     session_id: sessionId,
     prompt: text,
     cwd: _currentProjectDir(),
     name: '',
   };
-  if (defaultModel) startOpts.model = defaultModel;
-  if (defaultThinking) startOpts.thinking_level = defaultThinking;
+  if (_modelToUse) startOpts.model = _modelToUse;
+  if (_thinkingToUse) startOpts.thinking_level = _thinkingToUse;
   if (systemPrompt) startOpts.system_prompt = systemPrompt;
+
+  // Clear per-session overrides now that the session is being dispatched.
+  if (typeof _clearSessionModelOverride === 'function') _clearSessionModelOverride();
 
   // Auto-detect compose task context — inject compose_task_id so the
   // backend can resolve and inject the compose system prompt automatically.
@@ -1534,6 +1533,20 @@ function filterSessions() {
 // ===== Model / Thinking / Template / Department selectors =====
 
 // --- Model Selector ---
+// Migrate old short aliases ('sonnet', 'haiku', 'opus') stored in localStorage to
+// full model IDs.  Short aliases work at the CLI level but full IDs are more
+// explicit and avoid any version-specific alias resolution differences.
+const _MODEL_ALIAS_MIGRATION = {
+  'opus':   'claude-opus-4-6',
+  'sonnet': 'claude-sonnet-4-6',
+  'haiku':  'claude-haiku-4-5',
+};
+(function _migrateModelId() {
+  const stored = localStorage.getItem('defaultModel');
+  if (stored && _MODEL_ALIAS_MIGRATION[stored]) {
+    localStorage.setItem('defaultModel', _MODEL_ALIAS_MIGRATION[stored]);
+  }
+})();
 let defaultModel = localStorage.getItem('defaultModel') || 'claude-opus-4-7';
 
 async function openModelSelector() {
@@ -1551,11 +1564,12 @@ async function openModelSelector() {
     const resp = await fetch('/api/models');
     models = await resp.json();
   } catch (e) {
+    // Fallback list uses full model IDs — same as server aliases
     models = [
-      {id: 'claude-opus-4-7', name: 'Opus 4.7', desc: '1M context, deepest reasoning'},
-      {id: 'opus', name: 'Opus 4.6', desc: 'Deep reasoning, 200K context'},
-      {id: 'sonnet', name: 'Sonnet', desc: 'Fast, capable, balanced'},
-      {id: 'haiku', name: 'Haiku', desc: 'Fastest, most cost-efficient'},
+      {id: 'claude-opus-4-7',  name: 'Opus 4.7',   desc: '1M context, deepest reasoning'},
+      {id: 'claude-opus-4-6',  name: 'Opus 4.6',   desc: 'Deep reasoning, 200K context'},
+      {id: 'claude-sonnet-4-6',name: 'Sonnet 4.6', desc: 'Fast, capable, balanced'},
+      {id: 'claude-haiku-4-5', name: 'Haiku 4.5',  desc: 'Fastest, most cost-efficient'},
     ];
   }
 
@@ -1591,14 +1605,26 @@ async function openModelSelector() {
   });
 }
 
+/** Return a short human-readable label for a model ID string.
+ *  Handles both full IDs (e.g. 'claude-sonnet-4-6') and legacy short aliases
+ *  ('sonnet', 'haiku', 'opus') so users who had old localStorage values still
+ *  see correct labels without needing to re-select.
+ */
+function _modelLabel(modelId) {
+  if (!modelId) return 'Opus 4.7';
+  if (modelId.includes('opus-4-7'))  return 'Opus 4.7';
+  if (modelId.includes('opus-4-6') || modelId === 'opus')  return 'Opus 4.6';
+  if (modelId.includes('opus'))      return 'Opus';
+  if (modelId.includes('sonnet-4-6') || (modelId === 'sonnet')) return 'Sonnet 4.6';
+  if (modelId.includes('sonnet'))    return 'Sonnet';
+  if (modelId.includes('haiku-4-5') || (modelId === 'haiku'))  return 'Haiku 4.5';
+  if (modelId.includes('haiku'))     return 'Haiku';
+  return modelId;
+}
+
 function _updateModelLabel() {
   const el = document.getElementById('sys-model-label');
-  if (!el) return;
-  if (defaultModel.includes('opus-4-7')) el.textContent = 'Opus 4.7';
-  else if (defaultModel === 'opus') el.textContent = 'Opus 4.6';
-  else if (defaultModel.includes('sonnet')) el.textContent = 'Sonnet';
-  else if (defaultModel.includes('haiku')) el.textContent = 'Haiku';
-  else el.textContent = defaultModel || 'Opus 4.7';
+  if (el) el.textContent = _modelLabel(defaultModel);
 }
 _updateModelLabel();
 
