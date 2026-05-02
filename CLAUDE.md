@@ -64,7 +64,10 @@ VibeNode underwent a measurement-driven performance overhaul. The patterns below
 15. **`allSessionIds` Set** — `static/js/app.js`. Must stay in sync with `allSessions` at all mutation sites. Do NOT replace `.has()` with `.find()`.
 16. **Watchdog dedup** — `static/js/live-panel.js`. `window._watchdogSid`/`window._watchdogTimer` enable cross-script dedup. Do NOT remove the `window.` assignments.
 17. **`performance.mark()`/`performance.measure()` instrumentation** — `static/js/socket.js`. Submit timing and session switch timing. Do NOT remove.
-18. **Chrome-first browser launch** — `run.py` `_find_chrome()` + `open_browser()`. The Web Speech API (voice input) is Chromium-only. `open_browser()` MUST find and launch Chrome via `ShellExecuteW`, NOT use `os.startfile(url)` as the primary method (that opens the default browser which may be Firefox). `os.startfile` is ONLY the fallback when Chrome is not installed. Do NOT "simplify" by removing `_find_chrome()` or replacing `ShellExecuteW` with `os.startfile` — this exact regression already broke voice input in production.
+18. **Chrome-first browser launch** — `run.py` `_find_chrome()` / `_find_chrome_linux()` / `_find_chrome_macos()` + `open_browser()`. The Web Speech API (voice input) is Chromium-only. ALL THREE PLATFORMS must find and launch Chrome/Chromium before falling back to the system default browser opener — the default may be Firefox, which silently breaks voice with no error messages. This regression already happened once on Windows and shipped to users. Do NOT replace any platform's Chrome-first path with only the system fallback (`os.startfile`, `xdg-open`, or `open`) as the sole method. Platform pattern:
+   - Windows: `_find_chrome()` → `ShellExecuteW(chrome, url)` → `os.startfile` fallback
+   - Linux:   `_find_chrome_linux()` → `Popen([chrome, url])` → `xdg-open` fallback
+   - macOS:   `_find_chrome_macos()` → `Popen([chrome, url])` → `open` fallback
 
 ## Compose project-scoping — DO NOT REMOVE (fixed 2026-04-13)
 

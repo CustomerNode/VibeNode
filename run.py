@@ -80,21 +80,26 @@ def ensure_daemon():
     try:
         # Windows: CREATE_NO_WINDOW so it doesn't pop up a console
         # Also CREATE_NEW_PROCESS_GROUP so it survives this process dying
-        creation_flags = 0
-        if sys.platform == "win32":
-            creation_flags = (
-                subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-            )
+        # Linux/macOS: start_new_session=True creates a new session (setsid),
+        # detaching the daemon from the terminal's process group so it is immune
+        # to SIGHUP when the launch terminal is closed.
         daemon_log = Path(__file__).parent / "logs" / "daemon_debug.log"
         daemon_log.parent.mkdir(exist_ok=True)
         _daemon_fh = open(daemon_log, "a")
-        subprocess.Popen(
-            [sys.executable, str(daemon_script)],
-            cwd=str(daemon_script.parent.parent),
-            creationflags=creation_flags,
-            stdout=_daemon_fh,
-            stderr=_daemon_fh,
-        )
+        popen_kwargs = {
+            "cwd": str(daemon_script.parent.parent),
+            "stdout": _daemon_fh,
+            "stderr": _daemon_fh,
+        }
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = (
+                subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            # start_new_session=True calls setsid() in the child, placing it in
+            # a new process group and session independent of the launcher's TTY.
+            popen_kwargs["start_new_session"] = True
+        subprocess.Popen([sys.executable, str(daemon_script)], **popen_kwargs)
     except Exception as e:
         print("  WARNING: Could not start daemon: %s" % e, flush=True)
         return
@@ -307,11 +312,17 @@ except Exception as _init_err:
 ## ── CRITICAL: Chrome-first browser launch ──────────────────────────────────
 ## DO NOT replace this with os.startfile(url) or webbrowser.open(url) alone.
 ## The Web Speech API (voice input) is Chromium-only. Firefox does not support
-## it. If the default browser is Firefox, os.startfile silently breaks voice
-## with zero error messages — the mic button just disappears.
-## This exact regression already happened once and shipped to users.
-## The correct pattern: _find_chrome() → ShellExecuteW(chrome, url) → fallback.
-## Tests in tests/test_browser_launch.py enforce this — run them before changing.
+## it. If the default browser is Firefox, the browser opener silently breaks
+## voice with zero error messages — the mic button just disappears.
+## This exact regression already happened once on Windows and shipped to users.
+##
+## All three platforms use Chrome-first, system-browser fallback:
+##   Windows: _find_chrome()       → ShellExecuteW(chrome, url) → os.startfile
+##   Linux:   _find_chrome_linux() → Popen([chrome, url])       → xdg-open
+##   macOS:   _find_chrome_macos() → Popen([chrome, url])       → open
+##
+## Tests in tests/test_browser_launch.py enforce the Windows pattern.
+## Run them before changing _find_chrome() or the Windows open_browser block.
 ## ────────────────────────────────────────────────────────────────────────────
 
 def _find_chrome():
@@ -335,6 +346,62 @@ def _find_chrome():
         if not base:
             continue
         p = os.path.join(base, "Google", "Chrome", "Application", "chrome.exe")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _find_chrome_linux():
+    """Return the path to a Chromium-based browser on Linux, or None.
+
+    Tries binary names in order of preference — the Web Speech API requires
+    a Chromium-based browser, so we prefer Google Chrome over Chromium over
+    other Chromium-derived browsers.
+
+    Returns None if no Chromium-based browser is found in PATH or common
+    install locations, so the caller can fall back to xdg-open.
+    """
+    # Ordered by preference: stable Chrome first, then Chromium variants
+    candidates = [
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "google-chrome-beta",
+        "google-chrome-unstable",
+    ]
+    for name in candidates:
+        path = shutil.which(name)
+        if path:
+            return path
+    # Check common install locations not always on PATH
+    common_paths = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+        "/opt/google/chrome/google-chrome",
+    ]
+    for p in common_paths:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _find_chrome_macos():
+    """Return the path to Chrome/Chromium on macOS, or None.
+
+    Checks standard /Applications and ~/Applications locations.
+    Returns None so the caller falls back to the system `open` command.
+    """
+    home = str(Path.home())
+    common_paths = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        os.path.join(home, "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        os.path.join(home, "Applications/Chromium.app/Contents/MacOS/Chromium"),
+    ]
+    for p in common_paths:
         if os.path.isfile(p):
             return p
     return None
@@ -395,17 +462,46 @@ def open_browser():
             except Exception as e:
                 _log("os.startfile failed: %s" % e)
     elif sys.platform == "darwin":
-        try:
-            subprocess.Popen(["open", url])
-            opened = True
-        except FileNotFoundError:
-            pass
+        # CRITICAL: Prefer Chrome/Chromium on macOS for the same reason as
+        # Windows and Linux — the Web Speech API (voice input) is Chromium-only.
+        # `open url` would launch whatever the user's default browser is.
+        chrome_path = _find_chrome_macos()
+        if chrome_path:
+            try:
+                subprocess.Popen([chrome_path, url])
+                _log("Opened Chrome/Chromium via %s" % chrome_path)
+                opened = True
+            except Exception as e:
+                _log("Chrome launch failed (%s): %s" % (chrome_path, e))
+        if not opened:
+            try:
+                subprocess.Popen(["open", url])
+                _log("Chrome not found — opened default browser via open")
+                opened = True
+            except FileNotFoundError:
+                pass
     elif sys.platform == "linux":
-        try:
-            subprocess.Popen(["xdg-open", url])
-            opened = True
-        except FileNotFoundError:
-            pass
+        # CRITICAL: Prefer Chrome/Chromium on Linux for the same reason as
+        # Windows — the Web Speech API (voice input) is Chromium-only.
+        # Try to find and launch Chrome/Chromium first; fall back to xdg-open
+        # (which may open Firefox or another browser) only if Chromium is
+        # not installed.  This mirrors the Windows ShellExecuteW + Chrome
+        # pattern that was added after voice input broke for Windows users.
+        chrome_path = _find_chrome_linux()
+        if chrome_path:
+            try:
+                subprocess.Popen([chrome_path, url])
+                _log("Opened Chrome/Chromium via %s" % chrome_path)
+                opened = True
+            except Exception as e:
+                _log("Chrome launch failed (%s): %s" % (chrome_path, e))
+        if not opened:
+            try:
+                subprocess.Popen(["xdg-open", url])
+                _log("Chrome not found — opened default browser via xdg-open")
+                opened = True
+            except FileNotFoundError:
+                pass
 
     if not opened:
         try:
