@@ -375,12 +375,17 @@ def _find_chrome_linux():
         if path:
             return path
     # Check common install locations not always on PATH
+    home = str(Path.home())
     common_paths = [
         "/usr/bin/google-chrome",
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
-        "/snap/bin/chromium",
-        "/opt/google/chrome/google-chrome",
+        "/snap/bin/google-chrome",          # Ubuntu snap: google-chrome package
+        "/snap/bin/chromium",               # Ubuntu snap: chromium package
+        "/opt/google/chrome/google-chrome", # Manual/enterprise Chrome install
+        # Flatpak — system and per-user exports
+        "/var/lib/flatpak/exports/bin/com.google.Chrome",
+        os.path.join(home, ".local/share/flatpak/exports/bin/com.google.Chrome"),
     ]
     for p in common_paths:
         if os.path.isfile(p):

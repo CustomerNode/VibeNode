@@ -1,28 +1,84 @@
-"""Source guard: Windows browser launch MUST open Chrome (not the default browser).
+"""Source guards: browser launch on ALL platforms MUST open Chrome first.
 
-TWO hard requirements for browser launch on Windows:
+The Web Speech API (voice input) is Chromium-only.  Firefox and Safari do not
+implement it.  If the default browser is Firefox, voice input silently
+disappears with no error message.  All three platforms use a Chrome-finder +
+fallback pattern:
 
-1. MUST open Chrome/Chromium — The Web Speech API (voice input) is Chromium-only.
-   Firefox and Safari do not implement it. If the default browser is Firefox, voice
-   input silently disappears with no error message. This broke in production when
-   os.startfile (default browser) replaced the Chrome-specific launch.
+  Windows: _find_chrome()       → ShellExecuteW(chrome, url) → os.startfile
+  Linux:   _find_chrome_linux() → Popen([chrome, url])       → xdg-open
+  macOS:   _find_chrome_macos() → Popen([chrome, url])       → open
 
-2. MUST be focus-safe — launch.bat starts VibeNode minimized (start /min).
-   subprocess.Popen and webbrowser.open spawn child processes that inherit the
-   minimized state on Windows 11, creating invisible browser windows.
-   ShellExecuteW (via ctypes) and os.startfile go through ShellExecuteEx which
-   is focus-safe.  ShellExecuteW lets us target Chrome specifically.
+Windows additionally requires focus-safety: launch.bat uses start /min, and
+subprocess.Popen spawns minimised children that never come to the foreground.
+ShellExecuteW is focus-safe and Chrome-specific.
 
-The correct pattern is: find Chrome → ShellExecuteW(chrome, url) → fall back to
-os.startfile(url) only if Chrome is not installed.
-
-This test reads run.py source to verify these invariants haven't been broken.
+These tests read run.py source to verify none of these invariants have been
+accidentally broken.
 """
 
 import re
 from pathlib import Path
 
 _RUN_PY = Path(__file__).resolve().parent.parent / "run.py"
+
+
+def _get_open_browser_lines():
+    """Return (lines, first_line_index) for the open_browser() function body."""
+    src = _RUN_PY.read_text(encoding="utf-8")
+    lines = src.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if 'def open_browser' in line:
+            start = i
+            break
+    assert start is not None, "open_browser() not found in run.py"
+    # Collect until next top-level def/class or EOF
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i] and not lines[i][0].isspace() and (
+            lines[i].startswith('def ') or lines[i].startswith('class ')
+        ):
+            end = i
+            break
+    return lines[start:end], start
+
+
+def _get_platform_block(platform_value: str):
+    """Extract the if/elif block for a given platform string inside open_browser().
+
+    Returns the block as a single string.
+    platform_value: 'win32', 'darwin', or 'linux'
+    """
+    lines, _ = _get_open_browser_lines()
+
+    block_start = None
+    for i, line in enumerate(lines):
+        if 'sys.platform' in line and platform_value in line:
+            block_start = i
+            break
+
+    assert block_start is not None, \
+        f"No sys.platform == {platform_value!r} block found in open_browser()"
+
+    # Walk forward to find the next elif/else/if at the same indent level,
+    # or end of function.
+    indent = len(lines[block_start]) - len(lines[block_start].lstrip())
+    block_end = len(lines)
+    for i in range(block_start + 1, len(lines)):
+        stripped = lines[i].lstrip()
+        if not stripped:
+            continue
+        curr_indent = len(lines[i]) - len(stripped)
+        if curr_indent <= indent and (
+            stripped.startswith('elif') or stripped.startswith('else') or
+            stripped.startswith('if ') or stripped.startswith('return') or
+            stripped.startswith('opened')
+        ):
+            block_end = i
+            break
+
+    return "\n".join(lines[block_start:block_end])
 
 
 def _get_windows_browser_block():
@@ -161,3 +217,183 @@ class TestBrowserLaunchSourceGuard:
             assert "start /min" in src, \
                 "launch.bat uses start /min — this is why browser launch " \
                 "must use ShellExecuteW (child processes can't steal focus)"
+
+
+# ---------------------------------------------------------------------------
+# Linux source guards
+# ---------------------------------------------------------------------------
+
+class TestLinuxBrowserLaunch:
+    """Verify the Linux browser launch block is Chrome-first with xdg-open fallback.
+
+    The Web Speech API (voice input) is Chromium-only.  xdg-open alone opens
+    whatever the user's default browser is; if it is Firefox, voice silently
+    breaks.  _find_chrome_linux() must be called first so Chrome/Chromium is
+    the primary target.
+    """
+
+    def test_find_chrome_linux_function_exists(self):
+        """run.py must define _find_chrome_linux()."""
+        src = _RUN_PY.read_text(encoding="utf-8")
+        assert "def _find_chrome_linux" in src, \
+            "run.py must define _find_chrome_linux() — Linux Chrome-first launch " \
+            "requires a dedicated finder. Removing it falls back to xdg-open " \
+            "which opens Firefox if that is the system default, breaking voice."
+
+    def test_linux_block_calls_find_chrome_linux(self):
+        """Linux browser block must call _find_chrome_linux()."""
+        block = _get_platform_block("linux")
+        assert "_find_chrome_linux" in block, \
+            "Linux open_browser() block must call _find_chrome_linux() to locate " \
+            "Chrome before launching. Voice input requires Chromium."
+
+    def test_linux_block_has_xdg_open_fallback(self):
+        """xdg-open must exist as the FALLBACK (not primary) on Linux."""
+        block = _get_platform_block("linux")
+        assert "xdg-open" in block, \
+            "Linux browser launch must have xdg-open as a fallback for systems " \
+            "where Chrome/Chromium is not installed."
+
+    def test_linux_chrome_before_xdg_open(self):
+        """Chrome finder must appear BEFORE xdg-open in the Linux block."""
+        block = _get_platform_block("linux")
+        chrome_pos = block.find("_find_chrome_linux")
+        # Search for the actual Popen call (with quotes), not comment references
+        xdg_pos = block.find('"xdg-open"')
+        assert chrome_pos != -1 and xdg_pos != -1, \
+            "Linux block must contain both _find_chrome_linux and xdg-open"
+        assert chrome_pos < xdg_pos, \
+            "_find_chrome_linux() (Chrome, primary) must come BEFORE " \
+            "xdg-open (fallback). xdg-open opens the default browser which " \
+            "may be Firefox. Chrome must be the primary launch target."
+
+    def test_find_chrome_linux_checks_snap_path(self):
+        """_find_chrome_linux must check /snap/bin/google-chrome.
+
+        Ubuntu 22.04+ ships Google Chrome as a snap package.  The snap
+        binary is at /snap/bin/google-chrome and is NOT on the regular PATH
+        unless /snap/bin is in PATH.  Without this check, Chrome installed
+        via snap is invisible to the finder.
+        """
+        src = _RUN_PY.read_text(encoding="utf-8")
+        # Extract just the _find_chrome_linux function body
+        start = src.find("def _find_chrome_linux")
+        end = src.find("\ndef ", start + 1)
+        func_body = src[start:end]
+        assert "/snap/bin/google-chrome" in func_body, \
+            "_find_chrome_linux() must check /snap/bin/google-chrome — " \
+            "Ubuntu installs Chrome as a snap and the binary lives there."
+
+
+# ---------------------------------------------------------------------------
+# macOS source guards
+# ---------------------------------------------------------------------------
+
+class TestMacosBrowserLaunch:
+    """Verify the macOS browser launch block is Chrome-first with 'open' fallback.
+
+    The Web Speech API (voice input) is Chromium-only.  The macOS system
+    'open' command launches the user's default browser; if it is Firefox,
+    voice silently breaks.  _find_chrome_macos() must be called first.
+    """
+
+    def test_find_chrome_macos_function_exists(self):
+        """run.py must define _find_chrome_macos()."""
+        src = _RUN_PY.read_text(encoding="utf-8")
+        assert "def _find_chrome_macos" in src, \
+            "run.py must define _find_chrome_macos() — macOS Chrome-first launch " \
+            "requires a dedicated finder. Removing it falls back to 'open url' " \
+            "which opens Firefox if that is the system default, breaking voice."
+
+    def test_macos_block_calls_find_chrome_macos(self):
+        """macOS browser block must call _find_chrome_macos()."""
+        block = _get_platform_block("darwin")
+        assert "_find_chrome_macos" in block, \
+            "macOS open_browser() block must call _find_chrome_macos() to locate " \
+            "Chrome before launching. Voice input requires Chromium."
+
+    def test_macos_block_has_open_fallback(self):
+        """The macOS system 'open' command must exist as the FALLBACK."""
+        block = _get_platform_block("darwin")
+        assert '"open"' in block or "'open'" in block, \
+            "macOS browser launch must fall back to the system 'open' command " \
+            "for systems where Chrome/Chromium is not installed."
+
+    def test_macos_chrome_before_open_fallback(self):
+        """Chrome finder must appear BEFORE 'open' fallback in the macOS block."""
+        block = _get_platform_block("darwin")
+        chrome_pos = block.find("_find_chrome_macos")
+        open_pos = block.find('"open"')
+        if open_pos == -1:
+            open_pos = block.find("'open'")
+        assert chrome_pos != -1 and open_pos != -1, \
+            "macOS block must contain both _find_chrome_macos and the 'open' fallback"
+        assert chrome_pos < open_pos, \
+            "_find_chrome_macos() (Chrome, primary) must come BEFORE " \
+            "'open' (fallback). 'open' launches the default browser which " \
+            "may be Firefox. Chrome must be the primary launch target."
+
+    def test_find_chrome_macos_checks_applications_bundle(self):
+        """_find_chrome_macos must check the standard .app bundle path."""
+        src = _RUN_PY.read_text(encoding="utf-8")
+        start = src.find("def _find_chrome_macos")
+        end = src.find("\ndef ", start + 1)
+        func_body = src[start:end]
+        assert "Google Chrome.app" in func_body, \
+            "_find_chrome_macos() must check the standard macOS app bundle path " \
+            "'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'."
+
+
+# ---------------------------------------------------------------------------
+# Daemon detachment source guard
+# ---------------------------------------------------------------------------
+
+class TestDaemonDetachment:
+    """Verify the daemon is properly detached from the terminal on Linux/macOS.
+
+    Without start_new_session=True, closing the launch terminal sends SIGHUP
+    to the daemon's process group, killing it and terminating every active
+    Claude session.  Windows uses CREATE_NEW_PROCESS_GROUP; Linux/macOS must
+    use start_new_session=True (which calls setsid() in the child process).
+    """
+
+    def test_daemon_popen_uses_start_new_session_on_non_windows(self):
+        """ensure_daemon() must set start_new_session=True on non-Windows."""
+        src = _RUN_PY.read_text(encoding="utf-8")
+        # Locate ensure_daemon()
+        start = src.find("def ensure_daemon")
+        end = src.find("\ndef ", start + 1)
+        func_body = src[start:end]
+        assert "start_new_session" in func_body, \
+            "ensure_daemon() must set start_new_session=True for Linux/macOS. " \
+            "Without it, closing the launch terminal sends SIGHUP to the " \
+            "daemon's process group, killing all active Claude sessions."
+
+    def test_daemon_start_new_session_in_else_branch(self):
+        """start_new_session must be in the non-Windows (else) branch."""
+        src = _RUN_PY.read_text(encoding="utf-8")
+        start = src.find("def ensure_daemon")
+        end = src.find("\ndef ", start + 1)
+        func_body = src[start:end]
+        # Locate the else: that follows the win32 creationflags check
+        else_pos = func_body.find("else:")
+        assert else_pos != -1, \
+            "ensure_daemon() must have an else branch for non-Windows daemon spawn"
+        # Look for the actual assignment (not comment references to it)
+        sn_code = 'popen_kwargs["start_new_session"]'
+        sn_pos = func_body.find(sn_code)
+        assert sn_pos != -1, \
+            "ensure_daemon() must assign popen_kwargs[\"start_new_session\"] = True"
+        assert sn_pos > else_pos, \
+            "start_new_session=True must appear in the else (non-Windows) branch, " \
+            "not in the Windows block. Windows uses CREATE_NEW_PROCESS_GROUP instead."
+
+    def test_daemon_windows_uses_create_new_process_group(self):
+        """Windows daemon spawn must still use CREATE_NEW_PROCESS_GROUP."""
+        src = _RUN_PY.read_text(encoding="utf-8")
+        start = src.find("def ensure_daemon")
+        end = src.find("\ndef ", start + 1)
+        func_body = src[start:end]
+        assert "CREATE_NEW_PROCESS_GROUP" in func_body, \
+            "ensure_daemon() must use CREATE_NEW_PROCESS_GROUP on Windows so " \
+            "the daemon survives the web server process dying."
