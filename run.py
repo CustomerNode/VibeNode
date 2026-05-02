@@ -164,21 +164,49 @@ def _kill_port(port):
                         killed_any = True
 
             elif sys.platform == "linux":
-                r = _sp.run(
-                    ["lsof", "-ti", ":%d" % port],
-                    capture_output=True, text=True, timeout=5,
-                )
-                for pid_str in r.stdout.split():
+                try:
+                    r = _sp.run(
+                        ["lsof", "-ti", ":%d" % port],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                except FileNotFoundError:
+                    # lsof not installed — fall back to ss (iproute2, always present)
                     try:
-                        pid = int(pid_str)
-                    except ValueError:
-                        continue
-                    if pid > 0 and pid != os.getpid() and pid not in seen_pids:
-                        seen_pids.add(pid)
-                        _sp.run(["kill", "-9", str(pid)],
-                                capture_output=True, timeout=5)
-                        print("  Killed stale process %d on port %d" % (pid, port), flush=True)
-                        killed_any = True
+                        r2 = _sp.run(
+                            ["ss", "-tlnp", "sport", "= :%d" % port],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        pids_from_ss = set()
+                        for line in r2.stdout.splitlines():
+                            for part in line.split(","):
+                                part = part.strip()
+                                if part.startswith("pid="):
+                                    try:
+                                        pids_from_ss.add(int(part[4:]))
+                                    except ValueError:
+                                        pass
+                        for pid in pids_from_ss:
+                            if pid > 0 and pid != os.getpid() and pid not in seen_pids:
+                                seen_pids.add(pid)
+                                _sp.run(["kill", "-9", str(pid)],
+                                        capture_output=True, timeout=5)
+                                print("  Killed stale process %d on port %d" % (pid, port), flush=True)
+                                killed_any = True
+                    except Exception:
+                        pass
+                    break  # No further attempts without lsof
+                else:
+                    for pid_str in r.stdout.split():
+                        try:
+                            pid = int(pid_str)
+                        except ValueError:
+                            continue
+                        if pid > 0 and pid != os.getpid() and pid not in seen_pids:
+                            seen_pids.add(pid)
+                            _sp.run(["kill", "-9", str(pid)],
+                                    capture_output=True, timeout=5)
+                            print("  Killed stale process %d on port %d" % (pid, port), flush=True)
+                            killed_any = True
 
             if not killed_any:
                 break

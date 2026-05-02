@@ -45,9 +45,12 @@ logger = logging.getLogger(__name__)
 # Add the standard install location so shutil.which("claude") always works.
 # ---------------------------------------------------------------------------
 _extra_path_dirs = [
-    str(Path.home() / ".local" / "bin"),
-    "/opt/homebrew/bin",    # macOS Apple Silicon (Homebrew)
-    "/usr/local/bin",       # macOS Intel (Homebrew) / Linux common
+    str(Path.home() / ".local" / "bin"),      # Linux: pip --user, npm --prefix ~/.local
+    str(Path.home() / ".npm-global" / "bin"), # Linux: npm config set prefix ~/.npm-global
+    str(Path.home() / ".npm" / "bin"),        # Linux: some npm versions
+    "/opt/homebrew/bin",                       # macOS Apple Silicon (Homebrew)
+    "/usr/local/bin",                          # macOS Intel (Homebrew) / Linux common
+    "/usr/bin",                                # Linux fallback for system-installed claude
 ]
 _current_path = os.environ.get("PATH", "")
 _dirs_to_add = [d for d in _extra_path_dirs if d not in _current_path]
