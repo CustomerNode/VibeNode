@@ -238,24 +238,28 @@ class DaemonClient:
             return
         logger.info("Daemon appears dead — restarting it")
         try:
-            creation_flags = _NO_WINDOW
-            if sys.platform == "win32":
-                creation_flags = (
-                    _NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-                )
             log_file = daemon_script.parent.parent / "logs" / "daemon_debug.log"
             log_file.parent.mkdir(exist_ok=True)
             fh = open(log_file, "a")
-            try:
-                subprocess.Popen(
-                    [sys.executable, str(daemon_script)],
-                    cwd=str(daemon_script.parent.parent),
-                    creationflags=creation_flags,
-                    stdout=fh,
-                    stderr=fh,
+            popen_kwargs = {
+                "cwd": str(daemon_script.parent.parent),
+                "stdout": fh,
+                "stderr": fh,
+            }
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = (
+                    _NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
                 )
+            else:
+                # start_new_session=True calls setsid() so the restarted daemon
+                # is immune to SIGHUP if the web server's terminal is closed.
+                # Mirrors the same fix in run.py ensure_daemon().
+                popen_kwargs["start_new_session"] = True
+            fh_ref = fh
+            try:
+                subprocess.Popen([sys.executable, str(daemon_script)], **popen_kwargs)
             finally:
-                fh.close()  # child inherits its own fd copy
+                fh_ref.close()  # child inherits its own fd copy
         except Exception as e:
             logger.warning("Failed to restart daemon: %s", e)
 
