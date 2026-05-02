@@ -60,21 +60,31 @@ done
 
 if ! "$PY" -c "import flask" 2>/dev/null; then
     echo "  Installing Python dependencies..."
-    if ! "$PY" -m pip install --quiet -r requirements.txt; then
+    # Try plain install first (works in venvs and older distros).
+    # Fall back to --user (no-venv, older pip), then --break-system-packages
+    # (Ubuntu 23.04+ / Debian 12+ enforce PEP 668 which blocks plain installs).
+    if "$PY" -m pip install --quiet -r requirements.txt 2>/dev/null; then
+        echo "  Dependencies installed."
+    elif "$PY" -m pip install --quiet --user -r requirements.txt 2>/dev/null; then
+        echo "  Dependencies installed (user-local)."
+    elif "$PY" -m pip install --quiet --break-system-packages -r requirements.txt 2>/dev/null; then
+        echo "  Dependencies installed (system-packages override)."
+    else
         echo ""
         echo "Error: Could not install required packages."
         echo ""
-        echo "Try manually:"
-        echo "  $PY -m pip install -r requirements.txt"
+        echo "Recommended: use a virtual environment:"
+        echo "  $PY -m venv .venv"
+        echo "  source .venv/bin/activate"
+        echo "  pip install -r requirements.txt"
+        echo "  ./launch.sh"
         echo ""
-        echo "If pip is not available:"
-        echo "  Ubuntu/Debian: sudo apt install python3-pip"
-        echo "  Then re-run: pip3 install -r requirements.txt"
+        echo "Or with user-local install:"
+        echo "  $PY -m pip install --user -r requirements.txt"
         echo ""
         read -rp "Press Enter to close..."
         exit 1
     fi
-    echo "  Dependencies installed."
 fi
 
 # ── Claude CLI check ────────────────────────────────────────────────────────
