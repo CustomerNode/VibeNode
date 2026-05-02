@@ -160,17 +160,24 @@ chmod +x ~/Desktop/VibeNode.command
 
 ### 5. Desktop shortcut (Linux)
 
-Create a `.desktop` file:
+Create a `.desktop` file (the `$HOME` in `Exec` and `Icon` is expanded by the desktop environment — do not use `~` here):
 
 ```bash
-cat > ~/.local/share/applications/vibenode.desktop << 'EOF'
+cat > ~/.local/share/applications/vibenode.desktop << EOF
 [Desktop Entry]
 Name=VibeNode
-Exec=bash -c 'cd ~/Documents/VibeNode && ./launch.sh'
-Icon=~/Documents/VibeNode/static/vibenode.ico
+Exec=bash -c 'cd $HOME/Documents/VibeNode && ./launch.sh'
+Icon=$HOME/Documents/VibeNode/static/images/logo.png
 Type=Application
 Terminal=false
+Categories=Development;
 EOF
+```
+
+Then update the desktop database so it appears in your app launcher:
+
+```bash
+update-desktop-database ~/.local/share/applications/
 ```
 
 ## Platform support
@@ -181,18 +188,31 @@ EOF
 |---|---|---|---|
 | Process detection | PowerShell WMI | `ps` | `ps` |
 | Port cleanup | `netstat` + `taskkill` | `lsof` + `kill` | `lsof` + `kill` |
-| Server restart | PowerShell | `bash` + `nohup` | `bash` + `nohup` |
-| Browser launch | Chrome / fallback | `open` | `xdg-open` |
-| Auth login | `cmd` window | Terminal.app | `gnome-terminal` / `xterm` |
+| Server restart | `/api/restart` (web scope) | `/api/restart` (web scope) | `/api/restart` (web scope) |
+| Browser launch | Chrome → `os.startfile` | Chrome → `open` | Chrome/Chromium → `xdg-open` |
+| Auth login | `cmd` window | Terminal.app | `gnome-terminal` / `konsole` / `kitty` / `xterm` |
 | Boot splash | tkinter window | tkinter window | tkinter (falls back to `notify-send`) |
-| Desktop shortcut | `.lnk` (auto-healed) | — | — |
-| Background launch | `pythonw.exe` | `nohup` | `nohup` |
+| Desktop shortcut | `.lnk` (auto-healed) | `.command` file | `.desktop` file |
+| Daemon isolation | `CREATE_NEW_PROCESS_GROUP` | `setsid` (start_new_session) | `setsid` (start_new_session) |
 
 ### macOS and Linux users
 
-VibeNode was developed and primarily tested on Windows. macOS and Linux support has been added with explicit platform branching, but there may be minor setup bugs on your platform. The Claude Code self-setup flow should identify and patch most issues automatically.
+VibeNode runs on all three platforms with explicit, tested platform branches for each operating system. `launch.sh` handles Python detection, virtual environment activation, and automatic package installation — just clone and run.
 
-If you run into a platform-specific bug, please submit a pull request with the fix — or ask your Claude to submit one — so we can support everyone. See [CONTRIBUTING.md](CONTRIBUTING.md) or open an issue.
+**Linux quick-start** (Ubuntu/Debian):
+```bash
+# Prerequisites
+sudo apt install python3 python3-pip python3-tk
+# Optional: for the folder picker dialog
+sudo apt install zenity
+# Install Claude Code: https://docs.anthropic.com/en/docs/claude-code
+# Then launch VibeNode
+git clone https://github.com/CustomerNode/VibeNode.git ~/Documents/VibeNode
+cd ~/Documents/VibeNode
+./launch.sh
+```
+
+If you run into a platform-specific bug, please submit a pull request with the fix — or ask your Claude to submit one. See [CONTRIBUTING.md](CONTRIBUTING.md) or open an issue.
 
 ## API Documentation
 

@@ -46,10 +46,20 @@ def api_auth_login():
                 f'tell app "Terminal" to do script "{_claude_bin} auth login"',
             ])
         elif sys.platform == "linux":
-            # Try common terminal emulators in order of popularity
+            # Try common terminal emulators in order of popularity.
+            # Each entry: [binary, <terminal args...>, _claude_bin, "auth", "login"]
+            # Covers GNOME, KDE, XFCE, MATE, LXDE, tiling WMs, and GPU terminals.
             for term_cmd in [
                 ["x-terminal-emulator", "-e", f"{_claude_bin} auth login"],
                 ["gnome-terminal", "--", _claude_bin, "auth", "login"],
+                ["konsole", "-e", _claude_bin, "auth", "login"],
+                ["xfce4-terminal", "-e", f"{_claude_bin} auth login"],
+                ["tilix", "-e", _claude_bin, "auth", "login"],
+                ["mate-terminal", "-e", f"{_claude_bin} auth login"],
+                ["lxterminal", "-e", f"{_claude_bin} auth login"],
+                ["alacritty", "-e", _claude_bin, "auth", "login"],
+                ["kitty", _claude_bin, "auth", "login"],
+                ["wezterm", "start", "--", _claude_bin, "auth", "login"],
                 ["xterm", "-e", _claude_bin, "auth", "login"],
             ]:
                 try:
@@ -58,7 +68,7 @@ def api_auth_login():
                 except FileNotFoundError:
                     continue
             else:
-                return jsonify({"ok": False, "error": "No terminal emulator found. Run 'claude auth login' manually."}), 500
+                return jsonify({"ok": False, "error": "No terminal emulator found. Run 'claude auth login' in a terminal."}), 500
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
