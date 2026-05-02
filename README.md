@@ -163,6 +163,7 @@ chmod +x ~/Desktop/VibeNode.command
 Create a `.desktop` file (the `$HOME` in `Exec` and `Icon` is expanded by the desktop environment — do not use `~` here):
 
 ```bash
+mkdir -p ~/.local/share/applications
 cat > ~/.local/share/applications/vibenode.desktop << EOF
 [Desktop Entry]
 Name=VibeNode
