@@ -15,6 +15,45 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 os.chdir(_HERE)
 
+# ---------------------------------------------------------------------------
+# Augment PATH so claude CLI is findable regardless of launch method.
+# When launched via a .desktop file or pythonw.exe the login shell is not
+# sourced, so nvm shims, npm-global bins, and Volta are absent from PATH.
+# This runs once before any imports so auth_api.py's shutil.which("claude")
+# resolves correctly and the daemon subprocess inherits the corrected PATH.
+# ---------------------------------------------------------------------------
+if sys.platform != "win32":
+    _extra = [
+        str(Path.home() / ".local" / "bin"),
+        str(Path.home() / ".npm-global" / "bin"),
+        str(Path.home() / ".npm" / "bin"),
+        str(Path.home() / ".volta" / "bin"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+    ]
+    # nvm: resolve active version from NVM_BIN env var or ~/.nvm/alias/default
+    _nvm_dir = Path.home() / ".nvm"
+    if _nvm_dir.is_dir():
+        _nvm_bin = os.environ.get("NVM_BIN", "")
+        if _nvm_bin and os.path.isdir(_nvm_bin):
+            _extra.append(_nvm_bin)
+        else:
+            try:
+                _alias = (_nvm_dir / "alias" / "default").read_text(encoding="utf-8").strip().lstrip("v")
+                if "/" in _alias:
+                    _lts = _nvm_dir / "alias" / _alias
+                    if _lts.exists():
+                        _alias = _lts.read_text(encoding="utf-8").strip().lstrip("v")
+                _nb = _nvm_dir / "versions" / "node" / ("v" + _alias) / "bin"
+                if _nb.is_dir():
+                    _extra.append(str(_nb))
+            except Exception:
+                pass
+    _cur = os.environ.get("PATH", "")
+    _add = [d for d in _extra if d not in _cur]
+    if _add:
+        os.environ["PATH"] = os.pathsep.join(_add) + os.pathsep + _cur
+
 # pythonw.exe sets stdout and stderr to None — any print() would crash.
 # Detect this and redirect to a log file.
 if sys.stdout is None or sys.stderr is None:

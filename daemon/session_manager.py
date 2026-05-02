@@ -48,10 +48,38 @@ _extra_path_dirs = [
     str(Path.home() / ".local" / "bin"),      # Linux: pip --user, npm --prefix ~/.local
     str(Path.home() / ".npm-global" / "bin"), # Linux: npm config set prefix ~/.npm-global
     str(Path.home() / ".npm" / "bin"),        # Linux: some npm versions
+    str(Path.home() / ".volta" / "bin"),      # Volta node version manager
     "/opt/homebrew/bin",                       # macOS Apple Silicon (Homebrew)
     "/usr/local/bin",                          # macOS Intel (Homebrew) / Linux common
     "/usr/bin",                                # Linux fallback for system-installed claude
 ]
+
+# nvm (Node Version Manager) installs node into versioned directories that
+# can't be known statically.  When launched from a .desktop file or other
+# non-interactive shell, ~/.bashrc is not sourced so nvm's shims are absent
+# from PATH.  Resolve the active version from NVM_BIN (set when nvm is live)
+# or from ~/.nvm/alias/default (the version that would activate on login).
+_nvm_dir = Path.home() / ".nvm"
+if _nvm_dir.is_dir():
+    _nvm_bin = os.environ.get("NVM_BIN", "")
+    if _nvm_bin and os.path.isdir(_nvm_bin):
+        _extra_path_dirs.append(_nvm_bin)
+    else:
+        try:
+            _alias_file = _nvm_dir / "alias" / "default"
+            if _alias_file.exists():
+                _version = _alias_file.read_text(encoding="utf-8").strip().lstrip("v")
+                # Resolve lts/* aliases (e.g. "lts/iron" → ~/.nvm/alias/lts/iron)
+                if "/" in _version:
+                    _lts_file = _nvm_dir / "alias" / _version
+                    if _lts_file.exists():
+                        _version = _lts_file.read_text(encoding="utf-8").strip().lstrip("v")
+                _nvm_node_bin = _nvm_dir / "versions" / "node" / ("v" + _version) / "bin"
+                if _nvm_node_bin.is_dir():
+                    _extra_path_dirs.append(str(_nvm_node_bin))
+        except Exception:
+            pass  # Best-effort — never block startup
+
 _current_path = os.environ.get("PATH", "")
 _dirs_to_add = [d for d in _extra_path_dirs if d not in _current_path]
 if _dirs_to_add:
