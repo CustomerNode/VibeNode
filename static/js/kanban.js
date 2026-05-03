@@ -5072,7 +5072,7 @@ async function testConnection() {
   const status = document.getElementById('kb-conn-status');
   const btn = document.getElementById('kb-test-btn');
   const schemaPanel = document.getElementById('kb-schema-setup');
-  const switchBtn = document.getElementById('kb-switch-btn');
+  const actionArea = document.getElementById('kb-action-area');
 
   if (!url || !key) {
     if (status) { status.style.color = 'var(--orange)'; status.textContent = 'Enter URL and key first'; }
@@ -5081,7 +5081,7 @@ async function testConnection() {
 
   // Reset state
   if (schemaPanel) schemaPanel.style.display = 'none';
-  if (switchBtn) switchBtn.style.display = 'none';
+  if (actionArea) actionArea.innerHTML = '';
   if (btn) { btn.disabled = true; btn.textContent = 'Testing...'; }
   if (status) { status.style.color = 'var(--text-muted)'; status.textContent = 'Connecting...'; }
 
@@ -5094,8 +5094,8 @@ async function testConnection() {
     const data = await res.json();
     if (data.ok) {
       // Schema exists — ready to switch
-      if (status) { status.style.color = 'var(--green)'; status.textContent = '\u2713 Connected \u2014 ready to use'; }
-      if (switchBtn) switchBtn.style.display = '';
+      if (status) { status.style.color = 'var(--green)'; status.textContent = '\u2713 Connected \u2014 checking data\u2026'; }
+      await runMigrationPreflight(url, key);
     } else if (data.needs_schema) {
       // Connection works but tables missing — show setup panel
       if (status) { status.style.color = 'var(--orange)'; status.textContent = 'Step 2: Set up the database'; }
@@ -5147,64 +5147,261 @@ async function setupSupabaseSchema() {
 
 // saveKanbanSettings merged into saveAllKanbanSettings in openKanbanSettings()
 
-async function switchToSupabase() {
-  const url = document.getElementById('kb-supa-url')?.value?.trim();
-  const key = document.getElementById('kb-supa-key')?.value?.trim();
+// ---------------------------------------------------------------------------
+// Migration decision flow (replaces the legacy switchToSupabase confirm path)
+// ---------------------------------------------------------------------------
+// After Test Connection succeeds, we call /api/kanban/migrate/preflight to
+// learn the row counts on both sides and render a context-aware prompt
+// instead of a generic "this will replace cloud data" warning.
+//
+//   cloud has data        -> recommend "Use cloud data" (no copy)
+//                            override: type REPLACE to push local up
+//   cloud empty + local ! -> recommend "Copy local -> cloud"
+//                            override: switch without copying
+//   both empty            -> single "Switch to Supabase" button
+//
+// All paths converge on POST /api/kanban/migrate with a copy_data flag.
+// See kanban_api.migrate_backend() for the backend logic.
+
+async function runMigrationPreflight(url, key) {
+  const actionArea = document.getElementById('kb-action-area');
   const status = document.getElementById('kb-conn-status');
-
-  if (!url || !key) {
-    if (status) { status.style.color = 'var(--orange)'; status.textContent = 'Enter URL and key first'; }
-    return;
-  }
-
-  const switchBtn = document.getElementById('kb-switch-btn');
-
-  // If not yet confirmed, show confirmation inline instead of browser alert
-  if (!switchBtn?.dataset.confirmed) {
-    if (status) {
-      status.innerHTML = '<span style="color:var(--orange);">This will copy your local tasks to Supabase and replace any existing cloud data. Local data is kept as backup.</span>';
-    }
-    if (switchBtn) {
-      switchBtn.textContent = 'Confirm Switch';
-      switchBtn.dataset.confirmed = '1';
-      switchBtn.style.background = 'var(--orange)';
-    }
-    return;
-  }
-
-  // Reset button state
-  if (switchBtn) { switchBtn.disabled = true; switchBtn.textContent = 'Migrating...'; switchBtn.style.background = ''; }
-  if (status) { status.style.color = 'var(--text-muted)'; status.textContent = 'Copying tasks to Supabase...'; }
+  if (!actionArea) return;
 
   try {
-    const res = await fetch('/api/kanban/migrate', {
+    const res = await fetch('/api/kanban/migrate/preflight', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ target: 'supabase', supabase_url: url, supabase_secret_key: key }),
     });
     const data = await res.json();
-    if (data.ok) {
-      // Update the System dropdown label
-      const sysLabel = document.getElementById('sys-storage-label');
-      if (sysLabel) sysLabel.textContent = 'Cloud';
-
-      // Show success in the modal before closing
-      if (status) { status.style.color = 'var(--green)'; status.textContent = '\u2713 Switched to Supabase! All tasks migrated.'; }
-      if (switchBtn) { switchBtn.textContent = '\u2713 Done'; switchBtn.disabled = true; }
-      if (typeof showToast === 'function') showToast('Switched to Supabase!');
-      // Reload the board after a moment so user sees the success
-      setTimeout(async () => {
-        if (typeof _closePm === 'function') _closePm();
-        await initKanban(true);
-      }, 1500);
-    } else {
-      if (status) { status.style.color = 'var(--red, #f85149)'; status.textContent = '\u2717 ' + (data.error || 'Migration failed'); }
-      if (switchBtn) { switchBtn.disabled = false; switchBtn.textContent = 'Step 3: Switch to Supabase'; delete switchBtn.dataset.confirmed; }
+    if (!data.ok) {
+      if (status) { status.style.color = 'var(--red, #f85149)'; status.textContent = '\u2717 ' + (data.error || 'Could not inspect cloud data'); }
+      return;
     }
+    if (status) { status.style.color = 'var(--green)'; status.textContent = '\u2713 Connected \u2014 ready to choose'; }
+    renderMigrationDecision(data);
   } catch (e) {
     if (status) { status.style.color = 'var(--red, #f85149)'; status.textContent = '\u2717 ' + e.message; }
-    if (switchBtn) { switchBtn.disabled = false; switchBtn.textContent = 'Step 3: Switch to Supabase'; delete switchBtn.dataset.confirmed; }
   }
+}
+
+function renderMigrationDecision(preflight) {
+  const actionArea = document.getElementById('kb-action-area');
+  if (!actionArea) return;
+
+  const local = preflight.current || {};       // active backend (typically SQLite)
+  const cloud = preflight.target_data || {};   // Supabase
+  const localTasks = local.tasks || 0;
+  const cloudTasks = cloud.tasks || 0;
+  const cloudHasData = !cloud.is_empty;
+  const localHasData = !local.is_empty;
+
+  // Stash creds on the action area for the action handlers to read back.
+  actionArea.dataset.supaUrl = document.getElementById('kb-supa-url')?.value?.trim() || '';
+  actionArea.dataset.supaKey = document.getElementById('kb-supa-key')?.value?.trim() || '';
+
+  if (cloudHasData) {
+    // Most common when joining a shared project. Use what's there; never
+    // offer to wipe it without an explicit typed confirm.
+    actionArea.innerHTML = `
+      <div style="padding:14px;border:1px solid var(--green);border-radius:8px;background:rgba(63,185,80,0.06);">
+        <div style="font-size:14px;font-weight:700;color:var(--green);margin-bottom:6px;">
+          Found ${cloudTasks} task${cloudTasks === 1 ? '' : 's'} in Supabase
+        </div>
+        <div style="font-size:12px;color:var(--text-secondary);margin-bottom:12px;">
+          This Supabase project already has data. The safe move is to start using it &mdash;
+          your local board (${localTasks} task${localTasks === 1 ? '' : 's'}) stays on disk as a backup.
+          Nothing on either side is overwritten.
+        </div>
+        <button class="kanban-settings-btn-accent" onclick="useCloudData()" id="kb-use-cloud-btn"
+                style="padding:9px 20px;font-size:13px;font-weight:600;">
+          Use cloud data (recommended)
+        </button>
+        <div style="margin-top:14px;border-top:1px dashed var(--border);padding-top:10px;">
+          <a href="#" onclick="event.preventDefault();toggleReplaceCloudPanel();" id="kb-replace-link"
+             style="font-size:11px;color:var(--text-faint);text-decoration:underline;">
+            Or replace cloud data with my ${localTasks} local task${localTasks === 1 ? '' : 's'}\u2026
+          </a>
+          <div id="kb-replace-panel" style="display:none;margin-top:10px;padding:12px;border:2px solid var(--red, #f85149);border-radius:6px;background:rgba(248,81,73,0.06);">
+            <div style="font-size:13px;font-weight:700;color:var(--red, #f85149);margin-bottom:6px;">
+              \u26a0\ufe0f Permanently delete ${cloudTasks} cloud task${cloudTasks === 1 ? '' : 's'}?
+            </div>
+            <div style="font-size:12px;color:var(--text-secondary);margin-bottom:10px;">
+              Anyone else using this Supabase project will lose their data too. To confirm,
+              type <strong>REPLACE</strong> below.
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;">
+              <input type="text" id="kb-replace-confirm" placeholder="Type REPLACE"
+                     oninput="onReplaceConfirmInput()"
+                     style="flex:1;padding:6px 10px;font-size:12px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);">
+              <button id="kb-replace-btn" onclick="replaceCloudWithLocal()" disabled
+                      style="padding:8px 16px;font-size:12px;background:var(--red, #f85149);color:white;border:none;border-radius:4px;cursor:not-allowed;opacity:0.5;">
+                Replace cloud data
+              </button>
+            </div>
+          </div>
+        </div>
+        <div id="kb-action-status" style="font-size:12px;margin-top:10px;"></div>
+      </div>`;
+  } else if (localHasData) {
+    // Cloud empty, local has tasks: classic "push local up to fresh cloud."
+    // No scary warning since there's nothing on the cloud side to wipe.
+    actionArea.innerHTML = `
+      <div style="padding:14px;border:1px solid var(--accent);border-radius:8px;background:rgba(88,166,255,0.05);">
+        <div style="font-size:14px;font-weight:700;margin-bottom:6px;">Supabase is empty</div>
+        <div style="font-size:12px;color:var(--text-secondary);margin-bottom:12px;">
+          Copy your ${localTasks} local task${localTasks === 1 ? '' : 's'} up to Supabase and switch over.
+          Local data stays on disk as a backup.
+        </div>
+        <button class="kanban-settings-btn-accent" onclick="pushLocalToCloud()" id="kb-push-btn"
+                style="padding:9px 20px;font-size:13px;font-weight:600;">
+          Copy local \u2192 cloud (recommended)
+        </button>
+        <div style="margin-top:12px;">
+          <a href="#" onclick="event.preventDefault();switchEmptyToCloud();"
+             style="font-size:11px;color:var(--text-faint);text-decoration:underline;">
+            Or switch without copying anything\u2026
+          </a>
+        </div>
+        <div id="kb-action-status" style="font-size:12px;margin-top:10px;"></div>
+      </div>`;
+  } else {
+    // Both sides empty - nothing to copy either way.
+    actionArea.innerHTML = `
+      <div style="padding:14px;border:1px solid var(--border);border-radius:8px;">
+        <div style="font-size:14px;font-weight:700;margin-bottom:6px;">Both sides are empty</div>
+        <div style="font-size:12px;color:var(--text-secondary);margin-bottom:12px;">
+          Nothing to copy. Just point VibeNode at Supabase as the active backend.
+        </div>
+        <button class="kanban-settings-btn-accent" onclick="switchEmptyToCloud()" id="kb-switch-empty-btn"
+                style="padding:9px 20px;font-size:13px;font-weight:600;">
+          Switch to Supabase
+        </button>
+        <div id="kb-action-status" style="font-size:12px;margin-top:10px;"></div>
+      </div>`;
+  }
+}
+
+// ---- Action handlers -------------------------------------------------------
+
+function _afterMigrationSuccess(label) {
+  const sysLabel = document.getElementById('sys-storage-label');
+  if (sysLabel) sysLabel.textContent = 'Cloud';
+  if (typeof showToast === 'function') showToast(label || 'Switched to Supabase!');
+  setTimeout(async () => {
+    if (typeof _closePm === 'function') _closePm();
+    if (typeof initKanban === 'function') await initKanban(true);
+  }, 1200);
+}
+
+async function _postMigrate(payload, statusEl, btn, onSuccessLabel) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Working\u2026'; }
+  if (statusEl) { statusEl.style.color = 'var(--text-muted)'; statusEl.textContent = ''; }
+  try {
+    const res = await fetch('/api/kanban/migrate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      if (statusEl) { statusEl.style.color = 'var(--green)'; statusEl.textContent = '\u2713 ' + (data.message || 'Done'); }
+      _afterMigrationSuccess(onSuccessLabel);
+    } else {
+      if (statusEl) { statusEl.style.color = 'var(--red, #f85149)'; statusEl.textContent = '\u2717 ' + (data.error || 'Failed'); }
+      if (btn) { btn.disabled = false; }
+    }
+  } catch (e) {
+    if (statusEl) { statusEl.style.color = 'var(--red, #f85149)'; statusEl.textContent = '\u2717 ' + e.message; }
+    if (btn) { btn.disabled = false; }
+  }
+}
+
+function _supaCreds() {
+  const a = document.getElementById('kb-action-area');
+  return {
+    url: a?.dataset.supaUrl || document.getElementById('kb-supa-url')?.value?.trim() || '',
+    key: a?.dataset.supaKey || document.getElementById('kb-supa-key')?.value?.trim() || '',
+  };
+}
+
+// Cloud already has data - just flip active backend, no copy.
+async function useCloudData() {
+  const { url, key } = _supaCreds();
+  await _postMigrate(
+    { target: 'supabase', supabase_url: url, supabase_secret_key: key, copy_data: false },
+    document.getElementById('kb-action-status'),
+    document.getElementById('kb-use-cloud-btn'),
+    'Now using cloud data',
+  );
+}
+
+// Cloud empty, local has data - push local up (the legacy migrate behavior).
+async function pushLocalToCloud() {
+  const { url, key } = _supaCreds();
+  await _postMigrate(
+    { target: 'supabase', supabase_url: url, supabase_secret_key: key, copy_data: true },
+    document.getElementById('kb-action-status'),
+    document.getElementById('kb-push-btn'),
+    'Pushed local tasks to Supabase',
+  );
+}
+
+// Both empty (or "switch only" override) - no copy, just flip backend.
+async function switchEmptyToCloud() {
+  const { url, key } = _supaCreds();
+  await _postMigrate(
+    { target: 'supabase', supabase_url: url, supabase_secret_key: key, copy_data: false },
+    document.getElementById('kb-action-status'),
+    document.getElementById('kb-switch-empty-btn'),
+    'Switched to Supabase',
+  );
+}
+
+// Destructive override - reveals the typed-REPLACE panel.
+function toggleReplaceCloudPanel() {
+  const panel = document.getElementById('kb-replace-panel');
+  if (!panel) return;
+  const showing = panel.style.display !== 'none';
+  panel.style.display = showing ? 'none' : '';
+  if (!showing) {
+    const inp = document.getElementById('kb-replace-confirm');
+    if (inp) { inp.value = ''; inp.focus(); }
+    onReplaceConfirmInput();
+  }
+}
+
+function onReplaceConfirmInput() {
+  const inp = document.getElementById('kb-replace-confirm');
+  const btn = document.getElementById('kb-replace-btn');
+  if (!inp || !btn) return;
+  const ok = inp.value.trim() === 'REPLACE';
+  btn.disabled = !ok;
+  btn.style.cursor = ok ? 'pointer' : 'not-allowed';
+  btn.style.opacity = ok ? '1' : '0.5';
+}
+
+async function replaceCloudWithLocal() {
+  const inp = document.getElementById('kb-replace-confirm');
+  if (!inp || inp.value.trim() !== 'REPLACE') return;  // belt + suspenders
+  const { url, key } = _supaCreds();
+  await _postMigrate(
+    { target: 'supabase', supabase_url: url, supabase_secret_key: key, copy_data: true },
+    document.getElementById('kb-action-status'),
+    document.getElementById('kb-replace-btn'),
+    'Replaced cloud with local data',
+  );
+}
+
+// Backward-compat shim: setupSupabaseSchema() and any external callers used
+// to reach for switchToSupabase(). Re-route them through the new preflight
+// flow so the same context-aware prompt always fires.
+async function switchToSupabase() {
+  const url = document.getElementById('kb-supa-url')?.value?.trim();
+  const key = document.getElementById('kb-supa-key')?.value?.trim();
+  if (!url || !key) return;
+  await runMigrationPreflight(url, key);
 }
 
 

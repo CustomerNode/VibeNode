@@ -1770,17 +1770,40 @@ def suggest_tags():
 
 @bp.route("/api/kanban/migrate", methods=["POST"])
 def migrate_backend():
-    """Switch database backend (SQLite <-> Supabase)."""
+    """Switch database backend (SQLite <-> Supabase).
+
+    Two flavors, controlled by the ``copy_data`` flag (default True for
+    backward compatibility with the legacy single-button flow):
+
+    - ``copy_data: true``  — exports the current backend's data, wipes the
+      target, imports into target, then flips active. Use when the user
+      wants to push their tasks up to a fresh cloud project, or pull cloud
+      tasks down to local.
+    - ``copy_data: false`` — leaves both backends untouched and just flips
+      the active-backend pointer. Use when joining an existing shared cloud
+      project (the cloud already has the data you want; nothing to copy)
+      or when both sides are empty (no data to lose either way).
+
+    The Persistent Storage wizard uses ``/migrate/preflight`` to decide
+    which flavor to recommend so the user never gets a generic "this will
+    replace your cloud data" warning when there's nothing to replace.
+    """
     try:
         data = request.get_json(silent=True) or {}
         target_backend = data.get("target", "").strip()
         if target_backend not in ("sqlite", "supabase"):
             return jsonify({"error": "Invalid target. Use 'sqlite' or 'supabase'"}), 400
 
+        # Default True preserves the old behavior: existing callers that
+        # don't pass copy_data still get the export/wipe/import flow.
+        copy_data = data.get("copy_data", True)
+
         from ..db.migrator import BackendMigrator, MigrationError
         current_repo = _get_repo()
         migrator = BackendMigrator()
 
+        url = ""
+        key = ""
         if target_backend == "supabase":
             from ..db.supabase_backend import SupabaseRepository
             url = data.get("supabase_url", "")
@@ -1793,7 +1816,16 @@ def migrate_backend():
             target_repo = SqliteRepository()
 
         target_repo.initialize()
-        migrator.switch_backend(current_repo, target_repo)
+
+        if copy_data:
+            # Destructive: wipes target, imports current's data into it.
+            migrator.switch_backend(current_repo, target_repo)
+            msg = f"Migrated to {target_backend}"
+        else:
+            # Non-destructive: just verify target is reachable+ready (the
+            # initialize() above already did that) and flip the pointer.
+            # Both backends keep their existing data.
+            msg = f"Switched active backend to {target_backend} (no data copied)"
 
         from ..config import save_kanban_config, get_kanban_config
         cfg = get_kanban_config()
@@ -1807,7 +1839,91 @@ def migrate_backend():
         reset_repository()
         invalidate_ensured_cache()  # new backend needs fresh ensure
 
-        return jsonify({"ok": True, "message": f"Migrated to {target_backend}"})
+        return jsonify({"ok": True, "message": msg, "copied_data": bool(copy_data)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@bp.route("/api/kanban/migrate/preflight", methods=["POST"])
+def migrate_preflight():
+    """Inspect both backends so the UI can pick a safe migration prompt.
+
+    Used by the Persistent Storage wizard right after Test Connection passes.
+    Returns task / project / total-record counts for the currently active
+    backend (``local`` in the response — but actually whatever is active) and
+    for the prospective target backend (``cloud``). The frontend branches on
+    these counts to decide whether to recommend pull, push, or just switch,
+    so users never see a generic "this will replace your cloud data" warning
+    when there's nothing to replace, or worse, miss it when there is.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        target_backend = data.get("target", "").strip()
+        if target_backend not in ("sqlite", "supabase"):
+            return jsonify({"error": "Invalid target. Use 'sqlite' or 'supabase'"}), 400
+
+        from ..db.migrator import BackendMigrator
+
+        def _counts(repo):
+            """Cheap-ish summary by re-using the existing export path. The
+            migrator already knows how to dump every table; we just sum the
+            list lengths so the UI can show "N tasks" without a custom
+            count-only API on every backend."""
+            mig = BackendMigrator()
+            dump = mig.export_all(repo)
+            tasks = len(dump.get("tasks", []))
+            cols = len(dump.get("board_columns", []))
+            prefs = len(dump.get("preferences", []))
+            total = sum(len(v) for v in dump.values() if isinstance(v, list))
+            return {
+                "tasks": tasks,
+                "columns": cols,
+                "preferences": prefs,
+                "total_records": total,
+                "is_empty": total == 0,
+            }
+
+        # Current (active) backend — always queryable, no creds needed
+        current_repo = _get_repo()
+        local_summary = _counts(current_repo)
+
+        # Target backend
+        cloud_summary = {"reachable": False, "is_empty": True, "tasks": 0,
+                         "columns": 0, "preferences": 0, "total_records": 0}
+        if target_backend == "supabase":
+            from ..db.supabase_backend import SupabaseRepository, SchemaNotReady
+            url = data.get("supabase_url", "")
+            key = data.get("supabase_secret_key", "")
+            if not url or not key:
+                return jsonify({"error": "supabase_url and supabase_secret_key required"}), 400
+            target_repo = SupabaseRepository(url=url, key=key)
+            try:
+                target_repo.initialize()
+                summary = _counts(target_repo)
+                summary["reachable"] = True
+                cloud_summary = summary
+            except SchemaNotReady:
+                # Schema not set up yet — same status as Test Connection's
+                # needs_schema branch. Caller will route the user to setup.
+                return jsonify({"ok": False, "needs_schema": True}), 200
+        else:
+            from ..db.sqlite_backend import SqliteRepository
+            target_repo = SqliteRepository()
+            target_repo.initialize()
+            summary = _counts(target_repo)
+            summary["reachable"] = True
+            cloud_summary = summary
+
+        from ..config import get_kanban_config
+        current_backend_name = get_kanban_config().get("kanban_backend", "sqlite")
+
+        return jsonify({
+            "ok": True,
+            "current_backend": current_backend_name,
+            "target_backend": target_backend,
+            "current": local_summary,   # data on the side we're leaving
+            "target_data": cloud_summary,  # data on the side we're moving to
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

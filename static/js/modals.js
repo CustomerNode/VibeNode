@@ -211,9 +211,12 @@ async function openPersistentStorage() {
         <div class="kanban-settings-field"><label>Secret Key <span style="font-size:10px;color:var(--orange);">(service_role)</span></label><input type="password" id="kb-supa-key" value="${typeof escHtml === 'function' ? escHtml(config.supabase_secret_key || '') : (config.supabase_secret_key || '')}" placeholder="eyJhbGciOi..."></div>
         <div style="display:flex;gap:8px;margin-top:10px;align-items:center;">
           <button class="kanban-settings-btn-accent" id="kb-test-btn" onclick="testConnection()" style="padding:8px 18px;font-size:13px;">Step 1: Test Connection</button>
-          <button class="kanban-settings-btn-accent" id="kb-switch-btn" onclick="switchToSupabase()" style="display:none;padding:8px 18px;font-size:13px;">Step 3: Switch to Supabase</button>
           <span id="kb-conn-status" style="font-size:12px;margin-left:4px;"></span>
         </div>
+        <!-- Decision panel populated by renderMigrationDecision() in kanban.js
+             after Test Connection succeeds. Stays empty until the preflight
+             call returns row counts for both backends. -->
+        <div id="kb-action-area" style="margin-top:14px;"></div>
         <div id="kb-schema-setup" style="display:none;margin-top:12px;padding:16px;border:2px solid var(--orange);border-radius:8px;background:rgba(210,153,34,0.08);">
           <div style="font-size:14px;font-weight:700;color:var(--orange);margin-bottom:8px;">Step 2: Create database tables</div>
           <div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px;">Your Supabase project is connected but empty. To create the tables automatically:</div>
