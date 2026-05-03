@@ -192,6 +192,34 @@ Notes:
 - The Linux entry uses `static/vibenode.png` because most desktop environments don't render `.ico` files. The `.ico` is still used on Windows.
 - `~` and `$HOME` don't expand inside `.desktop` `Icon=`/`Exec=` fields, so the snippet above bakes in absolute paths via `$VIBENODE_DIR`.
 
+#### Optional: a "Stop VibeNode" shortcut
+
+Same idea, but kills the running web server (5050), the session daemon (5051), and any orphaned subprocesses. Uses a grayed-out logo with a red X (`static/vibenode_stop.png`) so it's visually distinct from the launch shortcut. Hard stop — any active Claude sessions are terminated.
+
+```bash
+VIBENODE_DIR="$(pwd)"
+mkdir -p ~/.local/share/applications
+cat > ~/.local/share/applications/vibenode-stop.desktop << EOF
+[Desktop Entry]
+Type=Application
+Name=Stop VibeNode
+Comment=Stop VibeNode (kills web server 5050, daemon 5051, and any orphaned subprocesses)
+Exec=bash -c "cd '$VIBENODE_DIR' && '$VIBENODE_DIR/stopvibenode.sh'; exec bash"
+Path=$VIBENODE_DIR
+Terminal=true
+Icon=$VIBENODE_DIR/static/vibenode_stop.png
+Categories=Development;
+EOF
+chmod +x ~/.local/share/applications/vibenode-stop.desktop
+update-desktop-database ~/.local/share/applications 2>/dev/null || true
+
+if [ -d "$HOME/Desktop" ]; then
+    cp ~/.local/share/applications/vibenode-stop.desktop "$HOME/Desktop/Stop VibeNode.desktop"
+    chmod +x "$HOME/Desktop/Stop VibeNode.desktop"
+    gio set "$HOME/Desktop/Stop VibeNode.desktop" metadata::trusted true 2>/dev/null || true
+fi
+```
+
 ## Platform support
 
 **Windows, macOS, and Linux.** VibeNode is actively developed on both Windows and Linux, so both are first-class targets. macOS *should* work — the platform branches are in place and the Claude Code SDK handles all session management cross-platform — but it isn't part of our regular development loop, so expect a few rough edges until a Mac user files them in.
