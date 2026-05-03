@@ -96,6 +96,7 @@ Claude Code has two similar concepts — skills and agents — that are really t
 - Python 3.10+
 - Claude Code installed and at least one session created
 - Windows, macOS, or Linux
+- **Linux only:** `python3-tk` (Debian/Ubuntu: `sudo apt install python3-tk`). Without it, the animated boot splash silently degrades to a single `notify-send` toast — the app still starts normally, you just don't see live startup progress.
 
 ## Setup (AI-assisted — recommended)
 
@@ -160,30 +161,40 @@ chmod +x ~/Desktop/VibeNode.command
 
 ### 5. Desktop shortcut (Linux)
 
-Create a `.desktop` file (the `$HOME` in `Exec` and `Icon` is expanded by the desktop environment — do not use `~` here):
+Run this from inside your cloned VibeNode directory. It writes a launcher entry that appears in your application menu and (optionally) on the Desktop. Paths are captured from the current working directory, so no manual editing is required:
 
 ```bash
+VIBENODE_DIR="$(pwd)"
 mkdir -p ~/.local/share/applications
 cat > ~/.local/share/applications/vibenode.desktop << EOF
 [Desktop Entry]
 Name=VibeNode
-Exec=bash -c 'cd $HOME/Documents/VibeNode && ./launch.sh'
-Icon=$HOME/Documents/VibeNode/static/images/logo.png
+Comment=Session orchestrator UI for Claude Code
+Exec=bash -c 'cd "$VIBENODE_DIR" && ./launch.sh'
+Icon=$VIBENODE_DIR/static/vibenode.png
 Type=Application
 Terminal=false
 Categories=Development;
 EOF
+chmod +x ~/.local/share/applications/vibenode.desktop
+update-desktop-database ~/.local/share/applications 2>/dev/null || true
+
+# Optional: also drop a clickable shortcut on the Desktop
+if [ -d "$HOME/Desktop" ]; then
+    cp ~/.local/share/applications/vibenode.desktop ~/Desktop/
+    chmod +x ~/Desktop/vibenode.desktop
+    # GNOME/Cinnamon: mark trusted so the icon (not a generic file) is shown
+    gio set ~/Desktop/vibenode.desktop metadata::trusted true 2>/dev/null || true
+fi
 ```
 
-Then update the desktop database so it appears in your app launcher:
-
-```bash
-update-desktop-database ~/.local/share/applications/
-```
+Notes:
+- The Linux entry uses `static/vibenode.png` because most desktop environments don't render `.ico` files. The `.ico` is still used on Windows.
+- `~` and `$HOME` don't expand inside `.desktop` `Icon=`/`Exec=` fields, so the snippet above bakes in absolute paths via `$VIBENODE_DIR`.
 
 ## Platform support
 
-**Windows, macOS, and Linux.** VibeNode was originally developed on Windows and has been adapted for cross-platform support. All session management is handled through the Claude Code SDK, so the core functionality is fully cross-platform.
+**Windows, macOS, and Linux.** VibeNode is actively developed on both Windows and Linux, so both are first-class targets. macOS *should* work — the platform branches are in place and the Claude Code SDK handles all session management cross-platform — but it isn't part of our regular development loop, so expect a few rough edges until a Mac user files them in.
 
 | Feature | Windows | macOS | Linux |
 |---|---|---|---|
@@ -196,7 +207,7 @@ update-desktop-database ~/.local/share/applications/
 | Desktop shortcut | `.lnk` (auto-healed) | `.command` file | `.desktop` file |
 | Daemon isolation | `CREATE_NEW_PROCESS_GROUP` | `setsid` (start_new_session) | `setsid` (start_new_session) |
 
-### macOS and Linux users
+### macOS users
 
 VibeNode runs on all three platforms with explicit, tested platform branches for each operating system. `launch.sh` handles Python detection, virtual environment activation, and automatic package installation — just clone and run.
 

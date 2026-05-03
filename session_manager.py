@@ -118,6 +118,16 @@ def _launch_splash():
         if not splash_script.exists():
             return False
 
+        # Pre-flight: the splash subprocess silently sys.exit(0) on ImportError
+        # (boot_splash.py top of file). On Debian/Ubuntu, tkinter is a
+        # separate apt package (python3-tk) and is missing by default. If we
+        # can't import it here, the subprocess can't either — return False so
+        # the notify-send fallback fires instead of the user seeing nothing.
+        try:
+            import tkinter  # noqa: F401
+        except ImportError:
+            return False
+
         # Create the status file that run.py will write to
         status_file = os.path.join(
             tempfile.gettempdir(),
@@ -145,9 +155,18 @@ def _launch_splash():
         return False
 
 
-# Try the splash first; fall back to a simple OS notification
+# Try the splash first; fall back to a simple OS notification.
+# On Linux, if tkinter is the missing piece, surface the apt hint in the
+# toast itself \u2014 otherwise the user just sees a generic "starting up" with
+# no indication that the splash *would* work after one apt-get away.
 if not _launch_splash():
-    _show_notification("VibeNode", "Starting up\u2026")
+    _msg = "Starting up\u2026"
+    if sys.platform == "linux":
+        try:
+            import tkinter  # noqa: F401
+        except ImportError:
+            _msg = "Starting up\u2026 (install python3-tk for the boot splash)"
+    _show_notification("VibeNode", _msg)
 
 # Now import and run the real app.
 import runpy
