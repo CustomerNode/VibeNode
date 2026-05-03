@@ -501,7 +501,16 @@ def open_browser():
         chrome_path = _find_chrome_macos()
         if chrome_path:
             try:
-                subprocess.Popen([chrome_path, url])
+                # start_new_session=True detaches Chrome from session_manager.py's
+                # process group so a daemon restart doesn't take Chrome with it.
+                # DEVNULL stdio keeps Chrome's chatty debug output out of the
+                # launch.sh terminal where it would scroll over our own messages.
+                subprocess.Popen(
+                    [chrome_path, url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
                 _log("Opened Chrome/Chromium via %s" % chrome_path)
                 opened = True
             except Exception as e:
@@ -523,7 +532,16 @@ def open_browser():
         chrome_path = _find_chrome_linux()
         if chrome_path:
             try:
-                subprocess.Popen([chrome_path, url])
+                # start_new_session=True detaches Chrome from session_manager.py's
+                # process group so a daemon restart doesn't take Chrome with it.
+                # DEVNULL stdio keeps Chrome's chatty debug output out of the
+                # launch.sh terminal where it would scroll over our own messages.
+                subprocess.Popen(
+                    [chrome_path, url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
                 _log("Opened Chrome/Chromium via %s" % chrome_path)
                 opened = True
             except Exception as e:
