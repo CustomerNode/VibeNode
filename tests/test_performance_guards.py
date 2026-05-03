@@ -115,6 +115,366 @@ class TestTrackedFilesNotGrownBySnapshot:
         assert "tracked_files |= fs_changed" not in src
 
 
+class TestTrackedFilesNotGrownOnResume:
+    """CLAUDE.md #7 — second snowball source: ``read_tracked_files`` must
+    NOT re-feed file-history-snapshot ``trackedFileBackups`` entries
+    into the in-memory ``tracked_files`` set.
+
+    The original CLAUDE.md #7 fix kept fs_changed out of tracked_files
+    in memory, but the same fs_snapshot_extras still landed in the JSONL
+    via ``trackedFileBackups`` on every post-turn snapshot.  When a
+    fresh ``SessionInfo`` is created (recovery, daemon restart, or
+    resume), ``_prepopulate_tracked_files`` calls ``read_tracked_files``
+    which scans the JSONL.  Source 1 (Edit/Write tool_use blocks) is
+    canonical; source 2 (file-history-snapshot) was re-introducing the
+    fs_snapshot_extras and snowballing the next pre-turn snapshot to
+    130-380 s on Windows.
+
+    These tests pin the invariant on both ends:
+      - The source-2-doesn't-feed-found contract in claude_store.py.
+      - End-to-end: a JSONL with one tool_use'd file but ten
+        snapshot-only files yields exactly one tracked file.
+    """
+
+    def test_read_tracked_files_ignores_snapshot_only_files(self, tmp_path):
+        """Source 2 (file-history-snapshot trackedFileBackups) entries
+        without a corresponding tool_use must NOT inflate ``found``.
+        Only the version counter (``max_version``) may be derived from
+        them — the file path itself stays out of the returned set."""
+        import json
+        import uuid
+        from app.config import _encode_cwd
+        from daemon.backends.claude_store import ClaudeJsonlStore
+
+        cwd = str(tmp_path / "proj")
+        (tmp_path / "proj").mkdir()
+        encoded = _encode_cwd(cwd)
+        proj_dir = tmp_path / ".claude" / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+
+        session_id = "snowball-test"
+        edit_target = str(tmp_path / "proj" / "edited.py")
+        snapshot_only_paths = [
+            str(tmp_path / "proj" / f"bash_touched_{i}.py")
+            for i in range(50)
+        ]
+
+        # Build a JSONL with:
+        #  - one Edit tool_use → counts as a tracked file (source 1)
+        #  - one file-history-snapshot whose trackedFileBackups dict
+        #    holds the edited file PLUS 50 snapshot-only fs_extras
+        lines = [
+            json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": "edit it"},
+                "uuid": str(uuid.uuid4()),
+                "sessionId": session_id,
+            }),
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "name": "Edit",
+                        "id": str(uuid.uuid4()),
+                        "input": {"file_path": edit_target},
+                    }],
+                },
+                "uuid": str(uuid.uuid4()),
+                "sessionId": session_id,
+            }),
+            json.dumps({
+                "type": "file-history-snapshot",
+                "messageId": str(uuid.uuid4()),
+                "snapshot": {
+                    "messageId": str(uuid.uuid4()),
+                    "trackedFileBackups": {
+                        edit_target: {
+                            "backupFileName": "abc@v1",
+                            "version": 7,
+                            "backupTime": "2026-05-03T00:00:00Z",
+                        },
+                        **{
+                            sp: {
+                                "backupFileName": f"hash{i}@v3",
+                                "version": 3,
+                                "backupTime": "2026-05-03T00:00:00Z",
+                            }
+                            for i, sp in enumerate(snapshot_only_paths)
+                        },
+                    },
+                    "timestamp": "2026-05-03T00:00:00Z",
+                },
+                "isSnapshotUpdate": True,
+            }),
+        ]
+        (proj_dir / f"{session_id}.jsonl").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+
+        store = ClaudeJsonlStore()
+        # Patch Path.home() inside the store module so it points at tmp_path
+        from unittest.mock import patch
+        from pathlib import Path as _Path
+        with patch("daemon.backends.claude_store.Path") as SP:
+            SP.side_effect = _Path
+            SP.home.return_value = tmp_path
+            found, max_version, _u, _a = store.read_tracked_files(
+                session_id, cwd=cwd
+            )
+
+        # Only the directly-edited file should be in `found`.  The 50
+        # snapshot-only paths must NOT appear — that's the regression.
+        assert found == {edit_target}, (
+            f"snowball regression: read_tracked_files returned "
+            f"{len(found)} files; expected exactly 1 (the Edit target). "
+            f"Snapshot-only files must not be re-fed into tracked_files."
+        )
+        # Version counters can still come from the snapshot — that's
+        # how new backup names avoid collisions on resume.
+        assert max_version.get(edit_target) == 7
+
+    def test_prepopulate_tracked_files_does_not_snowball(self, tmp_path):
+        """End-to-end: SessionInfo with no in-memory tracked_files,
+        scanning a JSONL whose snapshots reference 100 files but whose
+        tool_use blocks reference only 2, must end with exactly 2
+        files in ``info.tracked_files``."""
+        import json
+        import uuid
+        from unittest.mock import patch
+        from pathlib import Path as _Path
+
+        from app.config import _encode_cwd
+        from daemon.session_manager import (
+            SessionManager, SessionInfo, SessionState,
+        )
+
+        cwd = str(tmp_path / "proj")
+        (tmp_path / "proj").mkdir()
+        encoded = _encode_cwd(cwd)
+        proj_dir = tmp_path / ".claude" / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+
+        session_id = "snowball-resume"
+        directly_edited = [
+            str(tmp_path / "proj" / "real_edit_a.py"),
+            str(tmp_path / "proj" / "real_edit_b.py"),
+        ]
+        snapshot_only = [
+            str(tmp_path / "proj" / f"fs_extra_{i}.py")
+            for i in range(100)
+        ]
+
+        lines = [
+            # Two real Edit tool_uses
+            json.dumps({
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "name": "Edit",
+                        "id": str(uuid.uuid4()),
+                        "input": {"file_path": fp},
+                    }],
+                },
+                "uuid": str(uuid.uuid4()),
+                "sessionId": session_id,
+            })
+            for fp in directly_edited
+        ] + [
+            # One snapshot listing all 102 files (2 real + 100 fs-extras)
+            json.dumps({
+                "type": "file-history-snapshot",
+                "messageId": str(uuid.uuid4()),
+                "snapshot": {
+                    "messageId": str(uuid.uuid4()),
+                    "trackedFileBackups": {
+                        fp: {
+                            "backupFileName": f"hash@v1",
+                            "version": 1,
+                            "backupTime": "2026-05-03T00:00:00Z",
+                        }
+                        for fp in (directly_edited + snapshot_only)
+                    },
+                    "timestamp": "2026-05-03T00:00:00Z",
+                },
+                "isSnapshotUpdate": True,
+            }),
+        ]
+        (proj_dir / f"{session_id}.jsonl").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+
+        info = SessionInfo(
+            session_id=session_id,
+            cwd=cwd,
+            state=SessionState.IDLE,
+        )
+        mgr = SessionManager()
+        with mgr._lock:
+            mgr._sessions[session_id] = info
+
+        with patch("daemon.backends.claude_store.Path") as SP:
+            SP.side_effect = _Path
+            SP.home.return_value = tmp_path
+            mgr._prepopulate_tracked_files(info)
+
+        # tracked_files MUST contain only the 2 directly-edited files.
+        # 100 snapshot-only entries must stay out — that's the snowball.
+        assert info.tracked_files == set(directly_edited), (
+            f"snowball-on-resume regression: prepopulate left "
+            f"{len(info.tracked_files)} entries in tracked_files; "
+            f"expected exactly 2 (the Edit/Write tool_use targets)."
+        )
+
+
+class TestWriteFileSnapshotShortCircuit:
+    """Per-turn cost guard: ``_write_file_snapshot`` against many tracked
+    files should be cheap on follow-up turns when nothing changed,
+    AND must not grow ``info.tracked_files`` while doing so.
+
+    Bounding the loop is what saved Windows users from 130-380 s
+    pre-turn waits — Defender real-time scan + OneDrive synchronisation
+    in the user's Documents/ folder made every read_bytes() multi-second.
+    The (mtime, size) short-circuit means the 1000-file warm path
+    stat()s every file but reads ~zero of them.
+    """
+
+    def test_unchanged_files_short_circuit_under_500ms(self, tmp_path):
+        import time
+        from unittest.mock import patch
+        from pathlib import Path as _Path
+        from app.config import _encode_cwd
+        from daemon.session_manager import (
+            SessionManager, SessionInfo, SessionState,
+        )
+
+        N = 1000
+        cwd = str(tmp_path / "proj")
+        (tmp_path / "proj").mkdir()
+        encoded = _encode_cwd(cwd)
+        proj_dir = tmp_path / ".claude" / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+        session_id = "snap-perf"
+        # Empty JSONL is fine — read_tail_uuids tolerates empty files
+        (proj_dir / f"{session_id}.jsonl").write_text("", encoding="utf-8")
+
+        # Materialize N small source files
+        proj = tmp_path / "proj"
+        files = []
+        for i in range(N):
+            fp = proj / f"file_{i:04d}.py"
+            fp.write_text(f"# file {i}\n", encoding="utf-8")
+            files.append(str(fp))
+
+        info = SessionInfo(
+            session_id=session_id,
+            cwd=cwd,
+            state=SessionState.IDLE,
+        )
+        info.tracked_files.update(files)
+
+        mgr = SessionManager()
+        with mgr._lock:
+            mgr._sessions[session_id] = info
+
+        # First call warms the (mtime, size) cache and writes backups.
+        # We don't assert timing on this one — cold cache is allowed
+        # to be slow.  We just need a successful warm-up.
+        with patch("daemon.session_manager.Path") as MP, \
+             patch("daemon.backends.claude_store.Path") as SP:
+            MP.side_effect = _Path
+            MP.home.return_value = tmp_path
+            SP.side_effect = _Path
+            SP.home.return_value = tmp_path
+            mgr._write_file_snapshot(session_id, is_post_turn=False)
+
+            tracked_before = len(info.tracked_files)
+
+            # Second call: every file is unchanged → must short-circuit.
+            t0 = time.perf_counter()
+            mgr._write_file_snapshot(session_id, is_post_turn=False)
+            elapsed = time.perf_counter() - t0
+
+        # Snowball guard: warm path must NOT have grown tracked_files.
+        assert len(info.tracked_files) == tracked_before, (
+            f"tracked_files grew during a no-op snapshot: "
+            f"{tracked_before} → {len(info.tracked_files)}"
+        )
+
+        # Performance guard: 1000 unchanged files in <500ms.
+        # The short-circuit reduces this to N stat() calls + bookkeeping.
+        # Real-world Windows numbers should be well under this; the
+        # threshold is generous to absorb CI jitter on slow runners.
+        assert elapsed < 0.5, (
+            f"_write_file_snapshot took {elapsed:.3f}s for {N} unchanged "
+            f"tracked files — short-circuit not engaging"
+        )
+
+    def test_post_turn_fs_extras_do_not_grow_tracked_files(self, tmp_path):
+        """Pin CLAUDE.md #7 invariant: a post-turn snapshot whose
+        ``_detect_changed_files`` returns 200 fs-modified paths must
+        write them all into the JSONL backup dict yet leave
+        ``info.tracked_files`` untouched."""
+        from unittest.mock import patch
+        from pathlib import Path as _Path
+        from app.config import _encode_cwd
+        from daemon.session_manager import (
+            SessionManager, SessionInfo, SessionState,
+        )
+
+        cwd = str(tmp_path / "proj")
+        (tmp_path / "proj").mkdir()
+        encoded = _encode_cwd(cwd)
+        proj_dir = tmp_path / ".claude" / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+        session_id = "perf-extras"
+        (proj_dir / f"{session_id}.jsonl").write_text("", encoding="utf-8")
+
+        proj = tmp_path / "proj"
+        # 1 directly-edited file + 200 fs_changed extras (e.g. Bash output)
+        edited = proj / "edited.py"
+        edited.write_text("v1\n", encoding="utf-8")
+        extras = []
+        for i in range(200):
+            fp = proj / f"bash_out_{i:03d}.py"
+            fp.write_text(f"out {i}\n", encoding="utf-8")
+            extras.append(str(fp))
+
+        info = SessionInfo(
+            session_id=session_id,
+            cwd=cwd,
+            state=SessionState.IDLE,
+        )
+        info.tracked_files.add(str(edited))
+        info._turn_had_direct_edit = False  # so fs fallback engages
+
+        mgr = SessionManager()
+        with mgr._lock:
+            mgr._sessions[session_id] = info
+
+        before = set(info.tracked_files)
+
+        with patch("daemon.session_manager.Path") as MP, \
+             patch("daemon.backends.claude_store.Path") as SP, \
+             patch.object(SessionManager, "_detect_changed_files",
+                          lambda self, info: set(extras)):
+            MP.side_effect = _Path
+            MP.home.return_value = tmp_path
+            SP.side_effect = _Path
+            SP.home.return_value = tmp_path
+            mgr._write_file_snapshot(session_id, is_post_turn=True)
+
+        # The 200 fs_extras land in the JSONL snapshot but MUST NOT
+        # be added to in-memory tracked_files (CLAUDE.md #7).
+        assert info.tracked_files == before, (
+            f"CLAUDE.md #7 violation: post-turn fs_changed grew "
+            f"tracked_files from {len(before)} to {len(info.tracked_files)}"
+        )
+
+
 class TestPerfCriticalProximityGuard:
     """Automated check that detects modifications near PERF-CRITICAL markers.
 

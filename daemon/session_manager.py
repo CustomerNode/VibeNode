@@ -152,6 +152,7 @@ class SessionInfo:
     tracked_files: set = field(default_factory=set)      # absolute paths modified by tools
     file_versions: dict = field(default_factory=dict)    # file_path -> backup version counter
     _last_hashes: dict = field(default_factory=dict)     # file_path -> last backed-up content hash
+    _last_mtime_size: dict = field(default_factory=dict) # file_path -> (mtime, size) when content was last hashed; lets _write_file_snapshot skip read+md5 for unchanged files (Windows file-IO is the bottleneck)
     _pre_turn_mtimes: dict = field(default_factory=dict) # file_path -> mtime before turn
     _post_turn_mtimes: dict = field(default_factory=dict) # carried forward from _detect_changed_files
     _turn_had_direct_edit: bool = False                  # True if streaming saw Edit/Write this turn
@@ -2874,49 +2875,154 @@ class SessionManager:
             logger.info("_write_file_snapshot(%s): skipped (no tracked files)", session_id)
             return
 
+        # ── Profiling (gated by _PROFILE_PIPELINE) ──
+        # Tracks loop wall-clock + cache-hit rate so the same metric the
+        # snowball regression was caught with (write_snapshot+record_mtimes
+        # ballooning into hundreds of seconds) is visible per-call, not just
+        # at the _send_query stage.  Three numbers are useful for triage:
+        #   tracked / extras / total — confirms the snowball source
+        #   short_circuit_hits      — measures the (mtime, size) skip rate
+        #   loop_secs               — the actual disk-IO cost on this turn
+        _t_loop = time.perf_counter() if self._PROFILE_PIPELINE else 0.0
+        _short_circuit_hits = 0
+
         try:
             sid = info.session_id
             history_dir = Path.home() / ".claude" / "file-history" / sid
             history_dir.mkdir(parents=True, exist_ok=True)
 
             tracked_backups = {}
-            for fpath in list(all_snapshot_files):
+
+            # ── Per-file processor (runs in a thread pool below) ──
+            # PERF-CRITICAL (added 2026-05-03): the read_bytes + md5 loop
+            # used to be sequential.  On Windows with Defender real-time
+            # scan + OneDrive in Documents/, hashing 2,800+ backed-up files
+            # took 130-380 s per pre-turn snapshot — blocking the query
+            # before it ever reached Claude.  Two fixes:
+            #
+            #   1. (mtime, size) short-circuit — if a file's stat metadata
+            #      matches what we recorded the last time we backed it up,
+            #      its content is unchanged and we can skip the read + md5
+            #      entirely.  This is the dominant speedup; on a typical
+            #      follow-up turn with 1000 tracked files and 1 changed,
+            #      999 hits the short-circuit and the loop runs in <100 ms.
+            #
+            #   2. Thread pool — the few files that DO need hashing run
+            #      in parallel, so the slow path is also bounded.  Pool
+            #      size is small (8) because the bottleneck is filesystem
+            #      IO + AV scan, not CPU.
+            #
+            # ``_last_hashes`` alone wasn't enough: it required a full
+            # read_bytes + md5 to even know whether content was unchanged.
+            # ``_last_mtime_size`` lets us skip the read in the common case.
+            def _process_one(fpath: str):
+                """Return (fpath, action_kind, payload) for the main thread to apply.
+
+                action_kind:
+                  'skip'        — file unchanged or unreadable (no entry written)
+                  'missing'     — file gone; record None backup if previously tracked
+                  'unchanged'   — hash matched _last_hashes; no new backup version
+                  'backup'      — produced a new backup; payload carries metadata
+                """
                 p = Path(fpath)
-                if not p.exists():
-                    # Only record missing-file entry if we previously had a backup
+                try:
+                    st = p.stat()
+                except (OSError, FileNotFoundError):
+                    # File gone — record missing entry only if we'd backed it up before
                     if fpath in info._last_hashes:
-                        tracked_backups[fpath] = {
-                            "backupFileName": None,
-                            "version": 0,
-                            "backupTime": None,
-                        }
-                    continue
+                        return (fpath, "missing", None)
+                    return (fpath, "skip", None)
+
+                # ── Fast path: stat-based short-circuit ──
+                # If (mtime, size) matches what we recorded last backup,
+                # the content is byte-identical to what's already backed
+                # up.  Skip the read_bytes + md5.  This is the hot path
+                # on Windows, where AV scans dominate read latency.
+                last_ms = info._last_mtime_size.get(fpath)
+                if last_ms is not None and last_ms == (st.st_mtime, st.st_size):
+                    return (fpath, "skip", None)
+
                 try:
                     content = p.read_bytes()
                 except Exception:
-                    continue
+                    return (fpath, "skip", None)
 
                 content_hash = hashlib.md5(content).hexdigest()[:16]
 
-                # Skip if content hasn't changed since last backup
+                # Even if mtime changed, hash may not have — touch(1)
+                # bumps mtime without changing content.  Refresh the
+                # cache so the short-circuit catches this file next turn.
                 if info._last_hashes.get(fpath) == content_hash:
-                    continue
+                    return (fpath, "unchanged",
+                            (st.st_mtime, st.st_size, content_hash))
 
+                # Real change: caller will assign next version + write backup.
+                return (fpath, "backup",
+                        (st.st_mtime, st.st_size, content_hash, content))
+
+            # ── Parallel scan ──
+            # Bounded pool (8) keeps simultaneous AV reads under control on
+            # Windows while still cutting wall time by ~3-4x in the worst
+            # case where many files actually changed.
+            from concurrent.futures import ThreadPoolExecutor as _Pool
+            _file_list = list(all_snapshot_files)
+            _max_workers = min(8, max(1, len(_file_list)))
+            with _Pool(max_workers=_max_workers, thread_name_prefix="snap") as _ex:
+                results = list(_ex.map(_process_one, _file_list))
+
+            # ── Apply results on the calling thread (no lock needed:
+            #    _write_file_snapshot is invoked serially per session) ──
+            for fpath, kind, payload in results:
+                if kind == "skip":
+                    _short_circuit_hits += 1
+                    continue
+                if kind == "missing":
+                    tracked_backups[fpath] = {
+                        "backupFileName": None,
+                        "version": 0,
+                        "backupTime": None,
+                    }
+                    continue
+                if kind == "unchanged":
+                    mtime, size, content_hash = payload
+                    info._last_mtime_size[fpath] = (mtime, size)
+                    info._last_hashes[fpath] = content_hash
+                    continue
+                # kind == "backup"
+                mtime, size, content_hash, content = payload
                 version = info.file_versions.get(fpath, 0) + 1
                 info.file_versions[fpath] = version
                 info._last_hashes[fpath] = content_hash
+                info._last_mtime_size[fpath] = (mtime, size)
 
                 backup_name = f"{content_hash}@v{version}"
-
                 backup_path = history_dir / backup_name
                 if not backup_path.exists():
-                    backup_path.write_bytes(content)
+                    try:
+                        backup_path.write_bytes(content)
+                    except Exception as werr:
+                        logger.debug("backup write failed for %s: %s", fpath, werr)
+                        continue
 
                 tracked_backups[fpath] = {
                     "backupFileName": backup_name,
                     "version": version,
                     "backupTime": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 }
+
+            if self._PROFILE_PIPELINE:
+                logger.info(
+                    "PROFILE _write_file_snapshot(%s): tracked=%d extras=%d total=%d "
+                    "short_circuit_hits=%d new_backups=%d loop=%.3fs",
+                    session_id[:12],
+                    len(info.tracked_files),
+                    len(fs_snapshot_extras),
+                    len(_file_list),
+                    _short_circuit_hits,
+                    sum(1 for v in tracked_backups.values()
+                        if isinstance(v, dict) and v.get("backupFileName")),
+                    time.perf_counter() - _t_loop,
+                )
 
             has_valid = any(
                 isinstance(v, dict) and v.get("backupFileName")

@@ -74,6 +74,29 @@ class ClaudeJsonlStore(ChatStore):
         Moved from session_manager.py L3072-3131 (scan logic from
         ``_prepopulate_tracked_files``).
 
+        PERF-CRITICAL: tracked_files snowball-on-resume — see CLAUDE.md #7.
+
+        ``found`` is populated ONLY from Source 1 (Edit/Write/MultiEdit/
+        NotebookEdit ``tool_use`` blocks).  Source 2 (file-history-snapshot
+        ``trackedFileBackups`` dicts) is consulted ONLY for ``max_version``
+        bookkeeping — it must NOT contribute to ``found``.
+
+        Why: every post-turn snapshot's ``trackedFileBackups`` dict can
+        contain ``fs_snapshot_extras`` (files changed by Bash/Agent that
+        were NEVER directly edited via a tool_use, captured per CLAUDE.md
+        #7 as snapshot-only).  If we re-feed those into ``found``, the
+        in-memory ``info.tracked_files`` snowballs back to thousands of
+        entries on the next ``_prepopulate_tracked_files`` call (which
+        happens whenever a fresh ``SessionInfo`` is created — recovery,
+        daemon restart, resume).  The next pre-turn ``_write_file_snapshot``
+        then re-reads + MD5-hashes every one of those files, producing
+        130-380 s pre-turn waits on Windows with Defender real-time scan.
+
+        Source 1 alone is the canonical truth: anything the CLI or daemon
+        edited via a real tool_use is captured there.  Files that were
+        only filesystem-detected changes were intentionally kept out of
+        ``tracked_files`` and must stay out across resume.
+
         Returns:
             (tracked_files: set, file_versions: dict,
              last_user_uuid: str, last_asst_uuid: str)
@@ -119,7 +142,8 @@ class ClaudeJsonlStore(ChatStore):
                         elif t == "assistant":
                             last_asst_uuid = uid
 
-                    # Source 1: tool_use blocks in assistant messages
+                    # Source 1: tool_use blocks in assistant messages.
+                    # This is the ONLY source that contributes to ``found``.
                     if t == "assistant":
                         msg = obj.get("message", {})
                         content = msg.get("content", [])
@@ -137,12 +161,14 @@ class ClaudeJsonlStore(ChatStore):
                             if fp:
                                 found.add(fp)
 
-                    # Source 2: existing file-history-snapshot entries
+                    # Source 2: existing file-history-snapshot entries —
+                    # used ONLY to recover version counters so newly written
+                    # backup file names don't collide.  Files in this dict
+                    # are NOT added to ``found`` (snowball prevention; see
+                    # docstring + CLAUDE.md #7).
                     elif t == "file-history-snapshot":
                         snap = obj.get("snapshot", {})
                         for fp, binfo in snap.get("trackedFileBackups", {}).items():
-                            if fp:
-                                found.add(fp)
                             if isinstance(binfo, dict):
                                 v = binfo.get("version", 0)
                                 if v > max_version.get(fp, 0):
