@@ -2300,8 +2300,11 @@ def projects_alias():
         cfg["project_id_aliases"] = aliases
         save_kanban_config(cfg)
 
-        # Reset cached repo so the next request sees the alias take effect.
-        reset_repository()
+        # The alias only changes which project_id we query — same backend,
+        # same connection — so DON'T reset_repository() here (that re-opens
+        # the default DB and breaks test isolation). Just bust the per-
+        # project columns cache so the alias target gets its default
+        # columns ensured on the next board render.
         invalidate_ensured_cache()
 
         return jsonify({"ok": True, "message": msg, "aliases": aliases})

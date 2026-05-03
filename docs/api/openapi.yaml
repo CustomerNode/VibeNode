@@ -3087,6 +3087,14 @@ paths:
                   type: string
                 supabase_secret_key:
                   type: string
+                copy_data:
+                  type: boolean
+                  description: >-
+                    When true (default), exports the current backend's data,
+                    wipes the target, and imports — the legacy push behavior.
+                    When false, leaves both backends untouched and only flips
+                    the active-backend pointer (used when adopting an
+                    existing shared cloud board).
       responses:
         "200":
           description: Migration complete
@@ -3094,6 +3102,139 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/OkMessage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/kanban/migrate/preflight:
+    post:
+      tags: [Kanban Config]
+      summary: Inspect both backends so the wizard can pick a safe prompt
+      operationId: migratePreflight
+      description: >-
+        Returns task / column / preference counts for both the currently
+        active backend and the prospective target. The Persistent Storage
+        wizard branches on these counts to decide between push, pull, or
+        switch-only — so users never see a generic "this will replace
+        cloud data" warning when there's nothing to replace.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target]
+              properties:
+                target:
+                  type: string
+                  enum: [sqlite, supabase]
+                supabase_url:
+                  type: string
+                supabase_secret_key:
+                  type: string
+      responses:
+        "200":
+          description: Preflight summary
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  current_backend:
+                    type: string
+                  target_backend:
+                    type: string
+                  current:
+                    type: object
+                    properties:
+                      tasks: {type: integer}
+                      columns: {type: integer}
+                      preferences: {type: integer}
+                      total_records: {type: integer}
+                      is_empty: {type: boolean}
+                  target_data:
+                    type: object
+                    properties:
+                      tasks: {type: integer}
+                      columns: {type: integer}
+                      preferences: {type: integer}
+                      total_records: {type: integer}
+                      is_empty: {type: boolean}
+                      reachable: {type: boolean}
+                  needs_schema:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/kanban/projects/discover:
+    post:
+      tags: [Kanban Config]
+      summary: List distinct project_ids in the active backend with fuzzy-match scores
+      operationId: projectsDiscover
+      description: >-
+        Powers the empty-state "find tasks in cloud" button. Walks every
+        project_id present in the active backend, scores each against the
+        user's local project basename, and returns them sorted (best match
+        first) so the UI can surface the obvious answer.
+      responses:
+        "200":
+          description: Candidates with task counts and match scores
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  local_project_id:
+                    type: string
+                  local_basename:
+                    type: string
+                  candidates:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        project_id: {type: string}
+                        task_count: {type: integer}
+                        basename: {type: string}
+                        score: {type: integer}
+
+  /api/kanban/projects/alias:
+    post:
+      tags: [Kanban Config]
+      summary: Map the local project_id to a remote one (shared-cloud join)
+      operationId: projectsAlias
+      description: >-
+        Saves an entry in kanban_config.json under "project_id_aliases"
+        keyed by the active local project_id. From then on, every kanban
+        request transparently remaps the local id to the supplied remote
+        id via app.config.resolve_project_alias(). Pass remote_project_id
+        as null to clear the alias.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                remote_project_id:
+                  type: string
+                  nullable: true
+      responses:
+        "200":
+          description: Alias saved or cleared
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+                  message: {type: string}
+                  aliases:
+                    type: object
+                    additionalProperties: {type: string}
         "400":
           $ref: "#/components/responses/BadRequest"
 

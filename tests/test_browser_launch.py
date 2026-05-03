@@ -397,3 +397,82 @@ class TestDaemonDetachment:
         assert "CREATE_NEW_PROCESS_GROUP" in func_body, \
             "ensure_daemon() must use CREATE_NEW_PROCESS_GROUP on Windows so " \
             "the daemon survives the web server process dying."
+
+
+# ---------------------------------------------------------------------------
+# Chrome process detachment (Linux + macOS)
+# ---------------------------------------------------------------------------
+#
+# The browser process MUST be detached from session_manager.py's process
+# group so a daemon restart doesn't take Chrome with it, and stdio MUST be
+# routed to /dev/null so Chrome's chatty DBus/GPU debug output doesn't
+# scroll over the launch.sh terminal. Both fixes shipped 2026-05-03 after
+# users on Linux saw their browser tab die when the daemon recycled.
+#
+# Windows uses ShellExecuteW which is already detached by definition
+# (different mechanism, same effect), so it doesn't need these guards.
+
+class TestChromeDetachment:
+    """Source guards: Chrome launch on Linux/macOS uses start_new_session +
+    DEVNULL stdio so the browser survives daemon restarts cleanly."""
+
+    def test_linux_chrome_uses_start_new_session(self):
+        """Linux Chrome Popen must pass start_new_session=True so the
+        browser detaches from session_manager.py's process group. Without
+        it, a daemon restart cascades a SIGTERM to the Chrome child."""
+        block = _get_platform_block("linux")
+        # Heuristic: locate the Popen([chrome_path, ...]) call (NOT the
+        # xdg-open Popen) and confirm start_new_session=True is in the
+        # same call.
+        chrome_call_idx = block.find("Popen(\n")
+        if chrome_call_idx == -1:
+            chrome_call_idx = block.find("Popen([chrome_path")
+        assert chrome_call_idx != -1, \
+            "Linux block must Popen the chrome_path"
+        # Take the next 400 chars from the Popen — should fit the kwargs
+        nearby = block[chrome_call_idx:chrome_call_idx + 400]
+        assert "start_new_session=True" in nearby, \
+            "Linux Chrome Popen() must pass start_new_session=True so the " \
+            "browser survives a daemon restart. Without it, Chrome inherits " \
+            "the parent process group and dies when the parent recycles."
+
+    def test_linux_chrome_redirects_stdio_to_devnull(self):
+        """Chrome's debug output (DBus, GPU warnings) clutters the
+        launch.sh terminal. stdout/stderr=DEVNULL keeps the user's
+        startup messages readable."""
+        block = _get_platform_block("linux")
+        chrome_call_idx = block.find("Popen(\n")
+        if chrome_call_idx == -1:
+            chrome_call_idx = block.find("Popen([chrome_path")
+        nearby = block[chrome_call_idx:chrome_call_idx + 400]
+        assert "stdout=subprocess.DEVNULL" in nearby, \
+            "Linux Chrome Popen() must redirect stdout to DEVNULL — Chrome " \
+            "is chatty and otherwise scrolls over our launcher's messages."
+        assert "stderr=subprocess.DEVNULL" in nearby, \
+            "Linux Chrome Popen() must redirect stderr to DEVNULL too — " \
+            "stderr is where Chrome's DBus/GPU warnings actually go."
+
+    def test_macos_chrome_uses_start_new_session(self):
+        """Same detachment rationale as Linux: macOS Chrome must outlive
+        the parent's process group churn."""
+        block = _get_platform_block("darwin")
+        chrome_call_idx = block.find("Popen(\n")
+        if chrome_call_idx == -1:
+            chrome_call_idx = block.find("Popen([chrome_path")
+        assert chrome_call_idx != -1, \
+            "macOS block must Popen the chrome_path"
+        nearby = block[chrome_call_idx:chrome_call_idx + 400]
+        assert "start_new_session=True" in nearby, \
+            "macOS Chrome Popen() must pass start_new_session=True. " \
+            "Same reasoning as Linux — without it the browser dies when " \
+            "the parent process recycles."
+
+    def test_macos_chrome_redirects_stdio_to_devnull(self):
+        """macOS Chrome stdio also goes to DEVNULL for terminal cleanliness."""
+        block = _get_platform_block("darwin")
+        chrome_call_idx = block.find("Popen(\n")
+        if chrome_call_idx == -1:
+            chrome_call_idx = block.find("Popen([chrome_path")
+        nearby = block[chrome_call_idx:chrome_call_idx + 400]
+        assert "stdout=subprocess.DEVNULL" in nearby
+        assert "stderr=subprocess.DEVNULL" in nearby
