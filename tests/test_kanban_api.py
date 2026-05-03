@@ -661,18 +661,42 @@ class TestBackupEndpoints:
 class TestMigratePreflight:
     """``POST /api/kanban/migrate/preflight`` shape + safety."""
 
-    def test_returns_counts_for_both_sides(self, kanban_app):
+    def test_returns_counts_for_both_sides(self, kanban_app, monkeypatch):
         """Preflight must report task counts so the UI can branch the prompt
-        ('cloud has data' vs. 'cloud empty') instead of guessing."""
+        ('cloud has data' vs. 'cloud empty') instead of guessing.
+
+        Test isolation note: the /preflight endpoint constructs a fresh
+        SqliteRepository() (no path) when target=sqlite, which would resolve
+        to ~/.claude/gui_kanban.db (production). Read-only — initialize()
+        only does CREATE TABLE IF NOT EXISTS — but still leaks across the
+        test boundary. We swap in a tmp-path SqliteRepository so the test
+        only touches its own DB.
+        """
+        from app.db import sqlite_backend as sb_mod
+        from pathlib import Path
+        # Use a separate tmp DB for the "target" repo path. The fixture
+        # already has its own tmp DB for the "current" repo via kanban_app.
+        OriginalSqliteRepo = sb_mod.SqliteRepository
+
+        def _scoped_repo(db_path=None):
+            if db_path is None:
+                db_path = Path(_scoped_repo.tmp_db)
+            return OriginalSqliteRepo(db_path=db_path)
+        # Stash the tmp path on the function so the closure can access it
+        # without leaking it via the monkeypatch closure cell.
+        import tempfile
+        _scoped_repo.tmp_db = tempfile.mktemp(suffix=".db")
+        monkeypatch.setattr(sb_mod, "SqliteRepository", _scoped_repo)
+        # Also patch the import inside the route module — Flask already
+        # resolved the symbol at module load time.
+        monkeypatch.setattr(
+            "app.routes.kanban_api.SqliteRepository", _scoped_repo, raising=False,
+        )
+
         app, client, repo = kanban_app
-        # Seed the active backend with 2 tasks
         client.post('/api/kanban/tasks', json={"title": "T1"})
         client.post('/api/kanban/tasks', json={"title": "T2"})
 
-        # Target = sqlite same backend, so target_data sees the same rows.
-        # The point here isn't realistic preflight against Supabase (we'd
-        # need a live cloud), but to assert the response shape and that
-        # task counts roundtrip correctly.
         resp = client.post('/api/kanban/migrate/preflight',
                            json={"target": "sqlite"})
         assert resp.status_code == 200
@@ -703,18 +727,39 @@ class TestMigrateCopyDataFlag:
     """``POST /api/kanban/migrate`` accepts ``copy_data`` to gate the
     destructive export/wipe/import path."""
 
-    def test_default_preserves_legacy_copy_behavior(self, kanban_app):
+    def test_default_preserves_legacy_copy_behavior(self, kanban_app, monkeypatch):
         """copy_data omitted -> True -> legacy path runs. Existing callers
-        that don't know about the flag must keep working."""
+        that don't know about the flag must keep working.
+
+        IMPORTANT: we MUST spy switch_backend rather than let it run for
+        real. The /migrate endpoint constructs a fresh SqliteRepository()
+        with no path argument, which resolves to ~/.claude/gui_kanban.db
+        — the user's production DB. Letting switch_backend actually
+        execute would call clear_all_data() against that production DB.
+        This test isolation bug already shipped once and wiped a real
+        user's kanban; never again. Spy → assert call → done.
+        """
         app, client, repo = kanban_app
+        called = {"switch": 0}
+        from app.db import migrator as mig_mod
+
+        def _spy(self, current, target):
+            called["switch"] += 1
+            # NB: deliberately do nothing — see docstring above.
+
+        monkeypatch.setattr(mig_mod.BackendMigrator, "switch_backend", _spy)
+
         client.post('/api/kanban/tasks', json={"title": "Existing"})
-        # target=sqlite (same backend) is unusual but fine for shape testing
         resp = client.post('/api/kanban/migrate', json={"target": "sqlite"})
         assert resp.status_code == 200
         body = resp.get_json()
         assert body["ok"] is True
         # The default response includes copied_data:True
         assert body.get("copied_data") is True
+        assert called["switch"] == 1, \
+            "Default copy_data must trigger switch_backend (the legacy " \
+            "destructive path) — that's the whole point of preserving " \
+            "the legacy default."
 
     def test_copy_data_false_skips_copy_and_does_not_wipe(self, kanban_app, monkeypatch):
         """copy_data: false must NOT call BackendMigrator.switch_backend.
