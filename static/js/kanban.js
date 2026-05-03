@@ -465,12 +465,22 @@ function renderKanbanBoard(data) {
   // Empty state (plan lines 3341-3347)
   const allTasks = Array.isArray(tasks) ? tasks : Object.values(tasks).flat();
   if (!columns.length || allTasks.length === 0) {
+    // The "Find tasks in cloud" button is a one-shot opt-in for shared
+    // boards. Discovery itself works on either backend, so we always show
+    // it; users on local-only setups will just see "no other projects
+    // found" and can ignore it. See projects_discover() in kanban_api.py.
     board.innerHTML =
       '<div class="kanban-empty-state">' +
       '<div style="margin-bottom:12px;color:var(--text-muted);">' + KI.clipboard + '</div>' +
       '<div style="font-size:16px;font-weight:500;color:var(--text);margin-bottom:6px;">Welcome to your Kanban board</div>' +
       '<div style="font-size:13px;color:var(--text-muted);margin-bottom:16px;">This project doesn\'t have any tasks yet.</div>' +
       '<button class="kanban-create-first-btn" onclick="createTask(\'not_started\')">+ Create your first task</button>' +
+      '<div style="margin-top:14px;">' +
+      '<button class="kanban-create-first-btn" id="kb-find-cloud-btn" onclick="discoverCloudProjects()" ' +
+      'style="background:transparent;color:var(--text-muted);border:1px solid var(--border);font-weight:500;">' +
+      'Find tasks for this project in cloud</button>' +
+      '</div>' +
+      '<div id="kb-discover-results" style="margin-top:14px;text-align:left;max-width:560px;margin-left:auto;margin-right:auto;"></div>' +
       '</div>';
     return;
   }
@@ -5860,6 +5870,155 @@ window.addEventListener('popstate', (e) => {
   }
 });
 
+
+// ═══════════════════════════════════════════════════════════════
+// SHARED-BOARD DISCOVERY (empty-state "find tasks in cloud")
+// ═══════════════════════════════════════════════════════════════
+// One-shot opt-in flow for users joining a shared Supabase project. The
+// button is rendered in the empty-state above; clicking it queries the
+// active backend for distinct project_ids, fuzzy-matches them against the
+// current local project, and offers to alias the best match. The alias is
+// persisted in kanban_config.json["project_id_aliases"] and applied
+// transparently from then on by app.config.resolve_project_alias().
+//
+// We could auto-alias on backend switch, but that's spooky-action: a user
+// who genuinely wants per-machine boards (rare but valid — e.g. a personal
+// vs. shared workspace) would silently get cross-machine merging. Better
+// to keep it explicit, one click.
+
+async function discoverCloudProjects() {
+  const resultsEl = document.getElementById('kb-discover-results');
+  const btn = document.getElementById('kb-find-cloud-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Searching cloud…'; }
+  if (resultsEl) resultsEl.innerHTML = '';
+
+  try {
+    const proj = (typeof localStorage !== 'undefined' && localStorage.getItem('activeProject')) || '';
+    const res = await fetch('/api/kanban/projects/discover?project=' + encodeURIComponent(proj), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      if (resultsEl) resultsEl.innerHTML = '<div style="color:var(--red, #f85149);font-size:12px;">✗ ' + (data.error || 'Discovery failed') + '</div>';
+      return;
+    }
+    renderDiscoverResults(data);
+  } catch (e) {
+    if (resultsEl) resultsEl.innerHTML = '<div style="color:var(--red, #f85149);font-size:12px;">✗ ' + e.message + '</div>';
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Find tasks for this project in cloud'; }
+  }
+}
+
+function renderDiscoverResults(data) {
+  const resultsEl = document.getElementById('kb-discover-results');
+  if (!resultsEl) return;
+
+  const candidates = data.candidates || [];
+  const localId = data.local_project_id || '';
+  const localBase = data.local_basename || '';
+
+  if (candidates.length === 0) {
+    resultsEl.innerHTML = `
+      <div style="padding:12px;border:1px solid var(--border);border-radius:6px;font-size:12px;color:var(--text-muted);">
+        No other projects found in the active backend. If you're expecting tasks from a
+        teammate, double-check that you're connected to the right Supabase project (System &rarr;
+        Persistent Storage).
+      </div>`;
+    return;
+  }
+
+  // Top match (score > 0) gets the call-to-action; the rest live behind a
+  // "show all" link in case the heuristic missed.
+  const strongMatches = candidates.filter(c => c.score >= 60);
+  const weakMatches = candidates.filter(c => c.score < 60);
+
+  let html = '';
+  if (strongMatches.length > 0) {
+    const top = strongMatches[0];
+    const exact = top.score >= 100;
+    html += `
+      <div style="padding:14px;border:1px solid var(--green);border-radius:8px;background:rgba(63,185,80,0.06);">
+        <div style="font-size:13px;font-weight:700;color:var(--green);margin-bottom:6px;">
+          ${exact ? 'Exact basename match found' : 'Likely match found'}
+        </div>
+        <div style="font-size:12px;color:var(--text-secondary);margin-bottom:10px;">
+          Your local project basename is <strong>${escHtml(localBase || '(none)')}</strong>.
+          The cloud has a project with <strong>${top.task_count} task${top.task_count === 1 ? '' : 's'}</strong>
+          whose basename is <strong>${escHtml(top.basename)}</strong>:
+          <div style="font-family:monospace;font-size:11px;color:var(--text-muted);margin-top:4px;word-break:break-all;">
+            ${escHtml(top.project_id)}
+          </div>
+        </div>
+        <button class="kanban-create-first-btn" onclick="adoptCloudProject('${escHtml(top.project_id)}')"
+                style="padding:8px 18px;font-size:13px;">
+          Adopt this project (${top.task_count} task${top.task_count === 1 ? '' : 's'})
+        </button>
+      </div>`;
+  }
+
+  // List of all candidates (sorted by the backend) for manual pick. We
+  // include strongMatches[1:] here so the user can see runner-ups too.
+  const others = strongMatches.slice(1).concat(weakMatches);
+  if (others.length > 0) {
+    html += `
+      <div style="margin-top:12px;">
+        <a href="#" onclick="event.preventDefault();document.getElementById('kb-discover-others').style.display='';this.style.display='none';"
+           style="font-size:12px;color:var(--text-muted);text-decoration:underline;">
+          ${strongMatches.length > 0 ? 'Show ' + others.length + ' other project' + (others.length === 1 ? '' : 's') + ' in cloud…'
+                                       : 'No obvious match — show all ' + others.length + ' project' + (others.length === 1 ? '' : 's') + ' anyway…'}
+        </a>
+        <div id="kb-discover-others" style="display:none;margin-top:10px;">`;
+    for (const c of others) {
+      html += `
+        <div style="padding:10px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;">
+          <div style="font-size:12px;color:var(--text);margin-bottom:4px;">
+            <strong>${escHtml(c.basename)}</strong>
+            <span style="color:var(--text-muted);font-size:11px;">— ${c.task_count} task${c.task_count === 1 ? '' : 's'}</span>
+          </div>
+          <div style="font-family:monospace;font-size:10px;color:var(--text-muted);word-break:break-all;margin-bottom:6px;">
+            ${escHtml(c.project_id)}
+          </div>
+          <button class="kanban-create-first-btn" onclick="adoptCloudProject('${escHtml(c.project_id)}')"
+                  style="padding:5px 12px;font-size:11px;background:transparent;color:var(--text);border:1px solid var(--border);font-weight:500;">
+            Adopt
+          </button>
+        </div>`;
+    }
+    html += `</div></div>`;
+  }
+  // Show local project_id at the bottom so users can sanity-check what
+  // they're aliasing FROM (matters when reporting bugs or undoing later).
+  html += `
+    <div style="margin-top:12px;font-size:10px;color:var(--text-faint);font-family:monospace;word-break:break-all;">
+      Aliasing from: ${escHtml(localId || '(unknown)')}
+    </div>`;
+  resultsEl.innerHTML = html;
+}
+
+async function adoptCloudProject(remoteProjectId) {
+  if (!remoteProjectId) return;
+  const resultsEl = document.getElementById('kb-discover-results');
+  try {
+    const res = await fetch('/api/kanban/projects/alias', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ remote_project_id: remoteProjectId }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      if (resultsEl) resultsEl.innerHTML = '<div style="color:var(--red, #f85149);font-size:12px;">✗ ' + (data.error || 'Could not save alias') + '</div>';
+      return;
+    }
+    if (typeof showToast === 'function') showToast('Project aliased — loading tasks…');
+    // Refresh the board so the alias takes effect visibly.
+    if (typeof initKanban === 'function') await initKanban(true);
+  } catch (e) {
+    if (resultsEl) resultsEl.innerHTML = '<div style="color:var(--red, #f85149);font-size:12px;">✗ ' + e.message + '</div>';
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════
 // UTILITIES

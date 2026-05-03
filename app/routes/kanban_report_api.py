@@ -23,10 +23,15 @@ def _get_repo():
 
 
 def _get_project_id():
+    # Reports go through the same alias resolution as the kanban routes — see
+    # app.config.resolve_project_alias. Without this, a user who adopts a
+    # shared cloud project_id would see their tasks but get empty velocity /
+    # status / cycle-time charts because reports queried the local id.
+    from ..config import resolve_project_alias
     pid = request.args.get('project_id')
     if pid:
-        return pid
-    return get_active_project()
+        return resolve_project_alias(pid)
+    return resolve_project_alias(get_active_project())
 
 
 def _parse_date(s):

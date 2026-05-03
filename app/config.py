@@ -155,6 +155,35 @@ def set_active_project(value: str) -> None:
     _active_project = value
 
 
+def resolve_project_alias(project_id: str) -> str:
+    """Map a local-path-derived project_id to a remote one for kanban use only.
+
+    VibeNode keys all kanban tasks by ``project_id``, which ``_encode_cwd()``
+    derives from the absolute filesystem path of the project folder. That's
+    fine for single-machine use but breaks shared Supabase boards: two users
+    on Windows + Linux pointing at the same DB end up in different silos
+    because their absolute paths differ.
+
+    This function checks ``kanban_config.json["project_id_aliases"]`` for an
+    entry whose key matches ``project_id`` and returns the aliased value;
+    otherwise returns ``project_id`` unchanged. Only kanban routes call this
+    — sessions, git, file paths still use the real local-derived id, since
+    those legitimately depend on the actual folder on this machine.
+
+    Example kanban_config.json fragment::
+
+        {
+          "project_id_aliases": {
+            "-home-me-code-VibeNode": "C--Users-other-Documents-VibeNode"
+          }
+        }
+    """
+    if not project_id:
+        return project_id
+    aliases = (get_kanban_config().get("project_id_aliases") or {})
+    return aliases.get(project_id, project_id)
+
+
 # ---------------------------------------------------------------------------
 # Directory helpers
 # ---------------------------------------------------------------------------

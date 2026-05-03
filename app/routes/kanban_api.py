@@ -129,8 +129,16 @@ def _build_recursive_counts(all_tasks, repo):
 
 
 def _get_project_id():
-    """Return the active project identifier."""
-    return get_active_project()
+    """Return the active project identifier, alias-resolved for shared boards.
+
+    See ``app.config.resolve_project_alias`` for why this layer exists — it
+    lets two users on different machines (different absolute paths, hence
+    different encoded project_ids) point at the same Supabase board and see
+    the same tasks. Only the kanban code path goes through this remap; the
+    sessions / git / file APIs still use the real local-derived id.
+    """
+    from ..config import resolve_project_alias
+    return resolve_project_alias(get_active_project())
 
 
 def _emit(event, data):
@@ -2149,5 +2157,153 @@ def backup_delete():
 
         filepath.unlink()
         return jsonify({"ok": True, "message": f"Deleted {filename}"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Cross-machine shared-project discovery & aliasing
+# ---------------------------------------------------------------------------
+# When two users on different OSes (Windows + Linux) point at the same
+# Supabase backend, their tasks end up in different silos because the
+# project_id is encoded from the absolute filesystem path. These two
+# endpoints let a user, while staring at an empty board, discover what
+# project_ids exist in the cloud, fuzzy-match them against their local
+# project, and adopt one as a permanent alias. The alias is stored in
+# kanban_config.json["project_id_aliases"] and applied transparently by
+# app.config.resolve_project_alias() on every kanban request thereafter.
+
+
+def _project_basename(project_id: str) -> str:
+    """Last `-`-delimited segment of an encoded project_id.
+
+    project_ids come from _encode_cwd() which replaces /, \\, :, _ with -,
+    so the trailing segment is the original folder's basename. That's the
+    most user-recognizable piece for fuzzy matching ("VibeNode" matches
+    "VibeNode" even when the parents are wildly different).
+    """
+    if not project_id:
+        return ""
+    return project_id.rstrip("-").split("-")[-1]
+
+
+def _score_project_match(local_id: str, remote_id: str) -> int:
+    """Heuristic score for "is remote_id likely the same project as local_id?"
+
+    Cheap and good-enough: the user picks from a sorted list, so we don't
+    need anything fancy. 100 = exact basename, 60 = basename appears in the
+    other id (handles "VibeNode" inside "Documents-VibeNode"), 0 otherwise.
+    Case-insensitive throughout.
+    """
+    if not local_id or not remote_id or local_id == remote_id:
+        return 0  # exact match isn't useful — that means no aliasing needed
+    lb = _project_basename(local_id).lower()
+    rb = _project_basename(remote_id).lower()
+    if not lb or not rb:
+        return 0
+    if lb == rb:
+        return 100
+    li = local_id.lower()
+    ri = remote_id.lower()
+    if lb in ri or rb in li:
+        return 60
+    return 0
+
+
+@bp.route("/api/kanban/projects/discover", methods=["POST"])
+def projects_discover():
+    """Enumerate distinct project_ids in the active backend, ranked vs. local.
+
+    The empty-state "find tasks in cloud" button calls this. Returns one row
+    per distinct project_id with a task count and a fuzzy-match score so the
+    UI can lead with the obvious match (basename equal) and hide the rest
+    behind a "show all" toggle. Works on either backend — even SQLite
+    benefits if the user has worked on the same project from two paths.
+    """
+    try:
+        repo = _get_repo()
+        # Use the migrator's export_all to dump tasks; it's already abstract
+        # over both backends and a one-time button click can afford the cost.
+        from ..db.migrator import BackendMigrator
+        mig = BackendMigrator()
+        dump = mig.export_all(repo)
+
+        # Count tasks by project_id. Empty board is the dominant case so
+        # anything > 0 is interesting to surface.
+        counts = {}
+        for t in dump.get("tasks", []):
+            pid = t.get("project_id") if isinstance(t, dict) else getattr(t, "project_id", None)
+            if not pid:
+                continue
+            counts[pid] = counts.get(pid, 0) + 1
+
+        # The "local" id is whatever the active project resolves to PRE-alias
+        # — we want to compare against the user's actual folder, not against
+        # an alias they've already adopted. Bypass resolve_project_alias here.
+        local_id_raw = get_active_project()
+
+        candidates = []
+        for pid, n in counts.items():
+            score = _score_project_match(local_id_raw, pid)
+            candidates.append({
+                "project_id": pid,
+                "task_count": n,
+                "basename": _project_basename(pid),
+                "score": score,
+            })
+        # Sort: best score first, then most tasks. Ties broken alphabetically
+        # for deterministic output.
+        candidates.sort(key=lambda c: (-c["score"], -c["task_count"], c["project_id"]))
+
+        return jsonify({
+            "ok": True,
+            "local_project_id": local_id_raw,
+            "local_basename": _project_basename(local_id_raw),
+            "candidates": candidates,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@bp.route("/api/kanban/projects/alias", methods=["POST"])
+def projects_alias():
+    """Save a permanent project_id alias for the current local project.
+
+    Body: {"remote_project_id": "<id from /discover>"}.
+    Writes kanban_config.json["project_id_aliases"][local_id] = remote_id.
+    The alias takes effect immediately for subsequent kanban requests via
+    app.config.resolve_project_alias(); the kanban repo singleton is reset
+    so the next /board call queries the new project_id.
+
+    POST {"remote_project_id": null} to clear the alias for the current
+    local project (useful if the user picked the wrong match).
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        remote_id = body.get("remote_project_id")
+        # Always derive local from the active project (pre-alias), never
+        # accept it from the client — otherwise a misconfigured caller could
+        # accidentally overwrite an unrelated alias.
+        local_id = get_active_project()
+        if not local_id:
+            return jsonify({"ok": False, "error": "No active project"}), 400
+
+        from ..config import get_kanban_config, save_kanban_config
+        cfg = get_kanban_config()
+        aliases = dict(cfg.get("project_id_aliases") or {})
+        if remote_id:
+            aliases[local_id] = remote_id
+            msg = f"Aliased {local_id} -> {remote_id}"
+        else:
+            aliases.pop(local_id, None)
+            msg = f"Cleared alias for {local_id}"
+        cfg["project_id_aliases"] = aliases
+        save_kanban_config(cfg)
+
+        # Reset cached repo so the next request sees the alias take effect.
+        reset_repository()
+        invalidate_ensured_cache()
+
+        return jsonify({"ok": True, "message": msg, "aliases": aliases})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
