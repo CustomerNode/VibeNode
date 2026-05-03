@@ -727,19 +727,37 @@ class TestMigrateCopyDataFlag:
     """``POST /api/kanban/migrate`` accepts ``copy_data`` to gate the
     destructive export/wipe/import path."""
 
-    def test_default_preserves_legacy_copy_behavior(self, kanban_app, monkeypatch):
+    @staticmethod
+    def _redirect_target_sqlite_to_tmp(monkeypatch, tmp_path):
+        """Monkeypatch SqliteRepository so /migrate's `target_repo =
+        SqliteRepository()` (called inside the endpoint with no path arg)
+        returns a tmp-path instance instead of opening the production DB.
+
+        Without this, the autouse production-path guard (see conftest.py
+        ``_block_production_paths``) raises when the endpoint tries to
+        connect, the endpoint catches the exception and returns 500, and
+        the test fails its 200-status assertion.
+        """
+        from app.db import sqlite_backend as sb_mod
+        Original = sb_mod.SqliteRepository
+
+        def _ctor(db_path=None):
+            return Original(db_path=db_path or str(tmp_path / "migrate_target.db"))
+
+        monkeypatch.setattr(sb_mod, "SqliteRepository", _ctor)
+
+    def test_default_preserves_legacy_copy_behavior(self, kanban_app, monkeypatch, tmp_path):
         """copy_data omitted -> True -> legacy path runs. Existing callers
         that don't know about the flag must keep working.
 
-        IMPORTANT: we MUST spy switch_backend rather than let it run for
-        real. The /migrate endpoint constructs a fresh SqliteRepository()
-        with no path argument, which resolves to ~/.claude/gui_kanban.db
-        — the user's production DB. Letting switch_backend actually
-        execute would call clear_all_data() against that production DB.
-        This test isolation bug already shipped once and wiped a real
-        user's kanban; never again. Spy → assert call → done.
+        Defense-in-depth: we (a) redirect the target SqliteRepository to
+        tmp_path so the production-path guard doesn't trip, AND (b) spy
+        out switch_backend so even if the redirection were forgotten the
+        destructive call wouldn't reach a real DB.
         """
         app, client, repo = kanban_app
+        self._redirect_target_sqlite_to_tmp(monkeypatch, tmp_path)
+
         called = {"switch": 0}
         from app.db import migrator as mig_mod
 
@@ -761,11 +779,13 @@ class TestMigrateCopyDataFlag:
             "destructive path) — that's the whole point of preserving " \
             "the legacy default."
 
-    def test_copy_data_false_skips_copy_and_does_not_wipe(self, kanban_app, monkeypatch):
+    def test_copy_data_false_skips_copy_and_does_not_wipe(self, kanban_app, monkeypatch, tmp_path):
         """copy_data: false must NOT call BackendMigrator.switch_backend.
         The whole point of this flag is to avoid wiping existing target
         data on shared-cloud joins."""
         app, client, repo = kanban_app
+        self._redirect_target_sqlite_to_tmp(monkeypatch, tmp_path)
+
         called = {"switch": 0}
         from app.db import migrator as mig_mod
         original = mig_mod.BackendMigrator.switch_backend
