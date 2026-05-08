@@ -9,6 +9,8 @@ Patch inventory:
   1. Safe message parser — handle unknown message types gracefully
   2. Transport adapter injection — reformat permission responses + keep stdin open
   3. Suppress console windows — prevent CLI subprocess from flashing a window (Windows)
+  4. Isolate POSIX subprocesses — put each child in its own session/pgrp so
+     killpg-based session stop cannot blast the daemon (Linux/macOS)
 
 Patches 2b and 3 from the original session_manager.py monkey-patching have been
 replaced by the Transport Adapter pattern (see sdk_transport_adapter.py).
@@ -69,6 +71,7 @@ def apply_patches() -> list[str]:
         ("safe_parse_message", _apply_patch_safe_parse_message),
         ("transport_adapter", _apply_patch_transport_adapter),
         ("suppress_console_windows", _apply_patch_suppress_console_windows),
+        ("isolate_posix_subprocesses", _apply_patch_isolate_posix_subprocesses),
     ]:
         try:
             if fn():
@@ -252,4 +255,72 @@ def _apply_patch_suppress_console_windows() -> bool:
         return _original_init(self, *args, **kwargs)
 
     _subprocess.Popen.__init__ = _no_window_Popen_init  # type: ignore[method-assign]
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Patch 4: Isolate POSIX subprocesses in their own session / process group
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# When a session is stopped on Linux/macOS, daemon/session_manager.py
+# `_kill_process_tree()` calls
+#     os.killpg(os.getpgid(cli_pid), signal.SIGTERM)   # then SIGKILL
+# to terminate the Claude CLI subprocess and any descendants it spawned
+# (test runners, build tools, etc.).
+#
+# Without isolation, the spawned CLI inherits the daemon's process group.
+# run.py / app/daemon_client.py launch the daemon itself with
+# start_new_session=True, making the daemon the session leader of every
+# descendant — including each Claude CLI child. So
+# os.getpgid(cli_pid) returns the daemon's pgid, and killpg blasts the
+# daemon along with the targeted CLI. The daemon dies, every other live
+# session dies with it, and the launcher restarts the daemon. Stopping
+# one session takes down the whole daemon. (Windows is unaffected because
+# _kill_process_tree() takes a different `taskkill /F /T /PID` branch.)
+#
+# Fix: inject start_new_session=True into every Popen on POSIX so each
+# spawned subprocess (the SDK's Claude CLI in particular) lands in its
+# own session/pgrp. killpg then targets only that subtree. This mirrors
+# the isolation that run.py / app/daemon_client.py already apply when
+# spawning the daemon itself.
+#
+# Same low-fragility seam as Patch 3 — Popen.__init__ is stable CPython
+# API. Platform-gated to POSIX. Respects an explicit start_new_session
+# kwarg from callers, and skips injection when the caller passed a
+# preexec_fn (they're managing child setup themselves and combining the
+# two would be surprising).
+#
+# DO NOT change this to patch anyio.open_process or wrap the SDK's
+# connect(). See the warning on Patch 3 — that approach was tried and
+# broke control-protocol initialization. asyncio's POSIX subprocess
+# transport ultimately calls subprocess.Popen, so this patch covers the
+# SDK's spawn path through the same low-fragility seam.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _apply_patch_isolate_posix_subprocesses() -> bool:
+    """Patch Popen on POSIX to put each subprocess in its own session.
+
+    Prevents `os.killpg(os.getpgid(child_pid), ...)` from blasting the
+    daemon when stopping a single session. See the section header above
+    for the full root-cause writeup.
+
+    Returns True when applied, False on Windows (no-op there — see Patch 3
+    for the Windows-specific Popen patch).
+    """
+    if os.name == "nt":
+        return False
+
+    _original_init = _subprocess.Popen.__init__
+
+    def _isolated_session_Popen_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        # Respect explicit caller intent: only inject when neither
+        # start_new_session nor preexec_fn were supplied. preexec_fn is a
+        # caller-managed hook and stacking start_new_session on top of it
+        # could surprise callers who already handle child setup.
+        if "start_new_session" not in kwargs and "preexec_fn" not in kwargs:
+            kwargs["start_new_session"] = True
+        return _original_init(self, *args, **kwargs)
+
+    _subprocess.Popen.__init__ = _isolated_session_Popen_init  # type: ignore[method-assign]
     return True

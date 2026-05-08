@@ -6,10 +6,15 @@ Validates that:
 3. Transport adapter correctly reformats permission responses
 4. Transport adapter suppresses end_input when keep_stdin_open=True
 5. Transport adapter delegates all other methods unchanged
+6. POSIX subprocesses are isolated into their own session (Patch 4 — guards
+   against daemon-killing killpg in _kill_process_tree)
 """
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -536,3 +541,128 @@ class TestPatchApplication:
         # Should still be the same adapter, not double-wrapped
         assert q.transport is pre_wrapped
         assert q.transport.inner is mock
+
+
+# ── POSIX Subprocess Isolation Tests (Patch 4) ──────────────────────────
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only patch")
+class TestPosixSubprocessIsolation:
+    """Patch 4 must place every Popen child in its own session/pgrp.
+
+    Regression guard for the bug where stopping one session killed the
+    whole daemon on Linux. _kill_process_tree() calls
+    os.killpg(os.getpgid(cli_pid), SIGTERM); without start_new_session=True
+    the CLI inherited the daemon's pgid and killpg blasted the daemon.
+    """
+
+    def test_default_spawn_is_session_isolated(self):
+        """A normal Popen must land in a session distinct from this process."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(5)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            child_sid = os.getsid(proc.pid)
+            self_sid = os.getsid(os.getpid())
+            # If the patch is missing, child inherits parent's session.
+            # If the patch is applied, child is its own session leader.
+            assert child_sid != self_sid, (
+                f"Child SID {child_sid} == parent SID {self_sid}: "
+                "Patch 4 (start_new_session injection) is not active. "
+                "killpg-based session stop will kill the daemon."
+            )
+            # Child should be its own session leader (sid == pid).
+            assert child_sid == proc.pid, (
+                f"Child SID {child_sid} != child PID {proc.pid}: "
+                "child is not the session leader as expected."
+            )
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    def test_explicit_start_new_session_false_is_respected(self):
+        """Caller opt-out: explicit start_new_session=False must NOT be overridden."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(5)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=False,
+        )
+        try:
+            child_sid = os.getsid(proc.pid)
+            self_sid = os.getsid(os.getpid())
+            assert child_sid == self_sid, (
+                "Patch 4 overrode an explicit start_new_session=False — "
+                "caller intent must be respected."
+            )
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    def test_preexec_fn_skips_injection(self):
+        """If caller supplied preexec_fn, the patch must NOT add start_new_session.
+
+        Combining the two would silently change child setup behavior. The
+        patch detects preexec_fn and bows out, leaving the caller's setup
+        untouched.
+        """
+        # preexec_fn=lambda: None means "do nothing extra"; without our
+        # injection, the child stays in the parent's session.
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(5)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=lambda: None,
+        )
+        try:
+            child_sid = os.getsid(proc.pid)
+            self_sid = os.getsid(os.getpid())
+            assert child_sid == self_sid, (
+                "Patch 4 stepped on a caller-supplied preexec_fn by also "
+                "setting start_new_session=True."
+            )
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    def test_killpg_on_isolated_child_does_not_signal_parent(self):
+        """End-to-end guard: the exact bug scenario must not reproduce.
+
+        Spawn a child, kill its process group with SIGTERM, and confirm
+        THIS test process (the stand-in for the daemon) is unaffected.
+        If Patch 4 is missing, this test would deliver SIGTERM to itself.
+        """
+        import signal
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            child_pgid = os.getpgid(proc.pid)
+            self_pgid = os.getpgid(os.getpid())
+            assert child_pgid != self_pgid, (
+                "Child shares parent's pgid — killpg below would kill "
+                "the test process. Patch 4 is not active."
+            )
+            # Safe to killpg now; the child is in its own group.
+            os.killpg(child_pgid, signal.SIGTERM)
+            proc.wait(timeout=5)
+            # Child should be terminated by SIGTERM (negative returncode = signal).
+            assert proc.returncode is not None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only check")
+class TestWindowsPatchSkipsPosixIsolation:
+    """On Windows, Patch 4 must be a no-op (Windows uses taskkill, not killpg)."""
+
+    def test_isolation_patch_returns_false_on_windows(self):
+        from daemon.sdk_patches import _apply_patch_isolate_posix_subprocesses
+        # Returns False because the patch doesn't apply on Windows.
+        assert _apply_patch_isolate_posix_subprocesses() is False
