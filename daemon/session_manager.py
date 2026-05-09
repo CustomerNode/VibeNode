@@ -2334,11 +2334,17 @@ class SessionManager:
                     except Exception:
                         pass
 
-                # End of compaction (or session re-init) — always clear substatus.
+                # End of compaction (or session re-init) — clear substatus.
                 # Only add the "Context compacted" log entry if we were actually
                 # compacting; avoids spurious entries on a plain session restart.
+                # Preserve "auto-resuming": init also fires at the start of an
+                # SDK auto-resume turn (after a background-task notification),
+                # and the post-turn drain has already flipped state to WORKING
+                # with substatus="auto-resuming" — we must keep that visible
+                # through the init boundary or the UI will flicker.
                 was_compacting = info.substatus == 'compacting'
-                info.substatus = ""
+                if info.substatus != 'auto-resuming':
+                    info.substatus = ""
                 # Restore IDLE only if we're in post-turn context
                 # (_awaiting_compact_drain=True means RESULT already came and
                 # we're draining the buffer — safe to go IDLE now).
@@ -3111,76 +3117,174 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     async def _post_turn_compact_drain(self, session_id: str, info: SessionInfo) -> None:
-        """Drain the SDK buffer after RESULT to detect auto-compaction.
+        """Drain the SDK buffer after RESULT.
 
-        The SDK sends compact_boundary AFTER ResultMessage as a post-turn
-        notification.  The main receive_response() loop terminates at RESULT,
-        so compact_boundary (and init) are left in the SDK's MemoryObjectStream
-        buffer.  This method peeks at the buffer for up to 100 ms — fast enough
-        to be imperceptible on normal turns, but enough to catch a buffered
-        compact_boundary.  If one is found, we wait up to 5 minutes for init
-        so the session shows "Compacting…" for the true compaction duration.
+        Two things can be buffered after the assistant turn's RESULT:
+
+        1. Auto-compaction: ``compact_boundary`` system message followed by
+           ``init`` once the new context summary is ready.  The session
+           should show "Compacting…" until ``init`` arrives.
+
+        2. Auto-resume from a background hook (e.g. ``Bash`` started with
+           ``run_in_background=True``).  When the background task finishes,
+           the SDK injects a synthetic user message (``task_notification``)
+           and restarts the assistant turn (``init`` → content → fresh
+           ``RESULT``).  If we don't keep listening, the auto-resume's
+           events sit unread in the SDK buffer until the next user
+           ``send_message()`` reads them as if they were the response to
+           the new query — every subsequent turn returns instantly with
+           the wrong tokens, and the session becomes unusable.
+
+        Loops to handle chained auto-resumes (multiple background tasks
+        finishing in sequence) and ``compact_boundary`` followed by
+        auto-resume.
         """
-        compact_seen = False
+        # Flag the inner peek can set to mark "saw a true RESULT during peek"
+        while True:
+            compact_seen = False
+            auto_resume_seen = False
+            peek_got_result = False
 
-        # Phase 1: short peek for compact_boundary (already buffered if present)
-        try:
             async def _peek():
-                nonlocal compact_seen
+                nonlocal compact_seen, auto_resume_seen, peek_got_result
                 async for msg in self._sdk.receive_response(info.client):
                     if info.task is not asyncio.current_task():
                         return
                     await self._process_message(session_id, msg)
+                    if msg.kind == MessageKind.RESULT:
+                        # Auto-resume turn finished inside the peek window —
+                        # _process_message just set state=IDLE +
+                        # _awaiting_compact_drain=True.  Loop will decide
+                        # whether to peek again for chained activity.
+                        peek_got_result = True
+                        return
                     if msg.kind == MessageKind.SYSTEM:
                         sub = msg.subtype or ''
                         if sub == 'compact_boundary':
                             compact_seen = True
-                            return  # Confirmed — move to Phase 2
-                        elif sub == 'init':
-                            return  # Already done (fast compaction)
-                        # Other system messages (e.g. turn_duration) — keep draining
-                    else:
-                        # Non-system in post-turn buffer — unexpected, stop
-                        logger.warning("Unexpected post-turn msg kind=%s for %s",
-                                       msg.kind.value, session_id)
-                        return
-            await asyncio.wait_for(_peek(), timeout=0.1)
-        except asyncio.TimeoutError:
-            pass  # Normal — no buffered messages means no compaction
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning("_post_turn_compact_drain peek error for %s: %s", session_id, e)
+                            return
+                        if sub == 'task_notification':
+                            # SDK is auto-resuming from a background hook
+                            # (Bash run_in_background completion, etc.).
+                            # Flip back to WORKING immediately so the UI
+                            # reflects activity rather than a stale IDLE.
+                            auto_resume_seen = True
+                            self._enter_auto_resume(info)
+                            continue
+                        if sub == 'init':
+                            # Lone init (or init after task_notification we
+                            # already consumed) — return so the outer loop
+                            # decides whether to keep streaming.
+                            return
+                        # Other system messages (status, turn_duration) —
+                        # keep draining.
+                        continue
+                    # Non-system message arrived after RESULT — the SDK is
+                    # already streaming the auto-resume turn's content.
+                    auto_resume_seen = True
+                    self._enter_auto_resume(info)
+                    continue
 
-        if not compact_seen or info.task is not asyncio.current_task():
+            try:
+                await asyncio.wait_for(_peek(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("_post_turn_compact_drain peek error for %s: %s", session_id, e)
+                return
+
+            if info.task is not asyncio.current_task():
+                return
+
+            if compact_seen:
+                logger.info("Auto-compaction detected for %s — waiting for init", session_id)
+                try:
+                    async def _wait_init():
+                        async for msg in self._sdk.receive_response(info.client):
+                            if info.task is not asyncio.current_task():
+                                return
+                            await self._process_message(session_id, msg)
+                            if msg.kind == MessageKind.SYSTEM and (msg.subtype or '') == 'init':
+                                return  # Compaction complete
+                            if msg.kind == MessageKind.RESULT:
+                                return  # Unexpected second RESULT — stop
+                            if msg.kind != MessageKind.SYSTEM:
+                                logger.warning("Unexpected post-compact msg kind=%s for %s",
+                                               msg.kind.value, session_id)
+                                return
+                    await asyncio.wait_for(_wait_init(), timeout=300.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Auto-compact timed out waiting for init on %s (5 min)", session_id)
+                    if info.task is asyncio.current_task() and info.substatus:
+                        info.substatus = ""
+                        self._emit_state(info)
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("_post_turn_compact_drain wait-init error for %s: %s", session_id, e)
+                    return
+                # Compaction may be followed by auto-resume — loop again.
+                continue
+
+            if auto_resume_seen and not peek_got_result:
+                # SDK is mid-way through the auto-resume turn; stream the
+                # rest until its RESULT arrives.
+                logger.info("Auto-resume in progress for %s — streaming until RESULT", session_id)
+                got_result = False
+                try:
+                    async for msg in self._sdk.receive_response(info.client):
+                        if info.task is not asyncio.current_task():
+                            return
+                        await self._process_message(session_id, msg)
+                        if msg.kind == MessageKind.RESULT:
+                            got_result = True
+                            # _process_message set state=IDLE + _awaiting_compact_drain=True.
+                            break
+                        # Defensive: a stray non-system msg with state still IDLE
+                        # would mean we missed the WORKING flip — re-enter.
+                        if info.state == SessionState.IDLE \
+                                and msg.kind != MessageKind.SYSTEM:
+                            self._enter_auto_resume(info)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("_post_turn_compact_drain auto-resume stream error for %s: %s",
+                                   session_id, e)
+                    return
+                if not got_result:
+                    return
+                # Loop to detect chained auto-resume / compaction.
+                continue
+
+            if peek_got_result:
+                # We consumed an auto-resume's full turn entirely inside the
+                # 100 ms peek (very fast turn).  Loop to check for further
+                # buffered activity.
+                continue
+
+            # Nothing buffered — truly done.
             return
 
-        # Phase 2: compact_boundary confirmed — wait for init (actual compaction)
-        logger.info("Auto-compaction detected for %s — waiting for init", session_id)
-        try:
-            async def _wait_init():
-                async for msg in self._sdk.receive_response(info.client):
-                    if info.task is not asyncio.current_task():
-                        return
-                    await self._process_message(session_id, msg)
-                    if msg.kind == MessageKind.SYSTEM and (msg.subtype or '') == 'init':
-                        return  # Compaction complete
-                    elif msg.kind == MessageKind.RESULT:
-                        return  # Unexpected second RESULT — stop
-                    elif msg.kind != MessageKind.SYSTEM:
-                        logger.warning("Unexpected post-compact msg kind=%s for %s",
-                                       msg.kind.value, session_id)
-                        return
-            await asyncio.wait_for(_wait_init(), timeout=300.0)
-        except asyncio.TimeoutError:
-            logger.warning("Auto-compact timed out waiting for init on %s (5 min)", session_id)
-            if info.task is asyncio.current_task() and info.substatus:
-                info.substatus = ""
-                self._emit_state(info)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning("_post_turn_compact_drain wait-init error for %s: %s", session_id, e)
+    def _enter_auto_resume(self, info: SessionInfo) -> None:
+        """Flip a session back to WORKING when the SDK auto-resumes.
+
+        Called from the post-turn drain when ``task_notification`` (or
+        unexpected non-system content) arrives after RESULT, indicating
+        the SDK has injected a synthetic user message and restarted the
+        assistant turn.  Idempotent — only emits state on the IDLE→WORKING
+        transition so chained calls during the same auto-resume don't
+        spam clients.
+        """
+        if info.state != SessionState.IDLE:
+            return
+        info.state = SessionState.WORKING
+        info._awaiting_compact_drain = False
+        info.substatus = "auto-resuming"
+        info.working_since = time.time()
+        self._emit_state(info)
 
     def _emit_state(self, info: SessionInfo) -> None:
         """Push session state change to all connected WebSocket clients.

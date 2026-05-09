@@ -1329,10 +1329,13 @@ function updateLiveInputBar() {
     const _elapsedStr = _elapsed >= 60 ? Math.floor(_elapsed/60) + 'm ' + (_elapsed%60) + 's' : _elapsed + 's';
     const qCount = _getQueueList(id).length;
 
-    // Detect compacting substatus
+    // Detect compacting / auto-resuming substatus
     const _sub = (window._sessionSubstatus && window._sessionSubstatus[id]) || '';
     const _isCompacting = _sub === 'compacting';
-    const _statusLabel = _isCompacting ? 'Compacting\u2026' : 'Working\u2026';
+    const _isAutoResuming = _sub === 'auto-resuming';
+    const _statusLabel = _isCompacting
+      ? 'Compacting\u2026'
+      : (_isAutoResuming ? 'Resuming after background task\u2026' : 'Working\u2026');
     const _spinnerClass = _isCompacting ? 'spinner compacting-spinner' : 'spinner';
 
     // Build sub-agent team strip
@@ -1414,20 +1417,24 @@ function updateLiveInputBar() {
         if (!el) return;
         const s = Math.round((Date.now() - _liveWorkingStart) / 1000);
         el.textContent = s >= 60 ? Math.floor(s/60) + 'm ' + (s%60) + 's' : s + 's';
-        // Update compacting label dynamically without full re-render
+        // Update compacting / auto-resuming label dynamically without full re-render
         const indicator = el.closest('.live-working-indicator');
         if (indicator) {
           const curSub = (window._sessionSubstatus && window._sessionSubstatus[liveSessionId]) || '';
           const spinnerEl = indicator.querySelector('.spinner');
-          if (curSub === 'compacting') {
-            if (spinnerEl && !spinnerEl.classList.contains('compacting-spinner')) spinnerEl.classList.add('compacting-spinner');
-            const textNodes = [...indicator.childNodes].filter(n => n.nodeType === 3);
-            if (textNodes.length && !textNodes[0].textContent.includes('Compacting')) textNodes[0].textContent = ' Compacting\u2026 ';
-          } else {
-            if (spinnerEl) spinnerEl.classList.remove('compacting-spinner');
-            const textNodes = [...indicator.childNodes].filter(n => n.nodeType === 3);
-            if (textNodes.length && textNodes[0].textContent.includes('Compacting')) textNodes[0].textContent = ' Working\u2026 ';
+          const textNodes = [...indicator.childNodes].filter(n => n.nodeType === 3);
+          let want;
+          if (curSub === 'compacting') want = ' Compacting\u2026 ';
+          else if (curSub === 'auto-resuming') want = ' Resuming after background task\u2026 ';
+          else want = ' Working\u2026 ';
+          if (spinnerEl) {
+            if (curSub === 'compacting') {
+              if (!spinnerEl.classList.contains('compacting-spinner')) spinnerEl.classList.add('compacting-spinner');
+            } else {
+              spinnerEl.classList.remove('compacting-spinner');
+            }
           }
+          if (textNodes.length && textNodes[0].textContent !== want) textNodes[0].textContent = want;
         }
         // Update sub-agent elapsed times without full re-render
         const agentPills = document.querySelectorAll('.sub-agent-pill.active');
