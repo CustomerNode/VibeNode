@@ -26,6 +26,45 @@ DAEMON_PORT = int(os.environ.get("VIBENODE_DAEMON_PORT", 5051))
 PID_FILE = Path.home() / ".claude" / (f"gui_daemon_{DAEMON_PORT}.pid" if DAEMON_PORT != 5051 else "gui_daemon.pid")
 
 
+def _enable_tcp_keepalive(sock):
+    """Enable SO_KEEPALIVE with aggressive Linux/macOS timing.
+
+    Mirrors app.daemon_client._enable_tcp_keepalive — kept duplicated
+    here because the daemon module must be importable without
+    pulling in any Flask/app dependencies.
+
+    Without keepalive on this side, a Linux sleep/resume cycle leaves
+    the daemon-side socket blocked in recv() forever.  Even after
+    the web server reconnects, the daemon is still holding the dead
+    socket and refuses to give up its slot until something probes it.
+    Enabling keepalive lets the daemon detect and release a dead
+    peer in roughly 30 seconds.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    keepidle = getattr(socket, "TCP_KEEPIDLE", None)
+    keepintvl = getattr(socket, "TCP_KEEPINTVL", None)
+    keepcnt = getattr(socket, "TCP_KEEPCNT", None)
+    try:
+        if keepidle is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, keepidle, 15)
+        if keepintvl is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, keepintvl, 5)
+        if keepcnt is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, keepcnt, 3)
+    except OSError:
+        pass
+    if keepidle is None:
+        keepalive = getattr(socket, "TCP_KEEPALIVE", None)
+        if keepalive is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, keepalive, 15)
+            except OSError:
+                pass
+
+
 class SessionDaemon:
     """Long-lived process that manages Claude Code SDK sessions via TCP IPC."""
 
@@ -71,6 +110,9 @@ class SessionDaemon:
             try:
                 client, addr = self._server_socket.accept()
                 client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # Detect zombie peers (e.g. host sleep/resume) without
+                # waiting for the kernel's 2-hour default keepalive.
+                _enable_tcp_keepalive(client)
                 logger.info("Web UI connected from %s", addr)
                 # Handle client in a thread so we can accept new connections
                 # (e.g., when Web UI restarts)

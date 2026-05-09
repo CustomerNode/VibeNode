@@ -26,6 +26,64 @@ DAEMON_PORT = int(_os.environ.get("VIBENODE_DAEMON_PORT", 5051))
 # Set to False to disable IPC round-trip timing logs.
 _PROFILE_IPC = True
 
+# ----------------------------------------------------------------------
+# Sleep/resume resilience tuning
+# ----------------------------------------------------------------------
+# When a Linux host suspends (laptop lid close, systemd-suspend, etc.)
+# the loopback TCP connection between the web server and the daemon
+# enters a zombie state.  Without proactive probing, the kernel never
+# discovers the connection is dead and recv() blocks forever — the
+# reactive "reconnect on send/recv failure" logic never fires, so the
+# whole UI hangs until the user kills and restarts the server.
+#
+# We defend against this with two mechanisms:
+#   1. TCP keepalive (kernel-level probes) — see _enable_tcp_keepalive()
+#   2. Application-level heartbeat thread — see _heartbeat_loop()
+#
+# Both must be present.  Keepalive alone has too long a worst-case
+# detection window on some kernels; the heartbeat alone won't catch
+# sendall() blocking inside a zombie socket buffer.
+HEARTBEAT_INTERVAL = 20   # seconds between ping probes
+HEARTBEAT_TIMEOUT = 8     # seconds to wait for a ping response
+
+
+def _enable_tcp_keepalive(sock):
+    """Enable SO_KEEPALIVE with aggressive Linux/macOS timing.
+
+    The Linux defaults (2-hour idle, 75-second probe window) are far
+    too slow to recover the UI after the host wakes from sleep, so we
+    tighten the timers to detect a dead peer in roughly 30 seconds.
+
+    Options that don't exist on the current platform are skipped
+    silently — Windows and macOS expose different (or fewer) knobs.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        # Some socket types reject SO_KEEPALIVE; nothing more we can do.
+        return
+    # Linux: TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT
+    keepidle = getattr(socket, "TCP_KEEPIDLE", None)
+    keepintvl = getattr(socket, "TCP_KEEPINTVL", None)
+    keepcnt = getattr(socket, "TCP_KEEPCNT", None)
+    try:
+        if keepidle is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, keepidle, 15)
+        if keepintvl is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, keepintvl, 5)
+        if keepcnt is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, keepcnt, 3)
+    except OSError:
+        pass
+    # macOS uses TCP_KEEPALIVE for idle time (no per-probe interval/count).
+    if keepidle is None:
+        keepalive = getattr(socket, "TCP_KEEPALIVE", None)
+        if keepalive is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, keepalive, 15)
+            except OSError:
+                pass
+
 
 class DaemonClient:
     """Proxy for the SessionManager running in the daemon process."""
@@ -38,6 +96,7 @@ class DaemonClient:
         self._reader_thread = None
         self._emitter_thread = None
         self._reconnect_thread = None
+        self._heartbeat_thread = None
         self._pending = {}  # req_id -> (threading.Event, result_holder)
         self._pending_lock = threading.Lock()
         self._write_lock = threading.Lock()
@@ -80,6 +139,14 @@ class DaemonClient:
             target=self._emitter_loop, daemon=True, name="socketio-emitter"
         )
         self._emitter_thread.start()
+        # Heartbeat thread: actively probes the daemon so a zombie
+        # connection (e.g. after Linux sleep/resume) is detected
+        # promptly and a reconnect is triggered.  Without this, the
+        # reader thread can sit blocked in recv() forever.
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True, name="daemon-heartbeat"
+        )
+        self._heartbeat_thread.start()
         # Now that the reader thread is running, resync aliases/policy.
         # Do this in a background thread so start() returns immediately
         # and doesn't block Flask app creation.
@@ -130,6 +197,9 @@ class DaemonClient:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # Defends against Linux sleep/resume zombie sockets — see
+                # comment block at top of file.
+                _enable_tcp_keepalive(sock)
                 sock.connect(("127.0.0.1", DAEMON_PORT))
                 self._sock = sock
                 self._connected = True
@@ -281,6 +351,73 @@ class DaemonClient:
             target=self._reconnect_loop, daemon=True, name="daemon-reconnect"
         )
         self._reconnect_thread.start()
+
+    def _heartbeat_loop(self):
+        """Periodically ping the daemon to detect zombie connections.
+
+        Why this exists:
+            On Linux, when the host suspends and resumes, the loopback
+            TCP connection enters a half-open zombie state.  recv() in
+            the reader thread blocks indefinitely because no data
+            arrives, and the OS's keepalive timers may take longer
+            than the user is willing to wait.  Without an active
+            probe, the existing "reconnect on send/recv failure"
+            logic never fires — the user sees a frozen UI and has to
+            kill and restart the server (the exact symptom this fix
+            addresses).
+
+        How it works:
+            Every HEARTBEAT_INTERVAL seconds, we send a ping to the
+            daemon with a short HEARTBEAT_TIMEOUT.  If the ping fails
+            or times out, we forcibly close the socket — that wakes
+            up the reader thread's recv() with an OSError, which in
+            turn sets _connected=False and triggers reconnect.
+        """
+        while self._should_run:
+            time.sleep(HEARTBEAT_INTERVAL)
+            if not self._should_run:
+                break
+            if not self._connected:
+                # Reconnect logic owns this state; nothing to probe.
+                continue
+            try:
+                result = self._send_request("ping", timeout=HEARTBEAT_TIMEOUT)
+                ok = isinstance(result, dict) and result.get("ok") is True
+            except Exception as e:
+                logger.debug("Heartbeat ping raised: %s", e)
+                ok = False
+            if not ok and self._connected and self._should_run:
+                logger.warning(
+                    "Daemon heartbeat failed — connection appears dead, "
+                    "forcing reconnect"
+                )
+                self._force_disconnect()
+
+    def _force_disconnect(self):
+        """Tear down the current socket so the reader thread unblocks.
+
+        Calling close() alone is NOT enough on Linux: a recv() that
+        is already mid-call may not return until the next packet
+        arrives.  shutdown(SHUT_RDWR) reliably wakes any pending
+        recv() with EBADF/OSError, which is what we need for the
+        reader loop's exception handler to fire and trigger
+        reconnect.
+        """
+        self._connected = False
+        sock = self._sock
+        self._sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                # Already closed / never connected — nothing to do.
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+        if self._should_run:
+            self._start_reconnect()
 
     # ------------------------------------------------------------------
     # IPC: send request, receive response
