@@ -13,6 +13,7 @@ Validates that:
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
 import pytest
@@ -582,8 +583,23 @@ class TestPosixSubprocessIsolation:
             proc.kill()
             proc.wait(timeout=5)
 
-    def test_explicit_start_new_session_false_is_respected(self):
-        """Caller opt-out: explicit start_new_session=False must NOT be overridden."""
+    def test_explicit_start_new_session_false_is_overridden(self):
+        """Patch 4 OVERRIDES explicit start_new_session=False on POSIX.
+
+        Background:  the SDK uses ``anyio.open_process``, which has
+        ``start_new_session: bool = False`` as a default and forwards
+        that explicit False to ``subprocess.Popen``.  An earlier
+        "respect explicit False" rule made the patch silently no-op
+        for every SDK-spawned CLI — the daemon-blast bug returned
+        because the CLI inherited the daemon's process group.
+
+        The current rule: on POSIX we always force isolation unless
+        the caller supplied ``preexec_fn``.  This is a deliberate
+        deviation from honoring caller intent because the safety
+        guarantee (killpg cannot kill the daemon) requires it for
+        every spawn path, including third-party libraries that pass
+        their own default of False through.
+        """
         proc = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(5)"],
             stdout=subprocess.DEVNULL,
@@ -593,9 +609,15 @@ class TestPosixSubprocessIsolation:
         try:
             child_sid = os.getsid(proc.pid)
             self_sid = os.getsid(os.getpid())
-            assert child_sid == self_sid, (
-                "Patch 4 overrode an explicit start_new_session=False — "
-                "caller intent must be respected."
+            # The override must produce isolation, not honor False.
+            assert child_sid != self_sid, (
+                "Patch 4 honored explicit start_new_session=False — "
+                "this re-introduces the SDK daemon-blast bug. The "
+                "current policy is to force isolation on POSIX even "
+                "when False was passed explicitly."
+            )
+            assert child_sid == proc.pid, (
+                "Child should be its own session leader."
             )
         finally:
             proc.kill()
@@ -658,6 +680,114 @@ class TestPosixSubprocessIsolation:
                 proc.wait(timeout=5)
 
 
+# ── _close_session exception-safety contract ────────────────────────────
+
+
+class TestCloseSessionExceptionSafety:
+    """``_close_session`` must never let an exception escape.
+
+    It runs on the daemon's asyncio loop via ``run_coroutine_threadsafe``;
+    an unhandled exception lands on the resulting Future, where
+    ``close_session_sync`` reads it via ``future.result()`` and could
+    mislead callers into thinking the close failed when it actually
+    succeeded.  More importantly, an exception in the cleanup-side
+    ``except`` block (which itself emits state + schedules a save)
+    could fire on top of the original and break the
+    ``info.state = STOPPED`` invariant other code relies on.
+
+    These tests make sure each cleanup step is independently fault-isolated.
+    """
+
+    def _make_session_manager(self):
+        """Build a minimal SessionManager + SessionInfo for direct testing
+        of `_close_session` without spinning up the IPC plumbing.
+        """
+        from daemon.session_manager import SessionManager, SessionInfo, SessionState
+        sm = SessionManager()
+        info = SessionInfo(session_id="test-sid")
+        info.state = SessionState.IDLE
+        # Don't try to extract from a real client; pretend extract returns 0.
+        info.client = None
+        info._cli_pid = 0
+        with sm._lock:
+            sm._sessions[info.session_id] = info
+        return sm, info
+
+    def _run(self, coro):
+        """Run a coroutine synchronously."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                return pool.submit(asyncio.run, coro).result()
+        return asyncio.run(coro)
+
+    def test_close_session_swallows_emit_state_failure(self):
+        """If the push callback raises, _close_session must still
+        complete and leave ``info.state = STOPPED``.
+        """
+        from daemon.session_manager import SessionState
+        sm, info = self._make_session_manager()
+        # Force _emit_state to blow up by sticking in a callback that raises.
+        sm._push_callback = lambda *a, **kw: (_ for _ in ()).throw(
+            RuntimeError("simulated push failure"))
+
+        # Must not raise.
+        self._run(sm._close_session(info.session_id))
+
+        # Post-condition: STOPPED was reached even though emit threw.
+        assert info.state == SessionState.STOPPED, (
+            "_close_session let an _emit_state failure prevent "
+            "STOPPED — exception isolation is broken"
+        )
+
+    def test_close_session_swallows_kill_process_tree_failure(self):
+        """If _kill_process_tree raises, _close_session must still
+        complete and leave ``info.state = STOPPED``.
+        """
+        from daemon.session_manager import SessionState
+        sm, info = self._make_session_manager()
+        info._cli_pid = 1  # any nonzero so kill is attempted
+
+        # Replace _kill_process_tree with a raiser.
+        original_kpt = sm._kill_process_tree
+        sm._kill_process_tree = (lambda pid: (_ for _ in ()).throw(  # type: ignore[assignment]
+            RuntimeError("simulated kill failure")))
+        try:
+            self._run(sm._close_session(info.session_id))
+        finally:
+            sm._kill_process_tree = original_kpt  # type: ignore[assignment]
+
+        assert info.state == SessionState.STOPPED, (
+            "_close_session let a _kill_process_tree failure prevent "
+            "STOPPED"
+        )
+
+    def test_close_session_swallows_disconnect_failure(self):
+        """If SDK disconnect raises, _close_session must still
+        complete and leave ``info.state = STOPPED``.
+        """
+        from daemon.session_manager import SessionState
+        sm, info = self._make_session_manager()
+        # Set a sentinel client so the disconnect branch fires.
+        info.client = object()
+
+        # Make _sdk.disconnect raise.
+        async def _raise(_):
+            raise RuntimeError("simulated disconnect failure")
+        original = sm._sdk.disconnect
+        sm._sdk.disconnect = _raise  # type: ignore[assignment]
+        try:
+            self._run(sm._close_session(info.session_id))
+        finally:
+            sm._sdk.disconnect = original  # type: ignore[assignment]
+
+        assert info.state == SessionState.STOPPED
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows-only check")
 class TestWindowsPatchSkipsPosixIsolation:
     """On Windows, Patch 4 must be a no-op (Windows uses taskkill, not killpg)."""
@@ -666,3 +796,431 @@ class TestWindowsPatchSkipsPosixIsolation:
         from daemon.sdk_patches import _apply_patch_isolate_posix_subprocesses
         # Returns False because the patch doesn't apply on Windows.
         assert _apply_patch_isolate_posix_subprocesses() is False
+
+
+# ── End-to-End: Patch 4 catches the actual SDK spawn path ───────────────
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only path")
+class TestPatch4CatchesSdkSpawnPath:
+    """The SDK uses ``anyio.open_process`` →
+    ``asyncio.create_subprocess_exec`` → ``_UnixSubprocessTransport`` →
+    ``subprocess.Popen``.  Patching ``subprocess.Popen.__init__``
+    transitively isolates every CLI subprocess spawned via the SDK.
+
+    Earlier tests directly call ``subprocess.Popen`` to verify the patch
+    on its own seam.  This test exercises the EXACT chain the SDK uses
+    end-to-end so a future Python / anyio change that bypasses
+    ``subprocess.Popen`` (e.g. switching to a direct ``os.posix_spawn``
+    path) is caught immediately rather than at runtime when "Stop
+    Session" silently kills the daemon again.
+    """
+
+    def test_anyio_open_process_child_is_session_isolated(self):
+        """Run anyio.open_process with no explicit isolation kwargs and
+        confirm Patch 4 still injects start_new_session via the
+        Popen-level patch.  This is the same pattern
+        ``claude_code_sdk._internal.transport.subprocess_cli.py`` uses
+        to spawn the Claude CLI.
+        """
+        import anyio
+
+        async def _run() -> tuple[int, int, int]:
+            proc = await anyio.open_process(
+                [sys.executable, "-c", "import time; time.sleep(10)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                child_pid = proc.pid
+                child_sid = os.getsid(child_pid)
+                self_sid = os.getsid(os.getpid())
+                return child_pid, child_sid, self_sid
+            finally:
+                proc.kill()
+                # Drain wait so the test process doesn't leave a zombie.
+                await proc.wait()
+
+        child_pid, child_sid, self_sid = anyio.run(_run)
+
+        # The exact regression check: child must be in its own session.
+        # If this assertion ever fails, Patch 4 stopped catching the
+        # SDK's spawn path and "Stop Session" will start blasting the
+        # daemon again on Linux.
+        assert child_sid != self_sid, (
+            f"anyio.open_process child SID {child_sid} == parent SID "
+            f"{self_sid}: Patch 4 is no longer being invoked through the "
+            "SDK's actual spawn chain.  Either the patch isn't applied, "
+            "or asyncio/anyio bypasses subprocess.Popen on this runtime."
+        )
+        assert child_sid == child_pid, (
+            f"Child SID {child_sid} != child PID {child_pid}: child is "
+            "not the session leader."
+        )
+
+    def test_full_stop_session_simulation_does_not_kill_daemon(self):
+        """END-TO-END SMOKING GUN: reproduce the exact "Stop Session
+        blew up the daemon connection on Linux" bug and prove the
+        composite fix prevents it.
+
+        Sequence (mirrors what `_close_session` does on a real stop):
+          1. Spawn a CLI subprocess via ``anyio.open_process`` exactly
+             how the SDK does it.
+          2. Call ``SessionManager._kill_process_tree(cli_pid)`` —
+             which goes through the killpg path.
+          3. Confirm: the test process (daemon stand-in) is still
+             alive AND the CLI subprocess is dead.
+
+        Before the fix, step 2 would deliver SIGTERM to the test
+        process via killpg.  The test process would die before
+        reaching the post-condition assertion, so the test runner
+        would report a fatal signal — which is exactly how the bug
+        manifested in production.
+        """
+        import anyio
+        from daemon.session_manager import SessionManager
+
+        async def _spawn() -> int:
+            proc = await anyio.open_process(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return proc.pid
+
+        cli_pid = anyio.run(_spawn)
+
+        # Safety net so the child can't outlive the test if a future
+        # change breaks the kill path.
+        try:
+            # Pre-condition: the simulated CLI is in its OWN session,
+            # not ours (proves Patch 4 caught the SDK spawn path).
+            cli_pgid = os.getpgid(cli_pid)
+            self_pgid = os.getpgid(os.getpid())
+            assert cli_pgid != self_pgid, (
+                f"CLI subprocess landed in the daemon's process group "
+                f"(both pgid={cli_pgid}).  Patch 4 did not isolate the "
+                "anyio spawn — _kill_process_tree below would killpg "
+                "the test process.  The fix has regressed."
+            )
+
+            our_pid_before = os.getpid()
+
+            # The exact call that used to blast the daemon.
+            SessionManager._kill_process_tree(cli_pid)
+
+            # Post-condition 1: the daemon stand-in (us) survives.
+            # If killpg leaked, the test process would already be dead
+            # from SIGTERM and we'd never reach this line.
+            assert os.getpid() == our_pid_before, (
+                "Test process survived but somehow has a different PID "
+                "— this should be impossible."
+            )
+
+            # Post-condition 2: the CLI is actually dead.
+            #
+            # When anyio.run() returns, its child watcher has already
+            # exited so the killed CLI lingers as a zombie until reaped.
+            # ``os.kill(pid, 0)`` returns success for zombies (the PID
+            # still exists in the process table), so we can't use that
+            # for the "is it dead" check.  Read /proc/<pid>/status
+            # directly to distinguish "running" from "zombie/dead".
+            #
+            # Falls back to waitpid()-with-WNOHANG on platforms without
+            # /proc (macOS).
+            import time as _t
+
+            def _is_dead(pid: int) -> bool:
+                # Linux: /proc/<pid>/status — State: Z means zombie (dead).
+                try:
+                    with open(f"/proc/{pid}/status") as fh:
+                        for line in fh:
+                            if line.startswith("State:"):
+                                state = line.split()[1] if len(line.split()) > 1 else ""
+                                # Z = zombie, X = dead.  R/S/D = alive.
+                                return state in ("Z", "X")
+                except FileNotFoundError:
+                    # /proc entry gone → fully reaped → dead.
+                    return True
+                except OSError:
+                    pass
+                # Cross-platform fallback: try to reap.  If the process
+                # was never our direct child, waitpid raises
+                # ChildProcessError — fall back to /bin/kill -0 by way
+                # of os.kill(pid, 0).
+                try:
+                    rpid, _ = os.waitpid(pid, os.WNOHANG)
+                    return rpid != 0
+                except ChildProcessError:
+                    try:
+                        os.kill(pid, 0)
+                        return False
+                    except ProcessLookupError:
+                        return True
+
+            for _ in range(50):
+                if _is_dead(cli_pid):
+                    break
+                _t.sleep(0.1)
+            else:
+                pytest.fail(
+                    "_kill_process_tree did not kill the CLI subprocess. "
+                    "Either Patch 4's isolation broke the kill path, "
+                    "or the safe-path killpg is no longer firing."
+                )
+
+            # Reap the zombie so the test process doesn't leave it
+            # hanging around for the rest of the suite.
+            try:
+                os.waitpid(cli_pid, os.WNOHANG)
+            except (ChildProcessError, OSError):
+                pass
+        finally:
+            # Last-resort cleanup so a failed test doesn't leak.
+            try:
+                os.kill(cli_pid, signal.SIGKILL)
+            except (ProcessLookupError, NameError):
+                pass
+
+
+# ── _kill_process_tree Defensive-pgid Check ─────────────────────────────
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only defense")
+class TestKillProcessTreeDefensivePgidCheck:
+    """Belt-and-suspenders defense in `_kill_process_tree`.
+
+    Patch 4 is supposed to ensure every CLI subprocess lives in its own
+    session/pgrp.  If it ever fails to apply (race, third-party spawn
+    path that bypasses subprocess.Popen, PID reuse), the unconditional
+    `os.killpg(os.getpgid(pid), SIGTERM)` would blast the daemon and
+    kill every running session.  This regression already shipped to
+    Linux users.
+
+    `_kill_process_tree` now refuses to call killpg when the target's
+    pgid equals its own, falling back to per-PID kill.  These tests
+    exercise that defense end-to-end.
+    """
+
+    def test_kill_process_tree_refuses_killpg_on_own_pgroup(self):
+        """The exact bug scenario: child shares our pgid → killpg would
+        kill us.  The defensive check must short-circuit to per-PID kill
+        and the test process (stand-in for the daemon) must survive.
+        """
+        import signal as _signal
+        import time as _time
+
+        from daemon.session_manager import SessionManager
+
+        # Spawn a child in OUR process group.  Patch 4 only opts out
+        # when preexec_fn is supplied — using a no-op preexec_fn lets us
+        # force the child into our session/pgrp so the defensive check
+        # has a real failure mode to catch.
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(10)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=lambda: None,
+        )
+        try:
+            child_pgid = os.getpgid(proc.pid)
+            self_pgid = os.getpgid(os.getpid())
+            assert child_pgid == self_pgid, (
+                "Test setup failed — child should be in our pgroup so "
+                "the defensive check has something to defend against."
+            )
+
+            # Pre-condition: we (the test process, daemon stand-in) are alive.
+            assert os.getpid() > 0
+            our_pid_before = os.getpid()
+
+            # Call the kill path.  Without the defensive check this
+            # would killpg our own group and SIGTERM us.  With the
+            # defensive check it falls back to per-PID kill — the child
+            # dies, we survive.
+            SessionManager._kill_process_tree(proc.pid)
+
+            # Give the per-PID SIGTERM/SIGKILL a moment to land.
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pytest.fail(
+                    "Defensive fallback did not kill the child via per-PID."
+                )
+
+            # Post-condition: we (the daemon) are still alive.  If the
+            # defensive check failed, we wouldn't reach this assertion.
+            assert os.getpid() == our_pid_before
+            # Child terminated by signal — returncode is negative.
+            assert proc.returncode is not None
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_kill_process_tree_uses_killpg_when_target_isolated(self):
+        """When Patch 4 isolated the child correctly (different pgid),
+        `_kill_process_tree` must still take the killpg path so
+        descendants are reaped, not orphaned.  Verify by spawning a
+        child with start_new_session=True (its own pgrp), giving it a
+        grandchild, then confirming the grandchild dies too.
+        """
+        from daemon.session_manager import SessionManager
+
+        # Parent shells out to a sleeping grandchild it doesn't reap.
+        # When _kill_process_tree() killpgs the parent's group, the
+        # grandchild (same group) must die too.
+        script = (
+            "import os, subprocess, time;"
+            "p = subprocess.Popen(['python3', '-c', 'import time; time.sleep(60)']);"
+            "open('/tmp/_kill_pt_grandchild.pid', 'w').write(str(p.pid));"
+            "time.sleep(60)"
+        )
+        # Clean up any stale pid file from a previous run.
+        try:
+            os.unlink("/tmp/_kill_pt_grandchild.pid")
+        except FileNotFoundError:
+            pass
+
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # explicit isolation, like Patch 4
+        )
+        try:
+            # Wait until the parent has spawned its grandchild.
+            for _ in range(50):
+                try:
+                    grand_pid = int(
+                        open("/tmp/_kill_pt_grandchild.pid").read().strip()
+                    )
+                    break
+                except (FileNotFoundError, ValueError):
+                    import time as _t
+                    _t.sleep(0.1)
+            else:
+                pytest.fail("Grandchild never started")
+
+            # Sanity: parent and grandchild share a pgrp distinct from ours.
+            parent_pgid = os.getpgid(proc.pid)
+            grand_pgid = os.getpgid(grand_pid)
+            self_pgid = os.getpgid(os.getpid())
+            assert parent_pgid != self_pgid, "Parent should be isolated"
+            assert grand_pgid == parent_pgid, (
+                "Grandchild should share parent's pgrp so killpg reaps it"
+            )
+
+            SessionManager._kill_process_tree(proc.pid)
+
+            # Both parent and grandchild must be dead.
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pytest.fail("Parent was not killed by killpg")
+            # Grandchild — poll via os.kill(0) until it disappears.
+            import time as _t
+            for _ in range(50):
+                try:
+                    os.kill(grand_pid, 0)
+                    _t.sleep(0.1)
+                except ProcessLookupError:
+                    break
+            else:
+                pytest.fail(
+                    "Grandchild survived killpg — descendants are leaking"
+                )
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+            try:
+                os.unlink("/tmp/_kill_pt_grandchild.pid")
+            except FileNotFoundError:
+                pass
+
+
+# ── /api/restart POSIX detachment ───────────────────────────────────────
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only restart path")
+class TestApiRestartPosixDetachment:
+    """The /api/restart Linux/macOS path was previously broken because:
+
+    1. The outer ``subprocess.Popen(restart_cmd, shell=True)`` did not
+       pass ``start_new_session=True``, so the bash subprocess shared
+       the web server's process group.  When the new python instance
+       killed port 5050 (the old web), the kill propagated to bash
+       through the shared group — bash died before it could spawn the
+       replacement python, so the daemon never came back.
+
+    2. Output was redirected to /dev/null, making failures impossible
+       to debug.
+
+    These tests guard the fix at the source code level (string match)
+    so a future "cleanup" PR can't silently revert the bug back into
+    the codebase.
+    """
+
+    def _read_main_routes(self) -> str:
+        from pathlib import Path
+        path = Path(__file__).resolve().parents[1] / "app" / "routes" / "main.py"
+        return path.read_text()
+
+    def test_restart_posix_uses_start_new_session(self):
+        """Outer Popen on POSIX must pass start_new_session=True so the
+        bash subprocess survives the kill of the old web server."""
+        src = self._read_main_routes()
+        # Find the POSIX restart Popen call.
+        assert 'sys.platform in ("darwin", "linux")' in src, (
+            "POSIX branch in restart_server() not found — has the file moved?"
+        )
+        # Locate the Popen invocation following the POSIX branch and
+        # confirm it includes start_new_session=True.
+        posix_section_start = src.index('sys.platform in ("darwin", "linux")')
+        posix_section = src[posix_section_start:posix_section_start + 4000]
+        assert "subprocess.Popen(" in posix_section, (
+            "Popen call removed from POSIX restart branch"
+        )
+        assert "start_new_session=True" in posix_section, (
+            "POSIX restart Popen no longer detaches with "
+            "start_new_session=True — the daemon-restart-fails-on-Linux "
+            "regression has returned. Re-add it before merging."
+        )
+
+    def test_restart_posix_logs_to_file_not_devnull(self):
+        """The bash redirect must point at a log file we can read after
+        a failure, not /dev/null.  Without a log we can't debug silent
+        breakage in production."""
+        src = self._read_main_routes()
+        posix_section_start = src.index('sys.platform in ("darwin", "linux")')
+        posix_section = src[posix_section_start:posix_section_start + 4000]
+        # The bash command's stdout/stderr redirect must mention
+        # restart.log (the agreed log filename) and must NOT redirect
+        # everything to /dev/null in the launch line.
+        assert "restart.log" in posix_section, (
+            "POSIX restart no longer logs to logs/restart.log — failures "
+            "will be silent again"
+        )
+        # Specifically: the launched python's redirect must not be
+        # >/dev/null 2>&1 (the old broken pattern).  stdin can still be
+        # </dev/null — that's just closing the input.
+        # The launch line in the bash heredoc starts with `nohup` and
+        # ends with `&'`.  Check that line for the bad pattern.
+        for line in posix_section.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('f"nohup') or stripped.startswith('"nohup'):
+                # This is the launch line concatenation — the redirect
+                # is on a following line in the f-string concat.
+                pass
+            if ">> \"" in stripped or '>>"' in stripped:
+                # Append-redirect to a log file — good.
+                break
+        else:
+            # Fall back to a generic check: must not redirect stdout to
+            # /dev/null in the launch payload.
+            assert "> /dev/null 2>&1 &" not in posix_section, (
+                "POSIX restart still discards stdout/stderr to /dev/null"
+            )

@@ -94,35 +94,59 @@ def restart_server():
                 creationflags=_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
             )
 
-        elif sys.platform == "darwin":
+        elif sys.platform in ("darwin", "linux"):
+            # POSIX restart flow.  This path was previously broken on
+            # Linux for "Restart Server → Daemon": the new python died
+            # silently and the daemon never came back.  Two correctness
+            # requirements were missing — both are fixed here.
+            #
+            # 1. ``start_new_session=True`` on the outer ``subprocess.Popen``.
+            #    Without it the bash subprocess inherits the web server's
+            #    process group / controlling terminal.  The new python
+            #    instance launched by bash later kills port 5050 (the
+            #    old web); without isolation, that kill propagates to
+            #    bash via the shared process group, killing it before
+            #    it finishes spawning the replacement python.  Mirrors
+            #    what Windows gets implicitly via ``Start-Process``.
+            #
+            # 2. stdout/stderr redirected to ``logs/restart.log`` instead
+            #    of ``/dev/null``.  When a restart breaks (and they do
+            #    break — see the bug this fix addresses), the user can
+            #    read the log instead of staring at a dead UI.
+            #
+            # ``nohup ... &`` is preserved (portable across Linux and
+            # macOS, no external ``setsid`` binary required — macOS does
+            # not install setsid by default).  With the outer
+            # ``start_new_session=True`` in place, the launched python
+            # already lives outside the dying web server's session, so
+            # nohup+& is sufficient detachment for the inner spawn.
             kill_cmds = " ".join(
                 f"lsof -ti :{p} | xargs kill -9 2>/dev/null;" for p in ports
             )
             env_prefix = "VIBENODE_PRESERVE_DAEMON=1 " if preserve_daemon else ""
+            restart_log = os.path.join(project_dir, "logs", "restart.log")
+            # Ensure logs dir exists so the bash redirect can't fail.
+            try:
+                os.makedirs(os.path.dirname(restart_log), exist_ok=True)
+            except Exception:
+                pass
             restart_cmd = (
                 f"bash -c '"
                 f"for i in $(seq 1 10); do {kill_cmds} sleep 0.5; done; "
                 f"find \"{project_dir}\" -type d -name __pycache__ -exec rm -rf {{}} + 2>/dev/null; "
                 f"sleep 1; "
                 f"nohup {env_prefix}\"{sys.executable}\" \"{entry_script}\" "
-                f"> /dev/null 2>&1 &'"
+                f"</dev/null >>\"{restart_log}\" 2>&1 &'"
             )
-            subprocess.Popen(restart_cmd, shell=True)
-
-        elif sys.platform == "linux":
-            kill_cmds = " ".join(
-                f"lsof -ti :{p} | xargs kill -9 2>/dev/null;" for p in ports
+            subprocess.Popen(
+                restart_cmd,
+                shell=True,
+                # Detach the bash subprocess from this web server's
+                # process group so it survives the upcoming kill of
+                # port 5050.  Mirrors what Windows gets implicitly via
+                # Start-Process.
+                start_new_session=True,
             )
-            env_prefix = "VIBENODE_PRESERVE_DAEMON=1 " if preserve_daemon else ""
-            restart_cmd = (
-                f"bash -c '"
-                f"for i in $(seq 1 10); do {kill_cmds} sleep 0.5; done; "
-                f"find \"{project_dir}\" -type d -name __pycache__ -exec rm -rf {{}} + 2>/dev/null; "
-                f"sleep 1; "
-                f"nohup {env_prefix}\"{sys.executable}\" \"{entry_script}\" "
-                f"> /dev/null 2>&1 &'"
-            )
-            subprocess.Popen(restart_cmd, shell=True)
 
         return jsonify({"ok": True, "message": f"Restarting ({scope})..."})
     except Exception as e:
@@ -164,7 +188,12 @@ def shutdown_server():
                 "lsof -ti :5051 | xargs kill -9 2>/dev/null"
                 "'"
             )
-            subprocess.Popen(shutdown_cmd, shell=True)
+            # start_new_session=True so the bash isn't taken down with
+            # the web server when the kill -9 above lands on us.  Without
+            # it the bash dies before reaching the port-5051 kill, leaving
+            # the daemon orphaned (same root cause as the restart bug
+            # fixed above in restart_server()).
+            subprocess.Popen(shutdown_cmd, shell=True, start_new_session=True)
 
         return jsonify({"ok": True, "message": "Server shutting down..."})
     except Exception as e:

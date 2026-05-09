@@ -337,7 +337,37 @@ def main():
     daemon = SessionDaemon()
 
     def shutdown(sig, frame):
-        logger.info("Received signal %s, shutting down", sig)
+        # Log loudly with the sender's PID when known.  When a misbehaving
+        # ``killpg`` lands on the daemon (the historic Linux "Stop Session
+        # blew up the daemon" regression), this trail is the only way to
+        # tell after the fact whether the kill came from our own
+        # _kill_process_tree (likely a Patch 4 leak) or from outside the
+        # process (e.g. systemd / OOM killer / user `kill`).
+        try:
+            sender_pid = -1
+            try:
+                # POSIX-only: si_pid is populated by the kernel for
+                # SIGTERM/SIGINT delivered by another process via kill(2).
+                # We can't get it from the signal handler directly, but
+                # logging os.getppid() and our own pgid gives a strong
+                # forensic clue.
+                sender_pid = os.getppid()
+            except Exception:
+                pass
+            logger.warning(
+                "Daemon received signal %s — shutting down. "
+                "ppid=%s own_pid=%s own_pgid=%s.  "
+                "If this fired during a session-stop on Linux, the "
+                "killpg-blast regression has returned: re-check Patch 4 "
+                "(daemon/sdk_patches.py) and the defensive pgid check "
+                "in _kill_process_tree (daemon/session_manager.py).",
+                sig, sender_pid, os.getpid(),
+                os.getpgrp() if hasattr(os, 'getpgrp') else '?',
+            )
+        except Exception:
+            # Logging is best-effort — never let a logging failure
+            # delay the shutdown sequence.
+            pass
         daemon.stop()
         sys.exit(0)
 

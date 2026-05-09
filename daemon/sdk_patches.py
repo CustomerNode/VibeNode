@@ -307,6 +307,37 @@ def _apply_patch_isolate_posix_subprocesses() -> bool:
 
     Returns True when applied, False on Windows (no-op there — see Patch 3
     for the Windows-specific Popen patch).
+
+    POLICY (changed 2026-05-09 after debugging the Linux daemon-blast):
+
+        We FORCE ``start_new_session=True`` whenever it is missing OR
+        explicitly False.  We only opt out when the caller supplied
+        ``preexec_fn`` (they're managing child setup themselves and
+        stacking on top of that would be surprising).
+
+        The earlier "respect explicit False" rule was wrong in practice.
+        The SDK's spawn path is::
+
+            anyio.open_process(...)          # signature: start_new_session=False  (default!)
+              → asyncio.create_subprocess_exec(start_new_session=False, ...)
+              → loop.subprocess_exec(...,    start_new_session=False)
+              → _UnixSubprocessTransport._start(start_new_session=False)
+              → subprocess.Popen(..., start_new_session=False)
+
+        anyio's ``open_process()`` has ``start_new_session: bool = False``
+        as a positional default (anyio/_core/_subprocesses.py line 132)
+        and unconditionally forwards it to the backend.  So every CLI
+        the SDK spawned arrived at our patched ``Popen.__init__`` with
+        ``start_new_session=False`` already in kwargs — the old
+        "respect explicit False" rule made the patch a silent no-op,
+        the CLI inherited the daemon's process group, and "Stop
+        Session" called ``killpg`` on the daemon's group.  This is the
+        regression the user reported as "stop session blowing up the
+        daemon connection on Linux."
+
+        Reverse the rule: on POSIX we require isolation.  Anyone who
+        truly needs a child in our session should set ``preexec_fn``
+        and configure things themselves, or use ``os.fork`` directly.
     """
     if os.name == "nt":
         return False
@@ -314,11 +345,11 @@ def _apply_patch_isolate_posix_subprocesses() -> bool:
     _original_init = _subprocess.Popen.__init__
 
     def _isolated_session_Popen_init(self: Any, *args: Any, **kwargs: Any) -> None:
-        # Respect explicit caller intent: only inject when neither
-        # start_new_session nor preexec_fn were supplied. preexec_fn is a
-        # caller-managed hook and stacking start_new_session on top of it
-        # could surprise callers who already handle child setup.
-        if "start_new_session" not in kwargs and "preexec_fn" not in kwargs:
+        # Skip ONLY when the caller is using preexec_fn (managing child
+        # setup themselves).  Otherwise force isolation regardless of
+        # whether start_new_session was missing or set to False — see
+        # POLICY in the docstring above for why.
+        if "preexec_fn" not in kwargs or kwargs.get("preexec_fn") is None:
             kwargs["start_new_session"] = True
         return _original_init(self, *args, **kwargs)
 

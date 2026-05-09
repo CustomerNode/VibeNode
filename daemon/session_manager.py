@@ -519,12 +519,44 @@ class SessionManager:
             # non-interrupt cancel and sets state back to IDLE.
             # _send_query clears it on the event loop AFTER the old task exits.
             _was_interrupted = getattr(info, '_interrupted', False)
-            # Flag for _send_query: drain stale messages from the
-            # interrupted turn's SDK buffer before sending the new query.
-            # See the "Drain stale messages" block in _send_query for
-            # the full explanation of the SDK shared-buffer bug.
-            if _was_interrupted:
+            # Capture the existing post-turn listener (if any) so we can
+            # cancel it before launching the new query.  When state is
+            # IDLE and a task is still alive, the task is the
+            # extended-post-turn listener installed by the previous turn —
+            # it sits on receive_response() waiting for delayed
+            # task_notification / auto-resume content.  We must cancel it
+            # before send_query() so two consumers don't race the same
+            # SDK buffer.
+            _existing_listener = info.task if (
+                info.task is not None and not info.task.done()
+            ) else None
+            # Flag for _send_query: drain stale messages from the SDK
+            # buffer before sending the new query.  This fires for two
+            # cases that share the same shared-buffer bug:
+            #   • interrupt → follow-up: stale ResultMessage from
+            #     interrupted turn (see "Drain stale messages" block in
+            #     _send_query).
+            #   • supersede an extended-post-turn listener: any
+            #     last-second auto-resume content the listener didn't
+            #     consume before being cancelled.
+            if _was_interrupted or _existing_listener is not None:
                 info._drain_stale = True
+                # Supersede-of-listener uses the quick (200 ms) drain so we
+                # don't add a 5 s penalty when the buffer is empty.  The
+                # interrupt path keeps the long timeout so it can wait for
+                # the SDK's interrupt-ack RESULT.
+                if _existing_listener is not None and not _was_interrupted:
+                    info._drain_stale_quick = True
+            # Set the supersede flag INSIDE the lock so its visibility is
+            # ordered with the state flip below.  The listener checks both
+            # ``info.task`` identity AND this flag — having the flag set
+            # under the same lock that flips state means the listener
+            # cannot observe ``state == WORKING`` without also observing
+            # ``_listener_superseded == True``, so it correctly drops any
+            # straggling auto-resume RESULT instead of clobbering state
+            # back to IDLE.
+            if _existing_listener is not None:
+                info._listener_superseded = True
             # Add user entry to history. Normally the frontend shows it
             # optimistically so we skip the emit. But after an interrupt the
             # optimistic bubble was cleared, so emit to avoid a gap.
@@ -544,6 +576,20 @@ class SessionManager:
                 info.substatus = "compacting"
 
         self._emit_state(info)
+
+        # Cancel the previous turn's extended-post-turn listener (if any)
+        # before launching the new query.  Order matters: cancel first so
+        # the old task's receive_response() bails before the new
+        # _send_query() reads from the shared SDK buffer.  The
+        # _listener_superseded flag (set inside the lock above) tells the
+        # old task's CancelledError handler to bail without resetting
+        # state — otherwise it would force-IDLE / STOPPED and clobber the
+        # WORKING flip we just performed.  The new _send_query clears the
+        # flag at startup.  ``_drain_stale`` guarantees any straggler
+        # messages the listener didn't consume get flushed before the new
+        # query is read.
+        if _existing_listener is not None:
+            self._loop.call_soon_threadsafe(_existing_listener.cancel)
 
         asyncio.run_coroutine_threadsafe(
             self._tracked_coro(info, self._send_query(session_id, text)), self._loop
@@ -1010,9 +1056,13 @@ class SessionManager:
                 info.state = SessionState.IDLE
                 self._emit_state(info)
 
-            # Post-turn compact drain (same as _send_query — see comment there).
-            if result_handled and info._awaiting_compact_drain \
-                    and info.task is asyncio.current_task():
+            # Post-turn compact drain — also installs the extended listener
+            # that consumes auto-resume / late ``task_notification`` content.
+            # We MUST call this on every successful turn (including bare
+            # resume) or future buffered messages will land unread and the
+            # next user query will read them as stale.  The drain itself
+            # decides whether there's anything to consume right now.
+            if result_handled and info.task is asyncio.current_task():
                 await self._post_turn_compact_drain(session_id, info)
                 info._awaiting_compact_drain = False
                 if info.task is asyncio.current_task() \
@@ -1033,8 +1083,13 @@ class SessionManager:
 
         except asyncio.CancelledError:
             # Defense-in-depth for the stop→follow-up race (see "Drain
-            # stale messages" comment in _send_query).
-            _superseded = info.task is not asyncio.current_task()
+            # stale messages" comment in _send_query).  Also covers the
+            # post-turn-listener supersede case (send_message cancelled
+            # us before the new task claimed info.task).
+            _superseded = (
+                info.task is not asyncio.current_task()
+                or getattr(info, '_listener_superseded', False)
+            )
             if _superseded or getattr(info, '_interrupted', False):
                 if not _superseded:
                     logger.info("Session %s interrupted (task cancelled)", session_id)
@@ -1114,7 +1169,10 @@ class SessionManager:
             # Defense-in-depth for the stop→follow-up race (see "Drain
             # stale messages" comment in _send_query).  Superseded or
             # interrupted tasks must not touch state.
-            _superseded = info and info.task is not asyncio.current_task()
+            _superseded = info and (
+                info.task is not asyncio.current_task()
+                or getattr(info, '_listener_superseded', False)
+            )
             if _superseded or (info and getattr(info, '_interrupted', False)):
                 return
 
@@ -1264,6 +1322,12 @@ class SessionManager:
             info = self._sessions.get(session_id)
         if info:
             info._interrupted = False
+            # Clear the supersede flag set by send_message — the previous
+            # listener has now bailed (the asyncio.sleep(0) above gave it
+            # a tick to deliver its cancellation).  Leaving the flag set
+            # would make the NEXT listener bail spuriously the first time
+            # something cancels it.
+            info._listener_superseded = False
 
         _t0 = time.perf_counter()
         _profile_log = (lambda label: logger.info(
@@ -1394,15 +1458,76 @@ class SessionManager:
         # detects a newer task has replaced it.
         if getattr(info, '_drain_stale', False):
             info._drain_stale = False
+            # Two callers set this flag with different timing needs:
+            #   • Post-interrupt: client.interrupt() asynchronously emits a
+            #     stale RESULT — receive_response() blocks until it arrives.
+            #     One full cycle, 5 s timeout for CLI ack.
+            #   • Post-supersede of an extended-post-turn listener: the
+            #     buffer is usually empty (listener was already consuming),
+            #     but it CAN contain a partial auto-resume cycle if the
+            #     supersede caught us mid-stream.  In that case we MUST
+            #     consume the cycle's RESULT — otherwise the new query's
+            #     ``receive_response()`` will read the auto-resume's RESULT
+            #     as the response to the new query.  We use an adaptive
+            #     per-message timeout: short for the first message of a
+            #     cycle (empty-buffer detection), long once activity is
+            #     seen (let the in-progress cycle complete).
+            _quick = bool(getattr(info, '_drain_stale_quick', False))
+            info._drain_stale_quick = False
             try:
-                async def _drain():
-                    async for _msg in self._sdk.receive_response(info.client):
-                        logger.debug("Drained stale msg after interrupt for %s: %s",
-                                     session_id, type(_msg).__name__)
-                await asyncio.wait_for(_drain(), timeout=5.0)
-                _profile_log("drained_stale_messages")
-            except asyncio.TimeoutError:
-                logger.warning("_send_query %s: stale drain timed out (5s)", session_id)
+                if _quick:
+                    # Adaptive multi-cycle drain.  ``receive_response()`` is
+                    # an async generator that terminates at RESULT, so we
+                    # drive it manually with ``__anext__`` + ``wait_for``
+                    # to apply the adaptive per-message timeout.
+                    SHORT = 0.1   # first message: covers empty buffer
+                    LONG = 30.0   # subsequent: let cycle complete
+                    _max_cycles = 10  # real life is ≤ 2
+                    cycles_drained = 0
+                    for _ in range(_max_cycles):
+                        got_any_in_cycle = False
+                        cycle_completed = False
+                        gen = self._sdk.receive_response(info.client)
+                        aiter = gen.__aiter__()
+                        try:
+                            while True:
+                                try:
+                                    _msg = await asyncio.wait_for(
+                                        aiter.__anext__(),
+                                        timeout=LONG if got_any_in_cycle else SHORT,
+                                    )
+                                    got_any_in_cycle = True
+                                    logger.debug("Drained stale msg for %s: %s",
+                                                 session_id, type(_msg).__name__)
+                                except asyncio.TimeoutError:
+                                    break
+                                except StopAsyncIteration:
+                                    cycle_completed = True
+                                    break
+                        finally:
+                            try:
+                                await aiter.aclose()
+                            except Exception:
+                                pass
+                        if not cycle_completed:
+                            break
+                        cycles_drained += 1
+                    if cycles_drained:
+                        _profile_log("drained_stale_messages")
+                else:
+                    # Interrupt path: single cycle, simple async-for with
+                    # 5 s overall timeout.  ``client.interrupt()`` emits one
+                    # stale RESULT that we need to consume; subsequent
+                    # cycles aren't expected.
+                    async def _drain():
+                        async for _msg in self._sdk.receive_response(info.client):
+                            logger.debug("Drained stale msg for %s: %s",
+                                         session_id, type(_msg).__name__)
+                    try:
+                        await asyncio.wait_for(_drain(), timeout=5.0)
+                        _profile_log("drained_stale_messages")
+                    except asyncio.TimeoutError:
+                        logger.warning("_send_query %s: stale drain timed out (5s)", session_id)
             except asyncio.CancelledError:
                 raise
             except Exception as drain_err:
@@ -1442,15 +1567,17 @@ class SessionManager:
                         session_id, message.kind.value, pm_err
                     )
 
-            # Post-turn compact drain: pick up compact_boundary/init buffered
-            # after ResultMessage so auto-compaction shows "Compacting…" status
-            # rather than silently hanging IDLE for 1-2 minutes.
-            if result_handled and info._awaiting_compact_drain \
-                    and info.task is asyncio.current_task():
+            # Post-turn compact drain — also installs the extended listener
+            # that consumes auto-resume / late ``task_notification`` content.
+            # We MUST call this on every successful turn or future buffered
+            # messages will land unread and the next user query will read
+            # them as stale.  The drain itself decides whether there's
+            # anything to consume right now.
+            if result_handled and info.task is asyncio.current_task():
                 await self._post_turn_compact_drain(session_id, info)
                 info._awaiting_compact_drain = False
-                # Emit IDLE if drain didn't already transition state (no compaction
-                # found, or compaction already completed inside the drain).
+                # Emit IDLE if drain didn't already transition state (e.g.
+                # superseded by a new task).
                 if info.task is asyncio.current_task() \
                         and info.state == SessionState.IDLE:
                     self._emit_state(info)
@@ -1470,8 +1597,13 @@ class SessionManager:
         except asyncio.CancelledError:
             # Defense-in-depth for the stop→follow-up race (see "Drain
             # stale messages" comment above).  If a newer task replaced
-            # us, bail without touching state.
-            _superseded = info.task is not asyncio.current_task()
+            # us OR send_message flagged us as superseded (it cancels the
+            # extended-post-turn listener before the new task has a
+            # chance to claim info.task), bail without touching state.
+            _superseded = (
+                info.task is not asyncio.current_task()
+                or getattr(info, '_listener_superseded', False)
+            )
             if _superseded or getattr(info, '_interrupted', False):
                 if not _superseded:
                     logger.info("_send_query %s: interrupted (CancelledError)", session_id)
@@ -1545,7 +1677,10 @@ class SessionManager:
             # Defense-in-depth for the stop→follow-up race (see "Drain
             # stale messages" comment in _send_query).  Superseded or
             # interrupted tasks must not touch state.
-            _superseded = info and info.task is not asyncio.current_task()
+            _superseded = info and (
+                info.task is not asyncio.current_task()
+                or getattr(info, '_listener_superseded', False)
+            )
             if _superseded or (info and getattr(info, '_interrupted', False)):
                 return
 
@@ -1730,6 +1865,26 @@ class SessionManager:
         On Windows, ``taskkill /T`` only works while the parent is alive.
         If the parent already died, we fall back to WMI to find orphaned
         children by ParentProcessId and kill them individually.
+
+        On POSIX, this uses ``os.killpg(os.getpgid(pid), ...)`` to kill the
+        target process and its descendants.  This depends on Patch 4
+        (sdk_patches.py) having spawned the CLI subprocess with
+        ``start_new_session=True`` so it lives in its own session/pgrp.
+
+        DAEMON-SAFETY DEFENSE (CRITICAL):
+            We refuse to call ``killpg()`` when the target's pgid equals
+            the daemon's own pgid.  If Patch 4 ever fails to apply (race
+            during startup, third-party spawn path that bypasses
+            ``subprocess.Popen``, PID reuse landing on an unrelated
+            process in our group, etc.), the unconditional killpg would
+            blast the entire daemon — every running session dies, the
+            IPC connection drops, and "Stop Session" silently nukes the
+            whole app.  This regression already shipped to users on
+            Linux, so this defensive check is required even with Patch 4
+            in place.  When the check trips, we fall back to per-PID
+            ``os.kill`` which only signals the target (descendants leak
+            but the daemon survives — better than tearing everything
+            down).
         """
         try:
             if os.name == "nt":
@@ -1772,14 +1927,52 @@ class SessionManager:
                         logger.debug("WMIC orphan cleanup for PID %d: %s",
                                      pid, wmic_err)
             else:
-                # Send SIGTERM to the process group, then SIGKILL
+                # Resolve the target's pgid first.  If the process is
+                # already gone, getpgid raises ProcessLookupError — nothing
+                # to do.
                 try:
-                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                    target_pgid = os.getpgid(pid)
+                except (ProcessLookupError, OSError):
+                    return
+
+                # CRITICAL: never killpg our own group — that would kill
+                # the daemon.  See full explanation in the docstring above.
+                own_pgid = os.getpgid(os.getpid())
+                if target_pgid == own_pgid:
+                    logger.error(
+                        "_kill_process_tree(%d): target pgid %d == daemon "
+                        "pgid %d. Refusing killpg (would kill the daemon). "
+                        "Patch 4 (start_new_session injection) did not "
+                        "isolate this subprocess. Falling back to per-PID "
+                        "kill — descendants may leak but the daemon "
+                        "survives.",
+                        pid, target_pgid, own_pgid,
+                    )
+                    # Per-PID fallback: signal only the target.  This
+                    # leaks any grandchildren the target spawned, but
+                    # that's a recoverable resource leak; killing the
+                    # daemon is not recoverable.
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    time.sleep(0.3)
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    return
+
+                # Safe path: target is in its own session/pgrp.  Kill the
+                # whole subtree via SIGTERM, give it 300ms to exit, then
+                # SIGKILL anything still alive.
+                try:
+                    os.killpg(target_pgid, signal.SIGTERM)
                 except (ProcessLookupError, PermissionError):
                     pass
                 time.sleep(0.3)
                 try:
-                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    os.killpg(target_pgid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
         except Exception as e:
@@ -1845,14 +2038,32 @@ class SessionManager:
                 self._schedule_orphan_sweep()
 
     async def _close_session(self, session_id: str) -> None:
-        """Disconnect and clean up a session."""
+        """Disconnect and clean up a session.
+
+        Exception-safety contract: this coroutine MUST NEVER let an
+        exception escape.  It runs on the daemon's asyncio loop via
+        ``run_coroutine_threadsafe`` and the resulting Future's exception
+        is observed by ``close_session_sync``'s ``future.result()`` —
+        but a raised exception there can mislead callers into thinking
+        the close failed when it actually succeeded enough.  More
+        importantly, an unhandled exception in the cleanup-side
+        ``except`` block (which itself emits state and schedules a save)
+        could fire on top of the original exception and break the
+        ``info.state = STOPPED`` invariant other code relies on.
+
+        Each step is therefore wrapped in its own try/except so a
+        failure in one step (e.g., the SDK's disconnect throws, the
+        kill races with the orphan sweep, the push callback fails) can
+        never prevent later steps from running.
+        """
         with self._lock:
             info = self._sessions.get(session_id)
         if not info:
             return
 
+        # Step 1: Cancel pending permission so the agent's
+        # waiting-on-permission task wakes up and exits.
         try:
-            # Cancel pending permission if any
             if info.pending_permission:
                 perm_tuple = info.pending_permission
                 info.pending_permission = None
@@ -1863,36 +2074,65 @@ class SessionManager:
                     )
                     result_holder[0] = (deny, False, False)
                     perm_event.set()
+        except Exception:
+            logger.exception("close_session: pending-permission cleanup failed for %s",
+                             session_id)
 
-            # Cancel the driving task if running
+        # Step 2: Cancel the driving task.
+        try:
             if info.task and not info.task.done():
                 info.task.cancel()
+        except Exception:
+            logger.exception("close_session: task cancel failed for %s", session_id)
 
-            # Grab the CLI subprocess PID *before* disconnect() cleans it up.
+        # Step 3: Grab the CLI subprocess PID before the SDK's
+        # disconnect() cleans it up.
+        cli_pid = 0
+        try:
             cli_pid = self._sdk.extract_process_pid(info.client) or info._cli_pid
+        except Exception:
+            logger.exception("close_session: extract_process_pid failed for %s",
+                             session_id)
+            cli_pid = info._cli_pid or 0
 
-            # Disconnect the client (terminates the direct CLI process)
-            if info.client:
-                try:
-                    await self._sdk.disconnect(info.client)
-                except Exception:
-                    pass
+        # Step 4: Disconnect the SDK client (closes pipes, calls the
+        # SDK's process.terminate() — per-PID, safe).
+        if info.client:
+            try:
+                await self._sdk.disconnect(info.client)
+            except Exception:
+                logger.exception("close_session: SDK disconnect failed for %s",
+                                 session_id)
 
-            # Kill the full process tree so child processes (test runners,
-            # build tools, etc.) don't linger as orphans eating CPU/RAM.
-            if cli_pid:
+        # Step 5: Kill the full process tree so descendants don't leak.
+        # Defended at the kill_process_tree level against killpg-on-self.
+        if cli_pid:
+            try:
                 self._kill_process_tree(cli_pid)
-            info._cli_pid = 0
+            except Exception:
+                logger.exception("close_session: _kill_process_tree(%d) raised for %s",
+                                 cli_pid, session_id)
+        info._cli_pid = 0
 
-            info.state = SessionState.STOPPED
-            info.client = None
+        # Step 6: Drop session-local state.  This is the last step the
+        # caller cares about — guarantee STOPPED regardless of any
+        # earlier failures.
+        info.state = SessionState.STOPPED
+        info.client = None
+
+        # Step 7: Emit state + schedule registry save.  These can fail
+        # if the push callback throws or the timer can't be scheduled.
+        # Caught individually so neither blocks the other or leaks an
+        # exception out of the coroutine.
+        try:
             self._emit_state(info)
+        except Exception:
+            logger.exception("close_session: _emit_state failed for %s", session_id)
+        try:
             self._schedule_registry_save()
-        except Exception as e:
-            logger.exception("Close error for %s: %s", session_id, e)
-            info.state = SessionState.STOPPED
-            self._emit_state(info)
-            self._schedule_registry_save()
+        except Exception:
+            logger.exception("close_session: _schedule_registry_save failed for %s",
+                             session_id)
 
     # ------------------------------------------------------------------
     # Permission callback
@@ -2453,13 +2693,27 @@ class SessionManager:
                         {'old_id': session_id, 'new_id': result_session_id}
                     )
 
-            info.state = SessionState.IDLE
-            # Defer the IDLE emit: compact_boundary may be buffered immediately
-            # after this ResultMessage (auto-compaction post-turn notification).
-            # _post_turn_compact_drain() in _send_query/_drive_session will pick
-            # it up and emit WORKING+compacting instead; only if no compact_boundary
-            # is found does it fall through to emit IDLE normally.
-            info._awaiting_compact_drain = True
+            # Don't clobber state if the listener has been superseded —
+            # ``send_message`` has flipped state to WORKING for a new
+            # query and we must not undo that.  This case fires when a
+            # late auto-resume RESULT was already in the SDK buffer at
+            # the moment the listener was cancelled; the listener's
+            # check #1 is supposed to drop it before _process_message
+            # runs, but defense in depth here covers the GIL race where
+            # Flask thread sets the flag between this listener thread's
+            # check and the state assignment.  We use info._lock so the
+            # check+assignment is atomic with ``send_message``'s lock-
+            # protected state flip.
+            with info._lock:
+                if not getattr(info, '_listener_superseded', False):
+                    info.state = SessionState.IDLE
+                # Defer the IDLE emit: compact_boundary may be buffered
+                # immediately after this ResultMessage (auto-compaction
+                # post-turn notification).  _post_turn_compact_drain()
+                # in _send_query/_drive_session will pick it up and emit
+                # WORKING+compacting instead; only if no compact_boundary
+                # is found does it fall through to emit IDLE normally.
+                info._awaiting_compact_drain = True
 
         elif message.kind == MessageKind.STREAM_EVENT:
             # Forward raw streaming events for partial message display
@@ -3139,8 +3393,15 @@ class SessionManager:
         finishing in sequence) and ``compact_boundary`` followed by
         auto-resume.
         """
-        # Flag the inner peek can set to mark "saw a true RESULT during peek"
-        while True:
+        # CRITICAL invariant: this function MUST hand control to the
+        # extended listener at the end (or be cancelled / superseded).
+        # Returning without a consumer for the SDK buffer means future
+        # task_notification / auto-resume content lands unread, gets
+        # drained as the next user query's response, and breaks the
+        # session — exactly the bug we're fixing.  Every error path
+        # ``break``s out to the listener instead of returning early.
+        peek_phase_done = False
+        while not peek_phase_done:
             compact_seen = False
             auto_resume_seen = False
             peek_got_result = False
@@ -3193,13 +3454,14 @@ class SessionManager:
                 raise
             except Exception as e:
                 logger.warning("_post_turn_compact_drain peek error for %s: %s", session_id, e)
-                return
+                break  # fall through to extended listener
 
             if info.task is not asyncio.current_task():
-                return
+                return  # Superseded — new task owns state
 
             if compact_seen:
                 logger.info("Auto-compaction detected for %s — waiting for init", session_id)
+                wait_init_failed = False
                 try:
                     async def _wait_init():
                         async for msg in self._sdk.receive_response(info.client):
@@ -3220,12 +3482,15 @@ class SessionManager:
                     if info.task is asyncio.current_task() and info.substatus:
                         info.substatus = ""
                         self._emit_state(info)
-                    return
+                    wait_init_failed = True
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.warning("_post_turn_compact_drain wait-init error for %s: %s", session_id, e)
-                    return
+                    logger.warning("_post_turn_compact_drain wait-init error for %s: %s",
+                                   session_id, e)
+                    wait_init_failed = True
+                if wait_init_failed:
+                    break  # fall through to extended listener
                 # Compaction may be followed by auto-resume — loop again.
                 continue
 
@@ -3234,10 +3499,11 @@ class SessionManager:
                 # rest until its RESULT arrives.
                 logger.info("Auto-resume in progress for %s — streaming until RESULT", session_id)
                 got_result = False
+                stream_failed = False
                 try:
                     async for msg in self._sdk.receive_response(info.client):
                         if info.task is not asyncio.current_task():
-                            return
+                            return  # Superseded — new task owns state
                         await self._process_message(session_id, msg)
                         if msg.kind == MessageKind.RESULT:
                             got_result = True
@@ -3253,9 +3519,9 @@ class SessionManager:
                 except Exception as e:
                     logger.warning("_post_turn_compact_drain auto-resume stream error for %s: %s",
                                    session_id, e)
-                    return
-                if not got_result:
-                    return
+                    stream_failed = True
+                if stream_failed or not got_result:
+                    break  # fall through to extended listener
                 # Loop to detect chained auto-resume / compaction.
                 continue
 
@@ -3265,8 +3531,166 @@ class SessionManager:
                 # buffered activity.
                 continue
 
-            # Nothing buffered — truly done.
-            return
+            # Nothing more buffered — exit peek phase and drop into listener.
+            peek_phase_done = True
+
+        # Drop into the extended listener so a delayed ``task_notification``
+        # doesn't land on an empty buffer with no consumer.  Returns only
+        # on supersede / CancelledError; the listener owns IDLE-emit from
+        # this point on.
+        if info.task is asyncio.current_task():
+            await self._extended_post_turn_listener(session_id, info)
+
+    async def _extended_post_turn_listener(self, session_id: str,
+                                           info: SessionInfo) -> None:
+        """Keep listening on the SDK buffer while the session is post-turn IDLE.
+
+        When the agent ends a turn while a ``Bash(run_in_background=True)``
+        is still running, the SDK delivers the eventual ``task_notification``
+        + auto-resume turn long after RESULT — sometimes many minutes later.
+        Without a consumer those messages stack up in the SDK's
+        MemoryObjectStream and get drained as the response to the next user
+        message, breaking the session.
+
+        This coroutine emits the initial IDLE (so the user sees the session
+        as ready) and then sits on ``receive_response()`` until either:
+
+        * ``task_notification`` (or unexpected non-system content) arrives —
+          flip to WORKING with substatus="auto-resuming", stream until the
+          auto-resume's RESULT, emit IDLE, loop;
+        * ``compact_boundary`` arrives — drive the existing compaction flow;
+        * the task is superseded (a new ``send_message`` cancelled us);
+        * the task is cancelled (interrupt or session close) — ``CancelledError``
+          is propagated.
+
+        ``send_message`` cancels the listener and sets ``_drain_stale`` so any
+        late-arriving stale messages are consumed before the new query is read.
+        """
+        # Helper: this task is no longer the rightful owner of the SDK
+        # buffer.  Either ``info.task`` was replaced by a new task, or
+        # ``send_message`` flagged us for supersede.  Either condition is
+        # enough to bail without touching state — the new task takes
+        # over.  Critically, we must check BOTH because there is a
+        # window where ``send_message`` has set the flag but the new
+        # task has not yet claimed ``info.task`` (it's still queued on
+        # the event loop).  Without the flag check we'd keep processing
+        # auto-resume messages whose RESULT would clobber the WORKING
+        # state ``send_message`` just set for the new query.
+        def _bailing() -> bool:
+            return (
+                info.task is not asyncio.current_task()
+                or bool(getattr(info, '_listener_superseded', False))
+            )
+
+        # First: emit the IDLE that would normally fire in _send_query /
+        # _drive_session after the drain returns.  We're taking ownership
+        # of the IDLE-emit here because we never return normally.
+        info._awaiting_compact_drain = False
+        if not _bailing() and info.state == SessionState.IDLE:
+            self._emit_state(info)
+
+        while not _bailing():
+            try:
+                cycle_yielded = False
+                async for msg in self._sdk.receive_response(info.client):
+                    cycle_yielded = True
+                    if _bailing():
+                        return
+                    # Per-message try/except: a bad message must not kill
+                    # the entire listener and orphan the SDK buffer.  This
+                    # mirrors the main response loop's pattern in
+                    # _send_query / _drive_session.
+                    try:
+                        await self._process_message(session_id, msg)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as pm_err:
+                        logger.exception(
+                            "_extended_post_turn_listener _process_message error "
+                            "for %s (msg kind %s): %s",
+                            session_id, msg.kind.value, pm_err
+                        )
+                        # Continue iterating — the next message might be
+                        # the RESULT we need to consume for clean state.
+                        continue
+                    # Re-check: _process_message may have yielded under
+                    # info._lock contention, giving send_message a chance
+                    # to set _listener_superseded.
+                    if _bailing():
+                        return
+
+                    if msg.kind == MessageKind.RESULT:
+                        # Auto-resume turn ended.  _process_message set
+                        # state=IDLE + _awaiting_compact_drain=True; emit
+                        # IDLE and re-enter the listening loop.
+                        info._awaiting_compact_drain = False
+                        if not _bailing() and info.state == SessionState.IDLE:
+                            self._emit_state(info)
+                        # receive_response terminates at RESULT; outer
+                        # while-loop calls receive_response again to
+                        # listen for the next batch.
+                        break
+
+                    if msg.kind == MessageKind.SYSTEM:
+                        sub = msg.subtype or ''
+                        if sub == 'compact_boundary':
+                            # _process_message already flipped state to
+                            # WORKING+compacting and emitted.  Continue the
+                            # inner loop to receive init + content + RESULT.
+                            continue
+                        if sub == 'task_notification':
+                            self._enter_auto_resume(info)
+                            continue
+                        # init / status / turn_duration are handled by
+                        # _process_message; nothing else to do here.
+                        continue
+
+                    # Non-system message arrived after RESULT — the SDK is
+                    # streaming the auto-resume turn's content directly.
+                    if info.state == SessionState.IDLE:
+                        self._enter_auto_resume(info)
+                # receive_response() exhausted normally (e.g. RESULT consumed
+                # via break above) — outer while loop iterates.
+                # Anti-tight-loop guard: if a cycle yielded zero messages
+                # (anomalous — receive_response normally blocks forever
+                # waiting for the next batch), sleep briefly before retrying
+                # to avoid pegging the CPU on a wedged transport.
+                if not cycle_yielded and not _bailing():
+                    await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Transport-level error from receive_response itself.  If it
+                # looks like a stream/transport failure, hand off to the
+                # existing self-heal logic by flagging _stream_heal_needed
+                # and letting _send_query / _drive_session's finally block
+                # reconnect on the next user action.  Otherwise just log
+                # and exit — the buffer is unrecoverable from here.
+                err_str = str(e)
+                etype = type(e).__name__
+                is_transport = (
+                    "Stream closed" in err_str
+                    or "exit code" in err_str
+                    or "closed" in err_str.lower()
+                    or "CLIConnection" in etype
+                    or "Process" in etype
+                    or "ClosedResource" in etype
+                )
+                if is_transport:
+                    logger.info(
+                        "_extended_post_turn_listener %s: transport error (%s) — "
+                        "flagging stream_heal", session_id, etype
+                    )
+                    if not hasattr(info, '_stream_heal_count'):
+                        info._stream_heal_count = 0
+                    info._stream_heal_count += 1
+                    info._stream_heal_needed = True
+                else:
+                    logger.warning(
+                        "_extended_post_turn_listener error for %s: %s",
+                        session_id, e
+                    )
+                return
 
     def _enter_auto_resume(self, info: SessionInfo) -> None:
         """Flip a session back to WORKING when the SDK auto-resumes.
