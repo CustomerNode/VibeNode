@@ -118,6 +118,21 @@ class SessionOptions:
     # Permission callback -- set by SessionManager, not by the caller.
     permission_callback: Optional[Callable] = None
 
+    # Pre-compact callback -- set by SessionManager, not by the caller.
+    # Fires BEFORE the SDK starts a compaction cycle (both manual /compact
+    # and automatic context-fill compaction).  SessionManager uses this
+    # to mark substatus="compacting" early so the UI shows "Compacting…"
+    # during the actual work, not just briefly after the work is done
+    # (compact_boundary from the SDK arrives at the END of compaction).
+    # Signature::
+    #     async (input_data: dict, tool_use_id: str | None, context: Any)
+    #         -> dict
+    #
+    # The implementation MUST return an empty dict ``{}`` (the SDK's
+    # ``HookJSONOutput`` shape) so the SDK proceeds with compaction
+    # unaltered — this is a notification-only hook.
+    pre_compact_callback: Optional[Callable] = None
+
 
 class AgentSDK(ABC):
     """Abstract base for AI agent backends.

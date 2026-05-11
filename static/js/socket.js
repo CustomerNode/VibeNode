@@ -101,7 +101,7 @@ socket.on('connect', () => {
 
 // Restore persisted permission policy from backend on connect
 socket.on('permission_policy_loaded', (data) => {
-    if (data && data.policy && ['manual', 'auto', 'almost_always', 'custom'].includes(data.policy)) {
+    if (data && data.policy && ['manual', 'auto', 'almost_always', 'claude_auto', 'custom'].includes(data.policy)) {
         permissionPolicy = data.policy;
         localStorage.setItem('permPolicy', data.policy);
         if (data.custom_rules && typeof data.custom_rules === 'object') {
@@ -509,6 +509,12 @@ socket.on('session_state', (data) => {
     // Rules:
     //   • Only store a substatus for sessions that are actively WORKING —
     //     idle/stopped/waiting sessions must never carry a stale substatus.
+    //   • EXCEPTION: ``auto-resuming`` may persist into ``idle`` state to
+    //     mark a session that's sleeping with a scheduled wake-up pending
+    //     (ScheduleWakeup / Bash run_in_background).  Without this
+    //     exception the UI would show a plain-idle indicator the entire
+    //     time the agent is asleep, which is the UX half of the wake-up
+    //     bug — sessions look ready when they're actually waiting.
     //   • For working sessions: preserve an optimistic "compacting" value if
     //     the server sends a working event without an explicit substatus field
     //     (compact_boundary is the authoritative confirmation that arrives
@@ -519,8 +525,15 @@ socket.on('session_state', (data) => {
     if (substatus && state === 'working') {
         // Server says "compacting" (or future substatus) and session is working
         window._sessionSubstatus[session_id] = substatus;
+    } else if (substatus === 'auto-resuming' && state === 'idle') {
+        // Session is sleeping with a scheduled wake-up pending — keep the
+        // substatus visible so the idle indicator can show "Awaiting wake-up…"
+        // instead of plain ready.  Cleared by a fresh substatus='' from the
+        // server at the wake-up's final RESULT.
+        window._sessionSubstatus[session_id] = substatus;
     } else if (state !== 'working') {
-        // Non-working state (idle/stopped/waiting) — always clear substatus
+        // Non-working state (idle/stopped/waiting) — clear substatus unless
+        // the wake-up branch above preserved it.
         delete window._sessionSubstatus[session_id];
     } else if (substatusExplicit || window._sessionSubstatus[session_id] !== 'compacting') {
         // Working state, no substatus: clear unless we're preserving optimistic "compacting"
@@ -619,6 +632,15 @@ socket.on('session_state', (data) => {
     // Refresh active views — always call filterSessions so sidebar icons
     // update for substatus changes (e.g. compacting indicator)
     filterSessions();
+    // Kanban view: filterSessions doesn't re-render kanban, so use a
+    // targeted in-place refresh for any kanban session rows mounted for
+    // this session_id.  Without this, kanban indicators desynced from
+    // the sidebar / live panel during the wake-up cycle (user-reported
+    // bug: "kanban doesn't sync to working bar").  No-op if no kanban
+    // rows are mounted (typical when not in kanban view).
+    if (typeof _kanbanRefreshSessionIndicators === 'function') {
+        _kanbanRefreshSessionIndicators(session_id);
+    }
     if (liveSessionId === session_id) {
         liveBarState = null;  // force re-render
         updateLiveInputBar();

@@ -84,13 +84,17 @@ class PermissionManager:
     # Permission policy persistence
     # ------------------------------------------------------------------
 
+    # Allowed policy values.  Update in ONE place — used by load, save,
+    # and the WebSocket validator (which re-imports this tuple).
+    ALLOWED_POLICIES = ("manual", "auto", "almost_always", "claude_auto", "custom")
+
     def _load_policy(self):
         """Load persisted permission policy from disk."""
         try:
             if self._policy_path.exists():
                 data = json.loads(self._policy_path.read_text())
                 policy = data.get("policy", "manual")
-                if policy in ("manual", "auto", "almost_always", "custom"):
+                if policy in self.ALLOWED_POLICIES:
                     logger.info("Loaded persisted permission policy: %s", policy)
                     return policy, data.get("custom_rules", {})
         except Exception as e:
@@ -117,12 +121,33 @@ class PermissionManager:
 
     def set_permission_policy(self, policy: str, custom_rules: dict = None) -> None:
         """Update the permission policy (synced from browser)."""
-        if policy not in ("manual", "auto", "almost_always", "custom"):
+        if policy not in self.ALLOWED_POLICIES:
             return
         self._permission_policy = policy
         self._custom_rules = custom_rules or {}
         self._save_policy()
         logger.info("Permission policy updated and saved: %s", policy)
+
+    def get_sdk_permission_mode_override(self) -> Optional[str]:
+        """Return the SDK ``permission_mode`` implied by the current policy.
+
+        Most policies leave ``permission_mode`` at ``"default"`` and route
+        every tool use through our ``can_use_tool`` callback so we can apply
+        VibeNode logic ourselves.
+
+        The ``claude_auto`` policy is the exception: it asks the Claude SDK
+        to use its OWN built-in approval logic (``acceptEdits`` mode) for
+        Edit/Write/MultiEdit/NotebookEdit instead of round-tripping those
+        through our callback.  Edits never reach ``can_use_tool`` under
+        this mode — Claude handles them directly.
+
+        Returns:
+            ``"acceptEdits"`` when policy is ``claude_auto``, else ``None``.
+            ``None`` means "no override — caller picks the default".
+        """
+        if self._permission_policy == "claude_auto":
+            return "acceptEdits"
+        return None
 
     # ------------------------------------------------------------------
     # UI Preferences persistence
@@ -174,6 +199,17 @@ class PermissionManager:
             return True
         if policy == "almost_always":
             # Auto-approve everything EXCEPT dangerous commands
+            if self.is_dangerous(tool_name, tool_input):
+                return False
+            return True
+        if policy == "claude_auto":
+            # "Claude Auto": SDK's permission_mode="acceptEdits" auto-approves
+            # Edit/Write/MultiEdit/NotebookEdit BEFORE our callback runs, so
+            # those tool names never reach this function.  For everything
+            # else we still apply the dangerous-command guard so the user
+            # is prompted before destructive bash runs (rm -rf, force push,
+            # DROP TABLE, etc.).  Net effect: edits handled by Claude,
+            # other tools follow the same safety net as "Almost Always".
             if self.is_dangerous(tool_name, tool_input):
                 return False
             return True

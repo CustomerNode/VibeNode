@@ -818,6 +818,10 @@ function _applyPolicies(entry) {
   if (permissionPolicy === 'manual') return false;
   if (permissionPolicy === 'auto') return true;
   if (permissionPolicy === 'almost_always') return true;  // dangerous-command gate is server-side
+  // "Claude Auto": SDK's acceptEdits already handled edits server-side; anything
+  // that reaches the browser is non-edit (Bash/MCP/etc).  Same safety net as
+  // almost_always — dangerous-command gate is server-side, so approve here.
+  if (permissionPolicy === 'claude_auto') return true;
 
   // Custom policy
   if (permissionPolicy === 'custom') {
@@ -861,6 +865,7 @@ function openPermissionPolicySelector() {
   const policies = [
     {key: 'manual', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>', title: 'Manual', desc: 'Review and approve each tool use individually'},
     {key: 'almost_always', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>', title: 'Auto Approve Most', desc: 'Auto-approve all tools except destructive commands (rm -rf, force push, DROP TABLE, etc.)'},
+    {key: 'claude_auto', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l1.8 5.4L19 9l-5.2 1.6L12 16l-1.8-5.4L5 9l5.2-1.6z"/><path d="M19 14l.9 2.7L22 17.5l-2.1.8L19 21l-.9-2.7L16 17.5l2.1-.8z"/></svg>', title: 'Claude Auto', desc: 'Use Claude’s built-in approval logic for file edits, plus the destructive-command guard for shell. Edits are decided by Claude itself, not a regex.'},
     {key: 'auto', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>', title: 'Auto-Approve All', desc: 'Automatically approve all permission requests'},
     {key: 'custom', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>', title: 'Custom Rules', desc: 'Define per-tool auto-approve rules'},
   ];

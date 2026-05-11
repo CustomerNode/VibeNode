@@ -36,10 +36,23 @@ function _renderSessionRow(s, extraClass) {
   const activeClass = s.id === activeId ? ' active' : '';
   const colClick = `onclick="singleOrDouble('${s.id}',event)" style="cursor:pointer;"`;
   const _isCompacting = isRunning && window._sessionSubstatus && window._sessionSubstatus[s.id] === 'compacting';
+  // Sleeping/awaiting-wake-up = substatus 'auto-resuming' regardless of state.
+  // Spans both phases:
+  //  * idle + auto-resuming = asleep waiting for wake-up to fire
+  //  * working + auto-resuming = wake-up firing right now
+  // Both phases share the same moon icon so the sidebar/kanban/workforce
+  // visually agree with the live panel's "Awaiting wake-up…" label
+  // throughout the cycle.  Without this, the sidebar flipped to a
+  // pickaxe icon the moment the wake-up fired (state went idle→working)
+  // while the live panel still said "Awaiting wake-up…" — that's the
+  // state-desync the user reported.
+  const _isSleeping = window._sessionSubstatus && window._sessionSubstatus[s.id] === 'auto-resuming';
   const icon = isWaiting
     ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2" stroke-linecap="round" title="Waiting for input"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>'
     : _isCompacting
     ? '<svg class="state-icon compacting-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#aa88ff" stroke-width="2" stroke-linecap="round" title="Compacting context"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>'
+    : _isSleeping
+    ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#8aa9ff" stroke-width="2" stroke-linecap="round" title="Awaiting wake-up"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>'
     : isRunning
     ? '<img class="state-icon" src="/static/svg/pickaxe.svg" width="12" height="12" style="filter:brightness(0) saturate(100%) invert(55%) sepia(78%) saturate(1000%) hue-rotate(215deg);" title="Working">'
     : isIdle
@@ -140,11 +153,18 @@ function onRowEnter(e) {
     question:'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r=".5" fill="currentColor"/></svg> Question',
     working:'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Working',
     idle:'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><polyline points="20 6 9 17 4 12"/></svg> Idle',
-    sleeping:'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg> Sleeping'
+    sleeping:'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg> Awaiting wake-up'
   };
   const _isCompactingTip = status === 'working' && window._sessionSubstatus && window._sessionSubstatus[id] === 'compacting';
+  // Sleeping tooltip: substatus 'auto-resuming' regardless of state, so the
+  // tooltip stays "Awaiting wake-up" across idle→working→idle within the
+  // wake-up cycle.  Without this, the tooltip flickered to "Working" the
+  // moment the wake-up fired.
+  const _isSleepingTip = window._sessionSubstatus && window._sessionSubstatus[id] === 'auto-resuming';
   const stateLabel = _isCompactingTip
     ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#aa88ff" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg> Compacting'
+    : _isSleepingTip
+    ? stateLabels.sleeping
     : (stateLabels[status] || status);
 
   const tip = document.getElementById('session-tooltip');

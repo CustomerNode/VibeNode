@@ -101,6 +101,62 @@ function _hideKanbanHistory() {
   }, 300);
 }
 
+/** Refresh in-place all kanban session-row elements for a given session_id.
+ *
+ * Called from socket.js's session_state handler so the kanban view stays
+ * in sync with the sidebar / workforce / live panel when a session's
+ * substatus changes (compacting, awaiting-wake-up, etc.) without doing
+ * a full board re-render or re-fetching board data from the server.
+ *
+ * Walks all three kanban session-row variants:
+ *   1. .kanban-session-row (expanded card session list, line ~720)
+ *   2. .kanban-drill-subtask-row.kanban-drill-leaf-row (drill-down panel)
+ *   3. .kanban-drill-session-row (drill-down session-only panel)
+ *
+ * For matching elements (data-sid="<session_id>"), updates the visible
+ * status text + dot/badge color based on the live state cache
+ * (sessionKinds + _sessionSubstatus).  No-op if no matching elements
+ * are mounted (typical when the user isn't in kanban view).
+ */
+function _kanbanRefreshSessionIndicators(sessionId) {
+  if (!sessionId) return;
+  const rows = document.querySelectorAll('[data-sid="' + CSS.escape(sessionId) + '"]');
+  if (!rows.length) return;  // Nothing visible to update — common case
+  const state = (typeof sessionKinds !== 'undefined' && sessionKinds[sessionId]) || 'sleeping';
+  const substatus = (window._sessionSubstatus && window._sessionSubstatus[sessionId]) || '';
+  // Derive the effective sessStatus the renderers would have produced.
+  // Matches the logic in the three kanban session-row renderers — keep
+  // in sync if any of them changes their status-derivation rules.
+  let sessStatus = state;
+  if (substatus === 'auto-resuming') sessStatus = 'awaiting wake-up';
+  else if (substatus === 'compacting' && state === 'working') sessStatus = 'compacting';
+  // Color mapping (same palette as the renderers)
+  const colorVar =
+    sessStatus === 'working' ? 'var(--status-working)' :
+    sessStatus === 'idle' ? 'var(--status-complete)' :
+    sessStatus === 'awaiting wake-up' ? '#8aa9ff' :
+    sessStatus === 'compacting' ? '#aa88ff' :
+    'var(--text-dim)';
+  rows.forEach(row => {
+    // Variant 1: kanban-session-row → has .kanban-session-dot + .kanban-session-status
+    const dot = row.querySelector('.kanban-session-dot');
+    const statusSpan = row.querySelector('.kanban-session-status');
+    if (dot) dot.style.background = colorVar;
+    if (statusSpan) statusSpan.textContent = sessStatus;
+    // Variants 2 & 3: drill-row → has .kanban-drill-subtask-status badge
+    const badge = row.querySelector('.kanban-drill-subtask-status');
+    if (badge) {
+      const label = sessStatus.charAt(0).toUpperCase() + sessStatus.slice(1);
+      badge.textContent = label;
+      // The badge uses a tinted background (color26) + solid foreground.
+      // We can't easily produce the 26-alpha version of a var(...) string,
+      // so write inline color + a low-opacity background using rgba/var.
+      badge.style.color = colorVar;
+      badge.style.background = `color-mix(in srgb, ${colorVar} 15%, transparent)`;
+    }
+  });
+}
+
 // Status colors read from CSS variables for theme support
 let _statusColorCache = null;
 function _readStatusColors() {
@@ -705,9 +761,22 @@ function renderExpandedContent(taskData) {
     for (const sess of sessions) {
       const sessId = typeof sess === 'string' ? sess : sess.session_id;
       const sessTitle = _resolveSessionName(sessId);
-      const sessStatus = (typeof sess === 'object' && typeof sess.status === 'string' && sess.status) ? sess.status : 'sleeping';
-      const dotColor = sessStatus === 'working' ? 'var(--accent)' : sessStatus === 'idle' ? 'var(--green)' : 'var(--text-faint)';
-      html += `<div class="kanban-session-row" onclick="event.stopPropagation();selectSession('${escHtml(sessId)}');">
+      let sessStatus = (typeof sess === 'object' && typeof sess.status === 'string' && sess.status) ? sess.status : 'sleeping';
+      // Live override: if the session has substatus 'auto-resuming' in our
+      // real-time cache, surface "awaiting wake-up" regardless of the
+      // kanban API's stale snapshot.  Without this, the kanban panel
+      // disagrees with the sidebar/live panel during the wake-up cycle —
+      // the user-reported "kanban doesn't sync to the working bar" desync.
+      const _liveSub = (window._sessionSubstatus && window._sessionSubstatus[sessId]) || '';
+      if (_liveSub === 'auto-resuming') sessStatus = 'awaiting wake-up';
+      const dotColor = sessStatus === 'working' ? 'var(--accent)'
+                      : sessStatus === 'idle' ? 'var(--green)'
+                      : sessStatus === 'awaiting wake-up' ? '#8aa9ff'
+                      : 'var(--text-faint)';
+      // data-sid attribute lets _kanbanRefreshSessionIndicators() find
+      // and update this row in-place on session_state events without
+      // a full board re-render.
+      html += `<div class="kanban-session-row" data-sid="${escHtml(sessId)}" onclick="event.stopPropagation();selectSession('${escHtml(sessId)}');">
         <span class="kanban-session-dot" style="background:${dotColor};"></span>
         <span class="kanban-session-title">${escHtml(sessTitle)}</span>
         <span class="kanban-session-status">${escHtml(sessStatus)}</span>
@@ -2174,9 +2243,18 @@ async function renderTaskDetail(taskId, opts) {
       }
 
       // Session row
-      const sessStatus = existingSession ? (typeof existingSession.status === 'string' ? existingSession.status : 'sleeping') : 'not_started';
+      let sessStatus = existingSession ? (typeof existingSession.status === 'string' ? existingSession.status : 'sleeping') : 'not_started';
+      // Live override for awaiting-wake-up (same reason as the other
+      // kanban session-row render above).
+      if (existingSession) {
+        const _liveSub = (window._sessionSubstatus && window._sessionSubstatus[existingSession.session_id]) || '';
+        if (_liveSub === 'auto-resuming') sessStatus = 'awaiting wake-up';
+      }
       const sessColor = existingSession
-        ? (sessStatus === 'working' ? 'var(--status-working)' : sessStatus === 'idle' ? 'var(--status-complete)' : 'var(--text-dim)')
+        ? (sessStatus === 'working' ? 'var(--status-working)'
+           : sessStatus === 'idle' ? 'var(--status-complete)'
+           : sessStatus === 'awaiting wake-up' ? '#8aa9ff'
+           : 'var(--text-dim)')
         : 'var(--text-dim)';
       const sessLabel = existingSession ? (sessStatus.charAt(0).toUpperCase() + sessStatus.slice(1)) : 'New';
       const sessTitle = existingSession ? _resolveSessionName(existingSession.session_id) : 'Session';
@@ -2184,7 +2262,11 @@ async function renderTaskDetail(taskId, opts) {
         ? `_kanbanOpenSession('${task.id}','${escHtml(existingSession.session_id)}')`
         : `openSessionSpawner('${task.id}')`;
 
-      html += `<div class="kanban-drill-subtask-row kanban-drill-leaf-row" onclick="${sessClick}" style="cursor:pointer;">`;
+      // data-sid is required so _kanbanRefreshSessionIndicators() can
+      // find this leaf-row and update its sessStatus visuals when a
+      // session_state event arrives without re-fetching the board.
+      const _drillSid = existingSession ? escHtml(existingSession.session_id) : '';
+      html += `<div class="kanban-drill-subtask-row kanban-drill-leaf-row"${_drillSid ? ` data-sid="${_drillSid}"` : ''} onclick="${sessClick}" style="cursor:pointer;">`;
       html += `<span class="kanban-drill-subtask-grip" style="visibility:hidden;"></span>`;
       html += `<div class="kanban-drill-subtask-status" style="background:${sessColor}26;color:${sessColor};">${escHtml(sessLabel)}</div>`;
       html += `<span class="kanban-drill-subtask-title"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6;"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>${escHtml(sessTitle)}</span>`;
@@ -2309,11 +2391,21 @@ async function renderTaskDetail(taskId, opts) {
       for (const sess of sessions) {
         const sessId = typeof sess === 'string' ? sess : sess.session_id;
         const sessTitle = _resolveSessionName(sessId);
-        const sessStatus = (typeof sess === 'object' && typeof sess.status === 'string' && sess.status) ? sess.status : 'sleeping';
-        const sc = sessStatus === 'working' ? 'var(--status-working)' : sessStatus === 'idle' ? 'var(--status-complete)' : 'var(--text-dim)';
+        let sessStatus = (typeof sess === 'object' && typeof sess.status === 'string' && sess.status) ? sess.status : 'sleeping';
+        // Live override for awaiting-wake-up (consistent with other kanban
+        // session-row renderers).
+        const _liveSub = (window._sessionSubstatus && window._sessionSubstatus[sessId]) || '';
+        if (_liveSub === 'auto-resuming') sessStatus = 'awaiting wake-up';
+        const sc = sessStatus === 'working' ? 'var(--status-working)'
+                  : sessStatus === 'idle' ? 'var(--status-complete)'
+                  : sessStatus === 'awaiting wake-up' ? '#8aa9ff'
+                  : 'var(--text-dim)';
         const statusLabel = sessStatus.charAt(0).toUpperCase() + sessStatus.slice(1);
 
-        html += `<div class="kanban-drill-session-row" data-session-id="${escHtml(sessId)}" onclick="_kanbanOpenSession('${task.id}','${escHtml(sessId)}')" style="cursor:pointer;">`;
+        // data-sid (in addition to existing data-session-id) so
+        // _kanbanRefreshSessionIndicators() can find this row with the
+        // same selector used for the other kanban session-row variants.
+        html += `<div class="kanban-drill-session-row" data-session-id="${escHtml(sessId)}" data-sid="${escHtml(sessId)}" onclick="_kanbanOpenSession('${task.id}','${escHtml(sessId)}')" style="cursor:pointer;">`;
         html += `<div class="kanban-drill-subtask-status" style="background:${sc}26;color:${sc};">${escHtml(statusLabel)}</div>`;
         html += `<span class="kanban-drill-session-name">${escHtml(sessTitle)}</span>`;
         html += `<div class="kanban-drill-subtask-actions">`;

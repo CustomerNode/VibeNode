@@ -93,7 +93,29 @@ class SessionDaemon:
             # SO_EXCLUSIVEADDRUSE: hard guarantee no other process can bind this port
             self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         else:
+            # SO_REUSEADDR: let us rebind to a port whose previous owner left
+            # it in TIME_WAIT.  This is the common case during ``/api/restart
+            # → scope=daemon``: the old daemon was kill -9'd, the port is in
+            # TIME_WAIT for ~60 seconds, and without REUSEADDR the new daemon
+            # bind() fails with EADDRINUSE → daemon exits → web stays up
+            # without a daemon.  That's the "restart didn't restart the
+            # daemon" user-reported bug on Linux.
             self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # SO_REUSEPORT: belt-and-suspenders.  Linux 3.9+ supports it.
+            # Allows binding even when a sibling process briefly held the
+            # same port (e.g. a stale daemon dying during the restart's
+            # kill loop).  Wrapped because not all kernels have the
+            # constant defined.
+            _reuseport = getattr(socket, "SO_REUSEPORT", None)
+            if _reuseport is not None:
+                try:
+                    self._server_socket.setsockopt(
+                        socket.SOL_SOCKET, _reuseport, 1
+                    )
+                except OSError:
+                    # Old kernel without SO_REUSEPORT support — fall back
+                    # to SO_REUSEADDR alone (which is set above).
+                    pass
         try:
             self._server_socket.bind(("127.0.0.1", self.port))
         except OSError as e:
@@ -313,6 +335,179 @@ class SessionDaemon:
             pass
 
 
+def _cmdline_of(pid: int) -> str:
+    """Read /proc/<pid>/cmdline.  Returns '<unknown>' if not readable."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            raw = fh.read().replace(b"\x00", b" ").strip()
+        return raw.decode("utf-8", errors="replace") or "<empty>"
+    except FileNotFoundError:
+        return "<pid gone>"
+    except Exception as e:
+        return f"<err: {e}>"
+
+
+def _proc_name_of(pid: int) -> str:
+    """Read /proc/<pid>/comm.  Returns '<unknown>' if not readable."""
+    try:
+        with open(f"/proc/{pid}/comm") as fh:
+            return fh.read().strip()
+    except Exception:
+        return "<unknown>"
+
+
+def _ppid_of(pid: int) -> int:
+    """Read PPid from /proc/<pid>/status.  Returns -1 if not readable."""
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except Exception:
+        pass
+    return -1
+
+
+def _install_signal_forensics_watcher(daemon):
+    """Install a thread that captures the actual sender PID of every shutdown signal.
+
+    Why this exists: Python's standard `signal.signal()` handler runs in the
+    main thread without access to `siginfo_t.si_pid`, so by the time the
+    handler fires we have no way to know *who* killed us.  That's why every
+    previous round of debugging the "Stop Session crashed the daemon on
+    Linux" regression ended with a fix that "could not be reproduced" —
+    the logs only ever said "Received signal 15", with zero information
+    about the source.
+
+    The trick: block SIGTERM / SIGINT / SIGHUP at the thread level, then
+    have a dedicated thread loop on `signal.sigwaitinfo()`.  `sigwaitinfo()`
+    DOES preserve `si_pid`, so when the signal fires we get a definitive
+    "PID N (cmdline ...) killed us" record before exiting.
+
+    POSIX-only.  On Windows this is a no-op — Windows uses TerminateProcess,
+    not POSIX signals, and the historic regression is Linux/macOS-specific
+    anyway.
+
+    Returns True if installed, False on non-POSIX or hostile environments.
+    """
+    if os.name == "nt":
+        return False
+
+    # Signals we want forensic detail for.  SIGPIPE is intentionally
+    # excluded — it's a normal consequence of a dead socket peer.
+    watched = {signal.SIGTERM, signal.SIGINT}
+    if hasattr(signal, "SIGHUP"):
+        watched.add(signal.SIGHUP)
+
+    # Block at the process level so the kernel queues the signal for
+    # sigwaitinfo() to pick up, instead of running the default disposition
+    # (= terminate the process before we can log anything).  Threads created
+    # after this inherit the mask.
+    try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+    except Exception as e:
+        logger.warning("Could not block signals for forensics watcher: %s", e)
+        return False
+
+    def _watcher():
+        while True:
+            try:
+                si = signal.sigwaitinfo(watched)
+            except InterruptedError:
+                continue
+            except Exception as e:
+                # If sigwaitinfo dies for some reason, fall back to the
+                # default disposition so the process doesn't become
+                # unkillable.  Best-effort log.
+                logger.error("sigwaitinfo failed (%s) — restoring default disposition", e)
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, watched)
+                return
+
+            sender = getattr(si, "si_pid", -1) or -1
+            sig = si.si_signo
+            try:
+                sig_name = signal.Signals(sig).name
+            except (ValueError, AttributeError):
+                sig_name = f"signal{sig}"
+
+            logger.warning(
+                "=" * 78
+            )
+            logger.warning(
+                "DAEMON KILLED BY EXTERNAL SIGNAL — full forensic record below."
+            )
+            logger.warning(
+                "  signal:  %s (%d)   si_code=%s   si_uid=%s",
+                sig_name, sig, getattr(si, "si_code", "?"),
+                getattr(si, "si_uid", "?"),
+            )
+            logger.warning(
+                "  sender:  pid=%s  ppid=%s  name=%s",
+                sender, _ppid_of(sender), _proc_name_of(sender),
+            )
+            logger.warning(
+                "  sender cmdline: %s", _cmdline_of(sender),
+            )
+            logger.warning(
+                "  self:    pid=%s  pgid=%s  sid=%s  ppid=%s",
+                os.getpid(),
+                os.getpgrp() if hasattr(os, "getpgrp") else "?",
+                os.getsid(0) if hasattr(os, "getsid") else "?",
+                os.getppid(),
+            )
+
+            # Interpret the sender for the user.  The most important case
+            # is "killed by myself" — that means a buggy os.kill() /
+            # os.killpg() call inside this very process targeted us.
+            self_pid = os.getpid()
+            if sender == self_pid:
+                logger.warning(
+                    "  DIAGNOSIS: sender == self.  The daemon killed ITSELF "
+                    "via os.kill()/os.killpg() — a bug inside the daemon's "
+                    "own session-cleanup code.  Inspect _kill_process_tree "
+                    "and _close_session for an os.killpg() / os.kill() "
+                    "call whose target pgid/pid resolved to ours."
+                )
+            elif sender > 0 and _proc_name_of(sender) in ("python", "python3", "python3.12"):
+                logger.warning(
+                    "  DIAGNOSIS: sender is a Python process.  Likely the "
+                    "VibeNode web server (run.py) or a daemon-launcher "
+                    "running a restart endpoint.  Check app/routes/main.py "
+                    "/api/restart and /api/shutdown for whether scope="
+                    "'daemon' or scope='both' was triggered."
+                )
+            else:
+                logger.warning(
+                    "  DIAGNOSIS: sender is NOT this daemon and NOT a known "
+                    "VibeNode component.  External source — could be "
+                    "systemd, OOM killer, the user's terminal, or a "
+                    "wrapper script.  Inspect ps/journalctl for context."
+                )
+            logger.warning("=" * 78)
+
+            # Hand off to the normal shutdown path.  Unblock just this
+            # signal, then re-raise it to ourselves so the existing
+            # signal.signal() handler (registered below) runs daemon.stop()
+            # + sys.exit(0) on the main thread.
+            try:
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, {sig})
+                os.kill(self_pid, sig)
+            except Exception as e:
+                logger.error("Failed to forward signal to main thread: %s", e)
+                # Last resort — exit directly so the daemon doesn't hang.
+                daemon.stop()
+                os._exit(0)
+            # Re-block for any future signal.
+            try:
+                signal.pthread_sigmask(signal.SIG_BLOCK, {sig})
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_watcher, daemon=True, name="signal-forensics")
+    t.start()
+    return True
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -337,39 +532,26 @@ def main():
     daemon = SessionDaemon()
 
     def shutdown(sig, frame):
-        # Log loudly with the sender's PID when known.  When a misbehaving
-        # ``killpg`` lands on the daemon (the historic Linux "Stop Session
-        # blew up the daemon" regression), this trail is the only way to
-        # tell after the fact whether the kill came from our own
-        # _kill_process_tree (likely a Patch 4 leak) or from outside the
-        # process (e.g. systemd / OOM killer / user `kill`).
+        # The forensics watcher (_install_signal_forensics_watcher) already
+        # logged the full sender PID / cmdline / diagnosis before forwarding
+        # the signal here.  This handler just performs the graceful stop.
+        # We still emit one short line so an ungraceful exit (forensics
+        # watcher misfired) is still visible in the log.
         try:
-            sender_pid = -1
-            try:
-                # POSIX-only: si_pid is populated by the kernel for
-                # SIGTERM/SIGINT delivered by another process via kill(2).
-                # We can't get it from the signal handler directly, but
-                # logging os.getppid() and our own pgid gives a strong
-                # forensic clue.
-                sender_pid = os.getppid()
-            except Exception:
-                pass
-            logger.warning(
-                "Daemon received signal %s — shutting down. "
-                "ppid=%s own_pid=%s own_pgid=%s.  "
-                "If this fired during a session-stop on Linux, the "
-                "killpg-blast regression has returned: re-check Patch 4 "
-                "(daemon/sdk_patches.py) and the defensive pgid check "
-                "in _kill_process_tree (daemon/session_manager.py).",
-                sig, sender_pid, os.getpid(),
-                os.getpgrp() if hasattr(os, 'getpgrp') else '?',
+            logger.info(
+                "Daemon shutdown handler running (signal=%s pid=%s).",
+                sig, os.getpid(),
             )
         except Exception:
-            # Logging is best-effort — never let a logging failure
-            # delay the shutdown sequence.
             pass
         daemon.stop()
         sys.exit(0)
+
+    # Install the forensics watcher BEFORE registering the regular handlers.
+    # The watcher blocks the signals at the process level and re-delivers
+    # them to the main thread after logging — the signal.signal() handlers
+    # below catch the re-delivered copy.
+    _install_signal_forensics_watcher(daemon)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)

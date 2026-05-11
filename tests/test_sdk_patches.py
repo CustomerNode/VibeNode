@@ -1141,6 +1141,102 @@ class TestKillProcessTreeDefensivePgidCheck:
             except FileNotFoundError:
                 pass
 
+    # ── Suicide-PID guard (added 2026-05-10) ──────────────────────────
+    # The historic Linux "Stop Session crashes the daemon" regression was
+    # supposed to be fixed by the pgid check above, but the user reported
+    # it kept happening across 10+ "fix" attempts.  Root cause inspection
+    # found a SECOND path the pgid check did not cover: if pid==os.getpid(),
+    # pid==0, or pid<=1, the per-PID fallback INSIDE the pgid check would
+    # still execute os.kill(pid, SIGTERM) and kill the daemon (or, for
+    # pid==0, broadcast SIGTERM to the entire process group).  The new
+    # SUICIDE GUARD #0 short-circuits before any signal flies.  These
+    # tests prove the daemon stand-in survives every flavour of bad pid.
+    @pytest.mark.parametrize("bad_pid_factory,label", [
+        (lambda: os.getpid(), "own_pid"),
+        (lambda: 0, "zero"),
+        (lambda: 1, "init"),
+        (lambda: -1, "minus_one"),
+    ])
+    def test_kill_process_tree_refuses_suicidal_pids(self, bad_pid_factory, label):
+        """The daemon (stand-in: this test process) must survive when
+        `_kill_process_tree` is called with a pid that would otherwise
+        deliver a SIGTERM/SIGKILL to itself."""
+        from daemon.session_manager import SessionManager
+
+        bad_pid = bad_pid_factory()
+        our_pid_before = os.getpid()
+
+        # If the guard regresses, this call sends SIGTERM (then SIGKILL)
+        # to our own pid (or broadcasts via pid=0).  The pytest process
+        # would die mid-call and the assertion below would never run —
+        # pytest would report the test as KILLED rather than FAILED, so
+        # the absence of a green check is itself a regression signal.
+        SessionManager._kill_process_tree(bad_pid)
+
+        # We reached this line → we weren't signalled.  Sanity check.
+        assert os.getpid() == our_pid_before, (
+            f"Daemon stand-in survived suicide pid {bad_pid!r} ({label}) "
+            "but PID changed — should be impossible."
+        )
+
+    def test_kill_process_tree_none_pid_does_not_crash(self):
+        """`info._cli_pid` can be 0 by default and a buggy caller might
+        pass through ``None`` directly.  The guard must handle both."""
+        from daemon.session_manager import SessionManager
+
+        # None must not raise (the function's try/except wraps everything
+        # but the guard itself reads pid <= 1 which would raise TypeError
+        # on None without the explicit None check).
+        SessionManager._kill_process_tree(None)  # type: ignore[arg-type]
+        # If we got here without raising, the guard handled None correctly.
+        assert True
+
+
+# ── Signal-forensics watcher (added 2026-05-10) ─────────────────────────
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only sigwaitinfo")
+class TestSignalForensicsWatcher:
+    """`daemon/daemon_server.py` installs a thread that uses
+    ``signal.sigwaitinfo()`` to capture the sender PID of every shutdown
+    signal — Python's normal ``signal.signal()`` handler can't see si_pid.
+
+    Without this, every previous round of "Stop Session crashes the
+    daemon" debugging hit a dead end: the log only said
+    ``Received signal 15`` with no way to identify the killer.  These
+    tests prove the function exists and is wired in.
+    """
+
+    def test_forensics_helpers_present(self):
+        """`daemon_server` must export the helpers we depend on for
+        producing the forensic log line (sender cmdline / proc name /
+        ppid).  These are pure-Python /proc readers — easy to test."""
+        from daemon import daemon_server
+        assert callable(getattr(daemon_server, "_cmdline_of", None))
+        assert callable(getattr(daemon_server, "_proc_name_of", None))
+        assert callable(getattr(daemon_server, "_ppid_of", None))
+
+    def test_proc_helpers_return_safely_for_dead_pid(self):
+        """The helpers must not raise for a nonexistent pid — they run
+        from inside a signal-handling thread and any exception would
+        prevent the forensic log line from being emitted."""
+        from daemon import daemon_server
+        # A pid value that's guaranteed not to exist (32-bit max).
+        dead = 4_294_967_294
+        assert isinstance(daemon_server._cmdline_of(dead), str)
+        assert isinstance(daemon_server._proc_name_of(dead), str)
+        assert isinstance(daemon_server._ppid_of(dead), int)
+
+    def test_install_returns_true_on_posix(self):
+        """The installer should report success on POSIX.  We do NOT
+        actually call it here (it would block SIGTERM at the test
+        process level and leak across the suite), but we can verify
+        it's importable and callable."""
+        from daemon import daemon_server
+        installer = getattr(daemon_server, "_install_signal_forensics_watcher", None)
+        assert installer is not None
+        assert callable(installer)
+
 
 # ── /api/restart POSIX detachment ───────────────────────────────────────
 

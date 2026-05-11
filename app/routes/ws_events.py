@@ -735,8 +735,8 @@ def register_ws_events(socketio, app):
         policy = (data.get('policy') or '').strip()
         custom_rules = data.get('customRules') or {}
 
-        if policy not in ('manual', 'auto', 'almost_always', 'custom'):
-            emit('error', {'message': 'Invalid policy: must be manual, auto, almost_always, or custom'})
+        if policy not in ('manual', 'auto', 'almost_always', 'claude_auto', 'custom'):
+            emit('error', {'message': 'Invalid policy: must be manual, auto, almost_always, claude_auto, or custom'})
             return
 
         sm = app.session_manager

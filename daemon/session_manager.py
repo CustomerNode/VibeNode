@@ -158,6 +158,9 @@ class SessionInfo:
     _turn_had_direct_edit: bool = False                  # True if streaming saw Edit/Write this turn
     _turn_content_started: bool = False                  # True once first ASSISTANT message arrives this turn
     _awaiting_compact_drain: bool = False                # True when RESULT seen but IDLE emit deferred for post-turn compact check
+    _in_post_turn: bool = False                          # True while a post-turn listener owns the SDK buffer (suppresses queue auto-dispatch on IDLE emits so a buffered init/wake-up cycle can't race the dispatcher)
+    _wakeup_pending: bool = False                        # True if the most recent assistant turn scheduled a wake-up the SDK will deliver later (ScheduleWakeup, Bash run_in_background, etc.) — gates queue dispatch during the post-turn window
+    _post_compact_init_seen: bool = False                # True between the SDK's post-compact ``init`` and the first new-turn ASSISTANT — used to keep ``compacting`` substatus visible until the agent actually starts working in the new context (instead of flashing to "Working" the moment init lands)
     _tracked_files_populated: bool = False               # True after first _prepopulate_tracked_files
     _cached_git_files: list = field(default_factory=list) # cached git ls-files result
     _cached_git_files_ts: float = 0.0                     # time.time() when _cached_git_files was set
@@ -687,13 +690,38 @@ class SessionManager:
         self._mq.emit_queue_update(session_id)
 
     def queue_message(self, session_id: str, text: str) -> dict:
-        """Add a message to a session's queue."""
+        """Add a message to a session's queue.
+
+        If the session is IDLE we'd normally dispatch immediately so the
+        queued message runs without delay.  But during the post-turn
+        wake-up window (``_in_post_turn`` set AND ``_wakeup_pending``
+        set) the SDK may still deliver an auto-resume cycle — dispatching
+        now would cancel the post-turn listener mid-cycle and the
+        wake-up's remaining content would race the dispatched query.
+
+        Mirrors the gate in ``_emit_state``: same condition, same reason.
+        Without this duplicate check, ``queue_message`` would be the
+        bypass that re-introduces the bug.  The queued message sits in
+        the queue until either:
+          • the user explicitly sends a new message (which supersedes
+            via ``send_message``), or
+          • the wake-up cycle completes (``_enter_auto_resume`` clears
+            ``_wakeup_pending``, then the next IDLE emit dispatches).
+        """
         session_id = self._resolve_id(session_id)
         result = self._mq.queue_message(session_id, text)
 
-        # If the session is already idle, dispatch immediately
+        # If the session is already idle, dispatch immediately — unless
+        # we're in a wake-up post-turn window (see docstring above).
         info = self._sessions.get(session_id)
-        if info and info.state == SessionState.IDLE:
+        if (
+            info
+            and info.state == SessionState.IDLE
+            and not (
+                getattr(info, '_in_post_turn', False)
+                and getattr(info, '_wakeup_pending', False)
+            )
+        ):
             self._try_dispatch_queue(session_id)
 
         return result
@@ -739,6 +767,15 @@ class SessionManager:
         # of sending.
         info._interrupted = True
         info.state = SessionState.IDLE
+        # Clear sleeping/awaiting-wakeup state.  If the user explicitly
+        # interrupted the session, any scheduled wake-up is no longer a
+        # source of truth — the session is now stopped at the user's
+        # request, not asleep waiting for a wake-up.  Without this clear,
+        # the UI shows "Awaiting wake-up…" on a session the user just
+        # stopped, which is the bug they reported as "stuck in awaiting
+        # wake-up mode after stop".
+        info._wakeup_pending = False
+        info.substatus = ""
         # Capture the task NOW so _interrupt_session cancels the right one.
         # Without this, if the user sends a new message before
         # _interrupt_session runs, info.task gets replaced by the new
@@ -764,8 +801,13 @@ class SessionManager:
         if not info:
             return {"ok": False, "error": "Session not found"}
 
-        # Force STOPPED immediately so the session is unblocked for restart
+        # Force STOPPED immediately so the session is unblocked for restart.
+        # Also clear sleeping state — a STOPPED session is not awaiting a
+        # wake-up, so the substatus should not linger as "auto-resuming"
+        # after close.
         info.state = SessionState.STOPPED
+        info._wakeup_pending = False
+        info.substatus = ""
         self._emit_state(info)
 
         asyncio.run_coroutine_threadsafe(
@@ -903,12 +945,17 @@ class SessionManager:
                 await asyncio.sleep(0.5)
 
                 try:
+                    # Honor the global policy's SDK mode override.  Under the
+                    # "claude_auto" policy this becomes "acceptEdits" so the
+                    # SDK auto-handles edits without a callback round-trip.
+                    _mode_override = self._pm.get_sdk_permission_mode_override()
                     options = SessionOptions(
                         cwd=info.cwd or None,
                         resume=resolved,
                         permission_callback=self._make_permission_callback(session_id),
+                        pre_compact_callback=self._make_pre_compact_callback(session_id),
                         model=info.model or None,
-                        permission_mode="default",
+                        permission_mode=_mode_override or "default",
                         include_partial_messages=True,
                     )
                     client = await self._sdk.create_session(options)
@@ -950,15 +997,25 @@ class SessionManager:
         got_result = False
         result_handled = False
         try:
+            # Honor the global policy's SDK mode override (e.g. "claude_auto"
+            # → "acceptEdits") only when the caller hasn't pinned a specific
+            # mode for this session.  Explicit per-session modes — like the
+            # titling task's "plan" — always win.
+            _effective_mode = (
+                permission_mode
+                or self._pm.get_sdk_permission_mode_override()
+                or "default"
+            )
             options = SessionOptions(
                 cwd=cwd or None,
                 resume=session_id if resume else None,
                 permission_callback=self._make_permission_callback(session_id),
+                pre_compact_callback=self._make_pre_compact_callback(session_id),
                 model=model or None,
                 system_prompt=system_prompt or None,
                 max_turns=max_turns or None,
                 allowed_tools=allowed_tools or [],
-                permission_mode=permission_mode or "default",
+                permission_mode=_effective_mode,
                 include_partial_messages=True,
                 extra_args=extra_args or {},
             )
@@ -1004,6 +1061,12 @@ class SessionManager:
             # snapshots are deferred to _send_query (follow-up turns), where
             # the remap has already occurred.
             info._turn_had_direct_edit = False
+            # Fresh session start — clear any wake-up tracking from a
+            # prior incarnation of this session_id (e.g. crash recovery
+            # restoring a SessionInfo).  See _send_query's matching
+            # reset for full reasoning.
+            info._wakeup_pending = False
+            info._post_compact_init_seen = False
             await mtime_task
             _profile_log("pre_turn_mtimes_done")
 
@@ -1412,6 +1475,16 @@ class SessionManager:
         info._turn_had_direct_edit = False
         info._turn_content_started = False
         info._awaiting_compact_drain = False
+        # Reset wake-up tracking at the start of a user-driven turn.  The
+        # previous turn's pending wake-up is now moot — this fresh user
+        # query supersedes it (the post-turn listener was just cancelled
+        # by send_message, and any leftover wake-up content will be
+        # drained as stale below).  Tool uses in this turn will re-flag
+        # _wakeup_pending if they schedule a new wake-up.
+        info._wakeup_pending = False
+        # Same reasoning for the post-compact flag: a fresh user query
+        # supersedes any in-progress compaction transition.
+        info._post_compact_init_seen = False
         await asyncio.gather(
             loop.run_in_executor(None, self._write_file_snapshot, session_id, False),
             loop.run_in_executor(None, self._record_pre_turn_mtimes, info),
@@ -1927,6 +2000,51 @@ class SessionManager:
                         logger.debug("WMIC orphan cleanup for PID %d: %s",
                                      pid, wmic_err)
             else:
+                # ── DAEMON-SUICIDE GUARD #0 (HARD STOP) ─────────────────
+                # Refuse to operate on dangerous PID values before issuing
+                # any signal.  Every previous round of debugging the Linux
+                # "Stop Session crashed the daemon" regression focused on
+                # the pgid leak; this catches the OTHER category that the
+                # pgid check can miss — pid confusion.
+                #
+                #   pid == os.getpid()    →  caller passed our own pid
+                #                            (corrupt info._cli_pid, race
+                #                            in extract_process_pid).
+                #                            killpg AND the per-PID
+                #                            fallback would land on us.
+                #
+                #   pid == 0              →  os.kill(0, sig) sends to the
+                #                            ENTIRE current process group,
+                #                            which on the daemon includes
+                #                            the daemon itself.  This is
+                #                            the classic Unix footgun.
+                #
+                #   pid in (-1, 1)        →  -1 broadcasts to every process
+                #                            we can signal; 1 is init and
+                #                            never a CLI pid.  Both are
+                #                            certainly wrong.
+                #
+                # Returning early here means descendants may leak (the
+                # caller passed a bad pid so we have nothing reliable to
+                # kill), but the daemon survives.
+                try:
+                    if pid is None or pid <= 1 or pid == os.getpid():
+                        logger.error(
+                            "_kill_process_tree(pid=%r): refusing to act — "
+                            "pid is None/0/1/-1 or equals daemon pid %d. "
+                            "Caller passed a corrupt CLI pid (likely a "
+                            "stale info._cli_pid or an extract_process_pid "
+                            "race during a session close).  Descendants "
+                            "may leak; daemon survives.",
+                            pid, os.getpid(),
+                        )
+                        return
+                except Exception:
+                    # Even the guard must never raise.  If os.getpid()
+                    # somehow fails, fall through — every downstream call
+                    # is wrapped in its own try/except.
+                    pass
+
                 # Resolve the target's pgid first.  If the process is
                 # already gone, getpgid raises ProcessLookupError — nothing
                 # to do.
@@ -2137,6 +2255,58 @@ class SessionManager:
     # ------------------------------------------------------------------
     # Permission callback
     # ------------------------------------------------------------------
+
+    def _make_pre_compact_callback(self, session_id: str):
+        """Create a PreCompact hook callback for a specific session.
+
+        The SDK invokes this BEFORE starting a compaction cycle — both
+        manual ``/compact`` and SDK-initiated auto-compaction.  We use
+        it to flip ``substatus="compacting"`` early so the UI shows
+        "Compacting…" during the actual work, not just briefly at the
+        end (``compact_boundary`` arrives AFTER compaction completes,
+        which is the user-reported bug — "it's not showing me
+        compacting until the compacting is done").
+
+        The callback returns implicitly via the SDK's ``HookJSONOutput``
+        wrapper (see ``ClaudeAgentSDK.create_session``); we do nothing
+        that would alter SDK behavior — this is notification only.
+
+        Resolves session_id via ``_resolve_id`` because the hook may
+        fire AFTER the first turn's SDK-assigned-id remap.
+        """
+        captured_sid = session_id
+
+        async def pre_compact_hook(input_data, tool_use_id, context):
+            sid = self._resolve_id(captured_sid)
+            with self._lock:
+                info = self._sessions.get(sid)
+            if not info:
+                return
+            # Only flip if we'd actually change anything — avoid emitting
+            # a no-op state event for a session that's already in
+            # working+compacting (e.g. user just pressed /compact and the
+            # optimistic substatus is already set).
+            if info.substatus == 'compacting' and info.state == SessionState.WORKING:
+                return
+            logger.info(
+                "PreCompact hook fired for %s — flipping substatus early "
+                "(was state=%s substatus=%r)",
+                sid[:12], info.state.value, info.substatus,
+            )
+            # The SDK is about to compact.  Mark the session WORKING +
+            # compacting so the UI shows the indicator from the start
+            # of the work, not the end.  If state was IDLE (post-turn
+            # auto-compact case), this also keeps the listener's IDLE
+            # emit from confusingly showing "ready" while the SDK is
+            # actively summarizing in the background.
+            info.state = SessionState.WORKING
+            info.substatus = "compacting"
+            # Reset _post_compact_init_seen so the init handler's
+            # "wait for new content before clearing" logic re-arms.
+            info._post_compact_init_seen = False
+            self._emit_state(info)
+
+        return pre_compact_hook
 
     def _make_permission_callback(self, session_id: str):
         """Create the can_use_tool callback for a specific session.
@@ -2355,17 +2525,42 @@ class SessionManager:
         All SDK-specific isinstance() checks have been replaced with
         message.kind and block dict lookups.  The normalization from raw
         SDK types to VibeNodeMessage happens in AgentSDK.receive_response().
+
+        Session-id resolution: the caller may hold a stale (pre-remap)
+        ID — most notably the post-turn listener, which is launched from
+        ``_drive_session`` BEFORE the first turn's RESULT triggers the
+        SDK-assigned-id remap.  Without resolving here, every subsequent
+        ``_process_message`` call from the listener looks up an alias
+        that no longer exists in ``_sessions``, finds ``None``, and
+        returns silently — the wake-up's RESULT never sets
+        ``state=IDLE``, the queued message stays stranded, and the
+        session looks frozen.  Resolving via ``_resolve_id`` is cheap
+        (dict lookup) and the only correct fix.
         """
+        session_id = self._resolve_id(session_id)
         with self._lock:
             info = self._sessions.get(session_id)
         if not info:
             return
 
         if message.kind == MessageKind.ASSISTANT:
-            # Don't clear compacting substatus here — only RESULT or
-            # init SYSTEM should clear it. ASSISTANT can arrive
-            # mid-compact (e.g. partial streaming) and clearing here causes
-            # the UI to flash back to "Working" during compaction.
+            # First-content-of-new-post-compact-turn clears the
+            # "compacting" substatus.  Init alone is too early — the SDK
+            # announces a new context but the agent then takes several
+            # seconds to rebuild and start responding, during which the
+            # user would see "Working…" while perceptually compaction
+            # is still in progress.  Holding "compacting" through init
+            # and clearing here gives the user an honest indicator that
+            # spans the full perceived-compaction window.
+            #
+            # Guarded by _post_compact_init_seen so an ASSISTANT that
+            # arrives BETWEEN compact_boundary and init (late-streaming
+            # pre-compact content) doesn't strip the substatus prematurely.
+            if (info.substatus == 'compacting'
+                    and getattr(info, '_post_compact_init_seen', False)):
+                info.substatus = ""
+                info._post_compact_init_seen = False
+                self._emit_state(info)
             info._turn_content_started = True
             for block in message.blocks:
                 bk = block.get("kind", "")
@@ -2403,6 +2598,40 @@ class SessionManager:
                             info.tracked_files.add(fp)
                             info._turn_had_direct_edit = True
                             logger.info("  tracked_files now has %d entries", len(info.tracked_files))
+
+                    # Wake-up detection: tools that schedule a deferred SDK
+                    # auto-resume cycle (e.g. ScheduleWakeup, Bash with
+                    # run_in_background=True).  When the agent uses one of
+                    # these, the SDK keeps the session alive past the
+                    # turn's RESULT and later injects a synthetic turn
+                    # (init -> content -> RESULT).  We flag the session
+                    # so the post-turn listener can suppress queue
+                    # auto-dispatch — otherwise a queued message races
+                    # the wake-up content for the SDK buffer and the
+                    # session ends up "fucked" (queue dispatch fires on
+                    # the wake-up's init IDLE-emit, cancels the listener,
+                    # sends a new query that reads the wake-up's
+                    # remaining content as its own response).
+                    #
+                    # Set, never cleared here — cleared on user-driven
+                    # turn start (_send_query / _drive_session) and on
+                    # auto-resume turn start (_enter_auto_resume).  This
+                    # also catches sub-agent (Task) tool uses naturally
+                    # because the SDK normalizes sub-agent messages as
+                    # AssistantMessage just like parent-agent messages.
+                    if self._tool_creates_wakeup(tool_name, inp):
+                        info._wakeup_pending = True
+                        # NOTE: we do NOT set substatus here, even though
+                        # earlier versions did.  Setting it during the turn
+                        # made the working bar say "Awaiting wake-up…" while
+                        # the agent was still actively running tools after
+                        # the schedule call (the user-reported bug:
+                        # "shows awaiting wake-up while still working").
+                        # The substatus is applied AT RESULT (in the RESULT
+                        # branch below) once the turn actually ends and the
+                        # session is truly idle-waiting-for-wake-up.
+                        logger.info("Wake-up pending flagged for %s (tool=%s)",
+                                    session_id[:12], tool_name)
 
                 elif bk == BlockKind.THINKING.value:
                     # Skip thinking blocks -- they're internal reasoning
@@ -2542,6 +2771,11 @@ class SessionManager:
                 # This covers both mid-turn and post-turn (deferred IDLE) cases.
                 info.state = SessionState.WORKING
                 info.substatus = "compacting"
+                # Reset the "saw post-compact init" flag — the substatus must
+                # survive the upcoming init and only clear when the agent
+                # produces actual new-turn content.  See _post_compact_init_seen
+                # field docstring and the init / ASSISTANT branches below.
+                info._post_compact_init_seen = False
                 # Store pre-compaction token count for UI display
                 if pre_tokens:
                     info.usage['pre_compact_tokens'] = pre_tokens
@@ -2574,16 +2808,30 @@ class SessionManager:
                     except Exception:
                         pass
 
-                # End of compaction (or session re-init) — clear substatus.
-                # Only add the "Context compacted" log entry if we were actually
-                # compacting; avoids spurious entries on a plain session restart.
-                # Preserve "auto-resuming": init also fires at the start of an
-                # SDK auto-resume turn (after a background-task notification),
-                # and the post-turn drain has already flipped state to WORKING
-                # with substatus="auto-resuming" — we must keep that visible
-                # through the init boundary or the UI will flicker.
+                # End of the SDK's compaction phase (or session re-init).
+                # Substatus handling is subtle — the UI's "Compacting…" label
+                # must span the *perceived* compaction time, not just the
+                # SDK's brief compact_boundary→init window.
+                #
+                # Preserve:
+                #  * "auto-resuming" — init also fires at the start of an
+                #    SDK auto-resume turn (after a background-task or
+                #    ScheduleWakeup notification); stripping it here would
+                #    flicker the UI back to "Working…" the moment the
+                #    wake-up's init lands.
+                #  * "compacting" — mark _post_compact_init_seen so the next
+                #    ASSISTANT block clears it.  Without this, init clears
+                #    "compacting" the moment the SDK announces the new
+                #    context, but the agent then takes several seconds to
+                #    rebuild and respond — the user sees "Compacting…"
+                #    flash and then "Working…" while compaction is
+                #    perceptually still in progress.  Holding the substatus
+                #    through init keeps the label honest.
                 was_compacting = info.substatus == 'compacting'
-                if info.substatus != 'auto-resuming':
+                if was_compacting:
+                    # Don't clear yet — wait for first new-turn content.
+                    info._post_compact_init_seen = True
+                elif info.substatus != 'auto-resuming':
                     info.substatus = ""
                 # Restore IDLE only if we're in post-turn context
                 # (_awaiting_compact_drain=True means RESULT already came and
@@ -2592,6 +2840,14 @@ class SessionManager:
                 # still generating a response and will reach RESULT normally.
                 if was_compacting and info._awaiting_compact_drain:
                     info.state = SessionState.IDLE
+                    # Post-turn auto-compact: there will be NO follow-up
+                    # ASSISTANT to clear "compacting".  _emit_state's
+                    # auto-clear handles it via the state=IDLE branch,
+                    # but only if we let it — clear the post-compact
+                    # init-seen flag so a future spurious ASSISTANT
+                    # (e.g. self-heal retry) doesn't try to clear a
+                    # substatus that's already gone.
+                    info._post_compact_init_seen = False
                 self._emit_state(info)
                 if was_compacting:
                     entry = LogEntry(kind="system", text="Context compacted")
@@ -2609,9 +2865,26 @@ class SessionManager:
                     })
 
         elif message.kind == MessageKind.RESULT:
-            # Clear substatus on result (compaction is done if it was in progress)
-            if info.substatus:
+            # Clear stale substatus on result (compaction is done if it was
+            # in progress).  Then apply the sleeping substatus IFF the turn
+            # scheduled a wake-up: we set it HERE at RESULT (not earlier in
+            # the tool_use handler) so the working bar shows "Working…"
+            # during the trailing portion of the turn instead of jumping
+            # prematurely to "Awaiting wake-up…".
+            if info.substatus and not (
+                info.substatus == "auto-resuming"
+                and getattr(info, '_wakeup_pending', False)
+            ):
                 info.substatus = ""
+
+            # Apply the sleeping-substatus NOW that the turn has truly
+            # ended.  _emit_state's auto-clear has an exception that
+            # preserves "auto-resuming" through the post-turn IDLE window
+            # while _wakeup_pending is True.  When the wake-up fires and
+            # _enter_auto_resume clears _wakeup_pending=False, the next
+            # IDLE emit's auto-clear sweeps the substatus normally.
+            if getattr(info, '_wakeup_pending', False):
+                info.substatus = "auto-resuming"
 
             info.cost_usd = message.cost_usd or 0.0
 
@@ -2770,6 +3043,64 @@ class SessionManager:
                     'session_id': session_id,
                     'event': event_data,
                 })
+
+    # Tools that schedule a deferred SDK auto-resume cycle.  Used in
+    # _process_message to flag the session so the post-turn listener
+    # can suppress queue auto-dispatch while waiting for the wake-up.
+    #
+    # ScheduleWakeup is the explicit wake-up tool.  Bash with
+    # run_in_background=True triggers a task_notification when the
+    # background process exits.  Other names are matched
+    # case-insensitively via substring so renames / vendor variants
+    # (e.g. ``schedule_wakeup``, ``WakeUp``, ``BackgroundTask``) are
+    # still caught without code changes.
+    _WAKEUP_TOOL_NAMES = frozenset({"ScheduleWakeup"})
+    _WAKEUP_TOOL_SUBSTRINGS = ("schedulewake", "wakeup", "backgroundtask")
+
+    @classmethod
+    def _tool_creates_wakeup(cls, tool_name: str, tool_input: dict) -> bool:
+        """Return True if the tool call schedules a deferred wake-up.
+
+        A "wake-up" here means the SDK will deliver an auto-resume cycle
+        (init + content + RESULT) for this session AFTER the current
+        turn's RESULT.  Detecting this lets the post-turn listener
+        suppress queue auto-dispatch — otherwise a queued message
+        races the wake-up content into the SDK buffer and the session
+        ends up reading wake-up output as the response to the queued
+        message.
+
+        Cases handled:
+        * Explicit wake-up tools: ``ScheduleWakeup`` (exact match), plus
+          substring matches like ``schedule_wakeup`` / ``WakeUp`` /
+          ``BackgroundTask`` so renames don't silently regress the fix.
+        * ``Bash`` with ``run_in_background=True``: the SDK emits a
+          ``task_notification`` when the background process exits.
+
+        Args:
+            tool_name: Tool name from the tool_use block.
+            tool_input: Tool input dict (already normalized to a dict).
+
+        Returns:
+            True if this tool call schedules a wake-up; False otherwise.
+        """
+        if not tool_name:
+            return False
+        if tool_name in cls._WAKEUP_TOOL_NAMES:
+            return True
+        # Normalize separators so ``schedule_wakeup``, ``ScheduleWakeUp``,
+        # ``schedule-wake-up``, and ``background_task_runner`` all match
+        # their substring keys (``schedulewake`` / ``wakeup`` /
+        # ``backgroundtask``).
+        normalized = ''.join(ch for ch in tool_name.lower() if ch.isalnum())
+        for sub in cls._WAKEUP_TOOL_SUBSTRINGS:
+            if sub in normalized:
+                return True
+        # Bash run_in_background — the SDK keeps the process alive past
+        # RESULT and emits a task_notification when it exits.
+        if tool_name == "Bash" and isinstance(tool_input, dict):
+            if tool_input.get("run_in_background") is True:
+                return True
+        return False
 
     @staticmethod
     def _extract_tool_desc(inp: dict) -> str:
@@ -3411,7 +3742,27 @@ class SessionManager:
                 async for msg in self._sdk.receive_response(info.client):
                     if info.task is not asyncio.current_task():
                         return
+
+                    # ── Pre-detect auto-resume BEFORE _process_message ──
+                    # Mirrors the post-turn listener fix: when state is IDLE
+                    # and an init / task_notification / non-system content
+                    # arrives, flip to WORKING so _process_message's
+                    # subsequent _emit_state can't dispatch a queued message
+                    # mid-wake-up.  compact_boundary stays its own path.
+                    if info.state == SessionState.IDLE:
+                        is_resume = False
+                        if msg.kind == MessageKind.SYSTEM:
+                            sub_pre = msg.subtype or ''
+                            if sub_pre != 'compact_boundary':
+                                is_resume = True
+                        elif msg.kind != MessageKind.RESULT:
+                            is_resume = True
+                        if is_resume:
+                            auto_resume_seen = True
+                            self._enter_auto_resume(info)
+
                     await self._process_message(session_id, msg)
+
                     if msg.kind == MessageKind.RESULT:
                         # Auto-resume turn finished inside the peek window —
                         # _process_message just set state=IDLE +
@@ -3424,26 +3775,20 @@ class SessionManager:
                         if sub == 'compact_boundary':
                             compact_seen = True
                             return
-                        if sub == 'task_notification':
-                            # SDK is auto-resuming from a background hook
-                            # (Bash run_in_background completion, etc.).
-                            # Flip back to WORKING immediately so the UI
-                            # reflects activity rather than a stale IDLE.
-                            auto_resume_seen = True
-                            self._enter_auto_resume(info)
-                            continue
                         if sub == 'init':
-                            # Lone init (or init after task_notification we
-                            # already consumed) — return so the outer loop
-                            # decides whether to keep streaming.
+                            # Init in peek context: either auto-compact end
+                            # (compact_seen would be True and we'd have
+                            # returned earlier) or auto-resume turn start.
+                            # The pre-detect block above already entered
+                            # auto-resume if state was IDLE.  Return so the
+                            # outer loop can stream the rest of the cycle.
                             return
-                        # Other system messages (status, turn_duration) —
-                        # keep draining.
+                        # task_notification / status / turn_duration —
+                        # already handled by pre-detect (task_notification)
+                        # or are pure metadata.  Keep draining.
                         continue
-                    # Non-system message arrived after RESULT — the SDK is
-                    # already streaming the auto-resume turn's content.
-                    auto_resume_seen = True
-                    self._enter_auto_resume(info)
+                    # Non-system non-RESULT: pre-detect already entered
+                    # auto-resume.  Keep draining for the rest of the turn.
                     continue
 
             try:
@@ -3582,125 +3927,175 @@ class SessionManager:
                 or bool(getattr(info, '_listener_superseded', False))
             )
 
-        # First: emit the IDLE that would normally fire in _send_query /
-        # _drive_session after the drain returns.  We're taking ownership
-        # of the IDLE-emit here because we never return normally.
-        info._awaiting_compact_drain = False
-        if not _bailing() and info.state == SessionState.IDLE:
-            self._emit_state(info)
+        # Claim ownership of the SDK buffer for the post-turn window.
+        # _in_post_turn gates queue auto-dispatch in _emit_state (combined
+        # with _wakeup_pending so non-wake-up sessions are unaffected).  We
+        # set it BEFORE the initial IDLE emit so that emit can't dispatch
+        # a queued message that would then race the wake-up content.
+        info._in_post_turn = True
+        try:
+            # Emit the IDLE that would normally fire in _send_query /
+            # _drive_session after the drain returns.  We're taking
+            # ownership of the IDLE-emit here because we never return
+            # normally.
+            info._awaiting_compact_drain = False
+            if not _bailing() and info.state == SessionState.IDLE:
+                self._emit_state(info)
 
-        while not _bailing():
-            try:
-                cycle_yielded = False
-                async for msg in self._sdk.receive_response(info.client):
-                    cycle_yielded = True
-                    if _bailing():
-                        return
-                    # Per-message try/except: a bad message must not kill
-                    # the entire listener and orphan the SDK buffer.  This
-                    # mirrors the main response loop's pattern in
-                    # _send_query / _drive_session.
-                    try:
-                        await self._process_message(session_id, msg)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as pm_err:
-                        logger.exception(
-                            "_extended_post_turn_listener _process_message error "
-                            "for %s (msg kind %s): %s",
-                            session_id, msg.kind.value, pm_err
+            while not _bailing():
+                try:
+                    cycle_yielded = False
+                    async for msg in self._sdk.receive_response(info.client):
+                        cycle_yielded = True
+                        if _bailing():
+                            return
+
+                        # ── Pre-detect auto-resume BEFORE _process_message ──
+                        # The CRITICAL fix for the "session sleeps with a
+                        # wake-up wrapper" bug: when state is IDLE and the
+                        # SDK delivers a fresh turn (init / task_notification
+                        # / non-system content), flip to WORKING NOW so the
+                        # _emit_state call inside _process_message's init
+                        # handler doesn't fire on stale IDLE state and
+                        # accidentally dispatch a queued user message.
+                        # Without this pre-detect, ScheduleWakeup wake-ups
+                        # delivered as bare ``init`` (no leading
+                        # task_notification) reach _process_message with
+                        # state=IDLE, the init handler emits IDLE, and the
+                        # dispatcher sends a queued message into the middle
+                        # of the wake-up cycle.  After this transition the
+                        # wake-up's remaining content lands as the response
+                        # to the queued message and the session is "fucked".
+                        if info.state == SessionState.IDLE:
+                            is_resume_signal = False
+                            if msg.kind == MessageKind.SYSTEM:
+                                sub = msg.subtype or ''
+                                # compact_boundary is its own path; everything
+                                # else system-side (init, task_notification,
+                                # status, turn_duration) accompanies a new
+                                # turn, so treat as resume.
+                                if sub != 'compact_boundary':
+                                    is_resume_signal = True
+                            elif msg.kind != MessageKind.RESULT:
+                                # ASSISTANT / USER / STREAM_EVENT — auto-resume
+                                # turn content is already flowing in.
+                                is_resume_signal = True
+                            if is_resume_signal:
+                                self._enter_auto_resume(info)
+
+                        # Per-message try/except: a bad message must not kill
+                        # the entire listener and orphan the SDK buffer.  This
+                        # mirrors the main response loop's pattern in
+                        # _send_query / _drive_session.
+                        try:
+                            await self._process_message(session_id, msg)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as pm_err:
+                            logger.exception(
+                                "_extended_post_turn_listener _process_message error "
+                                "for %s (msg kind %s): %s",
+                                session_id, msg.kind.value, pm_err
+                            )
+                            # Continue iterating — the next message might be
+                            # the RESULT we need to consume for clean state.
+                            continue
+                        # Re-check: _process_message may have yielded under
+                        # info._lock contention, giving send_message a chance
+                        # to set _listener_superseded.
+                        if _bailing():
+                            return
+
+                        if msg.kind == MessageKind.RESULT:
+                            # Auto-resume turn ended.  _process_message set
+                            # state=IDLE + _awaiting_compact_drain=True; emit
+                            # IDLE and re-enter the listening loop.  Keep
+                            # _in_post_turn set: more auto-resumes may chain
+                            # (the agent might have scheduled another wake-up
+                            # during this turn).  _wakeup_pending reflects
+                            # whether they did — _emit_state uses that to
+                            # decide whether to suppress dispatch on THIS
+                            # IDLE emit.
+                            info._awaiting_compact_drain = False
+                            if not _bailing() and info.state == SessionState.IDLE:
+                                self._emit_state(info)
+                            # receive_response terminates at RESULT; outer
+                            # while-loop calls receive_response again to
+                            # listen for the next batch.
+                            break
+
+                        # SYSTEM / non-RESULT non-SYSTEM messages were
+                        # already handled by the pre-detect block above
+                        # (auto-resume entered if needed) and by
+                        # _process_message (content rendered).  Nothing
+                        # more to do in this iteration.
+                    # receive_response() exhausted normally (e.g. RESULT consumed
+                    # via break above) — outer while loop iterates.
+                    # Anti-tight-loop guard: if a cycle yielded zero messages
+                    # (anomalous — receive_response normally blocks forever
+                    # waiting for the next batch), sleep briefly before retrying
+                    # to avoid pegging the CPU on a wedged transport.
+                    if not cycle_yielded and not _bailing():
+                        await asyncio.sleep(0.5)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # Transport-level error from receive_response itself.  If
+                    # it looks like a stream/transport failure, hand off to
+                    # the existing self-heal logic by flagging
+                    # _stream_heal_needed and letting _send_query /
+                    # _drive_session's finally block reconnect on the next
+                    # user action.  Otherwise just log and exit — the
+                    # buffer is unrecoverable from here.
+                    err_str = str(e)
+                    etype = type(e).__name__
+                    is_transport = (
+                        "Stream closed" in err_str
+                        or "exit code" in err_str
+                        or "closed" in err_str.lower()
+                        or "CLIConnection" in etype
+                        or "Process" in etype
+                        or "ClosedResource" in etype
+                    )
+                    if is_transport:
+                        logger.info(
+                            "_extended_post_turn_listener %s: transport error (%s) — "
+                            "flagging stream_heal", session_id, etype
                         )
-                        # Continue iterating — the next message might be
-                        # the RESULT we need to consume for clean state.
-                        continue
-                    # Re-check: _process_message may have yielded under
-                    # info._lock contention, giving send_message a chance
-                    # to set _listener_superseded.
-                    if _bailing():
-                        return
-
-                    if msg.kind == MessageKind.RESULT:
-                        # Auto-resume turn ended.  _process_message set
-                        # state=IDLE + _awaiting_compact_drain=True; emit
-                        # IDLE and re-enter the listening loop.
-                        info._awaiting_compact_drain = False
-                        if not _bailing() and info.state == SessionState.IDLE:
-                            self._emit_state(info)
-                        # receive_response terminates at RESULT; outer
-                        # while-loop calls receive_response again to
-                        # listen for the next batch.
-                        break
-
-                    if msg.kind == MessageKind.SYSTEM:
-                        sub = msg.subtype or ''
-                        if sub == 'compact_boundary':
-                            # _process_message already flipped state to
-                            # WORKING+compacting and emitted.  Continue the
-                            # inner loop to receive init + content + RESULT.
-                            continue
-                        if sub == 'task_notification':
-                            self._enter_auto_resume(info)
-                            continue
-                        # init / status / turn_duration are handled by
-                        # _process_message; nothing else to do here.
-                        continue
-
-                    # Non-system message arrived after RESULT — the SDK is
-                    # streaming the auto-resume turn's content directly.
-                    if info.state == SessionState.IDLE:
-                        self._enter_auto_resume(info)
-                # receive_response() exhausted normally (e.g. RESULT consumed
-                # via break above) — outer while loop iterates.
-                # Anti-tight-loop guard: if a cycle yielded zero messages
-                # (anomalous — receive_response normally blocks forever
-                # waiting for the next batch), sleep briefly before retrying
-                # to avoid pegging the CPU on a wedged transport.
-                if not cycle_yielded and not _bailing():
-                    await asyncio.sleep(0.5)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                # Transport-level error from receive_response itself.  If it
-                # looks like a stream/transport failure, hand off to the
-                # existing self-heal logic by flagging _stream_heal_needed
-                # and letting _send_query / _drive_session's finally block
-                # reconnect on the next user action.  Otherwise just log
-                # and exit — the buffer is unrecoverable from here.
-                err_str = str(e)
-                etype = type(e).__name__
-                is_transport = (
-                    "Stream closed" in err_str
-                    or "exit code" in err_str
-                    or "closed" in err_str.lower()
-                    or "CLIConnection" in etype
-                    or "Process" in etype
-                    or "ClosedResource" in etype
-                )
-                if is_transport:
-                    logger.info(
-                        "_extended_post_turn_listener %s: transport error (%s) — "
-                        "flagging stream_heal", session_id, etype
-                    )
-                    if not hasattr(info, '_stream_heal_count'):
-                        info._stream_heal_count = 0
-                    info._stream_heal_count += 1
-                    info._stream_heal_needed = True
-                else:
-                    logger.warning(
-                        "_extended_post_turn_listener error for %s: %s",
-                        session_id, e
-                    )
-                return
+                        if not hasattr(info, '_stream_heal_count'):
+                            info._stream_heal_count = 0
+                        info._stream_heal_count += 1
+                        info._stream_heal_needed = True
+                    else:
+                        logger.warning(
+                            "_extended_post_turn_listener error for %s: %s",
+                            session_id, e
+                        )
+                    return
+        finally:
+            # Clear _in_post_turn on every exit path (normal return,
+            # CancelledError on supersede / interrupt, unhandled exception)
+            # so queue dispatch resumes normal behavior for the next turn.
+            # Only clear if WE still own the flag — a newer task that
+            # claimed info.task may have already set up its own post-turn
+            # state and we must not stomp it.
+            if info.task is asyncio.current_task():
+                info._in_post_turn = False
 
     def _enter_auto_resume(self, info: SessionInfo) -> None:
         """Flip a session back to WORKING when the SDK auto-resumes.
 
-        Called from the post-turn drain when ``task_notification`` (or
-        unexpected non-system content) arrives after RESULT, indicating
-        the SDK has injected a synthetic user message and restarted the
-        assistant turn.  Idempotent — only emits state on the IDLE→WORKING
-        transition so chained calls during the same auto-resume don't
-        spam clients.
+        Called from the post-turn drain / listener when an auto-resume
+        signal (task_notification, init after RESULT, or unexpected
+        non-system content) arrives — the SDK has injected a synthetic
+        turn and restarted assistant streaming.  Idempotent: only emits
+        state on the IDLE→WORKING transition so chained calls during the
+        same auto-resume don't spam clients.
+
+        Resets ``_wakeup_pending`` to False because the wake-up that
+        triggered this resume has been "consumed".  If the auto-resume
+        turn schedules ANOTHER wake-up, _process_message's tool_use
+        handler will flip it back to True before the turn ends.
         """
         if info.state != SessionState.IDLE:
             return
@@ -3708,6 +4103,9 @@ class SessionManager:
         info._awaiting_compact_drain = False
         info.substatus = "auto-resuming"
         info.working_since = time.time()
+        # The wake-up that caused this resume is consumed.  Subsequent
+        # tool uses in this turn will re-flag _wakeup_pending if needed.
+        info._wakeup_pending = False
         self._emit_state(info)
 
     def _emit_state(self, info: SessionInfo) -> None:
@@ -3725,7 +4123,25 @@ class SessionManager:
         # Auto-clear stale substatus when session is no longer actively working.
         # This ensures safety-net IDLE transitions don't carry "compacting" forward
         # into the next turn's WORKING state emission.
-        if info.state in (SessionState.IDLE, SessionState.STOPPED) and info.substatus:
+        #
+        # EXCEPTION: when a wake-up is pending (state=IDLE but the SDK still
+        # has a scheduled auto-resume coming), preserve ``auto-resuming``
+        # so the UI keeps showing "Awaiting wake-up…" through the sleep
+        # window instead of reverting to a plain-idle indicator.  The
+        # final wake-up's RESULT clears _wakeup_pending in
+        # _enter_auto_resume (or at the next user-driven turn start), so
+        # this branch falls through to the normal clear on the
+        # post-wake-up IDLE emit.
+        _preserve_for_wakeup = (
+            info.state == SessionState.IDLE
+            and getattr(info, '_wakeup_pending', False)
+            and info.substatus == "auto-resuming"
+        )
+        if (
+            info.state in (SessionState.IDLE, SessionState.STOPPED)
+            and info.substatus
+            and not _preserve_for_wakeup
+        ):
             info.substatus = ""
         if self._push_callback:
             data = info.to_state_dict()
@@ -3767,10 +4183,26 @@ class SessionManager:
                 info._cached_git_files = []
                 info._cached_git_files_ts = 0.0
 
-        # Auto-dispatch queued messages when session goes IDLE —
-        # but NOT if the user just interrupted (flag is cleared on next
-        # send_message so the session resumes normal dispatch after).
-        if info.state == SessionState.IDLE and not getattr(info, '_interrupted', False):
+        # Auto-dispatch queued messages when session goes IDLE — but NOT if:
+        #   • the user just interrupted (flag is cleared on next send_message
+        #     so the session resumes normal dispatch after); OR
+        #   • a post-turn listener owns the SDK buffer AND a wake-up was
+        #     scheduled by the agent (ScheduleWakeup / Bash run_in_background).
+        #     In that case a deferred auto-resume cycle (init -> content ->
+        #     RESULT) is still coming and dispatching the queue now would
+        #     race the wake-up content into the SDK buffer — the dispatched
+        #     query's response loop would read the wake-up's content as its
+        #     own response, breaking the session.  Sessions WITHOUT a pending
+        #     wake-up dispatch normally even with the listener active; the
+        #     listener exists defensively but no auto-resume will arrive.
+        if (
+            info.state == SessionState.IDLE
+            and not getattr(info, '_interrupted', False)
+            and not (
+                getattr(info, '_in_post_turn', False)
+                and getattr(info, '_wakeup_pending', False)
+            )
+        ):
             self._try_dispatch_queue(info.session_id)
             # Safety net: re-emit IDLE state after 3 seconds in case the first
             # push was silently lost (SocketIO transport hiccup, tab sleeping,
@@ -3780,7 +4212,11 @@ class SessionManager:
             def _deferred_idle_reemit():
                 with self._lock:
                     recheck = self._sessions.get(sid)
-                if recheck and recheck.state == SessionState.IDLE:
+                if recheck and recheck.state == SessionState.IDLE \
+                        and not (
+                            getattr(recheck, '_in_post_turn', False)
+                            and getattr(recheck, '_wakeup_pending', False)
+                        ):
                     # Safety net for race condition: if a message was queued
                     # right as the session went idle, dispatch it now.
                     self._try_dispatch_queue(sid)

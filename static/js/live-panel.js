@@ -1177,10 +1177,13 @@ function updateLiveInputBar() {
   const _liveSessionModel = (_liveSess && _liveSess.model) ? _liveSess.model : '';
 
   // Compute a state key — for question state, include question text so we re-render if the question changed
+  // For idle, include sleeping-substatus so we re-render the "Awaiting wake-up…"
+  // indicator when the wake-up fires/clears.
+  const _idleSub = (window._sessionSubstatus && window._sessionSubstatus[id]) || '';
   let stateKey;
   if (!isRunning) stateKey = 'ended';
   else if (kind === 'question') stateKey = 'question:' + (wd ? wd.question || '' : '');
-  else if (kind === 'idle') stateKey = 'idle';
+  else if (kind === 'idle') stateKey = 'idle:' + _idleSub;
   else {
     // Include sub-agent count + status in state key so bar re-renders when agents change
     const _sa = (window._subAgents && window._subAgents[id]) || {};
@@ -1304,8 +1307,27 @@ function updateLiveInputBar() {
     }
 
   } else if (kind === 'idle') {
+    // Sleeping with a scheduled wake-up pending?  Distinguish the idle
+    // bar so the user can tell apart "really done" vs "asleep, will wake
+    // itself up later" \u2014 the latter still accepts manual input (which
+    // supersedes the wake-up).
+    const _sleepingBanner = (_idleSub === 'auto-resuming')
+      ? ('<div class="live-sleeping-banner" style="display:flex;align-items:center;' +
+         'gap:8px;margin-bottom:8px;padding:8px 12px;background:var(--bg-card);' +
+         'border:1px solid var(--border-subtle);border-radius:8px;">' +
+         '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" ' +
+         'stroke-width="2" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>' +
+         '<span style="font-size:12px;color:var(--text-muted);">Awaiting wake-up\u2026 ' +
+         '<span style="color:var(--text-faint);">(send a message to take over)</span></span>' +
+         '</div>')
+      : '';
     bar.innerHTML =
-      '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="Type your next command\u2026"' +
+      _sleepingBanner +
+      '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="' +
+      (_idleSub === 'auto-resuming'
+        ? 'Type to override the scheduled wake-up\u2026'
+        : 'Type your next command\u2026') +
+      '"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitIdle()}"></textarea>' +
       '<div class="live-bar-row">' +
       (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id), false, _liveSessionModel) : _buildCtxBarCompact(id)) +
@@ -1335,7 +1357,7 @@ function updateLiveInputBar() {
     const _isAutoResuming = _sub === 'auto-resuming';
     const _statusLabel = _isCompacting
       ? 'Compacting\u2026'
-      : (_isAutoResuming ? 'Resuming after background task\u2026' : 'Working\u2026');
+      : (_isAutoResuming ? 'Awaiting wake-up\u2026' : 'Working\u2026');
     const _spinnerClass = _isCompacting ? 'spinner compacting-spinner' : 'spinner';
 
     // Build sub-agent team strip
@@ -1425,7 +1447,7 @@ function updateLiveInputBar() {
           const textNodes = [...indicator.childNodes].filter(n => n.nodeType === 3);
           let want;
           if (curSub === 'compacting') want = ' Compacting\u2026 ';
-          else if (curSub === 'auto-resuming') want = ' Resuming after background task\u2026 ';
+          else if (curSub === 'auto-resuming') want = ' Awaiting wake-up\u2026 ';
           else want = ' Working\u2026 ';
           if (spinnerEl) {
             if (curSub === 'compacting') {

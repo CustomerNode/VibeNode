@@ -4,8 +4,18 @@ Singleton enforcement via Windows named mutexes.
 A named mutex is kernel-managed, race-free, and auto-released when the
 owning process dies (even on crash). This makes it impossible for two
 VibeNode web servers or two daemons to run simultaneously.
+
+Port-awareness: when ``VIBENODE_TEST_PORT`` / ``VIBENODE_DAEMON_PORT``
+are set (test installs, side-by-side debugging instances), the singleton
+name must include the port so the test instance doesn't collide with
+the user's main instance.  Without this every test instance trying to
+spawn a daemon would fail the singleton check (because the production
+daemon already holds the lock).  Reported via "Restart Server → Daemon
+doesn't actually restart the daemon on Linux" — the same hardcoding
+indirectly caused that whole class of failure.
 """
 
+import os
 import sys
 
 # Keep handles alive for the entire process lifetime.
@@ -21,12 +31,24 @@ def acquire_singleton(name: str) -> bool:
         return _acquire_unix(name)
 
 
+def _web_port() -> int:
+    return (
+        int(os.environ.get("VIBENODE_TEST_PORT", "0"))
+        or int(os.environ.get("VIBENODE_WEB_PORT", "0"))
+        or 5050
+    )
+
+
+def _daemon_port() -> int:
+    return int(os.environ.get("VIBENODE_DAEMON_PORT", "0")) or 5051
+
+
 def acquire_web_singleton() -> bool:
-    return acquire_singleton("Global\\VibeNode_WebServer_5050")
+    return acquire_singleton(f"Global\\VibeNode_WebServer_{_web_port()}")
 
 
 def acquire_daemon_singleton() -> bool:
-    return acquire_singleton("Global\\VibeNode_Daemon_5051")
+    return acquire_singleton(f"Global\\VibeNode_Daemon_{_daemon_port()}")
 
 
 def _acquire_win32(name: str) -> bool:

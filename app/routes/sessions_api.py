@@ -356,7 +356,13 @@ def api_delete(session_id):
         from ..process_detection import _get_running_session_ids
         running = _get_running_session_ids()
         pid = running.get(session_id)
-        if pid and pid > 0:
+        # SUICIDE GUARD: refuse to signal pid <= 1 or our own pid.  pid==0
+        # would broadcast SIGTERM to our entire process group (which on
+        # Linux includes the daemon when the web/daemon are launched
+        # together); our-own-pid would kill the web server.  The "pid > 0"
+        # check below already excluded the negative "display-only" sentinel
+        # from process_detection.
+        if pid and pid > 1 and pid != os.getpid():
             try:
                 os.kill(pid, signal.SIGTERM)
             except (OSError, ProcessLookupError):
@@ -512,7 +518,12 @@ def api_delete_empty():
             from ..process_detection import _get_running_session_ids
             running = _get_running_session_ids()
             pid = running.get(sid)
-            if pid and pid > 0:
+            # SUICIDE GUARD: same reasoning as the api_delete endpoint above
+            # — never signal pid <= 1 or our own pid.  Process-detection
+            # filters by /comm in ("claude","node") so a python3 web/daemon
+            # pid should never appear here, but the suicide guard is
+            # belt-and-suspenders.
+            if pid and pid > 1 and pid != os.getpid():
                 try:
                     os.kill(pid, signal.SIGTERM)
                 except (OSError, ProcessLookupError):

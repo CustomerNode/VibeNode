@@ -407,10 +407,18 @@ function renderWorkforce(sessions) {
   grid.innerHTML = sessions.map(s => {
     const st = getSessionStatus(s.id);
     const _isCompacting = st === 'working' && window._sessionSubstatus && window._sessionSubstatus[s.id] === 'compacting';
+    // Sleeping = substatus 'auto-resuming' regardless of state.  Covers
+    // both phases: idle+auto-resuming (waiting for wake-up) and
+    // working+auto-resuming (wake-up firing).  Keeps the workforce card
+    // visually consistent with the live panel's "Awaiting wake-up…"
+    // throughout the cycle.
+    const _isSleepingCard = window._sessionSubstatus && window._sessionSubstatus[s.id] === 'auto-resuming';
     const emoji = _isCompacting
       ? '<svg class="compacting-icon" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#aa88ff" stroke-width="1.5" stroke-linecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>'
+      : _isSleepingCard
+      ? statusSvg.sleeping
       : (statusSvg[st] || statusSvg.sleeping);
-    const label = _isCompacting ? 'Compacting' : (statusLabel[st] || 'Sleeping');
+    const label = _isCompacting ? 'Compacting' : (_isSleepingCard ? 'Awaiting wake-up' : (statusLabel[st] || 'Sleeping'));
     const selClass = s.id === activeId ? ' wf-selected' : '';
     const name = escHtml((s.display_title||s.id).slice(0,22) + ((s.display_title||'').length>22?'\u2026':''));
     const date = _shortDate(s.last_activity);

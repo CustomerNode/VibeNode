@@ -53,13 +53,37 @@ from pathlib import Path
 # with no port killing, no singleton, no browser, no daemon dependency.
 _TEST_PORT = int(os.environ.get("VIBENODE_TEST_PORT", 0))
 
+# Production-mode port override: VIBENODE_WEB_PORT=7050 binds web to 7050
+# but performs ALL normal production setup (port killing, singleton, daemon
+# spawn, browser launch).  Distinct from VIBENODE_TEST_PORT which skips
+# every production setup step.  Used for side-by-side production-equivalent
+# instances (e.g. running a second VibeNode on 7050/7051 to exercise the
+# real ``/api/restart`` path without touching the user's main 5050/5051).
+# Defaults to 5050 when unset, preserving existing behavior.
+_WEB_PORT = int(os.environ.get("VIBENODE_WEB_PORT", 0)) or 5050
+
 DAEMON_PORT = int(os.environ.get("VIBENODE_DAEMON_PORT", 5051))
 
 from app.singleton import acquire_web_singleton
 
 
 def ensure_daemon():
-    """Make sure the session daemon is running. Start it if not."""
+    """Make sure the session daemon is running. Start it if not.
+
+    Failure modes are LOUD on purpose.  The historic Linux bug was that
+    ``Restart Server → Session Daemon`` would fail here silently: the new
+    web came up without a daemon, the user saw "everything looks normal"
+    in the UI, then tool calls failed mysteriously a minute later.  We
+    now:
+
+      • Print which port we're targeting and where the daemon log goes.
+      • Capture the spawn's PID so we can check whether the daemon
+        process actually exists (vs. died silently before bind).
+      • Distinguish three failure modes in the final timeout warning:
+        process-dead-no-bind, process-alive-no-bind, and spawn-never-fired.
+      • Print the tail of the daemon log when timeout fires so the
+        user can see the real error without hunting for log files.
+    """
     # Try to connect to an existing daemon
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -77,19 +101,34 @@ def ensure_daemon():
         print("  WARNING: daemon_server.py not found at %s" % daemon_script, flush=True)
         return
 
+    daemon_log = Path(__file__).parent / "logs" / "daemon_debug.log"
+    print("  Spawning daemon for port %d (log: %s)" % (DAEMON_PORT, daemon_log),
+          flush=True)
+    proc = None
     try:
-        # Windows: CREATE_NO_WINDOW so it doesn't pop up a console
-        # Also CREATE_NEW_PROCESS_GROUP so it survives this process dying
-        # Linux/macOS: start_new_session=True creates a new session (setsid),
-        # detaching the daemon from the terminal's process group so it is immune
-        # to SIGHUP when the launch terminal is closed.
-        daemon_log = Path(__file__).parent / "logs" / "daemon_debug.log"
         daemon_log.parent.mkdir(exist_ok=True)
         _daemon_fh = open(daemon_log, "a")
+        # Mark the spawn boundary in the shared daemon log so a user reading
+        # it after the fact can find "this restart's daemon" vs prior runs.
+        try:
+            _daemon_fh.write(
+                f"\n===== ensure_daemon() spawning daemon at "
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} for port {DAEMON_PORT} "
+                f"=====\n"
+            )
+            _daemon_fh.flush()
+        except Exception:
+            pass
         popen_kwargs = {
             "cwd": str(daemon_script.parent.parent),
             "stdout": _daemon_fh,
             "stderr": _daemon_fh,
+            # Explicit env propagation: the daemon needs VIBENODE_DAEMON_PORT
+            # to bind the right port.  Inheriting parent env normally works,
+            # but when this function runs from a Flask-handled /api/restart
+            # path, the env is filtered by Werkzeug's WSGI environ — be
+            # explicit to avoid surprises.
+            "env": dict(os.environ),
         }
         if sys.platform == "win32":
             popen_kwargs["creationflags"] = (
@@ -99,24 +138,53 @@ def ensure_daemon():
             # start_new_session=True calls setsid() in the child, placing it in
             # a new process group and session independent of the launcher's TTY.
             popen_kwargs["start_new_session"] = True
-        subprocess.Popen([sys.executable, str(daemon_script)], **popen_kwargs)
+        proc = subprocess.Popen([sys.executable, str(daemon_script)], **popen_kwargs)
+        print("  Daemon subprocess launched (pid=%d)" % proc.pid, flush=True)
     except Exception as e:
-        print("  WARNING: Could not start daemon: %s" % e, flush=True)
+        print("  ERROR: Could not start daemon subprocess: %s" % e, flush=True)
         return
 
-    # Wait for it to be ready
-    for _ in range(50):
+    # Wait for it to be ready.  Bumped from 50 attempts (5 s) to 100 (10 s)
+    # because cold daemon startup on slower machines can take 5-7 s once SDK
+    # patches + session-registry recovery are factored in.
+    for _ in range(100):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(1)
             sock.connect(("127.0.0.1", DAEMON_PORT))
             sock.close()
-            print("  Session daemon started on port %d" % DAEMON_PORT, flush=True)
+            print("  Session daemon started on port %d (pid=%d)"
+                  % (DAEMON_PORT, proc.pid if proc else -1), flush=True)
             return
         except (ConnectionRefusedError, OSError):
+            # Short-circuit: if the daemon process is already dead, no
+            # amount of polling will help — fail fast instead of waiting
+            # the full 10 s.
+            if proc is not None and proc.poll() is not None:
+                print("  ERROR: Daemon process %d died before binding port "
+                      "%d (exit code %s)" % (proc.pid, DAEMON_PORT, proc.returncode),
+                      flush=True)
+                break
             time.sleep(0.1)
+    else:
+        # Loop completed without binding — process is alive but stuck.
+        print("  ERROR: Daemon process %d is alive but did not bind port %d "
+              "within 10 s" % (proc.pid if proc else -1, DAEMON_PORT), flush=True)
 
-    print("  WARNING: Daemon started but not responding on port %d" % DAEMON_PORT, flush=True)
+    # On any failure path, dump the tail of the daemon log so the user
+    # doesn't have to hunt for it.  Without this they see a useless
+    # "Could not connect" message and have no idea why.
+    try:
+        with open(daemon_log) as fh:
+            lines = fh.readlines()
+        tail = lines[-30:] if len(lines) > 30 else lines
+        print("  ----- last %d lines of %s -----"
+              % (len(tail), daemon_log), flush=True)
+        for line in tail:
+            print("  | " + line.rstrip(), flush=True)
+        print("  ---------------------------------", flush=True)
+    except Exception as log_err:
+        print("  (could not read daemon log: %s)" % log_err, flush=True)
 
 
 # ---- Kill any stale processes on our ports before starting ----
@@ -216,7 +284,7 @@ def _kill_port(port):
 
 if not _TEST_PORT:
     _update_boot_status("STEP:ports")
-    _kill_port(5050)
+    _kill_port(_WEB_PORT)
     # Only kill the daemon port on a cold start.  When the web server is
     # restarted via /api/restart with scope="web", it sets
     # VIBENODE_PRESERVE_DAEMON=1 so the living daemon (and all its active
@@ -443,7 +511,7 @@ def _find_chrome_macos():
 def open_browser():
     import time
     import urllib.request
-    url = "http://localhost:5050"
+    url = f"http://localhost:{_WEB_PORT}"
     log_path = Path(__file__).resolve().parent / "logs" / "browser_open.log"
     log_path.parent.mkdir(exist_ok=True)
 
@@ -454,7 +522,7 @@ def open_browser():
         except Exception:
             pass
 
-    _log("Waiting for server on port 5050...")
+    _log(f"Waiting for server on port {_WEB_PORT}...")
     # Wait until the server is actually accepting connections before opening
     for attempt in range(60):
         try:
@@ -631,7 +699,7 @@ if __name__ == "__main__":
           "  ---------------------------------------------------------\n",
           flush=True)
 
-    _port = _TEST_PORT or 5050
+    _port = _TEST_PORT or _WEB_PORT
     if not _TEST_PORT:
         _update_boot_status("STEP:browser")
         _update_boot_status("DONE")

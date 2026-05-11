@@ -119,6 +119,55 @@ class TestPolicyModes:
         assert pm.should_auto_approve("Read", {"command": "rm -rf /"}) is True
         assert pm.should_auto_approve("Write", {"command": "DROP TABLE"}) is True
 
+    def test_claude_auto_approves_safe_commands(self, tmp_path):
+        """Claude Auto approves non-dangerous tool uses (mirrors almost_always).
+
+        WHY: claude_auto's contract is "SDK handles edits, VibeNode regex
+        handles the rest."  Anything reaching should_auto_approve under
+        this policy is non-edit, so the safety net must behave the same
+        as almost_always for those tools.
+        """
+        pm = _make_pm(tmp_path, policy="claude_auto")
+        assert pm.should_auto_approve("Bash", {"command": "ls -la"}) is True
+        assert pm.should_auto_approve("Read", {"file_path": "/a.py"}) is True
+        assert pm.should_auto_approve("Glob", {"pattern": "*.py"}) is True
+        assert pm.should_auto_approve("Grep", {"pattern": "TODO"}) is True
+
+    def test_claude_auto_blocks_dangerous_commands(self, tmp_path):
+        """Claude Auto blocks dangerous shell commands.
+
+        WHY: The SDK's acceptEdits mode only handles file edits; shell
+        commands still flow through our callback.  We must apply the
+        same dangerous-command guard as almost_always so claude_auto
+        doesn't silently degrade to bypassPermissions for bash.
+        """
+        pm = _make_pm(tmp_path, policy="claude_auto")
+        assert pm.should_auto_approve("Bash", {"command": "rm -rf /tmp/stuff"}) is False
+        assert pm.should_auto_approve("Bash", {"command": "git push --force"}) is False
+        assert pm.should_auto_approve("Bash", {"command": "DROP TABLE users"}) is False
+
+    def test_claude_auto_sdk_mode_override(self, tmp_path):
+        """claude_auto returns 'acceptEdits' as the SDK permission_mode.
+
+        WHY: This is the wiring contract — SessionManager reads this
+        helper to decide what to pass to ClaudeCodeOptions.  If it
+        returns the wrong string, the SDK either prompts for every
+        edit (degraded UX) or bypasses everything (security hole).
+        """
+        pm = _make_pm(tmp_path, policy="claude_auto")
+        assert pm.get_sdk_permission_mode_override() == "acceptEdits"
+
+    def test_other_policies_no_sdk_mode_override(self, tmp_path):
+        """Non-claude_auto policies must not override the SDK mode.
+
+        WHY: Returning a mode for the wrong policy would silently
+        change SDK behavior for users who chose manual/auto/etc.
+        """
+        for pol in ("manual", "auto", "almost_always", "custom"):
+            pm = _make_pm(tmp_path, policy=pol)
+            assert pm.get_sdk_permission_mode_override() is None, \
+                f"policy {pol!r} must not override SDK mode"
+
     def test_custom_falls_through_to_false(self, tmp_path):
         """Custom mode returns False when no rules match.
 
@@ -466,6 +515,25 @@ class TestPolicyPersistence:
         pm.set_permission_policy("auto")
         data = json.loads(pm._policy_path.read_text())
         assert data["policy"] == "auto"
+
+    def test_claude_auto_persists(self, tmp_path):
+        """claude_auto is accepted by set_permission_policy and round-trips.
+
+        WHY: If the validator tuple omits claude_auto, set_permission_policy
+        silently no-ops — the UI would appear to save the policy but the
+        backend would still be on whatever was selected before.
+        """
+        pm = _make_pm(tmp_path)
+        pm.set_permission_policy("claude_auto")
+        assert pm.get_permission_policy()["policy"] == "claude_auto"
+        # And it survives a round-trip through disk
+        pm2 = PermissionManager.__new__(PermissionManager)
+        pm2._policy_path = pm._policy_path
+        pm2._ui_prefs_path = tmp_path / "ui_prefs.json"
+        pm2._permission_policy, pm2._custom_rules = pm2._load_policy()
+        pm2._ui_prefs = {}
+        pm2._emit_entry_fn = None
+        assert pm2._permission_policy == "claude_auto"
 
     def test_load_from_existing_file(self, tmp_path):
         """Loading from a valid policy file restores settings.

@@ -33,6 +33,7 @@ from claude_code_sdk.types import (
     PermissionResultAllow,
     PermissionResultDeny,
     ContentBlock,
+    HookMatcher,
 )
 
 from daemon.backends.base import (
@@ -60,11 +61,37 @@ class ClaudeAgentSDK(AgentSDK):
         """Create a ClaudeSDKClient with mapped options.
 
         Moved from session_manager.py L1221-1234 and L1174-1182.
+
+        Hook registration: if ``options.pre_compact_callback`` is set,
+        wire it as a ``PreCompact`` hook so SessionManager is notified
+        the instant the SDK is about to start a compaction cycle.  This
+        is the only reliable EARLY signal — ``compact_boundary`` arrives
+        at the END of compaction, by which time the UI's "Compacting…"
+        indicator is meaningless.
         """
         # Convert the abstract permission callback to Claude's format
         can_use_tool = None
         if options.permission_callback:
             can_use_tool = self._wrap_permission_callback(options.permission_callback)
+
+        # PreCompact hook for early "compacting" UI signal.  The SDK
+        # invokes our callback before compaction begins (both manual
+        # /compact and SDK-initiated auto-compact).  We return ``{}``
+        # unconditionally so the SDK proceeds with compaction
+        # unaltered — this is a notification hook only.
+        hooks_config = None
+        if options.pre_compact_callback:
+            cb = options.pre_compact_callback
+            async def _pre_compact_wrap(input_data, tool_use_id, context):
+                logger.info("PreCompact hook fired (tool_use_id=%s)", tool_use_id)
+                try:
+                    await cb(input_data, tool_use_id, context)
+                except Exception as e:
+                    logger.warning("pre_compact_callback raised: %s", e)
+                return {}  # empty HookJSONOutput: do not alter SDK behavior
+            hooks_config = {
+                "PreCompact": [HookMatcher(matcher=None, hooks=[_pre_compact_wrap])],
+            }
 
         claude_options = ClaudeCodeOptions(
             cwd=os.path.normpath(options.cwd) if options.cwd else None,
@@ -77,6 +104,7 @@ class ClaudeAgentSDK(AgentSDK):
             permission_mode=options.permission_mode,
             include_partial_messages=options.include_partial_messages,
             extra_args=options.extra_args,
+            hooks=hooks_config,
         )
         return ClaudeSDKClient(options=claude_options)
 

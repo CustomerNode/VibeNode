@@ -12,6 +12,25 @@ from ..platform_utils import NO_WINDOW as _NO_WINDOW
 bp = Blueprint('main', __name__)
 
 
+def _web_port() -> int:
+    """Web port this process is bound to.  Respects VIBENODE_TEST_PORT
+    (legacy test-skip mode) and VIBENODE_WEB_PORT (production-mode port
+    override for side-by-side instances).  Without this, ``/api/restart``
+    always killed 5050 even when the web was bound elsewhere — the silent
+    footgun behind 'restart doesn't work on non-standard installs'."""
+    return (
+        int(os.environ.get("VIBENODE_TEST_PORT", "0"))
+        or int(os.environ.get("VIBENODE_WEB_PORT", "0"))
+        or 5050
+    )
+
+
+def _daemon_port() -> int:
+    """Daemon port this process is paired with.  Same env-aware policy
+    as _web_port()."""
+    return int(os.environ.get("VIBENODE_DAEMON_PORT", "0")) or 5051
+
+
 @bp.route("/")
 def index():
     return render_template('index.html')
@@ -46,13 +65,19 @@ def restart_server():
         data = request.get_json(silent=True) or {}
         scope = data.get("scope", "web")
 
+        # Resolve ports from env so test/side-by-side instances don't
+        # accidentally murder the user's production 5050/5051.  Previously
+        # hardcoded — a known cause of the "restart didn't restart" symptom
+        # on non-default installs.
+        web_port = _web_port()
+        daemon_port = _daemon_port()
         ports = []
         if scope in ("web", "both"):
-            ports.append(5050)
+            ports.append(web_port)
         if scope in ("daemon", "both"):
-            ports.append(5051)
+            ports.append(daemon_port)
         if not ports:
-            ports = [5050]
+            ports = [web_port]
 
         # Launch via session_manager.py (not run.py) so the boot splash shows
         entry_script = os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "session_manager.py")
@@ -164,7 +189,9 @@ def shutdown_server():
         project_dir = os.path.abspath(
             os.path.join(os.path.dirname(os.path.dirname(__file__)), "..")
         )
-        ports = "5050,5051"
+        web_port = _web_port()
+        daemon_port = _daemon_port()
+        ports = f"{web_port},{daemon_port}"
 
         if sys.platform == "win32":
             shutdown_cmd = (
@@ -184,8 +211,8 @@ def shutdown_server():
             shutdown_cmd = (
                 "bash -c '"
                 "sleep 2; "
-                "lsof -ti :5050 | xargs kill -9 2>/dev/null; "
-                "lsof -ti :5051 | xargs kill -9 2>/dev/null"
+                f"lsof -ti :{web_port} | xargs kill -9 2>/dev/null; "
+                f"lsof -ti :{daemon_port} | xargs kill -9 2>/dev/null"
                 "'"
             )
             # start_new_session=True so the bash isn't taken down with
