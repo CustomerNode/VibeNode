@@ -772,17 +772,22 @@ class TestUserDrivenTurnResetsWakeup:
         )
 
 
-# ── 6b. Compacting substatus spans perceived compaction window ──────────
+# ── 6b. Compacting substatus cleared at init ────────────────────────────
 
 
-class TestCompactingSubstatusSpansFullWindow:
-    """The "Compacting…" UI label must stay visible until the agent
-    actually produces new-turn content, NOT just from ``compact_boundary``
-    to ``init``.  Otherwise the user sees a brief flash of "Compacting…"
-    and then "Working…" while the agent is perceptually still compacting.
+class TestCompactingSubstatusClearedAtInit:
+    """The "Compacting…" UI label must clear when ``init`` arrives (the
+    SDK's signal that compaction has FINISHED and a new context is
+    ready), NOT after the agent's first post-compact ``ASSISTANT`` block.
 
-    Same shape of bug as the wake-up sleeping UX — the visible state
-    cleared too early, lying to the user about what's happening.
+    Earlier design preserved the substatus through init to span the
+    "perceived compaction window" (the seconds during which the agent
+    rebuilds context).  In practice this produced the user-reported
+    bug: "it comes out of compacting and it still shows compacting" —
+    the session is technically out of compacting but the UI still says
+    "Compacting…".  Same shape as the wake-up sleeping UX bug fixed in
+    `_enter_auto_resume`: once the state machine has moved past the
+    event the substatus was describing, the label stops being honest.
     """
 
     def _mk(self):
@@ -794,10 +799,11 @@ class TestCompactingSubstatusSpansFullWindow:
         sm._push_callback = lambda *a, **kw: None
         return sm, info
 
-    def test_init_preserves_compacting_substatus(self):
-        """``init`` arriving while substatus='compacting' must keep the
-        substatus set (and mark _post_compact_init_seen) instead of
-        clearing immediately.  This is the core of the perceptual fix."""
+    def test_init_clears_compacting_substatus(self):
+        """``init`` arriving while substatus='compacting' must CLEAR the
+        substatus (compaction has finished — SDK has emitted the new
+        context).  Holding "Compacting…" through the agent's
+        context-rebuild period after init was the stale-label bug."""
         from daemon.backends.messages import VibeNodeMessage, MessageKind
         sm, info = self._mk()
         info.substatus = "compacting"
@@ -808,13 +814,15 @@ class TestCompactingSubstatusSpansFullWindow:
         asyncio.new_event_loop().run_until_complete(
             sm._process_message(info.session_id, msg)
         )
-        assert info.substatus == "compacting", (
-            "init prematurely cleared 'compacting' — UI will flash to "
-            "'Working…' while compaction is perceptually still in progress"
+        assert info.substatus == "", (
+            "init failed to clear 'compacting' — UI will keep showing "
+            "'Compacting…' for several seconds while the agent is "
+            "rebuilding context, lying about what's actually happening"
         )
-        assert info._post_compact_init_seen is True, (
-            "_post_compact_init_seen not marked at post-compact init — "
-            "the ASSISTANT handler won't know it can clear the substatus"
+        assert info._post_compact_init_seen is False, (
+            "_post_compact_init_seen must stay False after init clears "
+            "substatus directly — leaving it True risks the dead "
+            "ASSISTANT-handler branch acting on stale state"
         )
 
     def test_assistant_clears_compacting_after_init_only(self):

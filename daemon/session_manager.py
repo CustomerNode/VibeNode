@@ -2863,26 +2863,30 @@ class SessionManager:
                 #    perceptually still in progress.  Holding the substatus
                 #    through init keeps the label honest.
                 was_compacting = info.substatus == 'compacting'
-                if was_compacting:
-                    # Don't clear yet — wait for first new-turn content.
-                    info._post_compact_init_seen = True
-                elif info.substatus != 'auto-resuming':
-                    info.substatus = ""
+                # Clear substatus on init unconditionally.  ``init`` is the
+                # SDK's signal that compaction has FINISHED (new context is
+                # ready) — keeping "Compacting…" visible through the
+                # agent's post-init context-rebuild period was stale and
+                # produced the user-reported bug: "it comes out of
+                # compacting and it still shows compacting".  Same
+                # principle as the wake-up fix in _enter_auto_resume:
+                # once the state machine has moved past the event the
+                # substatus was describing, the label stops being honest.
+                # For non-compacting inits (fresh session, post-wake-up
+                # init after _enter_auto_resume already cleared upstream)
+                # this is a no-op.  The ASSISTANT-handler clearing branch
+                # at the top of the ASSISTANT case below is left in place
+                # as a defensive backstop.
+                info.substatus = ""
+                info._post_compact_init_seen = False
                 # Restore IDLE only if we're in post-turn context
-                # (_awaiting_compact_drain=True means RESULT already came and
-                # we're draining the buffer — safe to go IDLE now).
-                # Mid-turn compaction must NOT set IDLE here — the session is
-                # still generating a response and will reach RESULT normally.
+                # (_awaiting_compact_drain=True means RESULT already came
+                # and we're draining the buffer — safe to go IDLE now).
+                # Mid-turn compaction must NOT set IDLE here — the session
+                # is still generating a response and will reach RESULT
+                # normally.
                 if was_compacting and info._awaiting_compact_drain:
                     info.state = SessionState.IDLE
-                    # Post-turn auto-compact: there will be NO follow-up
-                    # ASSISTANT to clear "compacting".  _emit_state's
-                    # auto-clear handles it via the state=IDLE branch,
-                    # but only if we let it — clear the post-compact
-                    # init-seen flag so a future spurious ASSISTANT
-                    # (e.g. self-heal retry) doesn't try to clear a
-                    # substatus that's already gone.
-                    info._post_compact_init_seen = False
                 self._emit_state(info)
                 if was_compacting:
                     entry = LogEntry(kind="system", text="Context compacted")
