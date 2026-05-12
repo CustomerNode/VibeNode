@@ -174,19 +174,28 @@ class TestEmitStateQueueDispatchGate:
 
 
 class TestEnterAutoResumeSideEffects:
-    """`_enter_auto_resume` must flip IDLE→WORKING with substatus
-    'auto-resuming' AND reset _wakeup_pending so the dispatch gate
-    re-opens at the next RESULT if no new wake-up was scheduled."""
+    """`_enter_auto_resume` must flip IDLE→WORKING, CLEAR substatus (the
+    wake-up has fired so we're no longer "awaiting"), AND reset
+    _wakeup_pending so the dispatch gate re-opens at the next RESULT if
+    no new wake-up was scheduled."""
 
     def test_enter_auto_resume_from_idle(self):
         sm = SessionManager()
         info = SessionInfo(session_id="test-sid")
         info.state = SessionState.IDLE
         info._wakeup_pending = True
+        # Simulate the sleep window: substatus was set to "auto-resuming"
+        # by the prior RESULT branch.
+        info.substatus = "auto-resuming"
         sm._push_callback = lambda *a, **kw: None
         sm._enter_auto_resume(info)
         assert info.state == SessionState.WORKING
-        assert info.substatus == "auto-resuming"
+        assert info.substatus == "", (
+            "_enter_auto_resume must clear the 'auto-resuming' substatus "
+            "when the wake-up actually fires — otherwise the working bar "
+            "keeps saying 'Awaiting wake-up…' and kanban keeps showing "
+            "the sleeping dot while the session is actively processing"
+        )
         assert info._wakeup_pending is False, (
             "the wake-up that triggered this resume is consumed — gate "
             "should re-open unless the auto-resume turn schedules a new one"
@@ -404,9 +413,10 @@ class TestListenerPreDetectAutoResume:
 
     def test_init_after_result_enters_working_before_process_message(self):
         """Bare init delivered after RESULT (ScheduleWakeup wake-up shape)
-        must transition state to WORKING with substatus=auto-resuming
-        BEFORE _process_message processes the init.  This proves the
-        pre-detect block fired."""
+        must transition state to WORKING (with substatus cleared, since
+        the wake-up has fired and we're no longer "awaiting") BEFORE
+        _process_message processes the init.  This proves the pre-detect
+        block fired."""
         sm = SessionManager()
         info = self._make_session(sm, wakeup_pending=True)
 
@@ -427,11 +437,20 @@ class TestListenerPreDetectAutoResume:
         )
 
         # Auto-resume must have been entered: somewhere in the trace we
-        # must see (working, auto-resuming).  The exact order may vary
-        # depending on emit timing but the auto-resume state MUST appear.
-        assert any(s == ('working', 'auto-resuming') for s in states), (
-            f"listener did not flip to WORKING+auto-resuming on the init — "
+        # must see state='working' (with substatus cleared — the wake-up
+        # has fired so we're no longer "awaiting").  The exact order may
+        # vary depending on emit timing but the WORKING transition MUST
+        # appear, and it MUST NOT carry the stale 'auto-resuming'
+        # substatus (that would re-introduce the "stale label" UX bug).
+        assert any(s[0] == 'working' for s in states), (
+            f"listener did not flip to WORKING on the init — "
             f"the pre-detect path is not firing.  states={states}"
+        )
+        assert not any(s == ('working', 'auto-resuming') for s in states), (
+            f"listener emitted WORKING+auto-resuming — the substatus must "
+            f"be cleared by _enter_auto_resume so the UI stops showing "
+            f"'Awaiting wake-up…' when the session is actively working. "
+            f"states={states}"
         )
 
     def test_queued_message_not_dispatched_during_wakeup_cycle(self):

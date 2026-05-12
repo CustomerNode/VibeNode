@@ -4169,16 +4169,34 @@ class SessionManager:
         state on the IDLE→WORKING transition so chained calls during the
         same auto-resume don't spam clients.
 
+        Substatus is CLEARED here, not preserved.  The ``auto-resuming``
+        substatus is the server's way of saying "this session is asleep
+        with a scheduled wake-up pending" (state=IDLE).  Once the wake-up
+        actually fires and the session transitions to WORKING, the
+        session is no longer "awaiting" anything — it's actively
+        processing the wake-up turn.  Leaving substatus='auto-resuming'
+        latched here caused the user-visible bug where the working bar
+        kept saying "Awaiting wake-up…" and kanban kept showing the blue
+        sleeping dot while the spinner was already running, until the
+        wake-up turn's own RESULT finally swept the substatus.
+
         Resets ``_wakeup_pending`` to False because the wake-up that
         triggered this resume has been "consumed".  If the auto-resume
         turn schedules ANOTHER wake-up, _process_message's tool_use
-        handler will flip it back to True before the turn ends.
+        handler will flip it back to True before the turn ends; the
+        RESULT branch will then re-apply substatus='auto-resuming' for
+        the next sleep window.
         """
         if info.state != SessionState.IDLE:
             return
         info.state = SessionState.WORKING
         info._awaiting_compact_drain = False
-        info.substatus = "auto-resuming"
+        # Wake-up has fired — clear the "awaiting" substatus so the UI
+        # stops showing "Awaiting wake-up…" the moment work resumes.
+        # The init handler's `elif info.substatus != 'auto-resuming'`
+        # guard becomes a no-op for this path (substatus is already "")
+        # but is left in place as a defensive backstop.
+        info.substatus = ""
         info.working_since = time.time()
         # The wake-up that caused this resume is consumed.  Subsequent
         # tool uses in this turn will re-flag _wakeup_pending if needed.
