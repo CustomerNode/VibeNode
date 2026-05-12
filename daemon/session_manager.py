@@ -1195,8 +1195,16 @@ class SessionManager:
                         info._stream_heal_count = 0
                     info._stream_heal_count += 1
                     info._stream_heal_needed = True
-                    logger.info("_drive_session %s: flagged stream_heal from "
-                                "exception (%s), deferring to finally", session_id, type(e).__name__)
+                    logger.info(
+                        "STREAM_HEAL_TRIGGER site=drive_session_except sid=%s "
+                        "etype=%s err=%r state=%s in_post_turn=%s "
+                        "listener_superseded=%s heal_count=%d",
+                        session_id, _etype, err_str[:200],
+                        getattr(info.state, 'value', info.state),
+                        getattr(info, '_in_post_turn', False),
+                        getattr(info, '_listener_superseded', False),
+                        info._stream_heal_count,
+                    )
                     entry = LogEntry(kind="system", text="Stream lost — will reconnect and retry...", is_error=True)
                     with info._lock:
                         info.entries.append(entry)
@@ -1283,6 +1291,11 @@ class SessionManager:
                                         last_user_text = e.text
                                         break
                             if last_user_text:
+                                logger.info(
+                                    "STREAM_HEAL_FIRE site=drive_session_finally sid=%s "
+                                    "heal_count=%d text_preview=%r",
+                                    session_id, heal_count, last_user_text[:120],
+                                )
                                 entry = LogEntry(
                                     kind="system",
                                     text="Reconnected — retrying last message automatically",
@@ -1714,8 +1727,16 @@ class SessionManager:
                         info._stream_heal_count = 0
                     info._stream_heal_count += 1
                     info._stream_heal_needed = True
-                    logger.info("_send_query %s: flagged stream_heal from "
-                                "exception (%s), deferring to finally", session_id, type(e).__name__)
+                    logger.info(
+                        "STREAM_HEAL_TRIGGER site=send_query_except sid=%s "
+                        "etype=%s err=%r state=%s in_post_turn=%s "
+                        "listener_superseded=%s heal_count=%d",
+                        session_id, _etype, err_str[:200],
+                        getattr(info.state, 'value', info.state),
+                        getattr(info, '_in_post_turn', False),
+                        getattr(info, '_listener_superseded', False),
+                        info._stream_heal_count,
+                    )
                     entry = LogEntry(kind="system", text="Stream lost — will reconnect and retry...", is_error=True)
                     with info._lock:
                         info.entries.append(entry)
@@ -1801,6 +1822,11 @@ class SessionManager:
                                         last_user_text = e.text
                                         break
                             if last_user_text:
+                                logger.info(
+                                    "STREAM_HEAL_FIRE site=send_query_finally sid=%s "
+                                    "heal_count=%d text_preview=%r",
+                                    session_id, heal_count, last_user_text[:120],
+                                )
                                 entry = LogEntry(
                                     kind="system",
                                     text="Reconnected — retrying last message automatically",
@@ -1809,7 +1835,6 @@ class SessionManager:
                                     info.entries.append(entry)
                                     entry_index = len(info.entries) - 1
                                 self._emit_entry(session_id, entry, entry_index)
-                                logger.info("Self-heal: resending last user message for %s", session_id)
                                 info.state = SessionState.IDLE
                                 self._emit_state(info)
                                 self.send_message(session_id, last_user_text, _self_heal=True)
@@ -2340,16 +2365,21 @@ class SessionManager:
             # retry the whole message on a fresh CLI process.
             _transport_alive = manager._sdk.is_transport_alive(info.client)
             if not _transport_alive:
-                logger.warning(
-                    "Transport dead for %s — aborting turn for tool %s "
-                    "(will reconnect in finally block)",
-                    resolved_id, tool_name,
-                )
                 # Flag for self-healing so the finally block reconnects
                 info._stream_heal_needed = True
                 if not hasattr(info, '_stream_heal_count'):
                     info._stream_heal_count = 0
                 info._stream_heal_count += 1
+                logger.warning(
+                    "STREAM_HEAL_TRIGGER site=can_use_tool_transport_dead sid=%s "
+                    "tool=%s state=%s in_post_turn=%s listener_superseded=%s "
+                    "heal_count=%d",
+                    resolved_id, tool_name,
+                    getattr(info.state, 'value', info.state),
+                    getattr(info, '_in_post_turn', False),
+                    getattr(info, '_listener_superseded', False),
+                    info._stream_heal_count,
+                )
                 # Log a single user-visible message (only on first detection)
                 if info._stream_heal_count == 1:
                     _heal_entry = LogEntry(
@@ -2661,9 +2691,14 @@ class SessionManager:
                         info._stream_heal_count += 1
                         info._stream_heal_needed = True
                         logger.warning(
-                            "Stream closed error #%d for session %s — "
-                            "will auto-reconnect and retry after turn ends",
-                            info._stream_heal_count, session_id,
+                            "STREAM_HEAL_TRIGGER site=tool_result_stream_closed sid=%s "
+                            "state=%s in_post_turn=%s listener_superseded=%s "
+                            "heal_count=%d tool_result_snippet=%r",
+                            session_id,
+                            getattr(info.state, 'value', info.state),
+                            getattr(info, '_in_post_turn', False),
+                            getattr(info, '_listener_superseded', False),
+                            info._stream_heal_count, rt[:200],
                         )
                         # Show the user what's happening (not an error, a status)
                         entry = LogEntry(
@@ -4047,29 +4082,71 @@ class SessionManager:
                     # _drive_session's finally block reconnect on the next
                     # user action.  Otherwise just log and exit — the
                     # buffer is unrecoverable from here.
+                    #
+                    # CRITICAL: if we're bailing (task superseded or replaced),
+                    # the exception is almost certainly the SDK's
+                    # ClosedResourceError / cancellation fallout from
+                    # send_message cancelling us — NOT a real transport
+                    # failure.  Flagging stream_heal here would cause the
+                    # next finally block to re-send the user's last message
+                    # on top of the brand-new turn they just submitted,
+                    # producing the "session reconnected, retrying last
+                    # message" loop on healthy sessions.  Bail without
+                    # touching heal state; the new task owns the buffer now.
+                    #
+                    # NOTE: another developer reports this loop does not
+                    # reproduce on Linux — it may be a Windows-only timing
+                    # window where the cancelled receive_response surfaces
+                    # the ClosedResourceError before the supersede flag's
+                    # bail check at the top of the loop catches it.  The
+                    # guard below covers both platforms either way.
+                    # CRITICAL: do NOT flag _stream_heal_needed here, even on
+                    # transport-shaped errors.  Evidence from STREAM_HEAL_
+                    # logs (2026-05-12) showed this site firing on healthy
+                    # idle sessions with `err='Command failed with exit code
+                    # 1'` and `listener_superseded=False` — producing the
+                    # "Reconnected — retrying last message automatically" loop
+                    # the user has repeatedly complained about.
+                    #
+                    # This listener only exists to drain late auto-resume
+                    # content AFTER the turn's ResultMessage already shipped.
+                    # The user already saw their response.  If the SDK throws
+                    # anything during this idle window (stale background-task
+                    # exit code, ClosedResource from a supersede, or even a
+                    # real transport death), resending the user's last
+                    # message is wrong — they didn't ask for it and the
+                    # original turn already produced its answer.
+                    #
+                    # Real stream death during a REAL user turn is still
+                    # caught and healed by the four other STREAM_HEAL_TRIGGER
+                    # sites that run during the active turn:
+                    #   • drive_session_except
+                    #   • send_query_except
+                    #   • tool_result_stream_closed
+                    #   • can_use_tool_transport_dead
+                    # If the transport is genuinely dead when the user sends
+                    # their NEXT message, those paths will catch it then.
+                    # Until the user sends again, the broken buffer is
+                    # harmless — nothing is listening on it.
                     err_str = str(e)
                     etype = type(e).__name__
-                    is_transport = (
-                        "Stream closed" in err_str
-                        or "exit code" in err_str
-                        or "closed" in err_str.lower()
-                        or "CLIConnection" in etype
-                        or "Process" in etype
-                        or "ClosedResource" in etype
-                    )
-                    if is_transport:
+                    if _bailing():
                         logger.info(
-                            "_extended_post_turn_listener %s: transport error (%s) — "
-                            "flagging stream_heal", session_id, etype
+                            "STREAM_HEAL_SUPPRESSED site=post_turn_listener_bailing "
+                            "sid=%s etype=%s err=%r task_replaced=%s "
+                            "listener_superseded=%s",
+                            session_id, etype, err_str[:200],
+                            info.task is not asyncio.current_task(),
+                            getattr(info, '_listener_superseded', False),
                         )
-                        if not hasattr(info, '_stream_heal_count'):
-                            info._stream_heal_count = 0
-                        info._stream_heal_count += 1
-                        info._stream_heal_needed = True
                     else:
-                        logger.warning(
-                            "_extended_post_turn_listener error for %s: %s",
-                            session_id, e
+                        logger.info(
+                            "STREAM_HEAL_SUPPRESSED site=post_turn_listener_exit "
+                            "sid=%s etype=%s err=%r state=%s in_post_turn=%s "
+                            "— turn already completed, not flagging heal",
+                            session_id, etype, err_str[:200],
+                            getattr(info.state, 'value', info.state),
+                            getattr(info, '_in_post_turn', False),
                         )
                     return
         finally:

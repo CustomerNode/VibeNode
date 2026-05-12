@@ -108,11 +108,31 @@ class MessageQueue:
     # ------------------------------------------------------------------
 
     def queue_message(self, session_id: str, text: str) -> dict:
-        """Add a message to a session's queue."""
+        """Add a message to a session's queue.
+
+        Adjacent-duplicate guard: if the tail of the queue is the EXACT
+        same text, drop the duplicate instead of appending.  This is a
+        defensive backstop for double-fire submissions (Enter+click,
+        send_message→auto-queue race with a wake-up IDLE→WORKING flip,
+        client double-tap, etc.).  Without it the user sees their
+        message re-dispatched to the thread once per duplicate when the
+        session next goes idle.  Real duplicates the user explicitly
+        wants (e.g. queueing "ok" twice on purpose) are extremely rare
+        for back-to-back identical text; the wedge is overwhelmingly
+        accidental.
+        """
         with self._queue_lock:
             if session_id not in self._queues:
                 self._queues[session_id] = []
-            self._queues[session_id].append(text)
+            q = self._queues[session_id]
+            if q and q[-1] == text:
+                logger.info("Dropping adjacent-duplicate queue add for %s "
+                            "(queue len=%d unchanged)", session_id, len(q))
+                # Still emit an update so the client's optimistic cache
+                # converges with server truth (no-op if already in sync).
+                self.emit_queue_update(session_id)
+                return {"ok": True, "queued": True, "deduped": True}
+            q.append(text)
         self.save_queues()
         self.emit_queue_update(session_id)
         logger.info("Queued message for %s (%d in queue)", session_id,
