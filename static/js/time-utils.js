@@ -38,3 +38,16 @@ function _shortDate(dateStr) {
       return months[d.getMonth()] + ' ' + d.getDate() + " '" + String(d.getFullYear()).slice(-2);
   return months[d.getMonth()] + ' ' + d.getDate(); // "Mar 18"
 }
+
+// Periodically re-format every element tagged with data-short-date so labels
+// like "Yesterday" or "2:34 PM" don't go stale when the day rolls over without
+// a fresh render. Elements opt in by setting data-short-date="<raw timestamp>".
+function _refreshShortDates() {
+  const elements = document.querySelectorAll('[data-short-date]');
+  for (const el of elements) {
+    const raw = el.getAttribute('data-short-date');
+    if (raw) el.textContent = _shortDate(raw);
+  }
+}
+
+setInterval(_refreshShortDates, 60000);
