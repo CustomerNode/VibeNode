@@ -162,8 +162,19 @@ def do_git_sync(action: str) -> dict:
                 ], "scan": scan2}
 
             msg = "Update VibeNode " + _dt.now().strftime("%Y-%m-%d %H:%M")
-            subprocess.run(["git", "-C", str(proj), "commit", "-m", msg],
-                           capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW)
+            commit = subprocess.run(["git", "-C", str(proj), "commit", "-m", msg],
+                                    capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW)
+            if commit.returncode != 0:
+                err = (commit.stderr.strip() or commit.stdout.strip() or
+                       "git commit failed with no output")
+                hint = ""
+                if "Author identity unknown" in err or "Please tell me who you are" in err:
+                    hint = (" Your git identity is missing. Run these in PowerShell:\n"
+                            '   git config --global user.name "Your Name"\n'
+                            '   git config --global user.email "you@example.com"')
+                return {"ok": False, "messages": messages + [
+                    "Could not save your changes: " + err + hint,
+                ]}
             messages.append("Saved your local changes as a new version.")
         push = subprocess.run(["git", "-C", str(proj), "push"],
                                capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)

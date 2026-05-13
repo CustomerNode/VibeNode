@@ -29,12 +29,8 @@ bp = Blueprint('project_api', __name__)
 
 @bp.route("/api/projects")
 def api_projects():
-    # On Windows, only show projects under ~/Documents.
-    # On Mac/Linux, show all projects under ~/ (Documents may not exist).
-    if sys.platform == "win32":
-        filter_base = str(Path.home() / "Documents").replace("\\", "/").lower()
-    else:
-        filter_base = str(Path.home()).replace("\\", "/").lower()
+    # Show all projects under the user's home directory on every platform.
+    filter_base = str(Path.home()).replace("\\", "/").lower()
     active_project = get_active_project()
     project_names = _load_project_names()
     results = []
