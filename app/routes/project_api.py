@@ -14,6 +14,7 @@ from ..platform_utils import native_folder_picker, default_project_roots
 
 from ..config import (
     _CLAUDE_PROJECTS,
+    _SYSTEM_UTILITY_CWD,
     _decode_project,
     _encode_cwd,
     _save_name,
@@ -31,6 +32,9 @@ bp = Blueprint('project_api', __name__)
 def api_projects():
     # Show all projects under the user's home directory on every platform.
     filter_base = str(Path.home()).replace("\\", "/").lower()
+    # Utility sessions (title gen, AI planner) live here — never show as a user project.
+    system_utility_norm = _SYSTEM_UTILITY_CWD.replace("\\", "/").lower()
+    system_utility_encoded = _encode_cwd(_SYSTEM_UTILITY_CWD)
     active_project = get_active_project()
     project_names = _load_project_names()
     results = []
@@ -39,7 +43,11 @@ def api_projects():
     for d in sorted(_CLAUDE_PROJECTS.iterdir()):
         if not d.is_dir() or d.name.startswith("subagents"):
             continue
+        if d.name == system_utility_encoded:
+            continue
         display = _decode_project(d.name)
+        if display.replace("\\", "/").lower() == system_utility_norm:
+            continue
         # Only show projects that live under the platform-appropriate base
         if not display.replace("\\", "/").lower().startswith(filter_base + "/"):
             continue
