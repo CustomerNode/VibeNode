@@ -3177,9 +3177,29 @@ class SessionManager:
         '.txt', '.xml', '.sql', '.rb', '.go', '.rs', '.java', '.c',
         '.cpp', '.h', '.hpp', '.cs', '.vue', '.svelte', '.astro',
     }
+    # Hardcoded directory names to prune during os.walk fallback.  In
+    # addition to this list, ``_should_skip_dir`` also skips any directory
+    # containing ``pyvenv.cfg`` — the canonical marker of a Python
+    # virtualenv — so non-standard venv names (``cn_venv``, ``myenv``,
+    # etc.) are pruned automatically without needing to be added here.
     _SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv',
                   '.tox', '.mypy_cache', '.pytest_cache', 'dist', 'build',
                   '.next', '.nuxt', '.claude'}
+
+    @classmethod
+    def _should_skip_dir(cls, parent: Path, name: str) -> bool:
+        """Return True if directory ``parent/name`` should be pruned from
+        os.walk traversal.  Skips known build/cache dirs by name AND any
+        directory containing a ``pyvenv.cfg`` (the canonical Python venv
+        marker — catches ``cn_venv``, ``myenv``, etc. without needing an
+        explicit name match).
+        """
+        if name in cls._SKIP_DIRS:
+            return True
+        try:
+            return (parent / name / 'pyvenv.cfg').exists()
+        except OSError:
+            return False
 
     # Set True to log per-step timing in _drive_session / _send_query
     _PROFILE_PIPELINE = True
@@ -3209,14 +3229,48 @@ class SessionManager:
             pass
         return True
 
+    def _find_git_repo_roots(self, cwd_path: Path) -> list:
+        """Find git repo roots at ``cwd_path`` or one level below.
+
+        Returns a list of absolute Path objects:
+        - ``[cwd_path]`` if cwd_path itself contains ``.git``
+        - ``[child1, child2, ...]`` if cwd_path isn't a repo but one or
+          more immediate children are (common layout: a project folder
+          that wraps a git repo alongside a venv or other siblings)
+        - ``[]`` if no repo found within one level
+
+        Sorted for cache determinism.  ``.git`` may be a file (worktree)
+        or directory — both are accepted.
+        """
+        if (cwd_path / ".git").exists():
+            return [cwd_path]
+        try:
+            children = []
+            for child in cwd_path.iterdir():
+                if not child.is_dir():
+                    continue
+                if (child / ".git").exists():
+                    children.append(child)
+            children.sort()
+            return children
+        except OSError:
+            return []
+
     def _git_ls_files(self, cwd_path: Path, info: "SessionInfo | None" = None) -> list:
         """Use `git ls-files` to get tracked files, respecting .gitignore.
+
+        Tries ``cwd_path`` first; if it isn't a repo, looks one level
+        below and unions ``git ls-files`` output from any nested repo
+        roots.  This handles project layouts where the VibeNode session
+        CWD wraps a git repo (e.g. ``CustomerNode/customerNode_root/``)
+        — without it the fallback os.walk fires every turn and crawls
+        sibling venvs, costing minutes per turn.
 
         When *info* is provided, caches the result on the SessionInfo so
         subsequent calls within the TTL window skip the subprocess entirely.
 
-        Returns a list of absolute Path objects, or None if git is unavailable
-        or the directory is not a git repo.
+        Returns a list of absolute Path objects, or None if no repo was
+        found at cwd or one level below.
         """
         # ── Check per-session cache ──
         if info is not None:
@@ -3225,32 +3279,42 @@ class SessionManager:
                     and now - info._cached_git_files_ts < self._GIT_LS_FILES_CACHE_TTL):
                 return info._cached_git_files
 
-        import subprocess as _sp
-        try:
-            result = _sp.run(
-                ["git", "ls-files", "-z"],
-                cwd=str(cwd_path),
-                capture_output=True,
-                timeout=10,
-            )
-            if result.returncode != 0:
-                return None
-            raw = result.stdout
-            if not raw:
-                return []
-            paths = []
-            for rel in raw.split(b'\x00'):
-                if rel:
-                    paths.append(cwd_path / rel.decode('utf-8', errors='replace'))
-
-            # ── Store in per-session cache ──
-            if info is not None:
-                info._cached_git_files = paths
-                info._cached_git_files_ts = time.time()
-
-            return paths
-        except Exception:
+        repo_roots = self._find_git_repo_roots(cwd_path)
+        if not repo_roots:
             return None
+
+        import subprocess as _sp
+        paths: list = []
+        any_success = False
+        for repo_root in repo_roots:
+            try:
+                result = _sp.run(
+                    ["git", "ls-files", "-z"],
+                    cwd=str(repo_root),
+                    capture_output=True,
+                    timeout=10,
+                )
+                if result.returncode != 0:
+                    continue
+                any_success = True
+                raw = result.stdout
+                if not raw:
+                    continue
+                for rel in raw.split(b'\x00'):
+                    if rel:
+                        paths.append(repo_root / rel.decode('utf-8', errors='replace'))
+            except Exception:
+                continue
+
+        if not any_success:
+            return None
+
+        # ── Store in per-session cache ──
+        if info is not None:
+            info._cached_git_files = paths
+            info._cached_git_files_ts = time.time()
+
+        return paths
 
     def _record_pre_turn_mtimes(self, info: SessionInfo) -> None:
         """Snapshot mtimes of source files in the working directory.
@@ -3317,9 +3381,10 @@ class SessionManager:
             else:
                 # Fallback: os.walk with directory pruning
                 for dirpath, dirnames, filenames in os.walk(cwd_path):
-                    dirnames[:] = [d for d in dirnames if d not in self._SKIP_DIRS]
+                    dp = Path(dirpath)
+                    dirnames[:] = [d for d in dirnames if not self._should_skip_dir(dp, d)]
                     for fname in filenames:
-                        f = Path(dirpath) / fname
+                        f = dp / fname
                         if f.suffix.lower() not in self._SOURCE_EXTS:
                             continue
                         try:
@@ -3374,9 +3439,10 @@ class SessionManager:
             else:
                 # Fallback: os.walk with directory pruning
                 for dirpath, dirnames, filenames in os.walk(cwd_path):
-                    dirnames[:] = [d for d in dirnames if d not in self._SKIP_DIRS]
+                    dp = Path(dirpath)
+                    dirnames[:] = [d for d in dirnames if not self._should_skip_dir(dp, d)]
                     for fname in filenames:
-                        f = Path(dirpath) / fname
+                        f = dp / fname
                         if f.suffix.lower() not in self._SOURCE_EXTS:
                             continue
                         fpath = str(f)
