@@ -900,6 +900,64 @@ class SessionManager:
     # Async internals (run on the event loop thread)
     # ------------------------------------------------------------------
 
+    async def _cli_watchdog(self, session_id: str, info: SessionInfo) -> None:
+        """Poll the CLI subprocess during a WORKING turn and trigger heal
+        if the process dies.
+
+        The existing STREAM_HEAL_TRIGGER sites only fire when the SDK
+        propagates death through ``receive_response()``,
+        ``can_use_tool``, or a tool_result block carrying "Stream
+        closed".  In practice the CLI can die or its control channel
+        can break in ways that none of those sites observe — the user
+        then sees a hung session or a cascade of "Tool permission
+        request failed: Error: Stream closed" tool_results that get
+        fed to the model without our daemon ever knowing.  This
+        watchdog catches outright CLI process death by polling the
+        subprocess returncode directly.  On death it flags heal and
+        disconnects the transport so ``receive_response()`` raises and
+        the active turn's exception handler fires the existing
+        heal-fire path.
+
+        Lifetime is bounded to a single WORKING-state turn: the
+        watchdog auto-returns when ``info.state`` leaves WORKING (which
+        the caller's ``async for`` exit guarantees) and is also
+        cancelled in the caller's ``finally`` block.  It does NOT run
+        during the post-turn listener — that path's exit logic is
+        intentionally suppressed (see L4173 comment on past heal-loop
+        regressions).
+        """
+        POLL_INTERVAL = 1.0
+        try:
+            while True:
+                await asyncio.sleep(POLL_INTERVAL)
+                if info.state != SessionState.WORKING:
+                    return
+                client = info.client
+                if client is None:
+                    return
+                try:
+                    cli_pid = self._sdk.extract_process_pid(client)
+                except Exception:
+                    return
+                if cli_pid != 0:
+                    continue
+                info._stream_heal_count = getattr(info, '_stream_heal_count', 0) + 1
+                info._stream_heal_needed = True
+                logger.warning(
+                    "STREAM_HEAL_TRIGGER site=cli_watchdog sid=%s "
+                    "state=%s heal_count=%d",
+                    session_id,
+                    getattr(info.state, 'value', info.state),
+                    info._stream_heal_count,
+                )
+                try:
+                    await self._sdk.disconnect(client)
+                except Exception:
+                    pass
+                return
+        except asyncio.CancelledError:
+            raise
+
     async def _reconnect_client(self, session_id: str, info) -> bool:
         """Reconnect a session whose SDK stream died.
 
@@ -1090,27 +1148,37 @@ class SessionManager:
             info._stream_evt_logged = False
             _first_msg_logged = False
             if prompt:
-                async for message in self._sdk.receive_response(client):
-                    # If a newer task has replaced us, stop processing —
-                    # our stream is stale and we must not touch state.
-                    if info.task is not asyncio.current_task():
-                        break
-                    if not _first_msg_logged:
-                        _profile_log("first_stream_message (%s)" % message.kind.value)
-                        _first_msg_logged = True
-                    if message.kind == MessageKind.RESULT:
-                        got_result = True
-                        _profile_log("result_message")
-                    try:
-                        await self._process_message(session_id, message)
+                _watchdog = asyncio.create_task(
+                    self._cli_watchdog(session_id, info)
+                )
+                try:
+                    async for message in self._sdk.receive_response(client):
+                        # If a newer task has replaced us, stop processing —
+                        # our stream is stale and we must not touch state.
+                        if info.task is not asyncio.current_task():
+                            break
+                        if not _first_msg_logged:
+                            _profile_log("first_stream_message (%s)" % message.kind.value)
+                            _first_msg_logged = True
                         if message.kind == MessageKind.RESULT:
-                            result_handled = True
-                    except Exception as pm_err:
-                        # Don't let one bad message kill the entire stream.
-                        logger.exception(
-                            "_process_message error for %s (msg kind %s): %s",
-                            session_id, message.kind.value, pm_err
-                        )
+                            got_result = True
+                            _profile_log("result_message")
+                        try:
+                            await self._process_message(session_id, message)
+                            if message.kind == MessageKind.RESULT:
+                                result_handled = True
+                        except Exception as pm_err:
+                            # Don't let one bad message kill the entire stream.
+                            logger.exception(
+                                "_process_message error for %s (msg kind %s): %s",
+                                session_id, message.kind.value, pm_err
+                            )
+                finally:
+                    _watchdog.cancel()
+                    try:
+                        await _watchdog
+                    except (asyncio.CancelledError, Exception):
+                        pass
             else:
                 # No prompt (empty session or bare resume) — nothing to receive.
                 # Go straight to IDLE so send_message() can dispatch follow-ups.
@@ -1629,29 +1697,39 @@ class SessionManager:
             # Process response messages — normalized to VibeNodeMessage by backend
             info.usage.pop('_per_call', None)  # clear stale per-call marker from previous turn
             info._stream_evt_logged = False  # re-enable diagnostic log for this turn
-            async for message in self._sdk.receive_response(info.client):
-                # If a newer task has replaced us, stop processing —
-                # our stream is stale and we must not touch state.
-                if info.task is not asyncio.current_task():
-                    break
-                if not _first_msg_logged:
-                    _profile_log("first_stream_message (%s)" % message.kind.value)
-                    _first_msg_logged = True
-                if message.kind == MessageKind.RESULT:
-                    got_result = True
-                    _profile_log("result_message")
-                try:
-                    await self._process_message(session_id, message)
+            _watchdog = asyncio.create_task(
+                self._cli_watchdog(session_id, info)
+            )
+            try:
+                async for message in self._sdk.receive_response(info.client):
+                    # If a newer task has replaced us, stop processing —
+                    # our stream is stale and we must not touch state.
+                    if info.task is not asyncio.current_task():
+                        break
+                    if not _first_msg_logged:
+                        _profile_log("first_stream_message (%s)" % message.kind.value)
+                        _first_msg_logged = True
                     if message.kind == MessageKind.RESULT:
-                        result_handled = True
-                except Exception as pm_err:
-                    # Don't let one bad message kill the entire stream.
-                    # Log the error and continue processing remaining
-                    # messages so ResultMessage can still arrive and set IDLE.
-                    logger.exception(
-                        "_process_message error for %s (msg kind %s): %s",
-                        session_id, message.kind.value, pm_err
-                    )
+                        got_result = True
+                        _profile_log("result_message")
+                    try:
+                        await self._process_message(session_id, message)
+                        if message.kind == MessageKind.RESULT:
+                            result_handled = True
+                    except Exception as pm_err:
+                        # Don't let one bad message kill the entire stream.
+                        # Log the error and continue processing remaining
+                        # messages so ResultMessage can still arrive and set IDLE.
+                        logger.exception(
+                            "_process_message error for %s (msg kind %s): %s",
+                            session_id, message.kind.value, pm_err
+                        )
+            finally:
+                _watchdog.cancel()
+                try:
+                    await _watchdog
+                except (asyncio.CancelledError, Exception):
+                    pass
 
             # Post-turn compact drain — also installs the extended listener
             # that consumes auto-resume / late ``task_notification`` content.
@@ -2685,7 +2763,16 @@ class SessionManager:
                     # finish (ResultMessage), then _send_query / _drive_session
                     # will reconnect the client and resend the last user message
                     # so the failed tools actually execute.
-                    if is_err and "Stream closed" in rt:
+                    #
+                    # Match both the bare "Stream closed" string AND the CLI's
+                    # control-channel error "Tool permission request failed:
+                    # Error: Stream closed" — the latter is what the Node CLI
+                    # writes to the JSONL when its permission-request stream is
+                    # broken but the main stdout stream is still alive, which
+                    # produces 10+ failed tool calls in a single turn without
+                    # any of the existing transport-death detectors firing.
+                    if is_err and ("Stream closed" in rt
+                                   or "Tool permission request failed" in rt):
                         if not hasattr(info, '_stream_heal_count'):
                             info._stream_heal_count = 0
                         info._stream_heal_count += 1

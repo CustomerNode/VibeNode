@@ -250,14 +250,29 @@ def _encode_cwd(cwd: str) -> str:
 
     E.g. ``C:\\Users\\foo\\Bar`` → ``C--Users-foo-Bar``
 
-    IMPORTANT: Underscores must also be replaced with dashes.  Claude Code's
-    own project directory encoding converts underscores to dashes (e.g.
-    ``customerNode_root`` → ``customerNode-root``), but the daemon's CWD
-    preserves the original filesystem underscores.  Without this, sessions
-    whose CWD contains underscores fail the project filter silently —
-    they appear to not exist even though the daemon has them running.
+    IMPORTANT: Underscores AND dots must also be replaced with dashes.  Claude
+    Code's own project directory encoding converts both to dashes (e.g.
+    ``customerNode_root`` → ``customerNode-root``, and ``.claude`` →
+    ``-claude``), but the daemon's CWD preserves the original filesystem
+    characters.  Without matching that exactly, sessions whose CWD contains
+    underscores or dots fail the project filter silently — they appear to not
+    exist even though the daemon has them running.
+
+    The dot-encoding rule matters specifically for the ``_SYSTEM_UTILITY_CWD``
+    filter in ``app/routes/project_api.py::api_projects`` and for
+    ``_cleanup_system_sessions()`` below: the on-disk directory is
+    ``C--Users-<user>--claude--system`` (encoded from ``~/.claude/_system``),
+    and without the ``.`` → ``-`` rule the filter built the wrong string and
+    the system utility project leaked into the user-facing project list AND
+    its old JSONLs never got pruned.  Do NOT remove the ``.replace('.', '-')``.
     """
-    return cwd.replace("\\", "-").replace("/", "-").replace(":", "-").replace("_", "-")
+    return (
+        cwd.replace("\\", "-")
+        .replace("/", "-")
+        .replace(":", "-")
+        .replace("_", "-")
+        .replace(".", "-")
+    )
 
 
 def cwd_matches_active_project(cwd: str, project: str = "") -> bool:

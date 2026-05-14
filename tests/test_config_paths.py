@@ -55,6 +55,36 @@ class TestEncodeCwd:
         result = _encode_cwd("/home/user/my-project")
         assert result == "-home-user-my-project"
 
+    def test_dots_replaced(self):
+        """Claude Code encodes ``.`` as ``-`` (e.g. ``.claude`` → ``-claude``).
+
+        REGRESSION GUARD: without this rule, the ``_SYSTEM_UTILITY_CWD``
+        filter in ``api_projects`` builds the wrong directory name and the
+        ``~/.claude/_system`` utility project leaks into the user-facing
+        project list.  Reverting ``_encode_cwd``'s ``.replace('.', '-')``
+        re-breaks Compose and the project picker.
+        """
+        from app.config import _encode_cwd
+        # Windows: the system utility CWD encoding
+        assert _encode_cwd("C:\\Users\\dev\\.claude\\_system") == "C--Users-dev--claude--system"
+        # Unix: dotfile directory
+        assert _encode_cwd("/home/user/.config/myapp") == "-home-user--config-myapp"
+        # Just a dot
+        assert _encode_cwd(".") == "-"
+
+    def test_system_utility_cwd_filter_matches_on_disk(self):
+        """The encoded form of ``_SYSTEM_UTILITY_CWD`` must match what Claude
+        Code actually writes to disk (``~/.claude/projects/<encoded>``).
+
+        This guards the filter in ``app/routes/project_api.py::api_projects``
+        that hides the system utility project from the user-facing list.
+        """
+        from app.config import _encode_cwd, _SYSTEM_UTILITY_CWD
+        encoded = _encode_cwd(_SYSTEM_UTILITY_CWD)
+        # Both ``.`` (from ``.claude``) and ``_`` (from ``_system``) must be
+        # encoded as ``-``, producing consecutive double-dashes.
+        assert "--claude--system" in encoded
+
 
 # ---------------------------------------------------------------------------
 # _decode_project() — Windows paths
