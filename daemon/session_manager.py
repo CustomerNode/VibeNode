@@ -3301,6 +3301,19 @@ class SessionManager:
     # How many turns before forcing a full mtime rescan (0 = never force)
     _MTIME_FULL_RESCAN_INTERVAL = 10
 
+    # Hard time budget (seconds) for any single filesystem-traversal call
+    # in ``_record_pre_turn_mtimes`` or ``_detect_changed_files``.  These
+    # functions enumerate source files to capture mtimes; on degenerate
+    # project layouts (missing/wrong ``.git``, large vendored trees, etc.)
+    # they have historically blown out to multi-minute runs and made the
+    # whole session look hung.  This budget guarantees no single call can
+    # block a turn for more than this many seconds — when it triggers, the
+    # function bails with the partial result it has, logs a warning, and
+    # the next turn proceeds normally.  Worst-case degradation: a few
+    # externally-edited files (Bash, Agent sub-tools) don't get tracked
+    # for one turn.  Acceptable; multi-second blocking is not.
+    _FS_TRAVERSAL_BUDGET_SECONDS = 2.0
+
     @staticmethod
     def _is_file_tracking_enabled() -> bool:
         """Check kanban_config.json for the file_tracking_enabled preference.
@@ -3316,48 +3329,25 @@ class SessionManager:
             pass
         return True
 
-    def _find_git_repo_roots(self, cwd_path: Path) -> list:
-        """Find git repo roots at ``cwd_path`` or one level below.
-
-        Returns a list of absolute Path objects:
-        - ``[cwd_path]`` if cwd_path itself contains ``.git``
-        - ``[child1, child2, ...]`` if cwd_path isn't a repo but one or
-          more immediate children are (common layout: a project folder
-          that wraps a git repo alongside a venv or other siblings)
-        - ``[]`` if no repo found within one level
-
-        Sorted for cache determinism.  ``.git`` may be a file (worktree)
-        or directory — both are accepted.
-        """
-        if (cwd_path / ".git").exists():
-            return [cwd_path]
-        try:
-            children = []
-            for child in cwd_path.iterdir():
-                if not child.is_dir():
-                    continue
-                if (child / ".git").exists():
-                    children.append(child)
-            children.sort()
-            return children
-        except OSError:
-            return []
-
     def _git_ls_files(self, cwd_path: Path, info: "SessionInfo | None" = None) -> list:
         """Use `git ls-files` to get tracked files, respecting .gitignore.
 
-        Tries ``cwd_path`` first; if it isn't a repo, looks one level
-        below and unions ``git ls-files`` output from any nested repo
-        roots.  This handles project layouts where the VibeNode session
-        CWD wraps a git repo (e.g. ``CustomerNode/customerNode_root/``)
-        — without it the fallback os.walk fires every turn and crawls
-        sibling venvs, costing minutes per turn.
+        Strategy (in order):
+          1. Run ``git ls-files`` at ``cwd_path`` directly.  Git auto-
+             discovers any ancestor ``.git`` directory, so this handles
+             both "cwd IS the repo root" and "cwd is a subdir deep in a
+             repo" (e.g. ``customerNode_root/customerNode_site/react/``).
+          2. If step 1 fails (cwd has no ancestor repo), look at
+             ``cwd_path``'s immediate children for nested repos and
+             union their ``git ls-files`` output.  This handles wrapper
+             layouts like ``CustomerNode/customerNode_root/.git`` where
+             the session CWD sits one level above the real repo.
 
         When *info* is provided, caches the result on the SessionInfo so
         subsequent calls within the TTL window skip the subprocess entirely.
 
-        Returns a list of absolute Path objects, or None if no repo was
-        found at cwd or one level below.
+        Returns a list of absolute Path objects, or None if neither step
+        located a repo.
         """
         # ── Check per-session cache ──
         if info is not None:
@@ -3366,35 +3356,46 @@ class SessionManager:
                     and now - info._cached_git_files_ts < self._GIT_LS_FILES_CACHE_TTL):
                 return info._cached_git_files
 
-        repo_roots = self._find_git_repo_roots(cwd_path)
-        if not repo_roots:
-            return None
-
         import subprocess as _sp
-        paths: list = []
-        any_success = False
-        for repo_root in repo_roots:
+
+        def _run_ls_files(root: Path) -> list | None:
             try:
                 result = _sp.run(
                     ["git", "ls-files", "-z"],
-                    cwd=str(repo_root),
+                    cwd=str(root),
                     capture_output=True,
                     timeout=10,
                 )
                 if result.returncode != 0:
-                    continue
-                any_success = True
-                raw = result.stdout
-                if not raw:
-                    continue
-                for rel in raw.split(b'\x00'):
+                    return None
+                out: list = []
+                for rel in result.stdout.split(b'\x00'):
                     if rel:
-                        paths.append(repo_root / rel.decode('utf-8', errors='replace'))
+                        out.append(root / rel.decode('utf-8', errors='replace'))
+                return out
             except Exception:
-                continue
+                return None
 
-        if not any_success:
-            return None
+        # Step 1: try cwd directly (git auto-discovers ancestor repos)
+        paths = _run_ls_files(cwd_path)
+
+        # Step 2: cwd isn't inside any repo — look one level down for
+        # nested repos (CustomerNode wrapper-folder layout).
+        if paths is None:
+            paths = []
+            try:
+                for child in sorted(cwd_path.iterdir()):
+                    if not child.is_dir():
+                        continue
+                    if not (child / ".git").exists():
+                        continue
+                    child_paths = _run_ls_files(child)
+                    if child_paths is not None:
+                        paths.extend(child_paths)
+            except OSError:
+                pass
+            if not paths:
+                return None
 
         # ── Store in per-session cache ──
         if info is not None:
@@ -3454,11 +3455,18 @@ class SessionManager:
 
         # ── Full rescan ──
         mtimes = {}
+        budget = self._FS_TRAVERSAL_BUDGET_SECONDS
+        deadline = time.monotonic() + budget
+        budget_exceeded = False
         try:
             # Fast path: use git ls-files (respects .gitignore)
             git_files = self._git_ls_files(cwd_path, info)
             if git_files is not None:
-                for f in git_files:
+                for i, f in enumerate(git_files):
+                    # Check budget every 256 files to keep clock-read overhead trivial
+                    if (i & 0xFF) == 0 and time.monotonic() > deadline:
+                        budget_exceeded = True
+                        break
                     if f.suffix.lower() not in self._SOURCE_EXTS:
                         continue
                     try:
@@ -3467,10 +3475,18 @@ class SessionManager:
                         pass
             else:
                 # Fallback: os.walk with directory pruning
+                processed = 0
                 for dirpath, dirnames, filenames in os.walk(cwd_path):
+                    if time.monotonic() > deadline:
+                        budget_exceeded = True
+                        break
                     dp = Path(dirpath)
                     dirnames[:] = [d for d in dirnames if not self._should_skip_dir(dp, d)]
                     for fname in filenames:
+                        processed += 1
+                        if (processed & 0xFF) == 0 and time.monotonic() > deadline:
+                            budget_exceeded = True
+                            break
                         f = dp / fname
                         if f.suffix.lower() not in self._SOURCE_EXTS:
                             continue
@@ -3478,8 +3494,16 @@ class SessionManager:
                             mtimes[str(f)] = f.stat().st_mtime
                         except OSError:
                             pass
+                    if budget_exceeded:
+                        break
         except Exception as e:
             logger.warning("_record_pre_turn_mtimes failed: %s", e)
+        if budget_exceeded:
+            logger.warning(
+                "_record_pre_turn_mtimes: %.1fs budget exceeded for %s "
+                "(captured %d files) — bailing with partial result",
+                budget, cwd, len(mtimes),
+            )
         info._pre_turn_mtimes = mtimes
         info._post_turn_mtimes = {}
         logger.debug("_record_pre_turn_mtimes: full rescan %d files in %s (turn %d)",
@@ -3508,11 +3532,17 @@ class SessionManager:
         pre = info._pre_turn_mtimes
         changed = set()
         post_mtimes = {}
+        budget = self._FS_TRAVERSAL_BUDGET_SECONDS
+        deadline = time.monotonic() + budget
+        budget_exceeded = False
         try:
             # Fast path: use git ls-files (cached per-session)
             git_files = self._git_ls_files(cwd_path, info)
             if git_files is not None:
-                for f in git_files:
+                for i, f in enumerate(git_files):
+                    if (i & 0xFF) == 0 and time.monotonic() > deadline:
+                        budget_exceeded = True
+                        break
                     if f.suffix.lower() not in self._SOURCE_EXTS:
                         continue
                     fpath = str(f)
@@ -3525,10 +3555,18 @@ class SessionManager:
                         changed.add(fpath)
             else:
                 # Fallback: os.walk with directory pruning
+                processed = 0
                 for dirpath, dirnames, filenames in os.walk(cwd_path):
+                    if time.monotonic() > deadline:
+                        budget_exceeded = True
+                        break
                     dp = Path(dirpath)
                     dirnames[:] = [d for d in dirnames if not self._should_skip_dir(dp, d)]
                     for fname in filenames:
+                        processed += 1
+                        if (processed & 0xFF) == 0 and time.monotonic() > deadline:
+                            budget_exceeded = True
+                            break
                         f = dp / fname
                         if f.suffix.lower() not in self._SOURCE_EXTS:
                             continue
@@ -3540,8 +3578,16 @@ class SessionManager:
                         post_mtimes[fpath] = current_mtime
                         if fpath not in pre or pre[fpath] != current_mtime:
                             changed.add(fpath)
+                    if budget_exceeded:
+                        break
         except Exception as e:
             logger.warning("_detect_changed_files failed: %s", e)
+        if budget_exceeded:
+            logger.warning(
+                "_detect_changed_files: %.1fs budget exceeded for %s "
+                "(captured %d files, %d changed) — bailing with partial result",
+                budget, cwd, len(post_mtimes), len(changed),
+            )
 
         # Save for carry-forward on next turn
         info._post_turn_mtimes = post_mtimes
@@ -4424,16 +4470,21 @@ class SessionManager:
                     info.entries = info.entries[-_ENTRY_KEEP_AFTER_TRIM:]
                     logger.info("Trimmed %d in-memory entries for %s (kept last %d)",
                                 trimmed, info.session_id[:12], _ENTRY_KEEP_AFTER_TRIM)
-            # Also release large per-turn data structures.  These get
-            # repopulated on the next turn start; no need to hold 1400+
-            # file paths in RAM while the session is idle.
-            if info._pre_turn_mtimes and len(info._pre_turn_mtimes) > 50:
-                info._pre_turn_mtimes = {}
-            if info._post_turn_mtimes and len(info._post_turn_mtimes) > 50:
-                info._post_turn_mtimes = {}
-            if info._cached_git_files and len(info._cached_git_files) > 100:
-                info._cached_git_files = []
-                info._cached_git_files_ts = 0.0
+            # NOTE (2026-05-14): we deliberately do NOT wipe
+            # ``_pre_turn_mtimes``, ``_post_turn_mtimes``, or
+            # ``_cached_git_files`` here.  An earlier version of this
+            # block wiped them on every IDLE transition "to save memory,"
+            # but that ran BETWEEN the pre-turn record and the post-turn
+            # ``_detect_changed_files`` for the same turn — leaving
+            # ``pre`` empty so every file looked "changed."  For a
+            # project with 3789 source files (CustomerNode), every turn
+            # then rewrote 3789 backups (~5-6s of disk IO) for no
+            # reason.  This was the root cause of the "looks fast,
+            # then dogshit slow" cycle.  Holding the dicts costs only
+            # a few hundred KB per session — far cheaper than the
+            # multi-second penalty of repopulating them every turn.
+            # See ``PERF-CRITICAL #4`` (mtime carry-forward) in
+            # CLAUDE.md, which this wipe was silently violating.
 
         # Auto-dispatch queued messages when session goes IDLE — but NOT if:
         #   • the user just interrupted (flag is cleared on next send_message
