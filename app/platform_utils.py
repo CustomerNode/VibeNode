@@ -55,57 +55,103 @@ def native_folder_picker() -> tuple:
         (None, error_string)  on failure / unsupported platform
     """
     if sys.platform == "win32":
-        # NOTE: FolderBrowserDialog.ShowDialog() with no owner often opens
-        # BEHIND the browser window (or invisibly minimised) because the
-        # PowerShell child process has no foreground window of its own.
-        # On the user's previous machine this happened to work; on a fresh
-        # Windows install it manifests as "click Browse, nothing happens".
-        # Fix: create a hidden, off-screen, TopMost owner Form, push it to
-        # the foreground via SetForegroundWindow, and pass it as the dialog
-        # owner so the picker inherits the foreground state and z-order.
+        # Windows folder-picker history of pain:
+        #   - FolderBrowserDialog.ShowDialog() with no owner opens BEHIND
+        #     Chrome on most machines because the PowerShell child has no
+        #     foreground window of its own.
+        #   - A TopMost owner form isn't enough: Windows refuses
+        #     SetForegroundWindow from a process that doesn't own the
+        #     current foreground (security feature, since Windows 2000).
+        # Canonical fix: AttachThreadInput to the foreground thread, then
+        # BringWindowToTop + SetForegroundWindow, then detach. This is the
+        # documented workaround in MS knowledge base Q97925 and is the only
+        # reliable way to surface a dialog from a background subprocess.
         ps_script = r'''
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-Add-Type -Namespace VN -Name Win -MemberDefinition @"
-[System.Runtime.InteropServices.DllImport("user32.dll")]
-public static extern bool SetForegroundWindow(System.IntPtr hWnd);
-"@
-$owner = New-Object System.Windows.Forms.Form
-$owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
-$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
-$owner.Location = New-Object System.Drawing.Point -10000, -10000
-$owner.Size = New-Object System.Drawing.Size 1, 1
-$owner.ShowInTaskbar = $false
-$owner.TopMost = $true
-$owner.Show()
-[void][VN.Win]::SetForegroundWindow($owner.Handle)
+$ErrorActionPreference = 'Stop'
 try {
-    $fb = New-Object System.Windows.Forms.FolderBrowserDialog
-    $fb.Description = "Select a project folder"
-    $fb.RootFolder = [System.Environment+SpecialFolder]::MyComputer
-    $fb.ShowNewFolderButton = $true
-    $result = $fb.ShowDialog($owner)
-} finally {
-    $owner.Close()
-    $owner.Dispose()
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class VNFG {
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr pid);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int n);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    public static void Force(IntPtr hWnd) {
+        uint fg = GetWindowThreadProcessId(GetForegroundWindow(), IntPtr.Zero);
+        uint me = GetCurrentThreadId();
+        if (fg != 0 && fg != me) {
+            AttachThreadInput(me, fg, true);
+            try { ShowWindow(hWnd, 5); BringWindowToTop(hWnd); SetForegroundWindow(hWnd); }
+            finally { AttachThreadInput(me, fg, false); }
+        } else {
+            ShowWindow(hWnd, 5); BringWindowToTop(hWnd); SetForegroundWindow(hWnd);
+        }
+    }
 }
-if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
-    Write-Output $fb.SelectedPath
-} else {
-    Write-Output "::CANCELLED::"
+"@
+    $owner = New-Object System.Windows.Forms.Form
+    $owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+    $owner.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+    $owner.Location = New-Object System.Drawing.Point -10000, -10000
+    $owner.Size = New-Object System.Drawing.Size 1, 1
+    $owner.ShowInTaskbar = $false
+    $owner.TopMost = $true
+    $owner.Opacity = 0
+    $owner.Show()
+    [VNFG]::Force($owner.Handle)
+    try {
+        $fb = New-Object System.Windows.Forms.FolderBrowserDialog
+        $fb.Description = "Select a project folder"
+        $fb.RootFolder = [System.Environment+SpecialFolder]::MyComputer
+        $fb.ShowNewFolderButton = $true
+        $result = $fb.ShowDialog($owner)
+    } finally {
+        $owner.Close()
+        $owner.Dispose()
+    }
+    if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+        Write-Output ("OK::" + $fb.SelectedPath)
+    } else {
+        Write-Output "CANCELLED::"
+    }
+} catch {
+    Write-Output ("ERROR::" + $_.Exception.Message)
 }
 '''
         try:
+            _log.info("native_folder_picker: spawning PowerShell picker")
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps_script],
                 capture_output=True, text=True, timeout=120,
                 creationflags=NO_WINDOW,
             )
-            chosen = r.stdout.strip()
-            if not chosen or chosen == "::CANCELLED::":
+            stdout = (r.stdout or "").strip()
+            stderr = (r.stderr or "").strip()
+            _log.info(
+                "native_folder_picker: rc=%s stdout=%r stderr=%r",
+                r.returncode, stdout[:500], stderr[:500],
+            )
+            # Parse tagged output to distinguish silent failures from cancels.
+            if stdout.startswith("OK::"):
+                return (stdout[4:], None)
+            if stdout.startswith("CANCELLED::") or stdout == "":
                 return (None, "cancelled")
-            return (chosen, None)
+            if stdout.startswith("ERROR::"):
+                return (None, "Picker error: " + stdout[7:])
+            if stderr:
+                return (None, "PowerShell stderr: " + stderr[:300])
+            return (None, "Unexpected picker output: " + stdout[:300])
+        except subprocess.TimeoutExpired:
+            _log.error("native_folder_picker: PowerShell timed out after 120s")
+            return (None, "Folder picker timed out — the dialog may be hidden behind another window")
         except Exception as e:
+            _log.exception("native_folder_picker: subprocess failed")
             return (None, str(e))
 
     elif sys.platform == "darwin":

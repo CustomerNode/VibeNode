@@ -479,19 +479,27 @@ async function addProjectBrowse() {
   // hung (e.g. dialog opening behind Chrome on a fresh Windows install),
   // the user would have no way to recover without refreshing the page.
   showToast('Opening folder picker\u2026');
+  console.log('[addProjectBrowse] POST /api/add-project mode=browse');
   try {
     const resp = await fetch('/api/add-project', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({mode:'browse'}) });
     const data = await resp.json();
+    console.log('[addProjectBrowse] response', resp.status, data);
     if (data.cancelled) { openProjectOverlay(); return; }
     if (data.ok) {
       showToast('Added ' + data.path);
       await loadProjects();
       openProjectOverlay();
     } else {
-      showToast(data.error || 'Add failed', true);
+      const errMsg = data.error || ('Add failed (HTTP ' + resp.status + ')');
+      console.error('[addProjectBrowse] failed:', errMsg, data);
+      showToast(errMsg, true);
       openProjectOverlay();
     }
-  } catch(e) { showToast('Add failed', true); openProjectOverlay(); }
+  } catch(e) {
+    console.error('[addProjectBrowse] exception:', e);
+    showToast('Add failed: ' + (e && e.message ? e.message : e), true);
+    openProjectOverlay();
+  }
 }
 
 let _findChat = null;
