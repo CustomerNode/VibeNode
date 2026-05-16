@@ -75,8 +75,25 @@ def create_app(testing=False) -> Flask:
         # PERF-CRITICAL: Startup-only cleanup — do NOT call from all_sessions() or per-request paths. See CLAUDE.md #13.
         # Prune stale utility session JSONL files (>24h) — once at startup,
         # not on every /api/sessions request.
-        from .config import _cleanup_system_sessions
+        from .config import _cleanup_system_sessions, _cleanup_aititle_orphans
         _cleanup_system_sessions()
+
+        # Prune ai-title-only JSONL orphans created when the CLI auto-titles
+        # a session but the conversation never lands on disk under that ID
+        # (CLI death mid-write after a delete, or SDK session-ID remap).
+        # Without this sweep these files accumulate and surface in the
+        # sidebar as bare-UUID "empty chats".  Startup-only — same hot-path
+        # rule as _cleanup_system_sessions.
+        try:
+            n = _cleanup_aititle_orphans()
+            if n:
+                import logging as _logging
+                _logging.getLogger("app").info(
+                    "Pruned %d ai-title-only orphan JSONL file(s) at startup", n
+                )
+        except Exception:
+            import logging as _logging
+            _logging.getLogger("app").exception("ai-title orphan cleanup failed")
 
         # Start background git fetch at startup
         from .git_ops import start_bg_fetch

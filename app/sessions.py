@@ -16,6 +16,7 @@ from .config import (
     _get_deleted_ids,
     _get_utility_ids,
     _get_remapped_ids,
+    _is_aititle_only_orphan,
 )
 
 
@@ -487,6 +488,14 @@ def _is_system_content(text: str) -> bool:
 def all_sessions(summary_only: bool = False, project: str = "") -> list:
     # Filter out tombstoned (recently deleted) sessions so zombie .jsonl files
     # recreated by dying claude.exe processes never appear in the UI.
+    # Also drop ai-title-only orphans — the CLI eagerly writes an ai-title
+    # record on session start, and if the conversation never lands under that
+    # filename (CLI dying post-delete; SDK remap edge cases) the leftover
+    # 100-byte stub would surface as a bare-UUID empty chat.  The startup
+    # sweep in app/__init__.py deletes them on disk; this filter is the
+    # in-flight guard for orphans created between sweeps.  The check is a
+    # stat() + 1-line read — only fires when the file is <500 bytes, so it
+    # adds no cost on real chats.
     deleted_ids = _get_deleted_ids(project)
     utility_ids = _get_utility_ids(project)
     remapped_ids = _get_remapped_ids(project)
@@ -494,7 +503,8 @@ def all_sessions(summary_only: bool = False, project: str = "") -> list:
              if f.stem not in deleted_ids
              and f.stem not in utility_ids
              and f.stem not in remapped_ids
-             and not f.stem.startswith("_")]
+             and not f.stem.startswith("_")
+             and not _is_aititle_only_orphan(f)]
     loader = load_session_summary if summary_only else load_session
     if summary_only and len(files) > 10:
         with ThreadPoolExecutor(max_workers=min(16, len(files))) as pool:

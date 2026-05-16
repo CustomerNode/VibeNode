@@ -6,9 +6,12 @@ independently defined the same platform-specific constants and
 message-classification helpers.
 """
 
+import logging
 import re
 import subprocess
 import sys
+
+_log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Windows process creation flag
@@ -52,13 +55,40 @@ def native_folder_picker() -> tuple:
         (None, error_string)  on failure / unsupported platform
     """
     if sys.platform == "win32":
+        # NOTE: FolderBrowserDialog.ShowDialog() with no owner often opens
+        # BEHIND the browser window (or invisibly minimised) because the
+        # PowerShell child process has no foreground window of its own.
+        # On the user's previous machine this happened to work; on a fresh
+        # Windows install it manifests as "click Browse, nothing happens".
+        # Fix: create a hidden, off-screen, TopMost owner Form, push it to
+        # the foreground via SetForegroundWindow, and pass it as the dialog
+        # owner so the picker inherits the foreground state and z-order.
         ps_script = r'''
 Add-Type -AssemblyName System.Windows.Forms
-$fb = New-Object System.Windows.Forms.FolderBrowserDialog
-$fb.Description = "Select a project folder"
-$fb.RootFolder = [System.Environment+SpecialFolder]::MyComputer
-$fb.ShowNewFolderButton = $true
-$result = $fb.ShowDialog()
+Add-Type -AssemblyName System.Drawing
+Add-Type -Namespace VN -Name Win -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool SetForegroundWindow(System.IntPtr hWnd);
+"@
+$owner = New-Object System.Windows.Forms.Form
+$owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+$owner.Location = New-Object System.Drawing.Point -10000, -10000
+$owner.Size = New-Object System.Drawing.Size 1, 1
+$owner.ShowInTaskbar = $false
+$owner.TopMost = $true
+$owner.Show()
+[void][VN.Win]::SetForegroundWindow($owner.Handle)
+try {
+    $fb = New-Object System.Windows.Forms.FolderBrowserDialog
+    $fb.Description = "Select a project folder"
+    $fb.RootFolder = [System.Environment+SpecialFolder]::MyComputer
+    $fb.ShowNewFolderButton = $true
+    $result = $fb.ShowDialog($owner)
+} finally {
+    $owner.Close()
+    $owner.Dispose()
+}
 if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
     Write-Output $fb.SelectedPath
 } else {

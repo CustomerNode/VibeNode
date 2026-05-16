@@ -270,6 +270,14 @@ function openProjectOverlay() {
   const list = document.getElementById('project-list');
   const saved = localStorage.getItem('activeProject');
 
+  // Restore footer visibility — addProjectOverlay() / addProjectFind() hide it
+  // when entering the Add flow; without this reset, the "+ Add Project" button
+  // stays hidden after the user goes "Back to Projects" and they can't add
+  // another project without a full page refresh.
+  const footer = document.querySelector('.project-footer');
+  if (footer) footer.style.display = '';
+  list.style.padding = '';
+
   list.innerHTML = _allProjects.map(p => {
     const shortName = _projectShortName(p);
     const isActive = p.encoded === saved;
@@ -465,7 +473,11 @@ function addProjectOverlay() {
 }
 
 async function addProjectBrowse() {
-  closeProjectOverlay();
+  // Keep the project overlay open while the native folder picker is up.
+  // Native OS dialogs always render above browser content, so the picker
+  // appears on top of the modal. If we closed the modal here and the picker
+  // hung (e.g. dialog opening behind Chrome on a fresh Windows install),
+  // the user would have no way to recover without refreshing the page.
   showToast('Opening folder picker\u2026');
   try {
     const resp = await fetch('/api/add-project', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({mode:'browse'}) });

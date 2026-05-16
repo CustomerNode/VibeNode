@@ -43,6 +43,69 @@ def _cleanup_system_sessions() -> None:
                 f.unlink()
         except Exception:
             pass
+
+
+def _is_aititle_only_orphan(path) -> bool:
+    """Return True when *path* is a JSONL whose sole record is an ``ai-title``.
+
+    The Claude CLI eagerly writes ``{"type":"ai-title", ...}`` to the project
+    JSONL when it auto-generates a session title.  If the conversation then
+    fails to land on disk under that same filename — e.g. the CLI subprocess
+    dies mid-write and silently recreates the file after `api_delete`
+    unlinked it, or the SDK remaps the session to a different on-disk ID —
+    the user is left with a 100-byte file containing nothing but the title
+    record.  ``app/sessions.py`` doesn't recognise the ``ai-title`` type, so
+    the chat surfaces in the sidebar with the bare UUID as its display name.
+
+    These orphans are safe to delete: they have no user/assistant turns and
+    are not reachable from any live session (active sessions append messages
+    continuously, so they wouldn't match the 1-line check).
+    """
+    import json as _json
+    try:
+        if path.stat().st_size > 500:
+            return False
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = [ln.strip() for ln in fh.readlines() if ln.strip()]
+    except Exception:
+        return False
+    if len(lines) != 1:
+        return False
+    try:
+        obj = _json.loads(lines[0])
+    except Exception:
+        return False
+    return obj.get("type") == "ai-title"
+
+
+def _cleanup_aititle_orphans() -> int:
+    """Delete ai-title-only orphan JSONL files across every project directory.
+
+    Run at startup (see ``app/__init__.py``) to keep the project directories
+    free of these zero-message stubs.  Returns the count of files removed
+    for logging.
+
+    Skips the encoded ``_SYSTEM_UTILITY_CWD`` project — those files are
+    legitimate title-generation transcripts and are pruned by their own
+    age-based sweep above.
+    """
+    if not _CLAUDE_PROJECTS.is_dir():
+        return 0
+    sys_encoded = _encode_cwd(_SYSTEM_UTILITY_CWD)
+    removed = 0
+    for d in _CLAUDE_PROJECTS.iterdir():
+        if not d.is_dir():
+            continue
+        if d.name == sys_encoded or d.name.startswith("subagents") or d.name.startswith("_"):
+            continue
+        for f in d.glob("*.jsonl"):
+            if _is_aititle_only_orphan(f):
+                try:
+                    f.unlink()
+                    removed += 1
+                except Exception:
+                    pass
+    return removed
 # Allow tests to override config path via env var
 _KANBAN_CONFIG_FILE = Path(_os.environ["VIBENODE_CONFIG"]) if _os.environ.get("VIBENODE_CONFIG") else _VIBENODE_DIR / "kanban_config.json"
 
