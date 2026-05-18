@@ -46,36 +46,64 @@ def _cleanup_system_sessions() -> None:
 
 
 def _is_aititle_only_orphan(path) -> bool:
-    """Return True when *path* is a JSONL whose sole record is an ``ai-title``.
+    """Return True when *path* is a JSONL whose only records are metadata.
 
-    The Claude CLI eagerly writes ``{"type":"ai-title", ...}`` to the project
-    JSONL when it auto-generates a session title.  If the conversation then
-    fails to land on disk under that same filename — e.g. the CLI subprocess
-    dies mid-write and silently recreates the file after `api_delete`
-    unlinked it, or the SDK remaps the session to a different on-disk ID —
-    the user is left with a 100-byte file containing nothing but the title
-    record.  ``app/sessions.py`` doesn't recognise the ``ai-title`` type, so
-    the chat surfaces in the sidebar with the bare UUID as its display name.
+    The Claude CLI eagerly writes ``{"type":"ai-title", ...}`` to the
+    project JSONL when it auto-generates a session title.  It may also
+    write ``{"type":"file-history-snapshot", ...}`` records during session
+    bootstrap (tracking files in the cwd before the first user turn).  If
+    the conversation then fails to land on disk under that same filename —
+    e.g. the user closes the tab before typing, the CLI subprocess dies
+    mid-write and silently recreates the file after `api_delete` unlinked
+    it, or the SDK remaps the session to a different on-disk ID — the
+    user is left with a stub file containing only an ``ai-title`` record
+    and (optionally) file-history-snapshot records.  ``app/sessions.py``
+    doesn't recognise these as conversation types, so the chat surfaces in
+    the sidebar with the bare UUID as its display name.
 
-    These orphans are safe to delete: they have no user/assistant turns and
-    are not reachable from any live session (active sessions append messages
-    continuously, so they wouldn't match the 1-line check).
+    These orphans are safe to delete: they have no user/assistant turns
+    and are not reachable from any live session (active sessions append
+    user/assistant records as soon as the first turn flushes).
+
+    Scan bounded to 100 KB.  Real sessions with even one user/assistant
+    turn easily exceed this in practice.  The largest stub-with-snapshots
+    observed in the wild was 73 KB (the file-history-snapshot machinery
+    can attach dozens of records before the first turn).  Files larger
+    than the cap return False without scanning so the per-request
+    ``all_sessions()`` filter stays cheap on real sidebar contents.
+
+    To declare an orphan we require ``ai-title`` to be present somewhere
+    in the file.  A pure file-history-snapshot file (no title) is left
+    alone — the function specifically targets the CLI's title-eager
+    leak path; it is not a generic "delete any file without messages"
+    sweeper.  Malformed lines also cause us to bail out (return False)
+    because we can't be sure what they contain.
     """
     import json as _json
     try:
-        if path.stat().st_size > 500:
+        if path.stat().st_size > 100_000:
             return False
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             lines = [ln.strip() for ln in fh.readlines() if ln.strip()]
     except Exception:
         return False
-    if len(lines) != 1:
+    if not lines:
         return False
-    try:
-        obj = _json.loads(lines[0])
-    except Exception:
-        return False
-    return obj.get("type") == "ai-title"
+    saw_ai_title = False
+    for line in lines:
+        try:
+            obj = _json.loads(line)
+        except Exception:
+            return False  # malformed line — be conservative, don't auto-delete
+        t = obj.get("type")
+        if t == "ai-title":
+            saw_ai_title = True
+        elif t == "file-history-snapshot":
+            continue
+        else:
+            # Any user/assistant/summary/tool_*/etc. record => real session
+            return False
+    return saw_ai_title
 
 
 def _cleanup_aititle_orphans() -> int:

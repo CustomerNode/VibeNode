@@ -164,3 +164,138 @@ class TestProjectAliasResolution:
         monkeypatch.setattr(config, "_KANBAN_CONFIG_FILE", cfg_file)
         config._kanban_config_cache = None
         assert config.resolve_project_alias("-home-me-X") == "-home-me-X"
+
+
+# ---------------------------------------------------------------------------
+# ai-title-only orphan detector
+# ---------------------------------------------------------------------------
+#
+# _is_aititle_only_orphan() detects stub .jsonl files left behind when the
+# CLI auto-titles a session but no conversation lands.  It is called from
+# the per-request all_sessions() filter AND from the startup-time
+# _cleanup_aititle_orphans() sweep.  Originally it only handled the single-
+# line ai-title case (≤500 B); extended 2026-05-18 to also catch the
+# multi-line case where the CLI attaches file-history-snapshot records
+# during session bootstrap (largest observed in the wild: 73 KB).
+
+class TestAiTitleOnlyOrphan:
+
+    def test_single_ai_title_line_is_orphan(self, tmp_path):
+        from app.config import _is_aititle_only_orphan
+        p = tmp_path / "stub.jsonl"
+        p.write_text(
+            '{"type":"ai-title","aiTitle":"foo","sessionId":"x"}\n',
+            encoding="utf-8",
+        )
+        assert _is_aititle_only_orphan(p) is True
+
+    def test_ai_title_plus_file_history_snapshot_is_orphan(self, tmp_path):
+        """Regression for the 73KB stub case — multi-line file where every
+        non-title record is a file-history-snapshot must still be orphan.
+        Without this fix the file survived both the all_sessions() filter
+        and the startup sweep."""
+        import json
+        from app.config import _is_aititle_only_orphan
+        p = tmp_path / "stub-with-snapshots.jsonl"
+        lines = [json.dumps({"type": "ai-title", "aiTitle": "foo"})]
+        for i in range(20):
+            lines.append(json.dumps({
+                "type": "file-history-snapshot",
+                "messageId": f"m{i}",
+                "snapshot": {"trackedFileBackups": {}},
+            }))
+        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        assert p.stat().st_size > 500, "test setup must exceed the old 500B cap"
+        assert _is_aititle_only_orphan(p) is True
+
+    def test_user_turn_is_not_orphan(self, tmp_path):
+        from app.config import _is_aititle_only_orphan
+        p = tmp_path / "real.jsonl"
+        p.write_text(
+            '{"type":"ai-title","aiTitle":"foo"}\n'
+            '{"type":"user","message":{"content":"hi"}}\n',
+            encoding="utf-8",
+        )
+        assert _is_aititle_only_orphan(p) is False
+
+    def test_assistant_turn_is_not_orphan(self, tmp_path):
+        from app.config import _is_aititle_only_orphan
+        p = tmp_path / "real.jsonl"
+        p.write_text(
+            '{"type":"ai-title","aiTitle":"foo"}\n'
+            '{"type":"assistant","message":{"content":"hi"}}\n',
+            encoding="utf-8",
+        )
+        assert _is_aititle_only_orphan(p) is False
+
+    def test_summary_record_is_not_orphan(self, tmp_path):
+        """Compacted sessions start with a summary record — must not be
+        wiped by the orphan sweep."""
+        from app.config import _is_aititle_only_orphan
+        p = tmp_path / "compacted.jsonl"
+        p.write_text(
+            '{"type":"ai-title","aiTitle":"foo"}\n'
+            '{"type":"summary","summary":"compact summary"}\n',
+            encoding="utf-8",
+        )
+        assert _is_aititle_only_orphan(p) is False
+
+    def test_large_file_not_scanned(self, tmp_path):
+        """Files >100KB return False without scanning — perf guard for the
+        per-request all_sessions() filter on real sidebar contents."""
+        from app.config import _is_aititle_only_orphan
+        p = tmp_path / "huge.jsonl"
+        # Pure ai-title content above the 100KB cap. Would otherwise pass
+        # the type check; the size guard must short-circuit first.
+        big_line = '{"type":"ai-title","aiTitle":"foo"}'
+        p.write_text((big_line + "\n") * 5000, encoding="utf-8")
+        assert p.stat().st_size > 100_000
+        assert _is_aititle_only_orphan(p) is False
+
+    def test_empty_file_is_not_orphan(self, tmp_path):
+        """Empty file is not specifically an ai-title stub — leave alone."""
+        from app.config import _is_aititle_only_orphan
+        p = tmp_path / "empty.jsonl"
+        p.write_text("", encoding="utf-8")
+        assert _is_aititle_only_orphan(p) is False
+
+    def test_snapshot_only_without_ai_title_is_not_orphan(self, tmp_path):
+        """File-history-snapshot only (no ai-title) → leave alone.  The
+        detector specifically targets the title-eager leak path, not any
+        file without messages."""
+        import json
+        from app.config import _is_aititle_only_orphan
+        p = tmp_path / "snapshot-only.jsonl"
+        p.write_text(
+            json.dumps({"type": "file-history-snapshot"}) + "\n",
+            encoding="utf-8",
+        )
+        assert _is_aititle_only_orphan(p) is False
+
+    def test_malformed_line_is_not_orphan(self, tmp_path):
+        """Malformed JSON line → be conservative, don't auto-delete."""
+        from app.config import _is_aititle_only_orphan
+        p = tmp_path / "broken.jsonl"
+        p.write_text(
+            '{"type":"ai-title","aiTitle":"foo"}\n'
+            'not valid json{{{\n',
+            encoding="utf-8",
+        )
+        assert _is_aititle_only_orphan(p) is False
+
+    def test_missing_file_is_not_orphan(self, tmp_path):
+        """Nonexistent path → False, no exception leaks to caller."""
+        from app.config import _is_aititle_only_orphan
+        p = tmp_path / "ghost.jsonl"
+        assert _is_aititle_only_orphan(p) is False
+
+    def test_tool_use_is_not_orphan(self, tmp_path):
+        """tool_use records mean a conversation happened — not orphan."""
+        from app.config import _is_aititle_only_orphan
+        p = tmp_path / "tooluse.jsonl"
+        p.write_text(
+            '{"type":"ai-title","aiTitle":"foo"}\n'
+            '{"type":"tool_use","name":"Read"}\n',
+            encoding="utf-8",
+        )
+        assert _is_aititle_only_orphan(p) is False
