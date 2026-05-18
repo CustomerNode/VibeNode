@@ -41,6 +41,9 @@ Do NOT use subprocess, os.system, taskkill, or any other method to start, stop, 
 ## File organization — keep the root clean
 All planning documents, implementation notes, design specs, task breakdowns, and working docs belong in `docs/plans/` — NEVER in the project root. The root directory is for code, config, and the README only. If you need to create a spec, plan, or notes file, put it in `docs/plans/`. This folder is gitignored and is not shipped to users.
 
+## Workforce agents — follow the authoring standard
+When you create or edit any `.md` file in `workforce/`, you MUST first read `workforce/AGENT_BEST_PRACTICES.md` and follow the rules it defines (Invocation Contract section, numbered Output Format with "Obstacles Encountered", unique-value statement, version bump, etc.). The agents in `workforce/` are loaded into every Claude session's catalog via `/api/workforce/assets`, so structural inconsistencies in them propagate to every spawned subagent. Treat the authoring standard as load-bearing, not optional.
+
 ## Performance-critical patterns — DO NOT MODIFY without profiling
 
 VibeNode underwent a measurement-driven performance overhaul. The patterns below were profiled and validated with real instrumentation. Reverting any of them causes measurable regression. Look for `PERF-CRITICAL` markers in the code.

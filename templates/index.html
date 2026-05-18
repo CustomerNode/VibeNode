@@ -55,6 +55,7 @@
       <button onclick="runTests('full');closeHdrSys()">Run Tests (Full)</button>
       <div class="sys-separator"></div>
       <button onclick="runCodeScan();closeHdrSys()">Server Scan</button>
+      <button onclick="scrubPhantomNames();closeHdrSys()" title="Remove session-name entries that point to deleted sessions">Scrub Phantom Names <span class="sys-item-value" id="sys-phantom-badge"></span></button>
       <button onclick="restartServer();closeHdrSys()">Restart Server</button>
       <button onclick="shutdownServer();closeHdrSys()" style="color:var(--danger,#e55)">Turn Off Server</button>
     </div>

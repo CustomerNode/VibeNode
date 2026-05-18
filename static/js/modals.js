@@ -169,6 +169,98 @@ function shutdownServer() {
   };
 }
 
+// --- Scrub Phantom Names ---
+// Removes _session_names.json entries that point to deleted sessions.
+// See docs/plans/phantom-sessions-fix-spec.md for the full algorithm.
+//
+// On click, runs dry_run=true first to compute the count across all
+// projects. If non-zero, shows a confirm dialog with the exact wording
+// from the spec. On confirm, fires dry_run=false. Then refreshes the
+// phantom-count badge regardless of outcome.
+async function scrubPhantomNames() {
+  let dry;
+  try {
+    const r = await fetch('/api/admin/scrub-phantoms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dry_run: true }),
+    });
+    dry = await r.json();
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Scrub preview failed: ' + e);
+    return;
+  }
+  if (!dry || dry.ok !== true) {
+    if (typeof showToast === 'function') showToast('Scrub preview failed.');
+    return;
+  }
+  const n = dry.total_removed || 0;
+  if (n === 0) {
+    if (typeof showToast === 'function') showToast('No phantom session names to remove.');
+    _refreshPhantomBadge();
+    return;
+  }
+  const msg = `Remove ${n} session-name entries that point to deleted sessions?\n\n`
+    + `No actual sessions will be deleted. A backup of each project's `
+    + `_session_names.json will be written before any change.`;
+  if (!window.confirm(msg)) return;
+  let result;
+  try {
+    const r = await fetch('/api/admin/scrub-phantoms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dry_run: false }),
+    });
+    result = await r.json();
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Scrub failed: ' + e);
+    return;
+  }
+  if (!result || result.ok !== true) {
+    if (typeof showToast === 'function') showToast('Scrub failed.');
+    return;
+  }
+  if (typeof showToast === 'function') {
+    showToast(`Removed ${result.total_removed} phantom session-name entries.`);
+  }
+  _refreshPhantomBadge();
+}
+
+// Silent dry-run on page load and after a scrub — updates the badge on the
+// System → Scrub Phantom Names button so the user can see at a glance
+// whether residue is present. No toast, no modal, no auto-cleanup. Scoped
+// to the *active* project so users with many projects aren't surprised by
+// a count that includes places they never use.
+async function _refreshPhantomBadge() {
+  const badge = document.getElementById('sys-phantom-badge');
+  if (!badge) return;
+  try {
+    let project = '';
+    try { project = localStorage.getItem('activeProject') || ''; } catch (e) {}
+    const body = { dry_run: true };
+    if (project) body.project = project;
+    const r = await fetch('/api/admin/scrub-phantoms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) { badge.textContent = ''; return; }
+    const data = await r.json();
+    const n = (data && data.total_removed) || 0;
+    badge.textContent = n > 0 ? String(n) : '';
+  } catch (e) {
+    badge.textContent = '';
+  }
+}
+
+// Refresh the badge once on initial load (after the rest of the UI boots).
+if (typeof window !== 'undefined') {
+  window.addEventListener('load', () => {
+    // Defer slightly so initial page boot work finishes first.
+    setTimeout(() => { try { _refreshPhantomBadge(); } catch (e) {} }, 1500);
+  });
+}
+
 // --- Persistent Storage modal (System → Persistent Storage) ---
 async function openPersistentStorage() {
   let config = {};

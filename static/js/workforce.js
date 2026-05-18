@@ -93,6 +93,16 @@ function _setViewModeImmediate(mode, prevMode) {
   const _proj = localStorage.getItem('activeProject');
   if (prevMode && prevMode !== mode) _saveViewPosition(_proj, prevMode);
 
+  // Sidebar multi-selection only makes sense in the sessions view.
+  // Leaving sessions for any other mode clears it so the badge doesn't
+  // sit stale when the user comes back.  No-op if selection is already
+  // empty.  Guarded by typeof so this stays safe if sessions.js is
+  // somehow not yet loaded (it always is by the time the view changes).
+  if (prevMode === 'sessions' && mode !== 'sessions'
+      && typeof _clearMultiSelect === 'function') {
+    _clearMultiSelect();
+  }
+
   viewMode = mode;
   localStorage.setItem('viewMode', mode);
   // Keep per-project view memory in sync so project switches restore it
@@ -420,9 +430,15 @@ function renderWorkforce(sessions) {
       : (statusSvg[st] || statusSvg.sleeping);
     const label = _isCompacting ? 'Compacting' : (_isSleepingCard ? 'Awaiting wake-up' : (statusLabel[st] || 'Sleeping'));
     const selClass = s.id === activeId ? ' wf-selected' : '';
+    // Multi-select: include .multi-selected class on initial render so the
+    // visual stays in sync after re-renders without an extra DOM pass.
+    // onmousedown (added below) intercepts Ctrl/Cmd+click to toggle the
+    // sidebar multi-selection without opening the session.  See
+    // _sessionRowMouseDown in sessions.js for the full mechanism.
+    const msClass = (typeof multiSelectedIds !== 'undefined' && multiSelectedIds.has(s.id)) ? ' multi-selected' : '';
     const name = escHtml((s.display_title||s.id).slice(0,22) + ((s.display_title||'').length>22?'\u2026':''));
     const date = _shortDate(s.last_activity);
-    return `<div class="wf-card wf-${st}${selClass}" onclick="singleOrDouble('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')" title="${escHtml(s.display_title)} \u2014 double-click to open in VibeNode">
+    return `<div class="wf-card wf-${st}${selClass}${msClass}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" onclick="singleOrDouble('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')" title="${escHtml(s.display_title)} \u2014 double-click to open in VibeNode">
       <div class="wf-avatar">${emoji}</div>
       <div class="wf-status-label">${label}</div>
       <div class="wf-name">${name}</div>

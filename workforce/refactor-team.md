@@ -3,7 +3,7 @@ id: refactor-team
 name: Refactor Team
 department: compose
 source: vibenode
-version: 1.0.0
+version: 1.1.0
 depends_on: []
 type: prompt-template
 ---
@@ -13,6 +13,17 @@ type: prompt-template
 Reusable prompt template. Invoke by typing: **refactor team**
 
 **Unique value**: Catches structural decay, duplication, and maintainability drag without changing external behavior. No other team improves internal quality as its primary mission.
+
+## Invocation Contract
+
+The caller MUST include in the kickoff prompt:
+- the target scope: specific files, modules, or a named code smell (e.g. "consolidate the three session-state caches in daemon/"),
+- explicit goals: what "better" means here (readability, duplication removal, structural clarity, testability, etc.),
+- explicit non-goals: behavior changes, performance changes, scope creep into adjacent code,
+- known PERF-CRITICAL paths in or near the target — these are no-touch unless preservation is provable,
+- the test suite or validation step that proves behavior is unchanged.
+
+If any of these are missing and cannot be inferred reliably from conversation context, request them before starting. Refactors without explicit boundaries become rewrites.
 
 ## The Prompt
 
@@ -58,15 +69,17 @@ Every Refactor Team run follows these rules:
 - The module is too tangled for safe incremental cleanup
 - The true scope is much larger than expected and needs prioritization
 
-## Output
+## Output Format
 
-Return one combined team report:
-- Scope
-- Approach
-- Changes made
-- Behavior verification
-- Before and after assessment
-- Documentation updated
-- Risks
-- Recommendations not implemented
-- What was not validated or could not be fully verified
+Return one combined team report in this numbered structure:
+
+1. **Scope** — Files and modules touched. Confirm out-of-scope code was not modified.
+2. **Approach** — The strategy taken (extract function, consolidate, rename, restructure). One sentence per major move.
+3. **Changes made** — Per-file summary of what changed and why.
+4. **Behavior verification** — How behavior was confirmed unchanged (test results, manual checks). Include the exact test commands run.
+5. **Before and after assessment** — Concrete improvement metric: line count, duplication count, cyclomatic complexity, readability. Not vibes — measurable.
+6. **Documentation updated** — Docstrings, module comments, inline comments updated to match the new structure.
+7. **Risks** — Anything that might subtly differ even if tests pass (timing, ordering, log output, error message text).
+8. **Recommendations not implemented** — Improvements out of scope or too risky for this pass.
+9. **What was not validated or could not be fully verified** — Behavior paths not covered by tests, env limits.
+10. **Obstacles encountered** — Setup issues, workarounds discovered, commands that needed special flags or configuration, dependencies or imports that caused problems, env quirks. Report anything the next stage would otherwise have to rediscover.

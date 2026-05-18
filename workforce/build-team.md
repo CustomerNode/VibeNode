@@ -3,7 +3,7 @@ id: build-team
 name: Build Team
 department: compose
 source: vibenode
-version: 1.0.0
+version: 1.1.0
 depends_on: [review-team]
 type: prompt-template
 ---
@@ -13,6 +13,17 @@ type: prompt-template
 Reusable prompt template. Invoke by typing: **build team**
 
 **Unique value**: Catches implementation errors, step-by-step correctness, and spec-to-code drift during construction. No other team builds with integrated review gates.
+
+## Invocation Contract
+
+The caller MUST include in the kickoff prompt:
+- the path to the spec being implemented (e.g. `docs/plans/<spec>.md`), OR the spec text inline if no file exists yet,
+- explicit out-of-scope items the build must NOT touch,
+- any pre-existing partial implementation to extend vs. replace,
+- known PERF-CRITICAL paths or strategic-intent constraints the spec touches,
+- the desired step granularity if non-default (e.g. "ship in one step, this is a 5-line change" or "break by file").
+
+If any of these are missing and cannot be inferred reliably from conversation context, request them before starting.
 
 ## The Prompt
 
@@ -98,15 +109,18 @@ Then update and enhance the regression tests:
 - Verify that all tests pass before proceeding.
 - If the project has an existing regression test file or suite, add to it rather than creating a separate file. Follow the existing test patterns and conventions.
 
-At the end, provide a final report with:
-- the steps completed,
-- the issues found and corrected,
-- any remaining assumptions, tradeoffs, or risks,
-- the top 3 suggested enhancements,
-- what was not validated or could not be fully verified.
-
-Enhancement suggestions must be plain English only. Do not implement them. Keep them aligned with the spec's intent or use them to highlight important unknown unknowns.
-
 Do not skip review cycles, do not collapse major steps into one, and do not stop early.
 
 Run this workflow through completion without asking for further prompts unless blocked by missing required information, missing access, or a material ambiguity that makes correct implementation impossible.
+
+## Output Format
+
+Return the final report in this numbered structure:
+
+1. **Steps completed** — Ordered list of the build steps and the files changed at each step.
+2. **Issues found and corrected** — Per-step and full-solution review findings that were fixed. Group by severity.
+3. **Strategic conflicts surfaced** — Any contradictions with `architecture-intent.md` that required user escalation (or "none" if none).
+4. **Assumptions, tradeoffs, and risks** — Decisions made on ambiguous points and why.
+5. **Top 3 suggested enhancements** — Plain English only. Do NOT implement them. Aligned with spec intent or highlighting unknown unknowns.
+6. **What was not validated or could not be fully verified** — Blind spots, env limits, paths that could not be tested.
+7. **Obstacles encountered** — Setup issues, workarounds discovered, commands that needed special flags or configuration, dependencies or imports that caused problems. Report anything the next stage would otherwise have to rediscover.

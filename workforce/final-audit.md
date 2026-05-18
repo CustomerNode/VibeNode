@@ -3,7 +3,7 @@ id: final-audit
 name: Final Audit
 department: compose
 source: vibenode
-version: 1.0.0
+version: 1.1.0
 depends_on: []
 type: prompt-template
 ---
@@ -15,6 +15,17 @@ Reusable prompt template. Invoke by typing: **final audit**
 **Unique value**: Catches intent mismatch, whole-system coherence failures, blast radius damage, and unintended behavioral drift that pass all other stages. No other team audits the finished result as a whole against the original goal.
 
 Last-pass skeptical audit of completed work. Use this after implementation, review, and testing are done. This is not a re-review — it is a whole-system sanity check that asks whether the finished result actually does what was intended, works end to end, and did not create new problems.
+
+## Invocation Contract
+
+The caller MUST include in the kickoff prompt:
+- the **original user request verbatim** — not paraphrased. Final Audit's whole purpose is comparing reality to original intent.
+- the list of files created or modified (or a git range like `HEAD~N..HEAD`),
+- pointers to prior pipeline artifacts if this is part of Execute Pipeline (e.g. `docs/plans/runs/<run-id>/`),
+- the spec the work was supposed to satisfy (if one exists),
+- any prior team's confidence levels and escalations so the audit can probe what was deferred.
+
+If any of these are missing and cannot be inferred reliably from conversation context, request them before starting. An audit without the original request cannot judge intent match.
 
 ## The Prompt
 
@@ -65,7 +76,9 @@ INSTRUCTIONS:
 - For anything that requires a judgment call, changes user-facing behavior, or has broader risk — do not fix it. Explain it clearly and recommend the next action.
 - Only conclude success if the solution is genuinely sound as a whole.
 
-OUTPUT FORMAT:
+## Output Format
+
+Return the audit report in this numbered structure:
 
 1. **Intent match** — Does the result achieve what the user actually wanted? Any gaps?
 2. **End-to-end behavior** — Does the full workflow hold together in practice?
@@ -74,7 +87,8 @@ OUTPUT FORMAT:
 5. **Fixes applied in this pass** — What was fixed directly, with file paths and brief explanation.
 6. **Issues escalated** — What needs the user's attention or a judgment call, and why.
 7. **What was not validated or could not be fully verified** — Blind spots, skipped areas, and anything this audit could not confirm.
-8. **Confidence level** — HIGH, MEDIUM, or LOW:
+8. **Obstacles encountered** — Setup issues, workarounds discovered, commands that needed special flags or configuration, dependencies or imports that caused problems, env quirks. Report anything that should be carried forward.
+9. **Confidence level** — HIGH, MEDIUM, or LOW:
    - **HIGH**: The solution is sound. It does what was intended, holds together end to end, and introduced no meaningful risk. Ship it. Do not assign HIGH unless there is no meaningful unresolved risk.
    - **MEDIUM**: The solution mostly works but has identifiable weak spots or gaps that should be addressed. Usable but not fully trusted yet.
    - **LOW**: Material problems found. The solution does not reliably achieve the intent, has significant risk, or broke something. Do not ship without further work.

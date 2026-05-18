@@ -3,8 +3,8 @@ id: execute-pipeline
 name: Execute Pipeline
 department: compose
 source: vibenode
-version: 1.1.0
-depends_on: [plan-team, build-team, review-team, test-team, final-audit]
+version: 1.2.0
+depends_on: [plan-team, build-team, review-team, test-team, final-audit, debug-team, hotfix-team, refactor-team]
 type: prompt-template
 ---
 
@@ -12,7 +12,17 @@ type: prompt-template
 
 Reusable prompt template. Invoke by typing: **execute pipeline**
 
-Full end-to-end orchestrator that chains Plan Team, Build Team, Review Team, Test Team, and Final Audit into a single uninterrupted execution. Use this when you want a request taken from idea to shipped result without stopping for intermediate prompts.
+Full end-to-end orchestrator that chains the relevant Teams into a single uninterrupted execution. Use this when you want a request taken from idea to shipped result without stopping for intermediate prompts.
+
+## Invocation Contract
+
+The caller MUST include in the kickoff prompt:
+- the original request verbatim (do not paraphrase it — the request itself is referenced by later stages),
+- any constraints, deadlines, or out-of-scope items the user has already specified,
+- pointers to prior conversation context that matter (e.g. "the conflict we discussed in compose project-scoping"),
+- whether this is new work, a bug fix, a production issue, or internal cleanup — if known. (If unknown, the pipeline classifies in Step 1.)
+
+If any of these are missing and cannot be inferred reliably from conversation context, request them before starting.
 
 ## The Prompt
 
@@ -45,10 +55,55 @@ TEAM UNIQUE VALUE — each team exists because it catches failures the others ca
 - Hotfix Team: catches production-blocking failures and applies minimum safe containment under time pressure.
 - Final Audit: catches intent mismatch, whole-system coherence failures, blast radius damage, and unintended behavioral drift that pass all other stages.
 
+ARTIFACT DISCIPLINE — STAGE OUTPUTS ON DISK:
+
+Each Team in this pipeline must persist its full findings to disk so subsequent stages can read the complete output rather than relying on summaries passed through context. Information loss between stages is the #1 failure mode of multi-stage pipelines; on-disk artifacts eliminate it.
+
+At the start of the pipeline, create a run directory under `docs/plans/runs/` (gitignored):
+
+    docs/plans/runs/<YYYY-MM-DD-HHMM>-<short-slug>/
+
+Use a short kebab-case slug derived from the request (e.g. `2026-05-15-1430-compose-conflict-fix`).
+
+Write a numbered file for each stage as it completes:
+- `00-request.md`     (the original request + classification)
+- `01-plan.md`        (Plan Team output, or the hardened spec)
+- `02-build.md`       (Build Team output: steps completed, per-step review notes)
+- `03-review.md`      (Review Team output)
+- `04-test.md`        (Test Team output, including any raw failure traces)
+- `05-debug.md`       (Debug Team output, if Debug was invoked)
+- `06-hotfix.md`      (Hotfix Team output, if Hotfix was invoked)
+- `07-refactor.md`    (Refactor Team output, if Refactor was invoked)
+- `08-audit.md`       (Final Audit output)
+
+Skip stage files that don't apply to the selected route. Numbering stays consistent.
+
+Each subsequent stage MUST read the prior stage's full artifact before starting, not just the in-context summary. The final pipeline report references these artifacts by path so the user can dig into any stage without re-running.
+
 TEAM WORKFLOW:
 
-1. Plan Team
-Convert the request into a hardened, executable implementation spec. Write the spec to docs/plans/.
+1. **Routing Decision** (BEFORE any team is invoked)
+
+Classify the request and select the route. Do not default to the new-feature route.
+
+Routes:
+- **(a) New feature or major change** → Plan Team → Build Team → Review Team → Test Team → Final Audit
+- **(b) Bug with unknown cause** → Debug Team → Build Team → Review Team → Test Team → Final Audit
+- **(c) Production issue where speed matters** → Hotfix Team → Review Team → targeted test validation → Final Audit
+- **(d) Internal cleanup with no intended behavior change** → Refactor Team → Review Team → Test Team → Final Audit
+
+Classification rules:
+- If the user said "fix" but the cause is known and the patch is small and bounded → route (b) is overkill; consider (a) with a minimal spec, or (c) if production is broken right now.
+- If symptoms exist but no one knows why → (b).
+- If a user-facing workflow is currently broken in production and minutes matter → (c).
+- If the user said "clean up," "refactor," "consolidate," or "extract" with no behavior change intended → (d).
+- If the request is ambiguous between routes → ask the user. Picking the wrong route burns more time than asking.
+
+Write the chosen route and a one-sentence rationale to `00-request.md` along with the verbatim original request.
+
+2. **Plan Team** (if route a; or skip to corresponding entry team for b/c/d)
+
+Convert the request into a hardened, executable implementation spec. Write the spec to `docs/plans/` (the spec itself) AND a copy of the Plan Team report to `01-plan.md` in the run directory.
 Challenge weak assumptions.
 Resolve ambiguity where possible.
 Identify risks, dependencies, edge cases, failure modes, performance concerns, and blast radius.
@@ -56,37 +111,48 @@ Define exactly what should be built, how success will be judged, and what must n
 When the spec is complete, hand off immediately to Build Team.
 If Build Team, Review Team, or Test Team later discovers a flaw that invalidates part of the spec, loop back here to revise before continuing.
 
-2. Build Team
-Implement the approved spec end to end.
+3. **Build Team**
+
+Implement the approved spec end to end. Read `01-plan.md` (or the spec at `docs/plans/<spec>.md`) in full before starting.
 Work step by step.
 Keep changes clean, scoped, and aligned to intent.
 Do not drift into unrelated cleanup or refactoring unless required.
 Preserve external behavior outside the requested scope.
 Add or update tests as implementation progresses.
 Document the code where needed so future developers can understand what changed and why.
+Write the Build Team report to `02-build.md`.
 When implementation is complete, hand off to Review Team.
 If Review Team finds issues, fix them and re-submit for review. Do not proceed to Test Team until Review passes.
 
-3. Review Team
+4. **Review Team**
+
+Read `02-build.md` in full before starting.
 Review the result for code quality, security, compliance, documentation, maintainability, and adherence to project rules.
 Do not rubber-stamp.
 If something is weak, fix it or send it back to Build Team for correction.
 Make sure the implementation matches the spec and does not create hidden risk.
 Confirm the code is understandable, the documentation is accurate, and the regression suite is appropriately strengthened for the change.
+Write the Review Team report to `03-review.md`.
 When review passes, hand off to Test Team.
 If issues are fundamental enough to require spec changes, loop back to Plan Team.
 
-4. Test Team
+5. **Test Team**
+
+Read `02-build.md` and `03-review.md` in full before starting.
 Run broad validation beyond implementation tests.
 Validate integrated behavior, real workflows, edge cases, stale state, concurrency risks, error handling, browser and platform behavior, and performance-sensitive paths where relevant.
 Do not stop at unit tests.
 Fix low-risk obvious issues directly. Escalate anything deeper back to Build Team with specifics.
 Strengthen regression coverage where gaps are found.
+When a test fails, include the raw verbatim output in `04-test.md` (full traceback, full assertion, full stderr) — do not summarize failures.
 When validation passes, proceed to Final Audit.
 If testing reveals a design-level problem, loop back to Plan Team or Build Team as appropriate.
 
-5. Final Audit
+6. **Final Audit**
+
 This is not a re-review. Review and Test already did their jobs. This is a whole-system skeptical audit that asks whether the finished result actually does what was intended, works end to end, and did not create new problems.
+
+Read `00-request.md` (for the original goal) and ALL prior stage artifacts in full before starting.
 
 Before auditing, scope the work:
 - Identify the original request and its actual goal — not the literal words, but what the user wanted to achieve.
@@ -127,26 +193,27 @@ Edge cases and operational risk:
 
 Fix problems that are clear, low-risk, and unambiguous. Do not expand scope — only fix issues directly related to the completed work. For anything that requires a judgment call, changes user-facing behavior, or has broader risk — do not fix it. Explain it clearly and recommend the next action.
 
-Produce the final report with confidence level.
+Write the Final Audit report to `08-audit.md`.
 
-ROUTING RULES:
-- New feature or major change → Plan Team → Build Team → Review Team → Test Team → Final Audit.
-- Bug with unknown cause → Debug Team → Build Team → Review Team → Test Team → Final Audit.
-- Production issue where speed matters → Hotfix Team → Review Team → targeted test validation → Final Audit.
-- Internal cleanup with no intended behavior change → Refactor Team → Review Team → Test Team → Final Audit.
+Produce the final pipeline report with confidence level.
 
-OUTPUT FORMAT:
-Return results in this structure:
+## Output Format
 
-1. Hardened spec (file path in docs/plans/)
-2. Implementation summary
-3. Review findings and fixes
-4. Test coverage and validation results
-5. Final audit findings: intent match, blast radius, fixes applied, issues escalated
-6. Risks, tradeoffs, and follow-up items
-7. Final confidence level: HIGH, MEDIUM, or LOW
-   - HIGH: Solution is sound, holds together end to end, no meaningful risk. Ship it. Do not assign HIGH unless there is no meaningful unresolved risk.
-   - MEDIUM: Mostly works but has identifiable weak spots that should be addressed. Usable but not fully trusted.
-   - LOW: Material problems found. Does not reliably achieve intent, has significant risk, or broke something. Do not ship.
+Return the final pipeline report in this numbered structure:
+
+1. **Route taken** — Which route (a/b/c/d) was selected and the one-sentence rationale.
+2. **Run directory** — Path to `docs/plans/runs/<...>/` containing all stage artifacts.
+3. **Hardened spec** — File path in `docs/plans/` (route a only).
+4. **Implementation summary** — What was built. Brief; full detail in `02-build.md`.
+5. **Review findings and fixes** — Brief summary; full detail in `03-review.md`.
+6. **Test coverage and validation results** — Brief summary; full detail in `04-test.md`. Raw failure traces, if any, are in the artifact.
+7. **Final audit findings** — Intent match, blast radius, fixes applied, issues escalated. Brief; full detail in `08-audit.md`.
+8. **Risks, tradeoffs, and follow-up items** — Anything material that was deferred or remains uncertain.
+9. **What was not validated or could not be fully verified** — Blind spots across the whole pipeline.
+10. **Obstacles encountered** — Setup issues, workarounds, commands needing special flags, dependency or env quirks discovered at any stage. Aggregated so the next pipeline run benefits.
+11. **Final confidence level** — HIGH, MEDIUM, or LOW:
+    - HIGH: Solution is sound, holds together end to end, no meaningful risk. Ship it. Do not assign HIGH unless there is no meaningful unresolved risk.
+    - MEDIUM: Mostly works but has identifiable weak spots that should be addressed. Usable but not fully trusted.
+    - LOW: Material problems found. Does not reliably achieve intent, has significant risk, or broke something. Do not ship.
 
 Execute this request through the full team workflow and take it to completion.

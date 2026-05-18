@@ -5178,6 +5178,95 @@ paths:
                     type: string
 
   # ==========================================================================
+  # Admin / maintenance (admin_api.py)
+  # ==========================================================================
+  /api/admin/scrub-phantoms:
+    post:
+      tags: [App]
+      summary: Remove phantom entries from _session_names.json
+      operationId: scrubPhantoms
+      description: |
+        Scrubs "phantom" session-name entries — rows whose session ID has no
+        on-disk JSONL, is not an in-flight daemon session, and is not a
+        tracked utility session. On `dry_run=true` (default), reports the
+        per-project count without mutating. On `dry_run=false`, writes a
+        timestamped backup of `_session_names.json` before removing the
+        phantom keys, then emits `sessions_refresh` over WebSocket. Returns
+        HTTP 429 if a scrub is already in progress.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                project:
+                  type: string
+                  description: |
+                    Encoded project name. When omitted, scrubs every visible
+                    user project.
+                dry_run:
+                  type: boolean
+                  default: true
+                  description: |
+                    When true, never mutate. When false, write backups and
+                    remove phantom keys.
+      responses:
+        "200":
+          description: Scrub result (or dry-run preview)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  dry_run:
+                    type: boolean
+                  total_removed:
+                    type: integer
+                  per_project:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        project:
+                          type: string
+                        removed:
+                          type: integer
+                        backup:
+                          type: string
+                          nullable: true
+                        error:
+                          type: string
+                          nullable: true
+        "400":
+          description: Unknown project
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  error:
+                    type: string
+                  valid_projects:
+                    type: array
+                    items:
+                      type: string
+        "429":
+          description: Another scrub is already in progress
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  error:
+                    type: string
+
+  # ==========================================================================
   # API Docs (served from the app)
   # ==========================================================================
   /api/docs:

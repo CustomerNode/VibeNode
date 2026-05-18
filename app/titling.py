@@ -3,9 +3,37 @@ Session title generation — uses Claude Haiku for concise, high-quality names
 with a fast heuristic fallback if the API is unavailable.
 
 Title generation chain:
-  1. Direct Anthropic API  (fastest, needs ANTHROPIC_API_KEY)
-  2. Claude CLI             (uses CLI auth/OAuth, no key needed)
-  3. Heuristic              (instant, no API needed)
+  1. Daemon (haiku via existing daemon connection, effort=low)
+  2. Direct Anthropic API (fastest, needs ANTHROPIC_API_KEY)
+  3. Claude CLI            (uses CLI auth/OAuth, no key needed)
+  4. Heuristic             (instant, no API needed)
+
+Title-utility JSONL cleanup
+---------------------------
+Daemon-based title generation spawns a session with ``cwd=_SYSTEM_UTILITY_CWD``
+(``~/.claude/_system``). The SDK persists those JSONL files in the encoded form
+of that path — ``C--Users-<user>--claude--system`` — **never under the user's
+active project**. The cleanup logic must therefore look for the file in the
+*system utility project*, not in ``_active_project``.
+
+``_cleanup_title_jsonl(sid, sm, project)`` tries three strategies, in order:
+
+  1. ``<system_project>/<sid>.jsonl`` — original spawn-time sid.
+  2. ``<system_project>/<remapped_sid>.jsonl`` — looked up via
+     ``sm._id_aliases`` (the in-memory daemon-client proxy map updated by the
+     ``session_id_remapped`` IPC event). This covers the same-process case.
+  3. Content-scan fallback: iterate the system project's ``*.jsonl`` files,
+     parse the first line as JSON, match the system-prompt signature. This
+     covers the cross-restart case (where ``_id_aliases`` was cleared) and
+     also picks up oversized title JSONLs (e.g. when Haiku silently upgrades
+     to Sonnet and the response goes long).
+
+After unlinking, the sid is tombstoned in the system project so a
+late-flushed JSONL with the same ID stays hidden.
+
+PERF NOTE: this cleanup is *not* on any per-turn hot path — it runs once per
+title-gen completion (a few times per minute at most). No PERF-CRITICAL
+constraint applies here.
 """
 
 import re
@@ -168,19 +196,104 @@ _TITLE_SYSTEM_PROMPT = (
 )
 
 
+# Negative-pattern set for LLM titles. Each pattern below corresponds to an
+# observed phantom-title shape that polluted ``_session_names.json`` in
+# production (see docs/plans/phantom-sessions-fix-spec.md, LEAK B). The
+# patterns are deliberately narrow — they reject titles that look like task
+# instructions, prompt echoes, or system-prompt fragments, NOT legitimate
+# short titles. When extending this list, prefer adding a tight observed
+# pattern over a broad heuristic.
+
+# Numbered-list item: e.g. "1. Refactor X", "2) Add Y".
+_LIST_PREFIX_RE = re.compile(r"^\s*\d+[.)]\s")
+
+# Instruction-style title prefixes (LLM echoes its task back at us):
+# "Title: ...", "Here's a title: ...", "Suggested title: ...".
+_TITLE_PREFIX_RE = re.compile(
+    r"^\s*(title|here'?s a title|the title is|suggested title)\s*[:\-]",
+    re.IGNORECASE,
+)
+
+# Phrases lifted from the system prompt or instruction stream — never
+# legitimate user-facing titles.
+_PROMPT_ECHO_PHRASES = (
+    "generate a title",
+    "coding chat session",
+    "very short title",
+    "the format you showed",
+    "following the format",
+    "<paste>",
+    "<example>",
+    "your title",
+    "your session",
+)
+
+
+def _is_prompt_echo(text: str) -> bool:
+    """True if *text* contains any literal system-prompt phrase."""
+    lower = text.lower()
+    return any(p in lower for p in _PROMPT_ECHO_PHRASES)
+
+
 def _validate_llm_title(title: str, source_texts: list) -> str | None:
-    """Apply quality checks to an LLM-generated title. Returns the title or None."""
+    """Apply quality checks to an LLM-generated title. Returns the title or None.
+
+    Negative patterns rejected (each one corresponds to a phantom-title shape
+    observed in production — see docs/plans/phantom-sessions-fix-spec.md
+    LEAK B):
+
+      - Empty / ``len <= 2`` / ``len >= 80`` — too short or too long.
+      - Single-word titles — too vague.
+      - All-caps strings longer than 4 chars — gibberish.
+      - More than 8 words — system prompt asks for 3-4 words MAX; anything
+        much longer is almost certainly an instruction-style response, not a
+        title.
+      - Zero word-overlap with the source text — title is unrelated.
+      - Numbered-list items (``"1. Refactor X"``) — LLM produced a list
+        instead of a single title.
+      - Instruction-style prefixes (``"Title: ..."``, ``"Here's a title: ..."``)
+        — LLM echoed its task back.
+      - System-prompt echoes (``"generate a title"``, ``"coding chat session"``,
+        etc.) — LLM repeated the prompt instead of obeying it.
+      - Markdown-emphasis pair with "title" or "session" anywhere in the
+        string (``"**Generate a title** for this session"``) — the original
+        production phantom shape.
+    """
     title = title.strip().strip("\"'").rstrip(".")
     if not title or len(title) <= 2 or len(title) >= 80:
         return None
+    words = title.split()
     # Reject single-word titles — too vague to be useful
-    if len(title.split()) < 2:
+    if len(words) < 2:
         log.debug("LLM title rejected (single word): %r", title)
+        return None
+    # Reject titles past 8 words — system prompt asks for 3-4 MAX
+    if len(words) > 8:
+        log.debug("LLM title rejected (too many words: %d): %r", len(words), title)
         return None
     # Reject all-caps gibberish (e.g. "FOOT")
     if title.isupper() and len(title) > 4:
         log.debug("LLM title rejected (all caps): %r", title)
         return None
+    # Reject numbered list items (1. Foo / 2) Bar)
+    if _LIST_PREFIX_RE.match(title):
+        log.debug("LLM title rejected (numbered list): %r", title)
+        return None
+    # Reject instruction prefixes ("Title: ..." / "Here's a title: ...")
+    if _TITLE_PREFIX_RE.match(title):
+        log.debug("LLM title rejected (instruction prefix): %r", title)
+        return None
+    # Reject system-prompt echoes
+    if _is_prompt_echo(title):
+        log.debug("LLM title rejected (prompt echo): %r", title)
+        return None
+    # Reject markdown-emphasis pairs that wrap "title" or "session" — the
+    # exact shape of the 169-phantom production bug.
+    if "**" in title and ("title" in title.lower() or "session" in title.lower()):
+        # Only reject if there's an actual emphasis pair (open + close)
+        if title.count("**") >= 2:
+            log.debug("LLM title rejected (markdown emphasis around title/session): %r", title)
+            return None
     # Reject titles with no meaningful word overlap with the source text
     if not _has_word_overlap(title, source_texts):
         log.debug("LLM title rejected (no overlap): %r", title)
@@ -262,8 +375,13 @@ def _daemon_title(messages: list) -> str | None:
     sid = f"_title_{uuid.uuid4().hex[:8]}"
 
     from pathlib import Path as _Path
-    from .config import _SYSTEM_UTILITY_CWD
+    from .config import _SYSTEM_UTILITY_CWD, _encode_cwd
     _Path(_SYSTEM_UTILITY_CWD).mkdir(parents=True, exist_ok=True)
+    # Compute the system utility project name ONCE at spawn time so cleanup
+    # always targets the correct directory, even if _active_project changes
+    # while the title session is in flight (project switch race — see
+    # test_title_gen_project_switch_race).
+    utility_project = _encode_cwd(_SYSTEM_UTILITY_CWD)
     result = sm.start_session(
         session_id=sid,
         prompt=msg_block,
@@ -295,50 +413,97 @@ def _daemon_title(messages: list) -> str | None:
             entries = sm.get_entries(sid, since=0)
             title = _extract_title_from_entries(entries, texts)
             sm.remove_session(sid)
-            _cleanup_title_jsonl(sid, sm)
+            _cleanup_title_jsonl(sid, sm, utility_project)
             return title
 
     # Timeout — grab whatever we have
     entries = sm.get_entries(sid, since=0)
     sm.remove_session(sid)
-    _cleanup_title_jsonl(sid, sm)
+    _cleanup_title_jsonl(sid, sm, utility_project)
     return _extract_title_from_entries(entries, texts)
 
 
-def _cleanup_title_jsonl(sid: str, sm=None):
-    """Delete leftover JSONL files created by title generation sessions.
+# First-line signature used to identify title-utility JSONL files in the
+# content-scan fallback. Matches the system prompt's opening rule line.
+_TITLE_JSONL_SIGNATURE = "You generate very short titles"
 
-    The SDK remaps session IDs, so the JSONL may be under a different name
-    than the original sid.  Check both the original and remapped ID.
+
+def _cleanup_title_jsonl(sid: str, sm=None, project: str = ""):
+    """Delete the leftover JSONL file from a title-generation session.
+
+    *project* must be the encoded form of ``_SYSTEM_UTILITY_CWD`` — the
+    daemon writes the JSONL into the system project, NOT into the user's
+    active project. Passing the active project here (the old bug) made
+    cleanup silently miss the file and leak it.
+
+    Strategies, tried in order:
+      1. ``<system_project>/<sid>.jsonl`` — original spawn-time sid.
+      2. ``<system_project>/<remapped_sid>.jsonl`` — via ``sm._id_aliases``
+         (only present in the same-process case; cross-restart misses).
+      3. Content-scan fallback: walk the system project's ``*.jsonl`` files
+         and unlink any whose first JSON line carries the title system-prompt
+         signature. The 5 KB size cap from the previous implementation has
+         been removed — Haiku occasionally upgrades to Sonnet for thinking
+         and produces multi-KB responses; size is not a reliable filter.
+
+    After deletion, tombstone the sid in the system utility project so a
+    late-flushed JSONL with the same name stays hidden.
     """
     try:
         from app.config import _sessions_dir
-        sd = _sessions_dir()
-        # Try original ID
+        from app.session_store import _mark_deleted
+        sd = _sessions_dir(project)
+        cleaned_ids: list[str] = []
+        # Strategy 1: original ID in the system project
         jsonl = sd / f"{sid}.jsonl"
         if jsonl.exists():
-            jsonl.unlink()
-        # Try remapped ID
-        if sm and hasattr(sm, '_id_aliases'):
+            try:
+                jsonl.unlink()
+                cleaned_ids.append(sid)
+            except Exception as e:
+                log.debug("_cleanup_title_jsonl: unlink %s failed: %s", jsonl, e)
+        # Strategy 2: in-memory alias (same-process only)
+        if sm is not None and hasattr(sm, '_id_aliases'):
             remapped = sm._id_aliases.get(sid)
             if remapped:
                 rjsonl = sd / f"{remapped}.jsonl"
                 if rjsonl.exists():
-                    rjsonl.unlink()
-                    return
-        # Fallback: title sessions are tiny (<5KB), scan and match by content
+                    try:
+                        rjsonl.unlink()
+                        cleaned_ids.append(remapped)
+                    except Exception as e:
+                        log.debug("_cleanup_title_jsonl: unlink %s failed: %s",
+                                  rjsonl, e)
+        # Strategy 3: content-scan fallback (no size cap — see docstring)
         import json as _json
         for f in sd.glob("*.jsonl"):
-            if f.stat().st_size > 5000:
-                continue
             try:
-                first = _json.loads(f.read_text(encoding="utf-8").split("\n", 1)[0])
-                if "You generate very short titles" in first.get("content", ""):
-                    f.unlink()
+                first_line = f.read_text(encoding="utf-8", errors="replace").split("\n", 1)[0]
+                if not first_line:
+                    continue
+                first = _json.loads(first_line)
+                content = first.get("content", "") or first.get("system", "")
+                if isinstance(content, str) and _TITLE_JSONL_SIGNATURE in content:
+                    try:
+                        f.unlink()
+                        cleaned_ids.append(f.stem)
+                    except Exception as e:
+                        log.debug("_cleanup_title_jsonl: unlink %s failed: %s",
+                                  f, e)
             except Exception:
+                # Malformed first line or non-JSON — skip silently
                 pass
+        # Tombstone every cleaned id in the system project so a late flush
+        # with the same name stays hidden. Defense in depth — today nothing
+        # lists the system project, but registry-driven filtering does.
+        for cleaned in cleaned_ids:
+            try:
+                _mark_deleted(cleaned, project)
+            except Exception as e:
+                log.debug("_cleanup_title_jsonl: tombstone %s failed: %s",
+                          cleaned, e)
     except Exception as e:
-        log.debug("_cleanup_title_jsonl: %s", e)
+        log.info("_cleanup_title_jsonl: %s", e)
 
 
 def _extract_title_from_entries(entries, texts):
@@ -347,6 +512,11 @@ def _extract_title_from_entries(entries, texts):
     The SDK wraps responses in agent behavior, so Haiku may return a long
     response instead of just a title. Try the full text first, then try
     each line individually (the title is usually the first non-empty line).
+
+    When a line is a numbered-list item ("1. Frontend polish pass"), peel
+    the leading number+separator and try the remainder as a candidate. This
+    rescues real titles from list-shaped responses; the bare numbered line
+    itself is rejected by ``_validate_llm_title`` (LEAK B negative pattern).
     """
     for e in entries:
         if not isinstance(e, dict) or e.get("kind") != "asst":
@@ -366,6 +536,14 @@ def _extract_title_from_entries(entries, texts):
             title = _validate_llm_title(line, texts)
             if title:
                 return title
+            # Numbered-list peel: "1. Frontend polish pass" -> "Frontend polish pass"
+            m = _LIST_PREFIX_RE.match(line)
+            if m:
+                peeled = line[m.end():].strip().strip("#*-").strip()
+                if peeled:
+                    title = _validate_llm_title(peeled, texts)
+                    if title:
+                        return title
     return None
 
 

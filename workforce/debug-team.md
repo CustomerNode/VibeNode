@@ -3,7 +3,7 @@ id: debug-team
 name: Debug Team
 department: compose
 source: vibenode
-version: 1.0.0
+version: 1.1.0
 depends_on: []
 type: prompt-template
 ---
@@ -13,6 +13,18 @@ type: prompt-template
 Reusable prompt template. Invoke by typing: **debug team**
 
 **Unique value**: Catches unknown-cause failures through root cause analysis and causal investigation. No other team diagnoses problems backward from symptom to cause.
+
+## Invocation Contract
+
+The caller MUST include in the kickoff prompt:
+- the symptom — what is observed, in user-facing language ("compose panel goes blank when I switch projects"),
+- the exact reproduction steps if known (or a clear note that reproduction is unknown),
+- any logs, error output, stack traces, or screenshots already captured,
+- recent changes that might be related (git range, recent PRs, recent deploys),
+- the suspected blast radius (which files, modules, or workflows are likely involved),
+- raw test output if a test failure triggered the investigation (full trace, not a summary).
+
+If any of these are missing and cannot be inferred reliably from conversation context, request them before starting. Debug runs without reproduction steps waste time on speculation.
 
 ## The Prompt
 
@@ -56,15 +68,17 @@ Every Debug Team run follows this process:
 - Root cause remains ambiguous after real investigation
 - Data integrity may be compromised
 
-## Output
+## Output Format
 
-Return one combined team report:
-- Symptom
-- Reproduction steps
-- Root cause
-- Fix applied
-- Blast radius
-- Regression test
-- Related issues found
-- What was not validated or could not be fully verified
-- Confidence: HIGH, MEDIUM, or LOW
+Return one combined team report in this numbered structure:
+
+1. **Symptom** — What was observed, in user-facing language.
+2. **Reproduction steps** — Exact steps that reliably reproduce the bug. If reproduction was not achieved, say so explicitly.
+3. **Root cause** — The actual underlying mechanism. Not the trigger, the cause.
+4. **Fix applied** — File-level changes and why each one is part of the fix.
+5. **Blast radius** — All callers, consumers, and related state flows checked. Note any that were modified vs. only verified.
+6. **Regression test** — The test that locks in the fix and would have caught the bug originally.
+7. **Related issues found** — Other instances of the same pattern, fixed or flagged.
+8. **What was not validated or could not be fully verified** — Hypotheses ruled out vs. hypotheses untested. Env limits.
+9. **Obstacles encountered** — Setup issues, workarounds discovered, commands that needed special flags or configuration, dependencies or imports that caused problems, env quirks. Report anything the next stage would otherwise have to rediscover.
+10. **Confidence** — HIGH, MEDIUM, or LOW with one-sentence rationale.

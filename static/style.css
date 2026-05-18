@@ -1032,6 +1032,77 @@ header h1:hover { opacity: 0.7; }
 .session-item:hover { background: var(--bg-hover); }
 .session-item.active { background: var(--bg-active); border-left: 2px solid var(--accent); }
 
+/* ---- Sidebar multi-select (Ctrl/Cmd+click) ----
+   .multi-selected layers a left-edge accent shadow on top of the row.
+   The inset shadow is the disambiguator when a row is BOTH active and
+   multi-selected (the active background already matches multi-selected
+   background). */
+.session-item.multi-selected {
+  background: var(--bg-active);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.session-item.active.multi-selected {
+  /* Active border-left + multi-selected inset shadow = both visual cues. */
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+/* Grid-mode equivalent: workforce cards also participate in multi-select.
+   Use an outline (not box-shadow) so it composes cleanly with the existing
+   .wf-selected styling and the per-status backgrounds (.wf-working etc). */
+.wf-card.multi-selected {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* Selection-count badge sits at the top of #session-list, above the
+   col-header-row.  Position: relative (in-flow) so it doesn't fight the
+   col-header-row's sticky positioning — the badge scrolls away when the
+   user scrolls down, and the col-header-row continues to stick.  This
+   matches the spec's "non-modal badge at the top of the session list"
+   intent without competing for top:0 with another sticky sibling. */
+.sidebar-multi-badge {
+  position: relative;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  background: var(--bg-active);
+  border-bottom: 1px solid var(--accent);
+  font-size: 12px;
+  color: var(--text-heading, var(--text-primary));
+  font-weight: 500;
+}
+.sidebar-multi-badge-text { letter-spacing: 0.02em; }
+.sidebar-multi-badge-clear {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 2px 4px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 4px;
+  transition: background 0.1s, color 0.1s;
+}
+.sidebar-multi-badge-clear:hover {
+  background: rgba(124, 124, 255, 0.15);
+  color: var(--text-heading, var(--text-primary));
+}
+
+/* Header strip for the bulk context menu — visually identifies the
+   menu as a multi-target action set. */
+.ws-ctx-bulk-header {
+  padding: 8px 12px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .session-item > div {
   padding: 7px 8px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;

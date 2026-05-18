@@ -3,7 +3,7 @@ id: plan-team
 name: Plan Team
 department: compose
 source: vibenode
-version: 1.0.0
+version: 1.1.0
 depends_on: []
 type: prompt-template
 ---
@@ -13,6 +13,17 @@ type: prompt-template
 Reusable prompt template. Invoke by typing: **plan team**
 
 **Unique value**: Catches spec gaps, ambiguity, and architectural risk before any code is written. No other team operates before implementation begins.
+
+## Invocation Contract
+
+The caller MUST include in the kickoff prompt:
+- the path to the draft spec or plan being reviewed (or the inline spec text),
+- the original user request the spec is meant to satisfy (verbatim if possible),
+- any prior conversation context that informs intent (decisions already made, options already ruled out),
+- known constraints: deadlines, scope boundaries, areas the user said are out of bounds,
+- whether the team is allowed to add scope to make the spec coherent, or must stay strictly within the user's stated request.
+
+If any of these are missing and cannot be inferred reliably from conversation context, request them before starting.
 
 ## The Prompt
 
@@ -89,8 +100,14 @@ Do not report issues back to me unless:
 
 Everything else, just fix directly in the spec.
 
-When complete, give me one short combined team report covering:
-- what you found,
-- what you fixed,
-- what, if anything, needs my input,
-- what you did not validate or could not fully verify.
+## Output Format
+
+Return one combined team report in this numbered structure:
+
+1. **Spec path** — Where the hardened spec was written (typically `docs/plans/<name>.md`).
+2. **What you found** — Contradictions, ambiguities, missing definitions, codebase mismatches. Group by lane (Spec / Strategy / Architecture / Implementation / Integration / Expert User).
+3. **What you fixed directly in the spec** — Brief list; the spec itself contains the detail.
+4. **Lifecycle states covered** — Confirm each applicable state (first launch, warm start, stale cache, startup race, offline, corrupted config, mid-session cache miss) has a defined UX.
+5. **What needs the user's input** — Items that meet escalation criteria: scope-changing fixes, real tradeoffs, ambiguous-intent decisions, breaking-change proposals.
+6. **What was not validated or could not be fully verified** — Blind spots and any areas the team could not check against the codebase.
+7. **Obstacles encountered** — Setup issues, missing files, broken references, conventions discovered, or env quirks the Build Team should know about.

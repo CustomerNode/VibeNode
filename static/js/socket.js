@@ -132,6 +132,17 @@ socket.on('ui_prefs_loaded', (data) => {
     }
 });
 
+// Server-initiated session list refresh — emitted by admin maintenance
+// routes (e.g. /api/admin/scrub-phantoms when entries are removed). Open
+// tabs reload their sidebar so they don't keep displaying scrubbed names.
+socket.on('sessions_refresh', (data) => {
+    try {
+        if (typeof loadSessions === 'function') {
+            loadSessions();
+        }
+    } catch (e) { /* best-effort */ }
+});
+
 // Daemon reconnection status — live toasts showing recovery progress
 socket.on('daemon_reconnect', (data) => {
     const status = data.status;

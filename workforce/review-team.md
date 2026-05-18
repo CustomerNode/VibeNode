@@ -3,7 +3,7 @@ id: review-team
 name: Review Team
 department: compose
 source: vibenode
-version: 1.0.0
+version: 1.1.0
 depends_on: [compose-test-engineer, compose-quality-engineer, compose-product-manager, compose-senior-engineer, compose-expert-user]
 type: prompt-template
 ---
@@ -13,6 +13,17 @@ type: prompt-template
 Reusable prompt template. Invoke by typing: **review team**
 
 **Unique value**: Catches code quality, security, documentation, and project rule violations in completed code. No other team does deep code-level quality and compliance review.
+
+## Invocation Contract
+
+The caller MUST include in the kickoff prompt:
+- the specific scope to review: file list, git range (e.g. `git diff HEAD~3..HEAD`), or PR description,
+- the spec, intent, or user request the code was supposed to satisfy,
+- any areas explicitly out of scope (e.g. "do not review the migration in app/legacy/"),
+- whether to auto-fix issues per the Fix Policy or only report them,
+- any PERF-CRITICAL paths or strategic-intent constraints in the touched code.
+
+If any of these are missing and cannot be inferred reliably from conversation context, request them before starting. A review without scope drifts and produces low-signal noise.
 
 ## The Prompt
 
@@ -68,4 +79,18 @@ The team fixes what it finds. Don't report problems back to me unless:
 - The fix has a meaningful tradeoff that needs a judgment call
 - The issue is ambiguous enough that two reasonable people would disagree on the right answer
 
-Everything else, just fix it. Update the code, update the tests, update implementation-notes.md. When done, give me one combined team report: what you found, what you fixed, what (if anything) needs my input, and what you did not validate or could not fully verify. Keep it short.
+Everything else, just fix it. Update the code, update the tests, update implementation-notes.md.
+
+## Output Format
+
+Return one combined team report in this numbered structure:
+
+1. **Scope reviewed** — Files or git range. Confirm out-of-scope items were skipped.
+2. **Findings by category** — Correctness & Architecture / Documentation / Error Handling / Security / Strategic Alignment / CLAUDE.md Compliance / Cleanup. Group findings by severity (blocking / non-blocking).
+3. **Fixes applied** — What was fixed directly, with file paths.
+4. **Strategic conflicts** — Anything that contradicts `architecture-intent.md` and was escalated rather than auto-resolved.
+5. **What needs the user's input** — Items meeting escalation criteria: spec/behavior changes, real tradeoffs, ambiguous interpretations.
+6. **What was not validated or could not be fully verified** — Areas skipped, depth limits, env constraints.
+7. **Obstacles encountered** — Setup issues, workarounds, commands needing special flags, dependency or env quirks discovered during review.
+
+Keep prose short. The artifact is the structure.

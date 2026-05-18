@@ -13,7 +13,16 @@ let allSessions = [];
 /** O(1) lookup set kept in sync with allSessions. */
 let allSessionIds = new Set();
 /** Rebuild allSessionIds from allSessions. Call after any reassignment of allSessions. */
-function _rebuildSessionIds() { allSessionIds = new Set(allSessions.map(s => s.id)); }
+function _rebuildSessionIds() {
+  allSessionIds = new Set(allSessions.map(s => s.id));
+  // Sidebar multi-selection may hold IDs that were filtered out by this
+  // bulk reassignment (e.g. deleteEmptySessions, loadSessions purge,
+  // session-type filter).  Prune so the badge count and DOM don't lie.
+  // Guarded by typeof so this stays callable before sessions.js loads.
+  if (typeof _pruneMultiSelectionToExisting === 'function') {
+    _pruneMultiSelectionToExisting();
+  }
+}
 let activeId = localStorage.getItem('activeSessionId') || null;
 let renameTarget = null;
 let sortMode = localStorage.getItem('sortMode') || 'date';
@@ -182,6 +191,11 @@ async function setProject(encoded, reload = true) {
   // sidebar/grid during the gap between project switch and loadSessions().
   allSessions = [];
   allSessionIds.clear();
+  // Clear sidebar multi-selection — the IDs in it belong to the old
+  // project and are about to vanish from allSessionIds.  Calling
+  // _clearMultiSelect() is also safe when sessions.js hasn't loaded yet
+  // (typeof guard) but in practice it's always loaded by this point.
+  if (typeof _clearMultiSelect === 'function') _clearMultiSelect();
   // Clear per-session state maps that would otherwise carry stale data from
   // the old project into the new one (timestamps, substatus, usage, timers).
   window._sessionStateTs = {};

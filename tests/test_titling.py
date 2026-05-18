@@ -339,6 +339,147 @@ class TestValidateLlmTitle:
         # "Fix" and "the" and "bug" are all <=3 chars, so overlap check is skipped
         assert result == "Fix the bug"
 
+    # ---------- LEAK B negative-pattern coverage ----------
+
+    def test_validate_rejects_numbered_list(self):
+        # Leading "1." / "2)" / etc must be rejected — these are list items,
+        # not titles.
+        assert _validate_llm_title(
+            "1. Refactor the foo system",
+            ["refactor the foo system please"],
+        ) is None
+        assert _validate_llm_title(
+            "2) Add memoization",
+            ["add memoization to the function"],
+        ) is None
+
+    def test_validate_rejects_title_prefix(self):
+        # "Title: ..." / "Here's a title: ..." / "Suggested title: ..." —
+        # these are instruction-style echoes, not titles.
+        assert _validate_llm_title(
+            "Title: Frontend polish pass",
+            ["frontend polish pass"],
+        ) is None
+        assert _validate_llm_title(
+            "Here's a title: Debug idle state",
+            ["debug idle state please"],
+        ) is None
+        assert _validate_llm_title(
+            "Suggested title - Fix login bug",
+            ["fix login bug please"],
+        ) is None
+
+    def test_validate_rejects_prompt_echoes(self):
+        # Direct echoes of system-prompt fragments — must be rejected.
+        assert _validate_llm_title(
+            "Generate a title for this session",
+            ["please write a title for this session"],
+        ) is None
+        assert _validate_llm_title(
+            "Very short title for coding chat session",
+            ["very short title example"],
+        ) is None
+        # Exact production phantom shape — markdown emphasis + "title" +
+        # "session".
+        assert _validate_llm_title(
+            "1. **Generate a title** for this session",
+            ["session title generation"],
+        ) is None
+
+    def test_validate_rejects_long_titles(self):
+        # System prompt asks for 3-4 words MAX. Past 8 words it's an
+        # instruction, not a title.
+        long_title = "Refactor the frontend polish pass and improve the test suite gaps too"
+        assert _validate_llm_title(long_title, ["refactor frontend tests"]) is None
+
+    def test_validate_rejects_markdown_emphasis_around_session(self):
+        # The leak-B canonical pattern: bold pair somewhere in the string
+        # AND the word "title" or "session" present.
+        assert _validate_llm_title(
+            "Improve **your title** flow",
+            ["improve title flow"],
+        ) is None
+        # But a regular title with bold and a non-trigger word is OK
+        # (no "title" or "session" present).
+        accepted = _validate_llm_title(
+            "Refactor **websocket** logic",
+            ["refactor the websocket logic"],
+        )
+        assert accepted is not None
+
+    def test_validate_accepts_legitimate_titles(self):
+        # Regression guard — the patterns above must not block real titles.
+        for title, src in [
+            ("Frontend polish pass", ["please polish the frontend"]),
+            ("Debug idle state", ["idle state debug session"]),
+            ("Fix 502 errors", ["fix 502 errors in production"]),
+            ("Refactor websocket reconnect logic",
+             ["refactor the websocket reconnect logic"]),
+            ("Review git changes", ["review the incoming git changes"]),
+        ]:
+            assert _validate_llm_title(title, src) == title, (
+                f"Legitimate title {title!r} was rejected"
+            )
+
+
+# ---------------------------------------------------------------------------
+# _extract_title_from_entries — numbered-list peeling
+# ---------------------------------------------------------------------------
+
+class TestExtractTitleFromEntries:
+
+    def test_extract_peels_numbered_list(self):
+        # Asst response is "1. Frontend polish pass\n2. Debug idle".
+        # The first line is rejected by _validate_llm_title because of the
+        # leading "1. ", but the peel pass strips the prefix and re-tries.
+        from app.titling import _extract_title_from_entries
+        entries = [{
+            "kind": "asst",
+            "text": "1. Frontend polish pass\n2. Debug idle state",
+        }]
+        title = _extract_title_from_entries(
+            entries, ["frontend polish pass and idle state"],
+        )
+        assert title == "Frontend polish pass"
+
+    def test_extract_returns_none_when_all_rejected(self):
+        from app.titling import _extract_title_from_entries
+        entries = [{
+            "kind": "asst",
+            "text": "Title: Generate a title for this session",
+        }]
+        title = _extract_title_from_entries(entries, ["help me work"])
+        assert title is None
+
+    def test_extract_accepts_plain_first_line(self):
+        # When the assistant response is purely the title, the full-text
+        # validator path succeeds.
+        from app.titling import _extract_title_from_entries
+        entries = [{
+            "kind": "asst",
+            "text": "Debug websocket reconnect",
+        }]
+        title = _extract_title_from_entries(
+            entries, ["debug websocket reconnect please"],
+        )
+        assert title == "Debug websocket reconnect"
+
+    def test_extract_falls_through_to_line_when_full_text_too_long(self):
+        # When the full text is past the 8-word cap, _validate_llm_title
+        # rejects it. The line-by-line pass then picks the title up.
+        from app.titling import _extract_title_from_entries
+        # Make the full text long enough (12 words) that the first
+        # _validate call returns None, forcing line-by-line walk.
+        full = (
+            "Debug websocket reconnect\n"
+            "and many more words here so that the full text exceeds the cap by far"
+        )
+        entries = [{"kind": "asst", "text": full}]
+        title = _extract_title_from_entries(
+            entries, ["debug websocket reconnect please"],
+        )
+        assert title == "Debug websocket reconnect"
+
 
 # ---------------------------------------------------------------------------
 # _cli_title

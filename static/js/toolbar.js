@@ -91,6 +91,21 @@ function _backToKanban() { deselectSession(); }
 function _showKanbanBackBtn() {}
 
 async function handleNameClick(id) {
+  // If the prior mousedown was a Ctrl/Cmd+click on the row that already
+  // toggled the multi-select state, swallow this name-cell click so we
+  // don't ALSO open or rename the session.
+  if (typeof _consumeMsSuppression === 'function' && _consumeMsSuppression()) {
+    return;
+  }
+  // Plain click on a session-name cell clears any active multi-selection.
+  // Matches Finder/Explorer/VS Code: clicking on a non-selected target
+  // collapses the working set.  Programmatic callers (e.g. _sessCtx('rename'))
+  // also harmlessly clear the selection — that's the right behavior since
+  // a rename is a single-target action.
+  if (typeof multiSelectedIds !== 'undefined' && multiSelectedIds.size > 0
+      && typeof _clearMultiSelect === 'function') {
+    _clearMultiSelect();
+  }
   if (id !== activeId) {
     openInGUI(id);
   } else {
@@ -868,6 +883,13 @@ async function deleteSession(id) {
   if (deleteOk) {
     allSessions = allSessions.filter(x => x.id !== id);
     allSessionIds.delete(id);
+    // Drop from sidebar multi-selection so the badge count stays honest
+    // when a session is deleted via single-target Delete while it was
+    // also part of a Ctrl+click selection.
+    if (typeof multiSelectedIds !== 'undefined' && multiSelectedIds.has(id)) {
+      multiSelectedIds.delete(id);
+      if (typeof _renderMultiSelectionBadge === 'function') _renderMultiSelectionBadge();
+    }
     // Clean up draft text for deleted session
     if (typeof _clearDraft === 'function') _clearDraft(id);
     // Remove from folder tree

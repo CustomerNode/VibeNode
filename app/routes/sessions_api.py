@@ -3,8 +3,10 @@ Session CRUD routes -- list, view, rename, auto-name, delete, duplicate, continu
 """
 
 import json
+import logging
 import shutil
 import sys
+import time as _time
 from datetime import datetime, timezone as tz
 from pathlib import Path
 
@@ -32,6 +34,46 @@ from ..sessions import load_session, load_session_timeline, all_sessions
 from ..titling import smart_title
 
 bp = Blueprint('sessions_api', __name__)
+log = logging.getLogger(__name__)
+
+
+# Windows + AV/Defender hold the .jsonl handle for tens to hundreds of
+# milliseconds after the CLI subprocess dies. The original 4-phase delete
+# handled this with a single 0.3 s retry then silently fell through; that
+# silent-pass produced "0-byte JSONL on disk" forensic surprises (see
+# docs/plans/phantom-sessions-fix-spec.md LEAK C). ``_unlink_with_retry``
+# replaces the single retry with a bounded loop: ``retries=5`` attempts at
+# ``delay=0.2`` s each gives a worst-case ~1 s wait — long enough for AV to
+# release the handle in practice. Callers in all three delete endpoints
+# (api_delete, api_delete_all, api_delete_empty) use this helper so the
+# retry behaviour is uniform.
+def _unlink_with_retry(path: Path, retries: int = 5, delay: float = 0.2) -> bool:
+    """Attempt to unlink *path*, retrying on Windows file-lock errors.
+
+    Returns ``True`` if the file is gone (either unlinked or never existed),
+    ``False`` if all retries were exhausted while the file remained locked.
+    On exhaustion we log at WARNING with the path so AV/Defender holds are
+    visible in production logs.
+    """
+    for attempt in range(retries):
+        try:
+            if not path.exists():
+                return True
+            path.unlink()
+            return True
+        except PermissionError:
+            if attempt < retries - 1:
+                _time.sleep(delay)
+                continue
+            log.warning("Unable to unlink %s after %d retries (file locked?)",
+                        path, retries)
+            return False
+        except FileNotFoundError:
+            return True
+        except Exception as e:
+            log.debug("_unlink_with_retry: %s -> %s", path, e)
+            return False
+    return False
 
 
 @bp.route("/api/sessions")
@@ -318,12 +360,40 @@ def api_autoname(session_id):
             return jsonify({"ok": True, "title": old_title, "skipped": True,
                             "reason": "Title unchanged"})
 
+        # PHANTOM-PREVENTION (docs/plans/phantom-sessions-fix-spec.md LEAK B):
+        # Decide whether to persist the title into _session_names.json. We
+        # skip the save in two cases that produced phantoms in production:
+        #
+        #   1. ``"Untitled Session"`` — the heuristic fallback's last-resort
+        #      string. Persisting it pollutes the names registry with rows
+        #      whose only purpose is to display the same default the UI
+        #      would render anyway from a missing entry.
+        #
+        #   2. The session has no .jsonl on disk AND the daemon doesn't
+        #      know about it. Such an autoname call came from a fresh
+        #      ``prompt_text`` for a session that may be abandoned before
+        #      flush — saving the name would create a phantom row that
+        #      survives even if the session never materialises.
+        should_save = True
+        if title == "Untitled Session":
+            should_save = False
+        elif (path is None or not (path and path.exists())):
+            sm = current_app.session_manager
+            try:
+                in_flight = bool(sm.has_session(session_id))
+            except Exception:
+                in_flight = False
+            if not in_flight:
+                should_save = False
+
         # Persist title — write to JSONL if available, always save to names file
+        # (subject to the phantom-prevention guard above).
         if path and path.exists():
             entry = json.dumps({"type": "custom-title", "customTitle": title, "sessionId": session_id})
             with open(path, "a", encoding="utf-8") as f:
                 f.write("\n" + entry + "\n")
-        _save_name(session_id, title, project)
+        if should_save:
+            _save_name(session_id, title, project)
 
         return jsonify({"ok": True, "title": title, "renamed": is_re_evaluate})
 
@@ -381,35 +451,33 @@ def api_delete(session_id):
         return jsonify({"ok": True})  # Already gone or never created
 
     # On Windows the CLI process may still hold the .jsonl open even after
-    # Phase 1/2 — unlink raises PermissionError in that case.  Wrap in
-    # try/except so the endpoint still returns ok; the tombstone written
-    # above is the authoritative "this session is deleted" signal and
-    # all_sessions() will hide it regardless of whether the file is gone.
-    try:
-        path.unlink()
-    except PermissionError:
-        pass  # tombstone will hide it; Phase 4 retries below
+    # Phase 1/2 — unlink raises PermissionError in that case. The retry
+    # helper attempts up to 5 unlinks at 0.2 s intervals (~1 s worst case)
+    # and logs at WARNING if the file stays locked. The tombstone above is
+    # the authoritative "this session is deleted" signal; truncate-to-zero
+    # is the last-resort fallback if AV refuses to release the handle.
+    unlinked = _unlink_with_retry(path)
     if folder.exists() and folder.is_dir():
         try:
             shutil.rmtree(folder)
         except (PermissionError, OSError):
             pass
 
-    # Phase 4: Sweep for file re-created by a dying process.
-    # Without this, a subprocess that hasn't fully exited can write the
-    # .jsonl back to disk right after we unlink it.
-    time.sleep(0.3)
+    # Phase 4: Sweep for files re-created by a dying process AND truncate
+    # any file the retry helper couldn't unlink.
     if path.exists():
-        try:
-            path.unlink()
-        except Exception:
+        if not _unlink_with_retry(path, retries=3, delay=0.2):
             # Last resort: truncate the file so even if the tombstone
             # eventually expires, the session would appear empty and be
             # auto-cleaned on the next "delete empty" sweep.
             try:
                 path.write_bytes(b"")
-            except Exception:
-                pass
+                log.warning("Truncated locked JSONL to 0 bytes: %s", path)
+            except Exception as e:
+                log.warning("Failed to truncate locked JSONL %s: %s", path, e)
+    elif not unlinked:
+        # File somehow disappeared between retries — fine, nothing to do.
+        pass
     if folder.exists() and folder.is_dir():
         try:
             shutil.rmtree(folder)
@@ -433,7 +501,6 @@ def api_delete(session_id):
 @bp.route("/api/delete-all", methods=["DELETE"])
 def api_delete_all():
     """Delete every session in the active workspace in one shot."""
-    import time
     from concurrent.futures import ThreadPoolExecutor
 
     project = request.args.get("project", "").strip()
@@ -459,17 +526,20 @@ def api_delete_all():
     with ThreadPoolExecutor(max_workers=8) as pool:
         pool.map(_close, sids_to_delete)
 
-    # Phase 3: delete all files
+    # Phase 3: delete all files (with retry helper for Windows file locks)
     deleted = 0
     for f in list(sd.glob("*.jsonl")):
-        try:
-            f.unlink()
+        if _unlink_with_retry(f, retries=3, delay=0.2):
             folder = sd / f.stem
             if folder.exists() and folder.is_dir():
                 shutil.rmtree(folder, ignore_errors=True)
             deleted += 1
-        except Exception:
-            pass
+        elif f.exists():
+            # Last resort: truncate locked file so it can be cleaned later.
+            try:
+                f.write_bytes(b"")
+            except Exception:
+                pass
 
     # Phase 4: clear names file in one write instead of per-session
     try:
@@ -488,7 +558,6 @@ def api_delete_all():
 def api_delete_empty():
     import os
     import signal
-    import time
 
     project = request.args.get("project", "").strip()
     sm = current_app.session_manager
@@ -533,10 +602,13 @@ def api_delete_empty():
 
         folder = _sessions_dir(project) / sid
         path_str = str(f)
-        if f.exists():
-            f.unlink()
+        # Use the retry helper so locked files don't silently leak
+        _unlink_with_retry(f)
         if folder.exists() and folder.is_dir():
-            shutil.rmtree(folder)
+            try:
+                shutil.rmtree(folder)
+            except Exception:
+                pass
         for key in [k for k in _summary_cache if k[0] == path_str]:
             del _summary_cache[key]
         _delete_name(sid, project)
@@ -545,13 +617,9 @@ def api_delete_empty():
 
     # Sweep for files re-created by dying processes
     if deleted_paths:
-        time.sleep(0.3)
         for f, folder in deleted_paths:
-            try:
-                if f.exists():
-                    f.unlink()
-            except Exception:
-                pass
+            if f.exists():
+                _unlink_with_retry(f, retries=3, delay=0.2)
             try:
                 if folder.exists() and folder.is_dir():
                     shutil.rmtree(folder)

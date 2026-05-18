@@ -2,6 +2,241 @@
 
 // _shortDate() extracted to time-utils.js per plan Section 14 line 2894
 
+// ===========================================================================
+// Sidebar multi-selection (Ctrl/Cmd+click)
+// ===========================================================================
+//
+// Independent of `activeId` and `allSessionIds`.
+// - `activeId`         = single session displayed in the main panel.
+// - `allSessionIds`    = O(1) lookup for streaming-event filtering
+//                        (PERF-CRITICAL #15 in CLAUDE.md). DO NOT conflate.
+// - `multiSelectedIds` = transient working set for batch actions; cleared
+//                        aggressively (see lifecycle table in
+//                        docs/plans/sidebar-multi-select-spec.md, Section 4).
+//
+// Mutation discipline: every change MUST call `_syncMultiSelectionDom()` and
+// `_renderMultiSelectionBadge()` so DOM and badge stay in sync without a
+// full sidebar re-render.  Selection is NOT persisted across page reloads
+// (resolved decision 3 in the spec).
+let multiSelectedIds = new Set();
+
+// Re-entrancy guard for bulk actions.  Multiple bulk runs concurrently would
+// race overlays, double-fire confirmations, and produce confusing toasts.
+let _bulkInFlight = false;
+
+/**
+ * Add or remove a session ID from the multi-select set, then sync DOM + badge.
+ * Idempotent: clicking the same row toggles its membership.
+ * @param {string} sessionId
+ */
+function _toggleMultiSelect(sessionId) {
+  if (!sessionId) return;
+  if (multiSelectedIds.has(sessionId)) {
+    multiSelectedIds.delete(sessionId);
+  } else {
+    multiSelectedIds.add(sessionId);
+  }
+  _syncMultiSelectionDom();
+  _renderMultiSelectionBadge();
+}
+
+/**
+ * Empty the multi-select set and sync DOM + badge.
+ * Safe to call when the set is already empty (no-op if so).
+ */
+function _clearMultiSelect() {
+  if (multiSelectedIds.size === 0) {
+    // Still ensure badge is gone in case of stale DOM
+    _renderMultiSelectionBadge();
+    return;
+  }
+  multiSelectedIds.clear();
+  _syncMultiSelectionDom();
+  _renderMultiSelectionBadge();
+}
+
+/**
+ * For each rendered .session-item row, toggle the .multi-selected class
+ * to reflect set membership.  O(N) over visible rows; cheap for the
+ * sidebar.  Avoids full re-render (which would lose scroll position,
+ * tooltip state, and naming-badge in-flight DOM).
+ */
+function _syncMultiSelectionDom() {
+  // Both list-mode (.session-item) and grid-mode (.wf-card) rows participate
+  // in multi-select.  Both carry data-sid and react to .multi-selected.
+  const rows = document.querySelectorAll('.session-item[data-sid], .wf-card[data-sid]');
+  rows.forEach(row => {
+    const sid = row.getAttribute('data-sid');
+    if (multiSelectedIds.has(sid)) {
+      row.classList.add('multi-selected');
+    } else {
+      row.classList.remove('multi-selected');
+    }
+  });
+}
+
+/**
+ * Render or remove the count badge above the column header.  The badge
+ * lives in a fixed container at the top of #session-list (created on
+ * demand) so we don't have to re-render the list to show/hide it.
+ *
+ * Uses aria-live="polite" so screen readers announce count changes
+ * without interrupting the user.
+ */
+function _renderMultiSelectionBadge() {
+  const list = document.getElementById('session-list');
+  if (!list) return;
+  let badge = document.getElementById('sidebar-multi-badge');
+  const count = multiSelectedIds.size;
+
+  if (count === 0) {
+    if (badge) badge.remove();
+    return;
+  }
+
+  if (!badge) {
+    badge = document.createElement('div');
+    badge.id = 'sidebar-multi-badge';
+    badge.className = 'sidebar-multi-badge';
+    badge.setAttribute('aria-live', 'polite');
+    // Insert as first child of session-list (above col-header-row).
+    list.insertBefore(badge, list.firstChild);
+  }
+  badge.innerHTML =
+    '<span class="sidebar-multi-badge-text">' + count + ' selected</span>'
+    + '<button type="button" class="sidebar-multi-badge-clear" '
+    + 'onclick="_clearMultiSelect()" title="Clear selection (Esc)">'
+    + '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" '
+    + 'stroke="currentColor" stroke-width="2.5" stroke-linecap="round">'
+    + '<line x1="18" y1="6" x2="6" y2="18"/>'
+    + '<line x1="6" y1="6" x2="18" y2="18"/></svg></button>';
+}
+
+/**
+ * Drop IDs from the multi-select set that no longer exist in
+ * `allSessionIds`.  Call this from any code that reassigns or filters
+ * `allSessions` in bulk (loadSessions, deleteSession, deleteEmptySessions,
+ * project switch teardown).  Without this, stale IDs accumulate and the
+ * count badge lies.
+ */
+function _pruneMultiSelectionToExisting() {
+  if (multiSelectedIds.size === 0) return;
+  let changed = false;
+  for (const id of Array.from(multiSelectedIds)) {
+    if (!allSessionIds.has(id)) {
+      multiSelectedIds.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) {
+    _syncMultiSelectionDom();
+    _renderMultiSelectionBadge();
+  }
+}
+
+// One-shot flag set by _sessionRowMouseDown when a Ctrl/Cmd+click has just
+// been handled.  The cell's subsequent click event still fires (preventDefault
+// on mousedown does NOT cancel click), so singleOrDouble and handleNameClick
+// check this flag and bail to avoid opening the session.  The flag is cleared
+// by every consumer and after a short timeout as a safety net in case the
+// click event never reaches a cell handler (e.g. user dragged off the row).
+let _msSuppressNextClick = false;
+
+function _consumeMsSuppression() {
+  if (_msSuppressNextClick) {
+    _msSuppressNextClick = false;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Mousedown handler attached to every .session-item row.  Intercepts
+ * Ctrl/Cmd+left-click to toggle multi-selection without opening the
+ * session.  Plain clicks fall through to the cell's existing onclick
+ * (singleOrDouble or handleNameClick).
+ *
+ * Mousedown fires BEFORE the cell onclick.  preventDefault() suppresses
+ * text-selection side effects, but the click event still fires — so we
+ * also raise the `_msSuppressNextClick` flag for the cell handlers to
+ * consume.
+ */
+function _sessionRowMouseDown(e, sessionId) {
+  // Only left button; right-click is routed via oncontextmenu.
+  if (e.button !== 0) return;
+  // Note on view-mode scoping: previously we blocked Ctrl+click outside the
+  // 'sessions' view, but the sidebar (and its session rows) are also visible
+  // in 'workplace', 'kanban', and 'compose' views.  Blocking the toggle there
+  // made the feature appear broken to users who Ctrl+click while a session
+  // is open in the main panel.  The toggle itself is harmless in any view —
+  // it's only the BULK MENU that needs the sessions-view guard (enforced in
+  // sessionContextMenu below) so the menu doesn't surface in compose where
+  // it would target sessions across composition boundaries confusingly.
+  if (e.ctrlKey || e.metaKey) {
+    e.preventDefault();
+    e.stopPropagation();
+    _toggleMultiSelect(sessionId);
+    // Raise the suppression flag so the upcoming click on the inner
+    // cell does NOT open the session.  Auto-clear after one tick as a
+    // safety net in case the click never arrives.
+    _msSuppressNextClick = true;
+    setTimeout(function() { _msSuppressNextClick = false; }, 200);
+  }
+  // Plain click: do nothing here — let the cell's onclick fire as today.
+  // (Plain-click selection clear happens inside singleOrDouble/handleNameClick.)
+}
+
+/**
+ * Bounded-concurrency runner for bulk actions.  Iterates `ids`, invoking
+ * `asyncFn(id)` with at most `concurrency` in flight at once.  Continues
+ * past per-item failures and collects them for the summary toast.
+ *
+ * @param {string[]} ids
+ * @param {(id:string) => Promise<void>} asyncFn
+ * @param {number} concurrency
+ * @returns {Promise<{ok:string[], fail:Array<{id:string, err:string}>}>}
+ */
+async function _runBulk(ids, asyncFn, concurrency) {
+  const results = { ok: [], fail: [] };
+  if (!ids || !ids.length) return results;
+  let i = 0;
+  async function worker() {
+    while (i < ids.length) {
+      const id = ids[i++];
+      try {
+        await asyncFn(id);
+        results.ok.push(id);
+      } catch (e) {
+        results.fail.push({ id: id, err: String(e && e.message ? e.message : e) });
+      }
+    }
+  }
+  const n = Math.min(Math.max(1, concurrency || 1), ids.length);
+  await Promise.all(Array.from({ length: n }, worker));
+  return results;
+}
+
+// Escape key clears the multi-selection (matches Finder/Explorer/VS Code).
+// Attached once at script load; safe to bind multiple times because of
+// the `_msEscBound` flag.
+if (typeof window !== 'undefined' && !window._msEscBound) {
+  window._msEscBound = true;
+  document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Escape') return;
+    if (multiSelectedIds.size === 0) return;
+    // Don't steal Esc from open modals (pm-overlay, project-overlay, etc.).
+    const pmOverlay = document.getElementById('pm-overlay');
+    if (pmOverlay && pmOverlay.classList.contains('show')) return;
+    const projOverlay = document.getElementById('project-overlay');
+    if (projOverlay && projOverlay.classList.contains('show')) return;
+    // Don't steal Esc from a focused editable field — user may be canceling
+    // an inline rename or clearing a search.
+    const ae = document.activeElement;
+    if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
+    _clearMultiSelect();
+  });
+}
+
 function setSort(mode) {
   if (sortMode === mode) {
     sortAsc = !sortAsc;   // same column — toggle direction
@@ -58,8 +293,13 @@ function _renderSessionRow(s, extraClass) {
     : isIdle
     ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#44aa66" stroke-width="2" stroke-linecap="round" title="Idle"><polyline points="20 6 9 17 4 12"/></svg>'
     : '';
+  // multi-select: include .multi-selected class on initial render so the
+  // visual stays in sync after sort/filter re-renders without needing an
+  // extra _syncMultiSelectionDom() pass.  onmousedown intercepts Ctrl/Cmd+
+  // click to toggle the selection without opening the session.
+  const msClass = multiSelectedIds.has(s.id) ? ' multi-selected' : '';
   return `
-  <div class="session-item${activeClass}${stateClass}${extraClass || ''}" data-sid="${s.id}" oncontextmenu="sessionContextMenu(event,'${s.id}')">
+  <div class="session-item${activeClass}${stateClass}${msClass}${extraClass || ''}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" oncontextmenu="sessionContextMenu(event,'${s.id}')">
     <div class="session-col-name" onclick="handleNameClick('${s.id}')" style="cursor:text;" title="Click to rename">
       ${icon}${escHtml(s.display_title)}${_autoNamingInFlight.has(s.id) ? '<span class="naming-badge"><span class="naming-dot"></span>Naming\u2026</span>' : ''}
     </div>
@@ -121,6 +361,11 @@ function renderList(sessions) {
       el.innerHTML = header + rows;
       initColResize();
       attachTooltipListeners();
+      // Re-render the multi-select badge after the list re-render destroys
+      // it (innerHTML = ...) so the count stays visible across sort/filter
+      // updates.  Pruning also handles cases where a selected session was
+      // filtered out by search and is no longer in `sessions`.
+      _renderMultiSelectionBadge();
       return;
     }
   }
@@ -131,6 +376,8 @@ function renderList(sessions) {
   el.innerHTML = header + rows;
   initColResize();
   attachTooltipListeners();
+  // See note above — keep the badge visible across re-renders.
+  _renderMultiSelectionBadge();
 }
 
 /* ---- Hover tooltip ---- */
@@ -250,6 +497,16 @@ let _lastClickId = null;
 let _lastClickTime = 0;
 
 function singleOrDouble(id, e) {
+  // If the prior mousedown was a Ctrl/Cmd+click that already toggled
+  // multi-select, swallow this click instead of opening the session.
+  // (preventDefault on mousedown does not cancel the subsequent click.)
+  if (_consumeMsSuppression()) return;
+  // Plain click on a row clears any active multi-selection.  Matches
+  // Finder/Explorer/VS Code semantics: clicking elsewhere collapses the
+  // working set down to whatever you just clicked.
+  if (typeof multiSelectedIds !== 'undefined' && multiSelectedIds.size > 0) {
+    _clearMultiSelect();
+  }
   openInGUI(id);
 }
 
@@ -265,6 +522,28 @@ function sessionContextMenu(e, sessionId) {
   // Remove any existing context menu
   var old = document.querySelector('.session-ctx-menu');
   if (old) old.remove();
+
+  // ----- Multi-selection routing (Finder/Explorer/VS Code semantics) -----
+  // Right-click on a row that's part of a 2+ selection -> show bulk menu.
+  // Right-click on a row NOT in the selection -> clear the selection and
+  // show the single-row menu (the user expects "act on just this row").
+  // Right-click with selection size <= 1 falls through to the single-row
+  // path so the bulk menu only appears for multi-target operations.
+  //
+  // NOTE: We previously gated this on viewMode === 'sessions', but the
+  // sidebar (and these rows) are rendered in 'workplace', 'kanban', and
+  // 'compose' views too — gating made the bulk menu silently disappear
+  // and the single-row menu appear instead, which looked exactly like
+  // "only one row is selected" to the user.  The bulk actions themselves
+  // are sensible regardless of which main view is active.  Compose view
+  // is the one nuance: there sessions are grouped by composition, but the
+  // bulk actions (stop/delete/etc) are still well-defined per session ID.
+  if (multiSelectedIds.size >= 2 && multiSelectedIds.has(sessionId)) {
+    return _bulkContextMenu(e);
+  }
+  if (multiSelectedIds.size > 0 && !multiSelectedIds.has(sessionId)) {
+    _clearMultiSelect();
+  }
 
   const isActive = sessionId === activeId;
   const isRunning = runningIds.has(sessionId);
@@ -778,4 +1057,488 @@ function _atcShowOverlay(overlay, html) {
     if (card) card.classList.remove('pm-enter');
   });
   overlay.onclick = function(e) { if (e.target === overlay) _closePm(); };
+}
+
+// ===========================================================================
+// Bulk context menu (multi-selection right-click)
+// ===========================================================================
+//
+// Built and styled to match the single-row context menu (`.ws-ctx-menu`,
+// `.ws-ctx-item`) so users carry the same muscle memory.  The bulk menu
+// only appears when right-clicking a row that's in a selection of size
+// >= 2 — single-target right-clicks always get the existing single-row
+// menu instead.
+//
+// Action coverage and reasoning are documented in the spec
+// (docs/plans/sidebar-multi-select-spec.md, Section 7).
+
+/**
+ * Render and show the bulk context menu at the click position.
+ * @param {MouseEvent} e
+ */
+function _bulkContextMenu(e) {
+  // Build a snapshot of IDs at menu-open time.  The selection set may
+  // mutate before the user picks an item (e.g. project switch teardown)
+  // and we want every action to operate on what was on screen when the
+  // menu opened, not what's in the set when the user clicks.
+  const ids = Array.from(multiSelectedIds);
+  const count = ids.length;
+  if (count < 2) return; // safety: routing should have prevented this
+
+  const menu = document.createElement('div');
+  menu.className = 'session-ctx-menu ws-ctx-menu sidebar-bulk-ctx-menu';
+
+  // Header strip showing the count — reinforces "this acts on N items".
+  let html = '<div class="ws-ctx-bulk-header">'
+    + '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
+    + '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>'
+    + '<rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>'
+    + ' ' + count + ' selected</div>';
+  html += '<div class="ws-ctx-divider"></div>';
+
+  // --- Stop all (silent skip for non-running) ---
+  html += '<div class="ws-ctx-item" onclick="_bulkStop()">'
+    + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
+    + '<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/></svg>'
+    + ' Stop all</div>';
+
+  // --- Auto-name all (with confirmation modal) ---
+  html += '<div class="ws-ctx-item" onclick="_bulkAutoName()">'
+    + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
+    + '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>'
+    + ' Auto-name all</div>';
+
+  // --- Duplicate all ---
+  html += '<div class="ws-ctx-item" onclick="_bulkDuplicate()">'
+    + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
+    + '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>'
+    + '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
+    + ' Duplicate all</div>';
+
+  // --- Add all to Compose (sequential modal per session) ---
+  html += '<div class="ws-ctx-item" onclick="_bulkAddToCompose()">'
+    + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
+    + '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>'
+    + ' Add all to Compose</div>';
+
+  html += '<div class="ws-ctx-divider"></div>';
+
+  // --- Delete all (danger; modal confirmation) ---
+  html += '<div class="ws-ctx-item danger" onclick="_bulkDelete()">'
+    + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
+    + '<polyline points="3 6 5 6 21 6"/>'
+    + '<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>'
+    + ' Delete all</div>';
+
+  html += '<div class="ws-ctx-divider"></div>';
+
+  // --- Clear selection ---
+  html += '<div class="ws-ctx-item" onclick="_clearMultiSelect();var m=document.querySelector(\'.session-ctx-menu\');if(m)m.remove();">'
+    + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
+    + '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
+    + ' Clear selection</div>';
+
+  menu.innerHTML = html;
+  menu.style.left = e.clientX + 'px';
+  menu.style.top = e.clientY + 'px';
+  document.body.appendChild(menu);
+
+  // Keep menu in viewport
+  requestAnimationFrame(function() {
+    const rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth) {
+      menu.style.left = (window.innerWidth - rect.width - 8) + 'px';
+    }
+    if (rect.bottom > window.innerHeight) {
+      menu.style.top = (window.innerHeight - rect.height - 8) + 'px';
+    }
+  });
+
+  // Close on click outside
+  const closer = function(ev) {
+    if (!menu.contains(ev.target)) {
+      menu.remove();
+      document.removeEventListener('click', closer);
+    }
+  };
+  setTimeout(function() { document.addEventListener('click', closer); }, 0);
+}
+
+/**
+ * Snapshot the current multi-selection.  Used by every bulk action to
+ * freeze the working set at action time so async work isn't disturbed
+ * by later user clicks.
+ */
+function _msSnapshot() {
+  return Array.from(multiSelectedIds);
+}
+
+/**
+ * Acquire the bulk-in-flight lock.  Returns true if acquired, false if
+ * a bulk action is already running (in which case the caller shows a
+ * toast and bails).
+ */
+function _bulkAcquire() {
+  if (_bulkInFlight) {
+    showToast('Another bulk action is in progress', true);
+    return false;
+  }
+  _bulkInFlight = true;
+  return true;
+}
+
+/** Release the bulk-in-flight lock.  Always pair with _bulkAcquire(). */
+function _bulkRelease() {
+  _bulkInFlight = false;
+}
+
+/**
+ * Bulk Stop.  Iterates the selection and emits `close_session` for each
+ * running ID; non-running IDs are silently skipped (resolved decision 2
+ * in the spec).  No confirmation modal — Stop is non-destructive (nothing
+ * is deleted) and matches the single-action UX pattern of "fire and
+ * forget" for terminations.
+ */
+function _bulkStop() {
+  // Close the menu first so it doesn't linger.
+  const menu = document.querySelector('.session-ctx-menu');
+  if (menu) menu.remove();
+
+  if (!_bulkAcquire()) return;
+  try {
+    const ids = _msSnapshot();
+    let stopped = 0;
+    for (const id of ids) {
+      if (typeof runningIds !== 'undefined' && runningIds.has(id)) {
+        if (typeof socket !== 'undefined') {
+          socket.emit('close_session', { session_id: id });
+        }
+        if (typeof guiOpenDelete === 'function') guiOpenDelete(id);
+        runningIds.delete(id);
+        if (typeof sessionKinds !== 'undefined') delete sessionKinds[id];
+        stopped++;
+      }
+    }
+    showToast('Stopped ' + stopped + ' session' + (stopped === 1 ? '' : 's'));
+    _clearMultiSelect();
+    if (typeof filterSessions === 'function') filterSessions();
+  } finally {
+    _bulkRelease();
+  }
+}
+
+/**
+ * Bulk Delete.  Modal confirmation listing count + sample of names,
+ * then deletes per-ID via the existing /api/delete/<id> endpoint with
+ * concurrency=4.  Mirrors single-session deleteSession's cleanup steps
+ * (allSessions filter, allSessionIds delete, draft clear, folder unlink,
+ * kanban unlink, deselect if active) without firing the per-session
+ * confirm modal each time.
+ */
+async function _bulkDelete() {
+  const menu = document.querySelector('.session-ctx-menu');
+  if (menu) menu.remove();
+
+  if (!_bulkAcquire()) return;
+  try {
+    const ids = _msSnapshot();
+    // Diagnostic for "deletes only one" reports — captured at action time so
+    // the count we operated on is recorded even if state mutates later.
+    console.log('[bulk-delete] starting with', ids.length, 'ids:', ids);
+    if (!ids.length) return;
+
+    // Build name preview: first 3 names + "and N-3 more".
+    const names = ids.map(id => {
+      const s = (typeof allSessions !== 'undefined') ? allSessions.find(x => x.id === id) : null;
+      return (s && s.display_title) || id.slice(0, 8);
+    });
+    const sample = names.slice(0, 3).map(n => '<li>' + escHtml(n) + '</li>').join('');
+    const more = names.length > 3 ? '<li>and ' + (names.length - 3) + ' more…</li>' : '';
+    const body = '<p>Delete <strong>' + ids.length + '</strong> session'
+      + (ids.length === 1 ? '' : 's') + '?</p>'
+      + '<ul style="margin:6px 0 8px 20px;color:var(--text-secondary);font-size:12px;">'
+      + sample + more + '</ul>'
+      + '<p>This cannot be undone.</p>';
+    const confirmed = await showConfirm('Delete sessions', body, {
+      danger: true,
+      confirmText: 'Delete ' + ids.length,
+      icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
+        + '<polyline points="3 6 5 6 21 6"/>'
+        + '<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
+    });
+    if (!confirmed) return;
+
+    showToast('Deleting ' + ids.length + ' session' + (ids.length === 1 ? '' : 's') + '…');
+
+    // Track which IDs were active so we can deselect at the end.
+    const hadActive = (typeof activeId !== 'undefined') && activeId && ids.indexOf(activeId) >= 0;
+    const proj = localStorage.getItem('activeProject') || '';
+    const projQ = proj ? '?project=' + encodeURIComponent(proj) : '';
+
+    /**
+     * Delete a single session by ID.  Mirrors the per-action half of
+     * deleteSession() in toolbar.js: stop if running, DELETE the JSONL,
+     * clean up local state.  Treats 404 as success (matches existing
+     * logic for "another tab already deleted it").  Throws on hard
+     * failure so _runBulk records it.
+     */
+    async function deleteOne(id) {
+      // Stop if running so the daemon releases the file before we delete it.
+      if (typeof runningIds !== 'undefined' && runningIds.has(id)) {
+        if (typeof socket !== 'undefined') socket.emit('close_session', { session_id: id });
+        if (typeof guiOpenDelete === 'function') guiOpenDelete(id);
+        runningIds.delete(id);
+      }
+      let okFlag = false;
+      try {
+        const resp = await fetch('/api/delete/' + id + projQ, { method: 'DELETE' });
+        try {
+          const data = await resp.json();
+          okFlag = !!(data && data.ok) || resp.status === 404;
+        } catch (_jsonErr) {
+          // Non-JSON response (e.g. 500 HTML) — server-side tombstone is
+          // already set; treat as ok so card is removed locally.
+          okFlag = true;
+        }
+      } catch (_fetchErr) {
+        // Network error — clean up locally; reload will reconcile.
+        okFlag = true;
+      }
+      if (!okFlag) throw new Error('delete failed');
+
+      // Local cleanup (mirrors deleteSession in toolbar.js).
+      if (typeof allSessions !== 'undefined') {
+        allSessions = allSessions.filter(x => x.id !== id);
+      }
+      if (typeof allSessionIds !== 'undefined') allSessionIds.delete(id);
+      if (typeof _clearDraft === 'function') _clearDraft(id);
+      if (typeof removeSessionFromAllFolders === 'function') removeSessionFromAllFolders(id);
+      // Best-effort kanban unlink; do not block on it.
+      fetch('/api/kanban/sessions/' + id + '/unlink-all', { method: 'DELETE' }).catch(() => {});
+      if (typeof liveSessionId !== 'undefined' && liveSessionId === id
+          && typeof stopLivePanel === 'function') {
+        stopLivePanel();
+      }
+    }
+
+    const result = await _runBulk(ids, deleteOne, 4);
+    console.log('[bulk-delete] result:', { ok: result.ok, fail: result.fail });
+
+    // If the active session was in the deleted set, navigate away from it.
+    if (hadActive && typeof deselectSession === 'function'
+        && typeof activeId !== 'undefined' && !allSessionIds.has(activeId)) {
+      deselectSession();
+    }
+
+    // Refresh sidebar count + project counts.
+    const searchEl = document.getElementById('search');
+    if (searchEl && typeof allSessions !== 'undefined') {
+      searchEl.placeholder = 'Search ' + allSessions.length + ' sessions…';
+    }
+    if (typeof loadProjects === 'function') loadProjects();
+    if (typeof filterSessions === 'function') filterSessions();
+
+    _clearMultiSelect();
+
+    if (result.fail.length === 0) {
+      showToast('Deleted ' + result.ok.length + ' session' + (result.ok.length === 1 ? '' : 's'));
+    } else if (result.ok.length === 0) {
+      showToast('Delete failed for ' + result.fail.length + ' session(s)', true);
+    } else {
+      showToast('Deleted ' + result.ok.length + ' of ' + ids.length
+        + '. ' + result.fail.length + ' failed.', true);
+    }
+    if (result.fail.length) {
+      // Console table for diagnostics (per spec error-handling table).
+      try { console.table(result.fail); } catch (_) {}
+    }
+  } finally {
+    _bulkRelease();
+  }
+}
+
+/**
+ * Bulk Auto-name.  Confirmation modal warns about API token cost
+ * (resolved decision 1 in the spec), then invokes the existing
+ * autoName(id, silent=true) per ID with concurrency=2 (LLM rate-limit
+ * aware).  Per-call toasts are suppressed by the silent flag; we show
+ * one summary toast at the end.
+ */
+async function _bulkAutoName() {
+  const menu = document.querySelector('.session-ctx-menu');
+  if (menu) menu.remove();
+
+  if (!_bulkAcquire()) return;
+  try {
+    const ids = _msSnapshot();
+    if (!ids.length) return;
+
+    const confirmed = await showConfirm('Auto-name sessions',
+      '<p>Auto-name <strong>' + ids.length + '</strong> session'
+      + (ids.length === 1 ? '' : 's') + '?</p>'
+      + '<p style="color:var(--text-muted);font-size:12px;">This will cost API tokens '
+      + '(one short LLM call per session).</p>',
+      { confirmText: 'Auto-name ' + ids.length });
+    if (!confirmed) return;
+
+    showToast('Auto-naming ' + ids.length + ' session' + (ids.length === 1 ? '' : 's') + '…');
+
+    const result = await _runBulk(ids, function(id) {
+      return autoName(id, true);
+    }, 2);
+
+    _clearMultiSelect();
+    if (result.fail.length === 0) {
+      showToast('Auto-named ' + result.ok.length + ' session' + (result.ok.length === 1 ? '' : 's'));
+    } else {
+      showToast('Auto-named ' + result.ok.length + ' of ' + ids.length
+        + '. ' + result.fail.length + ' failed.', true);
+      try { console.table(result.fail); } catch (_) {}
+    }
+  } finally {
+    _bulkRelease();
+  }
+}
+
+/**
+ * Bulk Duplicate.  No confirmation (file copy is cheap and reversible).
+ * Concurrency=4.  Each duplicate hits POST /api/duplicate/<id>; we skip
+ * the per-call loadSessions() that single-action duplicateSession does
+ * and call it once at the end so we don't re-render the sidebar four
+ * times in a row.
+ */
+async function _bulkDuplicate() {
+  const menu = document.querySelector('.session-ctx-menu');
+  if (menu) menu.remove();
+
+  if (!_bulkAcquire()) return;
+  try {
+    const ids = _msSnapshot();
+    if (!ids.length) return;
+
+    showToast('Duplicating ' + ids.length + ' session' + (ids.length === 1 ? '' : 's') + '…');
+
+    const proj = localStorage.getItem('activeProject') || '';
+    const projQ = proj ? '?project=' + encodeURIComponent(proj) : '';
+
+    async function dupOne(id) {
+      const resp = await fetch('/api/duplicate/' + id + projQ, { method: 'POST' });
+      const data = await resp.json();
+      if (!data || !data.ok) throw new Error((data && data.error) || 'duplicate failed');
+    }
+
+    const result = await _runBulk(ids, dupOne, 4);
+
+    // Single sidebar refresh at the end surfaces all the new IDs.
+    if (typeof loadSessions === 'function') {
+      try { await loadSessions(); } catch (_) {}
+    }
+    _clearMultiSelect();
+
+    if (result.fail.length === 0) {
+      showToast('Duplicated ' + result.ok.length + ' session' + (result.ok.length === 1 ? '' : 's'));
+    } else {
+      showToast('Duplicated ' + result.ok.length + ' of ' + ids.length
+        + '. ' + result.fail.length + ' failed.', true);
+      try { console.table(result.fail); } catch (_) {}
+    }
+  } finally {
+    _bulkRelease();
+  }
+}
+
+/**
+ * Bulk Add to Compose.  Sequentially opens the existing _addToCompose()
+ * picker for each selected session.  Reusing the single-session function
+ * preserves the `?project=` filter rule (CLAUDE.md Compose project-scoping
+ * item 1) and the existing modal UX users already know.
+ *
+ * "Apply to all remaining" affordance is deferred to v1.1 (resolved
+ * decision 4 in the spec).  v1 ships sequential single-prompt.
+ *
+ * Picker close detection: we poll pm-overlay's `.show` class via
+ * requestAnimationFrame.  If the user closes the picker without picking
+ * (cancel or backdrop click), we treat that session as skipped and move on.
+ */
+async function _bulkAddToCompose() {
+  const menu = document.querySelector('.session-ctx-menu');
+  if (menu) menu.remove();
+
+  if (!_bulkAcquire()) return;
+  try {
+    const ids = _msSnapshot();
+    if (!ids.length) return;
+
+    const overlay = document.getElementById('pm-overlay');
+    if (!overlay) {
+      showToast('Cannot open Add to Compose picker', true);
+      return;
+    }
+
+    let added = 0;
+    let skipped = 0;
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      // Skip IDs that disappeared between selection and now.
+      if (typeof allSessionIds !== 'undefined' && !allSessionIds.has(id)) {
+        skipped++;
+        continue;
+      }
+      // Open the picker for this session.  _addToCompose() awaits the
+      // composition list fetch but returns before the user interacts.
+      try {
+        await _addToCompose(id);
+      } catch (_e) {
+        skipped++;
+        continue;
+      }
+      // Wait for the overlay to close (user picks or cancels).  Cap
+      // the wait at 5 minutes per session to avoid hanging forever if
+      // something glitches.
+      const closed = await _waitForOverlayClose(overlay, 5 * 60 * 1000);
+      if (closed === 'timeout') {
+        // Safety bail: stop the bulk loop, leave overlay alone.
+        showToast('Add to Compose timed out — bulk halted', true);
+        break;
+      }
+      // We can't easily distinguish "added" from "cancelled" without
+      // hooking into _atc internals; rely on the per-call success toast
+      // for that.  Treat every closed iteration as +1 attempted.
+      added++;
+    }
+    _clearMultiSelect();
+    showToast('Add to Compose finished (' + added + ' processed'
+      + (skipped ? ', ' + skipped + ' skipped' : '') + ')');
+  } finally {
+    _bulkRelease();
+  }
+}
+
+/**
+ * Resolve when the pm-overlay loses its `.show` class (i.e. the picker
+ * has been closed by the user or by a successful action).
+ * Resolves to 'closed' on close, 'timeout' if we exceed the cap.
+ *
+ * Uses requestAnimationFrame for cheap polling (~16ms) so the next
+ * picker can open as soon as the previous one finishes its 150ms
+ * close transition.
+ */
+function _waitForOverlayClose(overlay, timeoutMs) {
+  return new Promise(function(resolve) {
+    const start = Date.now();
+    function tick() {
+      if (!overlay.classList.contains('show')) {
+        resolve('closed');
+        return;
+      }
+      if (Date.now() - start > timeoutMs) {
+        resolve('timeout');
+        return;
+      }
+      requestAnimationFrame(tick);
+    }
+    // Give the overlay a tick to register .show after _addToCompose's
+    // async fetch resolves and _atcShowOverlay runs.
+    setTimeout(tick, 50);
+  });
 }
