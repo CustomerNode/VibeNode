@@ -81,7 +81,7 @@ class TestNativeFolderPicker:
     def test_windows_returns_chosen_path(self, monkeypatch):
         from app import platform_utils
         monkeypatch.setattr(platform_utils, "sys", MagicMock(platform="win32"))
-        mock_result = MagicMock(stdout="C:\\Users\\test\\project\n", returncode=0)
+        mock_result = MagicMock(stdout="OK::C:\\Users\\test\\project\n", returncode=0)
         with patch.object(platform_utils.subprocess, "run", return_value=mock_result):
             path, err = platform_utils.native_folder_picker()
         assert path == "C:\\Users\\test\\project"
@@ -90,7 +90,7 @@ class TestNativeFolderPicker:
     def test_windows_cancelled(self, monkeypatch):
         from app import platform_utils
         monkeypatch.setattr(platform_utils, "sys", MagicMock(platform="win32"))
-        mock_result = MagicMock(stdout="::CANCELLED::\n", returncode=0)
+        mock_result = MagicMock(stdout="CANCELLED::\n", returncode=0)
         with patch.object(platform_utils.subprocess, "run", return_value=mock_result):
             path, err = platform_utils.native_folder_picker()
         assert path is None

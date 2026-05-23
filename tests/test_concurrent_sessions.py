@@ -200,9 +200,12 @@ def sm_module(mock_sdk_types):
 @pytest.fixture
 def session_manager(mock_socketio, sm_module, tmp_path):
     manager = sm_module.SessionManager()
-    # Use a temp queue file so tests don't interfere with each other
-    manager._queue_path = tmp_path / "test_queues.json"
-    manager._queues = {}
+    # Use a temp queue file so tests don't interfere with each other.
+    # After the OOP refactor the queue lives on manager._mq, not manager
+    # itself — point both the path and the in-memory state at tmp_path to
+    # discard anything loaded from the user's real ~/.claude file.
+    manager._mq._queue_path = tmp_path / "test_queues.json"
+    manager._mq._queues = {}
     manager.start(mock_socketio)
     yield manager
     manager.stop()

@@ -416,6 +416,17 @@ _models_cache: dict = {"data": None, "ts": 0}
 # Stored next to kanban_config so it survives restarts.
 _CONFIRMED_MODELS_FILE = Path(__file__).resolve().parents[2] / "confirmed_models.json"
 
+# Fallback model list when no source returns anything (no API key, no CLI installed,
+# no past sessions cached). Ensures the UI always offers a sensible choice.
+# Ordered: Opus, Sonnet, Haiku.
+_FALLBACK_KNOWN_MODELS = [
+    {"id": "claude-opus-4-7", "name": "Opus 4.7"},
+    {"id": "claude-sonnet-4-6", "name": "Sonnet 4.6"},
+    {"id": "claude-haiku-4-5", "name": "Haiku 4.5"},
+]
+# Default-model preference order by family: sonnet first (balanced), then opus, then haiku.
+_DEFAULT_FAMILY_PREFERENCE = ("sonnet", "opus", "haiku")
+
 
 def _invalidate_models_cache() -> None:
     """Force the models list to be rebuilt on the next /api/models request."""
@@ -520,9 +531,14 @@ def get_models():
     1. Anthropic /v1/models API (if ANTHROPIC_API_KEY is set)
     2. Persistent confirmed-models cache (grows as sessions run)
     3. Current model from a quick CLI init call
+    4. Hardcoded fallback (ensures the list is never empty)
+
+    Always marks exactly one model with ``default: True`` — the CLI-detected
+    model if available, otherwise the first sonnet, otherwise the first entry.
     Results are cached for 10 minutes.
     """
     import time as _time
+    import re as _re
 
     if _models_cache["data"] and _time.time() - _models_cache["ts"] < 600:
         return jsonify(_models_cache["data"])
@@ -530,12 +546,13 @@ def get_models():
     # 1. Try Anthropic API (best source — always up to date)
     result = _fetch_models_from_anthropic_api()
 
+    # 3. Always try CLI so we know which model the user is currently running
+    cli_model = _fetch_current_model_from_cli()
+
     if not result:
         # 2. Use the confirmed-models persistent cache
         confirmed = _load_confirmed_models()
 
-        # 3. Also fetch the current default model from the CLI and add it
-        cli_model = _fetch_current_model_from_cli()
         if cli_model and cli_model.startswith("claude-"):
             if cli_model not in confirmed:
                 confirmed[cli_model] = _model_id_to_display_name(cli_model)
@@ -546,22 +563,57 @@ def get_models():
 
         if confirmed:
             result = [{"id": mid, "name": name} for mid, name in confirmed.items()]
-            # Sort: opus first, then sonnet, then haiku; within family highest version first
-            import re as _re
-            def _sort_key(m):
-                mid = m["id"]
-                family = 0 if "opus" in mid else (1 if "sonnet" in mid else 2)
-                nums = [-int(x) for x in _re.findall(r"\d+", mid)]
-                return (family, nums)
-            result.sort(key=_sort_key)
-            # Dedup by display name — keep the first (shortest/cleanest ID per name)
-            seen_names: set = set()
-            deduped = []
-            for m in result:
-                if m["name"] not in seen_names:
-                    seen_names.add(m["name"])
-                    deduped.append(m)
-            result = deduped
+
+    def _sort_key(m):
+        mid = m["id"]
+        family = 0 if "opus" in mid else (1 if "sonnet" in mid else 2)
+        nums = [-int(x) for x in _re.findall(r"\d+", mid)]
+        return (family, nums)
+
+    # 4. Fallback: ensure every family (opus/sonnet/haiku) is represented so
+    #    the UI always shows a useful menu, even with no API key / CLI / cache.
+    existing_ids = {m["id"] for m in result}
+    present_families = {
+        fam for fam in ("opus", "sonnet", "haiku")
+        if any(fam in m["id"] for m in result)
+    }
+    for fallback in _FALLBACK_KNOWN_MODELS:
+        fam = next((f for f in ("opus", "sonnet", "haiku") if f in fallback["id"]), None)
+        if fam and fam not in present_families and fallback["id"] not in existing_ids:
+            result.append(fallback)
+            present_families.add(fam)
+            existing_ids.add(fallback["id"])
+
+    result.sort(key=_sort_key)
+
+    # Dedup by display name — keep the first (shortest/cleanest ID per name)
+    seen_names: set = set()
+    deduped = []
+    for m in result:
+        if m["name"] not in seen_names:
+            seen_names.add(m["name"])
+            deduped.append(m)
+    result = deduped
+
+    # Mark exactly one default: CLI-detected model > first sonnet > first entry.
+    default_idx = -1
+    if cli_model:
+        for i, m in enumerate(result):
+            if m["id"] == cli_model:
+                default_idx = i
+                break
+    if default_idx == -1:
+        for fam in _DEFAULT_FAMILY_PREFERENCE:
+            for i, m in enumerate(result):
+                if fam in m["id"]:
+                    default_idx = i
+                    break
+            if default_idx != -1:
+                break
+    if default_idx == -1 and result:
+        default_idx = 0
+    for i, m in enumerate(result):
+        m["default"] = (i == default_idx)
 
     _models_cache["data"] = result
     _models_cache["ts"] = _time.time()

@@ -121,22 +121,32 @@ class MessageQueue:
         for back-to-back identical text; the wedge is overwhelmingly
         accidental.
         """
+        deduped = False
+        queue_len = 0
         with self._queue_lock:
             if session_id not in self._queues:
                 self._queues[session_id] = []
             q = self._queues[session_id]
             if q and q[-1] == text:
-                logger.info("Dropping adjacent-duplicate queue add for %s "
-                            "(queue len=%d unchanged)", session_id, len(q))
-                # Still emit an update so the client's optimistic cache
-                # converges with server truth (no-op if already in sync).
-                self.emit_queue_update(session_id)
-                return {"ok": True, "queued": True, "deduped": True}
-            q.append(text)
+                deduped = True
+                queue_len = len(q)
+            else:
+                q.append(text)
+                queue_len = len(q)
+        # IMPORTANT: emit_queue_update re-acquires _queue_lock, so it MUST be
+        # called outside the `with self._queue_lock:` block above. Otherwise
+        # it deadlocks on the non-reentrant lock (regression caught 2026-05).
+        if deduped:
+            logger.info("Dropping adjacent-duplicate queue add for %s "
+                        "(queue len=%d unchanged)", session_id, queue_len)
+            # Still emit an update so the client's optimistic cache
+            # converges with server truth (no-op if already in sync).
+            self.emit_queue_update(session_id)
+            return {"ok": True, "queued": True, "deduped": True}
         self.save_queues()
         self.emit_queue_update(session_id)
         logger.info("Queued message for %s (%d in queue)", session_id,
-                     len(self._queues.get(session_id, [])))
+                     queue_len)
         return {"ok": True, "queued": True}
 
     def get_queue(self, session_id: str) -> list:
