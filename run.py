@@ -717,4 +717,4 @@ if __name__ == "__main__":
         # and Socket.IO will auto-reconnect — no duplicate window needed.
         if os.environ.get("VIBENODE_PRESERVE_DAEMON") != "1":
             threading.Thread(target=open_browser, daemon=True).start()
-    socketio.run(app, host="0.0.0.0", port=_port, debug=False, allow_unsafe_werkzeug=True)
+    socketio.run(app, host="127.0.0.1", port=_port, debug=False, allow_unsafe_werkzeug=True)
