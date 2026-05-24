@@ -19,6 +19,7 @@ backstop for that whole class of bug — present and future.
 """
 
 import json
+import os
 import sqlite3
 import pytest
 from pathlib import Path
@@ -112,6 +113,13 @@ def _isolate_daemon_home(tmp_path_factory, monkeypatch):
     (fake_home / ".claude").mkdir(exist_ok=True)
     (fake_home / "Downloads").mkdir(exist_ok=True)
     monkeypatch.setattr(Path, "home", lambda: fake_home)
+    # daemon.session_manager appends Path.home()-derived paths to
+    # os.environ["PATH"] at import time. Tests that reload that module
+    # (e.g., the sm_module fixture in test_state_transitions.py) would
+    # otherwise extend PATH unboundedly across the session — on Windows
+    # the env block overflows at 32767 chars and subsequent reloads
+    # raise ValueError. Snapshot/restore PATH so each test starts clean.
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     yield
 
 
