@@ -44,46 +44,66 @@ logger = logging.getLogger(__name__)
 # When the daemon is spawned with CREATE_NO_WINDOW the PATH may be stripped.
 # Add the standard install location so shutil.which("claude") always works.
 # ---------------------------------------------------------------------------
-_extra_path_dirs = [
-    str(Path.home() / ".local" / "bin"),      # Linux: pip --user, npm --prefix ~/.local
-    str(Path.home() / ".npm-global" / "bin"), # Linux: npm config set prefix ~/.npm-global
-    str(Path.home() / ".npm" / "bin"),        # Linux: some npm versions
-    str(Path.home() / ".volta" / "bin"),      # Volta node version manager
-    "/opt/homebrew/bin",                       # macOS Apple Silicon (Homebrew)
-    "/usr/local/bin",                          # macOS Intel (Homebrew) / Linux common
-    "/usr/bin",                                # Linux fallback for system-installed claude
-]
+# Wrapped in a function with a process-level guard so reloads (importlib.reload
+# from tests, dev hot-reload tooling, etc.) don't re-augment PATH every time.
+# Without the guard a fixture that varies Path.home() per test grows PATH past
+# the Windows 32767-char env block limit and subsequent reloads raise
+# ValueError (caught 2026-05 in test_state_transitions).
+#
+# The marker lives in os.environ — module-level globals get reset by reload,
+# but environment variables survive across reloads in the same process.
+_PATH_AUGMENTED_MARKER = "_VIBENODE_DAEMON_PATH_AUGMENTED"
 
-# nvm (Node Version Manager) installs node into versioned directories that
-# can't be known statically.  When launched from a .desktop file or other
-# non-interactive shell, ~/.bashrc is not sourced so nvm's shims are absent
-# from PATH.  Resolve the active version from NVM_BIN (set when nvm is live)
-# or from ~/.nvm/alias/default (the version that would activate on login).
-_nvm_dir = Path.home() / ".nvm"
-if _nvm_dir.is_dir():
-    _nvm_bin = os.environ.get("NVM_BIN", "")
-    if _nvm_bin and os.path.isdir(_nvm_bin):
-        _extra_path_dirs.append(_nvm_bin)
-    else:
-        try:
-            _alias_file = _nvm_dir / "alias" / "default"
-            if _alias_file.exists():
-                _version = _alias_file.read_text(encoding="utf-8").strip().lstrip("v")
-                # Resolve lts/* aliases (e.g. "lts/iron" → ~/.nvm/alias/lts/iron)
-                if "/" in _version:
-                    _lts_file = _nvm_dir / "alias" / _version
-                    if _lts_file.exists():
-                        _version = _lts_file.read_text(encoding="utf-8").strip().lstrip("v")
-                _nvm_node_bin = _nvm_dir / "versions" / "node" / ("v" + _version) / "bin"
-                if _nvm_node_bin.is_dir():
-                    _extra_path_dirs.append(str(_nvm_node_bin))
-        except Exception:
-            pass  # Best-effort — never block startup
 
-_current_path = os.environ.get("PATH", "")
-_dirs_to_add = [d for d in _extra_path_dirs if d not in _current_path]
-if _dirs_to_add:
-    os.environ["PATH"] = os.pathsep.join(_dirs_to_add) + os.pathsep + _current_path
+def _augment_path_for_cli() -> None:
+    """Idempotently add standard install dirs to PATH so the Claude CLI
+    is discoverable when the daemon was launched without a login shell.
+    Safe to call multiple times — only takes effect on the first call."""
+    if os.environ.get(_PATH_AUGMENTED_MARKER) == "1":
+        return
+    extra_path_dirs = [
+        str(Path.home() / ".local" / "bin"),      # Linux: pip --user, npm --prefix ~/.local
+        str(Path.home() / ".npm-global" / "bin"), # Linux: npm config set prefix ~/.npm-global
+        str(Path.home() / ".npm" / "bin"),        # Linux: some npm versions
+        str(Path.home() / ".volta" / "bin"),      # Volta node version manager
+        "/opt/homebrew/bin",                       # macOS Apple Silicon (Homebrew)
+        "/usr/local/bin",                          # macOS Intel (Homebrew) / Linux common
+        "/usr/bin",                                # Linux fallback for system-installed claude
+    ]
+    # nvm (Node Version Manager) installs node into versioned directories
+    # that can't be known statically. When launched from a .desktop file or
+    # other non-interactive shell, ~/.bashrc isn't sourced so nvm's shims
+    # are absent from PATH. Resolve the active version from NVM_BIN (set
+    # when nvm is live) or from ~/.nvm/alias/default.
+    nvm_dir = Path.home() / ".nvm"
+    if nvm_dir.is_dir():
+        nvm_bin = os.environ.get("NVM_BIN", "")
+        if nvm_bin and os.path.isdir(nvm_bin):
+            extra_path_dirs.append(nvm_bin)
+        else:
+            try:
+                alias_file = nvm_dir / "alias" / "default"
+                if alias_file.exists():
+                    version = alias_file.read_text(encoding="utf-8").strip().lstrip("v")
+                    # Resolve lts/* aliases (e.g. "lts/iron" -> ~/.nvm/alias/lts/iron)
+                    if "/" in version:
+                        lts_file = nvm_dir / "alias" / version
+                        if lts_file.exists():
+                            version = lts_file.read_text(encoding="utf-8").strip().lstrip("v")
+                    nvm_node_bin = nvm_dir / "versions" / "node" / ("v" + version) / "bin"
+                    if nvm_node_bin.is_dir():
+                        extra_path_dirs.append(str(nvm_node_bin))
+            except Exception:
+                pass  # Best-effort — never block startup
+
+    current_path = os.environ.get("PATH", "")
+    dirs_to_add = [d for d in extra_path_dirs if d not in current_path]
+    if dirs_to_add:
+        os.environ["PATH"] = os.pathsep.join(dirs_to_add) + os.pathsep + current_path
+    os.environ[_PATH_AUGMENTED_MARKER] = "1"
+
+
+_augment_path_for_cli()
 
 # SDK Patches — now applied by AgentSDK.apply_patches() in SessionManager.__init__().
 # See daemon/backends/claude.py for the Claude implementation.

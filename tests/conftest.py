@@ -110,9 +110,39 @@ def _isolate_daemon_home(tmp_path_factory, monkeypatch):
     fake_home = tmp_path_factory.mktemp("home")
     # Pre-create directories tests expect under home/. Add to this list
     # rather than skipping the fixture if a test needs a new one.
-    (fake_home / ".claude").mkdir(exist_ok=True)
+    # ``.claude/projects`` is iterated by ``app.routes.sessions_api`` —
+    # missing it causes order-dependent FileNotFoundError flakes.
+    (fake_home / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
     (fake_home / "Downloads").mkdir(exist_ok=True)
     monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    # Several daemon modules capture ``Path.home()``-derived paths at IMPORT
+    # time (module-level constants), so by the time this per-test fixture
+    # runs the values are already baked in to the real ``~/.claude/`` paths.
+    # Patch the captured constants too so writes land in the sandbox even
+    # when the module was imported before the fixture activated.
+    try:
+        import daemon.session_registry as _sr
+        monkeypatch.setattr(_sr, "REGISTRY_PATH",
+                            fake_home / ".claude" / "gui_active_sessions.json")
+    except ImportError:
+        pass
+    try:
+        import app.config as _cfg
+        monkeypatch.setattr(_cfg, "_CLAUDE_PROJECTS",
+                            fake_home / ".claude" / "projects")
+    except ImportError:
+        pass
+    # ``app.routes.sessions_api`` does ``from ..config import _CLAUDE_PROJECTS``,
+    # which binds the value at import time and doesn't follow ``app.config``
+    # reassignment. Patch the route's local binding directly.
+    try:
+        import app.routes.sessions_api as _sa
+        monkeypatch.setattr(_sa, "_CLAUDE_PROJECTS",
+                            fake_home / ".claude" / "projects")
+    except ImportError:
+        pass
+
     # daemon.session_manager appends Path.home()-derived paths to
     # os.environ["PATH"] at import time. Tests that reload that module
     # (e.g., the sm_module fixture in test_state_transitions.py) would
