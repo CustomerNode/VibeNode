@@ -20,8 +20,11 @@ on:
       - 'static/js/**'
       - 'static/css/**'
       - 'app/**'
+      - 'daemon/**'
       - 'tests/e2e/**'
       - 'run.py'
+      - 'requirements*.txt'
+      - '.github/workflows/e2e-tests.yml'
 
 jobs:
   e2e:
@@ -48,15 +51,26 @@ jobs:
 
       - name: Run E2E tests
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # ANTHROPIC_API_KEY: use a dedicated test key with low rate limits so
+          # a runaway test (infinite loop, pathological prompt) can't blow up
+          # the production billing. Configure ANTHROPIC_API_KEY_E2E in repo
+          # secrets; fall back to the production key only if no test key is
+          # set, and log a warning so the gap is visible.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_E2E || secrets.ANTHROPIC_API_KEY }}
         run: |
+          if [ -z "${{ secrets.ANTHROPIC_API_KEY_E2E }}" ]; then
+            echo "::warning::ANTHROPIC_API_KEY_E2E secret not set — using production API key. Configure a dedicated test key (low rate limit) in repo secrets to cap E2E spend."
+          fi
+          # No --reruns: flaky tests must be fixed, not retried. A test that
+          # passes 1-in-3 still ships if reruns mask it. If a real network/
+          # selenium glitch surfaces, fix the test, don't paper over it.
           if [ -n "${{ github.event.inputs.test_file }}" ]; then
             pytest "tests/e2e/${{ github.event.inputs.test_file }}" \
-              -m e2e -v --timeout=300 --reruns 2 \
+              -m e2e -v --timeout=300 \
               --html=test-report.html --self-contained-html
           else
             pytest tests/e2e \
-              -m e2e -v --timeout=300 --reruns 2 \
+              -m e2e -v --timeout=300 \
               --html=test-report.html --self-contained-html
           fi
 

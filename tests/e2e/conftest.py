@@ -83,13 +83,20 @@ _server_fh = None
 # IMPORTANT: Individual test files must NOT define their own driver() fixture.
 # This single fixture ensures consistent Chrome options across all tests.
 
-@pytest.fixture(scope="class")
+@pytest.fixture(scope="function")
 def driver():
     """Headless Chrome driver for E2E tests.
 
-    Scope is 'class' — each test class gets a fresh browser instance.
-    This prevents one class's failures from cascading to another while
-    keeping tests within a class fast (shared browser state).
+    Scope is 'function' — each test gets a fresh browser instance.
+
+    History: previously scoped to 'class' for speed. The trade-off broke
+    too often: when a test left the DOM/cookies/localStorage in an odd
+    state, every subsequent test in the same class inherited the
+    corruption and produced confusing cascading failures. Function scope
+    is ~3-5× slower per class but each failure is isolated to a single
+    test, which is what we want from a CI signal. If a specific class
+    has a documented reason to share browser state, override the fixture
+    locally with ``@pytest.fixture(scope="class")``.
     """
     options = webdriver.ChromeOptions()
     options.add_argument("--headless=new")
