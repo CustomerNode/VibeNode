@@ -85,6 +85,37 @@ def _is_production_path(p) -> bool:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_daemon_home(tmp_path_factory, monkeypatch):
+    """Redirect ``Path.home()`` to a per-session tmp dir so daemon-owned state
+    files land in a sandbox instead of the user's real ``~/.claude/``.
+
+    Background: ``MessageQueue``, ``PermissionManager``, and ``SessionRegistry``
+    each compute their persistence path from ``Path.home() / ".claude" / ...``
+    inside ``__init__``. Any test that constructs ``SessionManager()`` without
+    explicit fixtures was reading from and writing to the user's real files.
+    The ``_block_production_paths`` guard below catches WRITES (and raises),
+    but reads silently succeeded — so a queue file polluted by an earlier
+    leak kept causing order-dependent failures in ``test_wakeup_handling``
+    (queued entries auto-dispatched into a SessionManager with no event loop).
+
+    This fixture eliminates the read path entirely: by the time any daemon
+    component constructs its ``_queue_path`` / policy path, ``Path.home()``
+    returns a fresh tmp dir, so the loads come back empty.
+
+    The production-path constants in ``_block_production_paths`` are computed
+    once at module import (before this fixture runs), so the WRITE guard
+    still uses the real production paths as its tripwire.
+    """
+    fake_home = tmp_path_factory.mktemp("home")
+    # Pre-create directories tests expect under home/. Add to this list
+    # rather than skipping the fixture if a test needs a new one.
+    (fake_home / ".claude").mkdir(exist_ok=True)
+    (fake_home / "Downloads").mkdir(exist_ok=True)
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _block_production_paths(request, monkeypatch):
     """Hard-fail any test that tries to read/write the production DB or config.
 
