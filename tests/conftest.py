@@ -32,9 +32,32 @@ _REAL_KANBAN_DB = (Path.home() / ".claude" / "gui_kanban.db").resolve()
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _REAL_KANBAN_CONFIG = (_REPO_ROOT / "kanban_config.json").resolve()
 
+# Additional daemon-owned state files under ~/.claude/. Each one is
+# constructed (and read) by a daemon component at import time:
+#   - gui_message_queues.json  → MessageQueue
+#   - gui_active_sessions.json → SessionRegistry
+#   - gui_permission_policy.json, gui_ui_prefs.json → PermissionManager
+# A test that constructs SessionManager / MessageQueue / PermissionManager
+# without redirecting these paths will read from and overwrite the user's
+# real state. The guard fails such tests loudly instead of silently
+# corrupting state.
+_REAL_DAEMON_STATE_FILES = {
+    (Path.home() / ".claude" / "gui_message_queues.json").resolve(),
+    (Path.home() / ".claude" / "gui_active_sessions.json").resolve(),
+    (Path.home() / ".claude" / "gui_permission_policy.json").resolve(),
+    (Path.home() / ".claude" / "gui_ui_prefs.json").resolve(),
+}
+_REAL_FILE_HISTORY_ROOT = (Path.home() / ".claude" / "file-history").resolve()
+
 
 def _is_production_path(p) -> bool:
-    """Return True if *p* refers to the user's real kanban DB or config.
+    """Return True if *p* refers to a real production file or directory.
+
+    Covers:
+      - The kanban SQLite DB
+      - The repo-root ``kanban_config.json``
+      - Daemon-owned ``gui_*.json`` state files in ``~/.claude/``
+      - Anything under ``~/.claude/file-history/`` (per-session backups)
 
     We compare against the absolute, resolved form so a relative path or
     a symlink that points at the real file still trips the guard. Using
@@ -49,7 +72,16 @@ def _is_production_path(p) -> bool:
         candidate = candidate.resolve(strict=False)
     except (OSError, ValueError):
         return False
-    return candidate == _REAL_KANBAN_DB or candidate == _REAL_KANBAN_CONFIG
+    if candidate == _REAL_KANBAN_DB or candidate == _REAL_KANBAN_CONFIG:
+        return True
+    if candidate in _REAL_DAEMON_STATE_FILES:
+        return True
+    # file-history is a directory tree; treat anything beneath it as protected
+    try:
+        candidate.relative_to(_REAL_FILE_HISTORY_ROOT)
+        return True
+    except ValueError:
+        return False
 
 
 @pytest.fixture(autouse=True)

@@ -534,14 +534,19 @@ class TestCliTitle:
 class TestSmartTitle:
 
     def test_falls_back_to_heuristic_when_no_anthropic(self):
-        """smart_title should work even without anthropic SDK."""
+        """smart_title should work even without anthropic SDK.
+
+        Mocks the daemon and CLI paths too so the test doesn't try real
+        HTTP / subprocess calls (each of which adds ~10s of timeout).
+        """
         messages = [
             {"role": "user", "content": "Write a REST API with Flask"},
             {"role": "assistant", "content": "Sure, let me help."},
         ]
-        # Patch anthropic import to fail
         import unittest.mock
-        with unittest.mock.patch.dict("sys.modules", {"anthropic": None}):
+        with unittest.mock.patch.dict("sys.modules", {"anthropic": None}), \
+             unittest.mock.patch("app.titling._daemon_title", return_value=None), \
+             unittest.mock.patch("app.titling._cli_title", return_value=None):
             title = smart_title(messages)
         assert isinstance(title, str)
         assert len(title) > 0
@@ -551,7 +556,9 @@ class TestSmartTitle:
     def test_returns_string_for_trivial_input(self):
         messages = [{"role": "user", "content": "hi"}]
         import unittest.mock
-        with unittest.mock.patch.dict("sys.modules", {"anthropic": None}):
+        with unittest.mock.patch.dict("sys.modules", {"anthropic": None}), \
+             unittest.mock.patch("app.titling._daemon_title", return_value=None), \
+             unittest.mock.patch("app.titling._cli_title", return_value=None):
             title = smart_title(messages)
         assert isinstance(title, str)
         assert title == "Untitled Session"

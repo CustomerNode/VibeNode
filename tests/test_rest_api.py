@@ -417,7 +417,11 @@ class TestAutonameSession:
     """POST /api/autonname/<id> (note the double-n in the route)."""
 
     def test_autoname_generates_title(self, client, populated_project):
-        resp = client.post("/api/autonname/sess-002")
+        # Mock smart_title to avoid hitting the real daemon / API / CLI chain
+        # (~30s of timeouts in a sandbox without ANTHROPIC_API_KEY or claude CLI).
+        with patch("app.routes.sessions_api.smart_title",
+                   return_value="Generated Title"):
+            resp = client.post("/api/autonname/sess-002")
         assert resp.status_code == 200
         data = resp.get_json()
         assert data["ok"] is True
@@ -623,12 +627,19 @@ class TestDuplicateSession:
 
 
 class TestContinueSession:
-    """POST /api/continue/<id>"""
+    """POST /api/continue/<id>
+
+    NOTE: ``/api/continue`` calls ``smart_title`` to generate the topic for
+    the handoff context. We mock it in every test below — the real call
+    falls through daemon → API → CLI subprocess (~23s each) in a sandbox.
+    """
 
     def test_continue_creates_new_session(self, client, populated_project,
                                           fake_project):
         with patch("app.routes.sessions_api._decode_project",
-                   return_value=str(fake_project)):
+                   return_value=str(fake_project)), \
+             patch("app.routes.sessions_api.smart_title",
+                   return_value="Topic Stub"):
             resp = client.post("/api/continue/sess-001")
         assert resp.status_code == 200
         data = resp.get_json()
@@ -641,7 +652,9 @@ class TestContinueSession:
                                                 populated_project,
                                                 fake_project):
         with patch("app.routes.sessions_api._decode_project",
-                   return_value=str(fake_project)):
+                   return_value=str(fake_project)), \
+             patch("app.routes.sessions_api.smart_title",
+                   return_value="Topic Stub"):
             resp = client.post("/api/continue/sess-001")
         new_id = resp.get_json()["new_id"]
         content = (fake_project / f"{new_id}.jsonl").read_text(
@@ -1039,10 +1052,31 @@ class TestConfig:
 
 
 class TestModels:
-    """GET /api/models"""
+    """GET /api/models
+
+    NOTE: every test below patches ``_fetch_current_model_from_cli`` and
+    ``_fetch_models_from_anthropic_api`` and invalidates the module-level
+    cache. Without those mocks the endpoint shells out to ``claude`` and
+    hits the network with long timeouts (~10s).
+    """
+
+    def _setup_models(self, cli_model: str = ""):
+        """Return the context-manager pair that isolates /api/models from
+        external calls. Also clears the in-memory cache so each test gets
+        a fresh response."""
+        from app.routes import live_api
+        live_api._invalidate_models_cache()
+        return (
+            patch("app.routes.live_api._fetch_models_from_anthropic_api",
+                  return_value=[]),
+            patch("app.routes.live_api._fetch_current_model_from_cli",
+                  return_value=cli_model),
+        )
 
     def test_returns_model_list(self, client):
-        resp = client.get("/api/models")
+        api_mock, cli_mock = self._setup_models()
+        with api_mock, cli_mock:
+            resp = client.get("/api/models")
         assert resp.status_code == 200
         data = resp.get_json()
         assert isinstance(data, list)
@@ -1052,7 +1086,9 @@ class TestModels:
         assert any("opus" in i for i in ids)
 
     def test_has_default_model(self, client):
-        resp = client.get("/api/models")
+        api_mock, cli_mock = self._setup_models()
+        with api_mock, cli_mock:
+            resp = client.get("/api/models")
         data = resp.get_json()
         defaults = [m for m in data if m.get("default")]
         assert len(defaults) == 1
@@ -1227,7 +1263,9 @@ class TestCRUDEdgeCases:
                                           fake_project):
         """Continue should create snapshot + user entry + title entry."""
         with patch("app.routes.sessions_api._decode_project",
-                   return_value=str(fake_project)):
+                   return_value=str(fake_project)), \
+             patch("app.routes.sessions_api.smart_title",
+                   return_value="Topic Stub"):
             resp = client.post("/api/continue/sess-001")
         new_id = resp.get_json()["new_id"]
         content = (fake_project / f"{new_id}.jsonl").read_text(
