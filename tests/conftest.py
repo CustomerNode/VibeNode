@@ -86,7 +86,7 @@ def _is_production_path(p) -> bool:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_daemon_home(tmp_path_factory, monkeypatch):
+def _isolate_daemon_home(request, tmp_path_factory, monkeypatch):
     """Redirect ``Path.home()`` to a per-session tmp dir so daemon-owned state
     files land in a sandbox instead of the user's real ``~/.claude/``.
 
@@ -125,6 +125,23 @@ def _isolate_daemon_home(tmp_path_factory, monkeypatch):
         import daemon.session_registry as _sr
         monkeypatch.setattr(_sr, "REGISTRY_PATH",
                             fake_home / ".claude" / "gui_active_sessions.json")
+        # Neutralize the debounced save timer for every test EXCEPT the
+        # registry's own test file. Background: tests like test_fork_rewind
+        # construct SessionManager() (which owns a SessionRegistry) without
+        # ever calling stop(). The registry's 3-second timer then fires
+        # DURING a later test's fixture setup, racing with the next
+        # SessionRegistry's tmp-file write on the same path — surfacing
+        # as "[WinError 5] Access is denied" and an ERROR at fixture setup.
+        # Replacing the schedule with a no-op is safe in tests: the purpose
+        # of the registry (crash recovery) has no value in a test process
+        # that owns its own state and exits cleanly. test_session_registry
+        # opts out so its debounce tests still exercise the real timer.
+        if "test_session_registry" not in request.node.nodeid:
+            monkeypatch.setattr(
+                _sr.SessionRegistry,
+                "schedule_registry_save",
+                lambda self, save_fn: None,
+            )
     except ImportError:
         pass
     try:
