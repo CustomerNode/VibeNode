@@ -412,6 +412,155 @@ class TestRenameSession:
         )
         assert "Appended" in content
 
+    # --- DEDUP REGRESSION (see app/routes/sessions_api.py
+    # _append_custom_title_if_changed): without dedup, every rename call
+    # piled another identical custom-title line onto the .jsonl.  One
+    # Aras session in production accumulated 52 copies of the same title,
+    # which also bumped file mtime constantly and made the sort lie about
+    # "when was this last touched". ---
+
+    def test_rename_to_same_title_is_a_noop(self, client, populated_project,
+                                              fake_project):
+        """Rename to the title the file already carries — must NOT
+        append a duplicate line (size and mtime stay put)."""
+        import time as _t
+        path = fake_project / "sess-002.jsonl"
+        # sess-002 fixture starts with custom-title "My Titled Session"
+        before_size = path.stat().st_size
+        before_mtime = path.stat().st_mtime
+        _t.sleep(0.05)  # ensure mtime granularity would register a change
+        resp = client.post("/api/rename/sess-002",
+                           json={"title": "My Titled Session"})
+        assert resp.status_code == 200
+        assert path.stat().st_size == before_size
+        assert path.stat().st_mtime == before_mtime
+
+    def test_rename_repeated_with_same_title_only_appends_once(
+        self, client, populated_project, fake_project,
+    ):
+        """The Aras failure mode in miniature: spamming rename with the
+        same value must not accrete duplicate lines."""
+        path = fake_project / "sess-002.jsonl"
+
+        def _count_pinned_custom_titles():
+            n = 0
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if (obj.get("type") == "custom-title"
+                        and obj.get("customTitle") == "Pinned"):
+                    n += 1
+            return n
+
+        # Initial rename to a brand-new title — appends exactly once.
+        resp = client.post("/api/rename/sess-002",
+                           json={"title": "Pinned"})
+        assert resp.status_code == 200
+        assert _count_pinned_custom_titles() == 1
+        # Two more renames with the same title — both must be no-ops.
+        client.post("/api/rename/sess-002", json={"title": "Pinned"})
+        client.post("/api/rename/sess-002", json={"title": "Pinned"})
+        assert _count_pinned_custom_titles() == 1
+
+
+# ===================================================================
+# 2.5 SESSION TOUCH + ACCESS RECORDING
+# ===================================================================
+#
+# The sidebar's date sort uses ``effective_ts = max(last_message_ts,
+# file_mtime, last_access_ts)``.  The access_ts component is bumped by
+# UI hooks so view-only opens and SDK-remap-then-write-elsewhere cases
+# still bubble the user-clicked session to the top.  These tests guard:
+#
+#   - POST /api/session/<id>/touch persists into _session_access.json
+#   - GET  /api/session/<id> (non meta_only) ALSO persists
+#   - GET  /api/session/<id>?meta_only=1 does NOT persist (poll, not click)
+#
+# Regression: if any of these silently no-op, the sidebar stops
+# reflecting interactions and the Aras-style "I clicked it and it
+# didn't move" bug returns.
+
+class TestSessionTouch:
+    """POST /api/session/<id>/touch — explicit "I interacted" signal."""
+
+    def test_touch_returns_ok(self, client, populated_project):
+        resp = client.post("/api/session/sess-001/touch")
+        assert resp.status_code == 200
+        assert resp.get_json()["ok"] is True
+
+    def test_touch_records_access(self, client, populated_project,
+                                   fake_project, monkeypatch):
+        import time as _t
+        # The shared app fixture patches _sessions_dir in many spots, but
+        # session_store imports _sessions_dir as a local binding — we
+        # need an explicit patch there so the access file lands under
+        # fake_project, not the real user dir.
+        monkeypatch.setattr(
+            "app.session_store._sessions_dir",
+            lambda project="": fake_project,
+        )
+        resp = client.post("/api/session/sess-001/touch")
+        assert resp.status_code == 200
+        access_file = fake_project / "_session_access.json"
+        assert access_file.exists()
+        data = json.loads(access_file.read_text(encoding="utf-8"))
+        assert "sess-001" in data
+        assert abs(data["sess-001"] - _t.time()) < 5.0
+
+    def test_touch_unknown_id_still_ok(self, client, populated_project,
+                                         fake_project, monkeypatch):
+        """Best-effort sort hint — must not 404 on unknown IDs."""
+        monkeypatch.setattr(
+            "app.session_store._sessions_dir",
+            lambda project="": fake_project,
+        )
+        resp = client.post("/api/session/never-existed/touch")
+        assert resp.status_code == 200
+
+
+class TestSessionGetRecordsAccess:
+    """GET /api/session/<id> (full, non-meta_only) records access.
+    ``meta_only=1`` requests are polls and must NOT record."""
+
+    def test_full_get_records_access(self, client, populated_project,
+                                       fake_project, monkeypatch):
+        monkeypatch.setattr(
+            "app.session_store._sessions_dir",
+            lambda project="": fake_project,
+        )
+        access_file = fake_project / "_session_access.json"
+        if access_file.exists():
+            access_file.unlink()
+        resp = client.get("/api/session/sess-001")
+        assert resp.status_code == 200
+        assert access_file.exists()
+        data = json.loads(access_file.read_text(encoding="utf-8"))
+        assert "sess-001" in data
+
+    def test_meta_only_get_does_not_record_access(
+        self, client, populated_project, fake_project, monkeypatch,
+    ):
+        """If meta_only fired the recorder, every background widget
+        (live-panel existence check, etc.) would bump every session's
+        access_ts on every page render — the sort would be meaningless."""
+        monkeypatch.setattr(
+            "app.session_store._sessions_dir",
+            lambda project="": fake_project,
+        )
+        access_file = fake_project / "_session_access.json"
+        if access_file.exists():
+            access_file.unlink()
+        resp = client.get("/api/session/sess-001?meta_only=1")
+        assert resp.status_code == 200
+        # Either no file, or the file exists but sess-001 is not in it
+        if access_file.exists():
+            data = json.loads(access_file.read_text(encoding="utf-8"))
+            assert "sess-001" not in data
+
 
 class TestAutonameSession:
     """POST /api/autonname/<id> (note the double-n in the route)."""
