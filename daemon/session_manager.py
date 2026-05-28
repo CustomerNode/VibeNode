@@ -272,6 +272,39 @@ def _system_content_label(text: str) -> str:
     return "System message"
 
 
+def _is_thinking_block_modified_error(text: str) -> bool:
+    """Return True if text is the Anthropic "modified thinking block" 400.
+
+    When extended thinking is enabled and a session's stored transcript has a
+    tampered/partial thinking block (e.g. a turn force-completed by an older,
+    thinking-unsafe repair), ``--resume`` replays it and the API rejects the
+    request with, verbatim::
+
+        API Error: 400 messages.<i>.content.<j>: thinking or redacted_thinking
+        blocks in the latest assistant message cannot be modified. These blocks
+        must remain as they were in the original response.
+
+    The Claude CLI surfaces this as ordinary assistant text (the user sees the
+    raw "API Error: 400 ..." string) rather than raising a transport
+    exception, so nothing reconnects and every subsequent send hits the same
+    poisoned in-memory history.  Detecting it lets us trigger the existing
+    self-heal path: reconnect (which runs ``repair_incomplete_turn`` to strip
+    the bad blocks from disk) and auto-retry the last user message.
+
+    Matched loosely (substring) so minor wording or formatting changes in the
+    CLI/API don't silently disable the heal.
+
+    Perf: this runs on every assistant text block of every turn, so it
+    short-circuits on the rare literal "cannot be modified" phrase BEFORE any
+    case-folding — the common case is a single C-level substring scan with no
+    string copy.
+    """
+    if not text or "cannot be modified" not in text:
+        return False
+    low = text.lower()
+    return "thinking" in low or "redacted_thinking" in low
+
+
 # ---------------------------------------------------------------------------
 # Registry file for crash recovery — moved to daemon/session_registry.py
 # ---------------------------------------------------------------------------
@@ -2694,7 +2727,49 @@ class SessionManager:
                 bk = block.get("kind", "")
 
                 if bk == BlockKind.TEXT.value:
-                    entry = LogEntry(kind="asst", text=(block.get("text", "") or "")[:50000])
+                    _asst_text = (block.get("text", "") or "")[:50000]
+
+                    # Detect the Anthropic "modified thinking block" 400 and
+                    # flag the session for reconnect + auto-retry.  The CLI
+                    # surfaces this API error as assistant text (no transport
+                    # exception is raised), so without this the session goes
+                    # IDLE with the raw error shown and EVERY subsequent send
+                    # replays the same poisoned history and fails identically.
+                    #
+                    # We reuse the existing stream-heal machinery (mirrors the
+                    # "Stream closed" tool_result branch below): the finally
+                    # block reconnects via _reconnect_client — which runs
+                    # repair_incomplete_turn to strip the tampered thinking
+                    # blocks from the JSONL — then re-reads the cleaned
+                    # transcript and resends the last user message.  The
+                    # heal_count <= 3 guard bounds the retries.
+                    if _is_thinking_block_modified_error(_asst_text):
+                        if not hasattr(info, '_stream_heal_count'):
+                            info._stream_heal_count = 0
+                        info._stream_heal_count += 1
+                        info._stream_heal_needed = True
+                        logger.warning(
+                            "STREAM_HEAL_TRIGGER site=asst_thinking_block_400 "
+                            "sid=%s state=%s heal_count=%d snippet=%r",
+                            session_id,
+                            getattr(info.state, 'value', info.state),
+                            info._stream_heal_count, _asst_text[:200],
+                        )
+                        entry = LogEntry(
+                            kind="system",
+                            text="Recovering from an interrupted-response error "
+                                 "— reconnecting and retrying automatically",
+                        )
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
+                        # Don't also render the raw API error as an assistant
+                        # bubble — the status entry above explains it and the
+                        # retry supersedes it.
+                        continue
+
+                    entry = LogEntry(kind="asst", text=_asst_text)
                     with info._lock:
                         info.entries.append(entry)
                         entry_index = len(info.entries) - 1

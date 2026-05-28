@@ -317,6 +317,43 @@ class TestJsonlRepairBeforeReconnect:
         )
 
 
+class TestThinkingBlock400TriggersReconnect:
+    """The Anthropic "modified thinking block" 400 arrives as assistant text
+    (not a transport exception), so it must be detected in _process_message
+    and routed through the same reconnect + retry self-heal as Stream-closed.
+    """
+
+    def test_detection_helper_matches_real_error(self, sm_module):
+        """The exact API error string from a poisoned resume is detected."""
+        real = (
+            "API Error: 400 messages.1.content.6: thinking or "
+            "redacted_thinking blocks in the latest assistant message cannot "
+            "be modified. These blocks must remain as they were in the "
+            "original response."
+        )
+        assert sm_module._is_thinking_block_modified_error(real) is True
+
+    def test_detection_helper_ignores_unrelated_text(self, sm_module):
+        """Ordinary assistant text and other errors are not misclassified."""
+        assert sm_module._is_thinking_block_modified_error("") is False
+        assert sm_module._is_thinking_block_modified_error(
+            "Here is my thinking on the problem."
+        ) is False
+        assert sm_module._is_thinking_block_modified_error(
+            "API Error: 400 messages: tool_use ids were found without "
+            "tool_result blocks"
+        ) is False
+
+    def test_process_message_flags_heal_on_thinking_400(self, sm_module):
+        """An assistant TEXT block carrying the thinking-block 400 must set
+        _stream_heal_needed and increment _stream_heal_count so the finally
+        block reconnects (which sanitizes the JSONL) and retries."""
+        src = inspect.getsource(sm_module.SessionManager._process_message)
+        assert "_is_thinking_block_modified_error" in src
+        assert "_stream_heal_needed = True" in src
+        assert "_stream_heal_count += 1" in src
+
+
 class TestReconnectDuringPermissionWait:
     """Session waiting for permission when stream dies.
     Verify the code handles the case where state is WAITING."""

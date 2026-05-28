@@ -1053,6 +1053,228 @@ class TestRepairIncompleteJsonl:
         # The check at line ~276 -- should NOT repair non-assistant
         assert obj.get("type") != "assistant"
 
+    def _repair(self, jsonl_path, monkeypatch):
+        """Run the real ClaudeJsonlStore.repair_incomplete_turn against a
+        local tmp JSONL by stubbing the project-dir path resolution.
+        """
+        from daemon.backends.claude_store import ClaudeJsonlStore
+
+        store = ClaudeJsonlStore()
+        monkeypatch.setattr(store, "find_session_path", lambda sid, cwd="": jsonl_path)
+        return store.repair_incomplete_turn("sid", cwd="")
+
+    def test_strips_thinking_blocks_on_repair(self, tmp_path, monkeypatch):
+        """Regression: repairing an interrupted turn that contains thinking
+        blocks must DROP them, not leave them modified.
+
+        Otherwise --resume replays a mutated assistant message and the
+        Anthropic API rejects it with: "thinking or redacted_thinking blocks
+        in the latest assistant message cannot be modified."
+        """
+        jsonl_path = tmp_path / "session.jsonl"
+        incomplete = {
+            "type": "assistant",
+            "uuid": "a1",
+            "message": {
+                "content": [
+                    {"type": "thinking", "thinking": "partial reasoning",
+                     "signature": "incomplete"},
+                    {"type": "text", "text": "I was about to"},
+                    {"type": "redacted_thinking", "data": "abc"},
+                ],
+                "stop_reason": None,
+            },
+        }
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(incomplete) + "\n")
+
+        assert self._repair(jsonl_path, monkeypatch) is True
+
+        repaired = json.loads(jsonl_path.read_text(encoding="utf-8").strip())
+        content = repaired["message"]["content"]
+        kinds = [b["type"] for b in content]
+        # No thinking-family blocks may survive the repair.
+        assert "thinking" not in kinds
+        assert "redacted_thinking" not in kinds
+        # The original visible text is preserved and the notice is appended.
+        assert kinds == ["text", "text"]
+        assert "interrupted" in content[-1]["text"].lower()
+        assert repaired["message"]["stop_reason"] == "end_turn"
+
+    def test_strips_dangling_tool_use_on_repair(self, tmp_path, monkeypatch):
+        """An interrupted turn's tool_use never got a tool_result, so repair
+        must drop it to avoid a 'tool_use without tool_result' resume error.
+        """
+        jsonl_path = tmp_path / "session.jsonl"
+        incomplete = {
+            "type": "assistant",
+            "uuid": "a1",
+            "message": {
+                "content": [
+                    {"type": "thinking", "thinking": "x", "signature": "s"},
+                    {"type": "tool_use", "id": "t1", "name": "Bash",
+                     "input": {"command": "ls"}},
+                ],
+                "stop_reason": None,
+            },
+        }
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps(incomplete) + "\n")
+
+        assert self._repair(jsonl_path, monkeypatch) is True
+
+        repaired = json.loads(jsonl_path.read_text(encoding="utf-8").strip())
+        content = repaired["message"]["content"]
+        kinds = [b["type"] for b in content]
+        assert kinds == ["text"]  # only the interruption notice remains
+        assert "interrupted" in content[-1]["text"].lower()
+
+    def test_strips_empty_thinking_with_signature(self, tmp_path, monkeypatch):
+        """THE 400 FIX. On heavily-resumed sessions the CLI persists thinking
+        blocks with a signature but EMPTY text; replaying them triggers
+        "thinking ... blocks cannot be modified".  The CLI writes one block per
+        line under a shared message.id, so a thinking-ONLY line is removed and
+        the linear parentUuid chain is relinked to the nearest survivor.
+
+        Mirrors the real on-disk shape of session 9e6830a6: user → (thinking,
+        text, tool_use under one message.id) → tool_result.
+        """
+        jsonl_path = tmp_path / "session.jsonl"
+        entries = [
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "message": {"content": "do it"}},
+            {"type": "assistant", "uuid": "a_think", "parentUuid": "u1",
+             "message": {"id": "M", "stop_reason": "end_turn", "content": [
+                 {"type": "thinking", "thinking": "", "signature": "SIGVALUE"}]}},
+            {"type": "assistant", "uuid": "a_text", "parentUuid": "a_think",
+             "message": {"id": "M", "stop_reason": "end_turn", "content": [
+                 {"type": "text", "text": "Here is the answer"}]}},
+            {"type": "assistant", "uuid": "a_tool", "parentUuid": "a_text",
+             "message": {"id": "M", "stop_reason": "end_turn", "content": [
+                 {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]}},
+            {"type": "user", "uuid": "u2", "parentUuid": "a_tool",
+             "message": {"content": [
+                 {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}},
+        ]
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        assert self._repair(jsonl_path, monkeypatch) is True
+
+        out = [json.loads(l) for l in
+               jsonl_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+        uuids = [o["uuid"] for o in out]
+        # The empty-thinking-only entry is gone; everything else survives.
+        assert "a_think" not in uuids
+        assert uuids == ["u1", "a_text", "a_tool", "u2"]
+        # Chain is relinked: a_text now points past the removed a_think to u1.
+        by_uuid = {o["uuid"]: o for o in out}
+        assert by_uuid["a_text"]["parentUuid"] == "u1"
+        assert by_uuid["a_tool"]["parentUuid"] == "a_text"
+        # No empty-text thinking blocks remain anywhere; no content==[] entries.
+        for o in out:
+            if o.get("type") == "assistant":
+                c = o["message"]["content"]
+                assert c, "no assistant entry may have empty content"
+                assert not any(b.get("type") == "thinking"
+                               and not (b.get("thinking") or "").strip() for b in c)
+
+    def test_strips_empty_thinking_partial_entry(self, tmp_path, monkeypatch):
+        """If a single entry batches an empty thinking block WITH real content,
+        only the bad block is stripped — the line is kept (not removed)."""
+        jsonl_path = tmp_path / "session.jsonl"
+        entries = [
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "message": {"content": "hi"}},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1",
+             "message": {"id": "M", "stop_reason": "end_turn", "content": [
+                 {"type": "thinking", "thinking": "", "signature": "S"},
+                 {"type": "text", "text": "kept text"}]}},
+        ]
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        assert self._repair(jsonl_path, monkeypatch) is True
+        a1 = [json.loads(l) for l in
+              jsonl_path.read_text(encoding="utf-8").splitlines()
+              if l.strip()][1]
+        assert [b["type"] for b in a1["message"]["content"]] == ["text"]
+        assert a1["parentUuid"] == "u1"  # unchanged (its parent wasn't removed)
+
+    def test_empty_redacted_thinking_removed_valid_kept(self, tmp_path, monkeypatch):
+        """redacted_thinking with empty data is unreplayable (removed); one
+        with real data is valid and kept."""
+        jsonl_path = tmp_path / "session.jsonl"
+        entries = [
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "message": {"content": "hi"}},
+            {"type": "assistant", "uuid": "a_bad", "parentUuid": "u1",
+             "message": {"id": "M", "stop_reason": "end_turn", "content": [
+                 {"type": "redacted_thinking", "data": ""}]}},
+            {"type": "assistant", "uuid": "a_ok", "parentUuid": "a_bad",
+             "message": {"id": "M", "stop_reason": "end_turn", "content": [
+                 {"type": "redacted_thinking", "data": "ENCRYPTED"},
+                 {"type": "text", "text": "answer"}]}},
+        ]
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        assert self._repair(jsonl_path, monkeypatch) is True
+        out = [json.loads(l) for l in
+               jsonl_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+        by = {o["uuid"]: o for o in out}
+        assert "a_bad" not in by
+        assert by["a_ok"]["parentUuid"] == "u1"  # relinked past removed a_bad
+        assert [b["type"] for b in by["a_ok"]["message"]["content"]] == \
+            ["redacted_thinking", "text"]
+
+    def test_heal_is_idempotent_and_validates(self, tmp_path, monkeypatch):
+        """Second run after a heal is a no-op (returns False, file unchanged)."""
+        jsonl_path = tmp_path / "session.jsonl"
+        entries = [
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "message": {"content": "hi"}},
+            {"type": "assistant", "uuid": "a_t", "parentUuid": "u1",
+             "message": {"id": "M", "stop_reason": "end_turn", "content": [
+                 {"type": "thinking", "thinking": "", "signature": "S"}]}},
+            {"type": "assistant", "uuid": "a_x", "parentUuid": "a_t",
+             "message": {"id": "M", "stop_reason": "end_turn", "content": [
+                 {"type": "text", "text": "done"}]}},
+        ]
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        assert self._repair(jsonl_path, monkeypatch) is True
+        after_first = jsonl_path.read_text(encoding="utf-8")
+        assert self._repair(jsonl_path, monkeypatch) is False
+        assert jsonl_path.read_text(encoding="utf-8") == after_first
+
+    def test_healthy_session_untouched(self, tmp_path, monkeypatch):
+        """A normal completed turn with VALID thinking (non-empty text + sig)
+        must NOT be modified — those blocks are replayable as-is."""
+        jsonl_path = tmp_path / "session.jsonl"
+        entries = [
+            {"type": "user", "uuid": "u1", "parentUuid": None,
+             "message": {"content": "hi"}},
+            {"type": "assistant", "uuid": "a1", "parentUuid": "u1", "message": {
+                "id": "M", "stop_reason": "end_turn", "content": [
+                    {"type": "thinking", "thinking": "real reasoning",
+                     "signature": "valid"},
+                    {"type": "text", "text": "done"},
+                ]}},
+        ]
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+        before = jsonl_path.read_text(encoding="utf-8")
+
+        assert self._repair(jsonl_path, monkeypatch) is False
+        assert jsonl_path.read_text(encoding="utf-8") == before
+
 
 class TestUuidExtractionFromJsonlTail:
     """Verify UUID extraction from the tail of a JSONL file.

@@ -27,6 +27,49 @@ from daemon.backends.chat_store import ChatStore
 
 logger = logging.getLogger(__name__)
 
+# Text appended to a force-completed assistant turn so the model (and the
+# user) can see that the previous response was cut short.
+_INTERRUPTION_NOTICE = "\n\n[Session interrupted — resuming from last checkpoint]"
+
+# Block types that must NOT survive when we force-complete an *interrupted*
+# trailing turn (stop_reason=null), because replaying them through ``--resume``
+# makes the Anthropic API reject the request:
+#   • thinking / redacted_thinking — an interrupted turn's thinking is
+#     partial/unsigned, and we mutate the message by appending the notice; the
+#     API forbids modifying thinking blocks of the latest assistant message.
+#   • tool_use — an interrupted turn never produced the matching tool_result,
+#     so a dangling tool_use triggers "tool_use ids were found without
+#     tool_result blocks" on resume.
+_INTERRUPTED_TURN_DROP_TYPES = {"thinking", "redacted_thinking", "tool_use"}
+
+
+def _is_unreplayable_thinking(block) -> bool:
+    """Return True for a thinking block the Anthropic API will reject on resume.
+
+    The Claude CLI persists assistant thinking blocks to the session JSONL
+    with their cryptographic ``signature`` but with the ``thinking`` text
+    field EMPTY (observed on heavily-resumed sessions — the text is redacted on
+    disk while the signature is kept).  When ``--resume`` replays such a block,
+    the signature no longer matches the (now empty) text and the request 400s:
+
+        thinking or redacted_thinking blocks in the latest assistant message
+        cannot be modified. These blocks must remain as they were in the
+        original response.
+
+    A block is unreplayable when it is a ``thinking`` block whose text is
+    empty, or a ``redacted_thinking`` block whose ``data`` is empty.  A normal,
+    intact thinking block (non-empty text + signature) is replayable and is
+    left untouched.
+    """
+    if not isinstance(block, dict):
+        return False
+    t = block.get("type")
+    if t == "thinking":
+        return not str(block.get("thinking", "") or "").strip()
+    if t == "redacted_thinking":
+        return not str(block.get("data", "") or "").strip()
+    return False
+
 
 class ClaudeJsonlStore(ChatStore):
     """Claude Code JSONL implementation of ChatStore.
@@ -252,18 +295,39 @@ class ClaudeJsonlStore(ChatStore):
     def repair_incomplete_turn(
         self, session_id: str, cwd: str = ""
     ) -> bool:
-        """Repair a session that ends with an incomplete assistant turn.
+        """Make a session's transcript safe for ``--resume`` to replay.
 
-        Moved from session_manager.py L254-302
-        (``_repair_incomplete_jsonl``).
+        Originally moved from session_manager.py L254-302
+        (``_repair_incomplete_jsonl``).  Now performs two repairs, both of
+        which prevent the CLI's ``--resume`` from sending the Anthropic API a
+        transcript it will reject.
 
-        When the daemon is killed mid-response, the last entry in the
-        .jsonl is an assistant message with stop_reason=null.  The CLI's
-        --resume chokes on this and immediately closes the stream.
+        **Pass 1 — complete an interrupted trailing turn.**
+        When the daemon is killed mid-response, the last conversational entry
+        is an assistant message with ``stop_reason=null``.  ``--resume`` chokes
+        on that and immediately closes the stream.  We flip it to
+        ``stop_reason="end_turn"``, drop any blocks that cannot be replayed
+        (see ``_INTERRUPTED_TURN_DROP_TYPES``), and append an interruption
+        notice so the entry still has content.
 
-        This function detects that case and patches the last line so
-        stop_reason="end_turn" and a text block is appended saying the
-        session was interrupted.
+        **Pass 2 — strip unreplayable thinking blocks (the 400 fix).**
+        On heavily-resumed sessions the CLI persists assistant thinking blocks
+        with their ``signature`` but an EMPTY ``thinking`` text.  Replaying
+        those makes the API 400 with "thinking or redacted_thinking blocks in
+        the latest assistant message cannot be modified".  We remove every such
+        block (see ``_is_unreplayable_thinking``).  The Anthropic API expressly
+        allows omitting thinking blocks from prior assistant turns, so this is
+        safe; intact thinking blocks (non-empty text + signature) are kept.
+
+        The CLI writes one content block per JSONL line but groups consecutive
+        lines that share ``message.id`` into a single API message.  An entry
+        whose ONLY block is unreplayable would become empty — a shape the CLI
+        never emits — so instead of writing ``content: []`` we DELETE that line
+        and relink the linear ``parentUuid`` chain to the nearest survivor, so
+        the healed file matches shapes the CLI actually produces.
+
+        Returns True if anything was changed (and rewritten to disk).  Never
+        writes a result that fails to re-parse as valid JSONL.
         """
         jsonl_path = self.find_session_path(session_id, cwd)
         if not jsonl_path or not jsonl_path.exists():
@@ -275,35 +339,132 @@ class ClaudeJsonlStore(ChatStore):
             if not lines:
                 return False
 
-            last_line = lines[-1].strip()
-            if not last_line:
-                return False
+            changed = False
 
-            obj = json.loads(last_line)
-            if obj.get("type") != "assistant":
-                return False
+            # ── Pass 1: complete an interrupted trailing assistant turn ──
+            # Find the last non-empty conversational entry.  File-history
+            # snapshots can trail a real turn, so skip them while searching;
+            # stop at the first user/assistant (or unparseable) line.
+            for idx in range(len(lines) - 1, -1, -1):
+                stripped = lines[idx].strip()
+                if not stripped:
+                    continue
+                try:
+                    obj = json.loads(stripped)
+                except Exception:
+                    break  # can't parse — don't risk mis-repairing
+                if obj.get("type") == "file-history-snapshot":
+                    continue
+                if obj.get("type") == "assistant":
+                    msg = obj.get("message", {})
+                    if msg.get("stop_reason") is None:
+                        logger.info(
+                            "Repairing incomplete assistant turn in %s",
+                            jsonl_path.name,
+                        )
+                        msg["stop_reason"] = "end_turn"
+                        msg["stop_sequence"] = None
+                        raw = msg.get("content", [])
+                        if not isinstance(raw, list):
+                            raw = []
+                        kept = [
+                            b for b in raw
+                            if not (isinstance(b, dict)
+                                    and b.get("type") in _INTERRUPTED_TURN_DROP_TYPES)
+                        ]
+                        kept.append({"type": "text", "text": _INTERRUPTION_NOTICE})
+                        msg["content"] = kept
+                        lines[idx] = json.dumps(obj) + "\n"
+                        changed = True
+                break  # only the trailing entry matters for Pass 1
 
-            msg = obj.get("message", {})
-            if msg.get("stop_reason") is not None:
-                return False  # already complete
+            # ── Pass 2: strip unreplayable (empty-text) thinking blocks ──
+            # First parse every line and, for each assistant entry, decide
+            # whether stripping leaves it empty (→ delete the line) or keeps
+            # some content (→ rewrite with the bad blocks removed).
+            parsed = []          # (obj_or_None, original_raw_line)
+            parent_of = {}       # uuid -> parentUuid (pre-removal, for relink)
+            for line in lines:
+                s = line.strip()
+                if not s:
+                    parsed.append((None, line))
+                    continue
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    parsed.append((None, line))
+                    continue
+                parsed.append((obj, line))
+                if isinstance(obj, dict) and obj.get("uuid"):
+                    parent_of[obj["uuid"]] = obj.get("parentUuid")
 
-            # Patch the incomplete assistant turn
-            logger.info("Repairing incomplete assistant turn in %s", jsonl_path.name)
-            msg["stop_reason"] = "end_turn"
-            msg["stop_sequence"] = None
+            remove_uuids = set()
+            # 2a) classify: which assistant entries to strip vs. delete
+            for obj, _line in parsed:
+                if not isinstance(obj, dict) or obj.get("type") != "assistant":
+                    continue
+                content = obj.get("message", {}).get("content", [])
+                if not isinstance(content, list) or not content:
+                    continue
+                if any(_is_unreplayable_thinking(b) for b in content):
+                    if all(_is_unreplayable_thinking(b) for b in content):
+                        # entry is ONLY unreplayable thinking — delete the line
+                        if obj.get("uuid"):
+                            remove_uuids.add(obj["uuid"])
 
-            # Append an interruption notice to content so the model knows
-            content = msg.get("content", [])
-            content.append({
-                "type": "text",
-                "text": "\n\n[Session interrupted — resuming from last checkpoint]",
-            })
-            msg["content"] = content
+            def _surviving_parent(p):
+                """Walk up the parentUuid chain past any removed entries."""
+                seen = 0
+                while p in remove_uuids and seen < 100000:
+                    p = parent_of.get(p)
+                    seen += 1
+                return p
 
-            lines[-1] = json.dumps(obj) + "\n"
-            with open(jsonl_path, "w", encoding="utf-8") as f:
-                f.writelines(lines)
-            return True
+            # 2b) rebuild the line list
+            new_lines = []
+            for obj, line in parsed:
+                if not isinstance(obj, dict):
+                    new_lines.append(line)
+                    continue
+                if obj.get("uuid") in remove_uuids:
+                    changed = True
+                    continue  # drop the unreplayable-thinking-only entry
+                touched = False
+                # relink parent if it pointed at a removed entry
+                p = obj.get("parentUuid")
+                if p in remove_uuids:
+                    obj["parentUuid"] = _surviving_parent(p)
+                    touched = True
+                # strip unreplayable blocks from a mixed assistant entry
+                if obj.get("type") == "assistant":
+                    content = obj.get("message", {}).get("content", [])
+                    if isinstance(content, list) and any(
+                        _is_unreplayable_thinking(b) for b in content
+                    ):
+                        kept = [b for b in content
+                                if not _is_unreplayable_thinking(b)]
+                        if kept:  # empty-only entries were already removed above
+                            obj["message"]["content"] = kept
+                            touched = True
+                if touched:
+                    new_lines.append(json.dumps(obj) + "\n")
+                    changed = True
+                else:
+                    new_lines.append(line)
+
+            if changed:
+                # Safety: never persist a transcript that doesn't re-parse.
+                for nl in new_lines:
+                    s = nl.strip()
+                    if s:
+                        json.loads(s)  # raises -> caught below -> no write
+                logger.info(
+                    "Healed session %s: removed %d unreplayable-thinking "
+                    "entries", jsonl_path.name, len(remove_uuids),
+                )
+                with open(jsonl_path, "w", encoding="utf-8") as f:
+                    f.writelines(new_lines)
+            return changed
         except Exception as e:
             logger.warning("repair_incomplete_turn(%s) failed: %s", session_id, e)
             return False
