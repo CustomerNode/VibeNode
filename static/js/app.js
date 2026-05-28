@@ -37,9 +37,9 @@ if (!localStorage.getItem('viewMode')) viewMode = 'homepage';
 // Hash-based routing: URL hash overrides stored viewMode for direct-link support
 if (window.location.hash.startsWith('#kanban')) viewMode = 'kanban';
 if (window.location.hash.startsWith('#compose')) viewMode = 'compose';
-// Session display sub-mode (grid vs list within sessions view)
+// Session display sub-mode (grid vs list vs control within sessions view)
 let sessionDisplayMode = localStorage.getItem('sessionDisplayMode') || 'grid';
-if (!['grid', 'list'].includes(sessionDisplayMode)) sessionDisplayMode = 'grid';
+if (!['grid', 'list', 'control'].includes(sessionDisplayMode)) sessionDisplayMode = 'grid';
 let wfSort = localStorage.getItem('wfSort') || 'status';
 let runningIds = new Set();
 let waitingData = {};   // { session_id: {question, options, kind} }
@@ -1557,6 +1557,8 @@ function filterSessions() {
   }
   if (viewMode === 'workplace') {
     renderWorkspace(wfSortedSessions(filtered));
+  } else if (viewMode === 'sessions' && sessionDisplayMode === 'control') {
+    if (typeof renderMissionControl === 'function') renderMissionControl();
   } else if (viewMode === 'sessions' && sessionDisplayMode === 'grid') {
     renderWorkforce(wfSortedSessions(filtered));
   } else if (viewMode === 'sessions') {

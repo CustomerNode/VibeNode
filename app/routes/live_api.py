@@ -127,9 +127,22 @@ def api_session_log(session_id):
     except (ValueError, TypeError):
         since = 0
 
+    # last=N returns the last N entries regardless of total count.
+    # Used by Mission Control cards to get recent history without knowing the
+    # daemon's actual entry count (which differs from file-based message_count
+    # because daemon stores tool_use/tool_result as separate entries).
+    try:
+        last = int(request.args.get("last", 0))
+    except (ValueError, TypeError):
+        last = 0
+
     # Check if this session is managed by the SDK
     sm = current_app.session_manager
     if sm.has_session(session_id):
+        if last > 0:
+            all_entries = sm.get_entries(session_id)
+            entries = all_entries[-last:]
+            return jsonify({"entries": entries, "total_lines": len(all_entries)})
         entries = sm.get_entries(session_id, since=since)
         return jsonify({"entries": entries, "total_lines": since + len(entries)})
 
@@ -145,6 +158,8 @@ def api_session_log(session_id):
         return jsonify({"entries": [], "total_lines": 0})
 
     total = len(raw_lines)
+    if last > 0:
+        since = max(0, total - last)
     entries = []
     for raw in raw_lines[since:]:
         try:

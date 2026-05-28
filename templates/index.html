@@ -138,6 +138,7 @@
             <div class="sidebar-menu-section-label">Display</div>
             <button class="sidebar-sort-opt" data-display="grid" onclick="closeSidebarMenu();setSessionDisplayMode('grid')">Grid cards</button>
             <button class="sidebar-sort-opt" data-display="list" onclick="closeSidebarMenu();setSessionDisplayMode('list')">List table</button>
+            <button class="sidebar-sort-opt" data-display="control" onclick="closeSidebarMenu();setSessionDisplayMode('control')">Mission Control</button>
             <div class="sort-divider"></div>
             <div class="sidebar-menu-section-label">Actions</div>
             <button class="sidebar-sort-opt danger" onclick="closeSidebarMenu();sleepAllSessions()">Sleep all sessions</button>
@@ -284,6 +285,39 @@
         }
       })();
       </script>
+    </div>
+    <!-- Mission Control full-screen session grid -->
+    <div id="mission-control" style="display:none; flex-direction:column; height:100%; width:100%;">
+      <div class="mc-topbar">
+        <div class="mc-topbar-left">
+          <div class="mc-logo-mark">MC</div>
+          <span class="mc-topbar-label">Mission Control</span>
+          <div class="mc-topbar-divider"></div>
+          <span class="mc-project-label" id="mc-project-label">Project</span>
+        </div>
+        <div class="mc-topbar-center">
+          <div class="mc-search-wrap">
+            <span class="mc-search-icon"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg></span>
+            <input type="text" id="mc-search" class="mc-search-input" placeholder="Filter sessions&hellip;" oninput="mcFilterSessions()">
+          </div>
+        </div>
+        <div class="mc-topbar-right">
+          <span class="mc-session-count" id="mc-session-count"></span>
+          <button class="mc-btn mc-btn-new" onclick="addNewAgent()">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            New session
+          </button>
+          <button class="mc-btn mc-btn-icon" title="Grid view" onclick="setSessionDisplayMode('grid')">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+            Grid
+          </button>
+          <button class="mc-btn mc-btn-icon" title="List view" onclick="setSessionDisplayMode('list')">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="3" cy="6" r="1" fill="currentColor"/><circle cx="3" cy="12" r="1" fill="currentColor"/><circle cx="3" cy="18" r="1" fill="currentColor"/></svg>
+            List
+          </button>
+        </div>
+      </div>
+      <div id="mc-grid" class="mc-grid"></div>
     </div>
     <div id="compose-board" style="display:none;">
       <!-- Root Orchestrator Header Bar -->

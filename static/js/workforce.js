@@ -102,6 +102,12 @@ function _setViewModeImmediate(mode, prevMode) {
       && typeof _clearMultiSelect === 'function') {
     _clearMultiSelect();
   }
+  // Leaving sessions mode: clean up MC state
+  if (prevMode === 'sessions' && mode !== 'sessions') {
+    document.body.classList.remove('mc-mode');
+    const _mcEl = document.getElementById('mission-control');
+    if (_mcEl) _mcEl.style.display = 'none';
+  }
 
   viewMode = mode;
   localStorage.setItem('viewMode', mode);
@@ -241,6 +247,8 @@ function _setViewModeImmediate(mode, prevMode) {
     gridEl.classList.remove('visible');
     if (kanbanEl) kanbanEl.style.display = 'none';
     if (composeEl) composeEl.style.display = 'none';
+    const _mcHome = document.getElementById('mission-control');
+    if (_mcHome) _mcHome.style.display = 'none';
     document.getElementById('main-toolbar').style.display = 'none';
     document.getElementById('main-body').style.display = 'none';
     if (homepageEl) {
@@ -249,20 +257,30 @@ function _setViewModeImmediate(mode, prevMode) {
     }
 
   } else if (mode === 'sessions') {
-    // Combined grid + list mode
+    // Combined grid + list + control mode
+    const mcEl = document.getElementById('mission-control');
     if (sessionDisplayMode === 'grid') {
+      document.body.classList.remove('mc-mode');
       listEl.style.display = 'none';
       gridEl.classList.add('visible');
+      if (mcEl) mcEl.style.display = 'none';
+    } else if (sessionDisplayMode === 'control') {
+      document.body.classList.add('mc-mode');
+      listEl.style.display = 'none';
+      gridEl.classList.remove('visible');
+      if (mcEl) mcEl.style.display = 'flex';
     } else {
+      document.body.classList.remove('mc-mode');
       listEl.style.display = '';
       gridEl.classList.remove('visible');
+      if (mcEl) mcEl.style.display = 'none';
     }
-    if (searchRow) searchRow.style.display = '';
+    if (searchRow) searchRow.style.display = sessionDisplayMode === 'control' ? 'none' : '';
     if (menuWrap) menuWrap.style.display = '';
     if (sidebarPermPanel) sidebarPermPanel.style.display = 'none';
     if (kanbanEl) kanbanEl.style.display = 'none';
     if (composeEl) composeEl.style.display = 'none';
-    document.getElementById('main-body').style.display = '';
+    document.getElementById('main-body').style.display = sessionDisplayMode === 'control' ? 'none' : '';
     if (!activeId) document.getElementById('main-toolbar').style.display = 'none';
     const btnAdd = document.getElementById('btn-add-agent');
     if (btnAdd) btnAdd.style.display = '';
@@ -361,14 +379,421 @@ function setSessionDisplayMode(mode) {
   if (viewMode === 'sessions') {
     const listEl = document.getElementById('session-list');
     const gridEl = document.getElementById('workforce-grid');
+    const mcEl = document.getElementById('mission-control');
     if (mode === 'grid') {
+      document.body.classList.remove('mc-mode');
       listEl.style.display = 'none';
       gridEl.classList.add('visible');
-    } else {
+      if (mcEl) mcEl.style.display = 'none';
+      // Restore main-body (hidden when in control mode)
+      const _mb = document.getElementById('main-body');
+      if (_mb) _mb.style.display = '';
+      const _sr = document.querySelector('.sidebar-search-row');
+      if (_sr) _sr.style.display = '';
+      filterSessions();
+    } else if (mode === 'list') {
+      document.body.classList.remove('mc-mode');
       listEl.style.display = '';
       gridEl.classList.remove('visible');
+      if (mcEl) mcEl.style.display = 'none';
+      // Restore main-body (hidden when in control mode)
+      const _mb2 = document.getElementById('main-body');
+      if (_mb2) _mb2.style.display = '';
+      const _sr2 = document.querySelector('.sidebar-search-row');
+      if (_sr2) _sr2.style.display = '';
+      filterSessions();
+    } else if (mode === 'control') {
+      document.body.classList.add('mc-mode');
+      listEl.style.display = 'none';
+      gridEl.classList.remove('visible');
+      if (mcEl) mcEl.style.display = 'flex';
+      // Clear fetch cache so cards load fresh history on each MC entry
+      _mcPreviewFetched.clear();
+      renderMissionControl();
     }
-    filterSessions();
+  }
+}
+
+// =============================================================================
+// Mission Control — full-screen multi-session card grid
+// =============================================================================
+
+// Per-session streaming buffers: sid → { text: string, timer: number|null }
+const _mcStreamBuffers = new Map();
+// Track which sids have had their initial history fetched (avoid redundant API calls)
+const _mcPreviewFetched = new Set();
+// Current search filter text
+let _mcSearchFilter = '';
+
+/**
+ * Render (or refresh) all Mission Control cards.
+ * Called by setSessionDisplayMode('control'), filterSessions(), and
+ * socket event handlers when sessionDisplayMode === 'control'.
+ */
+function renderMissionControl() {
+  const grid = document.getElementById('mc-grid');
+  if (!grid) return;
+
+  // Update project label
+  const projLabel = document.getElementById('mc-project-label');
+  if (projLabel) {
+    const proj = localStorage.getItem('activeProject') || '';
+    let projDisplay = proj;
+    if (Array.isArray(window._allProjects)) {
+      const found = window._allProjects.find(p => p.encoded === proj);
+      if (found) projDisplay = found.custom_name || found.display || proj;
+    }
+    projLabel.textContent = projDisplay || 'All Projects';
+  }
+
+  // Apply search filter
+  const searchLower = _mcSearchFilter.toLowerCase();
+  const sessions = wfSortedSessions(
+    searchLower
+      ? allSessions.filter(s => (s.display_title || '').toLowerCase().includes(searchLower))
+      : allSessions
+  );
+
+  // Update session count badge
+  const countBadge = document.getElementById('mc-session-count');
+  if (countBadge) {
+    countBadge.textContent = sessions.length === 1 ? '1 session' : sessions.length + ' sessions';
+  }
+
+  // Track which sids should currently be in the grid
+  const newIds = new Set(sessions.map(s => s.id));
+
+  // Remove cards for sessions that no longer match
+  Array.from(grid.querySelectorAll('.mc-card')).forEach(card => {
+    if (!newIds.has(card.dataset.sid)) card.remove();
+  });
+
+  // Reorder + add/update cards
+  sessions.forEach((session, idx) => {
+    const sid = session.id;
+    const status = getSessionStatus(sid);
+    const substatus = window._sessionSubstatus && window._sessionSubstatus[sid];
+    const title = session.display_title || session.custom_title || sid.slice(0, 8);
+
+    let card = grid.querySelector(`.mc-card[data-sid="${sid}"]`);
+    if (!card) {
+      card = _createMcCard(session, status, substatus, title);
+      grid.appendChild(card);
+    } else {
+      _updateMcCardStatus(card, sid, status, substatus, title, session);
+      // Fetch history for existing cards that haven't been populated yet
+      if (!_mcPreviewFetched.has(sid)) _populateMcPreview(session);
+      // Maintain sort order — append to end if not already in position
+      if (card !== grid.children[idx]) {
+        grid.appendChild(card);
+      }
+    }
+  });
+
+  if (!sessions.length) {
+    if (!grid.querySelector('.mc-empty')) {
+      const empty = document.createElement('div');
+      empty.className = 'mc-empty';
+      empty.innerHTML = '<div class="mc-empty-text">No sessions</div>';
+      grid.appendChild(empty);
+    }
+  } else {
+    const empty = grid.querySelector('.mc-empty');
+    if (empty) empty.remove();
+  }
+}
+
+function _mcTimeAgo(ts) {
+  if (!ts) return '';
+  const diff = Math.floor(Date.now() / 1000) - ts;
+  if (diff < 60) return 'just now';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+  return Math.floor(diff / 86400) + 'd ago';
+}
+
+function _createMcCard(session, status, substatus, title) {
+  const sid = session.id;
+  const statusLabel = _getMcStatusLabel(status, substatus);
+
+  const card = document.createElement('div');
+  card.className = 'mc-card mc-card-' + status;
+  card.dataset.sid = sid;
+
+  // Left accent strip (CSS applies color based on status class)
+  const accent = document.createElement('div');
+  accent.className = 'mc-card-accent';
+
+  // Build header
+  const header = document.createElement('div');
+  header.className = 'mc-card-header';
+  header.title = 'Click to open in normal view';
+  header.onclick = () => _mcOpenSession(sid);
+
+  const metaParts = [];
+  if (session.message_count) metaParts.push(session.message_count + ' msgs');
+  const timeAgo = _mcTimeAgo(session.last_activity_ts);
+  if (timeAgo) metaParts.push(timeAgo);
+
+  header.innerHTML =
+    '<div class="mc-status-dot ' + status + '" id="mc-dot-' + sid + '"></div>' +
+    '<div class="mc-card-header-info">' +
+      '<div class="mc-card-name" id="mc-name-' + sid + '" title="' + escHtml(title) + '">' + escHtml(title) + '</div>' +
+      '<div class="mc-card-meta" id="mc-meta-' + sid + '">' + escHtml(metaParts.join(' · ')) + '</div>' +
+    '</div>' +
+    '<div class="mc-card-status ' + _getMcStatusClass(status) + '" id="mc-status-' + sid + '">' + escHtml(statusLabel) + '</div>';
+
+  // Preview area
+  const preview = document.createElement('div');
+  preview.className = 'mc-preview';
+  preview.id = 'mc-preview-' + sid;
+  preview.innerHTML = '<span class="mc-preview-placeholder">No recent messages</span>';
+
+  // Input row
+  const inputRow = document.createElement('div');
+  inputRow.className = 'mc-card-input';
+
+  const textarea = document.createElement('textarea');
+  textarea.className = 'mc-input';
+  textarea.id = 'mc-input-' + sid;
+  textarea.placeholder = 'Message…';
+  textarea.rows = 1;
+  textarea.addEventListener('keydown', (e) => _mcInputKeyDown(e, sid));
+  textarea.addEventListener('input', () => {
+    textarea.style.height = 'auto';
+    textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
+    textarea.scrollTop = textarea.scrollHeight;
+    inputRow.classList.toggle('has-text', textarea.value.trim().length > 0);
+  });
+
+  const voiceBtn = document.createElement('button');
+  voiceBtn.className = 'mc-voice-btn';
+  voiceBtn.id = 'mc-voice-' + sid;
+  voiceBtn.title = 'Voice input';
+  voiceBtn.innerHTML = _micSvg || '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="1" width="6" height="12" rx="3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="23" x2="12" y2="19"/></svg>';
+
+  inputRow.appendChild(textarea);
+  inputRow.appendChild(voiceBtn);
+
+  card.appendChild(accent);
+  card.appendChild(header);
+  card.appendChild(preview);
+  card.appendChild(inputRow);
+
+  // Wire up voice if available
+  if (typeof setupVoiceButton === 'function') {
+    setupVoiceButton(textarea, voiceBtn, () => _mcSendMessage(sid));
+  }
+
+  // Populate preview with buffered content or fetch history
+  _populateMcPreview(session);
+
+  return card;
+}
+
+function _updateMcCardStatus(card, sid, status, substatus, title, session) {
+  card.className = 'mc-card mc-card-' + status;
+  const dot = document.getElementById('mc-dot-' + sid);
+  if (dot) dot.className = 'mc-status-dot ' + status;
+  const statusEl = document.getElementById('mc-status-' + sid);
+  if (statusEl) {
+    statusEl.textContent = _getMcStatusLabel(status, substatus);
+    statusEl.className = 'mc-card-status ' + _getMcStatusClass(status);
+  }
+  const nameEl = document.getElementById('mc-name-' + sid);
+  if (nameEl && title) {
+    nameEl.title = title;
+    nameEl.textContent = title;
+  }
+  if (session) {
+    const metaEl = document.getElementById('mc-meta-' + sid);
+    if (metaEl) {
+      const metaParts = [];
+      if (session.message_count) metaParts.push(session.message_count + ' msgs');
+      const timeAgo = _mcTimeAgo(session.last_activity_ts);
+      if (timeAgo) metaParts.push(timeAgo);
+      metaEl.textContent = metaParts.join(' · ');
+    }
+  }
+}
+
+function _getMcStatusLabel(status, substatus) {
+  if (substatus === 'compacting') return 'Compacting…';
+  if (substatus === 'auto-resuming') return 'Resuming…';
+  if (status === 'working') return 'Working';
+  if (status === 'question') return 'Needs input';
+  if (status === 'idle') return 'Idle';
+  return 'Sleeping';
+}
+
+function _getMcStatusClass(status) {
+  if (status === 'working') return 'status-working';
+  if (status === 'question') return 'status-question';
+  if (status === 'idle') return 'status-idle';
+  return 'status-sleeping';
+}
+
+async function _populateMcPreview(session) {
+  const sid = session.id;
+
+  // Avoid redundant API calls on rapid re-renders
+  if (_mcPreviewFetched.has(sid)) return;
+  _mcPreviewFetched.add(sid);
+
+  const previewEl = document.getElementById('mc-preview-' + sid);
+  if (!previewEl) return;
+
+  const project = localStorage.getItem('activeProject') || '';
+  const url = '/api/session-log/' + encodeURIComponent(sid) +
+              '?last=20' +
+              (project ? '&project=' + encodeURIComponent(project) : '');
+
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) { _mcPreviewFetched.delete(sid); return; }
+    const data = await resp.json();
+    const entries = (data.entries || []).filter(e =>
+      e.kind === 'user' || e.kind === 'asst' || e.kind === 'assistant'
+    );
+
+    if (!entries.length) return;
+
+    // Don't overwrite if live streaming already started while we were fetching
+    if (previewEl.querySelector('.mc-stream-live')) return;
+
+    previewEl.innerHTML = '';
+    if (typeof renderLiveEntry === 'function') {
+      entries.forEach(e => {
+        const el = renderLiveEntry(e);
+        el.querySelectorAll('.live-expand-btn, .vn-msg-footer, .smart-copy-wrap').forEach(n => n.remove());
+        previewEl.appendChild(el);
+      });
+    }
+    previewEl.scrollTop = previewEl.scrollHeight;
+  } catch (e) {
+    console.warn('[MC] preview fetch failed for', sid, e);
+    _mcPreviewFetched.delete(sid);
+  }
+}
+
+/** Filter handler called by the MC search input */
+function mcFilterSessions() {
+  const input = document.getElementById('mc-search');
+  _mcSearchFilter = input ? input.value : '';
+  renderMissionControl();
+}
+
+/** Open a session in normal grid view */
+function _mcOpenSession(sid) {
+  setSessionDisplayMode('grid');
+  // openInGUI is the function that loads a session into the live panel
+  if (typeof openInGUI === 'function') {
+    openInGUI(sid);
+  }
+}
+
+function _mcInputKeyDown(event, sid) {
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    _mcSendMessage(sid);
+  }
+}
+
+function _mcSendMessage(sid, text) {
+  const textarea = document.getElementById('mc-input-' + sid);
+  const msg = (text !== undefined ? text : (textarea ? textarea.value.trim() : ''));
+  if (!msg) return;
+  if (textarea && text === undefined) {
+    textarea.value = '';
+    textarea.style.height = 'auto';
+  }
+
+  const _wasRunning = runningIds.has(sid);
+
+  // Optimistic state update so the status dot flips to working immediately
+  sessionKinds[sid] = 'working';
+  runningIds.add(sid);
+  if (typeof guiOpenAdd === 'function') guiOpenAdd(sid);
+  renderMissionControl();
+
+  if (_wasRunning) {
+    // Session is alive — send_message handles idle/working/queue automatically
+    socket.emit('send_message', { session_id: sid, text: msg });
+  } else {
+    // Session is sleeping — resume it with this message as the prompt
+    socket.emit('start_session', {
+      session_id: sid,
+      prompt: msg,
+      cwd: (typeof _currentProjectDir === 'function') ? _currentProjectDir() : '',
+      resume: true,
+    });
+  }
+}
+
+/**
+ * Called from socket.js stream_event handler to update a card's preview area
+ * with streaming delta text. Throttled to 80ms (matching live panel).
+ */
+function mcUpdateStreamPreview(sid, deltaText) {
+  if (sessionDisplayMode !== 'control') return;
+
+  let buf = _mcStreamBuffers.get(sid);
+  if (!buf) {
+    buf = { text: '', timer: null };
+    _mcStreamBuffers.set(sid, buf);
+  }
+  buf.text += deltaText;
+
+  if (!buf.timer) {
+    buf.timer = setTimeout(() => {
+      buf.timer = null;
+      const previewEl = document.getElementById('mc-preview-' + sid);
+      if (!previewEl) return;
+      let liveEl = previewEl.querySelector('.mc-stream-live');
+      if (!liveEl) {
+        liveEl = document.createElement('div');
+        liveEl.className = 'mc-stream-live';
+        previewEl.appendChild(liveEl);
+      }
+      liveEl.textContent = buf.text.slice(-600);
+      previewEl.scrollTop = previewEl.scrollHeight;
+    }, 80);
+  }
+}
+
+/**
+ * Called from socket.js session_entry handler when a complete entry arrives.
+ * Appends the finalized entry as a rendered chat bubble.
+ */
+function mcFinalizeEntry(sid, text, kind) {
+  if (sessionDisplayMode !== 'control') return;
+
+  // Clear streaming buffer
+  const buf = _mcStreamBuffers.get(sid);
+  if (buf) {
+    if (buf.timer) { clearTimeout(buf.timer); buf.timer = null; }
+    buf.text = '';
+    _mcStreamBuffers.delete(sid);
+  }
+
+  // Invalidate fetch cache so next MC open shows this newest entry
+  _mcPreviewFetched.delete(sid);
+
+  if (kind !== 'asst' && kind !== 'assistant' && kind !== 'user') return;
+
+  const previewEl = document.getElementById('mc-preview-' + sid);
+  if (!previewEl) return;
+
+  // Remove the streaming element
+  const liveEl = previewEl.querySelector('.mc-stream-live');
+  if (liveEl) liveEl.remove();
+
+  if (text && typeof renderLiveEntry === 'function') {
+    const entryKind = (kind === 'assistant') ? 'asst' : kind;
+    const el = renderLiveEntry({ kind: entryKind, text });
+    el.querySelectorAll('.live-expand-btn, .vn-msg-footer, .smart-copy-wrap').forEach(n => n.remove());
+    previewEl.appendChild(el);
+    previewEl.scrollTop = previewEl.scrollHeight;
   }
 }
 

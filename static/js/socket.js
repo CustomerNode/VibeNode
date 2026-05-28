@@ -640,6 +640,13 @@ socket.on('session_state', (data) => {
     // If currently showing a popup for a session that is no longer waiting, close it
     if (respondTarget === session_id && !waitingData[session_id]) closeRespond();
 
+    // Clear MC streaming indicator when a session goes idle
+    if ((state === 'idle' || state === 'stopped') &&
+        typeof sessionDisplayMode !== 'undefined' && sessionDisplayMode === 'control') {
+      const _mcPreview = document.getElementById('mc-preview-' + session_id);
+      if (_mcPreview) _mcPreview.classList.remove('mc-preview-streaming');
+    }
+
     // Refresh active views — always call filterSessions so sidebar icons
     // update for substatus changes (e.g. compacting indicator)
     filterSessions();
@@ -844,6 +851,24 @@ socket.on('stream_event', (data) => {
             }
         }
     }
+    // ── Route to Mission Control cards if in MC mode (all sessions) ──
+    if (typeof sessionDisplayMode !== 'undefined' && sessionDisplayMode === 'control') {
+      const _mcEvtType = data.event.event || '';
+      const _mcEvtData = data.event.data || {};
+      if (_mcEvtType === 'content_block_delta') {
+        const _mcDelta = _mcEvtData.delta;
+        let _mcChunk = '';
+        if (typeof _mcDelta === 'string') {
+          _mcChunk = _mcDelta;
+        } else if (_mcDelta && typeof _mcDelta === 'object') {
+          _mcChunk = _mcDelta.text || '';
+        }
+        if (_mcChunk && typeof mcUpdateStreamPreview === 'function') {
+          mcUpdateStreamPreview(data.session_id, _mcChunk);
+        }
+      }
+    }
+
     if (!_sidMatch) return;
 
     const evtType = data.event.event || '';
@@ -990,6 +1015,12 @@ socket.on('session_entry', (data) => {
             }
         }
     }
+    // ── Route completed entries to Mission Control preview ──
+    if (typeof sessionDisplayMode !== 'undefined' && sessionDisplayMode === 'control' &&
+        typeof mcFinalizeEntry === 'function' && data.entry) {
+      mcFinalizeEntry(data.session_id, data.entry.text, data.entry.kind);
+    }
+
     if (!_sidMatch) {
         console.warn('[entry] sid mismatch:', data.session_id, '!=', liveSessionId,
             'kind:', data.entry && data.entry.kind, 'idx:', data.index);
