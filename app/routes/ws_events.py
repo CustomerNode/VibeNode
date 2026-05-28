@@ -40,6 +40,12 @@ _setup_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ws-setup
 from ..platform_utils import is_system_user_content as _is_system_user_content
 from ..platform_utils import system_user_label as _system_user_label
 
+# Sidebar sort uses max(last_msg_ts, file_mtime, access_ts).  We bump
+# access_ts whenever the user clearly interacts with a session via WS
+# (send_message, start_session) so the session bubbles to the top even if
+# the SDK routes the actual write to a different file (resume + remap).
+from ..config import _record_session_access
+
 
 # ---- Entry cache for fast repeated loads ----------------------------------
 # Maps session_id -> (mtime, file_size, entries_list).
@@ -331,6 +337,16 @@ def register_ws_events(socketio, app):
             emit('error', {'message': 'session_id is required'})
             return
 
+        # Record interaction so the sidebar sort surfaces this session.
+        # Skip utility/title sessions — those are background helpers the
+        # user never sees and shouldn't bubble in their sidebar.
+        if session_type not in ('planner', 'title'):
+            try:
+                _record_session_access(session_id,
+                                       (data.get('project') or '').strip())
+            except Exception:
+                pass
+
         # Check if cross-session awareness is enabled (for non-utility sessions)
         want_awareness = False
         if session_type not in ('planner', 'title'):
@@ -494,6 +510,14 @@ def register_ws_events(socketio, app):
 
         sm = app.session_manager
         result = sm.send_message(session_id, text, voice=voice)
+
+        # Record interaction even on failure — the user touched this session,
+        # they expect the sidebar to reflect that regardless of IPC outcome.
+        try:
+            project = (data.get('project') or '').strip()
+            _record_session_access(session_id, project)
+        except Exception:
+            pass
 
         if result.get('ok'):
             # Acknowledge receipt so the client knows the message was accepted.

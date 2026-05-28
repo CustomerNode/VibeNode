@@ -71,7 +71,8 @@ function _renderFlatWorkspace(mainBody, sessions) {
     const sa = statusOrder[getSessionStatus(a.id)] ?? 3;
     const sb = statusOrder[getSessionStatus(b.id)] ?? 3;
     if (sa !== sb) return sa - sb;
-    return (b.last_activity_ts||b.sort_ts||0) - (a.last_activity_ts||a.sort_ts||0);
+    return ((b.effective_ts||b.last_activity_ts||b.sort_ts||0)
+          - (a.effective_ts||a.last_activity_ts||a.sort_ts||0));
   });
 
   const statusSvg = {
@@ -241,7 +242,8 @@ function _renderHierarchicalWorkspace(mainBody, sessions, tree) {
     // Recent sessions — sorted by last activity, show department label
     const recentSessions = sessions
       .filter(s => !workspaceHiddenSessions.has(s.id))
-      .sort((a, b) => (b.last_activity_ts || b.sort_ts || 0) - (a.last_activity_ts || a.sort_ts || 0))
+      .sort((a, b) => ((b.effective_ts || b.last_activity_ts || b.sort_ts || 0)
+                      - (a.effective_ts || a.last_activity_ts || a.sort_ts || 0)))
       .slice(0, 10);
 
     if (recentSessions.length) {
@@ -325,7 +327,8 @@ function _renderHierarchicalWorkspace(mainBody, sessions, tree) {
     const sa = statusOrder[getSessionStatus(a.id)] ?? 3;
     const sb = statusOrder[getSessionStatus(b.id)] ?? 3;
     if (sa !== sb) return sa - sb;
-    return (b.last_activity_ts||b.sort_ts||0) - (a.last_activity_ts||a.sort_ts||0);
+    return ((b.effective_ts||b.last_activity_ts||b.sort_ts||0)
+          - (a.effective_ts||a.last_activity_ts||a.sort_ts||0));
   });
 
   const _skillLabel = currentId && tree.folders[currentId] && tree.folders[currentId].skill ? tree.folders[currentId].skill.label : '';
@@ -1426,7 +1429,8 @@ function _openStatusPopup(status) {
       let va, vb;
       if (sortKey === 'name') { va = (a.display_title || '').toLowerCase(); vb = (b.display_title || '').toLowerCase(); }
       else if (sortKey === 'dept') { va = (_sidToFolder[a.id] || '').toLowerCase(); vb = (_sidToFolder[b.id] || '').toLowerCase(); }
-      else { va = a.last_activity_ts || a.sort_ts || 0; vb = b.last_activity_ts || b.sort_ts || 0; }
+      else { va = a.effective_ts || a.last_activity_ts || a.sort_ts || 0;
+             vb = b.effective_ts || b.last_activity_ts || b.sort_ts || 0; }
       if (va < vb) return sortAsc ? -1 : 1;
       if (va > vb) return sortAsc ? 1 : -1;
       return 0;

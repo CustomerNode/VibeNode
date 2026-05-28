@@ -257,7 +257,12 @@ function sortedSessions(sessions) {
   } else if (sortMode === 'name') {
     copy.sort((a, b) => dir * (a.display_title || '').localeCompare(b.display_title || ''));
   } else {
-    copy.sort((a, b) => dir * ((a.last_activity_ts || a.sort_ts || 0) - (b.last_activity_ts || b.sort_ts || 0)));
+    // Date sort uses effective_ts = max(last_message_ts, file_mtime) so
+    // sessions you've interacted with (rename, autoname, fork) bubble up
+    // even when no new conversation was added. Falls back to legacy fields
+    // for clients/payloads that pre-date the effective_ts field.
+    const key = s => s.effective_ts || s.last_activity_ts || s.sort_ts || 0;
+    copy.sort((a, b) => dir * (key(a) - key(b)));
   }
   return copy;
 }

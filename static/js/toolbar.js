@@ -113,7 +113,35 @@ async function handleNameClick(id) {
   }
 }
 
+// "User interacted with this session" — bumps access_ts server-side AND
+// updates the cached allSessions entry so the sidebar's date sort re-renders
+// with the session in its new (top) position immediately.  Called from
+// every entry point that opens or focuses a session: openInGUI (sidebar
+// click), selectSession (toolbar / workspace), kanban row click, etc.
+//
+// Without this, the sort change wouldn't show until the next full
+// loadSessions() fetch (project switch, page reload) because filterSessions()
+// operates on the cached array.  Fire-and-forget; the sort is best-effort.
+function _recordSessionTouch(id) {
+  if (!id) return;
+  try {
+    const _tp = localStorage.getItem('activeProject') || '';
+    const _tq = _tp ? '?project=' + encodeURIComponent(_tp) : '';
+    fetch('/api/session/' + id + '/touch' + _tq, { method: 'POST' })
+      .catch(() => {});
+  } catch (_) {}
+  try {
+    if (typeof allSessions !== 'undefined' && Array.isArray(allSessions)) {
+      const _now = Date.now() / 1000;
+      const _hit = allSessions.find(s => s.id === id);
+      if (_hit) _hit.effective_ts = _now;
+    }
+  } catch (_) {}
+}
+
 async function selectSession(id) {
+  _recordSessionTouch(id);
+
   // In workspace mode, delegate to expandWorkspaceCard to prevent poll clobbering
   if (workspaceActive && typeof expandWorkspaceCard === 'function') {
     expandWorkspaceCard(id);

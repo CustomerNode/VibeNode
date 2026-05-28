@@ -320,6 +320,35 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /api/session/{session_id}/touch:
+    post:
+      tags: [Sessions]
+      summary: Record a UI interaction with a session
+      description: |
+        Bumps the session's last-access timestamp so the sidebar's date sort
+        bubbles it up.  Used for interactions that don't write to the .jsonl
+        file (view-only opens, workspace-mode loads, SDK remap cases).
+        Always returns 200 — the access store is best-effort sort state.
+      operationId: touchSession
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Access recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+              example:
+                ok: true
+
   /api/rename/{session_id}:
     post:
       tags: [Sessions]

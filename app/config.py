@@ -542,4 +542,6 @@ from .session_store import (  # noqa: E402, F401
     _get_remapped_ids,
     _resolve_remapped_id,
     _load_remaps,
+    _record_session_access,
+    _load_session_access_cached,
 )

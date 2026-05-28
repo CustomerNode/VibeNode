@@ -810,18 +810,23 @@ function setWfSort(sort) {
 function wfSortedSessions(sessions) {
   const copy = [...sessions];
   const statusOrder = {question:0, working:1, idle:2, sleeping:3};
+  // Date key matches sortedSessions() in sessions.js — uses effective_ts
+  // (max of last-message, file mtime, and last-access) so any interaction
+  // bubbles the session up, including view-only opens that don't write
+  // to the .jsonl file.
+  const dateKey = s => s.effective_ts || s.last_activity_ts || s.sort_ts || 0;
   if (wfSort === 'status') {
     copy.sort((a, b) => {
       const sa = statusOrder[getSessionStatus(a.id)] ?? 3;
       const sb = statusOrder[getSessionStatus(b.id)] ?? 3;
       if (sa !== sb) return sa - sb;
-      return (b.last_activity_ts||b.sort_ts||0) - (a.last_activity_ts||a.sort_ts||0);
+      return dateKey(b) - dateKey(a);
     });
   } else if (wfSort === 'name') {
     copy.sort((a, b) => (a.display_title||'').localeCompare(b.display_title||''));
   } else {
     // recent
-    copy.sort((a, b) => (b.last_activity_ts||b.sort_ts||0) - (a.last_activity_ts||a.sort_ts||0));
+    copy.sort((a, b) => dateKey(b) - dateKey(a));
   }
   return copy;
 }

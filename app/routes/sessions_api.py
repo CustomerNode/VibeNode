@@ -29,6 +29,7 @@ from ..config import (
     _get_utility_ids,
     _resolve_remapped_id,
     _load_remaps,
+    _record_session_access,
 )
 from ..sessions import load_session, load_session_timeline, all_sessions
 from ..titling import smart_title
@@ -74,6 +75,77 @@ def _unlink_with_retry(path: Path, retries: int = 5, delay: float = 0.2) -> bool
             log.debug("_unlink_with_retry: %s -> %s", path, e)
             return False
     return False
+
+
+def _latest_custom_title_in_jsonl(path: Path) -> "str | None":
+    """Return the customTitle of the most recent ``custom-title`` entry in
+    the JSONL at *path*, or ``None`` if there is no such entry.
+
+    Read backwards in 8 KiB chunks so this stays O(rename history) on
+    multi-megabyte session files instead of scanning the whole file. Used
+    by api_rename / api_autoname to skip an append when the title is
+    already the current one — without dedup, every UI rename/autoname
+    call pushed another identical ``custom-title`` line onto disk. One
+    Aras session in production accumulated 52 copies of the same title.
+    """
+    if not path or not path.exists():
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            pos = f.tell()
+            if pos == 0:
+                return None
+            chunk_size = 8192
+            tail = b""
+            while pos > 0:
+                read = min(chunk_size, pos)
+                pos -= read
+                f.seek(pos)
+                tail = f.read(read) + tail
+                lines = tail.split(b"\n")
+                # Stash the first (possibly partial) line for the next iter;
+                # process the rest from end to start.
+                if pos > 0:
+                    tail = lines[0]
+                    candidates = lines[1:]
+                else:
+                    tail = b""
+                    candidates = lines
+                for raw in reversed(candidates):
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        continue
+                    if obj.get("type") == "custom-title":
+                        return obj.get("customTitle", "") or ""
+    except Exception:
+        return None
+    return None
+
+
+def _append_custom_title_if_changed(path: Path, title: str, session_id: str) -> bool:
+    """Append ``{"type":"custom-title", "customTitle": title, ...}`` to *path*
+    only when the latest custom-title in the file isn't already *title*.
+
+    Returns ``True`` if a line was appended, ``False`` if the append was
+    skipped because the title matches the current one. Callers that need
+    to know whether the file was touched can use the return value; most
+    callers just want the side-effect.
+    """
+    if not path or not path.exists():
+        return False
+    current = _latest_custom_title_in_jsonl(path)
+    if current == title:
+        return False
+    entry = json.dumps({"type": "custom-title", "customTitle": title,
+                        "sessionId": session_id})
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("\n" + entry + "\n")
+    return True
 
 
 @bp.route("/api/sessions")
@@ -137,6 +209,10 @@ def api_sessions():
         if sid and sid not in existing_ids and state.get("state") != "stopped":
             saved_name = names.get(sid, "")
             title = saved_name or state.get("name") or "New Session"
+            # Live sessions with no .jsonl yet get effective_ts=now so they
+            # surface at the top of the date-sorted sidebar — they're the
+            # most-recently-interacted-with thing in the project.
+            _now_ts = _time.time()
             sessions.insert(0, {
                 "id": sid,
                 "display_title": title,
@@ -145,6 +221,7 @@ def api_sessions():
                 "date": "",
                 "last_activity": "",
                 "last_activity_ts": 0,
+                "effective_ts": _now_ts,
                 "sort_ts": 0,
                 "size": "",
                 "file_bytes": 0,
@@ -186,6 +263,13 @@ def api_session(session_id):
     if canonical:
         session_id = canonical
 
+    # Record this read as an interaction so the sidebar's date sort bubbles
+    # the session up.  meta_only requests come from background widgets
+    # (live-panel existence checks, etc.) — they should NOT count as a
+    # user-initiated open, or every page render would touch every session.
+    if not meta_only:
+        _record_session_access(session_id, project)
+
     path = _sessions_dir(project) / f"{session_id}.jsonl"
     if not path.exists():
         # Check if it's an SDK-managed session with no .jsonl yet
@@ -224,6 +308,28 @@ def api_session(session_id):
     return jsonify(load_session(path))
 
 
+@bp.route("/api/session/<session_id>/touch", methods=["POST"])
+def api_session_touch(session_id):
+    """Explicit "I interacted with this session" signal from the UI.
+
+    The sidebar sort uses ``effective_ts = max(last_msg_ts, mtime, access_ts)``
+    and ``api_session`` records access on GET, but a session that was opened
+    before the page loaded (or restored from a cached view) won't fire that
+    GET.  This endpoint lets the JS bump the timestamp explicitly — e.g.,
+    when the user clicks a session that's already mounted, or when a live
+    panel takes focus.
+
+    Always returns 200; the access store is best-effort sort state, not
+    load-bearing data.
+    """
+    project = request.args.get("project", "").strip()
+    canonical = _resolve_remapped_id(session_id, project)
+    if canonical:
+        session_id = canonical
+    _record_session_access(session_id, project)
+    return jsonify({"ok": True})
+
+
 @bp.route("/api/rename/<session_id>", methods=["POST"])
 def api_rename(session_id):
     data = request.get_json(silent=True) or {}
@@ -236,12 +342,11 @@ def api_rename(session_id):
     # the .jsonl doesn't exist yet (new sessions before first message).
     _save_name(session_id, new_title, project)
 
-    # Also write to the .jsonl so Claude Code's own UI sees the name (if file exists)
+    # Also write to the .jsonl so Claude Code's own UI sees the name (if file exists).
+    # Dedup so renaming a session to the same name (a no-op the UI can fire
+    # on focus-out) doesn't keep appending identical custom-title lines.
     path = _sessions_dir(project) / f"{session_id}.jsonl"
-    if path.exists():
-        entry = json.dumps({"type": "custom-title", "customTitle": new_title, "sessionId": session_id})
-        with open(path, "a", encoding="utf-8") as f:
-            f.write("\n" + entry + "\n")
+    _append_custom_title_if_changed(path, new_title, session_id)
 
     return jsonify({"ok": True, "title": new_title})
 
@@ -260,12 +365,10 @@ def api_remap_name():
     if not title:
         return jsonify({"ok": True, "skipped": True})
 
-    # Write custom-title entry to the new .jsonl if it exists
+    # Write custom-title entry to the new .jsonl if it exists. Dedup so
+    # repeat remap-name calls don't pile identical lines onto the file.
     path = _sessions_dir(project) / f"{new_id}.jsonl"
-    if path.exists():
-        entry = json.dumps({"type": "custom-title", "customTitle": title, "sessionId": new_id})
-        with open(path, "a", encoding="utf-8") as f:
-            f.write("\n" + entry + "\n")
+    _append_custom_title_if_changed(path, title, new_id)
 
     return jsonify({"ok": True, "title": title})
 
@@ -347,9 +450,7 @@ def api_autoname(session_id):
         )
         title = f"Empty Session ({empty_count})"
         if path:
-            entry = json.dumps({"type": "custom-title", "customTitle": title, "sessionId": session_id})
-            with open(path, "a", encoding="utf-8") as f:
-                f.write("\n" + entry + "\n")
+            _append_custom_title_if_changed(path, title, session_id)
         return jsonify({"ok": True, "title": title})
 
     try:
@@ -387,11 +488,11 @@ def api_autoname(session_id):
                 should_save = False
 
         # Persist title — write to JSONL if available, always save to names file
-        # (subject to the phantom-prevention guard above).
+        # (subject to the phantom-prevention guard above). Dedup the JSONL
+        # append so repeat autoname calls (e.g. re-evaluations that landed on
+        # the same title) don't pile identical custom-title lines onto disk.
         if path and path.exists():
-            entry = json.dumps({"type": "custom-title", "customTitle": title, "sessionId": session_id})
-            with open(path, "a", encoding="utf-8") as f:
-                f.write("\n" + entry + "\n")
+            _append_custom_title_if_changed(path, title, session_id)
         if should_save:
             _save_name(session_id, title, project)
 

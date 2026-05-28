@@ -17,14 +17,35 @@ from .config import (
     _get_utility_ids,
     _get_remapped_ids,
     _is_aititle_only_orphan,
+    _load_session_access_cached,
 )
+
+
+def _overlay_access_ts(summary: dict, path: Path) -> dict:
+    """Return *summary* with ``effective_ts`` bumped by the project's
+    recorded last-access time for this session if it is newer.
+
+    Access timestamps live in ``_session_access.json`` and are updated by
+    UI hooks (session open, send_message, etc).  They are NOT part of the
+    file-content cache key, so we must overlay them on every call rather
+    than baking them into the cached summary dict.
+    """
+    try:
+        project = path.parent.name
+        access_ts = _load_session_access_cached(project).get(path.stem, 0)
+    except Exception:
+        return summary
+    if access_ts <= summary.get("effective_ts", 0):
+        return summary
+    return {**summary, "effective_ts": access_ts}
 
 
 def load_session_summary(path: Path) -> dict:
     """Cached summary — reads the whole file, no head/tail tricks."""
     _err = {"id": path.stem, "error": "", "custom_title": None,
             "display_title": path.stem, "date": "", "last_activity": "", "preview": "",
-            "last_activity_ts": 0, "sort_ts": 0, "size": "0 B", "file_bytes": 0, "message_count": 0}
+            "last_activity_ts": 0, "effective_ts": 0, "sort_ts": 0,
+            "size": "0 B", "file_bytes": 0, "message_count": 0}
     try:
         st = path.stat()
     except Exception:
@@ -33,7 +54,11 @@ def load_session_summary(path: Path) -> dict:
     cache_key = (str(path), st.st_mtime, st.st_size)
     cached = _summary_cache.get(cache_key)
     if cached is not None:
-        return cached
+        # Even on cache hit, overlay access_ts: access can update without
+        # invalidating the file-content cache (clicking a session in the
+        # sidebar doesn't change mtime/size), and the sort needs the live
+        # value.  See _overlay_access_ts below.
+        return _overlay_access_ts(cached, path)
 
     custom_title = None
     first_user_content = ""
@@ -101,6 +126,12 @@ def load_session_summary(path: Path) -> dict:
     user_set_name = names.get(path.stem)
     effective_title = user_set_name or custom_title
 
+    last_activity_ts = last_ts.timestamp() if last_ts else 0
+    # effective_ts = newest of (last user/assistant message, file mtime).
+    # File mtime catches interactions that don't add messages (renames,
+    # autoname appends, fork operations) so the sidebar sort bubbles a
+    # touched session up even when no new conversation happened.
+    effective_ts = max(last_activity_ts, st.st_mtime)
     result = {
         "id": path.stem,
         "custom_title": effective_title,
@@ -108,7 +139,8 @@ def load_session_summary(path: Path) -> dict:
         "display_title": effective_title if effective_title else (first_user_content[:60] + ("\u2026" if len(first_user_content) > 60 else "")) or path.stem,
         "date": date_str,
         "last_activity": last_activity_str,
-        "last_activity_ts": last_ts.timestamp() if last_ts else 0,
+        "last_activity_ts": last_activity_ts,
+        "effective_ts": effective_ts,
         "sort_ts": first_ts.timestamp() if first_ts else 0,
         "file_bytes": st.st_size,
         "size": _format_size(st.st_size),
@@ -116,7 +148,7 @@ def load_session_summary(path: Path) -> dict:
         "message_count": message_count,
     }
     _summary_cache[cache_key] = result
-    return result
+    return _overlay_access_ts(result, path)
 
 
 def load_session(path: Path) -> dict:
@@ -199,7 +231,8 @@ def load_session(path: Path) -> dict:
     except Exception as e:
         return {"id": path.stem, "error": str(e), "messages": [], "custom_title": None,
                 "display_title": path.stem, "date": "", "last_activity": "", "preview": "",
-                "last_activity_ts": 0, "sort_ts": 0, "size": "0 B", "file_bytes": 0, "message_count": 0}
+                "last_activity_ts": 0, "effective_ts": 0, "sort_ts": 0,
+                "size": "0 B", "file_bytes": 0, "message_count": 0}
 
     # Date: prefer first message timestamp, fall back to file mtime
     if first_ts:
@@ -241,13 +274,18 @@ def load_session(path: Path) -> dict:
     user_set_name = _load_names(project=_proj).get(path.stem)
     effective_title = user_set_name or custom_title
 
-    return {
+    last_activity_ts = last_ts.timestamp() if last_ts else 0
+    # effective_ts mirrors load_session_summary so consumers of the full
+    # session payload sort consistently with the sidebar.
+    effective_ts = max(last_activity_ts, path.stat().st_mtime)
+    payload = {
         "id": path.stem,
         "custom_title": effective_title,
         "display_title": effective_title if effective_title else (first_user[:60] + ("\u2026" if len(first_user) > 60 else "")) or path.stem,
         "date": date_str,
         "last_activity": last_activity_str,
-        "last_activity_ts": last_ts.timestamp() if last_ts else 0,
+        "last_activity_ts": last_activity_ts,
+        "effective_ts": effective_ts,
         "sort_ts": first_ts.timestamp() if first_ts else 0,
         "file_bytes": file_bytes,
         "size": size_str,
@@ -255,6 +293,7 @@ def load_session(path: Path) -> dict:
         "message_count": len(messages),
         "messages": messages,
     }
+    return _overlay_access_ts(payload, path)
 
 
 def load_session_timeline(path: Path) -> dict:

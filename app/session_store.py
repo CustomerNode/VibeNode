@@ -298,3 +298,97 @@ def _resolve_remapped_id(old_session_id: str, project: str = "") -> str | None:
     if entry and entry.get("new_id"):
         return entry["new_id"]
     return None
+
+
+# ---------------------------------------------------------------------------
+# Session access tracking -- "last interacted with" bookkeeping for sort
+# ---------------------------------------------------------------------------
+# The sidebar's date sort uses ``effective_ts`` (see app/sessions.py) which
+# is ``max(last_message_ts, file_mtime, last_access_ts)``.  This file holds
+# the third component: the wall-clock time of the most recent UI interaction
+# with a session, recorded server-side so it survives page refresh and is
+# consistent across browsers.
+#
+# Hooks that bump access_ts:
+#   - GET /api/session/<id>           (user opens the session)
+#   - POST /api/session/<id>/touch    (explicit "I clicked this" signal)
+#   - WS  send_message                (user typed in the live panel)
+#   - WS  start_session               (fresh session started)
+#
+# Without this layer, a session that the user *interacts with* but doesn't
+# *write to* (resume that gets SDK-remapped, view-only reads, daemon-side
+# writes routed to a different file) stays frozen at its last on-disk
+# activity timestamp and never bubbles up — the exact failure mode behind
+# the Aras-session report on 2026-05-27.
+#
+# Lazy prune drops entries older than _ACCESS_MAX_AGE whose .jsonl is gone.
+
+_ACCESS_MAX_AGE = 7776000  # seconds (90 days)
+_access_lock = threading.Lock()
+
+# Read-through cache: project -> {"data": {sid: ts}, "mtime": float}
+_access_cache: dict = {}
+
+
+def _access_file(project: str = "") -> Path:
+    return _sessions_dir(project) / "_session_access.json"
+
+
+def _load_session_access(project: str = "") -> dict:
+    """Return ``{session_id: unix_ts}`` of recorded UI interactions."""
+    af = _access_file(project)
+    try:
+        data = json.loads(af.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _load_session_access_cached(project: str = "") -> dict:
+    """Mtime-keyed read-through cache for the per-project access map.
+
+    Sidebar renders call this once per session summary so the cost has to
+    stay sub-ms even with hundreds of sessions.  Cache key is the access
+    file's mtime; writes by ``_record_session_access`` bump that mtime and
+    naturally invalidate the cache on the next read.
+    """
+    af = _access_file(project)
+    try:
+        mt = af.stat().st_mtime
+    except Exception:
+        return {}
+    entry = _access_cache.get(project)
+    if entry is None or mt != entry["mtime"]:
+        _access_cache[project] = {"data": _load_session_access(project),
+                                   "mtime": mt}
+    return _access_cache[project]["data"]
+
+
+def _record_session_access(session_id: str, project: str = "") -> None:
+    """Record ``now()`` as the last-interaction time for ``session_id``.
+
+    Cheap and idempotent — safe to call from request handlers and WS
+    events.  Failures are swallowed because this is a sort hint, not
+    load-bearing state."""
+    if not session_id:
+        return
+    with _access_lock:
+        try:
+            data = _load_session_access(project)
+            now = time.time()
+            data[session_id] = now
+            # Lazy prune: drop entries that are both old AND have no .jsonl
+            # on disk anymore, so the file can't grow unbounded across years.
+            sd = _sessions_dir(project)
+            pruned = {
+                sid: ts for sid, ts in data.items()
+                if (now - ts) < _ACCESS_MAX_AGE
+                or (sd / f"{sid}.jsonl").exists()
+            }
+            _access_file(project).write_text(
+                json.dumps(pruned, ensure_ascii=False), encoding="utf-8"
+            )
+        except Exception:
+            pass
