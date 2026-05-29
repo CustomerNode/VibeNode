@@ -565,6 +565,49 @@ class SessionManager:
         if not info:
             return {"ok": False, "error": "Session not found"}
 
+        # ── Subsession inbox drain (spec §4.3.4 + §4.3.5) ──
+        # Prepend any undelivered subsession reports onto the outbound
+        # text BEFORE the state lock acquisition and BEFORE _send_query
+        # is scheduled.  Fast path: ``info.inbox_dirty`` is an in-memory
+        # bool — when False (the common case) no disk I/O happens.
+        #
+        # PERF-CRITICAL ordering: this block sits ABOVE the
+        # _turn_had_direct_edit reset and the asyncio.gather() in
+        # _send_query.  The drain MUST NOT move into _send_query (which
+        # is the PERF-CRITICAL chokepoint per CLAUDE.md markers #2/#3/#4/#5)
+        # and MUST NOT be reordered after them.  See spec §7.1 and
+        # tests/test_send_query_operation_order.py for the invariant pin.
+        if info.inbox_dirty:
+            try:
+                from daemon.subsession_inbox import (
+                    drain_undelivered,
+                    format_drain_block,
+                )
+                drained = drain_undelivered(session_id)
+                if drained:
+                    block = format_drain_block(drained)
+                    if text == "" or not text.strip():
+                        # Pull-updates path (spec §4.3.5): send the block as
+                        # the entire SDK message; no "[Your message]" suffix.
+                        text = block
+                    else:
+                        text = (
+                            block + "\n---\n[Your message]\n" + text
+                        )
+                # Clear the in-memory flag whether or not anything was
+                # drained — if the disk file disagreed with the flag we
+                # still want to avoid re-reading on every turn.
+                info.inbox_dirty = False
+            except Exception as e:
+                # Per spec §9: a corrupt/missing inbox must NOT block the
+                # user's message.  Log and continue with the original text.
+                logger.warning(
+                    "send_message: inbox drain failed for %s: %s — "
+                    "continuing with original text",
+                    session_id, e,
+                )
+                info.inbox_dirty = False
+
         # Atomic state check + set under per-session lock to prevent two
         # concurrent send_message calls from both seeing IDLE and both
         # launching _send_query coroutines in parallel.
