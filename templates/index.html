@@ -107,7 +107,7 @@
           </button>
           <button class="sidebar-view-opt" data-view="compose" onclick="setViewMode('compose')">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/><rect x="12" y="19" width="9" height="2" rx="1"/></svg>
-            Compose
+            Subsessions
           </button>
         </div>
       </div>
@@ -160,7 +160,7 @@
       // Highlight active view option immediately
       var viewOpts = document.querySelectorAll('.sidebar-view-opt');
       viewOpts.forEach(function(b){ b.classList.toggle('active', b.dataset.view === mode); });
-      var _vn = { homepage:'Home', sessions:'Sessions', kanban:'Workflow', workplace:'Workforce', compose:'Compose' };
+      var _vn = { homepage:'Home', sessions:'Sessions', kanban:'Workflow', workplace:'Workforce', compose:'Subsessions' };
       var vl = document.getElementById('sidebar-view-label'); if (vl) vl.textContent = _vn[mode] || mode;
       if (mode === 'homepage') {
         // Hide sidebar entirely on homepage
