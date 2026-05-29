@@ -401,8 +401,20 @@ class SessionManager:
         logger.info("SessionManager started")
 
         # Recover sessions from a previous crash (non-blocking background task)
+        #
+        # Phase 6.5 P0-3: also pass ``mark_inbox_dirty`` so recover_sessions
+        # can rehydrate the in-memory ``inbox_dirty`` flag from on-disk
+        # inbox.json files.  Without this, every recovered parent boots up
+        # with inbox_dirty=False and the fast-path drain at
+        # session_manager.py:595 skips the disk read forever — any
+        # ``delivered: false`` entries written before the daemon restart
+        # are stranded.
         threading.Thread(
-            target=lambda: self._reg.recover_sessions(self.start_session, self._store),
+            target=lambda: self._reg.recover_sessions(
+                self.start_session,
+                self._store,
+                mark_inbox_dirty_fn=self.mark_inbox_dirty,
+            ),
             daemon=True,
             name="session-recovery"
         ).start()

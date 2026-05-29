@@ -130,7 +130,13 @@ class SessionRegistry:
         self._registry_timer.daemon = True
         self._registry_timer.start()
 
-    def recover_sessions(self, start_session_fn: Callable, store, max_age: int = None) -> None:
+    def recover_sessions(
+        self,
+        start_session_fn: Callable,
+        store,
+        max_age: int = None,
+        mark_inbox_dirty_fn: Optional[Callable[[str], bool]] = None,
+    ) -> None:
         """Recover sessions that were active before a crash.
 
         Called once at startup in a background thread. Reads the registry,
@@ -140,6 +146,12 @@ class SessionRegistry:
         start_session_fn: callback to SessionManager.start_session
         store: ChatStore instance for finding/repairing session files
         max_age: override MAX_RECOVERY_AGE for testing
+        mark_inbox_dirty_fn: optional callback to SessionManager.mark_inbox_dirty.
+            When provided, the recovery path checks each recovered session's
+            on-disk inbox.json for ``delivered: false`` entries and flips the
+            in-memory inbox_dirty flag back on so the next send_message turn
+            drains them.  Without this, daemon restart strands undelivered
+            reports (phase 6.5 P0-3).
         """
         if max_age is None:
             max_age = MAX_RECOVERY_AGE
@@ -261,6 +273,27 @@ class SessionRegistry:
                 )
                 if result.get("ok"):
                     recovered += 1
+                    # ── Phase 6.5 P0-3: rehydrate inbox_dirty from disk ──
+                    # If this recovered session has on-disk undelivered
+                    # subsession reports, set its in-memory inbox_dirty
+                    # flag so the next send_message turn drains them.
+                    # Without this, the fast-path in send_message reads
+                    # the cleared flag and skips the disk read forever,
+                    # stranding reports written before the daemon restart.
+                    if mark_inbox_dirty_fn is not None:
+                        try:
+                            from daemon.subsession_inbox import has_undelivered
+                            if has_undelivered(sid):
+                                mark_inbox_dirty_fn(sid)
+                                logger.info(
+                                    "Rehydrated inbox_dirty=True for "
+                                    "recovered session %s", sid,
+                                )
+                        except Exception as e:
+                            logger.debug(
+                                "inbox_dirty rehydration soft-fail for %s: %s",
+                                sid, e,
+                            )
                 else:
                     logger.warning(
                         "Failed to recover session %s: %s",

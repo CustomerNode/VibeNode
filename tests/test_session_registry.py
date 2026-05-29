@@ -639,6 +639,98 @@ class TestRecoverSessions:
             "sess-1", cwd=os.path.normpath("/tmp")
         )
 
+    def test_rehydrates_inbox_dirty_when_disk_has_undelivered(
+        self, tmp_path, monkeypatch
+    ):
+        """Phase 6.5 P0-3 — when a recovered session has on-disk
+        ``delivered: false`` reports, recover_sessions calls
+        mark_inbox_dirty_fn(sid) so the next send_message drains them.
+
+        Without this, the parent boots with inbox_dirty=False and the
+        fast-path drain at session_manager.py:595 reads False and skips
+        the disk read forever, stranding the reports.
+        """
+        # Isolate Path.home() to a fresh tmp dir so the subsession_inbox
+        # module writes its inbox.json into our sandbox, not into the
+        # user's real ~/.claude tree.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        from daemon import subsession_inbox as ibx
+
+        # Seed an undelivered report on disk for the parent SID we'll
+        # recover.  This is exactly the state a real daemon restart
+        # would leave behind: report-to-parent was called, the write
+        # hit disk, then the daemon died before the parent's next send.
+        parent_sid = "sess-parent-1"
+        ibx.append_report(parent_sid, "child-1", "Child", "Did the work")
+        assert ibx.has_undelivered(parent_sid) is True
+
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            parent_sid: {
+                "name": "Parent",
+                "state": "working",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+            },
+        }
+        _write_registry(registry_file, sessions)
+
+        start_fn = MagicMock(return_value={"ok": True})
+        mark_dirty_fn = MagicMock(return_value=True)
+        store = self._make_mock_store()
+
+        with patch('daemon.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(
+                start_fn, store, mark_inbox_dirty_fn=mark_dirty_fn
+            )
+
+        # start_session was called for our parent.
+        start_fn.assert_called_once()
+        # mark_inbox_dirty was called with the parent SID.
+        mark_dirty_fn.assert_called_once_with(parent_sid)
+
+    def test_no_rehydration_when_inbox_empty(self, tmp_path, monkeypatch):
+        """If a recovered session has NO on-disk undelivered reports,
+        mark_inbox_dirty_fn must NOT be called — otherwise every
+        recovered session would needlessly flip inbox_dirty=True on boot
+        and force a wasteful disk read on the next turn."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            "sess-clean": {
+                "name": "Parent",
+                "state": "working",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+            },
+        }
+        _write_registry(registry_file, sessions)
+
+        start_fn = MagicMock(return_value={"ok": True})
+        mark_dirty_fn = MagicMock(return_value=True)
+        store = self._make_mock_store()
+
+        with patch('daemon.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(
+                start_fn, store, mark_inbox_dirty_fn=mark_dirty_fn
+            )
+
+        start_fn.assert_called_once()
+        # No undelivered entries => no rehydration call.
+        mark_dirty_fn.assert_not_called()
+
 
 # =========================================================================
 # Section 5: cancel_timer
