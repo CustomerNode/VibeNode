@@ -713,6 +713,62 @@ paths:
                   error:
                     type: string
 
+  /api/sessions/{child_sid}/report-to-parent:
+    post:
+      tags: [Sessions]
+      summary: Write a subsession report into its parent's inbox
+      description: |
+        Appends a new entry to the parent's inbox.json under
+        ~/.claude/vibenode-state/<parent_sid>/.  The parent's next
+        send_message turn surfaces the report by prepending a delimited
+        block onto the user's text (spec §4.3).
+      operationId: reportToParent
+      parameters:
+        - name: child_sid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [summary]
+              properties:
+                summary:
+                  type: string
+                  description: Plain-text summary surfaced to the parent.
+                attachments:
+                  type: array
+                  items:
+                    type: object
+      responses:
+        "200":
+          description: Report written
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  report_id:
+                    type: string
+                  parent_session_id:
+                    type: string
+                  undelivered_count:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /api/rewind/{session_id}:
     post:
       tags: [Sessions]

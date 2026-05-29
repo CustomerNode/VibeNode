@@ -247,6 +247,121 @@ class TestSpawnSubsessionGuards:
                "different project" in resp.get_json()["error"].lower()
         session_manager.start_session.assert_not_called()
 
+    def test_report_to_parent_happy_path(
+        self, client, session_manager, parent_session
+    ):
+        """A child can report up to a known parent; the parent's inbox
+        receives the entry and the response carries the
+        undelivered_count."""
+        from daemon import subsession_inbox as ibx
+
+        parent_sid, project, _ = parent_session
+        child_sid = str(uuid.uuid4())
+
+        def _meta(sid):
+            if sid == child_sid:
+                return {
+                    "session_id": child_sid,
+                    "name": "Investigate flake",
+                    "cwd": "",
+                    "session_type": "subsession",
+                    "parent_session_id": parent_sid,
+                    "subsession_origin_turn": 3,
+                }
+            if sid == parent_sid:
+                return {
+                    "session_id": parent_sid,
+                    "name": "Parent topic",
+                    "cwd": "",
+                    "session_type": "",
+                    "parent_session_id": None,
+                    "subsession_origin_turn": 0,
+                }
+            return None
+
+        session_manager.get_subsession_meta.side_effect = _meta
+        session_manager.mark_inbox_dirty.return_value = True
+
+        resp = client.post(
+            f"/api/sessions/{child_sid}/report-to-parent?project={project}",
+            json={"summary": "Found a one-liner fix"},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["parent_session_id"] == parent_sid
+        assert data["undelivered_count"] == 1
+        assert data["report_id"]
+
+        # Sanity: the entry actually landed on disk.
+        inbox = ibx.load_inbox(parent_sid)
+        assert len(inbox["pending_reports"]) == 1
+        assert inbox["pending_reports"][0]["summary"] == "Found a one-liner fix"
+
+        # mark_inbox_dirty was called on the parent.
+        session_manager.mark_inbox_dirty.assert_called_with(parent_sid)
+
+    def test_report_to_parent_missing_summary(self, client, session_manager):
+        child_sid = str(uuid.uuid4())
+        session_manager.get_subsession_meta.return_value = {
+            "session_id": child_sid,
+            "parent_session_id": "p",
+            "cwd": "",
+            "session_type": "subsession",
+        }
+        resp = client.post(
+            f"/api/sessions/{child_sid}/report-to-parent",
+            json={"summary": ""},
+        )
+        assert resp.status_code == 400
+        assert "summary" in resp.get_json()["error"].lower()
+
+    def test_report_to_parent_no_parent(self, client, session_manager):
+        """A subsession whose parent_session_id is None returns 404."""
+        child_sid = str(uuid.uuid4())
+        session_manager.get_subsession_meta.return_value = {
+            "session_id": child_sid,
+            "name": "orphan",
+            "cwd": "",
+            "session_type": "subsession",
+            "parent_session_id": None,
+        }
+        resp = client.post(
+            f"/api/sessions/{child_sid}/report-to-parent",
+            json={"summary": "Hello"},
+        )
+        assert resp.status_code == 404
+        assert "parent" in resp.get_json()["error"].lower()
+
+    def test_report_to_parent_missing_parent(
+        self, client, session_manager, parent_session
+    ):
+        """A child whose parent_session_id points at a SID that exists in
+        neither the daemon nor on disk returns 404."""
+        parent_sid, project, parent_path = parent_session
+        # Delete the parent JSONL to simulate a parent that's been
+        # removed both from the daemon and from disk.
+        parent_path.unlink()
+        child_sid = str(uuid.uuid4())
+
+        def _meta(sid):
+            if sid == child_sid:
+                return {
+                    "session_id": child_sid,
+                    "name": "child",
+                    "cwd": "",
+                    "session_type": "subsession",
+                    "parent_session_id": parent_sid,
+                }
+            return None  # parent is gone from daemon too
+
+        session_manager.get_subsession_meta.side_effect = _meta
+        resp = client.post(
+            f"/api/sessions/{child_sid}/report-to-parent?project={project}",
+            json={"summary": "Hello"},
+        )
+        assert resp.status_code == 404
+
     def test_cycle_in_parent_chain_rejected(
         self, client, session_manager, parent_session
     ):

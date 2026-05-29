@@ -1060,6 +1060,105 @@ def api_spawn_subsession(parent_sid):
     })
 
 
+# ── Subsessions: report-to-parent endpoint (spec §4.3.3) ─────────────────
+# POST /api/sessions/<child_sid>/report-to-parent
+# Body: {"summary": str, "attachments"?: list}
+#
+# Looks up the child's parent_session_id via SessionManager, appends a
+# new entry to the parent's inbox.json under
+# ~/.claude/vibenode-state/<parent_sid>/, marks the in-memory
+# inbox_dirty flag on the parent if it's still loaded, and emits an
+# inbox_updated WS event so the sidebar badge updates without polling.
+@bp.route("/api/sessions/<child_sid>/report-to-parent", methods=["POST"])
+def api_report_to_parent(child_sid):
+    """Write a report from a subsession into its parent's inbox."""
+    from daemon.subsession_inbox import (
+        append_report,
+        undelivered_count,
+    )
+
+    project = request.args.get("project", "").strip()
+    sm = current_app.session_manager
+
+    canonical = _resolve_remapped_id(child_sid, project)
+    if canonical:
+        child_sid = canonical
+
+    data = request.get_json(silent=True) or {}
+    summary = (data.get("summary") or "").strip()
+    if not summary:
+        return jsonify({"error": "summary is required"}), 400
+    attachments = data.get("attachments") or []
+    if not isinstance(attachments, list):
+        return jsonify({"error": "attachments must be a list"}), 400
+
+    # Find the child's daemon-side metadata so we can locate the parent
+    # SID and child display name.
+    child_meta = sm.get_subsession_meta(child_sid)
+    if not child_meta:
+        return jsonify({"error": "child session not found"}), 404
+
+    parent_sid = child_meta.get("parent_session_id")
+    if not parent_sid:
+        return jsonify({"error": "this session has no parent"}), 404
+
+    # Verify the parent still exists somewhere — either daemon-managed
+    # or on disk.  Parent deletion (spec §6.2) leaves an orphaned child;
+    # the endpoint must refuse the write in that case so the UI can
+    # toast a "Reports to: (parent deleted)" affordance.
+    parent_meta = sm.get_subsession_meta(parent_sid)
+    parent_jsonl = _sessions_dir(project) / f"{parent_sid}.jsonl"
+    if not parent_meta and not parent_jsonl.exists():
+        return jsonify({"error": "parent session not found"}), 404
+
+    child_name = child_meta.get("name") or ""
+
+    try:
+        entry = append_report(
+            parent_sid=parent_sid,
+            child_sid=child_sid,
+            child_name=child_name,
+            summary=summary,
+            attachments=attachments,
+        )
+    except Exception as e:
+        log.warning(
+            "report-to-parent: append_report failed for child=%s parent=%s: %s",
+            child_sid, parent_sid, e,
+        )
+        return jsonify({"error": f"failed to write inbox: {e}"}), 500
+
+    # Best-effort: flip the parent's in-memory inbox_dirty flag so the
+    # next send_message picks up the report without reading the file.
+    # Falls through harmlessly if the parent isn't daemon-managed (the
+    # next time it loads, it will re-derive inbox_dirty from disk).
+    try:
+        if hasattr(sm, "mark_inbox_dirty"):
+            sm.mark_inbox_dirty(parent_sid)
+    except Exception as e:
+        log.debug("report-to-parent: mark_inbox_dirty soft-fail: %s", e)
+
+    # Emit a real-time inbox_updated event so any connected client can
+    # update the parent's badge immediately.  Best-effort — a missing
+    # socketio binding (e.g. in unit tests) silently falls through.
+    try:
+        from .. import socketio
+        socketio.emit("inbox_updated", {
+            "parent_session_id": parent_sid,
+            "undelivered_count": undelivered_count(parent_sid),
+            "from_child_session_id": child_sid,
+        })
+    except Exception as e:
+        log.debug("report-to-parent: socketio emit soft-fail: %s", e)
+
+    return jsonify({
+        "ok": True,
+        "report_id": entry.get("report_id"),
+        "parent_session_id": parent_sid,
+        "undelivered_count": undelivered_count(parent_sid),
+    })
+
+
 @bp.route("/api/rewind/<session_id>", methods=["POST"])
 def api_rewind(session_id):
     """Rewind tracked files to the state at a given message line number."""

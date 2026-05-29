@@ -961,6 +961,26 @@ class SessionManager:
             return info.state.value
         return None
 
+    def mark_inbox_dirty(self, session_id: str) -> bool:
+        """Set ``info.inbox_dirty = True`` on a managed parent session.
+
+        Returns True if the flag was set (parent is managed), False
+        otherwise.  Called by the report-to-parent endpoint so the next
+        send_message turn knows to drain the inbox without re-reading
+        the file off disk on every turn (spec §7.2 hot-path constraint).
+
+        If the parent isn't currently daemon-managed, the call falls
+        through; the next time the parent loads, send_message will
+        re-derive ``inbox_dirty`` from disk (Phase 4 behavior).
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+            if not info:
+                return False
+            info.inbox_dirty = True
+            return True
+
     def get_subsession_meta(self, session_id: str) -> Optional[dict]:
         """Return a lightweight metadata snapshot for spawn/subsession guards.
 
