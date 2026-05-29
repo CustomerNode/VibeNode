@@ -900,6 +900,166 @@ def api_fork(session_id):
     return jsonify({"ok": True, "new_id": new_id, "title": fork_title})
 
 
+# ── Subsessions: spawn endpoint (spec §4.2) ──────────────────────────────
+# POST /api/sessions/<parent_sid>/spawn-subsession
+#
+# Reuses the JSONL slice + sessionId-rewrite machinery from /api/fork.
+# A subsession is just a normal SDK session whose JSONL is seeded with
+# the parent's transcript up to the spawn moment, plus a parent pointer
+# in the registry (parent_session_id, subsession_origin_turn) and a
+# session_type of "subsession" for the sidebar discriminator.
+#
+# Guards (spec §4.2 + §6.8):
+#   1. Parent must exist and be in the active project (cross-project
+#      spawn is rejected — spec §6.5).
+#   2. Parent.session_type != "planner" — planners self-recycle and
+#      cannot legally be parents (spec §4.2).
+#   3. Cycle guard: walk the parent chain up to 32 hops via the daemon's
+#      in-memory SessionInfo + the registry snapshot, reject if the
+#      proposed child SID appears anywhere in the chain.  This is
+#      impossible in practice for a freshly-generated UUID4, but the
+#      guard codifies the invariant for any future re-parent flow.
+#
+# Returns: {ok: True, new_id, parent_id, title} on success;
+#          {error: "<reason>"} with 400 / 404 / 409 on rejection.
+@bp.route("/api/sessions/<parent_sid>/spawn-subsession", methods=["POST"])
+def api_spawn_subsession(parent_sid):
+    """Spawn a subsession from an existing parent session."""
+    import uuid as uuid_mod
+
+    project = request.args.get("project", "").strip()
+    sm = current_app.session_manager
+
+    # Resolve any in-memory alias on the parent SID.
+    canonical_parent = _resolve_remapped_id(parent_sid, project)
+    if canonical_parent:
+        parent_sid = canonical_parent
+
+    src = _sessions_dir(project) / f"{parent_sid}.jsonl"
+    if not src.exists():
+        return jsonify({"error": "Parent session not found"}), 404
+
+    # ── Guard 1: Parent project = active project (cross-project guard) ──
+    # The parent's cwd (when daemon-managed) must match the active
+    # project's cwd.  When the parent is only on-disk (no daemon entry)
+    # the request's project arg has already located the file under the
+    # active project's sessions_dir, so file-existence is the guard.
+    parent_meta = sm.get_subsession_meta(parent_sid)
+    if parent_meta:
+        parent_cwd = parent_meta.get("cwd") or ""
+        if parent_cwd and not cwd_matches_active_project(parent_cwd, project=project):
+            return jsonify({
+                "error": "Cross-project spawn rejected: parent belongs to a different project"
+            }), 400
+
+        # ── Guard 2: Planner parents are rejected (spec §4.2) ──
+        if parent_meta.get("session_type") == "planner":
+            return jsonify({
+                "error": "Cannot spawn a subsession from a planner session"
+            }), 400
+
+    # Generate the new child SID up front so we can include it in the
+    # cycle guard and the JSONL rewrite.
+    new_id = str(uuid_mod.uuid4())
+
+    # ── Guard 3: Cycle prevention (spec §6.8) ──
+    # Walk the parent chain up to 32 hops and abort if new_id appears.
+    # In practice impossible for a freshly-generated UUID4; the guard
+    # codifies the invariant for future re-parent code paths.
+    _MAX_PARENT_CHAIN = 32
+    cursor = parent_sid
+    visited = {new_id}
+    for _ in range(_MAX_PARENT_CHAIN):
+        if cursor in visited:
+            return jsonify({
+                "error": "Subsession parent chain contains a cycle — aborted"
+            }), 409
+        visited.add(cursor)
+        cursor_meta = sm.get_subsession_meta(cursor)
+        if not cursor_meta:
+            break
+        next_parent = cursor_meta.get("parent_session_id")
+        if not next_parent:
+            break
+        cursor = next_parent
+
+    # ── Slice the parent JSONL at the current line count ──
+    # Mirrors api_fork (line ~849) but appends a "[sub] <parent_name>"
+    # custom-title and persists the parent pointer on the new SessionInfo.
+    dst = _sessions_dir(project) / f"{new_id}.jsonl"
+    lines_out = []
+    line_count = 0
+    parent_name = (parent_meta or {}).get("name") or ""
+    original_title = parent_name or parent_sid[:8]
+
+    with open(src, encoding="utf-8") as f:
+        for line in f:
+            line_count += 1
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                lines_out.append(raw)
+                continue
+            if obj.get("type") == "custom-title" and not parent_name:
+                original_title = obj.get("customTitle", original_title)
+            if "sessionId" in obj:
+                obj["sessionId"] = new_id
+            lines_out.append(json.dumps(obj))
+
+    # subsession_origin_turn captures the parent's JSONL line count at
+    # the spawn moment.  Used by the rewind-past-spawn detector in
+    # Phase 6 to flag children whose anchor disappeared after a rewind.
+    subsession_origin_turn = line_count
+
+    sub_title = f"[sub] {original_title[:55]}"
+    lines_out.append(json.dumps({
+        "type": "custom-title",
+        "customTitle": sub_title,
+        "sessionId": new_id,
+    }))
+
+    with open(dst, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines_out) + "\n")
+
+    # Persist the human-readable title for sidebar rendering before
+    # start_session fires its first state emit.
+    try:
+        _save_name(new_id, sub_title, project)
+    except Exception as e:
+        log.debug("spawn_subsession: _save_name failed for %s: %s", new_id, e)
+
+    # ── Start the child SDK session with the parent pointer in-place ──
+    active_project = get_active_project()
+    proj_dir = _decode_project(active_project) if active_project else str(Path.home())
+    try:
+        result = sm.start_session(
+            session_id=new_id,
+            prompt="",
+            cwd=proj_dir,
+            name=sub_title,
+            resume=True,
+            session_type="subsession",
+            parent_session_id=parent_sid,
+            subsession_origin_turn=subsession_origin_turn,
+        )
+    except Exception as e:
+        return jsonify({"error": f"Failed to start subsession: {e}"}), 500
+
+    if not result.get("ok"):
+        return jsonify({"error": result.get("error", "Failed to start subsession")}), 500
+
+    return jsonify({
+        "ok": True,
+        "new_id": new_id,
+        "parent_id": parent_sid,
+        "title": sub_title,
+        "subsession_origin_turn": subsession_origin_turn,
+    })
+
+
 @bp.route("/api/rewind/<session_id>", methods=["POST"])
 def api_rewind(session_id):
     """Rewind tracked files to the state at a given message line number."""

@@ -660,6 +660,59 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /api/sessions/{parent_sid}/spawn-subsession:
+    post:
+      tags: [Sessions]
+      summary: Spawn a subsession from an existing parent session
+      description: |
+        Reuses the JSONL fork machinery to seed the new subsession with
+        the parent's transcript up to the spawn moment, then starts the
+        child as a normal SDK session with a parent pointer.  See
+        docs/plans/subsessions-spec.md §4.2.
+      operationId: spawnSubsession
+      parameters:
+        - name: parent_sid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Subsession spawned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  new_id:
+                    type: string
+                  parent_id:
+                    type: string
+                  title:
+                    type: string
+                  subsession_origin_turn:
+                    type: integer
+        "400":
+          description: Cross-project or planner-parent rejection
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Cycle detected in parent chain
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
   /api/rewind/{session_id}:
     post:
       tags: [Sessions]

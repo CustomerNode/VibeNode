@@ -961,6 +961,31 @@ class SessionManager:
             return info.state.value
         return None
 
+    def get_subsession_meta(self, session_id: str) -> Optional[dict]:
+        """Return a lightweight metadata snapshot for spawn/subsession guards.
+
+        Returns ``None`` if the session is not managed.  Otherwise returns
+        a plain dict with the fields needed to enforce the spawn-time
+        guards in spec §4.2 and §6.8: ``session_type`` (planner check),
+        ``cwd`` (cross-project check), and ``parent_session_id`` (cycle
+        walk).  Read under the manager lock so the snapshot is internally
+        consistent; the returned dict is a copy so callers can mutate it
+        freely.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+            if not info:
+                return None
+            return {
+                "session_id": info.session_id,
+                "name": info.name,
+                "cwd": info.cwd,
+                "session_type": info.session_type,
+                "parent_session_id": info.parent_session_id,
+                "subsession_origin_turn": info.subsession_origin_turn,
+            }
+
     # ------------------------------------------------------------------
     # Async internals (run on the event loop thread)
     # ------------------------------------------------------------------
