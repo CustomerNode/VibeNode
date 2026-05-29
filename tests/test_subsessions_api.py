@@ -738,6 +738,134 @@ class TestSessionManagerLifecycleHelpers:
         )
         assert resp.status_code == 404
 
+
+# ---------------------------------------------------------------------------
+# Phase 6.5 P1-5 — Rewind-orphan reanchor / detach endpoints
+# ---------------------------------------------------------------------------
+
+class TestRewindOrphanEndpoints:
+    """The rewind-orphan UI prompt calls POST /reanchor or /detach for
+    each orphaned child the user picks an action for.  Phase 6.5 P1-5."""
+
+    def test_reanchor_with_explicit_origin_turn(
+        self, client, session_manager
+    ):
+        """Caller passes an explicit origin_turn — endpoint forwards
+        to SessionManager.reanchor_subsession and returns 200."""
+        child_sid = str(uuid.uuid4())
+        session_manager.reanchor_subsession.return_value = True
+        resp = client.post(
+            f"/api/sessions/{child_sid}/reanchor",
+            json={"origin_turn": 12},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["subsession_origin_turn"] == 12
+        session_manager.reanchor_subsession.assert_called_once_with(
+            child_sid, 12
+        )
+
+    def test_reanchor_derives_origin_turn_from_parent_tip(
+        self, client, session_manager, parent_session
+    ):
+        """When the body has no origin_turn, the endpoint reads the
+        parent's current JSONL line count and uses that — the spec §6.3
+        'Re-anchor at current parent tip' affordance."""
+        parent_sid, project, parent_path = parent_session
+        child_sid = str(uuid.uuid4())
+
+        def _meta(sid):
+            if sid == child_sid:
+                return {
+                    "session_id": child_sid,
+                    "parent_session_id": parent_sid,
+                    "cwd": "",
+                    "session_type": "subsession",
+                }
+            return None
+
+        session_manager.get_subsession_meta.side_effect = _meta
+        session_manager.reanchor_subsession.return_value = True
+
+        # Parent JSONL fixture has 3 lines.
+        resp = client.post(
+            f"/api/sessions/{child_sid}/reanchor?project={project}",
+            json={},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["subsession_origin_turn"] == 3
+        session_manager.reanchor_subsession.assert_called_once_with(
+            child_sid, 3
+        )
+
+    def test_reanchor_404_when_child_missing(self, client, session_manager):
+        child_sid = str(uuid.uuid4())
+        session_manager.reanchor_subsession.return_value = False
+        resp = client.post(
+            f"/api/sessions/{child_sid}/reanchor",
+            json={"origin_turn": 1},
+        )
+        assert resp.status_code == 404
+
+    def test_detach_endpoint_calls_daemon_helper(
+        self, client, session_manager
+    ):
+        child_sid = str(uuid.uuid4())
+        session_manager.detach_subsession.return_value = True
+        resp = client.post(
+            f"/api/sessions/{child_sid}/detach",
+            json={},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        session_manager.detach_subsession.assert_called_once_with(child_sid)
+
+    def test_detach_endpoint_404_when_unknown(self, client, session_manager):
+        child_sid = str(uuid.uuid4())
+        session_manager.detach_subsession.return_value = False
+        resp = client.post(
+            f"/api/sessions/{child_sid}/detach",
+            json={},
+        )
+        assert resp.status_code == 404
+
+    def test_detach_helper_clears_parent_pointer_and_stamps_tombstone(self):
+        """SessionManager.detach_subsession sets parent_session_id=None
+        and stamps parent_deleted_at on the in-memory SessionInfo."""
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        class _MockSDKTypes:
+            ClaudeSDKClient = MagicMock
+            ClaudeCodeOptions = MagicMock
+
+        sdk_mod = MagicMock()
+        sdk_types_mod = MagicMock()
+        for name in ("ClaudeSDKClient", "ClaudeCodeOptions"):
+            setattr(sdk_mod, name, getattr(_MockSDKTypes, name))
+        with patch.dict(sys.modules, {
+            "claude_code_sdk": sdk_mod,
+            "claude_code_sdk.types": sdk_types_mod,
+        }):
+            import importlib
+            import daemon.session_manager as sm
+            importlib.reload(sm)
+
+            mgr = sm.SessionManager()
+            child = sm.SessionInfo(
+                session_id="child-1",
+                parent_session_id="parent-1",
+            )
+            mgr._sessions = {"child-1": child}
+            assert mgr.detach_subsession("child-1") is True
+            assert child.parent_session_id is None
+            assert child.parent_deleted_at  # ISO8601 timestamp
+            assert mgr.detach_subsession("missing") is False
+
     def test_reanchor_subsession_updates_origin_turn(self):
         import sys
         from unittest.mock import MagicMock, patch

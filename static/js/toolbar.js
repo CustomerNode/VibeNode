@@ -1221,6 +1221,12 @@ async function _confirmPicker() {
         msg += ' (' + data.files_skipped.length + ' skipped)';
       }
       showToast(msg);
+      // Phase 6.5 P1-5: surface the rewind-orphan modal (sessions.js)
+      // when the backend flagged children whose anchor was rewound past.
+      if (data.rewind_orphans && data.rewind_orphans.length
+        && typeof window._handleRewindOrphans === 'function') {
+        window._handleRewindOrphans(_pickerSessionId, data.rewind_orphans);
+      }
     }
   } catch (e) {
     _closePm();

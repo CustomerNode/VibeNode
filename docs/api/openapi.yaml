@@ -810,6 +810,87 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /api/sessions/{child_sid}/reanchor:
+    post:
+      tags: [Sessions]
+      summary: Re-anchor a rewind-orphaned subsession at a new parent tip
+      description: |
+        Spec §6.3 Re-anchor action.  Updates the child's
+        subsession_origin_turn so the rewind-orphan badge clears.
+        If origin_turn is omitted, the server reads the parent's
+        current JSONL line count and uses that.
+      operationId: reanchorSubsession
+      parameters:
+        - name: child_sid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                origin_turn:
+                  type: integer
+                  description: New parent JSONL line count to anchor at.
+      responses:
+        "200":
+          description: Re-anchored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  subsession_origin_turn:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/sessions/{child_sid}/detach:
+    post:
+      tags: [Sessions]
+      summary: Detach a subsession from its parent (orphan-like state)
+      description: |
+        Spec §6.3 Detach action — clears parent_session_id and stamps
+        parent_deleted_at so the orphan UI surfaces "Reports to:
+        (parent deleted)."
+      operationId: detachSubsession
+      parameters:
+        - name: child_sid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Detached
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /api/sessions/{child_sid}/auto-report-toggle:
     post:
       tags: [Sessions]

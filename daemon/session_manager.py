@@ -1097,6 +1097,30 @@ class SessionManager:
                     flagged.append(sid)
         return flagged
 
+    def detach_subsession(self, child_sid: str) -> bool:
+        """Phase 6.5 P1-5 — clear a subsession's parent pointer (Detach
+        action on the rewind-orphan UI prompt).
+
+        Sets ``parent_session_id = None`` and stamps a
+        ``parent_deleted_at`` tombstone so the orphan-state UI shows
+        "Reports to: (parent deleted)" exactly the same way as a true
+        parent deletion (spec §6.2).  Returns True on success.
+        """
+        from datetime import datetime, timezone
+
+        child_sid = self._resolve_id(child_sid)
+        with self._lock:
+            info = self._sessions.get(child_sid)
+            if not info:
+                return False
+            info.parent_session_id = None
+            info.parent_deleted_at = datetime.now(timezone.utc).isoformat(
+                timespec="seconds"
+            ).replace("+00:00", "Z")
+        self._schedule_registry_save()
+        self._emit_state(info)
+        return True
+
     def reanchor_subsession(self, child_sid: str, new_origin_turn: int) -> bool:
         """Set a new ``subsession_origin_turn`` on a child whose parent was
         rewound past its old anchor (spec §6.3 Re-anchor action).

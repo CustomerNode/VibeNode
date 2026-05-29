@@ -920,6 +920,121 @@ document.addEventListener('keydown', function(e) {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// Phase 6.5 P1-5 — Rewind-orphan UI prompt
+// ═══════════════════════════════════════════════════════════════
+//
+// When the rewind endpoint returns a non-empty `rewind_orphans` array,
+// surface a modal listing each orphaned child with [Re-anchor] and
+// [Detach] buttons (spec §6.3).
+//
+// Re-anchor → POST /api/sessions/<child>/reanchor (server resolves the
+//   new origin_turn from the current parent tip)
+// Detach    → POST /api/sessions/<child>/detach (clears parent pointer,
+//   stamps parent_deleted_at like §6.2 orphan)
+//
+// Exposed on window so toolbar.js (which holds the rewind response
+// handler) can call us without taking a hard dependency on this file.
+window._handleRewindOrphans = function(parentSid, orphanSids) {
+  if (!Array.isArray(orphanSids) || !orphanSids.length) return;
+  const proj = localStorage.getItem('activeProject') || '';
+  const projQ = proj ? '?project=' + encodeURIComponent(proj) : '';
+
+  function nameFor(sid) {
+    // Best-effort lookup in the existing session list; falls back to
+    // the SID prefix so the modal is never empty-labelled.
+    if (typeof allSessions !== 'undefined' && Array.isArray(allSessions)) {
+      const hit = allSessions.find(function(s) { return s && s.id === sid; });
+      if (hit && hit.title) return hit.title;
+    }
+    return (sid || '').slice(0, 8);
+  }
+
+  let modal = document.getElementById('rewind-orphans-modal');
+  if (modal) modal.remove();
+  modal = document.createElement('div');
+  modal.id = 'rewind-orphans-modal';
+  modal.className = 'subsession-report-modal';
+  let rows = '';
+  orphanSids.forEach(function(sid) {
+    const safe = String(sid).replace(/[^A-Za-z0-9_-]/g, '');
+    rows +=
+      '<div class="rewind-orphan-row" data-sid="' + safe + '">'
+      + '<div class="rewind-orphan-name">' + escHtml(nameFor(sid)) + '</div>'
+      + '<button type="button" class="rewind-orphan-reanchor">Re-anchor at current parent tip</button>'
+      + '<button type="button" class="rewind-orphan-detach">Detach</button>'
+      + '</div>';
+  });
+  modal.innerHTML =
+    '<div class="subsession-report-card">'
+    + '<div class="subsession-report-title">Subsessions orphaned by rewind</div>'
+    + '<div class="subsession-report-help">'
+    + 'These subsessions were spawned past the line you rewound to.  '
+    + 'Pick an action for each.'
+    + '</div>'
+    + '<div class="rewind-orphans-list">' + rows + '</div>'
+    + '<div class="subsession-report-actions">'
+    + '<button type="button" class="rewind-orphan-close">Close</button>'
+    + '</div>'
+    + '</div>';
+  document.body.appendChild(modal);
+
+  modal.querySelector('.rewind-orphan-close').addEventListener('click', function() {
+    modal.remove();
+  });
+
+  Array.prototype.forEach.call(
+    modal.querySelectorAll('.rewind-orphan-row'),
+    function(row) {
+      const childSid = row.getAttribute('data-sid');
+      row.querySelector('.rewind-orphan-reanchor').addEventListener('click', async function() {
+        try {
+          const url = '/api/sessions/' + encodeURIComponent(childSid) + '/reanchor' + projQ;
+          const resp = await fetch(url, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({}),
+          });
+          const data = await resp.json().catch(function() { return null; });
+          if (!resp.ok || !data || data.ok !== true) {
+            const err = (data && data.error) || ('HTTP ' + resp.status);
+            if (typeof showToast === 'function') showToast('Re-anchor failed: ' + err, true);
+            return;
+          }
+          if (typeof showToast === 'function') {
+            showToast('Re-anchored at line ' + (data.subsession_origin_turn || '?'));
+          }
+          row.remove();
+          if (!modal.querySelectorAll('.rewind-orphan-row').length) modal.remove();
+        } catch (e) {
+          if (typeof showToast === 'function') showToast('Re-anchor failed: network error', true);
+        }
+      });
+      row.querySelector('.rewind-orphan-detach').addEventListener('click', async function() {
+        try {
+          const url = '/api/sessions/' + encodeURIComponent(childSid) + '/detach' + projQ;
+          const resp = await fetch(url, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({}),
+          });
+          const data = await resp.json().catch(function() { return null; });
+          if (!resp.ok || !data || data.ok !== true) {
+            const err = (data && data.error) || ('HTTP ' + resp.status);
+            if (typeof showToast === 'function') showToast('Detach failed: ' + err, true);
+            return;
+          }
+          if (typeof showToast === 'function') showToast('Subsession detached.');
+          row.remove();
+          if (!modal.querySelectorAll('.rewind-orphan-row').length) modal.remove();
+        } catch (e) {
+          if (typeof showToast === 'function') showToast('Detach failed: network error', true);
+        }
+      });
+    }
+  );
+};
+
+// ═══════════════════════════════════════════════════════════════
 // Add to Structured composition — unified tree picker
 // ═══════════════════════════════════════════════════════════════
 

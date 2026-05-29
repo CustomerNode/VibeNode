@@ -1334,6 +1334,93 @@ def api_pull_subsession_updates(parent_sid):
     return jsonify(payload)
 
 
+# ── Subsessions: re-anchor / detach for rewind-orphaned children (P1-5) ──
+# POST /api/sessions/<child_sid>/reanchor
+# Body: {"origin_turn": int}     # optional; defaults to current parent tip
+#
+# Called by the rewind-orphan UI prompt when the user chooses "Re-anchor at
+# current parent tip" for a child whose subsession_origin_turn fell past
+# the parent's new line count after a rewind.  Updates the child's
+# in-memory ``subsession_origin_turn`` so the spawn-point badge clears.
+@bp.route("/api/sessions/<child_sid>/reanchor", methods=["POST"])
+def api_reanchor_subsession(child_sid):
+    """Re-anchor a rewind-orphaned subsession at a new parent tip."""
+    from daemon.subsession_inbox import _validate_sid
+
+    project = request.args.get("project", "").strip()
+    sm = current_app.session_manager
+
+    try:
+        _validate_sid(child_sid)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid child_sid: {e}"}), 400
+
+    canonical = _resolve_remapped_id(child_sid, project)
+    if canonical:
+        child_sid = canonical
+
+    data = request.get_json(silent=True) or {}
+    new_origin_turn = data.get("origin_turn")
+
+    # If no explicit origin_turn given, derive from the parent's current
+    # JSONL line count.  This is the spec §6.3 "Re-anchor at current parent
+    # tip" affordance.
+    if new_origin_turn is None:
+        meta = sm.get_subsession_meta(child_sid)
+        if not meta:
+            return jsonify({"error": "child session not found"}), 404
+        parent_sid = meta.get("parent_session_id")
+        if not parent_sid:
+            return jsonify({"error": "child has no parent"}), 400
+        parent_jsonl = _sessions_dir(project) / f"{parent_sid}.jsonl"
+        if not parent_jsonl.exists():
+            return jsonify({"error": "parent session not found"}), 404
+        try:
+            with open(parent_jsonl, encoding="utf-8") as f:
+                new_origin_turn = sum(1 for _ in f)
+        except Exception as e:
+            return jsonify({"error": f"failed to read parent jsonl: {e}"}), 500
+
+    if not isinstance(new_origin_turn, int) or new_origin_turn < 0:
+        return jsonify({"error": "origin_turn must be a non-negative integer"}), 400
+
+    if not hasattr(sm, "reanchor_subsession"):
+        return jsonify({"error": "reanchor not supported"}), 500
+    ok = bool(sm.reanchor_subsession(child_sid, new_origin_turn))
+    if not ok:
+        return jsonify({"error": "child session not found"}), 404
+    return jsonify({"ok": True, "subsession_origin_turn": new_origin_turn})
+
+
+# POST /api/sessions/<child_sid>/detach
+# Detaches a subsession from its parent (sets parent_session_id=None),
+# behaving like §6.2 orphan.  Used by the rewind-orphan UI prompt when
+# the user chooses "Detach" over "Re-anchor."
+@bp.route("/api/sessions/<child_sid>/detach", methods=["POST"])
+def api_detach_subsession(child_sid):
+    """Detach a subsession from its parent (orphan-like state)."""
+    from daemon.subsession_inbox import _validate_sid
+
+    project = request.args.get("project", "").strip()
+    sm = current_app.session_manager
+
+    try:
+        _validate_sid(child_sid)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid child_sid: {e}"}), 400
+
+    canonical = _resolve_remapped_id(child_sid, project)
+    if canonical:
+        child_sid = canonical
+
+    if not hasattr(sm, "detach_subsession"):
+        return jsonify({"error": "detach not supported"}), 500
+    ok = bool(sm.detach_subsession(child_sid))
+    if not ok:
+        return jsonify({"error": "child session not found"}), 404
+    return jsonify({"ok": True})
+
+
 # ── Subsessions: auto-report toggle (phase 6.5 P1-4) ─────────────────────
 # POST /api/sessions/<child_sid>/auto-report-toggle
 # Body: {"on": bool}
