@@ -5,6 +5,7 @@ merging, directive adding, gen number incrementing.
 
 import json
 import threading
+import time
 import pytest
 
 from app.compose.models import (
@@ -40,9 +41,24 @@ class TestReadWrite:
         assert "conflicts" in ctx
 
     def test_write_context(self, project):
+        """Round-trip a custom field through write_context / read_context.
+
+        Note: On Windows, `write_context` ultimately calls `os.replace()` to
+        atomically swap the temp file into place. Antivirus scans and the
+        Windows Search indexer can briefly hold an OS-level handle on the
+        destination, causing a transient PermissionError on the first attempt
+        even though no Python code is racing. Production callers handle this
+        by surfacing or retrying; the test mirrors that resilience with a
+        single 100ms-backoff retry. Same Windows-race awareness as
+        `test_atomic_write_no_corruption` below.
+        """
         ctx = read_context(project.id)
         ctx["custom_field"] = "test_value"
-        write_context(project.id, ctx)
+        try:
+            write_context(project.id, ctx)
+        except PermissionError:
+            time.sleep(0.1)
+            write_context(project.id, ctx)
         ctx2 = read_context(project.id)
         assert ctx2["custom_field"] == "test_value"
 
