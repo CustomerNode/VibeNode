@@ -496,6 +496,7 @@ class SessionManager:
         extra_args: Optional[dict] = None,
         parent_session_id: Optional[str] = None,
         subsession_origin_turn: int = 0,
+        parent_deleted_at: Optional[str] = None,
     ) -> dict:
         """Start or resume an SDK session. Returns immediately."""
         _forward_to_send = False
@@ -548,6 +549,7 @@ class SessionManager:
             session_type=session_type or "",
             parent_session_id=parent_session_id,
             subsession_origin_turn=subsession_origin_turn,
+            parent_deleted_at=parent_deleted_at,
         )
         with self._lock:
             self._sessions[session_id] = info

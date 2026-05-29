@@ -607,6 +607,10 @@ class TestRecoverSessions:
             # + origin turn through with safe defaults for legacy registries.
             parent_session_id=None,
             subsession_origin_turn=0,
+            # Phase 6.5 P1-1: parent_deleted_at tombstone round-trips through
+            # recovery so a daemon restart preserves the orphan state.  None
+            # for legacy registries (the field is absent).
+            parent_deleted_at=None,
         )
 
     def test_repairs_incomplete_turn_before_recovery(self, tmp_path):
@@ -694,6 +698,74 @@ class TestRecoverSessions:
         start_fn.assert_called_once()
         # mark_inbox_dirty was called with the parent SID.
         mark_dirty_fn.assert_called_once_with(parent_sid)
+
+    def test_parent_deleted_at_round_trips_through_recovery(self, tmp_path):
+        """Phase 6.5 P1-1 — the parent_deleted_at tombstone written to
+        the registry snapshot must survive a recovery cycle.  Previously
+        recover_sessions silently dropped the field (start_session didn't
+        accept the kwarg), so a daemon restart erased the orphan state.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        tombstone = "2026-05-28T19:00:00Z"
+        sessions = {
+            "orphan-child": {
+                "name": "Orphan",
+                "state": "working",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+                # Subsession state at restart: child's parent was
+                # deleted before we crashed.  Tombstone field carries
+                # the deletion timestamp through recovery.
+                "parent_session_id": None,
+                "subsession_origin_turn": 5,
+                "parent_deleted_at": tombstone,
+            },
+        }
+        _write_registry(registry_file, sessions)
+
+        start_fn = MagicMock(return_value={"ok": True})
+        store = self._make_mock_store()
+        with patch('daemon.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store)
+
+        start_fn.assert_called_once()
+        kwargs = start_fn.call_args.kwargs
+        assert kwargs["session_id"] == "orphan-child"
+        # Phase 6.5 P1-1 contract: tombstone is in the start_session call.
+        assert kwargs["parent_deleted_at"] == tombstone
+
+    def test_legacy_registry_without_tombstone_recovers_cleanly(
+        self, tmp_path
+    ):
+        """A registry written by a pre-tombstone daemon (no
+        parent_deleted_at field) must still recover; missing key
+        defaults to None — never raises."""
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        now = time.time()
+        sessions = {
+            "legacy-sess": {
+                "name": "Legacy",
+                "state": "working",
+                "cwd": "/tmp",
+                "model": "",
+                "last_activity": now - 30,
+                # No parent_deleted_at key at all.
+            },
+        }
+        _write_registry(registry_file, sessions)
+
+        start_fn = MagicMock(return_value={"ok": True})
+        store = self._make_mock_store()
+        with patch('daemon.session_registry.REGISTRY_PATH', registry_file):
+            reg.recover_sessions(start_fn, store)
+
+        start_fn.assert_called_once()
+        # Default is None for legacy registries.
+        assert start_fn.call_args.kwargs["parent_deleted_at"] is None
 
     def test_no_rehydration_when_inbox_empty(self, tmp_path, monkeypatch):
         """If a recovered session has NO on-disk undelivered reports,

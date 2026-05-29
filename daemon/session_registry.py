@@ -259,6 +259,13 @@ class SessionRegistry:
                 subsession_origin_turn = meta.get(
                     "subsession_origin_turn", 0
                 )
+                # Phase 6.5 P1-1: pass the parent_deleted_at tombstone
+                # through recovery.  Previously, _save_registry_now()
+                # wrote this field to the snapshot but recover_sessions
+                # silently dropped it, so a daemon restart erased the
+                # orphan state and the UI flipped back to "reports to:
+                # <parent>" for a parent that no longer existed.
+                parent_deleted_at = meta.get("parent_deleted_at")
 
                 # Use start_session with resume=True to reconnect via SDK --resume
                 result = start_session_fn(
@@ -270,6 +277,7 @@ class SessionRegistry:
                     model=model if model else None,
                     parent_session_id=parent_sid,
                     subsession_origin_turn=subsession_origin_turn,
+                    parent_deleted_at=parent_deleted_at,
                 )
                 if result.get("ok"):
                     recovered += 1
