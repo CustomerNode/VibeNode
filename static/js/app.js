@@ -648,8 +648,8 @@ const _viewModes = {
   },
   compose: {
     icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
-    label: 'Compose View',
-    title: 'Compose',
+    label: 'Subsessions View',
+    title: 'Subsessions',
     desc: 'Documents, diagrams, and knowledge creation board',
   },
 };
@@ -658,7 +658,7 @@ function openViewModeSelector() {
   setViewMode('homepage');
 }
 
-const _viewNames = { homepage: 'Home', sessions: 'Sessions', kanban: 'Workflow', workplace: 'Workforce', compose: 'Compose' };
+const _viewNames = { homepage: 'Home', sessions: 'Sessions', kanban: 'Workflow', workplace: 'Workforce', compose: 'Subsessions' };
 const _viewIcons = {
   homepage: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10" fill="var(--bg-body)"/></svg>',
   sessions: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
