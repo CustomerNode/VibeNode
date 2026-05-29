@@ -586,6 +586,158 @@ class TestSessionManagerLifecycleHelpers:
             flagged = mgr.detect_rewind_orphans(parent_sid, 5)
             assert flagged == ["old"]
 
+    def test_auto_report_on_idle_writes_to_parent_inbox(self, tmp_path, monkeypatch):
+        """Phase 6.5 P1-4 — a subsession with auto_report_on_idle=True
+        and a parent pointer writes its last assistant message to the
+        parent's inbox on every IDLE _emit_state that has a fresh entry.
+        Idempotent: a second IDLE emit with no new entries must NOT
+        produce a duplicate report.
+        """
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        # Isolate Path.home() so the inbox writes into a sandbox.
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        class _MockSDKTypes:
+            ClaudeSDKClient = MagicMock
+            ClaudeCodeOptions = MagicMock
+
+        sdk_mod = MagicMock()
+        sdk_types_mod = MagicMock()
+        for name in ("ClaudeSDKClient", "ClaudeCodeOptions"):
+            setattr(sdk_mod, name, getattr(_MockSDKTypes, name))
+        with patch.dict(sys.modules, {
+            "claude_code_sdk": sdk_mod,
+            "claude_code_sdk.types": sdk_types_mod,
+        }):
+            import importlib
+            import daemon.session_manager as sm
+            importlib.reload(sm)
+            from daemon import subsession_inbox as ibx
+
+            mgr = sm.SessionManager()
+            parent_sid = "auto-report-parent"
+            child_sid = "auto-report-child"
+
+            child = sm.SessionInfo(
+                session_id=child_sid,
+                parent_session_id=parent_sid,
+                auto_report_on_idle=True,
+                name="Investigate the flake",
+            )
+            # Synthesize a finished turn: one user entry + one assistant.
+            child.entries.append(sm.LogEntry(kind="user", text="run X"))
+            child.entries.append(
+                sm.LogEntry(kind="assistant", text="Found the bug at line 42.")
+            )
+            child.state = sm.SessionState.IDLE
+            mgr._sessions = {child_sid: child}
+
+            # First IDLE _emit_state — should trigger an auto-report.
+            mgr._emit_state(child)
+            inbox = ibx.load_inbox(parent_sid)
+            assert len(inbox["pending_reports"]) == 1
+            entry = inbox["pending_reports"][0]
+            assert entry["child_session_id"] == child_sid
+            assert "line 42" in entry["summary"]
+            assert entry["delivered"] is False
+            # Counter snapshotted at the fired entry count.
+            assert child._last_auto_report_entry_count == 2
+
+            # Second IDLE _emit_state with no new entries — idempotent.
+            mgr._emit_state(child)
+            inbox = ibx.load_inbox(parent_sid)
+            assert len(inbox["pending_reports"]) == 1, \
+                "Idempotency: second IDLE without new entries must not duplicate."
+
+            # Add a new assistant message — third IDLE emits a new report.
+            child.entries.append(
+                sm.LogEntry(kind="assistant", text="Second turn conclusion.")
+            )
+            mgr._emit_state(child)
+            inbox = ibx.load_inbox(parent_sid)
+            assert len(inbox["pending_reports"]) == 2
+            assert "Second turn" in inbox["pending_reports"][1]["summary"]
+
+    def test_auto_report_off_does_nothing(self, tmp_path, monkeypatch):
+        """When auto_report_on_idle is False, no report is written even
+        if the child has assistant content and a parent pointer."""
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        class _MockSDKTypes:
+            ClaudeSDKClient = MagicMock
+            ClaudeCodeOptions = MagicMock
+
+        sdk_mod = MagicMock()
+        sdk_types_mod = MagicMock()
+        for name in ("ClaudeSDKClient", "ClaudeCodeOptions"):
+            setattr(sdk_mod, name, getattr(_MockSDKTypes, name))
+        with patch.dict(sys.modules, {
+            "claude_code_sdk": sdk_mod,
+            "claude_code_sdk.types": sdk_types_mod,
+        }):
+            import importlib
+            import daemon.session_manager as sm
+            importlib.reload(sm)
+            from daemon import subsession_inbox as ibx
+
+            mgr = sm.SessionManager()
+            parent_sid = "no-auto-parent"
+            child = sm.SessionInfo(
+                session_id="no-auto-child",
+                parent_session_id=parent_sid,
+                auto_report_on_idle=False,
+                name="silent",
+            )
+            child.entries.append(
+                sm.LogEntry(kind="assistant", text="Wouldn't report this.")
+            )
+            child.state = sm.SessionState.IDLE
+            mgr._sessions = {child.session_id: child}
+            mgr._emit_state(child)
+
+            inbox = ibx.load_inbox(parent_sid)
+            assert inbox["pending_reports"] == []
+
+    def test_set_auto_report_on_idle_endpoint_toggles_flag(
+        self, client, session_manager
+    ):
+        """The /api/sessions/<sid>/auto-report-toggle endpoint calls
+        set_auto_report_on_idle on the daemon and returns ok."""
+        child_sid = str(uuid.uuid4())
+        session_manager.set_auto_report_on_idle.return_value = True
+
+        resp = client.post(
+            f"/api/sessions/{child_sid}/auto-report-toggle",
+            json={"on": True},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["auto_report_on_idle"] is True
+        session_manager.set_auto_report_on_idle.assert_called_once_with(
+            child_sid, True
+        )
+
+    def test_set_auto_report_on_idle_endpoint_404_when_unknown(
+        self, client, session_manager
+    ):
+        child_sid = str(uuid.uuid4())
+        session_manager.set_auto_report_on_idle.return_value = False
+        resp = client.post(
+            f"/api/sessions/{child_sid}/auto-report-toggle",
+            json={"on": True},
+        )
+        assert resp.status_code == 404
+
     def test_reanchor_subsession_updates_origin_turn(self):
         import sys
         from unittest.mock import MagicMock, patch

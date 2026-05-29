@@ -1334,6 +1334,54 @@ def api_pull_subsession_updates(parent_sid):
     return jsonify(payload)
 
 
+# ── Subsessions: auto-report toggle (phase 6.5 P1-4) ─────────────────────
+# POST /api/sessions/<child_sid>/auto-report-toggle
+# Body: {"on": bool}
+#
+# Sets the in-memory + persisted ``auto_report_on_idle`` preference on a
+# subsession.  When True, the daemon writes the last assistant message
+# to the parent's inbox on each IDLE transition that has a fresh turn
+# since the last auto-report.  Idempotent across multiple IDLE emits via
+# the SessionInfo ``_last_auto_report_entry_count`` counter.
+@bp.route(
+    "/api/sessions/<child_sid>/auto-report-toggle",
+    methods=["POST"],
+)
+def api_auto_report_toggle(child_sid):
+    """Toggle auto-report-on-idle for a subsession."""
+    from daemon.subsession_inbox import _validate_sid
+
+    project = request.args.get("project", "").strip()
+    sm = current_app.session_manager
+
+    try:
+        _validate_sid(child_sid)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid child_sid: {e}"}), 400
+
+    canonical = _resolve_remapped_id(child_sid, project)
+    if canonical:
+        child_sid = canonical
+
+    data = request.get_json(silent=True) or {}
+    on = bool(data.get("on"))
+
+    ok = False
+    try:
+        if hasattr(sm, "set_auto_report_on_idle"):
+            ok = bool(sm.set_auto_report_on_idle(child_sid, on))
+    except Exception as e:
+        log.warning(
+            "auto-report-toggle: set_auto_report_on_idle failed for %s: %s",
+            child_sid, e,
+        )
+        return jsonify({"error": str(e)}), 500
+
+    if not ok:
+        return jsonify({"error": "subsession not found"}), 404
+    return jsonify({"ok": True, "auto_report_on_idle": on})
+
+
 @bp.route("/api/rewind/<session_id>", methods=["POST"])
 def api_rewind(session_id):
     """Rewind tracked files to the state at a given message line number."""

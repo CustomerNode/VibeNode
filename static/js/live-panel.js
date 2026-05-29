@@ -266,11 +266,29 @@ function _subsessionReportToParent(childSid) {
   });
 }
 
-function _subsessionToggleAutoReport(childSid, on) {
+async function _subsessionToggleAutoReport(childSid, on) {
   if (!childSid) return;
   const key = 'vn.subsession.autoreport.' + childSid;
   if (on) localStorage.setItem(key, '1');
   else localStorage.removeItem(key);
+  // Phase 6.5 P1-4: also tell the daemon so it can fire auto-reports
+  // on IDLE transitions.  localStorage alone only persists the UI
+  // checkbox state — the actual auto-report behavior lives in the
+  // daemon's _emit_state hook.
+  try {
+    const proj = localStorage.getItem('activeProject') || '';
+    const url = '/api/sessions/' + encodeURIComponent(childSid)
+      + '/auto-report-toggle'
+      + (proj ? '?project=' + encodeURIComponent(proj) : '');
+    await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({on: !!on}),
+    });
+  } catch (e) {
+    // The localStorage cache survives even if the daemon call fails;
+    // a subsequent toggle will retry.  Don't surface to the user.
+  }
 }
 
 // Listen for inbox_updated WS events from the report-to-parent endpoint

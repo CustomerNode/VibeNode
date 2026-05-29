@@ -202,6 +202,18 @@ class SessionInfo:
     # for non-orphans.  Persisted to the registry so a daemon restart
     # preserves the tombstone.
     parent_deleted_at: Optional[str] = None
+    # Phase 6.5 P1-4: when True, the subsession auto-reports its last
+    # assistant message to its parent's inbox on each IDLE transition that
+    # has a fresh assistant turn since the previous report (spec §4.3.3
+    # "Automatic" / §11 "Child IDLE with auto-report ON → IDLE again").
+    # ``_last_auto_report_entry_count`` is the entry-count snapshot taken
+    # at the last successful auto-report; on every IDLE we compare against
+    # the current count and report iff strictly greater AND the most-
+    # recent entry is an assistant message.  This makes the trigger
+    # idempotent across multiple IDLE emits per turn (PERF-CRITICAL guards
+    # may fire _emit_state more than once for a single user turn).
+    auto_report_on_idle: bool = False
+    _last_auto_report_entry_count: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self):
@@ -245,6 +257,11 @@ class SessionInfo:
             d["subsession_origin_turn"] = self.subsession_origin_turn
         if self.inbox_dirty:
             d["inbox_dirty"] = True
+        # Phase 6.5 P1-4: expose auto-report preference so the live-panel
+        # toggle can reflect the persisted server-side state on switch /
+        # reconnect.  Only emit when True to keep the dict compact.
+        if self.auto_report_on_idle:
+            d["auto_report_on_idle"] = True
         return d
 
 
@@ -497,6 +514,7 @@ class SessionManager:
         parent_session_id: Optional[str] = None,
         subsession_origin_turn: int = 0,
         parent_deleted_at: Optional[str] = None,
+        auto_report_on_idle: bool = False,
     ) -> dict:
         """Start or resume an SDK session. Returns immediately."""
         _forward_to_send = False
@@ -550,6 +568,7 @@ class SessionManager:
             parent_session_id=parent_session_id,
             subsession_origin_turn=subsession_origin_turn,
             parent_deleted_at=parent_deleted_at,
+            auto_report_on_idle=auto_report_on_idle,
         )
         with self._lock:
             self._sessions[session_id] = info
@@ -1091,6 +1110,107 @@ class SessionManager:
                 return False
             info.subsession_origin_turn = max(0, int(new_origin_turn))
         self._schedule_registry_save()
+        return True
+
+    def _maybe_auto_report_to_parent(self, info: "SessionInfo") -> None:
+        """Phase 6.5 P1-4 — write the last assistant message to the parent's
+        inbox if this subsession has new content since the previous auto-
+        report.
+
+        Idempotent: tracks ``_last_auto_report_entry_count`` so multiple
+        IDLE emits per turn don't produce duplicate reports.  Caller must
+        already have verified ``info.auto_report_on_idle`` and
+        ``info.parent_session_id``.
+        """
+        # Snapshot under the per-session lock so we don't race a streaming
+        # writer that's appending entries.
+        with info._lock:
+            entry_count = len(info.entries)
+            if entry_count <= info._last_auto_report_entry_count:
+                return  # No new turn since last auto-report.
+            # Find the last assistant text entry.
+            last_assistant_text = ""
+            for entry in reversed(info.entries):
+                kind = getattr(entry, "kind", "")
+                if kind != "assistant":
+                    continue
+                text = (getattr(entry, "text", "") or "").strip()
+                if text:
+                    last_assistant_text = text
+                    break
+            if not last_assistant_text:
+                # No assistant content yet — bump the counter so we don't
+                # re-scan every IDLE emit for the same empty state.
+                info._last_auto_report_entry_count = entry_count
+                return
+            # Update the counter BEFORE the disk write so a slow write
+            # can't race a second concurrent _emit_state into double-
+            # reporting.
+            info._last_auto_report_entry_count = entry_count
+            parent_sid = info.parent_session_id
+            child_sid = info.session_id
+            child_name = info.name or ""
+            # Cap the auto-report summary so a long assistant message
+            # doesn't bloat the inbox.  The user can still see the full
+            # text by clicking the subsession.
+            summary = last_assistant_text[:1500]
+
+        # OUTSIDE the lock — disk write should never hold the session lock.
+        try:
+            from daemon.subsession_inbox import append_report
+            append_report(
+                parent_sid=parent_sid,
+                child_sid=child_sid,
+                child_name=child_name,
+                summary=summary,
+            )
+        except Exception as e:
+            logger.warning(
+                "auto-report append_report failed for %s -> %s: %s",
+                child_sid, parent_sid, e,
+            )
+            return
+        # Flip the parent's inbox-dirty flag if managed, so the parent's
+        # next send_message turn drains without re-reading disk.
+        try:
+            self.mark_inbox_dirty(parent_sid)
+        except Exception as e:
+            logger.debug(
+                "auto-report mark_inbox_dirty soft-fail for %s: %s",
+                parent_sid, e,
+            )
+        # Best-effort: emit an inbox_updated event so any connected
+        # client updates the badge.
+        try:
+            from daemon.subsession_inbox import undelivered_count
+            if self._push_callback:
+                self._push_callback("inbox_updated", {
+                    "parent_session_id": parent_sid,
+                    "undelivered_count": undelivered_count(parent_sid),
+                    "from_child_session_id": child_sid,
+                    "auto": True,
+                })
+        except Exception as e:
+            logger.debug("auto-report inbox_updated emit soft-fail: %s", e)
+
+    def set_auto_report_on_idle(self, session_id: str, on: bool) -> bool:
+        """Phase 6.5 P1-4 — toggle the subsession's auto-report preference.
+
+        Returns True if the flag was updated on a managed SessionInfo.  The
+        live-panel toggle calls this via POST /api/sessions/<sid>/auto-report-toggle.
+        The change is debounced into the registry snapshot via the existing
+        save-scheduler so a daemon restart preserves the preference.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+            if not info:
+                return False
+            info.auto_report_on_idle = bool(on)
+        self._schedule_registry_save()
+        # Push state so any connected client picks up the new flag in
+        # to_state_dict() without waiting for the next session_state emit.
+        self._emit_state(info)
         return True
 
     def mark_inbox_dirty(self, session_id: str) -> bool:
@@ -4219,6 +4339,9 @@ class SessionManager:
                     "parent_session_id": info.parent_session_id,
                     "subsession_origin_turn": info.subsession_origin_turn,
                     "parent_deleted_at": info.parent_deleted_at,
+                    # Phase 6.5 P1-4: persist the auto-report toggle so a
+                    # daemon restart preserves the user's preference.
+                    "auto_report_on_idle": info.auto_report_on_idle,
                 }
         self._reg.save_registry_now(sessions_data)
 
@@ -4745,6 +4868,28 @@ class SessionManager:
                              info.session_id, info.state, cb_err)
         # Keep the persistent registry up to date
         self._schedule_registry_save()
+
+        # ── Phase 6.5 P1-4: auto-report on IDLE for opted-in subsessions ──
+        # When a subsession with auto_report_on_idle == True transitions
+        # to IDLE AND has produced new assistant content since the last
+        # auto-report, write the last assistant message to its parent's
+        # inbox.  Idempotent across multiple IDLE emits per turn via
+        # ``_last_auto_report_entry_count``: we only fire when the entry
+        # count has actually advanced AND the most recent entry is an
+        # assistant message.
+        if (
+            info.state == SessionState.IDLE
+            and getattr(info, "auto_report_on_idle", False)
+            and getattr(info, "parent_session_id", None)
+        ):
+            try:
+                self._maybe_auto_report_to_parent(info)
+            except Exception as e:
+                # Auto-report must never break a session state emit.
+                logger.warning(
+                    "auto-report soft-fail for %s: %s",
+                    info.session_id, e,
+                )
 
         # ── Memory management: trim in-memory entries for idle sessions ──
         # The JSONL file is the source of truth; the web frontend reads it

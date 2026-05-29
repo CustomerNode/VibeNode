@@ -810,6 +810,52 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /api/sessions/{child_sid}/auto-report-toggle:
+    post:
+      tags: [Sessions]
+      summary: Toggle auto-report-on-idle for a subsession
+      description: |
+        Persists the subsession's auto_report_on_idle preference on the
+        daemon-side SessionInfo so each IDLE _emit_state with a fresh
+        assistant turn auto-writes a report into the parent's inbox
+        (phase 6.5 P1-4 / spec §4.3.3 "Automatic").
+      operationId: setAutoReportToggle
+      parameters:
+        - name: child_sid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                on:
+                  type: boolean
+      responses:
+        "200":
+          description: Toggle applied
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  auto_report_on_idle:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /api/rewind/{session_id}:
     post:
       tags: [Sessions]

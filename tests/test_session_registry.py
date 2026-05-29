@@ -611,6 +611,9 @@ class TestRecoverSessions:
             # recovery so a daemon restart preserves the orphan state.  None
             # for legacy registries (the field is absent).
             parent_deleted_at=None,
+            # Phase 6.5 P1-4: auto-report-on-idle preference persists
+            # through recovery.  False for legacy registries.
+            auto_report_on_idle=False,
         )
 
     def test_repairs_incomplete_turn_before_recovery(self, tmp_path):

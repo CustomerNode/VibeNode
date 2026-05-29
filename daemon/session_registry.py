@@ -266,6 +266,11 @@ class SessionRegistry:
                 # orphan state and the UI flipped back to "reports to:
                 # <parent>" for a parent that no longer existed.
                 parent_deleted_at = meta.get("parent_deleted_at")
+                # Phase 6.5 P1-4: persist auto-report-on-idle preference
+                # through recovery.  Default False for legacy registries.
+                auto_report_on_idle = bool(
+                    meta.get("auto_report_on_idle", False)
+                )
 
                 # Use start_session with resume=True to reconnect via SDK --resume
                 result = start_session_fn(
@@ -278,6 +283,7 @@ class SessionRegistry:
                     parent_session_id=parent_sid,
                     subsession_origin_turn=subsession_origin_turn,
                     parent_deleted_at=parent_deleted_at,
+                    auto_report_on_idle=auto_report_on_idle,
                 )
                 if result.get("ok"):
                     recovered += 1
