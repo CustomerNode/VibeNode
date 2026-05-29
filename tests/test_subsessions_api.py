@@ -617,3 +617,166 @@ class TestSessionManagerLifecycleHelpers:
             assert child.subsession_origin_turn == 5
             # Missing session returns False without raising.
             assert mgr.reanchor_subsession("missing", 1) is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 6.5 P0-2 — pull-subsession-updates endpoint
+# ---------------------------------------------------------------------------
+
+class TestPullSubsessionUpdatesEndpoint:
+    """The /api/sessions/<parent>/pull-subsession-updates REST endpoint
+    that replaces the broken WS user_message + /api/live/send fallback.
+    Phase 6.5 P0-1/P0-2.
+    """
+
+    def test_parent_not_managed_returns_404(self, client, session_manager):
+        """If the parent SID is not daemon-managed, return 404 without
+        firing send_message (which would also fail)."""
+        unknown = str(uuid.uuid4())
+        session_manager.get_subsession_meta.return_value = None
+        resp = client.post(
+            f"/api/sessions/{unknown}/pull-subsession-updates",
+            json={},
+        )
+        assert resp.status_code == 404
+        assert "not found" in resp.get_json()["error"].lower()
+        session_manager.send_message.assert_not_called()
+
+    def test_no_pending_reports_returns_pulled_false(
+        self, client, session_manager
+    ):
+        """When there are no undelivered reports on disk AND the in-memory
+        inbox_dirty flag is False, the endpoint short-circuits without
+        invoking send_message."""
+        parent_sid = str(uuid.uuid4())
+        session_manager.get_subsession_meta.return_value = {
+            "session_id": parent_sid,
+            "name": "Parent",
+            "cwd": "",
+            "session_type": "",
+            "parent_session_id": None,
+        }
+        # No inbox file on disk => has_undelivered() returns False.
+        # No in-memory dirty flag => endpoint does not call send_message.
+        # MagicMock session_manager has no real _sessions; use an empty dict
+        # so the endpoint's "is the in-memory parent dirty?" probe finds
+        # nothing.  The MagicMock _lock is acquirable as a context manager
+        # (default MagicMock supports __enter__/__exit__).
+        session_manager._sessions = {}
+        resp = client.post(
+            f"/api/sessions/{parent_sid}/pull-subsession-updates",
+            json={},
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["pulled"] is False
+        assert data["undelivered_count"] == 0
+        session_manager.send_message.assert_not_called()
+
+    def test_pending_report_triggers_send_message_with_empty_text(
+        self, client, session_manager
+    ):
+        """When the parent has undelivered reports on disk, the endpoint
+        calls send_message(parent_sid, '') — the daemon's empty-text
+        branch (spec §4.3.5) turns the empty into a drain-block-only
+        message."""
+        from daemon import subsession_inbox as ibx
+
+        parent_sid = str(uuid.uuid4())
+        session_manager.get_subsession_meta.return_value = {
+            "session_id": parent_sid,
+            "name": "Parent",
+            "cwd": "",
+            "session_type": "",
+            "parent_session_id": None,
+        }
+        session_manager._sessions = {}
+        session_manager.send_message.return_value = {"ok": True}
+
+        # Seed one undelivered report.
+        ibx.append_report(parent_sid, "c1", "child-1", "Did the thing")
+        try:
+            resp = client.post(
+                f"/api/sessions/{parent_sid}/pull-subsession-updates",
+                json={},
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["ok"] is True
+            assert data["pulled"] is True
+            assert data["queued"] is False
+            # send_message must have been invoked with EMPTY text — the
+            # daemon's drain branch keys off text == "" to omit the
+            # "[Your message]" suffix.
+            session_manager.send_message.assert_called_once_with(
+                parent_sid, ""
+            )
+        finally:
+            # Clean up the inbox we seeded so the next test starts fresh.
+            ibx.remove_inbox(parent_sid)
+
+    def test_queued_when_session_busy(self, client, session_manager):
+        """When send_message returns queued (parent was WORKING), the
+        endpoint forwards that shape — the frontend toasts a 'queued'
+        message instead of a success message."""
+        from daemon import subsession_inbox as ibx
+
+        parent_sid = str(uuid.uuid4())
+        session_manager.get_subsession_meta.return_value = {
+            "session_id": parent_sid,
+            "name": "Parent",
+            "cwd": "",
+            "session_type": "",
+            "parent_session_id": None,
+        }
+        session_manager._sessions = {}
+        session_manager.send_message.return_value = {"queued": True}
+
+        ibx.append_report(parent_sid, "c1", "child-1", "Hello")
+        try:
+            resp = client.post(
+                f"/api/sessions/{parent_sid}/pull-subsession-updates",
+                json={},
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["ok"] is True
+            assert data["pulled"] is True
+            assert data["queued"] is True
+        finally:
+            ibx.remove_inbox(parent_sid)
+
+    def test_send_message_failure_propagates_400(
+        self, client, session_manager
+    ):
+        """If send_message returns an error, the endpoint forwards a 400
+        with the error message so the toast can explain what broke."""
+        from daemon import subsession_inbox as ibx
+
+        parent_sid = str(uuid.uuid4())
+        session_manager.get_subsession_meta.return_value = {
+            "session_id": parent_sid,
+            "name": "Parent",
+            "cwd": "",
+            "session_type": "",
+            "parent_session_id": None,
+        }
+        session_manager._sessions = {}
+        session_manager.send_message.return_value = {
+            "ok": False,
+            "error": "Session is stopped",
+        }
+
+        ibx.append_report(parent_sid, "c1", "child-1", "Hi")
+        try:
+            resp = client.post(
+                f"/api/sessions/{parent_sid}/pull-subsession-updates",
+                json={},
+            )
+            assert resp.status_code == 400
+            data = resp.get_json()
+            assert data["ok"] is False
+            assert "stopped" in data["error"].lower()
+        finally:
+            ibx.remove_inbox(parent_sid)

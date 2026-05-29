@@ -1215,6 +1215,102 @@ def api_report_to_parent(child_sid):
     })
 
 
+# ── Subsessions: pull-subsession-updates endpoint (phase 6.5 P0-1/P0-2) ──
+# POST /api/sessions/<parent_sid>/pull-subsession-updates
+#
+# Explicit REST endpoint behind the live-panel "Pull updates" button.
+# Replaces the earlier attempt to route Pull-updates through the WS
+# `send_message` handler — that handler rejects empty text before the
+# inbox drain branch ever runs, so the only way to invoke the empty-text
+# Pull-updates path (spec §4.3.5) is via this dedicated endpoint.
+#
+# Behavior:
+#   1. Resolve the parent SID; 404 if not daemon-managed.
+#   2. If the parent has no undelivered reports on disk AND no in-memory
+#      inbox_dirty flag, return {ok: True, pulled: False, undelivered_count: 0}
+#      without invoking send_message.  This keeps a no-op button click
+#      from spamming the parent with empty turns.
+#   3. Call SessionManager.send_message(parent_sid, "") — the existing
+#      empty-text branch in send_message (daemon/session_manager.py §4.3.5)
+#      drains the inbox and sends the block as the entire user turn.
+#   4. Forward send_message's queued/ok/error shape back to the caller.
+@bp.route(
+    "/api/sessions/<parent_sid>/pull-subsession-updates",
+    methods=["POST"],
+)
+def api_pull_subsession_updates(parent_sid):
+    """Deliver pending subsession reports to the parent as the next turn."""
+    from daemon.subsession_inbox import (
+        has_undelivered,
+        undelivered_count,
+    )
+
+    project = request.args.get("project", "").strip()
+    sm = current_app.session_manager
+
+    canonical = _resolve_remapped_id(parent_sid, project)
+    if canonical:
+        parent_sid = canonical
+
+    # 1. Parent must be daemon-managed; otherwise there's no send_message
+    # to fire and the drain block never reaches the SDK.  We deliberately
+    # do NOT fall back to writing into the inbox on disk — the inbox is
+    # the *write* side; this endpoint is the *deliver* side.
+    parent_meta = sm.get_subsession_meta(parent_sid)
+    if not parent_meta:
+        return jsonify({"error": "parent session not found"}), 404
+
+    # 2. No-op guard.  If the in-memory flag is False AND the on-disk
+    # file is empty, do nothing.  This protects against a button mash
+    # from injecting a stream of empty turns into the parent.
+    has_pending = False
+    try:
+        has_pending = has_undelivered(parent_sid)
+    except Exception as e:
+        log.debug("pull-subsession-updates: has_undelivered soft-fail: %s", e)
+        has_pending = False
+    # Also honor the in-memory flag — it can be True while disk says
+    # otherwise for the brief window between report-to-parent's append
+    # and the next persist cycle.
+    inmem_dirty = False
+    try:
+        if hasattr(sm, "_sessions"):
+            with sm._lock:
+                info = sm._sessions.get(parent_sid)
+                if info:
+                    inmem_dirty = bool(getattr(info, "inbox_dirty", False))
+    except Exception:
+        inmem_dirty = False
+
+    if not has_pending and not inmem_dirty:
+        return jsonify({
+            "ok": True,
+            "pulled": False,
+            "undelivered_count": 0,
+        })
+
+    # 3. Fire send_message with empty text — the daemon's inbox-drain
+    # branch (spec §4.3.5) turns this into "deliver the drain block as
+    # the entire user turn."
+    result = sm.send_message(parent_sid, "")
+    if not isinstance(result, dict):
+        return jsonify({"error": "send_message returned non-dict"}), 500
+
+    # 4. Mirror send_message's response shape so the frontend can use the
+    # same success/failed/queued handling it uses for normal sends.
+    pulled = bool(result.get("ok") or result.get("queued"))
+    payload = {
+        "ok": bool(result.get("ok") or result.get("queued")),
+        "pulled": pulled,
+        "queued": bool(result.get("queued")),
+        "undelivered_count": undelivered_count(parent_sid),
+    }
+    if not pulled and result.get("error"):
+        payload["error"] = result.get("error")
+        return jsonify(payload), 400
+    return jsonify(payload)
+
+
 @bp.route("/api/rewind/<session_id>", methods=["POST"])
 def api_rewind(session_id):
     """Rewind tracked files to the state at a given message line number."""

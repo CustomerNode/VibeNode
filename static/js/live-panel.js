@@ -129,32 +129,49 @@ function _renderSubsessionAffordances(sid) {
   _renderSubsessionToolbar(panelEl, sess);
 }
 
-// ── Pull updates: send an empty message that the daemon will turn
-// into "drain block only" (spec §4.3.5). ──
+// ── Pull updates: dispatch the dedicated REST endpoint (phase 6.5 P0-1).
+// The earlier attempt routed through the WS `send_message` event with an
+// empty string — but that handler rejects empty text before the inbox
+// drain branch ever runs (see app/routes/ws_events.py `if not text: ...`).
+// The fetch fallback to `/api/live/send` also targeted a route that does
+// not exist.  We now POST to /api/sessions/<parent>/pull-subsession-updates,
+// which is the explicit REST surface for spec §4.3.5's empty-text drain.
 async function _subsessionPullUpdates(parentSid) {
   if (!parentSid) return;
-  // The daemon-side send_message handles the empty-text branch when
-  // inbox_dirty=True.  We send via the existing live submit path so
-  // the optimistic-bubble + queue logic stays consistent.  Submit an
-  // empty string — the backend draws the block from inbox.json and
-  // sends it as the entire user turn.
-  if (typeof socket !== 'undefined') {
-    socket.emit('user_message', {
-      session_id: parentSid,
-      text: '',
-      project: localStorage.getItem('activeProject') || '',
+  const proj = localStorage.getItem('activeProject') || '';
+  const url = '/api/sessions/' + encodeURIComponent(parentSid)
+    + '/pull-subsession-updates'
+    + (proj ? '?project=' + encodeURIComponent(proj) : '');
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
     });
-  } else if (typeof fetch === 'function') {
-    try {
-      await fetch('/api/live/send', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({session_id: parentSid, text: ''}),
-      });
-    } catch (e) {}
+  } catch (e) {
+    if (typeof showToast === 'function') {
+      showToast('Pull updates failed: network error', true);
+    }
+    return;
+  }
+  let data = null;
+  try { data = await resp.json(); } catch (_) {}
+  if (!resp.ok || !data || data.ok !== true) {
+    const err = (data && data.error) || ('HTTP ' + resp.status);
+    if (typeof showToast === 'function') {
+      showToast('Pull updates failed: ' + err, true);
+    }
+    return;
   }
   if (typeof showToast === 'function') {
-    showToast('Pulling subsession updates…');
+    if (data.pulled === false) {
+      showToast('No subsession reports waiting.');
+    } else if (data.queued) {
+      showToast('Pull queued — fires when the session goes idle.');
+    } else {
+      showToast('Pulling subsession updates…');
+    }
   }
   // The strip will disappear when the next session_state event arrives
   // with inbox_dirty=false.

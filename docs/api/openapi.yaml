@@ -769,6 +769,47 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /api/sessions/{parent_sid}/pull-subsession-updates:
+    post:
+      tags: [Sessions]
+      summary: Deliver pending subsession reports to the parent
+      description: |
+        Dedicated REST endpoint behind the live-panel "Pull updates" button.
+        Calls send_message(parent_sid, "") — the daemon's empty-text branch
+        (spec §4.3.5) drains the parent's inbox and sends the report block
+        as the entire user turn.  Replaces an earlier broken WS path.
+      operationId: pullSubsessionUpdates
+      parameters:
+        - name: parent_sid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Pull dispatched (or no-op when there is nothing to pull)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  pulled:
+                    type: boolean
+                  queued:
+                    type: boolean
+                  undelivered_count:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /api/rewind/{session_id}:
     post:
       tags: [Sessions]
