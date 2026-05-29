@@ -554,6 +554,27 @@ def api_delete(session_id):
         sm.close_session_sync(session_id)
         sm.remove_session(session_id)
 
+    # ── Subsessions cleanup (spec §6.2): orphan children + remove inbox ──
+    # Any in-memory child of this session gets parent_deleted_at + cleared
+    # parent_session_id so the sidebar stops indenting it.  The parent's
+    # per-parent inbox directory under ~/.claude/vibenode-state/<sid>/ is
+    # removed so deleted reports don't linger as orphan storage.
+    try:
+        if hasattr(sm, "orphan_children_of"):
+            orphaned = sm.orphan_children_of(session_id)
+            if orphaned:
+                log.info(
+                    "Subsessions: orphaned %d child(ren) of deleted parent %s",
+                    len(orphaned), session_id,
+                )
+    except Exception as e:
+        log.debug("orphan_children_of soft-fail: %s", e)
+    try:
+        from daemon.subsession_inbox import remove_inbox
+        remove_inbox(session_id)
+    except Exception as e:
+        log.debug("remove_inbox soft-fail for %s: %s", session_id, e)
+
     # Phase 2: Kill any orphaned CLI process for this session.
     # Always attempt this, even after SDK close, as a safety net -- the SDK
     # close may time out or the process may have been spawned by an earlier
@@ -1343,10 +1364,28 @@ def api_rewind(session_id):
         if fp not in _handled:
             skipped.append(fp)
 
+    # ── Subsessions rewind-orphan detection (spec §6.3) ──
+    # If this parent has any in-memory children whose subsession_origin_turn
+    # is now past the rewound line count, surface them so the UI can show a
+    # "Spawn point no longer in parent's history" badge and prompt the
+    # user to Re-anchor or Detach.  We do NOT auto-detach.
+    rewind_orphans = []
+    try:
+        sm = current_app.session_manager
+        if hasattr(sm, "detect_rewind_orphans"):
+            candidate = sm.detect_rewind_orphans(session_id, int(up_to_line))
+            # Only accept a real list — test stubs (MagicMock) return a
+            # non-list and we'd otherwise crash flask's JSON encoder.
+            if isinstance(candidate, list):
+                rewind_orphans = candidate
+    except Exception as e:
+        log.debug("detect_rewind_orphans soft-fail: %s", e)
+
     return jsonify({
         "ok": True,
         "files_restored": restored,
         "files_skipped": skipped,
+        "rewind_orphans": rewind_orphans,
     })
 
 

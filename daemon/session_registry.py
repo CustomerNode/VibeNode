@@ -237,11 +237,12 @@ class SessionRegistry:
                     "Recovering session %s (%s) from registry", sid, name or "unnamed"
                 )
 
-                # Subsessions (spec §4.1 / §6.8): read parent pointer +
-                # origin turn back with safe defaults.  Older registry
-                # files written by a pre-subsessions daemon will be missing
-                # these keys; .get() supplies the documented defaults
-                # (None / 0) so recovery is forward- and backward-compat.
+                # Subsessions (spec §4.1 / §6.2 / §6.8): read parent
+                # pointer + origin turn + orphan tombstone back with safe
+                # defaults.  Older registry files written by a
+                # pre-subsessions daemon will be missing these keys;
+                # .get() supplies the documented defaults so recovery
+                # is forward- and backward-compat.
                 parent_sid = meta.get("parent_session_id")
                 subsession_origin_turn = meta.get(
                     "subsession_origin_turn", 0

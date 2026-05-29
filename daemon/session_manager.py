@@ -197,6 +197,11 @@ class SessionInfo:
     parent_session_id: Optional[str] = None
     subsession_origin_turn: int = 0
     inbox_dirty: bool = False
+    # Set on children when their parent is deleted (spec §6.2).  An ISO8601
+    # timestamp surfaced in the UI as "Reports to: (parent deleted)".  None
+    # for non-orphans.  Persisted to the registry so a daemon restart
+    # preserves the tombstone.
+    parent_deleted_at: Optional[str] = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self):
@@ -1013,6 +1018,66 @@ class SessionManager:
         if info:
             return info.state.value
         return None
+
+    def orphan_children_of(self, parent_sid: str) -> list:
+        """Mark every in-memory child of *parent_sid* as orphaned.
+
+        Sets ``parent_deleted_at`` to the current ISO8601 UTC timestamp
+        and clears ``parent_session_id`` so the next sidebar render no
+        longer indents the child under a missing parent (spec §6.2).
+
+        Returns the list of orphaned child SIDs (may be empty).  Called
+        by the deletion endpoint immediately after the parent's
+        SessionInfo is removed from the registry.
+        """
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z")
+        orphaned = []
+        with self._lock:
+            for sid, info in self._sessions.items():
+                if info.parent_session_id == parent_sid:
+                    info.parent_deleted_at = now
+                    info.parent_session_id = None
+                    orphaned.append(sid)
+        if orphaned:
+            self._schedule_registry_save()
+        return orphaned
+
+    def detect_rewind_orphans(self, parent_sid: str, new_line_count: int) -> list:
+        """Sweep in-memory children of *parent_sid* and return those whose
+        ``subsession_origin_turn`` is now past the new line count.
+
+        Called by the rewind endpoint after the parent JSONL is rewritten
+        (spec §6.3).  The returned SIDs need a UI badge ("Spawn point no
+        longer in parent's history") and a Re-anchor / Detach prompt.
+        We do NOT auto-detach — the user decides.
+        """
+        flagged = []
+        with self._lock:
+            for sid, info in self._sessions.items():
+                if info.parent_session_id != parent_sid:
+                    continue
+                if info.subsession_origin_turn > new_line_count:
+                    flagged.append(sid)
+        return flagged
+
+    def reanchor_subsession(self, child_sid: str, new_origin_turn: int) -> bool:
+        """Set a new ``subsession_origin_turn`` on a child whose parent was
+        rewound past its old anchor (spec §6.3 Re-anchor action).
+
+        Returns True if the in-memory SessionInfo was updated.
+        """
+        child_sid = self._resolve_id(child_sid)
+        with self._lock:
+            info = self._sessions.get(child_sid)
+            if not info:
+                return False
+            info.subsession_origin_turn = max(0, int(new_origin_turn))
+        self._schedule_registry_save()
+        return True
 
     def mark_inbox_dirty(self, session_id: str) -> bool:
         """Set ``info.inbox_dirty = True`` on a managed parent session.
@@ -4139,6 +4204,7 @@ class SessionManager:
                     # without these keys still loads cleanly.
                     "parent_session_id": info.parent_session_id,
                     "subsession_origin_turn": info.subsession_origin_turn,
+                    "parent_deleted_at": info.parent_deleted_at,
                 }
         self._reg.save_registry_now(sessions_data)
 

@@ -390,3 +390,230 @@ class TestSpawnSubsessionGuards:
         assert resp.status_code == 409
         assert "cycle" in resp.get_json()["error"].lower()
         session_manager.start_session.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 lifecycle bits — parent-deleted orphaning + rewind detection
+# ---------------------------------------------------------------------------
+
+class TestParentDeletionOrphaning:
+    def test_delete_endpoint_calls_orphan_children_of(
+        self, client, session_manager, parent_session
+    ):
+        """Deleting a parent session calls SessionManager.orphan_children_of
+        so any in-memory children get their parent pointer cleared and a
+        parent_deleted_at timestamp.  Tested via the MagicMock — we just
+        assert the wiring."""
+        parent_sid, project, _ = parent_session
+
+        session_manager.has_session.return_value = False
+        session_manager.orphan_children_of.return_value = ["child-A"]
+
+        resp = client.delete(
+            f"/api/delete/{parent_sid}?project={project}"
+        )
+        # Delete is best-effort — 200 or 404 acceptable in the test fixture
+        # depending on tombstone semantics; the wiring is the contract.
+        assert resp.status_code in (200, 404)
+        session_manager.orphan_children_of.assert_called_with(parent_sid)
+
+    def test_delete_endpoint_removes_inbox_directory(
+        self, client, session_manager, parent_session, tmp_path, monkeypatch
+    ):
+        """Deleting a parent removes its vibenode-state/<sid>/ directory
+        (spec §6.2).  We append a report to seed the directory, then
+        confirm the endpoint nukes it.
+        """
+        from daemon import subsession_inbox as ibx
+
+        parent_sid, project, _ = parent_session
+        session_manager.has_session.return_value = False
+        session_manager.orphan_children_of.return_value = []
+
+        # Seed the inbox.
+        ibx.append_report(parent_sid, "c", "child", "msg")
+        assert ibx.inbox_dir_for(parent_sid).exists()
+
+        resp = client.delete(
+            f"/api/delete/{parent_sid}?project={project}"
+        )
+        assert resp.status_code in (200, 404)
+        assert not ibx.inbox_dir_for(parent_sid).exists()
+
+
+class TestRewindOrphanDetection:
+    def test_rewind_endpoint_surfaces_rewind_orphans_when_detected(
+        self, client, session_manager, parent_session
+    ):
+        """After a rewind, the endpoint returns the list of child SIDs
+        whose subsession_origin_turn is past the new line count."""
+        parent_sid, project, parent_path = parent_session
+
+        # Add edit-tool entries to the JSONL so the rewind endpoint
+        # actually proceeds past its "no edits" 400.
+        import json
+        edit_obj = {
+            "type": "assistant",
+            "uuid": "edit-1",
+            "sessionId": parent_sid,
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "name": "Edit",
+                    "input": {
+                        "file_path": "x.py",
+                        "old_string": "foo",
+                        "new_string": "bar",
+                    },
+                }],
+            },
+            "timestamp": "2026-05-28T10:01:00Z",
+        }
+        with open(parent_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(edit_obj) + "\n")
+
+        # Stub detect_rewind_orphans to return two flagged children.
+        session_manager.detect_rewind_orphans.return_value = [
+            "orphan-child-1", "orphan-child-2"
+        ]
+
+        resp = client.post(
+            f"/api/rewind/{parent_sid}?project={project}",
+            json={"up_to_line": 1},
+        )
+        # Rewind itself may 400 on "no edits found" depending on the test
+        # JSONL — what we're testing is the wiring; assert detect was called.
+        if resp.status_code == 200:
+            data = resp.get_json()
+            assert data.get("rewind_orphans") == [
+                "orphan-child-1", "orphan-child-2"
+            ]
+        # Either way, the daemon helper was invoked with up_to_line.
+        session_manager.detect_rewind_orphans.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — SessionManager helpers exposed by Phase 6 work
+# ---------------------------------------------------------------------------
+
+class TestSessionManagerLifecycleHelpers:
+    def test_orphan_children_of_clears_parent_pointer(self, sm_module=None):
+        """SessionManager.orphan_children_of sets parent_deleted_at and
+        clears parent_session_id on every in-memory child."""
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        class _MockSDKTypes:
+            ClaudeSDKClient = MagicMock
+            ClaudeCodeOptions = MagicMock
+
+        sdk_mod = MagicMock()
+        sdk_types_mod = MagicMock()
+        for name in ("ClaudeSDKClient", "ClaudeCodeOptions"):
+            setattr(sdk_mod, name, getattr(_MockSDKTypes, name))
+        with patch.dict(sys.modules, {
+            "claude_code_sdk": sdk_mod,
+            "claude_code_sdk.types": sdk_types_mod,
+        }):
+            import importlib
+            import daemon.session_manager as sm
+            importlib.reload(sm)
+
+            mgr = sm.SessionManager()
+            parent_sid = "parent-001"
+            child_a = sm.SessionInfo(session_id="child-a", parent_session_id=parent_sid)
+            child_b = sm.SessionInfo(session_id="child-b", parent_session_id=parent_sid)
+            unrelated = sm.SessionInfo(session_id="other", parent_session_id="someone-else")
+            mgr._sessions = {
+                "child-a": child_a,
+                "child-b": child_b,
+                "other": unrelated,
+            }
+
+            orphaned = mgr.orphan_children_of(parent_sid)
+            assert set(orphaned) == {"child-a", "child-b"}
+            assert child_a.parent_session_id is None
+            assert child_a.parent_deleted_at  # ISO8601 timestamp
+            assert child_b.parent_session_id is None
+            # Unrelated session is untouched.
+            assert unrelated.parent_session_id == "someone-else"
+            assert unrelated.parent_deleted_at is None
+
+    def test_detect_rewind_orphans_flags_only_children_past_anchor(self):
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        class _MockSDKTypes:
+            ClaudeSDKClient = MagicMock
+            ClaudeCodeOptions = MagicMock
+
+        sdk_mod = MagicMock()
+        sdk_types_mod = MagicMock()
+        for name in ("ClaudeSDKClient", "ClaudeCodeOptions"):
+            setattr(sdk_mod, name, getattr(_MockSDKTypes, name))
+        with patch.dict(sys.modules, {
+            "claude_code_sdk": sdk_mod,
+            "claude_code_sdk.types": sdk_types_mod,
+        }):
+            import importlib
+            import daemon.session_manager as sm
+            importlib.reload(sm)
+
+            mgr = sm.SessionManager()
+            parent_sid = "parent-rewind"
+            old_anchor = sm.SessionInfo(
+                session_id="old",
+                parent_session_id=parent_sid,
+                subsession_origin_turn=10,
+            )
+            new_anchor = sm.SessionInfo(
+                session_id="new",
+                parent_session_id=parent_sid,
+                subsession_origin_turn=2,
+            )
+            unrelated = sm.SessionInfo(
+                session_id="other",
+                parent_session_id="x",
+                subsession_origin_turn=100,
+            )
+            mgr._sessions = {
+                "old": old_anchor, "new": new_anchor, "other": unrelated,
+            }
+
+            # Rewind to line 5 — old (turn 10) is now an orphan,
+            # new (turn 2) survives.  Unrelated is ignored.
+            flagged = mgr.detect_rewind_orphans(parent_sid, 5)
+            assert flagged == ["old"]
+
+    def test_reanchor_subsession_updates_origin_turn(self):
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        class _MockSDKTypes:
+            ClaudeSDKClient = MagicMock
+            ClaudeCodeOptions = MagicMock
+
+        sdk_mod = MagicMock()
+        sdk_types_mod = MagicMock()
+        for name in ("ClaudeSDKClient", "ClaudeCodeOptions"):
+            setattr(sdk_mod, name, getattr(_MockSDKTypes, name))
+        with patch.dict(sys.modules, {
+            "claude_code_sdk": sdk_mod,
+            "claude_code_sdk.types": sdk_types_mod,
+        }):
+            import importlib
+            import daemon.session_manager as sm
+            importlib.reload(sm)
+
+            mgr = sm.SessionManager()
+            child = sm.SessionInfo(
+                session_id="c",
+                parent_session_id="p",
+                subsession_origin_turn=12,
+            )
+            mgr._sessions = {"c": child}
+            assert mgr.reanchor_subsession("c", 5) is True
+            assert child.subsession_origin_turn == 5
+            # Missing session returns False without raising.
+            assert mgr.reanchor_subsession("missing", 1) is False

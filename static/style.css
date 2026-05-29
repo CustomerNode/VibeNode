@@ -11554,3 +11554,102 @@ body.mc-mode #main-panel { width: 100% !important; margin-left: 0 !important; he
   text-decoration: line-through;
   cursor: not-allowed;
 }
+
+/* Subsession actions bar (Report-to-Parent + Auto-report toggle) — sits
+   above the live input bar when viewing a subsession (Phase 6). */
+.subsession-actions-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 12px;
+  font-size: 11px;
+  color: var(--text-muted, #888);
+  border-top: 1px dashed rgba(255, 255, 255, 0.08);
+}
+[data-theme="light"] .subsession-actions-bar {
+  border-top-color: rgba(0, 0, 0, 0.08);
+}
+.subsession-action-btn {
+  background: none;
+  border: 1px solid var(--text-muted, #555);
+  color: var(--text, #ddd);
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.subsession-action-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+.subsession-autoreport-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+
+/* Report-to-Parent modal popover. */
+.subsession-report-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+}
+.subsession-report-card {
+  background: var(--bg, #1a1d23);
+  border: 1px solid var(--border, #30363d);
+  border-radius: 6px;
+  padding: 16px;
+  max-width: 520px;
+  width: 92%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.subsession-report-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text, #ddd);
+}
+.subsession-report-help {
+  font-size: 11px;
+  color: var(--text-muted, #888);
+}
+.subsession-report-textarea {
+  width: 100%;
+  background: var(--bg-secondary, #1f2329);
+  border: 1px solid var(--border, #30363d);
+  color: var(--text, #ddd);
+  padding: 8px;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 12px;
+  resize: vertical;
+}
+.subsession-report-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+.subsession-report-cancel,
+.subsession-report-send {
+  background: none;
+  border: 1px solid var(--border, #30363d);
+  color: var(--text, #ddd);
+  padding: 4px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.subsession-report-send {
+  background: #0a84ff;
+  border-color: #0a84ff;
+  color: #fff;
+}
+.subsession-report-send:hover {
+  background: #409cff;
+}
