@@ -982,9 +982,18 @@ def api_fork(session_id):
 def api_spawn_subsession(parent_sid):
     """Spawn a subsession from an existing parent session."""
     import uuid as uuid_mod
+    from daemon.subsession_inbox import _validate_sid
 
     project = request.args.get("project", "").strip()
     sm = current_app.session_manager
+
+    # Phase 6.5 P1-2: validate the SID shape BEFORE we use it to compose
+    # filesystem paths.  Path-traversal SIDs (e.g. "..\\..\\evil") would
+    # otherwise resolve outside the sessions dir or the vibenode-state dir.
+    try:
+        _validate_sid(parent_sid)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid parent_sid: {e}"}), 400
 
     # Resolve any in-memory alias on the parent SID.
     canonical_parent = _resolve_remapped_id(parent_sid, project)
@@ -1129,12 +1138,19 @@ def api_spawn_subsession(parent_sid):
 def api_report_to_parent(child_sid):
     """Write a report from a subsession into its parent's inbox."""
     from daemon.subsession_inbox import (
+        _validate_sid,
         append_report,
         undelivered_count,
     )
 
     project = request.args.get("project", "").strip()
     sm = current_app.session_manager
+
+    # Phase 6.5 P1-2: validate the SID shape before any disk access.
+    try:
+        _validate_sid(child_sid)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid child_sid: {e}"}), 400
 
     canonical = _resolve_remapped_id(child_sid, project)
     if canonical:
@@ -1241,12 +1257,19 @@ def api_report_to_parent(child_sid):
 def api_pull_subsession_updates(parent_sid):
     """Deliver pending subsession reports to the parent as the next turn."""
     from daemon.subsession_inbox import (
+        _validate_sid,
         has_undelivered,
         undelivered_count,
     )
 
     project = request.args.get("project", "").strip()
     sm = current_app.session_manager
+
+    # Phase 6.5 P1-2: validate the SID shape before any disk access.
+    try:
+        _validate_sid(parent_sid)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid parent_sid: {e}"}), 400
 
     canonical = _resolve_remapped_id(parent_sid, project)
     if canonical:

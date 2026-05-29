@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -57,6 +58,61 @@ from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# SID validation (phase 6.5 P1-2)
+# ---------------------------------------------------------------------------
+#
+# inbox paths interpolate the parent SID directly into a filesystem path under
+# ~/.claude/vibenode-state/<parent_sid>/.  Without validation, an attacker (or
+# a buggy caller) could pass "..\\..\\evil" on Windows or "../../evil" on POSIX
+# and resolve outside the state dir.
+#
+# VibeNode session SIDs come from several sources:
+#   - str(uuid.uuid4())                        - canonical, most common
+#   - f"_title_{uuid.uuid4().hex[:8]}"         - title-only side sessions
+#   - Aliases (sm._id_aliases) - same character class as their canonical form
+#
+# All of these are alphanumeric with optional dashes and underscores.  None
+# of the legitimate forms contains the dangerous characters: ``/``, ``\\``,
+# ``..``, ``:`` (Windows drive letter), or null bytes.  We accept the
+# permissive character class and explicitly forbid the dangerous shapes —
+# this is the smallest-blast-radius defense that doesn't break legacy short
+# IDs (e.g. _title_a1b2c3d4) or the integration test fixtures.
+
+_SID_SAFE_CHARS_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
+_SID_MAX_LEN = 128  # generous; real SIDs are <= 40 chars
+
+
+def _validate_sid(sid: str) -> None:
+    """Raise ValueError if *sid* could be used for path traversal.
+
+    Accepts canonical UUID4 strings, short title SIDs (``_title_xxxxxxxx``)
+    and other alphanumeric forms.  Rejects:
+      - Non-string types and empty strings.
+      - Anything containing ``/``, ``\\``, ``..``, ``:``, or null bytes.
+      - Anything with characters outside ``[A-Za-z0-9_-]``.
+      - Anything longer than _SID_MAX_LEN (defense against absurd input).
+    """
+    if not isinstance(sid, str) or not sid:
+        raise ValueError(
+            f"Invalid session id (must be non-empty string): {sid!r}"
+        )
+    if len(sid) > _SID_MAX_LEN:
+        raise ValueError(
+            f"Invalid session id (exceeds {_SID_MAX_LEN} chars): {sid[:32]!r}..."
+        )
+    # Explicit path-traversal rejection — covers ".", "..", and ".x" forms
+    # the regex would otherwise reject implicitly, with a clearer error.
+    if ".." in sid or "/" in sid or "\\" in sid or ":" in sid or "\x00" in sid:
+        raise ValueError(
+            f"Invalid session id (contains path-traversal characters): {sid!r}"
+        )
+    if not _SID_SAFE_CHARS_RE.match(sid):
+        raise ValueError(
+            f"Invalid session id (allowed chars: [A-Za-z0-9_-]): {sid!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +153,12 @@ def _vibenode_state_root() -> Path:
 
 
 def inbox_dir_for(parent_sid: str) -> Path:
-    """Return the inbox directory for *parent_sid*."""
+    """Return the inbox directory for *parent_sid*.
+
+    Phase 6.5 P1-2: validates the SID shape before interpolation to defeat
+    a ``..\\..\\evil`` path-traversal from a buggy or malicious caller.
+    """
+    _validate_sid(parent_sid)
     return _vibenode_state_root() / parent_sid
 
 

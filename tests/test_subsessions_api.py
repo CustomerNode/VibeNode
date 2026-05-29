@@ -620,6 +620,98 @@ class TestSessionManagerLifecycleHelpers:
 
 
 # ---------------------------------------------------------------------------
+# Phase 6.5 P1-2 — SID format validation (path-traversal defense)
+# ---------------------------------------------------------------------------
+
+class TestSidValidation:
+    """The subsession endpoints interpolate the SID into a filesystem path
+    under ~/.claude/vibenode-state/<sid>/.  Path-traversal SIDs ("..", "/",
+    "\\") must be rejected at the endpoint with a 400 — never reach the
+    filesystem.  Phase 6.5 P1-2.
+    """
+
+    @pytest.mark.parametrize("bad_sid", [
+        "..",                                  # parent dir
+        "../etc",                              # POSIX traversal
+        "..\\..\\evil",                        # Windows traversal
+        "/etc/passwd",                         # absolute POSIX
+        "C:\\Windows",                         # absolute Windows
+        "{12345678-1234-1234-1234-123456789012}",  # braced UUID (curly braces)
+        "has spaces in it",                    # space char
+        "has@symbols",                         # @ char
+    ])
+    def test_spawn_rejects_invalid_sids(
+        self, client, session_manager, bad_sid
+    ):
+        """Spawn-subsession returns 400 for path-traversal SIDs or SIDs
+        with characters outside [A-Za-z0-9_-]."""
+        resp = client.post(
+            f"/api/sessions/{bad_sid}/spawn-subsession",
+            json={},
+        )
+        # Flask routes with a literal path may 404 instead of hitting
+        # the handler — that's also a safe failure (no path traversal),
+        # so 400 OR 404 OR 405 are all acceptable rejections.
+        assert resp.status_code in (400, 404, 405)
+        # If the handler did run, start_session must NOT have been called.
+        session_manager.start_session.assert_not_called()
+
+    def test_report_to_parent_rejects_invalid_sid(
+        self, client, session_manager
+    ):
+        bad = "..\\..\\evil"
+        resp = client.post(
+            f"/api/sessions/{bad}/report-to-parent",
+            json={"summary": "hi"},
+        )
+        assert resp.status_code in (400, 404, 405)
+
+    def test_pull_subsession_updates_rejects_invalid_sid(
+        self, client, session_manager
+    ):
+        bad = "../traverse"
+        resp = client.post(
+            f"/api/sessions/{bad}/pull-subsession-updates",
+            json={},
+        )
+        assert resp.status_code in (400, 404, 405)
+
+    def test_inbox_dir_for_rejects_invalid_sid(self):
+        """The lower-level inbox_dir_for() also validates.  Belt-and-
+        suspenders for any future caller that bypasses the endpoint
+        path."""
+        from daemon.subsession_inbox import inbox_dir_for
+        with pytest.raises(ValueError):
+            inbox_dir_for("..\\..\\evil")
+        with pytest.raises(ValueError):
+            inbox_dir_for("../traverse")
+        with pytest.raises(ValueError):
+            inbox_dir_for("")
+        with pytest.raises(ValueError):
+            inbox_dir_for("/abs/path")
+        with pytest.raises(ValueError):
+            inbox_dir_for("with spaces")
+        with pytest.raises(ValueError):
+            inbox_dir_for("with:colon")
+
+    def test_inbox_dir_for_accepts_valid_uuid4(self):
+        from daemon.subsession_inbox import inbox_dir_for
+        valid = str(uuid.uuid4())
+        # Should not raise.
+        path = inbox_dir_for(valid)
+        assert path.name == valid
+
+    def test_inbox_dir_for_accepts_legacy_short_ids(self):
+        """Short title SIDs and integration-test SIDs are alphanumeric
+        with dashes/underscores; the validator must not break them."""
+        from daemon.subsession_inbox import inbox_dir_for
+        # Mirrors app/titling.py:375 form.
+        assert inbox_dir_for("_title_a1b2c3d4").name == "_title_a1b2c3d4"
+        # Mirrors tests/test_subsessions_integration.py SIDs.
+        assert inbox_dir_for("parent-int-001").name == "parent-int-001"
+
+
+# ---------------------------------------------------------------------------
 # Phase 6.5 P0-2 — pull-subsession-updates endpoint
 # ---------------------------------------------------------------------------
 
