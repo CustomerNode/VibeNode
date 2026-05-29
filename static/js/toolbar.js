@@ -15,7 +15,7 @@ function setToolbarSession(id, titleText, isUntitled, customTitle) {
   titleEl.title = id ? 'Click to rename' : '';
   // Enable/disable action buttons regardless of view mode — the Actions
   // popup uses these same buttons even in kanban mode.
-  ['btn-autoname','btn-open','btn-open-gui','btn-delete','btn-duplicate','btn-continue','btn-summary','btn-extract','btn-export','btn-fork','btn-rewind','btn-fork-rewind'].forEach(b => {
+  ['btn-autoname','btn-open','btn-open-gui','btn-delete','btn-duplicate','btn-continue','btn-summary','btn-extract','btn-export','btn-fork','btn-rewind','btn-fork-rewind','btn-spawn-subsession'].forEach(b => {
     const el = document.getElementById(b);
     if (el) el.disabled = !id;
   });
