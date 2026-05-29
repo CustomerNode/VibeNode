@@ -189,6 +189,14 @@ class SessionInfo:
     _last_asst_uuid: str = ""                            # cached from JSONL, updated by _process_message
     created_ts: float = 0.0  # time.time() when session was created
     _cli_pid: int = 0  # PID of the CLI subprocess, for orphan cleanup
+    # ── Subsessions (spec §4.1) ────────────────────────────────────────────
+    # parent_session_id: None for top-level sessions; UUID of the parent
+    # session for subsessions.  subsession_origin_turn: parent JSONL line
+    # count captured at fork.  inbox_dirty: cached "has undelivered reports"
+    # flag for the in-memory fast path in send_message (spec §4.3.4).
+    parent_session_id: Optional[str] = None
+    subsession_origin_turn: int = 0
+    inbox_dirty: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self):
@@ -459,6 +467,8 @@ class SessionManager:
         permission_mode: Optional[str] = None,
         session_type: str = "",
         extra_args: Optional[dict] = None,
+        parent_session_id: Optional[str] = None,
+        subsession_origin_turn: int = 0,
     ) -> dict:
         """Start or resume an SDK session. Returns immediately."""
         _forward_to_send = False
@@ -509,6 +519,8 @@ class SessionManager:
             model=model or "",
             state=SessionState.STARTING,
             session_type=session_type or "",
+            parent_session_id=parent_session_id,
+            subsession_origin_turn=subsession_origin_turn,
         )
         with self._lock:
             self._sessions[session_id] = info
@@ -4023,6 +4035,12 @@ class SessionManager:
                         info.entries[0].timestamp if info.entries else time.time()
                     ),
                     "last_activity": time.time(),
+                    # Subsessions (spec §4.1) — backward-compatible additions.
+                    # Older registry readers ignore unknown keys; newer
+                    # readers use .get() with defaults so an older snapshot
+                    # without these keys still loads cleanly.
+                    "parent_session_id": info.parent_session_id,
+                    "subsession_origin_turn": info.subsession_origin_turn,
                 }
         self._reg.save_registry_now(sessions_data)
 

@@ -603,6 +603,10 @@ class TestRecoverSessions:
             name="My Session",
             resume=True,
             model="claude-sonnet-4-20250514",
+            # Subsessions (spec §4.1): recovery passes the parent pointer
+            # + origin turn through with safe defaults for legacy registries.
+            parent_session_id=None,
+            subsession_origin_turn=0,
         )
 
     def test_repairs_incomplete_turn_before_recovery(self, tmp_path):

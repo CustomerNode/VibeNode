@@ -150,6 +150,47 @@ class SessionRegistry:
                 logger.debug("No sessions to recover from registry")
                 return
 
+            # ── Subsessions cycle detection (spec §6.8) ────────────────────
+            # Walk each session's parent_session_id chain up to 32 hops.
+            # If a cycle is detected (which should be impossible given the
+            # spawn-time guard but could happen from registry corruption or
+            # manual edits), force-clear the offending session's
+            # parent_session_id and log a warning.  Recovery must never
+            # crash or loop on a cyclic graph.
+            _MAX_PARENT_CHAIN = 32
+            cleared_parents: set = set()
+            for sid, meta in sessions.items():
+                if sid in cleared_parents:
+                    continue
+                visited = {sid}
+                cursor = meta.get("parent_session_id")
+                hops = 0
+                while cursor and hops < _MAX_PARENT_CHAIN:
+                    if cursor in visited:
+                        logger.warning(
+                            "Subsession parent cycle detected at %s — "
+                            "force-clearing parent_session_id (was %s)",
+                            sid, meta.get("parent_session_id"),
+                        )
+                        meta["parent_session_id"] = None
+                        cleared_parents.add(sid)
+                        break
+                    visited.add(cursor)
+                    parent_meta = sessions.get(cursor)
+                    if not parent_meta:
+                        break
+                    cursor = parent_meta.get("parent_session_id")
+                    hops += 1
+                else:
+                    if cursor and hops >= _MAX_PARENT_CHAIN:
+                        logger.warning(
+                            "Subsession parent chain for %s exceeded %d "
+                            "hops — force-clearing parent_session_id",
+                            sid, _MAX_PARENT_CHAIN,
+                        )
+                        meta["parent_session_id"] = None
+                        cleared_parents.add(sid)
+
             now = time.time()
             recovered = 0
             for sid, meta in sessions.items():
@@ -196,6 +237,16 @@ class SessionRegistry:
                     "Recovering session %s (%s) from registry", sid, name or "unnamed"
                 )
 
+                # Subsessions (spec §4.1 / §6.8): read parent pointer +
+                # origin turn back with safe defaults.  Older registry
+                # files written by a pre-subsessions daemon will be missing
+                # these keys; .get() supplies the documented defaults
+                # (None / 0) so recovery is forward- and backward-compat.
+                parent_sid = meta.get("parent_session_id")
+                subsession_origin_turn = meta.get(
+                    "subsession_origin_turn", 0
+                )
+
                 # Use start_session with resume=True to reconnect via SDK --resume
                 result = start_session_fn(
                     session_id=sid,
@@ -204,6 +255,8 @@ class SessionRegistry:
                     name=name,
                     resume=True,
                     model=model if model else None,
+                    parent_session_id=parent_sid,
+                    subsession_origin_turn=subsession_origin_turn,
                 )
                 if result.get("ok"):
                     recovered += 1

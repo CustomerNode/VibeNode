@@ -101,13 +101,6 @@ def test_recover_sessions_terminates_on_cyclic_parent_graph(tmp_path):
 # Lands in Phase 1: force-clear one side of the cycle with a logged warning
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    reason="Cycle force-clear lands in Phase 1 of the Subsessions feature "
-           "(spec §6.8).  Today recover_sessions does not read the "
-           "parent_session_id field, so neither side is cleared and no "
-           "warning is logged.",
-    strict=False,
-)
 def test_recover_sessions_force_clears_one_side_of_cycle(tmp_path, caplog):
     """When recovery detects A↔B, one session's parent_session_id is
     cleared and a warning is logged.
@@ -118,6 +111,10 @@ def test_recover_sessions_force_clears_one_side_of_cycle(tmp_path, caplog):
     Phase 1: this test becomes the spec for ``recover_sessions`` after the
     parent-walk lands.  When the implementation is in place, remove the
     xfail mark and the assertion shape below should pass as-is.
+
+    State ``"working"`` keeps both sessions in the recovery-eligible set
+    so the cleared parent is observable through ``start_session_fn``'s
+    kwargs (idle sessions are short-circuited before that call site).
     """
     import logging
     caplog.set_level(logging.WARNING)
@@ -128,7 +125,7 @@ def test_recover_sessions_force_clears_one_side_of_cycle(tmp_path, caplog):
     sessions = {
         "sess-A": {
             "name": "Cycle A",
-            "state": "idle",
+            "state": "working",
             "cwd": "/tmp",
             "model": "",
             "last_activity": now,
@@ -137,7 +134,7 @@ def test_recover_sessions_force_clears_one_side_of_cycle(tmp_path, caplog):
         },
         "sess-B": {
             "name": "Cycle B",
-            "state": "idle",
+            "state": "working",
             "cwd": "/tmp",
             "model": "",
             "last_activity": now,
