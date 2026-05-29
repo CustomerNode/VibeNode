@@ -107,12 +107,21 @@ def driver():
     # --- ARM64 Windows workaround ---
     # Selenium Manager doesn't support win32/arm64.  On ARM Windows, look
     # for a manually-installed chromedriver in well-known locations.
+    #
+    # Note: ``Path.home()`` is monkeypatched by the autouse
+    # ``_isolate_daemon_home`` fixture in ``tests/conftest.py`` to point at
+    # a per-test temp directory (so daemon state files land in a sandbox).
+    # That patch breaks chromedriver lookup here, since the driver lives
+    # under the user's real profile, not the tmp sandbox.  Resolve the
+    # real profile via the OS-provided env var, which the unit fixture
+    # does not touch.
     service = None
     if sys.platform == "win32" and platform.machine().lower() in ("arm64", "aarch64"):
+        real_home = Path(os.environ.get("USERPROFILE") or os.path.expanduser("~"))
         _candidates = [
-            Path.home() / "chromedriver" / "chromedriver-win64" / "chromedriver.exe",
-            Path.home() / "chromedriver" / "chromedriver.exe",
-            Path.home() / "chromedriver.exe",
+            real_home / "chromedriver" / "chromedriver-win64" / "chromedriver.exe",
+            real_home / "chromedriver" / "chromedriver.exe",
+            real_home / "chromedriver.exe",
         ]
         for p in _candidates:
             if p.is_file():
