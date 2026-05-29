@@ -11407,3 +11407,150 @@ body.mc-mode #main-panel { width: 100% !important; margin-left: 0 !important; he
   color: rgba(235,235,245,0.22);
 }
 [data-theme="light"] .mc-empty-text { color: rgba(60,60,67,0.3); }
+
+/* ═══════════════════════════════════════════════════════════════
+   Subsessions (spec §4.4 / §4.6) — sidebar tree + badges
+   ═══════════════════════════════════════════════════════════════
+   New classes only; no modifications to existing classes per
+   §15.1 "Do No Harm" directive.
+*/
+
+/* Indented child row with a 1-px left-edge connector line.  The
+   border-left mimics the existing Compose tree connector line so the
+   visual is consistent with the structured composition view. */
+.session-item.subsession-row .session-col-name {
+  padding-left: 16px;
+  border-left: 1px solid rgba(255, 255, 255, 0.12);
+  position: relative;
+}
+[data-theme="light"] .session-item.subsession-row .session-col-name {
+  border-left-color: rgba(0, 0, 0, 0.12);
+}
+
+/* ↳ glyph prefix — muted, 60% opacity, 12 px. */
+.subsession-glyph {
+  display: inline-block;
+  margin-right: 4px;
+  opacity: 0.6;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+/* Secondary "from: <parent_name>" line under the subsession title.
+   Matches the existing date/time-ago typography in the sidebar. */
+.subsession-from-line {
+  font-size: 11px;
+  color: var(--text-muted, #888);
+  opacity: 0.75;
+  margin-top: 1px;
+  margin-left: 16px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Disclosure caret for parents with at least one child.  Keyboard
+   focusable (tabindex=0 on the markup). */
+.subsession-caret {
+  display: inline-block;
+  width: 12px;
+  margin-right: 2px;
+  cursor: pointer;
+  font-size: 10px;
+  opacity: 0.7;
+  user-select: none;
+  vertical-align: middle;
+}
+.subsession-caret:hover { opacity: 1; }
+.subsession-caret:focus {
+  outline: 1px dotted var(--text-muted, #888);
+  outline-offset: 2px;
+}
+
+/* Inbox envelope badge — amber, matches the existing WAITING dot. */
+.subsession-inbox-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: rgba(255, 149, 0, 0.18);
+  color: #ff9500;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+  vertical-align: middle;
+}
+.subsession-inbox-badge:hover {
+  background: rgba(255, 149, 0, 0.28);
+}
+
+/* Spawn-pulse: 600 ms soft yellow highlight on the new child + parent
+   rows.  CSS-only animation; the JS adds/removes the class. */
+@keyframes subsession-spawn-pulse-anim {
+  0%   { background-color: rgba(255, 230, 120, 0.35); }
+  100% { background-color: transparent; }
+}
+.session-item.subsession-spawn-pulse {
+  animation: subsession-spawn-pulse-anim 600ms ease-out;
+}
+
+/* Slide-in for the child row when freshly spawned — uses the existing
+   pattern of a translateY+opacity entrance; 180 ms per spec §4.6.3. */
+@keyframes subsession-slide-in-anim {
+  from { transform: translateY(-6px); opacity: 0; }
+  to   { transform: translateY(0); opacity: 1; }
+}
+.session-item.subsession-row.subsession-spawn-pulse {
+  animation:
+    subsession-spawn-pulse-anim 600ms ease-out,
+    subsession-slide-in-anim 180ms ease-out;
+}
+
+/* ── Parent inbox strip (live panel) — see Phase 6. ── */
+.subsession-inbox-strip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  background: rgba(255, 149, 0, 0.15);
+  border-top: 1px solid rgba(255, 149, 0, 0.3);
+  border-bottom: 1px solid rgba(255, 149, 0, 0.3);
+  font-size: 12px;
+  color: var(--text, #ddd);
+}
+.subsession-inbox-strip-text { flex: 1; }
+.subsession-inbox-strip-action {
+  background: none;
+  border: 1px solid rgba(255, 149, 0, 0.5);
+  color: #ff9500;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.subsession-inbox-strip-action:hover {
+  background: rgba(255, 149, 0, 0.18);
+}
+
+/* Subsession breadcrumb in the live-panel header (Phase 6). */
+.subsession-breadcrumb {
+  font-size: 12px;
+  color: var(--text-muted, #888);
+  opacity: 0.85;
+  margin-bottom: 2px;
+}
+.subsession-breadcrumb a {
+  color: var(--text-muted, #888);
+  text-decoration: none;
+  border-bottom: 1px dotted transparent;
+  cursor: pointer;
+}
+.subsession-breadcrumb a:hover {
+  border-bottom-color: var(--text-muted, #888);
+}
+.subsession-breadcrumb .deleted-parent {
+  text-decoration: line-through;
+  cursor: not-allowed;
+}

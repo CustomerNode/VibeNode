@@ -230,6 +230,16 @@ class SessionInfo:
                 "tool_input": self.pending_tool_input,
             }
         d["entry_count"] = len(self.entries)
+        # Subsessions (spec §4.4): expose parent pointer + inbox metadata
+        # so the sidebar can render child rows under their parent and
+        # show the envelope badge on parents with undelivered reports.
+        # Only emit when truthy to keep the dict compact for legacy
+        # top-level sessions.
+        if self.parent_session_id:
+            d["parent_session_id"] = self.parent_session_id
+            d["subsession_origin_turn"] = self.subsession_origin_turn
+        if self.inbox_dirty:
+            d["inbox_dirty"] = True
         return d
 
 

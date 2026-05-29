@@ -196,6 +196,11 @@ def api_sessions():
 
     existing_ids = {s["id"] for s in sessions}
     names = _load_names(project)  # check _session_names.json for auto-named titles
+    # Subsessions (spec §4.4): build a sid -> daemon-state lookup so the
+    # disk-sourced session list can be decorated with the parent pointer
+    # + inbox-dirty flag.  Without this the sidebar can't render the
+    # tree variant for closed-but-still-managed parents.
+    _state_by_sid = {}
     for state in sm.get_all_states():
         sid = state.get("session_id", "")
         if state.get("session_type") in ("planner", "title"):
@@ -206,6 +211,7 @@ def api_sessions():
         state_cwd = state.get("cwd", "")
         if state_cwd and not cwd_matches_active_project(state_cwd, project=project):
             continue
+        _state_by_sid[sid] = state
         if sid and sid not in existing_ids and state.get("state") != "stopped":
             saved_name = names.get(sid, "")
             title = saved_name or state.get("name") or "New Session"
@@ -213,7 +219,7 @@ def api_sessions():
             # surface at the top of the date-sorted sidebar — they're the
             # most-recently-interacted-with thing in the project.
             _now_ts = _time.time()
-            sessions.insert(0, {
+            new_entry = {
                 "id": sid,
                 "display_title": title,
                 "custom_title": saved_name or state.get("name") or "",
@@ -227,7 +233,36 @@ def api_sessions():
                 "file_bytes": 0,
                 "message_count": 0,
                 "preview": "",
-            })
+            }
+            # Subsessions decoration — same fields as the disk-side merge below.
+            if state.get("parent_session_id"):
+                new_entry["parent_session_id"] = state["parent_session_id"]
+                new_entry["subsession_origin_turn"] = state.get(
+                    "subsession_origin_turn", 0
+                )
+            if state.get("session_type") == "subsession":
+                new_entry["session_type"] = "subsession"
+            if state.get("inbox_dirty"):
+                new_entry["inbox_dirty"] = True
+            sessions.insert(0, new_entry)
+
+    # Decorate disk-sourced sessions with daemon-side subsession metadata
+    # (parent_session_id, inbox_dirty, session_type=subsession).  Closed
+    # sessions that aren't daemon-managed don't get decorated and render
+    # as plain top-level rows — same as today's behaviour.
+    for s in sessions:
+        st = _state_by_sid.get(s["id"])
+        if not st:
+            continue
+        if st.get("parent_session_id") and "parent_session_id" not in s:
+            s["parent_session_id"] = st["parent_session_id"]
+            s["subsession_origin_turn"] = st.get(
+                "subsession_origin_turn", 0
+            )
+        if st.get("session_type") == "subsession" and s.get("session_type") != "subsession":
+            s["session_type"] = "subsession"
+        if st.get("inbox_dirty"):
+            s["inbox_dirty"] = True
 
     return jsonify(sessions)
 
