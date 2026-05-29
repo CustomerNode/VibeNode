@@ -309,7 +309,7 @@ function _renderComposeEmpty() {
         <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.5" stroke-linecap="round">
           <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
         </svg>
-        <div style="font-size:16px;font-weight:500;color:var(--text);margin:12px 0 6px;">Welcome to Compose</div>
+        <div style="font-size:16px;font-weight:500;color:var(--text);margin:12px 0 6px;">Welcome to Subsessions</div>
         <div style="font-size:13px;color:var(--text-muted);margin-bottom:16px;">Orchestrate multiple sections with AI-powered composition.</div>
         <button class="kanban-create-first-btn" onclick="composeCreateProject()">+ Create your first composition</button>
       </div>`;
@@ -1283,7 +1283,7 @@ function _showComposeShortcutHelp() {
   if (existing) { existing.remove(); return; }
   const overlay = document.createElement('div');
   overlay.className = 'kanban-shortcut-overlay';
-  overlay.innerHTML = `<div class="kanban-shortcut-card"><h3>Compose Keyboard Shortcuts</h3>
+  overlay.innerHTML = `<div class="kanban-shortcut-card"><h3>Subsessions Keyboard Shortcuts</h3>
     <div class="kanban-shortcut-grid">
       <kbd>\u2191 \u2193</kbd><span>Move focus</span>
       <kbd>Enter</kbd><span>Open composition</span>

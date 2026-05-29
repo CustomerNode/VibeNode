@@ -575,7 +575,7 @@ function sessionContextMenu(e, sessionId) {
 
   // Link to task/section
   items += '<div class="ws-ctx-item" onclick="_sessCtx(\'link-workflow\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg> Link to Workflow Task</div>';
-  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'add-compose\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg> Add to Compose</div>';
+  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'add-compose\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg> Add to Structured composition</div>';
   items += '<div class="ws-ctx-item" onclick="_sessCtx(\'create-workflow\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> Create Workflow Task</div>';
 
   items += '<div class="ws-ctx-divider"></div>';
@@ -694,7 +694,7 @@ function _sessCtx(action, sessionId) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Add to Compose — unified tree picker
+// Add to Structured composition — unified tree picker
 // ═══════════════════════════════════════════════════════════════
 
 // Sanitize an ID for safe embedding in onclick attributes
@@ -752,7 +752,7 @@ async function _addToCompose(sessionId) {
 
   // Multiple — show composition picker
   let html = '<div class="pm-card pm-enter" style="max-width:480px;">';
-  html += '<h2 class="pm-title">Add to Compose</h2>';
+  html += '<h2 class="pm-title">Add to Structured composition</h2>';
   html += '<div class="pm-body" style="padding:0;"><div class="kanban-create-section">';
   html += '<div class="kanban-create-section-label">Choose composition</div>';
 
@@ -774,7 +774,7 @@ async function _addToCompose(sessionId) {
 // --- Zero compositions: inline create ---
 function _atcShowCreateComposition(overlay) {
   let html = '<div class="pm-card pm-enter" style="max-width:400px;">';
-  html += '<h2 class="pm-title">Add to Compose</h2>';
+  html += '<h2 class="pm-title">Add to Structured composition</h2>';
   html += '<div class="pm-body">';
   html += '<div class="kanban-create-section-label">No compositions yet. Create one:</div>';
   html += '<input type="text" id="atc-new-comp-name" class="kanban-input" placeholder="Composition name" style="width:100%;margin:8px 0;" autofocus>';
@@ -812,7 +812,7 @@ async function _atcLoadTree(overlay, projectId) {
 
   // Show loading state
   let html = '<div class="pm-card pm-enter" style="max-width:520px;">';
-  html += '<h2 class="pm-title">Add to Compose</h2>';
+  html += '<h2 class="pm-title">Add to Structured composition</h2>';
   html += '<div class="pm-body" style="text-align:center;padding:24px;color:var(--text-muted);">Loading sections...</div>';
   html += '</div>';
   _atcShowOverlay(overlay, html);
@@ -939,7 +939,7 @@ function _atcRenderTree(overlay) {
   }
 
   let html = '<div class="pm-card pm-enter" style="max-width:520px;">';
-  html += '<h2 class="pm-title">Add to Compose</h2>';
+  html += '<h2 class="pm-title">Add to Structured composition</h2>';
   html += '<div class="pm-body" style="padding:0;">';
   html += '<div class="atc-tree" id="atc-tree">';
   html += renderLevel('__root__', 0);
@@ -1015,7 +1015,7 @@ async function _atcConfirmAdd() {
     const data = await resp.json();
     if (data.ok) {
       _closePm();
-      showToast('Added to Compose: ' + name);
+      showToast('Added to Structured composition: ' + name);
     } else if (resp.status === 409) {
       // Session already linked
       showToast('Session already linked to "' + (data.linked_section || 'another section') + '"', 'error');
@@ -1124,7 +1124,7 @@ function _bulkContextMenu(e) {
   html += '<div class="ws-ctx-item" onclick="_bulkAddToCompose()">'
     + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
     + '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>'
-    + ' Add all to Compose</div>';
+    + ' Add all to Structured composition</div>';
 
   html += '<div class="ws-ctx-divider"></div>';
 
@@ -1453,7 +1453,7 @@ async function _bulkDuplicate() {
 }
 
 /**
- * Bulk Add to Compose.  Sequentially opens the existing _addToCompose()
+ * Bulk Add to Structured composition.  Sequentially opens the existing _addToCompose()
  * picker for each selected session.  Reusing the single-session function
  * preserves the `?project=` filter rule (CLAUDE.md Compose project-scoping
  * item 1) and the existing modal UX users already know.
@@ -1476,7 +1476,7 @@ async function _bulkAddToCompose() {
 
     const overlay = document.getElementById('pm-overlay');
     if (!overlay) {
-      showToast('Cannot open Add to Compose picker', true);
+      showToast('Cannot open Add to Structured composition picker', true);
       return;
     }
 
@@ -1503,7 +1503,7 @@ async function _bulkAddToCompose() {
       const closed = await _waitForOverlayClose(overlay, 5 * 60 * 1000);
       if (closed === 'timeout') {
         // Safety bail: stop the bulk loop, leave overlay alone.
-        showToast('Add to Compose timed out — bulk halted', true);
+        showToast('Add to Structured composition timed out — bulk halted', true);
         break;
       }
       // We can't easily distinguish "added" from "cancelled" without
@@ -1512,7 +1512,7 @@ async function _bulkAddToCompose() {
       added++;
     }
     _clearMultiSelect();
-    showToast('Add to Compose finished (' + added + ' processed'
+    showToast('Add to Structured composition finished (' + added + ' processed'
       + (skipped ? ', ' + skipped + ' skipped' : '') + ')');
   } finally {
     _bulkRelease();
