@@ -9695,6 +9695,64 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
 }
 
 /* ═══════════════════════════════════════════════════════════════
+   SUBSESSIONS TAB STRIP — Ad-hoc / Structured (spec §4.5)
+   ═══════════════════════════════════════════════════════════════ */
+
+.subsessions-tab-strip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border, #30363d);
+  background: var(--bg-subtle, transparent);
+  flex-shrink: 0;
+}
+.subsessions-tab {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 5px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.subsessions-tab:hover {
+  background: var(--bg-hover, rgba(255,255,255,0.04));
+  color: var(--text);
+}
+.subsessions-tab.subsessions-tab-active {
+  background: var(--bg-elevated, rgba(78,205,196,0.10));
+  color: var(--text);
+  border-color: var(--border, rgba(78,205,196,0.25));
+}
+.subsessions-tab.subsessions-tab-affordance {
+  margin-left: auto;
+  color: var(--accent, #4ecdc4);
+  font-weight: 500;
+}
+.subsessions-tab.subsessions-tab-affordance:hover {
+  background: rgba(78, 205, 196, 0.10);
+}
+
+.subsessions-adhoc-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+  flex: 1;
+  min-height: 200px;
+}
+.subsessions-adhoc-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+/* ═══════════════════════════════════════════════════════════════
    COMPOSE ROOT ORCHESTRATOR — Header Bar, Input Target, Sidebar
    ═══════════════════════════════════════════════════════════════ */
 

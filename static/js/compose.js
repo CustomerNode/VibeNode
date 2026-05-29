@@ -189,6 +189,96 @@ function _composeGetAllTags() {
   return [...tags].sort();
 }
 
+// ═══════════════════════════════════════════════════════════════
+// SUBSESSIONS TAB STRIP — Ad-hoc / Structured (spec §4.5)
+// ═══════════════════════════════════════════════════════════════
+//
+// State persists in localStorage under 'vn.compose.activeTab' per
+// spec §14.6.  Default tab is 'adhoc'.  The Structured tab is only
+// surfaced (and clickable) when the active project has at least one
+// composition on disk — _composeProjectsList comes from the
+// /api/compose/board response's `sibling_projects` field, which is
+// already filtered by project= per CLAUDE.md "Compose project-scoping".
+
+function _getSubsessionsActiveTab() {
+  return localStorage.getItem('vn.compose.activeTab') || 'adhoc';
+}
+
+function _setSubsessionsActiveTab(tab) {
+  localStorage.setItem('vn.compose.activeTab', tab);
+}
+
+/**
+ * Sync the tab strip DOM to reflect the requested active tab and the
+ * current `_composeProjectsList`.  Structured tab/body show only if
+ * there's at least one composition in the active project — the
+ * "+ New structured composition" affordance handles the empty case.
+ *
+ * Behavior preservation: when Structured is active, the existing
+ * compose-root-header / compose-input-target / compose-sections-board
+ * remain visible exactly as before, so the legacy Compose flow is
+ * bit-identical inside the Structured tab.
+ */
+function _applySubsessionsTabState() {
+  const tab = _getSubsessionsActiveTab();
+  const adhocBtn = document.getElementById('subsessions-tab-adhoc-btn');
+  const structBtn = document.getElementById('subsessions-tab-structured-btn');
+  const newStructBtn = document.getElementById('subsessions-tab-new-structured-btn');
+  const adhocBody = document.getElementById('subsessions-adhoc-body');
+  const header = document.getElementById('compose-root-header');
+  const target = document.getElementById('compose-input-target');
+  const board = document.getElementById('compose-sections-board');
+
+  const hasStructured = (_composeProjectsList && _composeProjectsList.length > 0);
+  // Structured tab button: only visible when there is at least one
+  // composition for this project.  Once visible, it stays visible
+  // until the user navigates away or the list becomes empty again.
+  if (structBtn) structBtn.style.display = hasStructured ? '' : 'none';
+  // The "+ New structured composition" affordance acts as the
+  // discovery entry point.  Hide it when Structured is the active
+  // view (the inline "+ Add Section" / sidebar "New Composition"
+  // buttons already cover the create flow there).
+  if (newStructBtn) newStructBtn.style.display = (tab === 'structured' && hasStructured) ? 'none' : '';
+
+  // Effective tab: if Structured is requested but there's no
+  // composition yet, fall through to Ad-hoc.
+  const effective = (tab === 'structured' && hasStructured) ? 'structured' : 'adhoc';
+
+  if (adhocBtn) adhocBtn.classList.toggle('subsessions-tab-active', effective === 'adhoc');
+  if (structBtn) structBtn.classList.toggle('subsessions-tab-active', effective === 'structured');
+
+  if (effective === 'adhoc') {
+    if (adhocBody) adhocBody.style.display = '';
+    // Hide Structured surfaces.  Existing display rules are preserved
+    // (header/target use display:flex when shown), so we toggle the
+    // wrapper visibility without touching their inner state.
+    if (header) header.style.display = 'none';
+    if (target) target.style.display = 'none';
+    if (board) board.style.display = 'none';
+  } else {
+    if (adhocBody) adhocBody.style.display = 'none';
+    // Let initCompose / _renderComposeBoard restore header/target/
+    // board visibility according to whether a composition is loaded
+    // (drill-down vs. board view).  We only need to make sure board
+    // is shown; header/target are managed by _renderComposeBoard().
+    if (board) board.style.display = '';
+  }
+}
+
+/**
+ * Tab switch handler invoked by the tab buttons.  Persists the
+ * choice and refreshes the panel.
+ */
+function setSubsessionsTab(tab) {
+  if (tab !== 'adhoc' && tab !== 'structured') tab = 'adhoc';
+  _setSubsessionsActiveTab(tab);
+  _applySubsessionsTabState();
+  if (tab === 'structured') {
+    // Re-run init so the Structured surfaces hydrate from current data.
+    initCompose();
+  }
+}
+
 /**
  * Initialize the compose board — fetch project data and render header.
  * Called by setViewMode('compose') in workforce.js.
@@ -220,6 +310,23 @@ async function initCompose() {
 
     // Populate sidebar list from sibling_projects (included in board response)
     _composeProjectsList = (data && data.sibling_projects) ? data.sibling_projects : [];
+
+    // Apply Subsessions tab state now that we know whether the
+    // current project has any compositions (spec §4.5).  If the
+    // user is on the Ad-hoc tab and Structured is empty, this
+    // hides the Structured surfaces; if Structured is the active
+    // tab we keep going and hydrate the Structured panel below.
+    _applySubsessionsTabState();
+    if (_getSubsessionsActiveTab() !== 'structured' || _composeProjectsList.length === 0) {
+      // Ad-hoc is showing (or Structured is requested but empty,
+      // which falls through to Ad-hoc per _applySubsessionsTabState).
+      // Render the sidebar so the user can still see/create
+      // compositions, and stop before hydrating the Structured
+      // header/sections — they're hidden anyway.
+      _renderComposeSidebar();
+      attachComposeShortcuts();
+      return;
+    }
 
     if (!data || !data.project) {
       // If we had a saved project_id that no longer exists (e.g. deleted),
