@@ -29,7 +29,6 @@ from ..config import (
     _get_utility_ids,
     _resolve_remapped_id,
     _load_remaps,
-    _record_session_access,
 )
 from ..sessions import load_session, load_session_timeline, all_sessions
 from ..titling import smart_title
@@ -263,12 +262,12 @@ def api_session(session_id):
     if canonical:
         session_id = canonical
 
-    # Record this read as an interaction so the sidebar's date sort bubbles
-    # the session up.  meta_only requests come from background widgets
-    # (live-panel existence checks, etc.) — they should NOT count as a
-    # user-initiated open, or every page render would touch every session.
-    if not meta_only:
-        _record_session_access(session_id, project)
+    # NOTE: opening / previewing a session is deliberately a no-op for the
+    # sidebar sort.  The order is state- and activity-driven only — a plain
+    # click or view must never bubble a session to the top.  access_ts is
+    # bumped exclusively by genuine work (send_message / start_session in
+    # ws_events.py), so sessions move only when you actually do something in
+    # them, not when you glance at them.
 
     path = _sessions_dir(project) / f"{session_id}.jsonl"
     if not path.exists():
@@ -306,28 +305,6 @@ def api_session(session_id):
             "custom_title": data.get("custom_title", ""),
         })
     return jsonify(load_session(path))
-
-
-@bp.route("/api/session/<session_id>/touch", methods=["POST"])
-def api_session_touch(session_id):
-    """Explicit "I interacted with this session" signal from the UI.
-
-    The sidebar sort uses ``effective_ts = max(last_msg_ts, mtime, access_ts)``
-    and ``api_session`` records access on GET, but a session that was opened
-    before the page loaded (or restored from a cached view) won't fire that
-    GET.  This endpoint lets the JS bump the timestamp explicitly — e.g.,
-    when the user clicks a session that's already mounted, or when a live
-    panel takes focus.
-
-    Always returns 200; the access store is best-effort sort state, not
-    load-bearing data.
-    """
-    project = request.args.get("project", "").strip()
-    canonical = _resolve_remapped_id(session_id, project)
-    if canonical:
-        session_id = canonical
-    _record_session_access(session_id, project)
-    return jsonify({"ok": True})
 
 
 @bp.route("/api/rename/<session_id>", methods=["POST"])

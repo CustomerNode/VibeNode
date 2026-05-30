@@ -1,11 +1,16 @@
-"""Regression tests for the sidebar date sort fix.
+"""Regression tests for the sidebar date sort.
 
 The sidebar's date column sorts by ``effective_ts`` =
-``max(last_user_assistant_msg_ts, file_mtime, last_access_ts)`` so any
-user interaction with a session bubbles it to the top — even when the
-interaction does not write a new user/assistant message to the .jsonl
-file (renames, autoname appends, view-only opens, SDK remap-then-write-
-elsewhere).
+``max(last_user_assistant_msg_ts, file_mtime, last_access_ts)``.  Genuine
+activity bubbles a session to the top even when it doesn't write a new
+user/assistant message to the .jsonl (renames/autoname appends touch the
+file mtime; real WS work — send_message/start_session — bumps last_access_ts
+to cover the SDK remap-then-write-elsewhere case).
+
+Opening or previewing a session is deliberately sort-neutral: a plain click
+must NEVER reorder the sidebar.  access_ts is bumped only by genuine work,
+never by a view-only open (the ``/touch`` ping endpoint was removed and the
+full GET no longer records access).
 
 Failure modes these tests guard against:
 
@@ -18,19 +23,15 @@ Failure modes these tests guard against:
      timestamp.
 
   3. Access timestamp not overlaid on cache hits — the body-content
-     cache key is ``(path, mtime, size)`` so a click that doesn't change
-     the file would never reflect in the cached summary.
+     cache key is ``(path, mtime, size)`` so a genuine-work bump that
+     doesn't change the file would never reflect in the cached summary.
 
   4. ``custom-title`` append dedup missing — every rename/autoname call
      piles another identical line onto the .jsonl (one production Aras
      session had 52 duplicates of the same title).
 
-  5. ``/api/session/<id>/touch`` endpoint missing or not recording — the
-     belt-and-suspenders signal from JS sidebar clicks goes nowhere.
-
-  6. GET ``/api/session/<id>`` recording access on ``meta_only=1``
-     requests — would mean every background polling widget bumps every
-     session's access_ts on every page render.
+  5. Opening a session bumping access_ts — a plain click/preview must NOT
+     reorder the sidebar (guarded at the API level in test_rest_api.py).
 """
 
 import json

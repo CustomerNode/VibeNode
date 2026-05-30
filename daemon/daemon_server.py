@@ -194,11 +194,17 @@ class SessionDaemon:
             except Exception:
                 pass
 
-        # Send initial state snapshot (includes all queues)
+        # Send initial state snapshot (includes all queues).
+        # Queues + lock moved into SessionManager._mq (a MessageQueue) during
+        # the queue refactor; older direct attribute access on session_manager
+        # itself raised AttributeError and silently dropped the snapshot — the
+        # UI still recovered via periodic get_all_states polling, but a fresh
+        # browser tab would briefly show empty queues until the next poll.
         try:
             states = self.session_manager.get_all_states()
-            with self.session_manager._queue_lock:
-                queues = {k: list(v) for k, v in self.session_manager._queues.items() if v}
+            mq = self.session_manager._mq
+            with mq._queue_lock:
+                queues = {k: list(v) for k, v in mq._queues.items() if v}
             self._push_event("state_snapshot", {"sessions": states, "queues": queues})
         except Exception as e:
             logger.warning("Failed to send state snapshot: %s", e)

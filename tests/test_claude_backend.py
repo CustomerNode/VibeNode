@@ -1275,6 +1275,76 @@ class TestRepairIncompleteJsonl:
         assert self._repair(jsonl_path, monkeypatch) is False
         assert jsonl_path.read_text(encoding="utf-8") == before
 
+    def test_repairs_real_stuck_session_shape(self, tmp_path, monkeypatch):
+        """Reproduces the exact on-disk shape of stuck session ee6e7d15
+        (2026-05-30): a single long turn (all blocks share one message.id,
+        stop_reason='end_turn' — NOT an interrupted trailing turn) with several
+        empty-but-signed thinking-only entries scattered between tool_use /
+        tool_result lines.  --resume groups them into one API message, so the
+        empty thinking blocks land at messages.1.content.* and the API 400s.
+
+        Repair must delete every empty-thinking-only entry, relink the linear
+        parentUuid chain past them, leave all real content intact, and produce
+        valid JSONL with no empty-text thinking blocks anywhere.
+        """
+        jsonl_path = tmp_path / "session.jsonl"
+        entries = [{"type": "user", "uuid": "u0", "parentUuid": None,
+                    "message": {"content": "go"}}]
+        prev = "u0"
+        # Interleave: think(empty) -> tool_use -> tool_result, several times,
+        # all assistant entries under the same message.id "M".
+        for i in range(4):
+            tk = f"think{i}"
+            entries.append({"type": "assistant", "uuid": tk, "parentUuid": prev,
+                            "message": {"id": "M", "stop_reason": "end_turn",
+                                        "content": [{"type": "thinking",
+                                                     "thinking": "",
+                                                     "signature": f"SIG{i}"}]}})
+            tu = f"tool{i}"
+            entries.append({"type": "assistant", "uuid": tu, "parentUuid": tk,
+                            "message": {"id": "M", "stop_reason": "end_turn",
+                                        "content": [{"type": "tool_use",
+                                                     "id": f"t{i}", "name": "Read",
+                                                     "input": {}}]}})
+            tr = f"res{i}"
+            entries.append({"type": "user", "uuid": tr, "parentUuid": tu,
+                            "message": {"content": [{"type": "tool_result",
+                                                     "tool_use_id": f"t{i}",
+                                                     "content": "ok"}]}})
+            prev = tr
+        # A final real assistant answer so the turn isn't thinking-only overall.
+        entries.append({"type": "assistant", "uuid": "ans", "parentUuid": prev,
+                        "message": {"id": "M", "stop_reason": "end_turn",
+                                    "content": [{"type": "text",
+                                                 "text": "final answer"}]}})
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        assert self._repair(jsonl_path, monkeypatch) is True
+
+        out = [json.loads(l) for l in
+               jsonl_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+        uuids = [o["uuid"] for o in out]
+        # Every empty-thinking-only entry is gone; all real content survives.
+        assert not any(u.startswith("think") for u in uuids)
+        assert uuids == ["u0", "tool0", "res0", "tool1", "res1",
+                         "tool2", "res2", "tool3", "res3", "ans"]
+        # The chain is relinked across the removed thinking entries.
+        by = {o["uuid"]: o for o in out}
+        assert by["tool0"]["parentUuid"] == "u0"   # relinked past think0
+        assert by["tool1"]["parentUuid"] == "res0"  # relinked past think1
+        # No empty-text thinking block survives anywhere, and no entry is empty.
+        for o in out:
+            if o.get("type") == "assistant":
+                c = o["message"]["content"]
+                assert c, "no assistant entry may have empty content"
+                assert not any(b.get("type") == "thinking"
+                               and not (b.get("thinking") or "").strip()
+                               for b in c)
+        # Repair is idempotent — a re-resume of the healed file is a no-op.
+        assert self._repair(jsonl_path, monkeypatch) is False
+
 
 class TestUuidExtractionFromJsonlTail:
     """Verify UUID extraction from the tail of a JSONL file.

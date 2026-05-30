@@ -408,12 +408,10 @@ function guiOpenDelete(id) {
 }
 
 async function openInGUI(id) {
-  // Record interaction BEFORE the kanban/compose short-circuits so a row
-  // click in those modes still bubbles the session in the underlying
-  // sidebar.  _recordSessionTouch hits /touch server-side AND bumps the
-  // cached effective_ts locally; filterSessions() below picks up the new
-  // sort.  Defined in toolbar.js.
-  if (typeof _recordSessionTouch === 'function') _recordSessionTouch(id);
+  // Opening a session is intentionally sort-neutral: clicking a row (in any
+  // view) must not bubble it to the top of the sidebar.  The order is driven
+  // by state and real activity only.  Sessions move when you actually work in
+  // them (send a message / start them), not when you open them to look.
 
   // In kanban mode, render session inside the kanban board with kanban titlebar
   if (typeof viewMode !== 'undefined' && viewMode === 'kanban' && typeof _openSessionInKanban === 'function') {

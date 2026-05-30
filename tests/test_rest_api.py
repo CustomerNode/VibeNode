@@ -468,66 +468,31 @@ class TestRenameSession:
 
 
 # ===================================================================
-# 2.5 SESSION TOUCH + ACCESS RECORDING
+# 2.5 SESSION ACCESS RECORDING — OPENING MUST NOT REORDER THE SIDEBAR
 # ===================================================================
 #
 # The sidebar's date sort uses ``effective_ts = max(last_message_ts,
-# file_mtime, last_access_ts)``.  The access_ts component is bumped by
-# UI hooks so view-only opens and SDK-remap-then-write-elsewhere cases
-# still bubble the user-clicked session to the top.  These tests guard:
+# file_mtime, last_access_ts)``.  access_ts is bumped ONLY by genuine work
+# (WS send_message / start_session) so the SDK-remap-then-write-elsewhere
+# case still bubbles up.  Opening, previewing, or clicking a session must
+# NOT bump it — the order is state- and activity-driven, never click-driven.
+# These tests guard:
 #
-#   - POST /api/session/<id>/touch persists into _session_access.json
-#   - GET  /api/session/<id> (non meta_only) ALSO persists
-#   - GET  /api/session/<id>?meta_only=1 does NOT persist (poll, not click)
+#   - GET /api/session/<id> (full)       does NOT record access
+#   - GET /api/session/<id>?meta_only=1  does NOT record access
 #
-# Regression: if any of these silently no-op, the sidebar stops
-# reflecting interactions and the Aras-style "I clicked it and it
-# didn't move" bug returns.
-
-class TestSessionTouch:
-    """POST /api/session/<id>/touch — explicit "I interacted" signal."""
-
-    def test_touch_returns_ok(self, client, populated_project):
-        resp = client.post("/api/session/sess-001/touch")
-        assert resp.status_code == 200
-        assert resp.get_json()["ok"] is True
-
-    def test_touch_records_access(self, client, populated_project,
-                                   fake_project, monkeypatch):
-        import time as _t
-        # The shared app fixture patches _sessions_dir in many spots, but
-        # session_store imports _sessions_dir as a local binding — we
-        # need an explicit patch there so the access file lands under
-        # fake_project, not the real user dir.
-        monkeypatch.setattr(
-            "app.session_store._sessions_dir",
-            lambda project="": fake_project,
-        )
-        resp = client.post("/api/session/sess-001/touch")
-        assert resp.status_code == 200
-        access_file = fake_project / "_session_access.json"
-        assert access_file.exists()
-        data = json.loads(access_file.read_text(encoding="utf-8"))
-        assert "sess-001" in data
-        assert abs(data["sess-001"] - _t.time()) < 5.0
-
-    def test_touch_unknown_id_still_ok(self, client, populated_project,
-                                         fake_project, monkeypatch):
-        """Best-effort sort hint — must not 404 on unknown IDs."""
-        monkeypatch.setattr(
-            "app.session_store._sessions_dir",
-            lambda project="": fake_project,
-        )
-        resp = client.post("/api/session/never-existed/touch")
-        assert resp.status_code == 200
+# Regression: if opening a session records access again, the "I just clicked
+# it and it jumped to the top of the list" bug returns.
 
 
-class TestSessionGetRecordsAccess:
-    """GET /api/session/<id> (full, non-meta_only) records access.
-    ``meta_only=1`` requests are polls and must NOT record."""
+class TestSessionGetDoesNotRecordAccess:
+    """Opening/previewing a session is sort-neutral — neither the full GET
+    nor a meta_only poll may record access."""
 
-    def test_full_get_records_access(self, client, populated_project,
-                                       fake_project, monkeypatch):
+    def test_full_get_does_not_record_access(self, client, populated_project,
+                                             fake_project, monkeypatch):
+        # session_store imports _sessions_dir as a local binding — patch it
+        # explicitly so any access file would land under fake_project.
         monkeypatch.setattr(
             "app.session_store._sessions_dir",
             lambda project="": fake_project,
@@ -537,16 +502,16 @@ class TestSessionGetRecordsAccess:
             access_file.unlink()
         resp = client.get("/api/session/sess-001")
         assert resp.status_code == 200
-        assert access_file.exists()
-        data = json.loads(access_file.read_text(encoding="utf-8"))
-        assert "sess-001" in data
+        # Opening must not bubble the session — no access recorded.
+        if access_file.exists():
+            data = json.loads(access_file.read_text(encoding="utf-8"))
+            assert "sess-001" not in data
 
     def test_meta_only_get_does_not_record_access(
         self, client, populated_project, fake_project, monkeypatch,
     ):
-        """If meta_only fired the recorder, every background widget
-        (live-panel existence check, etc.) would bump every session's
-        access_ts on every page render — the sort would be meaningless."""
+        """Background widgets (live-panel existence checks, etc.) poll with
+        meta_only and must never touch the sort either."""
         monkeypatch.setattr(
             "app.session_store._sessions_dir",
             lambda project="": fake_project,
@@ -556,7 +521,6 @@ class TestSessionGetRecordsAccess:
             access_file.unlink()
         resp = client.get("/api/session/sess-001?meta_only=1")
         assert resp.status_code == 200
-        # Either no file, or the file exists but sess-001 is not in it
         if access_file.exists():
             data = json.loads(access_file.read_text(encoding="utf-8"))
             assert "sess-001" not in data

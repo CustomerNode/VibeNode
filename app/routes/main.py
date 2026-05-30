@@ -148,7 +148,20 @@ def restart_server():
             kill_cmds = " ".join(
                 f"lsof -ti :{p} | xargs kill -9 2>/dev/null;" for p in ports
             )
-            env_prefix = "VIBENODE_PRESERVE_DAEMON=1 " if preserve_daemon else ""
+            # BUGFIX: ``nohup VAR=value cmd`` is NOT valid — env-prefix syntax
+            # is a bash builtin (only works for "simple commands"), but here
+            # bash sees ``nohup`` as the command and ``VAR=value`` as its first
+            # argument, so nohup tries to execute a file literally named
+            # "VAR=value" and dies with "No such file or directory".  This
+            # silently broke every Linux "Restart Web" (the only scope that
+            # sets preserve_daemon): the bash subshell killed port 5050, then
+            # nohup failed to launch the new web, and the user was left with
+            # no web server and an unresponsive UI.  Fix: ``export`` the var
+            # in the shell BEFORE calling nohup, so nohup inherits it via the
+            # environment (the standard pattern).
+            env_export = (
+                "export VIBENODE_PRESERVE_DAEMON=1; " if preserve_daemon else ""
+            )
             restart_log = os.path.join(project_dir, "logs", "restart.log")
             # Ensure logs dir exists so the bash redirect can't fail.
             try:
@@ -160,7 +173,8 @@ def restart_server():
                 f"for i in $(seq 1 10); do {kill_cmds} sleep 0.5; done; "
                 f"find \"{project_dir}\" -type d -name __pycache__ -exec rm -rf {{}} + 2>/dev/null; "
                 f"sleep 1; "
-                f"nohup {env_prefix}\"{sys.executable}\" \"{entry_script}\" "
+                f"{env_export}"
+                f"nohup \"{sys.executable}\" \"{entry_script}\" "
                 f"</dev/null >>\"{restart_log}\" 2>&1 &'"
             )
             subprocess.Popen(

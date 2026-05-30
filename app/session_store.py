@@ -309,17 +309,19 @@ def _resolve_remapped_id(old_session_id: str, project: str = "") -> str | None:
 # with a session, recorded server-side so it survives page refresh and is
 # consistent across browsers.
 #
-# Hooks that bump access_ts:
-#   - GET /api/session/<id>           (user opens the session)
-#   - POST /api/session/<id>/touch    (explicit "I clicked this" signal)
+# Hooks that bump access_ts (genuine activity ONLY — never a plain open/click):
 #   - WS  send_message                (user typed in the live panel)
-#   - WS  start_session               (fresh session started)
+#   - WS  start_session               (fresh session started / resumed)
 #
-# Without this layer, a session that the user *interacts with* but doesn't
-# *write to* (resume that gets SDK-remapped, view-only reads, daemon-side
-# writes routed to a different file) stays frozen at its last on-disk
-# activity timestamp and never bubbles up — the exact failure mode behind
-# the Aras-session report on 2026-05-27.
+# Opening or previewing a session is deliberately NOT a hook: clicking a
+# session must not change its sidebar position.  The sort is state- and
+# activity-driven, so it only moves when the user actually does work in it.
+#
+# This layer still exists because a session the user *writes to* but whose
+# write the SDK routes to a different file (resume that gets remapped) would
+# otherwise stay frozen at its last on-disk activity timestamp and never
+# bubble up — the failure mode behind the Aras-session report on 2026-05-27.
+# The send_message / start_session hooks cover that genuine-work case.
 #
 # Lazy prune drops entries older than _ACCESS_MAX_AGE whose .jsonl is gone.
 

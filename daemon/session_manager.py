@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import subprocess as _subprocess
 import tempfile
@@ -272,6 +273,14 @@ def _system_content_label(text: str) -> str:
     return "System message"
 
 
+# The genuine Anthropic 400 always points at the offending block with a
+# structured request path, e.g. ``messages.1.content.9``.  Ordinary prose that
+# paraphrases the error omits it; only the raw API envelope carries it.  Used
+# (together with the "API Error" prefix) to tell a real error apart from
+# assistant text that merely talks about one.
+_THINKING_400_PATH_RE = re.compile(r"messages\.\d+\.content\.\d+")
+
+
 def _is_thinking_block_modified_error(text: str) -> bool:
     """Return True if text is the Anthropic "modified thinking block" 400.
 
@@ -291,18 +300,37 @@ def _is_thinking_block_modified_error(text: str) -> bool:
     self-heal path: reconnect (which runs ``repair_incomplete_turn`` to strip
     the bad blocks from disk) and auto-retry the last user message.
 
-    Matched loosely (substring) so minor wording or formatting changes in the
-    CLI/API don't silently disable the heal.
+    CRITICAL — must NOT fire on assistant prose that merely *discusses or
+    quotes* this error.  A loose keyword match ("cannot be modified" + the word
+    "thinking") matches a diagnosis, a summary, or a verbatim quote of the error
+    inside a larger answer — and the caller then SUPPRESSES that text and fires
+    a spurious heal, eating the model's real output.  (Caught 2026-05-30: a
+    session debugging this very bug had its own explanation flagged and hidden.)
 
-    Perf: this runs on every assistant text block of every turn, so it
-    short-circuits on the rare literal "cannot be modified" phrase BEFORE any
-    case-folding — the common case is a single C-level substring scan with no
-    string copy.
+    The discriminator is structural, not lexical: the genuine error is the raw
+    API envelope, so the assistant message *is* the error string — it BEGINS
+    with "API Error" and carries the structured ``messages.<i>.content.<j>``
+    request path.  Prose that mentions the keywords does neither (it leads with
+    sentence text, and paraphrases drop the path).  We require both markers.
+    A live detection missed by this tightening is still backstopped by the
+    resume-time ``repair_incomplete_turn`` in ``_drive_session`` /
+    ``_reconnect_client``, which cleans the transcript before the next replay.
+
+    Perf: runs on every assistant text block of every turn, so it short-circuits
+    on the rare literal "cannot be modified" phrase BEFORE any case-folding or
+    regex — the common case is a single C-level substring scan with no copy.
     """
     if not text or "cannot be modified" not in text:
         return False
     low = text.lower()
-    return "thinking" in low or "redacted_thinking" in low
+    if "thinking" not in low and "redacted_thinking" not in low:
+        return False
+    # Structural guard: a real CLI-surfaced error leads with "API Error" AND
+    # carries the messages.<i>.content.<j> request path.  Prose about the error
+    # satisfies neither reliably, so both are required.
+    if not low.lstrip().startswith("api error"):
+        return False
+    return bool(_THINKING_400_PATH_RE.search(text))
 
 
 # ---------------------------------------------------------------------------
@@ -1108,6 +1136,46 @@ class SessionManager:
         got_result = False
         result_handled = False
         try:
+            # ── Self-heal on resume: sanitize the transcript BEFORE --resume
+            # replays it ────────────────────────────────────────────────────
+            # repair_incomplete_turn() strips assistant entries whose only
+            # content is an empty-but-signed ``thinking`` block (and completes
+            # interrupted trailing turns).  Replaying such a block makes the
+            # Anthropic API reject the request with "thinking ... blocks ...
+            # cannot be modified".  The CLI surfaces that 400 as ordinary
+            # assistant TEXT followed by a clean RESULT — NOT a transport
+            # exception — so the reactive finally-block self-heal can be
+            # stranded by the post-turn drain (which consumes auto-resume /
+            # background-task content and reassigns info.task) and never
+            # reconnect.  Observed 2026-05-30: a session looped on
+            # ``asst_thinking_block_400`` with 2 heal TRIGGERs but 0 reconnects,
+            # because every reconnect lives behind the supersede guard.
+            #
+            # _reconnect_client already repairs before its --resume; it was the
+            # ONLY place that did.  Repairing here too makes "safe for --resume"
+            # a true invariant across BOTH paths a fresh CLI re-reads the JSONL,
+            # so a poisoned session self-heals the next time it is resumed
+            # (user-driven resume, or crash-recovery re-drive) instead of
+            # staying wedged forever.  Idempotent and safe: repair never writes
+            # invalid JSONL, and the API expressly permits omitting prior
+            # thinking blocks.  Only meaningful on resume (a fresh session has
+            # no transcript to poison), and offloaded to a worker thread so a
+            # large transcript can't block the shared daemon event loop.
+            if resume:
+                try:
+                    _repair_id = self._resolve_id(session_id)
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        self._store.repair_incomplete_turn,
+                        _repair_id,
+                        cwd or "",
+                    )
+                except Exception as _rep_err:
+                    logger.warning(
+                        "_drive_session: pre-resume jsonl repair failed for "
+                        "%s: %s", session_id, _rep_err,
+                    )
+
             # Honor the global policy's SDK mode override (e.g. "claude_auto"
             # → "acceptEdits") only when the caller hasn't pinned a specific
             # mode for this session.  Explicit per-session modes — like the

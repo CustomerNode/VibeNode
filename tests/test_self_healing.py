@@ -317,6 +317,55 @@ class TestJsonlRepairBeforeReconnect:
         )
 
 
+class TestJsonlRepairOnResume:
+    """Verify _drive_session sanitizes the transcript on the RESUME path,
+    before --resume replays it.
+
+    Regression (session ee6e7d15, 2026-05-30): a poisoned transcript (assistant
+    entries whose only content is an empty-but-signed thinking block) makes the
+    Anthropic API 400 with "thinking ... blocks cannot be modified".  The CLI
+    surfaces that as assistant TEXT + a clean RESULT (no transport exception),
+    so the reactive finally-block heal gets stranded by the post-turn drain and
+    NEVER reconnects (logs showed 2 heal TRIGGERs, 0 reconnects).  Repairing on
+    every resume — not only inside _reconnect_client — makes "safe for --resume"
+    a true invariant so the session self-heals on its next resume instead of
+    staying wedged forever.
+    """
+
+    # Anchor on the actual call reference rather than the bare word, which also
+    # appears in the explanatory comment block above the call.
+    CALL = "self._store.repair_incomplete_turn"
+
+    def test_repair_called_in_drive_session(self, sm_module):
+        """_drive_session must call repair_incomplete_turn (resume self-heal)."""
+        src = inspect.getsource(sm_module.SessionManager._drive_session)
+        assert self.CALL in src
+
+    def test_repair_gated_by_resume(self, sm_module):
+        """The repair must only run when resuming — a fresh session has no
+        transcript to poison, and repairing it would be wasted IO."""
+        src = inspect.getsource(sm_module.SessionManager._drive_session)
+        call_pos = src.find(self.CALL)
+        assert call_pos >= 0, f"{self.CALL} not found in _drive_session"
+        # An `if resume` guard must appear before the repair call.
+        guard_pos = src.rfind("if resume", 0, call_pos)
+        assert guard_pos >= 0, (
+            "resume-time repair must be gated behind `if resume:`"
+        )
+
+    def test_repair_happens_before_connect(self, sm_module):
+        """The transcript must be cleaned BEFORE the CLI loads it — i.e. before
+        self._sdk.connect — or the poisoned history is already in memory."""
+        src = inspect.getsource(sm_module.SessionManager._drive_session)
+        call_pos = src.find(self.CALL)
+        connect_pos = src.find("self._sdk.connect")
+        assert call_pos >= 0, f"{self.CALL} not found in _drive_session"
+        assert connect_pos >= 0, "self._sdk.connect not found in _drive_session"
+        assert call_pos < connect_pos, (
+            "resume jsonl repair must happen before client.connect()"
+        )
+
+
 class TestThinkingBlock400TriggersReconnect:
     """The Anthropic "modified thinking block" 400 arrives as assistant text
     (not a transport exception), so it must be detected in _process_message
@@ -342,6 +391,39 @@ class TestThinkingBlock400TriggersReconnect:
         assert sm_module._is_thinking_block_modified_error(
             "API Error: 400 messages: tool_use ids were found without "
             "tool_result blocks"
+        ) is False
+
+    def test_detection_helper_ignores_prose_about_the_error(self, sm_module):
+        """REGRESSION (2026-05-30): the matcher must NOT fire on assistant text
+        that merely DISCUSSES or QUOTES this error.  These two strings are the
+        actual response texts that falsely triggered a heal — and got the
+        model's own output suppressed — while debugging this bug.  A diagnosis
+        contains every keyword ("thinking", "cannot be modified") and may even
+        quote the verbatim error mid-paragraph, but it does not lead with the
+        raw "API Error" envelope, so it must be classified as ordinary prose.
+        """
+        # Paraphrase embedded in a sentence (no structured path).
+        diagnosis = (
+            "Found it. The session is stuck in a loop hitting **API Error 400: "
+            "`thinking` blocks in the latest assistant message cannot be "
+            "modified**, and a STREAM_HEAL mechanism keeps triggering."
+        )
+        assert sm_module._is_thinking_block_modified_error(diagnosis) is False
+
+        # Summary that QUOTES the verbatim error (path present) but does not
+        # begin with it — the leading text proves it is the model talking.
+        summary = (
+            "Both `--resume` paths now repair the transcript. The error was: "
+            "API Error: 400 messages.1.content.9: thinking or redacted_thinking "
+            "blocks in the latest assistant message cannot be modified."
+        )
+        assert sm_module._is_thinking_block_modified_error(summary) is False
+
+    def test_detection_requires_structured_request_path(self, sm_module):
+        """An "API Error" envelope without the messages.<i>.content.<j> path is
+        not the modified-thinking 400 — the path is intrinsic to that error."""
+        assert sm_module._is_thinking_block_modified_error(
+            "API Error: 400 thinking blocks cannot be modified"
         ) is False
 
     def test_process_message_flags_heal_on_thinking_400(self, sm_module):
