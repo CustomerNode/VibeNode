@@ -174,6 +174,214 @@ def _get_deleted_ids(project: str = "") -> set:
     return set(pruned.keys())
 
 
+def _unmark_deleted(session_id: str, project: str = "") -> None:
+    """Remove a session's tombstone.  Used when restoring from trash so
+    all_sessions() stops hiding the resurrected session."""
+    with _tombstone_lock:
+        tombstones = _load_tombstones(project)
+        if session_id in tombstones:
+            tombstones.pop(session_id)
+            _save_tombstones(tombstones, project)
+
+
+# ---------------------------------------------------------------------------
+# Soft-delete trash -- recoverable session deletion
+# ---------------------------------------------------------------------------
+# Session deletion used to permanently unlink the .jsonl, with no undo.  A
+# single misclick (easy while clicking around the UI) lost an entire
+# transcript forever.  move_to_trash() relocates the .jsonl into a per-project
+# ``_trash/`` folder and records the deletion time + saved name in
+# ``_trash/_trash_index.json`` so deletes are reversible.  all_sessions()
+# globs ``*.jsonl`` non-recursively and skips ``_``-prefixed stems, so trashed
+# files never reappear in the UI.  Entries older than _TRASH_MAX_AGE are
+# pruned lazily (and their files removed) on the next trash operation.
+
+_TRASH_MAX_AGE = 2592000  # seconds (30 days)
+_trash_lock = threading.Lock()
+
+
+def _trash_dir(project: str = "") -> Path:
+    return _sessions_dir(project) / "_trash"
+
+
+def _trash_index_file(project: str = "") -> Path:
+    return _trash_dir(project) / "_trash_index.json"
+
+
+def _load_trash_index(project: str = "") -> dict:
+    """Return {session_id: {deleted_at: float, name: str}} for trashed sessions."""
+    try:
+        data = json.loads(_trash_index_file(project).read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_trash_index(index: dict, project: str = "") -> None:
+    # The _trash/ folder is created lazily by move_to_trash, but list/restore/
+    # purge can call this before any session has been trashed — ensure the
+    # directory exists so the write never fails with FileNotFoundError.
+    f = _trash_index_file(project)
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    f.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _prune_trash(index: dict, project: str = "") -> dict:
+    """Drop entries older than _TRASH_MAX_AGE and unlink their backing files."""
+    now = time.time()
+    td = _trash_dir(project)
+    result = {}
+    for sid, meta in index.items():
+        ts = (meta or {}).get("deleted_at", 0)
+        if now - ts < _TRASH_MAX_AGE:
+            result[sid] = meta
+        else:
+            try:
+                (td / f"{sid}.jsonl").unlink()
+            except Exception:
+                pass
+    return result
+
+
+def move_to_trash(session_id: str, project: str = "", name: str = "",
+                  retries: int = 5, delay: float = 0.2) -> bool:
+    """Move a session's .jsonl into the per-project ``_trash/`` folder so the
+    delete is recoverable.
+
+    Returns True if a file was trashed, False if there was no .jsonl to move
+    (already gone / never created) or every retry hit a Windows file lock.
+    Retries on PermissionError just like _unlink_with_retry so an AV/CLI hold
+    on the handle doesn't drop us straight into the hard-delete fallback.
+    """
+    src = _sessions_dir(project) / f"{session_id}.jsonl"
+    with _trash_lock:
+        td = _trash_dir(project)
+        try:
+            td.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return False
+        # Opportunistic prune so the trash folder self-bounds over time.
+        index = _prune_trash(_load_trash_index(project), project)
+        dest = td / f"{session_id}.jsonl"
+        moved = False
+        for attempt in range(retries):
+            if not src.exists():
+                break
+            try:
+                if dest.exists():
+                    dest.unlink()
+                src.replace(dest)
+                moved = True
+                break
+            except PermissionError:
+                if attempt < retries - 1:
+                    time.sleep(delay)
+                    continue
+                # Last-ditch: copy bytes then unlink the source.
+                try:
+                    dest.write_bytes(src.read_bytes())
+                    src.unlink()
+                    moved = True
+                except Exception:
+                    moved = False
+                break
+            except FileNotFoundError:
+                break
+            except Exception:
+                # Cross-device or other failure — try copy+unlink once.
+                try:
+                    dest.write_bytes(src.read_bytes())
+                    src.unlink()
+                    moved = True
+                except Exception:
+                    moved = False
+                break
+        if moved:
+            index[session_id] = {"deleted_at": time.time(), "name": name or ""}
+            _save_trash_index(index, project)
+        return moved
+
+
+def list_trash(project: str = "") -> list:
+    """Return [{id, name, deleted_at, size}] for restorable trashed sessions,
+    newest-deleted first.  Prunes expired entries as a side effect."""
+    with _trash_lock:
+        original = _load_trash_index(project)
+        index = _prune_trash(original, project)
+        # Only persist when pruning actually removed entries — avoids creating
+        # an empty _trash/ folder just because the user opened the trash view.
+        if len(index) != len(original):
+            _save_trash_index(index, project)
+        td = _trash_dir(project)
+        out = []
+        for sid, meta in index.items():
+            f = td / f"{sid}.jsonl"
+            if not f.exists():
+                continue
+            try:
+                size = f.stat().st_size
+            except Exception:
+                size = 0
+            out.append({
+                "id": sid,
+                "name": (meta or {}).get("name", ""),
+                "deleted_at": (meta or {}).get("deleted_at", 0),
+                "size": size,
+            })
+    out.sort(key=lambda e: e.get("deleted_at", 0), reverse=True)
+    return out
+
+
+def restore_from_trash(session_id: str, project: str = ""):
+    """Move a trashed .jsonl back into the sessions dir and drop its trash
+    index entry.  Returns the saved name (possibly '') on success, or None if
+    there was nothing to restore (or a live file already occupies the slot).
+    Callers are responsible for clearing the tombstone and re-saving the name.
+    """
+    with _trash_lock:
+        src = _trash_dir(project) / f"{session_id}.jsonl"
+        if not src.exists():
+            return None
+        dest = _sessions_dir(project) / f"{session_id}.jsonl"
+        if dest.exists():
+            # A live session already owns this id — refuse to clobber it.
+            return None
+        try:
+            src.replace(dest)
+        except Exception:
+            try:
+                dest.write_bytes(src.read_bytes())
+                src.unlink()
+            except Exception:
+                return None
+        index = _load_trash_index(project)
+        meta = index.pop(session_id, {}) or {}
+        _save_trash_index(index, project)
+    return meta.get("name", "")
+
+
+def purge_from_trash(session_id: str, project: str = "") -> bool:
+    """Permanently delete a single trashed session (file + index entry)."""
+    with _trash_lock:
+        index = _load_trash_index(project)
+        existed = session_id in index
+        index.pop(session_id, None)
+        _save_trash_index(index, project)
+        try:
+            (_trash_dir(project) / f"{session_id}.jsonl").unlink()
+            existed = True
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+    return existed
+
+
 # ---------------------------------------------------------------------------
 # Utility session tracking -- hide system sessions (title, planner, etc.)
 # ---------------------------------------------------------------------------

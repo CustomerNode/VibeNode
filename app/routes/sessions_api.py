@@ -26,6 +26,11 @@ from ..config import (
     _summary_cache,
     _mark_deleted,
     _mark_deleted_bulk,
+    _unmark_deleted,
+    move_to_trash,
+    list_trash,
+    restore_from_trash,
+    purge_from_trash,
     _get_utility_ids,
     _resolve_remapped_id,
     _load_remaps,
@@ -598,43 +603,43 @@ def api_delete(session_id):
     except Exception:
         pass  # best-effort
 
-    # Phase 3: Tombstone + delete the file.
+    # Capture the user-set name BEFORE we remove it from the names store, so
+    # restore-from-trash can re-create the session with its title intact.
+    saved_name = _load_names(project).get(session_id, "")
+
+    # Phase 3: Tombstone + soft-delete the file.
     # Write the tombstone FIRST so all_sessions() hides this ID immediately,
-    # even if a dying process recreates the .jsonl after we unlink it.
+    # even if a dying process recreates the .jsonl after we move it.
     _mark_deleted(session_id, project)
 
     if not path.exists():
         sm._save_registry_now()
         return jsonify({"ok": True})  # Already gone or never created
 
-    # On Windows the CLI process may still hold the .jsonl open even after
-    # Phase 1/2 — unlink raises PermissionError in that case. The retry
-    # helper attempts up to 5 unlinks at 0.2 s intervals (~1 s worst case)
-    # and logs at WARNING if the file stays locked. The tombstone above is
-    # the authoritative "this session is deleted" signal; truncate-to-zero
-    # is the last-resort fallback if AV refuses to release the handle.
-    unlinked = _unlink_with_retry(path)
+    # Soft-delete (recoverable): move the .jsonl into the per-project
+    # ``_trash/`` folder instead of unlinking it, so an accidental delete can
+    # be undone via /api/trash/<id>/restore. move_to_trash retries on Windows
+    # file locks (same bounded loop as _unlink_with_retry) and records the
+    # deletion time + saved name in _trash_index.json.
+    trashed = move_to_trash(session_id, project, name=saved_name)
     if folder.exists() and folder.is_dir():
         try:
             shutil.rmtree(folder)
         except (PermissionError, OSError):
             pass
 
-    # Phase 4: Sweep for files re-created by a dying process AND truncate
-    # any file the retry helper couldn't unlink.
-    if path.exists():
+    # Phase 4: If the move didn't succeed (file vanished mid-flight, or stayed
+    # locked through every retry), fall back to the hard-delete path so we
+    # never leave a visible zombie .jsonl behind. The tombstone above is the
+    # authoritative "deleted" signal; truncate-to-zero is the last resort if
+    # AV refuses to release the handle.
+    if not trashed and path.exists():
         if not _unlink_with_retry(path, retries=3, delay=0.2):
-            # Last resort: truncate the file so even if the tombstone
-            # eventually expires, the session would appear empty and be
-            # auto-cleaned on the next "delete empty" sweep.
             try:
                 path.write_bytes(b"")
                 log.warning("Truncated locked JSONL to 0 bytes: %s", path)
             except Exception as e:
                 log.warning("Failed to truncate locked JSONL %s: %s", path, e)
-    elif not unlinked:
-        # File somehow disappeared between retries — fine, nothing to do.
-        pass
     if folder.exists() and folder.is_dir():
         try:
             shutil.rmtree(folder)
@@ -646,13 +651,65 @@ def api_delete(session_id):
     for key in [k for k in _summary_cache if k[0] == path_str]:
         del _summary_cache[key]
 
-    # Clean up user-set name from persistent store
+    # Clean up user-set name from persistent store (the title is preserved in
+    # the trash index, so a later restore re-applies it).
     _delete_name(session_id, project)
 
     # Force immediate registry save so recovery can't resurrect this session
     sm._save_registry_now()
 
     return jsonify({"ok": True})
+
+
+@bp.route("/api/trash", methods=["GET"])
+def api_trash_list():
+    """List recoverable (soft-deleted) sessions for the active project.
+
+    Returns the trashed sessions newest-deleted first, each with its saved
+    title, deletion timestamp, and transcript size so the UI can offer a
+    one-click restore.  Entries expire after _TRASH_MAX_AGE (30 days).
+    """
+    project = request.args.get("project", "").strip()
+    items = list_trash(project)
+    # Add a human-friendly ISO timestamp without changing the raw epoch.
+    for it in items:
+        try:
+            it["deleted_at_iso"] = datetime.fromtimestamp(
+                it.get("deleted_at", 0), tz.utc
+            ).isoformat()
+        except Exception:
+            it["deleted_at_iso"] = ""
+    return jsonify({"ok": True, "trash": items})
+
+
+@bp.route("/api/trash/<session_id>/restore", methods=["POST"])
+def api_trash_restore(session_id):
+    """Restore a soft-deleted session: move its .jsonl back, clear the
+    tombstone so it stops being hidden, and re-apply its saved title."""
+    project = (
+        (request.get_json(silent=True) or {}).get("project")
+        or request.args.get("project", "")
+    ).strip()
+
+    name = restore_from_trash(session_id, project)
+    if name is None:
+        return jsonify({"error": "Not found in trash"}), 404
+
+    # Clear the tombstone so all_sessions() surfaces the session again.
+    _unmark_deleted(session_id, project)
+    # Re-apply the saved title (if any) so it sorts/labels correctly.
+    if name:
+        _save_name(session_id, name, project)
+
+    return jsonify({"ok": True, "id": session_id, "title": name})
+
+
+@bp.route("/api/trash/<session_id>", methods=["DELETE"])
+def api_trash_purge(session_id):
+    """Permanently delete a single trashed session (no further undo)."""
+    project = request.args.get("project", "").strip()
+    purged = purge_from_trash(session_id, project)
+    return jsonify({"ok": True, "purged": purged})
 
 
 @bp.route("/api/delete-all", methods=["DELETE"])
