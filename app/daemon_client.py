@@ -617,6 +617,16 @@ class DaemonClient:
             self._planner_ids.add(session_id)
             _mark_utility(session_id)
             params["session_type"] = kwargs["session_type"]
+        # Subsessions (spec §4.2): forward the type + parent linkage so the
+        # daemon persists them on the child's SessionInfo.  Subsessions are
+        # NOT utility sessions — they must stay visible in the sidebar, so we
+        # do NOT add them to _planner_ids / _mark_utility.
+        if kwargs.get("session_type") == "subsession":
+            params["session_type"] = "subsession"
+        if kwargs.get("parent_session_id"):
+            params["parent_session_id"] = kwargs["parent_session_id"]
+        if kwargs.get("subsession_origin_turn") is not None:
+            params["subsession_origin_turn"] = kwargs["subsession_origin_turn"]
         return self._send_request("start_session", params)
 
     def send_message(self, session_id, text, voice=False):
@@ -648,6 +658,48 @@ class DaemonClient:
     def remove_session(self, session_id):
         return self._send_request("remove_session", {
             "session_id": session_id,
+        })
+
+    # ── Subsessions (spec §4.2/§4.3/§6) ────────────────────────────────
+    # These proxy the daemon-side SessionManager subsession API across the
+    # IPC boundary.  Without them the web tier (which only ever holds a
+    # DaemonClient, never the real SessionManager) raises AttributeError on
+    # every subsession endpoint — the create_app(testing=True) MagicMock
+    # auto-fabricates them, which is exactly why the unit tests stayed green
+    # while production 500'd.  tests/test_daemon_client_parity.py pins this.
+    def get_subsession_meta(self, session_id):
+        return self._send_request("get_subsession_meta", {
+            "session_id": session_id,
+        })
+
+    def mark_inbox_dirty(self, session_id):
+        return self._send_request("mark_inbox_dirty", {
+            "session_id": session_id,
+        })
+
+    def orphan_children_of(self, parent_sid):
+        return self._send_request("orphan_children_of", {
+            "parent_sid": parent_sid,
+        })
+
+    def detect_rewind_orphans(self, parent_sid, new_line_count):
+        return self._send_request("detect_rewind_orphans", {
+            "parent_sid": parent_sid, "new_line_count": new_line_count,
+        })
+
+    def reanchor_subsession(self, child_sid, new_origin_turn):
+        return self._send_request("reanchor_subsession", {
+            "child_sid": child_sid, "new_origin_turn": new_origin_turn,
+        })
+
+    def detach_subsession(self, child_sid):
+        return self._send_request("detach_subsession", {
+            "child_sid": child_sid,
+        })
+
+    def set_auto_report_on_idle(self, session_id, on):
+        return self._send_request("set_auto_report_on_idle", {
+            "session_id": session_id, "on": on,
         })
 
     def _resolve_id(self, session_id):

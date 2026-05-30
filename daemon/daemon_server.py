@@ -298,6 +298,18 @@ class SessionDaemon:
             "edit_queue_item": self.session_manager.edit_queue_item,
             "clear_queue": self.session_manager.clear_queue,
             "get_aliases": lambda **kw: dict(self.session_manager._id_aliases),
+            # ── Subsessions (spec §4.2/§4.3/§6) ──
+            # get_subsession_meta normalizes None → {} so the falsy result
+            # survives IPC: the reader stores msg["result"], and _send_request
+            # treats a None result as a timeout.  {} is both non-None (IPC-safe)
+            # and correctly falsy for the route's "not daemon-managed" check.
+            "get_subsession_meta": lambda **kw: self.session_manager.get_subsession_meta(kw["session_id"]) or {},
+            "mark_inbox_dirty": lambda **kw: self.session_manager.mark_inbox_dirty(kw["session_id"]),
+            "orphan_children_of": lambda **kw: self.session_manager.orphan_children_of(kw["parent_sid"]),
+            "detect_rewind_orphans": lambda **kw: self.session_manager.detect_rewind_orphans(kw["parent_sid"], kw["new_line_count"]),
+            "reanchor_subsession": lambda **kw: self.session_manager.reanchor_subsession(kw["child_sid"], kw["new_origin_turn"]),
+            "detach_subsession": lambda **kw: self.session_manager.detach_subsession(kw["child_sid"]),
+            "set_auto_report_on_idle": lambda **kw: self.session_manager.set_auto_report_on_idle(kw["session_id"], kw["on"]),
             "ping": lambda **kw: {"ok": True, "pid": os.getpid()},
         }
 
