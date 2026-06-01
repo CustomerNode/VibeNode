@@ -90,7 +90,12 @@ class TestChatStoreAbstract:
             Incomplete()
 
     def test_all_abstract_methods_must_be_implemented(self):
-        """Verify the set of abstract methods matches expectations."""
+        """Verify the set of abstract methods matches expectations.
+
+        ``prepare_for_resume`` is intentionally CONCRETE (default delegates to
+        ``repair_incomplete_turn``), so it must NOT appear here — adding it as
+        abstract would break every existing ChatStore implementation.
+        """
         abstract_methods = ChatStore.__abstractmethods__
         expected = {
             "find_session_path",
@@ -102,6 +107,44 @@ class TestChatStoreAbstract:
             "read_entries",
         }
         assert abstract_methods == expected
+        assert "prepare_for_resume" not in abstract_methods
+
+
+class TestPrepareForResumeDefault:
+    """The concrete default ``prepare_for_resume`` must delegate to repair so
+    backends that don't externalize media still work unchanged."""
+
+    def test_prepare_for_resume_is_concrete(self):
+        """A stub that implements only the abstract methods still gets a
+        working ``prepare_for_resume`` for free."""
+        store = StubChatStore()
+        assert hasattr(store, "prepare_for_resume")
+        result = store.prepare_for_resume("sid")
+        assert isinstance(result, bool)
+
+    def test_default_delegates_to_repair(self):
+        """The base default must call ``repair_incomplete_turn`` (pure repair,
+        no eviction) so non-media backends behave identically to before."""
+
+        class RecordingStore(StubChatStore):
+            def __init__(self):
+                self.repaired = False
+
+            def repair_incomplete_turn(self, session_id, cwd=""):
+                self.repaired = True
+                return True
+
+        store = RecordingStore()
+        assert store.prepare_for_resume("sid", evict_media=True) is True
+        assert store.repaired is True
+
+    def test_prepare_for_resume_accepts_config_params(self):
+        """Signature must accept the eviction config knobs."""
+        import inspect as _inspect
+        sig = _inspect.signature(ChatStore.prepare_for_resume)
+        for p in ("evict_media", "keep_recent_turns",
+                  "dedup_recent_tooluseresult"):
+            assert p in sig.parameters
 
 
 # ---------------------------------------------------------------------------

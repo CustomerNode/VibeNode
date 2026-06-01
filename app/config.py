@@ -219,6 +219,27 @@ def _kanban_config_defaults() -> dict:
         # File tracking snapshots every source file's mtime each turn for
         # undo/rewind support.  Disable to speed up sessions on large repos.
         "file_tracking_enabled": True,
+        # ── Large-session performance ──
+        # Backend-only, no UI.  See docs/plans/large-session-perf.md.  These
+        # govern the lossless stale-media eviction that runs ONLY in the
+        # pre-`--resume` executor pass (never per-turn).  Old inline image
+        # payloads are externalized to ~/.claude/session-env/<sid>/vibenode-media/
+        # (content-addressed by sha256, fully recoverable) and replaced in the
+        # replayed transcript by a short text placeholder, shrinking both the
+        # bytes the CLI reads and the stale vision tokens the model re-attends.
+        #
+        # Master switch for WS1 (inline-image eviction) + WS2 (toolUseResult
+        # de-dup).  Disabling reverts to pure repair behavior with no code change.
+        "large_session_media_eviction": True,
+        # K = number of recent user turns whose images stay inline for the model
+        # (active screenshot→fix→screenshot loops are never degraded).  Older
+        # images are externalized.
+        "large_session_media_keep_recent_turns": 4,
+        # WS2: also externalize the provably-redundant `toolUseResult.file.base64`
+        # duplicate even for images still inside the recent-K window (the model
+        # only ever replays the inline `source.data` copy; toolUseResult is
+        # auxiliary metadata the CLI never feeds back).  Independently switchable.
+        "large_session_dedup_recent_tooluseresult": True,
     }
 
 

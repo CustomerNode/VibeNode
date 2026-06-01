@@ -174,6 +174,41 @@ class ChatStore(ABC):
         """
         ...
 
+    def prepare_for_resume(
+        self, session_id: str, cwd: str = "", evict_media: bool = True,
+        keep_recent_turns: int = 4, dedup_recent_tooluseresult: bool = True,
+    ) -> bool:
+        """Make a session safe AND cheap for ``--resume`` to replay.
+
+        Combined, change-gated pre-``--resume`` pass: repair (Pass 1 + Pass 2)
+        plus optional lossless stale-media eviction, in ONE read and AT MOST ONE
+        conditional rewrite.  Runs ONLY on resume/reconnect, never per-turn, and
+        never rewrites when nothing changed.  See
+        docs/plans/large-session-perf.md.
+
+        This is a CONCRETE method (not abstract) so existing ``ChatStore``
+        implementations and the ABC abstract-method set are unchanged.  The
+        default implementation falls back to ``repair_incomplete_turn`` (pure
+        repair, no eviction) so any backend that does not externalize media still
+        works correctly.  Backends that support media eviction (Claude JSONL)
+        override this.
+
+        Args:
+            session_id: The session identifier.
+            cwd: Working directory for locating the session file.
+            evict_media: When True, externalize OLD inline images + de-dup
+                ``toolUseResult`` duplicates.  When False, behaves exactly like
+                ``repair_incomplete_turn``.
+            keep_recent_turns: Number of recent user turns whose images stay
+                inline for the model (K).
+            dedup_recent_tooluseresult: Also de-dup the redundant
+                ``toolUseResult.file.base64`` of images still inside recent-K.
+
+        Returns:
+            True if the session file was rewritten, False otherwise.
+        """
+        return self.repair_incomplete_turn(session_id, cwd)
+
     # ── Summary / Display Operations ─────────────────────────────────
 
     @abstractmethod

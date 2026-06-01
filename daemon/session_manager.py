@@ -1099,6 +1099,52 @@ class SessionManager:
         except asyncio.CancelledError:
             raise
 
+    def _prepare_resume_transcript(self, resolved_id: str, cwd: str) -> None:
+        """Sanitize + shrink the transcript before a ``--resume`` reads it.
+
+        PERF-CRITICAL: called ONLY from the two ``--resume``-driving paths
+        (``_drive_session`` resume branch, ``_reconnect_client``), never on the
+        per-turn send path.  Runs the store's combined change-gated pass: repair
+        (so the API doesn't 400 on an interrupted/poisoned transcript) PLUS
+        lossless stale-media eviction (externalize OLD inline screenshots so the
+        model doesn't re-attend 60-85K stale vision tokens every round-trip).
+        See docs/plans/large-session-perf.md and CLAUDE.md PERF guardrails.
+
+        Config is read via the cached ``get_kanban_config`` (CLAUDE.md #11) — the
+        master switch ``large_session_media_eviction`` (default ON), the recency
+        window ``large_session_media_keep_recent_turns`` (K, default 4), and
+        ``large_session_dedup_recent_tooluseresult`` (default ON).  Because this
+        only runs on resume, even the cached read is off the per-turn path.
+
+        Never raises into the resume path: any failure falls back to a plain
+        ``repair_incomplete_turn`` so a broken eviction can never block resume.
+        """
+        try:
+            from app.config import get_kanban_config
+            cfg = get_kanban_config()
+            evict = bool(cfg.get("large_session_media_eviction", True))
+            keep = int(cfg.get("large_session_media_keep_recent_turns", 4))
+            dedup = bool(cfg.get("large_session_dedup_recent_tooluseresult", True))
+        except Exception:
+            evict, keep, dedup = True, 4, True
+        try:
+            self._store.prepare_for_resume(
+                resolved_id, cwd=cwd or "", evict_media=evict,
+                keep_recent_turns=keep, dedup_recent_tooluseresult=dedup,
+            )
+        except Exception as _prep_err:
+            logger.warning(
+                "_prepare_resume_transcript failed for %s, falling back to "
+                "repair-only: %s", resolved_id, _prep_err,
+            )
+            try:
+                self._store.repair_incomplete_turn(resolved_id, cwd=cwd or "")
+            except Exception as _rep_err:
+                logger.warning(
+                    "_prepare_resume_transcript repair fallback failed for "
+                    "%s: %s", resolved_id, _rep_err,
+                )
+
     async def _reconnect_client(self, session_id: str, info) -> bool:
         """Reconnect a session whose SDK stream died.
 
@@ -1131,13 +1177,14 @@ class SessionManager:
                         pass
                     info.client = None
 
-                # Repair incomplete .jsonl before reconnecting — if the stream
-                # died mid-response, the last entry has stop_reason=null and
-                # --resume will choke on it immediately.
-                try:
-                    self._store.repair_incomplete_turn(resolved, cwd=info.cwd or "")
-                except Exception as _rep_err:
-                    logger.warning("_reconnect_client: jsonl repair failed: %s", _rep_err)
+                # Sanitize + shrink the .jsonl before reconnecting — if the
+                # stream died mid-response, the last entry has stop_reason=null
+                # and --resume will choke on it immediately.  The combined
+                # pre-resume pass also evicts stale media (lossless; see
+                # docs/plans/large-session-perf.md).  It delegates to
+                # repair_incomplete_turn so the same repair semantics apply
+                # before connect.
+                self._prepare_resume_transcript(resolved, info.cwd or "")
 
                 # Small stagger to avoid slamming the system when multiple
                 # sessions are queued behind the semaphore.
@@ -1224,9 +1271,14 @@ class SessionManager:
             if resume:
                 try:
                     _repair_id = self._resolve_id(session_id)
+                    # Combined change-gated pass: repair (delegates to
+                    # repair_incomplete_turn) + lossless stale-media eviction.
+                    # Offloaded to a worker thread so a large transcript can't
+                    # block the shared daemon event loop, and overlapped with the
+                    # subsequent client.connect() — same as the original repair.
                     await asyncio.get_event_loop().run_in_executor(
                         None,
-                        self._store.repair_incomplete_turn,
+                        self._prepare_resume_transcript,
                         _repair_id,
                         cwd or "",
                     )

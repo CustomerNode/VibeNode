@@ -332,14 +332,24 @@ class TestJsonlRepairOnResume:
     staying wedged forever.
     """
 
-    # Anchor on the actual call reference rather than the bare word, which also
-    # appears in the explanatory comment block above the call.
-    CALL = "self._store.repair_incomplete_turn"
+    # The resume self-heal now runs through the combined change-gated
+    # pre-resume pass (_prepare_resume_transcript → store.prepare_for_resume),
+    # which DELEGATES to repair_incomplete_turn for the same repair semantics
+    # while ALSO performing lossless stale-media eviction (see
+    # docs/plans/large-session-perf.md).  Anchor on that call reference.
+    CALL = "self._prepare_resume_transcript"
 
     def test_repair_called_in_drive_session(self, sm_module):
-        """_drive_session must call repair_incomplete_turn (resume self-heal)."""
+        """_drive_session must sanitize the transcript on resume (self-heal),
+        now via the combined pre-resume pass that delegates to repair."""
         src = inspect.getsource(sm_module.SessionManager._drive_session)
         assert self.CALL in src
+        # The combined pass must still delegate to repair — verify the store
+        # method that does so exists and is wired through.
+        prep = inspect.getsource(
+            sm_module.SessionManager._prepare_resume_transcript)
+        assert "prepare_for_resume" in prep
+        assert "repair_incomplete_turn" in prep  # fallback / delegation anchor
 
     def test_repair_gated_by_resume(self, sm_module):
         """The repair must only run when resuming — a fresh session has no
