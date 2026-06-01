@@ -127,11 +127,18 @@ def load_session_summary(path: Path) -> dict:
     effective_title = user_set_name or custom_title
 
     last_activity_ts = last_ts.timestamp() if last_ts else 0
-    # effective_ts = newest of (last user/assistant message, file mtime).
-    # File mtime catches interactions that don't add messages (renames,
-    # autoname appends, fork operations) so the sidebar sort bubbles a
-    # touched session up even when no new conversation happened.
-    effective_ts = max(last_activity_ts, st.st_mtime)
+    # effective_ts seeds from the last real conversation message.  We do
+    # NOT max with file mtime — the Claude SDK appends untimestamped
+    # state entries (ai-title, mode, last-prompt, file-history-snapshot)
+    # to sessions in the background, which bumps mtime without any
+    # actual user interaction.  Maxing with mtime made those background
+    # writes bubble unrelated sessions to the top of the sidebar (one
+    # CustomerNode incident clustered 7 sessions at the same mtime
+    # minute and pushed the user's actually-recent conversation 9
+    # positions down).  Non-message user interactions bubble via the
+    # access_ts overlay (see _overlay_access_ts) which is fed by
+    # explicit UI hooks: click, send_message, rename, touch.
+    effective_ts = last_activity_ts
     result = {
         "id": path.stem,
         "custom_title": effective_title,
@@ -275,9 +282,11 @@ def load_session(path: Path) -> dict:
     effective_title = user_set_name or custom_title
 
     last_activity_ts = last_ts.timestamp() if last_ts else 0
-    # effective_ts mirrors load_session_summary so consumers of the full
-    # session payload sort consistently with the sidebar.
-    effective_ts = max(last_activity_ts, path.stat().st_mtime)
+    # See load_session_summary for the rationale: mtime is too noisy
+    # because the SDK appends untimestamped state entries in the
+    # background.  Non-message interactions reach the sort via the
+    # access_ts overlay applied below.
+    effective_ts = last_activity_ts
     payload = {
         "id": path.stem,
         "custom_title": effective_title,

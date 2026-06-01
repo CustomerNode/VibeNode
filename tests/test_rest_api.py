@@ -435,6 +435,28 @@ class TestRenameSession:
         assert path.stat().st_size == before_size
         assert path.stat().st_mtime == before_mtime
 
+    def test_rename_records_session_access(
+        self, client, populated_project, fake_project, monkeypatch,
+    ):
+        """Rename is a deliberate user interaction and MUST bubble the
+        session.  After dropping file-mtime from effective_ts (SDK
+        background writes pollute it), renames bubble via the access
+        store instead.  If this regresses, renames would stop moving
+        the session in the sidebar at all."""
+        monkeypatch.setattr(
+            "app.session_store._sessions_dir",
+            lambda project="": fake_project,
+        )
+        access_file = fake_project / "_session_access.json"
+        if access_file.exists():
+            access_file.unlink()
+        resp = client.post("/api/rename/sess-001",
+                           json={"title": "Fresh Name"})
+        assert resp.status_code == 200
+        assert access_file.exists()
+        data = json.loads(access_file.read_text(encoding="utf-8"))
+        assert "sess-001" in data
+
     def test_rename_repeated_with_same_title_only_appends_once(
         self, client, populated_project, fake_project,
     ):

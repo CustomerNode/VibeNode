@@ -388,6 +388,11 @@ def api_rename(session_id):
     path = _sessions_dir(project) / f"{session_id}.jsonl"
     _append_custom_title_if_changed(path, new_title, session_id)
 
+    # Rename is a deliberate user interaction — bubble the session in the
+    # sidebar sort.  effective_ts no longer uses file mtime (SDK
+    # background writes pollute it), so we record access explicitly here.
+    _record_session_access(session_id, project)
+
     return jsonify({"ok": True, "title": new_title})
 
 
