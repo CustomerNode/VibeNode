@@ -148,6 +148,38 @@ paths:
               schema:
                 type: string
 
+  /fix-from-watchdog:
+    get:
+      tags: [App]
+      summary: Open a CustomerNode fix session from a Watchdog error email
+      operationId: fixFromWatchdog
+      description: |
+        Landing target for the "Draft fix in VibeNode" button in a CustomerNode
+        Watchdog error email. The `d` param is the whole error (gzip + base64url
+        JSON) built by CustomerNode's `reports/fix_link.py`. The route switches
+        the active project to CustomerNode, forces the manual permission policy
+        so the agent pauses before editing, starts a new session pre-loaded with
+        the traceback, and returns an HTML interstitial that points the SPA at
+        the new session.
+      parameters:
+        - name: d
+          in: query
+          required: true
+          schema:
+            type: string
+          description: gzip + base64url-encoded JSON error payload
+      responses:
+        "200":
+          description: HTML interstitial that redirects the SPA to the new session
+          content:
+            text/html:
+              schema:
+                type: string
+        "400":
+          description: Missing or undecodable payload
+        "502":
+          description: Failed to start the fix session
+
   /api/restart:
     post:
       tags: [App]
