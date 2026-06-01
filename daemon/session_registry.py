@@ -152,11 +152,34 @@ class SessionRegistry:
 
             now = time.time()
             recovered = 0
+            # Read persisted queues — sessions with messages waiting in their
+            # queue at restart time MUST be recovered too, otherwise the
+            # message sits orphaned with no session task to consume it.  Build
+            # the set once outside the loop so the per-session check is O(1).
+            queued_sids = set()
+            try:
+                from pathlib import Path
+                qpath = Path.home() / ".claude" / "gui_message_queues.json"
+                if qpath.exists():
+                    import json as _json
+                    qdata = _json.loads(qpath.read_text(encoding="utf-8"))
+                    queued_sids = {
+                        sid for sid, msgs in qdata.items()
+                        if isinstance(msgs, list) and msgs
+                    }
+            except Exception as _qerr:
+                logger.warning("Could not read queue file for recovery: %s", _qerr)
+
             for sid, meta in sessions.items():
                 state = meta.get("state", "stopped")
-                # Only recover sessions that were mid-task (working/waiting).
-                # Idle sessions were done — no need to resume them.
-                if state not in ("working", "waiting", "starting"):
+                # Recover sessions that were mid-task (working/waiting/
+                # starting) OR sessions that have queued messages waiting to
+                # be delivered.  Pure-idle sessions with no queue are skipped
+                # — the user isn't expecting them to do anything until they
+                # send a new message (which auto-resumes them via the
+                # send_message fallback path).
+                if state not in ("working", "waiting", "starting") \
+                        and sid not in queued_sids:
                     continue
 
                 # Never recover planner sessions

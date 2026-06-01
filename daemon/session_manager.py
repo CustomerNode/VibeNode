@@ -579,7 +579,67 @@ class SessionManager:
         with self._lock:
             info = self._sessions.get(session_id)
         if not info:
-            return {"ok": False, "error": "Session not found"}
+            # Session isn't loaded in this daemon process.  Three reasons this
+            # happens AFTER startup recovery has run:
+            #   (a) the daemon was restarted while the session was IDLE — the
+            #       registry's recover_sessions() skips non-working sessions,
+            #       so they're absent from _sessions but the .jsonl is still
+            #       on disk and any pending queued messages are still alive.
+            #   (b) the session hit a fatal error (e.g. the thinking-block
+            #       400) that force-IDLE'd it; a later restart didn't recover.
+            #   (c) the user reopens an old session tab in the UI long after
+            #       the daemon was bounced.
+            # Before the fix below, send_message returned "Session not found"
+            # in all three cases, the frontend showed send_failed, AND any
+            # message that had been queued before the restart sat orphaned in
+            # the queue forever (no task to consume it).
+            # Fix: if the .jsonl exists on disk, auto-resume the session right
+            # here, then re-enter send_message so the message dispatches
+            # normally (covering both the new text and any queued backlog).
+            try:
+                jsonl = self._store.find_session_path(session_id)
+            except Exception:
+                jsonl = None
+            if jsonl and jsonl.exists():
+                # Recover cwd/model/name from the registry if available — the
+                # CLI's --resume needs cwd to find the right .jsonl, and the
+                # user's chosen model must be preserved across the restart.
+                reg = {}
+                try:
+                    reg = self._registry.load_registry().get("sessions", {}).get(
+                        session_id, {}
+                    ) or {}
+                except Exception:
+                    pass
+                cwd = reg.get("cwd") or ""
+                if cwd:
+                    cwd = os.path.normpath(cwd)
+                logger.info(
+                    "send_message: auto-resuming idle/dropped session %s "
+                    "(cwd=%s) before delivery", session_id, cwd or "(none)"
+                )
+                start_result = self.start_session(
+                    session_id=session_id,
+                    prompt="",
+                    cwd=cwd,
+                    name=reg.get("name", ""),
+                    resume=True,
+                    model=reg.get("model") or None,
+                )
+                if not start_result.get("ok"):
+                    # start_session can return ok=False if e.g. another race
+                    # already created the session; in that case _sessions now
+                    # has the entry and the re-enter below succeeds anyway.
+                    logger.warning(
+                        "send_message auto-resume returned %r for %s",
+                        start_result, session_id,
+                    )
+                with self._lock:
+                    info = self._sessions.get(session_id)
+                if not info:
+                    return {"ok": False, "error": "Session not found"}
+            else:
+                return {"ok": False, "error": "Session not found"}
 
         # Atomic state check + set under per-session lock to prevent two
         # concurrent send_message calls from both seeing IDLE and both
@@ -2812,28 +2872,108 @@ class SessionManager:
                     # transcript and resends the last user message.  The
                     # heal_count <= 3 guard bounds the retries.
                     if _is_thinking_block_modified_error(_asst_text):
+                        # The CLI's in-memory transcript is poisoned with
+                        # empty-but-signed thinking blocks; the API rejected
+                        # this turn and the CLI surfaced the 400 as plain
+                        # assistant text (no transport exception).  Every
+                        # follow-up send replays the same bad in-memory
+                        # history and 400s identically until we tear down
+                        # the CLI and replay the (healed) on-disk transcript.
                         if not hasattr(info, '_stream_heal_count'):
                             info._stream_heal_count = 0
                         info._stream_heal_count += 1
-                        info._stream_heal_needed = True
                         logger.warning(
                             "STREAM_HEAL_TRIGGER site=asst_thinking_block_400 "
-                            "sid=%s state=%s heal_count=%d snippet=%r",
+                            "sid=%s state=%s heal_count=%d snippet=%r "
+                            "— in-place heal+retry",
                             session_id,
                             getattr(info.state, 'value', info.state),
                             info._stream_heal_count, _asst_text[:200],
                         )
+                        # 1) Heal the on-disk JSONL so --resume replays a
+                        #    clean transcript.  Synchronous: the 400 already
+                        #    cost a full RTT — a few ms of file I/O is
+                        #    invisible to the user.
+                        try:
+                            self._store.repair_incomplete_turn(
+                                self._resolve_id(session_id), cwd=info.cwd or ""
+                            )
+                        except Exception as _rep_err:
+                            logger.warning(
+                                "thinking-400 disk heal failed for %s: %s",
+                                session_id, _rep_err,
+                            )
+
+                        # 2) Find the user message we need to re-send.
+                        last_user_text = None
+                        with info._lock:
+                            for e in reversed(info.entries):
+                                if e.kind == "user":
+                                    last_user_text = e.text
+                                    break
+
+                        # 3) User-visible status — replaces the raw API error.
                         entry = LogEntry(
                             kind="system",
-                            text="Recovering from an interrupted-response error "
-                                 "— reconnecting and retrying automatically",
+                            text="Recovering from interrupted-response error "
+                                 "— retrying your message…",
                         )
                         with info._lock:
                             info.entries.append(entry)
                             entry_index = len(info.entries) - 1
                         self._emit_entry(session_id, entry, entry_index)
-                        # Don't also render the raw API error as an assistant
-                        # bubble — the status entry above explains it and the
+
+                        # 4) Detach the poisoned client and force state to
+                        #    IDLE *before* the retry so send_message takes the
+                        #    fast path (immediate dispatch) instead of the
+                        #    queue path (which only drains after the current
+                        #    task fully unwinds — observed delay 80+ seconds).
+                        #    _interrupted=True + _superseded=True make the
+                        #    current _send_query's finally bail without
+                        #    re-touching state.  send_message itself re-clears
+                        #    _interrupted on the retry path so it's transient.
+                        _doomed = info.client
+                        info.client = None
+                        info.state = SessionState.IDLE
+                        info._interrupted = True
+                        info._listener_superseded = True
+                        # Dispose the poisoned CLI subprocess in the background;
+                        # don't await on the same loop tick we're reading from.
+                        if _doomed is not None:
+                            async def _kill_poisoned_client(c):
+                                try:
+                                    await self._sdk.disconnect(c)
+                                except Exception:
+                                    pass
+                            asyncio.create_task(_kill_poisoned_client(_doomed))
+
+                        # 5) Bounded auto-retry.  Schedule on the loop so
+                        #    locking + state semantics behave exactly like a
+                        #    fresh user send.  send_message will see state=IDLE
+                        #    and dispatch immediately; _send_query will see
+                        #    client=None and reconnect.  The whole round-trip
+                        #    is typically <5 s vs. the prior 80+ s queue path.
+                        if info._stream_heal_count <= 3 and last_user_text:
+                            self._loop.call_soon_threadsafe(
+                                lambda txt=last_user_text:
+                                    self.send_message(
+                                        session_id, txt, _self_heal=True
+                                    )
+                            )
+                        elif info._stream_heal_count > 3:
+                            # Persistent failure — surface to user, stop spinning.
+                            entry = LogEntry(
+                                kind="system",
+                                text="Repeated interrupted-response errors — "
+                                     "please resend your message manually.",
+                                is_error=True,
+                            )
+                            with info._lock:
+                                info.entries.append(entry)
+                                entry_index = len(info.entries) - 1
+                            self._emit_entry(session_id, entry, entry_index)
+                        # Skip rendering the raw API error as an assistant
+                        # bubble — the system entry above explains it and the
                         # retry supersedes it.
                         continue
 
