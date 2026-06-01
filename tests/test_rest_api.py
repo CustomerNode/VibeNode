@@ -1194,10 +1194,34 @@ class TestConfig:
     def test_get_config_invalid_json(self, client, tmp_path):
         claude_dir = tmp_path / ".claude"
         claude_dir.mkdir()
-        (claude_dir / "settings.json").write_text("not json!", encoding="utf-8")
+        corrupt = claude_dir / "settings.json"
+        corrupt.write_text("not json!", encoding="utf-8")
+        before = corrupt.read_text(encoding="utf-8")
         with patch("app.routes.live_api.Path.home", return_value=tmp_path):
             resp = client.get("/api/config")
         assert resp.status_code == 500
+        # GET is read-only: a corrupt file is never overwritten. The browser
+        # mirror skips the PUT on this 500, so settings.json stays intact.
+        assert corrupt.read_text(encoding="utf-8") == before
+
+    # --- Retention mirror: GET-merge-PUT contract (added 2026-05-30) ---
+
+    def test_config_put_preserves_other_keys(self, client, tmp_path):
+        """The browser mirrors cleanupPeriodDays via GET-merge-PUT (the endpoint
+        is a whole-file replace).  Seeding theme, then merging cleanupPeriodDays
+        into the full GET result and PUTting it, must keep BOTH keys — a partial
+        PUT of just {cleanupPeriodDays} would wipe the user's other settings.
+        """
+        with patch("app.routes.live_api.Path.home", return_value=tmp_path):
+            client.put("/api/config", json={"theme": "dark"})
+            cur = client.get("/api/config").get_json()
+            assert cur.get("theme") == "dark"
+            cur["cleanupPeriodDays"] = 30          # merge one key client-side
+            r = client.put("/api/config", json=cur)
+            assert r.status_code == 200
+            body = client.get("/api/config").get_json()
+        assert body.get("theme") == "dark"
+        assert body.get("cleanupPeriodDays") == 30
 
 
 class TestModels:

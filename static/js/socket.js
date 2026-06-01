@@ -130,6 +130,15 @@ socket.on('ui_prefs_loaded', (data) => {
             socket.emit('set_ui_prefs', { sendBehavior: local });
         }
     }
+    // Session retention policy (drives the "Recently Deleted" selector).
+    // Cache the value and, if the trash modal is open, sync the dropdown.
+    // Absent/invalid values default to Forever (36500) inside
+    // applyRetentionPref — never 30.
+    const rd = Number(data.session_retention_days);
+    window._sessionRetentionDays = Number.isFinite(rd) && rd > 0 ? rd : 36500;
+    if (typeof applyRetentionPref === 'function') {
+        applyRetentionPref(window._sessionRetentionDays);
+    }
 });
 
 // Server-initiated session list refresh — emitted by admin maintenance

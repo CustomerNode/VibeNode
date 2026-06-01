@@ -125,6 +125,12 @@ _FINDING_SUPPRESSIONS = [
     # Workforce agent docs use classification terms as templates
     (re.compile(r'workforce/'), "Confidential Marker"),
     (re.compile(r'docs/'), "Confidential Marker"),
+    # session_store.py defines Python constants whose NAMES end in _KEY
+    # (e.g. _RETENTION_PREFS_KEY = "session_retention_days"). The
+    # "Env Variable Secret" pattern matches the variable name, not a
+    # credential — the value is a plain dict-key string. Suppress only this
+    # finding type for this file; all other secret patterns still run.
+    (re.compile(r'app/session_store\.py$'), "Env Variable Secret"),
 ]
 
 # Files that should NEVER be committed (beyond .gitignore)

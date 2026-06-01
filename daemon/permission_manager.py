@@ -153,6 +153,15 @@ class PermissionManager:
     # UI Preferences persistence
     # ------------------------------------------------------------------
 
+    # Allowed session-retention values (days) for the "Recently Deleted"
+    # retention selector.  36500 == "Forever".  Defined here so the daemon
+    # (authoritative writer), the browser, and the tests share one source.
+    # A ``session_retention_days`` not in this set is dropped on the set path;
+    # the read-side resolver in ``session_store`` separately defaults any
+    # bad/missing value to Forever (never 30).
+    RETENTION_CHOICES = (30, 60, 90, 36500)
+    RETENTION_PREFS_KEY = "session_retention_days"
+
     def _load_ui_prefs(self) -> dict:
         """Load persisted UI preferences from disk."""
         try:
@@ -166,7 +175,10 @@ class PermissionManager:
         return {}
 
     def _save_ui_prefs(self):
-        """Persist UI preferences to disk."""
+        """Persist UI preferences to disk.
+
+        Single-writer (daemon only); session_store reads it read-only.
+        """
         try:
             self._ui_prefs_path.parent.mkdir(parents=True, exist_ok=True)
             self._ui_prefs_path.write_text(json.dumps(self._ui_prefs))
@@ -178,8 +190,26 @@ class PermissionManager:
         return dict(self._ui_prefs)
 
     def set_ui_prefs(self, prefs: dict) -> None:
-        """Merge new preferences into saved UI prefs and persist."""
+        """Merge new preferences into saved UI prefs and persist.
+
+        Defensive validation: if ``session_retention_days`` is present but not
+        one of ``RETENTION_CHOICES``, drop ONLY that key (other prefs are kept
+        and saved normally).  Keeps the daemon authoritative so a malformed
+        value can never land in prefs.
+        """
         if not isinstance(prefs, dict):
+            return
+        prefs = dict(prefs)  # don't mutate the caller's dict
+        if self.RETENTION_PREFS_KEY in prefs:
+            val = prefs[self.RETENTION_PREFS_KEY]
+            # bool is an int subclass — reject it explicitly.
+            if isinstance(val, bool) or val not in self.RETENTION_CHOICES:
+                logger.warning(
+                    "Dropping invalid %s=%r (not in %r)",
+                    self.RETENTION_PREFS_KEY, val, self.RETENTION_CHOICES,
+                )
+                prefs.pop(self.RETENTION_PREFS_KEY, None)
+        if not prefs:
             return
         self._ui_prefs.update(prefs)
         self._save_ui_prefs()

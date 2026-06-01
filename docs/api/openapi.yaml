@@ -485,6 +485,114 @@ paths:
               schema:
                 $ref: "#/components/schemas/OkResponse"
 
+  /api/trash:
+    get:
+      tags: [Sessions]
+      summary: List soft-deleted (recoverable) sessions
+      description: >
+        Returns soft-deleted sessions for the active project, newest first.
+        Each entry includes its saved title, deletion time, size, and the
+        computed purge time so the UI can offer one-click restore. Entries are
+        pruned lazily on the next trash operation per the user's retention
+        policy (session_retention_days; default Forever), honoring per-entry
+        grandfather protection. The selector that sets this policy also mirrors
+        the value to Claude Code's cleanupPeriodDays via the existing
+        GET/PUT /api/config (no new endpoint).
+      operationId: listTrash
+      parameters:
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Trash listing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  trash:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string
+                        deleted_at:
+                          type: number
+                        deleted_at_iso:
+                          type: string
+                        size:
+                          type: integer
+                        purge_at:
+                          type: number
+                          nullable: true
+                          description: >
+                            Epoch seconds when this entry will auto-delete under
+                            the active retention policy, or null when kept
+                            forever. Additive field.
+                        purge_at_iso:
+                          type: string
+                          nullable: true
+                          description: ISO-8601 form of purge_at (null when kept forever).
+
+  /api/trash/{session_id}/restore:
+    post:
+      tags: [Sessions]
+      summary: Restore a soft-deleted session from trash
+      operationId: restoreTrash
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session restored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  id:
+                    type: string
+                  title:
+                    type: string
+        "404":
+          description: Not found in trash
+
+  /api/trash/{session_id}:
+    delete:
+      tags: [Sessions]
+      summary: Permanently delete one trashed session (no further undo)
+      operationId: purgeTrash
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session purged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  purged:
+                    type: boolean
+
   /api/delete-all:
     delete:
       tags: [Sessions]

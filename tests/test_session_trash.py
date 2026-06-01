@@ -154,6 +154,144 @@ class TestTrashStore:
 
 
 # ===========================================================================
+# Retention policy (added 2026-05-30) — driven by gui_ui_prefs.json
+# ===========================================================================
+# Every test here MUST repoint ``_UI_PREFS_PATH`` to a tmp file so the real
+# ~/.claude/gui_ui_prefs.json is never read or written (conftest protects it).
+
+def _set_prefs(monkeypatch, tmp_path, value):
+    """Point ss._UI_PREFS_PATH at a tmp file. ``value``: None=no file,
+    str=raw bytes (corrupt), dict=JSON."""
+    p = tmp_path / "gui_ui_prefs.json"
+    if value is None:
+        if p.exists():
+            p.unlink()
+    elif isinstance(value, str):
+        p.write_text(value, encoding="utf-8")
+    else:
+        p.write_text(json.dumps(value), encoding="utf-8")
+    monkeypatch.setattr(ss, "_UI_PREFS_PATH", p)
+    return p
+
+
+def _backdate(sid, seconds_ago, extra=None):
+    idx = ss._load_trash_index()
+    idx[sid]["deleted_at"] = time.time() - seconds_ago
+    if extra:
+        idx[sid].update(extra)
+    ss._save_trash_index(idx)
+
+
+class TestRetentionPolicy:
+    def test_retention_default_is_forever(self, sdir, tmp_path, monkeypatch):
+        # No prefs file at all → Forever; a 60-day-old entry survives.
+        _set_prefs(monkeypatch, tmp_path, None)
+        assert ss._retention_days() == 36500
+        sid = str(uuid.uuid4())
+        _seed(sdir, sid)
+        ss.move_to_trash(sid, name="keep")
+        _backdate(sid, 60 * 86400)
+        assert any(it["id"] == sid for it in ss.list_trash())
+
+    def test_retention_corrupt_prefs_defaults_forever(self, sdir, tmp_path, monkeypatch):
+        _set_prefs(monkeypatch, tmp_path, "not json!!")
+        assert ss._retention_days() == 36500
+
+    @pytest.mark.parametrize("bad", [
+        {"session_retention_days": True},
+        {"session_retention_days": 0},
+        {"session_retention_days": -5},
+        {"session_retention_days": "30"},
+        {"session_retention_days": None},
+        {},
+    ])
+    def test_retention_garbage_value_defaults_forever(self, tmp_path, monkeypatch, bad):
+        _set_prefs(monkeypatch, tmp_path, bad)
+        assert ss._retention_days() == 36500
+
+    def test_retention_30_purges_old(self, sdir, tmp_path, monkeypatch):
+        _set_prefs(monkeypatch, tmp_path, {"session_retention_days": 30})
+        sid = str(uuid.uuid4())
+        _seed(sdir, sid)
+        ss.move_to_trash(sid, name="old")
+        _backdate(sid, 31 * 86400)  # no protected_until
+        assert ss.list_trash() == []
+        assert not (ss._trash_dir() / f"{sid}.jsonl").exists()
+
+    def test_retention_60_keeps_old(self, sdir, tmp_path, monkeypatch):
+        _set_prefs(monkeypatch, tmp_path, {"session_retention_days": 60})
+        sid = str(uuid.uuid4())
+        _seed(sdir, sid)
+        ss.move_to_trash(sid, name="mid")
+        _backdate(sid, 45 * 86400)
+        assert any(it["id"] == sid for it in ss.list_trash())
+
+    def test_monkeypatched_constant_still_wins(self, sdir, tmp_path, monkeypatch):
+        # Even with a Forever policy, an explicit _TRASH_MAX_AGE monkeypatch
+        # (back-compat / the original pruning test) takes precedence.
+        _set_prefs(monkeypatch, tmp_path, {"session_retention_days": 36500})
+        monkeypatch.setattr(ss, "_TRASH_MAX_AGE", 10)
+        sid = str(uuid.uuid4())
+        _seed(sdir, sid)
+        ss.move_to_trash(sid, name="x")
+        _backdate(sid, 9999)
+        assert ss.list_trash() == []
+
+    def test_lengthening_never_purges(self, sdir, tmp_path, monkeypatch):
+        # Policy 30 but the entry is grandfather-protected for 90 days → kept.
+        _set_prefs(monkeypatch, tmp_path, {"session_retention_days": 30})
+        sid = str(uuid.uuid4())
+        _seed(sdir, sid)
+        ss.move_to_trash(sid, name="g")
+        now = time.time()
+        _backdate(sid, 40 * 86400, extra={"protected_until": now + 50 * 86400})
+        assert any(it["id"] == sid for it in ss.list_trash())
+
+    def test_shortening_grandfathers(self, sdir, tmp_path, monkeypatch):
+        _set_prefs(monkeypatch, tmp_path, {"session_retention_days": 30})
+        sid = str(uuid.uuid4())
+        _seed(sdir, sid)
+        ss.move_to_trash(sid, name="g2")
+        now = time.time()
+        # 35 days old, but protected_until in the future → not purged.
+        _backdate(sid, 35 * 86400, extra={"protected_until": now + 10 * 86400})
+        assert any(it["id"] == sid for it in ss.list_trash())
+
+    def test_purge_at_in_list(self, sdir, tmp_path, monkeypatch):
+        sid = str(uuid.uuid4())
+        _seed(sdir, sid)
+        ss.move_to_trash(sid, name="p")
+        # Forever → purge_at is None.
+        _set_prefs(monkeypatch, tmp_path, {"session_retention_days": 36500})
+        it = next(x for x in ss.list_trash() if x["id"] == sid)
+        assert it["purge_at"] is None
+        # Finite → purge_at is a number.
+        _set_prefs(monkeypatch, tmp_path, {"session_retention_days": 60})
+        it = next(x for x in ss.list_trash() if x["id"] == sid)
+        assert isinstance(it["purge_at"], (int, float))
+
+    def test_reconcile_stamps_protected_until(self, sdir, tmp_path, monkeypatch):
+        _set_prefs(monkeypatch, tmp_path, {"session_retention_days": 30})
+        sid = str(uuid.uuid4())
+        _seed(sdir, sid)
+        ss.move_to_trash(sid, name="r")
+        idx = ss._load_trash_index()
+        deleted_at = idx[sid]["deleted_at"]
+        assert "protected_until" not in idx[sid]
+        n = ss.reconcile_retention_on_shorten(90, 30)
+        assert n == 1
+        idx = ss._load_trash_index()
+        expected = deleted_at + 90 * 86400
+        assert idx[sid]["protected_until"] == expected
+        # Idempotent: re-running keeps the max, does not stack.
+        ss.reconcile_retention_on_shorten(90, 30)
+        idx = ss._load_trash_index()
+        assert idx[sid]["protected_until"] == expected
+        # Lengthening is a no-op.
+        assert ss.reconcile_retention_on_shorten(30, 90) == 0
+
+
+# ===========================================================================
 # Layer 2 — route wiring through the Flask test client
 # ===========================================================================
 

@@ -667,11 +667,14 @@ def api_trash_list():
 
     Returns the trashed sessions newest-deleted first, each with its saved
     title, deletion timestamp, and transcript size so the UI can offer a
-    one-click restore.  Entries expire after _TRASH_MAX_AGE (30 days).
+    one-click restore.  Entries expire per the user's retention policy
+    (``session_retention_days``; default Forever), honoring per-entry
+    grandfather protection — see ``session_store._prune_trash``.  Each item
+    also carries an additive ``purge_at`` epoch (None == kept forever).
     """
     project = request.args.get("project", "").strip()
     items = list_trash(project)
-    # Add a human-friendly ISO timestamp without changing the raw epoch.
+    # Add human-friendly ISO timestamps without changing the raw epochs.
     for it in items:
         try:
             it["deleted_at_iso"] = datetime.fromtimestamp(
@@ -679,6 +682,14 @@ def api_trash_list():
             ).isoformat()
         except Exception:
             it["deleted_at_iso"] = ""
+        pa = it.get("purge_at")
+        try:
+            it["purge_at_iso"] = (
+                datetime.fromtimestamp(pa, tz.utc).isoformat()
+                if pa is not None else None
+            )
+        except Exception:
+            it["purge_at_iso"] = None
     return jsonify({"ok": True, "trash": items})
 
 
