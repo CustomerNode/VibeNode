@@ -26,6 +26,21 @@ def _make_token(**fields) -> str:
         "request_id": fields.get("request_id", ""),
         "paths": fields.get("paths", []),
     }
+    payload["kind"] = fields.get("kind", "error")
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(gzip.compress(raw)).decode("ascii").rstrip("=")
+
+
+def _make_infra_token(**fields) -> str:
+    """Mirror CustomerNode's encode_infra_payload (kind=infra)."""
+    payload = {
+        "kind": "infra",
+        "check_name": fields.get("check_name", ""),
+        "severity": fields.get("severity", ""),
+        "message": fields.get("message", ""),
+        "detail": fields.get("detail", ""),
+        "runbook_cmd": fields.get("runbook_cmd", ""),
+    }
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(gzip.compress(raw)).decode("ascii").rstrip("=")
 
@@ -86,6 +101,31 @@ def test_opens_customernode_session_with_manual_approval(app, client):
     assert "tasks/lessons/production/" in kw["prompt"]
     assert "_timeouterror_journey.md" in kw["prompt"]
     assert "Title" in kw["prompt"] and "Solution" in kw["prompt"] and "Lesson" in kw["prompt"]
+
+
+def test_opens_session_for_infra_issue(app, client):
+    tok = _make_infra_token(
+        check_name="root_disk", severity="critical", message="/ at 95% used",
+        detail="5 GB free of 100 GB", runbook_cmd="df -h /",
+    )
+    with patch(
+        "app.routes.watchdog_api._resolve_customernode_project",
+        return_value=("C--example-CustomerNode", r"C:\example\CustomerNode"),
+    ):
+        resp = client.get("/fix-from-watchdog?d=" + tok)
+
+    assert resp.status_code == 200
+    kw = app.session_manager.start_session.call_args.kwargs
+    prompt = kw["prompt"]
+    # Infra-flavored prompt (not "production error"), with the check + runbook.
+    assert "infrastructure issue" in prompt.lower()
+    assert "root_disk" in prompt
+    assert "df -h /" in prompt
+    # Remediation log slug derives from the check name.
+    assert "tasks/lessons/production/" in prompt
+    assert "_root_disk.md" in prompt
+    # Still forces manual approval.
+    app.session_manager.set_permission_policy.assert_called_once_with("manual")
 
 
 def test_missing_payload_is_400(client):

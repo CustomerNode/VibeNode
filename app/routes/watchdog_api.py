@@ -77,27 +77,38 @@ def _decode_token(token: str) -> dict:
     return json.loads(raw)
 
 
-def _remediation_slug(exc_type: str, location: str) -> str:
-    """A lowercase ``<exc>_<short-location>`` slug for the lesson filename,
-    e.g. ('TimeoutError', 'core/services/journey.py:212') -> 'timeouterror_journey'."""
-    base = (location.split(":")[0].rsplit("/", 1)[-1].rsplit(".", 1)[0]) if location else ""
-    raw = f"{exc_type}_{base}".lower()
-    slug = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
-    return slug or "production_error"
+def _slugify(*parts: str) -> str:
+    """Lowercase ``a_b`` slug from the given parts, safe for a filename."""
+    slug = re.sub(r"[^a-z0-9]+", "_", "_".join(p for p in parts if p).lower()).strip("_")
+    return slug or "production_issue"
 
 
-def _build_fix_prompt(p: dict, date_str: str) -> str:
-    """Turn the decoded error into the session's opening instruction.
+def _remediation_footer(log_path: str) -> list:
+    """Shared instruction: log the issue + fix in the standardized format."""
+    return [
+        "",
+        "As PART of the fix, also write a production remediation log so this issue "
+        "and its fix are recorded:",
+        f"- File: `{log_path}`",
+        "- Follow the format in `tasks/lessons/production/_TEMPLATE.md` exactly: "
+        "the four sections **Title → Traceback → Solution → Lesson**, in order.",
+        "- Title = one-line plain-terms summary. Traceback = the evidence above "
+        "(traceback for a code error; the check detail / command output for an "
+        "infra issue), verbatim. Solution = the actual root-cause change (files or "
+        "config touched). Lesson = the generalizable takeaway + what would have "
+        "caught it earlier.",
+    ]
 
-    ``date_str`` (YYYY-MM-DD, remediation date) seeds the deterministic
-    remediation-log filename so the agent doesn't have to guess today's date."""
+
+def _build_error_prompt(p: dict, date_str: str) -> str:
     exc_type = (p.get("exc_type") or "Error").strip()
     location = (p.get("location") or "unknown").strip()
     message = (p.get("message") or "").strip()
     traceback = (p.get("traceback") or "").strip()
     request_id = (p.get("request_id") or "").strip()
     paths = p.get("paths") or []
-    log_path = f"tasks/lessons/production/{date_str}_{_remediation_slug(exc_type, location)}.md"
+    base = (location.split(":")[0].rsplit("/", 1)[-1].rsplit(".", 1)[0]) if location else ""
+    log_path = f"tasks/lessons/production/{date_str}_{_slugify(exc_type, base)}.md"
 
     lines = [
         "A production error was caught by CustomerNode's Watchdog. Investigate the "
@@ -118,17 +129,60 @@ def _build_fix_prompt(p: dict, date_str: str) -> str:
         "",
         "Read the relevant AGENTS.md first, find the root cause (not a band-aid), "
         "then propose the fix. Do NOT apply any change until I approve it.",
-        "",
-        "As PART of the fix, also write a production remediation log so this issue "
-        "and its fix are recorded:",
-        f"- File: `{log_path}`",
-        "- Follow the format in `tasks/lessons/production/_TEMPLATE.md` exactly: "
-        "the four sections **Title → Traceback → Solution → Lesson**, in order.",
-        "- Title = one-line plain-terms summary. Traceback = the trace above, "
-        "verbatim. Solution = the actual root-cause change (files touched). "
-        "Lesson = the generalizable takeaway + what would have caught it earlier.",
     ]
+    lines += _remediation_footer(log_path)
     return "\n".join(lines)
+
+
+def _build_infra_prompt(p: dict, date_str: str) -> str:
+    check_name = (p.get("check_name") or "infra_issue").strip()
+    severity = (p.get("severity") or "").strip()
+    message = (p.get("message") or "").strip()
+    detail = (p.get("detail") or "").strip()
+    runbook_cmd = (p.get("runbook_cmd") or "").strip()
+    log_path = f"tasks/lessons/production/{date_str}_{_slugify(check_name)}.md"
+
+    headline = f"Watchdog flagged an infrastructure issue: {check_name}"
+    if severity:
+        headline += f" ({severity.upper()})"
+    lines = [
+        headline + ".",
+        "Investigate the root cause and propose a fix. This is an INFRASTRUCTURE "
+        "issue (deployment, container, disk, service, security, external API) — not "
+        "necessarily an application bug; the fix may be config, Docker, nginx, a "
+        "runbook step, or code.",
+        "",
+        f"- Check: {check_name}",
+    ]
+    if severity:
+        lines.append(f"- Severity: {severity}")
+    if message:
+        lines.append(f"- Summary: {message}")
+    if detail:
+        lines.append(f"- Detail: {detail}")
+    if runbook_cmd:
+        lines += ["", "Suggested runbook command (diagnostic starting point):",
+                  "```", runbook_cmd, "```"]
+    lines += [
+        "",
+        "Read the relevant AGENTS.md first (likely `infra/AGENTS.md` or a "
+        "subdirectory). Confirm the issue, find the root cause, then propose the "
+        "fix. Do NOT apply any change until I approve it.",
+    ]
+    lines += _remediation_footer(log_path)
+    return "\n".join(lines)
+
+
+def _build_fix_prompt(p: dict, date_str: str) -> str:
+    """Build the session's opening instruction from the decoded payload.
+
+    Dispatches on ``kind``: an error digest entry (code traceback) vs an infra
+    issue (flagged check from the morning/evening/weekly report). ``date_str``
+    (YYYY-MM-DD) seeds the deterministic remediation-log filename so the agent
+    doesn't have to guess today's date."""
+    if (p.get("kind") or "error") == "infra":
+        return _build_infra_prompt(p, date_str)
+    return _build_error_prompt(p, date_str)
 
 
 def _redirect_html(encoded_project: str, session_id: str) -> str:
