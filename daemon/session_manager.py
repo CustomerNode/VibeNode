@@ -110,6 +110,46 @@ _augment_path_for_cli()
 # See daemon/backends/claude.py for the Claude implementation.
 
 
+# ---------------------------------------------------------------------------
+# AskUserQuestion interception
+# ---------------------------------------------------------------------------
+# The Claude Agent SDK exposes an ``AskUserQuestion`` tool that pauses the turn
+# to present multiple-choice questions to the user.  VibeNode has NO interactive
+# UI to answer them — its permission flow is allow/deny only.  Whatever we do,
+# the tool is a trap:
+#
+#   • Auto-approve it (any policy other than "manual") → the CLI runs the tool
+#     with no answer source and hands the model a hollow result:
+#         "Your questions have been answered: . You can now continue ..."
+#     The model believes it got guidance, but the answer is EMPTY, so it ends
+#     the turn without doing the work it was about to ask about.  The session
+#     looks like it silently died.
+#   • Prompt for it manually → the user gets an allow/deny dialog with no way to
+#     actually pick an answer, so the turn stalls either way.
+#
+# Reproduced 2026-06-02 in session abc6bfac-fd6f-4eca-8757-eccb8d9c5e79: the
+# model proposed four concrete fixes via AskUserQuestion, was auto-approved, got
+# the empty "answered" result, and stopped without implementing any of them.
+#
+# Fix: never let AskUserQuestion execute.  Intercept it in can_use_tool and DENY
+# it WITHOUT interrupt.  A non-interrupting deny message is fed back to the model
+# as the tool result, so instead of an empty answer the model receives a
+# directive: proceed faithfully with what it was already asked, decide judgment
+# calls yourself, and surface any open question at the END of the response where
+# the user can revise it after the fact.  The turn keeps moving.
+INTERCEPT_ASK_USER_QUESTION = True
+ASK_USER_QUESTION_TOOL_NAME = "AskUserQuestion"
+ASK_USER_QUESTION_REDIRECT_MESSAGE = (
+    "You do not have the right to ask the user a question until you have "
+    "produced work. You have already been given the task — execute it to the "
+    "best of your ability, choosing the most reasonable options available at "
+    "every decision point, and carry it all the way through to completion. Do "
+    "not pause to ask. Once your work is done, you may retroactively present "
+    "these options to the user as alternative directions you could pursue, and "
+    "they can redirect you then. Proceed with the task now."
+)
+
+
 class SessionState(str, Enum):
     STARTING = "starting"
     WORKING = "working"
@@ -2705,6 +2745,51 @@ class SessionManager:
                 return manager._sdk.make_permission_result_deny(
                     message="Transport disconnected — reconnecting",
                     interrupt=True,
+                )
+
+            # ── AskUserQuestion redirect ──
+            # VibeNode has no interactive question UI, so this tool is a dead end
+            # however it resolves: auto-approving it returns an empty "answered"
+            # result that silently ends the turn, and prompting for it shows the
+            # user an unanswerable allow/deny dialog.  Instead, DENY without
+            # interrupt — the message below is fed back to the model as the tool
+            # result, telling it to proceed and surface the question at the end
+            # of its response rather than blocking.  This runs BEFORE every
+            # auto-approval path so the policy ("auto", "almost_always", etc.)
+            # can't let the question through.  See the module-level
+            # ASK_USER_QUESTION_REDIRECT_MESSAGE for the full rationale.
+            if INTERCEPT_ASK_USER_QUESTION and tool_name == ASK_USER_QUESTION_TOOL_NAME:
+                logger.info(
+                    "AskUserQuestion intercepted for %s — redirecting model to "
+                    "proceed instead of blocking on an unanswerable question",
+                    resolved_id,
+                )
+                # Surface the intercept in the session timeline so the user can
+                # see a question was raised (and where to look for it at the end
+                # of the response).  Must never break the permission flow.
+                try:
+                    _aq_entry = LogEntry(
+                        kind="permission",
+                        text=(
+                            "AskUserQuestion intercepted — VibeNode doesn't ask "
+                            "mid-task questions. The agent was told to proceed "
+                            "with its best judgment and surface the question at "
+                            "the end of its response."
+                        ),
+                        name=tool_name,
+                        is_error=False,
+                    )
+                    with info._lock:
+                        info.entries.append(_aq_entry)
+                        _aq_idx = len(info.entries) - 1
+                    manager._emit_entry(resolved_id, _aq_entry, _aq_idx)
+                except Exception as _aq_log_err:
+                    logger.warning(
+                        "Failed to log AskUserQuestion intercept: %s", _aq_log_err
+                    )
+                return manager._sdk.make_permission_result_deny(
+                    message=ASK_USER_QUESTION_REDIRECT_MESSAGE,
+                    interrupt=False,
                 )
 
             # ── CRITICAL: make_permission_result_allow always includes tool_input ──

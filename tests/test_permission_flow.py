@@ -518,3 +518,118 @@ class TestWebSocketEventVerification:
             assert len(errors) >= 1
 
             client.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# AskUserQuestion interception
+# ---------------------------------------------------------------------------
+# Regression coverage for the "empty answer kills the turn" bug: the Claude SDK
+# AskUserQuestion tool has no interactive UI in VibeNode, so it must be denied
+# with a redirect message (never auto-approved/executed, never prompted).
+# See the ASK_USER_QUESTION_* constants and can_use_tool in session_manager.py.
+
+def _run_async(coro):
+    """Run a coroutine to completion on a throwaway event loop.
+
+    The AskUserQuestion / auto-approve branches of can_use_tool resolve
+    synchronously (no anyio polling), so a fresh loop per call is fine and
+    keeps these tests off the manager's background loop.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+class TestAskUserQuestionInterception:
+
+    def _register_live_session(self, session_manager, sm_module, sid):
+        """Create a registered session whose transport reports as alive.
+
+        can_use_tool checks transport liveness before anything else and would
+        otherwise short-circuit to a 'Transport disconnected' deny against the
+        mock client.  We register a real SessionInfo with a client and force
+        is_transport_alive True so execution reaches the AskUserQuestion guard.
+        """
+        info = sm_module.SessionInfo(
+            session_id=sid, state=sm_module.SessionState.WORKING
+        )
+        info.client = MockClaudeSDKClient()
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+        # Force the transport to look alive so the dead-transport early-abort
+        # branch doesn't fire ahead of the AskUserQuestion guard.
+        session_manager._sdk.is_transport_alive = lambda client: True
+        return info
+
+    def test_ask_user_question_is_redirected_not_executed(self, session_manager, sm_module):
+        """AskUserQuestion is denied with a redirect message instead of running.
+
+        This is policy-independent: even in the default ('manual') policy the
+        tool is intercepted BEFORE the prompt path, so the user never sees an
+        unanswerable allow/deny dialog and the model never gets an empty answer.
+        """
+        sid = "auq-redirect-01"
+        info = self._register_live_session(session_manager, sm_module, sid)
+        callback = session_manager._make_permission_callback(sid)
+
+        question_input = {"questions": [{
+            "question": "Which fix should I apply?",
+            "header": "Scope",
+            "multiSelect": False,
+            "options": [{"label": "A", "description": "do A"},
+                        {"label": "B", "description": "do B"}],
+        }]}
+
+        result = _run_async(callback(
+            "AskUserQuestion", question_input, MockToolPermissionContext()
+        ))
+
+        # Denied, but WITHOUT interrupt — a non-interrupting deny feeds the
+        # message back to the model as the tool result so the turn continues.
+        assert isinstance(result, sm_module.PermissionResult)
+        assert result.action == sm_module.PermissionAction.DENY
+        assert result.interrupt is False
+        # The message must steer the model to proceed and defer the question:
+        # it earns no right to ask until work has been produced.
+        assert result.message == sm_module.ASK_USER_QUESTION_REDIRECT_MESSAGE
+        assert "produced work" in result.message
+
+        # AskUserQuestion must never be remembered as an allowed tool.
+        assert "AskUserQuestion" not in info.always_allowed_tools
+        assert "AskUserQuestion" not in info.almost_always_allowed_tools
+
+        # The intercept is surfaced in the session timeline for the user.
+        assert any(
+            e.kind == "permission" and "AskUserQuestion intercepted" in e.text
+            for e in info.entries
+        )
+
+    def test_redirect_beats_auto_policy_but_other_tools_still_approve(
+        self, session_manager, sm_module
+    ):
+        """In 'auto' policy AskUserQuestion is still redirected; normal tools approve.
+
+        Proves the guard runs ahead of the auto-approval path (so the empty
+        answer can't happen) without breaking ordinary auto-approval.
+        """
+        sid = "auq-redirect-02"
+        self._register_live_session(session_manager, sm_module, sid)
+        # In-memory policy flip only — do NOT call set_permission_policy(), which
+        # would persist to ~/.claude and clobber the real user's policy on disk.
+        session_manager._pm._permission_policy = "auto"
+        callback = session_manager._make_permission_callback(sid)
+
+        auq = _run_async(callback(
+            "AskUserQuestion", {"questions": []}, MockToolPermissionContext()
+        ))
+        assert auq.action == sm_module.PermissionAction.DENY
+        assert auq.interrupt is False
+        assert auq.message == sm_module.ASK_USER_QUESTION_REDIRECT_MESSAGE
+
+        # Control: a normal tool is still auto-approved under 'auto' policy.
+        bash = _run_async(callback(
+            "Bash", {"command": "ls"}, MockToolPermissionContext()
+        ))
+        assert bash.action == sm_module.PermissionAction.ALLOW
