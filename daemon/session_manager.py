@@ -1108,11 +1108,45 @@ class SessionManager:
         regressions).
         """
         POLL_INTERVAL = 1.0
+        # Long-turn heartbeat: on very large sessions a single legitimate turn
+        # can take 7-18 minutes to return its first content (measured: 465s and
+        # 1084s result times on an 8.2M-token session).  With nothing streaming
+        # the UI looks frozen and the user assumes the session is hung.  Emit a
+        # ONE-SHOT system entry once a turn has been silent (no content yet) for
+        # HEARTBEAT_AFTER seconds so they know it's alive and grinding, not
+        # stuck.  One entry per turn — the watchdog is recreated each turn, so
+        # these locals reset naturally.
+        HEARTBEAT_AFTER = 75.0
+        _t_start = time.perf_counter()
+        _heartbeat_sent = False
         try:
             while True:
                 await asyncio.sleep(POLL_INTERVAL)
                 if info.state != SessionState.WORKING:
                     return
+                # Heartbeat: only if the turn has produced no visible content
+                # yet (content streaming is its own progress signal) and we
+                # haven't already announced.
+                if (not _heartbeat_sent
+                        and not getattr(info, '_turn_content_started', False)
+                        and (time.perf_counter() - _t_start) >= HEARTBEAT_AFTER):
+                    _heartbeat_sent = True
+                    _elapsed_min = int((time.perf_counter() - _t_start) // 60)
+                    _hb = LogEntry(
+                        kind="system",
+                        text=(
+                            "Still working — this is a large turn and the model "
+                            "is taking a while to respond"
+                            + (f" (~{_elapsed_min} min so far)" if _elapsed_min else "")
+                            + ". This is normal for big sessions; it will stream "
+                            "output as soon as it's ready. (Tip: /compact shrinks "
+                            "the context and speeds up future turns.)"
+                        ),
+                    )
+                    with info._lock:
+                        info.entries.append(_hb)
+                        _hb_index = len(info.entries) - 1
+                    self._emit_entry(session_id, _hb, _hb_index)
                 client = info.client
                 if client is None:
                     return
@@ -1773,16 +1807,91 @@ class SessionManager:
                 return
 
         # Pre-flight liveness check: the client object exists but the
-        # underlying CLI process may have exited between turns.  Silently
-        # reconnect before sending so the user never sees "Stream lost".
+        # underlying CLI process may have exited between turns.  Reconnect
+        # before sending so the user never sees "Stream lost".
+        #
+        # BUG FIXED (2026-06-02): "Session shows 'working' for 10+ minutes with
+        # no output, no idea what it's doing."
+        #
+        # Root cause: on very large sessions (this path was observed firing 7
+        # times on a single 8.2M-token session) the CLI subprocess repeatedly
+        # OOMs/crashes mid-turn.  This reconnect used to be SILENT — it emitted
+        # nothing to the UI and had NO retry cap.  Meanwhile the *loud* heal
+        # path (STREAM_HEAL_TRIGGER, with its 3-strike breaker and user-facing
+        # "Reconnecting…" entries) never fired, because the orphan sweep had
+        # already reaped the dead CLI so the turn died via this preflight
+        # instead of via a transport exception.  Net effect: the user stares at
+        # a "working" spinner for 10+ minutes while the daemon silently
+        # crash-loops — reconnect, resend the giant query, crash, repeat.
+        #
+        # Fix: (1) make it VISIBLE — post a system entry so the live panel
+        # shows "CLI exited — reconnecting" instead of a frozen spinner; and
+        # (2) make it BOUNDED — reuse the shared _stream_heal_count breaker
+        # (reset on a genuine new user message in send_message()) so repeated
+        # crashes on the same turn stop after CAP attempts and surface a clear
+        # "context is too large" message instead of looping forever.
         if info.client:
             cli_pid = self._sdk.extract_process_pid(info.client)
             if cli_pid == 0:
-                # Process already exited — silent reconnect
-                logger.info("_send_query: %s CLI process dead before send — "
-                            "silent reconnect", session_id)
+                # Shared crash breaker.  send_message() resets this to 0 for a
+                # genuine new user message, so a fresh user turn always gets a
+                # clean retry budget; self-heal resends and same-turn crashes
+                # accumulate toward the cap.
+                _CLI_CRASH_CAP = 3
+                info._stream_heal_count = getattr(info, '_stream_heal_count', 0) + 1
+                _crash_n = info._stream_heal_count
+                logger.warning(
+                    "_send_query: %s CLI process dead before send "
+                    "(crash %d/%d) — reconnecting",
+                    session_id, _crash_n, _CLI_CRASH_CAP,
+                )
+                if _crash_n > _CLI_CRASH_CAP:
+                    # Circuit breaker: stop the silent crash-loop and tell the
+                    # user WHY, with an actionable next step, instead of
+                    # reconnecting into another multi-minute crash.
+                    logger.error(
+                        "_send_query: %s exceeded CLI crash cap (%d) — stopping "
+                        "auto-recovery; context likely too large",
+                        session_id, _CLI_CRASH_CAP,
+                    )
+                    info._stream_heal_count = 0
+                    info.state = SessionState.IDLE
+                    info.error = "CLI repeatedly crashed before sending"
+                    entry = LogEntry(
+                        kind="system",
+                        text=(
+                            f"The CLI process crashed {_CLI_CRASH_CAP} times in a "
+                            "row before your message could be sent. This almost "
+                            "always means the conversation has grown too large "
+                            "for the model to process (this session is carrying a "
+                            "very large context). Stopping automatic retries so "
+                            "you're not left waiting. Run /compact to shrink the "
+                            "context, then resend your message."
+                        ),
+                        is_error=True,
+                    )
+                    with info._lock:
+                        info.entries.append(entry)
+                        entry_index = len(info.entries) - 1
+                    self._emit_entry(session_id, entry, entry_index)
+                    self._emit_state(info)
+                    return
+                # Make the reconnect VISIBLE so the user isn't staring at a
+                # frozen "working" spinner with no explanation.
+                entry = LogEntry(
+                    kind="system",
+                    text=(
+                        "CLI process exited unexpectedly — reconnecting and "
+                        f"resuming your turn (attempt {_crash_n}/{_CLI_CRASH_CAP})…"
+                    ),
+                )
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(session_id, entry, entry_index)
                 if await self._reconnect_client(session_id, info):
-                    logger.info("_send_query: silent reconnect succeeded for %s", session_id)
+                    logger.info("_send_query: reconnect succeeded for %s "
+                                "(crash %d)", session_id, _crash_n)
                 else:
                     if info.state == SessionState.WORKING:
                         info.state = SessionState.IDLE
@@ -1792,6 +1901,8 @@ class SessionManager:
                                          is_error=True)
                         with info._lock:
                             info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
                         self._emit_state(info)
                     return
 
