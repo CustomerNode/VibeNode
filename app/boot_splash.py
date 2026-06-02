@@ -17,6 +17,17 @@ import math
 import time
 import random
 
+# Backstop: never let a native Tk/Tcl abort raise a Windows crash dialog.
+# The splash is cosmetic and runs as a child process — if Tk ever panics we
+# want it to die silently, not pop a "pythonw.exe stopped working" box at the
+# user.  SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX = 0x0001 | 0x0002.
+if sys.platform == "win32":
+    try:
+        import ctypes as _ctypes
+        _ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002)
+    except Exception:
+        pass
+
 try:
     import tkinter as tk
 except ImportError:
@@ -31,6 +42,7 @@ except ImportError:
 # ── Configuration ─────────────────────────────────────────────────────
 STEPS = [
     ("cache",   "Clearing caches"),
+    ("loading", "Loading modules"),
     ("ports",   "Releasing ports"),
     ("deps",    "Checking dependencies"),
     ("daemon",  "Starting session daemon"),
@@ -111,6 +123,17 @@ class BootSplash:
         self._frame = 0
         self._start_time = time.time()
 
+        # ── Lifecycle / crash-safety ──────────────────────────────────
+        # The render loop, status poller, and timeout each run on their own
+        # root.after() chain.  If the root is destroyed (timeout, auto-close,
+        # dismiss) while another chain still has a callback queued, that stale
+        # callback fires into a torn-down Tcl interpreter and Tk aborts with a
+        # native panic (0x80000003) — the recurring pythonw/tcl86t.dll crash.
+        # Track every pending after-id, cancel them all on teardown, and gate
+        # every callback on _alive so nothing touches Tk after destroy.
+        self._alive = True
+        self._after_ids: set = set()
+
         # Animation state
         self._target_progress = 0.0
         self._current_progress = 0.0
@@ -177,9 +200,9 @@ class BootSplash:
         self._create_steps()
 
         # ── Start loops ───────────────────────────────────────────────
-        self.root.after(FRAME_MS, self._render)
-        self.root.after(150, self._poll)
-        self.root.after(90_000, self._timeout)
+        self._schedule(FRAME_MS, self._render)
+        self._schedule(150, self._poll)
+        self._schedule(90_000, self._timeout)
 
     # ── Background (static gradient, drawn once) ──────────────────────
     def _draw_background(self):
@@ -401,6 +424,8 @@ class BootSplash:
     #  RENDER LOOP  (~60 fps)
     # ==================================================================
     def _render(self):
+        if not self._alive:
+            return
         # Auto-close after completion
         if self.done and self._finish_time:
             if time.time() - self._finish_time > 1.2:
@@ -434,7 +459,7 @@ class BootSplash:
         except Exception:
             pass
 
-        self.root.after(FRAME_MS, self._render)
+        self._schedule(FRAME_MS, self._render)
 
     # ── Particle motion ───────────────────────────────────────────────
     def _r_particles(self):
@@ -664,6 +689,8 @@ class BootSplash:
     #  STATUS FILE POLLING
     # ==================================================================
     def _poll(self):
+        if not self._alive:
+            return
         try:
             if os.path.exists(self.status_file):
                 with open(self.status_file, "r", encoding="utf-8") as fh:
@@ -685,7 +712,7 @@ class BootSplash:
         except Exception:
             pass
         if not self.done:
-            self.root.after(150, self._poll)
+            self._schedule(150, self._poll)
 
     def _activate(self, step_id):
         if self.current_step and self.current_step != step_id:
@@ -762,17 +789,49 @@ class BootSplash:
         self.root.attributes("-topmost", False)
 
     def _timeout(self):
+        if not self._alive:
+            return
         if not self.done:
             self._destroy()
 
+    def _schedule(self, ms, fn):
+        """root.after() that no-ops once torn down and records its id so
+        _destroy() can cancel every still-pending callback."""
+        if not self._alive:
+            return
+        try:
+            self._after_ids.add(self.root.after(ms, fn))
+        except Exception:
+            pass
+
     def _destroy(self):
+        # Idempotent, crash-safe teardown.  Cancel every pending after()
+        # FIRST so no stale render/poll/timeout callback can fire into a
+        # half-destroyed Tcl interpreter (the native-panic crash), then quit
+        # the loop and destroy the root.
+        if not self._alive:
+            return
+        self._alive = False
+        for aid in list(self._after_ids):
+            try:
+                self.root.after_cancel(aid)
+            except Exception:
+                pass
+        self._after_ids.clear()
+        try:
+            self.root.quit()
+        except Exception:
+            pass
         try:
             self.root.destroy()
         except Exception:
             pass
 
     def run(self):
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        except Exception:
+            pass
 
 
 # ──────────────────────────────────────────────────────────────────────

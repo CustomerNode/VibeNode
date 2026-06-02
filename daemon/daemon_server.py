@@ -5,6 +5,21 @@ Listens on localhost:5051 for JSON-line IPC from the Web UI.
 Push events from SessionManager are forwarded to the connected client.
 """
 
+# ---------------------------------------------------------------------------
+# Boot hardening.  This daemon is spawned as its OWN process, so it does not
+# inherit run.py's hardening — it must apply it itself, before any third-party
+# import.  _early_boot makes platform.uname() WMI-free (the aiohttp import
+# chain via session_manager calls platform.system(), which hangs forever when
+# the Windows WMI service is wedged) and arms a faulthandler autopsy.  We add
+# the repo root to sys.path here so this top-level module is importable before
+# the daemon's own path setup below.  See _early_boot.py.
+# ---------------------------------------------------------------------------
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+import _early_boot
+_early_boot.arm_hang_dump(120, "daemon-boot")
+
 import json
 import logging
 import os
@@ -127,6 +142,10 @@ class SessionDaemon:
 
         logger.info("Session daemon listening on port %d", self.port)
         print(f"Session daemon listening on port {self.port}", flush=True)
+
+        # Bound successfully — past the import phase that hangs on a wedged
+        # WMI service.  Stand the hang autopsy down.
+        _early_boot.disarm_hang_dump()
 
         while self._running:
             try:

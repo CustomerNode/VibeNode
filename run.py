@@ -8,6 +8,15 @@ that manages Claude Code SDK sessions. The daemon survives Web UI restarts,
 so running sessions continue uninterrupted when you restart the server.
 """
 
+# ---------------------------------------------------------------------------
+# Boot hardening.  MUST be the first import — before any third-party import —
+# so platform.uname() is WMI-free before aiohttp's import-time
+# platform.system() call.  Also arms a faulthandler autopsy: if boot wedges,
+# the log gets a full stack dump automatically.  See _early_boot.py.
+# ---------------------------------------------------------------------------
+import _early_boot
+_early_boot.arm_hang_dump(120, "web-boot")
+
 import importlib.util
 import logging
 import os
@@ -18,6 +27,19 @@ import subprocess
 # ---------------------------------------------------------------------------
 # Boot-splash status helper (must be defined early — before any boot phases)
 # ---------------------------------------------------------------------------
+# Boot watchdog state (read by _boot_watchdog).  _boot_step is the phase
+# currently executing; _boot_step_ts is when it started (monotonic seconds).
+_boot_step = "start"
+_boot_step_ts = None
+
+# Per-step time budgets (seconds).  Exceeding a budget means "something is
+# wedged" (not a perf target), so these are deliberately generous.  ``deps`` is
+# high because a cold pip install of missing packages can take ~2 min.
+_BOOT_STEP_BUDGET = {
+    "cache": 20, "loading": 75, "ports": 30, "deps": 150, "daemon": 45, "server": 60,
+}
+
+
 def _update_boot_status(msg):
     """Write a status line for the boot splash window (if running).
 
@@ -25,7 +47,16 @@ def _update_boot_status(msg):
         STEP:cache      — activate a named step
         DONE            — all steps complete, close splash
         ERROR:<text>    — show error, keep splash open with dismiss button
+
+    Also records the current step + timestamp so the boot watchdog can turn a
+    stalled step (e.g. a wedged WMI query mid-import) into a visible ERROR on
+    the splash instead of an infinite silent freeze.
     """
+    if msg.startswith("STEP:"):
+        global _boot_step, _boot_step_ts
+        _boot_step = msg[5:]
+        import time as _t
+        _boot_step_ts = _t.monotonic()
     _sf = os.environ.get("VIBENODE_BOOT_STATUS_FILE")
     if not _sf:
         return
@@ -64,6 +95,40 @@ _WEB_PORT = int(os.environ.get("VIBENODE_WEB_PORT", 0)) or 5050
 
 DAEMON_PORT = int(os.environ.get("VIBENODE_DAEMON_PORT", 5051))
 
+# ---------------------------------------------------------------------------
+# Boot watchdog.  If any step overruns its budget, convert the silent freeze
+# into (a) an immediate stack dump in the log and (b) a visible ERROR on the
+# splash.  Started here — right before the heavy ``app`` import, which is the
+# historical freeze point — and stood down once the Flask app is built.
+# ---------------------------------------------------------------------------
+_boot_done = threading.Event()
+
+
+def _boot_watchdog():
+    while not _boot_done.wait(3):
+        ts = _boot_step_ts
+        if ts is None:
+            continue
+        elapsed = time.monotonic() - ts
+        if elapsed > _BOOT_STEP_BUDGET.get(_boot_step, 45):
+            print("BOOT WATCHDOG: stalled at step '%s' for %ds — dumping stacks"
+                  % (_boot_step, int(elapsed)), flush=True)
+            _early_boot.dump_stacks_now()
+            _update_boot_status(
+                "ERROR:Boot stalled at '%s' (%ds). A wedged Windows service "
+                "(commonly WMI/Winmgmt) or an unreachable dependency is the "
+                "usual cause — a reboot clears it. See logs/_server.log."
+                % (_boot_step, int(elapsed))
+            )
+            return
+
+
+threading.Thread(target=_boot_watchdog, name="boot-watchdog", daemon=True).start()
+
+# STEP:loading — names the heavy import phase so the splash reflects where the
+# code actually is (this gap used to display the previous step, "cache",
+# which is why a freeze here looked like a stuck cache purge).
+_update_boot_status("STEP:loading")
 from app.singleton import acquire_web_singleton
 
 
@@ -400,6 +465,10 @@ _update_boot_status("STEP:server")
 try:
     from app import create_app, socketio
     app = create_app()
+    # Past the historically-wedging import + daemon phases — stand the
+    # watchdog and the faulthandler autopsy down.
+    _boot_done.set()
+    _early_boot.disarm_hang_dump()
 except Exception as _init_err:
     _update_boot_status("ERROR:Failed to initialize server: %s" % _init_err)
     raise
