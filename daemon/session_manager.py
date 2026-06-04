@@ -221,6 +221,11 @@ class SessionInfo:
     _awaiting_compact_drain: bool = False                # True when RESULT seen but IDLE emit deferred for post-turn compact check
     _in_post_turn: bool = False                          # True while a post-turn listener owns the SDK buffer (suppresses queue auto-dispatch on IDLE emits so a buffered init/wake-up cycle can't race the dispatcher)
     _wakeup_pending: bool = False                        # True if the most recent assistant turn scheduled a wake-up the SDK will deliver later (ScheduleWakeup, Bash run_in_background, etc.) — gates queue dispatch during the post-turn window
+    _wakeup_queue_blocked_since: float = 0.0             # time.time() when the starvation watchdog (_wakeup_queue_watchdog) first observed an undrained queue on this (alive, non-stopped) session.  0 == not armed.  Stays armed across the IDLE<->WORKING flicker of a wake-up loop and is reset only when the queue empties, so once the wait exceeds _WAKEUP_QUEUE_STARVATION_TIMEOUT the watchdog force-dispatches.  Guarantees a queued user message can NEVER be stranded indefinitely — whether behind a self-perpetuating wake-up loop OR a wake-up that never fires.  This is what stranded 4 queued messages overnight on 2026-06-04.
+    _force_queue_dispatch: bool = False                  # one-shot gate override set by the starvation watchdog.  When True, _emit_state / queue_message bypass the wake-up dispatch gate so the starved queued message is delivered at the next safe IDLE emit (or immediately, if already idle).  Cleared at user/dispatch-driven turn start (_send_query / _drive_session) and on interrupt/close; the watchdog re-sets it each sweep while a backlog remains.
+    _wakeup_deadline: float = 0.0                        # absolute time.time() by which the currently-pending wake-up MUST fire.  Set at RESULT when _wakeup_pending is applied (= now + expected wake delay + grace).  0 == none.  Past this instant the watchdog declares the wake-up PHANTOM and clears the "Awaiting wake-up…" state — guaranteeing the indicator can NEVER hang forever on a wake-up that never wakes (the 2026-06-04 rage bug).
+    _wakeup_max_delay: float = 0.0                       # per-turn accumulator: the longest expected wake delay among wake-up tools seen this turn (ScheduleWakeup.delaySeconds, or _WAKEUP_UNKNOWN_DELAY_WAIT for background Bash whose completion time is unknown).  Read at RESULT to compute _wakeup_deadline, then reset.
+    _wakeup_is_scheduled: bool = False                   # True only when the pending wake-up came from a REAL scheduled-wake tool (ScheduleWakeup), i.e. there is an actual timer that the CLI will fire at a known instant.  False when the only "wake-up" signal this turn was Bash(run_in_background=True) — a background process is NOT a scheduled wake-up (it resumes if/when the process exits, maybe never), so we must NOT show the "Awaiting wake-up…" label for it (that label promises a timer that doesn't exist — the root of the 2026-06-04 phantom hang).  The queue is still briefly gated for race-safety, but the UI stays honest-Idle.
     _post_compact_init_seen: bool = False                # True between the SDK's post-compact ``init`` and the first new-turn ASSISTANT — used to keep ``compacting`` substatus visible until the agent actually starts working in the new context (instead of flashing to "Working" the moment init lands)
     _tracked_files_populated: bool = False               # True after first _prepopulate_tracked_files
     _cached_git_files: list = field(default_factory=list) # cached git ls-files result
@@ -457,6 +462,13 @@ class SessionManager:
         self._orphan_sweep_timer: Optional[threading.Timer] = None
         self._schedule_orphan_sweep()
 
+        # Starvation watchdog: guarantees a queued user message can NEVER be
+        # stranded indefinitely behind a self-perpetuating wake-up loop.
+        # See _wakeup_queue_watchdog for the full rationale.  Runs every
+        # _WAKEUP_QUEUE_WATCHDOG_INTERVAL seconds.
+        self._wakeup_queue_watchdog_timer: Optional[threading.Timer] = None
+        self._schedule_wakeup_queue_watchdog()
+
     def _run_loop(self) -> None:
         """Entry point for the background thread."""
         asyncio.set_event_loop(self._loop)
@@ -472,6 +484,10 @@ class SessionManager:
         if getattr(self, '_orphan_sweep_timer', None):
             self._orphan_sweep_timer.cancel()
             self._orphan_sweep_timer = None
+        # Cancel wake-up queue starvation watchdog timer
+        if getattr(self, '_wakeup_queue_watchdog_timer', None):
+            self._wakeup_queue_watchdog_timer.cancel()
+            self._wakeup_queue_watchdog_timer = None
         # Flush queue to disk
         self._mq.flush()
         # Close all sessions
@@ -901,6 +917,9 @@ class SessionManager:
             and not (
                 getattr(info, '_in_post_turn', False)
                 and getattr(info, '_wakeup_pending', False)
+                # Starvation override: when the watchdog has flagged this
+                # session, the gate falls open so a starved message ships.
+                and not getattr(info, '_force_queue_dispatch', False)
             )
         ):
             self._try_dispatch_queue(session_id)
@@ -956,6 +975,11 @@ class SessionManager:
         # stopped, which is the bug they reported as "stuck in awaiting
         # wake-up mode after stop".
         info._wakeup_pending = False
+        info._force_queue_dispatch = False
+        info._wakeup_queue_blocked_since = 0.0
+        info._wakeup_deadline = 0.0
+        info._wakeup_max_delay = 0.0
+        info._wakeup_is_scheduled = False
         info.substatus = ""
         # Capture the task NOW so _interrupt_session cancels the right one.
         # Without this, if the user sends a new message before
@@ -988,6 +1012,11 @@ class SessionManager:
         # after close.
         info.state = SessionState.STOPPED
         info._wakeup_pending = False
+        info._force_queue_dispatch = False
+        info._wakeup_queue_blocked_since = 0.0
+        info._wakeup_deadline = 0.0
+        info._wakeup_max_delay = 0.0
+        info._wakeup_is_scheduled = False
         info.substatus = ""
         self._emit_state(info)
 
@@ -1431,6 +1460,11 @@ class SessionManager:
             # restoring a SessionInfo).  See _send_query's matching
             # reset for full reasoning.
             info._wakeup_pending = False
+            info._force_queue_dispatch = False
+            info._wakeup_queue_blocked_since = 0.0
+            info._wakeup_deadline = 0.0
+            info._wakeup_max_delay = 0.0
+            info._wakeup_is_scheduled = False
             info._post_compact_init_seen = False
             await mtime_task
             _profile_log("pre_turn_mtimes_done")
@@ -1945,6 +1979,16 @@ class SessionManager:
         # drained as stale below).  Tool uses in this turn will re-flag
         # _wakeup_pending if they schedule a new wake-up.
         info._wakeup_pending = False
+        # Consume any starvation-watchdog override and disarm its timer:
+        # THIS turn is the dispatch the watchdog asked for (or a fresh user
+        # turn that supersedes the wake-up anyway).  The watchdog re-arms
+        # and re-sets the flag on a later sweep if a backlog still remains
+        # behind a newly-scheduled wake-up.
+        info._force_queue_dispatch = False
+        info._wakeup_queue_blocked_since = 0.0
+        info._wakeup_deadline = 0.0
+        info._wakeup_max_delay = 0.0
+        info._wakeup_is_scheduled = False
         # Same reasoning for the post-compact flag: a fresh user query
         # supersedes any in-progress compaction transition.
         info._post_compact_init_seen = False
@@ -2694,6 +2738,162 @@ class SessionManager:
             if getattr(self, '_started', False):
                 self._schedule_orphan_sweep()
 
+    def _schedule_wakeup_queue_watchdog(self) -> None:
+        """Schedule the next wake-up queue starvation sweep."""
+        self._wakeup_queue_watchdog_timer = threading.Timer(
+            self._WAKEUP_QUEUE_WATCHDOG_INTERVAL, self._wakeup_queue_watchdog
+        )
+        self._wakeup_queue_watchdog_timer.daemon = True
+        self._wakeup_queue_watchdog_timer.start()
+
+    def _wakeup_queue_watchdog(self) -> None:
+        """Guarantee a queued user message can never be stranded on an idle
+        session — no matter why dispatch stalled.
+
+        ROOT-CAUSE FIX (2026-06-04).  The wake-up dispatch gate in
+        ``_emit_state`` / ``queue_message`` suppresses queue auto-dispatch
+        while ``_in_post_turn AND _wakeup_pending`` so a queued message
+        can't race a deferred auto-resume cycle into the SDK buffer.  That
+        gate is correct but UNBOUNDED.  Two real failure modes strand the
+        queue forever, both observed on session 086e2ccc (4 messages dead
+        for an entire night, UI stuck on "Awaiting wake-up…"):
+
+          1. Self-perpetuating wake-up loop — the agent schedules a fresh
+             wake-up (``Bash run_in_background`` / ``ScheduleWakeup``) on
+             every turn, so ``_wakeup_pending`` is re-armed at every RESULT
+             and the gate never reopens.
+          2. Phantom wake-up — ``_wakeup_pending`` is set but the SDK never
+             delivers the auto-resume (a background process that never exits,
+             a wake-up whose notification is lost).  The user observes this
+             directly: "those wake-ups never fire."  The session sits IDLE
+             behind a closed gate indefinitely.
+
+        Earlier drafts of this watchdog armed on ``_in_post_turn AND
+        _wakeup_pending``.  That bets on the listener being alive and the
+        flags being set — but if the wake-up never fires AND the listener
+        has since died (CLI exit, transport error clears ``_in_post_turn``),
+        nothing would arm.  So this version bets on NOTHING about wake-ups:
+
+        * The only invariant we enforce is the one the user actually cares
+          about — a non-empty queue on a session that is alive but not
+          actively producing a turn (state == IDLE) must drain.
+        * We arm ``_wakeup_queue_blocked_since`` the first sweep we see a
+          backlog the session has not drained, and keep it armed across the
+          IDLE<->WORKING oscillation of a wake-up loop (we only reset it when
+          the queue empties).  Normal sessions drain in milliseconds, so they
+          never reach the timeout — only a genuinely stuck queue does.
+        * Past the timeout we set ``_force_queue_dispatch`` (which makes the
+          gate fall open) and, when the session is IDLE, dispatch via
+          ``_try_dispatch_queue`` → ``send_message`` — the same supersede +
+          drain-stale path a manual user send uses during a sleep window
+          (documented safe in ``queue_message``).  WORKING/WAITING sessions
+          only get the flag set; the next IDLE emit delivers, so we never
+          interrupt an in-flight turn.
+
+        Bounding (not removing) the gate keeps its race protection intact for
+        the common case (real wake-ups complete in seconds, far under the
+        timeout) while making indefinite starvation impossible.
+        """
+        try:
+            with self._lock:
+                sessions = list(self._sessions.values())
+            now = time.time()
+            timeout = self._WAKEUP_QUEUE_STARVATION_TIMEOUT
+            for info in sessions:
+                q_len = len(self._mq.get_queue_data(info.session_id))
+
+                # ── (A) PHANTOM WAKE-UP: bound the "Awaiting wake-up…" state ──
+                # If a wake-up was scheduled but has not fired by its
+                # deadline, declare it phantom and clear the awaiting state
+                # back to plain Idle.  This is the absolute guarantee the
+                # user demanded: a wake-up that never wakes can NEVER leave
+                # the session hung on "Awaiting wake-up…".  Independent of
+                # the queue — it fixes the pure stuck-indicator case too.
+                # The listener (if any) stays alive, so a late wake-up can
+                # still resume the session; we only stop the indefinite lie.
+                if (
+                    info.state == SessionState.IDLE
+                    and getattr(info, '_wakeup_pending', False)
+                    and info._wakeup_deadline
+                    and now > info._wakeup_deadline
+                    and not getattr(info, '_interrupted', False)
+                ):
+                    logger.warning(
+                        "WAKEUP_PHANTOM sid=%s: scheduled wake-up did not "
+                        "fire by its deadline (overdue %.0fs) — clearing "
+                        "'Awaiting wake-up…' back to Idle%s",
+                        info.session_id[:12], now - info._wakeup_deadline,
+                        " and reopening the queue gate" if q_len else "",
+                    )
+                    info._wakeup_pending = False
+                    info._wakeup_deadline = 0.0
+                    info._wakeup_max_delay = 0.0
+                    info._wakeup_is_scheduled = False
+                    info.substatus = ""
+                    info._wakeup_queue_blocked_since = 0.0
+                    if q_len > 0:
+                        # Let any backlog drain on this same emit.
+                        info._force_queue_dispatch = True
+                    # Push the corrected state (UI -> Idle) and, via the
+                    # IDLE dispatch path, deliver any queued messages.
+                    self._emit_state(info)
+                    continue
+
+                if q_len == 0:
+                    # No backlog — disarm and drop any spent override so a
+                    # future backlog starts from a clean slate.
+                    if info._wakeup_queue_blocked_since or info._force_queue_dispatch:
+                        info._wakeup_queue_blocked_since = 0.0
+                        info._force_queue_dispatch = False
+                    continue
+                # A STOPPED session can't run anything; a freshly-interrupted
+                # one is being torn down (and its queue is normally cleared).
+                # Don't try to force work onto either.
+                if info.state == SessionState.STOPPED \
+                        or getattr(info, '_interrupted', False):
+                    continue
+                # Arm the clock the first sweep we observe an undrained
+                # backlog.  Kept across turns until the queue empties, so a
+                # tight wake-up loop's IDLE<->WORKING flicker can't keep
+                # resetting it (that flicker was the original starvation).
+                if not info._wakeup_queue_blocked_since:
+                    info._wakeup_queue_blocked_since = now
+                    continue
+                waited = now - info._wakeup_queue_blocked_since
+                if waited < timeout:
+                    continue
+                # ── STARVATION CONFIRMED — open the gate and deliver. ──
+                # The override makes _emit_state / queue_message bypass the
+                # wake-up gate; we additionally dispatch right now if the
+                # session is sitting IDLE.  A WORKING/WAITING session keeps
+                # the flag and drains at its next IDLE emit (no mid-turn
+                # interruption).  _wakeup_queue_blocked_since stays armed so
+                # the remaining backlog keeps draining on later sweeps.
+                info._force_queue_dispatch = True
+                if info.state == SessionState.IDLE:
+                    logger.warning(
+                        "WAKEUP_QUEUE_STARVATION sid=%s: %d queued message(s) "
+                        "stuck %.0fs on an idle session (limit %.0fs) — "
+                        "force-dispatching so the user's queue is not "
+                        "stranded (in_post_turn=%s wakeup_pending=%s)",
+                        info.session_id[:12], q_len, waited, timeout,
+                        getattr(info, '_in_post_turn', False),
+                        getattr(info, '_wakeup_pending', False),
+                    )
+                    try:
+                        self._try_dispatch_queue(info.session_id)
+                    except Exception as disp_err:
+                        logger.error(
+                            "WAKEUP_QUEUE_STARVATION dispatch failed for %s: %s",
+                            info.session_id[:12], disp_err,
+                        )
+        except Exception as e:
+            logger.debug("Wake-up queue watchdog error: %s", e)
+        finally:
+            # Reschedule regardless of success/failure
+            if getattr(self, '_started', False):
+                self._schedule_wakeup_queue_watchdog()
+
     async def _close_session(self, session_id: str) -> None:
         """Disconnect and clean up a session.
 
@@ -3332,6 +3532,18 @@ class SessionManager:
                     # AssistantMessage just like parent-agent messages.
                     if self._tool_creates_wakeup(tool_name, inp):
                         info._wakeup_pending = True
+                        # Only a real ScheduleWakeup earns the "Awaiting
+                        # wake-up…" label.  A background Bash gates the queue
+                        # for race-safety but must not claim a timer exists.
+                        if self._is_scheduled_wakeup(tool_name):
+                            info._wakeup_is_scheduled = True
+                        # Track the longest expected wake delay this turn so
+                        # the RESULT branch can set a realistic phantom-
+                        # wake-up deadline (see _wakeup_queue_watchdog).
+                        info._wakeup_max_delay = max(
+                            info._wakeup_max_delay,
+                            self._wakeup_expected_delay(tool_name, inp),
+                        )
                         # NOTE: we do NOT set substatus here, even though
                         # earlier versions did.  Setting it during the turn
                         # made the working bar say "Awaiting wake-up…" while
@@ -3613,7 +3825,33 @@ class SessionManager:
             # _enter_auto_resume clears _wakeup_pending=False, the next
             # IDLE emit's auto-clear sweeps the substatus normally.
             if getattr(info, '_wakeup_pending', False):
-                info.substatus = "auto-resuming"
+                # Show "Awaiting wake-up…" ONLY for a real scheduled wake-up
+                # (ScheduleWakeup).  A background Bash is not a timer — it
+                # resumes if/when its process exits, maybe never — so we keep
+                # the session as plain Idle and never promise a wake-up that
+                # doesn't exist.  The queue stays briefly gated either way
+                # (race-safety), bounded by the starvation watchdog.
+                if getattr(info, '_wakeup_is_scheduled', False):
+                    info.substatus = "auto-resuming"
+                # Arm the phantom-wake-up deadline: the moment by which this
+                # wake-up MUST fire or the watchdog gives up and clears the
+                # awaiting state / reopens the gate.  Use the longest expected
+                # delay seen this turn (exact for ScheduleWakeup, a bounded
+                # ceiling for background Bash) plus delivery grace.  This is
+                # what makes an indefinitely-hung "Awaiting wake-up…"
+                # impossible.
+                _base_delay = (
+                    info._wakeup_max_delay
+                    if info._wakeup_max_delay > 0
+                    else self._WAKEUP_UNKNOWN_DELAY_WAIT
+                )
+                info._wakeup_deadline = (
+                    time.time() + _base_delay + self._WAKEUP_DEADLINE_GRACE
+                )
+            else:
+                info._wakeup_deadline = 0.0
+            # Reset the per-turn accumulator for the next turn.
+            info._wakeup_max_delay = 0.0
 
             info.cost_usd = message.cost_usd or 0.0
 
@@ -3785,6 +4023,82 @@ class SessionManager:
     # still caught without code changes.
     _WAKEUP_TOOL_NAMES = frozenset({"ScheduleWakeup"})
     _WAKEUP_TOOL_SUBSTRINGS = ("schedulewake", "wakeup", "backgroundtask")
+
+    # ── Starvation watchdog tuning (see _wakeup_queue_watchdog) ──────────
+    # The wake-up dispatch gate (_emit_state / queue_message) holds a
+    # queued user message while a post-turn listener owns the SDK buffer
+    # AND a wake-up is pending, so the queued message can't race the
+    # wake-up's content into the buffer.  But when an agent re-schedules a
+    # wake-up on EVERY turn (e.g. a continuous Bash run_in_background
+    # loop), `_wakeup_pending` is re-armed at every RESULT and the gate
+    # never opens — the user's queue is starved indefinitely.  That is the
+    # bug that wasted an entire night (2026-06-04): 4 queued messages sat
+    # undispatched behind 38 consecutive background-Bash wake-ups.
+    #
+    # The watchdog bounds that wait.  If a queued message has been blocked
+    # behind the gate longer than this many seconds, the watchdog force-
+    # dispatches it the same way a manual user send would during a sleep
+    # window (supersede the listener, drain stale content, run the query).
+    # Overridable via env so ops can tune without a code change.
+    _WAKEUP_QUEUE_STARVATION_TIMEOUT = float(
+        os.environ.get("VIBENODE_WAKEUP_QUEUE_STARVATION_TIMEOUT", "120")
+    )
+    # How often the watchdog sweeps all sessions.  Cheap (one queue-length
+    # read per session); kept well below the starvation timeout so the
+    # effective force-dispatch latency is timeout + at most one interval.
+    _WAKEUP_QUEUE_WATCHDOG_INTERVAL = 30.0
+
+    # ── Phantom wake-up deadline (see _wakeup_queue_watchdog branch A) ───
+    # A scheduled wake-up that NEVER fires must not leave the session stuck
+    # on "Awaiting wake-up…" forever.  At RESULT we record a deadline by
+    # which the wake-up must arrive; past it the watchdog clears the
+    # awaiting state back to plain Idle.  For ScheduleWakeup we know the
+    # exact delay (SDK-clamped to <=3600s); for background Bash the
+    # completion time is unknowable, so we assume this ceiling.  Overridable
+    # via env.  The wake-up can STILL fire after we clear the display (the
+    # listener stays alive) — we only stop lying that it's pending.
+    _WAKEUP_UNKNOWN_DELAY_WAIT = float(
+        os.environ.get("VIBENODE_WAKEUP_MAX_WAIT", "1800")
+    )
+    # Slack added on top of the expected wake time before we call it phantom
+    # (covers SDK delivery latency so we never falsely clear a real wake-up).
+    _WAKEUP_DEADLINE_GRACE = 120.0
+    # SDK clamp on ScheduleWakeup.delaySeconds — used to bound a claimed delay.
+    _WAKEUP_SCHEDULE_MAX = 3600.0
+
+    @classmethod
+    def _is_scheduled_wakeup(cls, tool_name: str) -> bool:
+        """True only for a REAL scheduled-wake tool (ScheduleWakeup) — a
+        timer with a known fire instant the CLI reliably delivers.
+
+        Background Bash is deliberately excluded: it is not a scheduled
+        wake-up, so it must never drive the "Awaiting wake-up…" label.
+        """
+        norm = (tool_name or "").replace("_", "").replace("-", "").lower()
+        return tool_name in cls._WAKEUP_TOOL_NAMES or "schedulewake" in norm
+
+    @classmethod
+    def _wakeup_expected_delay(cls, tool_name: str, tool_input) -> float:
+        """Best-effort seconds until a wake-up tool's deferred resume fires.
+
+        Used to set a realistic phantom-wake-up deadline so a genuine long
+        sleep (e.g. ScheduleWakeup(3600)) is never falsely declared phantom,
+        while an unknowable background-Bash completion still gets a bounded
+        ceiling.  Only called when ``_tool_creates_wakeup`` is True.
+        """
+        norm = (tool_name or "").replace("_", "").replace("-", "").lower()
+        is_schedule = (
+            tool_name in cls._WAKEUP_TOOL_NAMES or "schedulewake" in norm
+        )
+        if is_schedule:
+            d = tool_input.get("delaySeconds") if isinstance(tool_input, dict) else None
+            if isinstance(d, (int, float)) and d > 0:
+                # Mirror the SDK's [60, 3600] clamp.
+                return float(min(max(d, 60.0), cls._WAKEUP_SCHEDULE_MAX))
+            # ScheduleWakeup with no parseable delay — assume the max.
+            return cls._WAKEUP_SCHEDULE_MAX
+        # Background Bash / other: completion time is unknowable → ceiling.
+        return cls._WAKEUP_UNKNOWN_DELAY_WAIT
 
     @classmethod
     def _tool_creates_wakeup(cls, tool_name: str, tool_input: dict) -> bool:
@@ -5007,6 +5321,11 @@ class SessionManager:
         # The wake-up that caused this resume is consumed.  Subsequent
         # tool uses in this turn will re-flag _wakeup_pending if needed.
         info._wakeup_pending = False
+        # The wake-up fired in time — drop its phantom deadline and the
+        # scheduled-flag.  A new one is armed at this turn's RESULT if it
+        # schedules another wake-up.
+        info._wakeup_deadline = 0.0
+        info._wakeup_is_scheduled = False
         self._emit_state(info)
 
     def _emit_state(self, info: SessionInfo) -> None:
@@ -5107,6 +5426,12 @@ class SessionManager:
             and not (
                 getattr(info, '_in_post_turn', False)
                 and getattr(info, '_wakeup_pending', False)
+                # Starvation override: the wake-up queue watchdog sets
+                # _force_queue_dispatch once a queued user message has been
+                # blocked behind the gate longer than the starvation
+                # timeout, so a self-perpetuating wake-up loop can never
+                # strand the queue indefinitely.  See _wakeup_queue_watchdog.
+                and not getattr(info, '_force_queue_dispatch', False)
             )
         ):
             self._try_dispatch_queue(info.session_id)
@@ -5122,6 +5447,7 @@ class SessionManager:
                         and not (
                             getattr(recheck, '_in_post_turn', False)
                             and getattr(recheck, '_wakeup_pending', False)
+                            and not getattr(recheck, '_force_queue_dispatch', False)
                         ):
                     # Safety net for race condition: if a message was queued
                     # right as the session went idle, dispatch it now.

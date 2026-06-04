@@ -36,6 +36,7 @@ These tests guard the fix:
 
 import asyncio
 import inspect
+import time
 import pytest
 
 from daemon.session_manager import (
@@ -946,3 +947,417 @@ class TestListenerSourceGuards:
         # under-suppress (re-introduce the wake-up race).
         assert "_in_post_turn" in src
         assert "_wakeup_pending" in src
+
+
+# ── 8. Starvation watchdog — queue can NEVER be stranded by a wake-up loop ──
+
+
+class TestWakeupQueueStarvationWatchdog:
+    """Regression guard for the 2026-06-04 incident: an agent that
+    re-scheduled a background Bash on every turn kept ``_wakeup_pending``
+    armed at every RESULT, so the dispatch gate never reopened and 4 queued
+    user messages were starved across an entire night.
+
+    ``_wakeup_queue_watchdog`` bounds that wait: once a queued message has
+    been blocked behind the gate longer than
+    ``_WAKEUP_QUEUE_STARVATION_TIMEOUT`` it force-dispatches via the same
+    supersede path a manual user send uses.
+    """
+
+    def _make_session(self, sm, *, in_post_turn, wakeup_pending,
+                      state=SessionState.IDLE):
+        info = SessionInfo(session_id="starve-sid")
+        info.state = state
+        info._in_post_turn = in_post_turn
+        info._wakeup_pending = wakeup_pending
+        with sm._lock:
+            sm._sessions[info.session_id] = info
+        return info
+
+    def _stub(self, sm, info, queue):
+        """Stub queue access + dispatch so the watchdog runs in isolation
+        (no event loop / no disk)."""
+        sm._mq.get_queue_data = lambda sid: list(queue) if sid == info.session_id else []
+        calls = []
+        sm._try_dispatch_queue = lambda sid: calls.append(sid)
+        return calls
+
+    def test_arms_then_force_dispatches_after_timeout(self):
+        sm = SessionManager()
+        info = self._make_session(sm, in_post_turn=True, wakeup_pending=True)
+        calls = self._stub(sm, info, ["queued msg"])
+
+        # First sweep: arms the timer, does NOT dispatch yet.
+        sm._wakeup_queue_watchdog()
+        assert info._wakeup_queue_blocked_since > 0, "watchdog failed to arm"
+        assert calls == [], "watchdog dispatched before the timeout elapsed"
+        assert info._force_queue_dispatch is False
+
+        # Simulate the starvation window having elapsed.
+        info._wakeup_queue_blocked_since = (
+            time.time() - sm._WAKEUP_QUEUE_STARVATION_TIMEOUT - 1
+        )
+        sm._wakeup_queue_watchdog()
+        assert info._force_queue_dispatch is True, (
+            "watchdog did not open the gate after the starvation timeout — "
+            "the queue would stay stranded behind the wake-up loop"
+        )
+        assert calls == [info.session_id], (
+            "watchdog did not force-dispatch the starved queue while idle"
+        )
+
+    def test_rescues_phantom_wakeup_with_dead_listener(self):
+        """THE bug 'those wake-ups never fire': an IDLE session with a
+        backlog and NO live listener / NO wake-up flags set must still be
+        rescued.  The watchdog must not depend on _in_post_turn or
+        _wakeup_pending being set — otherwise a wake-up that never fires
+        (after the listener died) strands the queue forever."""
+        sm = SessionManager()
+        info = self._make_session(sm, in_post_turn=False, wakeup_pending=False)
+        calls = self._stub(sm, info, ["queued msg"])
+        # First sweep arms purely on the presence of an undrained backlog.
+        sm._wakeup_queue_watchdog()
+        assert info._wakeup_queue_blocked_since > 0
+        assert calls == []
+        # Past the timeout it dispatches even with both wake-up flags False.
+        info._wakeup_queue_blocked_since = (
+            time.time() - sm._WAKEUP_QUEUE_STARVATION_TIMEOUT - 1
+        )
+        sm._wakeup_queue_watchdog()
+        assert calls == [info.session_id], (
+            "watchdog failed to rescue an idle backlog when no wake-up was "
+            "pending and no listener was alive — phantom wake-ups would "
+            "strand the queue forever"
+        )
+
+    def test_arms_on_any_undrained_backlog(self):
+        """Arming is driven purely by an undrained backlog on an alive
+        session, independent of the wake-up flags."""
+        sm = SessionManager()
+        info = self._make_session(sm, in_post_turn=False, wakeup_pending=False)
+        self._stub(sm, info, ["queued msg"])
+        sm._wakeup_queue_watchdog()
+        assert info._wakeup_queue_blocked_since > 0
+
+    def test_stopped_session_not_dispatched(self):
+        """A STOPPED session must never be force-dispatched — it has no live
+        client to run anything."""
+        sm = SessionManager()
+        info = self._make_session(sm, in_post_turn=True, wakeup_pending=True,
+                                  state=SessionState.STOPPED)
+        info._wakeup_queue_blocked_since = (
+            time.time() - sm._WAKEUP_QUEUE_STARVATION_TIMEOUT - 1
+        )
+        calls = self._stub(sm, info, ["queued msg"])
+        sm._wakeup_queue_watchdog()
+        assert calls == []
+
+    def test_interrupted_session_not_dispatched(self):
+        """A freshly-interrupted session is being torn down — the watchdog
+        must not resurrect its queue."""
+        sm = SessionManager()
+        info = self._make_session(sm, in_post_turn=True, wakeup_pending=True)
+        info._interrupted = True
+        info._wakeup_queue_blocked_since = (
+            time.time() - sm._WAKEUP_QUEUE_STARVATION_TIMEOUT - 1
+        )
+        calls = self._stub(sm, info, ["queued msg"])
+        sm._wakeup_queue_watchdog()
+        assert calls == []
+
+    def test_disarms_when_queue_drains(self):
+        sm = SessionManager()
+        info = self._make_session(sm, in_post_turn=True, wakeup_pending=True)
+        info._wakeup_queue_blocked_since = time.time() - 5
+        # Queue is now empty → watchdog must disarm and never dispatch.
+        calls = self._stub(sm, info, [])
+        sm._wakeup_queue_watchdog()
+        assert info._wakeup_queue_blocked_since == 0.0
+        assert calls == []
+
+    def test_keeps_armed_across_sweeps_until_drained(self):
+        """The timer must NOT reset between sweeps while the loop persists —
+        otherwise a tight wake-up loop would re-arm from zero every sweep
+        and never reach the timeout (the original starvation)."""
+        sm = SessionManager()
+        info = self._make_session(sm, in_post_turn=True, wakeup_pending=True)
+        self._stub(sm, info, ["a", "b"])
+        sm._wakeup_queue_watchdog()
+        armed_at = info._wakeup_queue_blocked_since
+        assert armed_at > 0
+        # A second sweep while still blocked must preserve the arm time.
+        sm._wakeup_queue_watchdog()
+        assert info._wakeup_queue_blocked_since == armed_at, (
+            "watchdog reset its own timer mid-loop — it would never fire"
+        )
+
+    def test_sets_flag_but_defers_dispatch_when_working(self):
+        """If the session is mid wake-up turn (WORKING) the watchdog sets
+        the override flag but must NOT call dispatch directly — the next
+        post-RESULT IDLE emit delivers it."""
+        sm = SessionManager()
+        info = self._make_session(sm, in_post_turn=True, wakeup_pending=True,
+                                  state=SessionState.WORKING)
+        info._wakeup_queue_blocked_since = (
+            time.time() - sm._WAKEUP_QUEUE_STARVATION_TIMEOUT - 1
+        )
+        calls = self._stub(sm, info, ["queued msg"])
+        sm._wakeup_queue_watchdog()
+        assert info._force_queue_dispatch is True
+        assert calls == [], "must not dispatch directly while WORKING"
+
+    def test_emit_state_force_flag_opens_gate(self):
+        """With _force_queue_dispatch set, _emit_state must dispatch even
+        though _in_post_turn + _wakeup_pending are both True."""
+        sm = SessionManager()
+        info = SessionInfo(session_id="force-sid")
+        info.state = SessionState.IDLE
+        info._in_post_turn = True
+        info._wakeup_pending = True
+        info._force_queue_dispatch = True
+        with sm._lock:
+            sm._sessions[info.session_id] = info
+        calls = []
+        sm._try_dispatch_queue = lambda sid: calls.append(sid)
+        sm._emit_state(info)
+        assert calls == [info.session_id], (
+            "force-dispatch override did not open the _emit_state gate"
+        )
+
+    def test_queue_message_force_flag_opens_gate(self):
+        sm = SessionManager()
+        info = SessionInfo(session_id="force-sid")
+        info.state = SessionState.IDLE
+        info._in_post_turn = True
+        info._wakeup_pending = True
+        info._force_queue_dispatch = True
+        with sm._lock:
+            sm._sessions[info.session_id] = info
+        calls = []
+        sm._try_dispatch_queue = lambda sid: calls.append(sid)
+        sm.queue_message(info.session_id, "msg")
+        assert calls == [info.session_id], (
+            "force-dispatch override did not open the queue_message gate"
+        )
+
+    def test_send_query_clears_force_dispatch(self):
+        src = inspect.getsource(SessionManager._send_query)
+        assert "info._force_queue_dispatch = False" in src, (
+            "_send_query no longer consumes the starvation override — the "
+            "flag would latch and dispatch could double-fire"
+        )
+
+    def test_emit_state_gate_includes_force_override(self):
+        src = inspect.getsource(SessionManager._emit_state)
+        assert "_force_queue_dispatch" in src, (
+            "the _emit_state gate dropped the starvation override — a "
+            "wake-up loop could once again strand the queue forever"
+        )
+
+
+# ── 9. Phantom wake-up — 'Awaiting wake-up…' can NEVER hang forever ─────────
+
+
+class TestPhantomWakeupDeadline:
+    """Hard guarantee: a scheduled wake-up that never fires must never leave
+    the session stuck on 'Awaiting wake-up…'.  At RESULT a deadline is armed;
+    past it the watchdog clears the awaiting state back to plain Idle — even
+    with NO queued messages (the pure stuck-indicator case the user raged
+    about: 'a waiting wake up that never wakes up')."""
+
+    def _make_awaiting(self, sm, *, deadline_offset, queue=None,
+                       state=SessionState.IDLE):
+        info = SessionInfo(session_id="phantom-sid")
+        info.state = state
+        info._wakeup_pending = True
+        info.substatus = "auto-resuming"
+        info._wakeup_deadline = time.time() + deadline_offset
+        with sm._lock:
+            sm._sessions[info.session_id] = info
+        q = list(queue or [])
+        sm._mq.get_queue_data = lambda sid: list(q) if sid == info.session_id else []
+        sm._push_callback = None
+        return info
+
+    def test_phantom_cleared_after_deadline_no_queue(self):
+        sm = SessionManager()
+        info = self._make_awaiting(sm, deadline_offset=-10, queue=[])
+        sm._try_dispatch_queue = lambda sid: None
+        sm._wakeup_queue_watchdog()
+        assert info.substatus == "", (
+            "phantom wake-up past its deadline did NOT clear the "
+            "'Awaiting wake-up…' substatus — the indicator would hang forever"
+        )
+        assert info._wakeup_pending is False
+        assert info._wakeup_deadline == 0.0
+
+    def test_awaiting_preserved_before_deadline(self):
+        """A real wake-up still pending (deadline in the future) must NOT be
+        cleared — we only kill it once it's overdue."""
+        sm = SessionManager()
+        info = self._make_awaiting(sm, deadline_offset=+1000, queue=[])
+        sm._try_dispatch_queue = lambda sid: None
+        sm._wakeup_queue_watchdog()
+        assert info.substatus == "auto-resuming"
+        assert info._wakeup_pending is True
+
+    def test_phantom_clear_also_dispatches_queue(self):
+        sm = SessionManager()
+        info = self._make_awaiting(sm, deadline_offset=-10, queue=["m1"])
+        calls = []
+        sm._try_dispatch_queue = lambda sid: calls.append(sid)
+        sm._wakeup_queue_watchdog()
+        assert info.substatus == ""
+        assert info._wakeup_pending is False
+        assert info._force_queue_dispatch is True
+        assert calls == [info.session_id], (
+            "phantom clear with a backlog must also drain the queue"
+        )
+
+    def test_phantom_not_cleared_when_working(self):
+        """If the session is actively WORKING (the wake-up DID fire and is
+        streaming), the deadline check must not fire."""
+        sm = SessionManager()
+        info = self._make_awaiting(sm, deadline_offset=-10, queue=[],
+                                   state=SessionState.WORKING)
+        sm._try_dispatch_queue = lambda sid: None
+        sm._wakeup_queue_watchdog()
+        # WORKING means the wake-up fired; branch A only acts on IDLE.
+        assert info.state == SessionState.WORKING
+
+    def test_expected_delay_schedule_wakeup_uses_delay(self):
+        d = SessionManager._wakeup_expected_delay(
+            "ScheduleWakeup", {"delaySeconds": 300}
+        )
+        assert d == 300.0
+
+    def test_expected_delay_schedule_wakeup_clamped(self):
+        # Mirrors the SDK [60, 3600] clamp.
+        assert SessionManager._wakeup_expected_delay(
+            "ScheduleWakeup", {"delaySeconds": 999999}) == 3600.0
+        assert SessionManager._wakeup_expected_delay(
+            "ScheduleWakeup", {"delaySeconds": 5}) == 60.0
+
+    def test_expected_delay_background_bash_uses_ceiling(self):
+        d = SessionManager._wakeup_expected_delay(
+            "Bash", {"command": "server", "run_in_background": True}
+        )
+        assert d == SessionManager._WAKEUP_UNKNOWN_DELAY_WAIT
+
+    def test_result_branch_arms_deadline_when_wakeup_pending(self):
+        """The RESULT branch must arm _wakeup_deadline from the per-turn
+        expected delay so the watchdog has something to enforce."""
+        from daemon.backends.messages import VibeNodeMessage, MessageKind
+        sm = SessionManager()
+        info = SessionInfo(session_id="arm-sid")
+        info.state = SessionState.WORKING
+        info._wakeup_pending = True          # a wake-up tool fired this turn
+        info._wakeup_max_delay = 300.0       # accumulated in tool_use handler
+        with sm._lock:
+            sm._sessions[info.session_id] = info
+        sm._push_callback = lambda *a, **k: None
+        msg = VibeNodeMessage(
+            kind=MessageKind.RESULT, session_id=info.session_id,
+            duration_ms=10, num_turns=1, cost_usd=0.0,
+        )
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(sm._process_message(info.session_id, msg))
+        finally:
+            loop.close()
+        expected = 300.0 + SessionManager._WAKEUP_DEADLINE_GRACE
+        assert info._wakeup_deadline > time.time() + expected - 30, (
+            "RESULT branch did not arm a phantom-wake-up deadline"
+        )
+        assert info._wakeup_max_delay == 0.0, (
+            "per-turn delay accumulator was not reset at RESULT"
+        )
+
+    def test_background_bash_does_not_show_awaiting_wakeup(self):
+        """THE root mislabel: a background-Bash-only turn must NOT display
+        'Awaiting wake-up…' (substatus stays empty / plain Idle), because a
+        background process is not a scheduled wake-up.  The queue is still
+        gated for race-safety (_wakeup_pending True) but the UI is honest."""
+        from daemon.backends.messages import VibeNodeMessage, MessageKind
+        sm = SessionManager()
+        info = SessionInfo(session_id="bg-sid")
+        info.state = SessionState.WORKING
+        info._wakeup_pending = True          # set by the bg-Bash tool_use
+        info._wakeup_is_scheduled = False    # ...but it was NOT a ScheduleWakeup
+        with sm._lock:
+            sm._sessions[info.session_id] = info
+        sm._push_callback = lambda *a, **k: None
+        msg = VibeNodeMessage(
+            kind=MessageKind.RESULT, session_id=info.session_id,
+            duration_ms=10, num_turns=1, cost_usd=0.0,
+        )
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(sm._process_message(info.session_id, msg))
+        finally:
+            loop.close()
+        assert info.substatus == "", (
+            "background Bash showed 'Awaiting wake-up…' — it is not a "
+            "scheduled wake-up and must render as plain Idle"
+        )
+        # Gate still active (race-safety) and deadline armed (bounded by the
+        # watchdog), but no misleading label.
+        assert info._wakeup_pending is True
+        assert info._wakeup_deadline > 0
+
+    def test_schedule_wakeup_does_show_awaiting_wakeup(self):
+        """A real ScheduleWakeup DOES show 'Awaiting wake-up…' — there is a
+        genuine timer the CLI will fire."""
+        from daemon.backends.messages import VibeNodeMessage, MessageKind
+        sm = SessionManager()
+        info = SessionInfo(session_id="sched-sid")
+        info.state = SessionState.WORKING
+        info._wakeup_pending = True
+        info._wakeup_is_scheduled = True
+        info._wakeup_max_delay = 300.0
+        with sm._lock:
+            sm._sessions[info.session_id] = info
+        sm._push_callback = lambda *a, **k: None
+        msg = VibeNodeMessage(
+            kind=MessageKind.RESULT, session_id=info.session_id,
+            duration_ms=10, num_turns=1, cost_usd=0.0,
+        )
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(sm._process_message(info.session_id, msg))
+        finally:
+            loop.close()
+        assert info.substatus == "auto-resuming", (
+            "real ScheduleWakeup should still show 'Awaiting wake-up…'"
+        )
+
+    def test_is_scheduled_wakeup_classifier(self):
+        assert SessionManager._is_scheduled_wakeup("ScheduleWakeup")
+        assert SessionManager._is_scheduled_wakeup("schedule_wakeup")
+        assert SessionManager._is_scheduled_wakeup("ScheduleWakeUp")
+        # Background Bash and unrelated tools are NOT scheduled wake-ups.
+        assert not SessionManager._is_scheduled_wakeup("Bash")
+        assert not SessionManager._is_scheduled_wakeup("Edit")
+
+    def test_result_branch_clears_deadline_when_no_wakeup(self):
+        from daemon.backends.messages import VibeNodeMessage, MessageKind
+        sm = SessionManager()
+        info = SessionInfo(session_id="noarm-sid")
+        info.state = SessionState.WORKING
+        info._wakeup_pending = False
+        info._wakeup_deadline = time.time() + 999  # stale from a prior turn
+        with sm._lock:
+            sm._sessions[info.session_id] = info
+        sm._push_callback = lambda *a, **k: None
+        msg = VibeNodeMessage(
+            kind=MessageKind.RESULT, session_id=info.session_id,
+            duration_ms=10, num_turns=1, cost_usd=0.0,
+        )
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(sm._process_message(info.session_id, msg))
+        finally:
+            loop.close()
+        assert info._wakeup_deadline == 0.0, (
+            "RESULT with no pending wake-up must clear any stale deadline"
+        )
