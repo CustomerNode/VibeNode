@@ -184,6 +184,15 @@ def ensure_daemon():
             _daemon_fh.flush()
         except Exception:
             pass
+        # Fingerprint the daemon's environment so it — and the claude CLI
+        # children it spawns — carry a discoverable "managed by VibeNode,
+        # do not kill" marker (see process_label.py).
+        _daemon_env = dict(os.environ)
+        try:
+            import process_label
+            _daemon_env.update(process_label.marker_env("session-daemon"))
+        except Exception:
+            pass
         popen_kwargs = {
             "cwd": str(daemon_script.parent.parent),
             "stdout": _daemon_fh,
@@ -193,7 +202,7 @@ def ensure_daemon():
             # but when this function runs from a Flask-handled /api/restart
             # path, the env is filtered by Werkzeug's WSGI environ — be
             # explicit to avoid surprises.
-            "env": dict(os.environ),
+            "env": _daemon_env,
         }
         if sys.platform == "win32":
             popen_kwargs["creationflags"] = (
@@ -203,7 +212,16 @@ def ensure_daemon():
             # start_new_session=True calls setsid() in the child, placing it in
             # a new process group and session independent of the launcher's TTY.
             popen_kwargs["start_new_session"] = True
-        proc = subprocess.Popen([sys.executable, str(daemon_script)], **popen_kwargs)
+        # Append an inert marker token to the daemon's command line so anyone
+        # (human or AI) inspecting the process list sees a "do not kill" label.
+        # The daemon never parses argv, so this is purely informational.
+        _daemon_cmd = [sys.executable, str(daemon_script)]
+        try:
+            import process_label
+            _daemon_cmd += process_label.daemon_spawn_marker_args("session-daemon")
+        except Exception:
+            pass
+        proc = subprocess.Popen(_daemon_cmd, **popen_kwargs)
         print("  Daemon subprocess launched (pid=%d)" % proc.pid, flush=True)
     except Exception as e:
         print("  ERROR: Could not start daemon subprocess: %s" % e, flush=True)
@@ -700,6 +718,14 @@ def open_browser():
 
 
 if __name__ == "__main__":
+    # Label this process so a resource-hunting human or AI sees a "do not kill"
+    # marker in the process list / window title.  Best-effort; never raises.
+    try:
+        import process_label
+        process_label.label_current_process("web-server")
+    except Exception:
+        pass
+
     # Log web server startup to file so we can diagnose launch failures
     # (console output is lost when launch.bat runs minimized)
     _web_log_path = Path(__file__).resolve().parent / "logs" / "web_server.log"

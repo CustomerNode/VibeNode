@@ -540,6 +540,15 @@ def main():
         datefmt="%H:%M:%S",
     )
 
+    # Label this process so a resource-hunting human or AI sees a "do not kill"
+    # marker (the daemon is the most catastrophic process to kill — it parents
+    # every active session CLI).  Best-effort; never raises.  See process_label.
+    try:
+        import process_label
+        process_label.label_current_process("session-daemon")
+    except Exception:
+        pass
+
     # Singleton gate: only one daemon allowed system-wide
     from app.singleton import acquire_daemon_singleton
     if not acquire_daemon_singleton():

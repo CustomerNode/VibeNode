@@ -1747,12 +1747,10 @@ class SessionManager:
             # eating CPU/RAM until the machine is rebooted.
             if info and info._cli_pid:
                 try:
-                    # Check if the CLI process is actually dead
-                    proc_alive = True
-                    try:
-                        os.kill(info._cli_pid, 0)  # signal 0 = existence check
-                    except (OSError, ProcessLookupError):
-                        proc_alive = False
+                    # Check if the CLI process is actually dead.  Windows-safe:
+                    # a bare os.kill(pid, 0) would TERMINATE a still-alive CLI
+                    # on Windows instead of probing it (see _process_alive).
+                    proc_alive = self._process_alive(info._cli_pid)
                     if not proc_alive:
                         logger.info("CLI process %d for %s is dead — "
                                     "cleaning up orphaned child processes",
@@ -2419,6 +2417,60 @@ class SessionManager:
             logger.exception("Interrupt error for %s: %s", session_id, e)
 
     @staticmethod
+    def _process_alive(pid: int) -> bool:
+        """Return True iff process ``pid`` currently exists — WITHOUT killing it.
+
+        WINDOWS-CRITICAL (bug fixed 2026-06-04):
+            The POSIX idiom ``os.kill(pid, 0)`` is a harmless existence probe
+            on Unix, but on Windows Python's ``os.kill`` has NO concept of
+            "signal 0".  For any signal other than CTRL_C_EVENT/CTRL_BREAK_EVENT
+            it calls ``TerminateProcess(handle, sig)`` — so ``os.kill(pid, 0)``
+            *terminates the target process* (with exit code 0) instead of
+            probing it.  The orphan sweep ran this "existence check" on every
+            IDLE session every 60s, which meant it KILLED the live, healthy CLI
+            of every idle session on Windows.  The user then saw "CLI process
+            exited unexpectedly — reconnecting…" on their next message, every
+            single turn, because the daemon had silently shot its own CLI.
+
+        This helper never terminates the process:
+          • Windows: OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) — read-only,
+            cannot terminate — then GetExitCodeProcess; alive iff STILL_ACTIVE.
+          • POSIX: os.kill(pid, 0), where signal 0 genuinely is a no-op probe.
+        """
+        if not pid or pid <= 0:
+            return False
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+            )
+            if not handle:
+                # OpenProcess failed — process does not exist (or we lack
+                # rights, which for our own child never happens).
+                return False
+            try:
+                code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return False
+                return code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        else:
+            try:
+                os.kill(pid, 0)  # signal 0: genuine existence probe on POSIX
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True  # exists but owned by another user
+            except OSError:
+                return False
+            return True
+
+    @staticmethod
     def _kill_process_tree(pid: int) -> None:
         """Kill a process and all its children.  Cross-platform.
 
@@ -2618,12 +2670,12 @@ class SessionManager:
                     # Stale PID — update and skip
                     info._cli_pid = current_pid
                     continue
-                # Check if the CLI process is still alive
-                try:
-                    os.kill(pid, 0)  # signal 0 = existence check
+                # Check if the CLI process is still alive.  MUST use the
+                # Windows-safe probe: a bare os.kill(pid, 0) here TERMINATES the
+                # live CLI on Windows (see _process_alive).  That bug made this
+                # sweep kill every idle session's CLI every 60s.
+                if self._process_alive(pid):
                     continue  # still alive, nothing to do
-                except (OSError, ProcessLookupError):
-                    pass
                 # CLI is dead but we still have a PID recorded — kill orphans
                 logger.warning(
                     "Orphan sweep: CLI PID %d for session %s is dead — "
