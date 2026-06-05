@@ -40,6 +40,40 @@ from daemon.session_registry import SessionRegistry
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Display-log capping for user messages.
+# ---------------------------------------------------------------------------
+# User messages are capped before being stored as a display LogEntry so a
+# runaway prompt can't bloat the in-memory log / IPC payload.  But an /invoke
+# message wraps the *entire* skill body in
+#     [[invoke::name::path=...]] ...skill... [[/invoke]] <user's own text>
+# and the web client renders that as a gradient pill keyed on the trailing
+# [[/invoke]] closing tag.  A blind prompt[:CAP] slice on a skill larger than
+# the cap chops off the closing tag, so the pill regex fails and the client
+# dumps the raw multi-thousand-char skill body into the chat (reported 2026-06:
+# "/invoke shows a long-ass skill instead of the pill", flaky because only
+# skills bigger than the cap break).  The entry text is ALSO what the self-heal
+# retry path re-sends to the SDK, so we must not mangle the block body either.
+# Fix: keep the invoke envelope whole (body included, regardless of size) and
+# cap only the user's own trailing text after [[/invoke]].
+_USER_DISPLAY_CAP = 20000
+
+
+def _cap_user_display_text(text: str, limit: int = _USER_DISPLAY_CAP) -> str:
+    """Cap a user message for the display log without ever splitting an
+    [[invoke]] block.  Non-invoke messages are simply truncated to ``limit``."""
+    if not text:
+        return text
+    if "[[invoke::" in text:
+        end = text.rfind("[[/invoke]]")
+        if end != -1:
+            end += len("[[/invoke]]")
+            # Preserve the full invoke envelope; cap only what follows it.
+            return text[:end] + text[end:end + limit]
+    return text[:limit]
+
+
 # ---------------------------------------------------------------------------
 # Ensure Claude Code CLI is discoverable.
 # When the daemon is spawned with CREATE_NO_WINDOW the PATH may be stripped.
@@ -1471,7 +1505,7 @@ class SessionManager:
 
             # Add user's message to the log and send
             if prompt:
-                entry = LogEntry(kind="user", text=prompt[:20000])
+                entry = LogEntry(kind="user", text=_cap_user_display_text(prompt))
                 with info._lock:
                     info.entries.append(entry)
                     entry_index = len(info.entries) - 1

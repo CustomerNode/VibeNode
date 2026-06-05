@@ -2076,20 +2076,17 @@ function _addOptimisticBubble(sid, text, isVoice) {
   const userMsg = document.createElement('div');
   userMsg.className = 'msg user msg-entering optimistic-bubble';
   userMsg.dataset.optimisticId = msgId;
-  // Strip [[invoke]]...[[/invoke]] tags and render as premium pill (same as server-rendered messages)
-  let _displayText = text;
-  let _invokePill = '';
-  const _invokeRx = /\[\[invoke\]\]([\s\S]*?)\[\[\/invoke\]\]/;
-  const _invokeMatch = _displayText.match(_invokeRx);
-  if (_invokeMatch) {
-    // Extract invoke name from first line (e.g. "# Skill Name")
-    const _invLines = _invokeMatch[1].trim().split('\n');
-    let _invName = _invLines[0].replace(/^#+\s*/, '').trim() || 'Workforce';
-    if (typeof _prettifyName === 'function') _invName = _prettifyName(_invName);
-    _invokePill = '<span class="invoke-pill">' + escHtml(_invName) + '</span> ';
-    _displayText = _displayText.replace(_invokeRx, '').trim();
+  // Strip [[invoke::name::path=]]...[[/invoke]] tags and render as premium pill.
+  // Reuse the same _renderInvokePills() helper the server-rendered path uses so
+  // the optimistic bubble and the persisted entry stay in lockstep on tag format.
+  let _bodyHtml;
+  const _invokeResult = (typeof _renderInvokePills === 'function') ? _renderInvokePills(text) : null;
+  if (_invokeResult) {
+    _bodyHtml = _invokeResult.pillHtml + ' ' +
+      (_invokeResult.remainder ? '<pre style="white-space:pre-wrap;margin:0;display:inline;">' + escHtml(_invokeResult.remainder) + '</pre>' : '');
+  } else {
+    _bodyHtml = '<pre style="white-space:pre-wrap;margin:0;display:inline;">' + escHtml(text) + '</pre>';
   }
-  const _bodyHtml = _invokePill + (_displayText ? '<pre style="white-space:pre-wrap;margin:0;display:inline;">' + escHtml(_displayText) + '</pre>' : '');
   userMsg.innerHTML = '<div class="msg-role">me <span class="msg-time">' + timestamp + '</span></div><div class="msg-body msg-content">' + _bodyHtml + '</div>';
   // Add VN metadata footer
   const vnFooter = document.createElement('div');

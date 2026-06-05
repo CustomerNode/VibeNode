@@ -33,6 +33,26 @@ from ..platform_utils import system_user_label as _system_user_label
 bp = Blueprint('live_api', __name__)
 
 
+# Cap user text for display without ever splitting an [[invoke]] block — a blind
+# slice on a skill larger than the cap chops off the trailing [[/invoke]] tag,
+# breaking the web client's gradient-pill render and dumping the raw skill body
+# into the chat.  Mirror of ws_events._cap_user_text.  See that module for the
+# full rationale (reported 2026-06).
+_USER_TEXT_CAP = 20000
+
+
+def _cap_user_text(text: str, limit: int = _USER_TEXT_CAP) -> str:
+    """Cap user text for display without ever splitting an [[invoke]] block."""
+    if not text:
+        return text
+    if "[[invoke::" in text:
+        end = text.rfind("[[/invoke]]")
+        if end != -1:
+            end += len("[[/invoke]]")
+            return text[:end] + text[end:end + limit]
+    return text[:limit]
+
+
 @bp.route("/api/_emit-permission", methods=["POST"])
 def internal_emit_permission():
     """Internal endpoint: emit session_permission via SocketIO.
@@ -173,7 +193,7 @@ def api_session_log(session_id):
             msg = obj.get("message", {})
             content = msg.get("content", "")
             if isinstance(content, str) and content.strip():
-                text = content.strip()[:20000]
+                text = _cap_user_text(content.strip())
                 if _is_system_user_content(text):
                     entries.append({"kind": "system", "text": _system_user_label(text)})
                 else:
@@ -182,7 +202,7 @@ def api_session_log(session_id):
                 for block in content:
                     bt = block.get("type", "")
                     if bt == "text" and block.get("text", "").strip():
-                        text = block["text"].strip()[:20000]
+                        text = _cap_user_text(block["text"].strip())
                         if _is_system_user_content(text):
                             entries.append({"kind": "system", "text": _system_user_label(text)})
                         else:

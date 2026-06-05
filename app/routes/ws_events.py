@@ -53,6 +53,31 @@ from ..config import _record_session_access
 _entry_cache: dict = {}
 _ENTRY_CACHE_MAX = 200  # max sessions to keep cached
 
+# ---- User-text display cap ------------------------------------------------
+# User messages are capped before display so a runaway prompt can't bloat the
+# log / IPC payload.  But an /invoke message wraps the ENTIRE skill body in
+#     [[invoke::name::path=...]] ...skill... [[/invoke]] <user's own text>
+# and the web client renders that as a gradient pill keyed on the trailing
+# [[/invoke]] closing tag.  A blind text[:CAP] slice on a skill larger than the
+# cap chops off the closing tag, so the pill regex never matches and the client
+# dumps the raw multi-thousand-char skill body into the chat (reported 2026-06:
+# "/invoke shows a long-ass skill instead of the pill"; flaky because only
+# skills bigger than the cap break).  Keep the invoke envelope whole regardless
+# of size and cap only the user's own trailing text after [[/invoke]].
+_USER_TEXT_CAP = 20000
+
+
+def _cap_user_text(text: str, limit: int = _USER_TEXT_CAP) -> str:
+    """Cap user text for display without ever splitting an [[invoke]] block."""
+    if not text:
+        return text
+    if "[[invoke::" in text:
+        end = text.rfind("[[/invoke]]")
+        if end != -1:
+            end += len("[[/invoke]]")
+            return text[:end] + text[end:end + limit]
+    return text[:limit]
+
 
 def _parse_raw_line(raw: str) -> list:
     """Parse a single JSONL line into zero or more structured entries."""
@@ -68,7 +93,7 @@ def _parse_raw_line(raw: str) -> list:
         msg = obj.get("message", {})
         content = msg.get("content", "")
         if isinstance(content, str) and content.strip():
-            text = content.strip()[:20000]
+            text = _cap_user_text(content.strip())
             if _is_system_user_content(text):
                 entries.append({"kind": "system", "text": _system_user_label(text)})
             else:
@@ -77,7 +102,7 @@ def _parse_raw_line(raw: str) -> list:
             for block in content:
                 bt = block.get("type", "")
                 if bt == "text" and block.get("text", "").strip():
-                    text = block["text"].strip()[:20000]
+                    text = _cap_user_text(block["text"].strip())
                     if _is_system_user_content(text):
                         entries.append({"kind": "system", "text": _system_user_label(text)})
                     else:
