@@ -546,8 +546,15 @@ def open_browser():
         if chrome_path:
             try:
                 import ctypes
+                # CRITICAL: pass the URL via --new-window, NOT as a bare arg.
+                # On a COLD Chrome start with "Continue where you left off"
+                # enabled, Chrome's session restore swallows a bare URL arg —
+                # the user gets a Chrome window with their old tabs and NO
+                # VibeNode tab. --new-window forces Chrome to open the URL in
+                # its own window every time, cold start or not.
+                params = '--new-window "%s"' % url
                 result = ctypes.windll.shell32.ShellExecuteW(
-                    None, "open", chrome_path, url, None, 1)
+                    None, "open", chrome_path, params, None, 1)
                 if result > 32:
                     _log("Opened Chrome via ShellExecuteW: %s" % chrome_path)
                     opened = True
