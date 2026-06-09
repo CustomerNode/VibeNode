@@ -36,7 +36,8 @@ _boot_step_ts = None
 # wedged" (not a perf target), so these are deliberately generous.  ``deps`` is
 # high because a cold pip install of missing packages can take ~2 min.
 _BOOT_STEP_BUDGET = {
-    "cache": 20, "loading": 75, "ports": 30, "deps": 150, "daemon": 45, "server": 60,
+    "cache": 20, "loading": 75, "ports": 30, "deps": 150, "update": 300,
+    "daemon": 45, "server": 60,
 }
 
 
@@ -473,6 +474,141 @@ def _check_dependencies():
 
 _update_boot_status("STEP:deps")
 _check_dependencies()
+
+# ---------------------------------------------------------------------------
+# Claude auto-update — keep the claude CLI + Python SDK current so newly
+# released models are picked up without manual intervention.
+#
+# Throttled to once per 24h via a gitignored state file, time-boxed, and
+# best-effort: any failure just logs a warning and boot continues.
+#
+# Placement is deliberate: this MUST run BEFORE ensure_daemon().  The session
+# daemon is the process that imports claude_code_sdk and spawns the claude
+# CLI, so an update applied after the daemon starts has no effect until the
+# daemon's next cold start.  If the daemon is already running (it survives
+# web restarts), the update still lands on disk and applies on the daemon's
+# next start — we NEVER restart the daemon automatically (see CLAUDE.md).
+# ---------------------------------------------------------------------------
+_UPDATE_STATE_FILE = Path(__file__).resolve().parent / ".cache" / "claude_update_state.json"
+_UPDATE_CHECK_INTERVAL = 24 * 3600  # seconds between update checks
+
+
+def _claude_cli_version(claude_path):
+    """Return `claude --version` output, or '' on any failure."""
+    if not claude_path:
+        return ""
+    try:
+        r = subprocess.run(
+            [claude_path, "--version"], capture_output=True, text=True, timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _daemon_is_running():
+    """True if something is listening on the daemon port (read-only check)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(1)
+        s.connect(("127.0.0.1", DAEMON_PORT))
+        s.close()
+        return True
+    except (ConnectionRefusedError, OSError):
+        return False
+
+
+def _check_claude_updates():
+    """Auto-update the claude CLI and claude-code-sdk, at most once per day.
+
+    New Claude models ship via CLI/SDK releases — without this, users on the
+    one-click install never get them until someone updates manually.  Set
+    VIBENODE_NO_AUTO_UPDATE=1 to disable.
+    """
+    import json
+
+    if os.environ.get("VIBENODE_NO_AUTO_UPDATE"):
+        return
+
+    # Throttle: at most one check per _UPDATE_CHECK_INTERVAL.  On throttled
+    # boots this function costs a single small file read.
+    state = {}
+    try:
+        if _UPDATE_STATE_FILE.exists():
+            state = json.loads(_UPDATE_STATE_FILE.read_text())
+    except Exception:
+        state = {}
+    if time.time() - state.get("last_check", 0) < _UPDATE_CHECK_INTERVAL:
+        return
+
+    no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    claude_path = shutil.which("claude")
+    daemon_was_running = _daemon_is_running()
+    before = _claude_cli_version(claude_path)
+
+    # 1. claude CLI — this is what gates new model availability.  Its
+    #    built-in self-updater handles native installs and refuses (with an
+    #    npm hint) when the install is npm-managed.
+    if claude_path:
+        print("  Checking for Claude CLI updates...", flush=True)
+        try:
+            r = subprocess.run(
+                [claude_path, "update"], capture_output=True, text=True,
+                timeout=240, creationflags=no_window,
+            )
+            out = (r.stdout or "") + (r.stderr or "")
+            if r.returncode != 0 and "npm" in out.lower():
+                npm = shutil.which("npm")
+                if npm:
+                    subprocess.run(
+                        [npm, "update", "-g", "@anthropic-ai/claude-code"],
+                        capture_output=True, timeout=240, creationflags=no_window,
+                    )
+        except Exception as e:
+            print("  WARNING: claude CLI update check failed: %s" % e, flush=True)
+
+    # 2. Python SDK — the daemon's interface to the CLI.  requirements.txt
+    #    only pins a floor (>=), so a plain upgrade is always safe here.
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade",
+             "claude-code-sdk"],
+            timeout=180, creationflags=no_window,
+        )
+    except Exception as e:
+        print("  WARNING: claude-code-sdk upgrade failed: %s" % e, flush=True)
+
+    after = _claude_cli_version(claude_path)
+    updated = bool(before and after and before != after)
+    if updated:
+        print("  Claude CLI updated: %s -> %s" % (before, after), flush=True)
+        if daemon_was_running:
+            print(
+                "  NOTE: the session daemon is already running and keeps the old\n"
+                "  version until its next restart. To apply now (this ends all\n"
+                "  running sessions): System -> Restart Server -> Session Daemon.",
+                flush=True,
+            )
+
+    try:
+        _UPDATE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _UPDATE_STATE_FILE.write_text(json.dumps({
+            "last_check": time.time(),
+            "cli_version": after or before,
+            "updated_last_check": updated,
+            "daemon_restart_pending": updated and daemon_was_running,
+        }, indent=2))
+    except Exception:
+        pass
+
+
+if not _TEST_PORT:
+    _update_boot_status("STEP:update")
+    try:
+        _check_claude_updates()
+    except Exception as _upd_err:
+        print("  WARNING: Claude update check failed: %s" % _upd_err, flush=True)
 
 # Ensure daemon is running before creating the Flask app (skip in test mode)
 if not _TEST_PORT:

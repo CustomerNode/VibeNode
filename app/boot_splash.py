@@ -45,6 +45,7 @@ STEPS = [
     ("loading", "Loading modules"),
     ("ports",   "Releasing ports"),
     ("deps",    "Checking dependencies"),
+    ("update",  "Checking Claude updates"),
     ("daemon",  "Starting session daemon"),
     ("server",  "Initializing server"),
     ("browser", "Opening browser"),
