@@ -138,8 +138,6 @@ def create_app(testing=False) -> Flask:
         start_compose_watcher(socketio, app)
 
     # Auto cache-busting: {{ versioned_static('js/app.js') }} → /static/js/app.js?v=<mtime>
-    import os as _os
-
     @app.context_processor
     def _static_cache_buster():
         def versioned_static(filename):
