@@ -362,7 +362,14 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
       // Cancel -> discard the panel. Normal stop -> KEEP it through finalize so the
       // message never appears to vanish; onstop fades it out after the handoff.
       if (this._discarded) { try { _snCaptionHide(); } catch (_) {} }
-      else { try { _snCaptionFinalize(); } catch (_) {} }
+      else {
+        try { _snCaptionFinalize(); } catch (_) {}
+        // Backstop: guarantee a send even if recorder.onstop NEVER fires (recorder error
+        // / already-inactive). commitSend is idempotent, so this can't double-send.
+        if (!this._sendBackstop && this._commitSend) {
+          this._sendBackstop = setTimeout(() => { try { this._commitSend(''); } catch (_) {} }, 7000);
+        }
+      }
       if (interimRecog) { try { interimRecog._intentionalStop = true; interimRecog.stop(); } catch (_) {} }
       try { if (this._recorder && this._recorder.state !== 'inactive') this._recorder.stop(); } catch (_) {}
       try { if (this._stream) this._stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
@@ -498,7 +505,12 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
       if (streamBusy || !chunks.length) { _reschedule(250); return; }
       streamBusy = true;
       const t0 = _now();
-      const useFast = streamCooldown > 0;   // full quality by default; greedy only if struggling
+      // Partials are ALWAYS fast/greedy (beam=1) so they return in well under a second
+      // and the live preview keeps up while you talk. If they still come back slow we
+      // additionally back OFF the rate (below). The final pause-snap uses full quality,
+      // so the committed message is never lower-quality. Full-quality partials were the
+      // bug: the first one was too slow to land before a short utterance finalized.
+      const useFast = true;
       const partial = new Blob(chunks.slice(), { type: (chunks[0] && chunks[0].type) || 'audio/webm' });
       window.SpeechNode.transcribeBlob(partial, { fast: useFast, cwd: snCwd }).then((res) => {
         streamBusy = false;
@@ -543,6 +555,7 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
     const commitSend = (text) => {
       if (controller._sent) return;
       controller._sent = true;
+      if (controller._sendBackstop) { clearTimeout(controller._sendBackstop); controller._sendBackstop = null; }
       if (_activeSpeechNode === controller) _activeSpeechNode = null;
       try { button.classList.remove('processing'); } catch (_) {}
       if (controller._userCancelled) {            // the ONLY thing that discards a message
@@ -557,19 +570,35 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
       if (joined) {
         try { _snCaptionSetFinal(t || joined); } catch (_) {}
         try { _snCaptionSend(); } catch (_) {}    // lift + fade as the message lands
-        textarea.value = joined;
-        textarea.dispatchEvent(new Event('input'));
+        // The input bar can re-render mid-capture (e.g. the session you're dictating to
+        // keeps streaming), swapping the textarea node. onSubmit re-queries the input by
+        // id, so write the message into the CURRENT live element — not the stale node we
+        // captured at start. (Writing to the detached node = "send motion plays, then it
+        // vanishes" — the message was put somewhere onSubmit never reads.)
+        const liveTa = (textarea.id && document.getElementById(textarea.id)) || textarea;
+        liveTa.value = joined;
+        try { liveTa.dispatchEvent(new Event('input')); } catch (_) {}
+        if (liveTa !== textarea) { try { textarea.value = joined; } catch (_) {} }
         updateIcon();
         _lastSubmitWasVoice = true;
-        if (onSubmit) onSubmit();
-      } else {                                     // genuinely no speech -> nothing to send
+        // If onSubmit throws, the text is already sitting in the live input -> recoverable,
+        // not lost. Tell the user so a failed auto-send never silently swallows a message.
+        try {
+          if (onSubmit) onSubmit();
+        } catch (e) {
+          console.warn('[SpeechNode] onSubmit threw; text left in the input box', e);
+          try { if (typeof showToast === 'function') showToast('Your dictation is ready — press Enter to send.', true); } catch (_) {}
+        }
+      } else {                                     // model recognized nothing -> say so, don't vanish silently
         try { _snCaptionHide(); } catch (_) {}
         updateIcon();
+        try { if (typeof showToast === 'function') showToast("Didn't catch that — try again.", true); } catch (_) {}
         textarea.focus();
       }
       setTimeout(() => { try { _snCaptionHide(); } catch (_) {} }, 340);
       _refreshBarSoon();
     };
+    controller._commitSend = commitSend;   // let the finalize-time backstop reach it
 
     recorder.onstop = () => {
       try { if (controller._stream) controller._stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
@@ -680,10 +709,15 @@ function _snCaptionEl() {
   }
   return el;
 }
+// Animated "Listening…" placeholder using the SAME shimmer gradient as the settling
+// tail, so the panel ALWAYS reads as alive — even when partials are empty/slow and no
+// text has streamed yet. Without it, "no live text" looked like a dead/broken capture.
+const _SN_LISTENING_HTML =
+  '<span class="sn-cap-word sn-cap-tail sn-cap-listening" style="font-style:italic">Listening…</span>';
 function _snCaptionShow(textarea) {
   const el = _snCaptionEl();
   el.classList.remove('finalizing', 'finalized', 'sn-cap-sending');
-  el.querySelector('.sn-cap-text').innerHTML = '';
+  el.querySelector('.sn-cap-text').innerHTML = _SN_LISTENING_HTML;
   try {
     const r = textarea.getBoundingClientRect();
     // Cover the textarea's box, but anchor to its BOTTOM so the panel grows UPWARD
@@ -703,6 +737,13 @@ function _snCaptionUpdate(committed, tail) {
   const textEl = el.querySelector('.sn-cap-text');
   const committedN = (committed || []).length;
   const words = (committed || []).concat(tail || []);
+  if (words.length === 0) {   // nothing recognized yet -> keep the shimmering "Listening…"
+    if (!textEl.querySelector('.sn-cap-listening')) textEl.innerHTML = _SN_LISTENING_HTML;
+    return;
+  }
+  if (textEl.firstElementChild && textEl.firstElementChild.classList.contains('sn-cap-listening')) {
+    textEl.innerHTML = '';    // leaving the placeholder -> render real words clean
+  }
   // Reconcile per word: only re-render words that actually changed, and glow-
   // highlight those so a retroactive correction reads as a deliberate refinement.
   for (let i = 0; i < words.length; i++) {
