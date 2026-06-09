@@ -2,12 +2,29 @@
 VibeNode Flask application factory.
 """
 
+import logging as _logging
+import os as _os
+import sys as _sys
+
 from flask import Flask, request
 from flask_socketio import SocketIO
 
 from .config import _VIBENODE_DIR
 
 socketio = SocketIO()
+
+# --- SpeechNode (extracted package: github.com/CustomerNode/SpeechNode) ---
+# Prefer a real install; fall back to the sibling source checkout next to the repo.
+# Reuse VibeNode's existing model/venv cache so consuming the package never triggers
+# a re-download. (Mounted via register_speechnode() in create_app.)
+try:
+    import speechnode  # noqa: F401
+except ImportError:
+    _sn_src = _VIBENODE_DIR.parent / "SpeechNode"
+    if _sn_src.is_dir():
+        _sys.path.insert(0, str(_sn_src))
+_os.environ.setdefault("SPEECHNODE_MODEL_DIR", str(_VIBENODE_DIR / ".cache" / "speechnode-models"))
+_os.environ.setdefault("SPEECHNODE_VENV_DIR", str(_VIBENODE_DIR / ".cache" / "speechnode-venv"))
 
 
 def create_app(testing=False) -> Flask:
@@ -60,7 +77,6 @@ def create_app(testing=False) -> Flask:
     from .routes.test_api import bp as test_bp
     from .routes.admin_api import bp as admin_bp
     from .routes.watchdog_api import bp as watchdog_bp
-    from .routes.speechnode_api import bp as speechnode_bp
 
     app.register_blueprint(main_bp)
     app.register_blueprint(sessions_bp)
@@ -75,7 +91,21 @@ def create_app(testing=False) -> Flask:
     app.register_blueprint(test_bp)
     app.register_blueprint(admin_bp)
     app.register_blueprint(watchdog_bp)
-    app.register_blueprint(speechnode_bp)
+
+    # SpeechNode (extracted package) — mount its routes + serve its web assets.
+    # Optional: if the package isn't importable, VibeNode still runs (voice off).
+    try:
+        from speechnode.flask import register_speechnode
+        import speechnode as _speechnode
+        register_speechnode(app)                       # /api/speechnode/*
+        from flask import send_from_directory as _sfd
+        _sn_web = _speechnode.web_dir()
+
+        @app.route("/speechnode/<path:filename>")
+        def _speechnode_assets(filename):              # serves speechnode.js / speechnode.css
+            return _sfd(_sn_web, filename)
+    except Exception as _e:                            # noqa: BLE001
+        _logging.getLogger("app").warning("SpeechNode unavailable: %s", _e)
 
     if not testing:
         # PERF-CRITICAL: Startup-only cleanup — do NOT call from all_sessions() or per-request paths. See CLAUDE.md #13.

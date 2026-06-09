@@ -336,6 +336,9 @@ function setupVoiceButton(textarea, button, onSubmit) {
  */
 function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
   const existingText = textarea.value ? textarea.value.replace(/\s+$/, '') : '';
+  // Bias SpeechNode toward the ACTIVE project's vocabulary: capture the current
+  // project dir once (so partials + the final all learn from the same codebase).
+  const snCwd = (typeof _currentProjectDir === 'function') ? (_currentProjectDir() || '') : '';
   let interimRecog = null;
   let stopped = false;
 
@@ -497,7 +500,7 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
       const t0 = _now();
       const useFast = streamCooldown > 0;   // full quality by default; greedy only if struggling
       const partial = new Blob(chunks.slice(), { type: (chunks[0] && chunks[0].type) || 'audio/webm' });
-      window.SpeechNode.transcribeBlob(partial, { fast: useFast }).then((res) => {
+      window.SpeechNode.transcribeBlob(partial, { fast: useFast, cwd: snCwd }).then((res) => {
         streamBusy = false;
         const dur = _now() - t0;
         if (dur > 1200) streamCooldown = Math.min(1500, streamCooldown + 300);
@@ -576,7 +579,7 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
       // Watchdog: if the final transcribe is slow or dies, still send the best live
       // transcript. commitSend is idempotent, so this can never double-send.
       const watchdog = setTimeout(() => { commitSend(''); }, 6000);
-      window.SpeechNode.transcribeBlob(blob, {}).then((res) => {
+      window.SpeechNode.transcribeBlob(blob, { cwd: snCwd }).then((res) => {
         clearTimeout(watchdog);
         if (res && res.ok && typeof res.text === 'string' && res.text.trim()) {
           _processVoiceTranscript(res.text, { textarea, onSubmit, source: 'speechnode' })
