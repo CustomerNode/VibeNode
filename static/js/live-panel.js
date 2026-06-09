@@ -88,6 +88,11 @@ function _formatMsgTime(tsStr) {
 let liveLineCount = 0;
 let _liveSending = false;
 let liveAutoScroll = true;
+// Timestamp (ms) of the last *programmatic* top-align auto-scroll. The live-log
+// scroll listener uses it to ignore the scroll event our own top-align fires —
+// otherwise it would mistake "scrolled to the AI message's top" for the user
+// manually scrolling up and disable auto-scroll. See _autoScrollLiveLog().
+let _autoScrollTopAlignTs = 0;
 // Monotonic counter used to tag optimistic user bubbles so they can be
 // matched/replaced when the server echoes the entry back — without any
 // text-based comparison that would eat legitimate duplicate messages.
@@ -538,6 +543,11 @@ function startLivePanel(id, opts) {
   _clearOutputShelf();
   const logEl = document.getElementById('live-log');
   logEl.addEventListener('scroll', () => {
+    // Ignore the scroll event triggered by our own programmatic top-align of
+    // the most-recent AI message — that is an auto-scroll, not the user
+    // scrolling up, so it must NOT disable auto-scroll. (Window is short so a
+    // genuine user scroll right afterward is still honored.)
+    if (Date.now() - _autoScrollTopAlignTs < 150) return;
     const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 60;
     liveAutoScroll = atBottom;
   });
@@ -695,7 +705,189 @@ function _savePendingInputAsDraft() {
   _saveDraft(id, text);
 }
 
-function renderLiveEntry(e) {
+// Character limits before a chat message body is truncated behind a
+// "show more" button. Assistant messages truncate sooner than user messages.
+const _MSG_TRUNCATE_LIMIT = { asst: 600, user: 800 };
+
+/**
+ * Populate (or re-populate) a chat message's `.msg-body`, managing truncation
+ * and the "show more" control.
+ *
+ * @param {HTMLElement} div       the `.msg` wrapper element
+ * @param {string}      kind      'asst' or 'user'
+ * @param {string}      fullText  the complete message text
+ * @param {boolean}     expanded  when true (assistant only), render the full
+ *                                text with no "show more" button and tag the
+ *                                element `msg-recent-expanded` so a later
+ *                                assistant message can re-collapse it.
+ *
+ * Used both at initial render and by _collapseRecentAsst() when a newer
+ * assistant message supersedes a previously auto-expanded one.
+ */
+function _fillMsgBody(div, kind, fullText, expanded) {
+  const isAsst = kind === 'asst';
+  const bodyEl = div.querySelector('.msg-body');
+  if (!bodyEl) return;
+
+  // Reset any state left from a prior render (matters on re-collapse).
+  const staleBtn = div.querySelector(':scope > .live-expand-btn');
+  if (staleBtn) staleBtn.remove();
+  div.classList.remove('msg-recent-expanded');
+  // Stash the full text so the message can be re-collapsed later without
+  // re-fetching it (property, not dataset — avoids serializing into the DOM).
+  div._vnFullText = fullText;
+
+  const LIMIT = _MSG_TRUNCATE_LIMIT[kind] != null ? _MSG_TRUNCATE_LIMIT[kind] : 600;
+  const truncate = !expanded && fullText.length > LIMIT;
+  const displayText = truncate ? fullText.slice(0, LIMIT) : fullText;
+
+  if (isAsst) {
+    bodyEl.innerHTML = mdParse(displayText);
+    if (typeof addSmartCopyButtons === 'function') addSmartCopyButtons(bodyEl, displayText);
+  } else {
+    bodyEl.innerHTML = '<pre style="white-space:pre-wrap;margin:0;">' + escHtml(displayText) + '</pre>';
+  }
+
+  // Tag the most-recent, auto-expanded assistant message so a later assistant
+  // message knows which element to collapse back to truncated form.
+  if (expanded && isAsst && fullText.length > LIMIT) {
+    div.classList.add('msg-recent-expanded');
+  }
+
+  if (truncate) {
+    const btn = document.createElement('button');
+    btn.className = 'live-expand-btn';
+    btn.textContent = '… show more';
+    btn.onclick = () => {
+      if (isAsst) {
+        bodyEl.innerHTML = mdParse(fullText);
+        if (typeof addSmartCopyButtons === 'function') addSmartCopyButtons(bodyEl, fullText);
+      } else {
+        bodyEl.innerHTML = '<pre style="white-space:pre-wrap;margin:0;">' + escHtml(fullText) + '</pre>';
+      }
+      btn.remove();
+    };
+    div.appendChild(btn);
+  }
+}
+
+/**
+ * Revert the previously auto-expanded most-recent assistant message back to its
+ * normal truncated "show more" form. Called when a newer assistant message
+ * arrives so that only the single most-recent AI message stays fully expanded.
+ * Messages the user manually expanded (via "show more") are NOT tagged
+ * `msg-recent-expanded`, so they are never collapsed by this.
+ *
+ * @param {HTMLElement} logEl  the live-log container to search within
+ */
+function _collapseRecentAsst(logEl) {
+  if (!logEl) return;
+  const prev = logEl.querySelector('.msg.assistant.msg-recent-expanded');
+  if (!prev) return;
+  const fullText = prev._vnFullText;
+  if (typeof fullText !== 'string') { prev.classList.remove('msg-recent-expanded'); return; }
+  _fillMsgBody(prev, 'asst', fullText, false);
+}
+
+// Small gap (px) left above a top-aligned AI message so its first line isn't
+// jammed against the very top edge of the log viewport.
+const _MSG_SCROLL_TOP_PAD = 8;
+
+/**
+ * Is `el` the newest conversation message in the log? True when no user or
+ * assistant `.msg` element follows it in DOM order. Trailing non-message nodes
+ * (output cards, buttons) are ignored — they don't represent newer chat turns.
+ *
+ * Used to decide whether a fallback top-align is safe: if the user just sent a
+ * message (an optimistic user bubble was appended below the last AI message),
+ * the AI message is no longer last, so we must scroll to bottom instead.
+ *
+ * @param {HTMLElement} logEl  the live-log container (messages are its children)
+ * @param {HTMLElement} el     the candidate message element
+ * @returns {boolean}
+ */
+function _isLastMessageEl(logEl, el) {
+  let sib = el.nextElementSibling;
+  while (sib) {
+    if (sib.classList && sib.classList.contains('msg')) return false;
+    sib = sib.nextElementSibling;
+  }
+  return true;
+}
+
+/**
+ * Auto-scroll the live log after new content is rendered or the view settles.
+ *
+ * Default behavior is scroll-to-bottom (follow the newest content). When the
+ * most-recent assistant message is rendered fully expanded AND is taller than
+ * the viewport, instead top-align it so the user starts reading from its first
+ * line and scrolls down as they read. If the message fits entirely within the
+ * viewport (there is extra space), scroll-to-bottom already shows all of it
+ * from the top, so we keep the simpler bottom behavior.
+ *
+ * This is the single source of truth for live-log auto-scroll so that the many
+ * settle-scrolls that fire on state transitions (input-bar re-render, session
+ * state change) all converge on the same top-aligned result instead of
+ * stomping each other back to the bottom.
+ *
+ * @param {HTMLElement}  logEl  the live-log scroll container
+ * @param {HTMLElement?} msgEl  the just-rendered AI message to top-align. When
+ *                              omitted, the last assistant message in the log
+ *                              is used (so settle-scrolls that don't have the
+ *                              element still top-align the most-recent AI msg).
+ */
+function _autoScrollLiveLog(logEl, msgEl) {
+  if (!logEl) return;
+
+  // While a response is actively streaming, always follow the tail — the
+  // partial streaming bubble is what the user is watching, not the previous
+  // completed message.
+  if (logEl.querySelector('.msg.assistant.streaming-bubble')) {
+    logEl.scrollTop = logEl.scrollHeight;
+    return;
+  }
+
+  // Fall back to the last assistant message in the log so callers that only
+  // have the log element (settle-scrolls fired on state transitions) still
+  // top-align the most-recent AI message. The offsetHeight gate below is the
+  // real decider — a short message that fits the viewport still scrolls to
+  // bottom regardless of which target is chosen.
+  //
+  // CRITICAL: only top-align the fallback target when it is the *last* message
+  // in the log. If anything newer follows it (e.g. the user just sent a message
+  // and an optimistic user bubble was appended below), we must scroll to bottom
+  // so that newest content is visible — top-aligning the older AI message would
+  // hide the user's own message. The explicit-element path (msgEl passed by the
+  // entry renderer) skips this check because the caller already knows it just
+  // rendered the newest entry.
+  let target = msgEl;
+  if (!target) {
+    const asstMsgs = logEl.querySelectorAll('.msg.assistant:not(.streaming-bubble)');
+    const lastAsst = asstMsgs.length ? asstMsgs[asstMsgs.length - 1] : null;
+    // Only adopt it as the top-align target if it is still the newest message
+    // in the log. _isLastMessageEl ignores trailing non-message nodes (output
+    // cards, buttons) but treats a newer user/assistant bubble as disqualifying.
+    if (lastAsst && _isLastMessageEl(logEl, lastAsst)) target = lastAsst;
+  }
+
+  if (target && target.offsetHeight > logEl.clientHeight) {
+    // Message is taller than the viewport — position its first line near the
+    // top edge. Compute the message's top relative to the log's scroll origin
+    // via getBoundingClientRect so it's correct regardless of offsetParent.
+    const top = target.getBoundingClientRect().top
+              - logEl.getBoundingClientRect().top
+              + logEl.scrollTop
+              - _MSG_SCROLL_TOP_PAD;
+    // Mark this as a programmatic top-align so the scroll listener doesn't
+    // misread the resulting scroll event as a manual scroll-up.
+    _autoScrollTopAlignTs = Date.now();
+    logEl.scrollTop = Math.max(0, top);
+  } else {
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+}
+
+function renderLiveEntry(e, opts) {
   const div = document.createElement('div');
   if (!e) return div;
 
@@ -739,39 +931,17 @@ function renderLiveEntry(e) {
     }
 
     div.className = 'msg ' + role;
-    const LIMIT = e.kind === 'asst' ? 600 : 800;
-    const displayText = text.length > LIMIT ? text.slice(0, LIMIT) : text;
-
     const roleLabel = e.kind === 'user' ? 'me' : 'claude';
     const ts = e.timestamp ? _formatMsgTime(e.timestamp) : '';
-    let body;
-    if (e.kind === 'asst') {
-      body = mdParse(displayText);
-    } else {
-      body = '<pre style="white-space:pre-wrap;margin:0;">' + escHtml(displayText) + '</pre>';
-    }
+    // Scaffold: role line + an empty body that _fillMsgBody() populates below.
     div.innerHTML = '<div class="msg-role">' + roleLabel + (ts ? ' <span class="msg-time">' + ts + '</span>' : '') + '</div>' +
-      '<div class="msg-body msg-content">' + body + '</div>';
+      '<div class="msg-body msg-content"></div>';
 
-    if (e.kind === 'asst' && typeof addSmartCopyButtons === 'function') {
-      addSmartCopyButtons(div.querySelector('.msg-body'), displayText);
-    }
-
-    if (text.length > LIMIT) {
-      const btn = document.createElement('button');
-      btn.className = 'live-expand-btn';
-      btn.textContent = '\u2026 show more';
-      btn.onclick = () => {
-        const bodyEl = div.querySelector('.msg-body');
-        if (e.kind === 'asst') {
-          bodyEl.innerHTML = mdParse(text);
-          if (typeof addSmartCopyButtons === 'function') addSmartCopyButtons(bodyEl, text);
-        }
-        else { bodyEl.innerHTML = '<pre style="white-space:pre-wrap;margin:0;">' + escHtml(text) + '</pre>'; }
-        btn.remove();
-      };
-      div.appendChild(btn);
-    }
+    // The caller can force the most-recent assistant message to render fully
+    // expanded (no truncation, no "show more"). Only honored for assistant
+    // messages \u2014 user messages always keep their truncation behavior.
+    const _forceExpand = !!(opts && opts.forceExpand) && e.kind === 'asst';
+    _fillMsgBody(div, e.kind, text, _forceExpand);
 
     // Add VN metadata footer for user messages
     if (e.kind === 'user' && vnSentAt) {
@@ -1244,7 +1414,7 @@ function updateLiveInputBar() {
     if (_barHadFocus) { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }
     setTimeout(() => {
       const logEl = document.getElementById('live-log');
-      if (logEl) logEl.scrollTop = logEl.scrollHeight;
+      if (logEl) _autoScrollLiveLog(logEl);
       const ta = document.getElementById('live-input-ta');
       if (ta) { if (!_barHadFocus) ta.focus(); _initAutoResize(ta); }
     }, 50);
@@ -1306,7 +1476,7 @@ function updateLiveInputBar() {
       _initAutoResize(ta);
       setTimeout(() => {
         const logEl = document.getElementById('live-log');
-        if (logEl) logEl.scrollTop = logEl.scrollHeight;
+        if (logEl) _autoScrollLiveLog(logEl);
         if (!_barHadFocus) ta.focus();
       }, 50);
     }
@@ -1344,7 +1514,7 @@ function updateLiveInputBar() {
     if (_barHadFocus) { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }
     setTimeout(() => {
       const logEl = document.getElementById('live-log');
-      if (logEl) logEl.scrollTop = logEl.scrollHeight;
+      if (logEl) _autoScrollLiveLog(logEl);
       const ta = document.getElementById('live-input-ta');
       if (ta) { if (!_barHadFocus) ta.focus(); _initAutoResize(ta); }
     }, 50);

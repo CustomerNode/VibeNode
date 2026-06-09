@@ -3480,6 +3480,296 @@ mark.find-match.current { background: var(--accent); color:#fff; }
 .add-mode-title { font-size: 14px; font-weight: 600; color: var(--text-heading); margin-bottom: 2px; }
 .add-mode-desc { font-size: 12px; color: var(--text-muted); }
 
+/* ===== Preferences: compact toggle rows ===== */
+.pref-list { display: flex; flex-direction: column; margin-bottom: 18px; }
+.pref-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 13px 0;
+  border-bottom: 1px solid var(--border);
+}
+.pref-row:first-child { padding-top: 4px; }
+.pref-row:last-child { border-bottom: none; padding-bottom: 0; }
+.pref-row-text { flex: 1; min-width: 0; }
+.pref-row-label { font-size: 13px; font-weight: 600; color: var(--text-heading); margin-bottom: 2px; }
+.pref-row-hint { font-size: 12px; color: var(--text-muted); line-height: 1.4; }
+.pref-toggle {
+  flex-shrink: 0;
+  width: 40px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: var(--bg-btn);
+  position: relative;
+  cursor: pointer;
+  outline: none;
+  transition: background 0.18s ease;
+}
+.pref-toggle:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+.pref-toggle.on { background: var(--accent); }
+.pref-toggle-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  transition: transform 0.18s cubic-bezier(0.16,1,0.3,1);
+}
+.pref-toggle.on .pref-toggle-knob { transform: translateX(18px); }
+
+/* ===== Developer Tools popup ===== */
+.dev-tool-section-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 16px 0 8px;
+}
+.dev-tool-section-label:first-of-type { margin-top: 6px; }
+.dev-tool-row {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  gap: 12px;
+  padding: 10px 14px;
+  margin-bottom: 6px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.15s;
+}
+.dev-tool-row:hover { background: var(--bg-hover); border-color: var(--border-hover); }
+.dev-tool-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.dev-tool-label { font-size: 13px; font-weight: 600; color: var(--text-heading); }
+.dev-tool-hint { font-size: 12px; color: var(--text-muted); line-height: 1.35; }
+.dev-tool-row.danger .dev-tool-label { color: var(--danger, #e55); }
+.dev-tool-row.danger:hover { border-color: var(--danger, #e55); }
+
+/* ===== SpeechNode setup/install modal ===== */
+.sn-msg { font-size: 13px; color: var(--text-secondary); line-height: 1.55; margin: 0 0 12px; }
+.sn-msg code, .sn-remediation { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.sn-sub { font-size: 12px; color: var(--text-muted); line-height: 1.5; margin: 10px 0 16px; }
+.sn-status { font-size: 14px; font-weight: 600; padding: 12px 14px; border-radius: 9px; margin-bottom: 12px; }
+.sn-ok { color: #36d399; background: rgba(54, 211, 153, 0.08); border: 1px solid rgba(54, 211, 153, 0.25); }
+.sn-error { color: var(--danger, #e55); background: rgba(229, 85, 85, 0.08); border: 1px solid rgba(229, 85, 85, 0.25); }
+.sn-remediation {
+  font-size: 12px; color: var(--text-secondary); background: var(--bg-code, #0d0d1a);
+  border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin: 0 0 16px;
+  white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow: auto;
+}
+.sn-progress { height: 8px; border-radius: 999px; background: var(--bg-btn); overflow: hidden; margin: 8px 0 4px; }
+.sn-progress-bar { height: 100%; background: var(--accent); border-radius: 999px; transition: width 0.4s ease; }
+
+/* Voice button while a SpeechNode transcript is being fetched */
+.recording.processing, .live-send-btn.processing { animation: sn-pulse 1s ease-in-out infinite; }
+@keyframes sn-pulse { 0%, 100% { opacity: 0.45; } 50% { opacity: 0.9; } }
+
+/* ===== SpeechNode Live caption — ultra-premium streaming surface ===== */
+.sn-live-caption {
+  --sn-level: 0;                 /* 0..1, driven by live mic level */
+  position: fixed;
+  z-index: 9000;
+  max-width: 92vw;
+  padding: 13px 18px;
+  border-radius: 12px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  font-size: 15px;
+  line-height: 1.6;
+  letter-spacing: 0.005em;
+  color: var(--text-heading);              /* theme tokens — adapts to light/dark */
+  background: var(--bg-modal);
+  border: 1px solid var(--border);
+  box-shadow:
+    0 16px 44px -16px rgba(0, 0, 0, 0.5),
+    0 0 calc(6px + 14px * var(--sn-level)) -4px var(--accent);   /* subtle, accent-tinted */
+  backdrop-filter: blur(24px) saturate(1.4);
+  -webkit-backdrop-filter: blur(24px) saturate(1.4);
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(0.985);
+  transform-origin: bottom center;   /* grows upward from the input, not off-screen */
+  transition: opacity 0.26s ease, transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.sn-live-caption.show {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;   /* enable the in-panel stop/cancel controls */
+}
+
+/* In-panel controls — purpose-built, fully inside the glass (no bar buttons) */
+.sn-cap-btn {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  border: 1px solid var(--border-btn, var(--border));
+  background: var(--bg-btn);
+  cursor: pointer;
+  transition: opacity 0.25s ease, transform 0.25s cubic-bezier(0.16,1,0.3,1), background 0.15s ease, border-color 0.15s ease, filter 0.15s ease;
+}
+.sn-cap-cancel { color: var(--text-muted); }
+.sn-cap-cancel:hover { color: #fff; background: var(--result-err, #c44); border-color: var(--result-err, #c44); }
+.sn-cap-stop {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.sn-cap-stop:hover { background: var(--accent-hover); border-color: var(--accent-hover); transform: translateY(-1px); }
+.sn-cap-stop:active { transform: scale(0.94); }
+/* During finalize, keep the ✕ available so you can still abort the send — only the
+   Stop button fades (it's moot once we're already sending). */
+.sn-live-caption.finalizing .sn-cap-stop,
+.sn-live-caption.finalized .sn-cap-stop { opacity: 0; transform: translateX(10px) scale(0.9); pointer-events: none; }
+
+/* live equalizer */
+.sn-cap-eq { display: inline-flex; align-items: flex-end; gap: 3px; height: 1.25em; margin-top: 3px; flex-shrink: 0; }
+.sn-cap-eq i {
+  width: 3px;
+  border-radius: 3px;
+  transform-origin: bottom;
+  background: var(--accent);
+  animation: sn-eq 1s ease-in-out infinite;
+}
+.sn-cap-eq i:nth-child(1) { height: 55%; animation-delay: 0s; }
+.sn-cap-eq i:nth-child(2) { height: 100%; animation-delay: 0.16s; }
+.sn-cap-eq i:nth-child(3) { height: 72%; animation-delay: 0.33s; }
+.sn-cap-eq i:nth-child(4) { height: 45%; animation-delay: 0.1s; }
+@keyframes sn-eq { 0%, 100% { transform: scaleY(0.4); } 50% { transform: scaleY(1); } }
+
+/* transcript text */
+.sn-cap-text { flex: 1; min-width: 0; }
+.sn-cap-text:empty::after { content: 'Listening…'; color: var(--text-faint, var(--text-muted)); font-style: italic; }
+.sn-cap-committed { color: var(--text-heading); }
+.sn-cap-tail {
+  background: linear-gradient(90deg,
+    var(--text-muted) 0%, var(--text-muted) 38%,
+    var(--text-heading) 50%, var(--text-muted) 62%, var(--text-muted) 100%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: sn-shimmer 1.7s linear infinite;
+}
+@keyframes sn-shimmer { 0% { background-position: 210% 0; } 100% { background-position: -110% 0; } }
+
+/* per-word change highlight: a brief accent glow so retroactive corrections
+   read as a deliberate refinement instead of text silently regenerating */
+.sn-cap-word { transition: color 0.18s ease; }
+.sn-cap-word.sn-word-anim { animation: sn-word-hl 0.6s ease-out; }
+@keyframes sn-word-hl {
+  0%   { filter: drop-shadow(0 0 7px var(--accent)); }
+  100% { filter: drop-shadow(0 0 0 transparent); }
+}
+
+/* Finalize handoff: the panel STAYS and gently "polishes" while the final pass
+   runs, then the clean text pops in and the panel fades out as the message sends
+   — no empty gap, no lonely "transcribing" toast. */
+.sn-live-caption.finalizing { animation: sn-cap-breathe 1.2s ease-in-out infinite; }
+@keyframes sn-cap-breathe {
+  0%, 100% { box-shadow: 0 16px 44px -16px rgba(0,0,0,0.5), 0 0 12px -6px var(--accent); }
+  50%      { box-shadow: 0 16px 44px -16px rgba(0,0,0,0.5), 0 0 26px 0 var(--accent); }
+}
+/* The moment you stop (finalizing) the equalizer COLLAPSES AWAY — it does not keep
+   animating. No more "looks like it's still recording". */
+.sn-live-caption.finalizing .sn-cap-eq,
+.sn-live-caption.finalized .sn-cap-eq {
+  opacity: 0;
+  width: 0;
+  margin: 0;
+  overflow: hidden;
+  transition: opacity 0.16s ease, width 0.24s ease, margin 0.24s ease;
+}
+.sn-live-caption.finalizing .sn-cap-eq i,
+.sn-live-caption.finalized .sn-cap-eq i { animation: none !important; }
+
+/* "Sending" spinner — takes the equalizer's spot on the left during finalize */
+.sn-cap-spinner {
+  display: none;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  margin-top: 4px;
+  border-radius: 50%;
+  border: 2px solid var(--border-hover, #888);
+  border-top-color: var(--accent);
+  animation: sn-spin 0.7s linear infinite;
+}
+.sn-live-caption.finalizing .sn-cap-spinner,
+.sn-live-caption.finalized .sn-cap-spinner { display: inline-block; }
+@keyframes sn-spin { to { transform: rotate(360deg); } }
+
+/* "Sent" motion — the whole panel lifts and fades as the message commits to chat */
+.sn-live-caption.sn-cap-sending {
+  pointer-events: none;
+  animation: sn-cap-send 0.34s cubic-bezier(0.4, 0, 1, 1) forwards;
+}
+@keyframes sn-cap-send {
+  to { opacity: 0; transform: translateY(-24px) scale(0.97); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sn-cap-spinner { animation: none; }
+  .sn-live-caption.sn-cap-sending { animation: none; opacity: 0; }
+}
+.sn-live-caption.finalized { animation: sn-cap-pop 0.42s ease-out; }
+@keyframes sn-cap-pop { 0% { filter: brightness(1.14); } 100% { filter: brightness(1); } }
+@media (prefers-reduced-motion: reduce) {
+  .sn-live-caption.finalizing, .sn-live-caption.finalized,
+  .sn-live-caption.finalizing .sn-cap-eq i { animation: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sn-cap-eq i, .sn-cap-tail { animation: none; }
+  .sn-live-caption { transition: opacity 0.2s ease; }
+}
+
+/* Recording controls, matched to the premium glass while SpeechNode is live.
+   Same glass material/tokens as the caption so they read as one system. Red is
+   calmed to a resting neutral and only asserts on hover/recording. Scoped to
+   body.sn-live so the standard Web Speech voice controls are unchanged. */
+body.sn-live .voice-cancel-btn,
+body.sn-live .live-send-btn.recording {
+  background: rgba(22, 22, 30, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 8px 22px -8px rgba(0, 0, 0, 0.6);
+  transition: all 0.16s ease;
+}
+body.sn-live .voice-cancel-btn {
+  width: 28px;
+  height: 28px;
+  color: rgba(255, 255, 255, 0.6);   /* calm at rest */
+}
+body.sn-live .voice-cancel-btn:hover {
+  background: rgba(239, 68, 68, 0.92);
+  border-color: rgba(239, 68, 68, 0.85);
+  color: #fff;
+  transform: translateY(-1px);
+}
+body.sn-live .live-send-btn.recording {
+  border-color: rgba(255, 120, 120, 0.42);
+  color: #ff7a7a;                    /* softened recording red */
+}
+/* keep the controls above the glass panel (which covers the textarea at z-9000) */
+body.sn-live .voice-cancel-btn,
+body.sn-live .live-send-btn { position: relative; z-index: 9001; }
+
 /* Overlay close button (top-right X) */
 .overlay-close {
   position: absolute;

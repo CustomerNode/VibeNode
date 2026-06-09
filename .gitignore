@@ -237,6 +237,11 @@ docs/video/audio/
 # Scratch/temp test files
 tests/_scratch_*
 
+# SpeechNode — local Whisper model cache + owned virtualenv (created on enable,
+# never committed; keeps the speech engine isolated from system/user Python)
+.cache/speechnode-models/
+.cache/speechnode-venv/
+
 # Secrets - contains Supabase keys
 kanban_config.json
 kanban_config.json.test_backup

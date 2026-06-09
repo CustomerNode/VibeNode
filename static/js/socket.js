@@ -662,9 +662,14 @@ socket.on('session_state', (data) => {
     if (liveSessionId === session_id) {
         liveBarState = null;  // force re-render
         updateLiveInputBar();
-        // Scroll to bottom on state change (working bar appears/disappears)
+        // Settle scroll on state change (working bar appears/disappears).
+        // Route through _autoScrollLiveLog so it top-aligns the most-recent
+        // expanded AI message instead of stomping it back to the bottom.
         const _logEl = document.getElementById('live-log');
-        if (_logEl && liveAutoScroll) setTimeout(() => { _logEl.scrollTop = _logEl.scrollHeight; }, 100);
+        if (_logEl && liveAutoScroll) setTimeout(() => {
+            if (typeof _autoScrollLiveLog === 'function') _autoScrollLiveLog(_logEl);
+            else _logEl.scrollTop = _logEl.scrollHeight;
+        }, 100);
 
         // Self-healing: check if frontend is missing entries vs backend.
         // Only re-fetch if the backend genuinely has MORE entries than the
@@ -1060,12 +1065,26 @@ socket.on('session_entry', (data) => {
             optimistic.remove();
         }
     }
-    logEl.appendChild(renderLiveEntry(data.entry));
+    // When a new assistant message arrives it becomes the most-recent AI
+    // message: collapse the previously auto-expanded one (if any) back to its
+    // truncated "show more" form, then render the new one fully expanded so
+    // only the latest AI message stays open.
+    const _isAsstEntry = data.entry.kind === 'asst';
+    if (_isAsstEntry && typeof _collapseRecentAsst === 'function') _collapseRecentAsst(logEl);
+    const _newEntryEl = renderLiveEntry(data.entry, _isAsstEntry ? { forceExpand: true } : undefined);
+    logEl.appendChild(_newEntryEl);
     if (typeof _tryAddOutputCard === 'function') _tryAddOutputCard(data.entry);
     liveLineCount = (data.index != null) ? data.index + 1 : liveLineCount + 1;
     if (typeof _updateLastMessageTimes === 'function') _updateLastMessageTimes();
     if (liveAutoScroll) {
-        logEl.scrollTop = logEl.scrollHeight;
+        // For a freshly-arrived AI message, top-align it (when taller than the
+        // viewport) so the user can start reading from its first line; for any
+        // other entry, scroll to bottom as usual.
+        if (typeof _autoScrollLiveLog === 'function') {
+            _autoScrollLiveLog(logEl, _isAsstEntry ? _newEntryEl : null);
+        } else {
+            logEl.scrollTop = logEl.scrollHeight;
+        }
     }
     // ── Sub-agent team tracking ──
     if (data.entry.kind === 'tool_use' && data.entry.name === 'Agent') {
@@ -1394,9 +1413,21 @@ socket.on('session_log', (data) => {
         logEl.appendChild(_createLoadMoreButton());
     }
 
+    // The most-recent expanded AI message, captured during render so we can
+    // top-align it (rather than scroll-to-bottom) once the page is laid out.
+    let _expandedAsstEl = null;
     if (entries.length) {
-        entries.forEach((entry) => {
-            logEl.appendChild(renderLiveEntry(entry));
+        // Find the most-recent assistant entry so it renders fully expanded
+        // (no "show more"). This is the tail page, so its last 'asst' entry is
+        // the newest AI message in the whole conversation.
+        let _lastAsstIdx = -1;
+        for (let i = entries.length - 1; i >= 0; i--) {
+            if (entries[i] && entries[i].kind === 'asst') { _lastAsstIdx = i; break; }
+        }
+        entries.forEach((entry, i) => {
+            const _el = renderLiveEntry(entry, i === _lastAsstIdx ? { forceExpand: true } : undefined);
+            if (i === _lastAsstIdx) _expandedAsstEl = _el;
+            logEl.appendChild(_el);
             if (typeof _tryAddOutputCard === 'function') _tryAddOutputCard(entry);
         });
         liveLineCount = total;
@@ -1405,7 +1436,13 @@ socket.on('session_log', (data) => {
     }
 
     if (typeof _updateLastMessageTimes === 'function') _updateLastMessageTimes();
-    if (liveAutoScroll) logEl.scrollTop = logEl.scrollHeight;
+    if (liveAutoScroll) {
+        // Top-align the most-recent AI message if it's taller than the viewport
+        // so the user starts reading from its first line; otherwise scroll to
+        // bottom as usual.
+        if (typeof _autoScrollLiveLog === 'function') _autoScrollLiveLog(logEl, _expandedAsstEl);
+        else logEl.scrollTop = logEl.scrollHeight;
+    }
 
     // Performance: measure session switch time (from get_session_log emit to render complete)
     if (performance.getEntriesByName('switch-' + data.session_id).length) {

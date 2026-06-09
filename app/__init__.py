@@ -60,6 +60,7 @@ def create_app(testing=False) -> Flask:
     from .routes.test_api import bp as test_bp
     from .routes.admin_api import bp as admin_bp
     from .routes.watchdog_api import bp as watchdog_bp
+    from .routes.speechnode_api import bp as speechnode_bp
 
     app.register_blueprint(main_bp)
     app.register_blueprint(sessions_bp)
@@ -74,6 +75,7 @@ def create_app(testing=False) -> Flask:
     app.register_blueprint(test_bp)
     app.register_blueprint(admin_bp)
     app.register_blueprint(watchdog_bp)
+    app.register_blueprint(speechnode_bp)
 
     if not testing:
         # PERF-CRITICAL: Startup-only cleanup — do NOT call from all_sessions() or per-request paths. See CLAUDE.md #13.

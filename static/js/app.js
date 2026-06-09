@@ -1716,112 +1716,156 @@ _updateThinkingLabel();
 // --- Preferences Modal ---
 function openPreferences() {
   const overlay = document.getElementById('pm-overlay');
-  const options = [
-    {key: 'ctrl-enter', name: _MOD + '+Enter, Shift+Enter, or Alt+Enter to send', desc: 'Any modifier + Enter sends. Enter alone adds a new line.'},
-    {key: 'enter', name: 'Enter to send', desc: 'Press Enter to send. ' + _MOD + '+Enter, Shift+Enter, and Alt+Enter add a new line.'},
-  ];
-  let html = '<div class="pm-card pm-enter" style="width:420px;">'
-    + '<h2 class="pm-title">Preferences</h2>'
-    + '<div class="pm-body"><p style="margin-bottom:4px;font-weight:600;font-size:13px;">Send Behavior</p>'
-    + '<p style="font-size:12px;color:var(--text-muted);">Choose how messages are sent from input fields.</p></div>'
-    + '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:20px;">';
-  for (const o of options) {
-    const isActive = o.key === sendBehavior;
-    html += `<div class="add-mode-card${isActive ? ' active' : ''}" data-pref="${o.key}">
-      <div class="add-mode-info">
-        <div class="add-mode-title">${o.name}</div>
-        <div class="add-mode-desc">${o.desc}</div>
-      </div>
-    </div>`;
-  }
-  html += '</div>';
 
-  // --- Sticky Chats toggle ---
+  // Current setting states
+  const enterToSend = sendBehavior === 'enter';
   const stickyOn = localStorage.getItem('stickyUserMsgs') !== 'off';
-  html += '<div class="pm-body" style="margin-top:8px;"><p style="margin-bottom:4px;font-weight:600;font-size:13px;">Sticky Chats</p>'
-    + '<p style="font-size:12px;color:var(--text-muted);">When scrolling through long responses, your most recent message stays pinned at the top so you can see what you sent.</p></div>'
-    + '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:20px;">';
-  const stickyOpts = [
-    {key: 'on',  name: 'Enabled',  desc: 'Pin your most recent chat at the top while scrolling.'},
-    {key: 'off', name: 'Disabled', desc: 'Normal scroll behavior \u2014 no pinned messages.'},
-  ];
-  for (const o of stickyOpts) {
-    const isActive = (o.key === 'on') === stickyOn;
-    html += `<div class="add-mode-card${isActive ? ' active' : ''}" data-sticky="${o.key}">
-      <div class="add-mode-info">
-        <div class="add-mode-title">${o.name}</div>
-        <div class="add-mode-desc">${o.desc}</div>
-      </div>
-    </div>`;
-  }
-  html += '</div>';
-
-  // --- Wrong-Session Detection toggle ---
   const wsdOn = window._wrongSessionDetectionEnabled !== false;
-  html += '<div class="pm-body" style="margin-top:8px;"><p style="margin-bottom:4px;font-weight:600;font-size:13px;">Wrong-Session Detection</p>'
-    + '<p style="font-size:12px;color:var(--text-muted);">When you have multiple sessions running, warns before sending a prompt that seems unrelated to the current session.</p></div>'
-    + '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:20px;">';
-  const wsdOpts = [
-    {key: 'on',  name: 'Enabled',  desc: 'Show a confirmation dialog when a prompt looks like it belongs to a different session.'},
-    {key: 'off', name: 'Disabled', desc: 'Send prompts without checking which session they belong to.'},
-  ];
-  for (const o of wsdOpts) {
-    const isActive = (o.key === 'on') === wsdOn;
-    html += `<div class="add-mode-card${isActive ? ' active' : ''}" data-wsd="${o.key}">
-      <div class="add-mode-info">
-        <div class="add-mode-title">${o.name}</div>
-        <div class="add-mode-desc">${o.desc}</div>
-      </div>
-    </div>`;
-  }
-  html += '</div>';
 
-  html += '<div class="pm-actions"><button class="pm-btn pm-btn-secondary" id="pm-pref-close">Close</button></div></div>';
+  const snOn = !!(window.SpeechNode && window.SpeechNode.isEnabled());
+
+  // Each setting renders as one compact row: label + one-line hint + a toggle switch.
+  const rows = [
+    {key: 'speechnode', label: 'SpeechNode voice', on: snOn,
+     hint: 'Local, codebase-aware voice that works in every browser (Firefox & Safari too). Downloads a small model on first enable.'},
+    {key: 'send', label: 'Enter to send', on: enterToSend,
+     hint: 'Press Enter to send. When off, ' + _MOD + '+Enter sends and Enter adds a new line.'},
+    {key: 'sticky', label: 'Sticky chats', on: stickyOn,
+     hint: 'Keep your most recent message pinned at the top while scrolling long replies.'},
+    {key: 'wsd', label: 'Wrong-session detection', on: wsdOn,
+     hint: 'Warn before sending a prompt that looks meant for a different active session.'},
+  ];
+
+  let html = '<div class="pm-card pm-enter" style="width:400px;">'
+    + '<h2 class="pm-title">Preferences</h2>'
+    + '<div class="pref-list">';
+  for (const r of rows) {
+    html += `<div class="pref-row">
+        <div class="pref-row-text">
+          <div class="pref-row-label">${r.label}</div>
+          <div class="pref-row-hint">${r.hint}</div>
+        </div>
+        <button class="pref-toggle${r.on ? ' on' : ''}" role="switch" aria-checked="${r.on ? 'true' : 'false'}" data-toggle="${r.key}" title="Toggle ${r.label}"><span class="pref-toggle-knob"></span></button>
+      </div>`;
+  }
+  html += '</div>'
+    + '<div class="pm-actions"><button class="pm-btn pm-btn-secondary" id="pm-pref-close">Close</button></div></div>';
+
   overlay.innerHTML = html;
   overlay.classList.add('show');
   requestAnimationFrame(() => overlay.querySelector('.pm-card').classList.remove('pm-enter'));
   document.getElementById('pm-pref-close').onclick = () => _closePm();
   overlay.onclick = e => { if (e.target === overlay) _closePm(); };
-  overlay.querySelectorAll('.add-mode-card[data-pref]').forEach(card => {
-    card.onclick = () => {
-      sendBehavior = card.dataset.pref;
-      localStorage.setItem('sendBehavior', sendBehavior);
-      _closePm();
-      showToast('Send: ' + card.querySelector('.add-mode-title').textContent);
-      _refreshSendHints();
-    };
-  });
-  overlay.querySelectorAll('.add-mode-card[data-sticky]').forEach(card => {
-    card.onclick = () => {
-      const val = card.dataset.sticky;
-      if (val === 'off') {
-        localStorage.setItem('stickyUserMsgs', 'off');
-        // Remove any active pin immediately
-        document.querySelectorAll('.msg.user.sticky-pinned').forEach(m => m.classList.remove('sticky-pinned'));
-      } else {
-        localStorage.removeItem('stickyUserMsgs');
-        // Re-init on current conversation
-        const c = document.getElementById('live-log') || document.getElementById('convo');
-        if (c && typeof initStickyUserMessages === 'function') initStickyUserMessages(c);
+
+  // Toggle handlers. The modal stays open so several settings can be flipped at once.
+  overlay.querySelectorAll('.pref-toggle').forEach(btn => {
+    btn.onclick = () => {
+      const on = !btn.classList.contains('on');
+      btn.classList.toggle('on', on);
+      btn.setAttribute('aria-checked', on ? 'true' : 'false');
+      switch (btn.dataset.toggle) {
+        case 'send':
+          sendBehavior = on ? 'enter' : 'ctrl-enter';
+          localStorage.setItem('sendBehavior', sendBehavior);
+          if (typeof _refreshSendHints === 'function') _refreshSendHints();
+          showToast('Enter to send: ' + (on ? 'On' : 'Off'));
+          break;
+        case 'sticky': {
+          if (on) {
+            localStorage.removeItem('stickyUserMsgs');
+            // Re-init on current conversation
+            const c = document.getElementById('live-log') || document.getElementById('convo');
+            if (c && typeof initStickyUserMessages === 'function') initStickyUserMessages(c);
+          } else {
+            localStorage.setItem('stickyUserMsgs', 'off');
+            // Remove any active pin immediately
+            document.querySelectorAll('.msg.user.sticky-pinned').forEach(m => m.classList.remove('sticky-pinned'));
+          }
+          showToast('Sticky chats: ' + (on ? 'On' : 'Off'));
+          break;
+        }
+        case 'wsd':
+          window._wrongSessionDetectionEnabled = on;
+          // Persist to kanban config on the server (PUT merges into existing config)
+          fetch('/api/kanban/config', {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({wrong_session_detection: on})
+          }).catch(() => { /* fail-open: in-memory flag is already set */ });
+          showToast('Wrong-session detection: ' + (on ? 'On' : 'Off'));
+          break;
+        case 'speechnode':
+          if (!window.SpeechNode) { showToast('SpeechNode is unavailable.', true); break; }
+          if (on) {
+            // One-click: go straight into setup (install + progress) — no second
+            // confirmation. Reuses this overlay, cleanly replacing the Preferences panel.
+            window.SpeechNode.enable();
+          } else {
+            window.SpeechNode.setEnabled(false);
+            showToast('SpeechNode disabled — using standard voice.');
+            if (typeof updateLiveInputBar === 'function') setTimeout(updateLiveInputBar, 0);
+          }
+          break;
       }
-      _closePm();
-      showToast('Sticky chats: ' + card.querySelector('.add-mode-title').textContent);
     };
   });
-  // --- Wrong-Session Detection click handler ---
-  // Persists to kanban_config.json via API and updates the in-memory flag immediately
-  overlay.querySelectorAll('.add-mode-card[data-wsd]').forEach(card => {
-    card.onclick = () => {
-      const enabled = card.dataset.wsd === 'on';
-      window._wrongSessionDetectionEnabled = enabled;
-      // Persist to kanban config on the server (PUT merges into existing config)
-      fetch('/api/kanban/config', {
-        method: 'PUT',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({wrong_session_detection: enabled})
-      }).catch(() => { /* fail-open: in-memory flag is already set */ });
+}
+
+// Developer Tools popup — groups maintenance/diagnostic actions that used to clutter
+// the System dropdown (tests, scan, scrub phantom names) plus the server controls.
+// Each row calls the existing function unchanged; server-control actions open their
+// own confirm modals, so we close this popup first to avoid stacking overlays.
+function openDeveloperTools() {
+  const overlay = document.getElementById('pm-overlay');
+  const phantomBadge = document.getElementById('sys-phantom-badge');
+  const phantomCount = (phantomBadge && phantomBadge.textContent) || '';
+
+  const sections = [
+    {title: 'Server', items: [
+      {key: 'restart', label: 'Restart Server', hint: 'Choose what to restart.'},
+      {key: 'shutdown', label: 'Turn Off Server', hint: 'Stop the server entirely.', danger: true},
+    ]},
+    {title: 'Diagnostics', items: [
+      {key: 'test-fast', label: 'Run Tests (Fast)', hint: 'Quick test suite.'},
+      {key: 'test-full', label: 'Run Tests (Full)', hint: 'Complete test suite.'},
+      {key: 'scan', label: 'Server Scan', hint: 'Scan the codebase for issues.'},
+      {key: 'scrub', label: 'Scrub Phantom Names', hint: 'Remove name entries that point to deleted sessions.', badge: phantomCount},
+    ]},
+  ];
+
+  let html = '<div class="pm-card pm-enter" style="width:400px;"><h2 class="pm-title">Developer Tools</h2>';
+  for (const sec of sections) {
+    html += `<div class="dev-tool-section-label">${sec.title}</div>`;
+    for (const it of sec.items) {
+      const badge = it.badge ? ` <span class="sys-item-value">${it.badge}</span>` : '';
+      html += `<button class="dev-tool-row${it.danger ? ' danger' : ''}" data-action="${it.key}">
+          <span class="dev-tool-text">
+            <span class="dev-tool-label">${it.label}${badge}</span>
+            <span class="dev-tool-hint">${it.hint}</span>
+          </span>
+        </button>`;
+    }
+  }
+  html += '<div class="pm-actions"><button class="pm-btn pm-btn-secondary" id="pm-dev-close">Close</button></div></div>';
+
+  overlay.innerHTML = html;
+  overlay.classList.add('show');
+  requestAnimationFrame(() => overlay.querySelector('.pm-card').classList.remove('pm-enter'));
+  document.getElementById('pm-dev-close').onclick = () => _closePm();
+  overlay.onclick = e => { if (e.target === overlay) _closePm(); };
+
+  overlay.querySelectorAll('.dev-tool-row').forEach(btn => {
+    btn.onclick = () => {
+      // Every action closes the popup first; server-control actions then open their own modal.
       _closePm();
-      showToast('Wrong-session detection: ' + (enabled ? 'Enabled' : 'Disabled'));
+      switch (btn.dataset.action) {
+        case 'test-fast': if (typeof runTests === 'function') runTests('fast'); break;
+        case 'test-full': if (typeof runTests === 'function') runTests('full'); break;
+        case 'scan':      if (typeof runCodeScan === 'function') runCodeScan(); break;
+        case 'scrub':     if (typeof scrubPhantomNames === 'function') scrubPhantomNames(); break;
+        case 'restart':   if (typeof restartServer === 'function') restartServer(); break;
+        case 'shutdown':  if (typeof shutdownServer === 'function') shutdownServer(); break;
+      }
     };
   });
 }
