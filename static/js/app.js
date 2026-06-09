@@ -1803,7 +1803,11 @@ function openPreferences() {
           } else {
             window.SpeechNode.setEnabled(false);
             showToast('SpeechNode disabled — using standard voice.');
-            if (typeof updateLiveInputBar === 'function') setTimeout(updateLiveInputBar, 0);
+            // force the bar to re-render (it skips on unchanged session state) so the mic updates now
+            if (typeof updateLiveInputBar === 'function') {
+              if (typeof liveBarState !== 'undefined') liveBarState = null;
+              setTimeout(updateLiveInputBar, 0);
+            }
           }
           break;
       }

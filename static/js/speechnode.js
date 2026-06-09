@@ -173,11 +173,20 @@
           setEnabled(false);
           if (typeof showToast === 'function') showToast('SpeechNode disabled — using standard voice.');
           _close();
-          if (typeof updateLiveInputBar === 'function') setTimeout(updateLiveInputBar, 0);
+          _refreshBar();
           return;
         }
       };
     });
+  }
+
+  // Force the live input bar to actually re-render. It skips when the session
+  // state key is unchanged — and toggling SpeechNode doesn't change that key, only
+  // the voice engine's readiness — so we must null the guard to make the mic appear.
+  function _refreshBar() {
+    if (typeof updateLiveInputBar !== 'function') return;
+    try { if (typeof liveBarState !== 'undefined') liveBarState = null; } catch (e) { /* ignore */ }
+    setTimeout(updateLiveInputBar, 0);
   }
 
   // One-click enable: open the modal immediately and go straight into setup —
@@ -194,7 +203,11 @@
     if (s.phase !== 'needs_restart' && !s.ready) await startInstall();
     _render();                       // body-only update, no flash
     const s2 = _status || {};
-    if (s2.phase === 'installing' || s2.phase === 'downloading' || s2.phase === 'loading') _startPolling();
+    if (s2.phase === 'installing' || s2.phase === 'downloading' || s2.phase === 'loading') {
+      _startPolling();
+    } else {
+      _refreshBar();   // already ready -> show the mic NOW, no reload
+    }
   }
 
   function _startPolling() {
@@ -209,7 +222,7 @@
       if (s.phase === 'ready' || s.phase === 'error') {
         _polling = false;
         if (s.phase === 'ready' && typeof showToast === 'function') showToast('SpeechNode is ready.');
-        if (typeof updateLiveInputBar === 'function') setTimeout(updateLiveInputBar, 0);
+        _refreshBar();
         return;
       }
       setTimeout(tick, 1500);
@@ -317,7 +330,7 @@
         // deps present but model not loaded yet — trigger a load.
         startInstall().then(_startPolling);
       }
-      if (typeof updateLiveInputBar === 'function') setTimeout(updateLiveInputBar, 0);
+      _refreshBar();
     });
   }
   if (document.readyState === 'loading') {

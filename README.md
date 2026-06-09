@@ -4,23 +4,6 @@ Session orchestrator UI for Claude Code — manage parallel sessions that are aw
 
 ![VibeNode homepage showing Sessions, Workflow, and Workforce cards](docs/screenshots/homepage.png)
 
-## SpeechNode — voice input that works in every browser
-
-Everything in VibeNode is a *node*. **SpeechNode** is the voice layer — an opt-in, **real-time** speech-to-text engine that runs entirely on your machine and is aware of the project you're working in.
-
-Standard browser dictation (the Web Speech API) is **Chromium-only** — on Firefox or Safari it silently locks you out, and even on Chrome it produces unpunctuated run-ons that mangle your project's own vocabulary. SpeechNode fixes all of that:
-
-- **Works in every browser** — Firefox, Safari, Chrome, Edge. SpeechNode captures audio with the standard `MediaRecorder` API and transcribes locally, so voice is no longer gated behind Chromium. No one is locked out of talking to VibeNode.
-- **Live, real-time transcription** — your words stream in *as you speak* in a clean on-screen panel. Confirmed words lock in while the phrase still being decided shimmers as it resolves, so you can watch it think without the text jumping around. When it's done, the panel hands the finished message off and sends it.
-- **Hands-free — even in a loud room** — SpeechNode detects when you've stopped talking using the model's own voice-activity detection (not the mic volume), so it auto-sends when you're done, reliably, in silence *or* background noise. Stop or cancel anytime from the panel.
-- **Knows your codebase** — SpeechNode reads your project's vocabulary (identifiers, file names, proper nouns) and biases recognition toward it. Words generic engines always botch — "Claude", your function names, "SpeechNode" itself — come out right.
-- **Punctuation & capitalization, automatically** — sentences end with periods and start with capitals instead of one endless run-on.
-- **Cleans up natural speech** — collapses "let's open the — let's open the config" restarts and strips filler words, so the text reads like you typed it.
-- **Fully local and private** — powered by a local [Whisper](https://github.com/openai/whisper) model. Your audio never leaves your machine, there's no cloud API, and there's no per-use cost.
-- **Opt-in, one click** — enable it under **System → Preferences**; SpeechNode checks your machine is a good fit, downloads a small (~150 MB) model once, and you're set. Anyone who doesn't turn it on keeps the default voice input unchanged — nothing extra is installed.
-
-SpeechNode is off by default. When enabled, it becomes the voice engine across VibeNode — the live session input, the AI planner, and anywhere else you can talk to VibeNode.
-
 ## Why we built this
 
 Three problems:
@@ -107,6 +90,23 @@ Claude Code has two similar concepts — skills and agents — that are really t
 - **Auto-discovery** — VibeNode scans your `.claude/agents/`, `.claude/skills/` (including installed skill packs), and its own workforce directories on startup. It also scans the active project's tree for any `skills/` or `agents/` folders, so project-scoped assets show up automatically alongside global ones. Everything appears in one unified view with source badges and tier indicators. Install a skill pack or drop a `.md` file into your project's `skills/` folder and it shows up in your departments automatically.
 - **Three complexity tiers** — Simple role prompts (one paragraph persona), structured skills (step-by-step workflows with tool permissions), and full pipelines (multi-phase execution with shell blocks, specialist dispatch, and external dependencies). All three tiers live in the same department tree and use the same invocation paths.
 - **Portable .md format** — Every asset is a markdown file with optional YAML frontmatter. Download them, share them, upload them, edit them in any text editor. The file format is a superset that accommodates everything from Claude Code's native agent format to gstack's SKILL.md pipeline format.
+
+## SpeechNode — voice input that works in every browser
+
+Everything in VibeNode is a *node*. **SpeechNode** is the voice layer — an opt-in, **real-time** speech-to-text engine that runs entirely on your machine and is aware of the project you're working in.
+
+Standard browser dictation (the Web Speech API) is **Chromium-only** — on Firefox or Safari it silently locks you out, and even on Chrome it produces unpunctuated run-ons that mangle your project's own vocabulary. SpeechNode fixes all of that:
+
+- **Works in every browser** — Firefox, Safari, Chrome, Edge. SpeechNode captures audio with the standard `MediaRecorder` API and transcribes locally, so voice is no longer gated behind Chromium. No one is locked out of talking to VibeNode.
+- **Live, real-time transcription** — your words stream in *as you speak* in a clean on-screen panel. Confirmed words lock in while the phrase still being decided shimmers as it resolves, so you can watch it think without the text jumping around. When it's done, the panel hands the finished message off and sends it.
+- **Hands-free — even in a loud room** — SpeechNode detects when you've stopped talking using the model's own voice-activity detection (not the mic volume), so it auto-sends when you're done, reliably, in silence *or* background noise. Stop or cancel anytime from the panel.
+- **Knows your codebase** — SpeechNode reads your project's vocabulary (identifiers, file names, proper nouns) and biases recognition toward it. Words generic engines always botch — "Claude", your function names, "SpeechNode" itself — come out right.
+- **Punctuation & capitalization, automatically** — sentences end with periods and start with capitals instead of one endless run-on.
+- **Cleans up natural speech** — collapses "let's open the — let's open the config" restarts and strips filler words, so the text reads like you typed it.
+- **Fully local and private** — powered by a local [Whisper](https://github.com/openai/whisper) model. Your audio never leaves your machine, there's no cloud API, and there's no per-use cost.
+- **Opt-in, one click** — enable it under **System → Preferences**; SpeechNode checks your machine is a good fit, downloads a small (~150 MB) model once, and you're set. Anyone who doesn't turn it on keeps the default voice input unchanged — nothing extra is installed.
+
+SpeechNode is off by default. When enabled, it becomes the voice engine across VibeNode — the live session input, the AI planner, and anywhere else you can talk to VibeNode.
 
 ## Requirements
 

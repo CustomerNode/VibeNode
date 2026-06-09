@@ -78,6 +78,7 @@ function _stopActiveVoice() {
     _activeRecognition = null;
   }
   if (_activeSpeechNode) {
+    _activeSpeechNode._userCancelled = true;   // context change (session switch / new capture) -> discard
     try { _activeSpeechNode.cancel(); } catch (_) {}
     _activeSpeechNode = null;
   }
@@ -136,6 +137,7 @@ function setupVoiceButton(textarea, button, onSubmit) {
       _activeRecognition = null;
     }
     if (_activeSpeechNode && _activeSpeechNode._target === textarea) {
+      _activeSpeechNode._userCancelled = true;
       try { _activeSpeechNode.cancel(); } catch (_) {}
       _activeSpeechNode = null;
     }
@@ -532,89 +534,61 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
     }
     controller._streamKick = setTimeout(pumpPartial, 400);
 
-    recorder.onstop = () => {
-      try { if (controller._stream) controller._stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
-      if (controller._discarded) {
-        if (_activeSpeechNode === controller) _activeSpeechNode = null;
-        textarea.value = '';
-        textarea.dispatchEvent(new Event('input'));
+    // Bulletproof send: NEVER drop a message. Idempotent (sends exactly once), and
+    // gated ONLY by an explicit ✕ cancel. Empty/failed/slow transcribes fall back to
+    // the best live transcript. (Pre-emptively sending is fine; dropping is not.)
+    const commitSend = (text) => {
+      if (controller._sent) return;
+      controller._sent = true;
+      if (_activeSpeechNode === controller) _activeSpeechNode = null;
+      try { button.classList.remove('processing'); } catch (_) {}
+      if (controller._userCancelled) {            // the ONLY thing that discards a message
+        try { _snCaptionHide(); } catch (_) {}
         updateIcon();
-        textarea.focus();
         _refreshBarSoon();
         return;
       }
+      let t = (text || '').trim();
+      if (!t) t = (controller._lastFullText || '').trim();   // best available transcript
+      const joined = (existingText ? (existingText + ' ' + t) : t).trim();
+      if (joined) {
+        try { _snCaptionSetFinal(t || joined); } catch (_) {}
+        try { _snCaptionSend(); } catch (_) {}    // lift + fade as the message lands
+        textarea.value = joined;
+        textarea.dispatchEvent(new Event('input'));
+        updateIcon();
+        _lastSubmitWasVoice = true;
+        if (onSubmit) onSubmit();
+      } else {                                     // genuinely no speech -> nothing to send
+        try { _snCaptionHide(); } catch (_) {}
+        updateIcon();
+        textarea.focus();
+      }
+      setTimeout(() => { try { _snCaptionHide(); } catch (_) {} }, 340);
+      _refreshBarSoon();
+    };
+
+    recorder.onstop = () => {
+      try { if (controller._stream) controller._stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+      if (controller._userCancelled) { commitSend(''); return; }   // ✕ -> discard (inside commitSend)
       const blob = new Blob(chunks, { type: (chunks[0] && chunks[0].type) || 'audio/webm' });
-      button.classList.add('processing');
-      button.title = 'Transcribing…';
+      try { button.classList.add('processing'); button.title = 'Transcribing…'; } catch (_) {}
+      // Watchdog: if the final transcribe is slow or dies, still send the best live
+      // transcript. commitSend is idempotent, so this can never double-send.
+      const watchdog = setTimeout(() => { commitSend(''); }, 6000);
       window.SpeechNode.transcribeBlob(blob, {}).then((res) => {
-        button.classList.remove('processing');
-        if (controller._discarded) { if (_activeSpeechNode === controller) _activeSpeechNode = null; updateIcon(); return; }
-        if (_activeSpeechNode === controller) _activeSpeechNode = null;
+        clearTimeout(watchdog);
         if (res && res.ok && typeof res.text === 'string' && res.text.trim()) {
-          // Route through the shared post-processing pipeline (empty by default).
-          _processVoiceTranscript(res.text, { textarea, onSubmit, source: 'speechnode' }).then((text) => {
-            const joined = existingText ? (existingText + ' ' + text) : text;
-            // Buttery handoff: show the clean final IN the panel with a quick polish,
-            // brief beat so it reads, then fade the panel out exactly as the message
-            // commits — no empty gap, no "where did my message go".
-            _snCaptionSetFinal(text);
-            setTimeout(() => {
-              if (controller._discarded) return;   // ✕ pressed during the handoff -> abort the send
-              _snCaptionSend();                    // panel lifts + fades as the message lands
-              textarea.value = joined;
-              textarea.dispatchEvent(new Event('input'));
-              updateIcon();
-              if (joined.trim() && onSubmit) { _lastSubmitWasVoice = true; onSubmit(); }
-              else textarea.focus();
-              _refreshBarSoon();
-              setTimeout(() => { try { _snCaptionHide(); } catch (_) {} }, 320);   // cleanup after the motion
-            }, 380);
-          });
+          _processVoiceTranscript(res.text, { textarea, onSubmit, source: 'speechnode' })
+            .then((t) => commitSend(t || res.text))
+            .catch(() => commitSend(res.text));
         } else {
-          // Final failed/empty -> fall back to the last good LIVE transcript so the
-          // message is NEVER lost (no error + empty box).
-          const fb = (controller._lastFullText || '').trim();
-          if (fb) {
-            _snCaptionSetFinal(fb);
-            const joined = existingText ? (existingText + ' ' + fb) : fb;
-            setTimeout(() => {
-              if (controller._discarded) return;   // ✕ pressed during the handoff -> abort the send
-              _snCaptionSend();                    // panel lifts + fades as the message lands
-              textarea.value = joined;
-              textarea.dispatchEvent(new Event('input'));
-              updateIcon();
-              if (joined.trim() && onSubmit) { _lastSubmitWasVoice = true; onSubmit(); }
-              else textarea.focus();
-              _refreshBarSoon();
-              setTimeout(() => { try { _snCaptionHide(); } catch (_) {} }, 320);   // cleanup after the motion
-            }, 380);
-          } else {
-            try { _snCaptionHide(); } catch (_) {}
-            updateIcon();
-            if (typeof showToast === 'function') showToast('SpeechNode: ' + ((res && res.error) || 'no speech detected'), true);
-            textarea.focus();
-            _refreshBarSoon();
-          }
+          commitSend('');     // empty/failed final -> fall back to the live transcript
         }
       }).catch((err) => {
-        button.classList.remove('processing');
-        if (_activeSpeechNode === controller) _activeSpeechNode = null;
+        clearTimeout(watchdog);
         console.warn('[SpeechNode] final transcribe failed:', err);
-        const fb = (controller._lastFullText || '').trim();
-        if (fb) {   // salvage the message from the live transcript
-          const joined = existingText ? (existingText + ' ' + fb) : fb;
-          try { _snCaptionHide(); } catch (_) {}
-          textarea.value = joined;
-          textarea.dispatchEvent(new Event('input'));
-          updateIcon();
-          if (joined.trim() && onSubmit) { _lastSubmitWasVoice = true; onSubmit(); }
-          else textarea.focus();
-        } else {
-          try { _snCaptionHide(); } catch (_) {}
-          updateIcon();
-          if (typeof showToast === 'function') showToast('SpeechNode error: ' + err, true);
-        }
-        _refreshBarSoon();
+        commitSend('');       // salvage from the live transcript -> never drop
       });
     };
 
@@ -692,7 +666,8 @@ function _snCaptionEl() {
       e.preventDefault(); e.stopPropagation();
       const c = _activeSpeechNode;
       if (c) {
-        c._discarded = true;            // also drops any in-flight FINAL transcribe / pending send
+        c._userCancelled = true;        // explicit cancel — the ONLY thing that drops a message
+        c._discarded = true;
         try { c.cancel(); } catch (_) {}
       }
       _activeSpeechNode = null;
