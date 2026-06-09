@@ -123,12 +123,10 @@ def create_app(testing=False) -> Flask:
         try:
             n = _cleanup_aititle_orphans()
             if n:
-                import logging as _logging
                 _logging.getLogger("app").info(
                     "Pruned %d ai-title-only orphan JSONL file(s) at startup", n
                 )
         except Exception:
-            import logging as _logging
             _logging.getLogger("app").exception("ai-title orphan cleanup failed")
 
         # Start background git fetch at startup
