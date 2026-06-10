@@ -9,3 +9,11 @@ python-pptx
 python-docx
 pytest
 pytest-timeout
+
+# SpeechNode — cross-browser, codebase-aware voice input (extracted package:
+# github.com/CustomerNode/SpeechNode). Import-light: NO heavy ASR deps are pulled
+# in here — the engine installs faster-whisper into its own venv on first enable.
+# Not yet on PyPI, so pinned to a commit for reproducibility. Without this line the
+# voice feature silently reports "SpeechNode unavailable" (it has no in-tree fallback
+# since the code was extracted out of VibeNode). Bump the @<sha> to upgrade.
+speechnode[flask] @ git+https://github.com/CustomerNode/SpeechNode.git@bf6c78ba3a092dd86cc086874a2fa5d67d1a5472

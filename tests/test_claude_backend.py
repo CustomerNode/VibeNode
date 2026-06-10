@@ -2021,3 +2021,73 @@ class TestDataclassFieldCompleteness:
                          "permission_mode", "include_partial_messages",
                          "extra_args"):
             assert required in fields, f"ClaudeCodeOptions missing field: {required}"
+
+
+# =========================================================================
+# Section 8: Mid-session model switch (set_model)
+#
+# ClaudeAgentSDK.set_model reaches the SDK-internal control protocol
+# (Query._send_control_request) because SDK 0.0.25 has no public wrapper.
+# These tests pin that internal contract so an SDK upgrade that renames or
+# removes it fails loudly here instead of silently breaking live switching.
+# =========================================================================
+
+class TestSetModel:
+
+    def test_sdk_query_has_send_control_request(self):
+        """The internal layer set_model depends on must exist in the SDK."""
+        from claude_code_sdk._internal.query import Query
+        assert hasattr(Query, "_send_control_request")
+
+    def test_set_model_sends_control_request(self):
+        """set_model must send {'subtype': 'set_model', 'model': <id>}."""
+        import anyio
+        from unittest.mock import AsyncMock, MagicMock
+        from daemon.backends.claude import ClaudeAgentSDK
+
+        sdk = ClaudeAgentSDK()
+        client = MagicMock()
+        client._query = MagicMock()
+        client._query._send_control_request = AsyncMock(return_value={})
+
+        anyio.run(sdk.set_model, client, "claude-sonnet-4-6")
+
+        client._query._send_control_request.assert_awaited_once_with(
+            {"subtype": "set_model", "model": "claude-sonnet-4-6"}
+        )
+
+    def test_set_model_disconnected_client_raises(self):
+        """A client with no active query (not connected) must raise, not
+        silently no-op -- callers treat a clean return as CLI confirmation."""
+        import anyio
+        from unittest.mock import MagicMock
+        from daemon.backends.claude import ClaudeAgentSDK
+
+        sdk = ClaudeAgentSDK()
+        client = MagicMock()
+        client._query = None
+
+        with pytest.raises(RuntimeError):
+            anyio.run(sdk.set_model, client, "claude-sonnet-4-6")
+
+    def test_base_backend_default_is_not_supported(self):
+        """AgentSDK.set_model default must raise NotImplementedError so
+        backends without live switching produce an honest error."""
+        import anyio
+        from daemon.backends.base import AgentSDK
+
+        class _Minimal(AgentSDK):
+            async def create_session(self, options): ...
+            async def connect(self, client): ...
+            async def send_query(self, client, prompt): ...
+            async def receive_response(self, client):
+                if False:
+                    yield None
+            async def interrupt(self, client): ...
+            async def disconnect(self, client): ...
+            def extract_process_pid(self, client): return 0
+            def is_transport_alive(self, client): return False
+            def apply_patches(self): ...
+
+        with pytest.raises(NotImplementedError):
+            anyio.run(_Minimal().set_model, object(), "claude-sonnet-4-6")

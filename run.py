@@ -450,10 +450,19 @@ threading.Thread(target=_fix_shortcut, daemon=True).start()
 def _check_dependencies():
     """Verify required Python packages are installed. Auto-install any missing."""
     # (package_import_name, pip_install_name)
+    # SpeechNode is a git dependency (not on PyPI) and has NO in-tree fallback since
+    # it was extracted out of VibeNode — without auto-install here, one-click/Update
+    # users (who never run pip manually) silently lose voice ("SpeechNode unavailable").
+    # Pinned to the same commit as requirements.txt; bump both together to upgrade.
+    _SPEECHNODE_SPEC = (
+        "speechnode[flask] @ git+https://github.com/CustomerNode/SpeechNode.git"
+        "@bf6c78ba3a092dd86cc086874a2fa5d67d1a5472"
+    )
     required = [
         ("flask", "flask"),
         ("flask_socketio", "flask-socketio"),
         ("anthropic", "anthropic"),
+        ("speechnode", _SPEECHNODE_SPEC),
     ]
     missing = []
     for import_name, pip_name in required:

@@ -696,7 +696,11 @@ class SessionManager:
                 # user's chosen model must be preserved across the restart.
                 reg = {}
                 try:
-                    reg = self._registry.load_registry().get("sessions", {}).get(
+                    # NOTE: attribute is _reg, not _registry — a typo here
+                    # was silently eaten by this except for months, so every
+                    # auto-resume ran with empty cwd/name/model (fixed
+                    # 2026-06-10).
+                    reg = self._reg.load_registry().get("sessions", {}).get(
                         session_id, {}
                     ) or {}
                 except Exception:
@@ -1026,6 +1030,112 @@ class SessionManager:
             self._interrupt_session(session_id, task_to_cancel), self._loop
         )
         return {"ok": True}
+
+    def set_session_model(self, session_id: str, model: str) -> dict:
+        """Switch a running session's model for all subsequent turns.
+
+        Honesty contract (this exists because the UI once lied about it):
+        ``info.model`` is updated ONLY after the CLI confirms the switch
+        via the control-protocol response.  On any failure the recorded
+        model is left untouched and the error is returned to the caller —
+        the UI must surface it, never fake success.  The init-message
+        handler remains the ultimate ground truth: if the CLI later
+        reports a different resolved model id, that overwrites this.
+        """
+        session_id = self._resolve_id(session_id)
+        model = (model or "").strip()
+        if not model:
+            return {"ok": False, "error": "No model specified"}
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            # Dormant session: the daemon restarted since this session went
+            # idle, so it lives on disk (.jsonl + registry) but has no
+            # in-memory task yet — the same situation send_message handles
+            # with its auto-resume fallback.  Mirror that fallback, but
+            # launch with the REQUESTED model: ``--model`` at resume is just
+            # as authoritative as a live set_model control request, and the
+            # init message will confirm the resolved id as usual.
+            try:
+                jsonl = self._store.find_session_path(session_id)
+            except Exception:
+                jsonl = None
+            if not (jsonl and jsonl.exists()):
+                return {"ok": False, "error": "Session not found"}
+            reg = {}
+            try:
+                reg = self._reg.load_registry().get("sessions", {}).get(
+                    session_id, {}
+                ) or {}
+            except Exception:
+                pass
+            cwd = reg.get("cwd") or ""
+            if cwd:
+                cwd = os.path.normpath(cwd)
+            logger.info(
+                "set_session_model: auto-resuming dormant session %s on %s",
+                session_id, model,
+            )
+            start_result = self.start_session(
+                session_id=session_id,
+                prompt="",
+                cwd=cwd,
+                name=reg.get("name", ""),
+                resume=True,
+                model=model,
+            )
+            if not start_result.get("ok"):
+                return {"ok": False,
+                        "error": start_result.get("error",
+                                                  "Failed to resume session")}
+            try:
+                from app.routes.live_api import record_confirmed_model
+                record_confirmed_model(model)
+            except Exception:
+                pass
+            return {"ok": True, "model": model, "resumed": True}
+        if info.state == SessionState.STOPPED:
+            return {"ok": False, "error": "Session is stopped"}
+        if not info.client:
+            return {"ok": False, "error": "Session has no connected client"}
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._sdk.set_model(info.client, model), self._loop
+            )
+            fut.result(timeout=15)
+        except NotImplementedError as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:
+            logger.warning("set_session_model failed for %s -> %s: %s",
+                           session_id, model, e)
+            return {"ok": False, "error": f"Model switch rejected: {e}"}
+
+        # CLI confirmed — now (and only now) record it.
+        info.model = model
+        logger.info("Session %s model switched to %s (CLI confirmed)",
+                    session_id, model)
+        self._schedule_registry_save()
+        # NOTE: do NOT call _emit_state here.  _emit_state on an IDLE session
+        # unconditionally calls _try_dispatch_queue — which would fire any
+        # message the user had queued while the session was busy.  That
+        # caused a surprise WORKING state immediately after the switch, with
+        # the first turn on the new model appearing "hung" (cold cache hit).
+        # The badge update is handled client-side from the socket result, and
+        # the next natural _emit_state (from the next turn's state transition)
+        # will carry the updated model field to all clients.
+        try:
+            from app.routes.live_api import record_confirmed_model
+            record_confirmed_model(model)
+        except Exception:
+            pass
+        # Human-readable log entry so the transcript records the switch.
+        entry = LogEntry(kind="system", text=f"Model switched to {model}")
+        with info._lock:
+            info.entries.append(entry)
+            entry_index = len(info.entries) - 1
+        self._emit_entry(session_id, entry, entry_index)
+        return {"ok": True, "model": model}
 
     def close_session(self, session_id: str) -> dict:
         """Close and disconnect an SDK session.

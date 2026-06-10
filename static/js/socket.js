@@ -611,6 +611,25 @@ socket.on('session_state', (data) => {
         if (sbModel) sbModel.textContent = model;
     }
 
+    // Keep the in-memory session record's model truthful.  Running/idle
+    // bars render the model badge from allSessions[..].model — without this
+    // sync a bar re-render would show a stale model after a daemon-confirmed
+    // mid-session switch (or after the CLI's init message resolves the id).
+    if (model && typeof allSessions !== 'undefined') {
+        const _sRec = allSessions.find(x => x.id === session_id);
+        if (_sRec && _sRec.model !== model) {
+            _sRec.model = model;
+            if (session_id === liveSessionId && typeof _modelLabel === 'function') {
+                const _badge = document.querySelector('.session-model-badge');
+                if (_badge) {
+                    const _lbl = _modelLabel(model);
+                    _badge.textContent = _lbl;
+                    _badge.title = 'Session model: ' + _lbl + ' — click to switch (applies from the next message)';
+                }
+            }
+        }
+    }
+
     if (state !== 'waiting') {
         delete waitingData[session_id];
         // Update workspace permission queue if permission was cleared

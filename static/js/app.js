@@ -1648,13 +1648,19 @@ async function openModelSelector() {
  */
 function _modelLabel(modelId) {
   if (!modelId) return 'Opus 4.7';
-  if (modelId.includes('opus-4-7'))  return 'Opus 4.7';
-  if (modelId.includes('opus-4-6') || modelId === 'opus')  return 'Opus 4.6';
-  if (modelId.includes('opus'))      return 'Opus';
-  if (modelId.includes('sonnet-4-6') || (modelId === 'sonnet')) return 'Sonnet 4.6';
-  if (modelId.includes('sonnet'))    return 'Sonnet';
-  if (modelId.includes('haiku-4-5') || (modelId === 'haiku'))  return 'Haiku 4.5';
-  if (modelId.includes('haiku'))     return 'Haiku';
+  // Legacy short aliases from old localStorage values
+  if (modelId === 'opus')   return 'Opus 4.6';
+  if (modelId === 'sonnet') return 'Sonnet 4.6';
+  if (modelId === 'haiku')  return 'Haiku 4.5';
+  // Generic: claude-<family>-<major>[-<minor>][-YYYYMMDD] with optional
+  // trailing capability marker like [1m].  Handles ANY family (opus,
+  // sonnet, haiku, fable, …) so new models never fall back to raw ids.
+  const m = modelId.match(/^claude-([a-z]+)-(\d+)(?:-(\d+))?(?:-\d{8})?/);
+  if (m) {
+    const fam = m[1].charAt(0).toUpperCase() + m[1].slice(1);
+    const ver = m[2] + (m[3] ? '.' + m[3] : '');
+    return fam + ' ' + ver + (modelId.includes('[1m]') ? ' [1m]' : '');
+  }
   return modelId;
 }
 
@@ -1798,8 +1804,12 @@ function openPreferences() {
           if (!window.SpeechNode) { showToast('SpeechNode is unavailable.', true); break; }
           if (on) {
             // One-click: go straight into setup (install + progress) — no second
-            // confirmation. Reuses this overlay, cleanly replacing the Preferences panel.
-            window.SpeechNode.enable();
+            // confirmation. VibeNode owns the install UX (see speechnode-install.js):
+            // resilient progress, a guaranteed success state, and the mic lights up
+            // without a manual refresh. Fall back to the package flow if that module
+            // somehow didn't load.
+            if (window.VibeSpeechInstall) window.VibeSpeechInstall.enable();
+            else window.SpeechNode.enable();
           } else {
             window.SpeechNode.setEnabled(false);
             showToast('SpeechNode disabled — using standard voice.');

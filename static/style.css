@@ -3029,6 +3029,13 @@ mark.find-match.current { background: var(--accent); color:#fff; }
   padding: 28px 32px 24px;
   width: 420px;
   max-width: 90vw;
+  /* Never exceed the viewport: tall modals (e.g. the per-session model +
+     thinking selector) must scroll internally so the action buttons at the
+     bottom stay reachable.  dvh handles mobile browser chrome correctly. */
+  max-height: 88vh;
+  max-height: 88dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   box-shadow: 0 24px 80px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.05);
   backdrop-filter: blur(40px) saturate(1.6);
   -webkit-backdrop-filter: blur(40px) saturate(1.6);
@@ -10344,6 +10351,11 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
   border-color: #3b82f6;
   color: #3b82f6;
   background: rgba(59,130,246,0.08);
+}
+/* Unconfirmed default: dimmer than a confirmed model, but still readable */
+.session-model-badge.session-model-default {
+  opacity: 0.55;
+  font-style: italic;
 }
 
 [data-theme="light"] .session-model-btn {

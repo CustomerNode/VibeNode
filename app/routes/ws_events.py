@@ -3,11 +3,12 @@ WebSocket event handlers for real-time session communication via Flask-SocketIO.
 
 Server -> Client events:
     state_snapshot, session_state, session_entry, session_permission,
-    session_started, session_log
+    session_started, session_log, session_model_result
 
 Client -> Server events:
     connect, start_session, send_message, permission_response,
-    interrupt_session, close_session, get_session_log, set_permission_policy
+    interrupt_session, close_session, get_session_log, set_permission_policy,
+    set_session_model
 """
 
 import json
@@ -614,6 +615,41 @@ def register_ws_events(socketio, app):
                 'message': result.get('error', 'Failed to interrupt session'),
                 'session_id': session_id,
             })
+
+    @socketio.on('set_session_model')
+    def handle_set_session_model(data):
+        """Switch a running session's model mid-session (applies from the
+        next turn).  Always replies with 'session_model_result' carrying the
+        daemon's honest outcome — the UI must only update its badge on
+        ok=True.  The daemon only reports ok=True after the Claude CLI
+        confirmed the switch via the control protocol."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        session_id = (data.get('session_id') or '').strip()
+        model = (data.get('model') or '').strip()
+        if not session_id or not model:
+            emit('session_model_result', {
+                'ok': False, 'session_id': session_id,
+                'error': 'session_id and model are required',
+            })
+            return
+
+        sm = app.session_manager
+        try:
+            result = sm.set_session_model(session_id, model)
+        except Exception as e:
+            result = {'ok': False, 'error': str(e)}
+
+        payload = {
+            'ok': bool(result.get('ok')),
+            'session_id': session_id,
+            'model': result.get('model', model),
+        }
+        if not payload['ok']:
+            payload['error'] = result.get('error', 'Model switch failed')
+        emit('session_model_result', payload)
 
     @socketio.on('close_session')
     def handle_close_session(data):

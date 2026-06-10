@@ -31,6 +31,7 @@ against the new shapes.
 """
 
 import asyncio
+import os
 import threading
 import time
 import pytest
@@ -332,6 +333,162 @@ class TestInterruptSession:
 
         result = session_manager.interrupt_session(sid)
         assert result["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# 13b. Mid-session model switch (set_session_model)
+#
+# Honesty contract under test: info.model must change ONLY when the backend
+# confirms the switch.  Any failure (rejected, unsupported, no client) must
+# leave the recorded model untouched and return ok=False with an error —
+# the UI relies on this to never display a model the session isn't running.
+# ---------------------------------------------------------------------------
+
+class TestSetSessionModel:
+
+    def _make_session(self, session_manager, sm_module, sid, state=None,
+                      model="claude-fable-5", client=object()):
+        info = sm_module.SessionInfo(
+            session_id=sid,
+            state=state or sm_module.SessionState.IDLE,
+        )
+        info.model = model
+        info.client = client
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+        return info
+
+    def test_nonexistent_session_rejected(self, session_manager):
+        result = session_manager.set_session_model("nope", "claude-sonnet-4-6")
+        assert result["ok"] is False
+        assert "not found" in result["error"].lower()
+
+    def test_stopped_session_rejected(self, session_manager, sm_module):
+        self._make_session(session_manager, sm_module, "sm-stopped",
+                           state=sm_module.SessionState.STOPPED)
+        result = session_manager.set_session_model("sm-stopped", "claude-sonnet-4-6")
+        assert result["ok"] is False
+        assert "stopped" in result["error"].lower()
+
+    def test_empty_model_rejected(self, session_manager, sm_module):
+        self._make_session(session_manager, sm_module, "sm-empty")
+        result = session_manager.set_session_model("sm-empty", "   ")
+        assert result["ok"] is False
+
+    def test_session_without_client_rejected(self, session_manager, sm_module):
+        info = self._make_session(session_manager, sm_module, "sm-noclient",
+                                  client=None)
+        result = session_manager.set_session_model("sm-noclient", "claude-sonnet-4-6")
+        assert result["ok"] is False
+        assert info.model == "claude-fable-5"  # untouched
+
+    def test_success_updates_model_and_logs(self, session_manager, sm_module):
+        info = self._make_session(session_manager, sm_module, "sm-ok")
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(return_value=None)) as mock_set, \
+             patch.object(session_manager, '_emit_state') as mock_emit:
+            result = session_manager.set_session_model("sm-ok", "claude-sonnet-4-6")
+        assert result["ok"] is True
+        assert result["model"] == "claude-sonnet-4-6"
+        # Recorded model updated ONLY after confirmed success
+        assert info.model == "claude-sonnet-4-6"
+        mock_set.assert_awaited_once()
+        # Transcript records the switch
+        assert any(e.kind == "system" and "claude-sonnet-4-6" in e.text
+                   for e in info.entries)
+        # Must NOT call _emit_state — doing so on an IDLE session fires
+        # _try_dispatch_queue which causes a surprise WORKING state immediately
+        # after the switch.  Badge updates go via the socket result instead.
+        mock_emit.assert_not_called()
+
+    def test_backend_rejection_leaves_model_untouched(self, session_manager, sm_module):
+        info = self._make_session(session_manager, sm_module, "sm-reject")
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(side_effect=Exception("CLI says no"))):
+            result = session_manager.set_session_model("sm-reject", "claude-sonnet-4-6")
+        assert result["ok"] is False
+        assert "CLI says no" in result["error"]
+        assert info.model == "claude-fable-5"  # NEVER updated on failure
+        assert not any("claude-sonnet-4-6" in e.text for e in info.entries)
+
+    def test_unsupported_backend_graceful(self, session_manager, sm_module):
+        info = self._make_session(session_manager, sm_module, "sm-unsup")
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(side_effect=NotImplementedError("no live switch"))):
+            result = session_manager.set_session_model("sm-unsup", "claude-sonnet-4-6")
+        assert result["ok"] is False
+        assert info.model == "claude-fable-5"
+
+    def test_dormant_session_resumed_with_requested_model(self, session_manager, tmp_path):
+        """After a daemon restart an idle session exists only on disk.
+        set_session_model must auto-resume it (like send_message does) with
+        the REQUESTED model instead of returning 'Session not found' — the
+        bug Q hit on 2026-06-10."""
+        sid = "sm-dormant"
+        jsonl = tmp_path / f"{sid}.jsonl"
+        jsonl.write_text("{}\n")
+
+        with patch.object(session_manager._store, 'find_session_path',
+                          return_value=jsonl), \
+             patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": {sid: {
+                              "cwd": str(tmp_path), "name": "Dormant",
+                              "model": "claude-fable-5"}}}), \
+             patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}) as mock_start:
+            result = session_manager.set_session_model(sid, "claude-sonnet-4-6")
+
+        assert result["ok"] is True
+        assert result["model"] == "claude-sonnet-4-6"
+        assert result.get("resumed") is True
+        kwargs = mock_start.call_args.kwargs
+        assert kwargs["session_id"] == sid
+        assert kwargs["resume"] is True
+        # The REQUESTED model, not the registry's stale one
+        assert kwargs["model"] == "claude-sonnet-4-6"
+        # cwd/name must come from the registry read.  This also guards the
+        # self._reg attribute name: a typo (e.g. self._registry) is swallowed
+        # by the except and resumes with empty cwd/name — the exact silent
+        # bug that lived in send_message's fallback until 2026-06-10.
+        assert os.path.normpath(kwargs["cwd"]) == os.path.normpath(str(tmp_path))
+        assert kwargs["name"] == "Dormant"
+
+    def test_no_registry_attr_typo_in_source(self):
+        """``self._registry`` does not exist on SessionManager (it's
+        ``self._reg``); references to it inside try/except blocks fail
+        silently and gut the auto-resume fallbacks."""
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "daemon" / "session_manager.py").read_text(encoding="utf-8")
+        assert "self._registry" not in src, \
+            "Use self._reg — self._registry silently breaks auto-resume"
+
+    def test_dormant_session_without_jsonl_rejected(self, session_manager):
+        """No in-memory session AND no .jsonl on disk → honest not-found."""
+        with patch.object(session_manager._store, 'find_session_path',
+                          return_value=None):
+            result = session_manager.set_session_model("sm-ghost",
+                                                       "claude-sonnet-4-6")
+        assert result["ok"] is False
+        assert "not found" in result["error"].lower()
+
+    def test_dormant_resume_failure_propagates(self, session_manager, tmp_path):
+        """If the resume launch fails, the error must reach the caller —
+        never a fake ok."""
+        sid = "sm-dormant-fail"
+        jsonl = tmp_path / f"{sid}.jsonl"
+        jsonl.write_text("{}\n")
+
+        with patch.object(session_manager._store, 'find_session_path',
+                          return_value=jsonl), \
+             patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": {}}), \
+             patch.object(session_manager, 'start_session',
+                          return_value={"ok": False, "error": "spawn failed"}):
+            result = session_manager.set_session_model(sid, "claude-sonnet-4-6")
+
+        assert result["ok"] is False
+        assert "spawn failed" in result["error"]
 
 
 # ---------------------------------------------------------------------------

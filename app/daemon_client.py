@@ -635,6 +635,14 @@ class DaemonClient:
             "session_id": session_id,
         })
 
+    def set_session_model(self, session_id, model):
+        """Switch a running session's model mid-session (next turn onward).
+        Returns the daemon's honest result — {"ok": True, "model": ...} only
+        if the CLI confirmed the switch, else {"ok": False, "error": ...}."""
+        return self._send_request("set_session_model", {
+            "session_id": session_id, "model": model,
+        })
+
     def close_session(self, session_id):
         return self._send_request("close_session", {
             "session_id": session_id,

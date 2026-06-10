@@ -248,6 +248,27 @@ class AgentSDK(ABC):
         """
         ...
 
+    async def set_model(self, client: Any, model: str) -> None:
+        """Switch the model used for subsequent turns of a connected session.
+
+        Non-abstract on purpose: live model switching is an optional
+        capability.  Backends that support it override this method;
+        the default raises so callers surface an honest "not supported"
+        error instead of silently pretending the switch happened.
+
+        Args:
+            client: Handle from ``create_session()``.
+            model:  Backend-specific model identifier.
+
+        Raises:
+            NotImplementedError: backend cannot switch models mid-session.
+            Exception: the backend rejected the switch (callers MUST NOT
+                update any recorded model state in that case).
+        """
+        raise NotImplementedError(
+            "This backend does not support mid-session model switching"
+        )
+
     @abstractmethod
     async def disconnect(self, client: Any) -> None:
         """Disconnect and clean up the client.

@@ -121,23 +121,33 @@ function _clearSessionModelOverride() {
  *   used in the running/idle bars to show what model is active.
  */
 function _buildSessionModelBtn(isNewSession, sessionModel) {
-  const isOverridden = window._sessionModelOverride !== null;
-  // Always show override if one is set (applies to next session started), else show session/default
-  const label = isOverridden
-    ? _modelLabel(window._sessionModelOverride)
-    : _modelLabel(sessionModel || (typeof defaultModel !== 'undefined' ? defaultModel : ''));
-
   if (isNewSession) {
+    // New session: the override (if any) is what the next session will
+    // actually start with — showing it here is truthful.
+    const isOverridden = window._sessionModelOverride !== null;
+    const label = _modelLabel(isOverridden
+      ? window._sessionModelOverride
+      : (typeof defaultModel !== 'undefined' ? defaultModel : ''));
     return '<button class="session-model-btn' + (isOverridden ? ' session-model-overridden' : '') + '" ' +
       'id="session-model-btn" onclick="_openSessionModelSelector()" ' +
       'title="' + (isOverridden ? 'Model overridden — click to change' : 'Click to choose model for this session') + '">' +
       label + '</button>';
-  } else {
-    return '<button class="session-model-badge' + (isOverridden ? ' session-model-overridden' : '') + '" ' +
-      'onclick="_openSessionModelSelector()" ' +
-      'title="' + (isOverridden ? 'Model overridden — click to change' : 'Click to change model') + '">' +
-      label + '</button>';
   }
+  // Running/idle session: show the confirmed session model when known.
+  // If not yet confirmed (dormant/sleeping session that hasn't sent an init
+  // message yet), fall back to the system default — that's what it WILL run
+  // on when it wakes up, so showing "—" is less useful than showing the
+  // actual expectation.  The tooltip distinguishes confirmed from assumed.
+  const _sysDefault = typeof defaultModel !== 'undefined' ? defaultModel : '';
+  const confirmed = !!(sessionModel);
+  const effectiveModel = sessionModel || _sysDefault;
+  const label = effectiveModel ? _modelLabel(effectiveModel) : '—';
+  const title = confirmed
+    ? 'Session model: ' + label + ' — click to switch (applies from the next message)'
+    : 'Will use system default (' + label + ') — click to switch before waking';
+  return '<button class="session-model-badge' + (!confirmed ? ' session-model-default' : '') + '" ' +
+    'onclick="_openSessionModelSelector(true)" title="' + title + '">' +
+    label + '</button>';
 }
 
 /**
@@ -146,22 +156,42 @@ function _buildSessionModelBtn(isNewSession, sessionModel) {
  * the per-session override WITHOUT affecting the system-level defaults
  * stored in localStorage.
  */
-async function _openSessionModelSelector() {
+async function _openSessionModelSelector(liveMode) {
   const overlay = document.getElementById('pm-overlay');
   if (!overlay) return;
 
+  // Live mode: switch the model of the CURRENTLY OPEN session via the
+  // daemon (CLI control protocol).  Capture the target id NOW so switching
+  // panels while the modal is open can't redirect the request.
+  const liveSid = liveMode ? (typeof liveSessionId !== 'undefined' ? liveSessionId : null) : null;
+  if (liveMode && !liveSid) {
+    if (typeof showToast === 'function') showToast('No active session to switch');
+    return;
+  }
+  const liveSess = (liveSid && typeof allSessions !== 'undefined')
+    ? allSessions.find(x => x.id === liveSid) : null;
+  const currentLiveModel = (liveSess && liveSess.model) ? liveSess.model : '';
+  // Normalize "claude-fable-5[1m]" / dated ids to the base id so the
+  // matching card in the list pre-selects correctly.
+  const currentLiveBase = currentLiveModel.replace(/\[1m\]$/, '').replace(/-\d{8}$/, '');
+
   overlay.innerHTML = '<div class="pm-card pm-enter" style="width:400px;">' +
-    '<h2 class="pm-title">Session Model</h2>' +
-    '<div class="pm-body"><p>Choose model and thinking level for <strong>this session</strong>. System default is unchanged.</p></div>' +
-    '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;" id="sm-model-list">' +
+    '<h2 class="pm-title">' + (liveMode ? 'Switch Session Model' : 'Session Model') + '</h2>' +
+    '<div class="pm-body"><p>' + (liveMode
+      ? 'Switch the model of <strong>this running session</strong>. Applies from the next message. Currently running on <strong>' + (currentLiveModel ? _modelLabel(currentLiveModel) : 'unknown') + '</strong>.'
+      : 'Choose model and thinking level for <strong>this session</strong>. System default is unchanged.') + '</p></div>' +
+    '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;max-height:32vh;overflow-y:auto;" id="sm-model-list">' +
     '<span class="spinner"></span></div>' +
     '<div id="sm-thinking-section" style="display:none;margin-bottom:16px;">' +
     '<div style="font-size:11px;font-weight:600;color:var(--text-faint);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;">Thinking Level</div>' +
     '<div style="display:flex;flex-direction:column;gap:6px;" id="sm-thinking-list"></div>' +
     '</div>' +
     '<div class="pm-actions">' +
-    '<button class="pm-btn pm-btn-secondary" onclick="_clearSessionModelOverrideAndClose()">Reset to Default</button>' +
-    '<button class="pm-btn pm-btn-primary" id="sm-apply-btn" disabled onclick="_applySessionModelOverride()">Apply</button>' +
+    (liveMode
+      ? '<button class="pm-btn pm-btn-secondary" onclick="_closePm()">Cancel</button>' +
+        '<button class="pm-btn pm-btn-primary" id="sm-apply-btn" disabled onclick="_applyLiveSessionModel()">Switch Model</button>'
+      : '<button class="pm-btn pm-btn-secondary" onclick="_clearSessionModelOverrideAndClose()">Reset to Default</button>' +
+        '<button class="pm-btn pm-btn-primary" id="sm-apply-btn" disabled onclick="_applySessionModelOverride()">Apply</button>') +
     '</div></div>';
   overlay.classList.add('show');
   requestAnimationFrame(() => { const c = overlay.querySelector('.pm-card'); if (c) c.classList.remove('pm-enter'); });
@@ -181,8 +211,11 @@ async function _openSessionModelSelector() {
     ];
   }
 
-  // Track pending selections
-  let pendingModel = window._sessionModelOverride || _effectiveModel();
+  // Track pending selections.  Live mode pre-selects the session's ACTUAL
+  // model; new-session mode pre-selects the override/default.
+  let pendingModel = liveMode
+    ? currentLiveBase
+    : (window._sessionModelOverride || _effectiveModel());
   let pendingThinking = window._sessionThinkingOverride !== null
     ? window._sessionThinkingOverride
     : (typeof defaultThinking !== 'undefined' ? defaultThinking : '');
@@ -229,7 +262,9 @@ async function _openSessionModelSelector() {
   }
 
   _renderModels();
-  _renderThinking();
+  // Thinking level is launch-time configuration — it cannot be changed on a
+  // running session, so live mode honestly hides it instead of pretending.
+  if (!liveMode) _renderThinking();
 
   // Enable apply only when a selection differs from current state
   function _refreshApply() {
@@ -275,6 +310,68 @@ async function _openSessionModelSelector() {
     _refreshSessionModelBtn();
     if (typeof showToast === 'function') showToast('Session model reset to system default');
   };
+
+  // Live mid-session switch.  HONESTY CONTRACT: nothing in the UI changes
+  // until the daemon confirms the CLI accepted the set_model control
+  // request.  On failure or timeout the badge keeps showing the real model
+  // and the user gets an explicit error — never silent fake success.
+  window._applyLiveSessionModel = function() {
+    if (!liveMode || !liveSid || !pendingModel) return;
+    if (pendingModel === currentLiveBase) {
+      _closePm();
+      if (typeof showToast === 'function') showToast('Already running on ' + _modelLabel(pendingModel));
+      return;
+    }
+    const btn = document.getElementById('sm-apply-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Switching…'; }
+
+    let settled = false;
+    const finish = () => {
+      settled = true;
+      clearTimeout(timer);
+      if (typeof socket !== 'undefined') socket.off('session_model_result', onResult);
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      finish();
+      if (btn) { btn.disabled = false; btn.textContent = 'Switch Model'; }
+      if (typeof showToast === 'function') {
+        showToast('Model switch timed out — model NOT changed');
+      }
+    }, 20000);
+
+    function onResult(data) {
+      if (settled || !data || data.session_id !== liveSid) return;
+      finish();
+      if (data.ok) {
+        // Daemon confirmed via the CLI control protocol — safe to display.
+        if (liveSess) liveSess.model = data.model;
+        const badge = document.querySelector('.session-model-badge');
+        if (badge) {
+          const lbl = _modelLabel(data.model);
+          badge.textContent = lbl;
+          badge.title = 'Session model: ' + lbl + ' — click to switch (applies from the next message)';
+        }
+        _closePm();
+        if (typeof showToast === 'function') {
+          showToast('Model switched to ' + _modelLabel(data.model) + ' — applies from the next message');
+        }
+      } else {
+        if (btn) { btn.disabled = false; btn.textContent = 'Switch Model'; }
+        if (typeof showToast === 'function') {
+          showToast('Model switch FAILED: ' + (data.error || 'unknown error'));
+        }
+      }
+    }
+
+    if (typeof socket === 'undefined') {
+      finish();
+      if (typeof showToast === 'function') showToast('Not connected — model NOT changed');
+      return;
+    }
+    socket.on('session_model_result', onResult);
+    socket.emit('set_session_model', { session_id: liveSid, model: pendingModel });
+  };
 }
 
 /**
@@ -285,7 +382,8 @@ function _refreshSessionModelBtn() {
   const label = _modelLabel(_effectiveModel());
   const isOverridden = window._sessionModelOverride !== null;
 
-  // New-session button (has id)
+  // New-session button (has id) — the override is what the next session
+  // will start with, so showing it here is truthful.
   const btn = document.getElementById('session-model-btn');
   if (btn) {
     btn.textContent = label;
@@ -295,13 +393,19 @@ function _refreshSessionModelBtn() {
       : 'Click to choose model for this session';
   }
 
-  // Running-session badge (no id, use class)
+  // Running-session badge: NEVER write the next-session override onto it —
+  // it must only ever show the session's actual model.  Refresh it from the
+  // live session record instead (updated on daemon-confirmed switches and
+  // on init messages from the CLI).
   const badge = document.querySelector('.session-model-badge');
-  if (badge) {
-    badge.textContent = label;
-    badge.title = isOverridden
-      ? 'Next session: ' + label + ' — click to change'
-      : 'Click to set model for next session';
+  if (badge && typeof liveSessionId !== 'undefined' && liveSessionId &&
+      typeof allSessions !== 'undefined') {
+    const s = allSessions.find(x => x.id === liveSessionId);
+    if (s && s.model) {
+      const lbl = _modelLabel(s.model);
+      badge.textContent = lbl;
+      badge.title = 'Session model: ' + lbl + ' — click to switch (applies from the next message)';
+    }
   }
 }
 

@@ -150,6 +150,31 @@ class ClaudeAgentSDK(AgentSDK):
         """
         await client.interrupt()
 
+    async def set_model(self, client: ClaudeSDKClient, model: str) -> None:
+        """Switch the model for all subsequent turns of this session.
+
+        Uses the CLI control protocol's ``set_model`` request — the same
+        mechanism behind the interactive ``/model`` command.  The CLI
+        applies the new model starting with the NEXT turn (verified by
+        standalone probe 2026-06-10: after the control request returned
+        success, the following assistant message reported the new model id).
+
+        SDK 0.0.25 does not expose a public ``set_model`` wrapper, so this
+        reaches the internal ``Query._send_control_request`` — the same
+        internal layer ``sdk_patches.py`` already relies on.  That call
+        raises on an error response from the CLI, so a successful return
+        IS the CLI's confirmation.
+
+        Raises:
+            RuntimeError: session not connected.
+            Exception: CLI rejected the request (unknown model, old CLI).
+                Callers must not record the new model in that case.
+        """
+        query = getattr(client, "_query", None)
+        if query is None:
+            raise RuntimeError("Session is not connected")
+        await query._send_control_request({"subtype": "set_model", "model": model})
+
     async def disconnect(self, client: ClaudeSDKClient) -> None:
         """Disconnect the Claude client.
 
