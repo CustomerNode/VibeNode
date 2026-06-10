@@ -1384,6 +1384,14 @@ function updateLiveInputBar() {
       _activeRecognition._target && bar.contains(_activeRecognition._target)) {
     return;  // liveBarState NOT updated — so deferred call will still see a mismatch
   }
+  // Same guard for SpeechNode (MediaRecorder path). Without this, when a session
+  // finishes its turn mid-dictation, the bar re-renders, replaces the textarea, and
+  // the onSubmit closure captured at bar-build time becomes stale — message dropped
+  // every time. _refreshBarSoon() inside commitSend() handles the deferred catch-up.
+  if (typeof _activeSpeechNode !== 'undefined' && _activeSpeechNode &&
+      _activeSpeechNode._target && bar.contains(_activeSpeechNode._target)) {
+    return;  // liveBarState NOT updated — commitSend's _refreshBarSoon() catches up
+  }
 
   const wasTransition = liveBarState !== null;  // true if switching between states
   liveBarState = stateKey;

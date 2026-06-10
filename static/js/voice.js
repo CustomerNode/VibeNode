@@ -422,12 +422,18 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
     // mirrors the old Web Speech 3s silence behavior. Manual click still stops too.
     const SILENCE_SHORT = 3000;   // pause-to-send in a quiet room
     const SILENCE_LONG = 5500;    // pause-to-send when background noise/music is present
-    const MAX_MS = 60000;         // hard cap on one recording
+    const MAX_MS = 300000;        // hard cap on one recording (5 min); silence detection ends it sooner
     const RMS_THRESHOLD = 0.015;  // absolute speech floor (a fast path for QUIET rooms)
     const QUIET_RMS = 0.02;       // background above this = "noisy" -> use the long window
     const SPEECH_FACTOR = 2.2;    // (reserved)
     const STABLE_MS = 4000;       // committed words unchanged this long -> end of speech (client fallback)
     const GAP_S = 3.0;            // Whisper-VAD trailing silence (real, noise-immune) -> end of speech
+    // Whisper processes at most 30 seconds of audio per inference call. Sending more
+    // is wasteful: the model silently truncates the front, serialization is slower,
+    // and the larger blob causes partial-transcription latency to grow unboundedly as
+    // the session gets longer. Always send the most recent PARTIAL_WINDOW chunks so
+    // response time stays constant regardless of how long the user has been talking.
+    const PARTIAL_WINDOW = 75;    // ~30s at 400ms timeslice — Whisper's per-chunk context limit
     let hasSpoken = false;
     let noiseFloor = 1;           // tracks background (min rms); starts high, drops to real floor
     let streamBusy = false;       // a partial transcription is in flight
@@ -500,7 +506,14 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
               if (controller._finishFallback) { clearTimeout(controller._finishFallback); controller._finishFallback = null; }
             }
           } else if (hasSpoken && !controller._finishing && !controller._silenceTimer) {
-            controller._silenceTimer = setTimeout(maybeFinish, silenceMs);
+            // Adaptive silence window: give longer messages more patience.
+            // Short dictations stay snappy; long ones tolerate natural inter-sentence
+            // pauses without prematurely ending mid-thought.
+            const wordCount = committedWords.length;
+            const adaptedSilenceMs = wordCount > 30 ? silenceMs + 2000
+                                   : wordCount > 12 ? silenceMs + 1000
+                                   : silenceMs;
+            controller._silenceTimer = setTimeout(maybeFinish, adaptedSilenceMs);
           }
         }, 100);
       } catch (_) { /* no silence detection available — manual stop still works */ }
@@ -559,7 +572,27 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
       // so the committed message is never lower-quality. Full-quality partials were the
       // bug: the first one was too slow to land before a short utterance finalized.
       const useFast = true;
-      const partial = new Blob(chunks.slice(), { type: (chunks[0] && chunks[0].type) || 'audio/webm' });
+      // Cap partial audio at Whisper's 30-second context window. Sending more
+      // audio than the model can process causes two problems: (1) response time
+      // grows linearly with audio length — the model processes a 60s blob as
+      // slowly as two 30s blobs while producing no better output; (2) the model
+      // silently truncates the front, so LocalAgreement sees a different word at
+      // position 0 each cycle, preventing committed words from growing and
+      // triggering the stability check. Using a fixed-size trailing window keeps
+      // partial latency constant and LocalAgreement working regardless of session
+      // length. The final recorder.onstop still uses ALL audio for the full transcript.
+      const partialStart = Math.max(0, chunks.length - PARTIAL_WINDOW);
+      // When the window start advances, the transcript baseline shifts by one word
+      // and the previous prevWords comparison is off-by-one. Reset LocalAgreement
+      // so it rebuilds cleanly over the next two partials instead of staying stuck.
+      if (partialStart > (controller._lastPartialStart || 0)) {
+        prevWords = [];
+        committedWords = [];
+        controller._lastCommitLen = undefined;
+        controller._lastCommitTs = undefined;
+      }
+      controller._lastPartialStart = partialStart;
+      const partial = new Blob(chunks.slice(partialStart), { type: (chunks[0] && chunks[0].type) || 'audio/webm' });
       window.SpeechNode.transcribeBlob(partial, { fast: useFast, cwd: snCwd }).then((res) => {
         streamBusy = false;
         const dur = _now() - t0;
@@ -581,10 +614,15 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
               micSilentFor(GAP_S * 1000)) controller._finishing = true;
           // (2) committed-words stability — recognizer stops growing when you stop.
           //     Same mic-confirmation guard: don't fire if the model was just slow.
+          //     Adaptive: require more stable time for longer messages, matching the
+          //     longer inter-sentence pauses that long dictations naturally produce.
+          const adaptedStableMs = committedWords.length > 30 ? STABLE_MS + 3000
+                                 : committedWords.length > 12 ? STABLE_MS + 1500
+                                 : STABLE_MS;
           if (committedWords.length === controller._lastCommitLen) {
             if (haveText && committedWords.length > 0 &&
-                _now() - (controller._lastCommitTs || _now()) >= STABLE_MS &&
-                micSilentFor(STABLE_MS)) controller._finishing = true;
+                _now() - (controller._lastCommitTs || _now()) >= adaptedStableMs &&
+                micSilentFor(adaptedStableMs)) controller._finishing = true;
           } else {
             controller._lastCommitLen = committedWords.length;
             controller._lastCommitTs = _now();

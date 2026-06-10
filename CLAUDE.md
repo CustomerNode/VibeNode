@@ -14,6 +14,17 @@ VibeNode is an **open-source public repository on GitHub**. Everything you commi
 
 Review the `.gitignore` before creating new files in unfamiliar directories. If a new category of file doesn't have a gitignore rule, add one.
 
+## Diagnosing slow sessions — NEVER blame large context
+
+When a user asks why a session is slow and they are trying to optimize their time, **do NOT cite large context as an explanation and stop there.** Large context is a factor in model latency, not a verdict. The user already knows their session is slow — they need actionable help, not a description of why it will always be slow.
+
+**Required behavior:**
+- Diagnose the actual, specific bottleneck for that session at that moment (e.g. browser automation wall-clock time, a blocking tool call, a permission prompt waiting for approval, an oversized file snapshot, a task stuck in a loop).
+- If `/compact` would help, say so — but only after identifying the real bottleneck, and frame it as one option among others.
+- If the session is slow because of something fixable in VibeNode itself (snapshot size, turn latency, IPC overhead), treat that as a bug to investigate and fix, not as something the user must work around.
+
+**Forbidden response pattern:** "Your context is ~Xk tokens, which means turns will take ~Y seconds. Run /compact to shrink it." That is the context-blame anti-pattern. It is not wrong, but it is useless — it converts a diagnostic question into a shrug with a workaround attached.
+
 ## Server restarts — CRITICAL RULES
 
 ### You must have explicit permission FIRST
