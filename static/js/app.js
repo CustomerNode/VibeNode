@@ -998,7 +998,7 @@ async function addNewAgent() {
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();_newSessionSubmit(\'' + newId + '\')}">' +
       '</textarea>' +
       '<div class="live-bar-row">' +
-      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup('', true, '') : '<div class="bar-left-group"></div>') +
+      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup('', true, '', newId) : '<div class="bar-left-group"></div>') +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>';
@@ -1143,8 +1143,12 @@ async function _newSessionSubmit(sessionId) {
       : _invokeNotice.trim();
   }
 
-  // Resolve model and thinking level: per-session override wins over system default.
-  const _modelToUse = (typeof _effectiveModel === 'function') ? _effectiveModel() : defaultModel;
+  // Resolve model: session-specific assignment wins over global override wins over system default.
+  // Session-specific model is set when the user clicks the model badge for THIS session.
+  const _sessRec = (typeof allSessions !== 'undefined') ? allSessions.find(function(x) { return x.id === sessionId; }) : null;
+  const _modelToUse = (_sessRec && _sessRec.model)
+    ? _sessRec.model
+    : ((typeof _effectiveModel === 'function') ? _effectiveModel() : defaultModel);
   const _thinkingToUse = (typeof _effectiveThinking === 'function') ? _effectiveThinking() : defaultThinking;
 
   const startOpts = {

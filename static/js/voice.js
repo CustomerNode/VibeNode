@@ -328,6 +328,30 @@ function setupVoiceButton(textarea, button, onSubmit) {
 }
 
 /**
+ * Pick the best transcript between the final single-pass result and the
+ * streaming's last-known-good text.
+ *
+ * The streaming LocalAgreement builds a committed prefix through multiple passes;
+ * those words are more reliable for project-specific proper nouns and identifiers
+ * (e.g. "SpeechNode", function names) than a single-pass final transcription.
+ * When the final regresses on committed words — e.g. "SpeechNode" → "speech note"
+ * — prefer the streaming version for the whole transcript.
+ *
+ * Guard: require ≥2 committed words to avoid false-positives on very short
+ * utterances where the committed prefix could be a common substring.
+ */
+function _mergeWithCommitted(finalText, streamingText, committedWords) {
+  if (!finalText || !finalText.trim()) return (streamingText || '').trim();
+  if (!streamingText || !streamingText.trim()) return finalText;
+  if (!committedWords || committedWords.length < 2) return finalText;
+  const norm = (s) => s.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
+  const committed = norm(committedWords.join(' '));
+  if (norm(finalText).includes(committed)) return finalText;      // final agrees — trust it
+  if (norm(streamingText).includes(committed)) return streamingText; // final regressed — use streaming
+  return finalText;   // neither clearly aligns — trust the higher-quality decoder
+}
+
+/**
  * SpeechNode capture path — used when SpeechNode is enabled & ready.
  * Records via MediaRecorder (works in EVERY browser, so Firefox/Safari users
  * finally get voice) and transcribes server-side with codebase-biased Whisper.
@@ -396,18 +420,23 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
     // When you finish speaking, a short pause ends the turn: stop -> transcribe
     // -> auto-send. Works in EVERY browser (Firefox has no Web Speech VAD), and
     // mirrors the old Web Speech 3s silence behavior. Manual click still stops too.
-    const SILENCE_SHORT = 2500;   // pause-to-send in a quiet room
-    const SILENCE_LONG = 5000;    // pause-to-send when background noise/music is present
+    const SILENCE_SHORT = 3000;   // pause-to-send in a quiet room
+    const SILENCE_LONG = 5500;    // pause-to-send when background noise/music is present
     const MAX_MS = 60000;         // hard cap on one recording
     const RMS_THRESHOLD = 0.015;  // absolute speech floor (a fast path for QUIET rooms)
     const QUIET_RMS = 0.02;       // background above this = "noisy" -> use the long window
     const SPEECH_FACTOR = 2.2;    // (reserved)
-    const STABLE_MS = 3500;       // committed words unchanged this long -> end of speech (client fallback)
-    const GAP_S = 2.5;            // Whisper-VAD trailing silence (real, noise-immune) -> end of speech
+    const STABLE_MS = 4000;       // committed words unchanged this long -> end of speech (client fallback)
+    const GAP_S = 3.0;            // Whisper-VAD trailing silence (real, noise-immune) -> end of speech
     let hasSpoken = false;
     let noiseFloor = 1;           // tracks background (min rms); starts high, drops to real floor
     let streamBusy = false;       // a partial transcription is in flight
     let streamCooldown = 0;
+    // _lastSpeechAt: timestamp of the most recent mic sample above RMS_THRESHOLD.
+    // Used as ground-truth "is the user currently talking?" — the model's signals
+    // (GAP_S, STABLE_MS) are computed on audio that was submitted seconds ago, so
+    // when the model is slow they can fire while the user is still speaking.
+    // Requiring mic-confirmation before honouring model-side signals prevents that.
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     if (AudioCtx) {
       try {
@@ -423,14 +452,24 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
         // Finalize-and-send, but only once the model has caught up (compute gate):
         // if a partial is still transcribing, defer until it returns so a stall on
         // a long utterance can't trigger a premature send.
+        // micSilentFor(ms): has the mic been below RMS_THRESHOLD for at least ms?
+        // Used as ground-truth confirmation before any signal fires a send.
+        const micSilentFor = (ms) => (_now() - (controller._lastSpeechAt || 0)) >= ms;
+
         const maybeFinish = () => {
           controller._silenceTimer = null;
           if (stopped || controller._discarded) return;
           controller._finishing = true;          // stop issuing new partials
           if (!streamBusy) { controller.stop(); return; }   // model idle -> send now
-          // model busy: the in-flight partial's handler stops us when it returns,
-          // but never hang on it — hard fallback so a stuck request can't trap us.
-          controller._finishFallback = setTimeout(() => { try { controller.stop(); } catch (_) {} }, 1500);
+          // Model is busy — wait for the in-flight partial to return (its handler
+          // calls controller.stop() when _finishing is set). Hard fallback guards
+          // against a stuck/slow request, but first re-checks the mic: if the user
+          // started speaking again while we were waiting, retract the finish.
+          controller._finishFallback = setTimeout(() => {
+            if (!controller._finishing) return;          // retracted by level timer
+            if (!micSilentFor(SILENCE_SHORT * 0.6)) return;  // mic says still talking
+            try { controller.stop(); } catch (_) {}
+          }, 2500);
         };
         controller._levelTimer = setInterval(() => {
           if (stopped) return;
@@ -450,7 +489,16 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
           const silenceMs = (noiseFloor > QUIET_RMS) ? SILENCE_LONG : SILENCE_SHORT;
           if (rms > RMS_THRESHOLD) {
             hasSpoken = true;
+            controller._lastSpeechAt = _now();
             if (controller._silenceTimer) { clearTimeout(controller._silenceTimer); controller._silenceTimer = null; }
+            // Retract a pending finish if the user is speaking again. The model's
+            // GAP_S / STABLE_MS signals are computed on audio that was submitted
+            // seconds ago — they can fire while you're still mid-sentence. The mic
+            // is the ground truth: if it's hearing you, we're not done.
+            if (controller._finishing && !controller._sent) {
+              controller._finishing = false;
+              if (controller._finishFallback) { clearTimeout(controller._finishFallback); controller._finishFallback = null; }
+            }
           } else if (hasSpoken && !controller._finishing && !controller._silenceTimer) {
             controller._silenceTimer = setTimeout(maybeFinish, silenceMs);
           }
@@ -521,15 +569,22 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
         if (res && res.ok && typeof res.text === 'string') {
           if (res.text.trim()) applyPartial(res.text);
           const haveText = !!(controller._lastFullText || '').trim();
-          // END-OF-SPEECH — noise-immune (mic level AND raw text both fail in loud rooms):
-          // (1) Whisper-VAD trailing-silence gap from the backend = real silence since you
-          //     last spoke; VAD ignores noise so it's solid. (needs the web restart)
-          if (haveText && typeof res.gap === 'number' && res.gap >= GAP_S) controller._finishing = true;
-          // (2) committed-words stability — the confidently-recognized prefix stops growing
-          //     when you stop talking. Works client-side (just a hard refresh).
+          // END-OF-SPEECH — both model-side signal AND mic must agree before we finish.
+          // When the model is slow (streamBusy for several seconds), _lastSpeechAt is
+          // updated live by the level timer while the model processes old audio. So if
+          // the model says "gap = 3s" but the mic saw speech 0.5s ago, the model is
+          // looking at stale audio — the user is still talking. Require mic silence of
+          // at least the same duration as the trigger before honouring either signal.
+          // (1) Whisper-VAD trailing-silence gap — noise-immune, but only trustworthy
+          //     when the mic confirms you've also been quiet that long.
+          if (haveText && typeof res.gap === 'number' && res.gap >= GAP_S &&
+              micSilentFor(GAP_S * 1000)) controller._finishing = true;
+          // (2) committed-words stability — recognizer stops growing when you stop.
+          //     Same mic-confirmation guard: don't fire if the model was just slow.
           if (committedWords.length === controller._lastCommitLen) {
             if (haveText && committedWords.length > 0 &&
-                _now() - (controller._lastCommitTs || _now()) >= STABLE_MS) controller._finishing = true;
+                _now() - (controller._lastCommitTs || _now()) >= STABLE_MS &&
+                micSilentFor(STABLE_MS)) controller._finishing = true;
           } else {
             controller._lastCommitLen = committedWords.length;
             controller._lastCommitTs = _now();
@@ -611,9 +666,14 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
       window.SpeechNode.transcribeBlob(blob, { cwd: snCwd }).then((res) => {
         clearTimeout(watchdog);
         if (res && res.ok && typeof res.text === 'string' && res.text.trim()) {
-          _processVoiceTranscript(res.text, { textarea, onSubmit, source: 'speechnode' })
-            .then((t) => commitSend(t || res.text))
-            .catch(() => commitSend(res.text));
+          // Prefer the streaming's committed words when the single-pass final regresses
+          // on them. LocalAgreement locked those words across multiple partial passes;
+          // the final's beam-search is higher quality overall but can still produce a
+          // worse result for specific proper nouns (e.g. "SpeechNode" → "speech note").
+          const best = _mergeWithCommitted(res.text, controller._lastFullText, committedWords);
+          _processVoiceTranscript(best, { textarea, onSubmit, source: 'speechnode' })
+            .then((t) => commitSend(t || best))
+            .catch(() => commitSend(best));
         } else {
           commitSend('');     // empty/failed final -> fall back to the live transcript
         }

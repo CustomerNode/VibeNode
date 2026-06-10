@@ -104,6 +104,19 @@ def create_app(testing=False) -> Flask:
         @app.route("/speechnode/<path:filename>")
         def _speechnode_assets(filename):              # serves speechnode.js / speechnode.css
             return _sfd(_sn_web, filename)
+
+        # Pre-warm: if the model was already installed before this restart, start
+        # reloading it into memory NOW (in the background) rather than waiting for
+        # the first client poll. The web-server restart animation takes ~5-10s, so
+        # the model is often warm again before the user can even try to use voice.
+        # start_install() is idempotent and thread-safe — safe to call at startup.
+        try:
+            from speechnode import engine as _sn_engine
+            if _sn_engine._deps_available():
+                _sn_engine.start_install()
+                _logging.getLogger("app").info("SpeechNode: pre-warming model after restart.")
+        except Exception:
+            pass  # best-effort; client-side polling handles it if this fails
     except Exception as _e:                            # noqa: BLE001
         _logging.getLogger("app").warning("SpeechNode unavailable: %s", _e)
 

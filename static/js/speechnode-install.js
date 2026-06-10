@@ -235,7 +235,9 @@
     _refreshBar();
     const s = (SN() && SN().getStatus()) || {};
     if (_shown) _renderSuccess(s);
-    else _toast('SpeechNode is ready — voice is on.');
+    else if (!opts.silent) _toast('SpeechNode is ready — voice is on.');
+    // silent=true: auto-resume after restart — bar update is the only signal needed;
+    // the package's _startPolling() may already fire its own "SpeechNode is ready." toast.
   }
 
   // ---- public entry points -------------------------------------------------
@@ -258,10 +260,16 @@
     _poll({ visible: true });
   }
 
-  // Runs on every page load. THE keystone fix: finish an install that the package's
-  // own _boot() leaves stranded (enabled + idle + deps missing — e.g. right after a
-  // restart-driven reload). For the cases the package already handles
-  // (in-progress, or deps importable), we stay out of the way to avoid double work.
+  // Runs on every page load. Ensures SpeechNode is ready after any restart.
+  //
+  // The package's own _boot() handles most cases but has two gaps we fill:
+  //  • enabled + idle + no deps  — the original dead-state bug (_boot() never fires)
+  //  • enabled + loading         — _boot() polls, but its _refreshBar() may not update
+  //                                VibeNode's mic reliably. We run our own silent poll
+  //                                so _refreshBar() fires from code we control.
+  //
+  // Server-side, app/__init__.py pre-warms the model on restart so it's often ready
+  // by the time this runs. The poll is the fallback for when it isn't.
   function resumeOnLoad() {
     if (_resumed) return;
     _resumed = true;
@@ -274,9 +282,15 @@
       if (s.ready) { _refreshBar(); return; }
       if (s.phase === 'needs_restart') { _renderNeedsRestart(); return; }
       const inProgress = s.phase === 'installing' || s.phase === 'downloading' || s.phase === 'loading';
-      if (inProgress || s.deps_available) return;   // package _boot() already resumes these
-      // The gap the package misses: enabled but idle with no deps -> finish silently.
-      sn.startInstall().then(() => _poll({ visible: false })).catch(() => { /* ignore */ });
+      if (inProgress || s.deps_available) {
+        // Model is loading (or about to load via package _boot()). Run a silent poll
+        // so we own the _refreshBar() call that lights the mic when it's done.
+        // No toast — the package's _startPolling() fires "SpeechNode is ready." for us.
+        _poll({ visible: false, silent: true });
+        return;
+      }
+      // The gap the package misses: enabled but idle with no deps -> start and poll silently.
+      sn.startInstall().then(() => _poll({ visible: false, silent: true })).catch(() => { /* ignore */ });
     }).catch(() => { /* offline / transient — package _boot may still recover */ });
   }
 

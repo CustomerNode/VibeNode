@@ -480,7 +480,7 @@ async function openInGUI(id) {
           ' onkeydown="if(_shouldSend(event)){event.preventDefault();_newSessionSubmit(\'' + id + '\')}">' +
           '</textarea>' +
           '<div class="live-bar-row">' +
-          (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup('', true, '') : '<div class="bar-left-group"></div>') +
+          (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup('', true, '', id) : '<div class="bar-left-group"></div>') +
           '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
           '<button class="live-send-btn" id="live-voice-btn"></button>' +
           '</div>';

@@ -3088,6 +3088,26 @@ mark.find-match.current { background: var(--accent); color:#fff; }
   justify-content: flex-end;
 }
 
+/* Model / live-switch modal: keep the Apply/Reset buttons always visible.
+   Without this, the whole .pm-card scrolls and the buttons disappear off the
+   bottom when there are many models + thinking levels. */
+.pm-card.sm-modal {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;   /* card itself does NOT scroll — internal div does */
+}
+.sm-scroll-body {
+  flex: 1 1 0;        /* grow to fill space between header and action bar */
+  overflow-y: auto;
+  min-height: 0;      /* required: allows flex child to shrink below content size */
+}
+.pm-card.sm-modal .pm-actions {
+  flex: 0 0 auto;     /* never shrink or grow — always visible at bottom */
+  padding-top: 16px;
+  margin-top: 4px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
+
 .pm-btn {
   padding: 8px 20px;
   border-radius: 8px;

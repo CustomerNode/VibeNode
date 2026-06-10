@@ -120,16 +120,19 @@ function _clearSessionModelOverride() {
  * @param {string}  [sessionModel=''] — model of the current live session,
  *   used in the running/idle bars to show what model is active.
  */
-function _buildSessionModelBtn(isNewSession, sessionModel) {
+function _buildSessionModelBtn(isNewSession, sessionModel, sessionId) {
   if (isNewSession) {
-    // New session: the override (if any) is what the next session will
-    // actually start with — showing it here is truthful.
-    const isOverridden = window._sessionModelOverride !== null;
-    const label = _modelLabel(isOverridden
-      ? window._sessionModelOverride
-      : (typeof defaultModel !== 'undefined' ? defaultModel : ''));
+    // Prefer a model explicitly assigned to this specific pending session,
+    // then the global per-session override, then the system default.
+    const _pSessModel = (sessionId && typeof allSessions !== 'undefined')
+      ? ((allSessions.find(function(x) { return x.id === sessionId; }) || {}).model || '')
+      : '';
+    const isOverridden = !!_pSessModel || window._sessionModelOverride !== null;
+    const label = _modelLabel(_pSessModel || window._sessionModelOverride
+      || (typeof defaultModel !== 'undefined' ? defaultModel : ''));
+    const _safeId = (sessionId || '').replace(/['"\\]/g, '');
     return '<button class="session-model-btn' + (isOverridden ? ' session-model-overridden' : '') + '" ' +
-      'id="session-model-btn" onclick="_openSessionModelSelector()" ' +
+      'id="session-model-btn" onclick="_openSessionModelSelector(false, \'' + _safeId + '\')" ' +
       'title="' + (isOverridden ? 'Model overridden — click to change' : 'Click to choose model for this session') + '">' +
       label + '</button>';
   }
@@ -156,7 +159,7 @@ function _buildSessionModelBtn(isNewSession, sessionModel) {
  * the per-session override WITHOUT affecting the system-level defaults
  * stored in localStorage.
  */
-async function _openSessionModelSelector(liveMode) {
+async function _openSessionModelSelector(liveMode, pendingSessionId) {
   const overlay = document.getElementById('pm-overlay');
   if (!overlay) return;
 
@@ -180,9 +183,9 @@ async function _openSessionModelSelector(liveMode) {
     '<div class="pm-body"><p>' + (liveMode
       ? 'Switch the model of <strong>this running session</strong>. Applies from the next message. Currently running on <strong>' + (currentLiveModel ? _modelLabel(currentLiveModel) : 'unknown') + '</strong>.'
       : 'Choose model and thinking level for <strong>this session</strong>. System default is unchanged.') + '</p></div>' +
-    '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;max-height:32vh;overflow-y:auto;" id="sm-model-list">' +
+    '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;max-height:35vh;overflow-y:auto;" id="sm-model-list">' +
     '<span class="spinner"></span></div>' +
-    '<div id="sm-thinking-section" style="display:none;margin-bottom:16px;">' +
+    '<div id="sm-thinking-section" style="display:none;margin-bottom:16px;max-height:20vh;overflow-y:auto;">' +
     '<div style="font-size:11px;font-weight:600;color:var(--text-faint);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;">Thinking Level</div>' +
     '<div style="display:flex;flex-direction:column;gap:6px;" id="sm-thinking-list"></div>' +
     '</div>' +
@@ -213,9 +216,14 @@ async function _openSessionModelSelector(liveMode) {
 
   // Track pending selections.  Live mode pre-selects the session's ACTUAL
   // model; new-session mode pre-selects the override/default.
+  // For new-session mode: prefer model explicitly assigned to this pending session,
+  // then global override, then system default.
+  const _pSessForModel = (!liveMode && pendingSessionId && typeof allSessions !== 'undefined')
+    ? (allSessions.find(function(x) { return x.id === pendingSessionId; }) || {})
+    : {};
   let pendingModel = liveMode
     ? currentLiveBase
-    : (window._sessionModelOverride || _effectiveModel());
+    : (_pSessForModel.model || window._sessionModelOverride || _effectiveModel());
   let pendingThinking = window._sessionThinkingOverride !== null
     ? window._sessionThinkingOverride
     : (typeof defaultThinking !== 'undefined' ? defaultThinking : '');
@@ -292,9 +300,15 @@ async function _openSessionModelSelector(liveMode) {
     else localStorage.removeItem('_sessionModelOverride');
     if (pendingThinking) localStorage.setItem('_sessionThinkingOverride', pendingThinking);
     else localStorage.removeItem('_sessionThinkingOverride');
+    // Store model directly on the pending session so _newSessionSubmit reads
+    // it from the session object — indestructible, not shared with other sessions.
+    if (pendingSessionId && typeof allSessions !== 'undefined') {
+      var _pSess = allSessions.find(function(x) { return x.id === pendingSessionId; });
+      if (_pSess) _pSess.model = pendingModel || '';
+    }
     _closePm();
     // Refresh any visible session-model-btn to show updated label
-    _refreshSessionModelBtn();
+    _refreshSessionModelBtn(pendingSessionId);
     const label = _modelLabel(pendingModel);
     const thinking = pendingThinking
       ? ' + ' + pendingThinking.charAt(0).toUpperCase() + pendingThinking.slice(1) + ' thinking'
@@ -306,8 +320,13 @@ async function _openSessionModelSelector(liveMode) {
     window._sessionThinkingOverride = null;
     localStorage.removeItem('_sessionModelOverride');
     localStorage.removeItem('_sessionThinkingOverride');
+    // Clear from the specific pending session
+    if (pendingSessionId && typeof allSessions !== 'undefined') {
+      var _pSess = allSessions.find(function(x) { return x.id === pendingSessionId; });
+      if (_pSess) delete _pSess.model;
+    }
     _closePm();
-    _refreshSessionModelBtn();
+    _refreshSessionModelBtn(pendingSessionId);
     if (typeof showToast === 'function') showToast('Session model reset to system default');
   };
 
@@ -378,12 +397,15 @@ async function _openSessionModelSelector(liveMode) {
  * Refresh the session-model-btn in the current input bar after
  * an override is applied or cleared, without re-rendering the full bar.
  */
-function _refreshSessionModelBtn() {
-  const label = _modelLabel(_effectiveModel());
-  const isOverridden = window._sessionModelOverride !== null;
+function _refreshSessionModelBtn(sessionId) {
+  // Resolve: session-specific model > global override > system default
+  const _pSessModel = (sessionId && typeof allSessions !== 'undefined')
+    ? ((allSessions.find(function(x) { return x.id === sessionId; }) || {}).model || '')
+    : '';
+  const label = _modelLabel(_pSessModel || _effectiveModel());
+  const isOverridden = !!_pSessModel || window._sessionModelOverride !== null;
 
-  // New-session button (has id) — the override is what the next session
-  // will start with, so showing it here is truthful.
+  // New-session button (has id) — shows the model this session will use.
   const btn = document.getElementById('session-model-btn');
   if (btn) {
     btn.textContent = label;
@@ -432,10 +454,10 @@ function _buildInvokeBtn() {
  * @param {string}  [sessionModel=''] - model of the current live session
  *   (used in idle/waiting/working bars for display purposes).
  */
-function _buildBarLeftGroup(ctxHtml, isNewSession, sessionModel) {
+function _buildBarLeftGroup(ctxHtml, isNewSession, sessionModel, sessionId) {
   return '<div class="bar-left-group">' +
     (typeof _buildInvokeBtn === 'function' ? _buildInvokeBtn() : '') +
-    _buildSessionModelBtn(isNewSession || false, sessionModel || '') +
+    _buildSessionModelBtn(isNewSession || false, sessionModel || '', sessionId || '') +
     (ctxHtml || '') +
     '</div>';
 }

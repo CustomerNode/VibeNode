@@ -3353,7 +3353,7 @@ async function openSessionSpawner(taskId) {
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();_newSessionSubmit(\'' + newId + '\')}">' +
       '</textarea>' +
       '<div class="live-bar-row">' +
-      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup('', true, '') : '') +
+      (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup('', true, '', newId) : '') +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + (typeof _sendHint === 'function' ? _sendHint() : '') + '</span>' +
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>' +
@@ -3515,6 +3515,8 @@ async function executeTask(taskId, mode, opts) {
   if (systemPrompt) startOpts.system_prompt = systemPrompt;
 
   socket.emit('start_session', startOpts);
+  // Clear per-session override so it isn't reused by the next kanban task.
+  if (typeof _clearSessionModelOverride === 'function') _clearSessionModelOverride();
 
   // 7. Link session to task immediately
   window._kanbanPendingTaskLink = taskId;

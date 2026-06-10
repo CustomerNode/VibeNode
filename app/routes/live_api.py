@@ -462,6 +462,14 @@ _FALLBACK_KNOWN_MODELS = [
 # Default-model preference order by family: sonnet first (balanced), then opus, then haiku.
 _DEFAULT_FAMILY_PREFERENCE = ("sonnet", "opus", "haiku")
 
+# Background refresh state — prevents duplicate refresh threads.
+_models_refresh_running: bool = False
+_models_refresh_lock = None  # Initialised lazily to avoid import-time threading issues.
+
+# How long (seconds) a cache entry is considered fresh before a background refresh is triggered.
+# Models change rarely, so 1 hour avoids unnecessary CLI/API round-trips.
+_MODELS_CACHE_TTL = 3600
+
 
 def _invalidate_models_cache() -> None:
     """Force the models list to be rebuilt on the next /api/models request."""
@@ -560,44 +568,13 @@ def _fetch_current_model_from_cli() -> str:
     return ""
 
 
-@bp.route('/api/models')
-def get_models():
-    """Return available Claude models. Sources in priority order:
-    1. Anthropic /v1/models API (if ANTHROPIC_API_KEY is set)
-    2. Persistent confirmed-models cache (grows as sessions run)
-    3. Current model from a quick CLI init call
-    4. Hardcoded fallback (ensures the list is never empty)
+def _finalize_model_list(result: list, cli_model: str) -> list:
+    """Sort, dedup, and mark the default model on a raw model list.
 
-    Always marks exactly one model with ``default: True`` — the CLI-detected
-    model if available, otherwise the first sonnet, otherwise the first entry.
-    Results are cached for 10 minutes.
+    Shared by the fast sync path and the background refresh so both produce
+    identically structured output.
     """
-    import time as _time
     import re as _re
-
-    if _models_cache["data"] and _time.time() - _models_cache["ts"] < 600:
-        return jsonify(_models_cache["data"])
-
-    # 1. Try Anthropic API (best source — always up to date)
-    result = _fetch_models_from_anthropic_api()
-
-    # 3. Always try CLI so we know which model the user is currently running
-    cli_model = _fetch_current_model_from_cli()
-
-    if not result:
-        # 2. Use the confirmed-models persistent cache
-        confirmed = _load_confirmed_models()
-
-        if cli_model and cli_model.startswith("claude-"):
-            if cli_model not in confirmed:
-                confirmed[cli_model] = _model_id_to_display_name(cli_model)
-                try:
-                    _CONFIRMED_MODELS_FILE.write_text(json.dumps(confirmed, indent=2))
-                except Exception:
-                    pass
-
-        if confirmed:
-            result = [{"id": mid, "name": name} for mid, name in confirmed.items()]
 
     def _sort_key(m):
         mid = m["id"]
@@ -605,8 +582,8 @@ def get_models():
         nums = [-int(x) for x in _re.findall(r"\d+", mid)]
         return (family, nums)
 
-    # 4. Fallback: ensure every family (opus/sonnet/haiku) is represented so
-    #    the UI always shows a useful menu, even with no API key / CLI / cache.
+    # Ensure every family (opus/sonnet/haiku) is represented so the UI always
+    # shows a useful menu even with no API key / CLI / cache.
     existing_ids = {m["id"] for m in result}
     present_families = {
         fam for fam in ("opus", "sonnet", "haiku")
@@ -621,7 +598,7 @@ def get_models():
 
     result.sort(key=_sort_key)
 
-    # Dedup by display name — keep the first (shortest/cleanest ID per name)
+    # Dedup by display name — keep the first (shortest/cleanest ID per name).
     seen_names: set = set()
     deduped = []
     for m in result:
@@ -650,9 +627,112 @@ def get_models():
     for i, m in enumerate(result):
         m["default"] = (i == default_idx)
 
-    _models_cache["data"] = result
-    _models_cache["ts"] = _time.time()
-    return jsonify(result)
+    return result
+
+
+def _build_models_quickly() -> list:
+    """Build a model list instantly from disk data only — no network, no subprocess.
+
+    Uses the confirmed-models persistent cache (which grows as sessions run) plus
+    the hardcoded fallbacks.  This is the fast path used for every /api/models
+    response so the UI never waits for external sources.
+    """
+    confirmed = _load_confirmed_models()
+    result = [{"id": mid, "name": name} for mid, name in confirmed.items()]
+    # No CLI call here — mark default by family preference only.
+    return _finalize_model_list(result, cli_model="")
+
+
+def _refresh_models_background() -> None:
+    """Refresh the model cache in a background daemon thread.
+
+    Runs the Anthropic API call and the Claude CLI call **in parallel** using
+    ThreadPoolExecutor so the total wall-clock cost is max(api_time, cli_time)
+    rather than the sequential sum.  Updates _models_cache in-place once done.
+    Previously these ran sequentially: Anthropic API (up to 8 s) + CLI spawn
+    (up to 20 s) = up to 28 s of blocking on the request thread.
+    """
+    global _models_refresh_running
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        # Run both slow sources concurrently.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            api_future = executor.submit(_fetch_models_from_anthropic_api)
+            cli_future = executor.submit(_fetch_current_model_from_cli)
+            api_models = api_future.result()
+            cli_model = cli_future.result()
+
+        result = list(api_models)
+
+        if not result:
+            # No API results — fall back to confirmed-models cache.
+            confirmed = _load_confirmed_models()
+            if cli_model and cli_model.startswith("claude-"):
+                if cli_model not in confirmed:
+                    confirmed[cli_model] = _model_id_to_display_name(cli_model)
+                    try:
+                        _CONFIRMED_MODELS_FILE.write_text(json.dumps(confirmed, indent=2))
+                    except Exception:
+                        pass
+            if confirmed:
+                result = [{"id": mid, "name": name} for mid, name in confirmed.items()]
+
+        result = _finalize_model_list(result, cli_model)
+
+        _models_cache["data"] = result
+        _models_cache["ts"] = _time.time()
+    except Exception:
+        pass
+    finally:
+        with _models_refresh_lock:
+            _models_refresh_running = False
+
+
+@bp.route('/api/models')
+def get_models():
+    """Return available Claude models — always responds immediately.
+
+    Fast path (every request):
+      Build the list from confirmed_models.json + hardcoded fallbacks.
+      No network calls, no subprocess — returns in < 1 ms.
+
+    Background refresh (triggered when cache is stale or empty):
+      A daemon thread runs the Anthropic /v1/models API call and the Claude CLI
+      call **in parallel** (previously sequential = up to 28 s) and updates the
+      cache for the next request.  Cache TTL is 1 hour.
+
+    Sources in priority order (background):
+      1. Anthropic /v1/models API (if ANTHROPIC_API_KEY is set)
+      2. Persistent confirmed-models cache (grows as sessions run)
+      3. Current model from a quick CLI init call
+      4. Hardcoded fallback (ensures the list is never empty)
+    """
+    global _models_refresh_running, _models_refresh_lock
+    import time as _time
+    import threading as _threading
+
+    # Lazy-init the lock so it is created in the correct thread context.
+    if _models_refresh_lock is None:
+        _models_refresh_lock = _threading.Lock()
+
+    # Always respond instantly — return whatever we have right now.
+    if not _models_cache["data"]:
+        # Very first call (cold start): build quickly from disk and return.
+        _models_cache["data"] = _build_models_quickly()
+        _models_cache["ts"] = 0  # Force a background refresh immediately.
+
+    # Trigger background refresh if the cache is stale (or was just force-expired).
+    if _time.time() - _models_cache["ts"] >= _MODELS_CACHE_TTL:
+        with _models_refresh_lock:
+            if not _models_refresh_running:
+                _models_refresh_running = True
+                _threading.Thread(
+                    target=_refresh_models_background, daemon=True
+                ).start()
+
+    return jsonify(_models_cache["data"])
 
 
 # ---------------------------------------------------------------------------

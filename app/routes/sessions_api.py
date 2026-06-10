@@ -226,6 +226,7 @@ def api_sessions():
                 "file_bytes": 0,
                 "message_count": 0,
                 "preview": "",
+                "model": state.get("model", ""),
             })
 
     return jsonify(sessions)

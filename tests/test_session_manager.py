@@ -490,6 +490,55 @@ class TestSetSessionModel:
         assert result["ok"] is False
         assert "spawn failed" in result["error"]
 
+    def test_startup_init_drain_prevents_stuck_working(self, session_manager, sm_module):
+        """Regression 2026-06-10: dormant bare resume must drain the CLI startup init.
+
+        When set_session_model resumes a dormant session via start_session(prompt="",
+        resume=True), the CLI emits a ``system.init`` message immediately after
+        connecting.  Without the ``_drain_startup_init()`` call in the else branch of
+        _drive_session, that init sits in the SDK buffer.  _post_turn_compact_drain then
+        reads it in its 100 ms peek window, mistakes it for an auto-resume signal,
+        calls _enter_auto_resume (→ WORKING), and waits for a RESULT that never arrives
+        — the session is stuck in WORKING indefinitely.
+
+        Fix (applied 2026-06-10): before declaring IDLE in the empty-prompt else branch,
+        _drive_session now drains up to one init within a 3-second window.  This test
+        verifies that a session started with an empty prompt whose mock SDK yields one
+        init on the first receive_response() call resolves to IDLE, not WORKING.
+        """
+        from daemon.backends.messages import VibeNodeMessage, MessageKind
+
+        sid = "sm-startup-drain-regression"
+        call_count = [0]
+
+        async def _mock_receive(client):
+            """First receive_response call yields the startup init; later calls empty."""
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # The startup init the CLI emits right after connect --resume.
+                yield VibeNodeMessage(kind=MessageKind.SYSTEM, subtype="init")
+            # Subsequent calls (from _post_turn_compact_drain and
+            # _extended_post_turn_listener) yield nothing — no buffered content.
+
+        mock_client = MockClaudeSDKClient()
+
+        with patch.object(session_manager._sdk, 'create_session',
+                          new=AsyncMock(return_value=mock_client)), \
+             patch.object(session_manager._sdk, 'receive_response',
+                          new=_mock_receive):
+            session_manager.start_session(sid, prompt="", cwd="/tmp", resume=True,
+                                          model="claude-sonnet-4-6")
+            # Without the drain fix the session would be stuck in WORKING
+            # indefinitely; with the fix it resolves to IDLE quickly.
+            wait_for(
+                lambda: session_manager.get_session_state(sid) == "idle",
+                timeout=10,
+            )
+
+        assert session_manager.get_session_state(sid) == "idle", (
+            "Session stuck in WORKING — _drain_startup_init regression in _drive_session"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 14. Close session
@@ -713,3 +762,120 @@ class TestSessionQueries:
         result = session_manager.resolve_permission(sid, allow=True)
         assert result["ok"] is False
         assert "no pending" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Regression: project-switch bleed — get_all_states cwd fill-in (2026-06-10)
+# ---------------------------------------------------------------------------
+
+class TestGetAllStatesCwdFillIn:
+    """Regression tests for the project-switch cross-project bleed fix.
+
+    Root cause: sessions auto-resumed before the _reg typo fix had info.cwd=""
+    which caused _filter_sessions_for_project to include them in EVERY project's
+    snapshot.  get_all_states() now fills in cwd from the registry for empty-cwd
+    sessions so the filter can exclude them correctly.
+    """
+
+    def test_empty_cwd_session_gets_registry_fallback(self, session_manager, sm_module):
+        """A session with cwd='' in daemon memory should get cwd filled from registry."""
+        sid = "bleed-test-session"
+        real_cwd = "C:/Users/test/code/ProjectA"
+
+        info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
+        info.cwd = ""  # simulate pre-fix auto-resume
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+        reg_data = {"sessions": {sid: {"cwd": real_cwd, "name": "test", "state": "idle"}}}
+        session_manager._reg.load_registry = MagicMock(return_value=reg_data)
+
+        states = session_manager.get_all_states()
+        by_id = {s["session_id"]: s for s in states}
+        assert sid in by_id
+        # cwd must be filled in from the registry
+        assert by_id[sid]["cwd"] == real_cwd, (
+            "get_all_states must fill in cwd from registry for empty-cwd sessions "
+            "so _filter_sessions_for_project can exclude them from wrong projects"
+        )
+
+    def test_session_with_real_cwd_is_unchanged(self, session_manager, sm_module):
+        """Sessions that already have a cwd set must not have it overwritten."""
+        sid = "has-cwd-session"
+        original_cwd = "C:/Users/test/code/ProjectB"
+        reg_cwd = "C:/Users/test/code/SomethingElse"
+
+        info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
+        info.cwd = original_cwd
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+        reg_data = {"sessions": {sid: {"cwd": reg_cwd, "name": "test"}}}
+        session_manager._reg.load_registry = MagicMock(return_value=reg_data)
+
+        states = session_manager.get_all_states()
+        by_id = {s["session_id"]: s for s in states}
+        assert by_id[sid]["cwd"] == original_cwd, (
+            "Sessions with a real cwd must not have it overwritten by the registry"
+        )
+        # Registry should not even be read when no empty-cwd sessions exist
+        session_manager._reg.load_registry.assert_not_called()
+
+    def test_registry_read_failure_is_silently_ignored(self, session_manager, sm_module):
+        """If the registry read raises, get_all_states() must still return normally."""
+        sid = "fail-reg-session"
+        info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
+        info.cwd = ""
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+        session_manager._reg.load_registry = MagicMock(side_effect=OSError("disk error"))
+
+        # Must not raise
+        states = session_manager.get_all_states()
+        by_id = {s["session_id"]: s for s in states}
+        assert sid in by_id
+        # cwd stays empty (no crash, just permissive)
+        assert by_id[sid]["cwd"] == ""
+
+    def test_no_registry_read_when_all_cwds_populated(self, session_manager, sm_module):
+        """Registry must not be read at all when every session already has a cwd."""
+        for i in range(3):
+            sid = f"cwd-session-{i}"
+            info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
+            info.cwd = f"C:/Users/test/proj{i}"
+            with session_manager._lock:
+                session_manager._sessions[sid] = info
+
+        session_manager._reg.load_registry = MagicMock()
+
+        session_manager.get_all_states()
+        session_manager._reg.load_registry.assert_not_called()
+
+    def test_filter_sessions_excludes_other_project(self):
+        """Server-side _filter_sessions_for_project must exclude sessions with a
+        non-matching cwd now that get_all_states() fills in the registry cwd."""
+        from app.routes.ws_events import register_ws_events
+        from unittest.mock import MagicMock
+        # Reconstruct the filter function the same way ws_events defines it
+        # (it's a closure, so we re-implement the same logic inline)
+        from app.config import cwd_matches_active_project
+
+        def _filter(sessions, project=""):
+            return [s for s in sessions
+                    if not s.get("cwd") or cwd_matches_active_project(s["cwd"], project=project)]
+
+        project_a_cwd = "C:/Users/test/ProjectA"
+        project_b_encoded = "C--Users-test-ProjectB"
+        sessions = [
+            {"session_id": "s1", "cwd": project_a_cwd, "state": "working"},
+            {"session_id": "s2", "cwd": "", "state": "idle"},  # new session, no cwd yet
+        ]
+        filtered = _filter(sessions, project=project_b_encoded)
+        ids = {s["session_id"] for s in filtered}
+        assert "s1" not in ids, (
+            "Session from ProjectA must be excluded when filtering for ProjectB"
+        )
+        assert "s2" in ids, (
+            "Brand-new session with empty cwd must still pass through (may belong to active project)"
+        )

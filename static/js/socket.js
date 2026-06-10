@@ -62,7 +62,7 @@ function _sessionBelongsToActiveProject(cwd) {
     if (!cwd) return true;  // no cwd → don't filter
     const active = localStorage.getItem('activeProject');
     if (!active) return true;  // no active project → don't filter
-    const encoded = cwd.replace(/\\/g, '-').replace(/\//g, '-').replace(/:/g, '-');
+    const encoded = cwd.replace(/\\/g, '-').replace(/\//g, '-').replace(/:/g, '-').replace(/_/g, '-').replace(/\./g, '-');
     return encoded.toLowerCase() === active.toLowerCase();
 }
 
@@ -93,9 +93,14 @@ socket.on('connect', () => {
     const _ap = _curProj;
     socket.emit('request_state_snapshot', {project: _ap});
     // Retry after 3s in case the first snapshot was silently dropped
-    // (e.g. DaemonClient not yet reconnected when server just restarted)
+    // (e.g. DaemonClient not yet reconnected when server just restarted).
+    // Read activeProject fresh at fire time — user may have switched projects
+    // within 3s of connect, and a stale project here causes cross-project bleed.
     setTimeout(() => {
-        if (socket.connected) socket.emit('request_state_snapshot', {project: _ap});
+        if (socket.connected) {
+            const _retryProj = localStorage.getItem('activeProject') || '';
+            socket.emit('request_state_snapshot', {project: _retryProj});
+        }
     }, 3000);
 });
 
@@ -378,6 +383,8 @@ socket.on('state_snapshot', (data) => {
         // Skip old pre-remap IDs that have already been replaced
         if (window._idRemaps && window._idRemaps[id]) return;
         if (!allSessionIds.has(id)) {
+            // Reject stubs from stale/wrong-project snapshots
+            if (s.cwd && !_sessionBelongsToActiveProject(s.cwd)) return;
             // Don't inject stub if an old alias for this ID still exists
             if (window._idRemaps) {
                 let _hasOld = false;
@@ -399,6 +406,7 @@ socket.on('state_snapshot', (data) => {
                 file_bytes: 0,
                 message_count: 0,
                 preview: '',
+                model: s.model || '',
             });
             _injectedStubs = true;
         }
@@ -414,6 +422,16 @@ socket.on('state_snapshot', (data) => {
         });
     }
     _rebuildSessionIds();
+
+    // Sync model from daemon snapshot into existing allSessions entries.
+    // Without this, idle/dormant sessions show "assumed system default" in
+    // the model badge until a state-change session_state event fires — which
+    // may never happen for truly dormant sessions.
+    (data.sessions || []).forEach(function(s) {
+        if (!s.model) return;
+        var _smRec = allSessions.find(function(x) { return x.id === s.session_id; });
+        if (_smRec && !_smRec.model) _smRec.model = s.model;
+    });
 
     // Update sidebar row classes
     document.querySelectorAll('.session-item[data-sid]').forEach(row => {

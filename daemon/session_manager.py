@@ -1196,10 +1196,32 @@ class SessionManager:
 
         Includes queue data from the server-side queue store so reconnecting
         clients can immediately display queued items.
+
+        Cross-project bleed fix (2026-06-10): sessions auto-resumed before the
+        ``_reg`` typo fix had ``info.cwd = ""`` because the registry was never
+        read.  Empty-cwd sessions pass through ``_filter_sessions_for_project``
+        (the filter treats them as "no project context → show everywhere"), so
+        they bled into every project's snapshot and appeared in the wrong
+        project's sidebar.  We fill in the cwd from the persistent registry for
+        any session whose in-memory ``cwd`` is still empty, so the server-side
+        filter can exclude them correctly.
         """
         with self._lock:
             states = [info.to_state_dict() for info in self._sessions.values()
                       if info.session_type not in ("planner", "title")]
+        # Fill in missing cwds from the registry for sessions with empty cwd.
+        # Only do the registry read when there are actually empty-cwd sessions
+        # (should be rare after the _reg fix; avoids disk I/O on the hot path).
+        _empty_cwd_states = [s for s in states if not s.get("cwd")]
+        if _empty_cwd_states:
+            try:
+                reg_sessions = self._reg.load_registry().get("sessions", {})
+                for s in _empty_cwd_states:
+                    reg_cwd = (reg_sessions.get(s["session_id"]) or {}).get("cwd") or ""
+                    if reg_cwd:
+                        s["cwd"] = reg_cwd
+            except Exception:
+                pass  # registry unreadable — leave cwd as-is; filter stays permissive
         # Merge queue data into state dicts
         for s in states:
             sid = s.get("session_id", "")
@@ -1667,8 +1689,45 @@ class SessionManager:
             else:
                 # No prompt (empty session or bare resume) — nothing to receive.
                 # Go straight to IDLE so send_message() can dispatch follow-ups.
+                #
+                # IMPORTANT (2026-06-10): drain the CLI's startup init message
+                # before declaring IDLE.  When the CLI is spawned (or resumed
+                # via --resume), it emits an ``init`` system message that lands
+                # in the SDK message stream.  If we skip this, the subsequent
+                # _post_turn_compact_drain peek reads the init in its 100 ms
+                # window, misinterprets it as an auto-resume signal
+                # (_enter_auto_resume → WORKING), waits for a RESULT that never
+                # comes, and leaves the session stuck in WORKING indefinitely.
+                # This manifested as "session appears working after model switch"
+                # for dormant sessions resumed via set_session_model.
+                #
+                # We consume up to one init (the only expected startup message)
+                # within a 3-second window.  A timeout means the CLI didn't emit
+                # one (non-fatal) — we continue to IDLE normally.
                 got_result = True
                 result_handled = True
+                try:
+                    async def _drain_startup_init():
+                        async for msg in self._sdk.receive_response(info.client):
+                            if info.task is not asyncio.current_task():
+                                return
+                            # Process the message so init records the model id
+                            await self._process_message(session_id, msg)
+                            if msg.kind == MessageKind.SYSTEM \
+                                    and (msg.subtype or '') == 'init':
+                                return  # startup init consumed — done
+                            if msg.kind == MessageKind.RESULT:
+                                return  # unexpected early result — stop
+                    await asyncio.wait_for(_drain_startup_init(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    pass   # no startup init — safe to continue
+                except asyncio.CancelledError:
+                    raise  # propagate task cancellation
+                except Exception as _drain_err:
+                    logger.warning(
+                        "_drive_session startup-init drain error for %s: %s",
+                        session_id, _drain_err,
+                    )
                 info.state = SessionState.IDLE
                 self._emit_state(info)
 

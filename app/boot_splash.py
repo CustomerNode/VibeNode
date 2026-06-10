@@ -568,6 +568,20 @@ class BootSplash:
 
         for sid, s in self._si.items():
             idx = s["idx"]
+
+            # Distance guard: hide steps more than 2.5 slots away from the
+            # current scroll position.  Without this, cos() periodicity causes
+            # a step at distance 6 (= one full 2π cycle at π/3/step) to land
+            # at the same screen y-coordinate as a nearby step, producing
+            # visually overlapping / duplicate text.  Adding the "update" step
+            # grew STEPS from 7→8, which put two wrap-around ghosts on screen
+            # simultaneously at scroll positions 0 and 1.
+            if abs(idx - self._scroll_current) > 2.5:
+                self.cv.coords(s["sym"], -100, -100)
+                self.cv.coords(s["txt"], -100, -100)
+                self.cv.itemconfigure(s["ring"], outline="")
+                continue
+
             angle = (idx - self._scroll_current) * sa
 
             # facing = how much this slot faces the viewer (1=front, 0=edge)
