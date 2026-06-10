@@ -805,7 +805,10 @@ class SessionManager:
                 if _was_interrupted:
                     entry_index = len(info.entries) - 1
                     self._emit_entry(info.session_id, entry, entry_index)
-            # Set state to WORKING before submitting query
+            # Set state to WORKING before submitting query.
+            # Also clear any stale model-switch flag so a real turn starting
+            # never gets misclassified by the post-turn listener.
+            info._model_switch_in_progress = False
             info.state = SessionState.WORKING
             # Reset any stale substatus from the previous turn, then re-set
             # if this turn is a /compact command.
@@ -1099,6 +1102,10 @@ class SessionManager:
         if not info.client:
             return {"ok": False, "error": "Session has no connected client"}
 
+        # Guard the extended listener from misinterpreting the CLI's init
+        # message (emitted after set_model) as an auto-resume signal.
+        # See _extended_post_turn_listener / _post_turn_compact_drain pre-detect.
+        info._model_switch_in_progress = True
         try:
             fut = asyncio.run_coroutine_threadsafe(
                 self._sdk.set_model(info.client, model), self._loop
@@ -5116,8 +5123,13 @@ class SessionManager:
                         elif msg.kind != MessageKind.RESULT:
                             is_resume = True
                         if is_resume:
-                            auto_resume_seen = True
-                            self._enter_auto_resume(info)
+                            if not getattr(info, '_model_switch_in_progress', False):
+                                auto_resume_seen = True
+                                self._enter_auto_resume(info)
+                            else:
+                                # CLI emitted init as a side-effect of set_model —
+                                # not a real auto-resume.  Clear flag and stay IDLE.
+                                info._model_switch_in_progress = False
 
                     await self._process_message(session_id, msg)
 
@@ -5339,7 +5351,12 @@ class SessionManager:
                                 # turn content is already flowing in.
                                 is_resume_signal = True
                             if is_resume_signal:
-                                self._enter_auto_resume(info)
+                                if not getattr(info, '_model_switch_in_progress', False):
+                                    self._enter_auto_resume(info)
+                                else:
+                                    # CLI emitted init as a side-effect of set_model —
+                                    # not a real auto-resume.  Clear flag and stay IDLE.
+                                    info._model_switch_in_progress = False
 
                         # Per-message try/except: a bad message must not kill
                         # the entire listener and orphan the SDK buffer.  This
