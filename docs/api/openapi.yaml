@@ -5696,6 +5696,22 @@ paths:
               schema:
                 type: string
 
+  /api/ping:
+    get:
+      tags: [App]
+      summary: Lightweight liveness probe used by the UI server-reachable health check
+      operationId: ping
+      responses:
+        "200":
+          description: Server is reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+
   /api/invoke/discover:
     get:
       tags: [Invoke]

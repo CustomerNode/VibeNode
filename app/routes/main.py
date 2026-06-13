@@ -36,6 +36,17 @@ def index():
     return render_template('index.html')
 
 
+@bp.route("/api/ping")
+def ping():
+    """Tiny liveness probe for the UI's server-reachable health check.
+
+    Returns {"ok": true} with no side effects. Cheaper than /api/auth-status
+    (which shells out to the Claude CLI) and decoupled from auth semantics,
+    so a slow auth check never produces a false 'server unreachable' overlay.
+    """
+    return jsonify(ok=True)
+
+
 @bp.route("/api/docs")
 def api_docs():
     """Serve the API documentation page (Redoc)."""

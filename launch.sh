@@ -121,15 +121,33 @@ if [ "$(uname -s)" = "Linux" ]; then
 fi
 
 # ── Launch ──────────────────────────────────────────────────────────────────
+#
+# Detached spawn: nohup + & + disown together make the web server survive a
+# closed terminal, a logout, or any SIGHUP cascade. The terminal window can
+# be closed immediately after launch without taking the server down. This
+# mirrors the daemon's own spawn treatment and removes the dead-window
+# failure mode where users on macOS/Linux saw their UI silently disappear
+# when they closed the launch terminal. See CLAUDE.md for the rationale.
+#
+# Output goes to logs/_server.log so the diagnostic prints from
+# ensure_daemon(), startup, and run.py are preserved for after-the-fact
+# debugging. session_manager.py also separately routes its own internal
+# stdout/stderr via the pythonw path on Windows; this file handles POSIX.
 
-"$PY" session_manager.py
-EXIT_CODE=$?
+mkdir -p logs
+nohup "$PY" session_manager.py >> logs/_server.log 2>&1 &
+SERVER_PID=$!
+disown "$SERVER_PID" 2>/dev/null || true
 
-if [ $EXIT_CODE -ne 0 ]; then
+# Brief check that the spawn actually took. If the process is already dead
+# 1.5 s in, show a hint about the log file so the user is not left guessing.
+sleep 1.5
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo ""
-    echo "VibeNode exited with error code $EXIT_CODE"
-    echo "Check logs/web_server.log and logs/daemon_debug.log for details."
+    echo "VibeNode failed to start (server pid $SERVER_PID died immediately)."
+    echo "See logs/_server.log and logs/daemon_debug.log for the error."
     read -rp "Press Enter to close..."
+    exit 1
 fi
 
-exit $EXIT_CODE
+exit 0

@@ -136,6 +136,65 @@ window.addEventListener('online', function() {
 _probeInternet();
 setInterval(_probeInternet, 60000);
 
+/* ---- Built-in: VibeNode web server reachable ----
+ *
+ * The web server is now spawned detached (pythonw on Windows, nohup on
+ * POSIX) so the failure mode of "minimized launcher window got closed"
+ * is gone. But if the server dies for any other reason — crash, manual
+ * kill, port conflict — the user is left with a loaded page whose backend
+ * is gone, and the existing wifi check won't catch it (gstatic still
+ * responds). This check probes our own /api/ping and shows the same
+ * blocker overlay used for wifi / auth issues.
+ *
+ * Requires N consecutive failures before showing, so a single transient
+ * blip during /api/restart doesn't flash the overlay. The restart UI in
+ * modals.js handles its own reboot overlay anyway.
+ */
+
+var _serverReachable = true;
+var _serverFailCount = 0;
+var _SERVER_FAIL_THRESHOLD = 3;  // ~9-12s of consecutive failures
+
+function _probeServer() {
+    fetch('/api/ping', { method: 'GET', cache: 'no-store' })
+        .then(function(r) {
+            if (r.ok) {
+                _serverFailCount = 0;
+                if (!_serverReachable) {
+                    _serverReachable = true;
+                    _runHealthChecks();
+                }
+            } else {
+                _serverFailCount++;
+                if (_serverFailCount >= _SERVER_FAIL_THRESHOLD && _serverReachable) {
+                    _serverReachable = false;
+                    _runHealthChecks();
+                }
+            }
+        })
+        .catch(function() {
+            _serverFailCount++;
+            if (_serverFailCount >= _SERVER_FAIL_THRESHOLD && _serverReachable) {
+                _serverReachable = false;
+                _runHealthChecks();
+            }
+        });
+}
+
+registerHealthCheck('server-reachable', {
+    label: 'VibeNode Server Unreachable',
+    icon: '<svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><line x1="2" y1="9" x2="22" y2="9"/></svg>',
+    message: 'The VibeNode web server is not responding. Your running sessions are likely safe in the session daemon — relaunch VibeNode from your desktop shortcut or launcher to reconnect. If this overlay persists after relaunch, check logs/_server.log.',
+    test: function() { return _serverReachable; }
+});
+
+// Fixed 5s cadence × 3-failure threshold = ~15s before the overlay shows.
+// That comfortably outlasts a normal /api/restart cycle (modals.js puts up
+// its own full-page restart overlay during the gap), so a restart never
+// flashes this overlay. A real outage flips within 15s.
+_probeServer();
+setInterval(_probeServer, 5000);
+
 /* ---- Built-in: Claude Code auth ---- */
 
 var _claudeLoggedIn = true; // assume ok until first poll says otherwise
