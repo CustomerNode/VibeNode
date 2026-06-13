@@ -137,7 +137,11 @@ fi
 mkdir -p logs
 nohup "$PY" session_manager.py >> logs/_server.log 2>&1 &
 SERVER_PID=$!
-disown "$SERVER_PID" 2>/dev/null || true
+# disown the most recent background job (the nohup above). bash's disown
+# takes jobspecs, not PIDs, so pass no argument — it defaults to the last
+# spawned bg job. Removes the server from the shell's job table so the
+# launcher exit cannot cascade into it under any shell-level signal path.
+disown 2>/dev/null || true
 
 # Brief check that the spawn actually took. If the process is already dead
 # 1.5 s in, show a hint about the log file so the user is not left guessing.
