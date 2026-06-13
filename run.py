@@ -515,12 +515,34 @@ def open_browser():
     log_path = Path(__file__).resolve().parent / "logs" / "browser_open.log"
     log_path.parent.mkdir(exist_ok=True)
 
+    # ISOLATED CHROME INSTANCE — see CLAUDE.md item 18.
+    # --app= + --user-data-dir= give VibeNode its own Chrome window and its
+    # own profile. The user's everyday Chrome stays fully independent: new
+    # windows open normally, closing it doesn't kill VibeNode's tab, and the
+    # launcher-spawned window no longer wedges focus on the main profile.
+    # The dedicated profile also sidesteps Chrome's session restore, so the
+    # URL always loads instead of being swallowed by "Continue where you
+    # left off" on a cold start.
+    profile_dir = Path(__file__).resolve().parent / "data" / "chrome-profile"
+    try:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        # If we can't create the profile dir, fall back to Chrome's default
+        # profile rather than failing the launch outright.
+        profile_dir = None
+        _log_dir_err = str(e)
+    else:
+        _log_dir_err = None
+
     def _log(msg):
         try:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write("%s %s\n" % (time.strftime("%H:%M:%S"), msg))
         except Exception:
             pass
+
+    if _log_dir_err:
+        _log("Could not create isolated Chrome profile dir: %s" % _log_dir_err)
 
     _log(f"Waiting for server on port {_WEB_PORT}...")
     # Wait until the server is actually accepting connections before opening
@@ -546,17 +568,21 @@ def open_browser():
         if chrome_path:
             try:
                 import ctypes
-                # CRITICAL: pass the URL via --new-window, NOT as a bare arg.
-                # On a COLD Chrome start with "Continue where you left off"
-                # enabled, Chrome's session restore swallows a bare URL arg —
-                # the user gets a Chrome window with their old tabs and NO
-                # VibeNode tab. --new-window forces Chrome to open the URL in
-                # its own window every time, cold start or not.
-                params = '--new-window "%s"' % url
+                # Isolated Chrome app window — see open_browser() comment block
+                # at the top for the full rationale. --app= mode also avoids
+                # session restore swallowing the URL, so we no longer need
+                # --new-window. If profile_dir is None (creation failed), fall
+                # back to plain --new-window so the launch still works.
+                if profile_dir is not None:
+                    params = '--app="%s" --user-data-dir="%s"' % (url, profile_dir)
+                else:
+                    params = '--new-window "%s"' % url
                 result = ctypes.windll.shell32.ShellExecuteW(
                     None, "open", chrome_path, params, None, 1)
                 if result > 32:
-                    _log("Opened Chrome via ShellExecuteW: %s" % chrome_path)
+                    _log("Opened Chrome via ShellExecuteW: %s (%s)" % (
+                        chrome_path,
+                        "isolated app mode" if profile_dir is not None else "shared profile"))
                     opened = True
                 else:
                     _log("ShellExecuteW returned %s for Chrome" % result)
@@ -580,13 +606,23 @@ def open_browser():
                 # process group so a daemon restart doesn't take Chrome with it.
                 # DEVNULL stdio keeps Chrome's chatty debug output out of the
                 # launch.sh terminal where it would scroll over our own messages.
+                # --app= + --user-data-dir= give VibeNode an isolated Chrome
+                # window — see open_browser() top comment for the rationale.
+                if profile_dir is not None:
+                    chrome_args = [chrome_path,
+                                   "--app=%s" % url,
+                                   "--user-data-dir=%s" % profile_dir]
+                else:
+                    chrome_args = [chrome_path, url]
                 subprocess.Popen(
-                    [chrome_path, url],
+                    chrome_args,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
                 )
-                _log("Opened Chrome/Chromium via %s" % chrome_path)
+                _log("Opened Chrome/Chromium via %s (%s)" % (
+                    chrome_path,
+                    "isolated app mode" if profile_dir is not None else "shared profile"))
                 opened = True
             except Exception as e:
                 _log("Chrome launch failed (%s): %s" % (chrome_path, e))
@@ -611,13 +647,23 @@ def open_browser():
                 # process group so a daemon restart doesn't take Chrome with it.
                 # DEVNULL stdio keeps Chrome's chatty debug output out of the
                 # launch.sh terminal where it would scroll over our own messages.
+                # --app= + --user-data-dir= give VibeNode an isolated Chrome
+                # window — see open_browser() top comment for the rationale.
+                if profile_dir is not None:
+                    chrome_args = [chrome_path,
+                                   "--app=%s" % url,
+                                   "--user-data-dir=%s" % profile_dir]
+                else:
+                    chrome_args = [chrome_path, url]
                 subprocess.Popen(
-                    [chrome_path, url],
+                    chrome_args,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
                 )
-                _log("Opened Chrome/Chromium via %s" % chrome_path)
+                _log("Opened Chrome/Chromium via %s (%s)" % (
+                    chrome_path,
+                    "isolated app mode" if profile_dir is not None else "shared profile"))
                 opened = True
             except Exception as e:
                 _log("Chrome launch failed (%s): %s" % (chrome_path, e))

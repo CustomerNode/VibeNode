@@ -216,6 +216,9 @@ __marimo__/
 # Runtime logs
 logs/
 
+# Isolated Chrome profile (run.py open_browser() — see CLAUDE.md item 18)
+data/chrome-profile/
+
 # Backups
 backups/
 

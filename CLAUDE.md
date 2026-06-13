@@ -68,9 +68,11 @@ VibeNode underwent a measurement-driven performance overhaul. The patterns below
 16. **Watchdog dedup** — `static/js/live-panel.js`. `window._watchdogSid`/`window._watchdogTimer` enable cross-script dedup. Do NOT remove the `window.` assignments.
 17. **`performance.mark()`/`performance.measure()` instrumentation** — `static/js/socket.js`. Submit timing and session switch timing. Do NOT remove.
 18. **Chrome-first browser launch** — `run.py` `_find_chrome()` / `_find_chrome_linux()` / `_find_chrome_macos()` + `open_browser()`. The Web Speech API (voice input) is Chromium-only. ALL THREE PLATFORMS must find and launch Chrome/Chromium before falling back to the system default browser opener — the default may be Firefox, which silently breaks voice with no error messages. This regression already happened once on Windows and shipped to users. Do NOT replace any platform's Chrome-first path with only the system fallback (`os.startfile`, `xdg-open`, or `open`) as the sole method. Platform pattern:
-   - Windows: `_find_chrome()` → `ShellExecuteW(chrome, url)` → `os.startfile` fallback
-   - Linux:   `_find_chrome_linux()` → `Popen([chrome, url])` → `xdg-open` fallback
-   - macOS:   `_find_chrome_macos()` → `Popen([chrome, url])` → `open` fallback
+   - Windows: `_find_chrome()` → `ShellExecuteW(chrome, --app=URL + --user-data-dir=DIR)` → `os.startfile` fallback
+   - Linux:   `_find_chrome_linux()` → `Popen([chrome, --app=URL, --user-data-dir=DIR])` → `xdg-open` fallback
+   - macOS:   `_find_chrome_macos()` → `Popen([chrome, --app=URL, --user-data-dir=DIR])` → `open` fallback
+
+    **Isolated Chrome instance (added 2026-06-13).** All three platforms pass `--app=<URL>` and `--user-data-dir=data/chrome-profile` so VibeNode runs in its own Chrome window with its own profile. Without isolation, VibeNode borrowed the user's everyday Chrome and the launcher-spawned window wedged Chrome's focus state — new windows opened from outside VibeNode would silently no-op until Chrome was fully closed and reopened. The dedicated profile also bypasses Chrome's session restore (no "Continue where you left off" interference on cold start), which was the original reason `--new-window` existed. Do NOT remove the `--app=` or `--user-data-dir=` flags. The profile directory is gitignored (`data/chrome-profile/`).
 
 ## Compose project-scoping — DO NOT REMOVE (fixed 2026-04-13)
 
