@@ -70,9 +70,9 @@
   <textarea id="cgb-prompt" placeholder="Ask ChatGPT anything…"></textarea>
   <div class="cgb-row" style="margin-top:10px; align-items:center;">
     <button id="cgb-send" class="cgb-btn">Send to ChatGPT</button>
-    <label class="cgb-check">
-      <input type="checkbox" id="cgb-headless" checked> run hidden (uncheck to watch the browser)
-    </label>
+    <span style="font-size:.78rem; opacity:.6;">
+      A Chrome window opens to do the work (ChatGPT blocks hidden browsers). Let it run; it closes itself.
+    </span>
   </div>
 
   <div class="cgb-result">
@@ -120,15 +120,14 @@ loginBtn.addEventListener("click", async () => {
 sendBtn.addEventListener("click", async () => {
   const prompt = $("cgb-prompt").value.trim();
   if (!prompt) { output.textContent = "Enter a prompt first."; return; }
-  const headless = $("cgb-headless").checked;
   sendBtn.disabled = true;
   output.classList.remove("cgb-err");
-  output.innerHTML = '<span class="cgb-spin"></span> Sending to ChatGPT… (this can take a while)';
+  output.innerHTML = '<span class="cgb-spin"></span> Sending to ChatGPT… a Chrome window will do the work (this can take a while)';
   try {
     const r = await fetch("/api/chatgpt/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, headless }),
+      body: JSON.stringify({ prompt }),
     });
     const d = await r.json();
     if (d.ok) { output.textContent = d.result; }
