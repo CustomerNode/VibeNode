@@ -433,8 +433,9 @@ _CONFIRMED_MODELS_FILE = Path(__file__).resolve().parents[2] / "confirmed_models
 
 # Fallback model list when no source returns anything (no API key, no CLI installed,
 # no past sessions cached). Ensures the UI always offers a sensible choice.
-# Ordered: Opus, Sonnet, Haiku.
+# Ordered: Fable (most capable), Opus, Sonnet, Haiku.
 _FALLBACK_KNOWN_MODELS = [
+    {"id": "claude-fable-5", "name": "Fable 5"},
     {"id": "claude-opus-4-7", "name": "Opus 4.7"},
     {"id": "claude-sonnet-4-6", "name": "Sonnet 4.6"},
     {"id": "claude-haiku-4-5", "name": "Haiku 4.5"},
@@ -507,10 +508,17 @@ def _fetch_models_from_anthropic_api() -> list:
             mid = m.get("id", "")
             if mid.startswith("claude-"):
                 result.append({"id": mid, "name": m.get("display_name") or _model_id_to_display_name(mid)})
-        # Sort: newest/most capable first (opus > sonnet > haiku, higher version first)
+        # Sort: newest/most capable first (fable > opus > sonnet > haiku, higher version first)
         def _sort_key(m):
             mid = m["id"]
-            family = 0 if "opus" in mid else (1 if "sonnet" in mid else 2)
+            if "fable" in mid:
+                family = 0
+            elif "opus" in mid:
+                family = 1
+            elif "sonnet" in mid:
+                family = 2
+            else:
+                family = 3
             return (family, [-int(x) for x in mid.replace("claude-", "").split("-") if x.isdigit()])
         result.sort(key=_sort_key)
         return result
@@ -579,21 +587,30 @@ def get_models():
         if confirmed:
             result = [{"id": mid, "name": name} for mid, name in confirmed.items()]
 
+    _KNOWN_FAMILIES = ("fable", "opus", "sonnet", "haiku")
+
     def _sort_key(m):
         mid = m["id"]
-        family = 0 if "opus" in mid else (1 if "sonnet" in mid else 2)
+        if "fable" in mid:
+            family = 0
+        elif "opus" in mid:
+            family = 1
+        elif "sonnet" in mid:
+            family = 2
+        else:
+            family = 3
         nums = [-int(x) for x in _re.findall(r"\d+", mid)]
         return (family, nums)
 
-    # 4. Fallback: ensure every family (opus/sonnet/haiku) is represented so
+    # 4. Fallback: ensure every family (fable/opus/sonnet/haiku) is represented so
     #    the UI always shows a useful menu, even with no API key / CLI / cache.
     existing_ids = {m["id"] for m in result}
     present_families = {
-        fam for fam in ("opus", "sonnet", "haiku")
+        fam for fam in _KNOWN_FAMILIES
         if any(fam in m["id"] for m in result)
     }
     for fallback in _FALLBACK_KNOWN_MODELS:
-        fam = next((f for f in ("opus", "sonnet", "haiku") if f in fallback["id"]), None)
+        fam = next((f for f in _KNOWN_FAMILIES if f in fallback["id"]), None)
         if fam and fam not in present_families and fallback["id"] not in existing_ids:
             result.append(fallback)
             present_families.add(fam)
