@@ -61,15 +61,23 @@ SEL_COMPOSER = "#prompt-textarea"
 SEL_SEND_BUTTON = 'button[data-testid="send-button"]'
 SEL_STOP_BUTTON = 'button[data-testid="stop-button"]'
 SEL_ASSISTANT_MSG = 'div[data-message-author-role="assistant"]'
+# Hidden <input type=file> behind the "+"/attach control and drag-drop zone.
+SEL_FILE_INPUT = 'input[type="file"]'
+# An attachment chip/thumbnail in the composer once a file is added.
+SEL_ATTACHMENT = '[data-testid$="attachment"], .group\\/attachment, div[class*="attachment"]'
 # A Cloudflare interstitial is present if any of these match.
 SEL_CLOUDFLARE_HINTS = ["text=Verifying", "text=Just a moment", "#challenge-running"]
+
+# --- Limits ----------------------------------------------------------------
+MAX_FILES = 20                  # ChatGPT's per-message attachment cap
 
 # --- Timeouts (ms unless noted) --------------------------------------------
 _NAV_TIMEOUT = 40_000
 _COMPOSER_TIMEOUT = 25_000      # wait for composer after Cloudflare clears
 _CF_CLEAR_TIMEOUT = 30          # seconds to let Cloudflare auto-clear (headed)
 _GEN_START_TIMEOUT = 20_000     # wait for generation to start (stop btn appears)
-_GEN_FINISH_TIMEOUT = 180_000   # wait for generation to finish (stop btn gone)
+_GEN_FINISH_TIMEOUT = 240_000   # wait for generation to finish (stop btn gone)
+_UPLOAD_TIMEOUT = 180           # seconds to wait for file upload+processing
 _LOGIN_WAIT_SECONDS = 600       # max lifetime of the login window
 _LOCK_ACQUIRE_TIMEOUT = 300     # seconds ask() will wait for the profile lock
 
@@ -237,16 +245,65 @@ def open_login() -> dict:
     }
 
 
-def ask(prompt: str, headless: bool = False) -> dict:
-    """Send ``prompt`` to ChatGPT in a fresh chat and return the reply text.
+def _upload_files(page, files: list) -> None:
+    """Attach ``files`` to the composer via the hidden <input type=file>, then
+    wait until ChatGPT finishes processing them.
 
-    Runs HEADED (visible) — Cloudflare blocks headless, so ``headless`` is
-    accepted for API compatibility but ignored.  Returns
-    ``{"ok", "result", "error"}``.  Each call uses a brand-new chat.
+    Uses ``set_input_files`` (more reliable than simulating drag-drop).  The
+    completion signal is the send button becoming enabled: ChatGPT keeps it
+    disabled while attachments are still processing, which is exactly the
+    "I had to do more on send" state the user hit doing this by hand.
+    """
+    file_input = page.locator(SEL_FILE_INPUT).first
+    # The input exists in the DOM but is hidden; set_input_files works anyway.
+    file_input.set_input_files(files, timeout=30_000)
+
+    # Wait for each file to register as an attachment chip.
+    deadline = time.monotonic() + _UPLOAD_TIMEOUT
+    want = len(files)
+    while time.monotonic() < deadline:
+        try:
+            if page.locator(SEL_ATTACHMENT).count() >= want:
+                break
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+    # Wait for processing to finish: send button enabled means uploads are done.
+    # (We type the prompt before calling this, so empty-composer is not the
+    # reason the button would be disabled.)
+    while time.monotonic() < deadline:
+        try:
+            if page.locator(SEL_SEND_BUTTON).first.is_enabled(timeout=1_000):
+                break
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+
+def ask(prompt: str, files=None, headless: bool = False) -> dict:
+    """Send ``prompt`` (and optional ``files``) to ChatGPT in a fresh chat and
+    return the reply text.
+
+    ``files`` is an optional list of absolute paths (max ``MAX_FILES``) attached
+    to the message exactly as a drag-and-drop would.  Runs HEADED (visible) —
+    Cloudflare blocks headless, so ``headless`` is accepted for API
+    compatibility but ignored.  Returns ``{"ok", "result", "error"}``.
     """
     prompt = (prompt or "").strip()
     if not prompt:
         return {"ok": False, "result": None, "error": "Empty prompt."}
+
+    files = list(files or [])
+    if len(files) > MAX_FILES:
+        return {"ok": False, "result": None,
+                "error": f"Too many files ({len(files)}); ChatGPT allows "
+                         f"at most {MAX_FILES} per message."}
+    missing = [f for f in files if not Path(f).is_file()]
+    if missing:
+        return {"ok": False, "result": None,
+                "error": "File(s) not found: " + ", ".join(missing)}
+
     if _login_active.is_set():
         return {"ok": False, "result": None,
                 "error": "A login window is open — finish logging in first."}
@@ -280,6 +337,16 @@ def ask(prompt: str, headless: bool = False) -> dict:
                 composer = page.locator(SEL_COMPOSER).first
                 composer.click()
                 page.keyboard.insert_text(prompt)
+
+                # Attach files (after typing, so send-enabled is a pure
+                # upload-done signal) and wait for processing to complete.
+                if files:
+                    try:
+                        _upload_files(page, files)
+                    except Exception as e:
+                        _dump_debug(page, "upload-error")
+                        return {"ok": False, "result": None,
+                                "error": f"File upload failed: {e}"}
 
                 before = page.locator(SEL_ASSISTANT_MSG).count()
 

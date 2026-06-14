@@ -43,7 +43,10 @@ def chatgpt_login():
 def chatgpt_ask():
     data = request.get_json(silent=True) or {}
     prompt = data.get("prompt", "")
-    headless = bool(data.get("headless", True))
-    result = chatgpt_bridge.ask(prompt, headless=headless)
+    files = data.get("files") or []
+    if not isinstance(files, list):
+        return jsonify({"ok": False, "result": None,
+                        "error": "'files' must be a list of file paths."}), 400
+    result = chatgpt_bridge.ask(prompt, files=files)
     status_code = 200 if result.get("ok") else 502
     return jsonify(result), status_code
