@@ -1051,6 +1051,47 @@ def api_fork(session_id):
 #
 # Returns: {ok: True, new_id, parent_id, title} on success;
 #          {error: "<reason>"} with 400 / 404 / 409 on rejection.
+# ── Subsession spawn directive (Patent 11 "Subsession Awareness", E6) ────
+# Injected as the child's system prompt at spawn so the child knows it is
+# a peeled-off investigation: it has the parent's full context up to the
+# spawn moment, the parent may still be running in parallel, and its
+# conclusion flows back to the parent.  Mirrors the cross-session
+# awareness injection pattern (app/session_awareness.py) — a plain string
+# passed through start_session(system_prompt=...).  The
+# ``<!-- subsession:report -->`` marker is acted on by the daemon's
+# IDLE-time scan (Patent 13); until the daemon picks up that scan the
+# marker is an inert HTML comment, so emitting it is always harmless.
+_SUBSESSION_REPORT_MARKER = "<!-- subsession:report -->"
+
+
+def _build_subsession_directive(parent_name: str) -> str:
+    """Return the system-prompt directive for a freshly spawned subsession."""
+    parent_label = (parent_name or "the parent session").strip()
+    return (
+        "## You are a subsession\n\n"
+        f'You were spawned from "{parent_label}". You start with that '
+        "session's full conversation up to the moment you were spawned, so "
+        "you already know everything it knew. The parent may still be "
+        "running in parallel — you do not block it and it does not block "
+        "you.\n\n"
+        "Your job is to carry out the focused investigation or task the "
+        "user peels off here, then hand a clear conclusion back up to the "
+        "parent. Guidance:\n\n"
+        "1. Stay scoped to the side task. Do not redo the parent's whole "
+        "thread.\n"
+        "2. When you reach a conclusion, end your message with a concise "
+        "summary the parent can act on (a few sentences, plus file:line "
+        "references where relevant).\n"
+        f"3. On the line AFTER that summary, emit the marker "
+        f"`{_SUBSESSION_REPORT_MARKER}` to send your latest conclusion up "
+        "to the parent's inbox. The parent receives it with their next "
+        "message. You can also report manually with the 'Report to Parent' "
+        "button.\n"
+        "4. Do not try to message the parent any other way — the inbox is "
+        "the only channel."
+    )
+
+
 @bp.route("/api/sessions/<parent_sid>/spawn-subsession", methods=["POST"])
 def api_spawn_subsession(parent_sid):
     """Spawn a subsession from an existing parent session."""
@@ -1182,6 +1223,7 @@ def api_spawn_subsession(parent_sid):
             session_type="subsession",
             parent_session_id=parent_sid,
             subsession_origin_turn=subsession_origin_turn,
+            system_prompt=_build_subsession_directive(parent_name),
         )
     except Exception as e:
         return jsonify({"error": f"Failed to start subsession: {e}"}), 500
@@ -1540,6 +1582,95 @@ def api_auto_report_toggle(child_sid):
     if not ok:
         return jsonify({"error": "subsession not found"}), 404
     return jsonify({"ok": True, "auto_report_on_idle": on})
+
+
+# ── Subsessions: last-conclusion extraction (Patent 15 reverse-parse) ────
+# GET /api/sessions/<sid>/last-conclusion
+#
+# Returns the most-recent meaningful assistant text for a session by
+# tail-reading its JSONL and reverse-parsing, skipping transient and
+# tool-only entries.  This is the authoritative source for the
+# "Report to Parent" prefill — the frontend previously scraped rendered
+# DOM (static/js/live-panel.js), which is fragile and breaks when the
+# log is virtualized or the bubble markup changes.  Mirrors the
+# out-of-band session inference reverse-parse (read only the file tail,
+# walk entries newest-first, stop at the first assistant text block).
+_LAST_CONCLUSION_TAIL_BYTES = 256 * 1024  # generous tail; assistant turns can be long
+
+
+def _extract_last_assistant_text(jsonl_path: Path) -> str:
+    """Reverse-parse *jsonl_path* and return the last assistant text block.
+
+    Reads only the final ``_LAST_CONCLUSION_TAIL_BYTES`` of the file so
+    cost is O(1) regardless of transcript length.  Walks decoded lines
+    newest-first and returns the first assistant entry that carries real
+    text (a ``text`` content block, or a plain string message).  Tool-use
+    / tool-result / transient entries are skipped.  Returns "" when no
+    assistant text is found in the tail.
+    """
+    try:
+        size = jsonl_path.stat().st_size
+    except OSError:
+        return ""
+    try:
+        with open(jsonl_path, "rb") as f:
+            if size > _LAST_CONCLUSION_TAIL_BYTES:
+                f.seek(size - _LAST_CONCLUSION_TAIL_BYTES)
+                f.readline()  # discard the partial first line after the seek
+            raw = f.read()
+    except OSError:
+        return ""
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "assistant":
+            continue
+        content = obj.get("message", {}).get("content", "")
+        if isinstance(content, str):
+            if content.strip():
+                return content.strip()
+            continue
+        if isinstance(content, list):
+            # Prefer the last text block within the entry (the visible
+            # conclusion usually follows any tool calls in the same turn).
+            for block in reversed(content):
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and (block.get("text") or "").strip()
+                ):
+                    return block["text"].strip()
+    return ""
+
+
+@bp.route("/api/sessions/<sid>/last-conclusion", methods=["GET"])
+def api_last_conclusion(sid):
+    """Return the most-recent meaningful assistant text for a session."""
+    from daemon.subsession_inbox import _validate_sid
+
+    project = request.args.get("project", "").strip()
+
+    try:
+        _validate_sid(sid)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid session id: {e}"}), 400
+
+    canonical = _resolve_remapped_id(sid, project)
+    if canonical:
+        sid = canonical
+
+    src = _sessions_dir(project) / f"{sid}.jsonl"
+    if not src.exists():
+        return jsonify({"error": "Session not found"}), 404
+
+    text = _extract_last_assistant_text(src)
+    return jsonify({"ok": True, "session_id": sid, "text": text})
 
 
 @bp.route("/api/rewind/<session_id>", methods=["POST"])

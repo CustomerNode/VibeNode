@@ -183,6 +183,11 @@ class TestSpawnSubsessionHappyPath:
         assert kwargs["subsession_origin_turn"] == 3
         assert kwargs["session_type"] == "subsession"
         assert kwargs["resume"] is True
+        # Patent 11: the child is told it is a subsession via system_prompt,
+        # and the directive references the report marker (Patent 13).
+        sysp = kwargs.get("system_prompt") or ""
+        assert "subsession" in sysp.lower()
+        assert "<!-- subsession:report -->" in sysp
 
 
 # ---------------------------------------------------------------------------
@@ -1152,3 +1157,67 @@ class TestPullSubsessionUpdatesEndpoint:
             assert "stopped" in data["error"].lower()
         finally:
             ibx.remove_inbox(parent_sid)
+
+
+# ---------------------------------------------------------------------------
+# Last-conclusion endpoint (Patent 15 reverse-parse) — prefill source
+# ---------------------------------------------------------------------------
+
+class TestLastConclusion:
+    def test_returns_last_assistant_text_block(
+        self, client, session_manager, parent_session
+    ):
+        """The endpoint returns the most-recent assistant text, not the
+        earlier one and not a tool-only entry."""
+        parent_sid, project, parent_path = parent_session
+        # Append a later assistant turn (with a tool_use that must be
+        # skipped) followed by the real conclusion text.
+        extra = [
+            json.dumps({
+                "type": "assistant",
+                "uuid": "a-2",
+                "sessionId": parent_sid,
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "name": "Edit", "input": {"path": "x.py"}},
+                ]},
+            }),
+            json.dumps({
+                "type": "assistant",
+                "uuid": "a-3",
+                "sessionId": parent_sid,
+                "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "The real conclusion is here."},
+                ]},
+            }),
+        ]
+        with open(parent_path, "a", encoding="utf-8") as f:
+            f.write("\n".join(extra) + "\n")
+
+        resp = client.get(
+            f"/api/sessions/{parent_sid}/last-conclusion?project={project}"
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["ok"] is True
+        assert data["text"] == "The real conclusion is here."
+
+    def test_404_for_missing_session(self, client, session_manager):
+        unknown = str(uuid.uuid4())
+        resp = client.get(f"/api/sessions/{unknown}/last-conclusion")
+        assert resp.status_code == 404
+
+    def test_empty_text_when_no_assistant_entry(
+        self, client, session_manager, tmp_path
+    ):
+        """A transcript with no assistant text yields ok=True, text=''."""
+        sid = str(uuid.uuid4())
+        project_dir = _sessions_dir("")
+        project_dir.mkdir(parents=True, exist_ok=True)
+        path = project_dir / f"{sid}.jsonl"
+        path.write_text(json.dumps({
+            "type": "user", "sessionId": sid,
+            "message": {"role": "user", "content": "only a user line"},
+        }) + "\n", encoding="utf-8")
+        resp = client.get(f"/api/sessions/{sid}/last-conclusion")
+        assert resp.status_code == 200
+        assert resp.get_json()["text"] == ""

@@ -306,6 +306,49 @@ class TestFormatDrainBlock:
         # Short SID is the first 8 chars.
         assert "child-ab" in block
 
+    def test_block_renders_file_ref_attachments(self):
+        """attachments[] of type file_ref render as path:line under the
+        report so the parent can act on them (spec §4.3.2 / §6.7)."""
+        sid = "parent-attach"
+        ibx.append_report(
+            sid, "child-z", "Locate the slicer bug",
+            "The slicer drops the trailing partial line",
+            attachments=[
+                {"type": "file_ref", "path": "app/routes/sessions_api.py", "line": 882},
+                {"type": "file_ref", "path": "README.md"},  # no line
+            ],
+        )
+        drained = ibx.drain_undelivered(sid)
+        block = ibx.format_drain_block(drained)
+        assert "app/routes/sessions_api.py:882" in block
+        assert "README.md" in block
+        # The no-line ref must not render a dangling colon.
+        assert "README.md:" not in block
+
+    def test_block_omits_refs_line_when_no_attachments(self):
+        sid = "parent-noattach"
+        ibx.append_report(sid, "child-q", "Plain report", "Just text")
+        drained = ibx.drain_undelivered(sid)
+        block = ibx.format_drain_block(drained)
+        assert "refs:" not in block
+
+    def test_causal_chain_id_round_trips_when_provided(self):
+        """The spawn-time lineage UUID is persisted on the entry when
+        provided and absent otherwise (Patent 04/06 chain-of-custody)."""
+        sid = "parent-chain"
+        entry = ibx.append_report(
+            sid, "child-c", "child", "msg",
+            causal_chain_id="chain-1234",
+        )
+        assert entry["causal_chain_id"] == "chain-1234"
+        loaded = ibx.load_inbox(sid)["pending_reports"][0]
+        assert loaded["causal_chain_id"] == "chain-1234"
+
+    def test_causal_chain_id_absent_when_not_provided(self):
+        sid = "parent-nochain"
+        entry = ibx.append_report(sid, "child-c", "child", "msg")
+        assert "causal_chain_id" not in entry
+
 
 # ---------------------------------------------------------------------------
 # remove_inbox

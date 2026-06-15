@@ -204,6 +204,122 @@ function _getSubsessionsActiveTab() {
   return localStorage.getItem('vn.compose.activeTab') || 'adhoc';
 }
 
+// ───────────────────────────────────────────────────────────────
+// Ad-hoc subsessions tree (spec §4.4)
+// ───────────────────────────────────────────────────────────────
+//
+// Renders the parent→child subsession family tree for the active
+// project into #subsessions-adhoc-body, reusing the same allSessions
+// global and _buildSubsessionIndex helper the sidebar uses (sessions.js).
+// Each row opens the session in the live panel on click.  Orphaned
+// subsessions (parent deleted / not in the list) render in a trailing
+// group so the user can still find them.  Idempotent and cheap — safe to
+// call from filterSessions() on every session-state update.
+
+function _adhocSessionStatusDot(sid) {
+  let status = '';
+  try {
+    if (typeof getSessionStatus === 'function') status = getSessionStatus(sid) || '';
+  } catch (_) { status = ''; }
+  // Reuse the sidebar's state vocabulary: working / idle / question.
+  let cls = 'adhoc-dot';
+  if (status === 'working') cls += ' adhoc-dot-working';
+  else if (status === 'question') cls += ' adhoc-dot-waiting';
+  else if (status === 'idle') cls += ' adhoc-dot-idle';
+  const label = status || 'unknown';
+  return `<span class="${cls}" title="${escHtml(label)}" aria-label="${escHtml(label)}"></span>`;
+}
+
+function _adhocTitleFor(sess) {
+  if (!sess) return '';
+  return sess.custom_title || sess.display_title || (sess.id || '').slice(0, 8);
+}
+
+function _renderAdhocSubsessionRow(sess, isChild, parentName) {
+  const dot = _adhocSessionStatusDot(sess.id);
+  const glyph = isChild
+    ? '<span class="subsession-glyph" aria-hidden="true">↳ </span>'
+    : '';
+  const inbox = sess.inbox_dirty
+    ? '<span class="subsession-inbox-badge" title="Subsession reports waiting">📬</span>'
+    : '';
+  const fromLine = (isChild && parentName)
+    ? `<div class="subsession-from-line">from: ${escHtml(parentName)}</div>`
+    : '';
+  const rowClass = 'adhoc-subsession-row' + (isChild ? ' adhoc-child' : ' adhoc-parent');
+  return `
+    <div class="${rowClass}" onclick="_adhocOpenSession('${sess.id}')" title="Open in live panel">
+      <div class="adhoc-row-main">${dot}${glyph}<span class="adhoc-row-title">${escHtml(_adhocTitleFor(sess))}</span>${inbox}</div>
+      ${fromLine}
+    </div>`;
+}
+
+function _adhocOpenSession(sid) {
+  if (typeof openInGUI === 'function') openInGUI(sid);
+}
+
+function _renderAdhocSubsessions() {
+  const body = document.getElementById('subsessions-adhoc-body');
+  if (!body) return;
+  // Only render when the Ad-hoc tab is the effective view.
+  if (_getSubsessionsActiveTab() === 'structured' &&
+      _composeProjectsList && _composeProjectsList.length > 0) {
+    return;
+  }
+  const sessions = (typeof allSessions !== 'undefined' && Array.isArray(allSessions))
+    ? allSessions : [];
+
+  // Build parent→children index (only counts children whose parent is in
+  // the list — same rule as the sidebar).
+  let childrenByParent = new Map();
+  if (typeof _buildSubsessionIndex === 'function') {
+    childrenByParent = _buildSubsessionIndex(sessions);
+  }
+
+  // Parents that actually have subsession children, in the user's sort.
+  const parentRows = [];
+  const idsInList = new Set(sessions.map(s => s.id));
+  for (const s of sessions) {
+    const kids = childrenByParent.get(s.id);
+    if (kids && kids.length) parentRows.push(s);
+  }
+
+  // Orphaned subsessions: parent_session_id set but parent not in the list.
+  const orphans = sessions.filter(s =>
+    s.parent_session_id && !idsInList.has(s.parent_session_id));
+
+  if (!parentRows.length && !orphans.length) {
+    body.innerHTML =
+      '<div class="subsessions-adhoc-empty">'
+      + '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.5" stroke-linecap="round">'
+      + '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>'
+      + '<div style="font-size:16px;font-weight:500;color:var(--text);margin:12px 0 6px;">No subsessions yet</div>'
+      + '<div style="font-size:13px;color:var(--text-muted);max-width:460px;text-align:center;">'
+      + 'Right-click any session and choose <b>Spawn Subsession</b> (or press Ctrl+Shift+S) to peel off a '
+      + 'focused side task. It inherits the parent’s full context and reports its conclusion back up. '
+      + 'The family tree appears here.</div>'
+      + '</div>';
+    return;
+  }
+
+  let html = '<div class="adhoc-subsessions-tree">';
+  for (const parent of parentRows) {
+    html += _renderAdhocSubsessionRow(parent, false, null);
+    const kids = (childrenByParent.get(parent.id) || []).slice();
+    for (const kid of kids) {
+      html += _renderAdhocSubsessionRow(kid, true, _adhocTitleFor(parent));
+    }
+  }
+  if (orphans.length) {
+    html += '<div class="adhoc-orphans-header">Orphaned subsessions (parent deleted)</div>';
+    for (const o of orphans) {
+      html += _renderAdhocSubsessionRow(o, true, null);
+    }
+  }
+  html += '</div>';
+  body.innerHTML = html;
+}
+
 function _setSubsessionsActiveTab(tab) {
   localStorage.setItem('vn.compose.activeTab', tab);
 }
@@ -255,6 +371,8 @@ function _applySubsessionsTabState() {
     if (header) header.style.display = 'none';
     if (target) target.style.display = 'none';
     if (board) board.style.display = 'none';
+    // Paint the live parent→child subsession tree (spec §4.4).
+    _renderAdhocSubsessions();
   } else {
     if (adhocBody) adhocBody.style.display = 'none';
     // Let initCompose / _renderComposeBoard restore header/target/

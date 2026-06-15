@@ -69,9 +69,18 @@ function _renderSubsessionInboxStrip(panelEl, sess) {
   const strip = document.createElement('div');
   strip.className = 'subsession-inbox-strip';
   strip.setAttribute('aria-live', 'polite');
+  // Show the undelivered count (spec §4.6.2: "N subsession reports …").
+  // The count is published by the inbox_updated WS handler into
+  // window.__subsessionInboxCounts; fall back to a count-less phrasing
+  // until it arrives.
+  const _stripCount = (window.__subsessionInboxCounts
+    && window.__subsessionInboxCounts[sess.id]) || 0;
+  const _stripLead = _stripCount
+    ? (_stripCount + ' subsession ' + (_stripCount === 1 ? 'report' : 'reports'))
+    : 'Subsession reports';
   strip.innerHTML =
     '<span class="subsession-inbox-strip-text">'
-    + 'Subsession reports will be included with your next message.'
+    + escHtml(_stripLead) + ' will be included with your next message.'
     + '</span>'
     + '<button type="button" class="subsession-inbox-strip-action" '
     + 'onclick="_subsessionPullUpdates(\'' + sess.id + '\')">Pull updates now</button>'
@@ -97,14 +106,28 @@ function _renderSubsessionToolbar(panelEl, sess) {
   if (old) old.remove();
   if (!_isSubsessionForUI(sess)) return;
 
-  const autoReportKey = 'vn.subsession.autoreport.' + sess.id;
-  const autoReportOn = localStorage.getItem(autoReportKey) === '1';
+  // F1: the daemon is the source of truth for the toggle.  to_state_dict()
+  // only emits auto_report_on_idle when ON, so its presence == ON and its
+  // absence == OFF.  This fixes the "fresh browser shows OFF while the
+  // daemon is still auto-reporting" mismatch (localStorage was the only
+  // prior source).  localStorage remains a cache the toggle also writes.
+  const autoReportOn = !!sess.auto_report_on_idle;
+
+  // F3: when the parent is gone (pointer still set but the parent is no
+  // longer in the session list), the report channel is dead.  Disable the
+  // Report-to-Parent button rather than letting it 404 on click.
+  const parentGone = !!sess.parent_session_id
+    && !_findSessionInList(sess.parent_session_id);
+  const reportBtn = parentGone
+    ? '<button type="button" class="subsession-action-btn" disabled '
+      + 'title="Parent session no longer exists">Report to Parent (parent deleted)</button>'
+    : '<button type="button" class="subsession-action-btn" '
+      + 'onclick="_subsessionReportToParent(\'' + sess.id + '\')">Report to Parent</button>';
 
   const bar = document.createElement('div');
   bar.className = 'subsession-actions-bar';
   bar.innerHTML =
-    '<button type="button" class="subsession-action-btn" '
-    + 'onclick="_subsessionReportToParent(\'' + sess.id + '\')">Report to Parent</button>'
+    reportBtn
     + '<label class="subsession-autoreport-label">'
     + '<input type="checkbox" ' + (autoReportOn ? 'checked' : '') + ' '
     + 'onchange="_subsessionToggleAutoReport(\'' + sess.id + '\', this.checked)">'
@@ -195,7 +218,12 @@ function _subsessionDismissInboxStrip(parentSid) {
 function _subsessionReportToParent(childSid) {
   if (!childSid) return;
 
-  // Pre-fill with the last assistant message text (best-effort).
+  // Pre-fill with the last assistant message text.  F4: the authoritative
+  // source is the backend last-conclusion endpoint (Patent 15 reverse-
+  // parse of the JSONL tail), fetched async after the modal opens.  The
+  // DOM scrape below is only a synchronous fallback used until the fetch
+  // resolves (or if it fails) — the rendered log can be virtualized or
+  // re-skinned, so it is not reliable on its own.
   let prefill = '';
   const log = document.getElementById('live-log');
   if (log) {
@@ -226,6 +254,27 @@ function _subsessionReportToParent(childSid) {
     + '</div>'
     + '</div>';
   document.body.appendChild(modal);
+
+  // F4: fetch the authoritative last conclusion and replace the prefill
+  // unless the user has already started editing.  Only overwrites when the
+  // textarea still holds the untouched fallback (or is empty).
+  (async function _fillFromBackend() {
+    try {
+      const proj = localStorage.getItem('activeProject') || '';
+      const url = '/api/sessions/' + encodeURIComponent(childSid)
+        + '/last-conclusion' + (proj ? '?project=' + encodeURIComponent(proj) : '');
+      const resp = await fetch(url);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const text = (data && data.text || '').trim();
+      if (!text) return;
+      const ta = modal.querySelector('.subsession-report-textarea');
+      // Don't clobber edits: only replace the synchronous fallback.
+      if (ta && (ta.value.trim() === '' || ta.value.trim() === prefill.trim())) {
+        ta.value = text.slice(0, 4000);
+      }
+    } catch (_) { /* keep the DOM-scrape fallback */ }
+  })();
 
   modal.querySelector('.subsession-report-cancel').addEventListener('click', function() {
     modal.remove();

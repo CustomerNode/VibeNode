@@ -9752,6 +9752,65 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
   text-align: center;
 }
 
+/* Ad-hoc subsessions family tree (spec §4.4) — rendered into
+   #subsessions-adhoc-body by compose.js _renderAdhocSubsessions(). */
+.adhoc-subsessions-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 16px;
+  overflow-y: auto;
+}
+.adhoc-subsession-row {
+  display: flex;
+  flex-direction: column;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.adhoc-subsession-row:hover {
+  background: var(--hover-bg, rgba(127,127,127,0.10));
+  border-color: var(--border, rgba(127,127,127,0.18));
+}
+.adhoc-subsession-row.adhoc-child {
+  margin-left: 22px;
+  border-left: 2px solid var(--border, rgba(127,127,127,0.25));
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+.adhoc-row-main {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.adhoc-row-title {
+  font-size: 13px;
+  color: var(--text, #ddd);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.adhoc-parent .adhoc-row-title { font-weight: 600; }
+.adhoc-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--text-muted, #888);
+}
+.adhoc-dot-working { background: #4a90e2; }
+.adhoc-dot-waiting { background: #e2a23b; }
+.adhoc-dot-idle    { background: #44aa66; }
+.adhoc-orphans-header {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted, #888);
+  margin: 14px 0 4px;
+  padding-left: 4px;
+}
+
 /* ═══════════════════════════════════════════════════════════════
    COMPOSE ROOT ORCHESTRATOR — Header Bar, Input Target, Sidebar
    ═══════════════════════════════════════════════════════════════ */

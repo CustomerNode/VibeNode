@@ -255,3 +255,37 @@ class TestSubsessionsIntegration:
                 break
             _time.sleep(0.05)
         assert captured["text"] == "plain message"
+
+
+# ---------------------------------------------------------------------------
+# Marker scan (Patent 13) — pure detection logic
+# ---------------------------------------------------------------------------
+
+class TestSubsessionReportMarkerScan:
+    def test_detects_marker_and_strips_it(self, sm_module):
+        found, conclusion = sm_module._scan_subsession_report_marker(
+            "Fixed the slicer bug at sessions_api.py:882.\n"
+            "<!-- subsession:report -->"
+        )
+        assert found is True
+        assert conclusion == "Fixed the slicer bug at sessions_api.py:882."
+
+    def test_absent_marker_returns_false(self, sm_module):
+        found, conclusion = sm_module._scan_subsession_report_marker(
+            "No marker in this message."
+        )
+        assert found is False
+        assert conclusion == ""
+
+    def test_marker_is_case_insensitive_and_whitespace_tolerant(self, sm_module):
+        found, _ = sm_module._scan_subsession_report_marker(
+            "done <!--   SUBSESSION:REPORT   -->"
+        )
+        assert found is True
+
+    def test_marker_only_message_yields_empty_conclusion(self, sm_module):
+        found, conclusion = sm_module._scan_subsession_report_marker(
+            "<!-- subsession:report -->"
+        )
+        assert found is True
+        assert conclusion == ""

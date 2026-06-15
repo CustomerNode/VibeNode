@@ -312,11 +312,18 @@ def append_report(
     child_name: str,
     summary: str,
     attachments: Optional[list] = None,
+    causal_chain_id: Optional[str] = None,
 ) -> dict:
     """Append a new report to the parent's inbox.
 
     Returns the appended entry (dict).  Thread-safe via per-parent
     in-process lock; atomic on disk via os.replace.
+
+    ``causal_chain_id`` (optional) is the spawn-time lineage UUID stamped
+    on the child at spawn (Patent 04/06 chain-of-custody pattern).  It is
+    threaded through the report so a parent decision can be traced back to
+    the exact child conclusion that drove it.  Older inboxes without the
+    field read it back as absent; older readers ignore the extra key.
     """
     entry = {
         "report_id": str(uuid.uuid4()),
@@ -329,6 +336,8 @@ def append_report(
         ).replace("+00:00", "Z"),
         "delivered": False,
     }
+    if causal_chain_id:
+        entry["causal_chain_id"] = causal_chain_id
     with _lock_for(parent_sid):
         inbox = load_inbox(parent_sid)
         inbox["pending_reports"].append(entry)
@@ -430,4 +439,39 @@ def format_drain_block(entries: list) -> str:
             f'From subsession "{child_name}" ({short_sid}):'
         )
         lines.append(summary)
+        # Render structured attachments (spec §4.3.2 / §6.7).  v1 surfaced
+        # only the summary; the schema has always carried attachments[] so
+        # we now render file references as "path:line" so the parent can
+        # act on them directly.  Unknown attachment types are rendered by
+        # their type name so nothing is silently dropped.
+        rendered_refs = _format_attachments(entry.get("attachments"))
+        if rendered_refs:
+            lines.append(f"  refs: {rendered_refs}")
     return "\n".join(lines)
+
+
+def _format_attachments(attachments: Optional[list]) -> str:
+    """Render an entry's ``attachments[]`` into a compact one-line string.
+
+    ``file_ref`` attachments become ``path:line`` (line omitted when
+    absent).  Any other attachment type is rendered as its ``type`` name
+    so the parent at least knows something was attached.  Returns an
+    empty string when there is nothing to render.
+    """
+    if not attachments or not isinstance(attachments, list):
+        return ""
+    parts = []
+    for att in attachments:
+        if not isinstance(att, dict):
+            continue
+        if att.get("type") == "file_ref":
+            path = att.get("path") or ""
+            if not path:
+                continue
+            line = att.get("line")
+            parts.append(f"{path}:{line}" if line else path)
+        else:
+            kind = att.get("type")
+            if kind:
+                parts.append(str(kind))
+    return ", ".join(parts)

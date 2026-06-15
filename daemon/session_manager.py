@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import subprocess as _subprocess
 import tempfile
@@ -214,6 +215,14 @@ class SessionInfo:
     # may fire _emit_state more than once for a single user turn).
     auto_report_on_idle: bool = False
     _last_auto_report_entry_count: int = 0
+    # Patent 13 marker report: a subsession can explicitly push its
+    # conclusion up by emitting ``<!-- subsession:report -->`` in its
+    # assistant output.  Unlike auto_report_on_idle this is opt-in per
+    # turn by the child itself, so it fires regardless of the toggle.
+    # ``_last_marker_report_entry_count`` deduplicates the same way the
+    # auto-report counter does — one report per advancing turn that
+    # carries the marker, idempotent across repeated IDLE emits.
+    _last_marker_report_entry_count: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self):
@@ -343,6 +352,37 @@ def _is_thinking_block_modified_error(text: str) -> bool:
         return False
     low = text.lower()
     return "thinking" in low or "redacted_thinking" in low
+
+
+# ---------------------------------------------------------------------------
+# Subsession report marker (Patent 13 — structured comment marker action)
+# ---------------------------------------------------------------------------
+#
+# A subsession can explicitly push its conclusion to the parent by emitting
+# an HTML-comment marker in its assistant output.  This mirrors the kanban
+# status marker pattern: invisible to the rendered transcript, parsed
+# out-of-band, and turned into an action.  The marker is stripped from the
+# extracted conclusion so the parent's inbox shows clean text.
+_SUBSESSION_REPORT_MARKER_RE = re.compile(
+    r"<!--\s*subsession:report\s*-->", re.IGNORECASE
+)
+
+
+def _scan_subsession_report_marker(text: str) -> tuple[bool, str]:
+    """Detect the subsession report marker in *text*.
+
+    Returns ``(found, conclusion)`` where ``conclusion`` is *text* with the
+    marker(s) removed and trimmed.  When the marker is absent, returns
+    ``(False, "")`` — callers only use the conclusion when ``found`` is
+    True.  Pure function so the trigger logic is unit-testable without a
+    running daemon.
+    """
+    if not text or "subsession:report" not in text.lower():
+        return (False, "")
+    if not _SUBSESSION_REPORT_MARKER_RE.search(text):
+        return (False, "")
+    conclusion = _SUBSESSION_REPORT_MARKER_RE.sub("", text).strip()
+    return (True, conclusion)
 
 
 # ---------------------------------------------------------------------------
@@ -1216,6 +1256,76 @@ class SessionManager:
                 })
         except Exception as e:
             logger.debug("auto-report inbox_updated emit soft-fail: %s", e)
+
+    def _maybe_marker_report_to_parent(self, info: "SessionInfo") -> None:
+        """Patent 13 — report the child's conclusion up when its latest
+        assistant message carries the ``<!-- subsession:report -->`` marker.
+
+        Independent of ``auto_report_on_idle``: the marker is the child
+        explicitly deciding to report, so this fires whenever the marker is
+        present on a fresh turn.  Idempotent across repeated IDLE emits via
+        ``_last_marker_report_entry_count``.  Caller must already have
+        verified ``info.parent_session_id``.
+        """
+        with info._lock:
+            entry_count = len(info.entries)
+            if entry_count <= getattr(info, "_last_marker_report_entry_count", 0):
+                return  # No new turn since the last marker report.
+            # Find the last assistant text entry and test it for the marker.
+            last_assistant_text = ""
+            for entry in reversed(info.entries):
+                if getattr(entry, "kind", "") != "assistant":
+                    continue
+                text = (getattr(entry, "text", "") or "").strip()
+                if text:
+                    last_assistant_text = text
+                    break
+            found, conclusion = _scan_subsession_report_marker(last_assistant_text)
+            if not found:
+                # Advance the counter so we don't re-scan the same turn on
+                # every IDLE emit; the marker either was or wasn't here.
+                info._last_marker_report_entry_count = entry_count
+                return
+            info._last_marker_report_entry_count = entry_count
+            parent_sid = info.parent_session_id
+            child_sid = info.session_id
+            child_name = info.name or ""
+            # Fall back to the raw text if stripping the marker left nothing.
+            summary = (conclusion or last_assistant_text)[:1500]
+
+        # OUTSIDE the lock — disk write never holds the session lock.
+        try:
+            from daemon.subsession_inbox import append_report
+            append_report(
+                parent_sid=parent_sid,
+                child_sid=child_sid,
+                child_name=child_name,
+                summary=summary,
+            )
+        except Exception as e:
+            logger.warning(
+                "marker-report append_report failed for %s -> %s: %s",
+                child_sid, parent_sid, e,
+            )
+            return
+        try:
+            self.mark_inbox_dirty(parent_sid)
+        except Exception as e:
+            logger.debug(
+                "marker-report mark_inbox_dirty soft-fail for %s: %s",
+                parent_sid, e,
+            )
+        try:
+            from daemon.subsession_inbox import undelivered_count
+            if self._push_callback:
+                self._push_callback("inbox_updated", {
+                    "parent_session_id": parent_sid,
+                    "undelivered_count": undelivered_count(parent_sid),
+                    "from_child_session_id": child_sid,
+                    "marker": True,
+                })
+        except Exception as e:
+            logger.debug("marker-report inbox_updated emit soft-fail: %s", e)
 
     def set_auto_report_on_idle(self, session_id: str, on: bool) -> bool:
         """Phase 6.5 P1-4 — toggle the subsession's auto-report preference.
@@ -4912,6 +5022,25 @@ class SessionManager:
                 # Auto-report must never break a session state emit.
                 logger.warning(
                     "auto-report soft-fail for %s: %s",
+                    info.session_id, e,
+                )
+
+        # ── Patent 13: marker-triggered report on IDLE ──
+        # Independent of the auto_report toggle: if the subsession's latest
+        # assistant turn carries the <!-- subsession:report --> marker, push
+        # that conclusion to the parent's inbox.  This is the child
+        # explicitly deciding to report, so it runs for ANY subsession with
+        # a parent.  Same soft-fail discipline — a marker scan must never
+        # break a state emit.
+        if (
+            info.state == SessionState.IDLE
+            and getattr(info, "parent_session_id", None)
+        ):
+            try:
+                self._maybe_marker_report_to_parent(info)
+            except Exception as e:
+                logger.warning(
+                    "marker-report soft-fail for %s: %s",
                     info.session_id, e,
                 )
 

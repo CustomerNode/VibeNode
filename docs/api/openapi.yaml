@@ -1045,6 +1045,46 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /api/sessions/{sid}/last-conclusion:
+    get:
+      tags: [Sessions]
+      summary: Most-recent meaningful assistant text for a session
+      description: |
+        Tail-reads the session's JSONL and reverse-parses to the last
+        assistant text block, skipping tool-only and transient entries
+        (Patent 15 out-of-band inference pattern). Authoritative source
+        for the subsession "Report to Parent" prefill, replacing fragile
+        DOM scraping of the rendered transcript.
+      operationId: getLastConclusion
+      parameters:
+        - name: sid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Last conclusion text (empty string when none found)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  session_id:
+                    type: string
+                  text:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   /api/rewind/{session_id}:
     post:
       tags: [Sessions]

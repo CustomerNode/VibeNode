@@ -1563,6 +1563,11 @@ function filterSessions() {
     renderWorkforce(wfSortedSessions(filtered));
   } else if (viewMode === 'sessions') {
     renderList(sortedSessions(filtered));
+  } else if (viewMode === 'compose') {
+    // Keep the Subsessions "Ad-hoc" family tree live as session state
+    // changes stream in.  No-op when the Structured tab is active or the
+    // renderer isn't loaded yet.
+    if (typeof _renderAdhocSubsessions === 'function') _renderAdhocSubsessions();
   }
 }
 
