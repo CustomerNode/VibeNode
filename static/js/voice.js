@@ -549,10 +549,17 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
       const agree = _commonPrefix(prevWords, cur);
       if (agree > committedWords.length) committedWords = cur.slice(0, agree);  // grow committed, never shrink
       prevWords = cur;
-      controller._lastFullText = cur.join(' ');   // remember last good transcript for failure fallback
-      // Premium live surface: render committed (solid) + settling tail (shimmer)
-      // into the floating caption, NOT the textarea — so the input never looks janky.
-      _snCaptionUpdate(committedWords, cur.slice(committedWords.length));
+      // Prepend the permanent prefix (committed words from prior PARTIAL_WINDOW cycles) so
+      // _lastFullText always holds the FULL dictation, not just the current 30-second window.
+      // This is the watchdog fallback — without it, long recordings silently lose their first
+      // N paragraphs whenever the window shifts and the final transcription times out.
+      const perm = controller._permanentPrefix || '';
+      controller._lastFullText = perm ? (perm + ' ' + cur.join(' ')).trim() : cur.join(' ');
+      // Premium live surface: permanent prefix words show solid (never rewrites); current
+      // committed words also solid; tail shimmers as Whisper refines each partial.
+      // Long dictations keep their full history visible without ever losing committed text.
+      const permWords = perm ? perm.trim().split(/\s+/).filter(Boolean) : [];
+      _snCaptionUpdate(permWords.concat(committedWords), cur.slice(committedWords.length));
     };
 
     const _reschedule = (ms) => {
@@ -561,9 +568,11 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
     };
     function pumpPartial() {
       if (stopped || controller._discarded) return;
-      // Not ready yet (no audio captured, or a request still in flight): keep the
-      // loop ALIVE by retrying soon, instead of dying on the first early bail.
-      if (streamBusy || !chunks.length) { _reschedule(250); return; }
+      // Not ready yet (no audio captured, request in-flight, or too little audio for Whisper's
+      // VAD to confidently detect speech): keep the loop ALIVE by retrying soon. Requiring ≥ 2
+      // chunks (~800ms) before the first partial prevents empty early transcriptions that confuse
+      // LocalAgreement and waste an inference slot right before the user starts speaking clearly.
+      if (streamBusy || chunks.length < 2) { _reschedule(250); return; }
       streamBusy = true;
       const t0 = _now();
       // Partials are ALWAYS fast/greedy (beam=1) so they return in well under a second
@@ -586,6 +595,14 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
       // and the previous prevWords comparison is off-by-one. Reset LocalAgreement
       // so it rebuilds cleanly over the next two partials instead of staying stuck.
       if (partialStart > (controller._lastPartialStart || 0)) {
+        // Before resetting LocalAgreement for the new window, promote any stably-committed
+        // words to the permanent prefix. This prevents _lastFullText (the watchdog fallback)
+        // from losing dictated text when the 30-second window shifts. Without this, a
+        // 60-second recording that triggers a window shift loses its first half if the final
+        // transcription times out. permanentPrefix grows monotonically and is never cleared.
+        if (committedWords.length > 0) {
+          controller._permanentPrefix = ((controller._permanentPrefix || '') + ' ' + committedWords.join(' ')).trim();
+        }
         prevWords = [];
         committedWords = [];
         controller._lastCommitLen = undefined;
@@ -685,7 +702,14 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
       } else {                                     // model recognized nothing -> say so, don't vanish silently
         try { _snCaptionHide(); } catch (_) {}
         updateIcon();
-        try { if (typeof showToast === 'function') showToast("Didn't catch that — try again.", true); } catch (_) {}
+        // If the mic captured audio but Whisper returned nothing, the issue is likely
+        // speech too quiet, accented, or in a noisy environment — give an actionable hint.
+        // If there was no real audio (very short click, mic not ready), use the generic message.
+        const hadAudio = chunks && chunks.length >= 2;
+        const emptyMsg = hadAudio
+          ? "Didn't catch that — try speaking louder or closer to the mic."
+          : "Didn't catch that — try again.";
+        try { if (typeof showToast === 'function') showToast(emptyMsg, true); } catch (_) {}
         textarea.focus();
       }
       setTimeout(() => { try { _snCaptionHide(); } catch (_) {} }, 340);
@@ -698,9 +722,15 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
       if (controller._userCancelled) { commitSend(''); return; }   // ✕ -> discard (inside commitSend)
       const blob = new Blob(chunks, { type: (chunks[0] && chunks[0].type) || 'audio/webm' });
       try { button.classList.add('processing'); button.title = 'Transcribing…'; } catch (_) {}
-      // Watchdog: if the final transcribe is slow or dies, still send the best live
-      // transcript. commitSend is idempotent, so this can never double-send.
-      const watchdog = setTimeout(() => { commitSend(''); }, 6000);
+      // Adaptive watchdog: scale with audio size so the final transcription always has
+      // enough time. The old 6000ms fired before Whisper finished on any recording over
+      // ~12 seconds, especially when an in-flight partial was holding _INFER_LOCK. Formula:
+      //   base 12s  — covers lock-wait (up to 3s) + short-clip inference (up to 6s)
+      //   +500ms/chunk — base.en on CPU processes ~30s of audio per second; 500ms/chunk
+      //                  at 400ms/chunk gives 1.25× the recording length as processing budget
+      //   cap 60s   — no real dictation should need more than a minute of Whisper time
+      const watchdogMs = Math.min(60000, Math.max(12000, chunks.length * 500));
+      const watchdog = setTimeout(() => { commitSend(''); }, watchdogMs);
       window.SpeechNode.transcribeBlob(blob, { cwd: snCwd }).then((res) => {
         clearTimeout(watchdog);
         if (res && res.ok && typeof res.text === 'string' && res.text.trim()) {

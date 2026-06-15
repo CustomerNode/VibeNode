@@ -269,8 +269,10 @@ class TestMergeWithCommittedGuards:
         # Use the handler assignment form (not comment occurrences like "recorder.onstop NEVER fires")
         onstop_pos = src.find("recorder.onstop = ")
         assert onstop_pos != -1, "recorder.onstop assignment not found in voice.js"
-        # The handler body is within the next ~1500 chars of the assignment.
-        snippet = src[onstop_pos:onstop_pos + 1500]
+        # The handler body is within the next ~2000 chars of the assignment.
+        # (Increased from 1500: the adaptive watchdog comment above transcribeBlob
+        # is intentionally detailed and pushed _mergeWithCommitted past the old window.)
+        snippet = src[onstop_pos:onstop_pos + 2000]
         assert "_mergeWithCommitted" in snippet, (
             "FINAL-REGRESSION: _mergeWithCommitted() is not called inside "
             "recorder.onstop. The merge logic is unreachable and the final "
@@ -434,4 +436,133 @@ class TestAdaptiveSilenceGuard:
             "ADAPTIVE-SILENCE regression: STABLE_MS is not adaptive. "
             "The stability check will fire prematurely for long messages "
             "when partial transcription is slow. Scale with committedWords.length."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression 7 — WATCHDOG-TIMEOUT
+# A fixed 6000ms watchdog fires before Whisper finishes processing recordings
+# longer than ~12s, especially when _INFER_LOCK contention (a partial still
+# running when the final fires) consumes most of that budget. Fixed by scaling
+# the watchdog with chunks.length so each recording gets proportional time.
+# ---------------------------------------------------------------------------
+
+class TestAdaptiveWatchdogGuard:
+
+    def _src(self):
+        return _read(_JS / "voice.js")
+
+    def test_watchdog_scales_with_chunk_count(self):
+        """Final transcription watchdog must scale with chunks.length.
+        A fixed 6000ms fires before Whisper finishes for 30+ second recordings,
+        especially when an in-flight partial is blocking _INFER_LOCK."""
+        src = self._src()
+        assert re.search(
+            r'watchdogMs.*chunks\.length|chunks\.length.*watchdog',
+            src, re.DOTALL | re.IGNORECASE
+        ) or (
+            "watchdogMs" in src and "chunks.length" in src
+        ), (
+            "WATCHDOG-TIMEOUT regression: watchdog must scale with chunks.length. "
+            "A fixed 6s watchdog drops messages for any recording longer than ~12s "
+            "(lock-wait time + Whisper inference time regularly exceeds 6s on CPU)."
+        )
+
+    def test_watchdog_minimum_is_at_least_10s(self):
+        """Minimum watchdog must be >= 10000ms. At 6s, lock-wait alone (partial
+        holds _INFER_LOCK for up to 3s) plus a short-clip inference (up to 6s)
+        already exceeds the budget even for a 5-second recording."""
+        src = self._src()
+        match = re.search(r'watchdogMs\s*=.*?Math\.max\((\d+)', src)
+        if not match:
+            match = re.search(r'Math\.max\((\d+),.*?watchdog', src)
+        assert match, "watchdogMs / Math.max pattern not found — see test above"
+        min_ms = int(match.group(1))
+        assert min_ms >= 10000, (
+            f"WATCHDOG-TIMEOUT regression: watchdog minimum is {min_ms}ms (< 10s). "
+            f"Lock-wait + inference regularly exceeds 6s. Minimum must be >= 10000ms."
+        )
+
+    def test_watchdog_cap_exists(self):
+        """Watchdog must have a reasonable upper cap (Math.min). Without it, a
+        5-minute recording produces a 150s watchdog that holds the caption open
+        long after the user expected a response."""
+        src = self._src()
+        assert re.search(r'Math\.min\(\d+,.*watchdogMs|watchdogMs.*Math\.min\(\d+', src) or \
+               re.search(r'Math\.min\(60000|Math\.min\(45000|Math\.min\(30000', src), (
+            "WATCHDOG-TIMEOUT regression: no upper cap on watchdog. A recording-length "
+            "proportional watchdog without a cap will stay open for minutes on very long "
+            "recordings. Add Math.min(60000, ...) to cap it reasonably."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression 8 — STREAMING-RESET
+# When the PARTIAL_WINDOW (75 chunks, ~30s) shifts forward, LocalAgreement
+# resets prevWords and committedWords. Before this fix, controller._lastFullText
+# was set from the NEW window's text only, so the watchdog fallback silently
+# lost the first N paragraphs of a long dictation. Fixed by promoting committed
+# words to controller._permanentPrefix before the reset, so _lastFullText
+# always reflects the full accumulated dictation.
+# ---------------------------------------------------------------------------
+
+class TestPermanentPrefixGuard:
+
+    def _src(self):
+        return _read(_JS / "voice.js")
+
+    def test_permanent_prefix_field_exists(self):
+        """controller._permanentPrefix must exist in voice.js.
+        Without it, every PARTIAL_WINDOW shift (every ~30s of audio) silently
+        loses the previously-committed text from _lastFullText, causing the
+        watchdog fallback to return only the current window's fragment."""
+        src = self._src()
+        assert "_permanentPrefix" in src, (
+            "STREAMING-RESET regression: controller._permanentPrefix not found. "
+            "The PARTIAL_WINDOW reset (every ~30s) clears committedWords without saving "
+            "them — _lastFullText loses all text from prior windows on watchdog fallback."
+        )
+
+    def test_permanent_prefix_saved_on_window_shift(self):
+        """committedWords must be appended to _permanentPrefix before the
+        PARTIAL_WINDOW reset. If committed words are discarded without saving,
+        the permanent prefix stays empty and the regression is unfixed."""
+        src = self._src()
+        # The save must happen INSIDE the `partialStart > _lastPartialStart` block
+        # (the window-shift guard). Check that _permanentPrefix assignment is
+        # near the committedWords reset.
+        shift_pos = src.find("partialStart > (controller._lastPartialStart")
+        assert shift_pos != -1, "partialStart window-shift check not found"
+        snippet = src[shift_pos:shift_pos + 600]
+        assert "_permanentPrefix" in snippet, (
+            "STREAMING-RESET regression: _permanentPrefix is not saved inside the "
+            "window-shift block. committedWords are cleared without being promoted, "
+            "so prior dictation is lost from _lastFullText when the window advances."
+        )
+
+    def test_permanent_prefix_included_in_last_full_text(self):
+        """controller._lastFullText must concatenate _permanentPrefix with the
+        current window text. Without this, the watchdog fallback only returns
+        the most recent 30 seconds of a long recording."""
+        src = self._src()
+        # applyPartial must build _lastFullText from both perm and cur
+        assert re.search(
+            r'_permanentPrefix.*_lastFullText|_lastFullText.*_permanentPrefix',
+            src, re.DOTALL
+        ), (
+            "STREAMING-RESET regression: _lastFullText does not include _permanentPrefix. "
+            "On watchdog fallback, the user loses everything before the last window shift."
+        )
+
+    def test_permanent_prefix_shown_in_caption(self):
+        """The live caption must include permanent prefix words in the committed
+        (solid) section. Without this, the caption appears to reset and lose
+        committed text every 30 seconds, making streaming look broken."""
+        src = self._src()
+        # _snCaptionUpdate must be called with permWords included
+        assert re.search(r'permWords.*_snCaptionUpdate|_snCaptionUpdate.*permWords', src, re.DOTALL) or \
+               re.search(r'permanentPrefix.*_snCaptionUpdate', src, re.DOTALL), (
+            "STREAMING-RESET regression: permanent prefix words are not passed to "
+            "_snCaptionUpdate. The caption will lose committed text every 30 seconds, "
+            "making long recordings appear to drop or reset mid-stream."
         )
