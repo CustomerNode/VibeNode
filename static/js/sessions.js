@@ -304,6 +304,46 @@ function _buildSubsessionIndex(sessions) {
   return childrenByParent;
 }
 
+// Reorder an already-sorted flat session list so each subsession sits
+// immediately after its parent, regardless of the active sort.  Used by
+// the flat renderers (grid) that would otherwise scatter children away
+// from their parent when sorting by date/name/size.  The list renderer
+// uses its own family-box path and does not call this.
+//
+// Returns { ordered, roleOf } where:
+//   ordered: the reordered session array (same objects, never mutated)
+//   roleOf:  Map(session_id -> 'parent' | 'child') for rows in a family;
+//            normal sessions are absent from the map.
+// Sort is preserved: top-level rows keep their order, and each parent's
+// children keep their order (children arrive pre-sorted in `sorted`).
+function _orderSessionsByFamily(sorted) {
+  const childrenByParent = _buildSubsessionIndex(sorted);
+  const roleOf = new Map();
+  if (!childrenByParent.size) {
+    return { ordered: sorted, roleOf };  // nothing to regroup — cheap exit
+  }
+  const claimed = new Set();
+  for (const kids of childrenByParent.values()) {
+    for (const k of kids) claimed.add(k.id);
+  }
+  const ordered = [];
+  for (const s of sorted) {
+    if (claimed.has(s.id)) continue;  // emitted under its parent below
+    const kids = childrenByParent.get(s.id);
+    if (kids && kids.length) {
+      roleOf.set(s.id, 'parent');
+      ordered.push(s);
+      for (const kid of kids) {
+        roleOf.set(kid.id, 'child');
+        ordered.push(kid);
+      }
+    } else {
+      ordered.push(s);
+    }
+  }
+  return { ordered, roleOf };
+}
+
 // Return a (sub)session's pre-defined name lookup helper.
 function _findSessionById(sessions, sid) {
   for (const s of sessions) if (s.id === sid) return s;
@@ -498,14 +538,26 @@ function renderList(sessions) {
   let rows = '';
   for (const s of sessions) {
     if (claimedChildren.has(s.id)) continue;  // rendered below its parent
-    rows += _renderSessionRow(s, '');
     const kids = childrenIdx.get(s.id);
-    if (kids && _isSubsessionExpanded(s.id)) {
-      // Children sorted by their own effective_ts (newest first by default).
-      const kidsSorted = sortedSessions(kids);
-      for (const kid of kidsSorted) {
-        rows += _renderSessionRow(kid, '');
+    const hasKids = !!(kids && kids.length);
+    // When a session has subsessions, wrap the parent + its children in a
+    // distinct "family" box so the hierarchy reads as one unit at a glance
+    // (the flat indent+glyph alone was too subtle to notice).  Sessions
+    // with no children render exactly as before — no wrapper, no visual
+    // change to the normal sidebar.
+    if (hasKids) {
+      const expanded = _isSubsessionExpanded(s.id);
+      rows += '<div class="subsession-family' + (expanded ? '' : ' collapsed') + '" data-family="' + s.id + '">';
+      rows += _renderSessionRow(s, ' family-parent');
+      if (expanded) {
+        const kidsSorted = sortedSessions(kids);
+        for (const kid of kidsSorted) {
+          rows += _renderSessionRow(kid, ' family-child');
+        }
       }
+      rows += '</div>';
+    } else {
+      rows += _renderSessionRow(s, '');
     }
   }
 

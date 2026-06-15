@@ -27,35 +27,64 @@ function _isSubsessionForUI(sess) {
 }
 
 function _renderSubsessionBreadcrumb(parentEl, sess) {
-  // Remove any existing breadcrumb first (idempotent).
-  const old = parentEl.querySelector('.subsession-breadcrumb');
+  // "You are here" role banner at the very top of the live panel.  This is
+  // the primary signal that tells the user which kind of session they are
+  // typing into — the earlier faint breadcrumb was too subtle, which led
+  // to typing into the wrong session.  Renders for BOTH roles:
+  //   - subsession  → amber "SUBSESSION ▸ from: <parent>" banner
+  //   - parent w/ children → blue "MAIN SESSION · N subsessions" banner
+  // A plain session with no parent and no children gets no banner.
+  const old = parentEl.querySelector('.session-role-banner');
   if (old) old.remove();
-  if (!_isSubsessionForUI(sess)) return;
+  if (!sess) return;
 
-  const parent = _findSessionInList(sess.parent_session_id);
-  const parentExists = !!parent;
-  const parentName = parent
-    ? (parent.custom_title || parent.display_title || sess.parent_session_id.slice(0, 8))
-    : sess.parent_session_id.slice(0, 8);
+  const isSub = _isSubsessionForUI(sess);
+
+  // Count this session's live subsession children (parent role).
+  let childCount = 0;
+  if (typeof allSessions !== 'undefined' && Array.isArray(allSessions)) {
+    childCount = allSessions.filter(x => x && x.parent_session_id === sess.id).length;
+  }
+
+  // Nothing to show for an ordinary top-level session.
+  if (!isSub && childCount === 0) return;
 
   const div = document.createElement('div');
-  div.className = 'subsession-breadcrumb';
-  if (parentExists) {
-    div.innerHTML = '<a href="#" class="subsession-bc-parent">'
-      + escHtml(parentName)
-      + '</a> ▸ <span>This subsession</span>';
-    const link = div.querySelector('.subsession-bc-parent');
-    link.addEventListener('click', function(ev) {
-      ev.preventDefault();
-      if (typeof openInGUI === 'function') {
-        openInGUI(sess.parent_session_id);
-      }
-    });
+
+  if (isSub) {
+    const parent = _findSessionInList(sess.parent_session_id);
+    const parentExists = !!parent;
+    const parentName = parent
+      ? (parent.custom_title || parent.display_title || sess.parent_session_id.slice(0, 8))
+      : sess.parent_session_id.slice(0, 8);
+    div.className = 'session-role-banner role-subsession';
+    if (parentExists) {
+      div.innerHTML =
+        '<span class="role-badge role-badge-sub">SUBSESSION</span>'
+        + '<span class="role-banner-text">from '
+        + '<a href="#" class="subsession-bc-parent">' + escHtml(parentName) + '</a>'
+        + '</span>';
+      const link = div.querySelector('.subsession-bc-parent');
+      link.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        if (typeof openInGUI === 'function') openInGUI(sess.parent_session_id);
+      });
+    } else {
+      div.innerHTML =
+        '<span class="role-badge role-badge-sub">SUBSESSION</span>'
+        + '<span class="role-banner-text">parent <span class="deleted-parent">'
+        + escHtml(parentName) + '</span> (deleted)</span>';
+    }
   } else {
-    div.innerHTML = '<span class="deleted-parent">'
-      + escHtml(parentName)
-      + '</span> ▸ <span>This subsession</span>';
+    // Parent role — has at least one subsession.
+    const noun = childCount === 1 ? 'subsession' : 'subsessions';
+    div.className = 'session-role-banner role-parent';
+    div.innerHTML =
+      '<span class="role-badge role-badge-main">MAIN SESSION</span>'
+      + '<span class="role-banner-text">' + childCount + ' ' + noun
+      + ' running in parallel</span>';
   }
+
   // Insert at the very top of #live-panel, above #live-log.
   parentEl.insertBefore(div, parentEl.firstChild);
 }

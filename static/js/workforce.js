@@ -844,6 +844,16 @@ function renderWorkforce(sessions) {
     sleeping: '<img src="/static/svg/sleeping.svg" width="28" height="28" class="sleeping-icon">',
   };
   const statusLabel = {question:'Question', working:'Working', idle:'Idle', sleeping:'Sleeping'};
+  // Keep subsessions glued to their parent regardless of the active sort,
+  // and tag each card with its family role so parent/child get distinct
+  // text colors (see .wf-parent / .wf-child in style.css).  Falls back to
+  // the raw list if the family helper isn't loaded.
+  let _roleOf = new Map();
+  if (typeof _orderSessionsByFamily === 'function') {
+    const _fam = _orderSessionsByFamily(sessions);
+    sessions = _fam.ordered;
+    _roleOf = _fam.roleOf;
+  }
   grid.innerHTML = sessions.map(s => {
     const st = getSessionStatus(s.id);
     const _isCompacting = st === 'working' && window._sessionSubstatus && window._sessionSubstatus[s.id] === 'compacting';
@@ -866,12 +876,19 @@ function renderWorkforce(sessions) {
     // sidebar multi-selection without opening the session.  See
     // _sessionRowMouseDown in sessions.js for the full mechanism.
     const msClass = (typeof multiSelectedIds !== 'undefined' && multiSelectedIds.has(s.id)) ? ' multi-selected' : '';
+    // Family role \u2192 distinct text color + a \u21b3 glyph on child cards so the
+    // parent/child relationship reads at a glance in the grid.
+    const _role = _roleOf.get(s.id);
+    const familyClass = _role === 'parent' ? ' wf-parent'
+                      : _role === 'child' ? ' wf-child' : '';
+    const childGlyph = _role === 'child'
+      ? '<span class="wf-sub-glyph" aria-hidden="true">\u21b3 </span>' : '';
     const name = escHtml((s.display_title||s.id).slice(0,22) + ((s.display_title||'').length>22?'\u2026':''));
     const date = _shortDate(s.last_activity);
-    return `<div class="wf-card wf-${st}${selClass}${msClass}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" onclick="singleOrDouble('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')" title="${escHtml(s.display_title)} \u2014 double-click to open in VibeNode">
+    return `<div class="wf-card wf-${st}${selClass}${msClass}${familyClass}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" onclick="singleOrDouble('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')" title="${escHtml(s.display_title)} \u2014 double-click to open in VibeNode">
       <div class="wf-avatar">${emoji}</div>
       <div class="wf-status-label">${label}</div>
-      <div class="wf-name">${name}</div>
+      <div class="wf-name">${childGlyph}${name}</div>
       <div class="wf-meta">${escHtml(date)}</div>
     </div>`;
   }).join('');

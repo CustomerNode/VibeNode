@@ -11567,6 +11567,109 @@ body.mc-mode #main-panel { width: 100% !important; margin-left: 0 !important; he
     subsession-slide-in-anim 180ms ease-out;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+   Subsession family box (sidebar) + role banner (live panel)
+   Added 2026-06-15 — makes the parent/child relationship unmistakable
+   so the user always knows which session they are in.
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Grouped "family" container wrapping a parent + its subsessions in the
+   sidebar.  Reads as one bordered unit so the hierarchy is obvious at a
+   glance, instead of relying on a subtle indent alone. */
+.subsession-family {
+  border: 1px solid var(--border, rgba(127,127,127,0.22));
+  border-radius: 8px;
+  margin: 4px 6px;
+  padding: 2px;
+  background: rgba(120, 150, 255, 0.05);
+}
+[data-theme="light"] .subsession-family {
+  background: rgba(60, 100, 220, 0.05);
+}
+/* The parent row inside the family box reads as the header. */
+.subsession-family .session-item.family-parent {
+  border-radius: 6px;
+}
+.subsession-family .session-item.family-parent .session-col-name {
+  font-weight: 600;
+}
+/* Child rows get a clear left rail + tint so they visibly belong to the
+   box (stronger than the base subsession-row treatment). */
+.subsession-family .session-item.family-child .session-col-name {
+  border-left: 2px solid rgba(255, 149, 0, 0.55);
+  margin-left: 6px;
+  padding-left: 14px;
+}
+
+/* ── Family text colors (sidebar) ──
+   Parent = blue, subsession = amber.  Same palette as the live-panel
+   role banner (.role-parent / .role-subsession) so a session's color is
+   consistent everywhere.  Normal sessions keep the default text color —
+   only family members are tinted, so parent + sub read as unique. */
+.subsession-family .session-item.family-parent .session-col-name {
+  color: #4a90e2;
+}
+.subsession-family .session-item.family-child .session-col-name {
+  color: #ff9500;
+}
+[data-theme="light"] .subsession-family .session-item.family-parent .session-col-name {
+  color: #2f6fb3;
+}
+[data-theme="light"] .subsession-family .session-item.family-child .session-col-name {
+  color: #c8780a;
+}
+
+/* ── Family colors in the GRID (default sidebar view) ──
+   The grid renderer (renderWorkforce) tags parent/child cards so subs
+   stay next to their parent and read with the same blue/amber palette. */
+.wf-card.wf-parent .wf-name { color: #4a90e2; font-weight: 600; }
+.wf-card.wf-child  .wf-name { color: #ff9500; }
+.wf-card.wf-child {
+  border-left: 2px solid rgba(255, 149, 0, 0.5);
+}
+.wf-sub-glyph { opacity: 0.7; }
+[data-theme="light"] .wf-card.wf-parent .wf-name { color: #2f6fb3; }
+[data-theme="light"] .wf-card.wf-child  .wf-name { color: #c8780a; }
+
+/* "You are here" role banner at the top of the live panel. */
+.session-role-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text, #ddd);
+  border-bottom: 1px solid var(--border, rgba(127,127,127,0.2));
+}
+.session-role-banner.role-subsession {
+  background: rgba(255, 149, 0, 0.14);
+  border-bottom-color: rgba(255, 149, 0, 0.35);
+}
+.session-role-banner.role-parent {
+  background: rgba(74, 144, 226, 0.14);
+  border-bottom-color: rgba(74, 144, 226, 0.35);
+}
+.role-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 5px;
+  white-space: nowrap;
+}
+.role-badge-sub  { background: #ff9500; color: #1a1300; }
+.role-badge-main { background: #4a90e2; color: #061626; }
+.role-banner-text { color: var(--text-muted, #aaa); }
+.role-banner-text .subsession-bc-parent {
+  color: var(--text, #ddd);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.role-banner-text .deleted-parent {
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
 /* ── Parent inbox strip (live panel) — see Phase 6. ── */
 .subsession-inbox-strip {
   display: flex;
