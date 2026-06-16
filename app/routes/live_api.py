@@ -436,7 +436,9 @@ _CONFIRMED_MODELS_FILE = Path(__file__).resolve().parents[2] / "confirmed_models
 # Ordered: Fable (most capable), Opus, Sonnet, Haiku.
 _FALLBACK_KNOWN_MODELS = [
     {"id": "claude-fable-5", "name": "Fable 5"},
+    {"id": "claude-opus-4-8", "name": "Opus 4.8"},
     {"id": "claude-opus-4-7", "name": "Opus 4.7"},
+    {"id": "claude-opus-4-6", "name": "Opus 4.6"},
     {"id": "claude-sonnet-4-6", "name": "Sonnet 4.6"},
     {"id": "claude-haiku-4-5", "name": "Haiku 4.5"},
 ]
@@ -462,8 +464,19 @@ def _load_confirmed_models() -> dict:
 
 def record_confirmed_model(model_id: str) -> None:
     """Called by session_manager when a session init message arrives with a model ID.
-    Adds the model to the persistent confirmed list so it always shows in the UI."""
-    if not model_id or not model_id.startswith("claude-"):
+    Adds the model to the persistent confirmed list so it always shows in the UI.
+
+    The Claude Code CLI reports its current model with a "[1m]" suffix when 1M
+    context is active (e.g. "claude-opus-4-8[1m]"). That suffix is a CLI display
+    convention — the SDK rejects model IDs with brackets, which surfaces in the
+    UI as "model not available". Strip the suffix and validate before recording
+    so the picker only ever stores SDK-valid IDs.
+    """
+    import re as _re
+    if not model_id:
+        return
+    model_id = _re.sub(r"\[[^\]]*\]", "", model_id).strip()
+    if not _re.fullmatch(r"claude-[A-Za-z0-9-]+", model_id):
         return
     confirmed = _load_confirmed_models()
     if model_id not in confirmed:
@@ -576,8 +589,10 @@ def get_models():
         # 2. Use the confirmed-models persistent cache
         confirmed = _load_confirmed_models()
 
-        if cli_model and cli_model.startswith("claude-"):
-            if cli_model not in confirmed:
+        if cli_model:
+            # Strip CLI display suffix (e.g. "claude-opus-4-8[1m]" -> "claude-opus-4-8").
+            cli_model = _re.sub(r"\[[^\]]*\]", "", cli_model).strip()
+            if _re.fullmatch(r"claude-[A-Za-z0-9-]+", cli_model) and cli_model not in confirmed:
                 confirmed[cli_model] = _model_id_to_display_name(cli_model)
                 try:
                     _CONFIRMED_MODELS_FILE.write_text(json.dumps(confirmed, indent=2))
