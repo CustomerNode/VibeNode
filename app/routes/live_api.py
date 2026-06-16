@@ -435,7 +435,6 @@ _CONFIRMED_MODELS_FILE = Path(__file__).resolve().parents[2] / "confirmed_models
 # no past sessions cached). Ensures the UI always offers a sensible choice.
 # Ordered: Fable (most capable), Opus, Sonnet, Haiku.
 _FALLBACK_KNOWN_MODELS = [
-    {"id": "claude-fable-5", "name": "Fable 5"},
     {"id": "claude-opus-4-8", "name": "Opus 4.8"},
     {"id": "claude-opus-4-7", "name": "Opus 4.7"},
     {"id": "claude-opus-4-6", "name": "Opus 4.6"},

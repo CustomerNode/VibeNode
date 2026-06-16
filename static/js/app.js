@@ -1607,7 +1607,6 @@ async function openModelSelector() {
   } catch (e) {
     // Fallback list uses full model IDs — same as server aliases
     models = [
-      {id: 'claude-fable-5',   name: 'Fable 5',    desc: 'Most capable, long-horizon agentic work'},
       {id: 'claude-opus-4-8',  name: 'Opus 4.8',   desc: 'Newest Opus, 1M context'},
       {id: 'claude-opus-4-7',  name: 'Opus 4.7',   desc: '1M context, deepest reasoning'},
       {id: 'claude-opus-4-6',  name: 'Opus 4.6',   desc: 'Deep reasoning, 200K context'},
