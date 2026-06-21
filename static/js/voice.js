@@ -235,7 +235,7 @@ function setupVoiceButton(textarea, button, onSubmit) {
       silenceTimer = setTimeout(() => {
         recognition._intentionalStop = true;
         recognition.stop();
-      }, 3000);  // 3s silence timeout — do NOT increase, causes premature cutoff feel
+      }, 7000);  // 7s silence timeout — gives room to pause/think mid-message before auto-send
     };
 
     recognition.onresult = (e) => {
@@ -396,14 +396,14 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
     // When you finish speaking, a short pause ends the turn: stop -> transcribe
     // -> auto-send. Works in EVERY browser (Firefox has no Web Speech VAD), and
     // mirrors the old Web Speech 3s silence behavior. Manual click still stops too.
-    const SILENCE_SHORT = 2500;   // pause-to-send in a quiet room
-    const SILENCE_LONG = 5000;    // pause-to-send when background noise/music is present
-    const MAX_MS = 60000;         // hard cap on one recording
+    const SILENCE_SHORT = 6000;   // pause-to-send in a quiet room (longer = room to think mid-message)
+    const SILENCE_LONG = 9000;    // pause-to-send when background noise/music is present
+    const MAX_MS = 120000;        // hard cap on one recording
     const RMS_THRESHOLD = 0.015;  // absolute speech floor (a fast path for QUIET rooms)
     const QUIET_RMS = 0.02;       // background above this = "noisy" -> use the long window
     const SPEECH_FACTOR = 2.2;    // (reserved)
-    const STABLE_MS = 3500;       // committed words unchanged this long -> end of speech (client fallback)
-    const GAP_S = 2.5;            // Whisper-VAD trailing silence (real, noise-immune) -> end of speech
+    const STABLE_MS = 7000;       // committed words unchanged this long -> end of speech (client fallback)
+    const GAP_S = 5.0;            // Whisper-VAD trailing silence (real, noise-immune) -> end of speech
     let hasSpoken = false;
     let noiseFloor = 1;           // tracks background (min rms); starts high, drops to real floor
     let streamBusy = false;       // a partial transcription is in flight
