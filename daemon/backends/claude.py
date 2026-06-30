@@ -345,12 +345,20 @@ class ClaudeAgentSDK(AgentSDK):
         raw_usage = getattr(msg, 'usage', None)
         return VibeNodeMessage(
             kind=MessageKind.RESULT,
+            # subtype distinguishes success / error_during_execution /
+            # error_max_turns; the daemon uses it (plus the result text below)
+            # to classify an is_error result as transient vs permanent for the
+            # API-error auto-retry.  See SessionManager._classify_result_error.
+            subtype=getattr(msg, 'subtype', '') or '',
             cost_usd=getattr(msg, 'total_cost_usd', 0.0) or 0.0,
             is_error=getattr(msg, 'is_error', False),
             session_id=getattr(msg, 'session_id', None),
             usage=dict(raw_usage) if raw_usage and isinstance(raw_usage, dict) else {},
             duration_ms=getattr(msg, 'duration_ms', 0) or 0,
             num_turns=getattr(msg, 'num_turns', 0) or 0,
+            # The error/result text — carried so the retry classifier can match
+            # transient signatures (overload / 429 / 529 / 5xx / timeout / …).
+            data={'result': getattr(msg, 'result', '') or ''},
             raw=msg,
         )
 

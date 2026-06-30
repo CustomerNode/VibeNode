@@ -635,6 +635,18 @@ class DaemonClient:
             "session_id": session_id,
         })
 
+    def cancel_auto_retry(self, session_id):
+        """Cancel a pending API-error auto-retry countdown (Cancel button)."""
+        return self._send_request("cancel_auto_retry", {
+            "session_id": session_id,
+        })
+
+    def retry_now(self, session_id):
+        """Fire the auto-retry / manual retry immediately (Retry-now button)."""
+        return self._send_request("retry_now", {
+            "session_id": session_id,
+        })
+
     def close_session(self, session_id):
         return self._send_request("close_session", {
             "session_id": session_id,

@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import signal
 import subprocess as _subprocess
@@ -269,6 +270,21 @@ class SessionInfo:
     _last_asst_uuid: str = ""                            # cached from JSONL, updated by _process_message
     created_ts: float = 0.0  # time.time() when session was created
     _cli_pid: int = 0  # PID of the CLI subprocess, for orphan cleanup
+    # ── API-error auto-retry (see SessionManager._API_RETRY_* + _arm_api_retry) ──
+    # When a turn ends with a *transient* API error (overload/429/529/5xx/network),
+    # the session automatically resumes ("Continue from where you left off") on an
+    # exponential backoff, spanning hours so overnight tasks survive long outages.
+    # These four fields are serialized in to_state_dict() so the UI can render a
+    # live "Auto-retrying in 12m… (attempt X/Y)" countdown with Cancel / Retry-now.
+    retry_at: float = 0.0          # epoch time.time() when the next auto-retry fires; 0 == none pending
+    retry_attempt: int = 0         # 1-based number of the retry currently being counted down
+    retry_max: int = 0             # total auto-retries that will be attempted before giving up
+    retry_reason: str = ""         # short human string for why we're retrying (e.g. "API overloaded")
+    _api_retry_count: int = 0                       # attempts already consumed; accumulates until _API_RETRY_MAX, reset on a genuine new user message
+    _api_retry_task: Optional[asyncio.Task] = None  # the pending backoff timer task (cancelled by Cancel / new message / interrupt / close)
+    _api_retry_needed: bool = False                 # set on a transient error (RESULT is_error, non-transport exception, or escalated stream-heal); consumed by the drive-loop finally to arm the timer
+    _retry_needs_reconnect: bool = False            # True when the retry follows a dead transport (CLI crash / connectivity loss) so the timer must _reconnect_client before resending
+    _ever_got_result: bool = False                  # True once the session has produced at least one RESULT (so the SDK id was remapped to a real UUID and the session is --resume-able).  A transport crash BEFORE this can't reconnect, so we don't escalate it to the long backoff.
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self):
@@ -292,6 +308,14 @@ class SessionInfo:
         # Always include substatus so the frontend can distinguish
         # "cleared" (empty string) from "not provided" (key absent).
         d["substatus"] = self.substatus
+        # Auto-retry countdown fields — always present (like substatus) so the
+        # UI can tell "no retry pending" (retry_at == 0) from "key absent".
+        # The browser computes the live "Auto-retrying in Ns…" countdown from
+        # retry_at locally, so no per-second emit is needed.
+        d["retry_at"] = self.retry_at
+        d["retry_attempt"] = self.retry_attempt
+        d["retry_max"] = self.retry_max
+        d["retry_reason"] = self.retry_reason
         if self.usage:
             d["usage"] = self.usage
         # Include permission details for WAITING sessions so reconnecting
@@ -654,7 +678,8 @@ class SessionManager:
         )
         return {"ok": True}
 
-    def send_message(self, session_id: str, text: str, _self_heal: bool = False) -> dict:
+    def send_message(self, session_id: str, text: str, _self_heal: bool = False,
+                     _auto_retry: bool = False) -> dict:
         """Send a follow-up message to an idle session.
 
         If the session is busy (WORKING/WAITING/STARTING), the message is
@@ -664,6 +689,10 @@ class SessionManager:
 
         _self_heal: internal flag -- when True, the call is a self-healing
         retry and the heal counter is NOT reset (so the <=3 limit works).
+        _auto_retry: internal flag -- when True, the call is an API-error
+        auto-retry and the _api_retry_count is NOT reset (so the
+        _API_RETRY_MAX cap works across the backoff chain).  Any other
+        send (a genuine new user message) resets the retry budget.
         """
         session_id = self._resolve_id(session_id)
         with self._lock:
@@ -746,6 +775,15 @@ class SessionManager:
                 if hasattr(info, '_stream_heal_count'):
                     info._stream_heal_count = 0
                 info._stream_heal_needed = False
+            # A genuine new user message (not a self-heal or auto-retry resend)
+            # is the user "taking over": cancel any pending API-error auto-retry,
+            # reset its budget so the next failure starts a fresh backoff chain,
+            # and clear the prior error banner.  An _auto_retry resend preserves
+            # the accumulating counter (the cap depends on it); _fire_api_retry
+            # has already cleared the countdown fields for it.
+            if not _self_heal and not _auto_retry:
+                self._clear_api_retry(info, reset_count=True)
+                info.error = ""
             # Read (but do NOT clear) the interrupted flag. Clearing it
             # here races: the old task's CancelledError/finally handler
             # runs on the event loop and checks _interrupted — if we clear
@@ -948,6 +986,9 @@ class SessionManager:
         if (
             info
             and info.state == SessionState.IDLE
+            # Same retry gate as _emit_state: a message queued DURING an
+            # auto-retry countdown must wait behind the recovery, not preempt it.
+            and not (getattr(info, 'retry_at', 0) > 0)
             and not (
                 getattr(info, '_in_post_turn', False)
                 and getattr(info, '_wakeup_pending', False)
@@ -1015,6 +1056,8 @@ class SessionManager:
         info._wakeup_max_delay = 0.0
         info._wakeup_is_scheduled = False
         info.substatus = ""
+        # Cancel any pending API-error auto-retry — the user took over.
+        self._clear_api_retry(info, reset_count=True)
         # Capture the task NOW so _interrupt_session cancels the right one.
         # Without this, if the user sends a new message before
         # _interrupt_session runs, info.task gets replaced by the new
@@ -1052,12 +1095,94 @@ class SessionManager:
         info._wakeup_max_delay = 0.0
         info._wakeup_is_scheduled = False
         info.substatus = ""
+        # Cancel any pending API-error auto-retry — the session is closing.
+        self._clear_api_retry(info, reset_count=True)
         self._emit_state(info)
 
         asyncio.run_coroutine_threadsafe(
             self._close_session(session_id), self._loop
         )
         return {"ok": True}
+
+    def cancel_auto_retry(self, session_id: str) -> dict:
+        """Cancel a pending API-error auto-retry (the Cancel button).
+
+        Leaves the session idle with the error visible and the retry budget
+        reset, so the user can type a fresh message or click manual Retry.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return {"ok": False, "error": "Session not found"}
+        had_pending = info.retry_at > 0
+        self._clear_api_retry(info, reset_count=True)
+        if had_pending:
+            info.error = "Auto-retry cancelled — use Retry or type a new message"
+            entry = LogEntry(kind="system", text="Auto-retry cancelled.")
+            with info._lock:
+                info.entries.append(entry)
+                entry_index = len(info.entries) - 1
+            self._emit_entry(session_id, entry, entry_index)
+        if info.state != SessionState.STOPPED:
+            info.state = SessionState.IDLE
+        self._emit_state(info)
+        return {"ok": True}
+
+    def retry_now(self, session_id: str) -> dict:
+        """Resend the last user message immediately (the Retry-now button during
+        a countdown, or the manual Retry button after the budget was exhausted
+        or a permanent error).
+
+        During an active countdown the accumulating attempt counter is preserved
+        (the _API_RETRY_MAX cap still applies).  A manual retry from a settled
+        error state (no countdown) instead restores the full auto-retry budget,
+        treating the click as a fresh start.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return {"ok": False, "error": "Session not found"}
+        if info.state == SessionState.STOPPED:
+            return {"ok": False, "error": "Session is stopped"}
+        if info.state != SessionState.IDLE:
+            return {"ok": False, "error": "Session is %s, not idle" % info.state.value}
+        countdown_active = info.retry_at > 0
+        self._cancel_api_retry_task(info)
+        if not countdown_active:
+            # Manual retry from an error state — fresh start, full budget.
+            info._api_retry_count = 0
+            info.error = ""
+        if getattr(info, '_retry_needs_reconnect', False):
+            # Transport is dead (connectivity loss / CLI crash) — reconnect on
+            # the loop before resending.  Done async so we don't block the
+            # caller's request thread on a network reconnect.
+            asyncio.run_coroutine_threadsafe(
+                self._do_retry_now_reconnect(session_id), self._loop
+            )
+        else:
+            self._fire_api_retry(session_id, info)
+        return {"ok": True}
+
+    async def _do_retry_now_reconnect(self, session_id: str) -> None:
+        """Reconnect-then-fire path for retry_now when the transport is dead."""
+        with self._lock:
+            info = self._sessions.get(self._resolve_id(session_id))
+        if not info:
+            return
+        reconnected = False
+        try:
+            reconnected = await self._reconnect_client(session_id, info)
+        except Exception as rc_err:
+            logger.warning("retry_now reconnect for %s raised: %s", session_id, rc_err)
+        if not reconnected:
+            info.error = "Reconnect failed — connection may still be down. Try again."
+            info.state = SessionState.IDLE
+            self._emit_state(info)
+            return
+        info._retry_needs_reconnect = False
+        self._fire_api_retry(session_id, info)
 
     def close_session_sync(self, session_id: str, timeout: float = 5.0) -> dict:
         """Close an SDK session and block until the disconnect finishes."""
@@ -1569,11 +1694,27 @@ class SessionManager:
             # next user query will read them as stale.  The drain itself
             # decides whether there's anything to consume right now.
             if result_handled and info.task is asyncio.current_task():
-                await self._post_turn_compact_drain(session_id, info)
-                info._awaiting_compact_drain = False
-                if info.task is asyncio.current_task() \
-                        and info.state == SessionState.IDLE:
-                    self._emit_state(info)
+                # API-error auto-retry takes precedence over the post-turn
+                # listener.  CRITICAL (found via live-CLI fault testing): after
+                # a transient error RESULT there is NO auto-resume content
+                # coming, so _post_turn_compact_drain's extended listener blocks
+                # forever waiting for it — which means this coroutine never
+                # returns and the drive-loop *finally* (where arming used to
+                # live) never runs.  The session then dead-ends at IDLE: exactly
+                # the "ended with error then stopped forever" bug.  So when a
+                # retry was flagged this turn, arm it directly here and SKIP the
+                # drain entirely.  (The transport self-heal still owns its own
+                # path; don't arm over it.)
+                if getattr(info, '_api_retry_needed', False) \
+                        and not getattr(info, '_stream_heal_needed', False):
+                    info.state = SessionState.IDLE
+                    self._arm_api_retry(info.session_id, info)
+                else:
+                    await self._post_turn_compact_drain(session_id, info)
+                    info._awaiting_compact_drain = False
+                    if info.task is asyncio.current_task() \
+                            and info.state == SessionState.IDLE:
+                        self._emit_state(info)
 
             # Safety net: if the stream ended without a ResultMessage,
             # force IDLE so the session isn't stuck.  Skip if we already
@@ -1654,7 +1795,9 @@ class SessionManager:
                         entry_index = len(info.entries) - 1
                     self._emit_entry(session_id, entry, entry_index)
                 else:
-                    # Non-transport error: reconnect but don't auto-retry
+                    # Non-transport error (e.g. an API 5xx / overload raised
+                    # mid-stream): reconnect the client, then auto-retry on the
+                    # exponential backoff if the error is transient.
                     entry = LogEntry(kind="system", text=f"Stream lost — reconnecting...", is_error=True)
                     with info._lock:
                         info.entries.append(entry)
@@ -1664,7 +1807,13 @@ class SessionManager:
                     if await self._reconnect_client(session_id, info):
                         info.state = SessionState.IDLE
                         info.error = ""
-                        entry = LogEntry(kind="system", text="Reconnected successfully")
+                        # Detection channel (b): flag a backoff auto-retry for a
+                        # transient API error.  The finally block arms it.
+                        if self._flag_api_retry_if_transient(info, err_str):
+                            _txt = "API error (%s) — auto-retry scheduled…" % info.retry_reason
+                        else:
+                            _txt = "Reconnected successfully"
+                        entry = LogEntry(kind="system", text=_txt)
                         with info._lock:
                             info.entries.append(entry)
                             entry_index = len(info.entries) - 1
@@ -1760,9 +1909,37 @@ class SessionManager:
                                 self._emit_state(info)
                         else:
                             info._stream_heal_count = 0
+                            # Reconnect itself failed — likely connectivity is
+                            # down.  Escalate to the long backoff (it retries the
+                            # reconnect on the backoff schedule) rather than
+                            # dead-ending with "please resend".
+                            if self._escalate_heal_to_backoff(info, "Connection lost"):
+                                info.state = SessionState.IDLE
+                            else:
+                                entry = LogEntry(
+                                    kind="system",
+                                    text="Reconnect failed — please resend your message",
+                                    is_error=True,
+                                )
+                                with info._lock:
+                                    info.entries.append(entry)
+                                    entry_index = len(info.entries) - 1
+                                self._emit_entry(session_id, entry, entry_index)
+                                info.state = SessionState.IDLE
+                                self._emit_state(info)
+                    else:
+                        info._stream_heal_count = 0
+                        # Persistent transport failure (the quick 3-try heal
+                        # couldn't recover) \u2014 most likely a connectivity outage.
+                        # Escalate to the long exponential backoff so an
+                        # overnight task rides it out instead of dead-ending.
+                        if self._escalate_heal_to_backoff(info, "Connection lost"):
+                            info.state = SessionState.IDLE
+                            # the API-retry arm block (below) emits the countdown
+                        else:
                             entry = LogEntry(
                                 kind="system",
-                                text="Reconnect failed — please resend your message",
+                                text="Too many stream errors \u2014 please resend your message",
                                 is_error=True,
                             )
                             with info._lock:
@@ -1771,25 +1948,26 @@ class SessionManager:
                             self._emit_entry(session_id, entry, entry_index)
                             info.state = SessionState.IDLE
                             self._emit_state(info)
-                    else:
-                        info._stream_heal_count = 0
-                        entry = LogEntry(
-                            kind="system",
-                            text="Too many stream errors \u2014 please resend your message",
-                            is_error=True,
-                        )
-                        with info._lock:
-                            info.entries.append(entry)
-                            entry_index = len(info.entries) - 1
-                        self._emit_entry(session_id, entry, entry_index)
-                        info.state = SessionState.IDLE
-                        self._emit_state(info)
             except Exception as heal_err:
                 logger.exception("Self-healing failed for %s: %s", session_id, heal_err)
                 if info:
                     info._stream_heal_count = 0
                     info.state = SessionState.IDLE
                     self._emit_state(info)
+
+            # ── API-error auto-retry: a transient error RESULT this turn asked
+            # for an automatic retry on exponential backoff.  Arm the countdown
+            # timer here (state has settled).  Skip if the transport self-heal
+            # already owns a retry of the same message — avoids a double-send.
+            try:
+                if info and getattr(info, '_api_retry_needed', False) \
+                        and not getattr(info, '_stream_heal_needed', False):
+                    self._arm_api_retry(info.session_id, info)
+            except Exception as _retry_err:
+                logger.exception("Arming API auto-retry failed for %s: %s",
+                                 session_id, _retry_err)
+                if info:
+                    info._api_retry_needed = False
 
             # Post-turn snapshot: captures file state AFTER Claude's edits.
             # By now the SDK remap has occurred (ResultMessage was processed
@@ -2198,13 +2376,24 @@ class SessionManager:
             # them as stale.  The drain itself decides whether there's
             # anything to consume right now.
             if result_handled and info.task is asyncio.current_task():
-                await self._post_turn_compact_drain(session_id, info)
-                info._awaiting_compact_drain = False
-                # Emit IDLE if drain didn't already transition state (e.g.
-                # superseded by a new task).
-                if info.task is asyncio.current_task() \
-                        and info.state == SessionState.IDLE:
-                    self._emit_state(info)
+                # API-error auto-retry takes precedence over the post-turn
+                # listener — see the matching block in _drive_session for the
+                # full rationale.  After a transient error RESULT the extended
+                # listener would block waiting for auto-resume content that
+                # never arrives, so this coroutine would never return and the
+                # finally's arm would never run.  Arm directly + skip the drain.
+                if getattr(info, '_api_retry_needed', False) \
+                        and not getattr(info, '_stream_heal_needed', False):
+                    info.state = SessionState.IDLE
+                    self._arm_api_retry(info.session_id, info)
+                else:
+                    await self._post_turn_compact_drain(session_id, info)
+                    info._awaiting_compact_drain = False
+                    # Emit IDLE if drain didn't already transition state (e.g.
+                    # superseded by a new task).
+                    if info.task is asyncio.current_task() \
+                            and info.state == SessionState.IDLE:
+                        self._emit_state(info)
 
             # Safety net: if the stream ended without a ResultMessage,
             # force IDLE so the session isn't stuck forever.  Skip if we
@@ -2281,6 +2470,9 @@ class SessionManager:
                         entry_index = len(info.entries) - 1
                     self._emit_entry(session_id, entry, entry_index)
                 else:
+                    # Non-transport error (e.g. an API 5xx / overload raised
+                    # mid-stream): reconnect, then auto-retry on the exponential
+                    # backoff if the error is transient.
                     entry = LogEntry(kind="system", text="Stream lost — reconnecting...")
                     with info._lock:
                         info.entries.append(entry)
@@ -2290,7 +2482,13 @@ class SessionManager:
                     if await self._reconnect_client(session_id, info):
                         info.state = SessionState.IDLE
                         info.error = ""
-                        entry = LogEntry(kind="system", text="Reconnected successfully")
+                        # Detection channel (b): flag a backoff auto-retry for a
+                        # transient API error.  The finally block arms it.
+                        if self._flag_api_retry_if_transient(info, err_str):
+                            _txt = "API error (%s) — auto-retry scheduled…" % info.retry_reason
+                        else:
+                            _txt = "Reconnected successfully"
+                        entry = LogEntry(kind="system", text=_txt)
                         with info._lock:
                             info.entries.append(entry)
                             entry_index = len(info.entries) - 1
@@ -2386,9 +2584,37 @@ class SessionManager:
                                 self._emit_state(info)
                         else:
                             info._stream_heal_count = 0
+                            # Reconnect itself failed — likely connectivity is
+                            # down.  Escalate to the long backoff (it retries the
+                            # reconnect on the backoff schedule) rather than
+                            # dead-ending with "please resend".
+                            if self._escalate_heal_to_backoff(info, "Connection lost"):
+                                info.state = SessionState.IDLE
+                            else:
+                                entry = LogEntry(
+                                    kind="system",
+                                    text="Reconnect failed — please resend your message",
+                                    is_error=True,
+                                )
+                                with info._lock:
+                                    info.entries.append(entry)
+                                    entry_index = len(info.entries) - 1
+                                self._emit_entry(session_id, entry, entry_index)
+                                info.state = SessionState.IDLE
+                                self._emit_state(info)
+                    else:
+                        info._stream_heal_count = 0
+                        # Persistent transport failure (the quick 3-try heal
+                        # couldn't recover) — most likely a connectivity outage.
+                        # Escalate to the long exponential backoff so an
+                        # overnight task rides it out instead of dead-ending.
+                        if self._escalate_heal_to_backoff(info, "Connection lost"):
+                            info.state = SessionState.IDLE
+                            # the API-retry arm block (below) emits the countdown
+                        else:
                             entry = LogEntry(
                                 kind="system",
-                                text="Reconnect failed — please resend your message",
+                                text="Too many stream errors — please resend your message",
                                 is_error=True,
                             )
                             with info._lock:
@@ -2397,25 +2623,28 @@ class SessionManager:
                             self._emit_entry(session_id, entry, entry_index)
                             info.state = SessionState.IDLE
                             self._emit_state(info)
-                    else:
-                        info._stream_heal_count = 0
-                        entry = LogEntry(
-                            kind="system",
-                            text="Too many stream errors — please resend your message",
-                            is_error=True,
-                        )
-                        with info._lock:
-                            info.entries.append(entry)
-                            entry_index = len(info.entries) - 1
-                        self._emit_entry(session_id, entry, entry_index)
-                        info.state = SessionState.IDLE
-                        self._emit_state(info)
             except Exception as heal_err:
                 logger.exception("Self-healing failed for %s: %s", session_id, heal_err)
                 if info:
                     info._stream_heal_count = 0
                     info.state = SessionState.IDLE
                     self._emit_state(info)
+
+            # ── API-error auto-retry: a transient error this turn (an is_error
+            # RESULT, a non-transport API exception, or an escalated stream-heal)
+            # asked for an automatic retry on exponential backoff.  Arm the
+            # countdown timer here (state has settled).  Skip if the transport
+            # self-heal still owns a retry of the same message — avoids a
+            # double-send.
+            try:
+                if info and getattr(info, '_api_retry_needed', False) \
+                        and not getattr(info, '_stream_heal_needed', False):
+                    self._arm_api_retry(info.session_id, info)
+            except Exception as _retry_err:
+                logger.exception("Arming API auto-retry failed for %s: %s",
+                                 session_id, _retry_err)
+                if info:
+                    info._api_retry_needed = False
 
             # Post-turn snapshot (isSnapshotUpdate=true, linked to assistant UUID)
             try:
@@ -3910,14 +4139,84 @@ class SessionManager:
                 info.usage['duration_ms'] = duration_ms
                 info.usage['num_turns'] = num_turns
 
+            # The session has now produced a RESULT — by this point the SDK id
+            # has been remapped to a real resumable UUID.  A transport crash from
+            # here on can --resume; a crash BEFORE this cannot (see escalation).
+            info._ever_got_result = True
+
             is_error = message.is_error
             if is_error:
-                info.error = "Session ended with error"
-                entry = LogEntry(kind="system", text="Session ended with error", is_error=True)
+                # Classify the error to decide whether an automatic retry is
+                # worthwhile.  Transient failures (overload/429/529/5xx/network)
+                # are resent on an exponential backoff; permanent ones
+                # (max-turns, invalid request, auth) surface the error and a
+                # manual Retry button instead.  See _classify_result_error.
+                #
+                # We only FLAG the retry here (info._api_retry_needed); the
+                # actual backoff timer is armed in the drive-loop finally block
+                # once turn state has fully settled — mirroring how
+                # _stream_heal_needed is handled.
+                _result_text = ""
+                try:
+                    _result_text = (message.data or {}).get('result', '') or ''
+                except Exception:
+                    _result_text = ""
+                _err_class = self._classify_result_error(message.subtype, _result_text)
+                # Never arm a retry if there's no user message to replay (e.g. a
+                # bare connect failure with an empty transcript).
+                _has_user_msg = False
+                with info._lock:
+                    for _e in reversed(info.entries):
+                        if _e.kind == "user":
+                            _has_user_msg = True
+                            break
+                _can_retry = (
+                    _err_class == "transient"
+                    and info._api_retry_count < self._API_RETRY_MAX
+                    and _has_user_msg
+                )
+                if _can_retry:
+                    info._api_retry_needed = True
+                    info.retry_reason = self._retry_reason_text(_result_text)
+                    info.error = ""  # not a dead-end — an auto-retry is coming
+                    # (The retry prompt — continue vs. re-send original — is
+                    # decided in _fire_api_retry from the transcript: whether the
+                    # failed turn produced any real assistant text yet.)
+                    entry = LogEntry(
+                        kind="system",
+                        text="Turn ended with a transient error (%s) — auto-retry scheduled…"
+                             % info.retry_reason,
+                        is_error=True,
+                    )
+                else:
+                    info._api_retry_needed = False
+                    if (_err_class == "transient" and _has_user_msg
+                            and info._api_retry_count >= self._API_RETRY_MAX):
+                        # Transient, but we've exhausted the auto-retry budget.
+                        n = info._api_retry_count
+                        info.error = ("Auto-retry gave up after %d attempt%s — "
+                                      "use Retry to try again"
+                                      % (n, "" if n == 1 else "s"))
+                        _txt = ("Auto-retry gave up after %d attempt%s. "
+                                "Use Retry to try again." % (n, "" if n == 1 else "s"))
+                    else:
+                        info.error = "Session ended with error"
+                        _txt = "Session ended with error"
+                    entry = LogEntry(kind="system", text=_txt, is_error=True)
                 with info._lock:
                     info.entries.append(entry)
                     entry_index = len(info.entries) - 1
                 self._emit_entry(session_id, entry, entry_index)
+            else:
+                # Successful (non-error) turn — clear any accumulated auto-retry
+                # budget so a later, unrelated failure starts its backoff fresh.
+                if info._api_retry_count or info.retry_at or info._api_retry_needed:
+                    info._api_retry_needed = False
+                    info._api_retry_count = 0
+                    info.retry_at = 0.0
+                    info.retry_attempt = 0
+                    info.retry_max = 0
+                    info.retry_reason = ""
 
             # Remap session ID if the SDK assigned a different one
             result_session_id = message.session_id
@@ -4099,6 +4398,451 @@ class SessionManager:
     _WAKEUP_DEADLINE_GRACE = 120.0
     # SDK clamp on ScheduleWakeup.delaySeconds — used to bound a claimed delay.
     _WAKEUP_SCHEDULE_MAX = 3600.0
+
+    # ── API-error auto-retry policy ──────────────────────────────────────
+    # When a turn ends with a *transient* API error result (overload/429/529/
+    # 5xx/network/timeout), the session automatically tries to CONTINUE on an
+    # exponential backoff: base_delay = min(BASE * FACTOR**attempt, CAP), then a
+    # random jitter of +/-JITTER is applied (so many sessions don't retry in
+    # lockstep and hammer the API at the same instants).
+    #
+    # The defaults are tuned for *unattended overnight resilience*, not fast
+    # recovery: an overnight task that hits a multi-hour outage should keep
+    # trying until the API comes back, while still polling often enough (cap
+    # 30 min between tries) to resume promptly once it does.  With BASE=10,
+    # FACTOR=2, CAP=1800, MAX=30 the interval ramps 10s, 20s, 40s, 80s, … up to
+    # the 30-min cap (~attempt 9), then holds there — giving a total retry
+    # window of ~14 hours across 30 attempts before it finally gives up and
+    # surfaces a manual Retry button.  That comfortably survives a 2-hour (or
+    # full overnight) outage.
+    #
+    # This complements the *transport*-error self-heal (_stream_heal_needed)
+    # which covers "Stream closed"/process death; an API error RESULT never
+    # sets that flag, so without this it dead-ends at IDLE.
+    # All knobs are overridable via env for testing / per-deployment tuning.
+    _API_RETRY_MAX = int(os.environ.get("VIBENODE_API_RETRY_MAX", "30"))
+    _API_RETRY_BASE = float(os.environ.get("VIBENODE_API_RETRY_BASE", "10"))
+    _API_RETRY_FACTOR = float(os.environ.get("VIBENODE_API_RETRY_FACTOR", "2"))
+    _API_RETRY_CAP = float(os.environ.get("VIBENODE_API_RETRY_CAP", "1800"))  # 30 min max between tries
+    _API_RETRY_JITTER = float(os.environ.get("VIBENODE_API_RETRY_JITTER", "0.2"))  # +/-20%
+    # The prompt the auto-retry resends.  We deliberately do NOT replay the
+    # original instruction — the failed turn may have already done partial work
+    # (edits, commits, tool calls), and re-running the instruction would
+    # duplicate it.  "Continue from where you left off" resumes the in-progress
+    # work using the session transcript the SDK already has.
+    _API_RETRY_CONTINUE_PROMPT = os.environ.get(
+        "VIBENODE_API_RETRY_CONTINUE_PROMPT", "Continue from where you left off.")
+
+    @staticmethod
+    def _api_retry_delay(attempt: int) -> float:
+        """Deterministic exponential backoff base delay (seconds) for retry index
+        ``attempt`` (0-based), BEFORE jitter.
+
+        Pure function (no clock, no randomness, no I/O) so it can be unit-tested
+        directly.  Jitter is applied separately in _apply_jitter so the base
+        schedule stays deterministic.
+        base = min(BASE * FACTOR**attempt, CAP).  attempt is clamped at >= 0.
+        """
+        a = max(0, attempt)
+        return min(
+            SessionManager._API_RETRY_BASE * (SessionManager._API_RETRY_FACTOR ** a),
+            SessionManager._API_RETRY_CAP,
+        )
+
+    @classmethod
+    def _apply_jitter(cls, base_delay: float) -> float:
+        """Apply symmetric +/-JITTER randomness to a base backoff delay.
+
+        Returns base_delay * (1 +/- up-to-JITTER), floored at 0.5s so a jittered
+        early delay can't collapse to ~0.  De-syncs many sessions so they don't
+        all hammer the API on the same cadence during a shared outage.
+        """
+        j = cls._API_RETRY_JITTER
+        if j <= 0:
+            return base_delay
+        return max(0.5, base_delay * (1.0 + random.uniform(-j, j)))
+
+    @staticmethod
+    def _fmt_duration(secs: float) -> str:
+        """Human-friendly duration for log/UI text: '45s', '12m 30s', '2h 5m'."""
+        s = max(0, int(round(secs)))
+        if s < 60:
+            return "%ds" % s
+        m, sec = divmod(s, 60)
+        if m < 60:
+            return "%dm %ds" % (m, sec) if sec else "%dm" % m
+        h, mm = divmod(m, 60)
+        return "%dh %dm" % (h, mm) if mm else "%dh" % h
+
+    @staticmethod
+    def _classify_result_error(subtype: str, result_text: str) -> str:
+        """Classify an ``is_error`` ResultMessage as retryable or not.
+
+        Returns:
+            "transient"  — a temporary, retryable failure (API overload, rate
+                           limit, 5xx, network/timeout).  Auto-retry is armed.
+            "permanent"  — retrying will not help (max-turns reached, invalid
+                           request, auth).  Surface the error + manual Retry.
+
+        The SDK's ResultMessage exposes ``subtype`` (success / error_during_
+        execution / error_max_turns) and ``result`` (the error text).  We match
+        the text against well-known transient signatures; an unrecognised error
+        defaults to "transient" because in practice the overwhelming majority of
+        mid-turn error results are temporary upstream hiccups, and a bounded
+        handful of retries is cheap insurance against a session dead-ending.
+        Pure function — no clock, no I/O — so it is trivially unit-testable.
+        """
+        st = (subtype or "").lower()
+        # error_max_turns: the turn budget is exhausted; resending the same
+        # message just hits the same wall.  Treat as permanent.
+        if "max_turns" in st or "max turns" in st:
+            return "permanent"
+        txt = (result_text or "").lower()
+        # Well-known permanent failures — retrying cannot succeed.
+        _permanent = (
+            "invalid request", "invalid_request", "400 bad request",
+            "authentication", "unauthorized", "401", "403 forbidden",
+            "permission denied", "not found", "404",
+        )
+        if any(sig in txt for sig in _permanent):
+            return "permanent"
+        # Well-known transient failures — safe to retry on backoff.  Includes
+        # connectivity loss (internet down / DNS / TLS) so an overnight task
+        # rides out a network outage the same way it rides out an API overload.
+        _transient = (
+            # API-side overload / rate limit / 5xx
+            "overload", "overloaded", "rate limit", "rate_limit", "ratelimit",
+            "429", "529", "500", "502", "503", "504",
+            "internal server error", "service unavailable", "gateway",
+            "temporarily", "unavailable", "try again",
+            # Connectivity loss (internet down, DNS, TLS, sockets)
+            "timeout", "timed out", "connection", "network",
+            "could not resolve", "name resolution", "getaddrinfo", "dns",
+            "connection refused", "connection reset", "connection aborted",
+            "connection error", "broken pipe", "unreachable", "no route to host",
+            "ssl", "tls", "handshake", "eof occurred", "remote end closed",
+            "temporary failure", "failed to establish", "max retries exceeded",
+        )
+        if any(sig in txt for sig in _transient):
+            return "transient"
+        # Unknown error → default to retryable (bounded by _API_RETRY_MAX).
+        return "transient"
+
+    @staticmethod
+    def _retry_reason_text(result_text: str) -> str:
+        """Short, human-friendly reason string shown in the retry countdown
+        banner (e.g. "API overloaded", "Rate limited").  Pure function."""
+        txt = (result_text or "").lower()
+        if "overload" in txt or "529" in txt:
+            return "API overloaded"
+        if "rate limit" in txt or "rate_limit" in txt or "ratelimit" in txt or "429" in txt:
+            return "Rate limited"
+        if any(c in txt for c in ("500", "502", "503", "504", "internal server error",
+                                  "service unavailable", "gateway")):
+            return "Server error"
+        if any(c in txt for c in ("timeout", "timed out", "connection", "network")):
+            return "Network error"
+        return "Temporary error"
+
+    # ── API-error auto-retry: timer + lifecycle helpers ──────────────────
+    # Flow:  a transient API error is detected on EITHER channel —
+    #   (a) a ResultMessage(is_error=True)  [_process_message], or
+    #   (b) a non-transport exception raised mid-stream  [_drive_session /
+    #       _send_query except handlers, e.g. a 500/503/529 API error]
+    # — and sets info._api_retry_needed.  The drive-loop finally then calls
+    # _arm_api_retry → a backoff timer task (_api_retry_timer) sleeps, then
+    # _fire_api_retry resumes with the CONTINUE prompt via
+    # send_message(_auto_retry=True).  The countdown fields
+    # (retry_at/attempt/max/reason) are serialized so the UI shows a live
+    # "Auto-retrying in 12m…" banner with Cancel / Retry-now controls.
+    # (Transport errors — "Stream closed"/process death — are handled by the
+    # separate _stream_heal mechanism, not this.)
+
+    def _has_user_message(self, info: SessionInfo) -> bool:
+        """True if the transcript has at least one user message — i.e. there's
+        actually a turn to resume.  Guards against arming a retry on a bare
+        connect failure with nothing to continue."""
+        with info._lock:
+            for e in reversed(info.entries):
+                if e.kind == "user":
+                    return True
+        return False
+
+    def _flag_api_retry_if_transient(self, info: SessionInfo, err_str: str) -> bool:
+        """Detection for channel (b): a non-transport stream exception.
+
+        If ``err_str`` classifies as a transient API error (5xx / overload /
+        rate-limit / network — and, by the classifier's default, any other
+        non-permanent error), flag an auto-retry so the drive-loop finally arms
+        the exponential backoff.  Permanent errors (400 invalid request, auth,
+        max-turns) are NOT flagged — they keep the plain reconnect-and-idle
+        behavior.  Returns True if a retry was flagged.
+        """
+        if self._classify_result_error("", err_str) != "transient":
+            return False
+        if info._api_retry_count >= self._API_RETRY_MAX:
+            return False
+        if not self._has_user_message(info):
+            return False
+        info._api_retry_needed = True
+        info.retry_reason = self._retry_reason_text(err_str)
+        return True
+
+    def _escalate_heal_to_backoff(self, info: SessionInfo, reason: str) -> bool:
+        """Detection for channel (c): a dead transport (CLI crash / connectivity
+        loss) that the short stream-heal couldn't recover within its quick 3-try
+        budget.  Rather than dead-ending with "please resend", escalate to the
+        long exponential backoff so an overnight task rides out a multi-hour
+        internet outage — reconnecting the CLI each attempt until it comes back.
+
+        Returns True if the escalation was flagged (the drive-loop finally then
+        arms the backoff); False if not eligible (no turn to resume, or the
+        backoff budget is already exhausted) so the caller keeps the existing
+        "please resend" fallback.
+        """
+        if not self._has_user_message(info):
+            return False
+        if info._api_retry_count >= self._API_RETRY_MAX:
+            return False
+        # A transport crash BEFORE the session ever produced a RESULT can't be
+        # resumed — the SDK id was never remapped to a real UUID, so every
+        # _reconnect_client --resume fails identically.  Escalating would just
+        # spin a doomed reconnect for the whole backoff budget.  Don't: let the
+        # caller fall back to "please resend" (nothing was accomplished anyway).
+        if not getattr(info, '_ever_got_result', False):
+            return False
+        info._api_retry_needed = True
+        info._retry_needs_reconnect = True   # transport is dead — reconnect before resending
+        info.retry_reason = reason
+        return True
+
+    def _cancel_api_retry_task(self, info: SessionInfo) -> None:
+        """Cancel a pending backoff timer task if present (idempotent, thread-safe).
+
+        Task.cancel() must run on the loop thread, but this helper is also called
+        from Flask-thread paths (send_message, interrupt, close, cancel/retry
+        actions), so route the cancel through the loop when we're off-thread.
+        """
+        task = info._api_retry_task
+        info._api_retry_task = None
+        if task is None or task.done():
+            return
+        try:
+            loop = self._loop
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(task.cancel)
+            else:
+                task.cancel()
+        except Exception:
+            pass
+
+    def _clear_api_retry(self, info: SessionInfo, reset_count: bool = True) -> None:
+        """Cancel any pending timer and clear the countdown fields.
+
+        reset_count=True also zeroes the accumulated attempt counter — used when
+        the user starts fresh (genuine new message, Cancel, interrupt, close).
+        reset_count=False preserves the counter so attempts keep accumulating
+        toward _API_RETRY_MAX across an auto-retry chain.
+        """
+        self._cancel_api_retry_task(info)
+        info._api_retry_needed = False
+        info._retry_needs_reconnect = False
+        info.retry_at = 0.0
+        info.retry_attempt = 0
+        info.retry_max = 0
+        info.retry_reason = ""
+        if reset_count:
+            info._api_retry_count = 0
+
+    def _arm_api_retry(self, session_id: str, info: SessionInfo) -> None:
+        """Schedule an automatic retry after an exponential-backoff delay.
+
+        Non-blocking: sets the countdown fields, emits state so the UI shows the
+        live countdown, and starts a timer task.  Called from the drive-loop
+        finally block when info._api_retry_needed was set this turn.  Must run on
+        the manager's event loop (the finally blocks do).
+        """
+        info._api_retry_needed = False
+        # Eligibility: never arm over a stopped session or one that already has a
+        # new turn in flight (e.g. a queued message dispatched on the post-turn
+        # IDLE) — that turn supersedes the retry.
+        if info.state in (SessionState.STOPPED, SessionState.WORKING,
+                          SessionState.WAITING, SessionState.STARTING):
+            return
+        attempt = info._api_retry_count  # 0-based index of the attempt to schedule
+        if attempt >= self._API_RETRY_MAX:
+            # Budget already exhausted — _process_message normally handles this,
+            # but guard here too so we never schedule a no-op timer.
+            return
+        # Deterministic base delay, then jitter so sessions don't retry in
+        # lockstep.  The jittered value drives BOTH the timer and retry_at, so
+        # the UI countdown matches when the retry actually fires.
+        delay = self._apply_jitter(self._api_retry_delay(attempt))
+        self._cancel_api_retry_task(info)  # drop any stale timer first
+        info.retry_at = time.time() + delay
+        info.retry_attempt = attempt + 1
+        info.retry_max = self._API_RETRY_MAX
+        # info.retry_reason was set in _process_message
+        info.error = ""
+        info.state = SessionState.IDLE
+        entry = LogEntry(
+            kind="system",
+            text="Auto-retrying in %s (attempt %d/%d)…" % (
+                self._fmt_duration(delay), info.retry_attempt, info.retry_max),
+        )
+        with info._lock:
+            info.entries.append(entry)
+            entry_index = len(info.entries) - 1
+        self._emit_entry(session_id, entry, entry_index)
+        self._emit_state(info)
+        try:
+            info._api_retry_task = asyncio.create_task(
+                self._api_retry_timer(session_id, delay)
+            )
+        except RuntimeError:
+            # No running loop (shouldn't happen on the manager loop) — fire
+            # immediately rather than silently stranding the session.
+            logger.warning("_arm_api_retry: no running loop for %s — firing now",
+                           session_id)
+            self._fire_api_retry(session_id, info)
+
+    async def _api_retry_timer(self, session_id: str, delay: float) -> None:
+        """Sleep for the backoff delay, then fire the retry — unless cancelled
+        (Cancel button / new user message / interrupt / close) or the session is
+        no longer eligible (a newer turn started, or it was stopped).
+
+        If the retry follows a dead transport (CLI crash / connectivity loss),
+        reconnect the client first.  If the reconnect itself fails (the outage is
+        still ongoing), count the attempt and re-arm the next backoff rather than
+        giving up — that is what lets a session ride out a multi-hour outage.
+        """
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        with self._lock:
+            info = self._sessions.get(self._resolve_id(session_id))
+        if not info:
+            return
+        # Re-check eligibility: cancelled out from under us, or a new turn began.
+        if info.retry_at <= 0:
+            return
+        if info.state in (SessionState.STOPPED, SessionState.WORKING,
+                          SessionState.WAITING, SessionState.STARTING):
+            return
+
+        if getattr(info, '_retry_needs_reconnect', False):
+            reconnected = False
+            try:
+                reconnected = await self._reconnect_client(session_id, info)
+            except Exception as rc_err:
+                logger.warning("Auto-retry reconnect for %s raised: %s",
+                               session_id, rc_err)
+            if not reconnected:
+                # Still down — consume this attempt and schedule the next
+                # backoff (keep trying through the outage) until the budget runs
+                # out, then surface a manual Retry.
+                info._api_retry_count += 1
+                info.retry_at = 0.0
+                info._api_retry_task = None
+                # Keep state IDLE so the next _arm_api_retry passes its
+                # eligibility guard (a failed reconnect may have left it STOPPED).
+                if info.state != SessionState.IDLE:
+                    info.state = SessionState.IDLE
+                if (info._api_retry_count < self._API_RETRY_MAX
+                        and self._has_user_message(info)):
+                    self._arm_api_retry(info.session_id, info)
+                else:
+                    self._clear_api_retry(info, reset_count=True)
+                    info.error = ("Auto-retry gave up — connection still down. "
+                                  "Use Retry to try again.")
+                    info.state = SessionState.IDLE
+                    self._emit_state(info)
+                return
+            # Reconnected — transport is healthy again; resume normally.
+            info._retry_needs_reconnect = False
+
+        self._fire_api_retry(session_id, info)
+
+    def _fire_api_retry(self, session_id: str, info: SessionInfo) -> None:
+        """Resume the failed turn.  Consumes one attempt from the budget
+        (increments _api_retry_count) and clears the countdown fields, but does
+        NOT reset the counter — the chain must accumulate so the _API_RETRY_MAX
+        cap is honored.
+
+        Prompt choice (set in _process_message via _retry_resend_original):
+        - If the failed turn produced NO output before erroring (error on the
+          first API call), RE-SEND the original request — "continue" would be
+          meaningless and makes the model ramble (confirmed via live-CLI test).
+        - If it had started working, send the CONTINUE prompt so we resume the
+          partial work instead of duplicating it.
+        """
+        # Find the last user message, and whether the failed turn produced any
+        # REAL assistant text after it.  We scan the transcript rather than rely
+        # on _turn_content_started, because the CLI emits empty assistant
+        # message_start events on each internal retry — that flag goes True even
+        # when nothing was actually produced.  An assistant entry with non-empty
+        # text after the last user message is the honest "had output" signal.
+        last_user_text = None
+        had_real_output = False
+        with info._lock:
+            last_user_idx = -1
+            for i in range(len(info.entries) - 1, -1, -1):
+                if info.entries[i].kind == "user":
+                    last_user_idx = i
+                    last_user_text = info.entries[i].text
+                    break
+            if last_user_idx >= 0:
+                for j in range(last_user_idx + 1, len(info.entries)):
+                    e = info.entries[j]
+                    # A TOOL CALL is side-effectful work (edits, commits, writes)
+                    # that must NOT be duplicated — so if the turn ran any tool,
+                    # we CONTINUE rather than re-send.  Pure-text turns (no tools)
+                    # are safe to re-send, so they don't count here.  (Note: the
+                    # CLI surfaces the API error itself as an "asst" text entry,
+                    # which is exactly why we must NOT key off assistant text —
+                    # only an actual tool_use/tool_result means real work was done.)
+                    if e.kind in ("tool_use", "tool_result"):
+                        had_real_output = True
+                        break
+        # Clear only the countdown (keep _api_retry_count accumulating).
+        info.retry_at = 0.0
+        info.retry_attempt = 0
+        info.retry_max = 0
+        info.retry_reason = ""
+        info._api_retry_task = None
+        if not last_user_text:
+            # Nothing to continue — clear out and surface a manual-retry error.
+            self._clear_api_retry(info, reset_count=True)
+            info.error = "Session ended with error"
+            info.state = SessionState.IDLE
+            self._emit_state(info)
+            return
+        if had_real_output:
+            retry_text = self._API_RETRY_CONTINUE_PROMPT
+            note = "Auto-retrying — continuing from where it left off…"
+        else:
+            # No real output before the error — "continue" is meaningless; the
+            # model would ramble.  Re-send the original request for a clean redo.
+            retry_text = last_user_text
+            note = "Auto-retrying — re-sending your request…"
+        info._api_retry_count += 1
+        info.error = ""
+        info.state = SessionState.IDLE
+        entry = LogEntry(kind="system", text=note)
+        with info._lock:
+            info.entries.append(entry)
+            entry_index = len(info.entries) - 1
+        self._emit_entry(session_id, entry, entry_index)
+        # NOTE: deliberately NOT calling _emit_state(IDLE) here.  retry_at is now
+        # 0, so an IDLE emit would open the queue gate and a queued follow-up
+        # could dispatch and jump AHEAD of this continuation.  send_message below
+        # flips the session to WORKING synchronously (closing the gate) and emits
+        # state itself, so the continuation always goes first; the queue then
+        # dispatches when that turn finishes.
+        # Send with the _auto_retry flag so send_message does NOT reset the
+        # accumulated retry counter (only a genuine new user message does).
+        self.send_message(info.session_id, retry_text, _auto_retry=True)
 
     @classmethod
     def _is_scheduled_wakeup(cls, tool_name: str) -> bool:
@@ -5457,6 +6201,13 @@ class SessionManager:
         if (
             info.state == SessionState.IDLE
             and not getattr(info, '_interrupted', False)
+            # Hold the queue while an API-error auto-retry countdown is active.
+            # The retry is the CONTINUATION of the failed turn, so it must run
+            # before the user's queued follow-ups — otherwise a queued message
+            # would jump ahead of the recovery and the failed work would be
+            # abandoned.  When the retry fires (or is cancelled / gives up),
+            # retry_at returns to 0 and the queue dispatches normally.
+            and not (getattr(info, 'retry_at', 0) > 0)
             and not (
                 getattr(info, '_in_post_turn', False)
                 and getattr(info, '_wakeup_pending', False)

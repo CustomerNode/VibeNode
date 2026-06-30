@@ -303,6 +303,8 @@ class SessionDaemon:
             "send_message": self.session_manager.send_message,
             "resolve_permission": self.session_manager.resolve_permission_unified,
             "interrupt_session": self.session_manager.interrupt_session,
+            "cancel_auto_retry": self.session_manager.cancel_auto_retry,
+            "retry_now": self.session_manager.retry_now,
             "close_session": self.session_manager.close_session,
             "close_session_sync": self.session_manager.close_session_sync,
             "remove_session": lambda **kw: self.session_manager.remove_session(**kw) or {"ok": True},
