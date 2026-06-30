@@ -153,11 +153,11 @@ async function _openSessionModelSelector() {
   overlay.innerHTML = '<div class="pm-card pm-enter" style="width:400px;">' +
     '<h2 class="pm-title">Session Model</h2>' +
     '<div class="pm-body"><p>Choose model and thinking level for <strong>this session</strong>. System default is unchanged.</p></div>' +
-    '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;" id="sm-model-list">' +
+    '<div class="msel-list" style="margin-bottom:16px;" id="sm-model-list">' +
     '<span class="spinner"></span></div>' +
     '<div id="sm-thinking-section" style="display:none;margin-bottom:16px;">' +
     '<div style="font-size:11px;font-weight:600;color:var(--text-faint);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;">Thinking Level</div>' +
-    '<div style="display:flex;flex-direction:column;gap:6px;" id="sm-thinking-list"></div>' +
+    '<div class="msel-list" id="sm-thinking-list"></div>' +
     '</div>' +
     '<div class="pm-actions">' +
     '<button class="pm-btn pm-btn-secondary" onclick="_clearSessionModelOverrideAndClose()">Reset to Default</button>' +
@@ -176,7 +176,8 @@ async function _openSessionModelSelector() {
     models = [
       {id: 'claude-opus-4-7',  name: 'Opus 4.7',   desc: '1M context, deepest reasoning'},
       {id: 'claude-opus-4-6',  name: 'Opus 4.6',   desc: 'Deep reasoning, 200K context'},
-      {id: 'claude-sonnet-4-6',name: 'Sonnet 4.6', desc: 'Fast, capable, balanced'},
+      {id: 'claude-sonnet-5',  name: 'Sonnet 5',   desc: 'Most agentic Sonnet, fast & capable'},
+      {id: 'claude-sonnet-4-6',name: 'Sonnet 4.6', desc: 'Previous Sonnet, balanced'},
       {id: 'claude-haiku-4-5', name: 'Haiku 4.5',  desc: 'Fastest, most cost-efficient'},
     ];
   }
@@ -190,17 +191,9 @@ async function _openSessionModelSelector() {
   function _renderModels() {
     const list = document.getElementById('sm-model-list');
     if (!list) return;
-    let html = '';
-    for (const m of models) {
-      const active = m.id === pendingModel;
-      html += '<div class="add-mode-card' + (active ? ' active' : '') + '" data-model="' + (m.id || '') + '" ' +
-        'onclick="_smSelectModel(this)">' +
-        '<div class="add-mode-info">' +
-        '<div class="add-mode-title">' + (m.name || m.id) + '</div>' +
-        (m.desc ? '<div class="add-mode-desc">' + m.desc + '</div>' : '') +
-        '</div></div>';
-    }
-    list.innerHTML = html;
+    list.innerHTML = _modelSelectorGroupsHtml(models, pendingModel);
+    list.querySelectorAll('.msel-row').forEach(row =>
+      row.onclick = () => window._smSelectModel(row));
   }
 
   function _renderThinking() {
@@ -218,14 +211,15 @@ async function _openSessionModelSelector() {
     let html = '';
     for (const l of levels) {
       const active = l.key === pendingThinking;
-      html += '<div class="add-mode-card' + (active ? ' active' : '') + '" style="padding:8px 12px;" data-level="' + l.key + '" ' +
-        'onclick="_smSelectThinking(this)">' +
-        '<div class="add-mode-info">' +
-        '<div class="add-mode-title" style="font-size:12px;">' + l.label + '</div>' +
-        '<div class="add-mode-desc" style="font-size:11px;">' + l.desc + '</div>' +
-        '</div></div>';
+      html += '<div class="msel-row' + (active ? ' active' : '') + '" data-level="' + l.key + '" role="button" tabindex="0">' +
+        _MSEL_CHECK +
+        '<span class="msel-name">' + l.label + '</span>' +
+        '<span class="msel-sub">' + l.desc + '</span>' +
+        '</div>';
     }
     list.innerHTML = html;
+    list.querySelectorAll('.msel-row').forEach(row =>
+      row.onclick = () => window._smSelectThinking(row));
   }
 
   _renderModels();
@@ -238,16 +232,16 @@ async function _openSessionModelSelector() {
   }
 
   // Expose helpers to inline onclick handlers
-  window._smSelectModel = function(card) {
-    document.querySelectorAll('#sm-model-list .add-mode-card').forEach(c => c.classList.remove('active'));
-    card.classList.add('active');
-    pendingModel = card.dataset.model;
+  window._smSelectModel = function(row) {
+    document.querySelectorAll('#sm-model-list .msel-row').forEach(c => c.classList.remove('active'));
+    row.classList.add('active');
+    pendingModel = row.dataset.model;
     _refreshApply();
   };
-  window._smSelectThinking = function(card) {
-    document.querySelectorAll('#sm-thinking-list .add-mode-card').forEach(c => c.classList.remove('active'));
-    card.classList.add('active');
-    pendingThinking = card.dataset.level;
+  window._smSelectThinking = function(row) {
+    document.querySelectorAll('#sm-thinking-list .msel-row').forEach(c => c.classList.remove('active'));
+    row.classList.add('active');
+    pendingThinking = row.dataset.level;
     _refreshApply();
   };
   window._applySessionModelOverride = function() {

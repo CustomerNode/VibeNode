@@ -1585,6 +1585,60 @@ const _MODEL_ALIAS_MIGRATION = {
 })();
 let defaultModel = localStorage.getItem('defaultModel') || 'claude-opus-4-7';
 
+// Group model entries by family (Fable / Opus / Sonnet / Haiku) and render a
+// compact, deliberate grouped selector.  Shared by the system Model picker
+// (openModelSelector) and the per-session selector (_openSessionModelSelector)
+// so both stay visually consistent.
+const _MODEL_FAMILY_ORDER = ['fable', 'opus', 'sonnet', 'haiku'];
+const _MODEL_FAMILY_DOT = { fable: '#e0b341', opus: '#a855f7', sonnet: '#3b82f6', haiku: '#22c4a0' };
+const _MSEL_CHECK = '<svg class="msel-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+
+/** Parse a model entry into {id, family, version, is1m}. */
+function _parseModelEntry(m) {
+  const id = m.id || '';
+  const is1m = /\[1m\]/i.test(id);
+  const core = id.replace(/^claude-/, '').replace(/\[1m\]/i, '').replace(/-\d{8}$/, '');
+  const parts = core.split('-').filter(Boolean);
+  return { id, family: (parts[0] || '').toLowerCase(), version: parts.slice(1).join('.'), is1m };
+}
+
+/** Build grouped-by-family selector HTML. Rows carry data-model; caller wires clicks. */
+function _modelSelectorGroupsHtml(models, selectedId) {
+  const groups = {};
+  const seen = [];
+  for (const m of (models || [])) {
+    const p = _parseModelEntry(m);
+    if (!groups[p.family]) { groups[p.family] = []; seen.push(p.family); }
+    groups[p.family].push({ m, p });
+  }
+  // Known families first (Fable, Opus, Sonnet, Haiku), then any extras as encountered.
+  const fams = _MODEL_FAMILY_ORDER.filter(f => groups[f])
+    .concat(seen.filter(f => !_MODEL_FAMILY_ORDER.includes(f)));
+
+  let html = '';
+  for (const f of fams) {
+    const dot = _MODEL_FAMILY_DOT[f] || 'var(--text-faint)';
+    const label = f ? f.charAt(0).toUpperCase() + f.slice(1) : 'Other';
+    html += '<div class="msel-group-hd"><span class="msel-dot" style="background:' + dot + '"></span>'
+      + '<span class="msel-group-name">' + escHtml(label) + '</span></div>';
+    // Within a family: higher version first; each version's 1M variant follows it.
+    const entries = groups[f].slice().sort((a, b) =>
+      (a.p.version !== b.p.version)
+        ? b.p.version.localeCompare(a.p.version, undefined, { numeric: true })
+        : (a.p.is1m === b.p.is1m ? 0 : (a.p.is1m ? 1 : -1)));
+    for (const { m, p } of entries) {
+      const active = (m.id === selectedId);
+      const verLabel = p.version || m.name || m.id || '';
+      html += '<div class="msel-row' + (active ? ' active' : '') + '" data-model="' + escHtml(m.id || '') + '" role="button" tabindex="0">'
+        + _MSEL_CHECK
+        + '<span class="msel-name">' + escHtml(verLabel) + '</span>'
+        + (p.is1m ? '<span class="msel-tag msel-tag-1m">1M</span>' : '')
+        + '</div>';
+    }
+  }
+  return html;
+}
+
 async function openModelSelector() {
   const overlay = document.getElementById('pm-overlay');
 
@@ -1604,39 +1658,29 @@ async function openModelSelector() {
     models = [
       {id: 'claude-opus-4-7',  name: 'Opus 4.7',   desc: '1M context, deepest reasoning'},
       {id: 'claude-opus-4-6',  name: 'Opus 4.6',   desc: 'Deep reasoning, 200K context'},
-      {id: 'claude-sonnet-4-6',name: 'Sonnet 4.6', desc: 'Fast, capable, balanced'},
+      {id: 'claude-sonnet-5',  name: 'Sonnet 5',   desc: 'Most agentic Sonnet, fast & capable'},
+      {id: 'claude-sonnet-4-6',name: 'Sonnet 4.6', desc: 'Previous Sonnet, balanced'},
       {id: 'claude-haiku-4-5', name: 'Haiku 4.5',  desc: 'Fastest, most cost-efficient'},
     ];
   }
 
-  let cardsHtml = '';
-  for (const m of models) {
-    const key = m.id || '';
-    const isActive = key === defaultModel;
-    const name = m.name || key;
-    const desc = m.desc || '';
-    cardsHtml += '<div class="add-mode-card' + (isActive ? ' active' : '') + '" data-model="' + escHtml(key) + '">'
-      + '<div class="add-mode-info">'
-      + '<div class="add-mode-title">' + escHtml(name) + '</div>'
-      + '<div class="add-mode-desc">' + escHtml(desc) + '</div>'
-      + '</div></div>';
-  }
+  const groupsHtml = _modelSelectorGroupsHtml(models, defaultModel);
 
   overlay.innerHTML = '<div class="pm-card" style="width:380px;">'
     + '<h2 class="pm-title">Select Model</h2>'
-    + '<div class="pm-body"><p>Choose the default model for new sessions.</p></div>'
-    + '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:20px;">' + cardsHtml + '</div>'
-    + '<div class="pm-actions"><button class="pm-btn pm-btn-secondary" id="pm-model-close">Close</button></div></div>';
+    + '<div class="pm-body" style="margin-bottom:14px;"><p>Choose the default model for new sessions.</p></div>'
+    + '<div class="msel-list">' + groupsHtml + '</div>'
+    + '<div class="pm-actions" style="margin-top:18px;"><button class="pm-btn pm-btn-secondary" id="pm-model-close">Close</button></div></div>';
 
   document.getElementById('pm-model-close').onclick = () => _closePm();
   overlay.onclick = e => { if (e.target === overlay) _closePm(); };
-  overlay.querySelectorAll('.add-mode-card').forEach(card => {
-    card.onclick = () => {
-      defaultModel = card.dataset.model;
+  overlay.querySelectorAll('.msel-row').forEach(row => {
+    row.onclick = () => {
+      defaultModel = row.dataset.model;
       localStorage.setItem('defaultModel', defaultModel);
       _closePm();
       _updateModelLabel();
-      showToast('Model: ' + (card.querySelector('.add-mode-title').textContent || 'Default'));
+      showToast('Model: ' + (_modelLabel(defaultModel) || 'Default'));
     };
   });
 }
@@ -1651,6 +1695,7 @@ function _modelLabel(modelId) {
   if (modelId.includes('opus-4-7'))  return 'Opus 4.7';
   if (modelId.includes('opus-4-6') || modelId === 'opus')  return 'Opus 4.6';
   if (modelId.includes('opus'))      return 'Opus';
+  if (modelId.includes('sonnet-5'))  return 'Sonnet 5';
   if (modelId.includes('sonnet-4-6') || (modelId === 'sonnet')) return 'Sonnet 4.6';
   if (modelId.includes('sonnet'))    return 'Sonnet';
   if (modelId.includes('haiku-4-5') || (modelId === 'haiku'))  return 'Haiku 4.5';

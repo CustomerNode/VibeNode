@@ -1014,7 +1014,36 @@ class SessionManager:
         return self._mq.clear_queue(self._resolve_id(session_id))
 
     def _try_dispatch_queue(self, session_id: str) -> None:
-        """Dispatch next queued message — delegates to MessageQueue with send_fn callback."""
+        """Dispatch next queued message — delegates to MessageQueue with send_fn callback.
+
+        CENTRALIZED auto-retry ordering guard.  While an API-error auto-retry
+        countdown is pending (``retry_at > 0``) we must NEVER dispatch a queued
+        follow-up: the retry has to fire first (it resends / continues the
+        un-answered turn), and the queued message drains normally only once the
+        retry's turn completes and clears ``retry_at``.
+
+        This guard lives HERE — the single chokepoint every dispatch path funnels
+        through — rather than at each call site, because the call sites do not all
+        gate the same way.  In particular the wake-up starvation watchdog sets
+        ``_force_queue_dispatch = True`` specifically to BYPASS the per-call-site
+        gates; without a guard at the chokepoint it would force a queued message
+        out ahead of the retry.  A real ordering race (queued "OMEGA" answered
+        before the retry resent "ALPHA") was caught by live-daemon queue testing;
+        unit tests never exercised the watchdog / deferred-timer dispatch paths.
+        Reading ``self._sessions`` / ``retry_at`` is a plain dict-get + attr read
+        (atomic under the GIL), so no lock is taken — this method is called from
+        inside ``_emit_state`` which already holds session state, and re-locking
+        here risked reentrancy.
+        """
+        info = self._sessions.get(session_id)
+        if info is not None and getattr(info, 'retry_at', 0) > 0:
+            logger.info(
+                "Queue dispatch suppressed for %s: auto-retry countdown pending "
+                "(fires in %.1fs) — queued message will drain after the retry's "
+                "turn completes",
+                session_id[:12], max(0.0, info.retry_at - time.time()),
+            )
+            return
         self._mq.try_dispatch_queue(session_id, self.send_message)
 
     def interrupt_session(self, session_id: str, clear_queue: bool = True) -> dict:
@@ -4805,11 +4834,6 @@ class SessionManager:
                     if e.kind in ("tool_use", "tool_result"):
                         had_real_output = True
                         break
-        # Clear only the countdown (keep _api_retry_count accumulating).
-        info.retry_at = 0.0
-        info.retry_attempt = 0
-        info.retry_max = 0
-        info.retry_reason = ""
         info._api_retry_task = None
         if not last_user_text:
             # Nothing to continue — clear out and surface a manual-retry error.
@@ -4834,15 +4858,21 @@ class SessionManager:
             info.entries.append(entry)
             entry_index = len(info.entries) - 1
         self._emit_entry(session_id, entry, entry_index)
-        # NOTE: deliberately NOT calling _emit_state(IDLE) here.  retry_at is now
-        # 0, so an IDLE emit would open the queue gate and a queued follow-up
-        # could dispatch and jump AHEAD of this continuation.  send_message below
-        # flips the session to WORKING synchronously (closing the gate) and emits
-        # state itself, so the continuation always goes first; the queue then
-        # dispatches when that turn finishes.
-        # Send with the _auto_retry flag so send_message does NOT reset the
-        # accumulated retry counter (only a genuine new user message does).
+        # CRITICAL ORDERING (found via live-daemon queue testing):
+        # Keep retry_at > 0 (queue gate CLOSED) until send_message has flipped
+        # the session to WORKING.  send_message dispatches because state is IDLE
+        # (it doesn't look at retry_at); it sets WORKING synchronously under the
+        # lock.  Only THEN do we clear the countdown fields.  If we cleared
+        # retry_at first, the brief IDLE+retry_at==0 window would open the gate
+        # and a queued follow-up could auto-dispatch AHEAD of this continuation
+        # (real race observed: the queued message ran and the resend got queued
+        # behind it).  send_message uses _auto_retry so it does NOT reset the
+        # accumulated counter (only a genuine new user message does).
         self.send_message(info.session_id, retry_text, _auto_retry=True)
+        info.retry_at = 0.0
+        info.retry_attempt = 0
+        info.retry_max = 0
+        info.retry_reason = ""
 
     @classmethod
     def _is_scheduled_wakeup(cls, tool_name: str) -> bool:
@@ -6229,6 +6259,7 @@ class SessionManager:
                 with self._lock:
                     recheck = self._sessions.get(sid)
                 if recheck and recheck.state == SessionState.IDLE \
+                        and not (getattr(recheck, 'retry_at', 0) > 0) \
                         and not (
                             getattr(recheck, '_in_post_turn', False)
                             and getattr(recheck, '_wakeup_pending', False)
@@ -6236,6 +6267,11 @@ class SessionManager:
                         ):
                     # Safety net for race condition: if a message was queued
                     # right as the session went idle, dispatch it now.
+                    # (But NOT while an auto-retry countdown is pending — this
+                    # deferred timer fires ~3s after the arm, which is BEFORE a
+                    # longer backoff fires, and without this guard it would
+                    # dispatch the queued follow-up ahead of the retry.  Real
+                    # race caught by live-daemon queue testing.)
                     self._try_dispatch_queue(sid)
                     # Re-check state — dispatch may have moved it to WORKING
                     if recheck.state != SessionState.IDLE:
