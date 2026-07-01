@@ -4246,6 +4246,17 @@ class SessionManager:
                     info.retry_attempt = 0
                     info.retry_max = 0
                     info.retry_reason = ""
+                # A turn that completed successfully resolves any prior error
+                # banner.  info.error is otherwise cleared ONLY on a genuine new
+                # user message (send_message L786) — NOT on an auto-retry or
+                # manual-Retry resend (those skip that clear to preserve the
+                # accumulating attempt counter).  Without this, a successful
+                # RETRY would leave the stale "Session ended with error" /
+                # "Auto-retry gave up" banner + Retry button showing even though
+                # the session is now perfectly fine.  (Reported as "Session
+                # ended with error / Retry when everything is fine.")
+                if info.error:
+                    info.error = ""
 
             # Remap session ID if the SDK assigned a different one
             result_session_id = message.session_id

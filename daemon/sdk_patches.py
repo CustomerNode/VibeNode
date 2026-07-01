@@ -11,6 +11,9 @@ Patch inventory:
   3. Suppress console windows — prevent CLI subprocess from flashing a window (Windows)
   4. Isolate POSIX subprocesses — put each child in its own session/pgrp so
      killpg-based session stop cannot blast the daemon (Linux/macOS)
+  5. Raise stdout JSON buffer limit — the SDK's 1 MB default is too small for
+     real agent workloads; a single >1 MB message otherwise fails to decode
+     and drops the session into an endless reconnect loop ("stopping mid-stream")
 
 Patches 2b and 3 from the original session_manager.py monkey-patching have been
 replaced by the Transport Adapter pattern (see sdk_transport_adapter.py).
@@ -72,6 +75,7 @@ def apply_patches() -> list[str]:
         ("transport_adapter", _apply_patch_transport_adapter),
         ("suppress_console_windows", _apply_patch_suppress_console_windows),
         ("isolate_posix_subprocesses", _apply_patch_isolate_posix_subprocesses),
+        ("raise_stdout_buffer_limit", _apply_patch_raise_stdout_buffer_limit),
     ]:
         try:
             if fn():
@@ -354,4 +358,80 @@ def _apply_patch_isolate_posix_subprocesses() -> bool:
         return _original_init(self, *args, **kwargs)
 
     _subprocess.Popen.__init__ = _isolated_session_Popen_init  # type: ignore[method-assign]
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Patch 5: Raise the stdout JSON buffer limit
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The SDK's subprocess transport parses the CLI's stream-json stdout by
+# accumulating text into `json_buffer` and speculatively json.loads()-ing it
+# (SubprocessCLITransport._read_messages_impl).  A single JSON message larger
+# than the module constant `_MAX_BUFFER_SIZE` (SDK default: 1 MB = 1024*1024)
+# raises CLIJSONDecodeError.  In the daemon that surfaces as
+#     "Send query stream error: Failed to decode JSON: JSON message exceeded
+#      maximum buffer size of 1048576 bytes"
+# which trips the stream-heal reconnect.
+#
+# ROOT CAUSE of the "repeatedly stopping mid-stream" report (session
+# 2a3df3fc, a large-context ~224K-token workload on opus): the CLI
+# legitimately emits single messages (big tool_results, large assistant
+# turns) that exceed 1 MB.  The reconnect --resumes and the model
+# regenerates the SAME oversized message, which fails the SAME way — an
+# endless reconnect loop, each iteration re-priming a ~275K-token prompt
+# cache.  The 1 MB default is simply too small for real agent workloads.
+#
+# Fix: raise `_MAX_BUFFER_SIZE`.  It is referenced as a MODULE GLOBAL inside
+# the hot read loop (verified below via source inspection), so reassigning
+# the module attribute takes effect immediately for every current and future
+# transport — no need to touch per-connection state.  Configurable via
+# VIBENODE_SDK_MAX_BUFFER_MB (default 100 MB): large enough that real
+# messages never trip it, still finite so a genuinely runaway
+# non-terminating stream can't buffer without bound.
+#
+# Low fragility: depends only on the module constant name and the read loop
+# still referencing it.  Both are asserted; if the SDK renames or removes
+# them the patch fails fast and is skipped rather than silently no-op'ing.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+_DEFAULT_MAX_BUFFER_MB = 100
+
+
+def _apply_patch_raise_stdout_buffer_limit() -> bool:
+    """Raise the SDK stdout JSON buffer cap so large messages don't loop-fail."""
+    from claude_code_sdk._internal.transport import subprocess_cli as _sc
+
+    # Fail-fast structural checks — bail (skip) if the SDK internals moved.
+    assert hasattr(_sc, "_MAX_BUFFER_SIZE"), "subprocess_cli._MAX_BUFFER_SIZE not found"
+    assert isinstance(_sc._MAX_BUFFER_SIZE, int), "_MAX_BUFFER_SIZE is not an int"
+    assert hasattr(_sc, "SubprocessCLITransport"), "SubprocessCLITransport not found"
+    read_src = inspect.getsource(_sc.SubprocessCLITransport._read_messages_impl)
+    assert "_MAX_BUFFER_SIZE" in read_src, (
+        "read loop no longer references _MAX_BUFFER_SIZE — buffer patch may be obsolete"
+    )
+
+    try:
+        mb = int(os.environ.get("VIBENODE_SDK_MAX_BUFFER_MB", str(_DEFAULT_MAX_BUFFER_MB)))
+    except (TypeError, ValueError):
+        mb = _DEFAULT_MAX_BUFFER_MB
+    if mb < 1:
+        mb = 1
+    new_limit = mb * 1024 * 1024
+
+    old_limit = _sc._MAX_BUFFER_SIZE
+    if new_limit <= old_limit:
+        logger.info(
+            "SDK stdout buffer limit already %d bytes (>= requested %d) — leaving as-is",
+            old_limit, new_limit,
+        )
+        return False
+
+    _sc._MAX_BUFFER_SIZE = new_limit
+    logger.info(
+        "Raised SDK stdout JSON buffer limit: %d -> %d bytes (%d MB) — "
+        "prevents >1MB messages from looping the stream-heal reconnect",
+        old_limit, new_limit, mb,
+    )
     return True
