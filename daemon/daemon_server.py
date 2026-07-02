@@ -314,6 +314,7 @@ class SessionDaemon:
             "get_entry_count": lambda **kw: self.session_manager.get_entry_count(kw["session_id"]),
             "has_session": self.session_manager.has_session,
             "get_session_state": self.session_manager.get_session_state,
+            "get_dormant_states": lambda **kw: self.session_manager.get_dormant_states(),
             "get_permission_policy": lambda **kw: self.session_manager.get_permission_policy(),
             "set_permission_policy": self.session_manager.set_permission_policy,
             "get_ui_prefs": lambda **kw: self.session_manager.get_ui_prefs(),

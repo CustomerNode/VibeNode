@@ -399,6 +399,46 @@ class TestGetAllStates:
 
 
 # ---------------------------------------------------------------------------
+# 17b. Get dormant states (restart memory)
+# ---------------------------------------------------------------------------
+
+class TestGetDormantStates:
+    """get_dormant_states() surfaces the restart-memory snapshot so the UI can
+    show sessions that were idle/working before a restart with their real
+    state instead of "sleeping" -- but only while they remain dormant."""
+
+    def test_returns_snapshot_for_dormant_sessions(self, session_manager):
+        """Sessions in the snapshot that aren't live are returned as-is."""
+        session_manager._last_known_states = {
+            "s-idle": {"last_state": "idle", "name": "Idle"},
+            "s-work": {"last_state": "working", "name": "Work"},
+        }
+        out = session_manager.get_dormant_states()
+        assert out["s-idle"]["last_state"] == "idle"
+        assert out["s-work"]["last_state"] == "working"
+
+    def test_omits_sessions_that_went_live(self, session_manager, sm_module):
+        """A session that has since gone live must be omitted -- its live state
+        from get_all_states() is authoritative and must win."""
+        session_manager._last_known_states = {
+            "s-idle": {"last_state": "idle"},
+            "s-live": {"last_state": "working"},
+        }
+        with session_manager._lock:
+            session_manager._sessions["s-live"] = sm_module.SessionInfo(
+                session_id="s-live", state=sm_module.SessionState.IDLE
+            )
+        out = session_manager.get_dormant_states()
+        assert "s-idle" in out
+        assert "s-live" not in out
+
+    def test_empty_when_no_snapshot(self, session_manager):
+        """No captured snapshot -> empty dict (nothing to restore)."""
+        session_manager._last_known_states = {}
+        assert session_manager.get_dormant_states() == {}
+
+
+# ---------------------------------------------------------------------------
 # 18. Get entries with since
 # ---------------------------------------------------------------------------
 

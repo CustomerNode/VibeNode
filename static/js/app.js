@@ -1448,6 +1448,16 @@ async function loadSessions() {
       if (s.user_named) _userNamedSessions.add(s.id);
     }
   }
+  // Restore-across-restart: /api/sessions tags sessions that were idle/working
+  // before the last restart (but aren't live now) with `last_state`. Seed a
+  // lookup map so getSessionStatus() can show them as idle/working instead of
+  // "sleeping". Rebuilt from scratch each load; live state always overrides it.
+  window.sessionLastState = {};
+  for (const s of allSessions) {
+    if (s.last_state === 'working' || s.last_state === 'idle') {
+      window.sessionLastState[s.id] = s.last_state;
+    }
+  }
   document.getElementById('search').placeholder = 'Search ' + allSessions.length + ' sessions\u2026';
   setViewMode(viewMode);
   // Template selector is handled by initFolderTree() — no duplicate call here

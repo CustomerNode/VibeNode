@@ -672,3 +672,109 @@ class TestCancelTimer:
         # Should not raise
         reg.cancel_timer()
         assert reg._registry_timer is None
+
+
+# =========================================================================
+# Section 6: load_last_known_states (restart memory)
+# =========================================================================
+
+
+class TestLoadLastKnownStates:
+    """Test the restart-memory snapshot.
+
+    load_last_known_states() is read ONCE at daemon startup, before the first
+    save overwrites the registry with only live sessions.  It preserves the
+    idle/working state of every session that was open before the restart so
+    the UI can restore it (show idle as idle, working as working) instead of
+    collapsing everything to "sleeping".  It is display memory only -- it
+    never launches a process, so (unlike recover_sessions) it applies no age
+    filter and keeps idle sessions.
+    """
+
+    def test_idle_session_remembered_as_idle(self, tmp_path):
+        """An idle session is remembered with last_state 'idle' plus metadata.
+
+        WHY: This is the core case -- idle sessions are NOT auto-recovered, so
+        without this snapshot they collapse to "sleeping" after a restart.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        _write_registry(registry_file, {
+            "s-idle": {"name": "Idle One", "state": "idle", "cwd": "/tmp",
+                       "session_type": "normal", "last_activity": 123.0},
+        })
+        with patch('daemon.session_registry.REGISTRY_PATH', registry_file):
+            out = reg.load_last_known_states()
+        assert out["s-idle"]["last_state"] == "idle"
+        assert out["s-idle"]["name"] == "Idle One"
+        assert out["s-idle"]["cwd"] == "/tmp"
+
+    def test_active_states_collapse_to_working(self, tmp_path):
+        """working/waiting/starting all remember as 'working'.
+
+        WHY: A mid-task session that failed to auto-recover is accurately
+        described to the user as "working" (where they left off), and we don't
+        want three near-identical display states.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        _write_registry(registry_file, {
+            "s-w": {"state": "working"},
+            "s-wait": {"state": "waiting"},
+            "s-start": {"state": "starting"},
+        })
+        with patch('daemon.session_registry.REGISTRY_PATH', registry_file):
+            out = reg.load_last_known_states()
+        assert out["s-w"]["last_state"] == "working"
+        assert out["s-wait"]["last_state"] == "working"
+        assert out["s-start"]["last_state"] == "working"
+
+    def test_stopped_session_excluded(self, tmp_path):
+        """Stopped sessions are not remembered.
+
+        WHY: The user explicitly ended them -- they should stay "sleeping".
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        _write_registry(registry_file, {"s-stop": {"state": "stopped"}})
+        with patch('daemon.session_registry.REGISTRY_PATH', registry_file):
+            out = reg.load_last_known_states()
+        assert "s-stop" not in out
+
+    def test_planner_session_excluded(self, tmp_path):
+        """Planner/utility sessions are never remembered.
+
+        WHY: They are transient orchestration sessions, not user-tracked work.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        _write_registry(registry_file, {
+            "s-plan": {"state": "working", "session_type": "planner"},
+        })
+        with patch('daemon.session_registry.REGISTRY_PATH', registry_file):
+            out = reg.load_last_known_states()
+        assert "s-plan" not in out
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        """No registry file -> empty snapshot (first launch, clean state)."""
+        reg = SessionRegistry()
+        with patch('daemon.session_registry.REGISTRY_PATH',
+                   tmp_path / "nonexistent.json"):
+            out = reg.load_last_known_states()
+        assert out == {}
+
+    def test_old_idle_session_still_remembered(self, tmp_path):
+        """Age does NOT filter restart memory (unlike recovery).
+
+        WHY: This is only a display label, not a relaunch, so a session being
+        old is irrelevant -- the user still wants to see where they left off.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        _write_registry(registry_file, {
+            "s-old": {"state": "idle", "last_activity": 1.0},  # ancient
+        })
+        with patch('daemon.session_registry.REGISTRY_PATH', registry_file):
+            out = reg.load_last_known_states()
+        assert "s-old" in out
+        assert out["s-old"]["last_state"] == "idle"

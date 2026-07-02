@@ -478,6 +478,14 @@ class SessionManager:
         self._started = False
         # Session registry (crash recovery) — delegated to SessionRegistry
         self._reg = SessionRegistry()
+        # Restart memory: pre-restart states of sessions that were active
+        # (idle/working) before the last shutdown.  Captured once at start()
+        # from the registry file BEFORE the first save overwrites it, then
+        # served (minus any session that has since gone live) via
+        # get_dormant_states() so the UI can distinguish "was active before
+        # restart" from a never-touched "sleeping" session.  Display only —
+        # never triggers a process launch.
+        self._last_known_states: dict = {}
         # Permission policy & UI prefs — delegated to PermissionManager
         self._pm = PermissionManager(emit_entry_fn=self._emit_entry)
         # Hook-based permission storage
@@ -507,6 +515,22 @@ class SessionManager:
         self._thread.start()
         self._started = True
         logger.info("SessionManager started")
+
+        # Restart memory: snapshot previously-active sessions NOW, before the
+        # first debounced _save_registry_now() (triggered by recovery below)
+        # overwrites the registry file with only the sessions it re-launches.
+        # This is what lets the UI show idle/working sessions as
+        # "previously active" instead of "sleeping" after a reboot.
+        try:
+            self._last_known_states = self._reg.load_last_known_states()
+            if self._last_known_states:
+                logger.info(
+                    "Captured %d previously-active session(s) for restart memory",
+                    len(self._last_known_states),
+                )
+        except Exception:
+            logger.exception("Failed to capture restart-memory snapshot")
+            self._last_known_states = {}
 
         # Recover sessions from a previous crash (non-blocking background task)
         threading.Thread(
@@ -1293,6 +1317,39 @@ class SessionManager:
         if info:
             return info.state.value
         return None
+
+    def get_dormant_states(self) -> dict:
+        """Return restart-memory states for previously-active dormant sessions.
+
+        After a restart, sessions that were merely idle are intentionally NOT
+        auto-recovered (see SessionRegistry.recover_sessions), so they are
+        absent from _sessions and get_session_state() returns None for them —
+        which the UI renders as "sleeping".  This returns the state each such
+        session held before the restart (captured at startup in
+        _last_known_states) so the UI can mark them "was active before
+        restart" instead.
+
+        A session that has since gone live (recovered, or re-opened by the
+        user) is OMITTED here: its live state from get_all_states() is
+        authoritative and must win.  This method never launches a process.
+
+        Returns {session_id: {"last_state", "name", "cwd", "session_type",
+        "last_activity"}} keyed by canonical (alias-resolved) id.
+        """
+        snapshot = self._last_known_states
+        if not snapshot:
+            return {}
+        with self._lock:
+            live = set(self._sessions.keys())
+        out = {}
+        for sid, meta in snapshot.items():
+            # Drop anything currently live under either the registry id or its
+            # canonical (post-recovery remap) id — live state wins.
+            rid = self._resolve_id(sid)
+            if sid in live or rid in live:
+                continue
+            out[rid] = meta
+        return out
 
     # ------------------------------------------------------------------
     # Async internals (run on the event loop thread)

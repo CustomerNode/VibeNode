@@ -721,6 +721,22 @@ class DaemonClient:
             "session_id": session_id,
         })
 
+    def get_dormant_states(self):
+        """Fetch restart-memory states for previously-active dormant sessions.
+
+        Returns {session_id: {"last_state", ...}}.  Returns {} against an older
+        daemon that predates the method (the response is an error/ok=False dict)
+        so the web layer degrades gracefully in the window between a web update
+        and the next daemon (re)start — the sidebar simply shows "sleeping"
+        until the daemon is restarted, exactly as before.
+        """
+        result = self._send_request("get_dormant_states")
+        if (isinstance(result, dict)
+                and "error" not in result
+                and result.get("ok") is not False):
+            return result
+        return {}
+
     def get_permission_policy(self):
         """Fetch current permission policy from the daemon."""
         result = self._send_request("get_permission_policy", {})
