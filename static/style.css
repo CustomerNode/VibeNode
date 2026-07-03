@@ -1987,6 +1987,21 @@ header h1:hover { opacity: 0.7; }
 mark.find-match { background:#7c7cff44; color:inherit; border-radius:2px; }
 mark.find-match.current { background: var(--accent); color:#fff; }
 
+/* ===== Deep search (search.js — full-text search across all transcripts) ===== */
+.deep-search-row { padding:8px 10px; border:1px solid var(--border); border-radius:8px;
+  margin-bottom:8px; cursor:pointer; background: var(--bg-tertiary); }
+.deep-search-row:hover { border-color: var(--accent); }
+.deep-search-row-head { display:flex; justify-content:space-between; gap:10px; align-items:baseline; }
+.deep-search-title { font-size:13px; font-weight:600; color: var(--text-heading);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.deep-search-date { font-size:11px; color: var(--text-muted); flex-shrink:0; }
+.deep-search-snip { font-size:12px; color: var(--text-primary); margin-top:5px;
+  line-height:1.45; word-break:break-word; }
+mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; padding:0 1px; }
+.deep-search-files { margin-top:6px; display:flex; flex-wrap:wrap; gap:4px; }
+.deep-search-file { font-size:11px; font-family:monospace; color: var(--text-muted);
+  border:1px solid var(--border); border-radius:4px; padding:1px 6px; }
+
 /* ===== Compare modal ===== */
 #compare-overlay { display:none; position:fixed; inset:0; background: var(--overlay);
   z-index:400; align-items:flex-start; justify-content:center; padding-top:40px; }

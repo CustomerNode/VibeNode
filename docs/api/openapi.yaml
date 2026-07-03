@@ -130,6 +130,10 @@ tags:
     description: Claude Code authentication status and login
   - name: Tests
     description: Test runner (SSE stream) and cancellation
+  - name: Search
+    description: Full-text search across session transcripts (FTS5-backed)
+  - name: ChatGPT
+    description: ChatGPT bridge — relay prompts to a logged-in ChatGPT via Playwright
 
 paths:
   # ==========================================================================
@@ -5788,6 +5792,222 @@ paths:
                     type: array
                     items:
                       type: object
+
+  # ==========================================================================
+  # Search (search_api.py)
+  # ==========================================================================
+  /api/search:
+    get:
+      tags: [Search]
+      summary: Full-text search across the active project's session transcripts
+      operationId: searchSessions
+      description: |
+        Searches the FTS5 index built from the project's session JSONLs.
+        Supports free-text queries (BM25-ranked, with highlighted snippets),
+        touched-file lookup ("which session edited this file"), or both
+        combined (intersection). The index is derived local state stored in
+        `~/.claude/gui_search_index.db`, updated incrementally (mtime-based)
+        and debounced — indexing never runs on a per-turn hot path. Deleted,
+        utility, and remapped sessions are filtered from results at query
+        time.
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Free-text query (min 2 chars unless `file` is given).
+        - name: file
+          in: query
+          schema:
+            type: string
+          description: |
+            Touched-file path fragment (case- and slash-insensitive). Matches
+            sessions that edited a file whose path contains the fragment.
+        - name: project
+          in: query
+          schema:
+            type: string
+          description: Encoded project dir name; defaults to the active project.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+          description: Max sessions returned.
+      responses:
+        "200":
+          description: Ranked search results grouped by session
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  project:
+                    type: string
+                  query:
+                    type: string
+                  file:
+                    type: string
+                  sessions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        session_id:
+                          type: string
+                        rank:
+                          type: number
+                          description: BM25 rank (lower/more negative = better).
+                        snippets:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              role:
+                                type: string
+                              ts:
+                                type: string
+                              text:
+                                type: string
+                                description: |
+                                  Snippet with matches wrapped in [[HIT]] /
+                                  [[/HIT]] markers (converted to highlights
+                                  client-side after HTML-escaping).
+                        files:
+                          type: array
+                          items:
+                            type: string
+                  stats:
+                    type: object
+                    properties:
+                      sessions_indexed:
+                        type: integer
+                      messages_indexed:
+                        type: integer
+                      took_ms:
+                        type: number
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  # ==========================================================================
+  # ChatGPT bridge (chatgpt_api.py)
+  # ==========================================================================
+  /chatgpt:
+    get:
+      tags: [ChatGPT]
+      summary: Serve the standalone ChatGPT bridge page
+      operationId: chatgptPage
+      responses:
+        "200":
+          description: HTML bridge page
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /api/chatgpt/status:
+    get:
+      tags: [ChatGPT]
+      summary: Get ChatGPT bridge status
+      operationId: chatgptStatus
+      responses:
+        "200":
+          description: Bridge status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  logged_in:
+                    type: boolean
+                  busy:
+                    type: boolean
+
+  /api/chatgpt/login:
+    post:
+      tags: [ChatGPT]
+      summary: Open a visible browser window for manual ChatGPT login
+      operationId: chatgptLogin
+      responses:
+        "200":
+          description: Login window result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  error:
+                    type: string
+                    nullable: true
+
+  /api/chatgpt/ask:
+    post:
+      tags: [ChatGPT]
+      summary: Relay a prompt to the logged-in ChatGPT and return the reply
+      operationId: chatgptAsk
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                prompt:
+                  type: string
+                files:
+                  type: array
+                  items:
+                    type: string
+                  description: Optional file paths to attach.
+      responses:
+        "200":
+          description: ChatGPT reply
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  result:
+                    type: string
+                    nullable: true
+                  error:
+                    type: string
+                    nullable: true
+        "400":
+          description: Invalid request ('files' must be a list)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  result:
+                    type: string
+                    nullable: true
+                  error:
+                    type: string
+        "502":
+          description: Bridge failure (not logged in, busy, or browser error)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  result:
+                    type: string
+                    nullable: true
+                  error:
+                    type: string
 
 components:
   parameters:

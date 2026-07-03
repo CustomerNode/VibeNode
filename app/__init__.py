@@ -60,6 +60,7 @@ def create_app(testing=False) -> Flask:
     from .routes.test_api import bp as test_bp
     from .routes.admin_api import bp as admin_bp
     from .routes.chatgpt_api import bp as chatgpt_bp
+    from .routes.search_api import bp as search_bp
 
     app.register_blueprint(main_bp)
     app.register_blueprint(sessions_bp)
@@ -74,6 +75,7 @@ def create_app(testing=False) -> Flask:
     app.register_blueprint(test_bp)
     app.register_blueprint(admin_bp)
     app.register_blueprint(chatgpt_bp)
+    app.register_blueprint(search_bp)
 
     if not testing:
         # PERF-CRITICAL: Startup-only cleanup — do NOT call from all_sessions() or per-request paths. See CLAUDE.md #13.

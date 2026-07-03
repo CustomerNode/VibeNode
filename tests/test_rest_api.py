@@ -1492,3 +1492,51 @@ class TestCRUDEdgeCases:
         if len(data) >= 2:
             timestamps = [s["sort_ts"] for s in data]
             assert timestamps == sorted(timestamps, reverse=True)
+
+
+# ===================================================================
+# PROJECT PATH-TRAVERSAL GUARD (sessions_api blueprint before_request)
+# ===================================================================
+
+class TestProjectTraversalGuard:
+    """The blueprint-level guard must reject any ``project`` containing
+    path separators or '..' (query string OR JSON body) with 400, while
+    leaving legitimate encoded project names and project-less requests
+    untouched.  Mirrors the /api/search guard added in the same pass."""
+
+    BAD_PROJECTS = ("..%2F..%2Fevil", ".." + chr(92) + "evil", "a/b", "..")
+
+    def test_query_param_traversal_rejected_on_get_routes(self, client):
+        for bad in self.BAD_PROJECTS:
+            for route in (f"/api/sessions?project={bad}",
+                          f"/api/session/sess-001?project={bad}",
+                          f"/api/trash?project={bad}",
+                          f"/api/session-timeline/sess-001?project={bad}"):
+                resp = client.get(route)
+                assert resp.status_code == 400, route
+                assert resp.get_json()["error"] == "invalid project name"
+
+    def test_query_param_traversal_rejected_on_mutating_routes(self, client):
+        bad = "..%2Fevil"
+        resp = client.delete(f"/api/delete/sess-001?project={bad}")
+        assert resp.status_code == 400
+        resp = client.post(f"/api/duplicate/sess-001?project={bad}")
+        assert resp.status_code == 400
+
+    def test_json_body_traversal_rejected(self, client):
+        resp = client.post("/api/rename/sess-001",
+                           json={"title": "x", "project": "../evil"})
+        assert resp.status_code == 400
+        assert resp.get_json()["error"] == "invalid project name"
+        resp = client.post("/api/autonname/sess-001",
+                           json={"project": ".." + chr(92) + "evil"})
+        assert resp.status_code == 400
+
+    def test_legitimate_encoded_project_still_works(self, client, populated_project):
+        resp = client.get("/api/sessions?project=C--Users-test-Documents-myproj")
+        assert resp.status_code == 200
+
+    def test_requests_without_project_unaffected(self, client, populated_project):
+        assert client.get("/api/sessions").status_code == 200
+        resp = client.post("/api/rename/sess-001", json={"title": "Renamed"})
+        assert resp.status_code == 200

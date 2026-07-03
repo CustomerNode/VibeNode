@@ -43,6 +43,32 @@ bp = Blueprint('sessions_api', __name__)
 log = logging.getLogger(__name__)
 
 
+@bp.before_request
+def _reject_traversal_project():
+    """Reject requests whose ``project`` carries path separators or ``..``.
+
+    Every route in this blueprint that honors ``?project=`` (or a JSON-body
+    ``project``) eventually resolves ``_CLAUDE_PROJECTS / project`` — either
+    directly or via ``_sessions_dir()`` / the session_store helpers.  Encoded
+    project names can never legitimately contain ``/``, ``\\`` or ``..``
+    (``_encode_cwd()`` replaces all separators with dashes), so anything that
+    does is a traversal attempt that would read from — or persist state
+    into — a directory outside ``~/.claude/projects``.  Same guard as
+    ``/api/search`` (app/routes/search_api.py).  Returning a response here
+    short-circuits the route; returning None lets the request proceed.
+    """
+    candidates = [request.args.get("project", "")]
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        body = request.get_json(silent=True)
+        if isinstance(body, dict):
+            candidates.append(str(body.get("project") or ""))
+    for value in candidates:
+        value = (value or "").strip()
+        if value and ("/" in value or "\\" in value or ".." in value):
+            return jsonify({"error": "invalid project name"}), 400
+    return None
+
+
 # Windows + AV/Defender hold the .jsonl handle for tens to hundreds of
 # milliseconds after the CLI subprocess dies. The original 4-phase delete
 # handled this with a single 0.3 s retry then silently fell through; that
