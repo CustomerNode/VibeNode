@@ -568,6 +568,16 @@ def main():
 
     daemon = SessionDaemon()
 
+    # Safety net: reap runaway external search processes (e.g. ugrep) that the
+    # Claude CLI can leave pinning every core after an interrupted turn. They
+    # otherwise drive load average into the 20s and starve every other session.
+    # See daemon/runaway_reaper.py. Best-effort; never blocks daemon startup.
+    try:
+        from daemon import runaway_reaper
+        runaway_reaper.start()
+    except Exception:
+        logger.warning("Failed to start runaway-reaper", exc_info=True)
+
     def shutdown(sig, frame):
         # The forensics watcher (_install_signal_forensics_watcher) already
         # logged the full sender PID / cmdline / diagnosis before forwarding
