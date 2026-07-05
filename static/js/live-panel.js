@@ -2532,6 +2532,11 @@ async function closeSession(id) {
   guiOpenDelete(id);
   runningIds.delete(id);
   delete sessionKinds[id];
+  // Also drop any restart-restored state so a dormant session the user just
+  // stopped actually falls back to 'sleeping' on the next render.  Without
+  // this, getSessionStatus() would keep reading window.sessionLastState and
+  // re-show the session as idle, making the Stop action look like a no-op.
+  if (window.sessionLastState) delete window.sessionLastState[id];
   showToast('Session closed');
   // Update the input bar to reflect stopped state — keep chat visible
   liveBarState = null;
