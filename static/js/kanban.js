@@ -3498,10 +3498,14 @@ async function executeTask(taskId, mode, opts) {
   runningIds.add(newId);
   sessionKinds[newId] = 'working';
 
-  // Resolve model/thinking: per-session override wins over system default.
-  const _kb_model = (typeof _effectiveModel === 'function') ? _effectiveModel()
+  // Resolve model/thinking from the single owner (SessionModel): this pending
+  // session's chosen model, else the system default.  (Previously this path
+  // read a global override and ignored the per-session choice entirely.)
+  const _kb_model = (typeof SessionModel !== 'undefined')
+    ? SessionModel.effectivePending(newId)
     : (typeof defaultModel !== 'undefined' ? defaultModel : '');
-  const _kb_thinking = (typeof _effectiveThinking === 'function') ? _effectiveThinking()
+  const _kb_thinking = (typeof SessionModel !== 'undefined')
+    ? SessionModel.getDesiredThinking(newId)
     : (typeof defaultThinking !== 'undefined' ? defaultThinking : '');
 
   const startOpts = {

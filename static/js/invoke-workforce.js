@@ -69,44 +69,46 @@ function _invokeAssetById(assetId) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PER-SESSION MODEL OVERRIDE
-// A lightweight per-session model+thinking override stored in memory.
-// Only applies to the *next* session start (cleared after use).
-// Separate from the system-level defaultModel / defaultThinking that are
-// persisted in localStorage.
+// PER-SESSION MODEL SELECTOR (rendering + interaction)
+//
+// All model STATE lives in the SessionModel store (session-model.js) — the
+// single owner of "what model does this session use?".  This section only
+// renders that state and wires the popup.  There is deliberately NO global
+// override here: a pending session's chosen model lives on the session object
+// (SessionModel.setDesired) and can never bleed into a different session.
+//
+// The three functions below are thin compatibility shims over the store, kept
+// so existing call sites keep working while every resolution flows through the
+// one resolver.
 // ═══════════════════════════════════════════════════════════════════════
 
-/** Current per-session model override — null means "use system default". */
-// Persist overrides in localStorage so they survive page refresh
-window._sessionModelOverride = localStorage.getItem('_sessionModelOverride') || null;
-window._sessionThinkingOverride = localStorage.getItem('_sessionThinkingOverride') || null;
-
-/**
- * Return the effective model for the next session:
- * per-session override if set, otherwise the system default.
- */
+/** System-default model (compat shim → SessionModel.getDefault). */
 function _effectiveModel() {
-  return window._sessionModelOverride || (typeof defaultModel !== 'undefined' ? defaultModel : 'claude-opus-4-7');
+  return (typeof SessionModel !== 'undefined')
+    ? SessionModel.getDefault()
+    : ((typeof defaultModel !== 'undefined' && defaultModel) || 'claude-opus-4-7');
 }
 
-/**
- * Return the effective thinking level for the next session:
- * per-session override if set, otherwise the system default.
- */
+/** System-default thinking level (compat shim → SessionModel.getDefaultThinking). */
 function _effectiveThinking() {
-  return window._sessionThinkingOverride !== null ? window._sessionThinkingOverride
-    : (typeof defaultThinking !== 'undefined' ? defaultThinking : '');
+  return (typeof SessionModel !== 'undefined')
+    ? SessionModel.getDefaultThinking()
+    : ((typeof defaultThinking !== 'undefined' && defaultThinking) || '');
 }
 
 /**
- * Clear per-session overrides.  Called by _newSessionSubmit after the
- * session is dispatched so the next session reverts to system defaults.
+ * Compat shim retained for existing post-start call sites.  In the new
+ * architecture a pending session's choice lives on the session object and is
+ * consumed by start_session itself, so there is no global one-shot to clear —
+ * nothing can leak into the next session.  Kept as a harmless no-op (plus a
+ * belt-and-suspenders cleanup of the obsolete legacy keys) so callers that
+ * still invoke it don't throw.
  */
 function _clearSessionModelOverride() {
-  window._sessionModelOverride = null;
-  window._sessionThinkingOverride = null;
-  localStorage.removeItem('_sessionModelOverride');
-  localStorage.removeItem('_sessionThinkingOverride');
+  try {
+    localStorage.removeItem('_sessionModelOverride');
+    localStorage.removeItem('_sessionThinkingOverride');
+  } catch (e) { /* localStorage unavailable */ }
 }
 
 /**
@@ -122,14 +124,14 @@ function _clearSessionModelOverride() {
  */
 function _buildSessionModelBtn(isNewSession, sessionModel, sessionId) {
   if (isNewSession) {
-    // Prefer a model explicitly assigned to this specific pending session,
-    // then the global per-session override, then the system default.
-    const _pSessModel = (sessionId && typeof allSessions !== 'undefined')
-      ? ((allSessions.find(function(x) { return x.id === sessionId; }) || {}).model || '')
-      : '';
-    const isOverridden = !!_pSessModel || window._sessionModelOverride !== null;
-    const label = _modelLabel(_pSessModel || window._sessionModelOverride
-      || (typeof defaultModel !== 'undefined' ? defaultModel : ''));
+    // Pending session: the model chosen for THIS session (desired), else the
+    // system default — resolved by the one store.  No global override exists,
+    // so nothing another session chose can appear here.
+    const _desired = (typeof SessionModel !== 'undefined') ? SessionModel.getDesired(sessionId) : '';
+    const isOverridden = !!_desired;
+    const label = _modelLabel((typeof SessionModel !== 'undefined')
+      ? SessionModel.effectivePending(sessionId)
+      : ((typeof defaultModel !== 'undefined' ? defaultModel : '')));
     const _safeId = (sessionId || '').replace(/['"\\]/g, '');
     return '<button class="session-model-btn' + (isOverridden ? ' session-model-overridden' : '') + '" ' +
       'id="session-model-btn" onclick="_openSessionModelSelector(false, \'' + _safeId + '\')" ' +
@@ -141,7 +143,9 @@ function _buildSessionModelBtn(isNewSession, sessionModel, sessionId) {
   // message yet), fall back to the system default — that's what it WILL run
   // on when it wakes up, so showing "—" is less useful than showing the
   // actual expectation.  The tooltip distinguishes confirmed from assumed.
-  const _sysDefault = typeof defaultModel !== 'undefined' ? defaultModel : '';
+  const _sysDefault = (typeof SessionModel !== 'undefined')
+    ? SessionModel.getDefault()
+    : (typeof defaultModel !== 'undefined' ? defaultModel : '');
   const confirmed = !!(sessionModel);
   const effectiveModel = sessionModel || _sysDefault;
   const label = effectiveModel ? _modelLabel(effectiveModel) : '—';
@@ -218,14 +222,13 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
   // model; new-session mode pre-selects the override/default.
   // For new-session mode: prefer model explicitly assigned to this pending session,
   // then global override, then system default.
-  const _pSessForModel = (!liveMode && pendingSessionId && typeof allSessions !== 'undefined')
-    ? (allSessions.find(function(x) { return x.id === pendingSessionId; }) || {})
-    : {};
   let pendingModel = liveMode
     ? currentLiveBase
-    : (_pSessForModel.model || window._sessionModelOverride || _effectiveModel());
-  let pendingThinking = window._sessionThinkingOverride !== null
-    ? window._sessionThinkingOverride
+    : ((typeof SessionModel !== 'undefined')
+        ? SessionModel.effectivePending(pendingSessionId)
+        : _effectiveModel());
+  let pendingThinking = (!liveMode && typeof SessionModel !== 'undefined')
+    ? SessionModel.getDesiredThinking(pendingSessionId)
     : (typeof defaultThinking !== 'undefined' ? defaultThinking : '');
 
   function _renderModels() {
@@ -294,17 +297,11 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
     _refreshApply();
   };
   window._applySessionModelOverride = function() {
-    window._sessionModelOverride = pendingModel;
-    window._sessionThinkingOverride = pendingThinking;
-    if (pendingModel) localStorage.setItem('_sessionModelOverride', pendingModel);
-    else localStorage.removeItem('_sessionModelOverride');
-    if (pendingThinking) localStorage.setItem('_sessionThinkingOverride', pendingThinking);
-    else localStorage.removeItem('_sessionThinkingOverride');
-    // Store model directly on the pending session so _newSessionSubmit reads
-    // it from the session object — indestructible, not shared with other sessions.
-    if (pendingSessionId && typeof allSessions !== 'undefined') {
-      var _pSess = allSessions.find(function(x) { return x.id === pendingSessionId; });
-      if (_pSess) _pSess.model = pendingModel || '';
+    // Store the choice ON this pending session only (SessionModel owns it).
+    // It is consumed by start_session for THIS session and can never bleed
+    // into another — there is no global override anymore.
+    if (typeof SessionModel !== 'undefined') {
+      SessionModel.setDesired(pendingSessionId, pendingModel, pendingThinking);
     }
     _closePm();
     // Refresh any visible session-model-btn to show updated label
@@ -316,15 +313,8 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
     if (typeof showToast === 'function') showToast('Session: ' + label + thinking);
   };
   window._clearSessionModelOverrideAndClose = function() {
-    window._sessionModelOverride = null;
-    window._sessionThinkingOverride = null;
-    localStorage.removeItem('_sessionModelOverride');
-    localStorage.removeItem('_sessionThinkingOverride');
-    // Clear from the specific pending session
-    if (pendingSessionId && typeof allSessions !== 'undefined') {
-      var _pSess = allSessions.find(function(x) { return x.id === pendingSessionId; });
-      if (_pSess) delete _pSess.model;
-    }
+    // Forget this pending session's choice; it reverts to the system default.
+    if (typeof SessionModel !== 'undefined') SessionModel.clearDesired(pendingSessionId);
     _closePm();
     _refreshSessionModelBtn(pendingSessionId);
     if (typeof showToast === 'function') showToast('Session model reset to system default');
@@ -364,13 +354,10 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
       finish();
       if (data.ok) {
         // Daemon confirmed via the CLI control protocol — safe to display.
-        if (liveSess) liveSess.model = data.model;
-        const badge = document.querySelector('.session-model-badge');
-        if (badge) {
-          const lbl = _modelLabel(data.model);
-          badge.textContent = lbl;
-          badge.title = 'Session model: ' + lbl + ' — click to switch (applies from the next message)';
-        }
+        // Route through the store's single write path, then the single badge
+        // renderer.  Never write model text to the DOM directly here.
+        if (typeof SessionModel !== 'undefined') SessionModel.ingestConfirmed(liveSid, data.model);
+        _renderSessionModelBadge(liveSid);
         _closePm();
         if (typeof showToast === 'function') {
           showToast('Model switched to ' + _modelLabel(data.model) + ' — applies from the next message');
@@ -398,37 +385,47 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
  * an override is applied or cleared, without re-rendering the full bar.
  */
 function _refreshSessionModelBtn(sessionId) {
-  // Resolve: session-specific model > global override > system default
-  const _pSessModel = (sessionId && typeof allSessions !== 'undefined')
-    ? ((allSessions.find(function(x) { return x.id === sessionId; }) || {}).model || '')
-    : '';
-  const label = _modelLabel(_pSessModel || _effectiveModel());
-  const isOverridden = !!_pSessModel || window._sessionModelOverride !== null;
-
-  // New-session button (has id) — shows the model this session will use.
+  // New-session button (has id) — shows the model THIS pending session will
+  // use: its desired choice, else the system default.  Resolved by the store,
+  // so it can never show a value another session chose.
   const btn = document.getElementById('session-model-btn');
-  if (btn) {
-    btn.textContent = label;
+  if (btn && typeof SessionModel !== 'undefined') {
+    const isOverridden = !!SessionModel.getDesired(sessionId);
+    btn.textContent = _modelLabel(SessionModel.effectivePending(sessionId));
     btn.classList.toggle('session-model-overridden', isOverridden);
     btn.title = isOverridden
       ? 'Model overridden — click to change'
       : 'Click to choose model for this session';
   }
 
-  // Running-session badge: NEVER write the next-session override onto it —
-  // it must only ever show the session's actual model.  Refresh it from the
-  // live session record instead (updated on daemon-confirmed switches and
-  // on init messages from the CLI).
+  // Running-session badge shows only the session's ACTUAL (confirmed) model —
+  // delegate to the single badge renderer so there is exactly one DOM writer.
+  _renderSessionModelBadge(typeof liveSessionId !== 'undefined' ? liveSessionId : '');
+}
+
+/**
+ * THE single DOM writer for the running-session model badge.
+ *
+ * Reads the confirmed model from the store (never from a parameter, never from
+ * the DOM) so every caller — socket state events, mid-session switch
+ * confirmations, and bar refreshes — produces identical, race-free output.
+ * Because the value always comes from the store, a late re-render can never
+ * "win" with stale text.  Only updates the badge for the currently-live
+ * session; it is a no-op if that badge isn't on screen.
+ */
+function _renderSessionModelBadge(sessionId) {
   const badge = document.querySelector('.session-model-badge');
-  if (badge && typeof liveSessionId !== 'undefined' && liveSessionId &&
-      typeof allSessions !== 'undefined') {
-    const s = allSessions.find(x => x.id === liveSessionId);
-    if (s && s.model) {
-      const lbl = _modelLabel(s.model);
-      badge.textContent = lbl;
-      badge.title = 'Session model: ' + lbl + ' — click to switch (applies from the next message)';
-    }
-  }
+  if (!badge) return;
+  if (typeof liveSessionId === 'undefined' || !liveSessionId) return;
+  // Only the live session owns the visible badge.
+  if (sessionId && sessionId !== liveSessionId) return;
+  const model = (typeof SessionModel !== 'undefined')
+    ? SessionModel.getConfirmed(liveSessionId)
+    : '';
+  if (!model) return;
+  const lbl = _modelLabel(model);
+  badge.textContent = lbl;
+  badge.title = 'Session model: ' + lbl + ' — click to switch (applies from the next message)';
 }
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -652,8 +652,16 @@ function _autoSendPendingInput() {
       runningIds.add(id);
       sessionKinds[id] = 'working';
       const startOpts = { session_id: id, prompt: text, cwd: _currentProjectDir(), name: '' };
-      if (typeof defaultModel !== 'undefined' && defaultModel) startOpts.model = defaultModel;
-      if (typeof defaultThinking !== 'undefined' && defaultThinking) startOpts.thinking_level = defaultThinking;
+      // Resolve via the single owner so this path honors a per-session choice
+      // instead of always falling back to the system default.
+      const _lpModel = (typeof SessionModel !== 'undefined')
+        ? SessionModel.effectivePending(id)
+        : (typeof defaultModel !== 'undefined' ? defaultModel : '');
+      const _lpThinking = (typeof SessionModel !== 'undefined')
+        ? SessionModel.getDesiredThinking(id)
+        : (typeof defaultThinking !== 'undefined' ? defaultThinking : '');
+      if (_lpModel) startOpts.model = _lpModel;
+      if (_lpThinking) startOpts.thinking_level = _lpThinking;
       socket.emit('start_session', startOpts);
       // Set placeholder title from message text
       const s = allSessions.find(x => x.id === id);

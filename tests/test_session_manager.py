@@ -463,6 +463,54 @@ class TestSetSessionModel:
         assert "self._registry" not in src, \
             "Use self._reg — self._registry silently breaks auto-resume"
 
+    # --- _set_confirmed_model: the single daemon write path ---------------
+    # The three previously-scattered writes to info.model (mid-session switch,
+    # CLI init message, and start) now funnel through one sink so their
+    # reconciliation order can never drift apart.
+
+    def test_confirmed_model_sink_updates_and_reports_change(self, session_manager, sm_module):
+        info = self._make_session(session_manager, sm_module, "sink-1",
+                                  model="claude-fable-5")
+        with patch("app.routes.live_api.record_confirmed_model") as rec:
+            changed = session_manager._set_confirmed_model(info, "claude-opus-4-7")
+        assert changed is True
+        assert info.model == "claude-opus-4-7"
+        rec.assert_called_once_with("claude-opus-4-7")
+
+    def test_confirmed_model_sink_noop_when_unchanged(self, session_manager, sm_module):
+        info = self._make_session(session_manager, sm_module, "sink-2",
+                                  model="claude-opus-4-7")
+        assert session_manager._set_confirmed_model(info, "claude-opus-4-7") is False
+        assert info.model == "claude-opus-4-7"
+
+    def test_confirmed_model_sink_ignores_empty(self, session_manager, sm_module):
+        info = self._make_session(session_manager, sm_module, "sink-3",
+                                  model="claude-fable-5")
+        assert session_manager._set_confirmed_model(info, "   ") is False
+        assert info.model == "claude-fable-5"
+
+    def test_confirmed_model_sink_init_is_ground_truth(self, session_manager, sm_module):
+        """The CLI init message's resolved id (e.g. a dated variant) overwrites
+        a previously recorded base id — init is the ultimate authority."""
+        info = self._make_session(session_manager, sm_module, "sink-4",
+                                  model="claude-sonnet-4-6")
+        changed = session_manager._set_confirmed_model(
+            info, "claude-sonnet-4-6-20251022")
+        assert changed is True
+        assert info.model == "claude-sonnet-4-6-20251022"
+
+    def test_confirmed_model_sink_saves_registry_only_when_requested(self, session_manager, sm_module):
+        info = self._make_session(session_manager, sm_module, "sink-5",
+                                  model="claude-fable-5")
+        with patch.object(session_manager, "_schedule_registry_save") as save:
+            # Default (init path): no extra disk write per turn.
+            session_manager._set_confirmed_model(info, "claude-opus-4-7")
+            save.assert_not_called()
+            # Explicit switch path: persist the change.
+            session_manager._set_confirmed_model(info, "claude-sonnet-4-6",
+                                                 save_registry=True)
+            save.assert_called_once()
+
     def test_dormant_session_without_jsonl_rejected(self, session_manager):
         """No in-memory session AND no .jsonl on disk → honest not-found."""
         with patch.object(session_manager._store, 'find_session_path',

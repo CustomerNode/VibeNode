@@ -1034,6 +1034,41 @@ class SessionManager:
         )
         return {"ok": True}
 
+    def _set_confirmed_model(self, info, model: str, *,
+                             save_registry: bool = False) -> bool:
+        """Single sink for a CLI/daemon-confirmed session model.
+
+        Model reconciliation on the daemon used to be three scattered writes to
+        ``info.model`` (start, mid-session switch, and the CLI ``init`` message)
+        each with their own ``record_confirmed_model`` call.  Centralizing them
+        here makes the contract explicit and keeps them from drifting apart:
+
+          * A confirmed model is GROUND TRUTH — we mirror it onto ``info.model``
+            and into the persistent confirmed-models list that backs /api/models.
+          * The CLI ``init`` message remains the ultimate authority: if the CLI
+            later reports a different resolved id, it flows through this same
+            sink and overwrites the previously recorded value.
+
+        Returns True if ``info.model`` actually changed.  Callers that need the
+        registry persisted (e.g. an explicit mid-session switch) pass
+        ``save_registry=True``; the periodic init path does not, to avoid an
+        extra disk write on every turn's init message.
+        """
+        model = (model or "").strip()
+        if not model:
+            return False
+        changed = info.model != model
+        if changed:
+            info.model = model
+        try:
+            from app.routes.live_api import record_confirmed_model
+            record_confirmed_model(model)
+        except Exception:
+            pass
+        if save_registry and changed:
+            self._schedule_registry_save()
+        return changed
+
     def set_session_model(self, session_id: str, model: str) -> dict:
         """Switch a running session's model for all subsequent turns.
 
@@ -1118,11 +1153,10 @@ class SessionManager:
                            session_id, model, e)
             return {"ok": False, "error": f"Model switch rejected: {e}"}
 
-        # CLI confirmed — now (and only now) record it.
-        info.model = model
+        # CLI confirmed — now (and only now) record it, via the single sink.
+        self._set_confirmed_model(info, model, save_registry=True)
         logger.info("Session %s model switched to %s (CLI confirmed)",
                     session_id, model)
-        self._schedule_registry_save()
         # NOTE: do NOT call _emit_state here.  _emit_state on an IDLE session
         # unconditionally calls _try_dispatch_queue — which would fire any
         # message the user had queued while the session was busy.  That
@@ -1131,11 +1165,6 @@ class SessionManager:
         # The badge update is handled client-side from the socket result, and
         # the next natural _emit_state (from the next turn's state transition)
         # will carry the updated model field to all clients.
-        try:
-            from app.routes.live_api import record_confirmed_model
-            record_confirmed_model(model)
-        except Exception:
-            pass
         # Human-readable log entry so the transcript records the switch.
         entry = LogEntry(kind="system", text=f"Model switched to {model}")
         with info._lock:
@@ -3947,13 +3976,9 @@ class SessionManager:
                 # which models this installation has actually used.
                 resolved_model = data.get("model", "")
                 if resolved_model and resolved_model.startswith("claude-"):
-                    if info.model != resolved_model:
-                        info.model = resolved_model
-                    try:
-                        from app.routes.live_api import record_confirmed_model
-                        record_confirmed_model(resolved_model)
-                    except Exception:
-                        pass
+                    # Init message is the CLI's ground truth for the resolved
+                    # model id — funnel it through the single sink.
+                    self._set_confirmed_model(info, resolved_model)
 
                 # End of the SDK's compaction phase (or session re-init).
                 # Substatus handling is subtle — the UI's "Compacting…" label

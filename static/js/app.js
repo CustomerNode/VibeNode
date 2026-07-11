@@ -1143,13 +1143,15 @@ async function _newSessionSubmit(sessionId) {
       : _invokeNotice.trim();
   }
 
-  // Resolve model: session-specific assignment wins over global override wins over system default.
-  // Session-specific model is set when the user clicks the model badge for THIS session.
-  const _sessRec = (typeof allSessions !== 'undefined') ? allSessions.find(function(x) { return x.id === sessionId; }) : null;
-  const _modelToUse = (_sessRec && _sessRec.model)
-    ? _sessRec.model
-    : ((typeof _effectiveModel === 'function') ? _effectiveModel() : defaultModel);
-  const _thinkingToUse = (typeof _effectiveThinking === 'function') ? _effectiveThinking() : defaultThinking;
+  // Resolve model/thinking from the single owner (SessionModel): this pending
+  // session's chosen model, else the system default.  There is no global
+  // override, so the choice can never leak in from another session.
+  const _modelToUse = (typeof SessionModel !== 'undefined')
+    ? SessionModel.effectivePending(sessionId)
+    : ((typeof defaultModel !== 'undefined') ? defaultModel : '');
+  const _thinkingToUse = (typeof SessionModel !== 'undefined')
+    ? SessionModel.getDesiredThinking(sessionId)
+    : ((typeof defaultThinking !== 'undefined') ? defaultThinking : '');
 
   const startOpts = {
     session_id: sessionId,
