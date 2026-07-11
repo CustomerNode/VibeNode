@@ -481,6 +481,13 @@ class SessionManager:
         self._orphan_sweep_timer: Optional[threading.Timer] = None
         self._schedule_orphan_sweep()
 
+        # Session health monitor: stall auto-restart, sleep/wake healing,
+        # and keep-awake-while-working.  Lazy import avoids a module cycle
+        # (health_monitor imports LogEntry back from this module).
+        from daemon.health_monitor import HealthMonitor
+        self._health_monitor = HealthMonitor(self)
+        self._health_monitor.start()
+
     def _run_loop(self) -> None:
         """Entry point for the background thread."""
         asyncio.set_event_loop(self._loop)
@@ -496,6 +503,10 @@ class SessionManager:
         if getattr(self, '_orphan_sweep_timer', None):
             self._orphan_sweep_timer.cancel()
             self._orphan_sweep_timer = None
+        # Stop the health monitor thread
+        if getattr(self, '_health_monitor', None):
+            self._health_monitor.stop()
+            self._health_monitor = None
         # Flush queue to disk
         self._mq.flush()
         # Close all sessions
