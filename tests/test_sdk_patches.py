@@ -53,6 +53,76 @@ class TestStructuralAssertions:
         from daemon.sdk_patches import _assert_patch_transport_adapter_preconditions
         _assert_patch_transport_adapter_preconditions()
 
+    def test_json_buffer_limit_preconditions(self):
+        """subprocess_cli._MAX_BUFFER_SIZE exists and the read loop references it."""
+        from daemon.sdk_patches import (
+            _assert_patch_raise_json_buffer_limit_preconditions,
+        )
+        # Returns the resolved target size in bytes; must be a positive int.
+        target = _assert_patch_raise_json_buffer_limit_preconditions()
+        assert isinstance(target, int) and target > 0
+
+
+# ── JSON Buffer Limit Tests (Patch 5) ────────────────────────────────────
+
+
+class TestRaiseJsonBufferLimit:
+    """Patch 5 lifts the SDK's hardcoded 1MB per-message JSON decode ceiling.
+
+    Regression guard for the "stream fails, reconnects, fails again" loop:
+    a single tool result / message over 1MB raised SDKJSONDecodeError, which
+    session_manager classified as a non-transport error and hard-reconnected
+    instead of self-healing — and the next turn busted the buffer again.
+    """
+
+    _SDK_DEFAULT = 1024 * 1024  # the value the SDK ships with
+
+    def test_buffer_limit_raised_above_sdk_default(self):
+        """After patching (done at module load), the ceiling must exceed 1MB."""
+        from claude_code_sdk._internal.transport import subprocess_cli as sc
+        assert sc._MAX_BUFFER_SIZE > self._SDK_DEFAULT, (
+            f"_MAX_BUFFER_SIZE {sc._MAX_BUFFER_SIZE} not raised above the SDK's "
+            f"1MB default — oversized messages will kill the stream again"
+        )
+
+    def test_buffer_limit_matches_default_target(self):
+        """With no env override, the ceiling should be the 64MB default."""
+        from daemon.sdk_patches import _DEFAULT_MAX_BUFFER_MB
+        from claude_code_sdk._internal.transport import subprocess_cli as sc
+        # This holds as long as VIBENODE_SDK_MAX_BUFFER_MB wasn't set when
+        # patches were applied at import time.
+        if not os.environ.get("VIBENODE_SDK_MAX_BUFFER_MB"):
+            assert sc._MAX_BUFFER_SIZE == _DEFAULT_MAX_BUFFER_MB * 1024 * 1024
+
+    def test_env_override_is_respected(self, monkeypatch):
+        """VIBENODE_SDK_MAX_BUFFER_MB overrides the default target size."""
+        from daemon.sdk_patches import (
+            _assert_patch_raise_json_buffer_limit_preconditions,
+        )
+        monkeypatch.setenv("VIBENODE_SDK_MAX_BUFFER_MB", "128")
+        target = _assert_patch_raise_json_buffer_limit_preconditions()
+        assert target == 128 * 1024 * 1024
+
+    def test_env_override_invalid_falls_back_to_default(self, monkeypatch):
+        """A non-integer override is ignored, not fatal."""
+        from daemon.sdk_patches import (
+            _assert_patch_raise_json_buffer_limit_preconditions,
+            _DEFAULT_MAX_BUFFER_MB,
+        )
+        monkeypatch.setenv("VIBENODE_SDK_MAX_BUFFER_MB", "not-a-number")
+        target = _assert_patch_raise_json_buffer_limit_preconditions()
+        assert target == _DEFAULT_MAX_BUFFER_MB * 1024 * 1024
+
+    def test_env_override_nonpositive_falls_back_to_default(self, monkeypatch):
+        """Zero/negative overrides are ignored (would disable the ceiling)."""
+        from daemon.sdk_patches import (
+            _assert_patch_raise_json_buffer_limit_preconditions,
+            _DEFAULT_MAX_BUFFER_MB,
+        )
+        monkeypatch.setenv("VIBENODE_SDK_MAX_BUFFER_MB", "0")
+        target = _assert_patch_raise_json_buffer_limit_preconditions()
+        assert target == _DEFAULT_MAX_BUFFER_MB * 1024 * 1024
+
 
 # ── Safe Parse Message Tests ─────────────────────────────────────────────
 

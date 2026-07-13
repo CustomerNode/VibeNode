@@ -11,6 +11,9 @@ Patch inventory:
   3. Suppress console windows — prevent CLI subprocess from flashing a window (Windows)
   4. Isolate POSIX subprocesses — put each child in its own session/pgrp so
      killpg-based session stop cannot blast the daemon (Linux/macOS)
+  5. Raise JSON stream buffer limit — lift the SDK's hardcoded 1MB
+     per-message decode ceiling so large tool results / messages don't
+     kill the stream and trigger an endless reconnect loop
 
 Patches 2b and 3 from the original session_manager.py monkey-patching have been
 replaced by the Transport Adapter pattern (see sdk_transport_adapter.py).
@@ -72,6 +75,7 @@ def apply_patches() -> list[str]:
         ("transport_adapter", _apply_patch_transport_adapter),
         ("suppress_console_windows", _apply_patch_suppress_console_windows),
         ("isolate_posix_subprocesses", _apply_patch_isolate_posix_subprocesses),
+        ("raise_json_buffer_limit", _apply_patch_raise_json_buffer_limit),
     ]:
         try:
             if fn():
@@ -354,4 +358,126 @@ def _apply_patch_isolate_posix_subprocesses() -> bool:
         return _original_init(self, *args, **kwargs)
 
     _subprocess.Popen.__init__ = _isolated_session_Popen_init  # type: ignore[method-assign]
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Patch 5: Raise the JSON stream buffer limit
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The SDK's subprocess transport (subprocess_cli.py) reads newline-delimited
+# JSON from the Claude CLI's stdout and speculatively accumulates each line
+# into `json_buffer` until it parses as a complete JSON object.  A module-level
+# constant caps that buffer:
+#
+#     _MAX_BUFFER_SIZE = 1024 * 1024   # 1MB
+#     ...
+#     if len(json_buffer) > _MAX_BUFFER_SIZE:
+#         json_buffer = ""
+#         raise SDKJSONDecodeError("JSON message exceeded maximum buffer size ...")
+#
+# A SINGLE message larger than 1MB therefore kills the whole receive stream.
+# This happens routinely on real sessions: one turn emits a large tool result
+# (reading a big file, grepping a large log, a big command's stdout) or a large
+# assistant/user message, serialized as one JSON line well over 1MB.
+#
+# Why this manifests as the "reconnect, then broken again" loop:
+# session_manager._send_query's except handler classifies this as a
+# SDKJSONDecodeError (a CLIJSONDecodeError subclass), NOT a transport error
+# ("Stream closed" / "exit code" / ClosedResource / CLIConnection / Process).
+# So it takes the immediate `_reconnect_client` branch instead of the
+# self-healing/backoff path — and the very next turn produces another oversized
+# message that busts the buffer again.  Endless fail → reconnect → fail.
+#
+# SDK 0.0.25 does NOT expose this limit through ClaudeCodeOptions, so we lift
+# it here.  `_read_messages_impl` looks up `_MAX_BUFFER_SIZE` as a module global
+# at call time, so reassigning the module attribute takes effect immediately for
+# all sessions (existing and future transports).  The cap is a transient safety
+# ceiling, not a preallocation — normal messages parse and reset the buffer
+# instantly; only a genuinely huge (or malformed/runaway) message ever grows the
+# buffer toward the ceiling.  We keep a bounded ceiling (default 64MB) rather
+# than removing it entirely so a truly runaway/never-terminating JSON line still
+# fails instead of consuming unbounded memory.
+#
+# Override with VIBENODE_SDK_MAX_BUFFER_MB (integer megabytes) if a workload
+# legitimately needs more or you want to tighten it.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Default per-message JSON decode ceiling, in megabytes.  Chosen to comfortably
+# cover large tool results (e.g. reading a multi-MB file) while still bounding
+# memory against a runaway stream.
+_DEFAULT_MAX_BUFFER_MB = 64
+
+
+def _assert_patch_raise_json_buffer_limit_preconditions() -> int:
+    """Verify the SDK buffer-limit seam still exists and return the new limit.
+
+    Fails fast if the SDK renamed/removed the constant or stopped referencing
+    it in the read loop — either would silently defeat this patch.
+    """
+    from claude_code_sdk._internal.transport import subprocess_cli as _sc
+
+    assert hasattr(_sc, "_MAX_BUFFER_SIZE"), (
+        "subprocess_cli._MAX_BUFFER_SIZE not found — SDK may have renamed or "
+        "removed the JSON buffer ceiling; re-check this patch"
+    )
+    assert isinstance(_sc._MAX_BUFFER_SIZE, int), (
+        "_MAX_BUFFER_SIZE is not an int — SDK internals changed"
+    )
+    # The read loop must still consult the module global (dynamic lookup) for a
+    # module-attribute reassignment to take effect.  The loop lives on the
+    # transport class (SubprocessCLITransport._read_messages_impl), not the
+    # module namespace.
+    assert hasattr(_sc, "SubprocessCLITransport"), (
+        "subprocess_cli.SubprocessCLITransport not found — SDK internals changed"
+    )
+    read_impl = getattr(_sc.SubprocessCLITransport, "_read_messages_impl", None)
+    assert read_impl is not None, (
+        "SubprocessCLITransport._read_messages_impl not found — SDK internals changed"
+    )
+    src = inspect.getsource(read_impl)
+    assert "_MAX_BUFFER_SIZE" in src, (
+        "_read_messages_impl no longer references _MAX_BUFFER_SIZE — reassigning "
+        "the module constant would no longer change behaviour"
+    )
+
+    # Resolve the target size (allow env override, floor at the SDK default).
+    mb = _DEFAULT_MAX_BUFFER_MB
+    raw = os.environ.get("VIBENODE_SDK_MAX_BUFFER_MB")
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed > 0:
+                mb = parsed
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid VIBENODE_SDK_MAX_BUFFER_MB=%r (not an int)", raw
+            )
+    return mb * 1024 * 1024
+
+
+def _apply_patch_raise_json_buffer_limit() -> bool:
+    """Raise subprocess_cli._MAX_BUFFER_SIZE above the SDK's 1MB default.
+
+    See the section header for the full root-cause writeup (oversized single
+    messages kill the stream and drive an endless reconnect loop).
+    """
+    new_limit = _assert_patch_raise_json_buffer_limit_preconditions()
+
+    from claude_code_sdk._internal.transport import subprocess_cli as _sc
+
+    old_limit = _sc._MAX_BUFFER_SIZE
+    if new_limit <= old_limit:
+        # Never shrink below what the SDK already allows.
+        logger.info(
+            "JSON buffer limit already >= target (%d bytes); leaving unchanged",
+            old_limit,
+        )
+        return False
+
+    _sc._MAX_BUFFER_SIZE = new_limit
+    logger.info(
+        "Raised SDK JSON buffer limit: %d -> %d bytes (%d MB)",
+        old_limit, new_limit, new_limit // (1024 * 1024),
+    )
     return True
