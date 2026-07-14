@@ -226,7 +226,7 @@ function _renderQueueBanner() {
     '<div class="live-queue-banner-header">' +
     '<span class="live-queue-banner-label">' +
     '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;margin-right:4px;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>' +
-    'Queued' + (total > 1 ? ' (' + total + ')' : '') + ' \u2014 will send when idle</span>' +
+    'Queued' + (total > 1 ? ' (' + total + ')' : '') + '<span class="live-queue-suffix"> \u2014 will send when idle</span></span>' +
     '<span style="display:flex;align-items:center;gap:4px;">' +
     navHtml +
     '<button class="live-queue-cancel-btn" onclick="liveEditQueue()" title="Edit this command">' +
@@ -2286,12 +2286,23 @@ function _addOptimisticBubble(sid, text, isVoice) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+// On mobile, drop focus after sending so the iOS keyboard dismisses and the reply is
+// visible immediately. No-op on desktop and when the composer isn't the focused element.
+function _defocusComposerMobile() {
+  try {
+    if (!window.matchMedia || !window.matchMedia('(max-width: 768px)').matches) return;
+    const ta = document.getElementById('live-input-ta') || document.getElementById('live-queue-ta');
+    if (ta && document.activeElement === ta) ta.blur();
+  } catch (_) {}
+}
+
 function liveSubmitContinue(fromId) {
   const ta = document.getElementById('live-input-ta');
   let text = ta ? ta.value.trim() : '';
   if (!text && !window._pendingInvoke) return;
   ta.value = '';
   _resetTextareaHeight(ta);
+  _defocusComposerMobile();
   if (window._pendingInvoke && typeof _wrapInvokeMessage === 'function') {
     text = _wrapInvokeMessage(text);
   }
@@ -2353,6 +2364,7 @@ function liveSubmitWaiting() {
   if (window._pendingInvoke && typeof _wrapInvokeMessage === 'function') {
     text = _wrapInvokeMessage(text);
   }
+  _defocusComposerMobile();
   _clearDraft(liveSessionId);
 
   // Use permission_response if there's an active permission request

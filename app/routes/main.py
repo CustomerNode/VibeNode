@@ -2,12 +2,14 @@
 Main route -- serves the single-page application.
 """
 
+import json
 import os
 import subprocess
 import sys
 
-from flask import Blueprint, jsonify, render_template, request, send_from_directory
+from flask import Blueprint, Response, jsonify, render_template, request, send_from_directory
 from ..platform_utils import NO_WINDOW as _NO_WINDOW
+from .. import mobile_command
 
 bp = Blueprint('main', __name__)
 
@@ -33,7 +35,39 @@ def _daemon_port() -> int:
 
 @bp.route("/")
 def index():
-    return render_template('index.html')
+    # a2hs_title is the label the phone's Home-Screen icon shows for THIS computer
+    # (defaults to the hostname), so multiple machines are distinguishable. Cheap —
+    # device_name() reads cached config + hostname, no Tailscale call. See mobile_command.
+    return render_template('index.html', a2hs_title=mobile_command.device_name())
+
+
+@bp.route("/manifest.webmanifest")
+def web_manifest():
+    """Per-machine PWA manifest so the installed app name matches THIS computer.
+
+    Served dynamically (not the static file) so the name follows the user's device
+    label. iOS keys the Add-to-Home-Screen name off apple-mobile-web-app-title (set
+    in index.html); this covers the manifest short_name for Android/Chrome installs.
+    """
+    name = mobile_command.device_name()
+    manifest = {
+        "name": name,
+        "short_name": name[:12] or "VibeNode",
+        "description": "Run and drive your Claude sessions from your phone.",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "orientation": "portrait",
+        "background_color": "#0b0d10",
+        "theme_color": "#0b0d10",
+        "icons": [{
+            "src": "/static/vibenode.png",
+            "sizes": "256x256",
+            "type": "image/png",
+            "purpose": "any maskable",
+        }],
+    }
+    return Response(json.dumps(manifest), mimetype="application/manifest+json")
 
 
 @bp.route("/api/docs")

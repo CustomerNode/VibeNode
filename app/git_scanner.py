@@ -65,7 +65,11 @@ _SECRET_PATTERNS = [
     ("Base64 Secret", re.compile(r'(?i)(secret|key|token|password|credential|auth)\s*[=:]\s*["\']?[A-Za-z0-9+/]{40,}={0,2}["\']?'), "Possible base64-encoded secret"),
 
     # ── Environment variable patterns ──
-    ("Env Variable Secret", re.compile(r'(?i)^[A-Z_]*(SECRET|TOKEN|KEY|PASSWORD|CREDENTIAL|AUTH)[A-Z_]*\s*=\s*[^\s]{8,}', re.MULTILINE), "Environment variable with secret value"),
+    # The negative lookahead excludes values that are a quoted pure-lowercase
+    # snake_case identifier (e.g. _CONFIG_KEY = "mobile_command_enabled"). Those
+    # are config-dict key constants, not secrets — real credentials always carry
+    # digits, mixed case, or special chars, so this never suppresses a true secret.
+    ("Env Variable Secret", re.compile(r'(?i)^[A-Z_]*(SECRET|TOKEN|KEY|PASSWORD|CREDENTIAL|AUTH)[A-Z_]*\s*=\s*(?!["\'][a-z]+(?:_[a-z]+)*["\']\s*$)[^\s]{8,}', re.MULTILINE), "Environment variable with secret value"),
 
     # ── PII / personal data ──
     ("Hardcoded User Path", re.compile(r'(?i)["\'][A-Z]:\\\\Users\\\\[a-zA-Z][a-zA-Z0-9._\-]{2,}\\\\|["\']/(?:Users|home)/[a-zA-Z][a-zA-Z0-9._\-]{2,}/'), "Hardcoded personal filesystem path"),

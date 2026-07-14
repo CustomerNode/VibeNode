@@ -1095,6 +1095,7 @@ async function _newSessionSubmit(sessionId) {
   }
   ta.value = '';  // clear immediately to prevent double-submit on key repeat
   _resetTextareaHeight(ta);
+  if (typeof _defocusComposerMobile === 'function') _defocusComposerMobile();
   if (typeof _clearDraft === 'function') _clearDraft(sessionId);
 
   // Wrap with invoke if pending

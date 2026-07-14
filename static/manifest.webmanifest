@@ -1,0 +1,19 @@
+{
+  "name": "VibeNode",
+  "short_name": "VibeNode",
+  "description": "Run and drive your Claude sessions from your phone.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b0d10",
+  "theme_color": "#0b0d10",
+  "icons": [
+    {
+      "src": "/static/vibenode.png",
+      "sizes": "256x256",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

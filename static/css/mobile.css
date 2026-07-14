@@ -1,0 +1,304 @@
+/* ============================================================================
+ * VibeNode — mobile responsive layer.
+ *
+ * This is NOT a separate UI. It's a set of @media (max-width:768px) overrides on
+ * the real desktop UI so the SAME app (same DOM, same JS, same voice/socket) is
+ * usable on a phone. Desktop is completely unaffected (all rules are inside the
+ * media query). Loaded AFTER style.css so these win at mobile widths.
+ *
+ * Strategy: the sidebar becomes a slide-in drawer reusing the existing
+ * `.sidebar.collapsed` state (toggleSidebar() in app.js). Main content fills the
+ * width. mobile.js manages the backdrop + sensible defaults.
+ * ========================================================================== */
+
+/* The injected ••• toolbar button + action sheet exist in the DOM always but
+   are desktop-hidden; they only appear at phone widths (below). */
+/* !important because style.css's `.main-toolbar button` out-specifies a plain
+   .toolbar-more selector — without it the ••• button leaks onto desktop. */
+.toolbar-more { display: none !important; }
+/* Mobile-only injected overlays are hidden on desktop so a window resize can't
+   leave ghost artifacts. Re-enabled inside the media query below. */
+#mobile-backdrop, #mobile-sheet, #mobile-sheet-backdrop { display: none; }
+
+@media (max-width: 768px) {
+
+  /* ---- Header: single tidy row that actually fits ---- */
+  header {
+    height: 52px;
+    padding: 0 10px;
+    gap: 8px;
+  }
+  header h1 { font-size: 17px; }
+  .app-logo { margin-top: 5px; }   /* nudge the logo down to sit level with the wordmark */
+
+  /* Landing: branding shown, no burger. Drilled-in (non-homepage): hide the
+     VibeNode logo/wordmark + the arrow, and make room for the burger opener. */
+  body.mob-drilled header { padding-left: 58px; }
+  body.mob-drilled header h1,
+  body.mob-drilled .app-logo { display: none !important; }
+  /* App-maintenance actions are desktop tasks — hide on phone so the bar fits.
+     (Still fully available on desktop; nothing removed there.) */
+  #btn-git-update, #btn-git-publish, #btn-git-sync { display: none !important; }
+  .hdr-sys-btn { font-size: 13px; padding: 7px 11px; }
+
+  /* Keep .layout as the desktop flex row (its height feeds .live-log scroll).
+     The REAL sidebar (project selector, view selector, New Session, search,
+     session list) becomes a slide-in drawer; when collapsed the content fills
+     the width. Toggled by the EXISTING collapse/expand buttons — no hamburger. */
+  #resize-handle { display: none; }
+  .sidebar {
+    position: fixed; top: 0; left: 0; bottom: 0;
+    width: 100vw; max-width: none; z-index: 500;   /* fullscreen slide-in */
+    transform: translateX(0);
+    transition: transform .28s cubic-bezier(.32, .72, 0, 1);
+  }
+  .sidebar.collapsed { transform: translateX(-100%); }
+
+  /* Close (X) button inside the drawer — big, easy tap target. */
+  .sidebar-collapse-btn {
+    width: 46px; height: 46px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-primary);
+  }
+  .sidebar-collapse-btn svg { width: 26px; height: 26px; }
+
+  /* The existing expand button (its own chevron) opens the drawer when collapsed. */
+  .sidebar-expand-btn {
+    position: fixed; top: 8px; left: 8px; z-index: 3000;
+    width: 40px; height: 40px; border-radius: 10px;
+    background: var(--bg-card); border: 1px solid var(--border);
+    color: var(--text-primary);
+  }
+  /* !important beats the inline style="display:none" a boot script sets on this
+     button (index.html) — inline style otherwise wins over every stylesheet. */
+  .sidebar-expand-btn.visible { display: flex !important; align-items: center; justify-content: center; }
+  .sidebar-expand-btn svg { width: 20px; height: 20px; }
+
+  /* Dimming backdrop behind the open drawer (created by mobile.js). */
+  #mobile-backdrop {
+    position: fixed; inset: 0; z-index: 480; background: rgba(0, 0, 0, .5);
+    opacity: 0; pointer-events: none; transition: opacity .25s ease;
+  }
+  #mobile-backdrop.show { opacity: 1; pointer-events: auto; }
+
+  /* ---- Landing/launcher cards ---- */
+  /* The homepage vertically-centers its cards (align-items:center). On a phone
+     the stacked cards are taller than the screen, so centering pushes the top
+     cards (project selector + Sessions) ABOVE the scroll area, unreachable.
+     Top-align + auto height so every card is visible and scrollable. */
+  .homepage {
+    align-items: flex-start !important;
+    justify-content: flex-start !important;
+    height: auto !important;
+    min-height: 100%;
+  }
+  .homepage-cards {
+    grid-template-columns: 1fr !important;
+    max-width: none !important;
+    gap: 12px;
+    margin: 0 !important;
+    padding: 6px 12px calc(20px + env(safe-area-inset-bottom));
+  }
+  .homepage-card { padding: 20px 18px; border-radius: 16px; }
+  .homepage-card:active { transform: scale(0.985); }   /* tap feedback instead of hover */
+  .homepage-card h3 { font-size: 20px; margin-bottom: 6px; }
+  .hp-icon-wrap { width: 44px; height: 44px; border-radius: 12px; margin-bottom: 14px; }
+  .hp-desc { font-size: 14px; margin-bottom: 16px; }
+
+
+  /* ---- iOS-like touch targets + roomier spacing throughout ---- */
+  .sidebar-action-btn,
+  .live-send-btn,
+  .sidebar-menu-btn,
+  .hdr-sys-dropdown button { min-height: 44px; }
+
+  .sidebar-header { padding: 10px; gap: 9px; }
+  .sidebar-action-btn { padding: 12px; font-size: 15px; border-radius: 10px; }
+
+  /* Session rows: taller, more padding, bigger text so they're easy to tap. */
+  .session-list { padding-left: 0; }
+  .session-item {
+    padding: 13px 12px;
+    min-height: 54px;
+    font-size: 15px;
+  }
+  .col-header-row { padding: 4px 12px; }
+
+  /* ---- Search + ••• row: make it line up with the rows above ----
+     The drawer reuses the desktop sidebar DOM, but three desktop assumptions
+     break at full-width phone widths. Fix each: */
+  /* 1) Desktop pulls ••• out with margin-right:-15px to sit inside the wider
+     desktop header padding (28px). Mobile overrides the header to padding:10px,
+     so that negative margin shoved ••• past the edge and out of line with the
+     New Session / project rows. Zero it so ••• ends flush with those rows. */
+  .sidebar-search-row { margin-right: 0; }
+  /* 2) The search field has no flex-grow, so in the 100vw drawer it stayed at
+     its intrinsic width and space-between flung ••• to the far right edge. Let
+     it grow to fill the row so ••• sits right after it. */
+  .sidebar-search { flex: 1 1 auto; min-width: 0; }
+  /* 3) Line the inset icon up with the action-button icons above (which sit at
+     the 10px header pad + 12px button pad). */
+  .sidebar-search-icon { left: 12px; }
+  /* 16px so iOS doesn't zoom on focus; comfortable height. Keep an explicit left
+     pad big enough to clear the icon — the old `padding:12px` shorthand wiped the
+     icon's gutter, so the icon overlapped the placeholder text. */
+  #search { font-size: 16px; padding: 12px 12px 12px 34px; }
+
+  /* ---- Live transcript: momentum scroll + edge padding ---- */
+  .live-log {
+    -webkit-overflow-scrolling: touch;
+    padding: 10px 12px;
+  }
+
+  /* ---- Composer: don't touch the edges, respect the home indicator, and cap
+     the auto-growing textarea so long input can't push the chat out of view --- */
+  .live-input-bar {
+    max-width: none;
+    padding: 10px 12px calc(12px + env(safe-area-inset-bottom));
+  }
+  .live-textarea {
+    font-size: 16px;            /* typed text stays >=16px so iOS never zooms on focus */
+    padding: 11px 13px;
+    min-height: 44px;
+    max-height: 120px;          /* long text scrolls inside instead of eating the screen */
+    overflow-y: auto;
+  }
+  /* Placeholder can be smaller — only the typed value's size affects iOS zoom. */
+  .live-textarea::placeholder { font-size: 13.5px; }
+  .live-textarea::-webkit-input-placeholder { font-size: 13.5px; }
+  /* Controls row under the textarea: single line, never wrap. Drop the text
+     bits that force wrapping — the keyboard hint and the model-name button
+     (model is still changeable via System → Model). */
+  .live-bar-row { flex-wrap: nowrap; gap: 8px; align-items: center; overflow: hidden; }
+  .send-hint { display: none !important; }
+  .session-model-btn { display: none !important; }
+  /* The send/voice button gets the 44px touch target (above). Without internal
+     flex-centering its icon sits at the TOP of that taller box instead of the middle.
+     Center the content so the icon aligns vertically inside the button. */
+  .live-send-btn {
+    flex: none;
+    padding: 10px 18px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* ---- Toasts: iOS-native capsule that drops in from the TOP, clear of the bottom
+     composer keys. On desktop they sit bottom-right (padding:10px 16px, bottom:20px;
+     right:20px) — on a narrow phone that lands right over the send/voice buttons.
+     Reposition to a centered pill under the header + notch, and give it the frosted
+     iOS look (blur, capsule, soft shadow, slide-down). ---- */
+  .toast {
+    top: calc(env(safe-area-inset-top) + 58px);   /* just under the 52px header */
+    bottom: auto;
+    left: 50%;
+    right: auto;
+    transform: translateX(-50%) translateY(-12px);
+    max-width: calc(100vw - 32px);
+    text-align: center;
+    padding: 11px 18px;
+    border-radius: 999px;
+    font-size: 13.5px;
+    font-weight: 500;
+    color: #fff;
+    background: rgba(28, 28, 32, 0.92);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    backdrop-filter: blur(20px) saturate(180%);
+    box-shadow: 0 10px 34px rgba(0, 0, 0, 0.4);
+    transition: opacity 0.25s ease, transform 0.28s cubic-bezier(.32, .72, 0, 1);
+  }
+  .toast.show { transform: translateX(-50%) translateY(0); }
+  /* Error toasts keep a red accent but the same capsule shape + top position. */
+  .toast.error {
+    background: rgba(58, 20, 22, 0.92);
+    border-color: rgba(255, 90, 90, 0.40);
+    color: #ffd9d9;
+  }
+
+  /* Queued banner: drop the "— will send when idle" suffix on mobile; the
+     "Queued (n)" label alone is enough on a phone. */
+  .live-queue-suffix { display: none !important; }
+
+  /* Align the queue banner's left/right with the topnav (and the chat content):
+     drop the desktop 760px centering + 14px inset for a flush 12px inset. */
+  #live-queue-area { max-width: none; margin: 0; padding: 0 12px; }
+  #live-queue-hint { display: none !important; }
+
+  /* ---- Kill the horizontal scroll: nothing may exceed the viewport width ---- */
+  html, body { overflow-x: hidden; max-width: 100%; }
+  #main-body, .main, .live-panel, .live-log, .live-output-shelf {
+    max-width: 100%;
+    overflow-x: hidden;
+  }
+  /* Code/pre in messages: scroll inside their own block, never widen the page. */
+  .live-log pre { max-width: 100%; overflow-x: auto; }
+
+  /* ---- Open-chat toolbar → compact but COMPLETE. Keep the actions (Actions
+     popup + Analyze dropdown); just shrink them and let the title truncate so
+     the row fits without sideways scroll. The dropdowns render on <body>
+     (see toggleGrpDropdown), so they're never clipped by the toolbar. ---- */
+  .main-toolbar {
+    overflow: hidden; flex-wrap: nowrap;
+    padding: 4px 8px 4px 15px;   /* left 15px aligns the ✕ with the content below */
+    gap: 2px; min-height: 44px;
+  }
+  #main-title {
+    flex: 1 1 auto; min-width: 0; margin: 0;
+    font-size: 14px; font-weight: 600; color: var(--text-primary);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* Collapse the desktop action labels — every action moves into the ••• sheet. */
+  .main-toolbar .btn-group-divider,
+  .main-toolbar .btn-group-label,
+  .main-toolbar .btn-group { display: none; }
+
+  /* ✕ and ••• are the SAME minimal icon button: identical size, transparent
+     background, and color — so they match each other and the bar. (Desktop
+     .toolbar-close is a boxed muted pill; override its box/color/margin here.) */
+  .toolbar-close, .toolbar-more {
+    flex: none !important; width: 34px; height: 34px; padding: 0 !important;
+    display: flex !important; align-items: center; justify-content: center;
+    background: transparent !important; border: none !important;
+    border-radius: 8px; margin: 0 !important;
+    color: var(--text-secondary) !important;
+  }
+  .toolbar-close svg, .toolbar-more svg { width: 19px; height: 19px; }
+  .toolbar-close:active, .toolbar-more:active { background: var(--bg-hover); }
+  /* Hide the session-close X on mobile — you leave a session via the burger/
+     drawer, so the tiny X next to ••• is redundant here. */
+  .toolbar-close { display: none !important; }
+
+  /* ---- iOS-style bottom action sheet (built by mobile.js) ---- */
+  #mobile-sheet-backdrop {
+    position: fixed; inset: 0; z-index: 9998; display: block; background: rgba(0, 0, 0, .5);
+    opacity: 0; pointer-events: none; transition: opacity .25s ease;
+  }
+  #mobile-sheet-backdrop.show { opacity: 1; pointer-events: auto; }
+  #mobile-sheet {
+    position: fixed; left: 8px; right: 8px; bottom: 0; z-index: 9999; display: block;
+    padding-bottom: calc(8px + env(safe-area-inset-bottom));
+    transform: translateY(130%);
+    transition: transform .3s cubic-bezier(.32, .72, 0, 1);
+  }
+  #mobile-sheet.show { transform: translateY(0); }
+  #mobile-sheet .sheet-card {
+    background: var(--bg-modal); border: 1px solid var(--border-light);
+    border-radius: 16px; overflow: hidden;
+  }
+  #mobile-sheet .sheet-item {
+    display: flex; align-items: center; width: 100%;
+    padding: 13px 16px; font-size: 15px; color: var(--text-primary);
+    background: none; border: none; border-bottom: 1px solid var(--border-subtle);
+    text-align: left; cursor: pointer;
+  }
+  #mobile-sheet .sheet-item:last-child { border-bottom: none; }
+  #mobile-sheet .sheet-item:active { background: var(--bg-hover); }
+  #mobile-sheet .sheet-item:disabled { opacity: .4; }
+  #mobile-sheet .sheet-cancel {
+    display: block; width: 100%; margin-top: 8px;
+    padding: 14px; font-size: 15px; font-weight: 600;
+    color: var(--accent-text); background: var(--bg-modal);
+    border: 1px solid var(--border-light); border-radius: 14px;
+  }
+}

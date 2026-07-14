@@ -484,22 +484,45 @@ socket.on('state_snapshot', (data) => {
         _updatePermissionQueue(waitingData);
     }
 
-    // Sync server-side queue cache from snapshot
+    // Sync server-side queue cache from snapshot.
+    //
+    // The snapshot is PROJECT-SCOPED (server filters sessions + queues by project — see
+    // ws_events.py request_state_snapshot), so it is authoritative ONLY for the sessions
+    // it reports on. Reconcile just those — set or clear each in-scope session's queue —
+    // and LEAVE out-of-scope sessions' cached queues intact.
+    //
+    // Previously this wiped the ENTIRE cache then repopulated from the scoped snapshot,
+    // so a queued message on any session not in the current (project-scoped) snapshot
+    // vanished as you switched sessions, until a full-load snapshot (hard refresh)
+    // re-fetched everything. request_state_snapshot fires on every session open, so
+    // banging around sessions dropped queues repeatedly.
     if (typeof _sessionQueues !== 'undefined') {
-        for (const k in _sessionQueues) delete _sessionQueues[k];
-        // Prefer top-level queues dict; fall back to per-session queue field
+        // Build the snapshot's queue map (top-level dict preferred, else per-session field).
+        const _snapQ = {};
         if (data.queues) {
             for (const k in data.queues) {
-                if (Array.isArray(data.queues[k]) && data.queues[k].length) {
-                    _sessionQueues[k] = data.queues[k];
-                }
+                if (Array.isArray(data.queues[k]) && data.queues[k].length) _snapQ[k] = data.queues[k];
             }
         } else {
             (data.sessions || []).forEach(s => {
-                if (s.queue && Array.isArray(s.queue) && s.queue.length) {
-                    _sessionQueues[s.session_id] = s.queue;
-                }
+                if (s.queue && Array.isArray(s.queue) && s.queue.length) _snapQ[s.session_id] = s.queue;
             });
+        }
+        const _scope = data.sessions || [];
+        if (_scope.length || data.queues) {
+            // Authoritative for in-scope sessions: set if queued, clear if the snapshot
+            // shows none (i.e. it was dispatched/cleared server-side).
+            _scope.forEach(s => {
+                const sid = s.session_id;
+                if (_snapQ[sid]) _sessionQueues[sid] = _snapQ[sid];
+                else delete _sessionQueues[sid];
+            });
+            // Honor any queue keys present in the dict but not in the session list.
+            for (const k in _snapQ) _sessionQueues[k] = _snapQ[k];
+        } else {
+            // No scope info at all — safest to fully replace (original behavior).
+            for (const k in _sessionQueues) delete _sessionQueues[k];
+            for (const k in _snapQ) _sessionQueues[k] = _snapQ[k];
         }
         _queueViewIndex = 0;
         if (typeof _renderQueueBanner === 'function') _renderQueueBanner();

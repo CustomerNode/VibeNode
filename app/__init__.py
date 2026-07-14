@@ -77,6 +77,7 @@ def create_app(testing=False) -> Flask:
     from .routes.test_api import bp as test_bp
     from .routes.admin_api import bp as admin_bp
     from .routes.watchdog_api import bp as watchdog_bp
+    from .routes.mobile_api import bp as mobile_bp
 
     app.register_blueprint(main_bp)
     app.register_blueprint(sessions_bp)
@@ -91,6 +92,7 @@ def create_app(testing=False) -> Flask:
     app.register_blueprint(test_bp)
     app.register_blueprint(admin_bp)
     app.register_blueprint(watchdog_bp)
+    app.register_blueprint(mobile_bp)
 
     # SpeechNode (extracted package) — mount its routes + serve its web assets.
     # Optional: if the package isn't importable, VibeNode still runs (voice off).
@@ -150,6 +152,16 @@ def create_app(testing=False) -> Flask:
         from .compose.watcher import start_compose_watcher
         start_compose_watcher(socketio, app)
 
+        # Mobile Command: if the user left phone access ON, re-establish the private
+        # tailnet bridge (tailscale serve) now so it persists across restarts —
+        # mirrors the Persistent Storage "set once, always works" behavior.
+        # Best-effort and silent; no-ops when disabled or Tailscale is unavailable.
+        try:
+            from . import mobile_command
+            mobile_command.rearm()
+        except Exception:
+            _logging.getLogger("app").exception("Mobile Command rearm failed (non-fatal)")
+
     # Auto cache-busting: {{ versioned_static('js/app.js') }} → /static/js/app.js?v=<mtime>
     @app.context_processor
     def _static_cache_buster():
@@ -171,6 +183,13 @@ def create_app(testing=False) -> Flask:
             response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
             response.headers['Pragma'] = 'no-cache'
             response.headers['Expires'] = '0'
+        elif response.mimetype == 'text/html':
+            # The SPA shell must revalidate every load. Without this the browser
+            # (esp. iOS Safari / home-screen PWA) serves a cached HTML that points
+            # at stale cache-busted JS/CSS — so fixes never reach the device even
+            # though versioned_static changed the ?v= for the assets.
+            response.headers['Cache-Control'] = 'no-cache, must-revalidate'
+            response.headers['Pragma'] = 'no-cache'
         return response
 
     return app

@@ -5,10 +5,23 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>VibeNode</title>
 <link rel="icon" href="/static/images/logo.png" type="image/png">
+<!-- Mobile Command: install-to-home-screen shell (inert on desktop). Lets the phone
+     add VibeNode as a standalone, native-feeling app icon. See app/mobile_command.py. -->
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/static/vibenode.png">
+<meta name="theme-color" content="#0b0d10">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<!-- Per-machine Home-Screen label so multiple computers are distinguishable on the
+     phone (defaults to hostname; set in System → Mobile Command). iOS uses this for
+     the Add-to-Home-Screen name. -->
+<meta name="apple-mobile-web-app-title" content="{{ a2hs_title|default('VibeNode', true) }}">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="{{ versioned_static('style.css') }}">
+<link rel="stylesheet" href="{{ versioned_static('css/mobile.css') }}">   <!-- mobile responsive layer (<=768px only) -->
 <link rel="stylesheet" href="/speechnode/speechnode.css">   <!-- SpeechNode package assets -->
 <link href="/static/vendor/quill.snow.css" rel="stylesheet">
 <script src="/static/vendor/quill.min.js"></script>
@@ -48,6 +61,7 @@
       <div class="sys-separator"></div>
       <button onclick="openPermissionPolicySelector();closeHdrSys()">Permission Policy</button>
       <button onclick="openPersistentStorage();closeHdrSys()">Persistent Storage <span class="sys-item-value" id="sys-storage-label">Local</span></button>
+      <button onclick="openMobileCommand();closeHdrSys()">Mobile Command <span class="sys-item-value" id="sys-mobile-label">Off</span></button>
       <div class="sys-separator"></div>
       <button onclick="openBulkOperations();closeHdrSys()">Bulk Operations</button>
       <button onclick="_showHelpModal();closeHdrSys()">Keyboard Shortcuts</button>
@@ -617,6 +631,9 @@
 <script src="{{ versioned_static('js/sessions.js') }}"></script>
 <script src="{{ versioned_static('js/toolbar.js') }}"></script>
 <script src="{{ versioned_static('js/modals.js') }}"></script>
+<script src="/static/js/vendor/qrcode.min.js"></script>
+<script src="{{ versioned_static('js/mobile-command.js') }}"></script>
+<script src="{{ versioned_static('js/mobile.js') }}"></script>   <!-- mobile drawer behavior (<=768px only) -->
 <script src="{{ versioned_static('js/file-drop.js') }}"></script>
 <script src="{{ versioned_static('js/templates.js') }}"></script>
 <script src="{{ versioned_static('js/git-sync.js') }}"></script>

@@ -261,7 +261,7 @@ function setupVoiceButton(textarea, button, onSubmit) {
 
       // If the browser killed recognition unexpectedly (not silence / not manual),
       // try to seamlessly restart and keep recording.
-      if (!recognition._intentionalStop && restartCount < MAX_RESTARTS && _activeRecognition === recognition) {
+      if (recognition._started && !recognition._intentionalStop && restartCount < MAX_RESTARTS && _activeRecognition === recognition) {
         restartCount++;
         try { recognition.start(); return; } catch (_) { /* fall through to normal end */ }
       }
@@ -321,6 +321,12 @@ function setupVoiceButton(textarea, button, onSubmit) {
       updateIcon();
     };
 
+    // Only auto-restart (in onend) once the engine has actually STARTED — i.e. mic
+    // permission was granted and audio is flowing. Without this guard, a first-time
+    // permission prompt that ends recognition before it ever ran would trip the
+    // restart loop and trap the UI in listen mode until the prompt is answered.
+    recognition.onstart = () => { recognition._started = true; restartCount = 0; };
+
     recognition.start();
     updateIcon();
     showToast('Listening...');
@@ -359,6 +365,22 @@ function _mergeWithCommitted(finalText, streamingText, committedWords) {
  * authoritative transcript always comes from SpeechNode.
  */
 function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
+  // iOS FIRST-PERMISSION FIX — prime the AudioContext HERE, synchronously inside the
+  // tap gesture. On iOS an AudioContext only resumes from a real user gesture. The
+  // silence-detection analyser below lives inside getUserMedia's .then, which on the
+  // FIRST use runs only after you tap "Allow" on the system prompt — no longer a page
+  // gesture — so resume() stays 'suspended', the analyser gets no samples, and that
+  // first recording never auto-stops (stuck in listen mode). Every later capture skips
+  // the prompt so it resumed in-gesture and worked. Resuming in the tap makes the very
+  // first capture behave like the rest. Safe/idempotent when the context is already live.
+  try {
+    const _AC = window.AudioContext || window.webkitAudioContext;
+    if (_AC) {
+      if (!_snSharedAudioCtx) _snSharedAudioCtx = new _AC();
+      if (_snSharedAudioCtx.state === 'suspended') _snSharedAudioCtx.resume().catch(() => {});
+    }
+  } catch (_) {}
+
   const existingText = textarea.value ? textarea.value.replace(/\s+$/, '') : '';
   // Bias SpeechNode toward the ACTIVE project's vocabulary: capture the current
   // project dir once (so partials + the final all learn from the same codebase).
