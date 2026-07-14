@@ -554,30 +554,28 @@ header h1 { font-family: 'Space Grotesk', sans-serif; font-size: 21px; font-weig
   margin-right: -15px;
 }
 
-/* Search with inset icon */
-.sidebar-search {
-  position: relative;
+/* Search-as-a-button: opens the deep-search modal (search.js). Styled to
+   read like the old search field (icon + muted placeholder text). */
+.sidebar-search-btn {
   flex: 1;
-}
-.sidebar-search-icon {
-  position: absolute;
-  left: 6px;
-  top: 50%;
-  transform: translateY(-50%);
-  color: var(--text-faint);
-  pointer-events: none;
-}
-.sidebar-search input {
-  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
   background: none;
   border: none;
-  border-radius: 0;
-  padding: 7px 10px 7px 26px;
-  color: var(--text-primary);
+  border-radius: 6px;
+  padding: 7px 10px;
+  color: var(--text-faint);
   font-size: 12px;
-  outline: none;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: color 0.12s, background 0.12s;
 }
-.sidebar-search input::placeholder { color: var(--text-faint); }
+.sidebar-search-btn:hover { color: var(--text-muted); background: var(--bg-tertiary); }
+.sidebar-search-btn .sidebar-search-icon { position: static; transform: none; flex-shrink: 0; color: inherit; }
+.sidebar-search-btn span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 #sidebar-perm-panel {
   flex-shrink: 0;

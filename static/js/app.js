@@ -1561,27 +1561,19 @@ async function loadSessions() {
 }
 
 function filterSessions() {
-  const rawQuery = document.getElementById('search').value.trim();
-  const q = rawQuery.toLowerCase();
-
-  // Active search query → deep search. Render the rich result cards
-  // (snippets, highlighted hits, matched files) inline in the list area.
-  // Every view mode renders into #session-list, so this consistently
-  // replaces the list while searching and restores it when the box clears.
-  // No modal, no second search box — the sidebar search box drives it.
-  if (q) {
-    if (typeof renderDeepSearchInto === 'function') {
-      renderDeepSearchInto(rawQuery, q);
-      return;
-    }
-  } else {
-    // Cleared box — drop the deep-search result set and show everything.
-    window._deepFilterQuery = '';
-    window._deepFilterSessions = null;
-    window._deepFilterStats = null;
-  }
-
-  const filtered = allSessions;
+  // Re-renders the session list. #search is now a hidden input (the visible
+  // control is the deep-search button that opens the modal), so `q` is
+  // normally empty and no client-side filter is applied; the deep-search
+  // modal (search.js) handles searching. Kept resilient in case #search is
+  // ever restored to a visible field.
+  const searchEl = document.getElementById('search');
+  const q = searchEl ? searchEl.value.toLowerCase() : '';
+  const filtered = q
+    ? allSessions.filter(s =>
+        (s.display_title||'').toLowerCase().includes(q) ||
+        (s.preview||'').toLowerCase().includes(q)
+      )
+    : allSessions;
   if (viewMode === 'homepage') {
     if (typeof _updateHomepageStats === 'function') _updateHomepageStats();
     return;
