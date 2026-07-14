@@ -677,11 +677,25 @@ function openActionsPopup() {
   } else {
     statusEl.innerHTML = '';
   }
-  document.getElementById('actions-overlay').classList.add('show');
+  const ov = document.getElementById('actions-overlay');
+  ov.classList.remove('actions-closing'); // cancel any in-flight slide-down (mobile)
+  ov.classList.add('show');
 }
 
 function closeActionsPopup() {
-  document.getElementById('actions-overlay').classList.remove('show');
+  const ov = document.getElementById('actions-overlay');
+  // On phones the popup is an iOS bottom sheet (see mobile.css). Animate it back
+  // down instead of vanishing, mirroring the ••• sheet's dismissal. Desktop closes
+  // instantly. Guard against double-invoke while a close animation is in flight.
+  if (window.matchMedia && window.matchMedia('(max-width: 768px)').matches) {
+    if (ov.classList.contains('actions-closing')) return;
+    ov.classList.add('actions-closing');
+    setTimeout(function () {
+      ov.classList.remove('show', 'actions-closing');
+    }, 250);
+  } else {
+    ov.classList.remove('show');
+  }
 }
 
 function switchActionsTab(tabName) {

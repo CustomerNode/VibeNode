@@ -157,6 +157,56 @@ socket.on('sessions_refresh', (data) => {
     } catch (e) { /* best-effort */ }
 });
 
+// Session name changed on the server (rename / autoname / remap) by THIS or
+// ANOTHER client. The server persists the title and broadcasts here so every
+// open client patches the affected sidebar row in place — without this, a
+// client that didn't originate the change (a second tab, or a desktop watching
+// a session created + auto-named on mobile) showed the stale "New Session"
+// placeholder until a manual refresh re-fetched /api/sessions.
+//
+// Deliberately patches a single row rather than reloading the whole list
+// (autoname fires often, so a full reload per name change would be a storm).
+socket.on('session_renamed', (data) => {
+    try {
+        const id = data && data.session_id;
+        const title = data && data.title;
+        if (!id || !title) return;
+
+        // Follow any old->new ID remap so a name that arrives under a
+        // pre-remap ID still lands on the current row.
+        const remappedId = (window._idRemaps && window._idRemaps[id]) || null;
+        const s = (typeof allSessions !== 'undefined')
+            ? (allSessions.find(x => x.id === (remappedId || id)) || allSessions.find(x => x.id === id))
+            : null;
+        // Scope naturally to the current project: if the session isn't in this
+        // client's list, ignore it (never synthesize a phantom row).
+        if (!s) return;
+
+        // No-op if we already show this title (e.g. the client that just
+        // originated the autoname). Cheap guard to avoid needless re-render.
+        if (s.custom_title === title && s.display_title === title) return;
+
+        s.custom_title = title;
+        s.display_title = title;
+
+        // Keep the open-session toolbar/breadcrumb in sync when this is active.
+        if (typeof activeId !== 'undefined' && (s.id === activeId || id === activeId)) {
+            const titleEl = document.getElementById('main-title');
+            if (titleEl) {
+                titleEl.textContent = title;
+                titleEl.classList.remove('untitled');
+                titleEl.dataset.customTitle = title;
+            }
+            const kbTitle = document.querySelector('.kanban-session-title');
+            if (kbTitle) kbTitle.textContent = title;
+        }
+        const _kbRow = document.querySelector('.kanban-drill-session-row[data-session-id="' + s.id + '"] .kanban-drill-session-name');
+        if (_kbRow) _kbRow.textContent = title;
+
+        if (typeof filterSessions === 'function') filterSessions();
+    } catch (e) { /* best-effort live update */ }
+});
+
 // Daemon reconnection status — live toasts showing recovery progress
 socket.on('daemon_reconnect', (data) => {
     const status = data.status;

@@ -892,6 +892,12 @@ async function openInGUI(id) {
           '<button class="live-send-btn" id="live-voice-btn"></button>' +
           '</div>';
         setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => _newSessionSubmit(id));
+        // Focus SYNCHRONOUSLY — a setTimeout here breaks the user-gesture chain
+        // on mobile browsers, so the on-screen keyboard doesn't come up. Keep
+        // the setTimeout only for the non-critical setup (auto-resize + input
+        // listener) to preserve the previous desktop timing.
+        const _taSync = document.getElementById('live-input-ta');
+        if (_taSync) _taSync.focus();
         setTimeout(() => { const ta = document.getElementById('live-input-ta'); if (ta) { ta.focus(); _initAutoResize(ta); ta.addEventListener('input', function() { if (typeof _hideTemplateGrid === 'function') _hideTemplateGrid(); }); } }, 50);
       }
       return;

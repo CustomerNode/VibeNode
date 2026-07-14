@@ -20,6 +20,38 @@
    leave ghost artifacts. Re-enabled inside the media query below. */
 #mobile-backdrop, #mobile-sheet, #mobile-sheet-backdrop { display: none; }
 
+/* Long-press context menu on session rows (see initSessionLongPress in
+   mobile.js). These declarations MUST NOT sit inside the phone media query:
+   iOS Safari checks -webkit-touch-callout / -webkit-user-select on the touched
+   element regardless of viewport width, and if it decides to start its native
+   selection/callout gesture it fires `touchcancel` on our touch — killing the
+   long-press timer before it fires. Suppressing the native gesture at all
+   widths costs desktop nothing (mouse users don't get callouts anyway) and
+   guarantees the mobile timer actually gets to fire.
+   `touch-action: manipulation` opts out of double-tap zoom and the browser's
+   own reserved long-press gestures, so our timer isn't racing them.
+
+   IMPORTANT: the rules MUST also apply to descendants (`.session-item *`).
+   `.session-col-name` carries an inline `cursor:text` + a `title` attr, and
+   mobile Safari treats such a text-styled child as a selection target on
+   long-press regardless of the parent's `user-select: none` — the selection
+   handles appear and a `touchcancel` fires. Setting the props on children
+   explicitly is what actually stops the "text highlights instead of the menu
+   opens" failure mode. Exclude form controls so rename inputs stay editable. */
+/* Applies to every element that represents a session — sidebar rows
+   (.session-item) and workspace grid cards (.ws-card[data-sid]) alike.
+   Using [data-sid] as the universal selector keeps future session
+   surfaces covered without needing to touch this file. */
+[data-sid],
+[data-sid] *:not(input):not(textarea) {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+[data-sid] {
+  touch-action: manipulation;
+}
+
 /* ============================================================================
  * Mobile Command SETUP WIZARD (System → Mobile Command).
  * These rules are OUTSIDE the media query on purpose — the wizard is used from
@@ -145,9 +177,14 @@
   body.mob-drilled header { padding-left: 58px; }
   body.mob-drilled header h1,
   body.mob-drilled .app-logo { display: none !important; }
-  /* App-maintenance actions are desktop tasks — hide on phone so the bar fits.
-     (Still fully available on desktop; nothing removed there.) */
-  #btn-git-update, #btn-git-publish, #btn-git-sync { display: none !important; }
+  /* App-maintenance actions: keep visible on phone, but shorten labels to one
+     word each so the header still fits. (Desktop labels untouched.) */
+  #btn-git-update .git-btn-txt,
+  #btn-git-publish .git-btn-txt,
+  #btn-git-sync .git-btn-txt { display: none; }
+  #btn-git-update::before  { content: "Update"; }
+  #btn-git-publish::before { content: "Publish"; }
+  #btn-git-sync::before    { content: "Sync"; }
   .hdr-sys-btn { font-size: 13px; padding: 7px 11px; }
 
   /* Keep .layout as the desktop flex row (its height feeds .live-log scroll).
@@ -163,6 +200,39 @@
   }
   .sidebar.collapsed { transform: translateX(-100%); }
 
+  /* --------------------------------------------------------------------------
+   * Preserve the slide-out animation on every automated collapse.
+   *
+   * The desktop .sidebar.collapsed rule (style.css) sets `width: 0 !important`
+   * + `min-width: 0 !important` and hides .sidebar-header / .session-list /
+   * #workforce-grid with `display: none`. On desktop that's how the sidebar
+   * closes — an instant width collapse. On mobile it *silently defeats* the
+   * `transform .28s` transition above: the moment .collapsed is added, width
+   * snaps to 0 and children vanish, so there is nothing on-screen for the
+   * transform to animate. The drawer just disappears — that's what users
+   * describe as "sudden".
+   *
+   * Every automated collapse path funnels through toggleSidebar() adding the
+   * .collapsed class (session tap → openInGUI, "New Session" → addNewAgent,
+   * view change → applyView, backdrop tap, close X). One CSS override here
+   * fixes ALL of them at once — no JS changes needed.
+   *
+   * !important is required to beat the desktop rule's !important. Children
+   * are explicitly restored to their normal display so they slide out with
+   * the drawer instead of blinking away first.
+   * ------------------------------------------------------------------------ */
+  .sidebar.collapsed {
+    width: 100vw !important;      /* keep full width so translateX has something to move */
+    min-width: 0 !important;
+    padding: 0;                    /* undo desktop's padding:0 — sidebar has no padding anyway */
+  }
+  .sidebar.collapsed .sidebar-header,
+  .sidebar.collapsed .session-list { display: flex; }
+  /* #workforce-grid is normally display:none, only shown when .visible.
+     Only un-hide it when it was already visible — leave the default hidden
+     state alone in views that don't use it. */
+  .sidebar.collapsed #workforce-grid.visible { display: flex; }
+
   /* Close (X) button inside the drawer — big, easy tap target. */
   .sidebar-collapse-btn {
     width: 46px; height: 46px;
@@ -170,6 +240,18 @@
     color: var(--text-primary);
   }
   .sidebar-collapse-btn svg { width: 26px; height: 26px; }
+
+  /* Long-press-for-menu tip in the sidebar footer. Hidden on desktop
+     (see .sidebar-footer-tip in style.css) because right-click already
+     surfaces the same menu; on mobile touch there's no right-click, so
+     the affordance needs to be discoverable. Sits above the copyright
+     row (flex-direction: column on .sidebar-footer). */
+  .sidebar-footer-tip {
+    display: block;
+    font-size: 11px;
+    color: var(--text-muted);
+    opacity: 0.85;
+  }
 
   /* The existing expand button (its own chevron) opens the drawer when collapsed. */
   .sidebar-expand-btn {
@@ -230,7 +312,33 @@
     padding: 13px 12px;
     min-height: 54px;
     font-size: 15px;
+    /* Note: -webkit-touch-callout / user-select / touch-action for the
+       long-press context menu live in the always-applied rule near the top of
+       this file — inside the media query they'd only take effect at phone
+       widths, but iOS Safari evaluates them regardless of viewport size and
+       needs them set before the touch begins. */
   }
+
+  /* Context menu (ws-ctx-menu) — desktop sizes rows at ~30px, too small to
+     reliably tap. Bump to WCAG-friendly touch targets, and let the menu scroll
+     if a long menu meets a short phone (sessionContextMenu already clamps the
+     top edge; without max-height the bottom rows fall off-screen). */
+  .ws-ctx-menu {
+    min-width: 220px;
+    font-size: 15px;
+    max-height: 80vh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .ws-ctx-item {
+    padding: 12px 14px;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .ws-ctx-item svg { flex: 0 0 auto; }
+  .ws-ctx-divider { margin: 6px 0; }
   .col-header-row { padding: 4px 12px; }
 
   /* ---- Search + ••• row: make it line up with the rows above ----
@@ -263,7 +371,14 @@
      the auto-growing textarea so long input can't push the chat out of view --- */
   .live-input-bar {
     max-width: none;
-    padding: 10px 12px calc(12px + env(safe-area-inset-bottom));
+    /* Split into long-hand so one parser oddity in the 4-value padding
+       shorthand can't null out a single side. Base 16px inset then add
+       safe-area on top of it (landscape/curved-edge devices contribute the
+       extra; portrait phones stay at 16px). */
+    padding-top: 10px;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+    padding-left: calc(16px + env(safe-area-inset-left));
+    padding-right: calc(16px + env(safe-area-inset-right));
   }
   .live-textarea {
     font-size: 16px;            /* typed text stays >=16px so iOS never zooms on focus */
@@ -277,20 +392,49 @@
   .live-textarea::-webkit-input-placeholder { font-size: 13.5px; }
   /* Controls row under the textarea: single line, never wrap. Drop the text
      bits that force wrapping — the keyboard hint and the model-name button
-     (model is still changeable via System → Model). */
-  .live-bar-row { flex-wrap: nowrap; gap: 8px; align-items: center; overflow: hidden; }
+     (model is still changeable via System → Model).
+     No `overflow: hidden` here: it visibly shaved a pixel or two off the
+     bottom-left / bottom-right button corners (their border-radius +
+     `:active` tap highlight bleed just past the row's box). `flex-wrap:
+     nowrap` is what keeps the row on a single line; the row can safely
+     `overflow: visible` because .live-input-bar / .live-panel above it
+     already clip anything that would leak past the composer. */
+  .live-bar-row {
+    flex-wrap: nowrap;
+    gap: 8px;
+    align-items: center;
+    overflow: visible;
+  }
+  /* If a very long ctx label were ever to push the row wide, let the left
+     group shrink and truncate rather than shoving the send button off the
+     right edge (where it WOULD then get clipped by .live-panel). */
+  .live-bar-row .bar-left-group {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+  }
   .send-hint { display: none !important; }
   .session-model-btn { display: none !important; }
   /* The send/voice button gets the 44px touch target (above). Without internal
      flex-centering its icon sits at the TOP of that taller box instead of the middle.
-     Center the content so the icon aligns vertically inside the button. */
+     Center the content so the icon aligns vertically inside the button.
+     `margin-right: 8px` is a belt-and-suspenders inset on TOP of the bar's
+     padding-right — user reported that even at 16px bar padding + 2px button
+     margin (18px total), ~3px of the send button was still visibly clipped on
+     their phone. Bumping the button margin to 8px puts the button's outer
+     edge ~24px inside the viewport, which clears anything the phone's
+     rendered viewport / parent `overflow: hidden` was shaving off. */
   .live-send-btn {
     flex: none;
     padding: 10px 18px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    margin-right: 8px;
   }
+  /* Symmetric protection for the leftmost element in the row (invoke button)
+     so both ends of the row visually breathe the same amount. */
+  .live-bar-row .invoke-btn { margin-left: 8px; }
 
   /* ---- Toasts: iOS-native capsule that drops in from the TOP, clear of the bottom
      composer keys. On desktop they sit bottom-right (padding:10px 16px, bottom:20px;
@@ -410,4 +554,102 @@
     color: var(--accent-text); background: var(--bg-modal);
     border: 1px solid var(--border-light); border-radius: 14px;
   }
+
+  /* ---- Actions popup as an iOS bottom sheet (continuous with the ••• sheet) ----
+     On desktop .actions-overlay is a centered modal. On phones we re-anchor it to
+     the bottom, stretch it edge-to-edge (with the same 8px side gutters + safe-area
+     padding as #mobile-sheet), and slide it up. We use @keyframes (not a transition)
+     because the overlay toggles display:none↔flex, which cancels transitions but
+     still runs animations — so this needs no JS change to openActionsPopup(). */
+  #actions-overlay {
+    flex-direction: column; align-items: stretch; justify-content: flex-end;
+    padding: 0 8px calc(8px + env(safe-area-inset-bottom));
+    background: rgba(0, 0, 0, .5);
+    animation: vnSheetBackdrop .25s ease;
+  }
+  #actions-overlay .actions-popup {
+    width: auto; max-width: none; max-height: 82vh;
+    border: 1px solid var(--border-light); border-radius: 16px;
+    animation: vnSheetUp .3s cubic-bezier(.32, .72, 0, 1);
+  }
+  /* Bigger tap targets + tab strip that reads like a sheet segment on phones.
+     Four tabs + the status badge + the ✕ can't share one row on a phone, so we
+     wrap the header: status (left) and ✕ (right) sit on top, and the tab strip
+     drops to its own full-width row below — like a segmented control under a
+     sheet title. Prevents the 4th tab / session-status overlap. */
+  #actions-overlay .actions-header { flex-wrap: wrap; align-items: center; padding: 8px 8px 0; gap: 8px; }
+  #actions-overlay .actions-status { order: 1; flex: 1 1 auto; min-width: 0; }
+  #actions-overlay .actions-header > .btn { order: 2; }        /* the ✕ close button */
+  #actions-overlay .actions-tabs { order: 3; flex-basis: 100%; width: 100%; overflow-x: auto; }
+  #actions-overlay .actions-tab { padding: 11px 12px 12px; font-size: 13px; }
+  #actions-overlay .actions-item { padding: 13px 12px; }
+
+  /* Dismissal: closeActionsPopup() adds .actions-closing (mobile only) and defers
+     the display:none removal so the sheet can slide back down like #mobile-sheet. */
+  #actions-overlay.actions-closing { animation: vnSheetBackdropOut .22s ease forwards; }
+  #actions-overlay.actions-closing .actions-popup {
+    animation: vnSheetDown .25s cubic-bezier(.32, .72, 0, 1) forwards;
+  }
+
+  @keyframes vnSheetUp {
+    from { transform: translateY(130%); }
+    to   { transform: translateY(0); }
+  }
+  @keyframes vnSheetDown {
+    from { transform: translateY(0); }
+    to   { transform: translateY(130%); }
+  }
+  @keyframes vnSheetBackdrop {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+  @keyframes vnSheetBackdropOut {
+    from { opacity: 1; }
+    to   { opacity: 0; }
+  }
+
+  /* --------------------------------------------------------------------------
+   * Chat entrance — smooth reveal when opening a session on mobile.
+   *
+   * When the user taps a session, the drawer slides away (0.28s) and the chat
+   * panel appears in its place. Without an entrance animation the full
+   * transcript materializes fully-formed the instant the drawer moves off it —
+   * users describe this as being "thrown into a lump of text". A short fade
+   * plus a small upward drift makes the reveal feel intentional and lets the
+   * eye settle into the content instead of hitting it cold.
+   *
+   * The animation is attached to `.live-panel`, which is freshly recreated on
+   * every openInGUI/startLivePanel call (via `#main-body.innerHTML = ...`).
+   * That's the CORRECT trigger — CSS keyframes fire once on element mount, so
+   * this plays exactly on session open and NOT when new messages arrive
+   * (they're appended into `#live-log` inside the already-mounted panel).
+   *
+   * Duration is slightly longer than the drawer's 0.28s slide so the chat
+   * feels like it's still settling in as the drawer clears — a coordinated
+   * two-stage reveal rather than two disconnected motions. `both` fill mode
+   * ensures the opening `opacity:0` applies before the first paint,
+   * preventing any single-frame flash of fully-visible content.
+   *
+   * `.empty-state` (the "Select a session" placeholder + the "What will we
+   * VibeNode today?" new-session greeting) gets the same treatment so every
+   * transition into main-body feels consistent.
+   * ------------------------------------------------------------------------ */
+  #main-body > .live-panel,
+  #main-body > .empty-state {
+    animation: vnChatEnter .32s cubic-bezier(.32, .72, 0, 1) both;
+  }
+  @keyframes vnChatEnter {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+}
+
+/* Respect the OS-level "reduce motion" preference (iOS: Settings → Accessibility
+   → Motion → Reduce Motion). Sits OUTSIDE the width media query so it applies
+   at every viewport; nested media queries are legal CSS but avoiding them keeps
+   the rule discoverable from a plain grep for `prefers-reduced-motion`. */
+@media (max-width: 768px) and (prefers-reduced-motion: reduce) {
+  #main-body > .live-panel,
+  #main-body > .empty-state { animation: none; }
+  .sidebar { transition: none; }
 }

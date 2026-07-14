@@ -596,6 +596,9 @@ header h1 { font-family: 'Space Grotesk', sans-serif; font-size: 21px; font-weig
 }
 .sidebar-footer a { color: var(--text-faint); text-decoration: underline; text-underline-offset: 2px; text-decoration-color: var(--border); }
 .sidebar-footer a:hover { color: var(--text-muted); text-decoration-color: var(--text-muted); }
+/* The long-press tip is a mobile affordance — hidden on desktop, where
+   right-click already surfaces the same context menu. Mobile.css shows it. */
+.sidebar-footer-tip { display: none; }
 /* Sidebar three-dots menu */
 .sidebar-menu-wrap {
   position: relative;

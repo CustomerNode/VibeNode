@@ -154,6 +154,20 @@
       window.openInGUI._mobClose = true;
     }
 
+    // "New Session" (sidebar/toolbar/workspace button, keyboard shortcut) reveals
+    // the empty chat + input bar. On mobile the drawer must collapse so the input
+    // is visible instead of the drawer springing back open over the new chat.
+    // Wrap addNewAgent — the single choke point every new-session path calls.
+    if (typeof window.addNewAgent === "function" && !window.addNewAgent._mobClose) {
+      var _addNewAgent = window.addNewAgent;
+      window.addNewAgent = function () {
+        var r = _addNewAgent.apply(this, arguments);
+        if (isMobile()) setDrawerOpen(false);
+        return r;
+      };
+      window.addNewAgent._mobClose = true;
+    }
+
     // Re-evaluate the drawer whenever the app switches views.
     if (typeof window.setViewMode === "function" && !window.setViewMode._mobWrapped) {
       var _svm = window.setViewMode;
@@ -345,10 +359,188 @@
   }
 
   // =========================================================================
+  // Long-press on a session row → open the same context menu as right-click.
+  // Desktop has right-click via oncontextmenu; touch devices have no equivalent
+  // gesture, so we synthesize one: hold ~500ms without moving → call
+  // sessionContextMenu() with the touch coordinates. The row's existing
+  // oncontextmenu handler in sessions.js is the single source of truth for the
+  // menu contents; we just trigger it from a different input path.
+  //
+  // Nuances handled:
+  //   - A finger twitch (< SLOP px) doesn't cancel; a real drag does — the swipe
+  //     handler above owns horizontal drags and vertical scrolls.
+  //   - The synthetic click that fires on touchend after a long-press would
+  //     otherwise trigger the row's onclick (opening the session). We suppress
+  //     that one click, but ONLY if the finger lifted on the original row —
+  //     if the user dragged onto a menu item to select it, we let that click
+  //     through so the action fires.
+  //   - iOS Safari fires `touchcancel` when it decides to start its own
+  //     gesture (selection, callout, magnifier). If we clear the timer on
+  //     touchcancel the menu never appears — the CSS in mobile.css suppresses
+  //     the native gesture, but on some iOS versions touchcancel still fires
+  //     spuriously. We deliberately KEEP the timer running through
+  //     touchcancel so the menu still opens; the CSS suppression is belt-and-
+  //     braces for the visual side of it.
+  //   - navigator.vibrate() gives the platform's usual "held long enough"
+  //     haptic when supported; wrapped in try/catch because some browsers
+  //     throw when called outside a user gesture chain.
+  //
+  // Note on `isMobile()` gating: we intentionally do NOT gate this on
+  // isMobile(). Touch-capable non-phone devices (iPad, Windows touchscreens,
+  // Chromebooks with touch) also lack a right-click gesture, so the long-press
+  // is useful there too. The handler only engages when the touch target is a
+  // .session-item, so it's inert on desktop mouse users regardless of width.
+  function initSessionLongPress() {
+    // One unified handler for mouse, touch, and pen via Pointer Events.
+    // Rationale for switching away from touch-only events:
+    //   - Desktop mouse press-and-hold produced NO events with a
+    //     touchstart-based implementation, so long-press did nothing in the
+    //     desktop web app (regression from the user's POV — they expect
+    //     press-and-hold to work in every input mode).
+    //   - Pointer Events unify the three input types (`pointerType`:
+    //     'mouse' | 'touch' | 'pen') behind one API, so we write the logic
+    //     once and it covers all three.
+    //   - Supported on every browser we care about: Chrome/Edge/Firefox on
+    //     all platforms, Safari 13+ (macOS Catalina, iOS 13). Well below
+    //     VibeNode's floor.
+    //
+    // Right-click on desktop still fires the row's `oncontextmenu`
+    // (unchanged) — the long-press is an ADDITION for mouse users who
+    // prefer holding, and the only path for touch users.
+    var LP_MS = 500;         // dwell time before the menu opens
+    var LP_SLOP = 20;        // px; small drift OK, larger cancels
+    var timer = null;
+    var startX = 0, startY = 0;
+    var startedSid = null;
+    var startedRow = null;
+    var activePointerId = null;
+    var suppressClicksUntil = 0;
+
+    function cancelTimer() {
+      if (timer) { clearTimeout(timer); timer = null; }
+    }
+    function clearActive() {
+      startedSid = null; startedRow = null; activePointerId = null;
+    }
+
+    // Shared start logic invoked by BOTH pointerdown and mousedown. We
+    // register both so if pointer events are being consumed upstream, the
+    // classic mouse fallback still works. `_lpArm` guards against
+    // double-arming when both fire on the same interaction.
+    // Match ANY session-bearing element: sidebar rows (.session-item),
+    // workspace grid cards (.ws-card[data-sid]), or anything else that
+    // carries a session id. Using [data-sid] as the universal handle means
+    // we don't have to enumerate every layout the app renders sessions in.
+    var _armedFor = null;   // sid we've armed for this interaction
+    function findSessionEl(target) {
+      if (!target || !target.closest) return null;
+      return target.closest("[data-sid]");
+    }
+    function startPress(kind, clientX, clientY, target, ptrId, button) {
+      if (kind === "mouse" && button !== 0) return;
+      var el = findSessionEl(target);
+      if (!el) return;
+      var sid = el.getAttribute("data-sid");
+      if (!sid) return;
+      if (_armedFor === sid && timer) return;   // already armed by peer event
+      cancelTimer();
+      startX = clientX; startY = clientY;
+      startedSid = sid; startedRow = el;
+      activePointerId = ptrId != null ? ptrId : null;
+      _armedFor = sid;
+      timer = setTimeout(function () {
+        timer = null;
+        if (!startedSid) return;
+        suppressClicksUntil = Date.now() + 800;
+        try { if (navigator.vibrate) navigator.vibrate(20); } catch (_) {}
+        if (typeof sessionContextMenu === "function") {
+          sessionContextMenu({
+            clientX: startX, clientY: startY,
+            preventDefault: function () {}, stopPropagation: function () {},
+          }, startedSid);
+        }
+      }, LP_MS);
+    }
+
+    // Workspace cards are `draggable="true"`, so on desktop a hold+move
+    // triggers HTML5 drag, and even a still hold can suppress our
+    // pointerup. Cancel any pending drag once our timer has fired so the
+    // menu behaves like a menu, not a drag preview.
+    document.addEventListener("dragstart", function (e) {
+      // If a long-press is armed (timer running or menu just opened),
+      // suppress the drag entirely — user is trying to open the menu, not
+      // drag the card.
+      if (timer || suppressClicksUntil > Date.now()) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    }, true);
+
+    document.addEventListener("pointerdown", function (e) {
+      startPress(e.pointerType || "mouse", e.clientX, e.clientY, e.target, e.pointerId, e.button);
+    });
+    // Mouse fallback — some browsers/extensions selectively squelch pointer
+    // events; classic mouse events almost always still fire.
+    document.addEventListener("mousedown", function (e) {
+      startPress("mouse", e.clientX, e.clientY, e.target, null, e.button);
+    });
+
+    function onMove(clientX, clientY, ptrId) {
+      if (!timer) return;
+      if (activePointerId !== null && ptrId != null && ptrId !== activePointerId) return;
+      if (Math.abs(clientX - startX) > LP_SLOP ||
+          Math.abs(clientY - startY) > LP_SLOP) {
+        _lpDebug("move exceeded slop — cancel");
+        cancelTimer();
+        clearActive();
+        _armedFor = null;
+      }
+    }
+    document.addEventListener("pointermove", function (e) {
+      onMove(e.clientX, e.clientY, e.pointerId);
+    });
+    document.addEventListener("mousemove", function (e) {
+      onMove(e.clientX, e.clientY, null);
+    });
+
+    function endInteraction(e, ptrId) {
+      if (activePointerId !== null && ptrId != null && ptrId !== activePointerId) return;
+      cancelTimer();
+      if (e && suppressClicksUntil > Date.now()) {
+        var onMenu = e.target && e.target.closest && e.target.closest(".ws-ctx-menu");
+        if (!onMenu) { try { e.preventDefault(); } catch (_) {} }
+      }
+      clearActive();
+      _armedFor = null;
+    }
+    document.addEventListener("pointerup", function (e) { endInteraction(e, e.pointerId); });
+    document.addEventListener("mouseup", function (e) { endInteraction(e, null); });
+    document.addEventListener("pointercancel", function (e) {
+      if (activePointerId !== null && e && e.pointerId !== activePointerId) return;
+      cancelTimer();
+      clearActive();
+      _armedFor = null;
+    });
+
+    // Capture-phase click blocker. Runs BEFORE the row's own onclick
+    // (handleNameClick / session-col-date openInGUI) so a long-press
+    // doesn't also open/rename the session on release. Menu items live
+    // inside `.ws-ctx-menu` and are excluded so tapping them still fires.
+    document.addEventListener("click", function (e) {
+      if (Date.now() >= suppressClicksUntil) return;
+      if (e.target && e.target.closest && e.target.closest(".ws-ctx-menu")) return;
+      e.stopPropagation();
+      e.preventDefault();
+      suppressClicksUntil = 0;  // one-shot: don't eat a subsequent click
+    }, true);
+  }
+
+  // =========================================================================
   function init() {
     initSidebar();
     initSwipe();
     ensureMoreButton();
+    initSessionLongPress();
   }
 
   if (MQ.addEventListener) {

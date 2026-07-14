@@ -43,6 +43,39 @@ bp = Blueprint('sessions_api', __name__)
 log = logging.getLogger(__name__)
 
 
+def _emit_session_renamed(session_id, title, project):
+    """Broadcast a session name change to every connected client.
+
+    Session autoname/rename used to persist the title to
+    ``_session_names.json`` (and/or the ``.jsonl``) and return it ONLY to the
+    calling client.  Any OTHER open client -- a second browser tab, or a
+    desktop viewing a session that was created and auto-named on a phone --
+    never learned the name changed, so its sidebar kept showing the stale
+    "New Session" placeholder until the user manually refreshed (which
+    re-fetches ``/api/sessions`` and re-reads the persisted name).  Kanban and
+    compose already broadcast their mutations; session names now do too.
+
+    A targeted ``session_renamed`` event (carrying just the id/title/project)
+    is used deliberately instead of the heavier ``sessions_refresh``, which
+    forces every client to re-fetch the entire session list.  Autoname fires
+    often (polling sweeps, state transitions), so a full-list reload on every
+    name change would be a broadcast storm; clients patch a single row instead.
+
+    Callers MUST only invoke this after a title was actually persisted and is a
+    real, user-meaningful title -- never for skipped/unchanged/placeholder
+    cases -- so idle clients aren't churned for no visible change.
+    """
+    try:
+        from .. import socketio
+        socketio.emit("session_renamed", {
+            "session_id": session_id,
+            "title": title,
+            "project": project,
+        })
+    except Exception as e:  # SocketIO not wired (e.g. unit tests) -- non-fatal
+        log.debug("session_renamed emit failed: %s", e)
+
+
 @bp.before_request
 def _reject_traversal_project():
     """Reject requests whose ``project`` carries path separators or ``..``.
@@ -415,6 +448,9 @@ def api_rename(session_id):
     # background writes pollute it), so we record access explicitly here.
     _record_session_access(session_id, project)
 
+    # Live-update every other open client's sidebar (see _emit_session_renamed).
+    _emit_session_renamed(session_id, new_title, project)
+
     return jsonify({"ok": True, "title": new_title})
 
 
@@ -436,6 +472,10 @@ def api_remap_name():
     # repeat remap-name calls don't pile identical lines onto the file.
     path = _sessions_dir(project) / f"{new_id}.jsonl"
     _append_custom_title_if_changed(path, title, new_id)
+
+    # The name moved to a new session ID (SDK remap). Broadcast under the new ID
+    # so every client's sidebar shows the title on the remapped row live.
+    _emit_session_renamed(new_id, title, project)
 
     return jsonify({"ok": True, "title": title})
 
@@ -562,6 +602,12 @@ def api_autoname(session_id):
             _append_custom_title_if_changed(path, title, session_id)
         if should_save:
             _save_name(session_id, title, project)
+            # Broadcast so a client that didn't originate this autoname (a second
+            # tab, or a desktop watching a session created on mobile) updates its
+            # sidebar card live instead of only after a manual refresh. Gated on
+            # should_save so phantom-prevented / placeholder titles never churn
+            # idle clients (see the phantom-prevention block above).
+            _emit_session_renamed(session_id, title, project)
 
         return jsonify({"ok": True, "title": title, "renamed": is_re_evaluate})
 

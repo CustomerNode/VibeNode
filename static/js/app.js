@@ -688,6 +688,10 @@ function _updateViewModeButton(mode) {
   let _closeTimer = null;
   const wrap = document.querySelector('.sidebar-view-wrap');
   if (!wrap) return;
+  const clearTimers = () => {
+    if (_openTimer) { clearTimeout(_openTimer); _openTimer = null; }
+    if (_closeTimer) { clearTimeout(_closeTimer); _closeTimer = null; }
+  };
   wrap.addEventListener('mouseenter', () => {
     if (_closeTimer) { clearTimeout(_closeTimer); _closeTimer = null; }
     _openTimer = setTimeout(() => wrap.classList.add('flyout-open'), 200);
@@ -695,6 +699,35 @@ function _updateViewModeButton(mode) {
   wrap.addEventListener('mouseleave', () => {
     if (_openTimer) { clearTimeout(_openTimer); _openTimer = null; }
     _closeTimer = setTimeout(() => wrap.classList.remove('flyout-open'), 300);
+  });
+  // Tapping the trigger toggles the flyout. On touch devices `mouseenter`
+  // fires on tap (opening the flyout) but `mouseleave` never fires, so hover
+  // alone leaves no way to collapse it. A click toggle gives an explicit
+  // open/close on both touch and mouse. Cancel any pending hover timers first
+  // so the delayed-open doesn't re-open a flyout we just tapped closed.
+  const trigger = document.getElementById('sidebar-view-trigger');
+  if (trigger) {
+    trigger.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      clearTimers();
+      wrap.classList.toggle('flyout-open');
+    });
+  }
+  // Tapping/clicking outside the flyout collapses it (touch has no mouseleave).
+  document.addEventListener('click', (e) => {
+    if (wrap.classList.contains('flyout-open') && !wrap.contains(e.target)) {
+      clearTimers();
+      wrap.classList.remove('flyout-open');
+    }
+  });
+  // Picking a view option collapses the flyout (touch has no mouseleave to
+  // auto-close it after the selection).
+  wrap.querySelectorAll('.sidebar-view-opt').forEach((opt) => {
+    opt.addEventListener('click', () => {
+      clearTimers();
+      wrap.classList.remove('flyout-open');
+    });
   });
 })();
 
@@ -1003,10 +1036,16 @@ async function addNewAgent() {
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>';
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => _newSessionSubmit(newId));
+    // Focus SYNCHRONOUSLY — a setTimeout here breaks the user-gesture chain on
+    // mobile browsers, so the on-screen keyboard doesn't come up. We still run
+    // the non-critical listener registration in a setTimeout below to keep the
+    // desktop timing identical to before.
+    const _taSync = document.getElementById('live-input-ta');
+    if (_taSync) _taSync.focus();
     setTimeout(() => {
       const ta = document.getElementById('live-input-ta');
       if (ta) {
-        ta.focus();
+        ta.focus();   // desktop retry — harmless if the sync focus already stuck
         ta.addEventListener('input', function() { if (typeof _hideTemplateGrid === 'function') _hideTemplateGrid(); });
       }
     }, 50);

@@ -382,6 +382,23 @@ class TestRenameSession:
         assert data["ok"] is True
         assert data["title"] == "New Name"
 
+    def test_rename_broadcasts_session_renamed(self, client,
+                                               populated_project,
+                                               fake_project):
+        """A rename must broadcast ``session_renamed`` so OTHER open clients
+        (a second tab, a desktop watching a session named on mobile) update
+        their sidebar live instead of only after a manual refresh."""
+        with patch("app.routes.sessions_api._emit_session_renamed") as emit:
+            resp = client.post(
+                "/api/rename/sess-001",
+                json={"title": "Broadcast Me"},
+            )
+        assert resp.status_code == 200
+        emit.assert_called_once()
+        args = emit.call_args.args
+        assert args[0] == "sess-001"
+        assert args[1] == "Broadcast Me"
+
     def test_rename_with_empty_title_rejected(self, client,
                                                populated_project):
         resp = client.post(
@@ -576,6 +593,47 @@ class TestAutonameSession:
         data = resp.get_json()
         assert data["ok"] is True
         assert data.get("skipped") is True
+
+    def test_autoname_broadcasts_on_persist(self, client, populated_project,
+                                            fake_project):
+        """When autoname persists a real title, it must broadcast
+        ``session_renamed`` so clients that didn't originate the call (the
+        core reported bug: a session created + auto-named on mobile, whose
+        card stayed stale on other screens until refresh) update live."""
+        with patch("app.routes.sessions_api._emit_session_renamed") as emit, \
+             patch("app.routes.sessions_api.smart_title",
+                   return_value="Live Named"):
+            resp = client.post("/api/autonname/sess-002")
+        assert resp.status_code == 200
+        emit.assert_called_once()
+        args = emit.call_args.args
+        assert args[0] == "sess-002"
+        assert args[1] == "Live Named"
+
+    def test_autoname_does_not_broadcast_when_skipped(self, client,
+                                                      populated_project,
+                                                      fake_project):
+        """A skipped autoname (user-set name preserved) persists nothing and
+        must NOT broadcast — idle clients shouldn't be churned for no change."""
+        with patch("app.routes.sessions_api._emit_session_renamed") as emit, \
+             patch("app.routes.sessions_api._load_names",
+                   return_value={"sess-001": "My Custom"}):
+            resp = client.post("/api/autonname/sess-001")
+        assert resp.status_code == 200
+        assert resp.get_json().get("skipped") is True
+        emit.assert_not_called()
+
+    def test_autoname_does_not_broadcast_untitled(self, client,
+                                                  populated_project,
+                                                  fake_project):
+        """``"Untitled Session"`` is never persisted (phantom prevention), so
+        it must never be broadcast either."""
+        with patch("app.routes.sessions_api._emit_session_renamed") as emit, \
+             patch("app.routes.sessions_api.smart_title",
+                   return_value="Untitled Session"):
+            resp = client.post("/api/autonname/sess-002")
+        assert resp.status_code == 200
+        emit.assert_not_called()
 
     def test_autoname_empty_session(self, client, populated_project):
         resp = client.post("/api/autonname/sess-empty")
