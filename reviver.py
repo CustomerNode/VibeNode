@@ -293,8 +293,15 @@ def _launch_vibenode() -> None:
 #               RunAtLoad — launchd restarts the reviver the instant it dies and
 #               loads it at login. Instant, not polled.
 #   * Linux   : systemd --user service with Restart=always + WantedBy=
-#               default.target — restarts on death, starts at login. loginger is
+#               default.target — restarts on death, starts at login. Linger is
 #               enabled best-effort so it can also come up before login.
+#               CAVEAT: linger cannot help on per-user ENCRYPTED homes
+#               (ecryptfs/fscrypt/homed) — pre-login, both the unit file in
+#               ~/.config/systemd/user and reviver.py itself are ciphertext,
+#               so nothing of ours can run until the user logs in. Covering
+#               that window requires a machine-local system-level stub
+#               installed OUTSIDE the home (root/one-time-sudo territory,
+#               which this self-installer deliberately never touches).
 #
 # All names are salted with the checkout path so multiple VibeNode clones never
 # fight over one task/agent/unit. Everything is best-effort: any failure just
@@ -502,6 +509,11 @@ def _systemd_unit_path() -> Path:
 
 
 def _systemd_unit_text() -> str:
+    # VIBENODE_REVIVER_STANDBY: under Restart=always, "control port busy ->
+    # exit 0" would be respawned by systemd every RestartSec forever while a
+    # session-spawned reviver owns the port — a permanent, pointless restart
+    # loop (one python spawn every 5s). The flag makes THIS copy wait in
+    # standby and take over in-process instead (see _standby_acquire_control).
     return (
         "[Unit]\n"
         "Description=VibeNode mobile Start-page reviver "
@@ -509,6 +521,7 @@ def _systemd_unit_text() -> str:
         "After=default.target\n\n"
         "[Service]\n"
         "Type=simple\n"
+        "Environment=VIBENODE_REVIVER_STANDBY=1\n"
         "ExecStart=%s %s\n"
         "WorkingDirectory=%s\n"
         "Restart=always\n"
@@ -957,6 +970,28 @@ class _ControlHandler(BaseHTTPRequestHandler):
                     "web_port": WEB_PORT})
 
 
+def _standby_acquire_control() -> "_ControlServer | None":
+    """OS-supervised copies (the systemd --user unit sets
+    VIBENODE_REVIVER_STANDBY=1) must NOT exit when the control port is busy:
+    with Restart=always, a clean exit is respawned every RestartSec forever
+    while a session-spawned reviver owns the port — a permanent restart loop
+    burning a python spawn every 5 seconds. Instead, wait quietly and take
+    over the instant the owner dies. Still self-retiring: returns None (caller
+    exits, and the unit self-unregisters) when Mobile Command is turned off.
+    """
+    _log("control port %d busy — standby mode (waiting to take over)"
+         % CONTROL_PORT)
+    while True:
+        time.sleep(_POLL_SECONDS * 2)
+        if not _mobile_enabled():
+            _log("Mobile Command disabled — standby reviver exiting")
+            return None
+        try:
+            return _ControlServer(("127.0.0.1", CONTROL_PORT), _ControlHandler)
+        except OSError:
+            continue
+
+
 def run_guardian() -> int:
     """The guardian: a minimal sidecar whose only job is to respawn the reviver
     if it dies. The reviver likewise respawns the guardian — mutual resurrection
@@ -1031,9 +1066,16 @@ def main() -> int:
     try:
         control = _ControlServer(("127.0.0.1", CONTROL_PORT), _ControlHandler)
     except OSError:
-        _log("control port %d busy — another reviver is running; exiting"
-             % CONTROL_PORT)
-        return 0
+        if os.environ.get("VIBENODE_REVIVER_STANDBY"):
+            control = _standby_acquire_control()
+            if control is None:  # Mobile Command turned off while waiting
+                return 0
+        else:
+            # Session-spawned copy (session_manager launches one per start):
+            # exiting fast IS the singleton contract — nothing respawns us.
+            _log("control port %d busy — another reviver is running; exiting"
+                 % CONTROL_PORT)
+            return 0
 
     # Ensure the always-on supervisor exists so we survive a broad kill / reboot.
     # Run it OFF the main path: OS calls (schtasks/launchctl/systemctl) can be
