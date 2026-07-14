@@ -25,8 +25,10 @@ def api_git_status():
 
 @bp.route("/api/git-sync", methods=["POST"])
 def api_git_sync():
-    action = (request.get_json() or {}).get("action", "both")
-    result = do_git_sync(action)
+    data = request.get_json() or {}
+    action = data.get("action", "both")
+    confirm_branch = bool(data.get("confirm_branch", False))
+    result = do_git_sync(action, confirm_branch=confirm_branch)
     # Include the freshly-updated git status so the frontend can use it
     # directly instead of making a separate poll that might race.
     result["git_status"] = get_git_cache()

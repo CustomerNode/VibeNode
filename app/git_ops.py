@@ -15,11 +15,48 @@ from .platform_utils import NO_WINDOW as _NO_WINDOW
 # Git cache and lock
 # ---------------------------------------------------------------------------
 
-_git_cache = {"ahead": 0, "behind": 0, "uncommitted": False, "has_git": False, "ready": False}
+_git_cache = {"ahead": 0, "behind": 0, "uncommitted": False, "has_git": False, "ready": False,
+              "branch": "", "default_branch": "", "on_default": True}
 _git_fetch_lock = threading.Lock()
 _sync_cooldown_until = 0.0  # epoch; bg refresh is suppressed until this time
 _last_refresh_time = 0.0     # epoch; throttle refresh_if_idle
 _REFRESH_MIN_INTERVAL = 45   # seconds; don't re-fetch more often than this
+
+
+# ---------------------------------------------------------------------------
+# Branch helpers
+# ---------------------------------------------------------------------------
+
+def _current_branch(proj) -> str:
+    """Return the current branch name, or "" if detached HEAD / unknown."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(proj), "symbolic-ref", "--short", "-q", "HEAD"],
+            capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW)
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _default_branch(proj) -> str:
+    """Return the repo's default branch (e.g. 'main') via origin/HEAD, or "".
+
+    Empty string means "couldn't determine" — callers must treat that as
+    "don't gate" (fail open) so we never block a normal sync on uncertainty.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(proj), "symbolic-ref", "--short", "-q",
+             "refs/remotes/origin/HEAD"],
+            capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW)
+        if r.returncode == 0:
+            name = r.stdout.strip()  # e.g. "origin/main"
+            return name.split("/", 1)[1] if "/" in name else name
+    except Exception:
+        pass
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -55,8 +92,15 @@ def _bg_git_fetch():
         uncommitted = bool(dirty.stdout.strip())
     except Exception:
         pass
+    branch = _current_branch(proj)
+    default_branch = _default_branch(proj)
+    # Fail open: if we can't determine the default branch, treat as "on default"
+    # so we never warn spuriously.
+    on_default = (not default_branch) or (branch == default_branch)
     _git_cache.update({"has_git": True, "ahead": ahead, "behind": behind,
-                       "uncommitted": uncommitted, "ready": True})
+                       "uncommitted": uncommitted, "ready": True,
+                       "branch": branch, "default_branch": default_branch,
+                       "on_default": on_default})
 
 
 def start_bg_fetch():
@@ -93,14 +137,38 @@ def get_git_cache() -> dict:
 # Git sync logic
 # ---------------------------------------------------------------------------
 
-def do_git_sync(action: str) -> dict:
+def do_git_sync(action: str, confirm_branch: bool = False) -> dict:
     """
     Perform git sync (pull, push, or both).
     Returns {"ok": bool, "messages": list[str]}.
+
+    If the working copy is not on the repo's default branch, this short-circuits
+    and returns {"needs_branch_confirm": True, ...} WITHOUT touching git, so a
+    user (or agent) who landed on a feature branch via Fork doesn't silently
+    commit/push there. Pass confirm_branch=True to proceed on the current branch.
     """
     proj = _VIBENODE_DIR
     if not (proj / ".git").is_dir():
         return {"ok": False, "messages": ["VibeNode has no git repo."]}
+
+    # ── Branch guard (short-circuit before any git operation) ──
+    if not confirm_branch:
+        cur = _current_branch(proj)
+        default = _default_branch(proj)
+        if default and cur != default:
+            branch_label = cur if cur else "a detached HEAD (no branch)"
+            return {
+                "ok": False,
+                "needs_branch_confirm": True,
+                "branch": cur,
+                "default_branch": default,
+                "messages": [
+                    "You are on branch '" + branch_label + "', not '" + default + "'.",
+                    "Syncing now will publish to '" + branch_label + "', not your main "
+                    "app. Switch to '" + default + "' first, or continue only if you "
+                    "meant to work on this branch.",
+                ],
+            }
 
     messages = []
     ok = True

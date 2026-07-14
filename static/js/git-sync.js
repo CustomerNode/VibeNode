@@ -48,6 +48,11 @@ function openGitPublish() {
       [{label:'OK', onclick: closeGitSyncModal}]);
     return;
   }
+  // Branch guard FIRST — before any publish/test options are shown.
+  if (s.on_default === false) {
+    _showBranchWarning('both', 'btn-git-publish', 'Publish App Update', s);
+    return;
+  }
   let body = '<p>Your local changes are ready to publish.</p>'
     + '<p style="color:var(--text-muted);font-size:12px">They will be saved and uploaded to remote automatically.</p>';
   if (s.behind > 0) {
@@ -70,6 +75,11 @@ function _testThenPublish(mode) {
 
 function openGitSyncBoth() {
   const s = _gitStatus;
+  // Branch guard FIRST — before any sync/test options are shown.
+  if (s.on_default === false) {
+    _showBranchWarning('both', 'btn-git-sync', 'Sync App', s);
+    return;
+  }
   let body = '<p><b style="color:var(--text-heading)">' + s.behind + ' update(s)</b> to pull and '
     + '<b style="color:var(--text-heading)">' + (s.ahead + (s.uncommitted ? 1 : 0)) + ' change(s)</b> to push.</p>'
     + '<p style="color:var(--text-muted);font-size:12px">Remote updates will be pulled first, merge conflicts resolved automatically, then your changes pushed.</p>'
@@ -187,6 +197,11 @@ function openGitUpdate() {
   if (s.behind === 0) {
     showGitSyncModal('Update App', '<p style="color:var(--text-muted)">Your app is already up to date.</p>',
       [{label:'OK', onclick: closeGitSyncModal}]);
+    return;
+  }
+  // Branch guard FIRST — pulling while off-branch updates the wrong branch.
+  if (s.on_default === false) {
+    _showBranchWarning('pull', 'btn-git-update', 'Update App', s);
     return;
   }
   showGitSyncModal('Update App', '<p><b style="color:var(--text-heading)">' + s.behind + ' update(s)</b> are available from remote.</p>'
@@ -322,7 +337,36 @@ function _setSyncStep(label, pct) {
   }
 }
 
-async function executeGitAction(action, btnId, btnLabel) {
+// ── Branch guard warning ──
+// Shown when a sync/publish is attempted while NOT on the repo's default
+// branch. Preserves the Fork feature (you can proceed) but stops a
+// non-technical user from silently pushing to the wrong branch.
+function _showBranchWarning(action, btnId, btnLabel, info) {
+  info = info || {};
+  const branch = info.branch || '';
+  const def = info.default_branch || 'main';
+  const branchLabel = branch ? branch : 'a detached HEAD (no branch)';
+  const body =
+      '<div style="padding:4px 0;">'
+    + '<p style="color:var(--result-err,#ff4444);font-weight:600;margin-bottom:6px;">'
+    +   '⚠ You are on branch "<code>' + escHtml(branchLabel) + '</code>", not "<code>' + escHtml(def) + '</code>".'
+    + '</p>'
+    + '<p style="color:var(--text-secondary);font-size:13px;">'
+    +   'Syncing now publishes your work to <b>' + escHtml(branchLabel) + '</b> — <b>not</b> your main app. '
+    +   'Most of the time you want to be on <b>' + escHtml(def) + '</b>.'
+    + '</p>'
+    + '<p style="color:var(--text-muted);font-size:12px;margin-top:8px;">'
+    +   'If you didn’t mean to be here, cancel and switch back to <b>' + escHtml(def) + '</b> first.'
+    + '</p>'
+    + '</div>';
+  showGitSyncModal('Wrong Branch?', body, [
+    {label: 'Cancel', primary: true, onclick: closeGitSyncModal},
+    {label: 'Sync to “' + branchLabel + '” anyway',
+     onclick: () => executeGitAction(action, btnId, btnLabel, true)}
+  ]);
+}
+
+async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
   closeGitSyncModal();
   // Reset minimize state for new operation
   _gitSyncMinimized = false;
@@ -330,6 +374,15 @@ async function executeGitAction(action, btnId, btnLabel) {
   _dismissMiniIndicator();
   const btn = document.getElementById(btnId);
   btn.disabled = true;
+
+  // ── Branch guard: warn before syncing while on a non-default branch. ──
+  // Uses the last-polled status for an instant pre-flight; the server enforces
+  // the same check again in case this status is stale.
+  if (!confirmBranch && _gitStatus && _gitStatus.on_default === false) {
+    btn.disabled = false;
+    _showBranchWarning(action, btnId, btnLabel, _gitStatus);
+    return;
+  }
 
   const isPush = action === 'push' || action === 'both';
   const isPull = action === 'pull' || action === 'both';
@@ -375,10 +428,17 @@ async function executeGitAction(action, btnId, btnLabel) {
   try {
     const res = await fetch('/api/git-sync', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({action})
+      body: JSON.stringify({action, confirm_branch: !!confirmBranch})
     });
     clearInterval(_pulseTimer);
     const r = await res.json();
+
+    // Server-side branch guard (in case the polled status was stale).
+    if (r.needs_branch_confirm) {
+      if (r.git_status) _applyGitStatus(r.git_status);
+      _showBranchWarning(action, btnId, btnLabel, r);
+      return;  // finally{} re-enables the button
+    }
 
     // Snap to 100%
     const fill = document.getElementById('scan-progress-fill');
