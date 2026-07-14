@@ -88,7 +88,7 @@ def test_opens_customernode_session_with_manual_approval(app, client):
     # Session starts in the resolved CustomerNode project (not VibeNode), edits
     # gated by the callback.
     kw = app.session_manager.start_session.call_args.kwargs
-    assert kw["cwd"].replace("\\", "/").endswith("code/CustomerNode")
+    assert kw["cwd"].replace("\\", "/").endswith("example/CustomerNode")
     assert kw["permission_mode"] == "default"
     assert kw["resume"] is False
     assert kw["name"] == "Watchdog fix"
