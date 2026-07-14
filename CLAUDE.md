@@ -25,6 +25,19 @@ When a user asks why a session is slow and they are trying to optimize their tim
 
 **Forbidden response pattern:** "Your context is ~Xk tokens, which means turns will take ~Y seconds. Run /compact to shrink it." That is the context-blame anti-pattern. It is not wrong, but it is useless — it converts a diagnostic question into a shrug with a workaround attached.
 
+## Never end a turn on pending background work
+
+The failure mode: launch an Agent or Bash with background execution, treat "dispatched" as "done," end the turn. The user comes back and asks "did you do it?" and the session has to re-read output it should have read the first time. This wastes turns, breaks trust, and produces sessions that look idle when they should be working — exactly the "session doing nothing when I asked it to do something" symptom users report.
+
+**Hard rules:**
+
+- **Foreground by default.** Any tool call that produces the answer the user is waiting for runs in foreground. On the Agent tool, pass `run_in_background: false`. On Bash, do not pass `run_in_background: true`. Foreground is the default even when it feels slow — the user is already waiting, and a visible wait beats an invisible one.
+- **Background is opt-in, not default.** Use it only when (a) the task is >2 minutes and belongs in `run-detached`, (b) the user explicitly asked for parallel/fan-out work, or (c) you have other productive tool calls to make in the same turn AND you will still wait for the background result before your final message.
+- **Never end a turn while primary work is pending.** If a background task IS the deliverable, wait for the completion notification before responding. "It's running, I'll check when it finishes" is not a valid final turn. "The agent went to background instead of foreground, reading its output now" is the failure this rule exists to prevent.
+- **Turn-end self-check.** Before sending the final message of a turn, ask: is there a background task, subagent, or detached job that is the answer the user asked for? If yes, keep working. If no, respond.
+
+For long-running jobs that genuinely need to survive session teardown (>2 min), use the `run-detached` skill — that is a different tool for a different purpose and is not covered by "foreground by default."
+
 ## Server restarts — CRITICAL RULES
 
 ### You must have explicit permission FIRST
