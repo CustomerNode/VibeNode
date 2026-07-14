@@ -3338,7 +3338,8 @@ async function openSessionSpawner(taskId) {
   if (bar) {
     bar.innerHTML =
       '<textarea id="live-input-ta" class="live-textarea" rows="3" placeholder="Describe what you want Claude to do\u2026" autofocus' +
-      ' onkeydown="if(_shouldSend(event)){event.preventDefault();_newSessionSubmit(\'' + newId + '\')}">' +
+      ' onkeydown="if(_shouldSend(event)){event.preventDefault();_newSessionSubmit(\'' + newId + '\')}"' +
+      ' onblur="if(_wasKeyboardDismissBlur()){_newSessionSubmit(\'' + newId + '\')}">' +
       '</textarea>' +
       '<div class="live-bar-row">' +
       (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup('', true, '', newId) : '') +

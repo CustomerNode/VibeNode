@@ -94,12 +94,22 @@
   cursor: grab; touch-action: none;   /* whole header is the drag handle */
 }
 .vnp-sheet-head:active { cursor: grabbing; }
-.vnp-sheet-title { flex: 1; font-size: 16px; font-weight: 600; color: var(--vnp-txt); display: flex; align-items: center; gap: 8px; overflow: hidden; }
+.vnp-sheet-title {
+  flex: 1; font-size: 16px; font-weight: 600; color: var(--vnp-txt);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  min-width: 0;   /* let flex actually shrink us so ellipsis engages */
+}
 .vnp-sheet-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .vnp-act {
   background: var(--vnp-panel2); color: var(--vnp-accent); border: 0; border-radius: 8px;
   font-size: 15px; font-weight: 600; padding: 6px 10px; cursor: pointer;
 }
+/* Icon-only header buttons (e.g. fullscreen) — square, no text padding, svg centered. */
+.vnp-act-icon {
+  padding: 0; width: 32px; height: 32px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.vnp-act-icon svg { display: block; }
 /* Back button — iOS-style leading chevron + label, obviously "go back". */
 .vnp-back {
   flex: 0 0 auto; display: inline-flex; align-items: center; gap: 3px;
@@ -112,6 +122,12 @@
   padding: 0 16px 10px; font-size: 12px; color: var(--vnp-txt2); border-bottom: .5px solid var(--vnp-sep);
   flex: 0 0 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* Single-preview mode: no URL row. The URL is meaningless for /api/preview/asset
+   screenshots and cramped for real ones — the header stays just title + actions. */
+#vnp-sheet:not(.vnp-gridmode) .vnp-sheet-sub { display: none; }
+/* And without the sub-line the head loses its bottom hairline — put a subtle
+   one on the head itself so the actions row still has a defined edge. */
+#vnp-sheet:not(.vnp-gridmode) .vnp-sheet-head { border-bottom: .5px solid var(--vnp-sep); padding-bottom: 8px; }
 
 /* single vs grid visibility */
 .vnp-grid { display: none; }
@@ -146,3 +162,57 @@
 .vnp-u-dots i { width: 9px; height: 9px; border-radius: 50%; background: #c4c4cc; display: block; }
 .vnp-u { flex: 1; background: #fff; border-radius: 7px; height: 20px; font-size: 11px; color: #555; display: flex; align-items: center; padding: 0 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .vnp-iframe { flex: 1; width: 100%; border: 0; background: #fff; }
+
+/* ---- fullscreen mode ---------------------------------------------------
+ * Escapes the bottom-sheet cage: sheet fills the viewport, header + snap
+ * drag are gone, the preview frame drops its 380px cap / rounded corners /
+ * shadow / letterbox padding, and floating overlay controls take over. Only
+ * meaningful in single-preview mode — grid never enters fullscreen. */
+#vnp-sheet.vnp-fs {
+  height: 100%; max-width: none; border-radius: 0;
+  box-shadow: none;
+  /* Honor iOS safe areas so controls stay inside the notch/home-indicator zones. */
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+/* Override the snap-transform rules (same specificity, later in source). */
+#vnp-sheet.show.vnp-fs { transform: translateY(0); }
+/* Hide the sheet chrome — header controls move to floating overlays. */
+#vnp-sheet.vnp-fs .vnp-grabber,
+#vnp-sheet.vnp-fs .vnp-sheet-head,
+#vnp-sheet.vnp-fs .vnp-sheet-sub { display: none; }
+/* Fill: no letterbox padding, no width cap, no card chrome. */
+#vnp-sheet.vnp-fs .vnp-stage { padding: 0; }
+#vnp-sheet.vnp-fs .vnp-frame {
+  max-width: none; width: 100%; height: 100%;
+  border-radius: 0; box-shadow: none;
+}
+/* Drop the fake "browser urlbar" — the whole point is to see the actual page. */
+#vnp-sheet.vnp-fs .vnp-urlbar { display: none; }
+/* Images fill the space too. */
+#vnp-sheet.vnp-fs .vnp-img { width: 100%; height: 100%; object-fit: contain; }
+
+/* Floating exit + refresh — only visible in fullscreen mode. */
+.vnp-fs-exit, .vnp-fs-refresh { display: none; }
+#vnp-sheet.vnp-fs .vnp-fs-exit,
+#vnp-sheet.vnp-fs .vnp-fs-refresh { display: inline-flex; }
+.vnp-fs-exit, .vnp-fs-refresh {
+  position: absolute;
+  top: calc(10px + env(safe-area-inset-top, 0px));
+  width: 38px; height: 38px; border-radius: 19px;
+  background: rgba(0, 0, 0, .58); color: #fff; border: 0;
+  align-items: center; justify-content: center; cursor: pointer;
+  z-index: 10; padding: 0; font-size: 18px; font-weight: 600;
+  -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .35);
+}
+.vnp-fs-exit    { right: calc(12px + env(safe-area-inset-right, 0px)); }
+.vnp-fs-refresh { right: calc(60px + env(safe-area-inset-right, 0px)); }
+.vnp-fs-exit:active, .vnp-fs-refresh:active { background: rgba(0, 0, 0, .78); }
+.vnp-fs-exit svg { display: block; }
+
+/* Hide the header fullscreen/refresh buttons when the grid is up — they only
+ * make sense in single-preview mode. (Refresh was already only functional in
+ * single mode; this makes it visually match.) */
+#vnp-sheet.vnp-gridmode #vnp-act-fs,
+#vnp-sheet.vnp-gridmode #vnp-act-refresh { display: none; }

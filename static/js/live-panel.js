@@ -887,7 +887,8 @@ async function openInGUI(id) {
       if (bar) {
         bar.innerHTML =
           '<textarea id="live-input-ta" class="live-textarea" rows="3" placeholder="Describe what you want Claude to do\u2026" autofocus' +
-          ' onkeydown="if(_shouldSend(event)){event.preventDefault();_newSessionSubmit(\'' + id + '\')}">' +
+          ' onkeydown="if(_shouldSend(event)){event.preventDefault();_newSessionSubmit(\'' + id + '\')}"' +
+          ' onblur="if(_wasKeyboardDismissBlur()){_newSessionSubmit(\'' + id + '\')}">' +
           '</textarea>' +
           '<div class="live-bar-row">' +
           (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup('', true, '', id) : '<div class="bar-left-group"></div>') +
@@ -899,9 +900,14 @@ async function openInGUI(id) {
         // on mobile browsers, so the on-screen keyboard doesn't come up. Keep
         // the setTimeout only for the non-critical setup (auto-resize + input
         // listener) to preserve the previous desktop timing.
+        // Mobile: skip both focus calls — opening a session should show the
+        // session, not pop the on-screen keyboard over it. The user will tap
+        // the composer themselves when they want to type. Matches the mobile
+        // gate on _wantAutofocus in updateLiveInputBar() below.
+        const _wantFocusHere = !_isMobileViewport();
         const _taSync = document.getElementById('live-input-ta');
-        if (_taSync) _taSync.focus();
-        setTimeout(() => { const ta = document.getElementById('live-input-ta'); if (ta) { ta.focus(); _initAutoResize(ta); ta.addEventListener('input', function() { if (typeof _hideTemplateGrid === 'function') _hideTemplateGrid(); }); } }, 50);
+        if (_taSync && _wantFocusHere) _taSync.focus();
+        setTimeout(() => { const ta = document.getElementById('live-input-ta'); if (ta) { if (_wantFocusHere) ta.focus(); _initAutoResize(ta); ta.addEventListener('input', function() { if (typeof _hideTemplateGrid === 'function') _hideTemplateGrid(); }); } }, 50);
       }
       return;
     }
@@ -1799,7 +1805,14 @@ function updateLiveInputBar() {
   // _barHadFocus, so "keep typing after send" and mid-typing transitions are
   // unaffected. The flag is captured here and consumed once, at the commit
   // point below, so an early-return re-render doesn't swallow it.
-  const _wantAutofocus = _guiFocusPending;
+  //
+  // Mobile: even a *deliberate* GUI-open must NOT autofocus. On phones the
+  // on-screen keyboard pops up and covers the session the user just wanted
+  // to look at — they'll tap the composer themselves when they want to type.
+  // The autofocus behavior is desirable on desktop (physical keyboard, no
+  // popover cost), so it stays gated on viewport width like the rest of the
+  // mobile-aware code in this file (_defocusComposerMobile, etc.).
+  const _wantAutofocus = _guiFocusPending && !_isMobileViewport();
 
   // Don't touch the bar for sessions that haven't started on the server yet.
   // addNewAgent() renders its own input bar with _newSessionSubmit handler.
@@ -1894,7 +1907,8 @@ function updateLiveInputBar() {
       '<span style="font-size:12px;color:var(--text-muted);">Session not running. Type a message to resume.</span>' +
       '</div>' +
       '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="Type a message to continue\u2026"' +
-      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitContinue(\'' + id + '\')}"></textarea>' +
+      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitContinue(\'' + id + '\')}"' +
+      ' onblur="if(_wasKeyboardDismissBlur()){liveSubmitContinue(\'' + id + '\')}"></textarea>' +
       '<div class="live-bar-row">' +
       (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id), false, _liveSessionModel) : _buildCtxBarCompact(id)) +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
@@ -1954,7 +1968,8 @@ function updateLiveInputBar() {
       questionHTML +
       optBtns +
       '<textarea id="live-input-ta" class="live-textarea waiting-focus" rows="2" placeholder="Type your response\u2026 (or click an option above)"' +
-      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitWaiting()}"></textarea>' +
+      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitWaiting()}"' +
+      ' onblur="if(_wasKeyboardDismissBlur()){liveSubmitWaiting()}"></textarea>' +
       '<div class="live-bar-row">' +
       (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id), false, _liveSessionModel) : _buildCtxBarCompact(id)) +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
@@ -2041,7 +2056,8 @@ function updateLiveInputBar() {
         ? 'Type to override the scheduled wake-up\u2026'
         : 'Type your next command\u2026') +
       '"' +
-      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitIdle()}"></textarea>' +
+      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitIdle()}"' +
+      ' onblur="if(_wasKeyboardDismissBlur()){liveSubmitIdle()}"></textarea>' +
       '<div class="live-bar-row">' +
       (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id), false, _liveSessionModel) : _buildCtxBarCompact(id)) +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
@@ -2144,7 +2160,8 @@ function updateLiveInputBar() {
       _agentStripHtml +
       '<textarea id="live-queue-ta" class="live-textarea live-queue-ta" rows="2" ' +
       'placeholder="' + (qCount ? 'Queue another command\u2026' : 'Type your next command \u2014 will send when Claude finishes\u2026') + '"' +
-      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveQueueSave()}"></textarea>' +
+      ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveQueueSave()}"' +
+      ' onblur="if(_wasKeyboardDismissBlur()){liveQueueSave()}"></textarea>' +
       '<div class="live-bar-row">' +
       (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id, true), false, _liveSessionModel) : _buildCtxBarCompact(id, true)) +
       '<span id="live-queue-hint" style="font-size:10px;color:var(--text-faint);">' +
@@ -2268,8 +2285,11 @@ function liveQueueSave() {
   // Scroll chat to bottom so banner is visible
   const logEl = document.getElementById('live-log');
   if (logEl) logEl.scrollTop = logEl.scrollHeight;
-  // Keep focus on textarea
-  ta.focus();
+  // Keep focus on textarea — desktop only. On mobile, re-focusing after a
+  // send pops the on-screen keyboard back over the chat the user just wanted
+  // to see; matches the mobile defocus in the other submit paths
+  // (liveSubmitContinue / liveSubmitIdle / _newSessionSubmit).
+  if (!_isMobileViewport()) ta.focus();
 }
 
 function liveClearQueue() {
@@ -2486,6 +2506,13 @@ function _wrongSessionIcon() {
 
 async function _liveSubmitDirect(sid, text, opts) {
   if (!sid) return;
+
+  // Mobile: drop keyboard on send. Callers vary (liveSubmitIdle, the
+  // direct-send branch of liveQueueSave, and liveSubmitWaiting's fallback)
+  // so centralize the defocus here — a single call covers every entry
+  // point. Idempotent if the caller already blurred (matches the pattern in
+  // liveSubmitContinue / liveSubmitWaiting / _newSessionSubmit).
+  _defocusComposerMobile();
 
   // ── Wrong-session detection gate ──
   // Runs before any socket.emit. The _checkWrongSession() call is synchronous

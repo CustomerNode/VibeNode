@@ -36,6 +36,47 @@ const _MOBILE_MQ = (typeof window !== 'undefined' && window.matchMedia)
   : { matches: false };
 function _isMobileViewport() { return !!_MOBILE_MQ.matches; }
 
+// ---------------------------------------------------------------------------
+// iOS "keyboard-dismiss = send" detection
+// ---------------------------------------------------------------------------
+// Tapping the iPhone keyboard's Done / dismiss-chevron (the button that feels
+// like a "send/confirm check") fires a blur on the focused textarea — but so
+// does tapping anywhere else on the page.  We need to distinguish the two so
+// only the keyboard-dismiss case auto-sends; tapping away should NOT commit
+// a half-typed message.
+//
+// Trick: the keyboard is system UI, so tapping its Done chevron does NOT
+// generate any pointerdown/touchstart event on the document.  Any page-tap
+// blur, in contrast, is preceded by a pointerdown within a few ms.  We stamp
+// the last pointer time globally (capture-phase, so we see it before any
+// stopPropagation), and the blur handler asks "was there a page tap recently?"
+// If not — keyboard dismissed itself → treat as send.
+let _lastPagePointerTs = 0;
+if (typeof document !== 'undefined') {
+  const _stamp = () => { _lastPagePointerTs = Date.now(); };
+  // pointerdown covers iOS 13+ Safari; touchstart is the pre-pointer-events
+  // fallback and is harmless on modern browsers (both fire, stamp is idempotent).
+  document.addEventListener('pointerdown', _stamp, { capture: true, passive: true });
+  document.addEventListener('touchstart',  _stamp, { capture: true, passive: true });
+  document.addEventListener('mousedown',   _stamp, { capture: true, passive: true });
+}
+
+/**
+ * Returns true if a just-fired blur on a composer textarea was caused by the
+ * user tapping the iOS keyboard's own dismiss button (Done / chevron-down),
+ * as opposed to tapping somewhere else on the page. Desktop always returns
+ * false — no virtual keyboard, no "dismiss" gesture to interpret as send.
+ *
+ * Call from an inline `onblur=""` on the textarea. Requires nothing else.
+ */
+function _wasKeyboardDismissBlur() {
+  if (!_isMobileViewport()) return false;
+  // 250ms window: real page taps land well under 50ms before the blur; the
+  // buffer absorbs any browser scheduling jitter without opening the door to
+  // "user tapped a second ago, then keyboard closed on its own" false-sends.
+  return (Date.now() - _lastPagePointerTs) > 250;
+}
+
 /** Returns true if the keyboard event should trigger a send based on preference */
 function _shouldSend(e) {
   if (e.key !== 'Enter') return false;

@@ -224,27 +224,64 @@
         '</button>' +
         '<div class="vnp-sheet-title" id="vnp-sheet-title">Previews</div>' +
         '<div class="vnp-sheet-actions">' +
+          '<button class="vnp-act vnp-act-icon" id="vnp-act-fs" title="Fullscreen" aria-label="Enter fullscreen">' +
+            '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">' +
+              '<path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>' +
+            '</svg>' +
+          '</button>' +
           '<button class="vnp-act" id="vnp-act-refresh" title="Reload">↻</button>' +
           '<button class="vnp-act" id="vnp-done">Done</button>' +
         '</div>' +
       '</div>' +
       '<div class="vnp-sheet-sub" id="vnp-sheet-sub"></div>' +
       '<div class="vnp-grid" id="vnp-grid"></div>' +
-      '<div class="vnp-stage" id="vnp-stage"></div>';
+      '<div class="vnp-stage" id="vnp-stage"></div>' +
+      // Floating controls that only appear in fullscreen mode. Kept siblings of
+      // the stage so they overlay it without being scoped inside the iframe frame.
+      '<button class="vnp-fs-exit" id="vnp-fs-exit" title="Exit fullscreen" aria-label="Exit fullscreen">' +
+        '<svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">' +
+          '<path d="M4 4l10 10M14 4L4 14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>' +
+        '</svg>' +
+      '</button>' +
+      '<button class="vnp-fs-refresh" id="vnp-fs-refresh" title="Reload" aria-label="Reload">↻</button>';
     document.body.appendChild(s);
     document.getElementById("vnp-grabber").addEventListener("click", _cycleSnap);
     document.getElementById("vnp-done").addEventListener("click", closeSheet);
     document.getElementById("vnp-act-grid").addEventListener("click", function () {
       if (s._sid) openGrid(s._sid);
     });
-    document.getElementById("vnp-act-refresh").addEventListener("click", function () {
+    var _reloadStage = function () {
       if (s._sid && s._pid) {
         var p = _stores[s._sid] && _stores[s._sid].byId[s._pid];
         if (p) { s._bust = (s._bust || 0) + 1; _renderStage(p, s._bust); }
       }
+    };
+    document.getElementById("vnp-act-refresh").addEventListener("click", _reloadStage);
+    document.getElementById("vnp-fs-refresh").addEventListener("click", _reloadStage);
+    document.getElementById("vnp-act-fs").addEventListener("click", _enterFs);
+    document.getElementById("vnp-fs-exit").addEventListener("click", _exitFs);
+    // ESC exits fullscreen first, then closes the sheet — same as most viewers.
+    document.addEventListener("keydown", function (e) {
+      if (e.key !== "Escape") return;
+      if (!s.classList.contains("show")) return;
+      if (s.classList.contains("vnp-fs")) { _exitFs(); e.preventDefault(); }
     });
     _installDrag(s);
     return s;
+  }
+
+  // ---- fullscreen mode -----------------------------------------------------
+  // Escapes the constraints of the bottom-sheet layout: no header, no letterbox
+  // padding, no 380px frame cap, no rounded corners, no width cap. Just the
+  // preview edge-to-edge on the phone. Only meaningful in single-preview mode.
+  function _enterFs() {
+    var s = _sheet();
+    if (s.classList.contains("vnp-gridmode")) return;   // no fullscreen for the grid
+    s.classList.add("vnp-fs");
+  }
+  function _exitFs() {
+    var s = document.getElementById("vnp-sheet");
+    if (s) s.classList.remove("vnp-fs");
   }
 
   // Snap positions as translateY percent of the sheet: full, half, peek.
@@ -329,13 +366,14 @@
   function closeSheet() {
     var s = document.getElementById("vnp-sheet");
     var back = document.getElementById("vnp-sheet-backdrop");
-    if (s) s.classList.remove("show");
+    if (s) { s.classList.remove("show"); s.classList.remove("vnp-fs"); }
     if (back) back.classList.remove("show");
   }
 
   function openGrid(sid) {
     var s = _sheet();
     s._sid = sid; s._pid = null;
+    s.classList.remove("vnp-fs");   // grid is never fullscreen
     _hasNew[sid] = false; updateNavButton(sid);
     document.getElementById("vnp-sheet-title").textContent = "Previews · this session";
     var items = list(sid);
@@ -365,9 +403,12 @@
     _hasNew[sid] = false; updateNavButton(sid);
     var s = _sheet();
     s._sid = sid; s._pid = pid;
-    var t = TYPE_META[p.type] || TYPE_META.browser;
-    document.getElementById("vnp-sheet-title").innerHTML =
-      esc(p.name) + ' <span class="vnp-type vnp-type-' + p.type + '">' + t.glyph + " " + t.label + "</span>";
+    // Title is JUST the preview name — no type chip, no URL sub-line. The card
+    // in chat + the grid tile both show the type; once you're staring at the
+    // preview, another chip labeling it "Image" is pure noise. The URL row is
+    // hidden in single mode via CSS (it's meaningless for asset:// screenshots
+    // and cramped for real URLs).
+    document.getElementById("vnp-sheet-title").textContent = p.name;
     document.getElementById("vnp-sheet-sub").textContent = p.src;
     _renderStage(p);
     _show("single");
