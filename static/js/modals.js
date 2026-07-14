@@ -1,14 +1,129 @@
 /* modals.js — header system dropdown, summary, group dropdowns, respond popup */
 
 // --- Header System dropdown ---
+// Phones (≤768px) get the same iOS-style bottom action sheet the ••• toolbar
+// menu and the long-press session menu use. Same DOM (#mobile-sheet), same CSS
+// (.sheet-card / .sheet-item / .sheet-cancel from mobile.css), so this menu
+// visually matches the rest of the mobile UI — backdrop + slide-up + rounded
+// card + separate Cancel button — instead of the tiny desktop dropdown.
+function _hdrSysIsMobile() {
+  return !!(window.matchMedia && window.matchMedia('(max-width:768px)').matches);
+}
+function _hdrSysEsc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function _hdrSysCloseSheet() {
+  var s = document.getElementById('mobile-sheet');
+  var b = document.getElementById('mobile-sheet-backdrop');
+  if (s) s.classList.remove('show');
+  if (b) b.classList.remove('show');
+}
+// Scan the existing #hdr-sys-dropdown so dynamic value labels (Model, Thinking,
+// Persistent Storage, Mobile Command, Developer Tools badge) and any future
+// items flow through automatically — no second source of truth.
+function _hdrSysBuildGroups() {
+  var dd = document.getElementById('hdr-sys-dropdown');
+  var groups = [[]];
+  if (!dd) return groups;
+  Array.prototype.forEach.call(dd.children, function(el) {
+    if (el.classList && el.classList.contains('sys-separator')) {
+      if (groups[groups.length - 1].length) groups.push([]);
+      return;
+    }
+    if (el.tagName !== 'BUTTON') return;
+    var valEl = el.querySelector('.sys-item-value');
+    var value = valEl ? (valEl.textContent || '').trim() : '';
+    // Label = button text minus the value badge.
+    var clone = el.cloneNode(true);
+    var vc = clone.querySelector('.sys-item-value');
+    if (vc) vc.remove();
+    var label = (clone.textContent || '').trim();
+    groups[groups.length - 1].push({ label: label, value: value, source: el });
+  });
+  return groups;
+}
+function _hdrSysOpenSheet() {
+  // Make sure the desktop dropdown isn't visible underneath (a leftover from a
+  // resize from desktop → mobile with it open).
+  var ddEl = document.getElementById('hdr-sys-dropdown');
+  if (ddEl) ddEl.classList.remove('open');
+
+  var backdrop = document.getElementById('mobile-sheet-backdrop');
+  if (!backdrop) {
+    backdrop = document.createElement('div');
+    backdrop.id = 'mobile-sheet-backdrop';
+    document.body.appendChild(backdrop);
+  }
+  // Rewire backdrop each open — the ••• sheet and the session long-press
+  // sheet reuse this same node with their own close handlers.
+  backdrop.onclick = _hdrSysCloseSheet;
+
+  var sheet = document.getElementById('mobile-sheet');
+  if (!sheet) {
+    sheet = document.createElement('div');
+    sheet.id = 'mobile-sheet';
+    document.body.appendChild(sheet);
+  }
+
+  var groups = _hdrSysBuildGroups();
+  var html = '';
+  groups.forEach(function(rows, gi) {
+    if (!rows.length) return;
+    var mt = gi === 0 ? '' : ' style="margin-top:8px;"';
+    html += '<div class="sheet-card"' + mt + '>';
+    rows.forEach(function(r, i) {
+      var value = r.value
+        ? '<span style="margin-left:auto;color:var(--text-secondary);font-size:13px;">'
+          + _hdrSysEsc(r.value) + '</span>'
+        : '';
+      html += '<button class="sheet-item" data-g="' + gi + '" data-i="' + i + '">'
+           + _hdrSysEsc(r.label) + value + '</button>';
+    });
+    html += '</div>';
+  });
+  html += '<button class="sheet-cancel">Cancel</button>';
+  sheet.innerHTML = html;
+
+  sheet.querySelectorAll('.sheet-item').forEach(function(el) {
+    el.addEventListener('click', function() {
+      var g = +el.getAttribute('data-g');
+      var i = +el.getAttribute('data-i');
+      var r = groups[g] && groups[g][i];
+      _hdrSysCloseSheet();
+      // Defer 80ms so the slide-down animation starts before we fire the
+      // original button's onclick — matches the ••• sheet's feel.
+      setTimeout(function() {
+        if (r && r.source) r.source.click();
+      }, 80);
+    });
+  });
+  var cancel = sheet.querySelector('.sheet-cancel');
+  if (cancel) cancel.addEventListener('click', _hdrSysCloseSheet);
+
+  requestAnimationFrame(function() {
+    backdrop.classList.add('show');
+    sheet.classList.add('show');
+  });
+}
+
 function toggleHdrSys() {
+  if (_hdrSysIsMobile()) { _hdrSysOpenSheet(); return; }
   document.getElementById('hdr-sys-dropdown').classList.toggle('open');
 }
 function closeHdrSys() {
-  document.getElementById('hdr-sys-dropdown').classList.remove('open');
+  // On mobile the menu lives in #mobile-sheet, not the dropdown — close both
+  // so callers (each dropdown button's inline `closeHdrSys()`) work in both
+  // modes without knowing which is active.
+  var dd = document.getElementById('hdr-sys-dropdown');
+  if (dd) dd.classList.remove('open');
+  if (_hdrSysIsMobile()) _hdrSysCloseSheet();
 }
 document.addEventListener('click', function(e) {
-  if (!document.getElementById('hdr-sys').contains(e.target)) closeHdrSys();
+  if (!document.getElementById('hdr-sys').contains(e.target)) {
+    var dd = document.getElementById('hdr-sys-dropdown');
+    if (dd) dd.classList.remove('open');
+  }
 });
 
 // --- Recently Deleted (session trash) ---
