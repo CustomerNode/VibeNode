@@ -120,11 +120,20 @@ def test_second_turn_uses_carry_forward_no_new_stats(sm_module, tmp_path):
         real_stat = Path.stat
 
         def _counting_stat(self, *args, **kwargs):
-            # Only count stats inside the tmp dir we care about, to
-            # avoid noise from unrelated stat calls (e.g. logging).
+            # Count stats on files INSIDE the tmp dir — i.e. the rescan's
+            # per-file stat() calls, which the carry-forward fast path must
+            # skip.  Deliberately does NOT count a stat on tmp_path itself:
+            # _record_pre_turn_mtimes always calls cwd_path.is_dir() (one
+            # stat on the cwd dir) before the fast-path check, and that is
+            # not part of the rescan.
+            #
+            # Compare via ``.parents`` (pure string manipulation, no
+            # filesystem access).  The previous version called
+            # ``Path(self).resolve()`` here, but resolve() itself calls
+            # stat(), which re-enters this patched wrapper and recurses
+            # infinitely on Windows (WindowsPath resolve → stat → resolve …).
             try:
-                if Path(tmp_path) in Path(self).resolve().parents \
-                        or Path(self).resolve() == Path(tmp_path).resolve():
+                if Path(tmp_path) in Path(self).parents:
                     stat_calls["count"] += 1
             except OSError:
                 pass

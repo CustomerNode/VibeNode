@@ -75,14 +75,10 @@ def app(tmp_path, fake_project):
     application = create_app(testing=True)
     # Default: session manager doesn't know about any sessions, so routes
     # fall through to file-based logic (which is what these tests exercise).
+    # (create_app(testing=True) already stubs has_session / get_all_states /
+    # get_dormant_states / get_entry_count with the "no sessions" defaults;
+    # re-stating has_session here is just for local readability.)
     application.session_manager.has_session.return_value = False
-    # The daemon-state decorators in api_sessions (live-session insert,
-    # subsession metadata, and the restart-memory/dormant overlay) iterate
-    # these.  Without explicit stubs a bare MagicMock leaks a non-serializable
-    # MagicMock into the session dicts and jsonify() raises.  Empty containers
-    # match the "no live sessions" default above.
-    application.session_manager.get_all_states.return_value = []
-    application.session_manager.get_dormant_states.return_value = {}
 
     # Redirect _sessions_dir and _CLAUDE_PROJECTS to tmp_path
     _patch_sessions = patch(

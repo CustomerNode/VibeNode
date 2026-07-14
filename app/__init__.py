@@ -62,6 +62,17 @@ def create_app(testing=False) -> Flask:
         # that reference app.session_manager don't crash on attribute access.
         from unittest.mock import MagicMock
         app.session_manager = MagicMock()
+        # Sane defaults for the daemon-state accessors that /api/sessions and
+        # the live endpoints iterate/serialize.  A bare MagicMock auto-returns
+        # child MagicMocks, which are truthy and non-JSON-serializable — so
+        # without these the subsession-decoration and restart-memory overlays
+        # leak a MagicMock into the session list and jsonify() raises.  These
+        # are the "no live/dormant sessions" defaults (routes then fall through
+        # to file-based logic); individual tests override as needed.
+        app.session_manager.has_session.return_value = False
+        app.session_manager.get_all_states.return_value = []
+        app.session_manager.get_dormant_states.return_value = {}
+        app.session_manager.get_entry_count.return_value = 0
 
     # Register blueprints
     from .routes.main import bp as main_bp
