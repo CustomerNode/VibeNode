@@ -698,7 +698,140 @@ function singleOrDouble(id, e) {
   openInGUI(id);
 }
 
-/* ---- Right-click context menu ---- */
+/* ---- Right-click / long-press context menu ----
+ *
+ * Two rendering modes:
+ *   - Desktop  → floating `.ws-ctx-menu` popup anchored at the pointer.
+ *   - Mobile   → iOS-style bottom action sheet (reuses #mobile-sheet DOM/CSS
+ *                that mobile.js installs for the ••• toolbar action sheet),
+ *                so this menu feels identical to the ••• menu: backdrop,
+ *                slide-up from bottom, full-width rows with dividers, and
+ *                a separate "Cancel" button.
+ *
+ * Both modes are driven by the same data-shaped `items` list built once,
+ * so action coverage is identical.  The only per-mode divergence is the
+ * DOM the items get rendered into.
+ */
+
+// Detect touch/phone width.  Kept in sync with mobile.js's own check so
+// both paths agree on where the ••• sheet UI kicks in.
+function _isMobileCtx() {
+  return !!(window.matchMedia && window.matchMedia('(max-width:768px)').matches);
+}
+
+// Reuse the same #mobile-sheet DOM the ••• toolbar sheet installs.  If it
+// hasn't been created yet (rare — mobile.js typically creates it on first
+// ••• tap), we create it here with the exact same ids/classes so the
+// existing mobile.css rules apply automatically.  No CSS edits required.
+function _closeSessionSheet() {
+  var s = document.getElementById('mobile-sheet');
+  var b = document.getElementById('mobile-sheet-backdrop');
+  if (s) s.classList.remove('show');
+  if (b) b.classList.remove('show');
+}
+
+/**
+ * Render a data-driven action sheet using the same iOS-style DOM as the
+ * ••• toolbar sheet.
+ *
+ * @param {Array<{divider?:boolean, label?:string, icon?:string,
+ *                action?:string, danger?:boolean, disabled?:boolean,
+ *                headerHtml?:string}>} items
+ * @param {(action:string, item:Object) => void} onAction
+ */
+function _openSessionSheet(items, onAction) {
+  var backdrop = document.getElementById('mobile-sheet-backdrop');
+  if (!backdrop) {
+    backdrop = document.createElement('div');
+    backdrop.id = 'mobile-sheet-backdrop';
+    document.body.appendChild(backdrop);
+  }
+  // Rewire the backdrop click each time — we don't want a stale handler
+  // (the ••• sheet's closeSheet vs. ours) firing for the wrong sheet.
+  backdrop.onclick = _closeSessionSheet;
+
+  var sheet = document.getElementById('mobile-sheet');
+  if (!sheet) {
+    sheet = document.createElement('div');
+    sheet.id = 'mobile-sheet';
+    document.body.appendChild(sheet);
+  }
+
+  // Strip dividers for the sheet.  On iOS action sheets, groups aren't
+  // separated by visible dividers within the card — every row has the
+  // same hairline separator.  Collapsing dividers keeps the row count
+  // dense (important on a phone) without losing any actions.
+  var actionable = items.filter(function(it) { return !it.divider; });
+
+  var html = '';
+  // Optional header row (used by the bulk sheet to show "N selected").
+  var headerItem = items.find(function(it) { return it.headerHtml; });
+  if (headerItem) {
+    html += '<div class="sheet-card" style="margin-bottom:8px;">'
+         + '<div class="sheet-item" style="justify-content:center;'
+         + 'font-weight:600;color:var(--text-secondary);cursor:default;">'
+         + headerItem.headerHtml + '</div></div>';
+  }
+  html += '<div class="sheet-card">';
+  actionable.forEach(function(it, i) {
+    if (it.headerHtml) return;  // already rendered above
+    var styles = it.danger ? ' style="color:var(--result-err);"' : '';
+    var disabled = it.disabled ? ' disabled' : '';
+    var iconHtml = it.icon
+      ? '<span style="display:inline-flex;align-items:center;margin-right:12px;flex:0 0 auto;">'
+        + it.icon + '</span>'
+      : '';
+    html += '<button class="sheet-item" data-i="' + i + '"' + disabled + styles + '>'
+         + iconHtml + escHtml(it.label || '') + '</button>';
+  });
+  html += '</div><button class="sheet-cancel">Cancel</button>';
+  sheet.innerHTML = html;
+
+  sheet.querySelectorAll('.sheet-item').forEach(function(el) {
+    el.addEventListener('click', function() {
+      var idx = +el.getAttribute('data-i');
+      var it = actionable[idx];
+      if (!it || it.disabled || it.headerHtml) return;
+      _closeSessionSheet();
+      // Let the slide-down animation get started before dispatching the
+      // action — matches the ••• sheet's 80ms delay for a snappier feel.
+      setTimeout(function() { onAction(it.action, it); }, 80);
+    });
+  });
+  var cancelBtn = sheet.querySelector('.sheet-cancel');
+  if (cancelBtn) cancelBtn.addEventListener('click', _closeSessionSheet);
+
+  requestAnimationFrame(function() {
+    backdrop.classList.add('show');
+    sheet.classList.add('show');
+  });
+}
+
+// ---- Icon strings, factored out so both mobile and desktop paths share ----
+var _ICONS = {
+  open:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>',
+  autoname: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
+  rename:   '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>',
+  link:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>',
+  compose:  '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
+  spawn:    '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 3v6"/><path d="M6 9c0 4 4 6 8 6"/><polyline points="11 12 14 15 11 18"/></svg>',
+  plus:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+  cont:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/></svg>',
+  dup:      '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  template: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>',
+  terminal: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>',
+  compact:  '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>',
+  stop:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/></svg>',
+  trash:    '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
+  grid:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
+  x:        '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+};
+
+// Downscaled 14×14 icon variant for the tighter desktop popup.
+function _iconDesktop(svg) {
+  return svg.replace('width="18" height="18"', 'width="14" height="14"');
+}
+
 function sessionContextMenu(e, sessionId) {
   e.preventDefault();
   e.stopPropagation();
@@ -707,9 +840,10 @@ function sessionContextMenu(e, sessionId) {
   const tip = document.getElementById('session-tooltip');
   if (tip) tip.classList.remove('visible');
 
-  // Remove any existing context menu
+  // Remove any existing context menu (desktop popup or mobile sheet)
   var old = document.querySelector('.session-ctx-menu');
   if (old) old.remove();
+  _closeSessionSheet();
 
   // ----- Multi-selection routing (Finder/Explorer/VS Code semantics) -----
   // Right-click on a row that's part of a 2+ selection -> show bulk menu.
@@ -750,63 +884,51 @@ function sessionContextMenu(e, sessionId) {
     ? getSessionStatus(sessionId) !== 'sleeping'
     : (isRunning || isOpenInGui);
 
+  // Build items as data — rendered as EITHER a floating popup (desktop)
+  // OR a bottom sheet (mobile).
+  var items = [];
+  if (!isActive) items.push({ label: 'Open',        icon: _ICONS.open,     action: 'open' });
+  items.push({ label: 'Auto-name',                  icon: _ICONS.autoname, action: 'autoname' });
+  items.push({ label: 'Rename',                     icon: _ICONS.rename,   action: 'rename' });
+  items.push({ divider: true });
+  items.push({ label: 'Link to Workflow Task',      icon: _ICONS.link,     action: 'link-workflow' });
+  items.push({ label: 'Add to Structured composition', icon: _ICONS.compose, action: 'add-compose' });
+  items.push({ label: 'Spawn Subsession',           icon: _ICONS.spawn,    action: 'spawn-subsession' });
+  items.push({ label: 'Create Workflow Task',       icon: _ICONS.plus,     action: 'create-workflow' });
+  items.push({ divider: true });
+  items.push({ label: 'Continue',                   icon: _ICONS.cont,     action: 'continue' });
+  items.push({ label: 'Duplicate',                  icon: _ICONS.dup,      action: 'duplicate' });
+  items.push({ label: 'Save as Template',           icon: _ICONS.template, action: 'save-template' });
+  items.push({ label: 'Open in Terminal',           icon: _ICONS.terminal, action: 'terminal' });
+  if (isActive) {
+    items.push({ divider: true });
+    items.push({ label: 'Compact Context',          icon: _ICONS.compact,  action: 'compact' });
+  }
+  if (appearsActive) {
+    items.push({ divider: true });
+    items.push({ label: 'Stop Session',             icon: _ICONS.stop,     action: 'stop',   danger: true });
+  }
+  items.push({ divider: true });
+  items.push({ label: 'Delete',                     icon: _ICONS.trash,    action: 'delete', danger: true });
+
+  // ----- Mobile: iOS-style bottom sheet -----
+  if (_isMobileCtx()) {
+    _openSessionSheet(items, function(action) { _sessCtx(action, sessionId); });
+    return;
+  }
+
+  // ----- Desktop: floating popup at the pointer -----
   var menu = document.createElement('div');
   menu.className = 'session-ctx-menu ws-ctx-menu';
 
-  // Build menu items
-  var items = '';
-
-  // Open (if not already active)
-  if (!isActive) {
-    items += '<div class="ws-ctx-item" onclick="_sessCtx(\'open\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg> Open</div>';
-  }
-
-  // Auto-name
-  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'autoname\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg> Auto-name</div>';
-
-  // Rename
-  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'rename\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg> Rename</div>';
-
-  items += '<div class="ws-ctx-divider"></div>';
-
-  // Link to task/section
-  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'link-workflow\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg> Link to Workflow Task</div>';
-  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'add-compose\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg> Add to Structured composition</div>';
-  // Spawn Subsession (spec §4.2 + §4.6) — downward-branching arrow.
-  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'spawn-subsession\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 3v6"/><path d="M6 9c0 4 4 6 8 6"/><polyline points="11 12 14 15 11 18"/></svg> Spawn Subsession</div>';
-  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'create-workflow\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> Create Workflow Task</div>';
-
-  items += '<div class="ws-ctx-divider"></div>';
-
-  // Continue
-  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'continue\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/></svg> Continue</div>';
-
-  // Duplicate
-  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'duplicate\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Duplicate</div>';
-
-  // Save as Template
-  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'save-template\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg> Save as Template</div>';
-
-  // Open in Terminal
-  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'terminal\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg> Open in Terminal</div>';
-
-  // Active-session-only actions
-  if (isActive) {
-    items += '<div class="ws-ctx-divider"></div>';
-    items += '<div class="ws-ctx-item" onclick="_sessCtx(\'compact\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg> Compact Context</div>';
-  }
-
-  // Stop (if running, open in GUI, or restored-as-active after a restart)
-  if (appearsActive) {
-    items += '<div class="ws-ctx-divider"></div>';
-    items += '<div class="ws-ctx-item danger" onclick="_sessCtx(\'stop\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/></svg> Stop Session</div>';
-  }
-
-  // Delete (always available)
-  items += '<div class="ws-ctx-divider"></div>';
-  items += '<div class="ws-ctx-item danger" onclick="_sessCtx(\'delete\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg> Delete</div>';
-
-  menu.innerHTML = items;
+  var html = '';
+  items.forEach(function(it) {
+    if (it.divider) { html += '<div class="ws-ctx-divider"></div>'; return; }
+    var cls = 'ws-ctx-item' + (it.danger ? ' danger' : '');
+    html += '<div class="' + cls + '" onclick="_sessCtx(\'' + it.action + '\',\'' + sessionId + '\')">'
+         + _iconDesktop(it.icon) + ' ' + escHtml(it.label) + '</div>';
+  });
+  menu.innerHTML = html;
   menu.style.left = e.clientX + 'px';
   menu.style.top = e.clientY + 'px';
   document.body.appendChild(menu);
@@ -833,9 +955,10 @@ function sessionContextMenu(e, sessionId) {
 }
 
 function _sessCtx(action, sessionId) {
-  // Remove context menu
+  // Remove context menu (desktop popup) and dismiss mobile sheet if open
   var menu = document.querySelector('.session-ctx-menu');
   if (menu) menu.remove();
+  _closeSessionSheet();
 
   switch (action) {
     case 'open':
@@ -1496,63 +1619,82 @@ function _bulkContextMenu(e) {
   const count = ids.length;
   if (count < 2) return; // safety: routing should have prevented this
 
+  // Dismiss any prior menu (desktop popup or mobile sheet).
+  var old = document.querySelector('.session-ctx-menu');
+  if (old) old.remove();
+  _closeSessionSheet();
+
+  // Data-shaped item list — same in both render modes.
+  var headerHtml = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" '
+    + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+    + 'style="vertical-align:-2px;margin-right:6px;">'
+    + '<rect x="3" y="3" width="7" height="7" rx="1"/>'
+    + '<rect x="14" y="3" width="7" height="7" rx="1"/>'
+    + '<rect x="3" y="14" width="7" height="7" rx="1"/>'
+    + '<rect x="14" y="14" width="7" height="7" rx="1"/></svg>'
+    + count + ' selected';
+
+  var items = [];
+  items.push({ headerHtml: headerHtml });
+  items.push({ divider: true });
+  items.push({ label: 'Stop all',                          icon: _ICONS.stop,     action: 'stop' });
+  items.push({ label: 'Auto-name all',                     icon: _ICONS.autoname, action: 'autoname' });
+  items.push({ label: 'Duplicate all',                     icon: _ICONS.dup,      action: 'duplicate' });
+  items.push({ label: 'Add all to Structured composition', icon: _ICONS.compose,  action: 'add-compose' });
+  items.push({ divider: true });
+  items.push({ label: 'Delete all',                        icon: _ICONS.trash,    action: 'delete', danger: true });
+  items.push({ divider: true });
+  items.push({ label: 'Clear selection',                   icon: _ICONS.x,        action: 'clear' });
+
+  function dispatch(action) {
+    switch (action) {
+      case 'stop':        _bulkStop();        break;
+      case 'autoname':    _bulkAutoName();    break;
+      case 'duplicate':   _bulkDuplicate();   break;
+      case 'add-compose': _bulkAddToCompose();break;
+      case 'delete':      _bulkDelete();      break;
+      case 'clear':
+        _clearMultiSelect();
+        var m = document.querySelector('.session-ctx-menu');
+        if (m) m.remove();
+        _closeSessionSheet();
+        break;
+    }
+  }
+
+  // ----- Mobile: iOS-style bottom sheet -----
+  if (_isMobileCtx()) {
+    _openSessionSheet(items, function(action) { dispatch(action); });
+    return;
+  }
+
+  // ----- Desktop: floating popup at the pointer -----
   const menu = document.createElement('div');
   menu.className = 'session-ctx-menu ws-ctx-menu sidebar-bulk-ctx-menu';
 
-  // Header strip showing the count — reinforces "this acts on N items".
-  let html = '<div class="ws-ctx-bulk-header">'
-    + '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
-    + '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>'
-    + '<rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>'
-    + ' ' + count + ' selected</div>';
+  let html = '<div class="ws-ctx-bulk-header">' + headerHtml + '</div>';
   html += '<div class="ws-ctx-divider"></div>';
-
-  // --- Stop all (silent skip for non-running) ---
-  html += '<div class="ws-ctx-item" onclick="_bulkStop()">'
-    + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
-    + '<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/></svg>'
-    + ' Stop all</div>';
-
-  // --- Auto-name all (with confirmation modal) ---
-  html += '<div class="ws-ctx-item" onclick="_bulkAutoName()">'
-    + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
-    + '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>'
-    + ' Auto-name all</div>';
-
-  // --- Duplicate all ---
-  html += '<div class="ws-ctx-item" onclick="_bulkDuplicate()">'
-    + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
-    + '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>'
-    + '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
-    + ' Duplicate all</div>';
-
-  // --- Add all to Compose (sequential modal per session) ---
-  html += '<div class="ws-ctx-item" onclick="_bulkAddToCompose()">'
-    + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
-    + '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>'
-    + ' Add all to Structured composition</div>';
-
-  html += '<div class="ws-ctx-divider"></div>';
-
-  // --- Delete all (danger; modal confirmation) ---
-  html += '<div class="ws-ctx-item danger" onclick="_bulkDelete()">'
-    + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
-    + '<polyline points="3 6 5 6 21 6"/>'
-    + '<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>'
-    + ' Delete all</div>';
-
-  html += '<div class="ws-ctx-divider"></div>';
-
-  // --- Clear selection ---
-  html += '<div class="ws-ctx-item" onclick="_clearMultiSelect();var m=document.querySelector(\'.session-ctx-menu\');if(m)m.remove();">'
-    + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
-    + '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
-    + ' Clear selection</div>';
+  items.forEach(function(it) {
+    if (it.headerHtml) return;               // already rendered above
+    if (it.divider) { html += '<div class="ws-ctx-divider"></div>'; return; }
+    var cls = 'ws-ctx-item' + (it.danger ? ' danger' : '');
+    // Escape the action into the onclick attribute safely — actions are
+    // static tokens from the items list above, so no user input flows here.
+    html += '<div class="' + cls + '" onclick="(function(){'
+         + 'var m=document.querySelector(\'.session-ctx-menu\');if(m)m.remove();'
+         + 'window._bulkDispatch(\'' + it.action + '\');})()">'
+         + _iconDesktop(it.icon) + ' ' + escHtml(it.label) + '</div>';
+  });
 
   menu.innerHTML = html;
   menu.style.left = e.clientX + 'px';
   menu.style.top = e.clientY + 'px';
   document.body.appendChild(menu);
+
+  // Publish dispatcher for the onclick handlers above.  We use a function
+  // hoisted onto window so inline handlers can call it without needing to
+  // capture the closure.
+  window._bulkDispatch = dispatch;
 
   // Keep menu in viewport
   requestAnimationFrame(function() {

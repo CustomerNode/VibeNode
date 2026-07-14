@@ -135,6 +135,14 @@ _FINDING_SUPPRESSIONS = [
     # credential — the value is a plain dict-key string. Suppress only this
     # finding type for this file; all other secret patterns still run.
     (re.compile(r'app/session_store\.py$'), "Env Variable Secret"),
+    # prelogin_unlock.py serves a pre-login unlock page whose embedded JS
+    # builds a form-encoded POST body: body: 'password=' + encodeURIComponent(pw).
+    # The "Password Assignment" regex reads `password=` + the opening quote
+    # and greedily slurps the following JS as a "hardcoded value" until the
+    # next quote. There is NO hardcoded password — the value comes from a
+    # user-typed <input> at runtime. Suppress only this finding type for this
+    # file; every other secret pattern still runs against it.
+    (re.compile(r'scripts/boot_access/prelogin_unlock\.py$'), "Password Assignment"),
 ]
 
 # Files that should NEVER be committed (beyond .gitignore)

@@ -717,6 +717,30 @@
     from { opacity: 0; transform: translateY(6px); }
     to   { opacity: 1; transform: translateY(0); }
   }
+
+  /* --------------------------------------------------------------------------
+   * iOS Safari zooms the viewport whenever a focused <input>/<textarea> has a
+   * computed font-size below 16px. The user experience: tap the search popup,
+   * the whole page jumps to a zoomed-in state, and Safari doesn't cleanly
+   * unzoom after blur. The threshold is exactly 16px — 14px, 13.5px, 13px all
+   * trigger it. openDeepSearch() in search.js writes font-size:13px INLINE on
+   * #ds-input for a compact desktop look, and the sidebar filter uses 13.5px.
+   * Bump both to 16px on phone widths. `!important` is required on #ds-input
+   * to beat the inline style; the sidebar filter takes it too so specificity
+   * quirks can't reintroduce the bug. The visual weight change at phone size
+   * is imperceptible and worth the tradeoff for a zoom-free tap.
+   *
+   * Applies to modals mounted via document.body appendChild (deep search),
+   * find bar, and any future popup that mounts an input — the generic
+   * `.modal-overlay input[type="text"]` catches them without per-widget edits.
+   * ------------------------------------------------------------------------ */
+  #ds-input,
+  .mc-search-input,
+  .modal-overlay input[type="text"],
+  .modal-overlay input[type="search"],
+  .modal-overlay textarea {
+    font-size: 16px !important;
+  }
 }
 
 /* Respect the OS-level "reduce motion" preference (iOS: Settings → Accessibility

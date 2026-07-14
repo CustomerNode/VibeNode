@@ -3339,7 +3339,13 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
   transition: background 0.12s;
   position: relative;
 }
-.project-item:hover { background: var(--bg-hover); }
+/* Gate :hover behind (hover: hover) so touch devices (iOS/Android) don't get
+   "sticky hover" — where the first tap only activates :hover styles and the
+   second tap fires the click. That double-tap regression made project
+   switching require two taps on mobile. */
+@media (hover: hover) {
+  .project-item:hover { background: var(--bg-hover); }
+}
 .project-item.active { background: var(--bg-active); }
 
 .project-item-info { flex: 1; min-width: 0; }
@@ -3373,7 +3379,16 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
   transition: opacity 0.12s;
   flex-shrink: 0;
 }
-.project-item:hover .project-item-actions { opacity: 1; }
+/* Only apply hover-to-reveal on true hover devices. On touch devices we keep
+   the actions permanently visible (see the (hover: none) rule below) so the
+   first tap fires selectProjectFromOverlay() instead of just revealing these
+   buttons — that was the "click twice to switch" mobile bug. */
+@media (hover: hover) {
+  .project-item:hover .project-item-actions { opacity: 1; }
+}
+@media (hover: none) {
+  .project-item-actions { opacity: 1; }
+}
 
 .project-act-btn {
   background: none;

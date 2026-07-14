@@ -525,10 +525,19 @@
     // Capture-phase click blocker. Runs BEFORE the row's own onclick
     // (handleNameClick / session-col-date openInGUI) so a long-press
     // doesn't also open/rename the session on release. Menu items live
-    // inside `.ws-ctx-menu` and are excluded so tapping them still fires.
+    // inside `.ws-ctx-menu` (desktop popup) OR `#mobile-sheet` /
+    // `#mobile-sheet-backdrop` (mobile iOS-style bottom sheet built by
+    // sessions.js _openSessionSheet), and all are excluded so tapping
+    // them still fires — otherwise the first tap on a sheet row (or the
+    // backdrop dismiss) would be swallowed for the 800ms suppression
+    // window that opens right after the long-press haptic.
     document.addEventListener("click", function (e) {
       if (Date.now() >= suppressClicksUntil) return;
-      if (e.target && e.target.closest && e.target.closest(".ws-ctx-menu")) return;
+      if (e.target && e.target.closest) {
+        if (e.target.closest(".ws-ctx-menu") ||
+            e.target.closest("#mobile-sheet") ||
+            e.target.closest("#mobile-sheet-backdrop")) return;
+      }
       e.stopPropagation();
       e.preventDefault();
       suppressClicksUntil = 0;  // one-shot: don't eat a subsequent click

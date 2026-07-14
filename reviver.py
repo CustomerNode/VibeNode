@@ -303,6 +303,12 @@ def _launch_vibenode() -> None:
 #               installed OUTSIDE the home (root/one-time-sudo territory,
 #               which this self-installer deliberately never touches).
 #
+# PRE-LOGIN WINDOW (all platforms): every mechanism above fires at LOGIN, not
+# at boot. If the machine reboots unattended, the phone link stays dead until
+# someone logs in. Opt-in, one-time setup scripts that close that window
+# (Windows boot task, Linux linger/ecryptfs unlock page) live in
+# scripts/boot_access/ — see its README.
+#
 # All names are salted with the checkout path so multiple VibeNode clones never
 # fight over one task/agent/unit. Everything is best-effort: any failure just
 # logs and falls back to lightweight (armed-each-launch) behavior — never a
