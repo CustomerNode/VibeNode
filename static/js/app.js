@@ -281,8 +281,6 @@ async function setProject(encoded, reload = true) {
 function openProjectOverlay() {
   const overlay = document.getElementById('project-overlay');
   const card = document.getElementById('project-card');
-  const list = document.getElementById('project-list');
-  const saved = localStorage.getItem('activeProject');
 
   // Restore footer visibility — addProjectOverlay() / addProjectFind() hide it
   // when entering the Add flow; without this reset, the "+ Add Project" button
@@ -290,7 +288,43 @@ function openProjectOverlay() {
   // another project without a full page refresh.
   const footer = document.querySelector('.project-footer');
   if (footer) footer.style.display = '';
-  list.style.padding = '';
+  const list = document.getElementById('project-list');
+  if (list) list.style.padding = '';
+
+  // Show the overlay immediately so the tap feels responsive, then render.
+  overlay.classList.add('show');
+  card.classList.add('pm-enter');
+  requestAnimationFrame(() => card.classList.remove('pm-enter'));
+  // Close on backdrop click
+  overlay.onclick = e => { if (e.target === overlay) closeProjectOverlay(); };
+
+  _renderProjectOverlay();
+
+  // Self-heal for the empty-list failure mode. The startup loadProjects() call
+  // (socket.js) populates _allProjects from /api/projects. If that fetch was
+  // slow (mobile over Tailscale, cold Wi-Fi), dropped, or hit a transient
+  // error, _allProjects stays [] and the overlay renders zero rows — user sees
+  // just the header and "+ Add Project" with no way to reach their projects
+  // short of a full page refresh. Refetching here recovers automatically the
+  // next time they tap "Select project" instead of leaving them stuck.
+  if (!_allProjects || _allProjects.length === 0) {
+    _refreshProjectsAndRerender();
+  }
+}
+
+function _renderProjectOverlay() {
+  const list = document.getElementById('project-list');
+  if (!list) return;
+  const saved = localStorage.getItem('activeProject');
+
+  if (!_allProjects || _allProjects.length === 0) {
+    // Loading placeholder — replaced by _refreshProjectsAndRerender() once the
+    // fetch settles. Kept generic so it fits both "still loading" and "just
+    // opened before startup fetch finished" cases; the error path below
+    // replaces this with an explicit error message.
+    list.innerHTML = '<div class="empty-state" style="padding:24px;text-align:center;color:var(--text-muted);font-size:13px;">Loading projects…</div>';
+    return;
+  }
 
   list.innerHTML = _allProjects.map(p => {
     const shortName = _projectShortName(p);
@@ -321,13 +355,35 @@ function openProjectOverlay() {
     item.querySelector('.project-rename-btn').onclick = e => { e.stopPropagation(); renameProjectOverlay(enc, name); };
     item.querySelector('.project-delete-btn').onclick = e => { e.stopPropagation(); deleteProjectOverlay(enc, name); };
   });
+}
 
-  overlay.classList.add('show');
-  card.classList.add('pm-enter');
-  requestAnimationFrame(() => card.classList.remove('pm-enter'));
-
-  // Close on backdrop click
-  overlay.onclick = e => { if (e.target === overlay) closeProjectOverlay(); };
+async function _refreshProjectsAndRerender() {
+  // Plain fetch — NOT loadProjects(), because loadProjects() also updates the
+  // sidebar label and can trigger setProject() (which tears down live panels).
+  // Here we just want to repopulate the cache so the overlay can re-render.
+  try {
+    const res = await fetch('/api/projects');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    _allProjects = await res.json();
+  } catch (e) {
+    const list = document.getElementById('project-list');
+    if (list) {
+      list.innerHTML = '<div class="empty-state" style="padding:24px;text-align:center;color:var(--text-muted);font-size:13px;">Couldn\'t load projects. Check your connection and tap "Select project" again.</div>';
+    }
+    return;
+  }
+  // Only re-render if the overlay is still visible (user may have closed it
+  // while the fetch was in flight).
+  const overlay = document.getElementById('project-overlay');
+  if (overlay && overlay.classList.contains('show')) {
+    _renderProjectOverlay();
+  }
+  // Also update the sidebar label if it was showing the placeholder — the
+  // startup loadProjects() may have failed before it got a chance to set it.
+  const saved = localStorage.getItem('activeProject');
+  const savedMatch = _allProjects.find(p => p.encoded === saved);
+  if (savedMatch) _updateProjectLabel(savedMatch);
+  else if (_allProjects.length > 0) _updateProjectLabel(_allProjects[0]);
 }
 
 function closeProjectOverlay() {
