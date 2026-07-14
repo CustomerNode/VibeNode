@@ -27,9 +27,19 @@ function showToast(msg, isError=false) {
 // ---------------------------------------------------------------------------
 let sendBehavior = localStorage.getItem('sendBehavior') || 'ctrl-enter';
 
+// Mobile phones: Enter is the natural "new line" key on a virtual keyboard,
+// and modifier combos (Shift/Ctrl/Alt+Enter) are impractical on touch. Always
+// treat Enter as new-line — the visible send button next to the mic handles
+// submission. Match the ≤768px breakpoint used everywhere else (mobile.js).
+const _MOBILE_MQ = (typeof window !== 'undefined' && window.matchMedia)
+  ? window.matchMedia('(max-width: 768px)')
+  : { matches: false };
+function _isMobileViewport() { return !!_MOBILE_MQ.matches; }
+
 /** Returns true if the keyboard event should trigger a send based on preference */
 function _shouldSend(e) {
   if (e.key !== 'Enter') return false;
+  if (_isMobileViewport()) return false;   // mobile: Enter is always new-line, use the send button
   if (sendBehavior === 'enter') return !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
   return e.ctrlKey || e.shiftKey || e.altKey || e.metaKey;
 }
@@ -67,6 +77,10 @@ function _initAutoResize(ta) {
 
 /** Returns HTML for the current send hint + toggle button */
 function _sendHint() {
+  // On mobile the Enter key always inserts a newline; sending is done via the
+  // send button that appears next to the mic. The keyboard-shortcut toggle
+  // below is desktop-only, so suppress the hint (and the toggle) on phones.
+  if (_isMobileViewport()) return '';
   const text = sendBehavior === 'enter' ? `Enter to send · ${_MOD}+Enter, Shift+Enter, or Alt+Enter for new line` : `${_MOD}+Enter, Shift+Enter, or Alt+Enter to send`;
   return text + '<span class="send-hint-btn" onclick="_toggleSendBehavior(event)" title="Change send shortcut">'
     + '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">'

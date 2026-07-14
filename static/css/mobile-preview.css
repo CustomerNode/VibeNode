@@ -1,0 +1,148 @@
+/* VibeNode — Mobile Visual Channel styles (companion to js/mobile-preview.js).
+ * iOS-flavored sheet, but THEME-AWARE: the chrome (panels, sheet, cards, text,
+ * borders, accent) maps onto VibeNode's theme tokens so it tracks light/dark and
+ * the app's real accent instead of a hardcoded dark palette. Scoped under .vnp-*.
+ *
+ * NOT themed (deliberately): the white preview frame + thumbnail surfaces
+ * (.vnp-frame/.vnp-img/.vnp-mini) — those show actual rendered web content
+ * (a screenshot / a live page), so they stay white in every theme. */
+
+:root {
+  --vnp-panel: var(--bg-modal);          /* sheet / card background */
+  --vnp-panel2: var(--bg-btn);           /* secondary surfaces (segments, tiles) */
+  --vnp-sep: var(--border-light);        /* separators / hairlines */
+  --vnp-txt: var(--text-primary);
+  --vnp-txt2: var(--text-muted);
+  --vnp-accent: var(--accent);           /* VibeNode purple, not iOS blue */
+  --vnp-green: #30d158;                  /* semantic "new"/image category (theme-neutral) */
+  --vnp-purple: var(--accent);           /* browser category → app accent */
+  --vnp-stage-bg: var(--bg-panel);       /* letterbox behind a preview */
+  --vnp-radius: 16px;
+}
+
+/* ---- type chip ---- */
+.vnp-type {
+  font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 20px;
+  display: inline-flex; align-items: center; gap: 4px; vertical-align: middle;
+}
+.vnp-type-browser { background: rgba(94, 92, 230, .22); color: #b6b4ff; }
+.vnp-type-image   { background: rgba(48, 209, 88, .18); color: var(--vnp-green); }
+
+/* ---- mini render placeholder (thumbnails) ---- */
+.vnp-mini { width: 100%; height: 100%; background: #fff; display: flex; flex-direction: column; overflow: hidden; }
+.vnp-mini-top { height: 26%; }
+.vnp-mini-body { flex: 1; padding: 8px; display: flex; flex-direction: column; gap: 5px; }
+.vnp-mini-l { height: 7px; border-radius: 3px; background: #e5e5ea; }
+
+/* ---- in-chat card ---- */
+.vnp-cards { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.vnp-card {
+  max-width: 320px; background: var(--vnp-panel); border: .5px solid var(--vnp-sep);
+  border-radius: var(--vnp-radius); overflow: hidden; cursor: pointer; transition: transform .12s;
+}
+.vnp-card:active { transform: scale(.98); }
+.vnp-card-thumb { height: 140px; background: var(--vnp-stage-bg); display: flex; align-items: center; justify-content: center; }
+.vnp-card-thumb .vnp-mini { width: 86%; height: 78%; border-radius: 8px; box-shadow: 0 6px 20px rgba(0, 0, 0, .5); }
+.vnp-card-meta { padding: 10px 13px; }
+.vnp-card-ttl { font-size: 15px; font-weight: 600; color: var(--vnp-txt); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.vnp-card-sub { font-size: 11.5px; color: var(--vnp-txt2); margin-top: 3px; }
+
+/* ---- aggregator nav button ---- */
+.vnp-navbtn {
+  position: relative; width: 40px; height: 40px; border: 0; background: transparent;
+  cursor: pointer; padding: 0; margin-left: 4px; color: var(--vnp-txt);
+}
+.vnp-navbtn:active { transform: scale(.94); }
+.vnp-stack { position: absolute; inset: 0; }
+.vnp-s { position: absolute; border-radius: 6px; border: 1.5px solid var(--vnp-panel2); background: var(--vnp-panel2); }
+.vnp-s3 { width: 22px; height: 22px; top: 11px; left: 3px; transform: rotate(-8deg); opacity: .55; }
+.vnp-s2 { width: 24px; height: 24px; top: 9px; left: 7px; transform: rotate(5deg); opacity: .8; }
+.vnp-s1 { width: 26px; height: 26px; top: 7px; left: 10px; background: var(--text-faint); }
+.vnp-badge {
+  position: absolute; top: -4px; right: -4px; min-width: 18px; height: 18px; border-radius: 9px;
+  background: var(--vnp-accent); color: #fff; font-size: 11px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center; padding: 0 5px;
+  border: 1.5px solid var(--vnp-panel); transition: background .3s; z-index: 2;
+}
+/* "New previews since last gallery open" is signaled by the badge turning green. */
+.vnp-navbtn.has-new .vnp-badge { background: var(--vnp-green); }
+
+/* ---- bottom sheet ---- */
+#vnp-sheet-backdrop {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, .45); opacity: 0; pointer-events: none;
+  transition: opacity .3s; z-index: 3000;
+}
+#vnp-sheet-backdrop.show { opacity: 1; pointer-events: auto; }
+#vnp-sheet {
+  position: fixed; left: 0; right: 0; bottom: 0; height: 92%;
+  background: var(--vnp-panel); border-radius: 20px 20px 0 0;
+  transform: translateY(100%); transition: transform .34s cubic-bezier(.32, .72, 0, 1);
+  z-index: 3001; display: flex; flex-direction: column; box-shadow: 0 -10px 40px rgba(0, 0, 0, .6);
+  max-width: 720px; margin: 0 auto;
+  /* Capture touches so a swipe on the sheet never chains to the chat behind. */
+  touch-action: none; overscroll-behavior: contain;
+}
+/* The gallery is the one region that must scroll — allow vertical pan, but keep
+   its scroll contained so reaching the end doesn't bleed to the page. */
+.vnp-grid { touch-action: pan-y; overscroll-behavior: contain; }
+#vnp-sheet.show.vnp-full { transform: translateY(0); }
+#vnp-sheet.show.vnp-half { transform: translateY(46%); }
+#vnp-sheet.show.vnp-peek { transform: translateY(72%); }
+.vnp-grabber { width: 40px; height: 5px; border-radius: 3px; background: var(--text-faint); margin: 9px auto 4px; flex: 0 0 auto; cursor: grab; }
+.vnp-sheet-head {
+  padding: 4px 16px 6px; display: flex; align-items: center; justify-content: space-between; gap: 10px; flex: 0 0 auto;
+  cursor: grab; touch-action: none;   /* whole header is the drag handle */
+}
+.vnp-sheet-head:active { cursor: grabbing; }
+.vnp-sheet-title { flex: 1; font-size: 16px; font-weight: 600; color: var(--vnp-txt); display: flex; align-items: center; gap: 8px; overflow: hidden; }
+.vnp-sheet-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.vnp-act {
+  background: var(--vnp-panel2); color: var(--vnp-accent); border: 0; border-radius: 8px;
+  font-size: 15px; font-weight: 600; padding: 6px 10px; cursor: pointer;
+}
+/* Back button — iOS-style leading chevron + label, obviously "go back". */
+.vnp-back {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 3px;
+  background: none; border: 0; padding: 6px 8px 6px 2px; margin-right: 2px;
+  color: var(--vnp-accent); font-size: 16px; font-weight: 600; cursor: pointer;
+}
+.vnp-back .vnp-chev { display: block; flex: 0 0 auto; }
+.vnp-back:active { opacity: .55; }
+.vnp-sheet-sub {
+  padding: 0 16px 10px; font-size: 12px; color: var(--vnp-txt2); border-bottom: .5px solid var(--vnp-sep);
+  flex: 0 0 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* single vs grid visibility */
+.vnp-grid { display: none; }
+.vnp-stage { display: flex; }
+#vnp-sheet.vnp-gridmode .vnp-grid { display: grid; }
+#vnp-sheet.vnp-gridmode .vnp-stage { display: none; }
+#vnp-sheet.vnp-gridmode #vnp-act-grid { display: none; }
+#vnp-sheet:not(.vnp-gridmode) #vnp-act-refresh { display: inline-block; }
+
+/* grid */
+.vnp-grid {
+  flex: 1 1 auto; overflow-y: auto; padding: 14px; grid-template-columns: 1fr 1fr; gap: 12px; align-content: start;
+}
+.vnp-tile { background: var(--vnp-panel2); border: .5px solid var(--vnp-sep); border-radius: 14px; overflow: hidden; cursor: pointer; transition: transform .12s; }
+.vnp-tile:active { transform: scale(.97); }
+.vnp-tile-thumb { height: 110px; background: var(--vnp-stage-bg); display: flex; align-items: center; justify-content: center; position: relative; }
+.vnp-tile-thumb .vnp-mini { width: 82%; height: 80%; border-radius: 6px; }
+.vnp-tag { position: absolute; top: 7px; right: 7px; }
+.vnp-tile-cap { padding: 8px 10px; }
+.vnp-tile-ttl { font-size: 13px; font-weight: 600; color: var(--vnp-txt); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vnp-tile-sub { font-size: 10.5px; color: var(--vnp-txt2); margin-top: 3px; }
+.vnp-empty { grid-column: 1 / -1; text-align: center; color: var(--vnp-txt2); padding: 40px 0; font-size: 13px; }
+
+/* single stage */
+.vnp-stage { flex: 1 1 auto; overflow: hidden; position: relative; background: var(--vnp-stage-bg); align-items: center; justify-content: center; padding: 14px; touch-action: none; }
+/* The live iframe manages its own touches (scroll/tap inside the page). */
+.vnp-iframe { touch-action: auto; }
+.vnp-frame { width: 100%; height: 100%; max-width: 380px; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 40px rgba(0, 0, 0, .5); background: #fff; display: flex; flex-direction: column; }
+.vnp-img { width: 100%; height: 100%; object-fit: contain; background: #fff; }
+.vnp-urlbar { height: 34px; background: #e9e9ee; display: flex; align-items: center; gap: 8px; padding: 0 12px; flex: 0 0 auto; }
+.vnp-u-dots { display: flex; gap: 5px; }
+.vnp-u-dots i { width: 9px; height: 9px; border-radius: 50%; background: #c4c4cc; display: block; }
+.vnp-u { flex: 1; background: #fff; border-radius: 7px; height: 20px; font-size: 11px; color: #555; display: flex; align-items: center; padding: 0 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vnp-iframe { flex: 1; width: 100%; border: 0; background: #fff; }

@@ -223,6 +223,9 @@ data/chrome-profile/
 data/chatgpt-profile/
 data/chatgpt-debug/
 
+# Mobile visual channel — headless-rendered preview screenshots (app/routes/preview_api.py)
+data/previews/
+
 # Backups
 backups/
 

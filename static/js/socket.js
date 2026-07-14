@@ -211,6 +211,13 @@ socket.on('session_renamed', (data) => {
 socket.on('daemon_reconnect', (data) => {
     const status = data.status;
     const msg = data.message || 'Daemon connection issue';
+    // Bridge to healthchecks.js so the "engine stopped" overlay clears the
+    // instant the daemon reconnects (don't wait for the next /api/health poll).
+    try {
+        window.dispatchEvent(new CustomEvent('vn-daemon-status', {
+            detail: { up: status === 'connected' }
+        }));
+    } catch (e) { /* ignore */ }
     if (status === 'connected') {
         showToast(msg);
         // Resync state after reconnect

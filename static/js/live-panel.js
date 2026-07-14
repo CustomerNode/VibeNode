@@ -431,6 +431,9 @@ function _clearDraft(sessionId) {
 
 // ── Strip "Sent from Q at ..." footer from message text for display ──
 function _stripVnMeta(text) {
+  // Remove the server-injected headless-mobile preamble (⟦VN-MOBILE⟧…⟦/VN-MOBILE⟧)
+  // so it never shows in the user's own bubble — it's context for the agent only.
+  text = text.replace(/⟦VN-MOBILE⟧[\s\S]*?⟦\/VN-MOBILE⟧\s*/g, '');
   const m = text.match(/\n{1,2}Sent from Q at (\d{4}-\d{2}-\d{2} \d{1,2}:\d{2} [AP]M)(\s*\(transcribed from voice[^)]*\))?\s*$/);
   if (!m) return {clean: text, sentAt: null, voice: false};
   return {clean: text.replace(m[0], ''), sentAt: m[1], voice: !!m[2]};
@@ -921,6 +924,9 @@ async function openInGUI(id) {
 function startLivePanel(id, opts) {
   stopLivePanel();
   liveSessionId = id;
+  // Mobile visual channel: point the preview nav button at the newly-active
+  // session (hides it if that session has no previews yet).
+  if (window.MobilePreview) { try { MobilePreview.onSessionActivated(id); } catch (e) {} }
   liveLineCount = 0;
   liveAutoScroll = true;
   if (!(opts && opts.skipLog)) _optimisticMsgId = 0;
@@ -1073,7 +1079,7 @@ function _autoSendPendingInput() {
       // New session that hasn't been submitted yet — start it
       runningIds.add(id);
       sessionKinds[id] = 'working';
-      const startOpts = { session_id: id, prompt: text, cwd: _currentProjectDir(), name: '' };
+      const startOpts = { session_id: id, prompt: text, cwd: _currentProjectDir(), name: '', remote_tailnet: window.VN_IS_TAILNET || undefined };
       // Resolve via the single owner so this path honors a per-session choice
       // instead of always falling back to the system default.
       const _lpModel = (typeof SessionModel !== 'undefined')
@@ -1167,15 +1173,32 @@ function _fillMsgBody(div, kind, fullText, expanded) {
   // re-fetching it (property, not dataset — avoids serializing into the DOM).
   div._vnFullText = fullText;
 
+  // Mobile visual channel: pull any [[VN-PREVIEW …]] markers out of assistant
+  // text BEFORE truncation/markdown, so they render as tappable preview cards
+  // (not raw JSON) and can never be sliced mid-marker by truncation.
+  let renderFull = fullText;
+  let _pv = null;
+  if (isAsst && window.MobilePreview && liveSessionId) {
+    try {
+      _pv = MobilePreview.extractForRender(liveSessionId, fullText);
+      renderFull = _pv.clean;
+    } catch (e) { renderFull = fullText; _pv = null; }
+  }
+
   const LIMIT = _MSG_TRUNCATE_LIMIT[kind] != null ? _MSG_TRUNCATE_LIMIT[kind] : 600;
-  const truncate = !expanded && fullText.length > LIMIT;
-  const displayText = truncate ? fullText.slice(0, LIMIT) : fullText;
+  const truncate = !expanded && renderFull.length > LIMIT;
+  const displayText = truncate ? renderFull.slice(0, LIMIT) : renderFull;
 
   if (isAsst) {
     bodyEl.innerHTML = mdParse(displayText);
     if (typeof addSmartCopyButtons === 'function') addSmartCopyButtons(bodyEl, displayText);
   } else {
     bodyEl.innerHTML = '<pre style="white-space:pre-wrap;margin:0;">' + escHtml(displayText) + '</pre>';
+  }
+
+  // Render the extracted previews as cards under the message body.
+  if (isAsst && _pv && _pv.found && _pv.found.length) {
+    try { MobilePreview.appendCards(div, _pv.found, liveSessionId); } catch (e) { /* non-fatal */ }
   }
 
   // Tag the most-recent, auto-expanded assistant message so a later assistant
@@ -1190,8 +1213,12 @@ function _fillMsgBody(div, kind, fullText, expanded) {
     btn.textContent = '… show more';
     btn.onclick = () => {
       if (isAsst) {
-        bodyEl.innerHTML = mdParse(fullText);
-        if (typeof addSmartCopyButtons === 'function') addSmartCopyButtons(bodyEl, fullText);
+        bodyEl.innerHTML = mdParse(renderFull);
+        if (typeof addSmartCopyButtons === 'function') addSmartCopyButtons(bodyEl, renderFull);
+        // Preview cards live outside .msg-body; re-append after full expand.
+        if (_pv && _pv.found && _pv.found.length) {
+          try { MobilePreview.appendCards(div, _pv.found, liveSessionId); } catch (e) { /* non-fatal */ }
+        }
       } else {
         bodyEl.innerHTML = '<pre style="white-space:pre-wrap;margin:0;">' + escHtml(fullText) + '</pre>';
       }
@@ -1762,6 +1789,18 @@ function updateLiveInputBar() {
   // restore it synchronously after innerHTML replacement (avoids focus flash).
   const _barHadFocus = bar.contains(document.activeElement);
 
+  // Whether a *deliberate* GUI action (opening this session — see openInGUI)
+  // asked us to pull focus into the input. Only that should proactively grab
+  // focus. A state-driven re-render must NOT: on touch devices (no physical
+  // keyboard) calling .focus() re-opens the on-screen keyboard, and these
+  // re-renders fire constantly (idle↔working, queue changes, every sub-agent
+  // status tick), so autofocusing on each one makes the keyboard flail on
+  // screen. Focus that already lives in the bar is still preserved below via
+  // _barHadFocus, so "keep typing after send" and mid-typing transitions are
+  // unaffected. The flag is captured here and consumed once, at the commit
+  // point below, so an early-return re-render doesn't swallow it.
+  const _wantAutofocus = _guiFocusPending;
+
   // Don't touch the bar for sessions that haven't started on the server yet.
   // addNewAgent() renders its own input bar with _newSessionSubmit handler.
   // If neither runningIds nor sessionKinds know about this session, leave it alone.
@@ -1832,6 +1871,10 @@ function updateLiveInputBar() {
 
   const wasTransition = liveBarState !== null;  // true if switching between states
   liveBarState = stateKey;
+  // Committed to a real re-render — consume the deliberate-focus request so it
+  // only applies to this one render (the first after a GUI open), never to the
+  // stream of state-driven re-renders that follow.
+  _guiFocusPending = false;
 
   // The bar is about to be rebuilt (innerHTML replaced), which destroys the
   // countdown element.  Stop any running auto-retry countdown timer; the idle
@@ -1859,14 +1902,13 @@ function updateLiveInputBar() {
       '</div>';
     const btnClose = document.getElementById('btn-close');
     if (btnClose) btnClose.disabled = true;
-    _guiFocusPending = false;
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => liveSubmitContinue(id));
     if (_barHadFocus) { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }
     setTimeout(() => {
       const logEl = document.getElementById('live-log');
       if (logEl) _autoScrollLiveLog(logEl);
       const ta = document.getElementById('live-input-ta');
-      if (ta) { if (!_barHadFocus) ta.focus(); _initAutoResize(ta); }
+      if (ta) { if (_wantAutofocus && !_barHadFocus) ta.focus(); _initAutoResize(ta); }
     }, 50);
 
   } else if (kind === 'question') {
@@ -1921,13 +1963,12 @@ function updateLiveInputBar() {
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), liveSubmitWaiting);
     const ta = document.getElementById('live-input-ta');
     if (ta) {
-      _guiFocusPending = false;
       if (_barHadFocus) ta.focus();
       _initAutoResize(ta);
       setTimeout(() => {
         const logEl = document.getElementById('live-log');
         if (logEl) _autoScrollLiveLog(logEl);
-        if (!_barHadFocus) ta.focus();
+        if (_wantAutofocus && !_barHadFocus) ta.focus();
       }, 50);
     }
 
@@ -2007,7 +2048,6 @@ function updateLiveInputBar() {
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>';
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), liveSubmitIdle);
-    _guiFocusPending = false;
     if (_barHadFocus) { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }
     // Live auto-retry countdown: tick the seconds text in place (no full
     // re-render) until the retry fires or is cleared.  Mirrors the working-bar
@@ -2030,7 +2070,7 @@ function updateLiveInputBar() {
       const logEl = document.getElementById('live-log');
       if (logEl) _autoScrollLiveLog(logEl);
       const ta = document.getElementById('live-input-ta');
-      if (ta) { if (!_barHadFocus) ta.focus(); _initAutoResize(ta); }
+      if (ta) { if (_wantAutofocus && !_barHadFocus) ta.focus(); _initAutoResize(ta); }
     }, 50);
 
   } else {
@@ -2116,7 +2156,7 @@ function updateLiveInputBar() {
     if (_barHadFocus) { const ta = document.getElementById('live-queue-ta'); if (ta) ta.focus(); }
     setTimeout(() => {
       const ta = document.getElementById('live-queue-ta');
-      if (ta) { if (!_barHadFocus) ta.focus(); _initAutoResize(ta); }
+      if (ta) { if (_wantAutofocus && !_barHadFocus) ta.focus(); _initAutoResize(ta); }
     }, 50);
     _renderQueueBanner();
     // Start elapsed timer — update only the time span, NOT the whole bar
@@ -2496,7 +2536,7 @@ async function _liveSubmitDirect(sid, text, opts) {
     sessionKinds[sid] = 'working';
   } else if (runningIds.has(sid)) {
     // Send message — server will process if idle, or queue if busy
-    socket.emit('send_message', {session_id: sid, text: text, voice: _isVoice || undefined});
+    socket.emit('send_message', {session_id: sid, text: text, voice: _isVoice || undefined, remote_tailnet: window.VN_IS_TAILNET || undefined});
     // Ghost session safety net: if no session_state event arrives within 3s,
     // the daemon has lost this session. Fall back to start_session to recover.
     const _ghostTimer = setTimeout(() => {

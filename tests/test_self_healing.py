@@ -549,3 +549,60 @@ class TestSelfHealingBehavior:
         assert "heal_err" in src or "heal_count" in src
         # The catch-all in finally should force IDLE
         assert "forcing IDLE" in src or "SessionState.IDLE" in src
+
+
+class TestUserStopBeatsSelfHeal:
+    """An explicit Sleep/Stop/Close must win over the transport self-heal.
+
+    Regression for the "Sleep won't stick" bug: a session whose CLI died
+    mid-turn (e.g. killed by a machine shutdown) schedules a reconnect that
+    re-sends the last message.  If the user Sleeps the session in the
+    meantime, the reconnect must NOT resurrect it back to WORKING.
+    """
+
+    def test_user_stopped_true_for_stopped_state(self, sm_module):
+        info = sm_module.SessionInfo(
+            session_id="s", state=sm_module.SessionState.STOPPED)
+        assert sm_module.SessionManager._user_stopped(info) is True
+
+    def test_user_stopped_true_for_interrupted(self, sm_module):
+        info = sm_module.SessionInfo(
+            session_id="s", state=sm_module.SessionState.IDLE)
+        info._interrupted = True
+        assert sm_module.SessionManager._user_stopped(info) is True
+
+    def test_user_stopped_false_for_live_session(self, sm_module):
+        info = sm_module.SessionInfo(
+            session_id="s", state=sm_module.SessionState.WORKING)
+        assert sm_module.SessionManager._user_stopped(info) is False
+        assert sm_module.SessionManager._user_stopped(None) is False
+
+    def test_reconnect_aborts_when_user_slept_session(self, session_manager, sm_module):
+        """_reconnect_client must bail out (return False) without connecting
+        when the user has closed/slept the session (state STOPPED)."""
+        sid = "slept-session"
+        info = sm_module.SessionInfo(
+            session_id=sid, state=sm_module.SessionState.STOPPED)
+        info.cwd = "/tmp"
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+        # Fail loudly if the guard is missing and it tries to actually connect.
+        session_manager._sdk = MagicMock()
+        session_manager._sdk.create_session = MagicMock(
+            side_effect=AssertionError("must not reconnect a slept session"))
+
+        result = asyncio.run(session_manager._reconnect_client(sid, info))
+        assert result is False
+        session_manager._sdk.create_session.assert_not_called()
+
+    def test_both_self_heal_sites_guard_on_user_stop(self, sm_module):
+        """Both the drive and query self-heal blocks must consult
+        _user_stopped before (and after) the reconnect backoff."""
+        for meth in (sm_module.SessionManager._drive_session,
+                     sm_module.SessionManager._send_query):
+            src = inspect.getsource(meth)
+            # Guard must appear at least twice: pre-backoff skip + post-backoff abort.
+            assert src.count("_user_stopped(info)") >= 2, (
+                f"{meth.__name__} is missing a _user_stopped guard around "
+                f"the self-heal reconnect")

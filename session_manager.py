@@ -198,6 +198,73 @@ if not _launch_splash():
             _msg = "Starting up\u2026 (install python3-tk for the boot splash)"
     _show_notification("VibeNode", _msg)
 
+# ---------------------------------------------------------------------------
+# Mobile Command reviver hook.
+# The reviver (reviver.py) keeps a "Start VibeNode" page reachable from the
+# phone (over the existing tailscale-serve -> 5050 mapping) whenever the web
+# server is down, so a killed VibeNode is a one-tap fix from mobile instead of
+# a dead link. See reviver.py for the full rationale.
+#
+# session_manager.py is the universal launch choke point — the desktop
+# shortcut, launch.bat, launch.sh, and /api/restart all run it — so this is the
+# one place that covers every start path. Two best-effort steps, only when
+# Mobile Command is enabled (otherwise a no-op for normal users):
+#   1. Tell any already-running reviver to release port 5050 NOW, so run.py can
+#      bind it without a fight and WITHOUT the reviver process dying.
+#   2. Make sure a reviver exists for next time (its own singleton guard makes
+#      this idempotent — a duplicate spawn simply exits).
+# ---------------------------------------------------------------------------
+def _reviver_hook():
+    try:
+        cfg_path = os.environ.get("VIBENODE_CONFIG") or str(_HERE / "kanban_config.json")
+        import json as _json
+        with open(cfg_path, "r", encoding="utf-8") as _fh:
+            _cfg = _json.load(_fh)
+        if not _cfg.get("mobile_command_enabled", False):
+            return  # feature off — nothing to do
+    except Exception:
+        return  # no/unreadable config — feature can't be on
+
+    control_port = int(os.environ.get("VIBENODE_REVIVER_PORT", 0) or 5052)
+
+    # 1. Yield: ask a live reviver to free 5050 before run.py binds it.
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/yield" % control_port, data=b"", method="POST")
+        urllib.request.urlopen(req, timeout=2)  # noqa: S310 (loopback only)
+    except Exception:
+        pass  # no reviver running yet, or already yielded — both fine
+
+    # 2. Ensure a reviver is running for next time (singleton-guarded).
+    try:
+        import subprocess
+        reviver_script = _HERE / "reviver.py"
+        if reviver_script.exists():
+            exe = sys.executable
+            if sys.platform == "win32":
+                _pw = Path(sys.executable).parent / "pythonw.exe"
+                if _pw.exists():
+                    exe = str(_pw)
+                subprocess.Popen(
+                    [exe, str(reviver_script)],
+                    cwd=str(_HERE),
+                    creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+                )
+            else:
+                subprocess.Popen(
+                    [exe, str(reviver_script)],
+                    cwd=str(_HERE),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+    except Exception:
+        pass  # best effort — never block startup
+
+
+_reviver_hook()
+
 # Now import and run the real app.
 import runpy
 runpy.run_path(str(_HERE / "run.py"), run_name='__main__')

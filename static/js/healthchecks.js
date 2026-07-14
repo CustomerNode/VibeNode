@@ -155,6 +155,20 @@ var _serverReachable = true;
 var _serverFailCount = 0;
 var _SERVER_FAIL_THRESHOLD = 3;  // ~9-12s of consecutive failures
 
+// When the backend is gone, the reviver holds port 5050 and serves a "Start
+// VibeNode" page — but only on a fresh document load. A still-loaded app never
+// re-requests '/', so without help the user is stranded on a dead UI until they
+// manually exit and re-enter. On failure we reload the page so it lands on the
+// reviver's Start page (which then handles start + auto-recovery). Guarded so it
+// only fires on a genuine death, never during an in-app restart (modals.js owns
+// that flow and shows its own overlay).
+function _recoverToStartPage() {
+    // Don't hijack an in-app restart — modals.js is already driving it.
+    if (document.getElementById('restart-overlay')) return;
+    // Reload once; the Start page we land on is not this app, so it won't loop.
+    try { window.location.reload(); } catch (e) { /* ignore */ }
+}
+
 function _probeServer() {
     fetch('/api/ping', { method: 'GET', cache: 'no-store' })
         .then(function(r) {
@@ -165,10 +179,12 @@ function _probeServer() {
                     _runHealthChecks();
                 }
             } else {
+                // 503 from the reviver (or any non-OK) = backend down.
                 _serverFailCount++;
                 if (_serverFailCount >= _SERVER_FAIL_THRESHOLD && _serverReachable) {
                     _serverReachable = false;
                     _runHealthChecks();
+                    _recoverToStartPage();
                 }
             }
         })
@@ -177,6 +193,7 @@ function _probeServer() {
             if (_serverFailCount >= _SERVER_FAIL_THRESHOLD && _serverReachable) {
                 _serverReachable = false;
                 _runHealthChecks();
+                _recoverToStartPage();
             }
         });
 }
@@ -194,6 +211,120 @@ registerHealthCheck('server-reachable', {
 // flashes this overlay. A real outage flips within 15s.
 _probeServer();
 setInterval(_probeServer, 5000);
+
+// Mobile browsers FREEZE setInterval while the tab/app is backgrounded or the
+// phone is locked. So if VibeNode is shut down (e.g. from the desktop) while
+// your phone is asleep, the 5s poll above never runs and the app looks alive
+// until you interact with it — the "doesn't know until I close out and come
+// back" bug. Probe the instant the page becomes visible again so death is
+// detected immediately on foreground instead of up to a poll-interval later.
+document.addEventListener('visibilitychange', function() {
+    if (document.visibilityState === 'visible') {
+        _probeServer();
+        _probeInternet();
+    }
+});
+// Some mobile PWA/webview cases fire pageshow (bfcache restore) but not
+// visibilitychange — cover both so foregrounding always re-checks.
+window.addEventListener('pageshow', function() { _probeServer(); _probeDaemon(); });
+
+/* ---- Built-in: Session daemon reachable (web up, daemon down) ----
+ *
+ * VibeNode's SECOND "up but broken" failure mode: the web server (5050) stays
+ * alive while the session DAEMON (5051) dies — a crash, or an agent killing it
+ * under load (the exact thing this whole feature exists for). In that state the
+ * UI loads and /api/ping returns 200, so the server-reachable check above is
+ * happy — but nothing actually works. Previously the user got only a fleeting
+ * 'Lost connection to daemon' toast over a dead UI, with no way to recover from
+ * a phone. This check turns that into a real blocking overlay with a Restart
+ * button. /api/health reports the daemon's connection state (see main.py).
+ *
+ * Registered AFTER server-reachable so a full web outage (which fails BOTH
+ * checks) shows the more fundamental 'server unreachable' overlay first.
+ */
+var _daemonReachable = true;
+var _daemonFailCount = 0;
+var _DAEMON_FAIL_THRESHOLD = 3;   // ~15s of web-up-but-daemon-down before overlay
+var _daemonRestarting = false;    // set while our Restart button drives a reboot
+
+function _probeDaemon() {
+    // Don't fight an in-app restart (modals.js owns that overlay) or our own
+    // restart-in-progress.
+    if (document.getElementById('restart-overlay') || _daemonRestarting) return;
+    fetch('/api/health', { method: 'GET', cache: 'no-store' })
+        .then(function(r) {
+            if (!r.ok) return;   // web itself down — server-reachable handles it
+            return r.json();
+        })
+        .then(function(d) {
+            if (!d) return;
+            if (d.daemon) {
+                _daemonFailCount = 0;
+                if (!_daemonReachable) { _daemonReachable = true; _runHealthChecks(); }
+            } else {
+                _daemonFailCount++;
+                if (_daemonFailCount >= _DAEMON_FAIL_THRESHOLD && _daemonReachable) {
+                    _daemonReachable = false;
+                    _runHealthChecks();
+                }
+            }
+        })
+        .catch(function() { /* web unreachable — server-reachable check owns this */ });
+}
+
+registerHealthCheck('daemon-reachable', {
+    label: 'VibeNode Engine Stopped',
+    icon: '<svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/></svg>',
+    message: 'The VibeNode engine that runs your sessions has stopped. Tap Restart to bring it back — your session history is safe.',
+    test: function() { return _daemonReachable; },
+    action: {
+        text: 'Restart VibeNode',
+        onClick: function() {
+            var btn = document.querySelector('#health-blocker .hb-btn');
+            if (btn) { btn.disabled = true; btn.textContent = 'Restarting…'; }
+            _daemonRestarting = true;
+            // Full clean restart: brings the daemon (and web) back to a known-good
+            // state. The reload afterward hits either the booting server (app.js
+            // retries until /api/projects answers) or the reviver's Start page —
+            // both recover on their own.
+            fetch('/api/restart', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scope: 'both' })
+            }).catch(function() { /* expected: server goes down mid-request */ });
+            // Poll /api/health until the stack is FULLY ready (web + daemon),
+            // then reload into a working app instead of a half-booted one.
+            var waited = 0;
+            var iv = setInterval(function() {
+                waited += 2;
+                fetch('/api/health', { cache: 'no-store' })
+                    .then(function(r) { return r.ok ? r.json() : null; })
+                    .then(function(d) {
+                        if (d && d.daemon) {
+                            clearInterval(iv);
+                            window.location.reload();
+                        }
+                    })
+                    .catch(function() { /* still down — keep waiting */ });
+                if (waited > 90) { clearInterval(iv); window.location.reload(); }
+            }, 2000);
+        }
+    }
+});
+
+_probeDaemon();
+setInterval(_probeDaemon, 5000);
+document.addEventListener('visibilitychange', function() {
+    if (document.visibilityState === 'visible') _probeDaemon();
+});
+
+// Socket push gives an instant signal too — when the web server reports the
+// daemon reconnected, clear our failure state immediately (don't wait for the
+// next poll). socket.js fires window event 'vn-daemon-status' (added there).
+window.addEventListener('vn-daemon-status', function(e) {
+    var up = e && e.detail && e.detail.up;
+    if (up) { _daemonFailCount = 0; if (!_daemonReachable) { _daemonReachable = true; _daemonRestarting = false; _runHealthChecks(); } }
+});
 
 /* ---- Built-in: Claude Code auth ---- */
 

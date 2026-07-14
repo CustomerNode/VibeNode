@@ -1,20 +1,20 @@
 # VibeNode
 
-Session orchestrator UI for Claude Code — manage parallel sessions that are aware of each other and avoid conflicts automatically, a hierarchical task board where your roadmap terminates in working Claude sessions, and a unified knowledge asset library that brings skills and agents together. Built by [CustomerNode](https://customernode.com) and [Claude Code](https://claude.ai/download).
+A development platform for agentic programming. VibeNode runs as a persistent session daemon and a web control plane that together orchestrate parallel coding agents: sessions that are aware of each other and avoid conflicts automatically, a hierarchical task board where your roadmap terminates in working agent sessions, a unified knowledge asset library that brings skills and agents together, plus private mobile access and local voice input. The orchestration layer is backend-agnostic by design; [Claude Code](https://claude.ai/download) is the currently supported backend (see [Supported backends](#supported-backends)). Built by [CustomerNode](https://customernode.com).
 
 ![VibeNode homepage showing Sessions, Workflow, and Workforce cards](docs/screenshots/homepage.png)
 
 ## Why we built this
 
-Three problems:
+VibeNode is a full platform for agentic programming — a persistent session daemon, a planning engine, a shared knowledge library, private mobile access, and local voice — built on a backend-agnostic core rather than tied to any one vendor's tool. It solves three problems that anyone running coding agents at scale hits:
 
-1. **Session sprawl.** Running 8+ Claude Code sessions across terminal windows gets unwieldy fast — especially permission management. Even a three-monitor setup runs out of space. We needed a way to graphically manage sessions without sprawling terminals everywhere.
+1. **Session sprawl.** Running 8+ coding-agent sessions across terminal windows gets unwieldy fast — especially permission management. Even a three-monitor setup runs out of space. VibeNode runs a *fleet* of agents graphically, not as a wall of terminals.
 
-2. **Velocity without direction.** Claude Code is powerful, but we noticed our roadmap wasn't actually moving faster. Sessions would drift, work would get duplicated, and there was no connection between what Claude was doing and what we needed delivered. We needed sessions tightly coupled to a task plan so every session is working toward a specific deliverable.
+2. **Velocity without direction.** Coding agents are powerful, but raw throughput doesn't move a roadmap — sessions drift, work gets duplicated, and there's no connection between what an agent is doing and what you need delivered. VibeNode couples every session to a task plan so every agent is working toward a specific deliverable.
 
-3. **Scattered, invisible knowledge assets.** Claude Code has skills and agents — two nearly identical concepts (markdown files with instructions) that differ only in invocation method. The distinction is confusing, and they live as scattered files across `.claude/` directories with no discoverability. There's no way to browse what's available, see how they're organized, or invoke them without memorizing names. We needed a visual library that treats them as one thing, organizes them into departments, and lets you build, browse, import, and invoke them without caring whether they run inline or as a subprocess.
+3. **Scattered, invisible knowledge assets.** Agentic coding tools have landed on two nearly identical concepts — skills and agents — that are really the same thing: a markdown file with instructions, differing only in how they're invoked. The distinction is confusing, and the files scatter across hidden config directories with no discoverability. There's no way to browse what's available, see how it's organized, or invoke it without memorizing names. VibeNode gives you a visual library that treats them as one thing, organizes them into departments, and lets you build, browse, import, and invoke them without caring whether they run inline or as a subprocess.
 
-VibeNode is the result: a development system where the human is responsible for planning, oversight, and validating outputs, while Claude handles execution — scoped to tasks, not left to wander. The session manager makes pure vibe coding better on its own, but the workflow board is where it becomes vibe *engineering* — structured planning and validation with a human in the loop.
+VibeNode is the result: a development platform where the human owns planning, oversight, and validating outputs, while coding agents handle execution — scoped to tasks, not left to wander. The session manager makes pure vibe coding better on its own, but the workflow board is where it becomes vibe *engineering* — structured planning and validation with a human in the loop. And because the execution layer is pluggable, none of this is bet on a single agent staying the best one.
 
 ## What it does
 
@@ -22,11 +22,11 @@ VibeNode is built around three pillars — **Sessions**, **Workflow**, and **Wor
 
 ### Sessions
 
-Run and interact with your Claude Code sessions. This is the full interactive terminal experience — not just a list of sessions, but where you actually work.
+Run and interact with your agent sessions (Claude Code today — see [Supported backends](#supported-backends)). This is the full interactive terminal experience — not just a list of sessions, but where you actually work.
 
 - Lists all sessions with live state (Working / Idle / Question / Sleeping)
-- Live terminal panel — watch Claude work in real time
-- Answer Claude's questions directly from the browser (with clickable option buttons)
+- Live terminal panel — watch the agent work in real time
+- Answer the agent's questions directly from the browser (with clickable option buttons)
 - Send commands to running sessions
 - Session tools: auto-name, duplicate, fork, rewind, delete, summarize, extract code, compare sessions
 - Display as visual grid cards or compact list — switch anytime from the sidebar menu
@@ -47,13 +47,13 @@ A full hierarchical task board for managing your development roadmap. Tasks are 
 ![Workflow board with tasks across status columns](docs/screenshots/workflow-board.png)
 
 - **Hierarchical tasks** — Arbitrary nesting depth. Break epics into tasks into subtasks. Each level tracks its own status independently, with completion propagating up automatically.
-- **Session scoping** — Sessions are integrated into the task tree itself. At any branch, a task can break into either subtasks or Claude Code sessions — so the leaf nodes of your hierarchy become actual working sessions instead of more tasks. Spawn a session from any task card and context (breadcrumb path, sibling tasks, parent description) is injected automatically. This is fundamentally different from tools that bolt sessions on as an afterthought — here the board structure *is* the session structure.
+- **Session scoping** — Sessions are integrated into the task tree itself. At any branch, a task can break into either subtasks or agent sessions — so the leaf nodes of your hierarchy become actual working sessions instead of more tasks. Spawn a session from any task card and context (breadcrumb path, sibling tasks, parent description) is injected automatically. This is fundamentally different from tools that bolt sessions on as an afterthought — here the board structure *is* the session structure.
 
 Drill into any task to see its subtasks with status tracking and a progress bar:
 
 ![A task drilled down to show its subtask hierarchy](docs/screenshots/task-hierarchy.png)
 
-Tasks can also branch into sessions instead of subtasks — the leaf nodes of your hierarchy become working Claude sessions:
+Tasks can also branch into sessions instead of subtasks — the leaf nodes of your hierarchy become working agent sessions:
 
 ![A task with linked sessions](docs/screenshots/task-sessions.png)
 
@@ -65,7 +65,7 @@ Open a session from the board and the full breadcrumb path stays visible, keepin
 
 ![A session opened from the kanban drill-down with breadcrumb navigation](docs/screenshots/kanban-session.png)
 
-- **AI planner** — Describe work in natural language and Claude breaks it into a hierarchical task tree. Because it runs through Claude Code, it can read your codebase while planning — so the task breakdown reflects your actual architecture, not just your description. Iterate on the breakdown, then accept to bulk-create. Supports voice input.
+- **AI planner** — Describe work in natural language and the agent breaks it into a hierarchical task tree. Because it runs through a real coding-agent session, it can read your codebase while planning — so the task breakdown reflects your actual architecture, not just your description. Iterate on the breakdown, then accept to bulk-create. Supports voice input.
 - **Dual storage backends** — SQLite (default, zero config, local file at `~/.claude/gui_kanban.db`) or Supabase (cloud PostgreSQL). Switch between them in System Settings with one-click migration.
 - **Collaborative with Supabase** — When using Supabase, multiple people can connect to the same board, making it a persistent and collaborative development roadmap. Task ownership tracking and per-user identity via git config.
 - **Cloud backups** — When using Supabase, download snapshots of your cloud data to local JSON files (`backups/` folder) with one click. Restore from any previous backup to roll back your board state. Backup files include full metadata and record counts for easy identification.
@@ -77,16 +77,16 @@ Open a session from the board and the full breadcrumb path stays visible, keepin
 
 ### Workforce
 
-Claude Code has two similar concepts — skills and agents — that are really the same thing: a markdown file with instructions. The only difference is how they're invoked: skills inject into your current session, agents spawn a subprocess. Multiple voices in the community have been [arguing for convergence](https://vivekhaldar.com/articles/claude-code-subagents-commands-skills-converging/) — and [Vercel's research](https://vercel.com/blog/agents-md-outperforms-skills-in-our-agent-evals) showed that both are ultimately context delivery mechanisms that differ only in push vs. pull.
+Agentic coding tools have two similar concepts — skills and agents — that are really the same thing: a markdown file with instructions. The only difference is how they're invoked: skills inject into your current session, agents spawn a subprocess. Multiple voices in the community have been [arguing for convergence](https://vivekhaldar.com/articles/claude-code-subagents-commands-skills-converging/) — and [Vercel's research](https://vercel.com/blog/agents-md-outperforms-skills-in-our-agent-evals) showed that both are ultimately context delivery mechanisms that differ only in push vs. pull.
 
 **We're opinionated about this.** VibeNode doesn't ask you to think in terms of skills vs. agents. We call them **departments** — named collections of knowledge assets organized by function. Drop any `.md` file into a department — a one-line persona, a Claude Code agent definition, a gstack review pipeline — and VibeNode handles both invocation paths transparently. You click a department to browse it, click an asset to invoke it, and never choose between "run as skill" or "spawn as agent." We're not claiming this is the objectively correct abstraction. It's how we think about it, and it works.
 
 ![Workforce organized by department](docs/screenshots/workforce.png)
 
 - **Departments, not file types** — The organizing unit is the department (Engineering, QA, Security, gstack, etc.), not whether something is a "skill" or an "agent." Import a skill file, an agent file, or a full pipeline into any department. VibeNode treats them all the same.
-- **Dual invocation** — Every asset can be used two ways from the same definition. As an **agent**: the full catalog is injected into every session's system prompt so Claude can spawn specialists autonomously. As a **skill**: you invoke on demand via the UI or slash commands, and the asset's instructions are injected into your current session. You don't pick — VibeNode decides based on context.
+- **Dual invocation** — Every asset can be used two ways from the same definition. As an **agent**: the full catalog is injected into every session's system prompt so the agent can spawn specialists autonomously. As a **skill**: you invoke on demand via the UI or slash commands, and the asset's instructions are injected into your current session. You don't pick — VibeNode decides based on context.
 - **Import anything** — Drop in Claude Code agent files (from `.claude/agents/`), skill packs (from `.claude/skills/`), or full execution pipelines like [gstack](https://github.com/garrytan/gstack). They all land in departments. gstack's 23+ skills become a "gstack" department with sub-departments for review, QA, security, shipping, and more.
-- **Invoke Workforce** — A button in the chat input bar opens a modal where you pick any workforce asset and attach it to your next message. The selected asset's instructions are injected into the session's system prompt, so Claude executes with that context without you copy-pasting anything. Works from any session state — idle, working, or waiting for input.
+- **Invoke Workforce** — A button in the chat input bar opens a modal where you pick any workforce asset and attach it to your next message. The selected asset's instructions are injected into the session's system prompt, so the agent executes with that context without you copy-pasting anything. Works from any session state — idle, working, or waiting for input.
 - **Auto-discovery** — VibeNode scans your `.claude/agents/`, `.claude/skills/` (including installed skill packs), and its own workforce directories on startup. It also scans the active project's tree for any `skills/` or `agents/` folders, so project-scoped assets show up automatically alongside global ones. Everything appears in one unified view with source badges and tier indicators. Install a skill pack or drop a `.md` file into your project's `skills/` folder and it shows up in your departments automatically.
 - **Three complexity tiers** — Simple role prompts (one paragraph persona), structured skills (step-by-step workflows with tool permissions), and full pipelines (multi-phase execution with shell blocks, specialist dispatch, and external dependencies). All three tiers live in the same department tree and use the same invocation paths.
 - **Portable .md format** — Every asset is a markdown file with optional YAML frontmatter. Download them, share them, upload them, edit them in any text editor. The file format is a superset that accommodates everything from Claude Code's native agent format to gstack's SKILL.md pipeline format.
@@ -107,6 +107,20 @@ Standard browser dictation (the Web Speech API) is **Chromium-only** — on Fire
 - **Opt-in, one click** — enable it under **System → Preferences**; SpeechNode checks your machine is a good fit, downloads a small (~150 MB) model once, and you're set. Anyone who doesn't turn it on keeps the default voice input unchanged — nothing extra is installed.
 
 SpeechNode is off by default. When enabled, it becomes the voice engine across VibeNode — the live session input, the AI planner, and anywhere else you can talk to VibeNode.
+
+## Mobile Command — drive VibeNode from your phone
+
+**Mobile Command** puts your whole VibeNode — sessions, task board, workforce, voice input and all — on your phone, privately. Answer a session's question from the couch, kick off a task from the train, check on a running session from anywhere, without exposing anything to the public internet.
+
+It's a persistent toggle under **System → Mobile Command** (it works like Persistent Storage — set it once and it re-arms itself on every startup). Under the hood it uses [Tailscale](https://tailscale.com), which you likely already have, to bridge your phone to the web server:
+
+- **Private to your devices — never public.** VibeNode stays bound to `127.0.0.1`; nothing rebinds the server or opens it to your LAN or the internet. Mobile Command uses `tailscale serve` (not `funnel`), so only your own authenticated devices on your tailnet can reach it. The connection is WireGuard-encrypted end to end.
+- **Full phone experience, including voice.** The bridge is served over HTTPS using Tailscale's real `ts.net` certificate — not for privacy (the tailnet is already encrypted) but because iOS only unlocks the microphone in a secure context. So SpeechNode voice input works on your phone, not just desktop.
+- **Add to Home Screen.** A per-machine device label (defaults to the computer's hostname, editable in the modal) names the Home-Screen icon, so multiple VibeNode machines stay distinguishable on the same phone.
+- **Guided, self-verifying setup.** A step-by-step wizard reads your live Tailscale state to walk you through the one-time setup — it tells you the exact account to sign your phone into (the #1 first-time mistake), shows a positive "✓ Your iPhone connected" the instant the phone joins, and routes you through Tailscale's one-time HTTPS-certificates toggle only if it's still off. After that it's automatic forever.
+- **Defensive by design.** Tailscale can be missing, logged out, or lacking certs — every path degrades to a clear status telling you the next action, never a stack trace. No new Python dependency: it's pure stdlib plus the Tailscale CLI already on your machine.
+
+Mobile Command is off by default. It requires [Tailscale](https://tailscale.com/download) installed and signed in on both your computer and your phone (same account).
 
 ## Requirements
 
@@ -186,7 +200,7 @@ mkdir -p ~/.local/share/applications
 cat > ~/.local/share/applications/vibenode.desktop << EOF
 [Desktop Entry]
 Name=VibeNode
-Comment=Session orchestrator UI for Claude Code
+Comment=Development platform for agentic programming
 Exec=bash -c 'cd "$VIBENODE_DIR" && ./launch.sh'
 Icon=$VIBENODE_DIR/static/vibenode.png
 Type=Application
@@ -211,7 +225,7 @@ Notes:
 
 #### Optional: a "Stop VibeNode" shortcut
 
-Same idea, but kills the running web server (5050), the session daemon (5051), and any orphaned subprocesses. Uses a grayed-out logo with a red X (`static/vibenode_stop.png`) so it's visually distinct from the launch shortcut. Hard stop — any active Claude sessions are terminated.
+Same idea, but kills the running web server (5050), the session daemon (5051), and any orphaned subprocesses. Uses a grayed-out logo with a red X (`static/vibenode_stop.png`) so it's visually distinct from the launch shortcut. Hard stop — any active agent sessions are terminated.
 
 ```bash
 VIBENODE_DIR="$(pwd)"
@@ -239,7 +253,7 @@ fi
 
 ## Platform support
 
-**Windows, macOS, and Linux.** VibeNode is actively developed on both Windows and Linux, so both are first-class targets. macOS *should* work — the platform branches are in place and the Claude Code SDK handles all session management cross-platform — but it isn't part of our regular development loop, so expect a few rough edges until a Mac user files them in.
+**Windows, macOS, and Linux.** VibeNode is actively developed on both Windows and Linux, so both are first-class targets. macOS *should* work — the platform branches are in place and the agent backend SDK handles all session management cross-platform — but it isn't part of our regular development loop, so expect a few rough edges until a Mac user files them in.
 
 | Feature | Windows | macOS | Linux |
 |---|---|---|---|
@@ -284,9 +298,9 @@ The API has no authentication — it's a localhost-only development tool. All en
 
 ## Architecture
 
-VibeNode runs as two processes on your machine: a Flask web server (port 5050) serving the UI, and a session daemon (port 5051) that owns all Claude sessions. The daemon survives web server restarts so active sessions are never interrupted. Each Claude session is an asyncio task on a single shared event loop, with its own CLI subprocess communicating via stdio. The web server proxies all session operations to the daemon over a TCP/JSON-lines IPC channel.
+VibeNode runs as two processes on your machine: a Flask web server (port 5050) serving the UI, and a session daemon (port 5051) that owns all agent sessions. The daemon survives web server restarts so active sessions are never interrupted. Each agent session is an asyncio task on a single shared event loop, with its own CLI subprocess communicating via stdio. The web server proxies all session operations to the daemon over a TCP/JSON-lines IPC channel.
 
-This separation means **VibeNode can code itself** — multiple Claude sessions can edit VibeNode's own source files simultaneously, restart the web server to pick up changes, and keep working without interrupting each other. The daemon holds all active sessions in memory while the web server restarts around it. Most of VibeNode was built this way: from inside VibeNode.
+This separation means **VibeNode can code itself** — multiple agent sessions can edit VibeNode's own source files simultaneously, restart the web server to pick up changes, and keep working without interrupting each other. The daemon holds all active sessions in memory while the web server restarts around it. Most of VibeNode was built this way: from inside VibeNode.
 
 ![VibeNode system architecture diagram](docs/architecture.svg)
 
@@ -294,7 +308,7 @@ This separation means **VibeNode can code itself** — multiple Claude sessions 
 
 **Key design decisions:**
 
-- **One event loop, N sessions.** Claude sessions are I/O-bound (waiting for CLI stdout), so asyncio cooperative scheduling gives us unlimited concurrency on a single thread with no inter-session threading bugs.
+- **One event loop, N sessions.** Agent sessions are I/O-bound (waiting for CLI stdout), so asyncio cooperative scheduling gives us unlimited concurrency on a single thread with no inter-session threading bugs.
 - **Daemon separation.** The daemon is a detached subprocess. Web server restarts (code changes, crashes) don't kill running sessions. Crash recovery restores sessions from a registry file on disk.
 - **Three-thread IPC bridge.** The DaemonClient uses a reader thread (TCP socket), an emitter thread (SocketIO broadcasts), and a queue between them. This prevents slow WebSocket writes from blocking IPC response processing.
 - **Heavy I/O offloaded.** File snapshots, JSONL parsing, and directory scans run in a ThreadPoolExecutor so they don't block the event loop and stall other sessions.
@@ -308,11 +322,46 @@ This separation means **VibeNode can code itself** — multiple Claude sessions 
 - **Debounced persistence.** Registry saves and queue saves are debounced with timers (3s and 1s respectively) so rapid state changes batch into single disk writes instead of hammering I/O.
 - **Conditional IPC.** Session log retrieval skips daemon IPC round-trips for idle sessions where the JSONL on disk is already complete, using a client-provided `is_working` hint.
 
+## Supported backends
+
+VibeNode is an orchestrator for agentic coding, not a client hard-wired to one vendor's SDK. This isn't aspirational — the decoupling is **already done and running in production**. The entire orchestration layer — cross-session awareness, the task board, the workforce library, permissions, the live terminal — talks only to an **abstract backend interface**, and `daemon/session_manager.py` contains **zero imports of any vendor SDK**. Every vendor-specific line lives behind the interface, in one swappable file.
+
+**Currently supported:**
+
+| Backend | Status |
+|---|---|
+| **Claude Code** | ✅ Fully supported (the default backend today) |
+| **Codex** | 🔜 Coming soon |
+| Others (e.g. Gemini, open-source agents) | 🔌 Drop-in — implement one class, inject it |
+
+The backend isn't hardcoded — it's **dependency-injected**. `SessionManager(sdk=…, store=…)` takes any `AgentSDK` / `ChatStore` pair and defaults to the Claude implementations when none is passed. Claude Code isn't wired into the orchestrator; it's simply the backend VibeNode injects today. Swapping it is constructing the manager with a different pair — no changes to the orchestrator, the daemon, the task board, or the UI.
+
+### How the abstraction works
+
+The daemon's orchestration logic never imports a vendor SDK — that was fully refactored out. Every point where it would touch one goes through `daemon/backends/`, and all of Claude's specifics (message types, permission classes, transport quirks, the four SDK monkey-patches) are quarantined in `daemon/backends/claude.py`:
+
+- **`AgentSDK` (abstract base)** — the single interface for every SDK touchpoint: create a session, connect (spawn the agent subprocess), send a query, stream the response, interrupt, disconnect, switch models mid-session, extract the subprocess PID for cleanup, and check transport liveness. `ClaudeAgentSDK` is the one implementation today; a new backend is a new subclass injected at construction.
+- **`VibeNodeMessage` (normalized message type)** — each backend normalizes its own message/content-block types into one backend-agnostic shape inside its `receive_response()`. The orchestrator processes only `VibeNodeMessage` and contains **zero `isinstance` checks against any SDK-specific type**, so a new backend's message formats never leak upward.
+- **`SessionOptions`** — backend-agnostic session config (working directory, resume ID, model, system prompt, allowed tools, permission mode, streaming). Each backend maps it to its own options object (`ClaudeCodeOptions` for Claude).
+- **`PermissionResult` / `PermissionAction`** — tool approval/denial expressed in neutral ALLOW/DENY terms, so VibeNode's permission orchestration doesn't depend on any vendor's permission classes.
+- **`ChatStore` (abstract persistence)** — all session reading/writing/discovery behind one interface. The Claude implementation reads and writes Claude Code's native JSONL under `~/.claude/projects/`; another backend could persist to SQLite, an API, or any other format without the rest of the app noticing.
+
+### Adding a new backend
+
+Because the orchestrator already speaks only the abstract types above, a new agent backend is scoped to writing one class and injecting it — no orchestrator surgery:
+
+1. Implement `AgentSDK` for the target SDK (session lifecycle + normalizing its messages into `VibeNodeMessage`).
+2. Optionally implement `ChatStore` if the backend stores sessions in a different format than Claude's JSONL.
+3. Apply any SDK-specific runtime patches in the subclass's `apply_patches()` (Claude needs four; another SDK may need none).
+4. Inject it: `SessionManager(sdk=YourAgentSDK(), store=YourStore())`.
+
+Everything else — the session grid, cross-session awareness, the hierarchical task board, session scoping, the workforce library, mobile access, and voice input — works unchanged, because none of it knows or cares which SDK is behind a session. That's the whole point of the boundary: the hard, differentiating work of VibeNode is backend-neutral, and vendor specifics are quarantined in one small, swappable layer.
+
 ## Notes
 
 - Sessions are read from `~/.claude/projects/`
-- Session input is managed through the Claude Code SDK
-- VibeNode itself stores everything locally. Claude Code sessions communicate with Anthropic's API as usual. Enabling Supabase cloud storage for tasks is optional.
+- Session input is managed through the active agent backend (Claude Code today)
+- VibeNode itself stores everything locally. Agent sessions communicate with their provider's API as usual (Claude Code → Anthropic). Enabling Supabase cloud storage for tasks is optional.
 
 ---
 

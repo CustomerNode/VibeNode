@@ -330,8 +330,14 @@ async function _doRestart(scope) {
       const r = await fetch('/', { method: 'GET', cache: 'no-store', signal: AbortSignal.timeout(3000) });
       if (r.ok) {
         const html = await r.text();
-        // Make sure we got a real, fully-rendered page
-        if (html.includes('</html>')) {
+        // Make sure we got a real, fully-rendered page — AND that it is the
+        // real VibeNode app, not the mobile "reviver" Start/Starting page.
+        // Over Tailscale the reviver races to bind 5050 the instant the old
+        // server dies, and its page also ends in </html>; without the sentinel
+        // guard the restart flow would reload early onto the reviver's static
+        // Start button and get stuck there until a hard refresh. Waiting past
+        // the reviver keeps this progress overlay up until VibeNode is truly back.
+        if (html.includes('</html>') && !html.includes('vibenode-reviver-page')) {
           clearInterval(check);
           clearInterval(_timer);
           statusEl.textContent = 'Back online — reloading';

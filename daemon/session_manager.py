@@ -2112,6 +2112,23 @@ class SessionManager:
                     "%s: %s", resolved_id, _rep_err,
                 )
 
+    @staticmethod
+    def _user_stopped(info) -> bool:
+        """True if the user explicitly stopped/slept/closed the session.
+
+        Sleep (UI) calls ``close_session`` which forces ``state = STOPPED``;
+        Stop calls the interrupt path which sets ``_interrupted``.  Either
+        one is an explicit "I want this session to stop" and MUST beat the
+        transport self-heal — otherwise a reconnect scheduled the instant the
+        stream died (e.g. the CLI killed by a machine shutdown) resurrects a
+        session the user just put to sleep, re-sending the last message and
+        flipping it back to WORKING.  That is the "Sleep won't stick" bug.
+        """
+        return info is not None and (
+            info.state == SessionState.STOPPED
+            or getattr(info, '_interrupted', False)
+        )
+
     async def _reconnect_client(self, session_id: str, info) -> bool:
         """Reconnect a session whose SDK stream died.
 
@@ -2123,6 +2140,14 @@ class SessionManager:
         CLI processes at once overwhelms the system and they all timeout on
         the "initialize" control request.
         """
+        # An explicit user stop/sleep/close wins over any reconnect — never
+        # resurrect a session the user deliberately put down.  Defense-in-depth
+        # for every caller (self-heal, retry-now, recovery).
+        if self._user_stopped(info):
+            logger.info("Reconnect skipped for %s — user stopped/slept the "
+                        "session", session_id)
+            return False
+
         # Lazy-init the semaphore on the event loop (can't create in __init__
         # because the loop doesn't exist yet).
         if self._reconnect_semaphore is None:
@@ -2597,7 +2622,14 @@ class SessionManager:
                 if info and getattr(info, '_stream_heal_needed', False):
                     info._stream_heal_needed = False
                     heal_count = getattr(info, '_stream_heal_count', 0)
-                    if heal_count <= 3:
+                    if self._user_stopped(info):
+                        # User slept/stopped the session after the stream died —
+                        # honour it, don't self-heal it back to life.
+                        logger.info(
+                            "Self-heal (drive) skipped for %s — user stopped/"
+                            "slept the session", session_id,
+                        )
+                    elif heal_count <= 3:
                         # Exponential backoff: 2s, 4s, 8s between retries
                         backoff = 2 ** heal_count
                         logger.info(
@@ -2612,7 +2644,13 @@ class SessionManager:
                         self._emit_entry(session_id, entry, entry_index)
                         await asyncio.sleep(backoff)
 
-                        if await self._reconnect_client(session_id, info):
+                        if self._user_stopped(info):
+                            # Slept DURING the backoff wait — abort the reconnect.
+                            logger.info(
+                                "Self-heal (drive) aborted post-backoff for %s — "
+                                "user stopped/slept the session", session_id,
+                            )
+                        elif await self._reconnect_client(session_id, info):
                             # Do NOT reset _stream_heal_count here.  Let it
                             # accumulate across retries so the heal_count<=3
                             # limit actually stops infinite loops.  The counter
@@ -3272,7 +3310,14 @@ class SessionManager:
                 if info and getattr(info, '_stream_heal_needed', False):
                     info._stream_heal_needed = False
                     heal_count = getattr(info, '_stream_heal_count', 0)
-                    if heal_count <= 3:
+                    if self._user_stopped(info):
+                        # User slept/stopped the session after the stream died —
+                        # honour it, don't self-heal it back to life.
+                        logger.info(
+                            "Self-heal (query) skipped for %s — user stopped/"
+                            "slept the session", session_id,
+                        )
+                    elif heal_count <= 3:
                         # Exponential backoff: 2s, 4s, 8s between retries
                         backoff = 2 ** heal_count
                         logger.info(
@@ -3287,7 +3332,13 @@ class SessionManager:
                         self._emit_entry(session_id, entry, entry_index)
                         await asyncio.sleep(backoff)
 
-                        if await self._reconnect_client(session_id, info):
+                        if self._user_stopped(info):
+                            # Slept DURING the backoff wait — abort the reconnect.
+                            logger.info(
+                                "Self-heal (query) aborted post-backoff for %s — "
+                                "user stopped/slept the session", session_id,
+                            )
+                        elif await self._reconnect_client(session_id, info):
                             # Do NOT reset _stream_heal_count here.  Let it
                             # accumulate across retries so the heal_count<=3
                             # limit actually stops infinite loops.  The counter

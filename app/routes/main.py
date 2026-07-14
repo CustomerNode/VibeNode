@@ -81,6 +81,33 @@ def ping():
     return jsonify(ok=True)
 
 
+@bp.route("/api/health")
+def health():
+    """Full-stack readiness: web AND daemon.
+
+    /api/ping only proves the WEB server (5050) is alive. But VibeNode has a
+    second failure mode that looks 'up but broken': the web server survives
+    while the session DAEMON (5051) dies (crash, or killed under load). In that
+    state the UI loads, /api/ping returns 200, yet nothing works — the user
+    just gets a 'Lost connection to daemon' toast over a dead UI. This endpoint
+    exposes the daemon's real connection state so the client can surface a
+    proper recovery action, and so the mobile reviver only hands the user into
+    the app once it is FULLY ready (web + daemon), not mid-boot when the daemon
+    is still coming up (which renders as an unstyled/half-broken page).
+
+    Side-effect-free: reads the DaemonClient's cached connection flag; no
+    shell-out, no daemon round-trip.
+    """
+    from flask import current_app
+    daemon_up = False
+    try:
+        sm = getattr(current_app, "session_manager", None)
+        daemon_up = bool(getattr(sm, "is_connected", False))
+    except Exception:
+        daemon_up = False
+    return jsonify(ok=True, web=True, daemon=daemon_up, ready=daemon_up)
+
+
 @bp.route("/api/docs")
 def api_docs():
     """Serve the API documentation page (Redoc)."""

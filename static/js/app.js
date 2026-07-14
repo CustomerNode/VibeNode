@@ -81,8 +81,34 @@ function _pushChatUrl(chatId) {
 }
 
 async function loadProjects() {
-  const res = await fetch('/api/projects');
-  _allProjects = await res.json();
+  // Resilient fetch of the project list. This is the boot entry point, and it
+  // can run against a backend that is still coming up — most importantly when
+  // the mobile reviver navigates here the instant Flask serves index.html, a
+  // moment BEFORE /api/projects (and the daemon behind it) is ready. If that
+  // first fetch throws or returns a non-OK/non-JSON body, the whole init chain
+  // used to die uncaught and the skeleton loader hung forever (the "infinite
+  // skeleton until I exit and come back" bug — a fresh reload later hit a ready
+  // backend and worked). Retry with backoff until the backend actually answers,
+  // so the boot always completes instead of dying on a transient early failure.
+  let res, ok = false;
+  for (let attempt = 0; attempt < 40; attempt++) {   // ~40 * 750ms ≈ 30s ceiling
+    try {
+      res = await fetch('/api/projects', { cache: 'no-store' });
+      if (res.ok) {
+        _allProjects = await res.json();
+        ok = true;
+        break;
+      }
+    } catch (e) { /* server mid-boot / connection reset — retry below */ }
+    await new Promise(r => setTimeout(r, 750));
+  }
+  if (!ok) {
+    // Backend never came up in the retry window. Leave a clear, non-skeleton
+    // state and let the server-reachable health check take over recovery.
+    const listEl = document.getElementById('session-list');
+    if (listEl) listEl.innerHTML = '<div class="empty-state" style="padding:24px;text-align:center;color:var(--text-muted);font-size:13px;">Reconnecting to VibeNode…</div>';
+    return;
+  }
   const saved = localStorage.getItem('activeProject');
 
   // Update the button label
@@ -1505,8 +1531,29 @@ async function loadSessions() {
   // reconnects and sends request_state_snapshot with the project context.
   const _projParam = localStorage.getItem('activeProject') || '';
   const _sessUrl = _projParam ? '/api/sessions?project=' + encodeURIComponent(_projParam) : '/api/sessions';
+  // Resilient sessions fetch — same reason as loadProjects(): after the mobile
+  // reviver hands off to a freshly-booting server, /api/sessions can transiently
+  // fail before the daemon is ready. Retry until it answers (or the project
+  // switches, which aborts _myAbort and breaks the loop) so the skeleton always
+  // resolves instead of hanging forever.
+  async function _fetchSessions() {
+    for (let attempt = 0; attempt < 40; attempt++) {
+      if (_myAbort.signal.aborted || _myGen !== _projectSwitchGen) break;
+      try {
+        const r = await fetch(_sessUrl, { signal: _myAbort.signal, cache: 'no-store' });
+        if (r.ok) return r;
+      } catch (e) {
+        if (_myAbort.signal.aborted) throw e;   // real cancellation — propagate
+        /* server mid-boot — retry below */
+      }
+      await new Promise(r => setTimeout(r, 750));
+    }
+    // Aborted/superseded — return a benign empty response so downstream guards
+    // (the _myGen / _nowProj checks below) discard it cleanly.
+    return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }
   const [resp] = await Promise.all([
-    fetch(_sessUrl, {signal: _myAbort.signal}),
+    _fetchSessions(),
     (typeof initFolderTree === 'function') ? initFolderTree().catch(function(){}) : Promise.resolve(),
   ]);
   // Guard: if project changed while we were fetching, discard stale response

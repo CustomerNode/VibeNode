@@ -385,6 +385,40 @@ def _looks_like_https_cert_error(text: str) -> bool:
 # Enable / disable
 # ---------------------------------------------------------------------------
 
+def _spawn_reviver() -> None:
+    """Best-effort: start the mobile "Start VibeNode" reviver now.
+
+    The reviver (repo-root reviver.py) keeps a one-tap Start page reachable from
+    the phone whenever the web server is down. session_manager.py also ensures it
+    on every launch, but spawning it here means enabling Mobile Command takes
+    effect immediately instead of only after the next restart. Its own control-
+    port singleton makes a duplicate spawn harmless (the extra process just
+    exits). Never raises into the enable() flow.
+    """
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        reviver_script = os.path.join(root, "reviver.py")
+        if not os.path.isfile(reviver_script):
+            return
+        exe = sys.executable
+        if sys.platform == "win32":
+            pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+            if os.path.isfile(pythonw):
+                exe = pythonw
+            subprocess.Popen(
+                [exe, reviver_script], cwd=root,
+                creationflags=NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+        else:
+            subprocess.Popen(
+                [exe, reviver_script], cwd=root,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+    except Exception:  # noqa: BLE001
+        _log.debug("Mobile Command: could not spawn reviver (non-fatal)", exc_info=True)
+
+
 def enable(port: Optional[int] = None) -> dict:
     """Turn Mobile Command on: bring up `tailscale serve` for the local port.
 
@@ -394,6 +428,7 @@ def enable(port: Optional[int] = None) -> dict:
     """
     port = int(port or configured_port())
     _set_flag(True, port=port)
+    _spawn_reviver()  # keep the phone's Start-page safety net running immediately
 
     if not tailscale_bin():
         return status(port=port)
@@ -425,9 +460,40 @@ def enable(port: Optional[int] = None) -> dict:
     return result
 
 
+def _retire_reviver() -> None:
+    """Best-effort: remove the always-on reviver supervisor task on disable.
+
+    A running reviver self-retires within ~2s of seeing the flag flip (and a
+    stale supervisor task self-removes on its next fire), but running the
+    reviver's ``--unregister`` cleanup here makes teardown prompt. Never raises."""
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        reviver_script = os.path.join(root, "reviver.py")
+        if not os.path.isfile(reviver_script):
+            return
+        exe = sys.executable
+        if sys.platform == "win32":
+            pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+            if os.path.isfile(pythonw):
+                exe = pythonw
+            subprocess.Popen(
+                [exe, reviver_script, "--unregister"], cwd=root,
+                creationflags=NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+        else:
+            subprocess.Popen(
+                [exe, reviver_script, "--unregister"], cwd=root,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+    except Exception:  # noqa: BLE001
+        _log.debug("Mobile Command: could not retire reviver (non-fatal)", exc_info=True)
+
+
 def disable() -> dict:
     """Turn Mobile Command off: tear down the serve config and clear the flag."""
     _set_flag(False)
+    _retire_reviver()  # remove the always-on reviver supervisor
     if tailscale_bin():
         rc, _out, err = _run_ts(["serve", "reset"], timeout=15)
         if rc != 0:

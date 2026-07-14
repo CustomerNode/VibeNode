@@ -68,6 +68,76 @@ _ENTRY_CACHE_MAX = 200  # max sessions to keep cached
 _USER_TEXT_CAP = 20000
 
 
+# ---- Mobile visual channel: headless-over-Tailscale detection + injection ---
+# When you message VibeNode from a phone over Tailscale you cannot see the dev
+# machine's screen. On those turns we prepend a loud preamble telling the agent
+# to SHOW visual results (via preview markers the client renders as cards) rather
+# than describe them. See static/js/mobile-preview.js for the client side.
+#
+# DETECTION (NOT source-IP based): `tailscale serve` proxies the phone to
+# 127.0.0.1, so request.remote_addr is localhost and useless as a signal. We use,
+# in order: an explicit client flag, the Tailscale identity header serve injects,
+# or the .ts.net Host the phone connected through.
+_MOBILE_PREAMBLE = (
+    "⟦VN-MOBILE⟧\n"
+    "IMPORTANT — HEADLESS MOBILE SESSION (over Tailscale). The user is on a "
+    "phone and CANNOT see this machine's screen. Do NOT describe visual results "
+    "in prose — SHOW them by emitting a preview marker on its own line:\n"
+    "  [[VN-PREVIEW {\"type\":\"image\",\"name\":\"<short name>\",\"src\":\"<url>\"}]]\n"
+    "Two ways to produce a preview:\n"
+    "  1. SCREENSHOT (most reliable — works even though the phone can't reach this "
+    "machine's localhost). Render any URL to an image the phone can see:\n"
+    "       curl -s -X POST http://127.0.0.1:5050/api/preview/render \\\n"
+    "         -H 'Content-Type: application/json' \\\n"
+    "         -d '{\"url\":\"http://localhost:5173\",\"name\":\"Settings screen\"}'\n"
+    "     It returns {\"src\":\"/api/preview/asset/<id>\", \"file\":\"<abs path>\", ...}. "
+    "Emit the src as an \"image\" marker: "
+    "[[VN-PREVIEW {\"type\":\"image\",\"name\":\"Settings screen\",\"src\":\"/api/preview/asset/<id>\"}]]\n"
+    "     ALWAYS VERIFY THE SHOT before sending it: open the returned \"file\" path "
+    "and LOOK at the image. If it's blank, a bare shell, or missing the content you "
+    "expected (a single-page app may still be loading), re-render with a larger "
+    "\"wait_ms\" (e.g. 6000–10000) and/or the correct URL, and look again. Only emit "
+    "a marker once the screenshot actually shows the intended content — never send a "
+    "preview you haven't visually confirmed.\n"
+    "  2. LIVE (interactive) — a \"browser\" marker whose src is a URL. A localhost "
+    "dev-server URL is auto-routed through the tailnet proxy so it loads on the "
+    "phone. Prefer the SCREENSHOT path for reliability; use \"browser\" when the "
+    "user needs to tap through the real UI.\n"
+    "Each marker renders as a tappable card in the user's chat and collects in the "
+    "session's preview gallery. Prefer showing over telling.\n"
+    "⟦/VN-MOBILE⟧"
+)
+
+
+def _is_tailnet_turn(data: dict) -> bool:
+    """True when this turn came from a phone over the Tailscale tunnel.
+
+    Cheap and defensive: any signal is enough, and any failure means "not mobile"
+    (the feature simply stays off rather than misfiring on a local turn)."""
+    try:
+        if isinstance(data, dict) and data.get("remote_tailnet"):
+            return True
+    except Exception:
+        pass
+    try:
+        # `tailscale serve` injects this identity header on proxied requests.
+        if flask_request.headers.get("Tailscale-User-Login"):
+            return True
+        host = (flask_request.host or "").lower()
+        if host.endswith(".ts.net") or ".ts.net:" in host:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _with_mobile_preamble(text: str) -> str:
+    """Prepend the headless-mobile preamble to an outgoing user message."""
+    if not text:
+        return text
+    return _MOBILE_PREAMBLE + "\n\n" + text
+
+
 def _cap_user_text(text: str, limit: int = _USER_TEXT_CAP) -> str:
     """Cap user text for display without ever splitting an [[invoke]] block."""
     if not text:
@@ -466,6 +536,12 @@ def register_ws_events(socketio, app):
                 _ts_tag += ' (transcribed from voice \u2014 may contain transcription errors)'
             prompt = prompt + _ts_tag
 
+        # Mobile visual channel: on a headless-over-Tailscale turn, prepend the
+        # loud preamble so the agent shows visual results instead of describing
+        # them. Client strips the \u27e6VN-MOBILE\u27e7 block from the user's own bubble.
+        if prompt and session_type not in ('planner', 'title') and _is_tailnet_turn(data):
+            prompt = _with_mobile_preamble(prompt)
+
         # Build extra_args from thinking_level — maps to --effort CLI flag.
         # Values: 'low', 'medium', 'high', 'auto', 'max' are forwarded;
         # '' or 'none' mean "no explicit effort setting" (use model default).
@@ -533,6 +609,12 @@ def register_ws_events(socketio, app):
         if not text:
             emit('error', {'message': 'text is required'})
             return
+
+        # Mobile visual channel: follow-up turns don't re-set system_prompt, so
+        # inject the headless-mobile preamble into the message text on every
+        # Tailscale turn. Client strips the ⟦VN-MOBILE⟧ block from display.
+        if _is_tailnet_turn(data):
+            text = _with_mobile_preamble(text)
 
         sm = app.session_manager
         result = sm.send_message(session_id, text, voice=voice)
