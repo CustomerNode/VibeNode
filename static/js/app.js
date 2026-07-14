@@ -1123,11 +1123,24 @@ async function addNewAgent() {
     // the non-critical listener registration in a setTimeout below to keep the
     // desktop timing identical to before.
     const _taSync = document.getElementById('live-input-ta');
-    if (_taSync) _taSync.focus();
+    if (_taSync) {
+      _taSync.focus();
+      // Mobile: .focus() opens the on-screen keyboard but does NOT reliably
+      // scroll the textarea into the visible viewport — the caret scroll only
+      // fires on the first input event, so the field stays hidden behind the
+      // keyboard until the user starts typing. Every other textarea focus in
+      // the app scrolls immediately because it pairs focus with scrollIntoView.
+      // Match that here. scrollIntoView is gesture-safe and won't re-open the
+      // keyboard, so it doesn't break the synchronous-focus contract above.
+      try { _taSync.scrollIntoView({ block: 'center' }); } catch (e) {}
+    }
     setTimeout(() => {
       const ta = document.getElementById('live-input-ta');
       if (ta) {
         ta.focus();   // desktop retry — harmless if the sync focus already stuck
+        // Re-run after the keyboard's viewport resize settles so the field
+        // lands above the keyboard even if the sync scroll fired too early.
+        try { ta.scrollIntoView({ block: 'center' }); } catch (e) {}
         ta.addEventListener('input', function() { if (typeof _hideTemplateGrid === 'function') _hideTemplateGrid(); });
       }
     }, 50);

@@ -770,28 +770,36 @@ def _start_page(device: str) -> bytes:
     try {{ await fetch('/start', {{ method: 'POST' }}); }} catch (e) {{}}
     poll();
   }}
+  async function _readyCheck() {{
+    // Advance ONLY when VibeNode is FULLY ready — web AND daemon. /api/health
+    // distinguishes all three states cleanly:
+    //   * us (reviver)           -> 503                 -> keep waiting
+    //   * web booting, no daemon -> 200 {{daemon:false}} -> keep waiting (spinner)
+    //   * fully ready            -> 200 {{daemon:true}}  -> navigate in
+    // This is the fix for landing on a half-booted, unstyled app: we never hand
+    // the phone in until the engine behind it is actually up.
+    try {{
+      const r = await fetch('/api/health?_=' + Date.now(), {{ cache: 'no-store' }});
+      if (!r.ok) return;                 // reviver 503 / 502 mid-boot — wait
+      const d = await r.json();
+      if (d && d.daemon) location.href = '/';   // web + daemon both up
+    }} catch (e) {{ /* connection refused mid-restart — keep polling */ }}
+  }}
   function poll() {{
     if (_polling) return;                // never stack intervals
     _polling = true;
-    // Advance ONLY when VibeNode is FULLY ready — web AND daemon. /api/health
-    // distinguishes all three states cleanly:
-    //   * us (reviver)        -> 503        -> keep waiting
-    //   * web booting, no daemon -> 200 {{daemon:false}} -> keep waiting (spinner)
-    //   * fully ready         -> 200 {{daemon:true}}  -> navigate in
-    // This is the fix for landing on a half-booted, unstyled app: we never hand
-    // the phone into VibeNode until the engine behind it is actually up. Runs on
-    // load too, so a phone parked here auto-recovers by any route (restart,
-    // another device, the guardian) with no tap and no manual refresh.
-    setInterval(async () => {{
-      try {{
-        const r = await fetch('/api/health?_=' + Date.now(), {{ cache: 'no-store' }});
-        if (!r.ok) return;               // reviver 503 / 502 mid-boot — wait
-        const d = await r.json();
-        if (d && d.daemon) location.href = '/';   // web + daemon both up
-      }} catch (e) {{ /* connection refused mid-restart — keep polling */ }}
-    }}, 1500);
+    setInterval(_readyCheck, 1500);
+    // Mobile freezes timers when backgrounded; re-check the instant we return
+    // so a phone parked here navigates in immediately once VibeNode is up,
+    // instead of waiting for the next resumed tick (or a manual refresh).
+    document.addEventListener('visibilitychange', () => {{
+      if (document.visibilityState === 'visible') _readyCheck();
+    }});
+    window.addEventListener('pageshow', _readyCheck);
+    window.addEventListener('focus', _readyCheck);
   }}
-  poll();   // auto-recover on load — do not wait for a tap
+  poll();      // auto-recover on load — do not wait for a tap
+  _readyCheck();   // and check once right now
 </script>
 </body></html>""".encode("utf-8")
 
@@ -823,14 +831,21 @@ def _starting_page(device: str) -> bytes:
     <p>This can take a few seconds. You'll be taken in automatically.</p>
   </div>
 <script>
-  setInterval(async () => {{
+  async function _readyCheck() {{
     try {{
       const r = await fetch('/api/health?_=' + Date.now(), {{ cache: 'no-store' }});
       if (!r.ok) return;                 // reviver 503 / 502 mid-boot — wait
       const d = await r.json();
       if (d && d.daemon) location.href = '/';   // web + daemon both up
     }} catch (e) {{ /* mid-restart — keep polling */ }}
-  }}, 1500);
+  }}
+  setInterval(_readyCheck, 1500);
+  document.addEventListener('visibilitychange', () => {{
+    if (document.visibilityState === 'visible') _readyCheck();
+  }});
+  window.addEventListener('pageshow', _readyCheck);
+  window.addEventListener('focus', _readyCheck);
+  _readyCheck();
 </script>
 </body></html>""".encode("utf-8")
 

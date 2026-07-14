@@ -341,6 +341,81 @@
   .ws-ctx-divider { margin: 6px 0; }
   .col-header-row { padding: 4px 12px; }
 
+  /* ---- Workspace / Workplace grid: fluid 2-across instead of the desktop
+     fixed-width 180x140 tile ----
+
+     Desktop `.ws-card` is `width:180px; height:140px; flex-shrink:0` inside a
+     flex-wrap `.ws-canvas`. At phone viewports that leaves the second column
+     with only a partial card visible (or nothing) and dead space on the right
+     — a full column's worth of width is wasted.
+
+     Swap `.ws-canvas` to CSS Grid with two `minmax(0, 1fr)` tracks. `minmax(0,
+     1fr)` (not just `1fr`) is the critical part: without the explicit 0 min,
+     each track's min-content is set from its widest child, and `.ws-card`'s
+     desktop `width:180px` would then push the track past viewport/2 on narrow
+     phones. Overriding the card to `width:auto; max-width:none; min-width:0`
+     lets each card size to its grid track, so two evenly-sized cards always
+     fill the row exactly with the 10px gap between them.
+
+     Card height also shrinks — 140px was sized for desktop density; on a
+     phone the same height fits only ~4 rows per screen for a project with
+     dozens of sessions. 108px is enough for avatar + status pill + name +
+     date and roughly doubles the rows-per-screen. */
+  .ws-canvas {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    padding: 10px 10px 20px;
+    gap: 10px;
+    /* Canvas was a flex-wrap container on desktop — unset those hints so
+       nothing about the desktop flex model leaks into grid children. */
+    flex-wrap: unset;
+    align-content: unset;
+  }
+  .ws-card {
+    width: auto;
+    min-width: 0;
+    max-width: none;
+    height: 108px;
+    padding: 8px 6px;
+    border-radius: 12px;
+    gap: 4px;
+    /* Grid tracks are already 1fr — allow the card to shrink to its track
+       instead of holding the desktop `flex-shrink: 0`. */
+    flex-shrink: 1;
+  }
+  /* Slightly smaller avatar + tighter type so the compact card still breathes. */
+  .ws-card .ws-avatar { font-size: 24px; }
+  .ws-card .ws-avatar svg,
+  .ws-card .ws-avatar img { width: 24px; height: 24px; }
+  .ws-card .ws-status-label { font-size: 9px; padding: 1px 6px; }
+  .ws-card .ws-name { font-size: 12px; max-width: 100%; }
+  .ws-card .ws-meta { font-size: 9px; max-width: 100%; }
+
+  /* Folder cards (departments in the hierarchical workspace) — same fluid
+     2-across layout. Desktop min-width:180px would otherwise force wrapping. */
+  .ws-folder-card {
+    min-width: 0;
+    max-width: none;
+    padding: 12px;
+    border-radius: 12px;
+  }
+  .ws-folder-card .ws-folder-name { font-size: 13px; }
+  .ws-section-label { padding: 10px 12px 4px; }
+
+  /* Workforce grid (departments picker + agent grid) — desktop `.wf-card` is
+     fixed 120x130 and #workforce-grid uses 12px padding. On a phone that
+     leaves noticeable dead space around each column. Snap to 3-across on a
+     ~390px viewport (3 * ~118px + 2 gaps + padding fits) and 2-across on
+     narrower phones by keeping a sensible min-width. */
+  #workforce-grid { padding: 10px 10px 20px; gap: 8px; }
+  .wf-card {
+    width: auto;
+    flex: 1 1 calc(33.333% - 6px);
+    min-width: 100px;
+    max-width: calc(50% - 4px);
+    height: 118px;
+  }
+
   /* ---- Search + ••• row: make it line up with the rows above ----
      The drawer reuses the desktop sidebar DOM, but three desktop assumptions
      break at full-width phone widths. Fix each: */

@@ -153,7 +153,8 @@ setInterval(_probeInternet, 60000);
 
 var _serverReachable = true;
 var _serverFailCount = 0;
-var _SERVER_FAIL_THRESHOLD = 3;  // ~9-12s of consecutive failures
+var _SERVER_FAIL_THRESHOLD = 2;  // connection-refused path: ~6s before reload
+                                  // (503 from the reviver reloads immediately)
 
 // When the backend is gone, the reviver holds port 5050 and serves a "Start
 // VibeNode" page — but only on a fresh document load. A still-loaded app never
@@ -162,11 +163,56 @@ var _SERVER_FAIL_THRESHOLD = 3;  // ~9-12s of consecutive failures
 // reviver's Start page (which then handles start + auto-recovery). Guarded so it
 // only fires on a genuine death, never during an in-app restart (modals.js owns
 // that flow and shows its own overlay).
+var _reloadingForDeath = false;
 function _recoverToStartPage() {
     // Don't hijack an in-app restart — modals.js is already driving it.
     if (document.getElementById('restart-overlay')) return;
+    if (_reloadingForDeath) return;   // never fire multiple reloads
+    _reloadingForDeath = true;
     // Reload once; the Start page we land on is not this app, so it won't loop.
-    try { window.location.reload(); } catch (e) { /* ignore */ }
+    try { window.location.reload(); } catch (e) { _reloadingForDeath = false; }
+}
+
+// DECISIVE single-probe check for foreground events. Mobile browsers FREEZE all
+// JS timers while the tab is backgrounded / the phone is asleep, so the debounced
+// interval below (which needs 3 consecutive failures) is useless the moment the
+// user comes back — it would need ~15s of foreground polling to trip. This runs
+// ONE probe the instant the page is foregrounded and reloads immediately if the
+// backend is gone. This is THE fix for "I have to manually refresh to see the
+// server is off": foregrounding now reloads to the Start page on its own.
+function _decisiveServerCheck() {
+    if (_reloadingForDeath) return;
+    if (document.getElementById('restart-overlay')) return;  // in-app restart owns it
+    var ctrl = null;
+    try { ctrl = AbortSignal.timeout ? AbortSignal.timeout(4000) : undefined; } catch (e) {}
+    fetch('/api/ping', { method: 'GET', cache: 'no-store', signal: ctrl })
+        .then(function(r) {
+            if (r.ok) {
+                // Healthy — clear any accumulated failures.
+                _serverFailCount = 0;
+                if (!_serverReachable) { _serverReachable = true; _runHealthChecks(); }
+            } else if (r.status === 503) {
+                // Reviver DEFINITIVELY owns 5050 — reloading now lands on its
+                // Start page. Safe to reload.
+                _serverReachable = false;
+                _recoverToStartPage();
+            } else {
+                // 502 / other = the web server is gone but NOBODY is serving
+                // 5050 yet (reviver not up). Reloading here dead-ends on
+                // Tailscale's JS-less 502 page (reproduced) and strands the
+                // phone until a manual refresh. Instead: show the "Unreachable"
+                // overlay and keep polling — a later poll that sees a 503
+                // (reviver up) or 200 (recovered) drives the transition.
+                _serverReachable = false;
+                _runHealthChecks();
+            }
+        })
+        .catch(function() {
+            // Connection refused / timeout = nobody home yet. Same policy as
+            // 502: overlay + keep polling, NEVER a reload into a dead 502.
+            _serverReachable = false;
+            _runHealthChecks();
+        });
 }
 
 function _probeServer() {
@@ -178,22 +224,37 @@ function _probeServer() {
                     _serverReachable = true;
                     _runHealthChecks();
                 }
+            } else if (r.status === 503) {
+                // A 503 is the reviver DEFINITIVELY announcing "VibeNode is down
+                // and I have taken over 5050." That is not a transient blip, so
+                // reload IMMEDIATELY — no threshold. This is what makes death
+                // detection near-instant even when you are staring at the screen
+                // (no foreground event to trigger the decisive check): the very
+                // next 3s poll gets a 503 and reloads to the Start page.
+                _serverReachable = false;
+                _recoverToStartPage();
             } else {
-                // 503 from the reviver (or any non-OK) = backend down.
+                // 502 / other = web gone, reviver NOT up yet. Do NOT reload —
+                // a reload here lands on Tailscale's JS-less 502 page and
+                // strands the phone (reproduced: "sits there until I manually
+                // refresh"). Just surface the overlay after a small threshold
+                // and keep polling; the 503 branch above reloads us into the
+                // Start page the instant the reviver binds 5050.
                 _serverFailCount++;
                 if (_serverFailCount >= _SERVER_FAIL_THRESHOLD && _serverReachable) {
                     _serverReachable = false;
                     _runHealthChecks();
-                    _recoverToStartPage();
                 }
             }
         })
         .catch(function() {
+            // Connection refused / timeout = nobody serving 5050. Same policy
+            // as 502: overlay after a small threshold, keep polling, NEVER a
+            // reload into a dead 502.
             _serverFailCount++;
             if (_serverFailCount >= _SERVER_FAIL_THRESHOLD && _serverReachable) {
                 _serverReachable = false;
                 _runHealthChecks();
-                _recoverToStartPage();
             }
         });
 }
@@ -205,28 +266,29 @@ registerHealthCheck('server-reachable', {
     test: function() { return _serverReachable; }
 });
 
-// Fixed 5s cadence × 3-failure threshold = ~15s before the overlay shows.
-// That comfortably outlasts a normal /api/restart cycle (modals.js puts up
-// its own full-page restart overlay during the gap), so a restart never
-// flashes this overlay. A real outage flips within 15s.
+// 3s cadence. Death is caught on the next poll after the reviver takes over
+// (immediate reload on its 503), so a foregrounded phone recovers in ~3s even
+// with no foreground event to fire the decisive check. A genuine in-app restart
+// is still safe: modals.js owns its own overlay and _recoverToStartPage/the
+// decisive check both bail when #restart-overlay is present.
 _probeServer();
-setInterval(_probeServer, 5000);
+setInterval(_probeServer, 3000);
 
-// Mobile browsers FREEZE setInterval while the tab/app is backgrounded or the
-// phone is locked. So if VibeNode is shut down (e.g. from the desktop) while
-// your phone is asleep, the 5s poll above never runs and the app looks alive
-// until you interact with it — the "doesn't know until I close out and come
-// back" bug. Probe the instant the page becomes visible again so death is
-// detected immediately on foreground instead of up to a poll-interval later.
+// Every path back to the foreground runs the DECISIVE check (single probe,
+// immediate reload if the backend is gone). We bind ALL of visibilitychange,
+// pageshow, focus, and online because no single one fires reliably across iOS
+// Safari, Android Chrome, and standalone PWA/webview — belt and suspenders so
+// foregrounding ALWAYS re-checks and self-recovers with no manual refresh.
 document.addEventListener('visibilitychange', function() {
     if (document.visibilityState === 'visible') {
-        _probeServer();
+        _decisiveServerCheck();
+        _decisiveDaemonCheck();
         _probeInternet();
     }
 });
-// Some mobile PWA/webview cases fire pageshow (bfcache restore) but not
-// visibilitychange — cover both so foregrounding always re-checks.
-window.addEventListener('pageshow', function() { _probeServer(); _probeDaemon(); });
+window.addEventListener('pageshow', function() { _decisiveServerCheck(); _decisiveDaemonCheck(); });
+window.addEventListener('focus', function() { _decisiveServerCheck(); });
+window.addEventListener('online', function() { _decisiveServerCheck(); });
 
 /* ---- Built-in: Session daemon reachable (web up, daemon down) ----
  *
@@ -270,6 +332,29 @@ function _probeDaemon() {
             }
         })
         .catch(function() { /* web unreachable — server-reachable check owns this */ });
+}
+
+// DECISIVE daemon check for foreground events — same reasoning as
+// _decisiveServerCheck: on foreground, evaluate on a SINGLE probe and show the
+// "engine stopped" overlay immediately if the daemon is down (no 3-strike wait
+// that mobile timer-freezing makes useless). If the web itself is down this
+// no-ops and _decisiveServerCheck handles the reload.
+function _decisiveDaemonCheck() {
+    if (_daemonRestarting || _reloadingForDeath) return;
+    if (document.getElementById('restart-overlay')) return;
+    fetch('/api/health', { method: 'GET', cache: 'no-store' })
+        .then(function(r) { return r.ok ? r.json() : null; })
+        .then(function(d) {
+            if (!d) return;   // web down — server check owns it
+            if (d.daemon) {
+                _daemonFailCount = 0;
+                if (!_daemonReachable) { _daemonReachable = true; _runHealthChecks(); }
+            } else {
+                _daemonReachable = false;
+                _runHealthChecks();   // show overlay now
+            }
+        })
+        .catch(function() { /* web unreachable — server check owns it */ });
 }
 
 registerHealthCheck('daemon-reachable', {

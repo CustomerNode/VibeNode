@@ -707,5 +707,37 @@
 <script src="{{ versioned_static('js/socket.js') }}"></script>
 
 <div id="session-tooltip"></div>
+<script>
+// Boot self-heal — kills the "half-baked UI until I manually refresh" bug.
+// After a restart (e.g. the mobile Start button), the server is swapped
+// underneath the same Tailscale TLS endpoint; some of this page's ~30 assets
+// can fail on the connection reset, leaving an unstyled / half-scripted app.
+// The user's workaround was a manual refresh; this does it automatically, once.
+// Probes two critical assets: style.css (via the --vn-loaded sentinel var) and
+// app.js (via its global loadProjects). If either is missing, reload — capped
+// at 2 attempts via sessionStorage so a genuinely-broken build can never loop.
+(function vnBootSelfHeal(){
+  function assetsOk(){
+    try {
+      var cssLoaded = getComputedStyle(document.documentElement)
+        .getPropertyValue('--vn-loaded').trim() === '1';
+      var jsLoaded = (typeof loadProjects === 'function');
+      return cssLoaded && jsLoaded;
+    } catch (e) { return false; }
+  }
+  function check(){
+    if (assetsOk()) { try { sessionStorage.removeItem('vnHealTries'); } catch (e) {} return; }
+    var tries = 0;
+    try { tries = parseInt(sessionStorage.getItem('vnHealTries') || '0', 10) || 0; } catch (e) {}
+    if (tries >= 2) return;   // give up after 2 auto-reloads; never loop forever
+    try { sessionStorage.setItem('vnHealTries', String(tries + 1)); } catch (e) {}
+    location.reload();
+  }
+  // Wait for the load event (fires after every asset has loaded OR errored),
+  // then a short beat, so a slow-but-successful asset isn't misread as missing.
+  if (document.readyState === 'complete') setTimeout(check, 400);
+  else window.addEventListener('load', function(){ setTimeout(check, 400); });
+})();
+</script>
 </body>
 </html>

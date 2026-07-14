@@ -1,5 +1,9 @@
 /* ===== Theme variables ===== */
 :root, [data-theme="dark"] {
+  /* Sentinel probed by the boot self-heal in index.html: proves style.css
+     actually loaded+applied. If a restart-time connection reset dropped this
+     stylesheet (half-baked UI), the self-heal reloads once to fetch it clean. */
+  --vn-loaded: 1;
   --bg-body: #0d0d0d;
   --bg-header: #161616;
   --bg-sidebar: #111;
