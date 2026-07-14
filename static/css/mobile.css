@@ -436,10 +436,25 @@
      icon's gutter, so the icon overlapped the placeholder text. */
   #search { font-size: 16px; padding: 12px 12px 12px 34px; }
 
-  /* ---- Live transcript: momentum scroll + edge padding ---- */
+  /* ---- Live transcript: momentum scroll + edge padding ----
+     `touch-action: pan-y` and `overscroll-behavior: contain` together make the
+     chat feel iOS-native to scroll:
+       - `touch-action: pan-y` tells Safari upfront that a vertical drag on this
+         element is a scroll gesture. Without it, iOS has to first consult any
+         non-passive touchmove handlers up the tree (mobile.js registers a
+         document-level swipe-to-open-drawer handler) before committing to
+         scroll — the observable symptom was "have to tap the chat first, then
+         it scrolls". With this hint, iOS latches on to the first touchmove.
+       - `overscroll-behavior: contain` keeps the scroll inside .live-log. Once
+         you hit the top or bottom, the gesture stops there instead of bubbling
+         up to rubber-band the whole viewport, which is the native iOS pattern
+         for a list inside a screen. Also pairs with `overscroll-behavior-y:
+         none` on html/body (below) to disable page-level rubber-band. */
   .live-log {
     -webkit-overflow-scrolling: touch;
     padding: 10px 12px;
+    touch-action: pan-y;
+    overscroll-behavior: contain;
   }
 
   /* ---- Composer: don't touch the edges, respect the home indicator, and cap
@@ -553,8 +568,14 @@
   #live-queue-area { max-width: none; margin: 0; padding: 0 12px; }
   #live-queue-hint { display: none !important; }
 
-  /* ---- Kill the horizontal scroll: nothing may exceed the viewport width ---- */
-  html, body { overflow-x: hidden; max-width: 100%; }
+  /* ---- Kill the horizontal scroll: nothing may exceed the viewport width ----
+     `overscroll-behavior-y: none` disables the whole-page rubber-band bounce
+     that iOS Safari does on the viewport when a touch doesn't land inside a
+     scrollable container. Combined with `overscroll-behavior: contain` on
+     .live-log (above), a vertical swipe on the chat scrolls the chat and
+     nothing else — no ghost "the whole app moved" feeling. Native iOS lists
+     behave exactly this way. */
+  html, body { overflow-x: hidden; max-width: 100%; overscroll-behavior-y: none; }
   #main-body, .main, .live-panel, .live-log, .live-output-shelf {
     max-width: 100%;
     overflow-x: hidden;
