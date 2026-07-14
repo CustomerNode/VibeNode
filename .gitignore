@@ -216,6 +216,13 @@ __marimo__/
 # Runtime logs
 logs/
 
+# Isolated Chrome profile (run.py open_browser() — see CLAUDE.md item 18)
+data/chrome-profile/
+
+# ChatGPT bridge — persistent login profile + failure debug dumps (app/chatgpt_bridge.py)
+data/chatgpt-profile/
+data/chatgpt-debug/
+
 # Backups
 backups/
 

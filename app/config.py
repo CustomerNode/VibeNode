@@ -192,6 +192,15 @@ def _kanban_config_defaults() -> dict:
         "supabase_secret_key": "",
         "supabase_publishable_key": "",
         "kanban_depth_limit": 5,
+        # ── Browser launch preferences ──
+        # How the VibeNode shortcut opens the app in Chrome:
+        #   "tab" (default) — a normal tab in the user's everyday Chrome profile,
+        #                     so VibeNode lives alongside their other tabs. This
+        #                     is how VibeNode behaved for most of its history.
+        #   "app"           — isolated Chrome app window on its own profile
+        #                     (--app= + --user-data-dir=). See CLAUDE.md item 18
+        #                     for the two bugs it fixes; opt in if you hit them.
+        "browser_launch_mode": "tab",
         # ── Behavior preferences ──
         # Session starts → task moves to Working
         "auto_start_on_session": True,
@@ -557,6 +566,11 @@ from .session_store import (  # noqa: E402, F401
     _mark_deleted,
     _mark_deleted_bulk,
     _get_deleted_ids,
+    _unmark_deleted,
+    move_to_trash,
+    list_trash,
+    restore_from_trash,
+    purge_from_trash,
     _mark_utility,
     _get_utility_ids,
     _mark_remapped,

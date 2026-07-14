@@ -740,6 +740,54 @@ def _find_chrome_macos():
     return None
 
 
+def _chrome_running():
+    """Best-effort check for whether a Chrome/Chromium process is already up.
+
+    This is the linchpin of tab-mode's tradeoff-free launch (see open_browser).
+    The two bugs the 6/13 isolated-profile change fixed are mutually exclusive
+    by Chrome's running state, so knowing that state lets us pick the safe
+    invocation for each case instead of paying for isolation we don't need:
+
+      * Chrome already running  -> a bare URL opens a new TAB. It can't wedge
+        focus (only a launcher-spawned *window* does that) and session restore
+        is irrelevant (Chrome already restored on its own startup).
+      * Chrome not running       -> ``--new-window <url>`` forces the URL to
+        display. This was the original pre-6/13 fix for "Continue where you
+        left off" swallowing a bare URL, and there is no running Chrome for a
+        new window to wedge.
+
+    Returns True/False. On any detection failure we return True (assume
+    running) so the common case — the user already has their Chrome-with-tabs
+    open — uses the bare-URL tab path and never risks a focus wedge. The only
+    cost of a wrong "True" is a rare cold-start bare-URL open, which at worst
+    means reopening the shortcut; a wrong "False" would wedge focus, which is
+    the more annoying failure, so we bias away from it.
+    """
+    try:
+        if sys.platform == "win32":
+            # CREATE_NO_WINDOW (0x08000000) keeps tasklist from flashing a
+            # console window during the detached/minimized launch.
+            out = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq chrome.exe", "/NH"],
+                capture_output=True, text=True, timeout=4,
+                creationflags=0x08000000,
+            )
+            return "chrome.exe" in (out.stdout or "").lower()
+        else:
+            # pgrep is present on macOS and virtually all Linux. -i matches
+            # "Google Chrome" (macOS), "chrome", and "chromium" (Linux).
+            for pat in ("chrome", "chromium"):
+                r = subprocess.run(
+                    ["pgrep", "-i", pat],
+                    capture_output=True, text=True, timeout=4,
+                )
+                if r.returncode == 0 and (r.stdout or "").strip():
+                    return True
+            return False
+    except Exception:
+        return True  # bias toward the no-wedge tab path — see docstring
+
+
 def open_browser():
     import time
     import urllib.request
@@ -747,12 +795,60 @@ def open_browser():
     log_path = Path(__file__).resolve().parent / "logs" / "browser_open.log"
     log_path.parent.mkdir(exist_ok=True)
 
+    # ISOLATED CHROME INSTANCE — see CLAUDE.md item 18.
+    # --app= + --user-data-dir= give VibeNode its own Chrome window and its
+    # own profile. The user's everyday Chrome stays fully independent: new
+    # windows open normally, closing it doesn't kill VibeNode's tab, and the
+    # launcher-spawned window no longer wedges focus on the main profile.
+    # The dedicated profile also sidesteps Chrome's session restore, so the
+    # URL always loads instead of being swallowed by "Continue where you
+    # left off" on a cold start.
+    profile_dir = Path(__file__).resolve().parent / "data" / "chrome-profile"
+    try:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        # If we can't create the profile dir, fall back to Chrome's default
+        # profile rather than failing the launch outright.
+        profile_dir = None
+        _log_dir_err = str(e)
+    else:
+        _log_dir_err = None
+
     def _log(msg):
         try:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write("%s %s\n" % (time.strftime("%H:%M:%S"), msg))
         except Exception:
             pass
+
+    if _log_dir_err:
+        _log("Could not create isolated Chrome profile dir: %s" % _log_dir_err)
+
+    # LAUNCH MODE — see CLAUDE.md item 18 and get_kanban_config() defaults.
+    #   "app" (default) → isolated Chrome app window (--app= + --user-data-dir=).
+    #   "tab"           → a normal tab in the user's everyday Chrome profile.
+    # The flags are gated, NOT removed: the shipped default stays "app" so the
+    # bug fixes remain in force for everyone who hasn't opted out.
+    launch_mode = "app"
+    try:
+        from app.config import get_kanban_config
+        launch_mode = (get_kanban_config().get("browser_launch_mode") or "app").strip().lower()
+        if launch_mode not in ("app", "tab"):
+            launch_mode = "app"
+    except Exception as e:
+        _log("Could not read browser_launch_mode (defaulting to 'app'): %s" % e)
+    # In tab mode we launch into the user's default Chrome profile, so the
+    # isolated profile dir is intentionally unused.
+    use_app_window = (launch_mode == "app" and profile_dir is not None)
+    # Tab mode picks its invocation from Chrome's running state so BOTH 6/13
+    # bugs are avoided without an isolated profile (see _chrome_running):
+    #   running     -> bare URL  (new tab; no wedge, no session-restore swallow)
+    #   not running -> --new-window (forces URL; nothing running to wedge)
+    tab_new_window = False
+    if launch_mode == "tab":
+        tab_new_window = not _chrome_running()
+    _log("Browser launch mode: %s (app window=%s, tab_new_window=%s)" % (
+        launch_mode, use_app_window, tab_new_window))
 
     _log(f"Waiting for server on port {_WEB_PORT}...")
     # Wait until the server is actually accepting connections before opening
@@ -778,10 +874,31 @@ def open_browser():
         if chrome_path:
             try:
                 import ctypes
+                # Isolated Chrome app window — see open_browser() comment block
+                # at the top for the full rationale. --app= mode also avoids
+                # session restore swallowing the URL, so we no longer need
+                # --new-window. If profile_dir is None (creation failed), fall
+                # back to plain --new-window so the launch still works.
+                if use_app_window:
+                    params = '--app="%s" --user-data-dir="%s"' % (url, profile_dir)
+                elif launch_mode == "app":
+                    # App mode requested but the isolated profile dir couldn't
+                    # be created — fall back to a plain new window.
+                    params = '--new-window "%s"' % url
+                elif tab_new_window:
+                    # Tab mode, Chrome cold — force the URL into a new window so
+                    # session restore can't swallow it (nothing running to wedge).
+                    params = '--new-window "%s"' % url
+                else:
+                    # Tab mode, Chrome already up — bare URL → new tab in the
+                    # user's everyday window. No wedge, no session-restore race.
+                    params = '"%s"' % url
                 result = ctypes.windll.shell32.ShellExecuteW(
-                    None, "open", chrome_path, url, None, 1)
+                    None, "open", chrome_path, params, None, 1)
                 if result > 32:
-                    _log("Opened Chrome via ShellExecuteW: %s" % chrome_path)
+                    _log("Opened Chrome via ShellExecuteW: %s (%s)" % (
+                        chrome_path,
+                        "isolated app mode" if use_app_window else "shared profile (tab)"))
                     opened = True
                 else:
                     _log("ShellExecuteW returned %s for Chrome" % result)
@@ -805,13 +922,30 @@ def open_browser():
                 # process group so a daemon restart doesn't take Chrome with it.
                 # DEVNULL stdio keeps Chrome's chatty debug output out of the
                 # launch.sh terminal where it would scroll over our own messages.
+                # --app= + --user-data-dir= give VibeNode an isolated Chrome
+                # window — see open_browser() top comment for the rationale.
+                if use_app_window:
+                    chrome_args = [chrome_path,
+                                   "--app=%s" % url,
+                                   "--user-data-dir=%s" % profile_dir]
+                elif tab_new_window or launch_mode == "app":
+                    # Tab mode with Chrome cold (force URL past session restore),
+                    # or app mode whose isolated profile couldn't be created.
+                    # Nothing running to wedge, so a new window is safe.
+                    chrome_args = [chrome_path, "--new-window", url]
+                else:
+                    # Tab mode, Chrome already up — bare URL → new tab in the
+                    # user's everyday Chrome. No wedge, no session-restore race.
+                    chrome_args = [chrome_path, url]
                 subprocess.Popen(
-                    [chrome_path, url],
+                    chrome_args,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
                 )
-                _log("Opened Chrome/Chromium via %s" % chrome_path)
+                _log("Opened Chrome/Chromium via %s (%s)" % (
+                    chrome_path,
+                    "isolated app mode" if use_app_window else "shared profile (tab)"))
                 opened = True
             except Exception as e:
                 _log("Chrome launch failed (%s): %s" % (chrome_path, e))
@@ -836,13 +970,30 @@ def open_browser():
                 # process group so a daemon restart doesn't take Chrome with it.
                 # DEVNULL stdio keeps Chrome's chatty debug output out of the
                 # launch.sh terminal where it would scroll over our own messages.
+                # --app= + --user-data-dir= give VibeNode an isolated Chrome
+                # window — see open_browser() top comment for the rationale.
+                if use_app_window:
+                    chrome_args = [chrome_path,
+                                   "--app=%s" % url,
+                                   "--user-data-dir=%s" % profile_dir]
+                elif tab_new_window or launch_mode == "app":
+                    # Tab mode with Chrome cold (force URL past session restore),
+                    # or app mode whose isolated profile couldn't be created.
+                    # Nothing running to wedge, so a new window is safe.
+                    chrome_args = [chrome_path, "--new-window", url]
+                else:
+                    # Tab mode, Chrome already up — bare URL → new tab in the
+                    # user's everyday Chrome. No wedge, no session-restore race.
+                    chrome_args = [chrome_path, url]
                 subprocess.Popen(
-                    [chrome_path, url],
+                    chrome_args,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     start_new_session=True,
                 )
-                _log("Opened Chrome/Chromium via %s" % chrome_path)
+                _log("Opened Chrome/Chromium via %s (%s)" % (
+                    chrome_path,
+                    "isolated app mode" if use_app_window else "shared profile (tab)"))
                 opened = True
             except Exception as e:
                 _log("Chrome launch failed (%s): %s" % (chrome_path, e))

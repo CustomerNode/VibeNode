@@ -687,6 +687,42 @@ class TestUIPrefs:
         result["key"] = "mutated"
         assert pm.get_ui_prefs()["key"] == "value"
 
+    # --- Session retention pref (added 2026-05-30) ---
+
+    def test_retention_pref_persists(self, tmp_path):
+        """A valid session_retention_days round-trips and merges (keeps theme).
+
+        WHY: The retention selector reuses set_ui_prefs/get_ui_prefs; it must
+        not wipe other UI prefs.
+        """
+        pm = _make_pm(tmp_path)
+        pm.set_ui_prefs({"theme": "dark"})
+        pm.set_ui_prefs({"session_retention_days": 30})
+        prefs = pm.get_ui_prefs()
+        assert prefs.get("session_retention_days") == 30
+        assert prefs.get("theme") == "dark"
+        for v in (30, 60, 90, 36500):
+            pm.set_ui_prefs({"session_retention_days": v})
+            assert pm.get_ui_prefs().get("session_retention_days") == v
+
+    def test_invalid_retention_dropped(self, tmp_path):
+        """An out-of-range/bool session_retention_days drops ONLY that key.
+
+        WHY: Validation lives at the daemon boundary so a malformed value can
+        never land in prefs; other keys in the same payload still persist.
+        """
+        pm = _make_pm(tmp_path)
+        pm.set_ui_prefs({"theme": "dark"})
+        pm.set_ui_prefs({"session_retention_days": 45})
+        prefs = pm.get_ui_prefs()
+        assert "session_retention_days" not in prefs
+        assert prefs.get("theme") == "dark"
+        # bool is an int subclass — must also be rejected; sibling key kept.
+        pm.set_ui_prefs({"session_retention_days": True, "sendBehavior": "enter"})
+        prefs = pm.get_ui_prefs()
+        assert "session_retention_days" not in prefs
+        assert prefs.get("sendBehavior") == "enter"
+
 
 # =========================================================================
 # Section 6: Audit Logging (log_auto_approved)

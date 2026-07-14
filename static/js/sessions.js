@@ -267,6 +267,89 @@ function sortedSessions(sessions) {
   return copy;
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// Subsessions (spec §4.4 / §4.6.1) — sidebar tree helpers
+// ───────────────────────────────────────────────────────────────────────
+// Disclosure caret state for parents.  Persisted per-parent in
+// localStorage so a user's collapse choices survive reload.
+function _subsessionCaretKey(parentSid) {
+  return 'vn.subsession.caret.' + parentSid;
+}
+function _isSubsessionExpanded(parentSid) {
+  // Default: expanded.  Only collapsed when user explicitly toggled.
+  const v = localStorage.getItem(_subsessionCaretKey(parentSid));
+  return v === null ? true : v === '1';
+}
+function _toggleSubsessionCaret(parentSid) {
+  const next = !_isSubsessionExpanded(parentSid);
+  localStorage.setItem(_subsessionCaretKey(parentSid), next ? '1' : '0');
+  // Re-render the sidebar to apply the new collapse state.
+  if (typeof filterSessions === 'function') filterSessions();
+}
+
+// Build a parent_sid -> [child rows] index from the flat session list.
+// Sessions whose parent_session_id is NOT a sibling in the current list
+// (e.g. parent was deleted or is in another project) get treated as
+// top-level so they never disappear from the UI.
+function _buildSubsessionIndex(sessions) {
+  const idsInList = new Set(sessions.map(s => s.id));
+  const childrenByParent = new Map();
+  for (const s of sessions) {
+    const p = s.parent_session_id;
+    if (p && idsInList.has(p)) {
+      if (!childrenByParent.has(p)) childrenByParent.set(p, []);
+      childrenByParent.get(p).push(s);
+    }
+  }
+  return childrenByParent;
+}
+
+// Reorder an already-sorted flat session list so each subsession sits
+// immediately after its parent, regardless of the active sort.  Used by
+// the flat renderers (grid) that would otherwise scatter children away
+// from their parent when sorting by date/name/size.  The list renderer
+// uses its own family-box path and does not call this.
+//
+// Returns { ordered, roleOf } where:
+//   ordered: the reordered session array (same objects, never mutated)
+//   roleOf:  Map(session_id -> 'parent' | 'child') for rows in a family;
+//            normal sessions are absent from the map.
+// Sort is preserved: top-level rows keep their order, and each parent's
+// children keep their order (children arrive pre-sorted in `sorted`).
+function _orderSessionsByFamily(sorted) {
+  const childrenByParent = _buildSubsessionIndex(sorted);
+  const roleOf = new Map();
+  if (!childrenByParent.size) {
+    return { ordered: sorted, roleOf };  // nothing to regroup — cheap exit
+  }
+  const claimed = new Set();
+  for (const kids of childrenByParent.values()) {
+    for (const k of kids) claimed.add(k.id);
+  }
+  const ordered = [];
+  for (const s of sorted) {
+    if (claimed.has(s.id)) continue;  // emitted under its parent below
+    const kids = childrenByParent.get(s.id);
+    if (kids && kids.length) {
+      roleOf.set(s.id, 'parent');
+      ordered.push(s);
+      for (const kid of kids) {
+        roleOf.set(kid.id, 'child');
+        ordered.push(kid);
+      }
+    } else {
+      ordered.push(s);
+    }
+  }
+  return { ordered, roleOf };
+}
+
+// Return a (sub)session's pre-defined name lookup helper.
+function _findSessionById(sessions, sid) {
+  for (const s of sessions) if (s.id === sid) return s;
+  return null;
+}
+
 function _renderSessionRow(s, extraClass) {
   const status = getSessionStatus(s.id);
   const isWaiting = status === 'question';
@@ -303,14 +386,77 @@ function _renderSessionRow(s, extraClass) {
   // extra _syncMultiSelectionDom() pass.  onmousedown intercepts Ctrl/Cmd+
   // click to toggle the selection without opening the session.
   const msClass = multiSelectedIds.has(s.id) ? ' multi-selected' : '';
+
+  // \u2500\u2500 Subsessions (spec \u00a74.4 + \u00a74.6.1) \u2500\u2500
+  // Subsession child row: indent 16 px, prefix with the \u21b3 glyph, and
+  // add a "from: <parent_name>" secondary line.  Pure CSS class \u2014 the
+  // existing row markup keeps working unchanged.
+  const isSubsession = !!s.parent_session_id;
+  const subsessionClass = isSubsession ? ' subsession-row' : '';
+  const subsessionGlyph = isSubsession
+    ? '<span class="subsession-glyph" aria-hidden="true">\u21b3 </span>'
+    : '';
+  // "from: <parent name>" secondary line.  Look up the parent's display
+  // title from allSessions; fall back to the SID short form when the
+  // parent isn't in the current list (e.g. closed-but-not-managed).
+  let subsessionFromLine = '';
+  if (isSubsession && typeof allSessions !== 'undefined') {
+    const parent = allSessions.find(x => x.id === s.parent_session_id);
+    const parentName = parent
+      ? (parent.custom_title || parent.display_title || s.parent_session_id.slice(0, 8))
+      : s.parent_session_id.slice(0, 8);
+    subsessionFromLine = '<div class="subsession-from-line" title="Parent session">from: '
+      + escHtml(parentName) + '</div>';
+  }
+
+  // Inbox badge (\ud83d\udcec N) on parents whose inbox_dirty flag is set.  Tap
+  // does NOT pull updates \u2014 it just toasts "N reports waiting" so the
+  // user understands what the count means.  Click handler stops
+  // propagation so it doesn't open the session.
+  const inboxCount = (typeof window.__subsessionInboxCounts === 'object'
+    && window.__subsessionInboxCounts) ? window.__subsessionInboxCounts[s.id] : 0;
+  const inboxBadge = s.inbox_dirty
+    ? `<span class="subsession-inbox-badge"
+            aria-label="${escHtml(String(inboxCount || ''))} subsession reports pending"
+            onclick="event.stopPropagation(); _showSubsessionBadgeToast('${s.id}');"
+            title="Subsession reports waiting \u2014 included on your next message">\ud83d\udcec${inboxCount ? ' ' + inboxCount : ''}</span>`
+    : '';
+
+  // Disclosure caret for parents that have at least one child in the
+  // current list.  Caret state persists per parent in localStorage.
+  const hasChildren = !!(window.__subsessionChildrenIndex
+    && window.__subsessionChildrenIndex.has(s.id));
+  const isExpanded = hasChildren ? _isSubsessionExpanded(s.id) : true;
+  const caretSpan = hasChildren
+    ? `<span class="subsession-caret" tabindex="0"
+            onclick="event.stopPropagation(); _toggleSubsessionCaret('${s.id}');"
+            onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();_toggleSubsessionCaret('${s.id}');}"
+            aria-label="Toggle subsessions"
+            title="${isExpanded ? 'Collapse' : 'Expand'} subsessions">${isExpanded ? '\u25be' : '\u25b8'}</span>`
+    : '';
+
   return `
-  <div class="session-item${activeClass}${stateClass}${msClass}${extraClass || ''}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" oncontextmenu="sessionContextMenu(event,'${s.id}')">
+  <div class="session-item${activeClass}${stateClass}${msClass}${subsessionClass}${extraClass || ''}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" oncontextmenu="sessionContextMenu(event,'${s.id}')">
     <div class="session-col-name" onclick="handleNameClick('${s.id}')" style="cursor:text;" title="Click to rename">
-      ${icon}${escHtml(s.display_title)}${_autoNamingInFlight.has(s.id) ? '<span class="naming-badge"><span class="naming-dot"></span>Naming\u2026</span>' : ''}
+      ${caretSpan}${subsessionGlyph}${icon}${escHtml(s.display_title)}${_autoNamingInFlight.has(s.id) ? '<span class="naming-badge"><span class="naming-dot"></span>Naming\u2026</span>' : ''}${inboxBadge}
+      ${subsessionFromLine}
     </div>
     <div class="session-col-date" ${colClick} title="${escHtml(s.last_activity)}" data-short-date="${escHtml(s.last_activity)}">${escHtml(_shortDate(s.last_activity))}</div>
     <div class="session-col-size" ${colClick}>${escHtml(s.size)}</div>
   </div>`;
+}
+
+// Toast shown when the user taps the inbox badge.  Does NOT trigger a
+// pull \u2014 that's an explicit affordance in the live panel (Phase 6) to
+// avoid accidental "send empty message" surprises.
+function _showSubsessionBadgeToast(parentSid) {
+  if (typeof showToast === 'function') {
+    showToast('Subsession reports waiting. Open the parent session to see and Pull updates.');
+  }
+  // Open the parent session so the user can see its children.
+  if (typeof openInGUI === 'function' && parentSid !== activeId) {
+    openInGUI(parentSid);
+  }
 }
 
 function renderList(sessions) {
@@ -376,7 +522,44 @@ function renderList(sessions) {
   }
   // --- End NB-10 ---
 
-  const rows = sessions.map(s => _renderSessionRow(s, '')).join('');
+  // ── Subsessions tree layout (spec §4.4 + §4.6.1) ──
+  // Build a parent_sid -> [child rows] index from the flat session list.
+  // We render top-level sessions in the user's chosen sort order, then
+  // immediately after each parent we render its children indented and
+  // sorted by their own ts.  Children are also "claimed" so they don't
+  // appear again at the top level.
+  const childrenIdx = _buildSubsessionIndex(sessions);
+  window.__subsessionChildrenIndex = childrenIdx;  // for _renderSessionRow
+  const claimedChildren = new Set();
+  for (const kids of childrenIdx.values()) {
+    for (const k of kids) claimedChildren.add(k.id);
+  }
+
+  let rows = '';
+  for (const s of sessions) {
+    if (claimedChildren.has(s.id)) continue;  // rendered below its parent
+    const kids = childrenIdx.get(s.id);
+    const hasKids = !!(kids && kids.length);
+    // When a session has subsessions, wrap the parent + its children in a
+    // distinct "family" box so the hierarchy reads as one unit at a glance
+    // (the flat indent+glyph alone was too subtle to notice).  Sessions
+    // with no children render exactly as before — no wrapper, no visual
+    // change to the normal sidebar.
+    if (hasKids) {
+      const expanded = _isSubsessionExpanded(s.id);
+      rows += '<div class="subsession-family' + (expanded ? '' : ' collapsed') + '" data-family="' + s.id + '">';
+      rows += _renderSessionRow(s, ' family-parent');
+      if (expanded) {
+        const kidsSorted = sortedSessions(kids);
+        for (const kid of kidsSorted) {
+          rows += _renderSessionRow(kid, ' family-child');
+        }
+      }
+      rows += '</div>';
+    } else {
+      rows += _renderSessionRow(s, '');
+    }
+  }
 
   el.innerHTML = header + rows;
   initColResize();
@@ -588,7 +771,9 @@ function sessionContextMenu(e, sessionId) {
 
   // Link to task/section
   items += '<div class="ws-ctx-item" onclick="_sessCtx(\'link-workflow\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg> Link to Workflow Task</div>';
-  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'add-compose\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg> Add to Compose</div>';
+  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'add-compose\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg> Add to Structured composition</div>';
+  // Spawn Subsession (spec §4.2 + §4.6) — downward-branching arrow.
+  items += '<div class="ws-ctx-item" onclick="_sessCtx(\'spawn-subsession\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 3v6"/><path d="M6 9c0 4 4 6 8 6"/><polyline points="11 12 14 15 11 18"/></svg> Spawn Subsession</div>';
   items += '<div class="ws-ctx-item" onclick="_sessCtx(\'create-workflow\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> Create Workflow Task</div>';
 
   items += '<div class="ws-ctx-divider"></div>';
@@ -675,6 +860,9 @@ function _sessCtx(action, sessionId) {
     case 'add-compose':
       _addToCompose(sessionId);
       break;
+    case 'spawn-subsession':
+      _spawnSubsession(sessionId);
+      break;
     case 'create-workflow':
       createWorkflowTaskFromSession(sessionId);
       break;
@@ -707,7 +895,212 @@ function _sessCtx(action, sessionId) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Add to Compose — unified tree picker
+// Spawn Subsession (spec §4.2 + §4.6) — peel off a side investigation
+// ═══════════════════════════════════════════════════════════════
+//
+// POSTs to /api/sessions/<parent_sid>/spawn-subsession, then opens
+// the resulting child in the live panel.  Reloads the session list so
+// the new child appears indented under its parent.  Fires a soft
+// highlight pulse on both rows for 600 ms (CSS handles the animation).
+async function _spawnSubsession(parentSid) {
+  if (!parentSid) return;
+  const proj = localStorage.getItem('activeProject') || '';
+  const url = '/api/sessions/' + encodeURIComponent(parentSid)
+    + '/spawn-subsession'
+    + (proj ? '?project=' + encodeURIComponent(proj) : '');
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+  } catch (e) {
+    if (typeof showToast === 'function') {
+      showToast('Spawn failed: network error', true);
+    }
+    return;
+  }
+  let data = null;
+  try { data = await resp.json(); } catch (e) {}
+  if (!resp.ok || !data || data.ok !== true) {
+    const errMsg = (data && data.error) || ('HTTP ' + resp.status);
+    if (typeof showToast === 'function') {
+      showToast('Spawn failed: ' + errMsg, true);
+    }
+    return;
+  }
+
+  // One-time intro tooltip (spec §4.6.1).
+  if (!localStorage.getItem('vn.tip.subsession_intro')) {
+    localStorage.setItem('vn.tip.subsession_intro', '1');
+    if (typeof showToast === 'function') {
+      showToast(
+        'This is a subsession. It knows everything its parent knew when it was spawned. '
+        + 'Reports flow back to the parent on your next message there.'
+      );
+    }
+  } else if (typeof showToast === 'function') {
+    showToast('Subsession spawned under "' + (data.title || parentSid.slice(0, 8)) + '"');
+  }
+
+  // Reload the session list so the child appears under its parent.
+  if (typeof loadSessions === 'function') {
+    try { await loadSessions(); } catch (e) {}
+  }
+
+  // Open the new subsession in the live panel.
+  if (typeof openInGUI === 'function' && data.new_id) {
+    try { await openInGUI(data.new_id); } catch (e) {}
+  }
+
+  // Spawn-pulse animation — CSS .subsession-spawn-pulse fades a soft
+  // yellow background over 600 ms.  Defer one tick so the new row
+  // exists in the DOM before we attach the class.
+  setTimeout(function() {
+    const childRow = document.querySelector('.session-item[data-sid="' + (data.new_id || '') + '"]');
+    if (childRow) childRow.classList.add('subsession-spawn-pulse');
+    const parentRow = document.querySelector('.session-item[data-sid="' + parentSid + '"]');
+    if (parentRow) parentRow.classList.add('subsession-spawn-pulse');
+    setTimeout(function() {
+      if (childRow) childRow.classList.remove('subsession-spawn-pulse');
+      if (parentRow) parentRow.classList.remove('subsession-spawn-pulse');
+    }, 700);
+  }, 50);
+}
+
+// Ctrl+Shift+S keyboard shortcut — spawn a subsession from whatever
+// session is currently open in the live panel.
+document.addEventListener('keydown', function(e) {
+  if (e.ctrlKey && e.shiftKey && (e.key === 'S' || e.key === 's')) {
+    // Skip if user is typing in an input/textarea.
+    const tag = (e.target && e.target.tagName) || '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if (e.target && e.target.isContentEditable) return;
+    if (typeof activeId !== 'undefined' && activeId) {
+      e.preventDefault();
+      _spawnSubsession(activeId);
+    }
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 6.5 P1-5 — Rewind-orphan UI prompt
+// ═══════════════════════════════════════════════════════════════
+//
+// When the rewind endpoint returns a non-empty `rewind_orphans` array,
+// surface a modal listing each orphaned child with [Re-anchor] and
+// [Detach] buttons (spec §6.3).
+//
+// Re-anchor → POST /api/sessions/<child>/reanchor (server resolves the
+//   new origin_turn from the current parent tip)
+// Detach    → POST /api/sessions/<child>/detach (clears parent pointer,
+//   stamps parent_deleted_at like §6.2 orphan)
+//
+// Exposed on window so toolbar.js (which holds the rewind response
+// handler) can call us without taking a hard dependency on this file.
+window._handleRewindOrphans = function(parentSid, orphanSids) {
+  if (!Array.isArray(orphanSids) || !orphanSids.length) return;
+  const proj = localStorage.getItem('activeProject') || '';
+  const projQ = proj ? '?project=' + encodeURIComponent(proj) : '';
+
+  function nameFor(sid) {
+    // Best-effort lookup in the existing session list; falls back to
+    // the SID prefix so the modal is never empty-labelled.
+    if (typeof allSessions !== 'undefined' && Array.isArray(allSessions)) {
+      const hit = allSessions.find(function(s) { return s && s.id === sid; });
+      if (hit && hit.title) return hit.title;
+    }
+    return (sid || '').slice(0, 8);
+  }
+
+  let modal = document.getElementById('rewind-orphans-modal');
+  if (modal) modal.remove();
+  modal = document.createElement('div');
+  modal.id = 'rewind-orphans-modal';
+  modal.className = 'subsession-report-modal';
+  let rows = '';
+  orphanSids.forEach(function(sid) {
+    const safe = String(sid).replace(/[^A-Za-z0-9_-]/g, '');
+    rows +=
+      '<div class="rewind-orphan-row" data-sid="' + safe + '">'
+      + '<div class="rewind-orphan-name">' + escHtml(nameFor(sid)) + '</div>'
+      + '<button type="button" class="rewind-orphan-reanchor">Re-anchor at current parent tip</button>'
+      + '<button type="button" class="rewind-orphan-detach">Detach</button>'
+      + '</div>';
+  });
+  modal.innerHTML =
+    '<div class="subsession-report-card">'
+    + '<div class="subsession-report-title">Subsessions orphaned by rewind</div>'
+    + '<div class="subsession-report-help">'
+    + 'These subsessions were spawned past the line you rewound to.  '
+    + 'Pick an action for each.'
+    + '</div>'
+    + '<div class="rewind-orphans-list">' + rows + '</div>'
+    + '<div class="subsession-report-actions">'
+    + '<button type="button" class="rewind-orphan-close">Close</button>'
+    + '</div>'
+    + '</div>';
+  document.body.appendChild(modal);
+
+  modal.querySelector('.rewind-orphan-close').addEventListener('click', function() {
+    modal.remove();
+  });
+
+  Array.prototype.forEach.call(
+    modal.querySelectorAll('.rewind-orphan-row'),
+    function(row) {
+      const childSid = row.getAttribute('data-sid');
+      row.querySelector('.rewind-orphan-reanchor').addEventListener('click', async function() {
+        try {
+          const url = '/api/sessions/' + encodeURIComponent(childSid) + '/reanchor' + projQ;
+          const resp = await fetch(url, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({}),
+          });
+          const data = await resp.json().catch(function() { return null; });
+          if (!resp.ok || !data || data.ok !== true) {
+            const err = (data && data.error) || ('HTTP ' + resp.status);
+            if (typeof showToast === 'function') showToast('Re-anchor failed: ' + err, true);
+            return;
+          }
+          if (typeof showToast === 'function') {
+            showToast('Re-anchored at line ' + (data.subsession_origin_turn || '?'));
+          }
+          row.remove();
+          if (!modal.querySelectorAll('.rewind-orphan-row').length) modal.remove();
+        } catch (e) {
+          if (typeof showToast === 'function') showToast('Re-anchor failed: network error', true);
+        }
+      });
+      row.querySelector('.rewind-orphan-detach').addEventListener('click', async function() {
+        try {
+          const url = '/api/sessions/' + encodeURIComponent(childSid) + '/detach' + projQ;
+          const resp = await fetch(url, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({}),
+          });
+          const data = await resp.json().catch(function() { return null; });
+          if (!resp.ok || !data || data.ok !== true) {
+            const err = (data && data.error) || ('HTTP ' + resp.status);
+            if (typeof showToast === 'function') showToast('Detach failed: ' + err, true);
+            return;
+          }
+          if (typeof showToast === 'function') showToast('Subsession detached.');
+          row.remove();
+          if (!modal.querySelectorAll('.rewind-orphan-row').length) modal.remove();
+        } catch (e) {
+          if (typeof showToast === 'function') showToast('Detach failed: network error', true);
+        }
+      });
+    }
+  );
+};
+
+// ═══════════════════════════════════════════════════════════════
+// Add to Structured composition — unified tree picker
 // ═══════════════════════════════════════════════════════════════
 
 // Sanitize an ID for safe embedding in onclick attributes
@@ -765,7 +1158,7 @@ async function _addToCompose(sessionId) {
 
   // Multiple — show composition picker
   let html = '<div class="pm-card pm-enter" style="max-width:480px;">';
-  html += '<h2 class="pm-title">Add to Compose</h2>';
+  html += '<h2 class="pm-title">Add to Structured composition</h2>';
   html += '<div class="pm-body" style="padding:0;"><div class="kanban-create-section">';
   html += '<div class="kanban-create-section-label">Choose composition</div>';
 
@@ -787,7 +1180,7 @@ async function _addToCompose(sessionId) {
 // --- Zero compositions: inline create ---
 function _atcShowCreateComposition(overlay) {
   let html = '<div class="pm-card pm-enter" style="max-width:400px;">';
-  html += '<h2 class="pm-title">Add to Compose</h2>';
+  html += '<h2 class="pm-title">Add to Structured composition</h2>';
   html += '<div class="pm-body">';
   html += '<div class="kanban-create-section-label">No compositions yet. Create one:</div>';
   html += '<input type="text" id="atc-new-comp-name" class="kanban-input" placeholder="Composition name" style="width:100%;margin:8px 0;" autofocus>';
@@ -825,7 +1218,7 @@ async function _atcLoadTree(overlay, projectId) {
 
   // Show loading state
   let html = '<div class="pm-card pm-enter" style="max-width:520px;">';
-  html += '<h2 class="pm-title">Add to Compose</h2>';
+  html += '<h2 class="pm-title">Add to Structured composition</h2>';
   html += '<div class="pm-body" style="text-align:center;padding:24px;color:var(--text-muted);">Loading sections...</div>';
   html += '</div>';
   _atcShowOverlay(overlay, html);
@@ -952,7 +1345,7 @@ function _atcRenderTree(overlay) {
   }
 
   let html = '<div class="pm-card pm-enter" style="max-width:520px;">';
-  html += '<h2 class="pm-title">Add to Compose</h2>';
+  html += '<h2 class="pm-title">Add to Structured composition</h2>';
   html += '<div class="pm-body" style="padding:0;">';
   html += '<div class="atc-tree" id="atc-tree">';
   html += renderLevel('__root__', 0);
@@ -1028,7 +1421,7 @@ async function _atcConfirmAdd() {
     const data = await resp.json();
     if (data.ok) {
       _closePm();
-      showToast('Added to Compose: ' + name);
+      showToast('Added to Structured composition: ' + name);
     } else if (resp.status === 409) {
       // Session already linked
       showToast('Session already linked to "' + (data.linked_section || 'another section') + '"', 'error');
@@ -1137,7 +1530,7 @@ function _bulkContextMenu(e) {
   html += '<div class="ws-ctx-item" onclick="_bulkAddToCompose()">'
     + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
     + '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>'
-    + ' Add all to Compose</div>';
+    + ' Add all to Structured composition</div>';
 
   html += '<div class="ws-ctx-divider"></div>';
 
@@ -1466,7 +1859,7 @@ async function _bulkDuplicate() {
 }
 
 /**
- * Bulk Add to Compose.  Sequentially opens the existing _addToCompose()
+ * Bulk Add to Structured composition.  Sequentially opens the existing _addToCompose()
  * picker for each selected session.  Reusing the single-session function
  * preserves the `?project=` filter rule (CLAUDE.md Compose project-scoping
  * item 1) and the existing modal UX users already know.
@@ -1489,7 +1882,7 @@ async function _bulkAddToCompose() {
 
     const overlay = document.getElementById('pm-overlay');
     if (!overlay) {
-      showToast('Cannot open Add to Compose picker', true);
+      showToast('Cannot open Add to Structured composition picker', true);
       return;
     }
 
@@ -1516,7 +1909,7 @@ async function _bulkAddToCompose() {
       const closed = await _waitForOverlayClose(overlay, 5 * 60 * 1000);
       if (closed === 'timeout') {
         // Safety bail: stop the bulk loop, leave overlay alone.
-        showToast('Add to Compose timed out — bulk halted', true);
+        showToast('Add to Structured composition timed out — bulk halted', true);
         break;
       }
       // We can't easily distinguish "added" from "cancelled" without
@@ -1525,7 +1918,7 @@ async function _bulkAddToCompose() {
       added++;
     }
     _clearMultiSelect();
-    showToast('Add to Compose finished (' + added + ' processed'
+    showToast('Add to Structured composition finished (' + added + ' processed'
       + (skipped ? ', ' + skipped + ' skipped' : '') + ')');
   } finally {
     _bulkRelease();

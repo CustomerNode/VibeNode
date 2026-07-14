@@ -5,6 +5,7 @@ anthropic
 supabase
 pg8000
 openpyxl
+playwright
 python-pptx
 python-docx
 pytest

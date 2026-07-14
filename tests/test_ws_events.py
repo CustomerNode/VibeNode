@@ -509,3 +509,26 @@ class TestUIPrefs:
 
         client.emit('set_ui_prefs', {'theme': 'light'})
         mock_session_manager.set_ui_prefs.assert_called_with({'theme': 'light'})
+
+    # --- Session retention pref over the socket (added 2026-05-30) ---
+
+    def test_set_retention_via_socket(self, app_and_client, mock_session_manager):
+        app, socketio, client = app_and_client
+        client.get_received()
+
+        client.emit('set_ui_prefs', {'session_retention_days': 60})
+        mock_session_manager.set_ui_prefs.assert_called_with(
+            {'session_retention_days': 60}
+        )
+
+    def test_get_retention_via_socket(self, app_and_client, mock_session_manager):
+        app, socketio, client = app_and_client
+        mock_session_manager.get_ui_prefs.return_value = {
+            'session_retention_days': 90
+        }
+        client.get_received()
+
+        client.emit('get_ui_prefs')
+        received = client.get_received()
+        loaded = next(m for m in received if m['name'] == 'ui_prefs_loaded')
+        assert loaded['args'][0].get('session_retention_days') == 90

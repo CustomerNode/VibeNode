@@ -76,6 +76,13 @@ def app(tmp_path, fake_project):
     # Default: session manager doesn't know about any sessions, so routes
     # fall through to file-based logic (which is what these tests exercise).
     application.session_manager.has_session.return_value = False
+    # The daemon-state decorators in api_sessions (live-session insert,
+    # subsession metadata, and the restart-memory/dormant overlay) iterate
+    # these.  Without explicit stubs a bare MagicMock leaks a non-serializable
+    # MagicMock into the session dicts and jsonify() raises.  Empty containers
+    # match the "no live sessions" default above.
+    application.session_manager.get_all_states.return_value = []
+    application.session_manager.get_dormant_states.return_value = {}
 
     # Redirect _sessions_dir and _CLAUDE_PROJECTS to tmp_path
     _patch_sessions = patch(
@@ -434,6 +441,28 @@ class TestRenameSession:
         assert resp.status_code == 200
         assert path.stat().st_size == before_size
         assert path.stat().st_mtime == before_mtime
+
+    def test_rename_records_session_access(
+        self, client, populated_project, fake_project, monkeypatch,
+    ):
+        """Rename is a deliberate user interaction and MUST bubble the
+        session.  After dropping file-mtime from effective_ts (SDK
+        background writes pollute it), renames bubble via the access
+        store instead.  If this regresses, renames would stop moving
+        the session in the sidebar at all."""
+        monkeypatch.setattr(
+            "app.session_store._sessions_dir",
+            lambda project="": fake_project,
+        )
+        access_file = fake_project / "_session_access.json"
+        if access_file.exists():
+            access_file.unlink()
+        resp = client.post("/api/rename/sess-001",
+                           json={"title": "Fresh Name"})
+        assert resp.status_code == 200
+        assert access_file.exists()
+        data = json.loads(access_file.read_text(encoding="utf-8"))
+        assert "sess-001" in data
 
     def test_rename_repeated_with_same_title_only_appends_once(
         self, client, populated_project, fake_project,
@@ -1158,10 +1187,34 @@ class TestConfig:
     def test_get_config_invalid_json(self, client, tmp_path):
         claude_dir = tmp_path / ".claude"
         claude_dir.mkdir()
-        (claude_dir / "settings.json").write_text("not json!", encoding="utf-8")
+        corrupt = claude_dir / "settings.json"
+        corrupt.write_text("not json!", encoding="utf-8")
+        before = corrupt.read_text(encoding="utf-8")
         with patch("app.routes.live_api.Path.home", return_value=tmp_path):
             resp = client.get("/api/config")
         assert resp.status_code == 500
+        # GET is read-only: a corrupt file is never overwritten. The browser
+        # mirror skips the PUT on this 500, so settings.json stays intact.
+        assert corrupt.read_text(encoding="utf-8") == before
+
+    # --- Retention mirror: GET-merge-PUT contract (added 2026-05-30) ---
+
+    def test_config_put_preserves_other_keys(self, client, tmp_path):
+        """The browser mirrors cleanupPeriodDays via GET-merge-PUT (the endpoint
+        is a whole-file replace).  Seeding theme, then merging cleanupPeriodDays
+        into the full GET result and PUTting it, must keep BOTH keys — a partial
+        PUT of just {cleanupPeriodDays} would wipe the user's other settings.
+        """
+        with patch("app.routes.live_api.Path.home", return_value=tmp_path):
+            client.put("/api/config", json={"theme": "dark"})
+            cur = client.get("/api/config").get_json()
+            assert cur.get("theme") == "dark"
+            cur["cleanupPeriodDays"] = 30          # merge one key client-side
+            r = client.put("/api/config", json=cur)
+            assert r.status_code == 200
+            body = client.get("/api/config").get_json()
+        assert body.get("theme") == "dark"
+        assert body.get("cleanupPeriodDays") == 30
 
 
 class TestModels:
@@ -1410,3 +1463,51 @@ class TestCRUDEdgeCases:
         if len(data) >= 2:
             timestamps = [s["sort_ts"] for s in data]
             assert timestamps == sorted(timestamps, reverse=True)
+
+
+# ===================================================================
+# PROJECT PATH-TRAVERSAL GUARD (sessions_api blueprint before_request)
+# ===================================================================
+
+class TestProjectTraversalGuard:
+    """The blueprint-level guard must reject any ``project`` containing
+    path separators or '..' (query string OR JSON body) with 400, while
+    leaving legitimate encoded project names and project-less requests
+    untouched.  Mirrors the /api/search guard added in the same pass."""
+
+    BAD_PROJECTS = ("..%2F..%2Fevil", ".." + chr(92) + "evil", "a/b", "..")
+
+    def test_query_param_traversal_rejected_on_get_routes(self, client):
+        for bad in self.BAD_PROJECTS:
+            for route in (f"/api/sessions?project={bad}",
+                          f"/api/session/sess-001?project={bad}",
+                          f"/api/trash?project={bad}",
+                          f"/api/session-timeline/sess-001?project={bad}"):
+                resp = client.get(route)
+                assert resp.status_code == 400, route
+                assert resp.get_json()["error"] == "invalid project name"
+
+    def test_query_param_traversal_rejected_on_mutating_routes(self, client):
+        bad = "..%2Fevil"
+        resp = client.delete(f"/api/delete/sess-001?project={bad}")
+        assert resp.status_code == 400
+        resp = client.post(f"/api/duplicate/sess-001?project={bad}")
+        assert resp.status_code == 400
+
+    def test_json_body_traversal_rejected(self, client):
+        resp = client.post("/api/rename/sess-001",
+                           json={"title": "x", "project": "../evil"})
+        assert resp.status_code == 400
+        assert resp.get_json()["error"] == "invalid project name"
+        resp = client.post("/api/autonname/sess-001",
+                           json={"project": ".." + chr(92) + "evil"})
+        assert resp.status_code == 400
+
+    def test_legitimate_encoded_project_still_works(self, client, populated_project):
+        resp = client.get("/api/sessions?project=C--Users-test-Documents-myproj")
+        assert resp.status_code == 200
+
+    def test_requests_without_project_unaffected(self, client, populated_project):
+        assert client.get("/api/sessions").status_code == 200
+        resp = client.post("/api/rename/sess-001", json={"title": "Renamed"})
+        assert resp.status_code == 200

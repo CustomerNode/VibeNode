@@ -26,15 +26,47 @@ from ..config import (
     _summary_cache,
     _mark_deleted,
     _mark_deleted_bulk,
+    _unmark_deleted,
+    move_to_trash,
+    list_trash,
+    restore_from_trash,
+    purge_from_trash,
     _get_utility_ids,
     _resolve_remapped_id,
     _load_remaps,
+    _record_session_access,
 )
 from ..sessions import load_session, load_session_timeline, all_sessions
 from ..titling import smart_title
 
 bp = Blueprint('sessions_api', __name__)
 log = logging.getLogger(__name__)
+
+
+@bp.before_request
+def _reject_traversal_project():
+    """Reject requests whose ``project`` carries path separators or ``..``.
+
+    Every route in this blueprint that honors ``?project=`` (or a JSON-body
+    ``project``) eventually resolves ``_CLAUDE_PROJECTS / project`` — either
+    directly or via ``_sessions_dir()`` / the session_store helpers.  Encoded
+    project names can never legitimately contain ``/``, ``\\`` or ``..``
+    (``_encode_cwd()`` replaces all separators with dashes), so anything that
+    does is a traversal attempt that would read from — or persist state
+    into — a directory outside ``~/.claude/projects``.  Same guard as
+    ``/api/search`` (app/routes/search_api.py).  Returning a response here
+    short-circuits the route; returning None lets the request proceed.
+    """
+    candidates = [request.args.get("project", "")]
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        body = request.get_json(silent=True)
+        if isinstance(body, dict):
+            candidates.append(str(body.get("project") or ""))
+    for value in candidates:
+        value = (value or "").strip()
+        if value and ("/" in value or "\\" in value or ".." in value):
+            return jsonify({"error": "invalid project name"}), 400
+    return None
 
 
 # Windows + AV/Defender hold the .jsonl handle for tens to hundreds of
@@ -195,6 +227,11 @@ def api_sessions():
 
     existing_ids = {s["id"] for s in sessions}
     names = _load_names(project)  # check _session_names.json for auto-named titles
+    # Subsessions (spec §4.4): build a sid -> daemon-state lookup so the
+    # disk-sourced session list can be decorated with the parent pointer
+    # + inbox-dirty flag.  Without this the sidebar can't render the
+    # tree variant for closed-but-still-managed parents.
+    _state_by_sid = {}
     for state in sm.get_all_states():
         sid = state.get("session_id", "")
         if state.get("session_type") in ("planner", "title"):
@@ -205,6 +242,7 @@ def api_sessions():
         state_cwd = state.get("cwd", "")
         if state_cwd and not cwd_matches_active_project(state_cwd, project=project):
             continue
+        _state_by_sid[sid] = state
         if sid and sid not in existing_ids and state.get("state") != "stopped":
             saved_name = names.get(sid, "")
             title = saved_name or state.get("name") or "New Session"
@@ -212,7 +250,7 @@ def api_sessions():
             # surface at the top of the date-sorted sidebar — they're the
             # most-recently-interacted-with thing in the project.
             _now_ts = _time.time()
-            sessions.insert(0, {
+            new_entry = {
                 "id": sid,
                 "display_title": title,
                 "custom_title": saved_name or state.get("name") or "",
@@ -227,7 +265,36 @@ def api_sessions():
                 "message_count": 0,
                 "preview": "",
                 "model": state.get("model", ""),
-            })
+            }
+            # Subsessions decoration — same fields as the disk-side merge below.
+            if state.get("parent_session_id"):
+                new_entry["parent_session_id"] = state["parent_session_id"]
+                new_entry["subsession_origin_turn"] = state.get(
+                    "subsession_origin_turn", 0
+                )
+            if state.get("session_type") == "subsession":
+                new_entry["session_type"] = "subsession"
+            if state.get("inbox_dirty"):
+                new_entry["inbox_dirty"] = True
+            sessions.insert(0, new_entry)
+
+    # Decorate disk-sourced sessions with daemon-side subsession metadata
+    # (parent_session_id, inbox_dirty, session_type=subsession).  Closed
+    # sessions that aren't daemon-managed don't get decorated and render
+    # as plain top-level rows — same as today's behaviour.
+    for s in sessions:
+        st = _state_by_sid.get(s["id"])
+        if not st:
+            continue
+        if st.get("parent_session_id") and "parent_session_id" not in s:
+            s["parent_session_id"] = st["parent_session_id"]
+            s["subsession_origin_turn"] = st.get(
+                "subsession_origin_turn", 0
+            )
+        if st.get("session_type") == "subsession" and s.get("session_type") != "subsession":
+            s["session_type"] = "subsession"
+        if st.get("inbox_dirty"):
+            s["inbox_dirty"] = True
 
     # ── Restart memory ──────────────────────────────────────────────────
     # Sessions that were idle/working before the last restart are NOT
@@ -342,6 +409,11 @@ def api_rename(session_id):
     # on focus-out) doesn't keep appending identical custom-title lines.
     path = _sessions_dir(project) / f"{session_id}.jsonl"
     _append_custom_title_if_changed(path, new_title, session_id)
+
+    # Rename is a deliberate user interaction — bubble the session in the
+    # sidebar sort.  effective_ts no longer uses file mtime (SDK
+    # background writes pollute it), so we record access explicitly here.
+    _record_session_access(session_id, project)
 
     return jsonify({"ok": True, "title": new_title})
 
@@ -514,6 +586,27 @@ def api_delete(session_id):
         sm.close_session_sync(session_id)
         sm.remove_session(session_id)
 
+    # ── Subsessions cleanup (spec §6.2): orphan children + remove inbox ──
+    # Any in-memory child of this session gets parent_deleted_at + cleared
+    # parent_session_id so the sidebar stops indenting it.  The parent's
+    # per-parent inbox directory under ~/.claude/vibenode-state/<sid>/ is
+    # removed so deleted reports don't linger as orphan storage.
+    try:
+        if hasattr(sm, "orphan_children_of"):
+            orphaned = sm.orphan_children_of(session_id)
+            if orphaned:
+                log.info(
+                    "Subsessions: orphaned %d child(ren) of deleted parent %s",
+                    len(orphaned), session_id,
+                )
+    except Exception as e:
+        log.debug("orphan_children_of soft-fail: %s", e)
+    try:
+        from daemon.subsession_inbox import remove_inbox
+        remove_inbox(session_id)
+    except Exception as e:
+        log.debug("remove_inbox soft-fail for %s: %s", session_id, e)
+
     # Phase 2: Kill any orphaned CLI process for this session.
     # Always attempt this, even after SDK close, as a safety net -- the SDK
     # close may time out or the process may have been spawned by an earlier
@@ -537,43 +630,43 @@ def api_delete(session_id):
     except Exception:
         pass  # best-effort
 
-    # Phase 3: Tombstone + delete the file.
+    # Capture the user-set name BEFORE we remove it from the names store, so
+    # restore-from-trash can re-create the session with its title intact.
+    saved_name = _load_names(project).get(session_id, "")
+
+    # Phase 3: Tombstone + soft-delete the file.
     # Write the tombstone FIRST so all_sessions() hides this ID immediately,
-    # even if a dying process recreates the .jsonl after we unlink it.
+    # even if a dying process recreates the .jsonl after we move it.
     _mark_deleted(session_id, project)
 
     if not path.exists():
         sm._save_registry_now()
         return jsonify({"ok": True})  # Already gone or never created
 
-    # On Windows the CLI process may still hold the .jsonl open even after
-    # Phase 1/2 — unlink raises PermissionError in that case. The retry
-    # helper attempts up to 5 unlinks at 0.2 s intervals (~1 s worst case)
-    # and logs at WARNING if the file stays locked. The tombstone above is
-    # the authoritative "this session is deleted" signal; truncate-to-zero
-    # is the last-resort fallback if AV refuses to release the handle.
-    unlinked = _unlink_with_retry(path)
+    # Soft-delete (recoverable): move the .jsonl into the per-project
+    # ``_trash/`` folder instead of unlinking it, so an accidental delete can
+    # be undone via /api/trash/<id>/restore. move_to_trash retries on Windows
+    # file locks (same bounded loop as _unlink_with_retry) and records the
+    # deletion time + saved name in _trash_index.json.
+    trashed = move_to_trash(session_id, project, name=saved_name)
     if folder.exists() and folder.is_dir():
         try:
             shutil.rmtree(folder)
         except (PermissionError, OSError):
             pass
 
-    # Phase 4: Sweep for files re-created by a dying process AND truncate
-    # any file the retry helper couldn't unlink.
-    if path.exists():
+    # Phase 4: If the move didn't succeed (file vanished mid-flight, or stayed
+    # locked through every retry), fall back to the hard-delete path so we
+    # never leave a visible zombie .jsonl behind. The tombstone above is the
+    # authoritative "deleted" signal; truncate-to-zero is the last resort if
+    # AV refuses to release the handle.
+    if not trashed and path.exists():
         if not _unlink_with_retry(path, retries=3, delay=0.2):
-            # Last resort: truncate the file so even if the tombstone
-            # eventually expires, the session would appear empty and be
-            # auto-cleaned on the next "delete empty" sweep.
             try:
                 path.write_bytes(b"")
                 log.warning("Truncated locked JSONL to 0 bytes: %s", path)
             except Exception as e:
                 log.warning("Failed to truncate locked JSONL %s: %s", path, e)
-    elif not unlinked:
-        # File somehow disappeared between retries — fine, nothing to do.
-        pass
     if folder.exists() and folder.is_dir():
         try:
             shutil.rmtree(folder)
@@ -585,13 +678,76 @@ def api_delete(session_id):
     for key in [k for k in _summary_cache if k[0] == path_str]:
         del _summary_cache[key]
 
-    # Clean up user-set name from persistent store
+    # Clean up user-set name from persistent store (the title is preserved in
+    # the trash index, so a later restore re-applies it).
     _delete_name(session_id, project)
 
     # Force immediate registry save so recovery can't resurrect this session
     sm._save_registry_now()
 
     return jsonify({"ok": True})
+
+
+@bp.route("/api/trash", methods=["GET"])
+def api_trash_list():
+    """List recoverable (soft-deleted) sessions for the active project.
+
+    Returns the trashed sessions newest-deleted first, each with its saved
+    title, deletion timestamp, and transcript size so the UI can offer a
+    one-click restore.  Entries expire per the user's retention policy
+    (``session_retention_days``; default Forever), honoring per-entry
+    grandfather protection — see ``session_store._prune_trash``.  Each item
+    also carries an additive ``purge_at`` epoch (None == kept forever).
+    """
+    project = request.args.get("project", "").strip()
+    items = list_trash(project)
+    # Add human-friendly ISO timestamps without changing the raw epochs.
+    for it in items:
+        try:
+            it["deleted_at_iso"] = datetime.fromtimestamp(
+                it.get("deleted_at", 0), tz.utc
+            ).isoformat()
+        except Exception:
+            it["deleted_at_iso"] = ""
+        pa = it.get("purge_at")
+        try:
+            it["purge_at_iso"] = (
+                datetime.fromtimestamp(pa, tz.utc).isoformat()
+                if pa is not None else None
+            )
+        except Exception:
+            it["purge_at_iso"] = None
+    return jsonify({"ok": True, "trash": items})
+
+
+@bp.route("/api/trash/<session_id>/restore", methods=["POST"])
+def api_trash_restore(session_id):
+    """Restore a soft-deleted session: move its .jsonl back, clear the
+    tombstone so it stops being hidden, and re-apply its saved title."""
+    project = (
+        (request.get_json(silent=True) or {}).get("project")
+        or request.args.get("project", "")
+    ).strip()
+
+    name = restore_from_trash(session_id, project)
+    if name is None:
+        return jsonify({"error": "Not found in trash"}), 404
+
+    # Clear the tombstone so all_sessions() surfaces the session again.
+    _unmark_deleted(session_id, project)
+    # Re-apply the saved title (if any) so it sorts/labels correctly.
+    if name:
+        _save_name(session_id, name, project)
+
+    return jsonify({"ok": True, "id": session_id, "title": name})
+
+
+@bp.route("/api/trash/<session_id>", methods=["DELETE"])
+def api_trash_purge(session_id):
+    """Permanently delete a single trashed session (no further undo)."""
+    project = request.args.get("project", "").strip()
+    purged = purge_from_trash(session_id, project)
+    return jsonify({"ok": True, "purged": purged})
 
 
 @bp.route("/api/delete-all", methods=["DELETE"])
@@ -895,6 +1051,650 @@ def api_fork(session_id):
     return jsonify({"ok": True, "new_id": new_id, "title": fork_title})
 
 
+# ── Subsessions: spawn endpoint (spec §4.2) ──────────────────────────────
+# POST /api/sessions/<parent_sid>/spawn-subsession
+#
+# Reuses the JSONL slice + sessionId-rewrite machinery from /api/fork.
+# A subsession is just a normal SDK session whose JSONL is seeded with
+# the parent's transcript up to the spawn moment, plus a parent pointer
+# in the registry (parent_session_id, subsession_origin_turn) and a
+# session_type of "subsession" for the sidebar discriminator.
+#
+# Guards (spec §4.2 + §6.8):
+#   1. Parent must exist and be in the active project (cross-project
+#      spawn is rejected — spec §6.5).
+#   2. Parent.session_type != "planner" — planners self-recycle and
+#      cannot legally be parents (spec §4.2).
+#   3. Cycle guard: walk the parent chain up to 32 hops via the daemon's
+#      in-memory SessionInfo + the registry snapshot, reject if the
+#      proposed child SID appears anywhere in the chain.  This is
+#      impossible in practice for a freshly-generated UUID4, but the
+#      guard codifies the invariant for any future re-parent flow.
+#
+# Returns: {ok: True, new_id, parent_id, title} on success;
+#          {error: "<reason>"} with 400 / 404 / 409 on rejection.
+# ── Subsession spawn directive (Patent 11 "Subsession Awareness", E6) ────
+# Injected as the child's system prompt at spawn so the child knows it is
+# a peeled-off investigation: it has the parent's full context up to the
+# spawn moment, the parent may still be running in parallel, and its
+# conclusion flows back to the parent.  Mirrors the cross-session
+# awareness injection pattern (app/session_awareness.py) — a plain string
+# passed through start_session(system_prompt=...).  The
+# ``<!-- subsession:report -->`` marker is acted on by the daemon's
+# IDLE-time scan (Patent 13); until the daemon picks up that scan the
+# marker is an inert HTML comment, so emitting it is always harmless.
+_SUBSESSION_REPORT_MARKER = "<!-- subsession:report -->"
+
+
+def _build_subsession_directive(parent_name: str) -> str:
+    """Return the system-prompt directive for a freshly spawned subsession."""
+    parent_label = (parent_name or "the parent session").strip()
+    return (
+        "## You are a subsession\n\n"
+        f'You were spawned from "{parent_label}". You start with that '
+        "session's full conversation up to the moment you were spawned, so "
+        "you already know everything it knew. The parent may still be "
+        "running in parallel — you do not block it and it does not block "
+        "you.\n\n"
+        "Your job is to carry out the focused investigation or task the "
+        "user peels off here, then hand a clear conclusion back up to the "
+        "parent. Guidance:\n\n"
+        "1. Stay scoped to the side task. Do not redo the parent's whole "
+        "thread.\n"
+        "2. When you reach a conclusion, end your message with a concise "
+        "summary the parent can act on (a few sentences, plus file:line "
+        "references where relevant).\n"
+        f"3. On the line AFTER that summary, emit the marker "
+        f"`{_SUBSESSION_REPORT_MARKER}` to send your latest conclusion up "
+        "to the parent's inbox. The parent receives it with their next "
+        "message. You can also report manually with the 'Report to Parent' "
+        "button.\n"
+        "4. Do not try to message the parent any other way — the inbox is "
+        "the only channel."
+    )
+
+
+@bp.route("/api/sessions/<parent_sid>/spawn-subsession", methods=["POST"])
+def api_spawn_subsession(parent_sid):
+    """Spawn a subsession from an existing parent session."""
+    import uuid as uuid_mod
+    from daemon.subsession_inbox import _validate_sid
+
+    project = request.args.get("project", "").strip()
+    sm = current_app.session_manager
+
+    # Phase 6.5 P1-2: validate the SID shape BEFORE we use it to compose
+    # filesystem paths.  Path-traversal SIDs (e.g. "..\\..\\evil") would
+    # otherwise resolve outside the sessions dir or the vibenode-state dir.
+    try:
+        _validate_sid(parent_sid)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid parent_sid: {e}"}), 400
+
+    # Resolve any in-memory alias on the parent SID.
+    canonical_parent = _resolve_remapped_id(parent_sid, project)
+    if canonical_parent:
+        parent_sid = canonical_parent
+
+    src = _sessions_dir(project) / f"{parent_sid}.jsonl"
+    if not src.exists():
+        return jsonify({"error": "Parent session not found"}), 404
+
+    # ── Guard 1: Parent project = active project (cross-project guard) ──
+    # The parent's cwd (when daemon-managed) must match the active
+    # project's cwd.  When the parent is only on-disk (no daemon entry)
+    # the request's project arg has already located the file under the
+    # active project's sessions_dir, so file-existence is the guard.
+    parent_meta = sm.get_subsession_meta(parent_sid)
+    if parent_meta:
+        parent_cwd = parent_meta.get("cwd") or ""
+        if parent_cwd and not cwd_matches_active_project(parent_cwd, project=project):
+            return jsonify({
+                "error": "Cross-project spawn rejected: parent belongs to a different project"
+            }), 400
+
+        # ── Guard 2: Planner parents are rejected (spec §4.2) ──
+        if parent_meta.get("session_type") == "planner":
+            return jsonify({
+                "error": "Cannot spawn a subsession from a planner session"
+            }), 400
+
+    # Generate the new child SID up front so we can include it in the
+    # cycle guard and the JSONL rewrite.
+    new_id = str(uuid_mod.uuid4())
+
+    # ── Guard 3: Cycle prevention (spec §6.8) ──
+    # Walk the parent chain up to 32 hops and abort if new_id appears.
+    # In practice impossible for a freshly-generated UUID4; the guard
+    # codifies the invariant for future re-parent code paths.
+    _MAX_PARENT_CHAIN = 32
+    cursor = parent_sid
+    visited = {new_id}
+    for _ in range(_MAX_PARENT_CHAIN):
+        if cursor in visited:
+            return jsonify({
+                "error": "Subsession parent chain contains a cycle — aborted"
+            }), 409
+        visited.add(cursor)
+        cursor_meta = sm.get_subsession_meta(cursor)
+        if not cursor_meta:
+            break
+        next_parent = cursor_meta.get("parent_session_id")
+        if not next_parent:
+            break
+        cursor = next_parent
+
+    # ── Slice the parent JSONL at the current line count ──
+    # Mirrors api_fork (line ~849) but appends a "[sub] <parent_name>"
+    # custom-title and persists the parent pointer on the new SessionInfo.
+    dst = _sessions_dir(project) / f"{new_id}.jsonl"
+    lines_out = []
+    line_count = 0
+    parent_name = (parent_meta or {}).get("name") or ""
+    original_title = parent_name or parent_sid[:8]
+
+    with open(src, encoding="utf-8") as f:
+        for line in f:
+            line_count += 1
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                lines_out.append(raw)
+                continue
+            if obj.get("type") == "custom-title" and not parent_name:
+                original_title = obj.get("customTitle", original_title)
+            if "sessionId" in obj:
+                obj["sessionId"] = new_id
+            lines_out.append(json.dumps(obj))
+
+    # subsession_origin_turn captures the parent's JSONL line count at
+    # the spawn moment.  Used by the rewind-past-spawn detector in
+    # Phase 6 to flag children whose anchor disappeared after a rewind.
+    subsession_origin_turn = line_count
+
+    sub_title = f"[sub] {original_title[:55]}"
+    lines_out.append(json.dumps({
+        "type": "custom-title",
+        "customTitle": sub_title,
+        "sessionId": new_id,
+    }))
+
+    with open(dst, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines_out) + "\n")
+
+    # Persist the human-readable title for sidebar rendering before
+    # start_session fires its first state emit.
+    try:
+        _save_name(new_id, sub_title, project)
+    except Exception as e:
+        log.debug("spawn_subsession: _save_name failed for %s: %s", new_id, e)
+
+    # ── Start the child SDK session with the parent pointer in-place ──
+    active_project = get_active_project()
+    proj_dir = _decode_project(active_project) if active_project else str(Path.home())
+    try:
+        result = sm.start_session(
+            session_id=new_id,
+            prompt="",
+            cwd=proj_dir,
+            name=sub_title,
+            resume=True,
+            session_type="subsession",
+            parent_session_id=parent_sid,
+            subsession_origin_turn=subsession_origin_turn,
+            system_prompt=_build_subsession_directive(parent_name),
+        )
+    except Exception as e:
+        return jsonify({"error": f"Failed to start subsession: {e}"}), 500
+
+    if not result.get("ok"):
+        return jsonify({"error": result.get("error", "Failed to start subsession")}), 500
+
+    return jsonify({
+        "ok": True,
+        "new_id": new_id,
+        "parent_id": parent_sid,
+        "title": sub_title,
+        "subsession_origin_turn": subsession_origin_turn,
+    })
+
+
+# ── Subsessions: report-to-parent endpoint (spec §4.3.3) ─────────────────
+# POST /api/sessions/<child_sid>/report-to-parent
+# Body: {"summary": str, "attachments"?: list}
+#
+# Looks up the child's parent_session_id via SessionManager, appends a
+# new entry to the parent's inbox.json under
+# ~/.claude/vibenode-state/<parent_sid>/, marks the in-memory
+# inbox_dirty flag on the parent if it's still loaded, and emits an
+# inbox_updated WS event so the sidebar badge updates without polling.
+@bp.route("/api/sessions/<child_sid>/report-to-parent", methods=["POST"])
+def api_report_to_parent(child_sid):
+    """Write a report from a subsession into its parent's inbox."""
+    from daemon.subsession_inbox import (
+        _validate_sid,
+        append_report,
+        undelivered_count,
+    )
+
+    project = request.args.get("project", "").strip()
+    sm = current_app.session_manager
+
+    # Phase 6.5 P1-2: validate the SID shape before any disk access.
+    try:
+        _validate_sid(child_sid)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid child_sid: {e}"}), 400
+
+    canonical = _resolve_remapped_id(child_sid, project)
+    if canonical:
+        child_sid = canonical
+
+    data = request.get_json(silent=True) or {}
+    summary = (data.get("summary") or "").strip()
+    if not summary:
+        return jsonify({"error": "summary is required"}), 400
+    attachments = data.get("attachments") or []
+    if not isinstance(attachments, list):
+        return jsonify({"error": "attachments must be a list"}), 400
+
+    # Find the child's daemon-side metadata so we can locate the parent
+    # SID and child display name.
+    child_meta = sm.get_subsession_meta(child_sid)
+    if not child_meta:
+        return jsonify({"error": "child session not found"}), 404
+
+    parent_sid = child_meta.get("parent_session_id")
+    if not parent_sid:
+        return jsonify({"error": "this session has no parent"}), 404
+
+    # Verify the parent still exists somewhere — either daemon-managed
+    # or on disk.  Parent deletion (spec §6.2) leaves an orphaned child;
+    # the endpoint must refuse the write in that case so the UI can
+    # toast a "Reports to: (parent deleted)" affordance.
+    parent_meta = sm.get_subsession_meta(parent_sid)
+    parent_jsonl = _sessions_dir(project) / f"{parent_sid}.jsonl"
+    if not parent_meta and not parent_jsonl.exists():
+        return jsonify({"error": "parent session not found"}), 404
+
+    child_name = child_meta.get("name") or ""
+
+    try:
+        entry = append_report(
+            parent_sid=parent_sid,
+            child_sid=child_sid,
+            child_name=child_name,
+            summary=summary,
+            attachments=attachments,
+        )
+    except Exception as e:
+        log.warning(
+            "report-to-parent: append_report failed for child=%s parent=%s: %s",
+            child_sid, parent_sid, e,
+        )
+        return jsonify({"error": f"failed to write inbox: {e}"}), 500
+
+    # Best-effort: flip the parent's in-memory inbox_dirty flag so the
+    # next send_message picks up the report without reading the file.
+    # Falls through harmlessly if the parent isn't daemon-managed (the
+    # next time it loads, it will re-derive inbox_dirty from disk).
+    try:
+        if hasattr(sm, "mark_inbox_dirty"):
+            sm.mark_inbox_dirty(parent_sid)
+    except Exception as e:
+        log.debug("report-to-parent: mark_inbox_dirty soft-fail: %s", e)
+
+    # Emit a real-time inbox_updated event so any connected client can
+    # update the parent's badge immediately.  Best-effort — a missing
+    # socketio binding (e.g. in unit tests) silently falls through.
+    try:
+        from .. import socketio
+        socketio.emit("inbox_updated", {
+            "parent_session_id": parent_sid,
+            "undelivered_count": undelivered_count(parent_sid),
+            "from_child_session_id": child_sid,
+        })
+    except Exception as e:
+        log.debug("report-to-parent: socketio emit soft-fail: %s", e)
+
+    return jsonify({
+        "ok": True,
+        "report_id": entry.get("report_id"),
+        "parent_session_id": parent_sid,
+        "undelivered_count": undelivered_count(parent_sid),
+    })
+
+
+# ── Subsessions: pull-subsession-updates endpoint (phase 6.5 P0-1/P0-2) ──
+# POST /api/sessions/<parent_sid>/pull-subsession-updates
+#
+# Explicit REST endpoint behind the live-panel "Pull updates" button.
+# Replaces the earlier attempt to route Pull-updates through the WS
+# `send_message` handler — that handler rejects empty text before the
+# inbox drain branch ever runs, so the only way to invoke the empty-text
+# Pull-updates path (spec §4.3.5) is via this dedicated endpoint.
+#
+# Behavior:
+#   1. Resolve the parent SID; 404 if not daemon-managed.
+#   2. If the parent has no undelivered reports on disk AND no in-memory
+#      inbox_dirty flag, return {ok: True, pulled: False, undelivered_count: 0}
+#      without invoking send_message.  This keeps a no-op button click
+#      from spamming the parent with empty turns.
+#   3. Call SessionManager.send_message(parent_sid, "") — the existing
+#      empty-text branch in send_message (daemon/session_manager.py §4.3.5)
+#      drains the inbox and sends the block as the entire user turn.
+#   4. Forward send_message's queued/ok/error shape back to the caller.
+@bp.route(
+    "/api/sessions/<parent_sid>/pull-subsession-updates",
+    methods=["POST"],
+)
+def api_pull_subsession_updates(parent_sid):
+    """Deliver pending subsession reports to the parent as the next turn."""
+    from daemon.subsession_inbox import (
+        _validate_sid,
+        has_undelivered,
+        undelivered_count,
+    )
+
+    project = request.args.get("project", "").strip()
+    sm = current_app.session_manager
+
+    # Phase 6.5 P1-2: validate the SID shape before any disk access.
+    try:
+        _validate_sid(parent_sid)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid parent_sid: {e}"}), 400
+
+    canonical = _resolve_remapped_id(parent_sid, project)
+    if canonical:
+        parent_sid = canonical
+
+    # 1. Parent must be daemon-managed; otherwise there's no send_message
+    # to fire and the drain block never reaches the SDK.  We deliberately
+    # do NOT fall back to writing into the inbox on disk — the inbox is
+    # the *write* side; this endpoint is the *deliver* side.
+    parent_meta = sm.get_subsession_meta(parent_sid)
+    if not parent_meta:
+        return jsonify({"error": "parent session not found"}), 404
+
+    # 2. No-op guard.  If the in-memory flag is False AND the on-disk
+    # file is empty, do nothing.  This protects against a button mash
+    # from injecting a stream of empty turns into the parent.
+    has_pending = False
+    try:
+        has_pending = has_undelivered(parent_sid)
+    except Exception as e:
+        log.debug("pull-subsession-updates: has_undelivered soft-fail: %s", e)
+        has_pending = False
+    # Also honor the in-memory flag — it can be True while disk says
+    # otherwise for the brief window between report-to-parent's append
+    # and the next persist cycle.
+    inmem_dirty = False
+    try:
+        if hasattr(sm, "_sessions"):
+            with sm._lock:
+                info = sm._sessions.get(parent_sid)
+                if info:
+                    inmem_dirty = bool(getattr(info, "inbox_dirty", False))
+    except Exception:
+        inmem_dirty = False
+
+    if not has_pending and not inmem_dirty:
+        return jsonify({
+            "ok": True,
+            "pulled": False,
+            "undelivered_count": 0,
+        })
+
+    # 3. Fire send_message with empty text — the daemon's inbox-drain
+    # branch (spec §4.3.5) turns this into "deliver the drain block as
+    # the entire user turn."
+    result = sm.send_message(parent_sid, "")
+    if not isinstance(result, dict):
+        return jsonify({"error": "send_message returned non-dict"}), 500
+
+    # 4. Mirror send_message's response shape so the frontend can use the
+    # same success/failed/queued handling it uses for normal sends.
+    pulled = bool(result.get("ok") or result.get("queued"))
+    payload = {
+        "ok": bool(result.get("ok") or result.get("queued")),
+        "pulled": pulled,
+        "queued": bool(result.get("queued")),
+        "undelivered_count": undelivered_count(parent_sid),
+    }
+    if not pulled and result.get("error"):
+        payload["error"] = result.get("error")
+        return jsonify(payload), 400
+    return jsonify(payload)
+
+
+# ── Subsessions: re-anchor / detach for rewind-orphaned children (P1-5) ──
+# POST /api/sessions/<child_sid>/reanchor
+# Body: {"origin_turn": int}     # optional; defaults to current parent tip
+#
+# Called by the rewind-orphan UI prompt when the user chooses "Re-anchor at
+# current parent tip" for a child whose subsession_origin_turn fell past
+# the parent's new line count after a rewind.  Updates the child's
+# in-memory ``subsession_origin_turn`` so the spawn-point badge clears.
+@bp.route("/api/sessions/<child_sid>/reanchor", methods=["POST"])
+def api_reanchor_subsession(child_sid):
+    """Re-anchor a rewind-orphaned subsession at a new parent tip."""
+    from daemon.subsession_inbox import _validate_sid
+
+    project = request.args.get("project", "").strip()
+    sm = current_app.session_manager
+
+    try:
+        _validate_sid(child_sid)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid child_sid: {e}"}), 400
+
+    canonical = _resolve_remapped_id(child_sid, project)
+    if canonical:
+        child_sid = canonical
+
+    data = request.get_json(silent=True) or {}
+    new_origin_turn = data.get("origin_turn")
+
+    # If no explicit origin_turn given, derive from the parent's current
+    # JSONL line count.  This is the spec §6.3 "Re-anchor at current parent
+    # tip" affordance.
+    if new_origin_turn is None:
+        meta = sm.get_subsession_meta(child_sid)
+        if not meta:
+            return jsonify({"error": "child session not found"}), 404
+        parent_sid = meta.get("parent_session_id")
+        if not parent_sid:
+            return jsonify({"error": "child has no parent"}), 400
+        parent_jsonl = _sessions_dir(project) / f"{parent_sid}.jsonl"
+        if not parent_jsonl.exists():
+            return jsonify({"error": "parent session not found"}), 404
+        try:
+            with open(parent_jsonl, encoding="utf-8") as f:
+                new_origin_turn = sum(1 for _ in f)
+        except Exception as e:
+            return jsonify({"error": f"failed to read parent jsonl: {e}"}), 500
+
+    if not isinstance(new_origin_turn, int) or new_origin_turn < 0:
+        return jsonify({"error": "origin_turn must be a non-negative integer"}), 400
+
+    if not hasattr(sm, "reanchor_subsession"):
+        return jsonify({"error": "reanchor not supported"}), 500
+    ok = bool(sm.reanchor_subsession(child_sid, new_origin_turn))
+    if not ok:
+        return jsonify({"error": "child session not found"}), 404
+    return jsonify({"ok": True, "subsession_origin_turn": new_origin_turn})
+
+
+# POST /api/sessions/<child_sid>/detach
+# Detaches a subsession from its parent (sets parent_session_id=None),
+# behaving like §6.2 orphan.  Used by the rewind-orphan UI prompt when
+# the user chooses "Detach" over "Re-anchor."
+@bp.route("/api/sessions/<child_sid>/detach", methods=["POST"])
+def api_detach_subsession(child_sid):
+    """Detach a subsession from its parent (orphan-like state)."""
+    from daemon.subsession_inbox import _validate_sid
+
+    project = request.args.get("project", "").strip()
+    sm = current_app.session_manager
+
+    try:
+        _validate_sid(child_sid)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid child_sid: {e}"}), 400
+
+    canonical = _resolve_remapped_id(child_sid, project)
+    if canonical:
+        child_sid = canonical
+
+    if not hasattr(sm, "detach_subsession"):
+        return jsonify({"error": "detach not supported"}), 500
+    ok = bool(sm.detach_subsession(child_sid))
+    if not ok:
+        return jsonify({"error": "child session not found"}), 404
+    return jsonify({"ok": True})
+
+
+# ── Subsessions: auto-report toggle (phase 6.5 P1-4) ─────────────────────
+# POST /api/sessions/<child_sid>/auto-report-toggle
+# Body: {"on": bool}
+#
+# Sets the in-memory + persisted ``auto_report_on_idle`` preference on a
+# subsession.  When True, the daemon writes the last assistant message
+# to the parent's inbox on each IDLE transition that has a fresh turn
+# since the last auto-report.  Idempotent across multiple IDLE emits via
+# the SessionInfo ``_last_auto_report_entry_count`` counter.
+@bp.route(
+    "/api/sessions/<child_sid>/auto-report-toggle",
+    methods=["POST"],
+)
+def api_auto_report_toggle(child_sid):
+    """Toggle auto-report-on-idle for a subsession."""
+    from daemon.subsession_inbox import _validate_sid
+
+    project = request.args.get("project", "").strip()
+    sm = current_app.session_manager
+
+    try:
+        _validate_sid(child_sid)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid child_sid: {e}"}), 400
+
+    canonical = _resolve_remapped_id(child_sid, project)
+    if canonical:
+        child_sid = canonical
+
+    data = request.get_json(silent=True) or {}
+    on = bool(data.get("on"))
+
+    ok = False
+    try:
+        if hasattr(sm, "set_auto_report_on_idle"):
+            ok = bool(sm.set_auto_report_on_idle(child_sid, on))
+    except Exception as e:
+        log.warning(
+            "auto-report-toggle: set_auto_report_on_idle failed for %s: %s",
+            child_sid, e,
+        )
+        return jsonify({"error": str(e)}), 500
+
+    if not ok:
+        return jsonify({"error": "subsession not found"}), 404
+    return jsonify({"ok": True, "auto_report_on_idle": on})
+
+
+# ── Subsessions: last-conclusion extraction (Patent 15 reverse-parse) ────
+# GET /api/sessions/<sid>/last-conclusion
+#
+# Returns the most-recent meaningful assistant text for a session by
+# tail-reading its JSONL and reverse-parsing, skipping transient and
+# tool-only entries.  This is the authoritative source for the
+# "Report to Parent" prefill — the frontend previously scraped rendered
+# DOM (static/js/live-panel.js), which is fragile and breaks when the
+# log is virtualized or the bubble markup changes.  Mirrors the
+# out-of-band session inference reverse-parse (read only the file tail,
+# walk entries newest-first, stop at the first assistant text block).
+_LAST_CONCLUSION_TAIL_BYTES = 256 * 1024  # generous tail; assistant turns can be long
+
+
+def _extract_last_assistant_text(jsonl_path: Path) -> str:
+    """Reverse-parse *jsonl_path* and return the last assistant text block.
+
+    Reads only the final ``_LAST_CONCLUSION_TAIL_BYTES`` of the file so
+    cost is O(1) regardless of transcript length.  Walks decoded lines
+    newest-first and returns the first assistant entry that carries real
+    text (a ``text`` content block, or a plain string message).  Tool-use
+    / tool-result / transient entries are skipped.  Returns "" when no
+    assistant text is found in the tail.
+    """
+    try:
+        size = jsonl_path.stat().st_size
+    except OSError:
+        return ""
+    try:
+        with open(jsonl_path, "rb") as f:
+            if size > _LAST_CONCLUSION_TAIL_BYTES:
+                f.seek(size - _LAST_CONCLUSION_TAIL_BYTES)
+                f.readline()  # discard the partial first line after the seek
+            raw = f.read()
+    except OSError:
+        return ""
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "assistant":
+            continue
+        content = obj.get("message", {}).get("content", "")
+        if isinstance(content, str):
+            if content.strip():
+                return content.strip()
+            continue
+        if isinstance(content, list):
+            # Prefer the last text block within the entry (the visible
+            # conclusion usually follows any tool calls in the same turn).
+            for block in reversed(content):
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and (block.get("text") or "").strip()
+                ):
+                    return block["text"].strip()
+    return ""
+
+
+@bp.route("/api/sessions/<sid>/last-conclusion", methods=["GET"])
+def api_last_conclusion(sid):
+    """Return the most-recent meaningful assistant text for a session."""
+    from daemon.subsession_inbox import _validate_sid
+
+    project = request.args.get("project", "").strip()
+
+    try:
+        _validate_sid(sid)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid session id: {e}"}), 400
+
+    canonical = _resolve_remapped_id(sid, project)
+    if canonical:
+        sid = canonical
+
+    src = _sessions_dir(project) / f"{sid}.jsonl"
+    if not src.exists():
+        return jsonify({"error": "Session not found"}), 404
+
+    text = _extract_last_assistant_text(src)
+    return jsonify({"ok": True, "session_id": sid, "text": text})
+
+
 @bp.route("/api/rewind/<session_id>", methods=["POST"])
 def api_rewind(session_id):
     """Rewind tracked files to the state at a given message line number."""
@@ -1044,10 +1844,28 @@ def api_rewind(session_id):
         if fp not in _handled:
             skipped.append(fp)
 
+    # ── Subsessions rewind-orphan detection (spec §6.3) ──
+    # If this parent has any in-memory children whose subsession_origin_turn
+    # is now past the rewound line count, surface them so the UI can show a
+    # "Spawn point no longer in parent's history" badge and prompt the
+    # user to Re-anchor or Detach.  We do NOT auto-detach.
+    rewind_orphans = []
+    try:
+        sm = current_app.session_manager
+        if hasattr(sm, "detect_rewind_orphans"):
+            candidate = sm.detect_rewind_orphans(session_id, int(up_to_line))
+            # Only accept a real list — test stubs (MagicMock) return a
+            # non-list and we'd otherwise crash flask's JSON encoder.
+            if isinstance(candidate, list):
+                rewind_orphans = candidate
+    except Exception as e:
+        log.debug("detect_rewind_orphans soft-fail: %s", e)
+
     return jsonify({
         "ok": True,
         "files_restored": restored,
         "files_skipped": skipped,
+        "rewind_orphans": rewind_orphans,
     })
 
 

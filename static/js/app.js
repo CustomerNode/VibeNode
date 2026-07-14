@@ -648,8 +648,8 @@ const _viewModes = {
   },
   compose: {
     icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
-    label: 'Compose View',
-    title: 'Compose',
+    label: 'Subsessions View',
+    title: 'Subsessions',
     desc: 'Documents, diagrams, and knowledge creation board',
   },
 };
@@ -658,7 +658,7 @@ function openViewModeSelector() {
   setViewMode('homepage');
 }
 
-const _viewNames = { homepage: 'Home', sessions: 'Sessions', kanban: 'Workflow', workplace: 'Workforce', compose: 'Compose' };
+const _viewNames = { homepage: 'Home', sessions: 'Sessions', kanban: 'Workflow', workplace: 'Workforce', compose: 'Subsessions' };
 const _viewIcons = {
   homepage: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10" fill="var(--bg-body)"/></svg>',
   sessions: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
@@ -1561,13 +1561,27 @@ async function loadSessions() {
 }
 
 function filterSessions() {
-  const q = document.getElementById('search').value.toLowerCase();
-  const filtered = q
-    ? allSessions.filter(s =>
-        (s.display_title||'').toLowerCase().includes(q) ||
-        (s.preview||'').toLowerCase().includes(q)
-      )
-    : allSessions;
+  const rawQuery = document.getElementById('search').value.trim();
+  const q = rawQuery.toLowerCase();
+
+  // Active search query → deep search. Render the rich result cards
+  // (snippets, highlighted hits, matched files) inline in the list area.
+  // Every view mode renders into #session-list, so this consistently
+  // replaces the list while searching and restores it when the box clears.
+  // No modal, no second search box — the sidebar search box drives it.
+  if (q) {
+    if (typeof renderDeepSearchInto === 'function') {
+      renderDeepSearchInto(rawQuery, q);
+      return;
+    }
+  } else {
+    // Cleared box — drop the deep-search result set and show everything.
+    window._deepFilterQuery = '';
+    window._deepFilterSessions = null;
+    window._deepFilterStats = null;
+  }
+
+  const filtered = allSessions;
   if (viewMode === 'homepage') {
     if (typeof _updateHomepageStats === 'function') _updateHomepageStats();
     return;
@@ -1580,6 +1594,11 @@ function filterSessions() {
     renderWorkforce(wfSortedSessions(filtered));
   } else if (viewMode === 'sessions') {
     renderList(sortedSessions(filtered));
+  } else if (viewMode === 'compose') {
+    // Keep the Subsessions "Ad-hoc" family tree live as session state
+    // changes stream in.  No-op when the Structured tab is active or the
+    // renderer isn't loaded yet.
+    if (typeof _renderAdhocSubsessions === 'function') _renderAdhocSubsessions();
   }
 }
 
@@ -1673,10 +1692,12 @@ async function openModelSelector() {
   } catch (e) {
     // Fallback list uses full model IDs — same as server aliases
     models = [
+      {id: 'claude-fable-5',   name: 'Fable 5',    desc: 'Most capable, 1M context'},
+      {id: 'claude-opus-4-8',  name: 'Opus 4.8',   desc: 'Newest Opus, 1M context'},
       {id: 'claude-opus-4-7',  name: 'Opus 4.7',   desc: '1M context, deepest reasoning'},
       {id: 'claude-opus-4-6',  name: 'Opus 4.6',   desc: 'Deep reasoning, 200K context'},
-      {id: 'claude-sonnet-5',  name: 'Sonnet 5',   desc: 'Most agentic Sonnet, fast & capable'},
-      {id: 'claude-sonnet-4-6',name: 'Sonnet 4.6', desc: 'Previous Sonnet, balanced'},
+      {id: 'claude-sonnet-5',  name: 'Sonnet 5',   desc: 'Newest Sonnet, fast + capable, 1M context'},
+      {id: 'claude-sonnet-4-6',name: 'Sonnet 4.6', desc: 'Fast, capable, balanced'},
       {id: 'claude-haiku-4-5', name: 'Haiku 4.5',  desc: 'Fastest, most cost-efficient'},
     ];
   }
@@ -1713,6 +1734,7 @@ function _modelLabel(modelId) {
   if (modelId === 'opus')   return 'Opus 4.6';
   if (modelId === 'sonnet') return 'Sonnet 4.6';
   if (modelId === 'haiku')  return 'Haiku 4.5';
+  if (modelId === 'fable')  return 'Fable 5';
   // Generic: claude-<family>-<major>[-<minor>][-YYYYMMDD] with optional
   // trailing capability marker like [1m].  Handles ANY family (opus,
   // sonnet, haiku, fable, …) so new models never fall back to raw ids.

@@ -174,6 +174,335 @@ def _get_deleted_ids(project: str = "") -> set:
     return set(pruned.keys())
 
 
+def _unmark_deleted(session_id: str, project: str = "") -> None:
+    """Remove a session's tombstone.  Used when restoring from trash so
+    all_sessions() stops hiding the resurrected session."""
+    with _tombstone_lock:
+        tombstones = _load_tombstones(project)
+        if session_id in tombstones:
+            tombstones.pop(session_id)
+            _save_tombstones(tombstones, project)
+
+
+# ---------------------------------------------------------------------------
+# Soft-delete trash -- recoverable session deletion
+# ---------------------------------------------------------------------------
+# Session deletion used to permanently unlink the .jsonl, with no undo.  A
+# single misclick (easy while clicking around the UI) lost an entire
+# transcript forever.  move_to_trash() relocates the .jsonl into a per-project
+# ``_trash/`` folder and records the deletion time + saved name in
+# ``_trash/_trash_index.json`` so deletes are reversible.  all_sessions()
+# globs ``*.jsonl`` non-recursively and skips ``_``-prefixed stems, so trashed
+# files never reappear in the UI.  Entries are pruned lazily (and their files
+# removed) on the next trash operation, per the user's retention policy
+# (default Forever) and honoring per-entry grandfather protection
+# (``protected_until``).  See ``_retention_seconds`` and ``_prune_trash``.
+
+_TRASH_MAX_AGE = 2592000  # seconds (30 days) — legacy fallback / test hook only
+_trash_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Retention policy resolution
+# ---------------------------------------------------------------------------
+# The active retention window is driven by the user's selection in the
+# "Recently Deleted" modal, stored as ``session_retention_days`` in the
+# daemon-owned ``~/.claude/gui_ui_prefs.json``.  This module is a READ-ONLY
+# consumer of that file (one writer = the daemon's PermissionManager; many
+# readers).  Reading the file directly (rather than via the daemon socket)
+# means pruning still works when the daemon is down and avoids a socket
+# round-trip on every trash op.
+#
+# SAFETY (load-bearing): every path that resolves retention treats a missing
+# key / non-int / bool / non-positive / unreadable value as Forever (36500),
+# NEVER 30.  Time-based deletion must require a deliberate user selection.
+_RETENTION_DEFAULT_DAYS = 36500  # "Forever"
+_RETENTION_PREFS_KEY = "session_retention_days"
+_UI_PREFS_PATH = Path.home() / ".claude" / "gui_ui_prefs.json"  # daemon-owned; READ only
+
+
+def _retention_days() -> int:
+    """Resolve the active retention window in days.
+
+    Returns ``_RETENTION_DEFAULT_DAYS`` (Forever) on any missing/corrupt/
+    non-positive value.  30 is only ever returned if explicitly chosen by
+    the user.  Read-only consumer of the daemon-owned gui_ui_prefs.json.
+    """
+    try:
+        data = json.loads(_UI_PREFS_PATH.read_text(encoding="utf-8"))
+        val = data.get(_RETENTION_PREFS_KEY) if isinstance(data, dict) else None
+        if isinstance(val, bool):          # bool is an int subclass — reject
+            return _RETENTION_DEFAULT_DAYS
+        if isinstance(val, int) and val > 0:
+            return val
+    except Exception:
+        pass
+    return _RETENTION_DEFAULT_DAYS
+
+
+def _retention_seconds() -> int:
+    return _retention_days() * 86400
+
+
+def _trash_dir(project: str = "") -> Path:
+    return _sessions_dir(project) / "_trash"
+
+
+def _trash_index_file(project: str = "") -> Path:
+    return _trash_dir(project) / "_trash_index.json"
+
+
+def _load_trash_index(project: str = "") -> dict:
+    """Return {session_id: {deleted_at: float, name: str}} for trashed sessions."""
+    try:
+        data = json.loads(_trash_index_file(project).read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_trash_index(index: dict, project: str = "") -> None:
+    # The _trash/ folder is created lazily by move_to_trash, but list/restore/
+    # purge can call this before any session has been trashed — ensure the
+    # directory exists so the write never fails with FileNotFoundError.
+    f = _trash_index_file(project)
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    f.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _prune_trash(index: dict, project: str = "") -> dict:
+    """Drop entries past the active retention window (honoring per-entry
+    grandfather protection) and unlink their backing files.
+
+    An entry is purged only when BOTH conditions hold:
+      * it has aged past the active window: ``now - deleted_at >= max_age``
+      * it is no longer grandfather-protected: ``now >= protected_until``
+    ``protected_until`` (epoch) is stamped by ``reconcile_retention_on_shorten``
+    so a policy change can never instantly delete an item the prior policy
+    promised to keep.  Missing ``protected_until`` is treated as 0 (unprotected).
+
+    Test/back-compat: an explicit monkeypatch of ``_TRASH_MAX_AGE`` wins so the
+    existing ``test_expired_entries_are_pruned`` (which sets it to 10) keeps
+    working.  Otherwise the live user policy applies (default Forever).
+    """
+    now = time.time()
+    max_age = _TRASH_MAX_AGE if _TRASH_MAX_AGE != 2592000 else _retention_seconds()
+    td = _trash_dir(project)
+    result = {}
+    for sid, meta in index.items():
+        meta = meta or {}
+        ts = meta.get("deleted_at", 0)
+        protected_until = meta.get("protected_until", 0) or 0
+        aged_out = (now - ts) >= max_age
+        unprotected = now >= protected_until
+        if aged_out and unprotected:
+            try:
+                (td / f"{sid}.jsonl").unlink()
+            except Exception:
+                pass
+        else:
+            result[sid] = meta
+    return result
+
+
+def move_to_trash(session_id: str, project: str = "", name: str = "",
+                  retries: int = 5, delay: float = 0.2) -> bool:
+    """Move a session's .jsonl into the per-project ``_trash/`` folder so the
+    delete is recoverable.
+
+    Returns True if a file was trashed, False if there was no .jsonl to move
+    (already gone / never created) or every retry hit a Windows file lock.
+    Retries on PermissionError just like _unlink_with_retry so an AV/CLI hold
+    on the handle doesn't drop us straight into the hard-delete fallback.
+    """
+    src = _sessions_dir(project) / f"{session_id}.jsonl"
+    with _trash_lock:
+        td = _trash_dir(project)
+        try:
+            td.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return False
+        # Opportunistic prune so the trash folder self-bounds over time.
+        index = _prune_trash(_load_trash_index(project), project)
+        dest = td / f"{session_id}.jsonl"
+        moved = False
+        for attempt in range(retries):
+            if not src.exists():
+                break
+            try:
+                if dest.exists():
+                    dest.unlink()
+                src.replace(dest)
+                moved = True
+                break
+            except PermissionError:
+                if attempt < retries - 1:
+                    time.sleep(delay)
+                    continue
+                # Last-ditch: copy bytes then unlink the source.
+                try:
+                    dest.write_bytes(src.read_bytes())
+                    src.unlink()
+                    moved = True
+                except Exception:
+                    moved = False
+                break
+            except FileNotFoundError:
+                break
+            except Exception:
+                # Cross-device or other failure — try copy+unlink once.
+                try:
+                    dest.write_bytes(src.read_bytes())
+                    src.unlink()
+                    moved = True
+                except Exception:
+                    moved = False
+                break
+        if moved:
+            index[session_id] = {"deleted_at": time.time(), "name": name or ""}
+            _save_trash_index(index, project)
+        return moved
+
+
+def list_trash(project: str = "") -> list:
+    """Return [{id, name, deleted_at, size}] for restorable trashed sessions,
+    newest-deleted first.  Prunes expired entries as a side effect."""
+    with _trash_lock:
+        original = _load_trash_index(project)
+        index = _prune_trash(original, project)
+        # Only persist when pruning actually removed entries — avoids creating
+        # an empty _trash/ folder just because the user opened the trash view.
+        if len(index) != len(original):
+            _save_trash_index(index, project)
+        td = _trash_dir(project)
+        # Resolve the active window once for purge-date computation.  Under
+        # "Forever", purge_at is None (never auto-deletes).
+        ret = _retention_seconds()
+        forever = ret >= _RETENTION_DEFAULT_DAYS * 86400
+        out = []
+        for sid, meta in index.items():
+            f = td / f"{sid}.jsonl"
+            if not f.exists():
+                continue
+            try:
+                size = f.stat().st_size
+            except Exception:
+                size = 0
+            meta = meta or {}
+            deleted_at = meta.get("deleted_at", 0)
+            protected_until = meta.get("protected_until", 0) or 0
+            # The effective purge time is the later of the window expiry and
+            # any grandfather protection (matches _prune_trash's AND-of-both).
+            purge_at = None if forever else max(deleted_at + ret, protected_until)
+            out.append({
+                "id": sid,
+                "name": meta.get("name", ""),
+                "deleted_at": deleted_at,
+                "size": size,
+                "purge_at": purge_at,
+            })
+    out.sort(key=lambda e: e.get("deleted_at", 0), reverse=True)
+    return out
+
+
+def restore_from_trash(session_id: str, project: str = ""):
+    """Move a trashed .jsonl back into the sessions dir and drop its trash
+    index entry.  Returns the saved name (possibly '') on success, or None if
+    there was nothing to restore (or a live file already occupies the slot).
+    Callers are responsible for clearing the tombstone and re-saving the name.
+    """
+    with _trash_lock:
+        src = _trash_dir(project) / f"{session_id}.jsonl"
+        if not src.exists():
+            return None
+        dest = _sessions_dir(project) / f"{session_id}.jsonl"
+        if dest.exists():
+            # A live session already owns this id — refuse to clobber it.
+            return None
+        try:
+            src.replace(dest)
+        except Exception:
+            try:
+                dest.write_bytes(src.read_bytes())
+                src.unlink()
+            except Exception:
+                return None
+        index = _load_trash_index(project)
+        meta = index.pop(session_id, {}) or {}
+        _save_trash_index(index, project)
+    return meta.get("name", "")
+
+
+def purge_from_trash(session_id: str, project: str = "") -> bool:
+    """Permanently delete a single trashed session (file + index entry)."""
+    with _trash_lock:
+        index = _load_trash_index(project)
+        existed = session_id in index
+        index.pop(session_id, None)
+        _save_trash_index(index, project)
+        try:
+            (_trash_dir(project) / f"{session_id}.jsonl").unlink()
+            existed = True
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+    return existed
+
+
+def reconcile_retention_on_shorten(old_days: int, new_days: int, project: str = "") -> int:
+    """Grandfather existing trash when the retention policy is shortened.
+
+    When ``new_days < old_days``, stamp every existing trash entry in the
+    given project with ``protected_until = deleted_at + old_window`` where it
+    is missing or smaller (idempotent via ``max``).  This guarantees that
+    shortening the policy can NEVER instantly delete an item the prior policy
+    promised to keep — the item only ages out once it passes BOTH its
+    grandfathered protection AND the new (shorter) active window.
+
+    No-op (returns 0) when the policy is unchanged or lengthened.  Returns the
+    number of entries stamped.  Never raises — a locked index just means
+    grandfathering is skipped this run (re-running is safe and idempotent).
+    """
+    try:
+        old_days = int(old_days)
+        new_days = int(new_days)
+    except (TypeError, ValueError):
+        return 0
+    if new_days >= old_days:
+        return 0
+    old_window = old_days * 86400
+    stamped = 0
+    with _trash_lock:
+        try:
+            index = _load_trash_index(project)
+        except Exception:
+            return 0
+        if not index:
+            return 0
+        changed = False
+        for sid, meta in index.items():
+            meta = meta or {}
+            deleted_at = meta.get("deleted_at", 0)
+            new_protect = deleted_at + old_window
+            existing = meta.get("protected_until", 0) or 0
+            if new_protect > existing:
+                meta["protected_until"] = new_protect
+                index[sid] = meta
+                changed = True
+                stamped += 1
+        if changed:
+            try:
+                _save_trash_index(index, project)
+            except Exception:
+                return 0
+    return stamped
+
+
 # ---------------------------------------------------------------------------
 # Utility session tracking -- hide system sessions (title, planner, etc.)
 # ---------------------------------------------------------------------------

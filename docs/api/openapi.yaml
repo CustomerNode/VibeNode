@@ -130,6 +130,10 @@ tags:
     description: Claude Code authentication status and login
   - name: Tests
     description: Test runner (SSE stream) and cancellation
+  - name: Search
+    description: Full-text search across session transcripts (FTS5-backed)
+  - name: ChatGPT
+    description: ChatGPT bridge — relay prompts to a logged-in ChatGPT via Playwright
 
 paths:
   # ==========================================================================
@@ -488,6 +492,114 @@ paths:
               schema:
                 $ref: "#/components/schemas/OkResponse"
 
+  /api/trash:
+    get:
+      tags: [Sessions]
+      summary: List soft-deleted (recoverable) sessions
+      description: >
+        Returns soft-deleted sessions for the active project, newest first.
+        Each entry includes its saved title, deletion time, size, and the
+        computed purge time so the UI can offer one-click restore. Entries are
+        pruned lazily on the next trash operation per the user's retention
+        policy (session_retention_days; default Forever), honoring per-entry
+        grandfather protection. The selector that sets this policy also mirrors
+        the value to Claude Code's cleanupPeriodDays via the existing
+        GET/PUT /api/config (no new endpoint).
+      operationId: listTrash
+      parameters:
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Trash listing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  trash:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string
+                        deleted_at:
+                          type: number
+                        deleted_at_iso:
+                          type: string
+                        size:
+                          type: integer
+                        purge_at:
+                          type: number
+                          nullable: true
+                          description: >
+                            Epoch seconds when this entry will auto-delete under
+                            the active retention policy, or null when kept
+                            forever. Additive field.
+                        purge_at_iso:
+                          type: string
+                          nullable: true
+                          description: ISO-8601 form of purge_at (null when kept forever).
+
+  /api/trash/{session_id}/restore:
+    post:
+      tags: [Sessions]
+      summary: Restore a soft-deleted session from trash
+      operationId: restoreTrash
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session restored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  id:
+                    type: string
+                  title:
+                    type: string
+        "404":
+          description: Not found in trash
+
+  /api/trash/{session_id}:
+    delete:
+      tags: [Sessions]
+      summary: Permanently delete one trashed session (no further undo)
+      operationId: purgeTrash
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Session purged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  purged:
+                    type: boolean
+
   /api/delete-all:
     delete:
       tags: [Sessions]
@@ -658,6 +770,323 @@ paths:
                 ok: true
                 new_id: "session_fork_ghi012"
                 title: "Refactor authentication module (fork)"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/sessions/{parent_sid}/spawn-subsession:
+    post:
+      tags: [Sessions]
+      summary: Spawn a subsession from an existing parent session
+      description: |
+        Reuses the JSONL fork machinery to seed the new subsession with
+        the parent's transcript up to the spawn moment, then starts the
+        child as a normal SDK session with a parent pointer.  See
+        docs/plans/subsessions-spec.md §4.2.
+      operationId: spawnSubsession
+      parameters:
+        - name: parent_sid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Subsession spawned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  new_id:
+                    type: string
+                  parent_id:
+                    type: string
+                  title:
+                    type: string
+                  subsession_origin_turn:
+                    type: integer
+        "400":
+          description: Cross-project or planner-parent rejection
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Cycle detected in parent chain
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
+  /api/sessions/{child_sid}/report-to-parent:
+    post:
+      tags: [Sessions]
+      summary: Write a subsession report into its parent's inbox
+      description: |
+        Appends a new entry to the parent's inbox.json under
+        ~/.claude/vibenode-state/<parent_sid>/.  The parent's next
+        send_message turn surfaces the report by prepending a delimited
+        block onto the user's text (spec §4.3).
+      operationId: reportToParent
+      parameters:
+        - name: child_sid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [summary]
+              properties:
+                summary:
+                  type: string
+                  description: Plain-text summary surfaced to the parent.
+                attachments:
+                  type: array
+                  items:
+                    type: object
+      responses:
+        "200":
+          description: Report written
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  report_id:
+                    type: string
+                  parent_session_id:
+                    type: string
+                  undelivered_count:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/sessions/{parent_sid}/pull-subsession-updates:
+    post:
+      tags: [Sessions]
+      summary: Deliver pending subsession reports to the parent
+      description: |
+        Dedicated REST endpoint behind the live-panel "Pull updates" button.
+        Calls send_message(parent_sid, "") — the daemon's empty-text branch
+        (spec §4.3.5) drains the parent's inbox and sends the report block
+        as the entire user turn.  Replaces an earlier broken WS path.
+      operationId: pullSubsessionUpdates
+      parameters:
+        - name: parent_sid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Pull dispatched (or no-op when there is nothing to pull)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  pulled:
+                    type: boolean
+                  queued:
+                    type: boolean
+                  undelivered_count:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/sessions/{child_sid}/reanchor:
+    post:
+      tags: [Sessions]
+      summary: Re-anchor a rewind-orphaned subsession at a new parent tip
+      description: |
+        Spec §6.3 Re-anchor action.  Updates the child's
+        subsession_origin_turn so the rewind-orphan badge clears.
+        If origin_turn is omitted, the server reads the parent's
+        current JSONL line count and uses that.
+      operationId: reanchorSubsession
+      parameters:
+        - name: child_sid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                origin_turn:
+                  type: integer
+                  description: New parent JSONL line count to anchor at.
+      responses:
+        "200":
+          description: Re-anchored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  subsession_origin_turn:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/sessions/{child_sid}/detach:
+    post:
+      tags: [Sessions]
+      summary: Detach a subsession from its parent (orphan-like state)
+      description: |
+        Spec §6.3 Detach action — clears parent_session_id and stamps
+        parent_deleted_at so the orphan UI surfaces "Reports to:
+        (parent deleted)."
+      operationId: detachSubsession
+      parameters:
+        - name: child_sid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Detached
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/sessions/{child_sid}/auto-report-toggle:
+    post:
+      tags: [Sessions]
+      summary: Toggle auto-report-on-idle for a subsession
+      description: |
+        Persists the subsession's auto_report_on_idle preference on the
+        daemon-side SessionInfo so each IDLE _emit_state with a fresh
+        assistant turn auto-writes a report into the parent's inbox
+        (phase 6.5 P1-4 / spec §4.3.3 "Automatic").
+      operationId: setAutoReportToggle
+      parameters:
+        - name: child_sid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                on:
+                  type: boolean
+      responses:
+        "200":
+          description: Toggle applied
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  auto_report_on_idle:
+                    type: boolean
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/sessions/{sid}/last-conclusion:
+    get:
+      tags: [Sessions]
+      summary: Most-recent meaningful assistant text for a session
+      description: |
+        Tail-reads the session's JSONL and reverse-parses to the last
+        assistant text block, skipping tool-only and transient entries
+        (Patent 15 out-of-band inference pattern). Authoritative source
+        for the subsession "Report to Parent" prefill, replacing fragile
+        DOM scraping of the rendered transcript.
+      operationId: getLastConclusion
+      parameters:
+        - name: sid
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Last conclusion text (empty string when none found)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  session_id:
+                    type: string
+                  text:
+                    type: string
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
@@ -5314,6 +5743,22 @@ paths:
               schema:
                 type: string
 
+  /api/ping:
+    get:
+      tags: [App]
+      summary: Lightweight liveness probe used by the UI server-reachable health check
+      operationId: ping
+      responses:
+        "200":
+          description: Server is reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+
   /api/invoke/discover:
     get:
       tags: [Invoke]
@@ -5350,6 +5795,222 @@ paths:
                     type: array
                     items:
                       type: object
+
+  # ==========================================================================
+  # Search (search_api.py)
+  # ==========================================================================
+  /api/search:
+    get:
+      tags: [Search]
+      summary: Full-text search across the active project's session transcripts
+      operationId: searchSessions
+      description: |
+        Searches the FTS5 index built from the project's session JSONLs.
+        Supports free-text queries (BM25-ranked, with highlighted snippets),
+        touched-file lookup ("which session edited this file"), or both
+        combined (intersection). The index is derived local state stored in
+        `~/.claude/gui_search_index.db`, updated incrementally (mtime-based)
+        and debounced — indexing never runs on a per-turn hot path. Deleted,
+        utility, and remapped sessions are filtered from results at query
+        time.
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Free-text query (min 2 chars unless `file` is given).
+        - name: file
+          in: query
+          schema:
+            type: string
+          description: |
+            Touched-file path fragment (case- and slash-insensitive). Matches
+            sessions that edited a file whose path contains the fragment.
+        - name: project
+          in: query
+          schema:
+            type: string
+          description: Encoded project dir name; defaults to the active project.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+          description: Max sessions returned.
+      responses:
+        "200":
+          description: Ranked search results grouped by session
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  project:
+                    type: string
+                  query:
+                    type: string
+                  file:
+                    type: string
+                  sessions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        session_id:
+                          type: string
+                        rank:
+                          type: number
+                          description: BM25 rank (lower/more negative = better).
+                        snippets:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              role:
+                                type: string
+                              ts:
+                                type: string
+                              text:
+                                type: string
+                                description: |
+                                  Snippet with matches wrapped in [[HIT]] /
+                                  [[/HIT]] markers (converted to highlights
+                                  client-side after HTML-escaping).
+                        files:
+                          type: array
+                          items:
+                            type: string
+                  stats:
+                    type: object
+                    properties:
+                      sessions_indexed:
+                        type: integer
+                      messages_indexed:
+                        type: integer
+                      took_ms:
+                        type: number
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  # ==========================================================================
+  # ChatGPT bridge (chatgpt_api.py)
+  # ==========================================================================
+  /chatgpt:
+    get:
+      tags: [ChatGPT]
+      summary: Serve the standalone ChatGPT bridge page
+      operationId: chatgptPage
+      responses:
+        "200":
+          description: HTML bridge page
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /api/chatgpt/status:
+    get:
+      tags: [ChatGPT]
+      summary: Get ChatGPT bridge status
+      operationId: chatgptStatus
+      responses:
+        "200":
+          description: Bridge status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  logged_in:
+                    type: boolean
+                  busy:
+                    type: boolean
+
+  /api/chatgpt/login:
+    post:
+      tags: [ChatGPT]
+      summary: Open a visible browser window for manual ChatGPT login
+      operationId: chatgptLogin
+      responses:
+        "200":
+          description: Login window result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  error:
+                    type: string
+                    nullable: true
+
+  /api/chatgpt/ask:
+    post:
+      tags: [ChatGPT]
+      summary: Relay a prompt to the logged-in ChatGPT and return the reply
+      operationId: chatgptAsk
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                prompt:
+                  type: string
+                files:
+                  type: array
+                  items:
+                    type: string
+                  description: Optional file paths to attach.
+      responses:
+        "200":
+          description: ChatGPT reply
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  result:
+                    type: string
+                    nullable: true
+                  error:
+                    type: string
+                    nullable: true
+        "400":
+          description: Invalid request ('files' must be a list)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  result:
+                    type: string
+                    nullable: true
+                  error:
+                    type: string
+        "502":
+          description: Bridge failure (not logged in, busy, or browser error)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  result:
+                    type: string
+                    nullable: true
+                  error:
+                    type: string
 
 components:
   parameters:

@@ -1,5 +1,399 @@
 /* live-panel.js — live terminal panel, input bar state machine, GUI session management */
 
+// ═══════════════════════════════════════════════════════════════
+// Subsessions — live panel additions (spec §4.6.2)
+// ═══════════════════════════════════════════════════════════════
+//
+// Three additions, all rendered into #live-panel as siblings of
+// #live-log / #live-input-bar:
+//   1. Breadcrumb above #live-log when the active session is a
+//      subsession ("Main session ▸ This subsession").
+//   2. Inbox strip above #live-input-bar when the active session is a
+//      parent with inbox_dirty = true.
+//   3. Subsession toolbar buttons inside #live-input-bar's left group:
+//      "Report to Parent" + "Auto-report on idle" toggle.
+//
+// All three call _renderSubsessionAffordances(sid) which is idempotent
+// — safe to call from the live panel build path and from the
+// session_state WS handler when inbox_dirty changes.
+
+function _findSessionInList(sid) {
+  if (typeof allSessions === 'undefined' || !sid) return null;
+  return allSessions.find(s => s.id === sid) || null;
+}
+
+function _isSubsessionForUI(sess) {
+  return !!(sess && sess.parent_session_id);
+}
+
+function _renderSubsessionBreadcrumb(parentEl, sess) {
+  // "You are here" role banner at the very top of the live panel.  This is
+  // the primary signal that tells the user which kind of session they are
+  // typing into — the earlier faint breadcrumb was too subtle, which led
+  // to typing into the wrong session.  Renders for BOTH roles:
+  //   - subsession  → amber "SUBSESSION ▸ from: <parent>" banner
+  //   - parent w/ children → blue "MAIN SESSION · N subsessions" banner
+  // A plain session with no parent and no children gets no banner.
+  const old = parentEl.querySelector('.session-role-banner');
+  if (old) old.remove();
+  if (!sess) return;
+
+  const isSub = _isSubsessionForUI(sess);
+
+  // Count this session's live subsession children (parent role).
+  let childCount = 0;
+  if (typeof allSessions !== 'undefined' && Array.isArray(allSessions)) {
+    childCount = allSessions.filter(x => x && x.parent_session_id === sess.id).length;
+  }
+
+  // Nothing to show for an ordinary top-level session.
+  if (!isSub && childCount === 0) return;
+
+  const div = document.createElement('div');
+
+  if (isSub) {
+    const parent = _findSessionInList(sess.parent_session_id);
+    const parentExists = !!parent;
+    const parentName = parent
+      ? (parent.custom_title || parent.display_title || sess.parent_session_id.slice(0, 8))
+      : sess.parent_session_id.slice(0, 8);
+    div.className = 'session-role-banner role-subsession';
+    if (parentExists) {
+      div.innerHTML =
+        '<span class="role-badge role-badge-sub">SUBSESSION</span>'
+        + '<span class="role-banner-text">from '
+        + '<a href="#" class="subsession-bc-parent">' + escHtml(parentName) + '</a>'
+        + '</span>';
+      const link = div.querySelector('.subsession-bc-parent');
+      link.addEventListener('click', function(ev) {
+        ev.preventDefault();
+        if (typeof openInGUI === 'function') openInGUI(sess.parent_session_id);
+      });
+    } else {
+      div.innerHTML =
+        '<span class="role-badge role-badge-sub">SUBSESSION</span>'
+        + '<span class="role-banner-text">parent <span class="deleted-parent">'
+        + escHtml(parentName) + '</span> (deleted)</span>';
+    }
+  } else {
+    // Parent role — has at least one subsession.
+    const noun = childCount === 1 ? 'subsession' : 'subsessions';
+    div.className = 'session-role-banner role-parent';
+    div.innerHTML =
+      '<span class="role-badge role-badge-main">MAIN SESSION</span>'
+      + '<span class="role-banner-text">' + childCount + ' ' + noun
+      + ' running in parallel</span>';
+  }
+
+  // Insert at the very top of #live-panel, above #live-log.
+  parentEl.insertBefore(div, parentEl.firstChild);
+}
+
+function _renderSubsessionInboxStrip(panelEl, sess) {
+  // Remove any existing strip first.
+  const old = panelEl.querySelector('.subsession-inbox-strip');
+  if (old) old.remove();
+  if (!sess || !sess.inbox_dirty) return;
+
+  const strip = document.createElement('div');
+  strip.className = 'subsession-inbox-strip';
+  strip.setAttribute('aria-live', 'polite');
+  // Show the undelivered count (spec §4.6.2: "N subsession reports …").
+  // The count is published by the inbox_updated WS handler into
+  // window.__subsessionInboxCounts; fall back to a count-less phrasing
+  // until it arrives.
+  const _stripCount = (window.__subsessionInboxCounts
+    && window.__subsessionInboxCounts[sess.id]) || 0;
+  const _stripLead = _stripCount
+    ? (_stripCount + ' subsession ' + (_stripCount === 1 ? 'report' : 'reports'))
+    : 'Subsession reports';
+  strip.innerHTML =
+    '<span class="subsession-inbox-strip-text">'
+    + escHtml(_stripLead) + ' will be included with your next message.'
+    + '</span>'
+    + '<button type="button" class="subsession-inbox-strip-action" '
+    + 'onclick="_subsessionPullUpdates(\'' + sess.id + '\')">Pull updates now</button>'
+    + '<button type="button" class="subsession-inbox-strip-action" '
+    + 'onclick="_subsessionDismissInboxStrip(\'' + sess.id + '\')">Dismiss</button>';
+
+  // Insert immediately above #live-input-bar.
+  const inputBar = panelEl.querySelector('#live-input-bar');
+  if (inputBar && inputBar.parentNode === panelEl) {
+    panelEl.insertBefore(strip, inputBar);
+  } else {
+    panelEl.appendChild(strip);
+  }
+}
+
+function _renderSubsessionToolbar(panelEl, sess) {
+  // The subsession toolbar additions live inside the live input bar
+  // (or its left group).  We render a small floating action bar above
+  // #live-input-bar with two affordances:
+  //   - Report to Parent
+  //   - Auto-report on idle (toggle)
+  const old = panelEl.querySelector('.subsession-actions-bar');
+  if (old) old.remove();
+  if (!_isSubsessionForUI(sess)) return;
+
+  // F1: the daemon is the source of truth for the toggle.  to_state_dict()
+  // only emits auto_report_on_idle when ON, so its presence == ON and its
+  // absence == OFF.  This fixes the "fresh browser shows OFF while the
+  // daemon is still auto-reporting" mismatch (localStorage was the only
+  // prior source).  localStorage remains a cache the toggle also writes.
+  const autoReportOn = !!sess.auto_report_on_idle;
+
+  // F3: when the parent is gone (pointer still set but the parent is no
+  // longer in the session list), the report channel is dead.  Disable the
+  // Report-to-Parent button rather than letting it 404 on click.
+  const parentGone = !!sess.parent_session_id
+    && !_findSessionInList(sess.parent_session_id);
+  const reportBtn = parentGone
+    ? '<button type="button" class="subsession-action-btn" disabled '
+      + 'title="Parent session no longer exists">Report to Parent (parent deleted)</button>'
+    : '<button type="button" class="subsession-action-btn" '
+      + 'onclick="_subsessionReportToParent(\'' + sess.id + '\')">Report to Parent</button>';
+
+  const bar = document.createElement('div');
+  bar.className = 'subsession-actions-bar';
+  bar.innerHTML =
+    reportBtn
+    + '<label class="subsession-autoreport-label">'
+    + '<input type="checkbox" ' + (autoReportOn ? 'checked' : '') + ' '
+    + 'onchange="_subsessionToggleAutoReport(\'' + sess.id + '\', this.checked)">'
+    + ' Auto-report on idle'
+    + '</label>';
+
+  const inputBar = panelEl.querySelector('#live-input-bar');
+  if (inputBar && inputBar.parentNode === panelEl) {
+    panelEl.insertBefore(bar, inputBar);
+  } else {
+    panelEl.appendChild(bar);
+  }
+}
+
+function _renderSubsessionAffordances(sid) {
+  const panelEl = document.getElementById('live-panel');
+  if (!panelEl) return;
+  const sess = _findSessionInList(sid);
+  if (!sess) return;
+  _renderSubsessionBreadcrumb(panelEl, sess);
+  _renderSubsessionInboxStrip(panelEl, sess);
+  _renderSubsessionToolbar(panelEl, sess);
+}
+
+// ── Pull updates: dispatch the dedicated REST endpoint (phase 6.5 P0-1).
+// The earlier attempt routed through the WS `send_message` event with an
+// empty string — but that handler rejects empty text before the inbox
+// drain branch ever runs (see app/routes/ws_events.py `if not text: ...`).
+// The fetch fallback to `/api/live/send` also targeted a route that does
+// not exist.  We now POST to /api/sessions/<parent>/pull-subsession-updates,
+// which is the explicit REST surface for spec §4.3.5's empty-text drain.
+async function _subsessionPullUpdates(parentSid) {
+  if (!parentSid) return;
+  const proj = localStorage.getItem('activeProject') || '';
+  const url = '/api/sessions/' + encodeURIComponent(parentSid)
+    + '/pull-subsession-updates'
+    + (proj ? '?project=' + encodeURIComponent(proj) : '');
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+  } catch (e) {
+    if (typeof showToast === 'function') {
+      showToast('Pull updates failed: network error', true);
+    }
+    return;
+  }
+  let data = null;
+  try { data = await resp.json(); } catch (_) {}
+  if (!resp.ok || !data || data.ok !== true) {
+    const err = (data && data.error) || ('HTTP ' + resp.status);
+    if (typeof showToast === 'function') {
+      showToast('Pull updates failed: ' + err, true);
+    }
+    return;
+  }
+  if (typeof showToast === 'function') {
+    if (data.pulled === false) {
+      showToast('No subsession reports waiting.');
+    } else if (data.queued) {
+      showToast('Pull queued — fires when the session goes idle.');
+    } else {
+      showToast('Pulling subsession updates…');
+    }
+  }
+  // The strip will disappear when the next session_state event arrives
+  // with inbox_dirty=false.
+}
+
+function _subsessionDismissInboxStrip(parentSid) {
+  // Hide the strip locally without delivering.  Reports remain on
+  // disk and the strip re-appears on the next inbox_updated event.
+  const panelEl = document.getElementById('live-panel');
+  if (panelEl) {
+    const strip = panelEl.querySelector('.subsession-inbox-strip');
+    if (strip) strip.remove();
+  }
+  // Also clear the in-memory flag on the local session record so the
+  // next render doesn't re-show the strip until a new report arrives.
+  const sess = _findSessionInList(parentSid);
+  if (sess) sess.inbox_dirty = false;
+}
+
+// ── Report to Parent: popover with a single text field. ──
+function _subsessionReportToParent(childSid) {
+  if (!childSid) return;
+
+  // Pre-fill with the last assistant message text.  F4: the authoritative
+  // source is the backend last-conclusion endpoint (Patent 15 reverse-
+  // parse of the JSONL tail), fetched async after the modal opens.  The
+  // DOM scrape below is only a synchronous fallback used until the fetch
+  // resolves (or if it fails) — the rendered log can be virtualized or
+  // re-skinned, so it is not reliable on its own.
+  let prefill = '';
+  const log = document.getElementById('live-log');
+  if (log) {
+    const asstBubbles = log.querySelectorAll('.msg.assistant .msg-text, .msg.assistant');
+    for (let i = asstBubbles.length - 1; i >= 0; i--) {
+      const t = (asstBubbles[i].textContent || '').trim();
+      if (t) { prefill = t.slice(0, 800); break; }
+    }
+  }
+
+  // Build a small modal popover.
+  let modal = document.getElementById('subsession-report-modal');
+  if (modal) modal.remove();
+  modal = document.createElement('div');
+  modal.id = 'subsession-report-modal';
+  modal.className = 'subsession-report-modal';
+  modal.innerHTML =
+    '<div class="subsession-report-card">'
+    + '<div class="subsession-report-title">Report to Parent</div>'
+    + '<div class="subsession-report-help">'
+    + 'This summary will appear at the top of the parent\'s next message.'
+    + '</div>'
+    + '<textarea class="subsession-report-textarea" rows="6">'
+    + escHtml(prefill) + '</textarea>'
+    + '<div class="subsession-report-actions">'
+    + '<button type="button" class="subsession-report-cancel">Cancel</button>'
+    + '<button type="button" class="subsession-report-send">Send report</button>'
+    + '</div>'
+    + '</div>';
+  document.body.appendChild(modal);
+
+  // F4: fetch the authoritative last conclusion and replace the prefill
+  // unless the user has already started editing.  Only overwrites when the
+  // textarea still holds the untouched fallback (or is empty).
+  (async function _fillFromBackend() {
+    try {
+      const proj = localStorage.getItem('activeProject') || '';
+      const url = '/api/sessions/' + encodeURIComponent(childSid)
+        + '/last-conclusion' + (proj ? '?project=' + encodeURIComponent(proj) : '');
+      const resp = await fetch(url);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const text = (data && data.text || '').trim();
+      if (!text) return;
+      const ta = modal.querySelector('.subsession-report-textarea');
+      // Don't clobber edits: only replace the synchronous fallback.
+      if (ta && (ta.value.trim() === '' || ta.value.trim() === prefill.trim())) {
+        ta.value = text.slice(0, 4000);
+      }
+    } catch (_) { /* keep the DOM-scrape fallback */ }
+  })();
+
+  modal.querySelector('.subsession-report-cancel').addEventListener('click', function() {
+    modal.remove();
+  });
+  modal.querySelector('.subsession-report-send').addEventListener('click', async function() {
+    const ta = modal.querySelector('.subsession-report-textarea');
+    const summary = (ta.value || '').trim();
+    if (!summary) {
+      if (typeof showToast === 'function') showToast('Summary cannot be empty', true);
+      return;
+    }
+    const proj = localStorage.getItem('activeProject') || '';
+    const url = '/api/sessions/' + encodeURIComponent(childSid)
+      + '/report-to-parent'
+      + (proj ? '?project=' + encodeURIComponent(proj) : '');
+    let resp;
+    try {
+      resp = await fetch(url, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({summary: summary}),
+      });
+    } catch (e) {
+      if (typeof showToast === 'function') showToast('Report failed: network error', true);
+      return;
+    }
+    let data = null;
+    try { data = await resp.json(); } catch (_) {}
+    if (!resp.ok || !data || data.ok !== true) {
+      const err = (data && data.error) || ('HTTP ' + resp.status);
+      if (typeof showToast === 'function') showToast('Report failed: ' + err, true);
+      return;
+    }
+    modal.remove();
+    if (typeof showToast === 'function') {
+      showToast('Reported to parent (' + (data.undelivered_count || 1) + ' pending)');
+    }
+  });
+}
+
+async function _subsessionToggleAutoReport(childSid, on) {
+  if (!childSid) return;
+  const key = 'vn.subsession.autoreport.' + childSid;
+  if (on) localStorage.setItem(key, '1');
+  else localStorage.removeItem(key);
+  // Phase 6.5 P1-4: also tell the daemon so it can fire auto-reports
+  // on IDLE transitions.  localStorage alone only persists the UI
+  // checkbox state — the actual auto-report behavior lives in the
+  // daemon's _emit_state hook.
+  try {
+    const proj = localStorage.getItem('activeProject') || '';
+    const url = '/api/sessions/' + encodeURIComponent(childSid)
+      + '/auto-report-toggle'
+      + (proj ? '?project=' + encodeURIComponent(proj) : '');
+    await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({on: !!on}),
+    });
+  } catch (e) {
+    // The localStorage cache survives even if the daemon call fails;
+    // a subsequent toggle will retry.  Don't surface to the user.
+  }
+}
+
+// Listen for inbox_updated WS events from the report-to-parent endpoint
+// and re-render the affordances for the currently-active session.
+if (typeof window !== 'undefined') {
+  window.addEventListener('DOMContentLoaded', function() {
+    if (typeof socket !== 'undefined' && socket && typeof socket.on === 'function') {
+      socket.on('inbox_updated', function(payload) {
+        if (!payload || !payload.parent_session_id) return;
+        // Update the local session record so the sidebar badge and live
+        // panel strip pick up the new state without a full reload.
+        const sess = _findSessionInList(payload.parent_session_id);
+        if (sess) sess.inbox_dirty = true;
+        if (!window.__subsessionInboxCounts) window.__subsessionInboxCounts = {};
+        window.__subsessionInboxCounts[payload.parent_session_id] =
+          payload.undelivered_count || 0;
+        if (typeof filterSessions === 'function') filterSessions();
+        if (typeof liveSessionId !== 'undefined'
+          && liveSessionId === payload.parent_session_id) {
+          _renderSubsessionAffordances(liveSessionId);
+        }
+      });
+    }
+  });
+}
+
+
 // ── Draft persistence: preserve unsent text across session/view switches AND page reloads ──
 const _LS_DRAFTS_KEY = 'vibenode_drafts';
 
@@ -588,6 +982,15 @@ function startLivePanel(id, opts) {
   liveBarState = null;
   updateLiveInputBar();
   _renderQueueBanner();
+
+  // ── Subsessions affordances (spec §4.6.2) ──
+  // Breadcrumb, inbox strip, and Report-to-Parent toolbar are rendered
+  // into #live-panel and refreshed whenever the local session record
+  // changes.  Idempotent: calling on a non-subsession + non-dirty
+  // parent just removes any stale elements.
+  if (typeof _renderSubsessionAffordances === 'function') {
+    try { _renderSubsessionAffordances(id); } catch (_) {}
+  }
 
   // Eagerly fetch this session's state from the daemon so we don't
   // show "sleeping" while waiting for the full state_snapshot.

@@ -64,6 +64,36 @@ if sys.stdout is None or sys.stderr is None:
     if sys.stderr is None:
         sys.stderr = _log
 
+# Spawn-mode probe — surfaces in logs/_server.log whether this process is
+# running detached (pythonw on Windows, nohup/setsid on POSIX) or attached
+# to a controlling terminal. The dead-window failure mode we fixed in
+# launch.bat / launch.sh stops being silent here: if a future change ever
+# regresses the launcher and the server ends up foregrounded again, this
+# line tells anyone reading the log immediately.
+try:
+    import time as _time
+    _spawn_facts = []
+    _exe = (sys.executable or "").lower()
+    _spawn_facts.append("exe=" + (Path(_exe).name if _exe else "?"))
+    if sys.platform == "win32":
+        # pythonw has no console; python.exe attaches one.
+        _spawn_facts.append("mode=" + ("detached(pythonw)" if "pythonw" in _exe else "attached(python)"))
+    else:
+        try:
+            _sid = os.getsid(0)
+            _pgid = os.getpgrp()
+            _detached = (_sid == os.getpid())
+            _spawn_facts.append("mode=" + ("detached(setsid)" if _detached else "attached(tty)"))
+            _spawn_facts.append("sid=%d pgid=%d pid=%d" % (_sid, _pgid, os.getpid()))
+        except Exception:
+            pass
+    (_HERE / "logs").mkdir(exist_ok=True)
+    with open(_HERE / "logs" / "_server.log", "a", encoding="utf-8") as _slog:
+        _slog.write("[%s] session_manager spawn %s\n" % (
+            _time.strftime("%Y-%m-%d %H:%M:%S"), " ".join(_spawn_facts)))
+except Exception:
+    pass
+
 
 def _show_notification(title, message, icon_path=None):
     """Show a desktop notification. Best-effort, never crashes."""

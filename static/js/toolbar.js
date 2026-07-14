@@ -15,7 +15,7 @@ function setToolbarSession(id, titleText, isUntitled, customTitle) {
   titleEl.title = id ? 'Click to rename' : '';
   // Enable/disable action buttons regardless of view mode — the Actions
   // popup uses these same buttons even in kanban mode.
-  ['btn-autoname','btn-open','btn-open-gui','btn-delete','btn-duplicate','btn-continue','btn-summary','btn-extract','btn-export','btn-fork','btn-rewind','btn-fork-rewind'].forEach(b => {
+  ['btn-autoname','btn-open','btn-open-gui','btn-delete','btn-duplicate','btn-continue','btn-summary','btn-extract','btn-export','btn-fork','btn-rewind','btn-fork-rewind','btn-spawn-subsession'].forEach(b => {
     const el = document.getElementById(b);
     if (el) el.disabled = !id;
   });
@@ -520,13 +520,13 @@ function _buildHomepageContent() {
         <div class="hp-icon-wrap">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
         </div>
-        <h3>Compose</h3>
-        <p class="hp-desc">Parallel content creation — multiple AI agents drafting sections simultaneously through a shared brain.</p>
+        <h3>Subsessions</h3>
+        <p class="hp-desc">Spawn parallel subsessions from any session — children inherit parent context and report conclusions back up.</p>
         <div class="hp-viz">
           <div class="hp-columns">${composeColBarsHtml}</div>
         </div>
         <div class="hp-stat">${composeStatLine}</div>
-        <div class="hp-cta">Open Compose <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>
+        <div class="hp-cta">Open Subsessions <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>
       </div>
 
     </div>
@@ -1198,6 +1198,12 @@ async function _confirmPicker() {
         msg += ' (' + data.files_skipped.length + ' skipped)';
       }
       showToast(msg);
+      // Phase 6.5 P1-5: surface the rewind-orphan modal (sessions.js)
+      // when the backend flagged children whose anchor was rewound past.
+      if (data.rewind_orphans && data.rewind_orphans.length
+        && typeof window._handleRewindOrphans === 'function') {
+        window._handleRewindOrphans(_pickerSessionId, data.rewind_orphans);
+      }
     }
   } catch (e) {
     _closePm();

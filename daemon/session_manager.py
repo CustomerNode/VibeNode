@@ -285,6 +285,39 @@ class SessionInfo:
     _api_retry_needed: bool = False                 # set on a transient error (RESULT is_error, non-transport exception, or escalated stream-heal); consumed by the drive-loop finally to arm the timer
     _retry_needs_reconnect: bool = False            # True when the retry follows a dead transport (CLI crash / connectivity loss) so the timer must _reconnect_client before resending
     _ever_got_result: bool = False                  # True once the session has produced at least one RESULT (so the SDK id was remapped to a real UUID and the session is --resume-able).  A transport crash BEFORE this can't reconnect, so we don't escalate it to the long backoff.
+    # ── Subsessions (spec §4.1) ────────────────────────────────────────────
+    # parent_session_id: None for top-level sessions; UUID of the parent
+    # session for subsessions.  subsession_origin_turn: parent JSONL line
+    # count captured at fork.  inbox_dirty: cached "has undelivered reports"
+    # flag for the in-memory fast path in send_message (spec §4.3.4).
+    parent_session_id: Optional[str] = None
+    subsession_origin_turn: int = 0
+    inbox_dirty: bool = False
+    # Set on children when their parent is deleted (spec §6.2).  An ISO8601
+    # timestamp surfaced in the UI as "Reports to: (parent deleted)".  None
+    # for non-orphans.  Persisted to the registry so a daemon restart
+    # preserves the tombstone.
+    parent_deleted_at: Optional[str] = None
+    # Phase 6.5 P1-4: when True, the subsession auto-reports its last
+    # assistant message to its parent's inbox on each IDLE transition that
+    # has a fresh assistant turn since the previous report (spec §4.3.3
+    # "Automatic" / §11 "Child IDLE with auto-report ON → IDLE again").
+    # ``_last_auto_report_entry_count`` is the entry-count snapshot taken
+    # at the last successful auto-report; on every IDLE we compare against
+    # the current count and report iff strictly greater AND the most-
+    # recent entry is an assistant message.  This makes the trigger
+    # idempotent across multiple IDLE emits per turn (PERF-CRITICAL guards
+    # may fire _emit_state more than once for a single user turn).
+    auto_report_on_idle: bool = False
+    _last_auto_report_entry_count: int = 0
+    # Patent 13 marker report: a subsession can explicitly push its
+    # conclusion up by emitting ``<!-- subsession:report -->`` in its
+    # assistant output.  Unlike auto_report_on_idle this is opt-in per
+    # turn by the child itself, so it fires regardless of the toggle.
+    # ``_last_marker_report_entry_count`` deduplicates the same way the
+    # auto-report counter does — one report per advancing turn that
+    # carries the marker, idempotent across repeated IDLE emits.
+    _last_marker_report_entry_count: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self):
@@ -326,6 +359,21 @@ class SessionInfo:
                 "tool_input": self.pending_tool_input,
             }
         d["entry_count"] = len(self.entries)
+        # Subsessions (spec §4.4): expose parent pointer + inbox metadata
+        # so the sidebar can render child rows under their parent and
+        # show the envelope badge on parents with undelivered reports.
+        # Only emit when truthy to keep the dict compact for legacy
+        # top-level sessions.
+        if self.parent_session_id:
+            d["parent_session_id"] = self.parent_session_id
+            d["subsession_origin_turn"] = self.subsession_origin_turn
+        if self.inbox_dirty:
+            d["inbox_dirty"] = True
+        # Phase 6.5 P1-4: expose auto-report preference so the live-panel
+        # toggle can reflect the persisted server-side state on switch /
+        # reconnect.  Only emit when True to keep the dict compact.
+        if self.auto_report_on_idle:
+            d["auto_report_on_idle"] = True
         return d
 
 
@@ -437,6 +485,37 @@ def _is_thinking_block_modified_error(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Subsession report marker (Patent 13 — structured comment marker action)
+# ---------------------------------------------------------------------------
+#
+# A subsession can explicitly push its conclusion to the parent by emitting
+# an HTML-comment marker in its assistant output.  This mirrors the kanban
+# status marker pattern: invisible to the rendered transcript, parsed
+# out-of-band, and turned into an action.  The marker is stripped from the
+# extracted conclusion so the parent's inbox shows clean text.
+_SUBSESSION_REPORT_MARKER_RE = re.compile(
+    r"<!--\s*subsession:report\s*-->", re.IGNORECASE
+)
+
+
+def _scan_subsession_report_marker(text: str) -> tuple[bool, str]:
+    """Detect the subsession report marker in *text*.
+
+    Returns ``(found, conclusion)`` where ``conclusion`` is *text* with the
+    marker(s) removed and trimmed.  When the marker is absent, returns
+    ``(False, "")`` — callers only use the conclusion when ``found`` is
+    True.  Pure function so the trigger logic is unit-testable without a
+    running daemon.
+    """
+    if not text or "subsession:report" not in text.lower():
+        return (False, "")
+    if not _SUBSESSION_REPORT_MARKER_RE.search(text):
+        return (False, "")
+    conclusion = _SUBSESSION_REPORT_MARKER_RE.sub("", text).strip()
+    return (True, conclusion)
+
+
+# ---------------------------------------------------------------------------
 # Registry file for crash recovery — moved to daemon/session_registry.py
 # ---------------------------------------------------------------------------
 
@@ -533,8 +612,20 @@ class SessionManager:
             self._last_known_states = {}
 
         # Recover sessions from a previous crash (non-blocking background task)
+        #
+        # Phase 6.5 P0-3: also pass ``mark_inbox_dirty`` so recover_sessions
+        # can rehydrate the in-memory ``inbox_dirty`` flag from on-disk
+        # inbox.json files.  Without this, every recovered parent boots up
+        # with inbox_dirty=False and the fast-path drain at
+        # session_manager.py:595 skips the disk read forever — any
+        # ``delivered: false`` entries written before the daemon restart
+        # are stranded.
         threading.Thread(
-            target=lambda: self._reg.recover_sessions(self.start_session, self._store),
+            target=lambda: self._reg.recover_sessions(
+                self.start_session,
+                self._store,
+                mark_inbox_dirty_fn=self.mark_inbox_dirty,
+            ),
             daemon=True,
             name="session-recovery"
         ).start()
@@ -550,6 +641,12 @@ class SessionManager:
         # _WAKEUP_QUEUE_WATCHDOG_INTERVAL seconds.
         self._wakeup_queue_watchdog_timer: Optional[threading.Timer] = None
         self._schedule_wakeup_queue_watchdog()
+        # Session health monitor: stall auto-restart, sleep/wake healing,
+        # and keep-awake-while-working.  Lazy import avoids a module cycle
+        # (health_monitor imports LogEntry back from this module).
+        from daemon.health_monitor import HealthMonitor
+        self._health_monitor = HealthMonitor(self)
+        self._health_monitor.start()
 
     def _run_loop(self) -> None:
         """Entry point for the background thread."""
@@ -570,6 +667,10 @@ class SessionManager:
         if getattr(self, '_wakeup_queue_watchdog_timer', None):
             self._wakeup_queue_watchdog_timer.cancel()
             self._wakeup_queue_watchdog_timer = None
+        # Stop the health monitor thread
+        if getattr(self, '_health_monitor', None):
+            self._health_monitor.stop()
+            self._health_monitor = None
         # Flush queue to disk
         self._mq.flush()
         # Close all sessions
@@ -625,6 +726,10 @@ class SessionManager:
         permission_mode: Optional[str] = None,
         session_type: str = "",
         extra_args: Optional[dict] = None,
+        parent_session_id: Optional[str] = None,
+        subsession_origin_turn: int = 0,
+        parent_deleted_at: Optional[str] = None,
+        auto_report_on_idle: bool = False,
     ) -> dict:
         """Start or resume an SDK session. Returns immediately."""
         _forward_to_send = False
@@ -675,6 +780,10 @@ class SessionManager:
             model=model or "",
             state=SessionState.STARTING,
             session_type=session_type or "",
+            parent_session_id=parent_session_id,
+            subsession_origin_turn=subsession_origin_turn,
+            parent_deleted_at=parent_deleted_at,
+            auto_report_on_idle=auto_report_on_idle,
         )
         with self._lock:
             self._sessions[session_id] = info
@@ -787,6 +896,49 @@ class SessionManager:
                     return {"ok": False, "error": "Session not found"}
             else:
                 return {"ok": False, "error": "Session not found"}
+
+        # ── Subsession inbox drain (spec §4.3.4 + §4.3.5) ──
+        # Prepend any undelivered subsession reports onto the outbound
+        # text BEFORE the state lock acquisition and BEFORE _send_query
+        # is scheduled.  Fast path: ``info.inbox_dirty`` is an in-memory
+        # bool — when False (the common case) no disk I/O happens.
+        #
+        # PERF-CRITICAL ordering: this block sits ABOVE the
+        # _turn_had_direct_edit reset and the asyncio.gather() in
+        # _send_query.  The drain MUST NOT move into _send_query (which
+        # is the PERF-CRITICAL chokepoint per CLAUDE.md markers #2/#3/#4/#5)
+        # and MUST NOT be reordered after them.  See spec §7.1 and
+        # tests/test_send_query_operation_order.py for the invariant pin.
+        if info.inbox_dirty:
+            try:
+                from daemon.subsession_inbox import (
+                    drain_undelivered,
+                    format_drain_block,
+                )
+                drained = drain_undelivered(session_id)
+                if drained:
+                    block = format_drain_block(drained)
+                    if text == "" or not text.strip():
+                        # Pull-updates path (spec §4.3.5): send the block as
+                        # the entire SDK message; no "[Your message]" suffix.
+                        text = block
+                    else:
+                        text = (
+                            block + "\n---\n[Your message]\n" + text
+                        )
+                # Clear the in-memory flag whether or not anything was
+                # drained — if the disk file disagreed with the flag we
+                # still want to avoid re-reading on every turn.
+                info.inbox_dirty = False
+            except Exception as e:
+                # Per spec §9: a corrupt/missing inbox must NOT block the
+                # user's message.  Log and continue with the original text.
+                logger.warning(
+                    "send_message: inbox drain failed for %s: %s — "
+                    "continuing with original text",
+                    session_id, e,
+                )
+                info.inbox_dirty = False
 
         # Atomic state check + set under per-session lock to prevent two
         # concurrent send_message calls from both seeing IDLE and both
@@ -1518,6 +1670,305 @@ class SessionManager:
                 continue
             out[rid] = meta
         return out
+    def orphan_children_of(self, parent_sid: str) -> list:
+        """Mark every in-memory child of *parent_sid* as orphaned.
+
+        Sets ``parent_deleted_at`` to the current ISO8601 UTC timestamp
+        and clears ``parent_session_id`` so the next sidebar render no
+        longer indents the child under a missing parent (spec §6.2).
+
+        Returns the list of orphaned child SIDs (may be empty).  Called
+        by the deletion endpoint immediately after the parent's
+        SessionInfo is removed from the registry.
+        """
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z")
+        orphaned = []
+        with self._lock:
+            for sid, info in self._sessions.items():
+                if info.parent_session_id == parent_sid:
+                    info.parent_deleted_at = now
+                    info.parent_session_id = None
+                    orphaned.append(sid)
+        if orphaned:
+            self._schedule_registry_save()
+        return orphaned
+
+    def detect_rewind_orphans(self, parent_sid: str, new_line_count: int) -> list:
+        """Sweep in-memory children of *parent_sid* and return those whose
+        ``subsession_origin_turn`` is now past the new line count.
+
+        Called by the rewind endpoint after the parent JSONL is rewritten
+        (spec §6.3).  The returned SIDs need a UI badge ("Spawn point no
+        longer in parent's history") and a Re-anchor / Detach prompt.
+        We do NOT auto-detach — the user decides.
+        """
+        flagged = []
+        with self._lock:
+            for sid, info in self._sessions.items():
+                if info.parent_session_id != parent_sid:
+                    continue
+                if info.subsession_origin_turn > new_line_count:
+                    flagged.append(sid)
+        return flagged
+
+    def detach_subsession(self, child_sid: str) -> bool:
+        """Phase 6.5 P1-5 — clear a subsession's parent pointer (Detach
+        action on the rewind-orphan UI prompt).
+
+        Sets ``parent_session_id = None`` and stamps a
+        ``parent_deleted_at`` tombstone so the orphan-state UI shows
+        "Reports to: (parent deleted)" exactly the same way as a true
+        parent deletion (spec §6.2).  Returns True on success.
+        """
+        from datetime import datetime, timezone
+
+        child_sid = self._resolve_id(child_sid)
+        with self._lock:
+            info = self._sessions.get(child_sid)
+            if not info:
+                return False
+            info.parent_session_id = None
+            info.parent_deleted_at = datetime.now(timezone.utc).isoformat(
+                timespec="seconds"
+            ).replace("+00:00", "Z")
+        self._schedule_registry_save()
+        self._emit_state(info)
+        return True
+
+    def reanchor_subsession(self, child_sid: str, new_origin_turn: int) -> bool:
+        """Set a new ``subsession_origin_turn`` on a child whose parent was
+        rewound past its old anchor (spec §6.3 Re-anchor action).
+
+        Returns True if the in-memory SessionInfo was updated.
+        """
+        child_sid = self._resolve_id(child_sid)
+        with self._lock:
+            info = self._sessions.get(child_sid)
+            if not info:
+                return False
+            info.subsession_origin_turn = max(0, int(new_origin_turn))
+        self._schedule_registry_save()
+        return True
+
+    def _maybe_auto_report_to_parent(self, info: "SessionInfo") -> None:
+        """Phase 6.5 P1-4 — write the last assistant message to the parent's
+        inbox if this subsession has new content since the previous auto-
+        report.
+
+        Idempotent: tracks ``_last_auto_report_entry_count`` so multiple
+        IDLE emits per turn don't produce duplicate reports.  Caller must
+        already have verified ``info.auto_report_on_idle`` and
+        ``info.parent_session_id``.
+        """
+        # Snapshot under the per-session lock so we don't race a streaming
+        # writer that's appending entries.
+        with info._lock:
+            entry_count = len(info.entries)
+            if entry_count <= info._last_auto_report_entry_count:
+                return  # No new turn since last auto-report.
+            # Find the last assistant text entry.
+            last_assistant_text = ""
+            for entry in reversed(info.entries):
+                kind = getattr(entry, "kind", "")
+                if kind != "assistant":
+                    continue
+                text = (getattr(entry, "text", "") or "").strip()
+                if text:
+                    last_assistant_text = text
+                    break
+            if not last_assistant_text:
+                # No assistant content yet — bump the counter so we don't
+                # re-scan every IDLE emit for the same empty state.
+                info._last_auto_report_entry_count = entry_count
+                return
+            # Update the counter BEFORE the disk write so a slow write
+            # can't race a second concurrent _emit_state into double-
+            # reporting.
+            info._last_auto_report_entry_count = entry_count
+            parent_sid = info.parent_session_id
+            child_sid = info.session_id
+            child_name = info.name or ""
+            # Cap the auto-report summary so a long assistant message
+            # doesn't bloat the inbox.  The user can still see the full
+            # text by clicking the subsession.
+            summary = last_assistant_text[:1500]
+
+        # OUTSIDE the lock — disk write should never hold the session lock.
+        try:
+            from daemon.subsession_inbox import append_report
+            append_report(
+                parent_sid=parent_sid,
+                child_sid=child_sid,
+                child_name=child_name,
+                summary=summary,
+            )
+        except Exception as e:
+            logger.warning(
+                "auto-report append_report failed for %s -> %s: %s",
+                child_sid, parent_sid, e,
+            )
+            return
+        # Flip the parent's inbox-dirty flag if managed, so the parent's
+        # next send_message turn drains without re-reading disk.
+        try:
+            self.mark_inbox_dirty(parent_sid)
+        except Exception as e:
+            logger.debug(
+                "auto-report mark_inbox_dirty soft-fail for %s: %s",
+                parent_sid, e,
+            )
+        # Best-effort: emit an inbox_updated event so any connected
+        # client updates the badge.
+        try:
+            from daemon.subsession_inbox import undelivered_count
+            if self._push_callback:
+                self._push_callback("inbox_updated", {
+                    "parent_session_id": parent_sid,
+                    "undelivered_count": undelivered_count(parent_sid),
+                    "from_child_session_id": child_sid,
+                    "auto": True,
+                })
+        except Exception as e:
+            logger.debug("auto-report inbox_updated emit soft-fail: %s", e)
+
+    def _maybe_marker_report_to_parent(self, info: "SessionInfo") -> None:
+        """Patent 13 — report the child's conclusion up when its latest
+        assistant message carries the ``<!-- subsession:report -->`` marker.
+
+        Independent of ``auto_report_on_idle``: the marker is the child
+        explicitly deciding to report, so this fires whenever the marker is
+        present on a fresh turn.  Idempotent across repeated IDLE emits via
+        ``_last_marker_report_entry_count``.  Caller must already have
+        verified ``info.parent_session_id``.
+        """
+        with info._lock:
+            entry_count = len(info.entries)
+            if entry_count <= getattr(info, "_last_marker_report_entry_count", 0):
+                return  # No new turn since the last marker report.
+            # Find the last assistant text entry and test it for the marker.
+            last_assistant_text = ""
+            for entry in reversed(info.entries):
+                if getattr(entry, "kind", "") != "assistant":
+                    continue
+                text = (getattr(entry, "text", "") or "").strip()
+                if text:
+                    last_assistant_text = text
+                    break
+            found, conclusion = _scan_subsession_report_marker(last_assistant_text)
+            if not found:
+                # Advance the counter so we don't re-scan the same turn on
+                # every IDLE emit; the marker either was or wasn't here.
+                info._last_marker_report_entry_count = entry_count
+                return
+            info._last_marker_report_entry_count = entry_count
+            parent_sid = info.parent_session_id
+            child_sid = info.session_id
+            child_name = info.name or ""
+            # Fall back to the raw text if stripping the marker left nothing.
+            summary = (conclusion or last_assistant_text)[:1500]
+
+        # OUTSIDE the lock — disk write never holds the session lock.
+        try:
+            from daemon.subsession_inbox import append_report
+            append_report(
+                parent_sid=parent_sid,
+                child_sid=child_sid,
+                child_name=child_name,
+                summary=summary,
+            )
+        except Exception as e:
+            logger.warning(
+                "marker-report append_report failed for %s -> %s: %s",
+                child_sid, parent_sid, e,
+            )
+            return
+        try:
+            self.mark_inbox_dirty(parent_sid)
+        except Exception as e:
+            logger.debug(
+                "marker-report mark_inbox_dirty soft-fail for %s: %s",
+                parent_sid, e,
+            )
+        try:
+            from daemon.subsession_inbox import undelivered_count
+            if self._push_callback:
+                self._push_callback("inbox_updated", {
+                    "parent_session_id": parent_sid,
+                    "undelivered_count": undelivered_count(parent_sid),
+                    "from_child_session_id": child_sid,
+                    "marker": True,
+                })
+        except Exception as e:
+            logger.debug("marker-report inbox_updated emit soft-fail: %s", e)
+
+    def set_auto_report_on_idle(self, session_id: str, on: bool) -> bool:
+        """Phase 6.5 P1-4 — toggle the subsession's auto-report preference.
+
+        Returns True if the flag was updated on a managed SessionInfo.  The
+        live-panel toggle calls this via POST /api/sessions/<sid>/auto-report-toggle.
+        The change is debounced into the registry snapshot via the existing
+        save-scheduler so a daemon restart preserves the preference.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+            if not info:
+                return False
+            info.auto_report_on_idle = bool(on)
+        self._schedule_registry_save()
+        # Push state so any connected client picks up the new flag in
+        # to_state_dict() without waiting for the next session_state emit.
+        self._emit_state(info)
+        return True
+
+    def mark_inbox_dirty(self, session_id: str) -> bool:
+        """Set ``info.inbox_dirty = True`` on a managed parent session.
+
+        Returns True if the flag was set (parent is managed), False
+        otherwise.  Called by the report-to-parent endpoint so the next
+        send_message turn knows to drain the inbox without re-reading
+        the file off disk on every turn (spec §7.2 hot-path constraint).
+
+        If the parent isn't currently daemon-managed, the call falls
+        through; the next time the parent loads, send_message will
+        re-derive ``inbox_dirty`` from disk (Phase 4 behavior).
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+            if not info:
+                return False
+            info.inbox_dirty = True
+            return True
+
+    def get_subsession_meta(self, session_id: str) -> Optional[dict]:
+        """Return a lightweight metadata snapshot for spawn/subsession guards.
+
+        Returns ``None`` if the session is not managed.  Otherwise returns
+        a plain dict with the fields needed to enforce the spawn-time
+        guards in spec §4.2 and §6.8: ``session_type`` (planner check),
+        ``cwd`` (cross-project check), and ``parent_session_id`` (cycle
+        walk).  Read under the manager lock so the snapshot is internally
+        consistent; the returned dict is a copy so callers can mutate it
+        freely.
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+            if not info:
+                return None
+            return {
+                "session_id": info.session_id,
+                "name": info.name,
+                "cwd": info.cwd,
+                "session_type": info.session_type,
+                "parent_session_id": info.parent_session_id,
+                "subsession_origin_turn": info.subsession_origin_turn,
+            }
 
     # ------------------------------------------------------------------
     # Async internals (run on the event loop thread)
@@ -5922,6 +6373,16 @@ class SessionManager:
                         info.entries[0].timestamp if info.entries else time.time()
                     ),
                     "last_activity": time.time(),
+                    # Subsessions (spec §4.1) — backward-compatible additions.
+                    # Older registry readers ignore unknown keys; newer
+                    # readers use .get() with defaults so an older snapshot
+                    # without these keys still loads cleanly.
+                    "parent_session_id": info.parent_session_id,
+                    "subsession_origin_turn": info.subsession_origin_turn,
+                    "parent_deleted_at": info.parent_deleted_at,
+                    # Phase 6.5 P1-4: persist the auto-report toggle so a
+                    # daemon restart preserves the user's preference.
+                    "auto_report_on_idle": info.auto_report_on_idle,
                 }
         self._reg.save_registry_now(sessions_data)
 
@@ -6463,6 +6924,47 @@ class SessionManager:
                              info.session_id, info.state, cb_err)
         # Keep the persistent registry up to date
         self._schedule_registry_save()
+
+        # ── Phase 6.5 P1-4: auto-report on IDLE for opted-in subsessions ──
+        # When a subsession with auto_report_on_idle == True transitions
+        # to IDLE AND has produced new assistant content since the last
+        # auto-report, write the last assistant message to its parent's
+        # inbox.  Idempotent across multiple IDLE emits per turn via
+        # ``_last_auto_report_entry_count``: we only fire when the entry
+        # count has actually advanced AND the most recent entry is an
+        # assistant message.
+        if (
+            info.state == SessionState.IDLE
+            and getattr(info, "auto_report_on_idle", False)
+            and getattr(info, "parent_session_id", None)
+        ):
+            try:
+                self._maybe_auto_report_to_parent(info)
+            except Exception as e:
+                # Auto-report must never break a session state emit.
+                logger.warning(
+                    "auto-report soft-fail for %s: %s",
+                    info.session_id, e,
+                )
+
+        # ── Patent 13: marker-triggered report on IDLE ──
+        # Independent of the auto_report toggle: if the subsession's latest
+        # assistant turn carries the <!-- subsession:report --> marker, push
+        # that conclusion to the parent's inbox.  This is the child
+        # explicitly deciding to report, so it runs for ANY subsession with
+        # a parent.  Same soft-fail discipline — a marker scan must never
+        # break a state emit.
+        if (
+            info.state == SessionState.IDLE
+            and getattr(info, "parent_session_id", None)
+        ):
+            try:
+                self._maybe_marker_report_to_parent(info)
+            except Exception as e:
+                logger.warning(
+                    "marker-report soft-fail for %s: %s",
+                    info.session_id, e,
+                )
 
         # ── Memory management: trim in-memory entries for idle sessions ──
         # The JSONL file is the source of truth; the web frontend reads it

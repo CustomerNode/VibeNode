@@ -189,6 +189,214 @@ function _composeGetAllTags() {
   return [...tags].sort();
 }
 
+// ═══════════════════════════════════════════════════════════════
+// SUBSESSIONS TAB STRIP — Ad-hoc / Structured (spec §4.5)
+// ═══════════════════════════════════════════════════════════════
+//
+// State persists in localStorage under 'vn.compose.activeTab' per
+// spec §14.6.  Default tab is 'adhoc'.  The Structured tab is only
+// surfaced (and clickable) when the active project has at least one
+// composition on disk — _composeProjectsList comes from the
+// /api/compose/board response's `sibling_projects` field, which is
+// already filtered by project= per CLAUDE.md "Compose project-scoping".
+
+function _getSubsessionsActiveTab() {
+  return localStorage.getItem('vn.compose.activeTab') || 'adhoc';
+}
+
+// ───────────────────────────────────────────────────────────────
+// Ad-hoc subsessions tree (spec §4.4)
+// ───────────────────────────────────────────────────────────────
+//
+// Renders the parent→child subsession family tree for the active
+// project into #subsessions-adhoc-body, reusing the same allSessions
+// global and _buildSubsessionIndex helper the sidebar uses (sessions.js).
+// Each row opens the session in the live panel on click.  Orphaned
+// subsessions (parent deleted / not in the list) render in a trailing
+// group so the user can still find them.  Idempotent and cheap — safe to
+// call from filterSessions() on every session-state update.
+
+function _adhocSessionStatusDot(sid) {
+  let status = '';
+  try {
+    if (typeof getSessionStatus === 'function') status = getSessionStatus(sid) || '';
+  } catch (_) { status = ''; }
+  // Reuse the sidebar's state vocabulary: working / idle / question.
+  let cls = 'adhoc-dot';
+  if (status === 'working') cls += ' adhoc-dot-working';
+  else if (status === 'question') cls += ' adhoc-dot-waiting';
+  else if (status === 'idle') cls += ' adhoc-dot-idle';
+  const label = status || 'unknown';
+  return `<span class="${cls}" title="${escHtml(label)}" aria-label="${escHtml(label)}"></span>`;
+}
+
+function _adhocTitleFor(sess) {
+  if (!sess) return '';
+  return sess.custom_title || sess.display_title || (sess.id || '').slice(0, 8);
+}
+
+function _renderAdhocSubsessionRow(sess, isChild, parentName) {
+  const dot = _adhocSessionStatusDot(sess.id);
+  const glyph = isChild
+    ? '<span class="subsession-glyph" aria-hidden="true">↳ </span>'
+    : '';
+  const inbox = sess.inbox_dirty
+    ? '<span class="subsession-inbox-badge" title="Subsession reports waiting">📬</span>'
+    : '';
+  const fromLine = (isChild && parentName)
+    ? `<div class="subsession-from-line">from: ${escHtml(parentName)}</div>`
+    : '';
+  const rowClass = 'adhoc-subsession-row' + (isChild ? ' adhoc-child' : ' adhoc-parent');
+  return `
+    <div class="${rowClass}" onclick="_adhocOpenSession('${sess.id}')" title="Open in live panel">
+      <div class="adhoc-row-main">${dot}${glyph}<span class="adhoc-row-title">${escHtml(_adhocTitleFor(sess))}</span>${inbox}</div>
+      ${fromLine}
+    </div>`;
+}
+
+function _adhocOpenSession(sid) {
+  if (typeof openInGUI === 'function') openInGUI(sid);
+}
+
+function _renderAdhocSubsessions() {
+  const body = document.getElementById('subsessions-adhoc-body');
+  if (!body) return;
+  // Only render when the Ad-hoc tab is the effective view.
+  if (_getSubsessionsActiveTab() === 'structured' &&
+      _composeProjectsList && _composeProjectsList.length > 0) {
+    return;
+  }
+  const sessions = (typeof allSessions !== 'undefined' && Array.isArray(allSessions))
+    ? allSessions : [];
+
+  // Build parent→children index (only counts children whose parent is in
+  // the list — same rule as the sidebar).
+  let childrenByParent = new Map();
+  if (typeof _buildSubsessionIndex === 'function') {
+    childrenByParent = _buildSubsessionIndex(sessions);
+  }
+
+  // Parents that actually have subsession children, in the user's sort.
+  const parentRows = [];
+  const idsInList = new Set(sessions.map(s => s.id));
+  for (const s of sessions) {
+    const kids = childrenByParent.get(s.id);
+    if (kids && kids.length) parentRows.push(s);
+  }
+
+  // Orphaned subsessions: parent_session_id set but parent not in the list.
+  const orphans = sessions.filter(s =>
+    s.parent_session_id && !idsInList.has(s.parent_session_id));
+
+  if (!parentRows.length && !orphans.length) {
+    body.innerHTML =
+      '<div class="subsessions-adhoc-empty">'
+      + '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.5" stroke-linecap="round">'
+      + '<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>'
+      + '<div style="font-size:16px;font-weight:500;color:var(--text);margin:12px 0 6px;">No subsessions yet</div>'
+      + '<div style="font-size:13px;color:var(--text-muted);max-width:460px;text-align:center;">'
+      + 'Right-click any session and choose <b>Spawn Subsession</b> (or press Ctrl+Shift+S) to peel off a '
+      + 'focused side task. It inherits the parent’s full context and reports its conclusion back up. '
+      + 'The family tree appears here.</div>'
+      + '</div>';
+    return;
+  }
+
+  let html = '<div class="adhoc-subsessions-tree">';
+  for (const parent of parentRows) {
+    html += _renderAdhocSubsessionRow(parent, false, null);
+    const kids = (childrenByParent.get(parent.id) || []).slice();
+    for (const kid of kids) {
+      html += _renderAdhocSubsessionRow(kid, true, _adhocTitleFor(parent));
+    }
+  }
+  if (orphans.length) {
+    html += '<div class="adhoc-orphans-header">Orphaned subsessions (parent deleted)</div>';
+    for (const o of orphans) {
+      html += _renderAdhocSubsessionRow(o, true, null);
+    }
+  }
+  html += '</div>';
+  body.innerHTML = html;
+}
+
+function _setSubsessionsActiveTab(tab) {
+  localStorage.setItem('vn.compose.activeTab', tab);
+}
+
+/**
+ * Sync the tab strip DOM to reflect the requested active tab and the
+ * current `_composeProjectsList`.  Structured tab/body show only if
+ * there's at least one composition in the active project — the
+ * "+ New structured composition" affordance handles the empty case.
+ *
+ * Behavior preservation: when Structured is active, the existing
+ * compose-root-header / compose-input-target / compose-sections-board
+ * remain visible exactly as before, so the legacy Compose flow is
+ * bit-identical inside the Structured tab.
+ */
+function _applySubsessionsTabState() {
+  const tab = _getSubsessionsActiveTab();
+  const adhocBtn = document.getElementById('subsessions-tab-adhoc-btn');
+  const structBtn = document.getElementById('subsessions-tab-structured-btn');
+  const newStructBtn = document.getElementById('subsessions-tab-new-structured-btn');
+  const adhocBody = document.getElementById('subsessions-adhoc-body');
+  const header = document.getElementById('compose-root-header');
+  const target = document.getElementById('compose-input-target');
+  const board = document.getElementById('compose-sections-board');
+
+  const hasStructured = (_composeProjectsList && _composeProjectsList.length > 0);
+  // Structured tab button: only visible when there is at least one
+  // composition for this project.  Once visible, it stays visible
+  // until the user navigates away or the list becomes empty again.
+  if (structBtn) structBtn.style.display = hasStructured ? '' : 'none';
+  // The "+ New structured composition" affordance acts as the
+  // discovery entry point.  Hide it when Structured is the active
+  // view (the inline "+ Add Section" / sidebar "New Composition"
+  // buttons already cover the create flow there).
+  if (newStructBtn) newStructBtn.style.display = (tab === 'structured' && hasStructured) ? 'none' : '';
+
+  // Effective tab: if Structured is requested but there's no
+  // composition yet, fall through to Ad-hoc.
+  const effective = (tab === 'structured' && hasStructured) ? 'structured' : 'adhoc';
+
+  if (adhocBtn) adhocBtn.classList.toggle('subsessions-tab-active', effective === 'adhoc');
+  if (structBtn) structBtn.classList.toggle('subsessions-tab-active', effective === 'structured');
+
+  if (effective === 'adhoc') {
+    if (adhocBody) adhocBody.style.display = '';
+    // Hide Structured surfaces.  Existing display rules are preserved
+    // (header/target use display:flex when shown), so we toggle the
+    // wrapper visibility without touching their inner state.
+    if (header) header.style.display = 'none';
+    if (target) target.style.display = 'none';
+    if (board) board.style.display = 'none';
+    // Paint the live parent→child subsession tree (spec §4.4).
+    _renderAdhocSubsessions();
+  } else {
+    if (adhocBody) adhocBody.style.display = 'none';
+    // Let initCompose / _renderComposeBoard restore header/target/
+    // board visibility according to whether a composition is loaded
+    // (drill-down vs. board view).  We only need to make sure board
+    // is shown; header/target are managed by _renderComposeBoard().
+    if (board) board.style.display = '';
+  }
+}
+
+/**
+ * Tab switch handler invoked by the tab buttons.  Persists the
+ * choice and refreshes the panel.
+ */
+function setSubsessionsTab(tab) {
+  if (tab !== 'adhoc' && tab !== 'structured') tab = 'adhoc';
+  _setSubsessionsActiveTab(tab);
+  _applySubsessionsTabState();
+  if (tab === 'structured') {
+    // Re-run init so the Structured surfaces hydrate from current data.
+    initCompose();
+  }
+}
+
 /**
  * Initialize the compose board — fetch project data and render header.
  * Called by setViewMode('compose') in workforce.js.
@@ -220,6 +428,23 @@ async function initCompose() {
 
     // Populate sidebar list from sibling_projects (included in board response)
     _composeProjectsList = (data && data.sibling_projects) ? data.sibling_projects : [];
+
+    // Apply Subsessions tab state now that we know whether the
+    // current project has any compositions (spec §4.5).  If the
+    // user is on the Ad-hoc tab and Structured is empty, this
+    // hides the Structured surfaces; if Structured is the active
+    // tab we keep going and hydrate the Structured panel below.
+    _applySubsessionsTabState();
+    if (_getSubsessionsActiveTab() !== 'structured' || _composeProjectsList.length === 0) {
+      // Ad-hoc is showing (or Structured is requested but empty,
+      // which falls through to Ad-hoc per _applySubsessionsTabState).
+      // Render the sidebar so the user can still see/create
+      // compositions, and stop before hydrating the Structured
+      // header/sections — they're hidden anyway.
+      _renderComposeSidebar();
+      attachComposeShortcuts();
+      return;
+    }
 
     if (!data || !data.project) {
       // If we had a saved project_id that no longer exists (e.g. deleted),
@@ -309,7 +534,7 @@ function _renderComposeEmpty() {
         <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.5" stroke-linecap="round">
           <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
         </svg>
-        <div style="font-size:16px;font-weight:500;color:var(--text);margin:12px 0 6px;">Welcome to Compose</div>
+        <div style="font-size:16px;font-weight:500;color:var(--text);margin:12px 0 6px;">Welcome to Subsessions</div>
         <div style="font-size:13px;color:var(--text-muted);margin-bottom:16px;">Orchestrate multiple sections with AI-powered composition.</div>
         <button class="kanban-create-first-btn" onclick="composeCreateProject()">+ Create your first composition</button>
       </div>`;
@@ -1283,7 +1508,7 @@ function _showComposeShortcutHelp() {
   if (existing) { existing.remove(); return; }
   const overlay = document.createElement('div');
   overlay.className = 'kanban-shortcut-overlay';
-  overlay.innerHTML = `<div class="kanban-shortcut-card"><h3>Compose Keyboard Shortcuts</h3>
+  overlay.innerHTML = `<div class="kanban-shortcut-card"><h3>Subsessions Keyboard Shortcuts</h3>
     <div class="kanban-shortcut-grid">
       <kbd>\u2191 \u2193</kbd><span>Move focus</span>
       <kbd>Enter</kbd><span>Open composition</span>

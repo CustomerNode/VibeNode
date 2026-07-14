@@ -248,6 +248,96 @@ def _https_available(status: Optional[dict]) -> bool:
     return bool(status.get("CertDomains"))
 
 
+# ---------------------------------------------------------------------------
+# Guided-setup signals — everything the step-by-step wizard needs to detect
+# progress from live Tailscale state (so each step self-verifies and the user
+# never has to guess whether they did it right). Read from THIS box's own
+# `tailscale status --json`, so the account/phone are always the user's own —
+# nothing is ever hardcoded.
+# ---------------------------------------------------------------------------
+
+def account_email(status: Optional[dict] = None) -> str:
+    """The Tailscale account THIS machine is signed into (e.g. 'jane@example.com').
+
+    Read live from status: Self.UserID → User[uid].LoginName. Used to tell the user
+    the exact account to sign their PHONE into (same account = same tailnet), which
+    is the single most common first-time failure. Empty string if not derivable.
+    """
+    status = status if status is not None else _status_json()
+    if not status:
+        return ""
+    self_node = status.get("Self") or {}
+    uid = self_node.get("UserID")
+    users = status.get("User") or {}
+    if uid is not None:
+        me = users.get(str(uid)) or users.get(uid) or {}
+        login = (me.get("LoginName") or "").strip()
+        if login:
+            return login
+    # Fallback: the tailnet name is often the owner's login for single-user tailnets.
+    return ((status.get("CurrentTailnet") or {}).get("Name") or "").strip()
+
+
+# OS families Tailscale reports for phones/tablets — used to detect "the phone joined".
+_PHONE_OSES = {"ios", "ipados", "android"}
+
+
+def phone_peer(status: Optional[dict] = None) -> Optional[dict]:
+    """Return {'name', 'os', 'online'} for a phone/tablet peer on the tailnet, or None.
+
+    This is what lets the wizard show a positive '✓ Your iPhone connected' the instant
+    the user finishes the phone-side setup — unambiguous proof they did it right,
+    before they even open the URL. Prefers an ONLINE phone; falls back to any known one.
+    """
+    status = status if status is not None else _status_json()
+    if not status:
+        return None
+    # Friendly label per OS when the peer's hostname is missing/generic (phones often
+    # report "localhost"), so the confirmation reads "Your iPhone connected", not junk.
+    friendly = {"ios": "iPhone", "ipados": "iPad", "android": "Android phone"}
+    peers = status.get("Peer") or {}
+    best = None
+    for _k, p in peers.items():
+        os_name = (p.get("OS") or "").lower()
+        if os_name not in _PHONE_OSES:
+            continue
+        host = (p.get("HostName") or "").strip()
+        if not host or host.lower() in ("localhost", "iphone", "ipad"):
+            host = friendly.get(os_name, "phone")
+        entry = {
+            "name": host,
+            "os": os_name,
+            "online": bool(p.get("Online")),
+        }
+        if entry["online"]:
+            return entry          # an online phone is the definitive signal
+        if best is None:
+            best = entry
+    return best
+
+
+def host_os() -> str:
+    """This machine's OS family for picking the right installer link: win|mac|linux."""
+    if sys.platform == "win32":
+        return "win"
+    if sys.platform == "darwin":
+        return "mac"
+    return "linux"
+
+
+# Per-OS Tailscale download targets. macOS → App Store (the supported path); others →
+# the platform download page which auto-serves the right installer.
+_INSTALL_URLS = {
+    "win": "https://tailscale.com/download/windows",
+    "mac": "https://apps.apple.com/us/app/tailscale/id1475387142",
+    "linux": "https://tailscale.com/download/linux",
+}
+
+
+def install_url() -> str:
+    return _INSTALL_URLS.get(host_os(), "https://tailscale.com/download")
+
+
 def _serve_targets_port(port: int) -> bool:
     """True if the current serve config serves our local port over HTTPS.
 
@@ -476,6 +566,10 @@ def status(port: Optional[int] = None) -> dict:
     elif enabled and not serving:
         needs = "starting"
 
+    # Guided-setup signals (all read live from THIS box — never hardcoded).
+    account = account_email(st) if logged_in else ""
+    phone = phone_peer(st) if logged_in else None
+
     return {
         "enabled": enabled,
         "installed": installed,
@@ -487,4 +581,10 @@ def status(port: Optional[int] = None) -> dict:
         "needs": needs,
         "https_help": HTTPS_HELP_URL,
         "device_name": device_name(),
+        # --- wizard signals ---
+        "account": account,                       # the account to sign the PHONE into
+        "phone_connected": bool(phone and phone.get("online")),
+        "phone_name": (phone or {}).get("name", ""),
+        "host_os": host_os(),                     # win|mac|linux — for the installer link
+        "install_url": install_url(),
     }

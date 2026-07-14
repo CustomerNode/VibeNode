@@ -11,6 +11,223 @@ document.addEventListener('click', function(e) {
   if (!document.getElementById('hdr-sys').contains(e.target)) closeHdrSys();
 });
 
+// --- Recently Deleted (session trash) ---
+function _trashEsc(x) {
+  if (typeof escHtml === 'function') return escHtml(x);
+  return String(x == null ? '' : x).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function _trashTimeAgo(epochSec) {
+  if (!epochSec) return '';
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - epochSec));
+  if (s < 60) return 'just now';
+  const m = Math.floor(s / 60); if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60); if (h < 24) return h + 'h ago';
+  return Math.floor(h / 24) + 'd ago';
+}
+function _trashFmtSize(bytes) {
+  if (!bytes) return '0 B';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+function openTrash() {
+  const proj = localStorage.getItem('activeProject') || '';
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'trash-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML = `
+    <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:10px;padding:22px 24px;min-width:420px;max-width:560px;max-height:72vh;display:flex;flex-direction:column;color:var(--text-primary);font-family:inherit">
+      <h3 style="margin:0 0 4px;font-size:16px;color:var(--text-heading)">Recently Deleted</h3>
+      <p style="margin:0 0 12px;font-size:12px;color:var(--text-muted)">Items are kept for the period you choose below. Restore brings the conversation back; permanent delete cannot be undone.</p>
+      <div class="retention-control" style="display:flex;align-items:center;gap:8px;font-size:12px;margin:0 0 12px">
+        <label for="retention-select" style="color:var(--text-muted)">Keep deleted sessions for:</label>
+        <select id="retention-select" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-primary);cursor:pointer;font-size:12px">
+          <option value="30">30 days</option>
+          <option value="60">60 days</option>
+          <option value="90">90 days</option>
+          <option value="36500">Forever</option>
+        </select>
+        <span id="retention-status" style="color:var(--text-muted)"></span>
+      </div>
+      <div id="trash-list" style="overflow:auto;flex:1;min-height:60px">
+        <div style="padding:18px;text-align:center;color:var(--text-muted);font-size:13px">Loading…</div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:16px">
+        <button id="trash-empty" style="padding:6px 16px;border-radius:6px;border:1px solid var(--danger,#e55);background:transparent;color:var(--danger,#e55);cursor:pointer;display:none">Empty trash</button>
+        <button id="trash-close" style="padding:6px 16px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-primary);cursor:pointer;margin-left:auto">Close</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('#trash-close').onclick = () => overlay.remove();
+  overlay.querySelector('#trash-empty').onclick = () => _trashEmpty(proj);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+
+  // Retention selector: default to Forever (safe default — never 30), apply
+  // any cached pref, then ask the server for the authoritative value.  The
+  // ui_prefs_loaded handler in socket.js calls applyRetentionPref() to set
+  // the dropdown when the value arrives.
+  const sel = overlay.querySelector('#retention-select');
+  if (sel) {
+    sel.value = '36500';
+    if (typeof window._sessionRetentionDays === 'number') {
+      applyRetentionPref(window._sessionRetentionDays);
+    }
+    if (typeof socket !== 'undefined' && socket && socket.emit) {
+      socket.emit('get_ui_prefs');
+    }
+    sel.onchange = () => _retentionChanged(proj);
+  }
+
+  _trashRender(proj);
+}
+
+// Allowed retention values (days).  36500 == Forever.  Mirrors
+// PermissionManager.RETENTION_CHOICES on the backend.
+const RETENTION_CHOICES = [30, 60, 90, 36500];
+
+// Apply a retention value to the dropdown if the modal is open.  Defaults the
+// dropdown to Forever (36500) when the value is absent or not an allowed
+// choice — never 30.
+function applyRetentionPref(days) {
+  const sel = document.getElementById('retention-select');
+  if (!sel) return;
+  const d = Number(days);
+  sel.value = RETENTION_CHOICES.includes(d) ? String(d) : '36500';
+}
+
+// On change: drive BOTH targets.  VibeNode retention (source of truth) is
+// saved first via set_ui_prefs; the Claude Code mirror is best-effort via a
+// GET-merge-PUT of /api/config (the endpoint is a whole-file replace, so we
+// must merge into the full object — a partial PUT would wipe the user's
+// permissions/theme/hooks).
+async function _retentionChanged(proj) {
+  const sel = document.getElementById('retention-select');
+  const status = document.getElementById('retention-status');
+  if (!sel) return;
+  const days = Number(sel.value);
+  // (a) source of truth — VibeNode retention.
+  if (typeof socket !== 'undefined' && socket && socket.emit) {
+    socket.emit('set_ui_prefs', { session_retention_days: days });
+  }
+  window._sessionRetentionDays = days;
+  // (b) mirror to Claude Code's cleanupPeriodDays via read-modify-write.
+  try {
+    const cur = await (await fetch('/api/config')).json();
+    if (cur && !cur.error) {
+      cur.cleanupPeriodDays = days;
+      await fetch('/api/config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cur),
+      });
+      if (status) status.textContent = 'Saved.';
+    } else {
+      // Corrupt/unreadable settings.json — never PUT a body that would
+      // clobber it.  VibeNode retention is still saved.
+      if (status) status.textContent = 'Saved. (Claude settings file unreadable — cleanup period there unchanged.)';
+    }
+  } catch (e) {
+    if (status) status.textContent = 'Saved. (Could not update Claude cleanup setting right now.)';
+  }
+  // Purge dates change with the policy — refresh the list.
+  _trashRender(proj);
+}
+
+async function _trashRender(proj) {
+  const listEl = document.getElementById('trash-list');
+  if (!listEl) return;
+  try {
+    const resp = await fetch('/api/trash?project=' + encodeURIComponent(proj));
+    const data = await resp.json();
+    const items = (data && data.trash) ? data.trash : [];
+    const emptyBtn = document.getElementById('trash-empty');
+    if (emptyBtn) emptyBtn.style.display = items.length ? 'inline-block' : 'none';
+    if (!items.length) {
+      listEl.innerHTML = '<div style="padding:24px;text-align:center;color:var(--text-muted);font-size:13px">No recently deleted sessions.</div>';
+      return;
+    }
+    let html = '';
+    for (const it of items) {
+      const title = it.name ? _trashEsc(it.name) : '<span style="color:var(--text-muted)">Untitled session</span>';
+      html += '<div class="trash-row" data-id="' + _trashEsc(it.id) + '" style="display:flex;align-items:center;gap:10px;padding:10px 4px;border-bottom:1px solid var(--border)">'
+        + '<div style="flex:1;min-width:0">'
+        +   '<div style="font-size:13px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + title + '</div>'
+        +   '<div style="font-size:11px;color:var(--text-muted)">deleted ' + _trashTimeAgo(it.deleted_at) + ' · ' + _trashFmtSize(it.size) + ' · ' + _trashPurgeLabel(it.purge_at) + '</div>'
+        + '</div>'
+        + '<button class="trash-restore" style="padding:5px 12px;border-radius:6px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;font-size:12px">Restore</button>'
+        + '<button class="trash-purge" title="Delete permanently — cannot be undone" style="padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--danger,#e55);cursor:pointer;font-size:12px">Delete forever</button>'
+        + '</div>';
+    }
+    listEl.innerHTML = html;
+    listEl.querySelectorAll('.trash-row').forEach(row => {
+      const id = row.dataset.id;
+      row.querySelector('.trash-restore').onclick = () => _trashRestore(id, proj);
+      row.querySelector('.trash-purge').onclick = () => _trashPurge(id, proj);
+    });
+  } catch (e) {
+    listEl.innerHTML = '<div style="padding:24px;text-align:center;color:var(--danger,#e55);font-size:13px">Failed to load trash.</div>';
+  }
+}
+
+async function _trashRestore(id, proj) {
+  try {
+    const resp = await fetch('/api/trash/' + encodeURIComponent(id) + '/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project: proj }),
+    });
+    const data = await resp.json();
+    if (data && data.ok) {
+      if (typeof showToast === 'function') showToast('Restored: ' + (data.title || 'session'));
+      if (typeof loadSessions === 'function') loadSessions();
+      _trashRender(proj);
+    } else {
+      if (typeof showToast === 'function') showToast((data && data.error) || 'Restore failed', 'error');
+    }
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Restore failed', 'error');
+  }
+}
+
+async function _trashPurge(id, proj) {
+  if (!confirm('Permanently delete this session? This cannot be undone.')) return;
+  try {
+    await fetch('/api/trash/' + encodeURIComponent(id) + '?project=' + encodeURIComponent(proj), { method: 'DELETE' });
+    if (typeof showToast === 'function') showToast('Permanently deleted');
+    _trashRender(proj);
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Delete failed', 'error');
+  }
+}
+
+async function _trashEmpty(proj) {
+  let ids = [];
+  try {
+    const resp = await fetch('/api/trash?project=' + encodeURIComponent(proj));
+    const data = await resp.json();
+    ids = ((data && data.trash) ? data.trash : []).map(it => it.id);
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Failed to load trash', 'error');
+    return;
+  }
+  if (!ids.length) return;
+  if (!confirm('Permanently delete all ' + ids.length + ' session(s) in the trash? This cannot be undone.')) return;
+  let ok = 0, fail = 0;
+  for (const id of ids) {
+    try {
+      const r = await fetch('/api/trash/' + encodeURIComponent(id) + '?project=' + encodeURIComponent(proj), { method: 'DELETE' });
+      if (r.ok) ok++; else fail++;
+    } catch (e) { fail++; }
+  }
+  if (typeof showToast === 'function') {
+    showToast('Emptied trash: ' + ok + ' deleted' + (fail ? ', ' + fail + ' failed' : ''), fail ? 'error' : undefined);
+  }
+  _trashRender(proj);
+}
+
 // --- Restart server ---
 function restartServer() {
   // Build a modal popup letting the user choose scope

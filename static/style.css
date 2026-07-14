@@ -557,6 +557,7 @@ header h1 { font-family: 'Space Grotesk', sans-serif; font-size: 21px; font-weig
 /* Search with inset icon */
 .sidebar-search {
   position: relative;
+  flex: 1;
 }
 .sidebar-search-icon {
   position: absolute;
@@ -1987,6 +1988,25 @@ header h1:hover { opacity: 0.7; }
 mark.find-match { background:#7c7cff44; color:inherit; border-radius:2px; }
 mark.find-match.current { background: var(--accent); color:#fff; }
 
+/* ===== Deep search (search.js — full-text search rendered inline in the
+   session list; driven by the sidebar #search box) ===== */
+.deep-search-results { padding: 6px 6px 10px; }
+.deep-search-head { font-size:11px; color: var(--text-muted); padding:4px 6px 8px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.deep-search-row { padding:8px 10px; border:1px solid var(--border); border-radius:8px;
+  margin-bottom:8px; cursor:pointer; background: var(--bg-tertiary); }
+.deep-search-row:hover { border-color: var(--accent); }
+.deep-search-row-head { display:flex; justify-content:space-between; gap:10px; align-items:baseline; }
+.deep-search-title { font-size:13px; font-weight:600; color: var(--text-heading);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.deep-search-date { font-size:11px; color: var(--text-muted); flex-shrink:0; }
+.deep-search-snip { font-size:12px; color: var(--text-primary); margin-top:5px;
+  line-height:1.45; word-break:break-word; }
+mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; padding:0 1px; }
+.deep-search-files { margin-top:6px; display:flex; flex-wrap:wrap; gap:4px; }
+.deep-search-file { font-size:11px; font-family:monospace; color: var(--text-muted);
+  border:1px solid var(--border); border-radius:4px; padding:1px 6px; }
+
 /* ===== Compare modal ===== */
 #compare-overlay { display:none; position:fixed; inset:0; background: var(--overlay);
   z-index:400; align-items:flex-start; justify-content:center; padding-top:40px; }
@@ -2213,7 +2233,7 @@ mark.find-match.current { background: var(--accent); color:#fff; }
 /* ===== Actions popup ===== */
 .actions-popup {
   background: var(--bg-modal); border:1px solid var(--border-modal); border-radius:12px;
-  width:360px; max-width:92vw; max-height:85vh; display:flex; flex-direction:column;
+  width:480px; max-width:92vw; max-height:85vh; display:flex; flex-direction:column;
   box-shadow: 0 8px 32px var(--shadow);
 }
 .actions-header {
@@ -2221,11 +2241,12 @@ mark.find-match.current { background: var(--accent); color:#fff; }
   padding:10px 12px 0; border-bottom:1px solid var(--border-subtle);
 }
 .actions-tabs {
-  display:flex; gap:0; flex:1; min-width:0;
+  display:flex; gap:0; flex:1; min-width:0; overflow-x:auto;
 }
+.actions-tabs::-webkit-scrollbar { height:0; }
 .actions-tab {
   background:none; border:none; border-bottom:2px solid transparent;
-  padding:8px 14px 10px; font-size:12px; font-weight:500;
+  padding:8px 10px 10px; font-size:12px; font-weight:500;
   color:var(--text-muted); cursor:pointer; white-space:nowrap;
   font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   transition:color .12s, border-color .12s;
@@ -9864,6 +9885,123 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
 }
 
 /* ═══════════════════════════════════════════════════════════════
+   SUBSESSIONS TAB STRIP — Ad-hoc / Structured (spec §4.5)
+   ═══════════════════════════════════════════════════════════════ */
+
+.subsessions-tab-strip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border, #30363d);
+  background: var(--bg-subtle, transparent);
+  flex-shrink: 0;
+}
+.subsessions-tab {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 5px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.subsessions-tab:hover {
+  background: var(--bg-hover, rgba(255,255,255,0.04));
+  color: var(--text);
+}
+.subsessions-tab.subsessions-tab-active {
+  background: var(--bg-elevated, rgba(78,205,196,0.10));
+  color: var(--text);
+  border-color: var(--border, rgba(78,205,196,0.25));
+}
+.subsessions-tab.subsessions-tab-affordance {
+  margin-left: auto;
+  color: var(--accent, #4ecdc4);
+  font-weight: 500;
+}
+.subsessions-tab.subsessions-tab-affordance:hover {
+  background: rgba(78, 205, 196, 0.10);
+}
+
+.subsessions-adhoc-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+  flex: 1;
+  min-height: 200px;
+}
+.subsessions-adhoc-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+/* Ad-hoc subsessions family tree (spec §4.4) — rendered into
+   #subsessions-adhoc-body by compose.js _renderAdhocSubsessions(). */
+.adhoc-subsessions-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 16px;
+  overflow-y: auto;
+}
+.adhoc-subsession-row {
+  display: flex;
+  flex-direction: column;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+.adhoc-subsession-row:hover {
+  background: var(--hover-bg, rgba(127,127,127,0.10));
+  border-color: var(--border, rgba(127,127,127,0.18));
+}
+.adhoc-subsession-row.adhoc-child {
+  margin-left: 22px;
+  border-left: 2px solid var(--border, rgba(127,127,127,0.25));
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+.adhoc-row-main {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.adhoc-row-title {
+  font-size: 13px;
+  color: var(--text, #ddd);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.adhoc-parent .adhoc-row-title { font-weight: 600; }
+.adhoc-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--text-muted, #888);
+}
+.adhoc-dot-working { background: #4a90e2; }
+.adhoc-dot-waiting { background: #e2a23b; }
+.adhoc-dot-idle    { background: #44aa66; }
+.adhoc-orphans-header {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted, #888);
+  margin: 14px 0 4px;
+  padding-left: 4px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
    COMPOSE ROOT ORCHESTRATOR — Header Bar, Input Target, Sidebar
    ═══════════════════════════════════════════════════════════════ */
 
@@ -11523,3 +11661,352 @@ body.mc-mode #main-panel { width: 100% !important; margin-left: 0 !important; he
   color: rgba(235,235,245,0.22);
 }
 [data-theme="light"] .mc-empty-text { color: rgba(60,60,67,0.3); }
+
+/* ═══════════════════════════════════════════════════════════════
+   Subsessions (spec §4.4 / §4.6) — sidebar tree + badges
+   ═══════════════════════════════════════════════════════════════
+   New classes only; no modifications to existing classes per
+   §15.1 "Do No Harm" directive.
+*/
+
+/* Indented child row with a 1-px left-edge connector line.  The
+   border-left mimics the existing Compose tree connector line so the
+   visual is consistent with the structured composition view. */
+.session-item.subsession-row .session-col-name {
+  padding-left: 16px;
+  border-left: 1px solid rgba(255, 255, 255, 0.12);
+  position: relative;
+}
+[data-theme="light"] .session-item.subsession-row .session-col-name {
+  border-left-color: rgba(0, 0, 0, 0.12);
+}
+
+/* ↳ glyph prefix — muted, 60% opacity, 12 px. */
+.subsession-glyph {
+  display: inline-block;
+  margin-right: 4px;
+  opacity: 0.6;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+/* Secondary "from: <parent_name>" line under the subsession title.
+   Matches the existing date/time-ago typography in the sidebar. */
+.subsession-from-line {
+  font-size: 11px;
+  color: var(--text-muted, #888);
+  opacity: 0.75;
+  margin-top: 1px;
+  margin-left: 16px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Disclosure caret for parents with at least one child.  Keyboard
+   focusable (tabindex=0 on the markup). */
+.subsession-caret {
+  display: inline-block;
+  width: 12px;
+  margin-right: 2px;
+  cursor: pointer;
+  font-size: 10px;
+  opacity: 0.7;
+  user-select: none;
+  vertical-align: middle;
+}
+.subsession-caret:hover { opacity: 1; }
+.subsession-caret:focus {
+  outline: 1px dotted var(--text-muted, #888);
+  outline-offset: 2px;
+}
+
+/* Inbox envelope badge — amber, matches the existing WAITING dot. */
+.subsession-inbox-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: rgba(255, 149, 0, 0.18);
+  color: #ff9500;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+  vertical-align: middle;
+}
+.subsession-inbox-badge:hover {
+  background: rgba(255, 149, 0, 0.28);
+}
+
+/* Spawn-pulse: 600 ms soft yellow highlight on the new child + parent
+   rows.  CSS-only animation; the JS adds/removes the class. */
+@keyframes subsession-spawn-pulse-anim {
+  0%   { background-color: rgba(255, 230, 120, 0.35); }
+  100% { background-color: transparent; }
+}
+.session-item.subsession-spawn-pulse {
+  animation: subsession-spawn-pulse-anim 600ms ease-out;
+}
+
+/* Slide-in for the child row when freshly spawned — uses the existing
+   pattern of a translateY+opacity entrance; 180 ms per spec §4.6.3. */
+@keyframes subsession-slide-in-anim {
+  from { transform: translateY(-6px); opacity: 0; }
+  to   { transform: translateY(0); opacity: 1; }
+}
+.session-item.subsession-row.subsession-spawn-pulse {
+  animation:
+    subsession-spawn-pulse-anim 600ms ease-out,
+    subsession-slide-in-anim 180ms ease-out;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Subsession family box (sidebar) + role banner (live panel)
+   Added 2026-06-15 — makes the parent/child relationship unmistakable
+   so the user always knows which session they are in.
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Grouped "family" container wrapping a parent + its subsessions in the
+   sidebar.  Reads as one bordered unit so the hierarchy is obvious at a
+   glance, instead of relying on a subtle indent alone. */
+.subsession-family {
+  border: 1px solid var(--border, rgba(127,127,127,0.22));
+  border-radius: 8px;
+  margin: 4px 6px;
+  padding: 2px;
+  background: rgba(120, 150, 255, 0.05);
+}
+[data-theme="light"] .subsession-family {
+  background: rgba(60, 100, 220, 0.05);
+}
+/* The parent row inside the family box reads as the header. */
+.subsession-family .session-item.family-parent {
+  border-radius: 6px;
+}
+.subsession-family .session-item.family-parent .session-col-name {
+  font-weight: 600;
+}
+/* Child rows get a clear left rail + tint so they visibly belong to the
+   box (stronger than the base subsession-row treatment). */
+.subsession-family .session-item.family-child .session-col-name {
+  border-left: 2px solid rgba(255, 149, 0, 0.55);
+  margin-left: 6px;
+  padding-left: 14px;
+}
+
+/* ── Family text colors (sidebar) ──
+   Parent = blue, subsession = amber.  Same palette as the live-panel
+   role banner (.role-parent / .role-subsession) so a session's color is
+   consistent everywhere.  Normal sessions keep the default text color —
+   only family members are tinted, so parent + sub read as unique. */
+.subsession-family .session-item.family-parent .session-col-name {
+  color: #4a90e2;
+}
+.subsession-family .session-item.family-child .session-col-name {
+  color: #ff9500;
+}
+[data-theme="light"] .subsession-family .session-item.family-parent .session-col-name {
+  color: #2f6fb3;
+}
+[data-theme="light"] .subsession-family .session-item.family-child .session-col-name {
+  color: #c8780a;
+}
+
+/* ── Family colors in the GRID (default sidebar view) ──
+   The grid renderer (renderWorkforce) tags parent/child cards so subs
+   stay next to their parent and read with the same blue/amber palette. */
+.wf-card.wf-parent .wf-name { color: #4a90e2; font-weight: 600; }
+.wf-card.wf-child  .wf-name { color: #ff9500; }
+.wf-card.wf-child {
+  border-left: 2px solid rgba(255, 149, 0, 0.5);
+}
+.wf-sub-glyph { opacity: 0.7; }
+[data-theme="light"] .wf-card.wf-parent .wf-name { color: #2f6fb3; }
+[data-theme="light"] .wf-card.wf-child  .wf-name { color: #c8780a; }
+
+/* "You are here" role banner at the top of the live panel. */
+.session-role-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--text, #ddd);
+  border-bottom: 1px solid var(--border, rgba(127,127,127,0.2));
+}
+.session-role-banner.role-subsession {
+  background: rgba(255, 149, 0, 0.14);
+  border-bottom-color: rgba(255, 149, 0, 0.35);
+}
+.session-role-banner.role-parent {
+  background: rgba(74, 144, 226, 0.14);
+  border-bottom-color: rgba(74, 144, 226, 0.35);
+}
+.role-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 5px;
+  white-space: nowrap;
+}
+.role-badge-sub  { background: #ff9500; color: #1a1300; }
+.role-badge-main { background: #4a90e2; color: #061626; }
+.role-banner-text { color: var(--text-muted, #aaa); }
+.role-banner-text .subsession-bc-parent {
+  color: var(--text, #ddd);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.role-banner-text .deleted-parent {
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
+/* ── Parent inbox strip (live panel) — see Phase 6. ── */
+.subsession-inbox-strip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  background: rgba(255, 149, 0, 0.15);
+  border-top: 1px solid rgba(255, 149, 0, 0.3);
+  border-bottom: 1px solid rgba(255, 149, 0, 0.3);
+  font-size: 12px;
+  color: var(--text, #ddd);
+}
+.subsession-inbox-strip-text { flex: 1; }
+.subsession-inbox-strip-action {
+  background: none;
+  border: 1px solid rgba(255, 149, 0, 0.5);
+  color: #ff9500;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.subsession-inbox-strip-action:hover {
+  background: rgba(255, 149, 0, 0.18);
+}
+
+/* Subsession breadcrumb in the live-panel header (Phase 6). */
+.subsession-breadcrumb {
+  font-size: 12px;
+  color: var(--text-muted, #888);
+  opacity: 0.85;
+  margin-bottom: 2px;
+}
+.subsession-breadcrumb a {
+  color: var(--text-muted, #888);
+  text-decoration: none;
+  border-bottom: 1px dotted transparent;
+  cursor: pointer;
+}
+.subsession-breadcrumb a:hover {
+  border-bottom-color: var(--text-muted, #888);
+}
+.subsession-breadcrumb .deleted-parent {
+  text-decoration: line-through;
+  cursor: not-allowed;
+}
+
+/* Subsession actions bar (Report-to-Parent + Auto-report toggle) — sits
+   above the live input bar when viewing a subsession (Phase 6). */
+.subsession-actions-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 12px;
+  font-size: 11px;
+  color: var(--text-muted, #888);
+  border-top: 1px dashed rgba(255, 255, 255, 0.08);
+}
+[data-theme="light"] .subsession-actions-bar {
+  border-top-color: rgba(0, 0, 0, 0.08);
+}
+.subsession-action-btn {
+  background: none;
+  border: 1px solid var(--text-muted, #555);
+  color: var(--text, #ddd);
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.subsession-action-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+.subsession-autoreport-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+
+/* Report-to-Parent modal popover. */
+.subsession-report-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+}
+.subsession-report-card {
+  background: var(--bg, #1a1d23);
+  border: 1px solid var(--border, #30363d);
+  border-radius: 6px;
+  padding: 16px;
+  max-width: 520px;
+  width: 92%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.subsession-report-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text, #ddd);
+}
+.subsession-report-help {
+  font-size: 11px;
+  color: var(--text-muted, #888);
+}
+.subsession-report-textarea {
+  width: 100%;
+  background: var(--bg-secondary, #1f2329);
+  border: 1px solid var(--border, #30363d);
+  color: var(--text, #ddd);
+  padding: 8px;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 12px;
+  resize: vertical;
+}
+.subsession-report-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+.subsession-report-cancel,
+.subsession-report-send {
+  background: none;
+  border: 1px solid var(--border, #30363d);
+  color: var(--text, #ddd);
+  padding: 4px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.subsession-report-send {
+  background: #0a84ff;
+  border-color: #0a84ff;
+  color: #fff;
+}
+.subsession-report-send:hover {
+  background: #409cff;
+}

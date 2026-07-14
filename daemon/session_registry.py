@@ -195,7 +195,13 @@ class SessionRegistry:
         self._registry_timer.daemon = True
         self._registry_timer.start()
 
-    def recover_sessions(self, start_session_fn: Callable, store, max_age: int = None) -> None:
+    def recover_sessions(
+        self,
+        start_session_fn: Callable,
+        store,
+        max_age: int = None,
+        mark_inbox_dirty_fn: Optional[Callable[[str], bool]] = None,
+    ) -> None:
         """Recover sessions that were active before a crash.
 
         Called once at startup in a background thread. Reads the registry,
@@ -205,6 +211,12 @@ class SessionRegistry:
         start_session_fn: callback to SessionManager.start_session
         store: ChatStore instance for finding/repairing session files
         max_age: override MAX_RECOVERY_AGE for testing
+        mark_inbox_dirty_fn: optional callback to SessionManager.mark_inbox_dirty.
+            When provided, the recovery path checks each recovered session's
+            on-disk inbox.json for ``delivered: false`` entries and flips the
+            in-memory inbox_dirty flag back on so the next send_message turn
+            drains them.  Without this, daemon restart strands undelivered
+            reports (phase 6.5 P0-3).
         """
         if max_age is None:
             max_age = MAX_RECOVERY_AGE
@@ -214,6 +226,47 @@ class SessionRegistry:
             if not sessions:
                 logger.debug("No sessions to recover from registry")
                 return
+
+            # ── Subsessions cycle detection (spec §6.8) ────────────────────
+            # Walk each session's parent_session_id chain up to 32 hops.
+            # If a cycle is detected (which should be impossible given the
+            # spawn-time guard but could happen from registry corruption or
+            # manual edits), force-clear the offending session's
+            # parent_session_id and log a warning.  Recovery must never
+            # crash or loop on a cyclic graph.
+            _MAX_PARENT_CHAIN = 32
+            cleared_parents: set = set()
+            for sid, meta in sessions.items():
+                if sid in cleared_parents:
+                    continue
+                visited = {sid}
+                cursor = meta.get("parent_session_id")
+                hops = 0
+                while cursor and hops < _MAX_PARENT_CHAIN:
+                    if cursor in visited:
+                        logger.warning(
+                            "Subsession parent cycle detected at %s — "
+                            "force-clearing parent_session_id (was %s)",
+                            sid, meta.get("parent_session_id"),
+                        )
+                        meta["parent_session_id"] = None
+                        cleared_parents.add(sid)
+                        break
+                    visited.add(cursor)
+                    parent_meta = sessions.get(cursor)
+                    if not parent_meta:
+                        break
+                    cursor = parent_meta.get("parent_session_id")
+                    hops += 1
+                else:
+                    if cursor and hops >= _MAX_PARENT_CHAIN:
+                        logger.warning(
+                            "Subsession parent chain for %s exceeded %d "
+                            "hops — force-clearing parent_session_id",
+                            sid, _MAX_PARENT_CHAIN,
+                        )
+                        meta["parent_session_id"] = None
+                        cleared_parents.add(sid)
 
             now = time.time()
             recovered = 0
@@ -284,6 +337,29 @@ class SessionRegistry:
                     "Recovering session %s (%s) from registry", sid, name or "unnamed"
                 )
 
+                # Subsessions (spec §4.1 / §6.2 / §6.8): read parent
+                # pointer + origin turn + orphan tombstone back with safe
+                # defaults.  Older registry files written by a
+                # pre-subsessions daemon will be missing these keys;
+                # .get() supplies the documented defaults so recovery
+                # is forward- and backward-compat.
+                parent_sid = meta.get("parent_session_id")
+                subsession_origin_turn = meta.get(
+                    "subsession_origin_turn", 0
+                )
+                # Phase 6.5 P1-1: pass the parent_deleted_at tombstone
+                # through recovery.  Previously, _save_registry_now()
+                # wrote this field to the snapshot but recover_sessions
+                # silently dropped it, so a daemon restart erased the
+                # orphan state and the UI flipped back to "reports to:
+                # <parent>" for a parent that no longer existed.
+                parent_deleted_at = meta.get("parent_deleted_at")
+                # Phase 6.5 P1-4: persist auto-report-on-idle preference
+                # through recovery.  Default False for legacy registries.
+                auto_report_on_idle = bool(
+                    meta.get("auto_report_on_idle", False)
+                )
+
                 # Use start_session with resume=True to reconnect via SDK --resume
                 result = start_session_fn(
                     session_id=sid,
@@ -292,9 +368,34 @@ class SessionRegistry:
                     name=name,
                     resume=True,
                     model=model if model else None,
+                    parent_session_id=parent_sid,
+                    subsession_origin_turn=subsession_origin_turn,
+                    parent_deleted_at=parent_deleted_at,
+                    auto_report_on_idle=auto_report_on_idle,
                 )
                 if result.get("ok"):
                     recovered += 1
+                    # ── Phase 6.5 P0-3: rehydrate inbox_dirty from disk ──
+                    # If this recovered session has on-disk undelivered
+                    # subsession reports, set its in-memory inbox_dirty
+                    # flag so the next send_message turn drains them.
+                    # Without this, the fast-path in send_message reads
+                    # the cleared flag and skips the disk read forever,
+                    # stranding reports written before the daemon restart.
+                    if mark_inbox_dirty_fn is not None:
+                        try:
+                            from daemon.subsession_inbox import has_undelivered
+                            if has_undelivered(sid):
+                                mark_inbox_dirty_fn(sid)
+                                logger.info(
+                                    "Rehydrated inbox_dirty=True for "
+                                    "recovered session %s", sid,
+                                )
+                        except Exception as e:
+                            logger.debug(
+                                "inbox_dirty rehydration soft-fail for %s: %s",
+                                sid, e,
+                            )
                 else:
                     logger.warning(
                         "Failed to recover session %s: %s",

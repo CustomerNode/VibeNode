@@ -66,6 +66,7 @@
       <button onclick="openBulkOperations();closeHdrSys()">Bulk Operations</button>
       <button onclick="_showHelpModal();closeHdrSys()">Keyboard Shortcuts</button>
       <div class="sys-separator"></div>
+      <button onclick="openTrash();closeHdrSys()" title="View and restore recently deleted sessions">Recently Deleted</button>
       <button onclick="openDeveloperTools();closeHdrSys()" title="Tests, scans, and server controls">Developer Tools <span class="sys-item-value" id="sys-phantom-badge"></span></button>
     </div>
   </div>
@@ -116,7 +117,7 @@
           </button>
           <button class="sidebar-view-opt" data-view="compose" onclick="setViewMode('compose')">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/><rect x="12" y="19" width="9" height="2" rx="1"/></svg>
-            Compose
+            Subsessions
           </button>
         </div>
       </div>
@@ -129,7 +130,7 @@
       <div class="sidebar-search-row">
         <div class="sidebar-search">
           <svg class="sidebar-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-          <input type="text" id="search" placeholder="Search sessions&hellip;" oninput="filterSessions()">
+          <input type="text" id="search" placeholder="Search all transcripts&hellip;" oninput="filterSessions()">
         </div>
         <div class="sidebar-menu-wrap">
           <button class="sidebar-menu-btn" id="sidebar-menu-btn" onclick="toggleSidebarMenu()" title="Options">
@@ -169,7 +170,7 @@
       // Highlight active view option immediately
       var viewOpts = document.querySelectorAll('.sidebar-view-opt');
       viewOpts.forEach(function(b){ b.classList.toggle('active', b.dataset.view === mode); });
-      var _vn = { homepage:'Home', sessions:'Sessions', kanban:'Workflow', workplace:'Workforce', compose:'Compose' };
+      var _vn = { homepage:'Home', sessions:'Sessions', kanban:'Workflow', workplace:'Workforce', compose:'Subsessions' };
       var vl = document.getElementById('sidebar-view-label'); if (vl) vl.textContent = _vn[mode] || mode;
       if (mode === 'homepage') {
         // Hide sidebar entirely on homepage
@@ -329,6 +330,30 @@
       <div id="mc-grid" class="mc-grid"></div>
     </div>
     <div id="compose-board" style="display:none;">
+      <!-- Subsessions tab strip (spec §4.5). Ad-hoc is default; Structured
+           is hidden until the active project has at least one composition
+           on disk under compose-projects/. The "+ New structured
+           composition" affordance reveals/creates a Structured comp. -->
+      <div id="subsessions-tab-strip" class="subsessions-tab-strip">
+        <button id="subsessions-tab-adhoc-btn" class="subsessions-tab subsessions-tab-active" onclick="setSubsessionsTab('adhoc')">Ad-hoc</button>
+        <button id="subsessions-tab-structured-btn" class="subsessions-tab" onclick="setSubsessionsTab('structured')" style="display:none;">Structured</button>
+        <button id="subsessions-tab-new-structured-btn" class="subsessions-tab subsessions-tab-affordance" onclick="composeCreateProject()" title="Create a Structured composition">+ New structured composition</button>
+      </div>
+      <!-- Ad-hoc tab body (default). v1 placeholder — Build Team will
+           populate with the parent-child subsessions tree per spec §4.4. -->
+      <div id="subsessions-adhoc-body" class="subsessions-adhoc-body">
+        <div class="subsessions-adhoc-empty">
+          <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="1.5" stroke-linecap="round">
+            <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
+          </svg>
+          <div style="font-size:16px;font-weight:500;color:var(--text);margin:12px 0 6px;">Ad-hoc subsessions</div>
+          <div style="font-size:13px;color:var(--text-muted);max-width:440px;text-align:center;">Spawn lightweight subsessions from any active session and see the parent-child tree here. (Available in a coming update.)</div>
+        </div>
+      </div>
+      <!-- Structured tab body — wraps the legacy Compose UX. The three
+           load-bearing children (CLAUDE.md "Compose project-scoping" fix
+           #4) remain direct children of #compose-board so initCompose()
+           can still resolve them by ID. The wrapper toggles via JS. -->
       <!-- Root Orchestrator Header Bar -->
       <div id="compose-root-header" class="compose-root-header" style="display:none;">
         <div class="compose-root-header-left">
@@ -364,22 +389,36 @@
       <script>
       (function(){
         if ((localStorage.getItem('viewMode') || '') === 'compose') {
-          var b = document.getElementById('compose-board');
-          var h = '<div class="kanban-columns-wrapper compose-columns-wrapper">';
-          var names = ['Drafting','Reviewing','Complete'];
-          for (var c = 0; c < 3; c++) {
-            h += '<div class="kanban-column compose-column kanban-skel-col"><div class="kanban-column-header"><div class="skel-shimmer skel-col-title"></div><div class="skel-shimmer skel-col-count"></div></div><div class="kanban-column-body">';
-            var n = 2 + Math.floor(Math.random() * 3);
-            for (var i = 0; i < n; i++) {
-              h += '<div class="kanban-card compose-card kanban-skel-card"><div class="skel-shimmer skel-card-title" style="width:' + (50 + Math.random() * 40) + '%;"></div><div class="skel-shimmer skel-card-meta" style="width:' + (30 + Math.random() * 30) + '%;"></div></div>';
+          // Apply persisted Subsessions tab choice (spec §14.6).
+          // Default: 'adhoc'.  Only paint the Structured loading skeleton
+          // if the saved tab is 'structured' — otherwise the empty Ad-hoc
+          // body remains as the initial render and avoids a confusing
+          // flash of kanban-card shimmers under the Ad-hoc tab.
+          var activeTab = localStorage.getItem('vn.compose.activeTab') || 'adhoc';
+          var adhocBody = document.getElementById('subsessions-adhoc-body');
+          var adhocBtn = document.getElementById('subsessions-tab-adhoc-btn');
+          var structBtn = document.getElementById('subsessions-tab-structured-btn');
+          if (activeTab === 'structured') {
+            if (adhocBody) adhocBody.style.display = 'none';
+            if (adhocBtn) adhocBtn.classList.remove('subsessions-tab-active');
+            if (structBtn) { structBtn.style.display = ''; structBtn.classList.add('subsessions-tab-active'); }
+            var b = document.getElementById('compose-board');
+            var h = '<div class="kanban-columns-wrapper compose-columns-wrapper">';
+            var names = ['Drafting','Reviewing','Complete'];
+            for (var c = 0; c < 3; c++) {
+              h += '<div class="kanban-column compose-column kanban-skel-col"><div class="kanban-column-header"><div class="skel-shimmer skel-col-title"></div><div class="skel-shimmer skel-col-count"></div></div><div class="kanban-column-body">';
+              var n = 2 + Math.floor(Math.random() * 3);
+              for (var i = 0; i < n; i++) {
+                h += '<div class="kanban-card compose-card kanban-skel-card"><div class="skel-shimmer skel-card-title" style="width:' + (50 + Math.random() * 40) + '%;"></div><div class="skel-shimmer skel-card-meta" style="width:' + (30 + Math.random() * 30) + '%;"></div></div>';
+              }
+              h += '</div></div>';
             }
-            h += '</div></div>';
+            h += '</div>';
+            // Don't overwrite the header — insert after it
+            var wrapper = document.createElement('div');
+            wrapper.innerHTML = h;
+            b.appendChild(wrapper);
           }
-          h += '</div>';
-          // Don't overwrite the header — insert after it
-          var wrapper = document.createElement('div');
-          wrapper.innerHTML = h;
-          b.appendChild(wrapper);
         }
       })();
       </script>
@@ -405,6 +444,7 @@
       <div class="actions-tabs">
         <button class="actions-tab active" onclick="switchActionsTab('organize')">Organize</button>
         <button class="actions-tab" onclick="switchActionsTab('branch')">Branch</button>
+        <button class="actions-tab" onclick="switchActionsTab('subsession')">Subsession</button>
         <button class="actions-tab" onclick="switchActionsTab('session')">Session</button>
       </div>
       <div class="actions-status" id="actions-status"></div>
@@ -442,6 +482,13 @@
       <button class="actions-item" id="btn-fork-rewind" disabled onclick="showMessagePicker(activeId,'fork-rewind');closeActionsPopup()">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg>
         <div class="actions-item-text"><div class="actions-item-name">Fork + Rewind</div><div class="actions-item-desc">Fork conversation and restore files in one step</div></div>
+      </button>
+    </div>
+    <!-- Subsession tab -->
+    <div class="actions-body actions-tab-panel" data-tab="subsession">
+      <button class="actions-item" id="btn-spawn-subsession" disabled onclick="_spawnSubsession(activeId);closeActionsPopup()" title="Spawn a subsession from this session (Ctrl+Shift+S)">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 3v6"/><path d="M6 9c0 4 4 6 8 6"/><polyline points="11 12 14 15 11 18"/></svg>
+        <div class="actions-item-text"><div class="actions-item-name">Spawn Subsession</div><div class="actions-item-desc">Start a child session that reports back to this one (Ctrl+Shift+S)</div></div>
       </button>
     </div>
     <!-- Session Controls tab -->
@@ -642,6 +689,7 @@
 <script src="{{ versioned_static('js/invoke-workforce.js') }}"></script>
 <script src="{{ versioned_static('js/live-panel.js') }}"></script>
 <script src="{{ versioned_static('js/find.js') }}"></script>
+<script src="{{ versioned_static('js/search.js') }}"></script>
 <script src="{{ versioned_static('js/extract.js') }}"></script>
 <script src="{{ versioned_static('js/compare.js') }}"></script>
 <script src="/speechnode/speechnode.js"></script>   <!-- SpeechNode package asset -->

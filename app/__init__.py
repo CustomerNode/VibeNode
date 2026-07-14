@@ -78,6 +78,8 @@ def create_app(testing=False) -> Flask:
     from .routes.admin_api import bp as admin_bp
     from .routes.watchdog_api import bp as watchdog_bp
     from .routes.mobile_api import bp as mobile_bp
+    from .routes.chatgpt_api import bp as chatgpt_bp
+    from .routes.search_api import bp as search_bp
 
     app.register_blueprint(main_bp)
     app.register_blueprint(sessions_bp)
@@ -93,6 +95,8 @@ def create_app(testing=False) -> Flask:
     app.register_blueprint(admin_bp)
     app.register_blueprint(watchdog_bp)
     app.register_blueprint(mobile_bp)
+    app.register_blueprint(chatgpt_bp)
+    app.register_blueprint(search_bp)
 
     # SpeechNode (extracted package) — mount its routes + serve its web assets.
     # Optional: if the package isn't importable, VibeNode still runs (voice off).

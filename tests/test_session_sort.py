@@ -1,26 +1,34 @@
 """Regression tests for the sidebar date sort.
 
 The sidebar's date column sorts by ``effective_ts`` =
-``max(last_user_assistant_msg_ts, file_mtime, last_access_ts)``.  Genuine
-activity bubbles a session to the top even when it doesn't write a new
-user/assistant message to the .jsonl (renames/autoname appends touch the
-file mtime; real WS work — send_message/start_session — bumps last_access_ts
-to cover the SDK remap-then-write-elsewhere case).
+``max(last_user_assistant_msg_ts, last_access_ts)`` so user interactions
+bubble a session to the top — without being polluted by SDK background
+writes that bump file mtime without representing real activity.
 
-Opening or previewing a session is deliberately sort-neutral: a plain click
-must NEVER reorder the sidebar.  access_ts is bumped only by genuine work,
-never by a view-only open (the ``/touch`` ping endpoint was removed and the
-full GET no longer records access).
+Two clean signals feed effective_ts:
+
+  * **last_activity_ts**: timestamp of the last user/assistant message
+    inside the .jsonl.  Real conversation moves this forward.
+
+  * **access_ts**: server-recorded GENUINE work (send_message, rename;
+    real WS work also covers the SDK remap-then-write-elsewhere case).
+    Overlaid on every load_session_summary call.  A plain view-only open
+    never records access and the old ``/touch`` ping endpoint was removed,
+    so opening or previewing a session is deliberately sort-neutral: a
+    plain click must NEVER reorder the sidebar.
 
 Failure modes these tests guard against:
 
   1. ``effective_ts`` field missing from the session summary — frontend
-     sort silently falls back to ``last_activity_ts`` and renames stop
-     bubbling.  (Regression: rename Aras → still sorts at May 15.)
+     sort silently falls back to ``last_activity_ts`` and rename
+     interactions stop bubbling.
 
-  2. ``effective_ts`` not maxed against file mtime — autoname/rename
-     touches the file but the sort key stays at the last conversation
-     timestamp.
+  2. ``effective_ts`` reflecting file mtime — the Claude SDK appends
+     untimestamped state entries (ai-title, mode, last-prompt,
+     file-history-snapshot) in the background, bumping mtime without
+     real activity.  One CustomerNode incident clustered 7 sessions at
+     the same mtime minute and pushed an actually-recent conversation
+     9 positions down.  effective_ts MUST NOT max with mtime.
 
   3. Access timestamp not overlaid on cache hits — the body-content
      cache key is ``(path, mtime, size)`` so a genuine-work bump that
@@ -103,7 +111,13 @@ class TestEffectiveTsField:
         result = load_session(path)
         assert "effective_ts" in result
 
-    def test_effective_ts_at_least_last_message(self, tmp_path):
+    def test_effective_ts_equals_last_activity_ts_without_access(
+        self, tmp_path, monkeypatch,
+    ):
+        """No access entry → effective_ts is exactly last_activity_ts."""
+        monkeypatch.setattr(
+            "app.sessions._load_session_access_cached", lambda project: {},
+        )
         from app.sessions import load_session_summary, _summary_cache
         _summary_cache.clear()
         path = tmp_path / "sess.jsonl"
@@ -112,27 +126,36 @@ class TestEffectiveTsField:
             _msg_line("assistant", "yo", "2026-03-01T10:00:05Z"),
         ])
         result = load_session_summary(path)
-        assert result["effective_ts"] >= result["last_activity_ts"]
+        assert result["effective_ts"] == result["last_activity_ts"]
 
-    def test_effective_ts_uses_mtime_when_newer_than_messages(self, tmp_path):
-        """The Aras failure mode: file touched (rename appended a custom-title
-        line) after the last real message.  effective_ts must reflect the
-        touch, not just the message timestamp."""
+    def test_effective_ts_ignores_file_mtime(self, tmp_path, monkeypatch):
+        """Regression for the CustomerNode 06-01 incident: the Claude SDK
+        appends untimestamped entries (ai-title, mode, last-prompt) to
+        session files in the background, bumping mtime without any user
+        interaction.  effective_ts MUST NOT max with mtime, or those
+        background writes pollute the sort and push real-activity
+        sessions down."""
+        monkeypatch.setattr(
+            "app.sessions._load_session_access_cached", lambda project: {},
+        )
         from app.sessions import load_session_summary, _summary_cache
         _summary_cache.clear()
         path = tmp_path / "sess.jsonl"
-        # Last user/asst message is 12 days ago
+        # Last real message ts is far in the past
         _write_session(path, [
             _msg_line("user", "old", "2026-03-01T10:00:00Z"),
             _msg_line("assistant", "old", "2026-03-01T10:00:05Z"),
-            _custom_title_line("Renamed"),
         ])
-        # File mtime is "now" (just written)
+        # Simulate SDK background write — append a state entry that bumps
+        # mtime to ~now without adding any user/assistant message
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "ai-title", "aiTitle": "auto"}) + "\n")
+        # mtime is "now"; last user/asst message is still 2026-03-01
+        assert path.stat().st_mtime - time.time() < 5
         result = load_session_summary(path)
-        # mtime should be far newer than the 2026-03-01 message timestamp
-        assert result["effective_ts"] > result["last_activity_ts"]
-        # and within a reasonable window of file mtime
-        assert abs(result["effective_ts"] - path.stat().st_mtime) < 1.0
+        # effective_ts must reflect ONLY the message timestamp, not mtime
+        assert result["effective_ts"] == result["last_activity_ts"]
+        assert path.stat().st_mtime - result["effective_ts"] > 86400  # >1 day gap
 
     def test_last_activity_ts_still_means_last_message(self, tmp_path):
         """Renaming must not change last_activity_ts — display code uses

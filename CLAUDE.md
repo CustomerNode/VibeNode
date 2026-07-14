@@ -79,9 +79,19 @@ VibeNode underwent a measurement-driven performance overhaul. The patterns below
 16. **Watchdog dedup** — `static/js/live-panel.js`. `window._watchdogSid`/`window._watchdogTimer` enable cross-script dedup. Do NOT remove the `window.` assignments.
 17. **`performance.mark()`/`performance.measure()` instrumentation** — `static/js/socket.js`. Submit timing and session switch timing. Do NOT remove.
 18. **Chrome-first browser launch** — `run.py` `_find_chrome()` / `_find_chrome_linux()` / `_find_chrome_macos()` + `open_browser()`. The Web Speech API (voice input) is Chromium-only. ALL THREE PLATFORMS must find and launch Chrome/Chromium before falling back to the system default browser opener — the default may be Firefox, which silently breaks voice with no error messages. This regression already happened once on Windows and shipped to users. Do NOT replace any platform's Chrome-first path with only the system fallback (`os.startfile`, `xdg-open`, or `open`) as the sole method. Platform pattern:
-   - Windows: `_find_chrome()` → `ShellExecuteW(chrome, url)` → `os.startfile` fallback
-   - Linux:   `_find_chrome_linux()` → `Popen([chrome, url])` → `xdg-open` fallback
-   - macOS:   `_find_chrome_macos()` → `Popen([chrome, url])` → `open` fallback
+   - Windows: `_find_chrome()` → `ShellExecuteW(chrome, --app=URL + --user-data-dir=DIR)` → `os.startfile` fallback
+   - Linux:   `_find_chrome_linux()` → `Popen([chrome, --app=URL, --user-data-dir=DIR])` → `xdg-open` fallback
+   - macOS:   `_find_chrome_macos()` → `Popen([chrome, --app=URL, --user-data-dir=DIR])` → `open` fallback
+
+    **Isolated Chrome instance (added 2026-06-13).** All three platforms pass `--app=<URL>` and `--user-data-dir=data/chrome-profile` so VibeNode runs in its own Chrome window with its own profile. Without isolation, VibeNode borrowed the user's everyday Chrome and the launcher-spawned window wedged Chrome's focus state — new windows opened from outside VibeNode would silently no-op until Chrome was fully closed and reopened. The dedicated profile also bypasses Chrome's session restore (no "Continue where you left off" interference on cold start), which was the original reason `--new-window` existed. Do NOT remove the `--app=` or `--user-data-dir=` flags. The profile directory is gitignored (`data/chrome-profile/`).
+
+    **`browser_launch_mode` toggle + tradeoff-free tab mode (added 2026-07-13).** `open_browser()` reads `kanban_config.json["browser_launch_mode"]`. **Default is `"tab"`** — a tab in the user's everyday Chrome profile, how VibeNode behaved for most of its history. `"app"` opts back into the isolated app window; item 18's flags are intact and reachable via `"app"`, only the default changed.
+
+    Tab mode does NOT reintroduce the two 6/13 bugs, because they are mutually exclusive by Chrome's running state and `open_browser()` now branches on it via `_chrome_running()`:
+    - **Chrome already running** → bare URL → new tab. A focus wedge requires a launcher-spawned *window*, not a tab; and session restore already ran on Chrome's own startup, so there is nothing to swallow the URL.
+    - **Chrome not running (cold start)** → `--new-window <url>` → forces the URL to display (the original pre-6/13 fix for "Continue where you left off" swallowing a bare URL), and there is no running Chrome for a new window to wedge.
+
+    So `--new-window` is used ONLY on a cold start, which is exactly when it cannot wedge. Do NOT collapse the `_chrome_running()` branch to an unconditional bare URL (reintroduces the cold-start swallow) or an unconditional `--new-window` (reintroduces the focus wedge). `_chrome_running()` biases to `True` on detection failure so the common already-open case never risks a wedge.
 
 ## Compose project-scoping — DO NOT REMOVE (fixed 2026-04-13)
 
@@ -94,6 +104,18 @@ Three bugs combined to make the Compose feature unusable across multiple VibeNod
 3. **Snapshot-based test cleanup** — `tests/test_compose_api.py`. The `cleanup_projects` fixture MUST snapshot `COMPOSE_PROJECTS_DIR` before each test and remove anything new after. The old `startswith("test-")` check missed cloned projects (directory names like `copy-of-test-clone-src-*` and UUIDs), which leaked 52 orphan projects into production data. Do NOT revert to name-prefix cleanup.
 
 4. **Compose DOM skeleton preserved on project switch** — `static/js/app.js`. When the user switches projects while in compose view, the cleanup code MUST NOT set `compose-board.innerHTML = ''`. The `#compose-board` container holds static child elements defined in `index.html` (`compose-root-header`, `compose-input-target`, `compose-sections-board`) that `initCompose()` writes into by ID. Nuking the parent's innerHTML destroys those elements and `initCompose()` silently writes to `null`, producing a blank panel even though the API returns valid data. Only clear `compose-sections-board.innerHTML` (the dynamic card area). Do NOT replace with a blanket `innerHTML = ''` on the parent — this exact regression already blanked the compose panel in production (fixed 2026-04-14).
+
+## Detached web-server launch — DO NOT REVERT (fixed 2026-06-13)
+
+The web server is spawned detached on every platform. Reverting any of the pieces below re-introduces the "minimized launcher window got closed → web server dies → user sees a dead page even though sessions are intact" failure mode that hit a user on 6/12.
+
+1. **`launch.bat` uses `pythonw.exe`** — `start "" pythonw session_manager.py` then `exit /b`. pythonw has no console window, so there is nothing for the user (or Windows on sign-out) to close. Fallback to legacy `python session_manager.py` (minimized re-launch) only when pythonw is genuinely missing from PATH. Do NOT switch the primary path back to `python` or remove the `start ""` — both reintroduce the closeable window.
+
+2. **`launch.sh` background-spawns with `nohup` and `disown`** — `nohup "$PY" session_manager.py >> logs/_server.log 2>&1 &` followed by `disown`. The terminal can close without taking the server down via SIGHUP. Output goes to `logs/_server.log` so diagnostic prints from `ensure_daemon()` and `run.py` are preserved. Do NOT remove `nohup`, `&`, or `disown` — the trio is what makes the spawn a true daemon under bash.
+
+3. **Spawn-mode log line in `session_manager.py`** — writes `spawn exe=pythonw mode=detached(...) sid=… pgid=…` to `logs/_server.log` immediately on startup. This is the only on-disk signal that tells future maintainers whether a given run was attached or detached. If a future launcher regression silently foregrounds the server, this line is the smoking gun.
+
+4. **`server-reachable` health check in `static/js/healthchecks.js`** — registers a blocker overlay (same machinery as the wifi check) that probes `/api/ping` every 5s and shows "VibeNode Server Unreachable" after 3 consecutive failures. Catches any post-load server death (crash, manual kill, port conflict) that the detached spawn doesn't prevent. The `/api/ping` route lives in `app/routes/main.py` and must stay side-effect-free so it never lies about reachability. Do NOT remove the check or repurpose `/api/auth-status` — auth-status is a heavier call that can stall on a slow Claude CLI shell-out and would produce false positives.
 
 ## Slash commands are intercepted client-side
 Claude CLI slash commands (e.g. `/compact`, `/rewind`, `/clear`) are NOT sent to the SDK. They get silently eaten with no response, leaving the session stuck idle. Instead, `_interceptSlashCommand()` in `live-panel.js` catches them at every submit path and either triggers the GUI equivalent (e.g. `/rewind` clicks the Rewind toolbar button, `/compact` fires `liveCompact()`) or shows a toast explaining the command isn't supported in the GUI. The command map lives in `_slashCommandMap`. Messages with `/` that aren't bare commands (e.g. "fix /etc/config") pass through normally.

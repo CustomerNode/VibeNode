@@ -999,6 +999,7 @@ let _plannerStashed = null;
 let _plannerEntryListener = null;
 let _plannerStateListener = null;
 let _plannerAccumText = '';
+let _plannerHistory = [];  // [{role, content}] for multi-turn refine via the chat endpoint
 
 const _PLANNER_SYSTEM = [
   'You are a task planning assistant for a Kanban board.',
@@ -1163,30 +1164,14 @@ function _updatePlannerProgress() {
 let _earlyParseAttempted = false;
 function _tryEarlyParse() {
   if (_earlyParseAttempted) return;
-  const text = _plannerAccumText;
-  // Find first { then walk forward respecting strings so braces inside "..." are ignored
-  const start = text.indexOf('{');
-  if (start < 0) return;
-  let depth = 0, end = -1, inStr = false, esc = false;
-  for (let i = start; i < text.length; i++) {
-    const c = text[i];
-    if (esc) { esc = false; continue; }
-    if (c === '\\' && inStr) { esc = true; continue; }
-    if (c === '"') { inStr = !inStr; continue; }
-    if (inStr) continue;
-    if (c === '{') depth++;
-    else if (c === '}') { depth--; if (depth === 0) { end = i; break; } }
+  // Same robust extractor used at idle — fires the moment a complete task tree
+  // is present in the stream, even if surrounded by prose or tool narration.
+  const proposal = _extractPlanProposal(_plannerAccumText);
+  if (proposal && proposal.tasks && proposal.tasks.length > 0) {
+    _earlyParseAttempted = true;
+    _stopPlannerTimer();
+    _showPlanResult(_plannerAccumText);
   }
-  if (end < 0) return; // JSON not complete yet
-  const jsonStr = text.slice(start, end + 1);
-  try {
-    const parsed = JSON.parse(jsonStr);
-    if (parsed.tasks && parsed.tasks.length > 0) {
-      _earlyParseAttempted = true;
-      _stopPlannerTimer();
-      _showPlanResult(text);
-    }
-  } catch (_) { /* not valid yet, keep waiting */ }
 }
 
 function _detachPlannerListeners() {
@@ -1201,103 +1186,160 @@ async function _openPlannerSlideout(prompt) {
   if (old) old.remove();
   _plannerProposal = null;
 
-  const newId = crypto.randomUUID();
-  _plannerSessionId = newId;
-
-  // Don't add to allSessions — planner is a utility session, not user-visible
-  if (typeof _hiddenSessionIds !== 'undefined') _hiddenSessionIds.add(newId);
+  // HTTP-based planner — one constrained, single-turn structured call rather than
+  // a full agentic CLI session. The old approach emitted start_session with
+  // max_turns:0 and tools enabled in the project dir; the session frequently
+  // wandered (tool calls, prose) or returned no clean JSON, which surfaced as
+  // "Couldn't parse a task structure". The /api/kanban/planner/chat endpoint runs
+  // a single bounded turn and injects the existing task tree + detected routes
+  // server-side, so it returns a parseable proposal reliably.
+  _plannerSessionId = null;
+  try { localStorage.removeItem('plannerSessionId'); } catch (_) {}
+  _plannerHistory = [];
 
   // Build and show panel
   const panel = _buildPlannerPanel();
   document.body.appendChild(panel);
   requestAnimationFrame(() => panel.classList.add('open'));
   setTimeout(_wirePlannerVoice, 350);
-
   _persistPlannerState('open');
 
-  // Attach listeners BEFORE emitting
-  _attachPlannerListeners();
-
-  // Fetch validation config, task tree, detected URLs, and drill-down context in parallel
-  let valUrlSnippet = '';
-  let taskTreeSnippet = '';
-  let drillDownSnippet = '';
-  let detectedUrlSnippet = '';
-  const contextTaskId = _plannerScopeParentId || kanbanDetailTaskId;
-  const projectDir = typeof _currentProjectDir === 'function' ? _currentProjectDir() : '';
-  try {
-    const fetches = [
-      fetch('/api/kanban/config').then(r => r.ok ? r.json() : {}),
-      fetch('/api/kanban/task-tree-summary').then(r => r.ok ? r.json() : {}),
-      fetch('/api/kanban/detected-urls' + (projectDir ? '?cwd=' + encodeURIComponent(projectDir) : '')).then(r => r.ok ? r.json() : {}),
-    ];
-    // If we're inside a drill-down, fetch the ancestor chain + task detail
-    if (contextTaskId) {
-      fetches.push(
-        fetch('/api/kanban/tasks/' + contextTaskId + '/ancestors').then(r => r.ok ? r.json() : null)
-      );
-      fetches.push(
-        fetch('/api/kanban/tasks/' + contextTaskId).then(r => r.ok ? r.json() : null)
-      );
-    }
-    const results = await Promise.all(fetches);
-    const cfgRes = results[0];
-    const treeRes = results[1];
-    const urlsRes = results[2] || {};
-    const ancestorRes = results[3] || null;
-    const taskDetail = results[4] || null;
-
-    if (cfgRes.validation_url_enabled && cfgRes.validation_base_url) {
-      valUrlSnippet = ' VALIDATION URLS ENABLED. Dev server base URL: ' + cfgRes.validation_base_url + '. You MUST set verification_url on EVERY task and subtask by constructing absolute URLs from this base URL + one of the DETECTED ROUTES below. NEVER invent URLs — only use routes from the detected list. Every task MUST have a verification_url unless it is purely non-visual work like refactoring or config with no observable endpoint.';
-    }
-    if (urlsRes.formatted) {
-      detectedUrlSnippet = '\n\nDETECTED ROUTES (real URLs from project source code — use ONLY these):\n' + urlsRes.formatted + '\n\nIMPORTANT: ONLY use routes from the list above. NEVER invent or guess URLs. If no route matches a task, set verification_url to null.';
-    }
-    if (treeRes.summary) {
-      taskTreeSnippet = '\n\nEXISTING TASK TREE (current board state):\n' + treeRes.summary + '\n\nConsider these existing tasks when planning. Avoid duplicating work that already exists. You may reference existing tasks or plan complementary work.';
-    }
-    // Build drill-down position context: breadcrumb + current task + its children
-    if (contextTaskId && (ancestorRes || taskDetail)) {
-      let parts = [];
-      if (ancestorRes && ancestorRes.ancestors && ancestorRes.ancestors.length) {
-        const breadcrumb = ancestorRes.ancestors.map(a => a.title).join(' → ');
-        const currentTitle = ancestorRes.task ? ancestorRes.task.title : '';
-        parts.push('CURRENT POSITION IN TREE: ' + breadcrumb + (currentTitle ? ' → ' + currentTitle : ''));
-      }
-      if (taskDetail) {
-        parts.push('CURRENT TASK (id: ' + contextTaskId + '): "' + (taskDetail.title || '') + '"');
-        if (taskDetail.description) parts.push('Description: ' + taskDetail.description);
-        if (taskDetail.status) parts.push('Status: ' + taskDetail.status);
-        if (taskDetail.children && taskDetail.children.length) {
-          const childLines = taskDetail.children.map(c => '  - [' + c.status + '] ' + c.title + ' (id: ' + c.id + ')');
-          parts.push('EXISTING SUBTASKS:\n' + childLines.join('\n'));
-        }
-      }
-      if (parts.length) {
-        drillDownSnippet = '\n\nDRILL-DOWN CONTEXT (the user is currently viewing this task):\n' + parts.join('\n');
-        drillDownSnippet += '\n\nYou may edit the parent task itself by including its id. To edit existing subtasks include their id. New tasks (no id) will be added as children. Avoid duplicating existing subtasks.';
-      }
-    }
-  } catch (_) {}
-
-  // Start session via daemon
-  _earlyParseAttempted = false;
+  // Spinner + live timer (no socket streaming in the HTTP flow)
   _plannerSteps = [];
-  runningIds.add(newId);
-  sessionKinds[newId] = 'working';
-  // For scoped plans (subtree editing), add explicit instruction to NOT include the parent
-  let sysPrompt = _PLANNER_SYSTEM + valUrlSnippet + detectedUrlSnippet + taskTreeSnippet + drillDownSnippet;
+  _earlyParseAttempted = false;
+  _plannerAccumText = '';
+  _startPlannerSpinner();
+
+  // For scoped (subtree) edits, fold the constraint into the message so the
+  // single-turn endpoint returns exactly one top-level task to replace the subtree.
+  let message = prompt;
   if (_plannerScopeParentId) {
-    sysPrompt += ' IMPORTANT: You are editing an EXISTING task and its subtree. Return EXACTLY ONE top-level task in your "tasks" array — this is the parent task being edited. Include its updated title, description, and subtasks. The parent will be updated in place and its old subtree will be replaced.';
+    let title = '';
+    try {
+      const detail = await fetch('/api/kanban/tasks/' + _plannerScopeParentId).then(r => r.ok ? r.json() : null);
+      if (detail) title = detail.title || '';
+    } catch (_) {}
+    message += '\n\n[SCOPED EDIT] Return EXACTLY ONE top-level task in "tasks" — the parent being edited' +
+      (title ? ' (titled "' + title + '")' : '') + ' — including its updated subtasks. Its old subtree will be replaced.';
   }
-  socket.emit('start_session', {
-    session_id: newId,
-    prompt: prompt,
-    cwd: typeof _currentProjectDir === 'function' ? _currentProjectDir() : '',
-    system_prompt: sysPrompt,
-    max_turns: 0,
-    session_type: 'planner',
-  });
+
+  await _sendPlannerMessage(message);
+}
+
+// ── Start (or restart) the planner spinner + live elapsed timer ──
+function _startPlannerSpinner() {
+  _plannerStartTime = Date.now();
+  _stopPlannerTimer();
+  _plannerTimerInterval = setInterval(() => {
+    const el = document.getElementById('planner-timer');
+    if (el) el.textContent = Math.floor((Date.now() - _plannerStartTime) / 1000) + 's';
+  }, 1000);
+  _updatePlannerProgress();
+}
+
+// ── Send a planner message to the chat endpoint and render the result ──
+async function _sendPlannerMessage(message) {
+  const priorHistory = _plannerHistory.slice();  // history BEFORE this turn
+  _plannerHistory.push({ role: 'user', content: message });
+  try {
+    const res = await fetch('/api/kanban/planner/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: message, history: priorHistory }),
+    });
+    const data = await res.json().catch(() => ({}));
+    _stopPlannerTimer();
+    if (!res.ok || data.error) {
+      _showPlannerError(data.error || ('Planner request failed (' + res.status + ')'));
+      return;
+    }
+    _plannerHistory.push({ role: 'assistant', content: data.response || '' });
+    if (data.proposal && data.proposal.tasks && data.proposal.tasks.length) {
+      // Render via the shared parser (also sets _plannerProposal + stashes it).
+      _showPlanResult(JSON.stringify(data.proposal));
+    } else {
+      // No structured tasks — surface the model's prose + raw for debugging.
+      _showPlanResult(data.response || '');
+    }
+  } catch (e) {
+    _stopPlannerTimer();
+    _showPlannerError('Network error: ' + (e && e.message ? e.message : e));
+  }
+}
+
+// ── Render an explicit planner error (network/API failure) ──
+function _showPlannerError(msg) {
+  const body = document.getElementById('planner-body');
+  if (!body) return;
+  body.innerHTML =
+    '<div class="planner-result">' +
+      '<div class="planner-error">' + escHtml(msg) + '</div>' +
+      '<div class="planner-hint">Try rephrasing your request below.</div>' +
+    '</div>';
+}
+
+// ── Coerce a parsed JSON value into a task list, or null ──
+// Accepts {tasks:[…]}, a bare [{title…}, …] array, or {sections:[…]} shapes.
+function _coercePlanTasks(parsed) {
+  if (!parsed || typeof parsed !== 'object') return null;
+  if (Array.isArray(parsed)) {
+    const tasks = parsed.filter(t => t && typeof t === 'object' && t.title);
+    return tasks.length ? tasks : null;
+  }
+  if (Array.isArray(parsed.tasks) && parsed.tasks.length) return parsed.tasks;
+  return null;
+}
+
+// ── Robustly extract a plan proposal from arbitrary model output ──
+// The planner runs as a full agentic session, so its text can interleave prose,
+// tool narration, code fences, and stray braces (e.g. "targets like {A, B}")
+// before the real JSON. Rather than trust the FIRST brace, scan EVERY balanced
+// {…} / […] candidate (string-aware) and return the first that yields a task
+// tree. Returns {tasks:[…]} or null.
+function _extractPlanProposal(rawText) {
+  if (!rawText) return null;
+  const candidates = [];
+
+  // 1) Prefer fenced blocks — collect every ```json … ``` / ``` … ``` body.
+  const fenceRe = /```(?:json)?\s*([\s\S]*?)```/g;
+  let fm;
+  while ((fm = fenceRe.exec(rawText)) !== null) {
+    if (fm[1] && fm[1].trim()) candidates.push(fm[1].trim());
+  }
+
+  // 2) Whole text, in case the model returned bare JSON with no prose.
+  candidates.push(rawText.trim());
+
+  // 3) Every balanced {…} then every balanced […] substring (string-aware).
+  //    Objects are scanned before arrays so {tasks:[…]} wins over a stray list.
+  for (const [open, close] of [['{', '}'], ['[', ']']]) {
+    let i = 0;
+    while (i < rawText.length) {
+      if (rawText[i] !== open) { i++; continue; }
+      let depth = 0, end = -1, inStr = false, esc = false;
+      for (let j = i; j < rawText.length; j++) {
+        const c = rawText[j];
+        if (esc) { esc = false; continue; }
+        if (c === '\\' && inStr) { esc = true; continue; }
+        if (c === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (c === open) depth++;
+        else if (c === close) { depth--; if (depth === 0) { end = j; break; } }
+      }
+      if (end < 0) break;       // no balanced close remains
+      candidates.push(rawText.slice(i, end + 1));
+      i = end + 1;              // resume after this candidate
+    }
+  }
+
+  // 4) First candidate that parses into a usable task list wins.
+  for (const cand of candidates) {
+    let parsed;
+    try { parsed = JSON.parse(cand); } catch (_) { continue; }
+    const tasks = _coercePlanTasks(parsed);
+    if (tasks) return { tasks };
+  }
+  return null;
 }
 
 // ── Show parsed plan result in the panel body ──
@@ -1310,51 +1352,7 @@ function _showPlanResult(rawText) {
   // If the plan was already accepted, don't overwrite the UI with stale results
   if (!_plannerSessionId && !rawText) return;
   console.log('[planner] rawText (' + rawText.length + '):', rawText.slice(0, 500));
-  let parsed = null;
-  // Try 1: ```json ... ``` or ``` ... ```
-  const m1 = rawText.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (m1) { try { parsed = JSON.parse(m1[1]); } catch (_) {} }
-  // Try 2: whole text as JSON
-  if (!parsed) { try { parsed = JSON.parse(rawText.trim()); } catch (_) {} }
-  // Try 3: string-aware brace extraction (handles braces inside JSON strings)
-  if (!parsed) {
-    const s = rawText.indexOf('{');
-    if (s >= 0) {
-      let depth = 0, end = -1, inStr = false, esc = false;
-      for (let i = s; i < rawText.length; i++) {
-        const c = rawText[i];
-        if (esc) { esc = false; continue; }
-        if (c === '\\' && inStr) { esc = true; continue; }
-        if (c === '"') { inStr = !inStr; continue; }
-        if (inStr) continue;
-        if (c === '{') depth++;
-        else if (c === '}') { depth--; if (depth === 0) { end = i; break; } }
-      }
-      if (end > s) { try { parsed = JSON.parse(rawText.slice(s, end + 1)); } catch (_) {} }
-    }
-  }
-  // Try 4: bare array — wrap in {tasks: [...]}
-  if (!parsed) {
-    const aStart = rawText.indexOf('[');
-    if (aStart >= 0) {
-      let depth = 0, end = -1, inStr = false, esc = false;
-      for (let i = aStart; i < rawText.length; i++) {
-        const c = rawText[i];
-        if (esc) { esc = false; continue; }
-        if (c === '\\' && inStr) { esc = true; continue; }
-        if (c === '"') { inStr = !inStr; continue; }
-        if (inStr) continue;
-        if (c === '[') depth++;
-        else if (c === ']') { depth--; if (depth === 0) { end = i; break; } }
-      }
-      if (end > aStart) {
-        try {
-          const arr = JSON.parse(rawText.slice(aStart, end + 1));
-          if (Array.isArray(arr) && arr.length && arr[0].title) parsed = { tasks: arr };
-        } catch (_) {}
-      }
-    }
-  }
+  const parsed = _extractPlanProposal(rawText);
 
   if (parsed && parsed.tasks && parsed.tasks.length > 0) {
     _plannerProposal = parsed;
@@ -1382,34 +1380,23 @@ function _showPlanResult(rawText) {
   }
 }
 
-// ── Refine: send follow-up to the same session ──
+// ── Refine: send a follow-up turn to the chat endpoint with prior history ──
 function _refinePlan() {
   const ta = document.getElementById('planner-refine-input');
   const text = ta ? ta.value.trim() : '';
   if (!text) return;
   ta.value = '';
 
-  // If no session exists yet (opened via scoped planner), start one now
-  if (!_plannerSessionId) {
+  // Panel opened empty (e.g. scoped planner prefill) — treat as the initial request.
+  if (!_plannerHistory || !_plannerHistory.length) {
     _openPlannerSlideout(text);
     return;
   }
 
-  // Reset accumulator, timer, and early parse flag
   _plannerAccumText = '';
   _earlyParseAttempted = false;
-  _plannerStartTime = Date.now();
-  _stopPlannerTimer();
-  _plannerTimerInterval = setInterval(() => {
-    const el = document.getElementById('planner-timer');
-    if (!el) return;
-    el.textContent = Math.floor((Date.now() - _plannerStartTime) / 1000) + 's';
-  }, 1000);
-
-  _updatePlannerProgress();
-
-  // Send message to existing session
-  socket.emit('send_message', { session_id: _plannerSessionId, text: text });
+  _startPlannerSpinner();
+  _sendPlannerMessage(text);
 }
 
 function _renderPlanTree(tasks, depth) {
@@ -1541,6 +1528,7 @@ function _openPlannerPanel(prefill) {
   const old = document.getElementById('kanban-planner-panel');
   if (old) old.remove();
   _plannerProposal = null;
+  _plannerHistory = [];
 
   const panel = _buildPlannerPanel();
   document.body.appendChild(panel);
@@ -4064,27 +4052,23 @@ function _showDrillDownPlanResult(rawText) {
   const logEl = document.getElementById('planner-drilldown-log');
   if (!logEl) return;
 
-  // Try to extract JSON from the raw text
-  const jsonMatch = rawText.match(/```json\s*([\s\S]*?)```/) || rawText.match(/(\{[\s\S]*\})/);
-  if (jsonMatch) {
-    try {
-      const parsed = JSON.parse(jsonMatch[1]);
-      _plannerProposal = parsed;
+  // Extract JSON from the raw text using the shared robust parser — survives
+  // prose, tool narration, stray braces, and code fences in the stream.
+  const proposal = _extractPlanProposal(rawText);
+  if (proposal) {
+    _plannerProposal = proposal;
 
-      // Show accept bar below the log
-      let acceptBar = document.getElementById('planner-dd-accept');
-      if (!acceptBar) {
-        const panel = document.getElementById('live-panel');
-        if (panel) {
-          panel.insertAdjacentHTML('beforeend',
-            '<div id="planner-dd-accept" style="padding:10px 20px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-shrink:0;">' +
-            '<button class="pm-btn pm-btn-primary" onclick="_acceptPlannerDrillDown()" style="background:var(--purple);border-color:var(--purple);">Accept Plan</button>' +
-            '<span style="font-size:12px;color:var(--text-dim);">Accept to create subtasks on the board</span>' +
-            '</div>');
-        }
+    // Show accept bar below the log
+    let acceptBar = document.getElementById('planner-dd-accept');
+    if (!acceptBar) {
+      const panel = document.getElementById('live-panel');
+      if (panel) {
+        panel.insertAdjacentHTML('beforeend',
+          '<div id="planner-dd-accept" style="padding:10px 20px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px;flex-shrink:0;">' +
+          '<button class="pm-btn pm-btn-primary" onclick="_acceptPlannerDrillDown()" style="background:var(--purple);border-color:var(--purple);">Accept Plan</button>' +
+          '<span style="font-size:12px;color:var(--text-dim);">Accept to create subtasks on the board</span>' +
+          '</div>');
       }
-    } catch (_) {
-      // Not valid JSON — show as-is (just a text response, no plan to accept)
     }
   }
 

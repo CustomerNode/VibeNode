@@ -163,6 +163,111 @@
   }
 
   // =========================================================================
+  // Edge-swipe to open / swipe to close the drawer (iOS-style, follows finger)
+  //
+  // Open: a drag that STARTS within EDGE px of the left screen edge (drawer
+  // closed) drags the drawer in 1:1 with the finger. Close: a drag anywhere on
+  // the OPEN drawer drags it back out. On release we snap to whichever side the
+  // gesture committed to (past ~30% of the width) and hand the final animation +
+  // state back to the app's own .collapsed toggle so localStorage stays in sync.
+  // =========================================================================
+  function initSwipe() {
+    var sb = sidebar();
+    if (!sb) { setTimeout(initSwipe, 200); return; }
+
+    // A rightward drag starting ANYWHERE on the screen opens the drawer (iOS-style —
+    // you can begin the swipe mid-screen, not just at the edge). We only skip the
+    // first few px, which mobile browsers reserve for their own back-navigation
+    // gesture, and we bail if the drag begins inside something that scrolls
+    // horizontally (a code block) so we don't hijack its own left/right scroll.
+    var EDGE_MIN = 8;          // ignore the first few px (browser back-swipe territory)
+    var SLOP = 8;               // px of movement before we lock horizontal vs vertical
+    var COMMIT = 0.3;           // fraction of width past which the gesture "wins"
+
+    // True if el or an ancestor (up to the drawer/body) can actually scroll sideways.
+    function inHorizontalScroller(el) {
+      for (var n = el; n && n !== document.body; n = n.parentElement) {
+        if (n.scrollWidth > n.clientWidth + 2) {
+          var ox = getComputedStyle(n).overflowX;
+          if (ox === "auto" || ox === "scroll") return true;
+        }
+      }
+      return false;
+    }
+    var startX = 0, startY = 0, dx = 0;
+    var tracking = false;       // a candidate gesture is in progress
+    var decided = false;        // locked into a horizontal drag (vs vertical scroll)
+    var mode = null;            // "open" | "close"
+    var width = 0;
+
+    function drawerWidth() { return sb.getBoundingClientRect().width || window.innerWidth; }
+
+    function onStart(e) {
+      tracking = decided = false; mode = null;
+      if (!isMobile() || currentView() === "homepage") return;   // no list to reveal on landing
+      if (!e.touches || e.touches.length !== 1) return;
+      var t = e.touches[0];
+      var open = drawerOpen();
+      if (!open && t.clientX >= EDGE_MIN && !inHorizontalScroller(e.target)) mode = "open";  // rightward drag anywhere opens
+      else if (open) mode = "close";                            // any drag on the drawer closes
+      else return;
+      startX = t.clientX; startY = t.clientY; dx = 0;
+      width = drawerWidth(); tracking = true;
+    }
+
+    function onMove(e) {
+      if (!tracking) return;
+      var t = e.touches[0];
+      dx = t.clientX - startX;
+      var dy = t.clientY - startY;
+      if (!decided) {
+        if (Math.abs(dx) < SLOP && Math.abs(dy) < SLOP) return;  // wait for intent
+        if (Math.abs(dy) >= Math.abs(dx)) { tracking = false; return; }  // vertical → let it scroll
+        // Direction must match the gesture: open = rightward, close = leftward.
+        // A drag the "wrong" way (e.g. leftward scroll inside a code block that
+        // happens to start in the open band) is released back to the content.
+        if ((mode === "open" && dx <= 0) || (mode === "close" && dx >= 0)) { tracking = false; return; }
+        decided = true;
+        sb.style.transition = "none";                            // follow the finger with no lag
+        var bd0 = ensureBackdrop();
+        bd0.style.transition = "none";
+        bd0.classList.add("show");                               // enable pointer-events; opacity set live
+      }
+      e.preventDefault();                                        // we own this gesture now
+      var base = (mode === "open") ? -width : 0;                 // closed sits at -100%, open at 0
+      var pos = Math.max(-width, Math.min(0, base + dx));
+      sb.style.transform = "translateX(" + pos + "px)";
+      ensureBackdrop().style.opacity = String(0.5 * (1 + pos / width));  // 0 closed → .5 open
+    }
+
+    function onEnd() {
+      if (!tracking) return;
+      var wasDecided = decided;
+      tracking = false; decided = false;
+      if (!wasDecided) return;                                   // never became a horizontal drag
+
+      var target = (mode === "open") ? (dx > width * COMMIT)     // opened far enough?
+                                     : (dx > -width * COMMIT);   // stayed (not dragged far left)?
+
+      // Restore transitions, flip the app's own drawer state, then drop the inline
+      // transform so the element animates from where the finger left it to the
+      // class position (0 or -100%). setDrawerOpen persists state via toggleSidebar.
+      var bd = ensureBackdrop();
+      sb.style.transition = "";
+      bd.style.transition = "";
+      bd.style.opacity = "";
+      setDrawerOpen(target);
+      sb.style.transform = "";
+      syncFromState();
+    }
+
+    document.addEventListener("touchstart", onStart, { passive: true });
+    document.addEventListener("touchmove", onMove, { passive: false });  // preventDefault needs this
+    document.addEventListener("touchend", onEnd, { passive: true });
+    document.addEventListener("touchcancel", onEnd, { passive: true });
+  }
+
+  // =========================================================================
   // Chat "•••" action sheet (open-chat toolbar actions, iOS bottom sheet)
   // =========================================================================
   function buildSheetRows() {
@@ -242,6 +347,7 @@
   // =========================================================================
   function init() {
     initSidebar();
+    initSwipe();
     ensureMoreButton();
   }
 
