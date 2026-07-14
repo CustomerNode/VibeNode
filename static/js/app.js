@@ -1038,6 +1038,32 @@ async function autoNameAllSessions() {
   showToast('Named ' + named + ' session' + (named !== 1 ? 's' : ''));
 }
 
+// Mobile: bring a programmatically-focused composer above the on-screen
+// keyboard. A user tap gets this for free from the browser; a JS .focus() does
+// not — the native reveal is deferred to the first keystroke. We wait for the
+// keyboard to actually open (visualViewport 'resize' fires when it does) and
+// then scroll the field into view. scrollIntoView is gesture-safe and won't
+// re-open/close the keyboard, so it doesn't break the synchronous-focus chain
+// the caller relies on to raise the keyboard in the first place.
+function _revealComposerAboveKeyboard(el) {
+  if (!el) return;
+  const doScroll = () => { try { el.scrollIntoView({ block: 'center' }); } catch (e) {} };
+  const vv = window.visualViewport;
+  if (!vv) { setTimeout(doScroll, 350); return; }
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    vv.removeEventListener('resize', onResize);
+    doScroll();
+  };
+  const onResize = finish;
+  vv.addEventListener('resize', onResize);
+  // Fallback: if the keyboard was already open (no resize fires) or the event
+  // never lands, reveal after the typical keyboard-open animation window.
+  setTimeout(finish, 350);
+}
+
 // --- New Agent ---
 async function addNewAgent() {
   // If on homepage, switch to sessions mode first
@@ -1125,22 +1151,20 @@ async function addNewAgent() {
     const _taSync = document.getElementById('live-input-ta');
     if (_taSync) {
       _taSync.focus();
-      // Mobile: .focus() opens the on-screen keyboard but does NOT reliably
-      // scroll the textarea into the visible viewport — the caret scroll only
-      // fires on the first input event, so the field stays hidden behind the
-      // keyboard until the user starts typing. Every other textarea focus in
-      // the app scrolls immediately because it pairs focus with scrollIntoView.
-      // Match that here. scrollIntoView is gesture-safe and won't re-open the
-      // keyboard, so it doesn't break the synchronous-focus contract above.
-      try { _taSync.scrollIntoView({ block: 'center' }); } catch (e) {}
+      // Mobile: a *programmatic* .focus() opens the on-screen keyboard but —
+      // unlike a real user tap — does NOT trigger the browser's native "scroll
+      // the focused field above the keyboard" pass. That native reveal only
+      // fires on the first keystroke, which is exactly the "doesn't shift into
+      // view until I start typing" bug. Reproduce the reveal ourselves once the
+      // keyboard has actually opened. (A bare post-focus scrollIntoView here is
+      // useless: at focus time the keyboard isn't up yet, so there's nothing to
+      // scroll past — the scroll target only exists after the viewport resizes.)
+      _revealComposerAboveKeyboard(_taSync);
     }
     setTimeout(() => {
       const ta = document.getElementById('live-input-ta');
       if (ta) {
         ta.focus();   // desktop retry — harmless if the sync focus already stuck
-        // Re-run after the keyboard's viewport resize settles so the field
-        // lands above the keyboard even if the sync scroll fired too early.
-        try { ta.scrollIntoView({ block: 'center' }); } catch (e) {}
         ta.addEventListener('input', function() { if (typeof _hideTemplateGrid === 'function') _hideTemplateGrid(); });
       }
     }, 50);
