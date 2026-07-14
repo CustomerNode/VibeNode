@@ -250,6 +250,92 @@ socket.on('disconnect', () => {
     if (sbConn) { sbConn.textContent = '\u25CF'; sbConn.style.color = 'var(--result-err)'; sbConn.title = 'Disconnected'; }
 });
 
+// \u2500\u2500 Wake-up socket resync: fix for "stale/frozen UI until manual refresh" on mobile \u2500\u2500
+//
+// Mobile browsers (iOS Safari, Android Chrome) freeze WebSocket traffic and JS
+// timers while the tab is backgrounded, and the OS may silently kill the socket
+// without the client noticing. When the user returns:
+//   \u2022 The HTTP-level healthchecks in healthchecks.js (server-reachable,
+//     daemon-reachable) both PASS \u2014 the web server and daemon are fine.
+//   \u2022 But `socket.connected` can still report true even though the underlying
+//     WebSocket transport is dead ("zombie socket"), so no events flow.
+//   \u2022 The 30s heartbeat setInterval that would eventually request a snapshot
+//     was ALSO frozen while backgrounded \u2014 it fires whenever the timer wheel
+//     resumes, not immediately on wake.
+//   \u2022 Socket.IO's own ping/pong takes 25-45s to detect a zombie, and even
+//     that clock may have been frozen. Result: user sees stale UI until they
+//     manually refresh, which rebuilds the socket from scratch.
+//
+// This is especially bad over Tailscale \u2014 network handoffs between wifi and
+// cellular (or a phone waking from lockscreen) cause the socket to die
+// frequently, and each such death produces a "why is nothing updating"
+// moment for the user.
+//
+// On every path back to the foreground we:
+//   1. If the socket is disconnected, call socket.connect() immediately
+//      (don't wait for the client's built-in reconnect timer, which may
+//      itself have been frozen mid-countdown).
+//   2. If the socket claims connected but no incoming event arrived in the
+//      last _ZOMBIE_THRESHOLD_MS, treat it as a zombie and cycle the socket
+//      (disconnect + connect) so a fresh transport is negotiated.
+//   3. Otherwise emit request_state_snapshot so the UI catches up on any
+//      incremental events that fired while backgrounded.
+//
+// Debounced so a burst of visibilitychange/focus/pageshow/online in the same
+// wake doesn't cause a storm. Never causes a reload \u2014 worst case it cycles
+// the socket, which the existing 'connect' handler cleanly resyncs from.
+let _lastSocketEventAt = Date.now();
+let _lastWakeResyncAt = 0;
+const _ZOMBIE_THRESHOLD_MS = 12000;
+const _WAKE_DEBOUNCE_MS = 750;
+
+// Update _lastSocketEventAt on ANY incoming socket event (onAny fires only
+// for events the server sends us, not our own emits). This is the signal we
+// use to distinguish "live socket" from "zombie socket".
+try {
+    if (typeof socket.onAny === 'function') {
+        socket.onAny(() => { _lastSocketEventAt = Date.now(); });
+    }
+} catch (e) { /* older socket.io \u2014 falls back to disconnected-only detection */ }
+
+function _wakeSocketResync() {
+    const now = Date.now();
+    if (now - _lastWakeResyncAt < _WAKE_DEBOUNCE_MS) return;
+    _lastWakeResyncAt = now;
+
+    const proj = localStorage.getItem('activeProject') || '';
+
+    if (!socket.connected) {
+        console.log('[WS] wake: socket disconnected \u2014 forcing reconnect');
+        try { socket.connect(); } catch (e) { /* ignore */ }
+        return;  // 'connect' handler resyncs state on its own
+    }
+
+    const staleness = now - _lastSocketEventAt;
+    if (staleness > _ZOMBIE_THRESHOLD_MS) {
+        console.warn('[WS] wake: no events for', staleness, 'ms \u2014 cycling zombie socket');
+        try {
+            socket.disconnect();
+            socket.connect();
+        } catch (e) { /* ignore */ }
+        // Reset the clock so a rapid second wake doesn't re-cycle before
+        // the fresh connection has a chance to send its first event.
+        _lastSocketEventAt = now;
+        return;  // 'connect' handler resyncs state on its own
+    }
+
+    // Socket looks healthy \u2014 request a snapshot so the UI catches up on
+    // any incremental events that may have fired while backgrounded.
+    socket.emit('request_state_snapshot', { project: proj });
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') _wakeSocketResync();
+});
+window.addEventListener('pageshow', _wakeSocketResync);
+window.addEventListener('focus', _wakeSocketResync);
+window.addEventListener('online', _wakeSocketResync);
+
 // Server-side error messages
 socket.on('error', (data) => {
     const msg = (data && data.message) || 'Unknown error';
