@@ -553,6 +553,19 @@ function sessionContextMenu(e, sessionId) {
   const isActive = sessionId === activeId;
   const isRunning = runningIds.has(sessionId);
   const isOpenInGui = guiOpenSessions.has(sessionId);
+  // "Appears active" drives the Stop item.  getSessionStatus() is the single
+  // source of truth for the row icon — it returns working/idle/question for
+  // live sessions AND for sessions restored from before a restart, and only
+  // 'sleeping' for genuinely dormant, never-active sessions.  Gating Stop on
+  // it (rather than runningIds/guiOpenSessions alone) keeps the menu and the
+  // icon consistent: a session that shows an idle/working icon always offers
+  // Stop.  Without this, restored sessions displayed as idle but had no Stop
+  // item, which read as "the Stop button vanished".  closeSession() is safe
+  // for a dormant session — it only messages the daemon when the session is
+  // actually live, otherwise it just clears local state.
+  const appearsActive = (typeof getSessionStatus === 'function')
+    ? getSessionStatus(sessionId) !== 'sleeping'
+    : (isRunning || isOpenInGui);
 
   var menu = document.createElement('div');
   menu.className = 'session-ctx-menu ws-ctx-menu';
@@ -598,8 +611,8 @@ function sessionContextMenu(e, sessionId) {
     items += '<div class="ws-ctx-item" onclick="_sessCtx(\'compact\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg> Compact Context</div>';
   }
 
-  // Stop (if running or open in GUI)
-  if (isRunning || isOpenInGui) {
+  // Stop (if running, open in GUI, or restored-as-active after a restart)
+  if (appearsActive) {
     items += '<div class="ws-ctx-divider"></div>';
     items += '<div class="ws-ctx-item danger" onclick="_sessCtx(\'stop\',\'' + sessionId + '\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/></svg> Stop Session</div>';
   }

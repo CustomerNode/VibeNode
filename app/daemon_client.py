@@ -643,6 +643,18 @@ class DaemonClient:
             "session_id": session_id, "model": model,
         })
 
+    def cancel_auto_retry(self, session_id):
+        """Cancel a pending API-error auto-retry countdown (Cancel button)."""
+        return self._send_request("cancel_auto_retry", {
+            "session_id": session_id,
+        })
+
+    def retry_now(self, session_id):
+        """Fire the auto-retry / manual retry immediately (Retry-now button)."""
+        return self._send_request("retry_now", {
+            "session_id": session_id,
+        })
+
     def close_session(self, session_id):
         return self._send_request("close_session", {
             "session_id": session_id,
@@ -716,6 +728,22 @@ class DaemonClient:
         return self._send_request("get_session_state", {
             "session_id": session_id,
         })
+
+    def get_dormant_states(self):
+        """Fetch restart-memory states for previously-active dormant sessions.
+
+        Returns {session_id: {"last_state", ...}}.  Returns {} against an older
+        daemon that predates the method (the response is an error/ok=False dict)
+        so the web layer degrades gracefully in the window between a web update
+        and the next daemon (re)start — the sidebar simply shows "sleeping"
+        until the daemon is restarted, exactly as before.
+        """
+        result = self._send_request("get_dormant_states")
+        if (isinstance(result, dict)
+                and "error" not in result
+                and result.get("ok") is not False):
+            return result
+        return {}
 
     def get_permission_policy(self):
         """Fetch current permission policy from the daemon."""

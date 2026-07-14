@@ -402,6 +402,19 @@ let liveBarState = null;   // 'ended' | 'question:<questionText>' | 'idle' | 'wo
 let _guiFocusPending = false;
 let _liveWorkingStart = null;  // timestamp when working state began
 let _liveWorkingTimer = null;  // interval for elapsed time updates
+let _liveRetryTimer = null;    // interval that ticks the auto-retry countdown text
+
+// Format a seconds count for the auto-retry countdown.  Backoff can reach the
+// 30-minute cap, so render minutes/hours rather than a giant seconds value:
+// '45s', '12m 30s', '1h 5m'.
+function _fmtRetrySecs(s) {
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60), sec = s % 60;
+  if (m < 60) return sec ? (m + 'm ' + sec + 's') : (m + 'm');
+  const h = Math.floor(m / 60), mm = m % 60;
+  return mm ? (h + 'h ' + mm + 'm') : (h + 'h');
+}
 
 function guiOpenAdd(id) {
   guiOpenSessions.add(id);
@@ -1363,10 +1376,17 @@ function updateLiveInputBar() {
   // For idle, include sleeping-substatus so we re-render the "Awaiting wake-up…"
   // indicator when the wake-up fires/clears.
   const _idleSub = (window._sessionSubstatus && window._sessionSubstatus[id]) || '';
+  // Auto-retry countdown / error state — folded into the idle stateKey so the
+  // bar re-renders when a retry is armed/cleared, the attempt advances, or an
+  // error appears (which surfaces the manual Retry button).
+  const _retrySt = (window._sessionRetryState && window._sessionRetryState[id]) || null;
+  const _sessErr = (window._sessionError && window._sessionError[id]) || '';
   let stateKey;
   if (!isRunning) stateKey = 'ended';
   else if (kind === 'question') stateKey = 'question:' + (wd ? wd.question || '' : '');
-  else if (kind === 'idle') stateKey = 'idle:' + _idleSub;
+  else if (kind === 'idle') stateKey = 'idle:' + _idleSub
+    + (_retrySt ? ':retry:' + _retrySt.retry_at + ':' + _retrySt.retry_attempt : '')
+    + (!_retrySt && _sessErr ? ':err:1' : '');
   else {
     // Include sub-agent count + status in state key so bar re-renders when agents change
     const _sa = (window._subAgents && window._subAgents[id]) || {};
@@ -1403,6 +1423,11 @@ function updateLiveInputBar() {
 
   const wasTransition = liveBarState !== null;  // true if switching between states
   liveBarState = stateKey;
+
+  // The bar is about to be rebuilt (innerHTML replaced), which destroys the
+  // countdown element.  Stop any running auto-retry countdown timer; the idle
+  // branch below re-creates it if a retry banner is rendered.
+  if (_liveRetryTimer) { clearInterval(_liveRetryTimer); _liveRetryTimer = null; }
 
   // Animate the bar content when switching between states (not on initial render)
   if (wasTransition) {
@@ -1512,7 +1537,54 @@ function updateLiveInputBar() {
          '<span style="color:var(--text-faint);">(send a message to take over)</span></span>' +
          '</div>')
       : '';
+    // \u2500\u2500 Auto-retry countdown banner \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    // When the server has armed an API-error auto-retry, show a live countdown
+    // (ticked by _liveRetryTimer below) with Cancel + Retry-now controls.  If
+    // the session instead settled on a (non-retrying) error, show a one-click
+    // manual Retry button.  These are mutually exclusive.
+    const _retryBtns =
+      '<button class="live-mini-btn" onclick="liveRetryNow()" ' +
+      'style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid var(--border-subtle);' +
+      'background:var(--bg-elevated,var(--bg-card));color:var(--text);cursor:pointer;">Retry now</button>' +
+      '<button class="live-mini-btn" onclick="liveCancelRetry()" ' +
+      'style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid var(--border-subtle);' +
+      'background:transparent;color:var(--text-muted);cursor:pointer;">Cancel</button>';
+    let _retryBanner = '';
+    if (_retrySt) {
+      const _secs = Math.max(0, Math.ceil(_retrySt.retry_at - Date.now() / 1000));
+      const _attemptStr = (_retrySt.retry_attempt && _retrySt.retry_max)
+        ? ' \u00b7 attempt ' + _retrySt.retry_attempt + '/' + _retrySt.retry_max : '';
+      const _reasonStr = _retrySt.retry_reason ? ' \u00b7 ' + escHtml(_retrySt.retry_reason) : '';
+      _retryBanner =
+        '<div class="live-retry-banner" style="display:flex;align-items:center;gap:8px;' +
+        'margin-bottom:8px;padding:8px 12px;background:var(--bg-card);' +
+        'border:1px solid var(--warn-border,#8a6d3b);border-radius:8px;">' +
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--warn,#d9a441)" ' +
+        'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/>' +
+        '<path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>' +
+        '<span style="font-size:12px;color:var(--text-muted);flex:1;">' +
+        'Auto-retrying in <strong id="live-retry-countdown" style="color:var(--text);">' +
+        _fmtRetrySecs(_secs) + '</strong>' + _attemptStr + _reasonStr + '</span>' +
+        _retryBtns +
+        '</div>';
+    } else if (_sessErr) {
+      _retryBanner =
+        '<div class="live-retry-banner error" style="display:flex;align-items:center;gap:8px;' +
+        'margin-bottom:8px;padding:8px 12px;background:var(--bg-card);' +
+        'border:1px solid var(--err-border,#a33);border-radius:8px;">' +
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--err,#e06c6c)" ' +
+        'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+        '<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/>' +
+        '<line x1="12" y1="16" x2="12.01" y2="16"/></svg>' +
+        '<span style="font-size:12px;color:var(--text-muted);flex:1;">' + escHtml(_sessErr) + '</span>' +
+        '<button class="live-mini-btn" onclick="liveRetryNow()" ' +
+        'style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid var(--border-subtle);' +
+        'background:var(--bg-elevated,var(--bg-card));color:var(--text);cursor:pointer;">Retry</button>' +
+        '</div>';
+    }
     bar.innerHTML =
+      _retryBanner +
       _sleepingBanner +
       '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="' +
       (_idleSub === 'auto-resuming'
@@ -1528,6 +1600,23 @@ function updateLiveInputBar() {
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), liveSubmitIdle);
     _guiFocusPending = false;
     if (_barHadFocus) { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }
+    // Live auto-retry countdown: tick the seconds text in place (no full
+    // re-render) until the retry fires or is cleared.  Mirrors the working-bar
+    // elapsed-timer pattern — update only the text node.
+    if (_retrySt) {
+      _liveRetryTimer = setInterval(() => {
+        const rs = (window._sessionRetryState && window._sessionRetryState[liveSessionId]) || null;
+        const el = document.getElementById('live-retry-countdown');
+        if (!rs || !el) {
+          // Retry cleared (server fired/cancelled it) — stop ticking; the
+          // session_state event already forced a re-render of the bar.
+          if (_liveRetryTimer) { clearInterval(_liveRetryTimer); _liveRetryTimer = null; }
+          return;
+        }
+        const secs = Math.max(0, Math.ceil(rs.retry_at - Date.now() / 1000));
+        el.textContent = secs > 0 ? _fmtRetrySecs(secs) : 'now…';
+      }, 1000);
+    }
     setTimeout(() => {
       const logEl = document.getElementById('live-log');
       if (logEl) _autoScrollLiveLog(logEl);
@@ -2412,6 +2501,34 @@ function liveSubmitInterrupt() {
   }
 }
 
+// Cancel a pending API-error auto-retry (Cancel button in the countdown banner).
+// Stops the local countdown immediately and tells the server to drop the timer;
+// the resulting session_state event re-renders the bar without the banner.
+function liveCancelRetry() {
+  if (!liveSessionId) return;
+  if (_liveRetryTimer) { clearInterval(_liveRetryTimer); _liveRetryTimer = null; }
+  if (window._sessionRetryState) delete window._sessionRetryState[liveSessionId];
+  socket.emit('cancel_auto_retry', {session_id: liveSessionId});
+  liveBarState = null;
+  updateLiveInputBar();
+}
+
+// Fire the auto-retry / manual retry immediately (Retry-now button during a
+// countdown, or the manual Retry button after the budget was exhausted or a
+// permanent error).  The server resends the last user message right away.
+function liveRetryNow() {
+  if (!liveSessionId) return;
+  if (_liveRetryTimer) { clearInterval(_liveRetryTimer); _liveRetryTimer = null; }
+  if (window._sessionRetryState) delete window._sessionRetryState[liveSessionId];
+  if (window._sessionError) delete window._sessionError[liveSessionId];
+  socket.emit('retry_now', {session_id: liveSessionId});
+  // Optimistically show working so the bar doesn't flash an empty idle state.
+  sessionKinds[liveSessionId] = 'working';
+  liveBarState = null;
+  updateLiveInputBar();
+  if (typeof _startMessageWatchdog === 'function') _startMessageWatchdog(liveSessionId);
+}
+
 function liveClearDisplay() {
   const logEl = document.getElementById('live-log');
   if (logEl) { logEl.innerHTML = ''; liveLineCount = 0; }
@@ -2443,6 +2560,11 @@ async function closeSession(id) {
   guiOpenDelete(id);
   runningIds.delete(id);
   delete sessionKinds[id];
+  // Also drop any restart-restored state so a dormant session the user just
+  // stopped actually falls back to 'sleeping' on the next render.  Without
+  // this, getSessionStatus() would keep reading window.sessionLastState and
+  // re-show the session as idle, making the Stop action look like a no-op.
+  if (window.sessionLastState) delete window.sessionLastState[id];
   showToast('Session closed');
   // Update the input bar to reflect stopped state — keep chat visible
   liveBarState = null;

@@ -406,7 +406,7 @@ def _apply_patch_isolate_posix_subprocesses() -> bool:
 # Default per-message JSON decode ceiling, in megabytes.  Chosen to comfortably
 # cover large tool results (e.g. reading a multi-MB file) while still bounding
 # memory against a runaway stream.
-_DEFAULT_MAX_BUFFER_MB = 64
+_DEFAULT_MAX_BUFFER_MB = 100
 
 
 def _assert_patch_raise_json_buffer_limit_preconditions() -> int:

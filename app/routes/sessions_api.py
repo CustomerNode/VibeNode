@@ -229,6 +229,23 @@ def api_sessions():
                 "model": state.get("model", ""),
             })
 
+    # ── Restart memory ──────────────────────────────────────────────────
+    # Sessions that were idle/working before the last restart are NOT
+    # auto-recovered by the daemon, so they carry no live state and would
+    # render as "sleeping".  Tag each with the state it held before the
+    # restart so the sidebar can mark it "was active before restart".  Live
+    # status (delivered via WebSocket) always overrides this on the client.
+    # Wrapped defensively: a slow/absent daemon must never break the list.
+    try:
+        dormant = sm.get_dormant_states() if hasattr(sm, "get_dormant_states") else {}
+    except Exception:
+        dormant = {}
+    if dormant:
+        for s in sessions:
+            info = dormant.get(s["id"])
+            if info and info.get("last_state"):
+                s["last_state"] = info["last_state"]
+
     return jsonify(sessions)
 
 

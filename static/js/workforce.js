@@ -8,6 +8,14 @@ function getSessionStatus(id) {
   if (runningIds.has(id)) return 'working';
   // Sessions opened in GUI panel are considered idle even if no OS process detected
   if (guiOpenSessions.has(id)) return 'idle';
+  // Restore-across-restart: a session that was idle/working before the last
+  // restart isn't auto-relaunched by the daemon (idle sessions stay dormant to
+  // avoid spinning up processes on boot), so it has no live state above. Fall
+  // back to the state it held before the restart — from /api/sessions, seeded
+  // into window.sessionLastState — so it shows idle/working just like you left
+  // it instead of collapsing to "sleeping". Any live state above always wins.
+  const last = window.sessionLastState && window.sessionLastState[id];
+  if (last === 'working' || last === 'idle') return last;
   return 'sleeping';
 }
 

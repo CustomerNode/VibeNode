@@ -259,6 +259,18 @@ socket.on('state_snapshot', (data) => {
         } else {
             delete window._sessionSubstatus[id];
         }
+        // Sync API-error auto-retry countdown from snapshot (survives refresh).
+        if (!window._sessionRetryState) window._sessionRetryState = {};
+        if (s.retry_at && Number(s.retry_at) > 0) {
+            window._sessionRetryState[id] = {
+                retry_at: Number(s.retry_at),
+                retry_attempt: Number(s.retry_attempt) || 0,
+                retry_max: Number(s.retry_max) || 0,
+                retry_reason: s.retry_reason || '',
+            };
+        } else {
+            delete window._sessionRetryState[id];
+        }
         if (s.usage) {
             window._sessionUsage[id] = s.usage;
         }
@@ -590,6 +602,30 @@ socket.on('session_state', (data) => {
     } else if (substatusExplicit || window._sessionSubstatus[session_id] !== 'compacting') {
         // Working state, no substatus: clear unless we're preserving optimistic "compacting"
         delete window._sessionSubstatus[session_id];
+    }
+
+    // Track API-error auto-retry countdown per session.  The server sends the
+    // absolute fire time (retry_at, epoch seconds); the live panel renders a
+    // local "Auto-retrying in Ns…" countdown from it.  retry_at == 0 means no
+    // retry pending — clear the entry so the banner disappears.
+    if (!window._sessionRetryState) window._sessionRetryState = {};
+    if (data.retry_at && Number(data.retry_at) > 0) {
+        window._sessionRetryState[session_id] = {
+            retry_at: Number(data.retry_at),
+            retry_attempt: Number(data.retry_attempt) || 0,
+            retry_max: Number(data.retry_max) || 0,
+            retry_reason: data.retry_reason || '',
+        };
+    } else {
+        delete window._sessionRetryState[session_id];
+    }
+    // Track the last error string per session — drives the manual "Retry"
+    // button shown on an idle session that ended with a (non-retrying) error.
+    if (!window._sessionError) window._sessionError = {};
+    if (error) {
+        window._sessionError[session_id] = error;
+    } else {
+        delete window._sessionError[session_id];
     }
 
     // Track token usage per session for context window indicator

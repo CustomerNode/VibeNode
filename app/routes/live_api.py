@@ -456,7 +456,7 @@ _CONFIRMED_MODELS_FILE = Path(__file__).resolve().parents[2] / "confirmed_models
 # Ordered: Opus, Sonnet, Haiku.
 _FALLBACK_KNOWN_MODELS = [
     {"id": "claude-opus-4-7", "name": "Opus 4.7"},
-    {"id": "claude-sonnet-4-6", "name": "Sonnet 4.6"},
+    {"id": "claude-sonnet-5", "name": "Sonnet 5"},
     {"id": "claude-haiku-4-5", "name": "Haiku 4.5"},
 ]
 # Default-model preference order by family: sonnet first (balanced), then opus, then haiku.
@@ -469,6 +469,16 @@ _models_refresh_lock = None  # Initialised lazily to avoid import-time threading
 # How long (seconds) a cache entry is considered fresh before a background refresh is triggered.
 # Models change rarely, so 1 hour avoids unnecessary CLI/API round-trips.
 _MODELS_CACHE_TTL = 3600
+
+# Current models that should ALWAYS be offered in the picker, even before the
+# user has run a session with them or set an ANTHROPIC_API_KEY. The family
+# backfill below only adds a model when its whole family is absent, so a newly
+# launched model in an already-present family (e.g. a new Sonnet alongside an
+# existing Sonnet 4.6 in the confirmed cache) would otherwise never appear.
+# Merged in by id (deduped), so it never duplicates an API/CLI/cache entry.
+_ALWAYS_OFFER_MODELS = [
+    {"id": "claude-sonnet-5", "name": "Sonnet 5"},
+]
 
 
 def _invalidate_models_cache() -> None:
@@ -582,8 +592,16 @@ def _finalize_model_list(result: list, cli_model: str) -> list:
         nums = [-int(x) for x in _re.findall(r"\d+", mid)]
         return (family, nums)
 
-    # Ensure every family (opus/sonnet/haiku) is represented so the UI always
-    # shows a useful menu even with no API key / CLI / cache.
+    # 3.5. Always offer current models (e.g. newly launched Sonnet 5) even when a
+    #      same-family model is already present from the API/CLI/confirmed cache.
+    _always_ids = {m["id"] for m in result}
+    for extra in _ALWAYS_OFFER_MODELS:
+        if extra["id"] not in _always_ids:
+            result.append(dict(extra))
+            _always_ids.add(extra["id"])
+
+    # 4. Fallback: ensure every family (opus/sonnet/haiku) is represented so
+    #    the UI always shows a useful menu, even with no API key / CLI / cache.
     existing_ids = {m["id"] for m in result}
     present_families = {
         fam for fam in ("opus", "sonnet", "haiku")

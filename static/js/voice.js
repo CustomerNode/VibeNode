@@ -235,7 +235,7 @@ function setupVoiceButton(textarea, button, onSubmit) {
       silenceTimer = setTimeout(() => {
         recognition._intentionalStop = true;
         recognition.stop();
-      }, 3000);  // 3s silence timeout — do NOT increase, causes premature cutoff feel
+      }, 7000);  // 7s silence timeout — gives room to pause/think mid-message before auto-send
     };
 
     recognition.onresult = (e) => {

@@ -23,6 +23,13 @@ REGISTRY_PATH = Path.home() / ".claude" / "gui_active_sessions.json"
 # Maximum age (seconds) for a session to be eligible for recovery
 MAX_RECOVERY_AGE = 3600  # 1 hour
 
+# States that mean a session was in active use before the last shutdown.
+# These are the states we "remember" across a restart so the UI can mark the
+# session as previously-active instead of collapsing it to a generic
+# "sleeping".  "starting"/"working"/"waiting" are mid-task; "idle" is at rest
+# but still an open, in-use session the user was tracking.
+_MEMORY_ELIGIBLE_STATES = ("working", "waiting", "starting", "idle")
+
 
 class SessionRegistry:
     """Persistent session registry for crash recovery."""
@@ -55,6 +62,64 @@ class SessionRegistry:
         except Exception as e:
             logger.warning("Failed to load session registry: %s", e)
         return {"sessions": {}}
+
+    def load_last_known_states(self) -> dict:
+        """Snapshot previously-active sessions for restart memory.
+
+        MUST be read once at daemon startup — BEFORE the first debounced
+        registry save (see SessionManager._save_registry_now) overwrites the
+        file with ONLY currently-live sessions.  At that point the file still
+        contains every session that was open before the restart, including the
+        idle ones.
+
+        recover_sessions() deliberately re-launches only mid-task sessions
+        (working/waiting/starting) and leaves idle sessions dormant so the
+        machine doesn't spin up a pile of processes on boot.  The side effect
+        is that dormant sessions vanish from the daemon's live state and the UI
+        shows them as "sleeping", losing the idle/working distinction the user
+        relied on to track their work.  This snapshot preserves that memory.
+
+        Returns a map keyed by session id::
+
+            {
+              "<sid>": {
+                "last_state": "idle" | "working",  # collapsed for display
+                "name": str,
+                "cwd": str,
+                "session_type": str,
+                "last_activity": float,
+              },
+              ...
+            }
+
+        This is display memory only — it never launches or resumes a process.
+        Planner/utility sessions are excluded (never user-tracked work).
+        """
+        out = {}
+        try:
+            registry = self.load_registry()
+            for sid, meta in registry.get("sessions", {}).items():
+                if not isinstance(meta, dict):
+                    continue
+                state = meta.get("state", "")
+                if state not in _MEMORY_ELIGIBLE_STATES:
+                    continue
+                if meta.get("session_type") == "planner":
+                    continue
+                # Collapse the mid-task states to a single "working" marker and
+                # keep "idle" distinct.  A session that was mid-task but failed
+                # to auto-recover is accurately described as "was working".
+                last_state = "idle" if state == "idle" else "working"
+                out[sid] = {
+                    "last_state": last_state,
+                    "name": meta.get("name", ""),
+                    "cwd": meta.get("cwd", ""),
+                    "session_type": meta.get("session_type", ""),
+                    "last_activity": meta.get("last_activity", 0),
+                }
+        except Exception as e:
+            logger.warning("Failed to snapshot last-known session states: %s", e)
+        return out
 
     def save_registry_now(self, sessions_snapshot: dict) -> None:
         """Write the session state to the registry file atomically.

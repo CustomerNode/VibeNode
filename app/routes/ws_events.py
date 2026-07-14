@@ -651,6 +651,48 @@ def register_ws_events(socketio, app):
             payload['error'] = result.get('error', 'Model switch failed')
         emit('session_model_result', payload)
 
+    @socketio.on('cancel_auto_retry')
+    def handle_cancel_auto_retry(data):
+        """Cancel a pending API-error auto-retry countdown (Cancel button)."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        session_id = data.get('session_id', '').strip()
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+
+        sm = app.session_manager
+        result = sm.cancel_auto_retry(session_id)
+
+        if not result.get('ok'):
+            emit('error', {
+                'message': result.get('error', 'Failed to cancel auto-retry'),
+                'session_id': session_id,
+            })
+
+    @socketio.on('retry_now')
+    def handle_retry_now(data):
+        """Fire the auto-retry / manual retry immediately (Retry-now button)."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        session_id = data.get('session_id', '').strip()
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+
+        sm = app.session_manager
+        result = sm.retry_now(session_id)
+
+        if not result.get('ok'):
+            emit('error', {
+                'message': result.get('error', 'Failed to retry'),
+                'session_id': session_id,
+            })
+
     @socketio.on('close_session')
     def handle_close_session(data):
         """Close and disconnect a session."""

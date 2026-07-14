@@ -304,6 +304,8 @@ class SessionDaemon:
             "resolve_permission": self.session_manager.resolve_permission_unified,
             "interrupt_session": self.session_manager.interrupt_session,
             "set_session_model": self.session_manager.set_session_model,
+            "cancel_auto_retry": self.session_manager.cancel_auto_retry,
+            "retry_now": self.session_manager.retry_now,
             "close_session": self.session_manager.close_session,
             "close_session_sync": self.session_manager.close_session_sync,
             "remove_session": lambda **kw: self.session_manager.remove_session(**kw) or {"ok": True},
@@ -313,6 +315,7 @@ class SessionDaemon:
             "get_entry_count": lambda **kw: self.session_manager.get_entry_count(kw["session_id"]),
             "has_session": self.session_manager.has_session,
             "get_session_state": self.session_manager.get_session_state,
+            "get_dormant_states": lambda **kw: self.session_manager.get_dormant_states(),
             "get_permission_policy": lambda **kw: self.session_manager.get_permission_policy(),
             "set_permission_policy": self.session_manager.set_permission_policy,
             "get_ui_prefs": lambda **kw: self.session_manager.get_ui_prefs(),
@@ -565,6 +568,16 @@ def main():
             print("Stale daemon mutex detected (port not listening). Starting anyway.", flush=True)
 
     daemon = SessionDaemon()
+
+    # Safety net: reap runaway external search processes (e.g. ugrep) that the
+    # Claude CLI can leave pinning every core after an interrupted turn. They
+    # otherwise drive load average into the 20s and starve every other session.
+    # See daemon/runaway_reaper.py. Best-effort; never blocks daemon startup.
+    try:
+        from daemon import runaway_reaper
+        runaway_reaper.start()
+    except Exception:
+        logger.warning("Failed to start runaway-reaper", exc_info=True)
 
     def shutdown(sig, frame):
         # The forensics watcher (_install_signal_forensics_watcher) already
