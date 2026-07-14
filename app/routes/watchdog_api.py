@@ -24,6 +24,7 @@ from flask import Blueprint, Response, current_app, request
 
 from ..config import (
     _CLAUDE_PROJECTS,
+    _VIBENODE_DIR,
     _decode_project,
     _encode_cwd,
     _load_project_names,
@@ -36,9 +37,12 @@ bp = Blueprint("watchdog_api", __name__)
 # project". Override the matcher or the fallback path via env.
 CUSTOMERNODE_MATCH = os.environ.get("VIBENODE_CUSTOMERNODE_MATCH", "customernode").lower()
 # Fallback path used only when no existing project matches (e.g. fresh machine).
+# Derived from the repo location — a "CustomerNode" checkout sitting next to VibeNode
+# (the same sibling-of-repo convention used to locate SpeechNode) — so no personal path
+# is baked into this public repo. Override explicitly with VIBENODE_CUSTOMERNODE_CWD.
 CUSTOMERNODE_FALLBACK_CWD = os.environ.get(
     "VIBENODE_CUSTOMERNODE_CWD",
-    r"C:\example\CustomerNode",
+    str(_VIBENODE_DIR.parent / "CustomerNode"),
 )
 
 
