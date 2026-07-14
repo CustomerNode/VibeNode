@@ -2147,7 +2147,7 @@ function _startMessageWatchdog(sid) {
 
     // Tier 1: WS snapshot resync
     console.warn('[watchdog] No response activity for', sid, 'after 10s — requesting state snapshot');
-    socket.emit('request_state_snapshot');
+    socket.emit('request_state_snapshot', {project: localStorage.getItem('activeProject') || ''});
 
     // Tier 2: direct HTTP fetch (bypasses WS entirely)
     setTimeout(() => {
@@ -2210,7 +2210,7 @@ function _watchdogHttpCheck(sid, forceApply) {
         }
         if (forceApply) {
           // Request a fresh snapshot to resync any other stale state
-          socket.emit('request_state_snapshot');
+          socket.emit('request_state_snapshot', {project: localStorage.getItem('activeProject') || ''});
         }
       }
     })

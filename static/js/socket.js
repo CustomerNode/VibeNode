@@ -156,7 +156,7 @@ socket.on('daemon_reconnect', (data) => {
         showToast(msg);
         // Resync state after reconnect
         setTimeout(() => {
-            if (socket.connected) socket.emit('request_state_snapshot');
+            if (socket.connected) socket.emit('request_state_snapshot', {project: localStorage.getItem('activeProject') || ''});
         }, 500);
     } else if (status === 'disconnected' || status === 'connecting' || status === 'restarting') {
         showToast(msg, true);
@@ -197,7 +197,7 @@ socket.on('error', (data) => {
     if (errSid) {
         if (typeof _cancelMessageWatchdog === 'function') _cancelMessageWatchdog(errSid);
         // Request authoritative state from the server via WS
-        socket.emit('request_state_snapshot');
+        socket.emit('request_state_snapshot', {project: localStorage.getItem('activeProject') || ''});
         // Also do an HTTP check as ultimate fallback (bypasses WS entirely)
         if (typeof _watchdogHttpCheck === 'function') {
             setTimeout(() => _watchdogHttpCheck(errSid, true), 2000);
@@ -1049,7 +1049,7 @@ socket.on('session_entry', (data) => {
                 if (typeof updateLiveInputBar === 'function') updateLiveInputBar();
             }
             _updateRowState(data.session_id, 'working');
-            socket.emit('request_state_snapshot');
+            socket.emit('request_state_snapshot', {project: localStorage.getItem('activeProject') || ''});
         }
     }
 
@@ -1662,7 +1662,12 @@ function _processKanbanStatusMarkers(text) {
 // tab sleep). Re-request full state every 30s so stale UI self-corrects
 // within one interval instead of requiring a manual refresh.
 setInterval(() => {
-    if (socket.connected) socket.emit('request_state_snapshot');
+    // Include the tab's active project so the server filters the snapshot to
+    // THIS tab's project. Without it the server falls back to its global
+    // _active_project; when that differs (multiple projects/sessions open) the
+    // current project's idle sessions get filtered OUT of the snapshot and the
+    // full-replace below demotes them from "idle" to "sleeping" until refresh.
+    if (socket.connected) socket.emit('request_state_snapshot', {project: localStorage.getItem('activeProject') || ''});
 }, 30000);
 
 
