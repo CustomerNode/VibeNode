@@ -102,6 +102,23 @@ socket.on('connect', () => {
             socket.emit('request_state_snapshot', {project: _retryProj});
         }
     }, 3000);
+
+    // Cure "skeletons forever" on reconnect: if the user has a live session
+    // open and its log is empty (skeleton showing), the original
+    // socket.emit('get_session_log') was likely swallowed by a zombie socket
+    // that has since been cycled. Re-emit now that the transport is fresh.
+    // Also covers first-connect race where startLivePanel() emitted before
+    // the socket finished connecting (emits during handshake are buffered by
+    // socket.io, but not always reliably across mobile transport hiccups).
+    if (typeof liveSessionId !== 'undefined' && liveSessionId &&
+        typeof liveLineCount !== 'undefined' && liveLineCount === 0) {
+        const _lpProj = localStorage.getItem('activeProject') || '';
+        const _limit = (typeof LIVE_PAGE_SIZE !== 'undefined') ? LIVE_PAGE_SIZE : 100;
+        console.log('[WS] connect: live session has empty log, re-emitting get_session_log');
+        socket.emit('get_session_log', {
+            session_id: liveSessionId, since: 0, limit: _limit, project: _lpProj,
+        });
+    }
 });
 
 // Restore persisted permission policy from backend on connect
@@ -1857,6 +1874,26 @@ setInterval(() => {
     // full-replace below demotes them from "idle" to "sleeping" until refresh.
     if (socket.connected) socket.emit('request_state_snapshot', {project: localStorage.getItem('activeProject') || ''});
 }, 30000);
+
+// ---- Continuous zombie-socket detection (foreground path) ----
+// The wake-up handler above catches zombies when the tab returns from
+// background — but a Tailscale tunnel can drop while the tab stays
+// foregrounded (network handoff, sleep/wake with tab still visible), and no
+// visibilitychange fires. socket.connected keeps reporting true, emits go
+// into the void, and the UI has no idea. Every 20s, if we're marked
+// connected but haven't received ANY event in >45s (well beyond the 30s
+// heartbeat's guaranteed response), cycle the socket to force a fresh
+// transport negotiation. This is the last line of defense against the
+// "skeletons forever without a visibility change" symptom.
+setInterval(() => {
+    if (!socket.connected) return;   // disconnect handler + reconnect logic covers this
+    const staleness = Date.now() - _lastSocketEventAt;
+    if (staleness > 45000) {
+        console.warn('[WS] bg-zombie: no events for', staleness, 'ms while connected — cycling socket');
+        try { socket.disconnect(); socket.connect(); } catch (e) { /* ignore */ }
+        _lastSocketEventAt = Date.now();   // avoid immediate re-cycle
+    }
+}, 20000);
 
 
 // ---- Continuous stuck-session watchdog ----
