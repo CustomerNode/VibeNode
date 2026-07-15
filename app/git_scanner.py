@@ -55,7 +55,13 @@ _SECRET_PATTERNS = [
     ("Generic Secret", re.compile(r'(?i)(secret[_-]?key|client[_-]?secret|app[_-]?secret)\s*[=:]\s*["\']?[A-Za-z0-9_\-]{16,}'), "Generic secret assignment"),
     ("Generic Token", re.compile(r'(?i)(access[_-]?token|auth[_-]?token|bearer[_-]?token)\s*[=:]\s*["\']?[A-Za-z0-9_\-\.]{20,}'), "Token assignment"),
     ("Bearer Token", re.compile(r'(?i)bearer\s+[A-Za-z0-9_\-\.]{20,}'), "Bearer auth token in header"),
-    ("Password Assignment", re.compile(r'(?i)(password|passwd|pwd)\s*[=:]\s*["\'][^"\']{8,}["\']'), "Hardcoded password"),
+    # The value class excludes newlines. A negated class like [^"'] happily
+    # matches \n, so on a line such as  body: 'password=' + encode(pw),  the
+    # regex read the opening quote and slurped the following lines of code
+    # until it found the next quote — reporting a multi-line JS blob as a
+    # "hardcoded password". A real password literal never spans newlines, so
+    # anchoring the class costs no detection and kills that whole FP class.
+    ("Password Assignment", re.compile(r'(?i)(password|passwd|pwd)\s*[=:]\s*["\'][^"\'\r\n]{8,}["\']'), "Hardcoded password"),
 
     # ── Cryptographic material ──
     ("Private Key", re.compile(r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'), "Private key file"),
@@ -135,14 +141,12 @@ _FINDING_SUPPRESSIONS = [
     # credential — the value is a plain dict-key string. Suppress only this
     # finding type for this file; all other secret patterns still run.
     (re.compile(r'app/session_store\.py$'), "Env Variable Secret"),
-    # prelogin_unlock.py serves a pre-login unlock page whose embedded JS
-    # builds a form-encoded POST body: body: 'password=' + encodeURIComponent(pw).
-    # The "Password Assignment" regex reads `password=` + the opening quote
-    # and greedily slurps the following JS as a "hardcoded value" until the
-    # next quote. There is NO hardcoded password — the value comes from a
-    # user-typed <input> at runtime. Suppress only this finding type for this
-    # file; every other secret pattern still runs against it.
-    (re.compile(r'scripts/boot_access/prelogin_unlock\.py$'), "Password Assignment"),
+    # NOTE: prelogin_unlock.py previously needed a "Password Assignment"
+    # suppression here. It no longer does — the root cause was the pattern's
+    # value class matching newlines (see _SECRET_PATTERNS above). The
+    # suppression was removed deliberately: that file serves the pre-login
+    # unlock page, so it is exactly the file where a real hardcoded password
+    # would be most dangerous, and it must stay in scope for that pattern.
 ]
 
 # Files that should NEVER be committed (beyond .gitignore)
