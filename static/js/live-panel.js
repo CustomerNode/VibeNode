@@ -522,15 +522,51 @@ function liveLoadMore() {
   const btn = document.getElementById('live-load-more-btn');
   if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
 
+  // Force a socket health check — same reason as startLivePanel. A dropped
+  // emit here leaves the button stuck at "Loading…" forever, which is the
+  // same class of bug as the infinite-skeleton issue. See CLAUDE.md
+  // "Mobile zombie-socket recovery" #10.
+  if (typeof window._wakeSocketResync === 'function') {
+    try { window._wakeSocketResync(); } catch (_e) { /* ignore */ }
+  }
+
   // Request older entries from server — the session_log handler's
   // prepend path will insert them into the DOM.
+  const _lmSid = liveSessionId;
+  const _lmBefore = _liveRenderedFrom;
   socket.emit('get_session_log', {
-    session_id: liveSessionId,
+    session_id: _lmSid,
     since: 0,
     limit: LIVE_PAGE_SIZE,
-    before: _liveRenderedFrom,
+    before: _lmBefore,
     project: localStorage.getItem('activeProject') || ''
   });
+
+  // Skeleton-stuck watchdog: if the prepend response doesn't arrive within
+  // 5s, cycle the socket and re-emit. Cleared by the session_log handler in
+  // socket.js — clears its own timer under the load-more key.
+  if (window._loadMoreStuckTimer) clearTimeout(window._loadMoreStuckTimer);
+  window._loadMoreStuckSid = _lmSid;
+  window._loadMoreStuckBefore = _lmBefore;
+  window._loadMoreStuckTimer = setTimeout(function() {
+    if (window._loadMoreStuckSid !== _lmSid) return;
+    if (liveSessionId !== _lmSid) return;
+    if (_liveRenderedFrom < _lmBefore) return;   // response already arrived and prepended
+    console.warn('[load-more-watchdog] No prepend response after 5s for', _lmSid,
+      '— cycling socket and re-emitting');
+    if (typeof window._wakeSocketResync === 'function') {
+      try { window._wakeSocketResync(); } catch (_e) { /* ignore */ }
+    }
+    socket.emit('get_session_log', {
+      session_id: _lmSid, since: 0, limit: LIVE_PAGE_SIZE,
+      before: _lmBefore, project: localStorage.getItem('activeProject') || ''
+    });
+    // Re-enable the button in case the second emit also gets lost — user
+    // can retry manually instead of being stuck on a disabled control.
+    const btn2 = document.getElementById('live-load-more-btn');
+    if (btn2) { btn2.disabled = false; btn2.textContent = 'Load older messages'; }
+    window._loadMoreStuckTimer = null;
+  }, 5000);
 }
 // Per-session queue — server-backed local cache (synced via queue_updated events)
 const _sessionQueues = {};

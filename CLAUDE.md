@@ -119,3 +119,31 @@ The web server is spawned detached on every platform. Reverting any of the piece
 
 ## Slash commands are intercepted client-side
 Claude CLI slash commands (e.g. `/compact`, `/rewind`, `/clear`) are NOT sent to the SDK. They get silently eaten with no response, leaving the session stuck idle. Instead, `_interceptSlashCommand()` in `live-panel.js` catches them at every submit path and either triggers the GUI equivalent (e.g. `/rewind` clicks the Rewind toolbar button, `/compact` fires `liveCompact()`) or shows a toast explaining the command isn't supported in the GUI. The command map lives in `_slashCommandMap`. Messages with `/` that aren't bare commands (e.g. "fix /etc/config") pass through normally.
+
+## Mobile zombie-socket recovery — DO NOT REGRESS (fixed 2026-07-14)
+
+The single worst mobile UX bug this project has had. After being on for a while — phone locks, tab backgrounds, Tailscale hands off between wifi and cellular, iOS Safari bfcache-restores the tab — the WebSocket transport dies silently. `socket.connected` keeps reporting `true`, Socket.IO's ping/pong is either paused or takes ~30s to detect, and any `socket.emit()` on that zombie is dropped into the void. The user sees a stale UI, or worse, an "infinite skeleton" that only clears after a full page reload (or, in the bfcache case, closing the tab AND clearing history).
+
+**Every mechanism below is load-bearing. Reverting any of them re-opens the exact failure mode that the user described three times in one hour before it was fixed. Do NOT "simplify" or remove any of them.**
+
+1. **`onAny` event-time tracker** — `static/js/socket.js` `_lastSocketEventAt`. Any incoming server event bumps this timestamp. This is the primary signal for "is the socket actually alive." Do NOT remove the `socket.onAny(...)` binding.
+
+2. **`_lastForegroundAt` hidden-time stamp** — `static/js/socket.js`. Set on every `visibilitychange` → hidden. Lets the wake handler distinguish "tab was truly backgrounded for a while" (needs an unconditional socket cycle) from "just a focus event on a foregrounded tab" (fall back to staleness heuristic). Trusting `_lastSocketEventAt` alone was insufficient — a stray event landing just before the OS froze the tab made the socket look falsely healthy.
+
+3. **`_wakeSocketResync()` wired to visibilitychange / pageshow / focus / online** — `static/js/socket.js`. Belt and suspenders — no single lifecycle event fires reliably across iOS Safari, Android Chrome, and standalone PWAs. Binding all four is what makes wake detection reliable.
+
+4. **Backgrounded-tab wake ALWAYS cycles the socket** (`_BG_CYCLE_THRESHOLD_MS = 3000`) — `static/js/socket.js`. Do NOT gate this on any staleness heuristic. Mobile OSes routinely kill the WebSocket transport during backgrounding without the client noticing; reconnects are cheap, missed pushes are what the user actually feels.
+
+5. **`pageshow` with `event.persisted === true` reloads the page immediately** — `static/js/socket.js`. bfcache restore means the entire JS runtime (including Socket.IO's engine.io state) was frozen and thawed with the underlying transport already dead. `socket.disconnect() + socket.connect()` cannot cleanly rebuild from the corrupted state — a full reload is the only definitive recovery. Guarded by `#restart-overlay` presence so an in-app restart's own reload flow is never fought.
+
+6. **20s foreground zombie watchdog** — `static/js/socket.js`. Catches a socket that dies while the tab stays visible (Tailscale tunnel drop with no visibilitychange). If `socket.connected` is true but no event has been received in >45s, cycle the socket. Backup to (3) for cases where no lifecycle event fires.
+
+7. **`socket.on('connect')` unconditionally re-emits `get_session_log`** — `static/js/socket.js`. Socket.IO does NOT replay events missed during a disconnect, so any `session_entry` / `session_state` push that fired during the outage is lost forever. If a live session is open, always re-fetch its log on every reconnect. Do NOT re-add a `liveLineCount === 0` gate — that misses the "stale entries, nothing new" failure mode.
+
+8. **`startLivePanel` triggers `window._wakeSocketResync()` before its `get_session_log` emit** — `static/js/live-panel.js`. The user tapping a session is a moment of trust that the socket is alive; forcing a health check there closes the gap between "user acted" and the periodic watchdogs firing. Do NOT remove — it eliminates the "click into stale session, back out, click again to force a fresh load" workaround.
+
+9. **5-second skeleton-stuck watchdog on `get_session_log`** — `static/js/live-panel.js` `window._skeletonStuckTimer`. If no `session_log` response arrives within 5s of the emit, cycle the socket AND re-emit directly (covers both zombie-transport and daemon-dropped-request cases). Server-side handler is <100ms even for 1000+ entries per `logs/web_server.log`, so 5s is firmly in "the emit was lost" territory. Cleared by the `session_log` handler in `socket.js` on any matching response.
+
+10. **`liveLoadMore()` mirrors #8 and #9** — `static/js/live-panel.js`. Same emit path as startLivePanel's, same failure mode: dropped emit leaves the button stuck at "Loading…" forever. Applies the wake-check-before-emit and the 5s skeleton-stuck watchdog. Do NOT special-case pagination as "less important" — a stuck Load Older button is the same class of bug from the user's perspective.
+
+**Diagnosing regressions:** the browser console `[WS]` log lines from the wake handler (`wake: tab was backgrounded Xms — cycling socket`, `wake: no events for Xms — cycling zombie socket`, `pageshow persisted=true (bfcache restore) — reloading`) are the primary signal that the recovery machinery is firing. If a user reports "stale UI after being away" and NONE of those lines appear near the incident, a lifecycle-event binding was likely removed or renamed.

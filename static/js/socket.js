@@ -1662,6 +1662,13 @@ socket.on('session_log', (data) => {
         clearTimeout(window._skeletonStuckTimer);
         window._skeletonStuckTimer = null;
     }
+    // Same for the load-more (prepend) watchdog. A prepend response has
+    // data.prepend === true and its own sid tracking key.
+    if (window._loadMoreStuckTimer && data.prepend &&
+        window._loadMoreStuckSid === data.session_id) {
+        clearTimeout(window._loadMoreStuckTimer);
+        window._loadMoreStuckTimer = null;
+    }
     if (data.session_id !== liveSessionId) return;
     const logEl = document.getElementById('live-log');
     if (!logEl) return;
