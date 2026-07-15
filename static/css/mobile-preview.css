@@ -28,7 +28,34 @@
 .vnp-type-browser { background: rgba(94, 92, 230, .22); color: #b6b4ff; }
 .vnp-type-image   { background: rgba(48, 209, 88, .18); color: var(--vnp-green); }
 
-/* ---- mini render placeholder (thumbnails) ---- */
+/* ---- thumbnails ----
+ * These show REAL content, not a mockup of content:
+ *   image   -> the actual screenshot (server-downscaled; see /api/preview/thumb)
+ *   browser -> the actual URL, in a mini browser chrome
+ * The abstract "colored bar + grey lines" mockup below survives only as the
+ * fallback when a screenshot genuinely fails to load. A placeholder that renders
+ * identically for every preview is indistinguishable from every other preview —
+ * which defeats the entire point of a gallery. */
+
+/* Real screenshot thumb. `cover` + top alignment because a page capture is tall
+   and narrow: the top of the page is what identifies it, and letterboxing the
+   whole 4000px scroll into a 110px tile would render it unreadable mush. */
+.vnp-mini-img { width: 100%; height: 100%; object-fit: cover; object-position: top center; background: #fff; display: block; }
+
+/* Live-page thumb: real browser chrome showing the real host + path. */
+.vnp-mini-web { background: #fff; }
+.vnp-mini-bar { height: 20px; background: #e9e9ee; display: flex; align-items: center; gap: 5px; padding: 0 6px; flex: 0 0 auto; }
+.vnp-mini-bar .vnp-u-dots i { width: 5px; height: 5px; }
+.vnp-mini-ubox {
+  flex: 1; min-width: 0; background: #fff; border-radius: 4px; height: 12px;
+  font-size: 7px; color: #666; display: flex; align-items: center; padding: 0 4px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.vnp-mini-web-body { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; padding: 6px; text-align: center; }
+.vnp-mini-host { font-size: 12px; font-weight: 700; color: #1c1c1e; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vnp-mini-path { font-size: 9.5px; color: #8e8e93; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- mini render placeholder (screenshot-failed fallback only) ---- */
 .vnp-mini { width: 100%; height: 100%; background: #fff; display: flex; flex-direction: column; overflow: hidden; }
 .vnp-mini-top { height: 26%; }
 .vnp-mini-body { flex: 1; padding: 8px; display: flex; flex-direction: column; gap: 5px; }
@@ -41,8 +68,11 @@
   border-radius: var(--vnp-radius); overflow: hidden; cursor: pointer; transition: transform .12s;
 }
 .vnp-card:active { transform: scale(.98); }
-.vnp-card-thumb { height: 140px; background: var(--vnp-stage-bg); display: flex; align-items: center; justify-content: center; }
+.vnp-card-thumb { height: 140px; background: var(--vnp-stage-bg); display: flex; align-items: center; justify-content: center; overflow: hidden; }
 .vnp-card-thumb .vnp-mini { width: 86%; height: 78%; border-radius: 8px; box-shadow: 0 6px 20px rgba(0, 0, 0, .5); }
+/* A real screenshot goes full-bleed — the inset "floating card" treatment is for
+   the synthetic minis, where the letterboxing IS the styling. */
+.vnp-card-thumb .vnp-mini-img { width: 100%; height: 100%; align-self: stretch; }
 .vnp-card-meta { padding: 10px 13px; }
 .vnp-card-ttl { font-size: 15px; font-weight: 600; color: var(--vnp-txt); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .vnp-card-sub { font-size: 11.5px; color: var(--vnp-txt2); margin-top: 3px; }
@@ -137,18 +167,59 @@
 #vnp-sheet.vnp-gridmode #vnp-act-grid { display: none; }
 #vnp-sheet:not(.vnp-gridmode) #vnp-act-refresh { display: inline-block; }
 
-/* grid */
+/* grid
+ * `grid-auto-rows: max-content` IS LOAD-BEARING — do not drop it back to the
+ * default `auto`. This is the "tiles smooshed and the gallery wouldn't scroll"
+ * bug, measured on a real 390px viewport:
+ *
+ *   auto rows:        12 tiles -> row = 86px, scrollHeight == clientHeight
+ *   max-content rows: 12 tiles -> row = 162px, scrollHeight 1060 / client 692
+ *
+ * Why: implicit rows default to `auto`, and `.vnp-tile` is a grid item with
+ * overflow:hidden, so its automatic minimum size is ZERO — the row has no floor
+ * to resist compression. The grid is also a flex item (`flex: 1 1 auto`) that
+ * gets shrunk to fit the sheet, and that shrink propagates straight into the
+ * auto rows. They collapsed to 86px — SHORTER than the 110px thumb inside them —
+ * so overflow:hidden ate the caption, and because the rows always "fit", the
+ * scroll container had nothing to scroll. max-content pins each row to its real
+ * height, so content overflows and scrolling works again.
+ *
+ * `repeat(auto-fill, minmax(130px, 1fr))` replaces a hardcoded `1fr 1fr` so the
+ * 720px desktop sheet uses 4 columns instead of 2 very wide ones. 130px (not
+ * higher) is deliberate: it keeps 2 columns on a 320px iPhone SE, which a 150px
+ * min drops to a single fat column. This is NOT a min-content-blowout guard —
+ * `1fr` was measured to be fine there; it's purely column count.
+ *
+ * `min-width: 0` is belt-and-braces, not a fix for an observed bug: a flex item's
+ * automatic minimum is its min-content width, and the tile titles are nowrap. No
+ * sideways overflow was measured with or without it (320/360/390/900). */
 .vnp-grid {
-  flex: 1 1 auto; overflow-y: auto; padding: 14px; grid-template-columns: 1fr 1fr; gap: 12px; align-content: start;
+  flex: 1 1 auto; min-width: 0; overflow-y: auto; padding: 14px; gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  grid-auto-rows: max-content;
+  align-content: start;
 }
 .vnp-tile { background: var(--vnp-panel2); border: .5px solid var(--vnp-sep); border-radius: 14px; overflow: hidden; cursor: pointer; transition: transform .12s; }
 .vnp-tile:active { transform: scale(.97); }
-.vnp-tile-thumb { height: 110px; background: var(--vnp-stage-bg); display: flex; align-items: center; justify-content: center; position: relative; }
+.vnp-tile-thumb { height: 110px; background: var(--vnp-stage-bg); display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; }
 .vnp-tile-thumb .vnp-mini { width: 82%; height: 80%; border-radius: 6px; }
-.vnp-tag { position: absolute; top: 7px; right: 7px; }
+.vnp-tile-thumb .vnp-mini-img { width: 100%; height: 100%; align-self: stretch; }
+/* The chip floats over REAL pixels now (a white screenshot, a browser urlbar),
+   not a dark synthetic mockup — so it carries its own dark scrim instead of the
+   translucent tinted background the in-chat chips use. Without this it renders
+   as light-purple-on-white and is effectively invisible. The type hue survives
+   on the text, so the colour coding still reads. */
+.vnp-tag {
+  position: absolute; top: 7px; right: 7px; z-index: 1; max-width: calc(100% - 14px);
+  overflow: hidden; white-space: nowrap;
+  background: rgba(0, 0, 0, .62);
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+}
+.vnp-tag.vnp-type-browser { color: #c8c7ff; }
+.vnp-tag.vnp-type-image   { color: #5cf08a; }
 .vnp-tile-cap { padding: 8px 10px; }
 .vnp-tile-ttl { font-size: 13px; font-weight: 600; color: var(--vnp-txt); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.vnp-tile-sub { font-size: 10.5px; color: var(--vnp-txt2); margin-top: 3px; }
+.vnp-tile-sub { font-size: 10.5px; color: var(--vnp-txt2); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .vnp-empty { grid-column: 1 / -1; text-align: center; color: var(--vnp-txt2); padding: 40px 0; font-size: 13px; }
 
 /* single stage */

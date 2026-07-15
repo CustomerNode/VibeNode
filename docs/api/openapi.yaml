@@ -134,6 +134,8 @@ tags:
     description: Full-text search across session transcripts (FTS5-backed)
   - name: ChatGPT
     description: ChatGPT bridge — relay prompts to a logged-in ChatGPT via Playwright
+  - name: Preview
+    description: Mobile Visual Channel — headless render, thumbnails, asset serving, live-page proxy
 
 paths:
   # ==========================================================================
@@ -6011,6 +6013,182 @@ paths:
                     nullable: true
                   error:
                     type: string
+
+  /api/preview/render:
+    post:
+      tags: [Preview]
+      summary: Headless-render a URL to a PNG the phone can fetch
+      operationId: renderPreview
+      description: |
+        Captures `url` with headless Chrome and stores the PNG under
+        `data/previews/`. Used by the Mobile Visual Channel: an agent running on
+        the dev machine cannot show a phone its screen, and the phone (remote
+        over Tailscale) cannot reach the machine's localhost — so the render
+        happens server-side and the phone just fetches an image.
+
+        The returned `file` is an absolute path so the agent can OPEN the PNG and
+        visually confirm it captured real content before showing it to the user.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  description: "An http(s) or data: URL to capture"
+                name:
+                  type: string
+                  default: Preview
+                  description: Short label shown on the preview card (max 80 chars)
+                width:
+                  type: integer
+                  default: 1024
+                  description: Viewport width (clamped 200-2000)
+                height:
+                  type: integer
+                  default: 1400
+                  description: Viewport height (clamped 200-4000)
+                wait_ms:
+                  type: integer
+                  default: 3000
+                  description: |
+                    How long to let the page's JS/network settle before capturing
+                    (clamped 0-20000). Raise for a slow SPA that would otherwise
+                    be shot while still blank.
+      responses:
+        "200":
+          description: Render succeeded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  id: { type: string, description: Opaque 32-char hex render id }
+                  src: { type: string, description: "URL to fetch the PNG: /api/preview/asset/<id>" }
+                  file: { type: string, description: Absolute path on disk, for agent verification }
+                  bytes: { type: integer }
+                  name: { type: string }
+                  type: { type: string, enum: [image] }
+        "400":
+          description: Missing or non-http(s) URL
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Chrome not found, or the render failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "504":
+          description: Render timed out (45s)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/preview/asset/{pid}:
+    get:
+      tags: [Preview]
+      summary: Serve a full-size rendered PNG
+      operationId: getPreviewAsset
+      description: |
+        Ids are opaque 32-char hex and resolve only inside the previews
+        directory, so a traversal attempt (`../`) 404s rather than escaping.
+      parameters:
+        - name: pid
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{32}$"
+      responses:
+        "200":
+          description: The rendered PNG
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Unknown, malformed, or non-existent id
+
+  /api/preview/thumb/{pid}:
+    get:
+      tags: [Preview]
+      summary: Serve a downscaled JPEG of a render, for gallery tiles
+      operationId: getPreviewThumb
+      description: |
+        The preview gallery shows real screenshots rather than a generic
+        placeholder, and its client is a phone on a cellular tailnet. Shipping a
+        dozen full-size renders (each up to 2000x4000) to paint 110px tiles is
+        the one real cost of that — so this downscales once and caches the result
+        on disk next to the source.
+
+        Tall page captures are cropped to the top rather than squeezed whole: the
+        top of a page is what identifies it, and a full 4000px scroll compressed
+        into a tile is unreadable.
+
+        Falls back to the full-size PNG (200, `image/png`) when a thumbnail can't
+        be produced — Pillow is an optional/transitive dependency, so its absence
+        must degrade rather than fail.
+      parameters:
+        - name: pid
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{32}$"
+      responses:
+        "200":
+          description: Downscaled JPEG, or the full PNG if thumbnailing was unavailable
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Unknown, malformed, or non-existent id
+
+  /api/preview/proxy:
+    get:
+      tags: [Preview]
+      summary: Reverse-proxy a URL so a live preview iframe can load it
+      operationId: proxyPreview
+      description: |
+        Best-effort: lets a phone on the tailnet load a dev server bound to the
+        machine's localhost, which it cannot reach directly. HTML responses have
+        their resource URLs rewritten back through this proxy.
+
+        Only static markup is handled — URLs injected later by JS are out of
+        scope. Prefer `/api/preview/render` when reliability matters.
+      parameters:
+        - name: u
+          in: query
+          required: true
+          schema:
+            type: string
+          description: The absolute http(s) URL to fetch
+      responses:
+        "200":
+          description: The proxied response, HTML rewritten to route assets back through the proxy
+          content:
+            "*/*":
+              schema:
+                type: string
+        "400":
+          description: Missing or non-http(s) target
+        "502":
+          description: The upstream URL could not be reached
 
 components:
   parameters:

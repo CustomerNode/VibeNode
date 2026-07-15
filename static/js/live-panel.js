@@ -522,14 +522,6 @@ function liveLoadMore() {
   const btn = document.getElementById('live-load-more-btn');
   if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
 
-  // Force a socket health check — same reason as startLivePanel. A dropped
-  // emit here leaves the button stuck at "Loading…" forever, which is the
-  // same class of bug as the infinite-skeleton issue. See CLAUDE.md
-  // "Mobile zombie-socket recovery" #10.
-  if (typeof window._wakeSocketResync === 'function') {
-    try { window._wakeSocketResync(); } catch (_e) { /* ignore */ }
-  }
-
   // Request older entries from server — the session_log handler's
   // prepend path will insert them into the DOM.
   const _lmSid = liveSessionId;
@@ -542,9 +534,10 @@ function liveLoadMore() {
     project: localStorage.getItem('activeProject') || ''
   });
 
-  // Skeleton-stuck watchdog: if the prepend response doesn't arrive within
-  // 5s, cycle the socket and re-emit. Cleared by the session_log handler in
-  // socket.js — clears its own timer under the load-more key.
+  // Stuck watchdog: if the prepend response doesn't arrive within 8s,
+  // re-enable the button so the user can retry. Never cycles the socket
+  // (that path was reverted 2026-07-15 — dropping in-flight session_entry
+  // pushes mid-stream was worse than a stuck button).
   if (window._loadMoreStuckTimer) clearTimeout(window._loadMoreStuckTimer);
   window._loadMoreStuckSid = _lmSid;
   window._loadMoreStuckBefore = _lmBefore;
@@ -552,21 +545,12 @@ function liveLoadMore() {
     if (window._loadMoreStuckSid !== _lmSid) return;
     if (liveSessionId !== _lmSid) return;
     if (_liveRenderedFrom < _lmBefore) return;   // response already arrived and prepended
-    console.warn('[load-more-watchdog] No prepend response after 5s for', _lmSid,
-      '— cycling socket and re-emitting');
-    if (typeof window._wakeSocketResync === 'function') {
-      try { window._wakeSocketResync(); } catch (_e) { /* ignore */ }
-    }
-    socket.emit('get_session_log', {
-      session_id: _lmSid, since: 0, limit: LIVE_PAGE_SIZE,
-      before: _lmBefore, project: localStorage.getItem('activeProject') || ''
-    });
-    // Re-enable the button in case the second emit also gets lost — user
-    // can retry manually instead of being stuck on a disabled control.
+    console.warn('[load-more-watchdog] No prepend response after 8s for', _lmSid,
+      '— re-enabling button');
     const btn2 = document.getElementById('live-load-more-btn');
     if (btn2) { btn2.disabled = false; btn2.textContent = 'Load older messages'; }
     window._loadMoreStuckTimer = null;
-  }, 5000);
+  }, 8000);
 }
 // Per-session queue — server-backed local cache (synced via queue_updated events)
 const _sessionQueues = {};
@@ -1026,44 +1010,50 @@ function startLivePanel(id, opts) {
   // Request the log via WebSocket (skip for brand-new sessions — optimistic bubble is enough)
   if (!skipLog) {
     performance.mark('switch-' + id);
-    // Force a socket health check the instant the user has trusted the
-    // socket to be alive by tapping into a session. On a healthy socket
-    // this is a cheap no-op; on a zombie (very common on mobile after
-    // being away) it cycles the transport and the connect handler
-    // re-emits get_session_log on the fresh socket. Without this, tapping
-    // a session while the socket is a zombie drops the emit forever and
-    // strands the user on the previous session's rendered content until
-    // they back out and re-tap (which the user reported as the workaround).
-    if (typeof window._wakeSocketResync === 'function') {
-      try { window._wakeSocketResync(); } catch (_e) { /* ignore */ }
-    }
     socket.emit('get_session_log', {session_id: id, since: 0, limit: LIVE_PAGE_SIZE, project: localStorage.getItem('activeProject') || ''});
 
-    // Skeleton-stuck watchdog: if session_log doesn't arrive within 5s, the
-    // emit was likely swallowed by a zombie transport that our upstream
-    // health check missed. Cycle the socket to force a fresh reconnect —
-    // the socket.js 'connect' handler then re-emits get_session_log on the
-    // fresh transport. Cleared by the session_log handler in socket.js as
-    // soon as any response arrives. Server-side typical time is <100ms
-    // even for 1000+ entries, so 5s is well past normal and firmly in
-    // "the emit was lost" territory. User was closing/reopening the phone
-    // browser as their workaround — this replaces that with auto-recovery.
+    // Skeleton-stuck watchdog: after 8s of no session_log response, re-emit
+    // once. After a further 8s (16s total), verify the server is alive via
+    // HTTP /api/ping (side-effect-free, no daemon IPC, cannot starve). If
+    // HTTP works but WebSocket doesn't, the socket is a proven zombie —
+    // cycle it ONCE. Hard rate-limited via _skeletonZombieCycleAt (60s min
+    // between cycles) so it can't chain-storm even under pathological
+    // conditions. This is the only path in the codebase allowed to cycle
+    // a socket based on WebSocket-vs-HTTP disagreement; everything else
+    // stays passive. See CLAUDE.md "Mobile socket recovery".
     if (window._skeletonStuckTimer) clearTimeout(window._skeletonStuckTimer);
     window._skeletonStuckSid = id;
-    window._skeletonStuckTimer = setTimeout(function() {
+    window._skeletonStuckStage = 1;
+    window._skeletonStuckTimer = setTimeout(function _sk1() {
       if (window._skeletonStuckSid !== id) return;
       if (liveSessionId !== id) return;
       if (liveLineCount > 0) return;   // response arrived and rendered
-      console.warn('[skeleton-watchdog] No session_log response after 5s for', id,
-        '— cycling socket to force recovery');
-      if (typeof window._wakeSocketResync === 'function') {
-        try { window._wakeSocketResync(); } catch (_e) { /* ignore */ }
-      }
-      // Re-emit directly too, in case the socket is healthy but the daemon
-      // dropped the first request (cycle above won't help that case).
+      console.warn('[skeleton-watchdog] No session_log after 8s for', id, '— re-emitting');
       socket.emit('get_session_log', {session_id: id, since: 0, limit: LIVE_PAGE_SIZE, project: localStorage.getItem('activeProject') || ''});
-      window._skeletonStuckTimer = null;
-    }, 5000);
+      // Stage 2: if still stuck 8s later, probe HTTP to decide whether to cycle.
+      window._skeletonStuckStage = 2;
+      window._skeletonStuckTimer = setTimeout(function _sk2() {
+        if (window._skeletonStuckSid !== id) return;
+        if (liveSessionId !== id) return;
+        if (liveLineCount > 0) return;
+        // HTTP proof that the server is actually responsive.
+        fetch('/api/ping', { cache: 'no-store' }).then(function(r) {
+          if (!r.ok) return;   // server itself down — healthchecks own it
+          // Server is fine but our WebSocket produced nothing. Zombie confirmed.
+          var lastCycle = window._skeletonZombieCycleAt || 0;
+          if (Date.now() - lastCycle < 60000) {
+            console.warn('[skeleton-watchdog] Zombie detected for', id, 'but cycle rate-limited (60s)');
+            return;
+          }
+          window._skeletonZombieCycleAt = Date.now();
+          console.warn('[skeleton-watchdog] Server responsive but socket silent — cycling once');
+          try { socket.disconnect(); socket.connect(); } catch (_e) {}
+          // The socket.js connect handler re-fetches get_session_log on
+          // reconnect, so no explicit re-emit needed here.
+        }).catch(function() { /* HTTP itself down — healthchecks own it */ });
+        window._skeletonStuckTimer = null;
+      }, 8000);
+    }, 8000);
   }
 
 

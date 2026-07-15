@@ -305,35 +305,26 @@ socket.on('disconnect', () => {
 // Debounced so a burst of visibilitychange/focus/pageshow/online in the same
 // wake doesn't cause a storm. Never causes a reload \u2014 worst case it cycles
 // the socket, which the existing 'connect' handler cleanly resyncs from.
-let _lastSocketEventAt = Date.now();
-let _lastForegroundAt = Date.now();
+// \u2500\u2500 Wake resync \u2014 MINIMAL, passive-only \u2500\u2500
+//
+// EMERGENCY BACKOUT (2026-07-15, second time): the active client-ping /
+// client-pong heartbeat that lived here was ripped out entirely. It kept
+// causing socket-cycle storms under load (Flask worker thread blocked on
+// concurrent daemon IPC \u2192 client_pong delayed >8s \u2192 heartbeat cycled the
+// socket \u2192 fresh handle_connect triggered more get_all_states IPC \u2192 made
+// the underlying congestion worse \u2192 chain of "Engine Stopped" flashes).
+//
+// New rule: this file NEVER cycles a healthy socket. Period.
+//   - If socket.connected is false \u2192 call socket.connect() (harmless).
+//   - If socket.connected is true \u2192 emit request_state_snapshot only.
+//
+// A genuinely dead socket will surface as either a Socket.IO 'disconnect'
+// event (its own ping/pong takes 25-45s to notice) or as user-visible
+// staleness that the user can fix by refreshing the page. Both of those
+// outcomes are STRICTLY BETTER than a flashing "Engine Stopped" overlay
+// during real work.
 let _lastWakeResyncAt = 0;
 const _WAKE_DEBOUNCE_MS = 750;
-// If the tab was hidden for longer than this, force a socket cycle on wake
-// regardless of what _lastSocketEventAt reports. Mobile OSes silently kill
-// the WebSocket transport during backgrounding, and a stray event that
-// arrived just before the tab was frozen makes _lastSocketEventAt look
-// falsely fresh on return. Cheaper to always cycle than to trust it.
-const _BG_CYCLE_THRESHOLD_MS = 3000;
-// Fallback zombie threshold used only when the tab was NOT backgrounded
-// (browser focus/online events on a foregrounded tab).
-const _ZOMBIE_THRESHOLD_MS = 12000;
-
-// Update _lastSocketEventAt on ANY incoming socket event (onAny fires only
-// for events the server sends us, not our own emits). This is the signal we
-// use to distinguish "live socket" from "zombie socket".
-try {
-    if (typeof socket.onAny === 'function') {
-        socket.onAny(() => { _lastSocketEventAt = Date.now(); });
-    }
-} catch (e) { /* older socket.io \u2014 falls back to disconnected-only detection */ }
-
-// Track the moment the tab was last known to be foregrounded, so wake handlers
-// can tell "just a focus event" apart from "returning after being backgrounded
-// for minutes". Only the latter warrants an unconditional socket cycle.
-document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') _lastForegroundAt = Date.now();
-});
 
 function _wakeSocketResync() {
     const now = Date.now();
@@ -343,35 +334,10 @@ function _wakeSocketResync() {
     if (!socket.connected) {
         console.log('[WS] wake: socket disconnected \u2014 forcing reconnect');
         try { socket.connect(); } catch (e) { /* ignore */ }
-        return;  // 'connect' handler resyncs state on its own
-    }
-
-    // If the tab was backgrounded longer than the cycle threshold, ALWAYS
-    // cycle the socket. Mobile OSes routinely kill the WebSocket transport
-    // during backgrounding without the client noticing \u2014 trusting
-    // socket.connected here (or a fresh-looking _lastSocketEventAt) has
-    // repeatedly stranded users on stale UI. Reconnects are cheap; missed
-    // pushes are what the user actually feels.
-    const bgDuration = now - _lastForegroundAt;
-    if (bgDuration > _BG_CYCLE_THRESHOLD_MS) {
-        console.warn('[WS] wake: tab was backgrounded', bgDuration, 'ms \u2014 cycling socket');
-        try { socket.disconnect(); socket.connect(); } catch (e) { /* ignore */ }
-        _lastSocketEventAt = now;
         return;
     }
 
-    // Foregrounded-tab wake (focus/online with no backgrounding) \u2014 fall back
-    // to the event-staleness heuristic.
-    const staleness = now - _lastSocketEventAt;
-    if (staleness > _ZOMBIE_THRESHOLD_MS) {
-        console.warn('[WS] wake: no events for', staleness, 'ms \u2014 cycling zombie socket');
-        try { socket.disconnect(); socket.connect(); } catch (e) { /* ignore */ }
-        _lastSocketEventAt = now;
-        return;
-    }
-
-    // Socket looks healthy \u2014 request a snapshot so the UI catches up on
-    // any incremental events that may have fired while backgrounded.
+    // Refresh state snapshot \u2014 cheap, covers UI catch-up.
     const proj = localStorage.getItem('activeProject') || '';
     socket.emit('request_state_snapshot', { project: proj });
 }
@@ -1942,25 +1908,14 @@ setInterval(() => {
     if (socket.connected) socket.emit('request_state_snapshot', {project: localStorage.getItem('activeProject') || ''});
 }, 30000);
 
-// ---- Continuous zombie-socket detection (foreground path) ----
-// The wake-up handler above catches zombies when the tab returns from
-// background — but a Tailscale tunnel can drop while the tab stays
-// foregrounded (network handoff, sleep/wake with tab still visible), and no
-// visibilitychange fires. socket.connected keeps reporting true, emits go
-// into the void, and the UI has no idea. Every 20s, if we're marked
-// connected but haven't received ANY event in >45s (well beyond the 30s
-// heartbeat's guaranteed response), cycle the socket to force a fresh
-// transport negotiation. This is the last line of defense against the
-// "skeletons forever without a visibility change" symptom.
-setInterval(() => {
-    if (!socket.connected) return;   // disconnect handler + reconnect logic covers this
-    const staleness = Date.now() - _lastSocketEventAt;
-    if (staleness > 45000) {
-        console.warn('[WS] bg-zombie: no events for', staleness, 'ms while connected — cycling socket');
-        try { socket.disconnect(); socket.connect(); } catch (e) { /* ignore */ }
-        _lastSocketEventAt = Date.now();   // avoid immediate re-cycle
-    }
-}, 20000);
+// NOTE: A 20s foreground zombie-socket watchdog used to live here, cycling
+// the socket if no events arrived in >45s. It was removed 2026-07-15 after
+// it fired mid-stream and dropped in-flight session_entry pushes, which the
+// user experienced as "session stream got fucked". If a foregrounded socket
+// really did die silently, the 30s heartbeat above (request_state_snapshot)
+// will get no reply, Socket.IO's own ping/pong will time out within another
+// ~25s, and the disconnect handler + auto-reconnect will kick in. Erring on
+// the side of stale-UI instead of blowing away live streams.
 
 
 // ---- Continuous stuck-session watchdog ----

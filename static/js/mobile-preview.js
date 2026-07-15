@@ -119,9 +119,35 @@
 
   // ---- in-chat cards -------------------------------------------------------
 
-  function _miniHTML(p) {
-    // A generic stylized "render" placeholder for the thumbnail (we don't fetch
-    // the real pixels for the card — the sheet does that on open).
+  // ---- thumbnails ----------------------------------------------------------
+  // A thumbnail's whole job is to tell previews APART. These show real content:
+  // a screenshot shows its own pixels, a live page shows its real URL.
+
+  // Our own renders (POST /api/preview/render) are full-size page captures — up
+  // to 2000x4000 and often hundreds of KB. A gallery paints a dozen at ~110px
+  // tall, and the phone is on a cellular tailnet, so ask the server for a
+  // downscaled copy instead of shipping the full PNG. Any other src (an external
+  // image URL we didn't render) is used as-is — we have nothing to downscale.
+  var _ASSET_RE = /^\/api\/preview\/asset\/([0-9a-f]{32})$/;
+
+  function _thumbSrc(src) {
+    var m = _ASSET_RE.exec(src || "");
+    return m ? "/api/preview/thumb/" + m[1] : src;
+  }
+
+  function _urlParts(src) {
+    try {
+      var u = new URL(src, location.href);
+      return { host: u.host || u.protocol, path: (u.pathname || "") + (u.search || "") };
+    } catch (e) {
+      return { host: String(src || "").slice(0, 40), path: "" };
+    }
+  }
+
+  // The old thumbnail for EVERY preview: a colored bar over grey lines. Now only
+  // the fallback for a screenshot that fails to load — where "something generic"
+  // genuinely is all we know.
+  function _placeholderHTML(p) {
     var accent = p.type === "image" ? "#30d158" : "#5e5ce6";
     return '<div class="vnp-mini">' +
              '<div class="vnp-mini-top" style="background:' + accent + '"></div>' +
@@ -133,6 +159,50 @@
            '</div>';
   }
 
+  function _miniHTML(p) {
+    if (p.type === "image") {
+      // lazy: a gallery of 20 shouldn't fetch 20 PNGs to paint 4 visible tiles.
+      return '<img class="vnp-mini-img" alt="" loading="lazy" decoding="async" src="' +
+             esc(_thumbSrc(p.src)) + '">';
+    }
+    // A live page can't be pixel-previewed without rendering it (the phone can't
+    // even reach it directly) — so show the thing that actually identifies it.
+    var u = _urlParts(p.src);
+    return '<div class="vnp-mini vnp-mini-web">' +
+             '<div class="vnp-mini-bar">' +
+               '<span class="vnp-u-dots"><i></i><i></i><i></i></span>' +
+               '<span class="vnp-mini-ubox">' + esc(u.host) + '</span>' +
+             '</div>' +
+             '<div class="vnp-mini-web-body">' +
+               '<div class="vnp-mini-host">' + esc(u.host) + '</div>' +
+               (u.path && u.path !== "/" ? '<div class="vnp-mini-path">' + esc(u.path) + '</div>' : '') +
+             '</div>' +
+           '</div>';
+  }
+
+  // Swap a broken screenshot for the placeholder. Done as a listener rather than
+  // an inline onerror= so we don't depend on inline-script permissions.
+  function _wireThumbs(root, byId) {
+    root.querySelectorAll(".vnp-mini-img").forEach(function (img) {
+      img.addEventListener("error", function () {
+        var holder = img.parentNode;
+        if (!holder) return;
+        img.remove();
+        holder.insertAdjacentHTML("beforeend", _placeholderHTML(byId || { type: "image" }));
+      }, { once: true });
+    });
+  }
+
+  // What a tile/card says under its title. For a live page the URL is the single
+  // most useful fact about it, so it wins over "tap to open" boilerplate.
+  function _subText(p, fallback) {
+    if (p.type === "browser") {
+      var u = _urlParts(p.src);
+      return u.host + (u.path && u.path !== "/" ? u.path : "");
+    }
+    return fallback;
+  }
+
   function _cardHTML(p) {
     var t = TYPE_META[p.type] || TYPE_META.browser;
     return '<div class="vnp-card" data-pid="' + esc(p.id) + '">' +
@@ -141,7 +211,7 @@
                '<div class="vnp-card-ttl">' + esc(p.name) +
                  ' <span class="vnp-type vnp-type-' + p.type + '">' + t.glyph + ' ' + t.label + '</span>' +
                '</div>' +
-               '<div class="vnp-card-sub">tap to open</div>' +
+               '<div class="vnp-card-sub">' + esc(_subText(p, "tap to open")) + '</div>' +
              '</div>' +
            '</div>';
   }
@@ -155,6 +225,7 @@
     var wrap = document.createElement("div");
     wrap.className = "vnp-cards";
     wrap.innerHTML = found.map(_cardHTML).join("");
+    _wireThumbs(wrap);
     wrap.querySelectorAll(".vnp-card").forEach(function (el) {
       el.addEventListener("click", function () { openPreview(sid, el.getAttribute("data-pid")); });
     });
@@ -386,9 +457,12 @@
                '<div class="vnp-tile-thumb"><span class="vnp-type vnp-type-' + p.type + ' vnp-tag">' +
                  t.glyph + " " + t.label + '</span>' + _miniHTML(p) + '</div>' +
                '<div class="vnp-tile-cap"><div class="vnp-tile-ttl">' + esc(p.name) + '</div>' +
-                 '<div class="vnp-tile-sub">' + (p.lastOpened != null ? "opened" : "new") + '</div></div>' +
+                 '<div class="vnp-tile-sub">' +
+                   esc(_subText(p, p.lastOpened != null ? "opened" : "new")) +
+                 '</div></div>' +
              '</div>';
     }).join("") || '<div class="vnp-empty">No previews yet.</div>';
+    _wireThumbs(grid);
     grid.querySelectorAll(".vnp-tile").forEach(function (el) {
       el.addEventListener("click", function () { openPreview(sid, el.getAttribute("data-pid")); });
     });

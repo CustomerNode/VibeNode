@@ -6,6 +6,8 @@ Turns a URL into something a phone on the tailnet can actually see:
   POST /api/preview/render      {url,name,width,height} -> headless-Chrome PNG,
                                  returns {ok,id,src,name,type:"image"}
   GET  /api/preview/asset/<id>  serve a rendered PNG (opaque id, dir-scoped)
+  GET  /api/preview/thumb/<id>  downscaled JPEG of a render, for gallery tiles
+                                 (falls back to the full PNG without Pillow)
   GET  /api/preview/proxy?u=..  best-effort reverse proxy so a live iframe can
                                  load a localhost dev server through the tailnet
                                  origin (relative asset URLs rewritten back
@@ -166,6 +168,69 @@ def asset(pid):
     if not f.exists():
         abort(404)
     return send_file(str(f), mimetype="image/png", max_age=0)
+
+
+# ---------------------------------------------------------------------------
+# Thumbnails
+# ---------------------------------------------------------------------------
+
+_THUMB_SUFFIX = ".thumb.jpg"
+_THUMB_W = 480          # ~2x the widest gallery tile, so it stays sharp on a phone
+_THUMB_MAX_ASPECT = 1.4  # crop taller-than-this captures (see _make_thumb)
+
+
+def _make_thumb(src: Path, dst: Path) -> bool:
+    """Write a downscaled JPEG of `src` to `dst`. False if we can't (caller falls back).
+
+    Pillow is NOT in requirements.txt — it's only ever present transitively, so
+    this must degrade rather than 500 when the import fails.
+    """
+    try:
+        from PIL import Image
+    except Exception:  # noqa: BLE001 — Pillow absent is an expected, handled state
+        return False
+    try:
+        with Image.open(src) as im:
+            im = im.convert("RGB")   # renders are opaque; drops any alpha for JPEG
+            # A page capture is tall (up to 4000px). Squeezing a whole scroll into
+            # a 110px tile is unreadable mush, so keep the top — that's the part
+            # that identifies the page. The CSS crops the same way (object-fit:
+            # cover + top), this just avoids shipping pixels nobody will see.
+            w, h = im.size
+            max_h = int(w * _THUMB_MAX_ASPECT)
+            if h > max_h:
+                im = im.crop((0, 0, w, max_h))
+            im.thumbnail((_THUMB_W, int(_THUMB_W * _THUMB_MAX_ASPECT)), Image.LANCZOS)
+            im.save(dst, "JPEG", quality=78, optimize=True)
+        return True
+    except Exception as e:  # noqa: BLE001
+        _log.debug("preview thumb failed for %s: %s", src.name, e)
+        return False
+
+
+@bp.route("/api/preview/thumb/<pid>")
+def thumb(pid):
+    """Serve a small copy of a render, for gallery tiles and in-chat cards.
+
+    WHY THIS EXISTS: the gallery shows real screenshots rather than a synthetic
+    placeholder, and the client is a phone on a cellular tailnet. A dozen
+    full-size renders (each up to 2000x4000) to paint 110px tiles is the one
+    genuine cost of showing real pixels — so downscale once and cache on disk.
+    Falls back to the full-size asset if we can't thumbnail: a heavy thumbnail is
+    still infinitely more useful than a generic mockup.
+    """
+    if not _ID_RE.match(pid or ""):
+        abort(404)
+    src = _PREVIEW_DIR / (pid + ".png")
+    if not src.exists():
+        abort(404)
+    dst = _PREVIEW_DIR / (pid + _THUMB_SUFFIX)
+    # Re-render if missing or older than the source (↻ can overwrite a render).
+    if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
+        if not _make_thumb(src, dst):
+            return send_file(str(src), mimetype="image/png", max_age=0)
+    # Content is immutable per id, so let the phone cache it.
+    return send_file(str(dst), mimetype="image/jpeg", max_age=3600)
 
 
 # ---------------------------------------------------------------------------

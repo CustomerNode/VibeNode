@@ -105,6 +105,10 @@ _MOBILE_PREAMBLE = (
     "user needs to tap through the real UI.\n"
     "Each marker renders as a tappable card in the user's chat and collects in the "
     "session's preview gallery. Prefer showing over telling.\n"
+    "NAME THEM DISTINCTLY: the gallery shows each preview's real content (a "
+    "screenshot thumbnails itself; a browser preview shows its URL), and \"name\" is "
+    "the caption under it. Use a specific one (\"Settings — dark mode\", not "
+    "\"Preview\") so a gallery of ten is scannable.\n"
     "⟦/VN-MOBILE⟧"
 )
 
@@ -351,6 +355,14 @@ def register_ws_events(socketio, app):
     @socketio.on('disconnect')
     def handle_disconnect():
         logger.debug("WebSocket client disconnected")
+    # NOTE: A client_ping / client_pong handler used to live here (added +
+    # reverted 2026-07-15). It fed a client-side heartbeat that cycled the
+    # WebSocket transport when pongs came back too slowly under load, which
+    # cascaded into daemon IPC pressure and "Engine Stopped" flashing. See
+    # CLAUDE.md "Mobile socket recovery" section. Do NOT re-add without
+    # (a) proving pong latency is decoupled from Flask worker load, and
+    # (b) a strict guarantee that no socket cycle can ever chain into
+    #     another socket cycle within the same 60s.
 
     @socketio.on('request_state_snapshot')
     def handle_request_state_snapshot(data=None):
