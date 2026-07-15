@@ -103,18 +103,22 @@ socket.on('connect', () => {
         }
     }, 3000);
 
-    // Cure "skeletons forever" on reconnect: if the user has a live session
-    // open and its log is empty (skeleton showing), the original
-    // socket.emit('get_session_log') was likely swallowed by a zombie socket
-    // that has since been cycled. Re-emit now that the transport is fresh.
-    // Also covers first-connect race where startLivePanel() emitted before
-    // the socket finished connecting (emits during handshake are buffered by
-    // socket.io, but not always reliably across mobile transport hiccups).
-    if (typeof liveSessionId !== 'undefined' && liveSessionId &&
-        typeof liveLineCount !== 'undefined' && liveLineCount === 0) {
+    // Cure BOTH "skeletons forever" AND "stale entries, nothing new" on any
+    // reconnect: unconditionally re-fetch the live session log if one is open.
+    // Socket.IO does NOT replay events missed while disconnected, so any
+    // session_entry / session_state pushed during the outage is lost forever
+    // — the only way to recover the missing tail is to explicitly re-fetch.
+    // The server-side handler at ws_events.py:825 guards against destructive
+    // re-render when its response covers fewer entries than the DOM already
+    // shows (socket.js:1634), so re-emitting is safe when liveLineCount > 0.
+    // Confirmed against 2026-07-14 20:01:13 web_server.log: a browser
+    // reconnect that fetched get_permission_policy + get_ui_prefs but not
+    // get_session_log left the user stuck with stale entries until a manual
+    // server restart forced a fresh reload.
+    if (typeof liveSessionId !== 'undefined' && liveSessionId) {
         const _lpProj = localStorage.getItem('activeProject') || '';
         const _limit = (typeof LIVE_PAGE_SIZE !== 'undefined') ? LIVE_PAGE_SIZE : 100;
-        console.log('[WS] connect: live session has empty log, re-emitting get_session_log');
+        console.log('[WS] connect: re-emitting get_session_log for', liveSessionId);
         socket.emit('get_session_log', {
             session_id: liveSessionId, since: 0, limit: _limit, project: _lpProj,
         });
@@ -302,9 +306,18 @@ socket.on('disconnect', () => {
 // wake doesn't cause a storm. Never causes a reload \u2014 worst case it cycles
 // the socket, which the existing 'connect' handler cleanly resyncs from.
 let _lastSocketEventAt = Date.now();
+let _lastForegroundAt = Date.now();
 let _lastWakeResyncAt = 0;
-const _ZOMBIE_THRESHOLD_MS = 12000;
 const _WAKE_DEBOUNCE_MS = 750;
+// If the tab was hidden for longer than this, force a socket cycle on wake
+// regardless of what _lastSocketEventAt reports. Mobile OSes silently kill
+// the WebSocket transport during backgrounding, and a stray event that
+// arrived just before the tab was frozen makes _lastSocketEventAt look
+// falsely fresh on return. Cheaper to always cycle than to trust it.
+const _BG_CYCLE_THRESHOLD_MS = 3000;
+// Fallback zombie threshold used only when the tab was NOT backgrounded
+// (browser focus/online events on a foregrounded tab).
+const _ZOMBIE_THRESHOLD_MS = 12000;
 
 // Update _lastSocketEventAt on ANY incoming socket event (onAny fires only
 // for events the server sends us, not our own emits). This is the signal we
@@ -315,12 +328,17 @@ try {
     }
 } catch (e) { /* older socket.io \u2014 falls back to disconnected-only detection */ }
 
+// Track the moment the tab was last known to be foregrounded, so wake handlers
+// can tell "just a focus event" apart from "returning after being backgrounded
+// for minutes". Only the latter warrants an unconditional socket cycle.
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') _lastForegroundAt = Date.now();
+});
+
 function _wakeSocketResync() {
     const now = Date.now();
     if (now - _lastWakeResyncAt < _WAKE_DEBOUNCE_MS) return;
     _lastWakeResyncAt = now;
-
-    const proj = localStorage.getItem('activeProject') || '';
 
     if (!socket.connected) {
         console.log('[WS] wake: socket disconnected \u2014 forcing reconnect');
@@ -328,21 +346,33 @@ function _wakeSocketResync() {
         return;  // 'connect' handler resyncs state on its own
     }
 
+    // If the tab was backgrounded longer than the cycle threshold, ALWAYS
+    // cycle the socket. Mobile OSes routinely kill the WebSocket transport
+    // during backgrounding without the client noticing \u2014 trusting
+    // socket.connected here (or a fresh-looking _lastSocketEventAt) has
+    // repeatedly stranded users on stale UI. Reconnects are cheap; missed
+    // pushes are what the user actually feels.
+    const bgDuration = now - _lastForegroundAt;
+    if (bgDuration > _BG_CYCLE_THRESHOLD_MS) {
+        console.warn('[WS] wake: tab was backgrounded', bgDuration, 'ms \u2014 cycling socket');
+        try { socket.disconnect(); socket.connect(); } catch (e) { /* ignore */ }
+        _lastSocketEventAt = now;
+        return;
+    }
+
+    // Foregrounded-tab wake (focus/online with no backgrounding) \u2014 fall back
+    // to the event-staleness heuristic.
     const staleness = now - _lastSocketEventAt;
     if (staleness > _ZOMBIE_THRESHOLD_MS) {
         console.warn('[WS] wake: no events for', staleness, 'ms \u2014 cycling zombie socket');
-        try {
-            socket.disconnect();
-            socket.connect();
-        } catch (e) { /* ignore */ }
-        // Reset the clock so a rapid second wake doesn't re-cycle before
-        // the fresh connection has a chance to send its first event.
+        try { socket.disconnect(); socket.connect(); } catch (e) { /* ignore */ }
         _lastSocketEventAt = now;
-        return;  // 'connect' handler resyncs state on its own
+        return;
     }
 
     // Socket looks healthy \u2014 request a snapshot so the UI catches up on
     // any incremental events that may have fired while backgrounded.
+    const proj = localStorage.getItem('activeProject') || '';
     socket.emit('request_state_snapshot', { project: proj });
 }
 
@@ -352,6 +382,12 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('pageshow', _wakeSocketResync);
 window.addEventListener('focus', _wakeSocketResync);
 window.addEventListener('online', _wakeSocketResync);
+
+// Expose so any code path that starts to trust "the socket must be alive"
+// (e.g. opening a session and expecting its log to stream) can force a
+// health check first. Cheap on a healthy socket (a debounced snapshot emit),
+// definitive on a zombie (cycle + reconnect + connect-handler re-emit).
+window._wakeSocketResync = _wakeSocketResync;
 
 // Server-side error messages
 socket.on('error', (data) => {
@@ -1602,6 +1638,13 @@ socket.on('session_id_remapped', (data) => {
 // Session log response — server-side pagination.
 // Server sends only the requested page; "Load older" fetches from server.
 socket.on('session_log', (data) => {
+    // Clear the live-panel.js skeleton-stuck watchdog on any matching response.
+    // Set BEFORE the liveSessionId guard so a late reply for a session the user
+    // has since backed out of still clears its own timer (harmless if none).
+    if (window._skeletonStuckTimer && window._skeletonStuckSid === data.session_id) {
+        clearTimeout(window._skeletonStuckTimer);
+        window._skeletonStuckTimer = null;
+    }
     if (data.session_id !== liveSessionId) return;
     const logEl = document.getElementById('live-log');
     if (!logEl) return;

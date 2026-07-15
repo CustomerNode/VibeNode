@@ -990,7 +990,44 @@ function startLivePanel(id, opts) {
   // Request the log via WebSocket (skip for brand-new sessions — optimistic bubble is enough)
   if (!skipLog) {
     performance.mark('switch-' + id);
+    // Force a socket health check the instant the user has trusted the
+    // socket to be alive by tapping into a session. On a healthy socket
+    // this is a cheap no-op; on a zombie (very common on mobile after
+    // being away) it cycles the transport and the connect handler
+    // re-emits get_session_log on the fresh socket. Without this, tapping
+    // a session while the socket is a zombie drops the emit forever and
+    // strands the user on the previous session's rendered content until
+    // they back out and re-tap (which the user reported as the workaround).
+    if (typeof window._wakeSocketResync === 'function') {
+      try { window._wakeSocketResync(); } catch (_e) { /* ignore */ }
+    }
     socket.emit('get_session_log', {session_id: id, since: 0, limit: LIVE_PAGE_SIZE, project: localStorage.getItem('activeProject') || ''});
+
+    // Skeleton-stuck watchdog: if session_log doesn't arrive within 5s, the
+    // emit was likely swallowed by a zombie transport that our upstream
+    // health check missed. Cycle the socket to force a fresh reconnect —
+    // the socket.js 'connect' handler then re-emits get_session_log on the
+    // fresh transport. Cleared by the session_log handler in socket.js as
+    // soon as any response arrives. Server-side typical time is <100ms
+    // even for 1000+ entries, so 5s is well past normal and firmly in
+    // "the emit was lost" territory. User was closing/reopening the phone
+    // browser as their workaround — this replaces that with auto-recovery.
+    if (window._skeletonStuckTimer) clearTimeout(window._skeletonStuckTimer);
+    window._skeletonStuckSid = id;
+    window._skeletonStuckTimer = setTimeout(function() {
+      if (window._skeletonStuckSid !== id) return;
+      if (liveSessionId !== id) return;
+      if (liveLineCount > 0) return;   // response arrived and rendered
+      console.warn('[skeleton-watchdog] No session_log response after 5s for', id,
+        '— cycling socket to force recovery');
+      if (typeof window._wakeSocketResync === 'function') {
+        try { window._wakeSocketResync(); } catch (_e) { /* ignore */ }
+      }
+      // Re-emit directly too, in case the socket is healthy but the daemon
+      // dropped the first request (cycle above won't help that case).
+      socket.emit('get_session_log', {session_id: id, since: 0, limit: LIVE_PAGE_SIZE, project: localStorage.getItem('activeProject') || ''});
+      window._skeletonStuckTimer = null;
+    }, 5000);
   }
 
 
