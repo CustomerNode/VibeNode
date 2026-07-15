@@ -379,7 +379,24 @@ function _wakeSocketResync() {
 document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') _wakeSocketResync();
 });
-window.addEventListener('pageshow', _wakeSocketResync);
+// pageshow: distinguish bfcache restore from a normal show. bfcache means
+// iOS Safari (and other browsers) froze the entire JS runtime with the
+// WebSocket state intact but the underlying transport dead. socket.connected
+// still reports true, socket.disconnect()+connect() often cannot rebuild
+// cleanly because the engine.io state is corrupted by the freeze/thaw.
+// The definitive recovery is a full reload — which is exactly what the user
+// was doing manually ("close the app, clear history, reload"). Automating
+// it is a strict improvement over the workaround.
+window.addEventListener('pageshow', function(e) {
+    if (e && e.persisted) {
+        // Guard: don't fight an in-app restart's own reload flow.
+        if (document.getElementById('restart-overlay')) return;
+        console.warn('[WS] pageshow persisted=true (bfcache restore) — reloading to rebuild transport');
+        try { window.location.reload(); } catch (_e) { /* ignore */ }
+        return;
+    }
+    _wakeSocketResync();
+});
 window.addEventListener('focus', _wakeSocketResync);
 window.addEventListener('online', _wakeSocketResync);
 
