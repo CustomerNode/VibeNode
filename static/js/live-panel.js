@@ -1012,15 +1012,26 @@ function startLivePanel(id, opts) {
     performance.mark('switch-' + id);
     socket.emit('get_session_log', {session_id: id, since: 0, limit: LIVE_PAGE_SIZE, project: localStorage.getItem('activeProject') || ''});
 
-    // Skeleton-stuck watchdog: after 8s of no session_log response, re-emit
-    // once. After a further 8s (16s total), verify the server is alive via
-    // HTTP /api/ping (side-effect-free, no daemon IPC, cannot starve). If
-    // HTTP works but WebSocket doesn't, the socket is a proven zombie —
-    // cycle it ONCE. Hard rate-limited via _skeletonZombieCycleAt (60s min
-    // between cycles) so it can't chain-storm even under pathological
-    // conditions. This is the only path in the codebase allowed to cycle
-    // a socket based on WebSocket-vs-HTTP disagreement; everything else
-    // stays passive. See CLAUDE.md "Mobile socket recovery".
+    // Skeleton-stuck watchdog: three stages, each only fires if the user
+    // still sees a stuck skeleton for this exact session.
+    //   Stage 1 (8s):  re-emit get_session_log — cures a dropped emit.
+    //   Stage 2 (16s): probe /api/ping over HTTP. If HTTP is fine but the
+    //                  WebSocket produced nothing, the socket is a proven
+    //                  zombie — cycle it once. 60s hard rate-limit.
+    //   Stage 3 (28s): if we're STILL stuck 12s after the cycle, Socket.IO's
+    //                  own state is wedged (this happens on iOS Safari after
+    //                  bfcache-thaw when event.persisted is falsely false).
+    //                  A full page reload is guaranteed to fix any wedged
+    //                  Socket.IO/engine.io state — it's exactly what the
+    //                  user's "turn off and back on" workaround does.
+    //                  Rate-limited via _skeletonReloadAt to at most one
+    //                  reload per 120s, and guarded by a live restart-overlay
+    //                  so it never fights an in-app restart flow.
+    //
+    // Every stage requires the skeleton to still be visible for THIS session.
+    // The 60s cycle limit + 120s reload limit + user-visible-only trigger
+    // together mean no periodic loop can chain-storm — the storm 2026-07-15
+    // required a background 4s tick, which none of these stages have.
     if (window._skeletonStuckTimer) clearTimeout(window._skeletonStuckTimer);
     window._skeletonStuckSid = id;
     window._skeletonStuckStage = 1;
@@ -1043,15 +1054,35 @@ function startLivePanel(id, opts) {
           var lastCycle = window._skeletonZombieCycleAt || 0;
           if (Date.now() - lastCycle < 60000) {
             console.warn('[skeleton-watchdog] Zombie detected for', id, 'but cycle rate-limited (60s)');
-            return;
+          } else {
+            window._skeletonZombieCycleAt = Date.now();
+            console.warn('[skeleton-watchdog] Server responsive but socket silent — cycling once');
+            try { socket.disconnect(); socket.connect(); } catch (_e) {}
+            // The socket.js connect handler re-fetches get_session_log on
+            // reconnect, so no explicit re-emit needed here.
           }
-          window._skeletonZombieCycleAt = Date.now();
-          console.warn('[skeleton-watchdog] Server responsive but socket silent — cycling once');
-          try { socket.disconnect(); socket.connect(); } catch (_e) {}
-          // The socket.js connect handler re-fetches get_session_log on
-          // reconnect, so no explicit re-emit needed here.
+          // Stage 3: if the cycle also fails to unstick us within 12s,
+          // Socket.IO state is wedged (typical after iOS Safari bfcache).
+          // A full page reload is guaranteed to fix any wedged engine.io
+          // state — it's what "turn off and back on" does. Rate-limited.
+          window._skeletonStuckStage = 3;
+          window._skeletonStuckTimer = setTimeout(function _sk3() {
+            if (window._skeletonStuckSid !== id) return;
+            if (liveSessionId !== id) return;
+            if (liveLineCount > 0) return;
+            // Don't fight an in-app restart's own overlay/reload.
+            if (document.getElementById('restart-overlay')) return;
+            var lastReload = 0;
+            try { lastReload = parseInt(sessionStorage.getItem('vn_skel_reload_at') || '0', 10); } catch (_e) {}
+            if (Date.now() - lastReload < 120000) {
+              console.warn('[skeleton-watchdog] Would reload but rate-limited (120s)');
+              return;
+            }
+            try { sessionStorage.setItem('vn_skel_reload_at', String(Date.now())); } catch (_e) {}
+            console.warn('[skeleton-watchdog] Cycle did not recover — reloading page');
+            try { window.location.reload(); } catch (_e) {}
+          }, 12000);
         }).catch(function() { /* HTTP itself down — healthchecks own it */ });
-        window._skeletonStuckTimer = null;
       }, 8000);
     }, 8000);
   }
