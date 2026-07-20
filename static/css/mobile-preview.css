@@ -103,14 +103,38 @@
   transition: opacity .3s; z-index: 3000;
 }
 #vnp-sheet-backdrop.show { opacity: 1; pointer-events: auto; }
+/* `visibility: hidden` when closed IS LOAD-BEARING — do not drop it and leave the
+ * sheet relying on `transform: translateY(100%)` alone to be "off-screen".
+ *
+ * With `bottom: 0; height: 92%`, translateY(100%) moves the sheet down by 92vh,
+ * landing its TOP EDGE exactly at the viewport bottom (100vh). The box below is
+ * off-screen — but `box-shadow: 0 -10px 40px` is cast UPWARD from that top edge,
+ * and a box-shadow is NOT clipped just because its element sits outside the
+ * viewport. Result: a permanent ~30px dark band across the bottom of the screen,
+ * 720px wide and centered (max-width + margin auto), for the entire life of the
+ * page once `_sheet()` has lazily appended the node to <body>. `closeSheet()`
+ * only removes `.show`, so nothing ever cleaned it up. Reported in the wild as
+ * "the preview overlay is hanging around, I can see the shadow at the bottom".
+ *
+ * The `visibility 0s linear .34s` delay is what keeps the close animation intact:
+ * visibility flips to hidden only AFTER the .34s slide-down finishes. On open,
+ * `.show` sets it to `visible` with no delay so the slide-up is visible from
+ * frame one. Hiding also drops the closed sheet out of the a11y tree and out of
+ * hit-testing, which the transform alone never did. */
 #vnp-sheet {
   position: fixed; left: 0; right: 0; bottom: 0; height: 92%;
   background: var(--vnp-panel); border-radius: 20px 20px 0 0;
-  transform: translateY(100%); transition: transform .34s cubic-bezier(.32, .72, 0, 1);
+  transform: translateY(100%);
+  visibility: hidden;
+  transition: transform .34s cubic-bezier(.32, .72, 0, 1), visibility 0s linear .34s;
   z-index: 3001; display: flex; flex-direction: column; box-shadow: 0 -10px 40px rgba(0, 0, 0, .6);
   max-width: 720px; margin: 0 auto;
   /* Capture touches so a swipe on the sheet never chains to the chat behind. */
   touch-action: none; overscroll-behavior: contain;
+}
+#vnp-sheet.show {
+  visibility: visible;
+  transition: transform .34s cubic-bezier(.32, .72, 0, 1), visibility 0s;
 }
 /* The gallery is the one region that must scroll — allow vertical pan, but keep
    its scroll contained so reaching the end doesn't bleed to the page. */

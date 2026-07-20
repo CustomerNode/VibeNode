@@ -69,6 +69,13 @@ function _sessionBelongsToActiveProject(cwd) {
 socket.on('connect', () => {
     _wsConnected = true;
     console.log('[WS] Connected');
+    // Cancel any pending "flash red" from a recent short disconnect \u2014
+    // the socket came back inside the grace window, so the user never
+    // needs to see a "Disconnected" state.
+    if (typeof _disconnectFlashTimer !== 'undefined' && _disconnectFlashTimer) {
+        clearTimeout(_disconnectFlashTimer);
+        _disconnectFlashTimer = null;
+    }
     // Update SocketIO query params with current project so reconnects
     // and the server's handle_connect use the right project context.
     const _curProj = localStorage.getItem('activeProject') || '';
@@ -261,14 +268,28 @@ socket.on('daemon_reconnect', (data) => {
     }
 });
 
+// Delay flipping the status-bar indicator to red \u2014 mobile Tailscale drops
+// the socket briefly during wifi/cellular handoffs and Socket.IO reconnects
+// within 1\u20133s. Flashing "Disconnected" on every micro-drop is visual noise
+// that reads as broken even when recovery is imminent. Only mark the bar
+// red if the disconnect persists past _DISCONNECT_GRACE_MS. `connect`
+// clears the pending timer so a fast reconnect leaves the bar green.
+let _disconnectFlashTimer = null;
+const _DISCONNECT_GRACE_MS = 4000;
 socket.on('disconnect', () => {
     _wsConnected = false;
     console.log('[WS] Disconnected');
     // Clear staleness timestamps so reconnect snapshot is authoritative
     window._sessionStateTs = {};
-    // Update status bar connection indicator
-    const sbConn = document.getElementById('sb-connection');
-    if (sbConn) { sbConn.textContent = '\u25CF'; sbConn.style.color = 'var(--result-err)'; sbConn.title = 'Disconnected'; }
+    if (_disconnectFlashTimer) { clearTimeout(_disconnectFlashTimer); _disconnectFlashTimer = null; }
+    _disconnectFlashTimer = setTimeout(() => {
+        _disconnectFlashTimer = null;
+        // Only flip if we're STILL disconnected \u2014 otherwise a fast reconnect
+        // already put us back to green.
+        if (socket.connected) return;
+        const sbConn = document.getElementById('sb-connection');
+        if (sbConn) { sbConn.textContent = '\u25CF'; sbConn.style.color = 'var(--result-err)'; sbConn.title = 'Disconnected'; }
+    }, _DISCONNECT_GRACE_MS);
 });
 
 // \u2500\u2500 Wake-up socket resync: fix for "stale/frozen UI until manual refresh" on mobile \u2500\u2500

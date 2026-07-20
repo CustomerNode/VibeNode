@@ -75,7 +75,9 @@ function _runHealthChecks() {
         if (!_healthBlocking) {
             overlay.classList.add('show');
             _healthBlocking = true;
-            _restartHealthPoll(3000);
+            // Aggressive re-eval while blocked so recovery is near-instant
+            // once the underlying probe (server / gstatic / daemon) succeeds.
+            _restartHealthPoll(1000);
         }
     } else if (_healthBlocking) {
         overlay.classList.remove('show');
@@ -94,20 +96,25 @@ function _restartHealthPoll(ms) {
     _healthPollId = setInterval(_runHealthChecks, ms);
 }
 
-/* ---- Built-in: WiFi / Internet connectivity ---- */
-
-/*
- * Two-layer detection:
- *   1. navigator.onLine  — instant but unreliable on Windows (stays true if
- *      any adapter is up, even loopback)
- *   2. Real probe        — HEAD request to a known external URL to confirm
- *      actual internet reachability.  Falls back to navigator.onLine if the
- *      probe can't run yet.
+/* ---- Built-in: WiFi / Internet connectivity ----
+ *
+ * Design note (2026-07-20): On mobile over Tailscale, this check used to be
+ * the primary source of the "no internet" overlay. Two problems:
+ *   1. The gstatic probe fires every 60s. Once it fails, the overlay stays
+ *      up for up to a full minute — long enough that users hard-close the app.
+ *   2. iOS Safari fires spurious `offline` events during wifi/cellular
+ *      handoff. Trusting them flashes the overlay for no real reason.
+ *
+ * Fix: SERVER-REACHABLE IS THE PRIMARY SIGNAL. If we can talk to our own
+ * `/api/ping` (over the network the phone is currently on), we obviously
+ * have working internet — the gstatic probe is redundant and only reliable
+ * enough to be a tie-breaker when the server ALSO looks down. The wifi
+ * overlay now only shows when BOTH signals fail, and the probe cadence
+ * accelerates aggressively while blocking so recovery is near-immediate.
  */
 var _internetReachable = navigator.onLine;  // seed with browser hint
 
 function _probeInternet() {
-    // Tiny cacheless HEAD to a highly-available endpoint
     fetch('https://www.gstatic.com/generate_204', {
         method: 'HEAD', mode: 'no-cors', cache: 'no-store'
     })
@@ -119,22 +126,31 @@ registerHealthCheck('wifi', {
     label: 'No Internet Connection',
     icon: '<svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 1l22 22"/><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/><path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/><path d="M10.71 5.05A16 16 0 0 1 22.56 9"/><path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>',
     message: 'VibeNode requires an active internet connection to communicate with Claude. Please check your WiFi or network settings.',
-    test: function() { return _internetReachable; }
+    test: function() {
+        // If our own server is reachable, we have internet by definition.
+        // This suppresses false-positive wifi overlays during Tailscale
+        // reconnection where gstatic can be slow/blocked but /api/ping works.
+        if (_serverReachable) return true;
+        return _internetReachable;
+    }
 });
 
-// Browser events give us an instant trigger for the obvious cases
-window.addEventListener('offline', function() {
-    _internetReachable = false;
-    _runHealthChecks();
-});
-window.addEventListener('online', function() {
-    // Don't trust online event blindly — verify with a real probe
-    _probeInternet();
-});
+// Browser `offline` event is unreliable on mobile — fires during handoffs
+// even though real connectivity is fine. Treat it as a HINT to re-probe,
+// never as authoritative. The gstatic + server probes are the source of truth.
+window.addEventListener('offline', function() { _probeInternet(); _probeServer(); });
+window.addEventListener('online', function() { _probeInternet(); _probeServer(); });
 
-// Run the real probe on load and then on the same cadence as the health poll
 _probeInternet();
-setInterval(_probeInternet, 60000);
+// Probe every 10s normally, but drop to 3s while any overlay is blocking so
+// recovery is fast. The old 60s cadence made the wifi overlay stick for up to
+// a minute after the network was actually back — the "hard-close" trigger.
+setInterval(function() {
+    _probeInternet();
+}, 10000);
+setInterval(function() {
+    if (_healthBlocking) _probeInternet();
+}, 3000);
 
 /* ---- Built-in: VibeNode web server reachable ----
  *
@@ -153,8 +169,13 @@ setInterval(_probeInternet, 60000);
 
 var _serverReachable = true;
 var _serverFailCount = 0;
-var _SERVER_FAIL_THRESHOLD = 2;  // connection-refused path: ~6s before reload
-                                  // (503 from the reviver reloads immediately)
+// Raised from 2 → 4 (2026-07-20). At 3s cadence that's ~12s before the
+// "Unreachable" overlay fires from steady-state polling. Mobile Tailscale
+// wifi ↔ cellular handoffs routinely stall for 5–10s; the old 6s threshold
+// tripped on every handoff. A genuinely-dead server surfaces via the 503
+// path (immediate reload, threshold does NOT apply — see below) or via the
+// decisive foreground check (also independent of this threshold).
+var _SERVER_FAIL_THRESHOLD = 4;
 
 // When the backend is gone, the reviver holds port 5050 and serves a "Start
 // VibeNode" page — but only on a fresh document load. A still-loaded app never
@@ -173,16 +194,28 @@ function _recoverToStartPage() {
     try { window.location.reload(); } catch (e) { _reloadingForDeath = false; }
 }
 
-// DECISIVE single-probe check for foreground events. Mobile browsers FREEZE all
-// JS timers while the tab is backgrounded / the phone is asleep, so the debounced
-// interval below (which needs 3 consecutive failures) is useless the moment the
-// user comes back — it would need ~15s of foreground polling to trip. This runs
-// ONE probe the instant the page is foregrounded and reloads immediately if the
-// backend is gone. This is THE fix for "I have to manually refresh to see the
-// server is off": foregrounding now reloads to the Start page on its own.
+// DECISIVE two-probe check for foreground events. Mobile browsers FREEZE all
+// JS timers while the tab is backgrounded / the phone is asleep, so the
+// debounced interval below (which needs 2 consecutive failures) is useless
+// the moment the user comes back — it would need ~6s of foreground polling
+// to trip. This runs a probe the instant the page is foregrounded, and if it
+// fails, ONE quick retry ~1.2s later before showing the overlay.
+//
+// The retry eats the 1–3s Tailscale reconnection window (wifi handoff, radio
+// waking, tunnel re-establishing) that used to flash the "Unreachable"
+// overlay for every foreground event. A truly-dead server still surfaces
+// within ~1.5s — an order of magnitude faster than waiting for the 3s
+// interval poll to threshold — but transient network flakes are absorbed.
+//
+// A 503 from the reviver is unambiguous ("VibeNode is down and I've taken
+// over 5050"), so it still reloads immediately without waiting for a retry.
 function _decisiveServerCheck() {
     if (_reloadingForDeath) return;
     if (document.getElementById('restart-overlay')) return;  // in-app restart owns it
+    _decisiveServerProbe(false);
+}
+
+function _decisiveServerProbe(isRetry) {
     var ctrl = null;
     try { ctrl = AbortSignal.timeout ? AbortSignal.timeout(4000) : undefined; } catch (e) {}
     fetch('/api/ping', { method: 'GET', cache: 'no-store', signal: ctrl })
@@ -193,25 +226,29 @@ function _decisiveServerCheck() {
                 if (!_serverReachable) { _serverReachable = true; _runHealthChecks(); }
             } else if (r.status === 503) {
                 // Reviver DEFINITIVELY owns 5050 — reloading now lands on its
-                // Start page. Safe to reload.
+                // Start page. Safe to reload without a retry.
                 _serverReachable = false;
                 _recoverToStartPage();
             } else {
                 // 502 / other = the web server is gone but NOBODY is serving
-                // 5050 yet (reviver not up). Reloading here dead-ends on
-                // Tailscale's JS-less 502 page (reproduced) and strands the
-                // phone until a manual refresh. Instead: show the "Unreachable"
-                // overlay and keep polling — a later poll that sees a 503
-                // (reviver up) or 200 (recovered) drives the transition.
-                _serverReachable = false;
-                _runHealthChecks();
+                // 5050 yet (reviver not up). Retry once before showing overlay
+                // to absorb transient Tailscale hiccups.
+                if (!isRetry) {
+                    setTimeout(function() { _decisiveServerProbe(true); }, 1200);
+                } else {
+                    _serverReachable = false;
+                    _runHealthChecks();
+                }
             }
         })
         .catch(function() {
-            // Connection refused / timeout = nobody home yet. Same policy as
-            // 502: overlay + keep polling, NEVER a reload into a dead 502.
-            _serverReachable = false;
-            _runHealthChecks();
+            // Connection refused / timeout — retry once before overlay.
+            if (!isRetry) {
+                setTimeout(function() { _decisiveServerProbe(true); }, 1200);
+            } else {
+                _serverReachable = false;
+                _runHealthChecks();
+            }
         });
 }
 
@@ -220,6 +257,10 @@ function _probeServer() {
         .then(function(r) {
             if (r.ok) {
                 _serverFailCount = 0;
+                // Server reachability implies internet reachability.
+                // Refresh the gstatic-derived flag so a subsequent stale
+                // probe doesn't flash the wifi overlay.
+                _internetReachable = true;
                 if (!_serverReachable) {
                     _serverReachable = true;
                     _runHealthChecks();
@@ -306,7 +347,13 @@ window.addEventListener('online', function() { _decisiveServerCheck(); });
  */
 var _daemonReachable = true;
 var _daemonFailCount = 0;
-var _DAEMON_FAIL_THRESHOLD = 3;   // ~15s of web-up-but-daemon-down before overlay
+// Raised from 3 → 5 (2026-07-20). At 5s cadence that's ~25s before the
+// "Engine Stopped" overlay fires from steady-state polling. Same rationale
+// as the server threshold: mobile Tailscale handoffs and phone-lock wake
+// windows can look like brief daemon-unreachable spells; the old 15s window
+// clipped them. The decisive foreground check (with its own retry) still
+// catches a truly-dead daemon within ~2s of a foreground event.
+var _DAEMON_FAIL_THRESHOLD = 5;
 var _daemonRestarting = false;    // set while our Restart button drives a reboot
 
 function _probeDaemon() {
@@ -335,13 +382,19 @@ function _probeDaemon() {
 }
 
 // DECISIVE daemon check for foreground events — same reasoning as
-// _decisiveServerCheck: on foreground, evaluate on a SINGLE probe and show the
-// "engine stopped" overlay immediately if the daemon is down (no 3-strike wait
-// that mobile timer-freezing makes useless). If the web itself is down this
-// no-ops and _decisiveServerCheck handles the reload.
+// _decisiveServerCheck: on foreground, evaluate quickly rather than waiting
+// for the 3-strike interval that mobile timer-freezing makes useless. Uses
+// a two-probe pattern (one retry ~1.5s later) to absorb transient
+// Tailscale/network hiccups where /api/health returns daemon:false for a
+// beat during reconnection. If the web itself is down this no-ops and
+// _decisiveServerCheck handles the reload.
 function _decisiveDaemonCheck() {
     if (_daemonRestarting || _reloadingForDeath) return;
     if (document.getElementById('restart-overlay')) return;
+    _decisiveDaemonProbe(false);
+}
+
+function _decisiveDaemonProbe(isRetry) {
     fetch('/api/health', { method: 'GET', cache: 'no-store' })
         .then(function(r) { return r.ok ? r.json() : null; })
         .then(function(d) {
@@ -349,9 +402,11 @@ function _decisiveDaemonCheck() {
             if (d.daemon) {
                 _daemonFailCount = 0;
                 if (!_daemonReachable) { _daemonReachable = true; _runHealthChecks(); }
+            } else if (!isRetry) {
+                setTimeout(function() { _decisiveDaemonProbe(true); }, 1500);
             } else {
                 _daemonReachable = false;
-                _runHealthChecks();   // show overlay now
+                _runHealthChecks();
             }
         })
         .catch(function() { /* web unreachable — server check owns it */ });

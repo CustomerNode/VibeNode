@@ -1,0 +1,23 @@
+[Unit]
+Description=VibeNode leaked-process reaper (dead sessions only) + report-only sweep
+Documentation=file://__REPO_ROOT__/scripts/leak_detector.py
+
+[Service]
+Type=oneshot
+# Two passes, deliberately different in what they are allowed to do:
+#
+# 1. session_reaper --reap: kills ONLY processes whose session LEADER is dead.
+#    That is an exact ownership claim (a process cannot forge another session's
+#    id, and orphaning does not change it), not a guess -- which is what makes
+#    killing safe. A live session is never touched no matter how much CPU it
+#    burns; a test suite is supposed to saturate the box.
+# 2. leak_detector: report-only sweep for anything the first pass will not
+#    touch. Pattern-matching must never kill -- one bad match takes out the
+#    session daemon and aborts every running session.
+ExecStart=__PYTHON__ __REPO_ROOT__/scripts/session_reaper.py --reap --notify --min-age-min 10
+ExecStart=__PYTHON__ __REPO_ROOT__/scripts/leak_detector.py --notify --min-age-min 10
+# exit 1 == "leaks found" -- a successful detection, not a unit failure.
+# exit 2 == "scan could not run" -- deliberately NOT listed, so it surfaces as
+#           a failed unit instead of passing silently as a clean bill of health.
+SuccessExitStatus=0 1
+Nice=19
