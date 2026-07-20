@@ -34,9 +34,10 @@ _boot_step_ts = None
 
 # Per-step time budgets (seconds).  Exceeding a budget means "something is
 # wedged" (not a perf target), so these are deliberately generous.  ``deps`` is
-# high because a cold pip install of missing packages can take ~2 min.
+# high because a cold pip install of missing packages can take several minutes
+# when native wheels (webrtcvad in speechnode) have to compile from source.
 _BOOT_STEP_BUDGET = {
-    "cache": 20, "loading": 75, "ports": 30, "deps": 150, "update": 300,
+    "cache": 20, "loading": 75, "ports": 30, "deps": 600, "update": 300,
     "daemon": 45, "server": 60,
 }
 
@@ -472,12 +473,37 @@ def _check_dependencies():
     if missing:
         print("  Installing missing packages: %s" % ", ".join(missing), flush=True)
         try:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--quiet"] + missing,
-                timeout=120,
+            # Capture output so we can surface the real error on failure. Drop
+            # --quiet: silencing pip AND ignoring the return code (previous
+            # behavior) meant a failed install printed "Packages installed
+            # successfully" on every restart with zero diagnostic. SpeechNode
+            # pulls native-wheel deps (webrtcvad) that must compile on Windows;
+            # a cold build can take >2min, so timeout is generous.
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install"] + missing,
+                capture_output=True,
+                text=True,
+                timeout=600,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
-            print("  Packages installed successfully.", flush=True)
+            if result.returncode == 0:
+                print("  Packages installed successfully.", flush=True)
+            else:
+                print("  WARNING: pip install exited %d." % result.returncode, flush=True)
+                if result.stderr:
+                    print("  pip stderr (last 20 lines):", flush=True)
+                    for line in result.stderr.strip().splitlines()[-20:]:
+                        print("    " + line, flush=True)
+                if result.stdout:
+                    print("  pip stdout (last 10 lines):", flush=True)
+                    for line in result.stdout.strip().splitlines()[-10:]:
+                        print("    " + line, flush=True)
+        except subprocess.TimeoutExpired:
+            print(
+                "  WARNING: pip install timed out (>600s). Package(s) may still be missing; "
+                "run pip manually to diagnose.",
+                flush=True,
+            )
         except Exception as e:
             print("  WARNING: Could not install packages: %s" % e, flush=True)
 
