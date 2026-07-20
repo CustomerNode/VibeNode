@@ -1763,6 +1763,8 @@ function _bulkStop() {
     let stopped = 0;
     for (const id of ids) {
       if (typeof runningIds !== 'undefined' && runningIds.has(id)) {
+        // Explicit user stop — see markUserStopped() in live-panel.js.
+        if (typeof markUserStopped === 'function') markUserStopped(id);
         if (typeof socket !== 'undefined') {
           socket.emit('close_session', { session_id: id });
         }
@@ -1838,6 +1840,9 @@ async function _bulkDelete() {
     async function deleteOne(id) {
       // Stop if running so the daemon releases the file before we delete it.
       if (typeof runningIds !== 'undefined' && runningIds.has(id)) {
+        // Deleting is an even stronger stop intent than sleeping — never let
+        // ghost recovery restart it. See markUserStopped() in live-panel.js.
+        if (typeof markUserStopped === 'function') markUserStopped(id);
         if (typeof socket !== 'undefined') socket.emit('close_session', { session_id: id });
         if (typeof guiOpenDelete === 'function') guiOpenDelete(id);
         runningIds.delete(id);

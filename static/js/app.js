@@ -872,6 +872,9 @@ async function sleepAllSessions() {
   if (!ok) return;
   let closed = 0;
   for (const s of running) {
+    // Explicit user sleep — block the live panel's ghost-recovery timers
+    // from resurrecting any of these. See markUserStopped() in live-panel.js.
+    if (typeof markUserStopped === 'function') markUserStopped(s.id);
     socket.emit('close_session', {session_id: s.id});
     runningIds.delete(s.id);
     delete sessionKinds[s.id];

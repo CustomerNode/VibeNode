@@ -130,6 +130,47 @@ The web server is spawned detached on every platform. Reverting any of the piece
 
 4. **`server-reachable` health check in `static/js/healthchecks.js`** — registers a blocker overlay (same machinery as the wifi check) that probes `/api/ping` every 5s and shows "VibeNode Server Unreachable" after 3 consecutive failures. Catches any post-load server death (crash, manual kill, port conflict) that the detached spawn doesn't prevent. The `/api/ping` route lives in `app/routes/main.py` and must stay side-effect-free so it never lies about reachability. Do NOT remove the check or repurpose `/api/auth-status` — auth-status is a heavier call that can stall on a slow Claude CLI shell-out and would produce false positives.
 
+## Sleep must stick — user-stop intent beats ghost recovery (fixed 2026-07-20)
+
+`_liveSubmitDirect()` in `static/js/live-panel.js` arms "ghost recovery" timers on every
+submit: if no `session_state` arrives within 3s, it emits `close_session` and then, 1.5s
+later, `start_session` with `resume: true` — reviving a session the daemon silently
+dropped and re-sending the last prompt.
+
+Their cancel handlers (`_ghostCancel` / `_ghostCancel2`) deliberately ignore
+`state === 'stopped'`, because a genuinely dead session also reports stopped and that is
+exactly the case recovery exists to repair. The side effect was the **"Sleep won't stick"
+bug**: the one event proving the user slept the session was the one event that could not
+cancel recovery. Sleeping within ~3s of sending got silently overridden — the session came
+back awake and re-ran the prompt. The daemon was innocent (its own
+`SessionManager._user_stopped()` guard held correctly); the resurrection was entirely
+client-side, which is why the session looked dead in `~/.claude/gui_active_sessions.json`
+yet kept reappearing in the UI.
+
+The fix mirrors the daemon's guard on the client. The discriminator is not the *state* but
+the *cause* — did the user ask for this stop?
+
+- `markUserStopped(sid)` / `clearUserStopped(sid)` / `isUserStopped(sid)` live in
+  `live-panel.js` and are exported on `window` for cross-script use.
+- **Every explicit user stop path must call `markUserStopped()` BEFORE emitting
+  `close_session`** so an already-pending ghost timer sees the intent when it fires:
+  `closeSession()` (live-panel.js), `deleteSession()` (toolbar.js), `sleepAllSessions()`
+  (app.js), `_bulkStop()` and `deleteOne()` (sessions.js). If you add a new sleep/stop/delete
+  entry point, add the call there too.
+- Both ghost timers check `isUserStopped()` **twice** — once when the 3s timer fires and
+  again inside the 1.5s close→start gap, because the user can hit Sleep mid-recovery.
+- The `send_message` error fallback (`/not found|is stopped/`) checks it too — "is stopped"
+  is precisely what the daemon returns for a freshly-slept session.
+- An explicit send (`_liveSubmitDirect`, `_autoSendPendingInput`) clears the flag: the user
+  asking for work supersedes an earlier sleep.
+- A 60s TTL (`_USER_STOP_INTENT_TTL_MS`) is a backstop so a stale flag can never permanently
+  disable ghost recovery. Recovery windows are at most ~4.5s.
+
+Do NOT "simplify" the ghost timers by cancelling on `state === 'stopped'` — that restores
+Sleep but breaks recovery for genuinely dead sessions. Do NOT remove the second
+`isUserStopped()` check inside the inner `setTimeout`; without it, sleeping during the
+close→start gap is still ignored.
+
 ## Slash commands are intercepted client-side
 Claude CLI slash commands (e.g. `/compact`, `/rewind`, `/clear`) are NOT sent to the SDK. They get silently eaten with no response, leaving the session stuck idle. Instead, `_interceptSlashCommand()` in `live-panel.js` catches them at every submit path and either triggers the GUI equivalent (e.g. `/rewind` clicks the Rewind toolbar button, `/compact` fires `liveCompact()`) or shows a toast explaining the command isn't supported in the GUI. The command map lives in `_slashCommandMap`. Messages with `/` that aren't bare commands (e.g. "fix /etc/config") pass through normally.
 

@@ -1172,6 +1172,8 @@ function _autoSendPendingInput() {
     const text = inputTa.value.trim();
     inputTa.value = '';
     _clearDraft(id);
+    // Explicit send/resume supersedes any earlier sleep intent.
+    clearUserStopped(id);
     const kind = sessionKinds[id];
     const isRunning = runningIds.has(id);
 
@@ -2598,8 +2600,65 @@ function _wrongSessionIcon() {
   return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>';
 }
 
+// ── User-stop intent registry ─────────────────────────────────────────
+// Mirrors the daemon's SessionManager._user_stopped() guard on the client.
+//
+// THE BUG THIS FIXES (2026-07-20): "Sleep won't stick."  The ghost-recovery
+// timers below fire 3s after a submit and, if no session_state arrived, do
+// close_session + start_session(resume) to revive a session the daemon
+// silently dropped.  Their cancel handler deliberately ignored
+// `state === 'stopped'` — so the ONE event that proves the user slept the
+// session was the one event that could not cancel recovery.  Sleep within
+// ~3s of sending therefore got overridden: ~1.5s later the frontend
+// re-started the session AND re-sent the last prompt.  The daemon was
+// innocent (its own _user_stopped guard held) — the resurrection was
+// entirely client-side, which is why the session looked dead in the
+// registry yet kept coming back in the UI.
+//
+// We cannot simply cancel on 'stopped': a genuinely dead/ghost session also
+// reports stopped, and that IS the case ghost recovery exists to repair.
+// The correct discriminator is not the state but the CAUSE — did the user
+// ask for this stop?  So every explicit user sleep/stop/close path records
+// intent here, and recovery refuses to override it.  Same principle the
+// daemon already applies server-side.
+window._userStoppedSessions = window._userStoppedSessions || {};
+// Backstop TTL: recovery windows are at most ~4.5s, so a stale flag can
+// never permanently disable ghost recovery for a session.
+const _USER_STOP_INTENT_TTL_MS = 60000;
+
+/** Record that the user explicitly slept/stopped this session. */
+function markUserStopped(sid) {
+  if (!sid) return;
+  window._userStoppedSessions[sid] = Date.now();
+}
+
+/** Clear the flag — the user explicitly wants this session running again. */
+function clearUserStopped(sid) {
+  if (!sid) return;
+  delete window._userStoppedSessions[sid];
+}
+
+/** True if the user deliberately put this session down (and it hasn't aged out). */
+function isUserStopped(sid) {
+  const t = sid && window._userStoppedSessions[sid];
+  if (!t) return false;
+  if (Date.now() - t > _USER_STOP_INTENT_TTL_MS) {
+    delete window._userStoppedSessions[sid];
+    return false;
+  }
+  return true;
+}
+
+window.markUserStopped = markUserStopped;
+window.clearUserStopped = clearUserStopped;
+window.isUserStopped = isUserStopped;
+
 async function _liveSubmitDirect(sid, text, opts) {
   if (!sid) return;
+
+  // An explicit send is an explicit "I want this session running" — it
+  // supersedes any earlier sleep, so recovery is armed normally again.
+  clearUserStopped(sid);
 
   // Mobile: drop keyboard on send. Callers vary (liveSubmitIdle, the
   // direct-send branch of liveQueueSave, and liveSubmitWaiting's fallback)
@@ -2663,6 +2722,12 @@ async function _liveSubmitDirect(sid, text, opts) {
     const _ghostTimer = setTimeout(() => {
       socket.off('session_state', _ghostCancel);
       if (liveSessionId !== sid) return;
+      // User slept/stopped this session while we were waiting — that is an
+      // explicit instruction, not a ghost.  Never resurrect it.
+      if (isUserStopped(sid)) {
+        console.log('[submit] Ghost recovery skipped for', sid, '— user slept the session');
+        return;
+      }
       console.warn('[submit] No daemon response for', sid, 'after 3s — ghost recovery: close then restart');
       // Close the zombie session first, then restart after a short delay
       socket.emit('close_session', {session_id: sid});
@@ -2670,6 +2735,11 @@ async function _liveSubmitDirect(sid, text, opts) {
       delete sessionKinds[sid];
       setTimeout(() => {
         if (liveSessionId !== sid) return;
+        // Re-check: the user may have hit Sleep during the 1.5s gap.
+        if (isUserStopped(sid)) {
+          console.log('[submit] Ghost restart aborted for', sid, '— user slept the session');
+          return;
+        }
         socket.emit('start_session', {
           session_id: sid,
           prompt: text,
@@ -2703,6 +2773,13 @@ async function _liveSubmitDirect(sid, text, opts) {
         socket.off('error', _fallbackHandler);
         clearTimeout(_ghostTimer2);  // fallback fired — no need for ghost timer
         socket.off('session_state', _ghostCancel2);
+        // "is stopped" is exactly what the daemon reports for a session the
+        // user just slept.  If they slept it after this send, honour that
+        // rather than auto-resuming it back to life.
+        if (isUserStopped(sid)) {
+          console.log('[submit] Resume-on-error skipped for', sid, '— user slept the session');
+          return;
+        }
         console.warn('[submit] send_message failed (' + err.message + ') — resuming with start_session');
         socket.emit('start_session', {
           session_id: sid,
@@ -2721,10 +2798,20 @@ async function _liveSubmitDirect(sid, text, opts) {
       socket.off('error', _fallbackHandler);
       socket.off('session_state', _ghostCancel2);
       if (liveSessionId !== sid) return;
+      // Explicit user sleep beats ghost recovery — see the intent registry.
+      if (isUserStopped(sid)) {
+        console.log('[submit] Ghost recovery skipped for', sid, '— user slept the session');
+        return;
+      }
       console.warn('[submit] No daemon response for', sid, 'after 3s (not-running path) — close then restart');
       socket.emit('close_session', {session_id: sid});
       setTimeout(() => {
         if (liveSessionId !== sid) return;
+        // Re-check: the user may have hit Sleep during the 1.5s gap.
+        if (isUserStopped(sid)) {
+          console.log('[submit] Ghost restart aborted for', sid, '— user slept the session');
+          return;
+        }
         socket.emit('start_session', {
           session_id: sid,
           prompt: text,
@@ -3123,6 +3210,9 @@ async function closeSession(id) {
   const name = (s && s.display_title) || id.slice(0, 8);
   const confirmed = await showConfirm('Close Session', '<p>Close <strong>' + escHtml(name) + '</strong>?</p><p>This will stop the running Claude process and close the terminal window.</p>', { danger: true, confirmText: 'Close', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>' });
   if (!confirmed) return;
+  // Record the intent BEFORE emitting so any in-flight ghost-recovery timer
+  // sees it the moment it fires and declines to resurrect the session.
+  markUserStopped(id);
   // Close via WebSocket
   if (runningIds.has(id)) {
     socket.emit('close_session', {session_id: id});

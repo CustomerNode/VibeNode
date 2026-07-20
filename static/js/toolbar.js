@@ -858,6 +858,9 @@ async function deleteSession(id) {
   // Close the session if it's still running
   if (runningIds.has(id)) {
     showToast('Stopping session\u2026');
+    // Deleting is an explicit stop \u2014 block ghost recovery from restarting a
+    // session we are about to delete. See markUserStopped() in live-panel.js.
+    if (typeof markUserStopped === 'function') markUserStopped(id);
     socket.emit('close_session', {session_id: id});
     guiOpenDelete(id);
     runningIds.delete(id);
