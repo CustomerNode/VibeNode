@@ -802,9 +802,16 @@ def register_ws_events(socketio, app):
         sm = app.session_manager
         result = sm.close_session(session_id)
 
-        if not result.get('ok'):
+        # "Session not found" is not a failure for a stop — the requested end
+        # state (this session is not running) already holds.  The client now
+        # emits close_session unconditionally so a stop is authoritative even
+        # when its local runningIds is stale, which makes this the common,
+        # expected reply.  Surfacing it as an error toast would spam the user
+        # on every stop of an already-dormant session.
+        err = result.get('error', '')
+        if not result.get('ok') and err != 'Session not found':
             emit('error', {
-                'message': result.get('error', 'Failed to close session'),
+                'message': err or 'Failed to close session',
                 'session_id': session_id,
             })
 

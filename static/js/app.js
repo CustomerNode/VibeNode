@@ -866,7 +866,15 @@ document.addEventListener('click', function(e) {
 
 // --- Sleep All ---
 async function sleepAllSessions() {
-  const running = allSessions.filter(s => runningIds.has(s.id));
+  // Match on displayed status, not runningIds.  A session shown as idle via
+  // guiOpenSessions or restart memory is absent from runningIds, so filtering
+  // on runningIds silently skipped sessions the user could plainly see and had
+  // just asked to sleep — they stayed alive on the daemon and came back as
+  // idle on the next page refresh.  getSessionStatus() is the same source of
+  // truth the sidebar icons use.
+  const running = allSessions.filter(s => (typeof getSessionStatus === 'function')
+    ? getSessionStatus(s.id) !== 'sleeping'
+    : runningIds.has(s.id));
   if (!running.length) { showToast('No running sessions'); return; }
   const ok = await showConfirm('Sleep All Sessions', '<p>Close <strong>' + running.length + '</strong> running session' + (running.length > 1 ? 's' : '') + ' in this workspace?</p>', { danger: true, confirmText: 'Sleep All', icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>' });
   if (!ok) return;
@@ -878,6 +886,9 @@ async function sleepAllSessions() {
     socket.emit('close_session', {session_id: s.id});
     runningIds.delete(s.id);
     delete sessionKinds[s.id];
+    // Drop restart-memory too, or getSessionStatus() keeps reporting idle and
+    // the session never falls back to 'sleeping'.
+    if (window.sessionLastState) delete window.sessionLastState[s.id];
     closed++;
   }
   showToast(closed + ' session' + (closed !== 1 ? 's' : '') + ' closed');

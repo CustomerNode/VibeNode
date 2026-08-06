@@ -3213,10 +3213,19 @@ async function closeSession(id) {
   // Record the intent BEFORE emitting so any in-flight ghost-recovery timer
   // sees it the moment it fires and declines to resurrect the session.
   markUserStopped(id);
-  // Close via WebSocket
-  if (runningIds.has(id)) {
-    socket.emit('close_session', {session_id: id});
-  }
+  // Close via WebSocket — UNCONDITIONALLY.  This used to be gated on
+  // `runningIds.has(id)`, on the assumption that a session missing from
+  // runningIds could not be live on the daemon.  That assumption is false, and
+  // the Stop menu item itself proves it: sessions.js offers Stop whenever
+  // getSessionStatus() != 'sleeping', which includes sessions considered idle
+  // via guiOpenSessions or restart memory — neither of which is in runningIds.
+  // For exactly those sessions the guard made Stop a client-side no-op: local
+  // state was cleared, nothing reached the daemon, the session kept running,
+  // and the next page refresh rebuilt the truth from the server and showed it
+  // idle again.  Only the daemon knows whether it holds a session, so always
+  // ask it; a stop for a session it doesn't have is a no-op there (the server
+  // no longer reports "Session not found" as an error for close_session).
+  socket.emit('close_session', {session_id: id});
   guiOpenDelete(id);
   runningIds.delete(id);
   delete sessionKinds[id];

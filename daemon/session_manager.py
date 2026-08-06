@@ -1428,7 +1428,18 @@ class SessionManager:
         calls don't get rejected with 'already running'.  The async cleanup
         (disconnect, cancel task) still runs in the background.
         """
+        raw_id = session_id
         session_id = self._resolve_id(session_id)
+        # An explicit user stop is authoritative: erase the restart-memory
+        # entry for this session unconditionally.  _last_known_states is a
+        # snapshot taken once at daemon startup and is served by
+        # get_dormant_states() to /api/sessions as `last_state`.  Nothing else
+        # ever prunes it, so a session the user stopped kept being tagged
+        # "idle" on every page load and reappeared as idle after a refresh —
+        # the stop looked like it silently un-did itself.  Done BEFORE the
+        # not-found check because the not-found case is exactly the one that
+        # produced the bug: the session exists only as restart memory.
+        self.forget_dormant(raw_id)
         with self._lock:
             info = self._sessions.get(session_id)
         if not info:
@@ -1670,6 +1681,36 @@ class SessionManager:
                 continue
             out[rid] = meta
         return out
+
+    def forget_dormant(self, session_id: str) -> None:
+        """Drop *session_id* from the restart-memory snapshot.
+
+        Called on an explicit user stop (and on delete).  ``_last_known_states``
+        is loaded once at daemon startup and is otherwise immutable for the
+        life of the process, so without this a stopped session keeps being
+        reported to the UI with ``last_state="idle"`` on every /api/sessions
+        call.  The user stops it, the sidebar shows "sleeping", they refresh,
+        and the server hands the idle marker straight back — the stop appears
+        to be undone by the refresh.  Only a daemon restart cleared it.
+
+        Removes both the id as given and its alias-resolved form, because the
+        snapshot is keyed by the pre-remap registry id while callers usually
+        hold the canonical one.  Safe to call for unknown ids.
+        """
+        snapshot = self._last_known_states
+        if not snapshot:
+            return
+        snapshot.pop(session_id, None)
+        try:
+            resolved = self._resolve_id(session_id)
+        except Exception:
+            return
+        if resolved != session_id:
+            snapshot.pop(resolved, None)
+        # Also drop any registry-side alias that resolves to the same session.
+        for sid in [s for s in snapshot if self._resolve_id(s) == resolved]:
+            snapshot.pop(sid, None)
+
     def orphan_children_of(self, parent_sid: str) -> list:
         """Mark every in-memory child of *parent_sid* as orphaned.
 

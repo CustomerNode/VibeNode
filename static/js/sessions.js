@@ -878,8 +878,10 @@ function sessionContextMenu(e, sessionId) {
   // icon consistent: a session that shows an idle/working icon always offers
   // Stop.  Without this, restored sessions displayed as idle but had no Stop
   // item, which read as "the Stop button vanished".  closeSession() is safe
-  // for a dormant session — it only messages the daemon when the session is
-  // actually live, otherwise it just clears local state.
+  // for a dormant session — it always messages the daemon, which no-ops for a
+  // session it doesn't hold.  (It used to skip the daemon unless runningIds
+  // had the session, which made Stop a no-op for every session this condition
+  // newly exposed it for — see closeSession() in live-panel.js.)
   const appearsActive = (typeof getSessionStatus === 'function')
     ? getSessionStatus(sessionId) !== 'sleeping'
     : (isRunning || isOpenInGui);
@@ -1762,7 +1764,17 @@ function _bulkStop() {
     const ids = _msSnapshot();
     let stopped = 0;
     for (const id of ids) {
-      if (typeof runningIds !== 'undefined' && runningIds.has(id)) {
+      // Stop anything that DISPLAYS as active, not just what's in runningIds.
+      // getSessionStatus() is what drew the icon and gated the Stop menu item
+      // (see _sessionContextMenu), and it reports idle for sessions known only
+      // via guiOpenSessions or restart memory — which are absent from
+      // runningIds.  Gating the emit on runningIds therefore skipped exactly
+      // the sessions the user could see and asked to stop, leaving them alive
+      // on the daemon to reappear as idle on the next refresh.
+      const _active = (typeof getSessionStatus === 'function')
+        ? getSessionStatus(id) !== 'sleeping'
+        : (typeof runningIds !== 'undefined' && runningIds.has(id));
+      if (_active) {
         // Explicit user stop — see markUserStopped() in live-panel.js.
         if (typeof markUserStopped === 'function') markUserStopped(id);
         if (typeof socket !== 'undefined') {
@@ -1771,6 +1783,9 @@ function _bulkStop() {
         if (typeof guiOpenDelete === 'function') guiOpenDelete(id);
         runningIds.delete(id);
         if (typeof sessionKinds !== 'undefined') delete sessionKinds[id];
+        // Drop restart-memory too, or getSessionStatus() keeps reporting idle
+        // and the row never falls back to 'sleeping'.
+        if (window.sessionLastState) delete window.sessionLastState[id];
         stopped++;
       }
     }

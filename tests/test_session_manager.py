@@ -598,6 +598,43 @@ class TestCloseSession:
         """Closing a nonexistent session should fail gracefully."""
         result = session_manager.close_session("nonexistent")
         assert result["ok"] is False
+
+    def test_close_forgets_restart_memory_for_live_session(self, session_manager, sm_module):
+        """Stopping a session must erase its restart-memory entry.
+
+        ``_last_known_states`` is snapshotted once at daemon startup and served
+        to the UI as ``last_state`` by get_dormant_states().  If a stop leaves
+        it behind, /api/sessions keeps tagging the session "idle" and the very
+        next page refresh shows it idle again — the stop silently un-does
+        itself, forever, until the daemon restarts.
+        """
+        sid = "close-forgets-memory"
+        info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+        session_manager._last_known_states = {sid: {"last_state": "idle"}}
+
+        session_manager.close_session(sid)
+
+        assert sid not in session_manager._last_known_states
+        assert session_manager.get_dormant_states() == {}
+
+    def test_close_forgets_restart_memory_when_not_live(self, session_manager):
+        """The dormant-only case — the one that produced the bug.
+
+        A session the daemon knows ONLY as restart memory is displayed as idle,
+        so the UI offers Stop for it.  close_session returns "Session not
+        found", but it must still drop the memory entry, otherwise the stop is
+        a pure no-op and the session pops back to idle on every refresh.
+        """
+        sid = "dormant-only"
+        session_manager._last_known_states = {sid: {"last_state": "idle"}}
+
+        result = session_manager.close_session(sid)
+
+        assert result["ok"] is False  # nothing live to disconnect
+        assert sid not in session_manager._last_known_states
+        assert session_manager.get_dormant_states() == {}
 class TestErrorHandling:
 
     def test_restart_stopped_session(self, session_manager, sm_module):
