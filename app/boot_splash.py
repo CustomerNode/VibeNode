@@ -45,7 +45,6 @@ STEPS = [
     ("loading", "Loading modules"),
     ("ports",   "Releasing ports"),
     ("deps",    "Checking dependencies"),
-    ("update",  "Checking Claude updates"),
     ("daemon",  "Starting session daemon"),
     ("server",  "Initializing server"),
     ("browser", "Opening browser"),
@@ -573,9 +572,9 @@ class BootSplash:
             # current scroll position.  Without this, cos() periodicity causes
             # a step at distance 6 (= one full 2π cycle at π/3/step) to land
             # at the same screen y-coordinate as a nearby step, producing
-            # visually overlapping / duplicate text.  Adding the "update" step
-            # grew STEPS from 7→8, which put two wrap-around ghosts on screen
-            # simultaneously at scroll positions 0 and 1.
+            # visually overlapping / duplicate text — with 8 steps, two
+            # wrap-around ghosts appeared on screen simultaneously at scroll
+            # positions 0 and 1.  Keep the guard regardless of len(STEPS).
             if abs(idx - self._scroll_current) > 2.5:
                 self.cv.coords(s["sym"], -100, -100)
                 self.cv.coords(s["txt"], -100, -100)

@@ -37,7 +37,7 @@ _boot_step_ts = None
 # high because a cold pip install of missing packages can take several minutes
 # when native wheels (webrtcvad in speechnode) have to compile from source.
 _BOOT_STEP_BUDGET = {
-    "cache": 20, "loading": 75, "ports": 30, "deps": 600, "update": 300,
+    "cache": 20, "loading": 75, "ports": 30, "deps": 600,
     "daemon": 45, "server": 60,
 }
 
@@ -515,17 +515,73 @@ _check_dependencies()
 # released models are picked up without manual intervention.
 #
 # Throttled to once per 24h via a gitignored state file, time-boxed, and
-# best-effort: any failure just logs a warning and boot continues.
+# best-effort: any failure just logs a warning.
 #
-# Placement is deliberate: this MUST run BEFORE ensure_daemon().  The session
-# daemon is the process that imports claude_code_sdk and spawns the claude
-# CLI, so an update applied after the daemon starts has no effect until the
-# daemon's next cold start.  If the daemon is already running (it survives
-# web restarts), the update still lands on disk and applies on the daemon's
-# next start — we NEVER restart the daemon automatically (see CLAUDE.md).
+# Runs in a BACKGROUND THREAD after boot completes — never on the boot path.
+# It used to run synchronously before ensure_daemon() so a fresh CLI landed
+# before the daemon's cold start, but that let a slow or dead network stall
+# boot until the splash watchdog declared it dead.  The trade we accept now
+# is the one the old comment already accepted for warm daemons: the update
+# lands on disk mid-session and applies on the daemon's next cold start —
+# we NEVER restart the daemon automatically (see CLAUDE.md).  The thread
+# waits for _boot_done, then probes the network every few minutes until it
+# can actually reach the update endpoints ("do it when able").
 # ---------------------------------------------------------------------------
 _UPDATE_STATE_FILE = Path(__file__).resolve().parent / ".cache" / "claude_update_state.json"
 _UPDATE_CHECK_INTERVAL = 24 * 3600  # seconds between update checks
+
+
+def _run_captured(cmd, timeout):
+    """Run ``cmd`` with output captured to a temp file, never to pipes.
+
+    subprocess.run(capture_output=True) uses pipes + reader threads on
+    Windows; when the child spawns a grandchild (claude's .cmd shim spawns
+    node) the grandchild inherits the pipe, so after a timeout kill the
+    reader threads never see EOF and communicate() blocks forever — boot
+    wedged at "Checking Claude updates" until the splash watchdog declared
+    it dead.  A temp file has no reader threads: wait()/kill() always
+    return, and a lingering grandchild can finish (or not) on its own.
+
+    Returns (returncode, output); returncode is None if the timeout hit.
+    """
+    import tempfile
+
+    no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    out_path = None
+    try:
+        fd, out_path = tempfile.mkstemp(prefix="vibenode_update_")
+        with os.fdopen(fd, "r+", encoding="utf-8", errors="replace") as fh:
+            proc = subprocess.Popen(
+                cmd, stdout=fh, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, creationflags=no_window,
+            )
+            rc = None
+            try:
+                rc = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+            fh.seek(0)
+            out = fh.read()
+        return rc, out
+    finally:
+        if out_path:
+            try:
+                os.remove(out_path)  # may fail while a grandchild holds it
+            except OSError:
+                pass
+
+
+def _network_reachable(host="api.anthropic.com", port=443, timeout=5):
+    """Cheap TCP probe — can this machine plausibly download an update?"""
+    try:
+        socket.create_connection((host, port), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
 
 
 def _claude_cli_version(claude_path):
@@ -533,11 +589,8 @@ def _claude_cli_version(claude_path):
     if not claude_path:
         return ""
     try:
-        r = subprocess.run(
-            [claude_path, "--version"], capture_output=True, text=True, timeout=20,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-        return (r.stdout or "").strip()
+        rc, out = _run_captured([claude_path, "--version"], timeout=15)
+        return out.strip() if rc == 0 else ""
     except Exception:
         return ""
 
@@ -554,6 +607,23 @@ def _daemon_is_running():
         return False
 
 
+def _update_check_due():
+    """True if no update check has completed in _UPDATE_CHECK_INTERVAL.
+
+    Costs a single small file read; throttling means the background worker
+    exits immediately on most boots.
+    """
+    import json
+
+    state = {}
+    try:
+        if _UPDATE_STATE_FILE.exists():
+            state = json.loads(_UPDATE_STATE_FILE.read_text())
+    except Exception:
+        state = {}
+    return time.time() - state.get("last_check", 0) >= _UPDATE_CHECK_INTERVAL
+
+
 def _check_claude_updates():
     """Auto-update the claude CLI and claude-code-sdk, at most once per day.
 
@@ -565,40 +635,39 @@ def _check_claude_updates():
 
     if os.environ.get("VIBENODE_NO_AUTO_UPDATE"):
         return
-
-    # Throttle: at most one check per _UPDATE_CHECK_INTERVAL.  On throttled
-    # boots this function costs a single small file read.
-    state = {}
-    try:
-        if _UPDATE_STATE_FILE.exists():
-            state = json.loads(_UPDATE_STATE_FILE.read_text())
-    except Exception:
-        state = {}
-    if time.time() - state.get("last_check", 0) < _UPDATE_CHECK_INTERVAL:
+    if not _update_check_due():
         return
 
-    no_window = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    # Final reachability guard — the worker already waited for the network,
+    # but wifi can drop between its probe and this call.  Skip without
+    # writing last_check so the worker's next attempt retries.
+    if not _network_reachable():
+        print("  Network unreachable — skipping Claude update check.", flush=True)
+        return
+
     claude_path = shutil.which("claude")
     daemon_was_running = _daemon_is_running()
     before = _claude_cli_version(claude_path)
 
+    # Each call is time-boxed so a stalled transfer can't pin the worker
+    # thread for long.  The npm fallback only runs when `claude update`
+    # returned fast with an npm hint, so it doesn't stack with a timeout.
     # 1. claude CLI — this is what gates new model availability.  Its
     #    built-in self-updater handles native installs and refuses (with an
     #    npm hint) when the install is npm-managed.
     if claude_path:
         print("  Checking for Claude CLI updates...", flush=True)
         try:
-            r = subprocess.run(
-                [claude_path, "update"], capture_output=True, text=True,
-                timeout=240, creationflags=no_window,
-            )
-            out = (r.stdout or "") + (r.stderr or "")
-            if r.returncode != 0 and "npm" in out.lower():
+            rc, out = _run_captured([claude_path, "update"], timeout=120)
+            if rc is None:
+                print("  WARNING: claude CLI update timed out — skipping.",
+                      flush=True)
+            elif rc != 0 and "npm" in out.lower():
                 npm = shutil.which("npm")
                 if npm:
-                    subprocess.run(
+                    _run_captured(
                         [npm, "update", "-g", "@anthropic-ai/claude-code"],
-                        capture_output=True, timeout=240, creationflags=no_window,
+                        timeout=120,
                     )
         except Exception as e:
             print("  WARNING: claude CLI update check failed: %s" % e, flush=True)
@@ -606,10 +675,10 @@ def _check_claude_updates():
     # 2. Python SDK — the daemon's interface to the CLI.  requirements.txt
     #    only pins a floor (>=), so a plain upgrade is always safe here.
     try:
-        subprocess.run(
+        _run_captured(
             [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade",
              "claude-code-sdk"],
-            timeout=180, creationflags=no_window,
+            timeout=120,
         )
     except Exception as e:
         print("  WARNING: claude-code-sdk upgrade failed: %s" % e, flush=True)
@@ -638,12 +707,36 @@ def _check_claude_updates():
         pass
 
 
-if not _TEST_PORT:
-    _update_boot_status("STEP:update")
+_UPDATE_NETWORK_RETRY = 300  # seconds between reachability probes
+
+
+def _claude_update_worker():
+    """Run the daily update check off the boot path, once the network allows.
+
+    Waits for boot to finish (so it never competes with the splash/watchdog
+    or delays first paint), then probes connectivity every few minutes until
+    a check actually completes.  On wifi that's down or unusable, boot is
+    unaffected and the update simply happens whenever connectivity returns.
+    A freshly downloaded CLI applies on the daemon's next cold start.
+    """
+    if os.environ.get("VIBENODE_NO_AUTO_UPDATE"):
+        return
     try:
-        _check_claude_updates()
-    except Exception as _upd_err:
-        print("  WARNING: Claude update check failed: %s" % _upd_err, flush=True)
+        _boot_done.wait()
+        while _update_check_due():
+            if _network_reachable():
+                _check_claude_updates()
+                if not _update_check_due():
+                    return
+            time.sleep(_UPDATE_NETWORK_RETRY)
+    except Exception as e:
+        print("  WARNING: Claude update check failed: %s" % e, flush=True)
+
+
+if not _TEST_PORT:
+    threading.Thread(
+        target=_claude_update_worker, name="claude-update", daemon=True,
+    ).start()
 
 # Ensure daemon is running before creating the Flask app (skip in test mode)
 if not _TEST_PORT:
