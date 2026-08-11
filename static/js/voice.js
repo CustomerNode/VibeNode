@@ -609,21 +609,35 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
       // slowly as two 30s blobs while producing no better output; (2) the model
       // silently truncates the front, so LocalAgreement sees a different word at
       // position 0 each cycle, preventing committed words from growing and
-      // triggering the stability check. Using a fixed-size trailing window keeps
-      // partial latency constant and LocalAgreement working regardless of session
+      // triggering the stability check. Using a fixed-size window keeps partial
+      // latency constant and LocalAgreement working regardless of session
       // length. The final recorder.onstop still uses ALL audio for the full transcript.
-      const partialStart = Math.max(0, chunks.length - PARTIAL_WINDOW);
+      //
+      // SEGMENTED WINDOW — the start advances in whole PARTIAL_WINDOW hops
+      // (segment k covers chunks [k*W, (k+1)*W)), NOT a continuous slide. Two
+      // load-bearing reasons: (a) a stable start between hops lets LocalAgreement
+      // actually re-commit words — a continuously-sliding start advanced on EVERY
+      // pump past 30s, tripping the reset below each cycle so committed words
+      // never grew again; (b) a promoted segment's audio is never re-covered by
+      // the next window, so the caption/fallback can't show duplicated text.
+      const partialStart = Math.floor(Math.max(0, chunks.length - 1) / PARTIAL_WINDOW) * PARTIAL_WINDOW;
       // When the window start advances, the transcript baseline shifts by one word
       // and the previous prevWords comparison is off-by-one. Reset LocalAgreement
       // so it rebuilds cleanly over the next two partials instead of staying stuck.
       if (partialStart > (controller._lastPartialStart || 0)) {
-        // Before resetting LocalAgreement for the new window, promote any stably-committed
-        // words to the permanent prefix. This prevents _lastFullText (the watchdog fallback)
-        // from losing dictated text when the 30-second window shifts. Without this, a
-        // 60-second recording that triggers a window shift loses its first half if the final
-        // transcription times out. permanentPrefix grows monotonically and is never cleared.
-        if (committedWords.length > 0) {
-          controller._permanentPrefix = ((controller._permanentPrefix || '') + ' ' + committedWords.join(' ')).trim();
+        // Before resetting LocalAgreement for the new window, promote the finished
+        // segment's words to the permanent prefix. This prevents _lastFullText (the
+        // watchdog fallback) from losing dictated text when the 30-second window shifts.
+        // Without this, a 60-second recording that triggers a window shift loses its
+        // first half if the final transcription times out. permanentPrefix grows
+        // monotonically and is never cleared. Promote prevWords (the segment's last
+        // full greedy transcript) rather than just committedWords: the settling tail's
+        // audio is NOT covered by the next segment, so dropping it would lose the last
+        // few words of every segment from the caption/fallback. A single rough settling
+        // word beats a hole at every 30s seam — and the final full-audio pass still
+        // produces the authoritative sent message.
+        if (prevWords.length > 0) {
+          controller._permanentPrefix = ((controller._permanentPrefix || '') + ' ' + prevWords.join(' ')).trim();
         }
         prevWords = [];
         committedWords = [];
@@ -631,7 +645,19 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
         controller._lastCommitTs = undefined;
       }
       controller._lastPartialStart = partialStart;
-      const partial = new Blob(chunks.slice(partialStart), { type: (chunks[0] && chunks[0].type) || 'audio/webm' });
+      // WINDOW-HEADER: a MediaRecorder stream is ONE continuous container — only
+      // chunk 0 carries the WebM/EBML (or MP4) header. A mid-stream slice alone is
+      // headerless and ffmpeg rejects it ("Invalid data found when processing
+      // input"), so before this fix EVERY partial past ~30s failed server-side:
+      // the live caption froze, end-of-speech signals died, and the fallback
+      // transcript was capped at the first window — long mobile dictations
+      // arrived truncated. Prepending chunk 0 restores a valid container; the
+      // decoder resyncs onto the later clusters (verified against faster-whisper's
+      // decoder). Cost: ~400ms of stale audio at the blob's front — usually the
+      // pre-speech silence right after the mic tap, at most a word fragment, and
+      // only in live partials. The final pass still sends all chunks in order.
+      const winChunks = partialStart > 0 ? [chunks[0]].concat(chunks.slice(partialStart)) : chunks.slice(partialStart);
+      const partial = new Blob(winChunks, { type: (chunks[0] && chunks[0].type) || 'audio/webm' });
       window.SpeechNode.transcribeBlob(partial, { fast: useFast, cwd: snCwd }).then((res) => {
         streamBusy = false;
         const dur = _now() - t0;
@@ -740,6 +766,12 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
     controller._commitSend = commitSend;   // let the finalize-time backstop reach it
 
     recorder.onstop = () => {
+      // onstop DID fire — retire the finalize-time 7s backstop; it exists solely
+      // for the recorder-never-stops case. From here the adaptive watchdog below
+      // owns the send guarantee. Leaving it armed preempted any final transcription
+      // slower than 7s (long recording + mobile upload + _INFER_LOCK wait), sending
+      // the lower-quality live transcript and discarding the real final result.
+      if (controller._sendBackstop) { clearTimeout(controller._sendBackstop); controller._sendBackstop = null; }
       try { if (controller._stream) controller._stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
       if (controller._userCancelled) { commitSend(''); return; }   // ✕ -> discard (inside commitSend)
       const blob = new Blob(chunks, { type: (chunks[0] && chunks[0].type) || 'audio/webm' });

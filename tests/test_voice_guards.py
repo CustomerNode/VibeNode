@@ -269,10 +269,12 @@ class TestMergeWithCommittedGuards:
         # Use the handler assignment form (not comment occurrences like "recorder.onstop NEVER fires")
         onstop_pos = src.find("recorder.onstop = ")
         assert onstop_pos != -1, "recorder.onstop assignment not found in voice.js"
-        # The handler body is within the next ~2000 chars of the assignment.
+        # The handler body is within the next ~3000 chars of the assignment.
         # (Increased from 1500: the adaptive watchdog comment above transcribeBlob
-        # is intentionally detailed and pushed _mergeWithCommitted past the old window.)
-        snippet = src[onstop_pos:onstop_pos + 2000]
+        # is intentionally detailed and pushed _mergeWithCommitted past the old window.
+        # Increased from 2000: the BACKSTOP-PREEMPT fix (regression 10) retires the
+        # finalize-time backstop at the top of onstop with its own explanatory comment.)
+        snippet = src[onstop_pos:onstop_pos + 3000]
         assert "_mergeWithCommitted" in snippet, (
             "FINAL-REGRESSION: _mergeWithCommitted() is not called inside "
             "recorder.onstop. The merge logic is unreachable and the final "
@@ -533,7 +535,10 @@ class TestPermanentPrefixGuard:
         # near the committedWords reset.
         shift_pos = src.find("partialStart > (controller._lastPartialStart")
         assert shift_pos != -1, "partialStart window-shift check not found"
-        snippet = src[shift_pos:shift_pos + 600]
+        # (Window increased from 600: the WINDOW-HEADER fix (regression 9) expanded
+        # the promotion comment — it now documents why prevWords, not just
+        # committedWords, is promoted at each segment seam.)
+        snippet = src[shift_pos:shift_pos + 1200]
         assert "_permanentPrefix" in snippet, (
             "STREAMING-RESET regression: _permanentPrefix is not saved inside the "
             "window-shift block. committedWords are cleared without being promoted, "
@@ -565,4 +570,111 @@ class TestPermanentPrefixGuard:
             "STREAMING-RESET regression: permanent prefix words are not passed to "
             "_snCaptionUpdate. The caption will lose committed text every 30 seconds, "
             "making long recordings appear to drop or reset mid-stream."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression 9 — WINDOW-HEADER
+# A MediaRecorder stream is one continuous container: only chunk 0 carries the
+# WebM/EBML (or MP4) header. pumpPartial's windowed slice (chunks.slice(
+# partialStart) with partialStart > 0) produced a HEADERLESS blob that ffmpeg
+# rejected with "Invalid data found when processing input" — so every partial
+# past ~30s of dictation failed server-side. The live caption froze, the
+# gap/stability end-of-speech signals died, and the fallback transcript
+# (_lastFullText) was capped at the first window: long mobile dictations
+# arrived truncated at ~30 seconds. Fixed by prepending chunk 0 to windowed
+# partials (the decoder resyncs onto later clusters — verified empirically
+# against faster-whisper's decoder), and by advancing the window start in
+# whole-PARTIAL_WINDOW hops so LocalAgreement keeps a stable baseline between
+# hops and promoted segments are never re-covered (no duplicated caption text).
+# ---------------------------------------------------------------------------
+
+class TestWindowHeaderChunkGuard:
+
+    def _src(self):
+        return _read(_JS / "voice.js")
+
+    def test_windowed_partial_prepends_header_chunk(self):
+        """Windowed partial blobs must prepend chunks[0] (the container header).
+        Without it, every partial past ~30s is undecodable server-side and long
+        dictations silently truncate at the first window."""
+        src = self._src()
+        assert re.search(r'\[chunks\[0\]\]\.concat\(chunks\.slice\(partialStart\)\)', src), (
+            "WINDOW-HEADER regression: pumpPartial no longer prepends chunks[0] to "
+            "the windowed slice. A mid-stream slice has no WebM/MP4 header, ffmpeg "
+            "fails with 'Invalid data found when processing input', and every "
+            "partial past ~30s of dictation breaks — capping long voice input."
+        )
+
+    def test_header_prepend_is_conditional_on_window_shift(self):
+        """The chunk-0 prepend must apply ONLY when partialStart > 0. An
+        unconditional prepend would duplicate chunk 0's audio in every
+        pre-window partial (the common short-dictation case)."""
+        src = self._src()
+        assert re.search(r'partialStart\s*>\s*0\s*\?\s*\[chunks\[0\]\]', src), (
+            "WINDOW-HEADER regression: the chunk-0 prepend must be gated on "
+            "partialStart > 0 so un-windowed partials (recordings under ~30s) "
+            "keep sending chunks.slice(partialStart) verbatim."
+        )
+
+    def test_partial_start_advances_in_whole_window_hops(self):
+        """partialStart must advance in whole-PARTIAL_WINDOW hops (segmented,
+        non-overlapping windows), not slide continuously. A continuous slide
+        advances on every pump past 30s, which (a) trips the LocalAgreement
+        reset each cycle so committed words never grow again, and (b) overlaps
+        the promoted permanent prefix, duplicating text in the caption and the
+        watchdog fallback."""
+        src = self._src()
+        assert re.search(r'Math\.floor\(.*PARTIAL_WINDOW\)\s*\*\s*PARTIAL_WINDOW', src), (
+            "WINDOW-HEADER regression: partialStart no longer advances in "
+            "whole-PARTIAL_WINDOW hops. A continuously-sliding window start resets "
+            "LocalAgreement on every pump past 30s and re-covers promoted text, "
+            "freezing committed words and duplicating the live caption."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Regression 10 — BACKSTOP-PREEMPT
+# _finish() arms a 7s send backstop to guarantee a send when recorder.onstop
+# NEVER fires. But it stayed armed after onstop DID fire, so any final
+# transcription slower than 7s (long recording + mobile upload over Tailscale
+# + _INFER_LOCK wait) was preempted: the backstop sent the lower-quality live
+# transcript and the real full-quality final result was discarded on arrival
+# (commitSend is idempotent). Combined with WINDOW-HEADER this hard-truncated
+# long mobile dictations at ~30s. Fixed by retiring the backstop at the top of
+# recorder.onstop — from there the adaptive chunk-scaled watchdog owns the
+# send guarantee.
+# ---------------------------------------------------------------------------
+
+class TestFinalizeBackstopGuard:
+
+    def _src(self):
+        return _read(_JS / "voice.js")
+
+    def test_onstop_retires_finalize_backstop(self):
+        """recorder.onstop must clear controller._sendBackstop near its top.
+        Otherwise the 7s backstop races the (up to 60s) adaptive watchdog and
+        wins whenever the final transcription takes >7s, replacing the real
+        final transcript with the live fallback."""
+        src = self._src()
+        onstop_pos = src.find("recorder.onstop = ")
+        assert onstop_pos != -1, "recorder.onstop assignment not found in voice.js"
+        snippet = src[onstop_pos:onstop_pos + 900]
+        assert re.search(r'clearTimeout\(controller\._sendBackstop\)', snippet), (
+            "BACKSTOP-PREEMPT regression: recorder.onstop does not retire the "
+            "finalize-time _sendBackstop. Any final transcription slower than 7s "
+            "(routine for long recordings on mobile) is preempted by the backstop, "
+            "which sends the live fallback and discards the full-quality final."
+        )
+
+    def test_finish_still_arms_backstop_for_dead_recorder(self):
+        """_finish() must still arm the send backstop (the recorder-never-stops
+        contingency). Retiring it in onstop is only safe because onstop firing
+        proves the recorder worked; if _finish() stops arming it, a dead
+        recorder silently drops the message."""
+        src = self._src()
+        assert re.search(r'_sendBackstop\s*=\s*setTimeout', src), (
+            "BACKSTOP-PREEMPT regression: _finish() no longer arms _sendBackstop. "
+            "If recorder.onstop never fires (recorder error / already inactive), "
+            "nothing sends the message — dictation is silently dropped."
         )
