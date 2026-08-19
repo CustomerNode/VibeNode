@@ -24,7 +24,12 @@
 <link rel="stylesheet" href="{{ versioned_static('css/mobile.css') }}">   <!-- mobile responsive layer (<=768px only) -->
 <link rel="stylesheet" href="{{ versioned_static('css/mobile-preview.css') }}">   <!-- mobile visual channel: preview cards + sheet -->
 <link rel="stylesheet" href="/speechnode/speechnode.css">   <!-- SpeechNode package assets -->
+<link rel="stylesheet" href="{{ versioned_static('css/embed.css') }}">   <!-- embed mode: hides project/view chrome, only active with ?embed=1 -->
 <link href="/static/vendor/quill.snow.css" rel="stylesheet">
+<!-- Embed mode. Must load before app.js, which reads localStorage.activeProject
+     during boot — embed.js shims that read so an embedded panel can be pinned to
+     one project without repointing the user's own window. No-op without ?embed=1. -->
+<script src="{{ versioned_static('js/embed.js') }}"></script>
 <script src="/static/vendor/quill.min.js"></script>
 <script>
 // Apply saved theme immediately to avoid flash

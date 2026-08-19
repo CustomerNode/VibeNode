@@ -1,0 +1,31 @@
+/*
+ * Embed mode chrome — active only when static/js/embed.js adds .vn-embed.
+ *
+ * The host app supplies its own navigation, so an embedded VibeNode should not
+ * offer a second way to change project or view. Everything hidden here is a
+ * control that would either navigate away from the pinned project or publish
+ * from inside someone else's UI.
+ *
+ * Adding ?chrome=1 sets .vn-embed-chrome, which restores these controls for
+ * debugging an embed without losing navigation entirely.
+ */
+
+/* Project switcher and view switcher — the two ways out of the pinned scope. */
+body.vn-embed:not(.vn-embed-chrome) #btn-project,
+body.vn-embed:not(.vn-embed-chrome) #sidebar-nav,
+body.vn-embed:not(.vn-embed-chrome) #project-overlay,
+
+/* Git controls. Publishing from inside an embedded panel is almost never
+   intended, and the button is easy to hit by accident when the surrounding
+   context is a different application. */
+body.vn-embed:not(.vn-embed-chrome) #btn-git-update,
+body.vn-embed:not(.vn-embed-chrome) #btn-git-publish,
+body.vn-embed:not(.vn-embed-chrome) #btn-git-sync {
+  display: none !important;
+}
+
+/* The sidebar header keeps its spacing rules with two children removed; this
+   just tightens the gap left behind so the remaining actions sit naturally. */
+body.vn-embed:not(.vn-embed-chrome) .sidebar-header {
+  gap: 6px;
+}
