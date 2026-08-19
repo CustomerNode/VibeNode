@@ -46,9 +46,16 @@
   var keepChrome = params.get('chrome') === '1';
 
   /**
-   * Encode a filesystem path the way VibeNode names project folders:
+   * Encode a filesystem path the way Claude Code names project folders:
    * "C:/Users/me/code/Thing" -> "C--Users-me-code-Thing".
-   * Already-encoded values pass through untouched.
+   *
+   * Mirrors _encode_cwd() in app/config.py — separators, colons, underscores
+   * and dots all become dashes. The underscore and dot rules are easy to miss
+   * and fail silently: the pinned project simply never matches a directory and
+   * the panel looks empty for no visible reason. Keep the two in agreement.
+   *
+   * A value with no path separators is assumed to be already encoded and is
+   * passed through, so a host app can supply either form.
    */
   function encodeProject(value) {
     if (!value) return '';
@@ -56,7 +63,12 @@
         value.indexOf(':') === -1) {
       return value;                          // already encoded
     }
-    return value.replace(/\\/g, '/').replace(/:/g, '-').replace(/\//g, '-');
+    return value
+      .replace(/\\/g, '-')
+      .replace(/\//g, '-')
+      .replace(/:/g, '-')
+      .replace(/_/g, '-')
+      .replace(/\./g, '-');
   }
 
   var project = encodeProject(raw);

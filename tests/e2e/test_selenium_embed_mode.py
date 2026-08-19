@@ -74,6 +74,29 @@ class TestEmbedMode:
         assert driver.execute_script(
             "return window.VN_EMBED.project") == "C--Users-tester-code-Thing"
 
+    def test_embed_encoding_matches_encode_cwd(self, driver):
+        """Underscores and dots must become dashes, exactly like _encode_cwd().
+
+        This is the rule that is easy to miss and fails silently: a project
+        containing "_" or "." would encode differently from the directory Claude
+        Code actually created, so the pinned project would match nothing and the
+        panel would render empty with no error anywhere.
+        """
+        from app.config import _encode_cwd
+
+        for path in (
+            r"C:\Users\tester\code\customerNode_root",
+            r"C:\Users\tester\.claude\_system",
+            r"C:\Users\tester\code\my.app_v2",
+        ):
+            driver.get(f"{BASE_URL}/?embed=1&project={path}")
+            _wait_for_app(driver)
+            js_encoded = driver.execute_script("return window.VN_EMBED.project")
+            assert js_encoded == _encode_cwd(path), (
+                f"embed.js encoded {path!r} as {js_encoded!r}, "
+                f"but _encode_cwd gives {_encode_cwd(path)!r}"
+            )
+
     def test_embed_hides_navigation_chrome(self, driver):
         driver.get(f"{BASE_URL}/?embed=1&project={PINNED}")
         _wait_for_app(driver)
