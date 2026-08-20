@@ -39,7 +39,7 @@ included. Those are interface specification, not implementation.
 - Part 0 — How to use this document
 - Part 1 — The product
 - Part 2 — Architecture and the consequential decisions
-- Part 3 — Launch, process management, and resilience *(not yet included)*
+- Part 3 — Launch, process management, and resilience
 - Part 4 — The session daemon
 - Part 5 — The web tier: HTTP and WebSocket surface
 - Part 6 — Persistence and the data model
@@ -49,8 +49,8 @@ included. Those are interface specification, not implementation.
 - Part 10 — Surrounding tools
 - Part 11 — The rule catalogue
 - Part 12 — Build order and the prompt sequence
-- Part 13 — The design system *(not yet included)*
-- Part 14 — Screens, modals, and interactions *(not yet included)*
+- Part 13 — The design system *(not yet written)*
+- Part 14 — Screens, modals, and interactions
 - Appendix A — The backend transport decision
 
 ---
@@ -723,6 +723,1767 @@ The rule that emerged: **every automatic recovery mechanism must be triggered by
 7. **Do not duplicate the agent backend's transcript store.** Read it, defensively. *Failure mode: two sources of truth that drift apart, with no principled way to reconcile them.*
 
 8. **Bind to loopback only. Never rebind to a public interface to enable remote access.** *Failure mode: an unauthenticated control plane with filesystem and shell access, reachable from the network.*
+
+
+---
+
+# Part 3 — Launch, Process Management, and Resilience
+
+> **Clean-room notice.** This document describes *design knowledge*: contracts, invariants, ordered procedures, thresholds, and the incidents that produced them. It contains no source code. Where a flag name, environment-variable name, file name, or numeric constant appears, that name or number **is the specification** — reproduce it exactly unless you have a reason to diverge, and write the reason down.
+>
+> `<App>` stands for the product you are building: a locally-hosted web application that runs long-lived AI coding sessions on the user's own machine. `<repo-root>/` is wherever the application is checked out. Vendor names are replaced with role descriptions ("the agent backend's CLI", "a mesh VPN") except for **Chrome/Chromium**, where the browser's identity is the actual technical constraint, and operating-system names.
+
+---
+
+## 3.1 What this part covers, and the user it is designed for
+
+This part specifies the layer between "a person wants to use the application" and "the application is running and stays running." It covers launching, process supervision, port ownership, browser invocation, restart semantics, self-healing, remote revival, logging, diagnostics, and the testing discipline that keeps all of it from silently rotting.
+
+In most products this layer is an afterthought — a shell script and a README line. In this product it is load-bearing, and the reason is the user.
+
+### The user
+
+**Some of your users will never open a terminal.** They double-click an icon. They publish their changes with an in-app "Update" button that stages everything, writes a commit message for them, and pushes — without their ever reading a diff. They do not know what a port is. They cannot be told "check the logs."
+
+Every decision below follows from that single constraint. Concretely, it means:
+
+1. **A failure must either self-heal or become a visible, actionable overlay in the user interface.** A log line is not a user-facing outcome. A stack trace is not a diagnosis. "Nothing happened when I clicked it" is the most common bug report you will receive, and your architecture must make that report rare.
+2. **Degradation must be announced, never silent.** If an optional capability is unavailable, say so, in the interface, with the exact remedy.
+3. **The application must be able to repair itself between runs.** Shortcuts drift, dependencies go missing, caches go stale, state files rot. Fix them at boot rather than asking.
+4. **Anything that can be diagnosed automatically must be.** Where the system can name the specific cause of a failure, it must print the cause and the remedy, not the symptom.
+5. **Blast radius governs authorization.** Two operations that share an endpoint can deserve completely different permission levels if one costs ten seconds and the other destroys hours of work.
+
+### A second audience: automated agents
+
+Your application will be modified, operated, and occasionally *debugged* by AI agents acting on the user's behalf. That has two consequences that appear repeatedly below:
+
+- **Agents kill processes.** An agent under memory or CPU pressure that sorts a process list by resident size and terminates the largest entry can take down the single most catastrophic process in your system. You must label your processes so that anything inspecting the process list sees a "do not kill" warning *before* acting (§3.11.8).
+- **Agents need standing instructions that cannot be argued with.** Prose rules in a contributor guide get lost. Convert your most important invariants into tests that read the shipped source text and fail when the invariant is removed (§3.16).
+
+### What "done" looks like
+
+- Double-click to working application on Windows, macOS, and Linux, with no terminal.
+- Closing any window the launcher opened does not kill the running application.
+- Restarting the user interface does not interrupt running work.
+- A crashed component either restarts itself or produces a blocking overlay with a working recovery button.
+- Every failure mode above is covered by a test that reads the shipped artifact, not just the intent.
+
+---
+
+## 3.2 The one-click startup experience
+
+**The user double-clicks one icon and gets a working application. There is no terminal, no command to type, no waiting at a blank screen, and no step where they must judge whether something worked.**
+
+Everything else in this chapter exists to serve that sentence. Treat it as a **product requirement**, not an operational convenience. The persona in §3.1 cannot distinguish "starting slowly" from "broken," and when a person cannot tell the difference, they conclude it is broken — they click again, they force-quit, they file a bug that says "it doesn't open." A premium startup experience is the cheapest defect-prevention mechanism you will ever build.
+
+Assume most of your users are on a **Windows host**. Windows is where the failure modes are worst (console windows that flash and can be closed, shortcuts that drift, an interpreter choice that silently changes behaviour), so Windows gets the most specification here. macOS and Linux must reach the same destination by their own idioms.
+
+### 3.2.1 The one-click contract
+
+Four things must be true. If any one is false, the experience is not one-click.
+
+1. **One icon, one click.** No terminal, no arguments, no working-directory requirement, no "run this first" step. The icon must work from a fresh login, from a locked-down user account, and after the user has moved or renamed nothing.
+2. **Visible feedback within roughly one second.** Not "the app has started" — *visible feedback*. A window appears and is obviously alive. One second is the budget because it is roughly the point at which a user's attention leaves the screen.
+3. **Continuous, honest progress until the browser opens.** Named steps, in order, each announced when it *begins*. Never a static frame, never a step name that lags reality, never an unexplained gap.
+4. **The window the user clicked can be closed without killing anything.** This is the constraint that forces the detached-spawn rule in §3.8. It is listed here, in the product section, because it is a *user-experience* requirement first and an operational one second: a window that is dangerous to close is a trap you have laid for your own user.
+
+Point (4) deserves emphasis. If you satisfy (1) through (3) with a console window that streams progress text, you have built a beautiful trap. The user will eventually close that window — it looks like leftover clutter — and the application will die. See the incident in §3.8.1.
+
+### 3.2.2 Desktop shortcut creation, per platform
+
+#### Windows (primary target)
+
+Create a shortcut file (`.lnk`) on the user's Desktop. The ordered creation steps, expressed generically:
+
+1. Instantiate a **shell scripting host** shell object.
+2. Ask it to create a shortcut object at the Desktop path, named for the application.
+3. Set the **target** to the **windowless interpreter** (`pythonw.exe`) — resolved from the interpreter currently running the installer, by looking for the windowless variant as a sibling file, **not** by assuming a fixed install location.
+4. Set the **arguments** to the quoted absolute path of the launch choke-point script (§3.4).
+5. Set the **working directory** to the application root.
+6. Set the **icon location** to a bundled `.ico`, index 0.
+7. Set the **window style** to minimized.
+8. Save.
+
+**Why the windowless interpreter, specifically.** With the ordinary console interpreter, two things happen, and the second is far worse than the first:
+
+- A console window **flashes** on every single launch. It reads as instability. Users report it as a virus.
+- More importantly, it **leaves a closeable window that owns the server's lifetime.** The user now has a permanent opportunity to destroy their own running work by tidying their taskbar.
+
+The windowless interpreter has no console at all. There is nothing to flash and nothing to close.
+
+There is a consequence you must handle: under the windowless interpreter, the process's standard output and standard error streams are **`None`**, and **any print statement crashes the process outright**. The choke-point script must detect this and redirect both streams to a log file *before anything can print* (§3.4, step 3).
+
+#### macOS
+
+Either a symlink into the Applications folder pointing at the POSIX launcher, or a two-line double-clickable `.command` file on the Desktop that changes to the application directory and executes the launcher. Mark it executable.
+
+#### Linux
+
+Write a `.desktop` entry into the per-user applications directory so the application appears in the menu, and optionally copy it to the Desktop.
+
+Three traps, all of which produce a broken-looking result rather than an error:
+
+- **`~` and `$HOME` do not expand** inside the `Icon=` and `Exec=` fields. Bake absolute paths in at generation time, derived from the current working directory. A tilde here yields a launcher that silently does nothing.
+- **The icon must be a PNG.** Most desktop environments will not render a Windows `.ico`, so you get a generic file glyph even though the file is present and valid.
+- **Mark the desktop copy executable and trusted.** On several desktop environments an untrusted desktop entry renders as a plain text file and either does nothing or opens in an editor.
+
+Set `Terminal=false`.
+
+#### Shortcut self-healing — build this, it is cheap and it is invisible
+
+**On every application startup, inspect the existing shortcut. If its target is the console interpreter rather than the windowless one, or its icon path is wrong, rewrite it silently.**
+
+This fixes an entire class of user who is otherwise unreachable: someone who created the shortcut by hand from a README, or with an older installer, or before you fixed the interpreter choice. They will never report the console flash as a bug — they will assume it is normal — and they will never see a fix you ship unless it applies itself.
+
+Two implementation requirements:
+
+- **Read before writing.** Compare the current target and icon against the expected values, and return without touching the file if they already match. Otherwise you rewrite a file on every launch, which churns file timestamps and, on some systems, triggers backup and sync tooling.
+- **Run it on a background thread and swallow every exception.** It involves slow shell-scripting-host calls and must never delay or break startup. It is a nicety, not a correctness requirement.
+
+#### Optional companion: a Stop shortcut
+
+Ship a second shortcut that performs a hard stop (§3.10). Give it a **visually distinct icon** — a greyed version of the logo with a red X — so it can never be confused with the launch icon at a glance. Label it honestly in its description: it terminates running work.
+
+### 3.2.3 The premium boot splash
+
+Specify the splash as a **real visual deliverable with real numbers**, not "show a loading window."
+
+| Property | Specification |
+|---|---|
+| Window | **480 × 490**, borderless, always-on-top, centred on screen |
+| Chrome | **None** — no OS title bar, no border. Set the undecorated / override-redirect flag |
+| Rendering | **Fully canvas-rendered**, not a static image and not a stock progress-bar widget |
+| Frame rate | **~60 fps**, i.e. a **~16 ms** frame tick |
+| Entrance | **Fades in from fully transparent** on an **ease-out-cubic** curve, stepping window alpha by **~0.035 per frame** |
+| Ambient motion | Drifting particles at low alpha (**~0.12 – 0.35**) over a dark gradient |
+| Progress | **Eased interpolation** toward the target value — the indicator animates smoothly rather than jumping between steps |
+| Content | A **step list with live status**, a **percentage counter with an ETA**, and a **subtle close affordance** |
+| Palette | The application's own dark theme tokens, so the splash reads as the same product |
+| Process | A **separate, windowless** child process |
+
+Three of these rows are load-bearing and deserve their reasoning stated:
+
+**The window must animate independently of progress.** Particles drift, the border gradient moves, the title glow breathes — all on the frame tick, regardless of whether a step is advancing. *A frozen splash is indistinguishable from a hung application.* The dependency-installation step can legitimately take minutes on a first run; if the window is static during that time, the user force-quits a perfectly healthy launch. Ambient motion is not decoration; it is the signal that carries "alive" when "progress" has nothing to say.
+
+**The fade-in must be eased, not linear and not absent.** A window that pops into existence at full opacity reads as a system dialog — something *interrupting* you. A window that fades in reads as the application *starting*. Same information, opposite emotional register.
+
+**It must be a separate process.** The splash cannot be blocked by the server's startup work (which is exactly when it needs to render), and it cannot block that work. Windowless, so it does not itself flash a console.
+
+Match the palette to the application's dark theme by referencing the same design tokens the product uses — see the theming part of this specification. A splash in a different palette reads as a third-party installer.
+
+### 3.2.4 The step protocol between the application and the splash
+
+Communication is a **one-way, append-only text file**. The path is generated by the choke-point script, passed to the splash **both** as a command-line argument **and** through the environment variable `VIBENODE_BOOT_STATUS_FILE` so that the boot code can find it without any shared object. The application appends lines. The splash polls, tracking a **saved byte offset** so it reads only what is new.
+
+Three message types:
+
+| Line | Meaning |
+|---|---|
+| `STEP:<name>` | Activate the named step |
+| `DONE` | All steps complete — close the splash |
+| `ERROR:<text>` | Show the error, **keep the window open**, show a dismiss control |
+
+The seven canonical steps, with the labels the user actually reads:
+
+| Identifier | User-facing label |
+|---|---|
+| `cache` | Clearing caches |
+| `loading` | Loading modules |
+| `ports` | Releasing ports |
+| `deps` | Checking dependencies |
+| `daemon` | Starting session daemon |
+| `server` | Initializing server |
+| `browser` | Opening browser |
+
+**Why a file and not a socket or a pipe:** a file is the *weakest* mechanism available, and that is precisely the point. It needs no port, no serialization, no shared library, and no handshake. It survives the parent crashing. The splash can be killed at any instant without affecting boot, and boot can fail at any instant without leaving the splash hung waiting on a peer.
+
+Two rules that came from real bugs. Keep both.
+
+- **Every step must be announced when it begins, including the slow invisible ones.** The heavy-import phase originally had **no** status line. A freeze there kept displaying the *previous* step — "Clearing caches" — so every import-phase hang looked like a stuck cache purge, and debugging went to the wrong place repeatedly before anyone noticed. **A progress indicator that lags reality actively misdirects diagnosis. It is worse than no indicator, because it is confidently wrong.**
+- **Delete the status file shortly after completion** — a **5-second** timer after `DONE`, so the splash has time to read the final line — and ship a **stale-file sweep** in your stop script, because a force-kill orphans these files and a stale one confuses the next launch's IPC.
+
+### 3.2.5 Graceful degradation — never a broken first impression
+
+The startup path is the one moment where a missing optional dependency turns into "this product does not work."
+
+1. **Pre-flight the GUI toolkit in the parent process, before spawning the splash.** The splash child, on failing to import its toolkit, exits **silently with status 0** — which is correct behaviour for a cosmetic child, and catastrophic if the parent assumes success. On Debian-family Linux the toolkit ships as a **separate package** and is absent by default. Without a parent-side import check the user sees **absolutely nothing**: no splash, no error, no notification, for the entire boot. Test the import in the parent and only spawn if it succeeds. **A silent child failure must be detected by the parent, because only the parent can fall back.**
+2. **Fall back to a native OS notification** carrying the same "starting up" message — a balloon tip on Windows, a script-driven notification on macOS, `notify-send` on Linux. On Linux, when the toolkit is the specific missing piece, **put the package-install hint in the toast itself.** Otherwise the user sees a generic "starting up" and has no idea the splash *would* work after one package install.
+3. **Suppress native crash dialogs in the splash process.** On Windows, set the process error mode flags that disable the critical-error and general-protection-fault dialogs. If the GUI toolkit ever panics, the splash must die quietly rather than popping a system-level "application stopped working" box in front of a non-technical user during startup. Apply this to any purely cosmetic subprocess.
+4. **The splash is cosmetic and must never be load-bearing.** If it fails to start, fails to render, is closed by the user, or crashes mid-boot, the application must start normally regardless. Every splash interaction from the application side is a best-effort file append wrapped in an exception guard.
+
+### 3.2.6 Closing the loop — the browser hand-off
+
+The final step opens the browser (§3.9), and the splash auto-dismisses once the page is up.
+
+The complete user experience, start to finish:
+
+> Click icon → animated window appears within a second → seven named steps advance with live progress and an ETA → the browser opens on a working application → the splash disappears.
+
+**At no moment is there a blank screen or an unexplained wait.**
+
+Two ordering requirements make that true:
+
+- Write `STEP:browser` and then `DONE` **before** launching the browser thread, so the splash closes as the browser opens rather than lingering behind it.
+- The browser launcher itself must **wait for the server to actually accept connections** before opening anything (§3.9, Rule 3). If it opens early, the user's first impression of your product is a connection-refused page — which is worse than three more seconds of splash.
+
+### 3.2.7 First run and dependency installation
+
+**The first launch is the slowest and by far the most likely to be abandoned.** A returning user waits through a slow start because they have seen it work; a first-time user does not.
+
+- **Budget the dependency step generously — 600 seconds.** A native extension may compile from source on a cold machine, and on Windows without a prebuilt wheel that genuinely takes minutes. A tight budget here converts a successful first run into a false "boot stalled" error.
+- **Surface real installation errors.** Never combine a quiet flag with an ignored return code; see the incident in §3.5.1. Print the last 20 lines of captured error output and the last 10 lines of standard output on failure.
+- **Over-communicate on first run.** The step list is doing double duty here: it is both progress *and* an explanation of why this particular launch is slow. "Checking dependencies" sitting for two minutes with live ambient motion and a moving ETA is tolerable. The same two minutes behind a static window is not.
+- Consider persisting a marker after the first successful boot, so you can phrase first-run messaging differently ("Setting up for the first time — this only happens once") from steady-state messaging.
+
+---
+
+## 3.3 The end-user launch story, per platform
+
+### 3.3.1 Artifacts
+
+| Platform | What the user clicks | Interpreter | Detachment mechanism |
+|---|---|---|---|
+| Windows | A desktop shortcut (`.lnk`), or a batch launcher | **`pythonw.exe`** (no console) | No console exists to close |
+| macOS | A double-clickable `.command` file that delegates to the POSIX launcher, or an alias in `/Applications` | `python3` | `nohup … & ; disown` |
+| Linux | A `.desktop` entry in the application menu and optionally on the desktop, invoking the POSIX launcher | `python3` | `nohup … & ; disown` |
+
+All three converge on **one script** (§3.4).
+
+### 3.3.2 The POSIX launcher — ordered steps
+
+The launcher script for macOS and Linux must perform these steps **in this order**:
+
+1. **Change directory to the script's own location** and capture it as the application root. Never hardcode a path. Every subsequent path derives from this.
+2. **Find a suitable Python.** Probe `python3`, then `python`. For each candidate, *execute* a version assertion in that interpreter (do not parse `--version` output) and require **3.10 or later**. On failure, print per-distribution install commands — Debian/Ubuntu, Fedora/RHEL, Arch, and the macOS package manager — plus the upstream download URL, then wait for the user to press Enter before closing. A non-technical user must be handed a copy-pasteable fix, not a traceback.
+3. **Activate an existing virtual environment** if one is present at `.venv/` or `venv/`. **Do not create one automatically.** Silently creating a virtual environment strands every package the user already installed globally, and they will have no idea why the application suddenly cannot find its dependencies.
+4. **Check dependencies.** If the web framework is not importable, run the package installer against the requirements file with a **three-tier fallback**:
+   1. plain install (works inside a virtual environment and on older distributions),
+   2. `--user` (no virtual environment, older package manager),
+   3. `--break-system-packages` (Ubuntu 23.04+ and Debian 12+ enforce PEP 668, which rejects the plain form outright).
+
+   If all three fail, print the virtual-environment recipe verbatim and stop.
+5. **Check for the agent backend's CLI on `PATH`.** If it is missing, warn loudly with the install URL — **but continue anyway**. The interface should open and explain the problem. Refusing to start leaves the user with nothing to read.
+6. **Check for the GUI toolkit used by the boot splash (Linux only).** If it is missing, print a note that the splash will be skipped and give the exact package name per distribution. Degradation is announced, never silent.
+7. **Create the log directory, then spawn detached** (§3.8), redirecting both streams in *append* mode into the shared server log.
+8. **Probe liveness.** Sleep **1.5 seconds**, then check whether the spawned process still exists. If it is already dead, name the two log files the user should read and wait for Enter.
+
+### 3.3.3 The Windows launcher — ordered steps
+
+1. Change directory to the batch file's own location.
+2. Test whether a **windowless interpreter** (`pythonw`) is on `PATH`.
+3. **If present** (the expected path): start the entry script with the windowless interpreter using a detached start, then exit immediately. The batch window closes instantly and nothing visible remains on screen.
+4. **If absent** (rare fallback only): re-launch the batch file minimized using an environment sentinel to prevent infinite recursion, run the console interpreter, and pause on a non-zero exit so the error is readable.
+
+Do not promote the fallback to the primary path. See §3.8 for the incident.
+
+### 3.3.4 Installation and shortcuts
+
+Provide two setup routes:
+
+- **Assisted setup.** If your product's audience already has an AI coding agent installed, the single best onboarding instruction is a sentence they can paste into it: *"Set me up with `<repository URL>`."* The agent clones, installs the runtime and dependencies, creates the desktop shortcut, and launches. This is the primary path for non-technical users and it costs you nothing but a well-structured README.
+- **Manual setup.** Clone, install requirements, run the entry script. Then a per-platform shortcut snippet:
+  - **Windows** — a PowerShell snippet creating a `.lnk` whose target is the **windowless** interpreter, with the entry script as its argument, the application root as its working directory, an icon, and a minimized window style.
+  - **macOS** — either a symlink into `/Applications` or a two-line `.command` file on the Desktop, made executable.
+  - **Linux** — a `.desktop` entry written into the per-user applications directory, with `Terminal=false`. Two traps: `~` and `$HOME` **do not expand** inside `Icon=` and `Exec=` fields, so bake absolute paths in at generation time from the current working directory; and most desktop environments will not render a Windows `.ico`, so ship a PNG for Linux. On GNOME/Cinnamon, mark a desktop copy as trusted or the user sees a generic file icon.
+  - Optionally, a **Stop** shortcut with a visually distinct icon (greyed logo with a red X). Label it clearly as a hard stop that terminates running work.
+
+### 3.3.5 Requirements to state plainly
+
+State the runtime version floor, the agent backend's CLI as a prerequisite, and — critically — call out **optional** dependencies together with exactly what degrades without them. For example: without the GUI toolkit on Debian-family Linux, the animated boot splash silently degrades to a single desktop notification; the application still starts. Users who know that will not file a bug.
+
+---
+
+## 3.4 The single launch choke point
+
+**Build this first. Everything else in this part hangs off it.**
+
+There must be exactly **one** script that every start path invokes:
+
+- the desktop shortcut,
+- the Windows batch launcher,
+- the POSIX launcher,
+- the in-application restart endpoint,
+- the remote "Start" button on a phone (§3.12),
+- the pre-login unlock page (§3.13).
+
+Anything that must happen on *every conceivable* start is written once, there. The choke point script must, in order:
+
+1. **Change the working directory to its own location**, so launch context cannot affect relative paths. A shortcut, a `.desktop` file, and a service unit all invoke you with different working directories.
+
+2. **Repair `PATH` on POSIX.** A `.desktop` launch or a windowless-interpreter launch **does not source a login shell**. Node version managers, per-user package binaries, and toolchain shims are therefore absent, and a lookup for the agent backend's CLI returns nothing — the application starts and then mysteriously cannot run any session. Prepend, if not already present:
+   - `~/.local/bin`
+   - `~/.npm-global/bin`
+   - `~/.npm/bin`
+   - the Node version manager's toolchain bin directory
+   - `/opt/homebrew/bin`
+   - `/usr/local/bin`
+
+   For the Node version manager, resolve the active version from its environment variable if set; otherwise read its default-alias file and **follow alias-of-alias indirection** (the default alias frequently points at a channel name like `lts/*`, which points at a version). Do this before any import, so the child processes you spawn inherit the corrected environment.
+
+3. **Repair standard output and error.** Under a windowless interpreter on Windows, both streams are `None`, and **any print statement crashes the process**. Detect this and redirect both to the shared server log before anything can print.
+
+4. **Write the spawn-mode evidence line** (§3.8).
+
+5. **Launch the boot splash** as a subprocess, with a desktop-notification fallback (§3.6).
+
+6. **Run any always-on supervisor hook** — for example, telling an already-running revival helper to release the web port before you try to bind it (§3.12).
+
+7. **Execute the real entry point in the same process**, so that it behaves exactly as if it had been invoked directly. Do not re-exec; you would lose the environment repair you just performed.
+
+**Why one choke point rather than duplicated preambles:** the environment repair in step 2 was added because of a launch method nobody thought about (a desktop entry). If that repair had lived in three launcher scripts, it would have been fixed in one and stayed broken in the other two — and the broken ones would be the ones your non-technical users actually use.
+
+---
+
+## 3.5 The boot sequence, in order
+
+The entry point must execute these phases in exactly this order. Each phase name in bold is also the identifier written to the boot splash (§3.6).
+
+1. **Boot hardening — before any third-party import.**
+   Import a tiny, standard-library-only hardening module *first*. It must not live inside your application package, because importing that package triggers the very import chain you are trying to neutralize. It does two things:
+   - **Platform-query immunity.** On Windows with recent Python versions, the standard platform-information calls issue a system management query. A widely used asynchronous HTTP library calls one of them **at import time**. If the Windows management service is wedged, that query **never returns** and boot freezes forever. Pre-seed the platform module's internal cache so the call becomes a pure cache read. When building the cache, **do not call the machine-architecture helper** — that is one of the wedging calls. Read the architecture from the `PROCESSOR_ARCHITECTURE` environment variable instead. Leave release and version blank; consumers only read the system name.
+   - **Hang autopsy.** Arm a fault handler to dump every thread's stack after **120 seconds** unless disarmed. Entry points redirect standard error to their log file, so a wedge produces a complete stack dump *for free* instead of requiring a human to reproduce it. Disarm once the process is healthy.
+
+2. **`cache`** — Recursively delete every compiled-bytecode cache directory under the application root. After the user pulls an update, a stale compiled file can shadow updated source, and the target user cannot possibly diagnose that. Budget: **20 s**.
+
+3. Start the **boot watchdog** thread (§3.15).
+
+4. **`loading`** — The heavy import phase. **Name this phase explicitly.** See the trap in §3.6. Budget: **75 s**.
+
+5. **`ports`** — Kill anything listening on the web port. Kill anything listening on the engine port **only if** the preservation flag `VIBENODE_PRESERVE_DAEMON` is not set to `1`; when it is set, log the skip explicitly. Budget: **30 s**.
+
+6. **Singleton gate** (§3.14).
+
+7. **Self-healing desktop shortcut (Windows), on a background thread.** Read the existing shortcut. If its target is not the windowless interpreter, or its icon path is wrong, rewrite it. **Read before writing** so you do not churn the file on every launch. This solves a permanent, invisible annoyance: the user created the shortcut once with the console interpreter and gets a console flash forever, and will never connect that to anything they can fix. Best-effort; never block startup.
+
+8. **`deps`** — Verify that each required package is importable and install any that are missing. Budget: **600 s**, because a native extension may need to compile from source on a cold machine. **Do not silence the installer and ignore its return code** — see §3.5.1.
+
+9. Start the **background updater thread** (§3.5.2).
+
+10. **`daemon`** — Ensure the engine process is running (§3.7). Budget: **45 s**.
+
+11. **`server`** — Build the web application. On success, signal boot-complete and disarm the hang autopsy. On exception, write an `ERROR:` line to the splash **and re-raise**. Budget: **60 s**.
+
+12. **`browser`**, then `DONE` — Open the browser (§3.9) on a background thread, **but only when the preservation flag is not set**. A web-only restart must not open a duplicate window; the user already has the tab open and the socket layer reconnects on its own.
+
+13. **Bind and serve on `127.0.0.1`.** Not `0.0.0.0`. All remote access must go through an explicit tunnel (§3.12); nothing should ever be exposed on a LAN interface by default.
+
+The per-phase budgets are **"something is wedged" thresholds, not performance targets.** Set them generously. The dependency budget is ten minutes precisely because a cold native-extension compile genuinely takes minutes and a false alarm there is worse than a slow honest wait.
+
+### 3.5.1 Dependency installation: surface real errors
+
+Install missing packages with output **captured**, and check the return code. On failure, print the last **20 lines of standard error** and the last **10 lines of standard output**, prefixed and indented.
+
+> **Incident.** The installer originally ran quiet *and* ignored its return code. A failed install therefore printed **"Packages installed successfully"** on every single restart, with zero diagnostic information, while the feature that needed the package remained silently broken. The combination — suppress output *and* ignore the exit status — is what made it invisible; either alone would have been survivable.
+
+Give the install a generous timeout (**600 s**) and, on timeout, say so explicitly and tell the user to run the installer manually to see the real error.
+
+### 3.5.2 Background self-update: never on the boot path
+
+If your application auto-updates the agent backend's CLI or SDK — you probably should, because new model availability ships through those releases and one-click users will otherwise never get them — obey these rules:
+
+- **Throttle** to once per 24 hours using a small state file under a cache directory (record `last_check`, the observed CLI version, whether an update landed, and whether an engine restart is now pending).
+- **Provide an opt-out** environment variable (`VIBENODE_NO_AUTO_UPDATE`).
+- **Run on a background thread that waits for boot to complete**, then probes network reachability every **300 s** until a check actually succeeds. On a machine with no working network, boot is unaffected and the update simply happens whenever connectivity returns.
+- **Time-box every subprocess** (120 s per call).
+- **Never restart the engine automatically** to apply an update. Print a note explaining that the new version applies on the engine's next cold start, and tell the user the exact menu path to force it. See §3.10.
+
+> **Incident.** The update check originally ran **synchronously before the engine spawn**, so a fresh CLI would be on disk before the engine's cold start. A slow or dead network then stalled boot until the splash watchdog declared the application dead. The trade that fixed it — the update lands mid-session and applies on the *next* cold start — was one the system already accepted for warm engines anyway.
+
+> **Trap: capturing subprocess output through pipes can hang forever on Windows.** Standard capture-output helpers use pipes plus reader threads. When the child spawns a *grandchild* (a command shim that spawns a runtime), the grandchild inherits the pipe. After you kill the child on timeout, the reader threads **never see end-of-file**, and the communication call blocks forever — boot wedged at "checking for updates." **Redirect to a temporary file instead.** A file has no reader threads: wait and kill always return, and a lingering grandchild can finish, or not, on its own. Return `None` as the exit status to signal "timed out" distinctly from any real exit code.
+
+---
+
+## 3.6 The boot splash and its status protocol
+
+### 3.6.1 Why it exists
+
+A non-technical user staring at nothing for ninety seconds concludes the application is broken and clicks the icon again — which is how you get three simultaneous launches. The splash is not decoration; it is the difference between "starting" and "broken" in the only vocabulary this user has.
+
+### 3.6.2 Protocol
+
+The splash must be a **separate process**, launched windowless, and must communicate through a **one-way, append-only text file**. Pass the file path both as a command-line argument and through the environment variable `VIBENODE_BOOT_STATUS_FILE`, so the splash can read it and the boot code can write it without any shared object.
+
+The parent appends lines; the splash polls, keeping a saved byte offset so it only reads what is new. Three message forms:
+
+| Line | Meaning |
+|---|---|
+| `STEP:<name>` | Activate the named step |
+| `DONE` | All steps complete; close the splash |
+| `ERROR:<text>` | Show the error, keep the window open, offer a dismiss button |
+
+The step names, in order, are: **cache, loading, ports, deps, daemon, server, browser**, with human-readable labels ("Clearing caches", "Loading modules", "Releasing ports", "Checking dependencies", "Starting session engine", "Initializing server", "Opening browser").
+
+A file is the right IPC here precisely because it is the *weakest* mechanism available: it survives the parent crashing, it needs no port, no socket, no serialization, and no shared library. The splash can be killed at any moment without affecting boot, and boot can fail at any moment without leaving the splash hung.
+
+### 3.6.3 Lifecycle rules
+
+- Delete the status file on a **5-second timer** after `DONE`, so the splash has time to read it.
+- Your stop script must sweep orphaned status files from the temporary directory (glob on a stable prefix), because a force-kill leaves them behind and they confuse the next launch's IPC.
+
+### 3.6.4 Three non-obvious requirements
+
+1. **Pre-flight the GUI toolkit in the parent, not just the child.** The splash child exits silently (status 0) if the toolkit cannot be imported. On Debian-family Linux the toolkit is a *separate* package and is missing by default. Without a parent-side import check, the user sees **absolutely nothing** — no splash, no error, no notification. With it, the parent falls back to a desktop notification, and on Linux the notification text itself carries the missing package name. **A silent child failure must be detected by the parent, because only the parent can fall back.**
+
+2. **Suppress native crash dialogs in cosmetic child processes.** On Windows, set the process error mode to suppress critical-error and general-protection-fault dialogs in the splash. If the GUI toolkit ever panics, the splash must die silently rather than popping an "application stopped working" box in front of a non-technical user during startup. Any purely cosmetic subprocess deserves this treatment.
+
+3. **Name every phase, including the boring ones.** The heavy-import phase originally had **no** status line, so the splash kept displaying the *previous* step — "Clearing caches" — for the entire duration. Every freeze during imports therefore looked like a stuck cache purge, and debugging went to the wrong place repeatedly. **A progress indicator that lags reality actively misdirects diagnosis.** It is worse than no indicator, because it is confidently wrong.
+
+### 3.6.5 Fallback
+
+If the splash cannot be launched at all, fire a platform-native desktop notification: a balloon tip on Windows, a script-driven notification on macOS, `notify-send` on Linux. All best-effort, all exception-swallowed, all on a background thread. The user gets *something* that says the application is starting.
+
+---
+
+## 3.7 The two-process model in operational terms
+
+### 3.7.1 The split
+
+| | **Web server** | **Session engine** |
+|---|---|---|
+| Role | User interface, HTTP API, real-time socket layer, static assets | Owns all AI sessions; is the **parent of every session's CLI child process** |
+| Default port | **5050** | **5051** |
+| Port override | `VIBENODE_WEB_PORT` | `VIBENODE_DAEMON_PORT` |
+| Test-mode port | **5099** | **5098** |
+| Lifetime | Restartable freely, many times a day | **Must survive web restarts** |
+| Cost of killing | ~5–10 seconds | **Every running session is destroyed, unrecoverably** |
+
+Two auxiliary loopback ports belong to the revival helper: **5052** (control and singleton) and **5053** (guardian beacon). See §3.12.
+
+**This split is the single most important architectural decision in this part.** It is what allows a user to restart a broken interface — or an agent to restart it after a code change — without destroying hours of running work. If you build only one process, every UI bug fix costs the user everything in flight.
+
+### 3.7.2 Who spawns whom
+
+There is no supervisor above these two. **The web server is the engine's launcher, and the engine is deliberately more durable than its launcher.**
+
+The engine spawn procedure:
+
+1. **Probe first.** Try to connect to the engine port. If something answers, return immediately. (A redundant spawn is harmless anyway — the engine enforces its own singleton — but the probe avoids the noise.)
+2. **Write a spawn banner into the shared engine log**, including a timestamp and the target port, framed by a visually distinctive delimiter. Without it, a reader cannot tell which restart's engine they are looking at in a log that spans weeks.
+3. **Build the child environment explicitly** as a copy of the current environment plus process-identification markers (§3.11.8). Do **not** rely on implicit inheritance. When this code runs inside an HTTP request handler for the restart endpoint, the environment can be filtered by the web-gateway layer — and the engine reads *all* of its configuration from environment variables, including which port to bind.
+4. **Spawn detached**, with platform-appropriate flags (§3.8).
+5. **Append an inert marker token to the engine's command line** (§3.11.8). The engine must never parse its own arguments, so the token is purely informational.
+6. **Poll for the bind**, up to **100 attempts at 0.1 s intervals (10 seconds total)**. Cold engine startup on a slow machine genuinely takes 5–7 seconds once SDK patching and session-registry recovery are counted, so an earlier ceiling (50 attempts) produced spurious failures.
+7. **Short-circuit on death.** On each failed connect, check whether the child process has already exited. If it has, stop polling immediately — no amount of waiting helps a dead process, and you have just saved the user ten seconds of false hope.
+8. **On any failure, distinguish three modes explicitly** in the message:
+   - process died before binding (include the exit code),
+   - process alive but did not bind within the timeout,
+   - spawn never fired at all.
+9. **Print the last 30 lines of the engine log inline**, prefixed. Do not make the user hunt for a log file. If the log cannot be read, say that instead.
+
+> **Incident.** Before the loud failure handling existed, the "restart the engine" path failed **silently** on Linux: a new web server came up with no engine behind it, the interface looked completely normal, and tool calls started failing mysteriously a minute later. The user could not connect the two events. Loud, specific, immediate failure reporting is the fix; a generic "could not connect" message is not.
+
+### 3.7.3 How they find each other
+
+Plain TCP on loopback carrying **newline-delimited JSON**. Request envelope: a request identifier, a method name, and a parameters object. The engine pushes asynchronous events over the same socket. Give the request identifier a real purpose — it is what makes latency profiling correlatable (§3.15).
+
+Document this protocol for contributors, and open that documentation with a warning that **external consumers must use the HTTP API and the socket layer, never the engine protocol directly.** An internal protocol that acquires external consumers stops being changeable.
+
+### 3.7.4 Connection hardening — both sides, both mechanisms
+
+Apply **all** of the following, and apply them **on both sides of the connection**. The helper that sets them will necessarily be duplicated between the engine and the client, because the engine module must remain importable without any web-framework dependency. **Accept that duplication and pin it with a test** asserting both sides call the same logic (§3.16).
+
+- Disable Nagle's algorithm on accepted connections.
+- Enable socket keepalive.
+- Tighten the keepalive timers well below the operating-system defaults: **idle 15 s, interval 5 s, count 3**. On platforms exposing only a single combined keepalive option, set that to **15 s**.
+- Run an **application-level heartbeat**: probe every **20 s** (`HEARTBEAT_INTERVAL`), with an **8 s** response timeout (`HEARTBEAT_TIMEOUT`).
+
+**Both mechanisms are required, and the reasoning is precise.** Kernel keepalive alone has too long a worst-case detection window on some kernels — the default is measured in *hours*. The application heartbeat alone will not catch a send call blocking inside a zombie socket buffer.
+
+> **Incident.** When a Linux host suspends — a closed laptop lid, a system suspend — the loopback connection between the two processes enters a zombie state. Without proactive probing the kernel never discovers the connection is dead, the receive call blocks **forever**, and the reactive "reconnect when a send fails" logic never fires because nothing ever fails. The entire interface hangs until the user kills and restarts the server. On the engine side the same zombie leaves the engine holding a dead socket and refusing to accept the reconnecting web server. With tightened keepalive, a dead peer is detected and released in roughly **30 seconds**.
+
+### 3.7.5 Reconnection and engine resurrection
+
+The client's reconnect loop must:
+
+1. Retry every **2 s**.
+2. Emit reconnection progress events to the interface (status, attempt number, human-readable message) for at least the first **10** attempts, so the user sees activity rather than a frozen screen.
+3. **At attempt 5 (~10 seconds), conclude the engine is dead and respawn it** — using the same detachment flags as the original spawn, appending to the same engine log. Emit a distinct "engine unresponsive — restarting it" status first.
+
+This makes the engine resurrectable without a full application restart, which matters because the engine is exactly the process a user cannot afford to lose and exactly the process most likely to be killed by something outside your control.
+
+### 3.7.6 What survives what
+
+| Event | Web | Engine | Running sessions |
+|---|---|---|---|
+| Web server dies | dies | survives | **survive** — relaunching reattaches |
+| Engine dies | survives (but useless) | dies | **destroyed** — client detects, respawns, interface shows a blocking overlay with a Restart button |
+| Launcher window closed | survives | survives | survive |
+| Machine sleeps | survives | survives | survive — keepalive plus heartbeat rebuild the link; the engine's health monitor resets stall clocks on wake |
+| Restart, scope = web | restarts | **survives** | **survive** |
+| Restart, scope = engine or both | — | restarts | **destroyed** |
+
+### 3.7.7 Port allocation and side-by-side instances
+
+Provide **three distinct override modes**, and keep the distinction sharp — conflating them is a documented source of bugs:
+
+| Variable | Effect |
+|---|---|
+| `VIBENODE_TEST_PORT` | Skips **every** production setup step: no port killing, no singleton, no browser launch, no engine dependency. For automated tests. |
+| `VIBENODE_WEB_PORT` | Binds a different web port but performs **all** normal production setup. This is what lets you run a genuinely production-equivalent second instance (say on 7050/7051) and exercise the real restart path without touching the user's live instance. |
+| `VIBENODE_DAEMON_PORT` | The engine-side equivalent. |
+
+**Both the singleton names and the restart endpoint's port resolution must be derived from these variables.** Hardcoding either was a real, user-reported bug class: the restart endpoint always killed 5050 even when the web server was bound elsewhere, and every test instance failed the singleton check because the production engine already held a hardcoded lock name.
+
+---
+
+## 3.8 Detached launch: the rule, the incident, and the on-disk evidence line
+
+### 3.8.1 The incident
+
+**Dated 2026-06-12. One user. It is the archetype for this entire chapter.**
+
+The launcher ran the web server inside a **minimized console window**. The user closed that window — or Windows reclaimed it during sign-out. The web server died with it.
+
+**The engine survived. Every session was intact.** But there was no interface left to reach them. From the user's point of view, hours of work had vanished behind a dead page, with no error message and nothing to click. They had done nothing wrong; they had closed a window that looked like leftover clutter.
+
+An instruction to the user is not a fix. A banner reading "KEEP THIS TERMINAL OPEN" is a confession that the architecture is fragile.
+
+### 3.8.2 The rule, per platform
+
+**Windows — the launcher must use the windowless interpreter.**
+Start the entry script with a detached start, then exit the batch file immediately.
+- The windowless interpreter has **no console at all**, so there is nothing for the user to close and nothing for the operating system to reclaim on sign-out.
+- The detached start form returns immediately so the batch file can exit; the mandatory empty title argument must be present, or the command will treat a quoted path as the window title.
+- The console-interpreter-plus-minimized-window path must remain **only** as a fallback for machines genuinely lacking the windowless interpreter. **Do not promote it back.** Both changes reintroduce the closeable window.
+
+**POSIX — the launcher must use all three of `nohup`, background execution, and `disown`.**
+- `nohup` immunizes against the hangup signal.
+- Backgrounding returns control to the launcher.
+- `disown` removes the job from the shell's job table, so the launcher's exit cannot cascade into the server through any shell-level signal path.
+
+All three. The trio is what makes the spawn a true daemon under a login shell.
+
+> **Implementation trap that will bite you: the shell's `disown` builtin takes job specifications, not process identifiers.** Call it with **no argument**, which defaults to the most recent background job. Passing the stored process ID is an error, and because you are almost certainly suppressing that error to keep the launcher robust, it will fail *silently* and you will ship an undisowned server.
+
+**Restart helpers on POSIX must run in their own session.** When an HTTP handler spawns a helper shell that will kill the port the handler itself is listening on, that helper **must** be spawned with a new session. Without it, the helper inherits the web server's process group; the helper then kills the web port, and **that kill propagates back through the shared process group and kills the helper** before it finishes spawning the replacement. Windows gets this implicitly from its process-launch API; POSIX does not.
+
+**Every long-lived spawn uses the same discipline:** a new process group on Windows, a new session on POSIX. This applies to the engine, to restart helpers, and to the browser (§3.9) — otherwise an engine restart takes the user's browser window with it.
+
+### 3.8.3 The on-disk evidence line
+
+**This is the highest-value-per-line-of-code item in the chapter. Build it.**
+
+At every startup, unconditionally, the choke-point script must append one line to the shared server log:
+
+```
+[YYYY-MM-DD HH:MM:SS] <entry-script> spawn exe=<interpreter basename> mode=<detached(pythonw)|attached(python)|detached(setsid)|attached(tty)> sid=<n> pgid=<n> pid=<n>
+```
+
+Determine the mode by **self-assessment, not by assumption**:
+- **POSIX:** you are detached if your session ID equals your process ID — that is, if you are your own session leader.
+- **Windows:** you are detached if the running interpreter's filename indicates the windowless variant.
+
+**Why this is load-bearing:** detachment regressions are *invisible* until the exact moment they matter, which may be hours later when somebody closes a window. There is no test you can run at launch time that reveals the bug, and the user who experiences it cannot describe it. This line converts a silent regression into a one-grep diagnosis. If a future change re-foregrounds the server, the log says `attached` and that is the smoking gun.
+
+**Generalize the technique:** any property of your process that (a) matters enormously, (b) is set at spawn time by code far away, and (c) has no visible symptom until a rare event — should be *self-assessed and recorded at boot*. Detachment is the canonical case. Effective user, working directory, and inherited environment markers are others.
+
+### 3.8.4 The client-side backstop
+
+The evidence line diagnoses a regression *after* the fact. You also need live detection.
+
+Register a health check in the interface that probes a **trivial liveness endpoint** on a **3-second cadence** and raises a blocking overlay after a small number of consecutive failures. This catches any post-load death the detached spawn does not prevent: a crash, a manual kill, a port conflict.
+
+Two requirements on that endpoint:
+- **It must be side-effect-free and trivially cheap** — return a constant. It must never be able to lie about reachability.
+- **Do not reuse a heavier endpoint** such as an authentication-status check that shells out to an external CLI. Under load that call can stall for seconds and produce false "server unreachable" overlays, which trains users to ignore the overlay.
+
+Full health-check design, including the subtle 503-versus-502 distinction, is in §3.12.
+
+---
+
+
+---
+
+## 3.9 Browser launch policy
+
+### 3.9.1 The constraint that dictates everything
+
+**The browser speech-recognition API is Chromium-only.** Firefox does not implement it; neither does Safari. Voice input therefore works in Chrome and Chromium and nowhere else.
+
+> If you open the user's *default* browser and that default is Firefox, the microphone button silently disappears. No error. No warning. No console message. The user does not know a feature exists, and you do not know they lost it.
+
+**This exact regression shipped to Windows users once.** Somebody replaced a Chrome-targeted launch with the system-default opener — a strictly simpler call that looks like a cleanup. Voice died for every user whose default was not Chromium-based, and it went unnoticed because there is no failure signal to notice.
+
+**The rule, on all three platforms: find Chrome or Chromium explicitly and launch it. The system-default opener is a fallback for machines that genuinely do not have Chrome installed — never the primary path.**
+
+### 3.9.2 The finder and launch table
+
+| Platform | Finder strategy | Launch mechanism | Fallback chain |
+|---|---|---|---|
+| **Windows** | Registry `App Paths\chrome.exe` under both the machine hive and the user hive first (works for every install type), then well-known install directories under `PROGRAMFILES`, `PROGRAMFILES(X86)`, and `LOCALAPPDATA` | **Shell-execute API call** with the Chrome path as the executable and the URL/flags as parameters | Chrome shell-execute → system-default opener → generic library opener |
+| **Linux** | Binary-name probe on `PATH` in preference order: `google-chrome`, `google-chrome-stable`, `chromium`, `chromium-browser`, `google-chrome-beta`, `google-chrome-unstable`; then explicit paths not always on `PATH`: `/usr/bin/*`, **`/snap/bin/google-chrome`**, `/snap/bin/chromium`, `/opt/google/chrome/google-chrome`, and both the system and per-user Flatpak export directories | Detached subprocess spawn | Chrome → `xdg-open` → generic library opener |
+| **macOS** | Explicit app-bundle paths for Chrome and Chromium under `/Applications` and `~/Applications` | Detached subprocess spawn | Chrome → `open` → generic library opener |
+
+Two entries in that table exist because of specific misses and must not be dropped:
+
+- **The snap path.** Recent Ubuntu ships Chrome as a snap; the binary lives at `/snap/bin/google-chrome` and is invisible unless `/snap/bin` happens to be on `PATH`. Without an explicit check, Chrome is installed and your finder reports "no Chrome."
+- **The registry first on Windows.** Guessing install directories misses per-user installs, enterprise installs, and relocated installs. The registry entry is authoritative.
+
+### 3.9.3 Why Windows must use a shell-execute call and not a plain subprocess spawn
+
+On Windows the launcher runs from a **windowless or minimized parent**. A child process spawned by ordinary process creation **inherits the parent's show state**: the browser window is genuinely created, and it never comes to the foreground. The user sees nothing happen. They click the icon again.
+
+The shell-execute API is **focus-safe** under a windowless parent *and* lets you name Chrome specifically. It is the only mechanism with both properties. Therefore:
+
+- **Do not use plain subprocess creation in the Windows browser block.** It reintroduces the invisible-window bug.
+- **Do not use the generic browser-opening library call in the Windows block.** It uses subprocess creation internally (same focus bug) *and* opens the default browser (the voice bug). Two defects in one line.
+- The system-default opener may appear **only after** the Chrome attempt, and only as a fallback.
+
+Pin all four of those as source guards (§3.16.4). They are exactly the kind of thing a well-meaning simplification deletes.
+
+### 3.9.4 Wait for the server before opening anything
+
+The browser opener must **poll the server's own URL until it answers**, up to **60 attempts at 1-second intervals**. If the server never responds, **log the failure and open nothing.**
+
+A connection-refused page is a worse first impression than three more seconds of splash. Opening a broken tab also trains the user to reload manually, which is the behaviour you least want.
+
+### 3.9.5 Two launch modes
+
+Read a configuration key `browser_launch_mode` from the application's config file. Two legal values; anything else falls back to the default.
+
+| Mode | What it does | Trade |
+|---|---|---|
+| `app` | Isolated Chrome **app window** — pass `--app=<URL>` plus `--user-data-dir=<repo-root>/data/chrome-profile` | Complete isolation from the user's everyday browser; but a separate profile means no bookmarks, no extensions, no signed-in state |
+| `tab` | A normal **tab in the user's everyday profile** | Feels native; requires the running-state branch in §3.9.6 to stay safe |
+
+Gitignore the profile directory. **Gate the flags, do not delete them** — whichever default you ship, the other mode's flags must remain reachable and correct.
+
+> **Doc drift, recorded honestly.** The contributor guide for this system says the default is `tab`; the shipped code defaults to `app`. Both were true at different times and nobody reconciled them. **The lesson is not "pick one" — it is that a defaulted config value documented in prose will drift from the code that reads it.** State the default in exactly one place, and add a test that asserts the documented default equals the code default.
+
+### 3.9.6 The two mutually-exclusive bugs, and the branch that dissolves both
+
+Two real bugs, dated **2026-06-13**:
+
+**Bug A — the focus wedge.** A launcher-spawned Chrome *window* on the user's everyday profile wedges Chrome's internal focus state. Afterwards, new windows opened from *outside* the application silently no-op — the user clicks a link elsewhere on their machine and nothing happens. The only cure is fully quitting and reopening Chrome. Users do not connect this to your application at all; they think their browser is broken.
+
+**Bug B — the cold-start URL swallow.** On a cold Chrome start with "Continue where you left off" enabled, session restore consumes a bare URL argument. Chrome opens, restores yesterday's tabs, and your page never appears.
+
+The instinctive fixes are opposites. Bug B says "always pass `--new-window`." Bug A says "never spawn a window." Isolated-profile mode sidesteps both by never touching the everyday profile — at the cost of bookmarks and extensions.
+
+**The insight: these two bugs cannot co-occur, because they depend on opposite browser-running states.**
+
+- **Chrome already running** → a bare URL opens a **tab**. A tab cannot wedge focus (only a launcher-spawned *window* does that), and session restore already ran during Chrome's own startup, so there is nothing left to swallow your URL. **Bug B is impossible.**
+- **Chrome not running** → `--new-window <url>` forces the URL to display past session restore, and there is no running Chrome instance for a new window to wedge. **Bug A is impossible.**
+
+So you do not choose a side. **You branch on "is the browser already running" and pick the invocation that is safe in that state.**
+
+Detection, per platform: on Windows, a filtered task-list query for the Chrome image name, run with the no-window creation flag and a **4-second** timeout so it cannot flash a console or hang the launch; on macOS and Linux, a case-insensitive process-name grep for `chrome` and then `chromium`.
+
+**On any detection failure, return "yes, it is running."** This bias is deliberate and asymmetric:
+
+- A wrong "yes" costs you a rare cold-start bare-URL open — the page may not appear and the user reopens the shortcut. Annoying, recoverable in one click.
+- A wrong "no" spawns a window into a running Chrome and **wedges focus** — a confusing, sticky failure that outlives your application and requires quitting Chrome entirely.
+
+Bias away from the failure that is worse and harder to attribute.
+
+**Do not collapse the branch.** An unconditional bare URL reintroduces the cold-start swallow. An unconditional `--new-window` reintroduces the focus wedge.
+
+### 3.9.7 Degradation and detachment
+
+- **If the isolated profile directory cannot be created** (read-only checkout, permissions, full disk): log the specific error, set the profile to unavailable, and **fall back to a plain new window rather than failing the launch.** A cosmetic isolation feature must never be able to prevent the browser from opening.
+- **Spawn the browser detached** — a new session on POSIX, and inherently detached via the shell-execute path on Windows. Without detachment, restarting the engine sends a signal through the shared process group and **takes the user's browser window with it**. This was reported by Linux users as "my tab dies when the app recycles."
+- **Send browser standard output and error to the null device.** Chrome is chatty about GPU and desktop-bus warnings and will scroll over your launcher's own messages in a terminal launch.
+- **Log every browser-launch decision** to a dedicated log: chosen mode, whether the app window was used, whether a new window was forced, which finder path matched, and the result code. This is a rarely-exercised, platform-forked code path with several silent failure modes; the log is how you diagnose "it didn't open" without a reproduction.
+
+---
+
+## 3.10 Restart policy and the hard safety rule
+
+### 3.10.1 The scoped endpoint
+
+One endpoint, `POST /api/restart`, accepting a JSON body with an optional `scope`:
+
+| Scope | Ports killed | Web | Engine | Running sessions | Cost |
+|---|---|---|---|---|---|
+| `web` (default) | web port only | restarts | **survives** | **survive** | ~5–10 s |
+| `daemon` | engine port only | survives | restarts | **all destroyed** | hours of work |
+| `both` | both ports | restarts | restarts | **all destroyed** | hours of work |
+
+**Resolve both ports from the environment**, never as literals — the same three-variable policy as §3.7.7. A hardcoded port here is the documented cause of "Restart doesn't restart" on any non-default install: the endpoint dutifully killed the standard port while the server was bound elsewhere.
+
+When the scope is `web`, set `VIBENODE_PRESERVE_DAEMON=1` in the replacement's environment so the boot sequence skips the engine-port kill (§3.5, step 5) and skips the browser open (§3.5, step 12).
+
+**Launch the replacement through the choke-point script, not the raw entry point**, so the restart gets the boot splash, the `PATH` repair, and the revival-helper hook like every other start path.
+
+### 3.10.2 The detached helper that must survive being killed
+
+The endpoint cannot restart the process it is running inside. It spawns a **helper** that outlives it:
+
+1. Loop up to **10 times**: enumerate the process(es) listening on the target port(s) and force-kill them; sleep **500 ms**; break early when the port is clear.
+2. Recursively delete compiled-bytecode cache directories under the application root.
+3. Sleep **1 second** for ports to release.
+4. Export the preservation variable if the scope requires it.
+5. Launch the choke-point script detached, with output appended to a restart log.
+
+**Per platform:**
+
+| | Windows | POSIX |
+|---|---|---|
+| Helper shell | A shell scripting host one-liner | `bash -c '…'` |
+| Port enumeration | TCP-connection query by local port, taking unique owning process IDs | `lsof -ti :<port>` piped to a force kill |
+| Replacement spawn | Process-start cmdlet with the windowless interpreter, the entry script as argument, and the application root as working directory | `nohup <interpreter> <entry-script> </dev/null >> logs/restart.log 2>&1 &` |
+| Outer detachment | No-window flag **plus** new process group | **`start_new_session=True`** on the outer spawn |
+| Preservation variable | Set as a shell environment variable **before** the process-start call | **`export VAR=1;` before `nohup`** |
+
+### 3.10.3 The two POSIX bugs pinned into that code
+
+**Bug 1 — environment-variable prefix syntax is not valid before `nohup`. This silently broke every Linux web restart for months.**
+
+`VAR=value command` is a *shell* construct valid only for simple commands. Written as `nohup VAR=value cmd`, the shell parses `nohup` as the command and `VAR=value` as its first **argument**. `nohup` then tries to execute a file literally named `VAR=value` and dies with "No such file or directory."
+
+The damage is that the failure lands **after** the kill. The helper had already killed the web port, so the user got: no web server, an unresponsive interface, and no error anywhere they would look. The symptom read exactly as "restart is broken on Linux," which is a maddeningly generic bug report.
+
+**The correct form is `export VAR=1; nohup …`** — set the variable in the shell environment so `nohup` inherits it.
+
+Guard it three ways (§3.16.4): a source guard forbidding the broken pattern, a source guard requiring `export` to appear before `nohup` in the same construction, and an **execution probe** that runs the real shell construction with a harmless stand-in for the interpreter and asserts the child saw the variable with no `nohup` error. Add a fourth, unusual test: a **regression canary** that runs the *old broken* form and asserts it still fails. If that canary ever flips, the platform's behaviour changed and the guards can be revisited — a test that documents *why* the guard exists by demonstrating the bug.
+
+**Bug 2 — the missing new-session flag let the port kill cascade into the helper's own process group.**
+
+Without `start_new_session=True` on the outer spawn, the helper shell inherits the **web server's process group**. The helper then kills the web port — and that kill propagates back through the shared group and **kills the helper**, before it finishes spawning the replacement. The web server died, nothing replaced it, and no log said why. Windows gets group isolation implicitly from its process-start API; POSIX does not, and you must ask for it.
+
+**Also required:** redirect the helper's output to `logs/restart.log`, not the null device. Restarts break; when they do, the user needs something to read other than a dead page. Create the log directory before the redirect so the shell redirect itself cannot fail.
+
+`nohup … &` is kept for the *inner* spawn rather than `setsid` because macOS does not install `setsid` by default. With the outer new-session flag in place, the inner `nohup &` is sufficient.
+
+### 3.10.4 The hard safety rule
+
+> **No automated agent may ever restart the stateful process. This is not a guideline. There are zero exceptions.**
+
+Express it in exactly these terms, and put it where agents will read it (the contributor guide, the tool descriptions, and the endpoint's own docstring):
+
+- An agent may call the restart endpoint with `scope: "web"`, **and only when the user has explicitly asked for a restart in the current conversation.** Making a code change does not imply permission to restart.
+- An agent must **never** use `scope: "daemon"` or `scope: "both"`.
+- An agent must never kill, stop, or restart the engine by any other means: no direct process management, no task-kill, no signals, no spawning terminal windows to do it indirectly.
+- If a user asks an agent to restart the engine, the agent must **warn** that doing so terminates every active session and agent across the entire application, and direct the user to the explicit menu path so the destructive action requires a human hand.
+
+**The blast-radius justification, stated plainly:** the two operations share one endpoint and differ by a single string, but one costs ten seconds and the other destroys every running session unrecoverably — potentially hours of work the user cannot reproduce. **Authorization must be granted per blast radius, not per endpoint.** This is the generalizable rule from §3.1(5): when one parameter value is three orders of magnitude more destructive than another, it is a different operation and deserves a different permission level, even though your router cannot tell them apart.
+
+---
+
+## 3.11 The resilience layer: eight independent healing mechanisms
+
+Each mechanism below is **independent**: none depends on another being alive, and no two share a failure mode. That is the point. A single supervisor is a single point of failure, and the thing most likely to be killed by whatever killed your application is the supervisor sitting next to it.
+
+Every one of them obeys the same meta-invariant, stated once here and repeated per mechanism because it is the rule most often violated:
+
+> **A safety net must never be able to break the thing it protects.** A healer that can kill a healthy session, cycle a working socket, or restart-loop under a supervisor is a net negative — it converts a rare failure into a frequent one.
+
+### 3.11.1 (a) The phone-facing revival service
+
+**Problem.** Remote access maps a tunnel to the web port on loopback. That mapping lives inside the tunnel daemon and stays configured even when your application is completely down — so when the web server is not running, the phone gets the tunnel's own bare **502 Bad Gateway** page, with no application left to render a "Start" button. **From a phone, a stopped application is a dead link with no way back short of walking to the computer.**
+
+**Design.** A tiny, **dependency-free, standard-library-only** helper that keeps a "Start" page reachable on the web port *whenever the real server is absent*. Whoever holds that port is exactly what the phone sees: application up → the real application; application down → the Start page, and one tap relaunches through the same choke point the desktop shortcut uses.
+
+**State machine.** Three states, one **2-second** poll loop:
+
+| State | Meaning | Exit |
+|---|---|---|
+| `dormant` | The real server holds the web port | Web port goes silent → bind it, go to `serving` |
+| `serving` | The helper holds the web port and serves the Start page | A `/yield` control request, or the phone taps Start |
+| `waiting` | The port has been released; a real start is in flight | Real server binds → `dormant`; or the **90-second** grace deadline expires → re-show the Start page |
+
+A control server on a separate loopback port (**5052**, overridable via `VIBENODE_REVIVER_PORT`) exposes `POST /yield` and a `GET` status endpoint. The choke-point script `POST`s `/yield` on **every** launch, so the helper releases the port *synchronously* before the real server tries to bind it — **no port fight, and the helper process does not die.**
+
+The phone's Start button posts to `/start`, which merely **sets a flag**. The main loop consumes the flag and performs the yield-and-launch **off the serving thread** — a server cannot shut itself down from inside one of its own request handlers without deadlocking.
+
+When the helper launches the application, it first checks whether the engine is still alive on its port. If it is (the common case — the web server died alone), it sets `VIBENODE_PRESERVE_DAEMON=1` so live sessions survive. **This makes the phone's Start button strictly safer than the desktop shortcut.**
+
+**The six design invariants.** Reproduce all six:
+
+1. **Zero hot-path footprint.** While the application is up, the helper holds **no web port at all** — it only polls. It is never a proxy and never sits in front of live real-time traffic. It binds the web port *only* during the window when the application is down.
+2. **Stays private.** Both the serve socket and the control socket bind loopback only. Nothing new is exposed; the phone arrives through the *existing* tunnel mapping, exactly as it reaches the real application.
+3. **Singleton.** The helper holds the control port for its entire lifetime. A second instance fails that bind and exits. The choke point can therefore spawn one on every launch without ever stacking duplicates.
+4. **Gets out of the way cleanly.** `/yield` releases the port **without the helper process dying**, so the supervisor survives to help again next time.
+5. **Opt-in and self-retiring.** It exists only for users who enabled remote access. It re-reads that flag every loop and exits when the feature is turned off, taking its OS supervisor registration with it (§3.11.3).
+6. **No new dependency.** Pure standard library. It must run when the application's own packages are half-installed or broken — **that is often precisely why the server is down.**
+
+**One subtlety that is load-bearing.** Reading the config must distinguish three outcomes, not two:
+
+- file **absent** → never configured → feature off;
+- file **parsed** → use the flag;
+- file **exists but is unreadable right now** (a concurrent partial write, a momentary lock) → **"unknown — tear nothing down."**
+
+A partial-write race must never be read as "the user turned the feature off." Without this distinction, saving settings can silently uninstall your entire revival layer.
+
+**The 503-versus-502 distinction.** The helper answers **anything under `/api/` with HTTP 503** and a small JSON body identifying itself, never with its HTML page. This is what makes client recovery decisive:
+
+| What the client's health probe gets | What it means | Correct client action |
+|---|---|---|
+| `200` | The real server is alive | Clear failure count |
+| **`503`** | **The helper definitively owns the port; the application is down** | **Reload immediately, no threshold, no retry.** The reload lands on the Start page, which is not the application, so it cannot loop |
+| `502` / connection refused | The web server is gone and **nobody** is serving the port yet | **Do not reload** — a reload lands on the tunnel's script-less 502 page and strands the phone. Show the overlay after a small threshold and keep polling |
+
+That asymmetry is the whole trick. Without it, either death detection is slow (wait for a threshold on every case) or the phone gets stranded on a dead gateway page (reload on every case). Reproduced from a real report: "it just sits there until I manually refresh."
+
+If the helper answered `200` with its own HTML for API calls, the loaded application would conclude the backend is alive and **never surface the down state at all**.
+
+**Invariant that stops it breaking what it protects:** it binds the web port only when nothing else does; it yields synchronously on request rather than fighting; and if the bind fails between its probe and its attempt, it treats the port as "not ours," stays out of the way, and retries on the next poll.
+
+### 3.11.2 (b) The mutual-resurrection guardian
+
+**Problem.** The revival helper is just a process. Whatever killed the application — a broad "kill every interpreter" sweep, an out-of-memory kill, an agent tidying up — can take it too. Then the phone is back to a dead link.
+
+**Design.** A second, minimal sidecar started with a `--guardian` flag, whose only job is to respawn the helper when it dies. The helper, on each poll, checks the guardian and respawns *it* when it is missing. **Mutual resurrection: no single point of failure and no dependency on the OS scheduler.**
+
+- The guardian holds a loopback port (**5053**, `VIBENODE_GUARDIAN_PORT`) as **both its singleton lock and its liveness beacon**. A second guardian fails the bind and exits.
+- It must **drain the accept queue** — spawn a thread that accepts and immediately closes probe connections — or the listen backlog fills and liveness probes start failing against a perfectly healthy guardian.
+- It polls every **2 seconds** and never binds the web port or serves anything.
+- It honours the same opt-out: feature off → exit.
+
+**Invariant:** the guardian's only action is *spawning*. It never kills, never binds the web port, and never touches application state. The worst it can do is start a redundant helper, which immediately fails its own singleton bind and exits.
+
+### 3.11.3 (c) The self-installing per-checkout OS supervisor
+
+**Problem.** Mutual resurrection covers process death. It does not cover a **reboot**, or a sweep broad enough to kill both peers at once.
+
+**Design.** The helper registers an **OS-level autostart mechanism for its own checkout**, idempotently, on a background thread (the OS calls are slow and must never delay its real duties). The OS starts the helper; the helper ensures the OS mechanism exists. It also **self-uninstalls** when the feature is turned off, so nothing lingers.
+
+**Everything runs in the plain logged-in user context — no administrator rights, no elevation, no system service install.**
+
+| OS | Primary mechanism | Secondary | Notes |
+|---|---|---|---|
+| **Windows** | A tiny script file in the user's **Startup folder** that launches the helper windowless at logon | A scheduler task on a **2-minute** repeat for mid-session respawn, registered with limited privileges and verified with a follow-up query | The Startup file is **plain file I/O** — no service API, nothing a locked-down or virtualized environment can silently no-op. It is the load-bearing guarantee; the scheduler task is a bonus |
+| **macOS** | A per-user launch agent with **`RunAtLoad`** and **`KeepAlive`** | — | Restarts the helper *the instant* it dies. Event-driven, not polled |
+| **Linux** | A per-user service unit with **`Restart=always`**, **`RestartSec=5`**, and `WantedBy=default.target` | Best-effort user lingering so it can start before login | Written to the per-user unit directory; requires a reload and an idempotent enable-and-start |
+
+**Salt every registered name with a hash of the checkout path** (a short hex digest suffices) so multiple clones never fight over one task, agent, or unit.
+
+**The standby-flag fix — restart-loop under a supervisor.** Naively, a duplicate helper that finds the control port busy should exit cleanly. Under `Restart=always` that is a **permanent restart loop**: the service manager respawns the exiting copy every `RestartSec` forever — one process spawn every 5 seconds, for as long as a session-spawned helper owns the port.
+
+**Fix:** the unit sets `VIBENODE_REVIVER_STANDBY=1`. A copy carrying that flag does **not** exit on a busy control port — it enters **standby**, polls at twice the normal interval, and **takes over in-process** the instant the owner dies. A copy *without* the flag (the session-spawned one, which nothing respawns) exits immediately, because exiting fast **is** the singleton contract for that path. **Same flag, opposite correct behaviour, decided by who spawned you** — record the reasoning; it reads as an inconsistency until you know it.
+
+**The never-unload-your-own-agent trap.** On macOS the obvious idempotent registration is "unload then load." **Unloading your own agent sends a termination signal to the very process doing the unloading** — you kill yourself trying to install yourself. Instead: **load without unloading first**, ignoring the already-loaded error, since keep-alive already protects the running instance. Linux is the same shape: an idempotent enable-and-start that does **not** restart an already-running unit.
+
+**Invariant:** every step is best-effort; every failure degrades to lightweight, armed-each-launch behaviour with a log line. A supervisor that crashes the thing it supervises is worse than no supervisor. **Honest scope limit:** the OS-spawned copy uses **default ports**, so custom side-by-side instances are covered within a session but not across reboots.
+
+### 3.11.4 (d) The health monitor
+
+One background thread inside the engine, ticking every **30 seconds**, doing three independent read-mostly jobs.
+
+**Job 1 — stall detection and auto-restart.** A session that sits in the working state with **zero new output** for `STALL_AFTER_SECONDS` is wedged: a dead API call, a hung tool, a lost stream.
+
+**Measure progress with a cheap fingerprint of the entry list, not with elapsed time.** The fingerprint is `(entry count, length of the last entry's text, the last entry's timestamp)` — an O(1) tuple that catches both *new* entries and *in-place streaming growth* of the trailing entry.
+
+This is the central design decision. A healthy long turn can legitimately run for a very long time while continuously producing output. **If you time out on wall-clock duration you will kill your best long-running work.** The fingerprint distinguishes "slow" from "stuck," which elapsed time cannot.
+
+Tuning: `VIBENODE_STALL_MINUTES` (default **10**, floored at 60 s), `VIBENODE_STALL_MAX_RESTARTS` (default **2**), `VIBENODE_KEEP_AWAKE` (set `0` to disable).
+
+Recovery procedure, in order: (1) post a **visible system entry** naming the restart and the attempt number — silent recovery is indistinguishable from a bug; (2) **snapshot whether the session has queued messages before interrupting**, because the interrupt's idle transition auto-dispatches the queue and, when a queue exists, **the queue is the continuation** while a nudge would be noise behind it; (3) interrupt without clearing the queue; (4) if there was no queue, send a short resume nudge naming the watchdog and suggesting long commands be backgrounded; (5) on exceeding the cap, announce, interrupt once more, and **leave the session idle for manual review** — do not loop.
+
+Safety limits that stop the healer breaking sessions:
+- Sessions with a **scheduled wake-up pending** are never treated as stalled — they are legitimately quiet.
+- Sessions in a **compacting** sub-state are **never** auto-restarted; interrupting mid-compaction risks a truncated conversation. Log loudly instead.
+- Never fire inside a turn younger than the stall window, even if the fingerprint says otherwise.
+- The attempt counter resets only when the session is **observed idle** at a tick — the monitor's own interrupt-and-nudge returns to working within the same tick, so it is never miscounted as a recovery.
+- The tick body is wrapped so an unexpected error logs and keeps ticking. **The safety net must not die.**
+
+**Job 2 — sleep and suspend detection.** Compare monotonic time across iterations; a gap exceeding the tick interval by **`SLEEP_GAP_SECONDS` = 120** means the machine slept or the process was suspended (timer waits do not elapse during system sleep). On wake, **reset every stall clock**, giving in-flight turns a full grace window to recover through the existing stream-healing machinery first. Without it, every laptop-lid close mass-interrupts every running session on resume.
+
+**Job 3 — keep-awake (Windows only).** While at least one session is working, pulse the thread-execution-state API with the *system-required* flag once per tick, resetting the OS idle timer so the machine does not auto-sleep mid-turn. Deliberately **do not** pass the display-required flag — the screen may still turn off, which is what the user wants — and pulse **without** the continuous flag so the effect expires on its own the moment the monitor stops. Do not block an explicit user-initiated sleep or lid close; job 2 covers recovery for those.
+
+**Invariant:** the monitor only *reads* session state on its own thread and performs recovery through the same public, thread-safe entry points the web layer uses. It touches no performance-critical path.
+
+### 3.11.5 (e) The runaway CPU reaper
+
+**Problem.** The agent backend's CLI shells out to an external code-search binary during a turn. When a turn is interrupted, or the CLI otherwise loses track of one, that search process can be left running detached. On a large repository it then **pins every core indefinitely — observed in the wild at 1199% CPU sustained for 11 hours.** Several at once drives the load average into the twenties and starves everything: real-time round-trips time out, interface latency spikes, end-to-end tests fail, builds crawl.
+
+You cannot change how a third-party CLI spawns or reaps its children. **This is a safety net, not a root-cause fix, and you should say so in the code.**
+
+**Design.** A background thread in the engine sweeping every **`VIBENODE_REAP_INTERVAL_SECONDS` = 60**. Each sweep lists processes with their command name and accumulated CPU time, matches against an **explicit comm allowlist** (`VIBENODE_REAP_COMMS`, default: the single search binary), and force-kills any match whose CPU time is at or above **`VIBENODE_REAP_CPU_SECONDS` = 120**.
+
+**Keyed on accumulated CPU time, not wall time — and this is the whole safety argument.**
+
+- A genuine search finishes in a **fraction of a CPU-second** even on a huge tree. Only a runaway accumulates minutes. A 120-CPU-second threshold is **orders of magnitude** above anything legitimate, so the reaper can only ever hit true runaways.
+- A process that is merely **blocked or idle** consumes no CPU and is therefore **not causing load** — it is intentionally left alone. A wall-clock rule would kill it for the crime of waiting.
+
+Parsing detail: the process-listing time field is `[[DD-]HH:]MM:SS`. **Return a sentinel of `-1` on any parse failure** so an unparseable field is never treated as a runaway.
+
+**Invariants:** POSIX only — `start()` is a no-op returning `false` elsewhere. Disableable with `VIBENODE_REAP_DISABLED=1`. Never targets the engine, session CLIs, or anything outside the explicit allowlist. Never kills itself. Sweep errors are swallowed — **a reaper must never crash the process it lives in.**
+
+### 3.11.6 (f) The report-only leak detector
+
+**Problem, with its incident.** On **2026-07-19** a reproduction script leaked **64 spinning processes**. They reparented to the init process and ran for **20 hours — 615 CPU-hours** — pinning a 32-core machine at load 67. Nobody noticed until the box was unusable. It had been happening every couple of days.
+
+**Design.** A cross-platform report-only scanner. A process is reported only when **all three** hold, because any one alone is far too noisy:
+
+1. **Orphaned** — the parent is gone (reparented to init), or the recorded parent ID has been recycled by a newer process.
+2. **Burning CPU** over a **live sampling window**, not cumulative time. A quiet orphan is a daemon; a spinning orphan is a leak.
+3. **Old enough** to have survived a grace period, so a short-lived job mid-burst is not reported.
+
+Minimum CPU and minimum age are overridable (`--min-cpu`, `--min-age-min`); human report by default, `--json` for machines.
+
+**Exit codes: `0` clean (the scan *ran* and found nothing), `1` leaks reported, `2` the scan could not run** (missing process library, wrong platform). **Never conflate 2 with 0** — a tool must never report a clean bill of health it did not actually establish.
+
+**It never kills anything. That is a design decision, not an omission.** State the reasoning in the file:
+
+> An auto-killer is permanently racing the next novel leak pattern, and the cost of one wrong match here is severe: this machine hosts live AI sessions, and killing the session host aborts every one of them — **this has already happened.** Detection is high-value and safe; killing is low-marginal-value and unbounded-risk. So it prints a report and the exact command a human can run. Judgement stays with the operator.
+
+**Allowlist discipline.** Known long-lived, sometimes-busy daemons are allowlisted by name and command line. Two hard-won rules:
+
+- **Anchor to real binary and script paths.** An earlier pattern matched any checkout under a directory named `code/` — a very common layout — and silently allowlisted **every** process launched from there, i.e. exactly the leaks the tool exists to find. Test each entry against a repository path *and* a temp-directory path.
+- **Anchor to a path-component boundary, not to line start.** A script usually appears as the second argument behind its interpreter, so a start-anchored pattern matches nothing — but a bare directory prefix is too loose, and would hide leaks from the agent-hooks directory, which legitimately backgrounds processes and must stay **visible**.
+
+Schedule as a per-user timer: first run **10 minutes after boot**, then every **15 minutes**, with catch-up for missed runs. No elevation, nothing system-wide.
+
+### 3.11.7 (g) The session reaper — the one tool allowed to kill
+
+**Problem.** A session spawns a command; the command backgrounds a process; the command exits without reaping it. The child reparents to init and runs forever. The leak is **not the session's fault and cannot be fixed in whatever repository the script lives in** — any script anywhere can do this, and a shell trap cannot stop it (the shell defers trap handlers while blocked in a foreground command and skips them entirely under an uncatchable kill, and a tight-loop child ignores polite termination outright).
+
+**The ownership insight that makes killing safe.** Every spawned CLI is forced into its own session at spawn time (that is what lets orphans survive). But:
+
+> **Orphaning changes a process's PARENT (to init). It does NOT change its SESSION ID.**
+
+So every descendant of a session — however deeply nested, however orphaned, even after an intermediate process detaches itself — still carries the session id of the leader it came from. **A process cannot forge another session's id.** That yields an ownership claim that is *exact* rather than heuristic:
+
+> The session leader is **gone**, but processes carrying its session id are still running and burning CPU → **those are leaked, definitionally.**
+
+That precision is what makes reaping safe here where pattern-matching would not be. **We never kill on "looks like junk."**
+
+**Safety rails — all five must hold before anything is signalled:**
+
+1. The session **leader must be dead.** A live leader means a live session; never touch it no matter how much CPU it uses. A test suite is *supposed* to saturate the machine.
+2. The process must be **burning CPU over a live sampling window** (default minimum **20%**, sample window **1 second**).
+3. It must be **older than a grace period** (default **30 minutes**; the scheduled unit uses 10).
+4. It must not match the leak detector's allowlist — **shared by import**, so the two tools can never disagree about what is untouchable. If the allowlist cannot be loaded, **refuse to run** and say why: an unfiltered sweep could kill the session host.
+5. Session ids `0` and `1`, and the reaper's own session, are never candidates.
+
+**Dry run by default.** Killing requires an explicit `--reap`. Same three-value exit-code contract as the detector.
+
+**Platform honesty:** POSIX only — session ids do not exist on Windows, where it **exits 2 rather than pretending**. Name the Windows equivalent in the docstring (a job object with kill-on-close) so the gap is a known design note rather than an oversight.
+
+**Composition.** Schedule both tools in one unit, in this order, with deliberately different powers: first the session reaper **with** `--reap` (exact ownership → allowed to kill), then the leak detector **report-only** (pattern matching → never allowed to kill). Mark exit codes `0` and `1` as success — "leaks found" is a *successful detection*, not a unit failure — and deliberately leave `2` out, so "the scan could not run" surfaces as a failed unit instead of passing silently as a clean bill of health.
+
+**Related containment layer.** For anything that backgrounds processes and might not clean up (reproduction scripts, benchmarks, load tests), provide a wrapper that runs the command inside a transient control-group scope and reaps the **entire group** on exit. **Nothing escapes its control group**, whereas anything can escape its parent by detaching. Five rules learned the hard way:
+
+- **Probe the user bus, do not just check that the tool exists.** The binary is present under scheduled jobs and non-lingering remote sessions, but the per-user bus is not — and the tool then dies *after* you have committed to it, silently never running the command at all.
+- **Kill the group first, then stop the unit.** A plain stop waits out the default stop timeout on anything ignoring polite termination — and the shell defers your own exit trap while blocked there, **reproducing the very deferral bug the tool exists to fix.**
+- Read the *current task count* property; the similarly named plain property is always empty and made the leak report dead code.
+- **Degrade loudly, never block work.** Off-platform, run the command uncontained and say so on standard error.
+- **Say plainly what must not run under it:** anything you *want* to outlive the command (development servers) will be reaped. Launch those as their own named unit, so persistence is explicit rather than accidental.
+
+### 3.11.8 (h) Transport self-heal and API-error retry
+
+Two client-visible healers with published schedules.
+
+**Transport self-heal (browser side).** Full design, survivors, and tombstones live in the mobile-recovery part of this specification. Operational summary:
+
+- A **skeleton-stuck watchdog** in three stages, each firing only while the user is still looking at a stuck skeleton for the same session: **8 s** re-request the log; **16 s** probe the liveness endpoint over HTTP and, if HTTP is fine but the socket produced nothing, cycle the socket **once** (at most **1 per 60 s**); **28 s** full page reload (at most **1 per 120 s** via session storage, suppressed while a restart overlay is present).
+- The **server-reachable** check polls the liveness endpoint every **3 s** and raises a blocking overlay after **4** consecutive failures, with the 503/502 branch from §3.11.1.
+- A **decisive two-probe check** on every foreground event (visibility change, page show, focus, network online): probe immediately, and on failure **one** retry ~**1.2 s** later before the overlay. Mobile browsers freeze timers while backgrounded, so the interval poller needs ~6 s of foreground time to trip — far too slow. The retry absorbs the 1–3 s tunnel reconnection window (wifi handoff, radio waking) that otherwise flashed an "unreachable" overlay on **every** return to the app.
+- **The cap that matters most is a prohibition:** never cycle a socket that reports connected based on a heuristic. Cycling drops in-flight streams (there is no replay), triggers a fresh connect that cascades into engine IPC, and can chain across taps. **Only cycle on proof: a failed response to an actively-emitted probe, or a disconnect event from the transport itself.**
+
+**API-error auto-retry (engine side).** On a **transient** API error — overload, rate limit, gateway, network — the session resumes itself on an exponential backoff **spanning hours, so overnight work survives long outages.**
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `VIBENODE_API_RETRY_MAX` | **30** | Total automatic retries before giving up |
+| `VIBENODE_API_RETRY_BASE` | **10 s** | First delay |
+| `VIBENODE_API_RETRY_FACTOR` | **2** | Exponential factor |
+| `VIBENODE_API_RETRY_CAP` | **1800 s** | Maximum delay between attempts (30 min) |
+| `VIBENODE_API_RETRY_JITTER` | **0.2** | ±20% randomization |
+| `VIBENODE_API_RETRY_CONTINUE_PROMPT` | "Continue from where you left off." | The resume text |
+
+Rules that keep it from breaking sessions:
+
+- Surface `retry_at`, `retry_attempt`, `retry_max`, and `retry_reason` in the session state **always** (like the sub-status field), so the client can distinguish "no retry pending" from "key absent" and render a live countdown with **Cancel** and **Retry now** — computed locally from `retry_at`, so no per-second server emit is needed.
+- **A queued message must never preempt a pending retry.** Gate queue dispatch on `retry_at == 0` in one central place.
+- The retry budget **accumulates across the backoff chain** and resets only on a genuine new user message — never on an internal self-heal or auto-retry.
+- Classify unknown errors as **retryable** and let the attempt cap bound them, rather than guessing them fatal.
+- Track whether the session has ever produced a result: a transport crash *before* the first result cannot be resumed, so it must not be escalated into the long backoff.
+
+---
+
+## 3.12 Remote revival and the always-available start page
+
+**The promise:** *if the machine is on, the phone can always reach either the application or a button that starts it.*
+
+**Topology.** Phone → HTTPS over a mesh VPN → the machine's tunnel daemon → loopback web port. The mapping is configured once and lives in the tunnel daemon, **outside** your application, so it survives the application being completely down. **Never bind the application to a non-loopback interface** — remote access is the tunnel's job, and a LAN-exposed default is a security regression you cannot take back.
+
+**Layering.** Each layer covers the previous one's failure:
+
+| Layer | Covers |
+|---|---|
+| Real web server | Normal operation |
+| Revival helper (§3.11.1) | Web server dead, machine up, user logged in |
+| Guardian (§3.11.2) | Helper process killed |
+| OS supervisor (§3.11.3) | Both killed, or a reboot with a logged-in user |
+| Boot-access scripts (§3.13) | Reboot with **nobody** logged in |
+
+**The Start page itself.** Dark, single-card, mobile-first with safe-area insets, one large button, and an embedded **sentinel comment** so a client-side poller can tell "still the helper" from "the real application is up now." Two variants: the Start card, and a spinner "Starting…" card shown when a start is already in flight so a manual refresh does not look like nothing happened.
+
+**Readiness must mean fully ready — web *and* engine.** The page polls a full-stack health endpoint every **1.5 s** and navigates in **only** when the engine is connected: helper serving → `503` → wait; web booting with no engine → `200` with `daemon: false` → keep the spinner; both up → `200` with `daemon: true` → navigate in. This is the fix for landing on a half-booted, unstyled application. **Never hand the user in until the engine behind it is actually up.**
+
+That health endpoint must be **side-effect-free** — read the client's cached connection flag, no shell-out, no engine round-trip — and must stay **distinct from the trivial liveness endpoint**. One proves the web tier is alive; the other proves the whole stack is ready. Conflating them produces exactly the half-booted hand-off above.
+
+**Mobile timer freezing.** Phones suspend timers when backgrounded. Re-run the readiness check on **visibility change, page show, and focus** in addition to the interval, and poll **on load without waiting for a tap** — otherwise a phone parked on the Start page waits for a resumed tick, or a manual refresh, after the application is already up.
+
+**Survivability, stated honestly.** The helper survives a normal Stop because it does not match the stop script's kill patterns (different filename; it holds no application port while dormant) — which is the entire point: after a Stop, the phone can bring the application back. **It cannot defend against an indiscriminate "kill every interpreter" sweep.** It collapses the common failure window from *forever* to *one tap*, and that is the honest claim to make.
+
+**Per-machine identity.** Render the device name (configurable, defaulting to the short hostname) into the Start page title, the heading, the home-screen title, and a dynamically served web-app manifest, so a user with several machines can tell them apart on a phone home screen.
+
+---
+
+## 3.13 Pre-login boot access, and honest scope limits
+
+**The one window the revival layer cannot cover on its own: the machine rebooted and nobody has logged in yet.**
+
+The tunnel daemon runs as a *system* service, so the phone still reaches the machine — but nothing answers on the web port and the user gets a bare 502. Every autostart mechanism in §3.11.3 fires **at login**, not at boot. If the machine ever reboots unattended (power blip, automatic update, crash), the phone link is dead until someone physically logs in.
+
+**What "fixed" looks like:** power the machine off and on; **without touching it**, the phone shows either the familiar Start page (tap → running application) or, in the encrypted-home case, an **Unlock & start** page (type the login password → running application).
+
+Ship this as **opt-in, one-time setup scripts**, separate from the always-on machinery, each idempotent so it can be re-run after moving the checkout.
+
+| OS | Situation | Fix |
+|---|---|---|
+| **Windows** | Nothing runs before logon | A **boot-time scheduled task** that runs the helper windowless as the user, whether or not they are logged on |
+| **Linux**, unencrypted home | User services need lingering to start at boot | Enable lingering and re-register the helper's unit |
+| **Linux**, encrypted home | Pre-login, the unit file **and the helper script itself** are ciphertext — lingering cannot help | A tiny system-level unlock-and-start page installed **outside** the home |
+| **macOS** | Login agents fire at login; full-disk encryption blocks anything earlier anyway | **No safe pre-login path.** Enable automatic login, or accept the window |
+
+**Windows gotchas the script must handle or warn about:**
+- **Execution time limit** — tasks are killed after 72 hours by default. Set the limit to none.
+- **Battery** — tasks do not start on battery by default. Enable battery start, so a laptop that reboots on battery still recovers.
+- **Fast startup** — a Windows "shut down" is really a hibernate, and *at-startup* triggers may **not** fire on the next power-on (they always fire on Restart). **Detect and warn**, with the exact remedy.
+- **Full-disk encryption with a pre-boot PIN** — the machine never reaches the OS, so no software can help remotely. Say so.
+- The account password is required **once, at registration**, via a standard credential prompt handed straight to the scheduler. **Nothing is written to disk.**
+
+**The encrypted-home unlock page** is the most sensitive component in this chapter. State its security posture in the user-facing README, not just in code: binds **loopback only** and is reachable *solely* through the existing tunnel-only HTTPS mapping (**nothing new is exposed**); the password is **piped once to the stock unlock helpers' standard input** — never stored, logged, or present in a command line; **5 failed attempts → 15-minute lockout**; and the moment the home is mounted **by any means** it releases the port and goes dormant.
+
+**Honest scope limits — write them down, because a resilience feature that overstates its coverage is worse than one that admits gaps:** other encryption schemes have the same blindness but different unlock plumbing and are **not covered**; full-disk encryption that prompts at the boot console is **out of reach for any userspace service** (name the third-party tools that address it and stop there); and closing the pre-login window at all requires a machine-local component installed **outside the home** — elevation territory, which **the self-installer deliberately never touches.** Keeping the always-on path elevation-free is a promise; the opt-in script is where the user consciously trades it.
+
+---
+
+## 3.14 Singleton, port locking, and socket options
+
+### 3.14.1 Singleton
+
+Enforce "only one web server, only one engine" with a **kernel-managed named mutex** on Windows: race-free, and **auto-released when the owning process dies, even on a crash**. On POSIX, use an exclusive non-blocking advisory lock on a lock file under the user's application state directory.
+
+Two implementation requirements:
+
+- **Hold the handle for the entire process lifetime.** Stash it in a module-level structure so garbage collection can never release the lock out from under you. Do not close it; let the OS clean up on exit.
+- **Derive the lock name from the resolved port**, not from a constant. Every side-by-side or test instance otherwise fails the check because the production instance already holds the one hardcoded name. This is the same hardcoding class that produced the "Restart engine does nothing" report.
+
+**On a failed acquisition during a cold boot, log "stale singleton detected" and proceed anyway** — you have just killed the ports, so a still-held mutex means a dead owner, and refusing to start would leave the user with nothing.
+
+### 3.14.2 Port killing
+
+Kill anything listening on the target port before binding, retrying up to **5 times** with a **500 ms** pause between rounds, breaking early when nothing was killed. Per platform: a connection-table listing plus a force-kill on Windows; a socket-listing utility plus a force-kill on macOS; the same on Linux **with a fallback to the iproute2 socket tool**, because the usual utility is not installed by default on many distributions. Never kill your own process id. Skip the engine port when the preservation flag is set, and **log the skip explicitly** — a silent skip is indistinguishable from a bug.
+
+### 3.14.3 The same-flag-opposite-answer lesson
+
+**The address-reuse socket option is required in one place and catastrophic in another. Understand which, and why, before you copy a socket setup between components.**
+
+| Component | Address reuse | Reason |
+|---|---|---|
+| **Engine listener** | **Required — on** | Without it, a killed engine leaves its port in the kernel's wait state and the immediately-following restart **fails to bind**. Restart is a routine operation here; a restart that fails half the time is unusable |
+| **Revival helper's control port** | **Required — off** | Here **the port *is* the mutex.** The entire singleton contract is "a second instance fails the bind and exits." Address reuse lets a second process bind the same port and **hijack** it, silently defeating the guarantee |
+
+On Windows the default for the standard HTTP server class is address-reuse **on**, so the helper must **explicitly** set the exclusive-use socket option and clear the reuse flag. The guardian's beacon socket needs the same treatment.
+
+**The generalizable rule:** a socket option is not a style choice. Ask what the port *means* in this component. If it means "a service endpoint I want back quickly," reuse. If it means "a mutual-exclusion token," exclusive. Copying the option along with the socket code is how you get a supervisor that can be silently hijacked.
+
+### 3.14.4 Connection hardening
+
+Both sides, both mechanisms, exactly as §3.7.4: Nagle disabled, keepalive enabled, keepalive timers tightened to **idle 15 s / interval 5 s / count 3** (or a single combined **15 s** where that is all the platform exposes), plus an application heartbeat at **20 s** with an **8 s** timeout.
+
+---
+
+## 3.15 Logging and diagnostics
+
+### 3.15.1 The log set
+
+| File | Written by | Contents |
+|---|---|---|
+| `logs/_server.log` | Choke point + POSIX launcher | Spawn-mode evidence line, launcher output, early boot |
+| `logs/web_server.log` | Web entry point | Tee'd standard output and error, plus profiling records |
+| `logs/daemon_debug.log` | Engine | Engine output, spawn banners |
+| `logs/restart.log` | Restart helper | Restart-path output |
+| `logs/browser_open.log` | Browser opener | Every launch decision and result |
+| `logs/reviver.log` | Revival helper | State transitions, supervisor registration, spawns |
+
+**Tee, do not redirect.** Wrap standard output and error in a writer that forwards to both the original stream (when it exists) and the log file, flushing on every write. Under a windowless interpreter the original is `None` and the tee must tolerate that.
+
+**Route application loggers into the tee'd stream** at info level with a compact `HH:MM:SS [web] LEVEL message` format, attached to a **narrow namespace list** — the route namespace and the engine-client namespace — rather than the root, to avoid flooding from third-party libraries. **The engine-client namespace must stay in that list; removing it silences IPC latency profiling entirely**, and that has happened. Suppress the web framework's per-request logging and its startup banner. Log the engine protocol's **request id on both sides**, so a slow turn can be traced across the process boundary.
+
+### 3.15.2 Required diagnostic discipline
+
+When a user asks *"why is this slow?"*, they have already noticed it is slow. They are asking for something actionable.
+
+> **Forbidden response pattern: "Your context is ~X thousand tokens, which means turns will take ~Y seconds. Compact it."**
+
+That answer is not *wrong*. It is **useless** — it converts a diagnostic question into a shrug with a workaround attached. Large context is a factor in model latency, not a verdict, and the user cannot act on a restatement of physics.
+
+**Required behaviour instead:**
+
+1. **Diagnose the actual, specific bottleneck for that session at that moment**: browser-automation wall-clock time, a blocking tool call, a permission prompt waiting on approval, an oversized file snapshot, a task stuck in a loop, a saturated machine (see §3.11.5).
+2. If compaction genuinely would help, say so — **but only after naming the real bottleneck**, and frame it as one option among several.
+3. **If the slowness is caused by something fixable in the application itself** — snapshot size, turn latency, IPC overhead — **treat it as a bug to investigate and fix, not as something the user must work around.**
+
+Encode this as a standing instruction in the contributor guide, because the failure mode is an agent taking the cheapest available true statement and stopping there.
+
+### 3.15.3 No log rotation exists. This is a v1 requirement for a reimplementation.
+
+**Observed on a normally-used development machine:** the engine log at **107 MB**, the launcher log at **73 MB**, the web-server log at **73 MB**, the revival-helper log at under **1 MB**. Together roughly **250 MB of unbounded, unrotated plain text.**
+
+**This is a defect, stated plainly.** It is not a crash, which is exactly why it survived: nothing fails, the disk just fills, and the failure eventually lands somewhere far from its cause. A reimplementation must ship rotation from the first commit:
+
+- **Size-based rotation** with a per-file cap (10–20 MB is ample) and a small number of retained generations.
+- Rotation must be **safe for append-mode file handles held open by multiple processes** — the launcher, the entry point, and the engine all append to overlapping files. Prefer a rotation strategy that does not rename a file out from under an open handle, or reopen handles on rotation.
+- **Never rotate on the boot path** and never let a rotation failure block startup.
+- Sweep the temporary directory for orphaned boot-status files, which the stop script already does; generalize that to a startup-time cleanup of your own stale artifacts.
+
+---
+
+## 3.16 Testing strategy as an operational concern
+
+### 3.16.1 Layers
+
+| Layer | Scope | Default? |
+|---|---|---|
+| Unit / integration | Everything except the end-to-end directory; **60-second** per-test timeout | **Yes** — the default run ignores the end-to-end directory entirely |
+| End-to-end (browser-driven) | Real server, real browser, `e2e` marker, **300-second** timeout | No — opt in explicitly |
+| Guard tests (§3.16.4) | Read production source and assert patterns still exist | Yes, in the default run |
+
+Declare markers explicitly (`e2e`, `slow`, `live_server`) so an undeclared marker is an error rather than a silent no-op.
+
+### 3.16.2 The two autouse isolation guards, and the incident behind them
+
+> **Incident, 2026-05-03.** A migration test constructed a repository object with its **default path** — the user's real database — and ran a clear-all-data routine against it. **It wiped the user's live database.**
+
+Two **autouse** fixtures, applied to every test with no opt-in required, now make that class of bug impossible:
+
+**Guard 1 — redirect the home directory** to a per-test temporary directory. Several engine components compute their persistence paths from the home directory **inside their constructors**, so any test constructing a manager without explicit fixtures was reading from *and* writing to the user's real state files. Guard 2 caught the writes; **reads succeeded silently**, so a queue file polluted by an earlier leak caused order-dependent failures in unrelated tests. Redirecting home eliminates the read path entirely. Pre-create the subdirectories tests expect (projects, downloads) — **add to that list rather than skipping the fixture**, because a missing directory produces order-dependent not-found flakes.
+
+**Guard 2 — block production paths.** Wrap the database connect call and the file-write call, and **raise immediately** if either is invoked with a production path: the real database, the real config file, or anything under the real history root. The message must name the offending test, the exact path, and **the specific correct alternative**.
+
+Three notes that make these work:
+- **Resolve the production path constants at module import**, before the home-redirect fixture runs, so the write guard's tripwire still points at the *real* paths.
+- **The guard cannot be opted out of globally. That is the entire point.**
+- Once home is redirected, anything that legitimately needs the *real* profile (a manually installed browser driver) must resolve it through an OS environment variable the fixture does not touch — document that, or you will chase a confusing skip.
+
+**Also snapshot and restore `PATH` per test:** repeated monkeypatched appends accumulate until the environment block overflows the platform limit and subsequent operations raise.
+
+**Cleanup fixtures must snapshot, not name-match.** A cleanup that removed directories starting with a test prefix missed cloned and UUID-named artifacts and **leaked 52 orphan projects into production data**. Snapshot the directory before each test; remove anything new afterwards.
+
+### 3.16.3 Page objects and the no-bare-sleeps rule
+
+End-to-end tests use a **page-object architecture**: one class per screen, all inheriting a base page that owns navigation and every wait helper. Tests express intent ("open the board, drag this card"); the page object owns the selectors and the timing.
+
+The base page defines two timeouts — a **default of 10 seconds** and a **long of 90 seconds** for genuinely slow operations (a real model turn) — and a complete set of condition-based waits: present, visible, clickable, invisible, contains-text, and count-at-least.
+
+**The rule: no bare sleeps in tests. Ever.** Every wait must be a condition wait with a timeout. A bare sleep is simultaneously too short (flaky on a loaded machine) and too long (slow on a fast one), and it tells you nothing about *what* you were waiting for when it fails. If you find yourself needing a sleep, the missing piece is an observable condition — add one to the application if necessary.
+
+Capture screenshots on failure into a gitignored directory and upload them as CI artifacts. A browser test that fails with only a stack trace is nearly undiagnosable.
+
+### 3.16.4 CI policy
+
+Trigger the browser suite three ways: **manual dispatch** (with an optional single-file input), a **nightly schedule**, and on pull requests **path-filtered** to the directories that can actually affect it (templates, client assets, application, engine, the test directory itself, the entry point, requirement files, and the workflow file). Job timeout: **30 minutes**.
+
+**Budget-capped API key.** Use a **dedicated test key with low rate limits** so a runaway test — an infinite loop, a pathological prompt — cannot blow up production billing. Fall back to the production key only when no test key is configured, **and emit a warning annotation so the gap is visible** rather than silently costing money.
+
+**No reruns. This is a policy, not an oversight.**
+
+> Flaky tests must be **fixed**, not retried. A test that passes one time in three still ships if reruns mask it. If a real network or driver glitch surfaces, fix the test — do not paper over it.
+
+Upload the test report **always**, and the failure screenshots **on failure**.
+
+### 3.16.5 The guard-test genre — executable standing instructions
+
+**This is the most transferable idea in the chapter.**
+
+A guard test **reads production source text and asserts that a pattern is still present** (or still absent). It does not exercise behaviour. It exists because prose rules in a contributor guide get lost, and because the invariants that matter most are exactly the ones that look like cruft to a well-meaning simplifier.
+
+Use one when **all four** hold:
+
+1. The invariant is **invisible in normal operation** — nothing fails at build, boot, or test time when it is removed.
+2. The failure it prevents is **rare, remote, and hard to attribute** (a browser default, a suspended laptop, a closed window hours later).
+3. It is **cheaper to assert the pattern than to reproduce the condition** — often the condition cannot be reproduced in CI at all.
+4. The correct code **looks removable** — a "redundant" flag, an "unnecessary" duplicate, a "verbose" fallback.
+
+**Every guard test's assertion message must contain the reason and the incident**, not just the rule. The message is the only documentation the person deleting the pattern will ever read.
+
+Representative inventory:
+
+| Guard | What it asserts | What breaks without it |
+|---|---|---|
+| Chrome finder exists (×3 platforms) | A platform-specific Chrome finder function is defined | Voice input silently disappears for every non-Chromium default browser |
+| Chrome before fallback (×3) | The finder appears **before** the system opener in the same block | Same, but subtler — the fallback quietly becomes the primary path |
+| Shell-execute on Windows | The Windows block uses the shell-execute call | Browser window opens behind a windowless parent and never appears |
+| No subprocess / no generic opener in the Windows browser block | Absence of ordinary process creation and of the library opener | The invisible-window bug; the library opener adds the wrong-browser bug too |
+| Snap path present | The finder checks the snap install location | Chrome installed via snap is invisible; the user is told it is not installed |
+| Launcher starts minimized | The Windows launcher still minimizes | Documents *why* the shell-execute constraint exists; relax only together |
+| Engine detachment (POSIX / Windows) | New-session flag in the non-Windows branch; new-process-group flag on Windows | Closing the launch terminal — or restarting the web tier — kills the engine and every session |
+| Browser detachment (POSIX ×2) | New-session flag **and** null-device stdio on the browser spawn | Engine restart takes the user's browser with it; browser noise scrolls over launcher output |
+| Restart: forbidden env-prefix | The broken `nohup VAR=…` form is **absent** | Every Linux web restart dies after killing the port — no server, no error |
+| Restart: required export form | `export VAR=1` appears **before** `nohup` | Same |
+| Restart: execution probe | The real shell construction propagates the variable with no error | Catches a rewrite that keeps the source pattern but breaks the semantics |
+| Restart: regression canary | The **old broken form still fails** | Tells you when the platform changed and the guards can be revisited |
+| Separate reader/emitter threads | Both named threads exist in the IPC client | A blocking real-time emit stalls the reader and every IPC call times out |
+| Deferred resync after reader start | The deferred resync thread exists | Resync sent before the reader is listening blocks for 30 seconds |
+| Parallel snapshot operations | The parallel-await construct is present | Sequential awaits add 60–70 ms to every turn |
+| Cache TTL floor | The git-listing cache TTL parses to **≥ 120** | Subprocess spam in rapid-turn sessions |
+| Count-without-serialization / post-turn-only scan / debounced saves | Each perf-critical shape is still present in the engine source | 25–32 ms per call; a 199-file scan per message; disk-write latency per queue op |
+| Client-side identifier set, watchdog dedup globals, timing marks | Each client-side perf shape is still present | Thousands of linear scans per response; doubled IPC load; all timing data lost |
+| Slash-command interception | The interception function or command map exists | Slash commands are silently eaten; the session sits idle forever |
+| No-window flag consistency | Subprocess-heavy modules import the no-window flag | Console windows flash during ordinary operations |
+
+**One guard deserves special mention as a pattern:** the *regression canary* — a test that runs the **old, broken** construction and asserts it **still fails**. It converts "we fixed this" into "and here is the proof the underlying hazard is still real." When a canary starts failing the wrong way, the platform changed and your guard may be obsolete. Very few test suites do this; it costs five lines and it dates your assumptions.
+
+---
+
+## 3.17 Documentation and marketing automation
+
+Three artifact families, all generated, all kept out of the hand-maintained path.
+
+**API documentation.** A machine-readable API description plus a static reference viewer served from a dedicated route, with supporting files served from the same directory. Alongside it, prose documents for the **engine IPC protocol** and the **real-time event catalogue**. Open the IPC document with an explicit warning: **external consumers must use the HTTP API and the real-time layer, never the internal protocol.** An internal protocol that acquires external consumers stops being changeable.
+
+**Marketing screenshots.** A headless-browser script producing marketing imagery by **injecting a fixed synthetic dataset into the DOM** — no API writes, no database changes, and it must not disturb the running application's ports. Two properties make it safe: **zero writes** (it reads the real, styled application and paints fabricated content over it, so real user data can never leak into a published screenshot and a screenshot run can never corrupt anything), and **deterministic data** (the same board, cards, and names every time, so screenshots are reproducible and diffable across releases).
+
+**Video and splash rendering.** Keep the launch-video build and the splash-frame renderer as scripts under the documentation tree, so the splash's visual design (§3.2.3) is re-rendered from the same tokens the product uses rather than diverging into a hand-edited image.
+
+**Rule:** every generated artifact must be regenerable from a committed script with no manual steps, and no generation script may write production data or bind a production port.
+
+---
+
+## 3.18 Consequential decisions
+
+| Decision | What we chose | Why | What breaks if you choose differently |
+|---|---|---|---|
+| Process model | **Two processes**: restartable web tier, durable session engine | A UI restart must not cost the user hours of running work | Every interface bug fix and every code change destroys all in-flight sessions |
+| Launcher detachment | **Windowless interpreter** (Windows); **`nohup` + background + `disown`** (POSIX) | The user must be able to close any window the launcher opened | The 2026-06-12 incident: a closed window kills the server; sessions survive but are unreachable |
+| Browser target | **Chrome/Chromium first, always, on all three platforms** | The speech API is Chromium-only and fails **silently** elsewhere | Voice input vanishes with no error for every user whose default is Firefox — shipped once already |
+| Windows browser invocation | **Shell-execute API**, not process creation | Focus-safe under a windowless parent *and* targetable at Chrome | The browser window is created and never appears; user clicks the icon again |
+| Browser launch mode | **Branch on "is Chrome running"** rather than picking a side | The focus wedge and the cold-start swallow are mutually exclusive by browser state | Unconditional bare URL → cold-start swallow; unconditional new window → focus wedge |
+| Restart authorization | **Scoped**, with `web` allowed to agents and engine scopes **forbidden** to them | Blast radius, not endpoint identity, governs permission | An agent "helpfully" restarts the engine and destroys every running session |
+| Revival helper posture | **Binds the web port only while the real server is absent**; never a proxy | Zero footprint on the hot path; never sits in front of live traffic | A permanent proxy adds latency and becomes a new single point of failure |
+| Revival API responses | **503** for API paths, never the HTML page | Makes client recovery decisive and prevents a false "alive" reading | The loaded app thinks the backend is up and never surfaces the down state |
+| Duplicate-instance policy | **Exit fast** when session-spawned; **stand by** when supervisor-spawned | A clean exit under `Restart=always` is a permanent restart loop | One process spawn every 5 seconds, forever, for as long as the real helper lives |
+| Address-reuse socket option | **On** for the engine, **off** for the helper's control port | Engine: restart must rebind immediately. Helper: the port **is** the mutex | Engine restarts fail intermittently; or a second helper hijacks the control port and the singleton silently fails |
+| Stall detection signal | **Entry fingerprint**, not elapsed time | A healthy long turn produces output continuously; a wedged one does not | You kill your best long-running work, or you never detect a stall at all |
+| Runaway reaper signal | **Accumulated CPU time**, not wall time | Legitimate searches use a fraction of a CPU-second; idle processes cause no load | Wall-clock rules kill blocked-but-harmless processes and miss short spinners |
+| Leak detector power | **Never kills** | One wrong pattern match takes down the session host | An auto-killer permanently races novel leak patterns with unbounded downside |
+| Session reaper power | **Allowed to kill**, on session-id ownership only | Orphaning changes the parent, not the session id — an exact claim, not a guess | Pattern-based killing eventually kills a live session host |
+| Test isolation | **Two autouse guards** that cannot be opted out of | 2026-05-03: a test wiped the user's live database | The same class of bug recurs, and the next one may not be recoverable |
+| CI reruns | **None** | A test that passes one time in three still ships if reruns mask it | Flakiness accumulates until the suite means nothing |
+| Standing invariants | **Guard tests** over prose rules | Prose gets lost; tests fail | Every hard-won fix is one "cleanup" away from being deleted |
+| Log rotation | **None today — a known defect** | (No reason. Nobody noticed because nothing fails) | ~250 MB of unbounded plain text; eventual disk exhaustion far from its cause |
+
+---
+
+## 3.19 Non-negotiable rules
+
+1. **Every start path goes through one choke-point script.**
+   *Failure mode if violated:* an environment repair added for one launch method silently does not apply to the others — and the ones it misses are the ones non-technical users actually use.
+
+2. **The web server spawns detached on every platform.**
+   *Failure mode if violated:* the user closes a window that looks like clutter and their running work becomes unreachable, with no error and nothing to click.
+
+3. **Write the spawn-mode evidence line at every startup, by self-assessment.**
+   *Failure mode if violated:* a detachment regression is invisible until the moment it matters, hours later, and the user who hits it cannot describe it.
+
+4. **Open Chrome/Chromium explicitly on all three platforms; the system opener is only ever a fallback. On Windows, use the shell-execute call — never plain process creation, never the generic opener.**
+   *Failure mode if violated:* voice input disappears silently for every user whose default browser is not Chromium-based; and on Windows the browser window is created behind a windowless parent and never surfaces.
+
+5. **Branch the browser invocation on whether the browser is already running, and bias detection failures to "running." Wait until the server answers before opening anything.**
+   *Failure mode if violated:* the cold-start URL swallow, or the focus wedge — which outlives your application and breaks the user's browser until they quit it entirely. Opening early makes a connection-refused page the first impression of the product.
+
+6. **No automated agent may ever restart the stateful process. Web scope only, and only on explicit user request.**
+   *Failure mode if violated:* every running session and agent across the entire application is destroyed, unrecoverably, by a routine code change.
+
+7. **Set the preservation flag on web-scope restarts; skip the engine-port kill and the browser open when it is set.**
+   *Failure mode if violated:* a "restart the interface" action kills the sessions it was supposed to preserve, and spawns duplicate browser windows.
+
+8. **On POSIX, `export VAR=1;` before `nohup` — never the env-prefix form. Spawn the restart helper in a new session.**
+   *Failure mode if violated:* the helper kills the port and then dies, leaving no server, no replacement, and no error the user can find. Silently broke every Linux restart for months.
+
+9. **Resolve every port, singleton name, and restart target from environment variables.**
+   *Failure mode if violated:* a test instance kills the user's production server, or restart silently targets a port nothing is bound to.
+
+10. **Address reuse on for the engine listener; exclusive bind for any port used as a mutex.**
+    *Failure mode if violated:* restarts fail intermittently on a lingering wait state, or a second supervisor hijacks the control port and the singleton guarantee silently evaporates.
+
+11. **Detect stalls by output fingerprint, never by elapsed time. Never auto-restart a compacting session.**
+    *Failure mode if violated:* the watchdog kills healthy long-running turns, or truncates a conversation mid-compaction.
+
+12. **Reap on accumulated CPU time with an explicit allowlist, orders of magnitude above any legitimate value.**
+    *Failure mode if violated:* the reaper kills a blocked-but-harmless process, or misses the runaway that is melting the machine.
+
+13. **Pattern-matching tools never kill. Only exact session-id ownership authorizes a kill, and only when the leader is dead.**
+    *Failure mode if violated:* one loose pattern takes down the session host and aborts every running session — this has already happened.
+
+14. **A scan that could not run must never exit as "clean."**
+    *Failure mode if violated:* you report a clean bill of health you never established, and the next incident is attributed to something else entirely.
+
+15. **The revival helper answers API paths with 503, never with its own HTML.**
+    *Failure mode if violated:* the loaded application believes the backend is alive and never surfaces the down state; the phone is stranded.
+
+16. **Never bind the application to a non-loopback interface. Remote access goes through the tunnel only.**
+    *Failure mode if violated:* the application is exposed on every LAN the machine ever joins, by default, forever.
+
+17. **Two autouse test-isolation guards, un-opt-out-able: redirect the home directory, and block production paths. Cleanup fixtures snapshot state; they never match on names.**
+    *Failure mode if violated:* a test wipes the user's live data (2026-05-03), or generated artifacts leak into production data (52 orphan projects, once).
+
+18. **No bare sleeps in tests. No reruns in CI.**
+    *Failure mode if violated:* the suite becomes slow *and* unreliable, and stops carrying information.
+
+19. **Convert every hard-won invariant into a guard test whose failure message carries the incident.**
+    *Failure mode if violated:* the fix is one plausible-looking cleanup away from deletion, and the person deleting it will have no way to know.
+
+20. **Every degradation is announced with the exact remedy, and every healer swallows its own exceptions.**
+    *Failure mode if violated:* the user experiences a silently missing feature as "this product is broken"; or the safety net becomes the most common cause of the outage it exists to prevent.
+
+21. **"Your context is large" is never an acceptable answer to "why is this slow."**
+    *Failure mode if violated:* diagnostic questions get shrugs, real bottlenecks stay unfixed, and the product's own performance bugs are laundered into user error.
+
+---
+
+## 3.20 Implementation prompts
+
+Build in this order. Each prompt is self-contained and ends with acceptance criteria.
+
+### v1 — critical
+
+```
+PROMPT 3.1 — The launch choke point and the detached spawn
+
+Create ONE entry script that every start path invokes: desktop shortcut,
+Windows launcher, POSIX launcher, restart endpoint, remote start button,
+pre-login page.
+
+In order, it must: (1) chdir to its own directory; (2) on POSIX, prepend the
+missing user/toolchain bin directories to PATH, resolving the Node version
+manager's active version from its env var or by following alias-of-alias
+indirection in its default-alias file; (3) redirect stdout/stderr to
+logs/_server.log when either is None; (4) append the spawn-mode evidence line;
+(5) launch the boot splash with a notification fallback; (6) run the
+revival-helper hook; (7) execute the real entry point IN PROCESS (do not
+re-exec).
+
+Write the Windows launcher (windowless interpreter, detached start with the
+mandatory empty title argument, immediate exit; console-interpreter fallback
+only when the windowless one is genuinely absent) and the POSIX launcher
+(nohup + background + disown-with-no-argument; 1.5 s liveness probe naming
+the two log files on failure).
+
+Acceptance:
+- Closing every window the launcher opened leaves the server running.
+- logs/_server.log contains a line of the form
+  `<script> spawn exe=<name> mode=<detached|attached>(…) sid=… pgid=… pid=…`
+  with mode determined by self-assessment (POSIX: sid == pid; Windows:
+  interpreter filename).
+- Launching from a desktop entry with no login shell still resolves the agent
+  backend's CLI on PATH.
+- Nothing prints before the stream redirect.
+```
+
+```
+PROMPT 3.2 — Two-process split, ports, and connection hardening
+
+Implement the web tier (default 5050) and the session engine (default 5051),
+with VIBENODE_WEB_PORT / VIBENODE_DAEMON_PORT overrides, VIBENODE_TEST_PORT
+(5099/5098) skipping ALL production setup, and the engine spawned by the web
+tier — detached (new process group on Windows, new session on POSIX), with an
+explicitly constructed environment, a spawn banner in the shared engine log, an
+inert do-not-kill marker token appended to its command line, a 100 × 0.1 s bind
+poll, an early exit when the child is already dead, three distinct failure
+messages, and the last 30 lines of the engine log printed inline on failure.
+
+Transport: newline-delimited JSON over loopback TCP with request ids. On BOTH
+sides: Nagle off, keepalive on, keepalive idle 15 s / interval 5 s / count 3,
+plus a 20 s application heartbeat with an 8 s timeout. Client reconnect every
+2 s, progress events for the first 10 attempts, and engine respawn at attempt 5.
+
+Acceptance:
+- Restarting the web tier leaves every running session intact.
+- Suspending and resuming the host recovers the link within ~30 s with no
+  manual action.
+- Killing the engine produces a blocking overlay AND an automatic respawn.
+- A second instance on 7050/7051 runs alongside the first with no interference.
+```
+
+```
+PROMPT 3.3 — The one-click startup experience
+
+Deliver the complete first-run and every-run experience for a user who will
+never open a terminal.
+
+Shortcuts: Windows .lnk targeting the WINDOWLESS interpreter (resolved as a
+sibling of the running interpreter, never a fixed path), arguments = quoted
+absolute path to the choke point, working directory = application root, bundled
+.ico at index 0, minimized window style. macOS: /Applications symlink or an
+executable two-line .command on the Desktop. Linux: a .desktop entry with
+Terminal=false, ABSOLUTE baked-in paths (tilde and $HOME do NOT expand in
+Icon=/Exec=), a PNG icon (not .ico), marked executable and trusted.
+
+Self-heal: on every startup, on a background thread, READ the existing shortcut
+first; rewrite it only if the target is not the windowless interpreter or the
+icon path is wrong; swallow every exception.
+
+Splash: a separate windowless process. 480 × 490, borderless, always-on-top,
+centred, fully canvas-rendered at ~60 fps (~16 ms tick), fading in from
+transparent on an ease-out-cubic curve at ~0.035 alpha per frame, drifting
+particles at 0.12–0.35 alpha over a dark gradient, eased progress
+interpolation, a live step list, a percentage counter with an ETA, and the
+product's own dark-theme tokens. It must animate even when no step is
+advancing.
+
+Status protocol: an append-only text file whose path is passed BOTH as argv and
+via VIBENODE_BOOT_STATUS_FILE. Lines: STEP:<name> | DONE | ERROR:<text>. The
+splash polls from a saved byte offset. Steps, in order: cache, loading, ports,
+deps, daemon, server, browser. Delete the status file on a 5 s timer after
+DONE; sweep stale files in the stop script.
+
+Degradation: pre-flight the GUI toolkit IN THE PARENT (the child exits silently
+with status 0); fall back to a native notification carrying the same message,
+and on Linux put the missing package name in the toast itself; suppress native
+crash dialogs in the splash process; the splash is cosmetic and may fail at any
+point without affecting boot.
+
+Acceptance (written from the user's point of view):
+- I double-click one icon. Nothing else is required of me, ever.
+- A window appears within about a second and is visibly alive.
+- I always know what is happening: named steps, a moving percentage, an ETA.
+- The window never freezes, even during a multi-minute first-run install.
+- The browser opens on a working application and the splash disappears.
+- I can close anything on my screen without killing my work.
+- If something is missing, the app tells me exactly what to install and starts
+  anyway.
+- On a machine without the GUI toolkit I still get a notification — never
+  silence.
+```
+
+```
+PROMPT 3.4 — Boot sequence, budgets, and the boot watchdog
+
+Implement the ordered phases: standard-library-only boot hardening FIRST
+(pre-seed the platform cache without calling the machine-architecture helper —
+read PROCESSOR_ARCHITECTURE instead; arm a 120 s stack-dump autopsy), cache
+purge, watchdog start, heavy imports (NAMED), port kill (engine port only when
+VIBENODE_PRESERVE_DAEMON != 1, logging the skip), singleton gate, shortcut
+self-heal, dependency check, background update thread, engine ensure, app build,
+browser open (skipped under the preservation flag), then bind 127.0.0.1.
+
+Budgets: cache 20 s, loading 75 s, ports 30 s, deps 600 s, daemon 45 s,
+server 60 s; watchdog ticks every 3 s and on overrun dumps stacks AND writes
+an ERROR: line naming the step, the elapsed seconds, the likely cause, and the
+log file.
+
+Dependencies: capture output, check the return code, print the last 20 stderr
+and 10 stdout lines on failure, and say so explicitly on timeout.
+
+Background updater: 24 h throttle via a state file, VIBENODE_NO_AUTO_UPDATE
+opt-out, waits for boot-complete then probes the network every 300 s, 120 s per
+subprocess, captures to a TEMP FILE (never pipes — a grandchild inheriting a
+pipe makes the communicate call hang forever after a timeout kill), returns None
+as the status to mean "timed out", and NEVER restarts the engine automatically.
+
+Acceptance:
+- A wedged platform query produces a stack dump and a visible splash error
+  instead of an infinite freeze.
+- A failed dependency install prints the real error and never says "installed
+  successfully".
+- A dead network delays nothing at boot; the update lands whenever
+  connectivity returns.
+```
+
+```
+PROMPT 3.5 — Browser launch policy
+
+Implement the Chrome finders for all three platforms per §3.9.2 (registry
+first on Windows; snap, Flatpak, and /opt paths on Linux; app bundles on
+macOS). Windows uses the shell-execute API; macOS and Linux use detached
+subprocess spawns with null-device stdio and a new session.
+
+Wait for the server to answer its own URL (60 × 1 s) before opening anything.
+
+Implement both launch modes from a config key `browser_launch_mode`
+("app" | "tab"), the isolated profile under data/chrome-profile (gitignored),
+and the running-state branch: browser running → bare URL (tab); browser not
+running → --new-window <url>. Detection biases to TRUE on any failure. If the
+profile directory cannot be created, log it and fall back to a plain new window
+rather than failing the launch. Log every decision to logs/browser_open.log.
+
+Acceptance:
+- Voice input works on a machine whose default browser is Firefox.
+- With the browser already open, launching adds a tab and never wedges focus;
+  new windows opened from elsewhere on the machine keep working.
+- With the browser closed, launching displays the page even with session
+  restore enabled.
+- The server never receives a request before it can answer one.
+```
+
+```
+PROMPT 3.6 — Restart endpoint, helper, and the safety rule
+
+Implement POST /api/restart with scope web|daemon|both, ports resolved from the
+environment, VIBENODE_PRESERVE_DAEMON=1 set for web scope, and a detached
+helper that survives its own port kill: 10 × (kill listeners, 500 ms sleep,
+break when clear), purge bytecode caches, sleep 1 s, then launch the CHOKE
+POINT.
+
+POSIX: `export VAR=1; nohup … </dev/null >> logs/restart.log 2>&1 &`, with
+start_new_session=True on the OUTER spawn. Windows: shell-scripting-host
+one-liner with the windowless interpreter, no-window flag plus new process
+group. Create the log directory before the redirect.
+
+Document the hard rule in the contributor guide, the endpoint docstring, and
+any agent-facing tool description: web scope only, on explicit user request
+only; engine scopes forbidden to agents with the blast-radius justification and
+the manual menu path.
+
+Acceptance:
+- A Linux web restart works and preserves running sessions.
+- The helper survives killing the port it is standing on.
+- logs/restart.log contains the replacement's output when a restart fails.
+- Four guard tests cover the shell syntax, including the regression canary.
+```
+
+```
+PROMPT 3.7 — Singleton, port locking, and socket options
+
+Kernel-named mutex on Windows / exclusive file lock on POSIX, handle held for
+process lifetime, name derived from the RESOLVED port. Port kill with 5 retries
+at 500 ms, per-platform enumeration with the iproute2 fallback on Linux. Stale
+acquisition failure during a cold boot logs and proceeds.
+
+Address reuse ON for the engine listener; exclusive bind (and reuse explicitly
+disabled) for any port used as a mutex — the helper's control port and the
+guardian's beacon. Document both, together, with the reason each way.
+
+Acceptance:
+- Two instances on the same port cannot both run.
+- A test instance on 7050/7051 does not fail the singleton check.
+- Killing the engine and immediately restarting it binds successfully.
+- A second helper cannot hijack the control port.
+```
+
+```
+PROMPT 3.8 — Health monitor, and the client-side liveness backstop
+
+Engine-side monitor thread, 30 s tick, three jobs: stall detection via the
+(count, last text length, last timestamp) fingerprint with
+VIBENODE_STALL_MINUTES (10) / VIBENODE_STALL_MAX_RESTARTS (2); sleep detection
+at a 120 s gap beyond the tick, resetting all stall clocks on wake; Windows
+keep-awake pulsing the system-required flag only while a session is working
+(never the display flag, never continuous).
+
+Recovery: announce a visible system entry, snapshot the queue BEFORE
+interrupting, interrupt without clearing, nudge only when there was no queue,
+and on cap leave the session IDLE. Never touch sessions with a pending wake-up
+or in a compacting sub-state. Wrap the tick so it can never die.
+
+Client: a trivial, side-effect-free liveness endpoint plus a 3 s poll raising a
+blocking overlay after 4 consecutive failures, and a decisive two-probe check
+(immediate + one retry at ~1.2 s) on visibility change, page show, focus, and
+network online.
+
+Acceptance:
+- A wedged turn recovers automatically and says so in the timeline.
+- A healthy 40-minute turn that streams output is never interrupted.
+- A laptop lid close and reopen does not mass-interrupt sessions.
+- Killing the web server surfaces the overlay within ~5 s with a working
+  recovery path.
+```
+
+```
+PROMPT 3.9 — Test isolation, page objects, and guard tests
+
+Two autouse fixtures: redirect the home directory to a per-test temp dir
+(pre-creating the projects and downloads subdirectories) and block production
+paths by wrapping the database connect and file write calls, with error
+messages naming the test, the path, and the correct alternative. Resolve the
+production path constants at module import. Snapshot and restore PATH per test.
+Cleanup fixtures snapshot directories; they never match on name prefixes.
+
+Page objects: one class per screen over a base page owning navigation and every
+condition wait (default 10 s, long 90 s). NO bare sleeps anywhere.
+
+Guard tests: implement the inventory in §3.16.5, each with an assertion message
+carrying the reason and the incident. Include at least one regression canary.
+
+Acceptance:
+- No test can open the production database or write the production config, even
+  by accident, even without requesting a fixture.
+- The default test run ignores the end-to-end directory and finishes fast.
+- Deleting any guarded pattern from production source fails a test with a
+  message explaining why the pattern exists.
+```
+
+### v1.5 — resilience and remote access
+
+```
+PROMPT 3.10 — The revival helper, the guardian, and the OS supervisor
+
+Standard-library-only helper: control port 5052 (VIBENODE_REVIVER_PORT) held
+for life as the singleton, serve port = the web port, 2 s poll, 90 s start
+grace, three states (dormant | serving | waiting), POST /yield releasing the
+port synchronously WITHOUT dying, POST /start setting a flag consumed by the
+main loop off the serving thread, and API paths answered with 503 JSON — never
+HTML.
+
+Config reads distinguish absent (off), parsed (use the flag), and unreadable
+(unknown — tear nothing down). Launch with VIBENODE_PRESERVE_DAEMON=1 when the
+engine is still alive.
+
+Guardian: `--guardian` mode holding port 5053 as singleton and beacon, draining
+the accept queue, 2 s poll, respawning the helper; the helper respawns it.
+
+OS supervisor, salted per checkout path: Windows Startup-folder script (primary)
+plus a 2-minute scheduler task verified by a follow-up query; macOS launch agent
+with RunAtLoad + KeepAlive, LOADED WITHOUT UNLOADING FIRST; Linux user unit with
+Restart=always, RestartSec=5, and Environment=VIBENODE_REVIVER_STANDBY=1 so a
+supervisor-spawned duplicate stands by instead of exiting into a restart loop.
+Register on a background thread; self-unregister when the feature is disabled.
+
+Start page: dark mobile-first card with a sentinel comment, polling a full-stack
+health endpoint every 1.5 s and navigating in only when web AND engine are both
+up, re-checking on visibility change, page show, and focus.
+
+Acceptance:
+- Killing the web server makes the phone show a Start page within ~4 s.
+- One tap brings the application back and the phone lands on a FULLY rendered
+  app, never a half-booted one.
+- Killing the helper: the guardian restores it. Killing both: the OS restores
+  them. Rebooting with a logged-in user: they come back.
+- With the feature off, no task, agent, or unit remains registered.
+- No restart loop appears in any service manager's log.
+```
+
+```
+PROMPT 3.11 — Runaway reaper, leak detector, session reaper, containment
+
+Engine-side runaway reaper: POSIX only, 60 s sweeps, explicit comm allowlist
+(VIBENODE_REAP_COMMS), 120 CPU-second threshold (VIBENODE_REAP_CPU_SECONDS),
+VIBENODE_REAP_DISABLED opt-out, -1 sentinel on unparseable time fields, never
+kills itself or anything off the allowlist, never crashes the engine.
+
+Leak detector: report-only, three simultaneous conditions (orphaned + burning
+CPU over a live window + old enough), shared allowlist anchored to real
+binary/script paths at path-component boundaries, exit codes 0/1/2 with 2 never
+conflated with 0, --json mode, and an explicit in-file statement that it never
+kills and why.
+
+Session reaper: dry-run by default, --reap to act, five safety rails (dead
+leader, live CPU burn, minimum age, shared allowlist, never sid 0/1/self), and
+exit 2 rather than pretending on Windows.
+
+Scheduled unit: session reaper --reap FIRST, then the report-only detector;
+success statuses 0 and 1 only. Timer at 10 min after boot, then every 15 min,
+with catch-up.
+
+Containment wrapper: transient control-group scope, probe the user bus (not
+just the binary), kill the group before stopping the unit, read the current-task
+count property, degrade loudly and run uncontained off-platform, and document
+what must NOT run under it.
+
+Acceptance:
+- A pinned core from a stray search process is released within ~60 s.
+- No live session, no matter how much CPU it burns, is ever killed.
+- A scan that cannot run reports "did not run", never "clean".
+- A script that backgrounds processes under the wrapper leaves nothing behind.
+```
+
+```
+PROMPT 3.12 — API-error auto-retry and transport self-heal
+
+Engine: classify transient errors (overload, rate limit, gateway, network) and
+arm an exponential backoff — base 10 s, factor 2, cap 1800 s, ±20% jitter, max
+30 attempts, all env-overridable. Surface retry_at / retry_attempt / retry_max /
+retry_reason ALWAYS in the session state. Queue dispatch is gated centrally on
+retry_at == 0. The budget accumulates across the chain and resets only on a
+genuine new user message. Unknown errors default to retryable. A transport
+crash before the first result is not escalated.
+
+Client: a live countdown computed locally from retry_at, with Cancel and
+Retry-now. Skeleton watchdog at 8 s (re-request), 16 s (HTTP probe, then at most
+one socket cycle per 60 s), 28 s (reload, at most once per 120 s, suppressed
+under a restart overlay). NEVER cycle a connected-looking socket on a heuristic.
+
+Acceptance:
+- An overnight session survives a multi-hour backend outage and resumes itself.
+- The countdown is accurate with no per-second server traffic.
+- A queued message never jumps ahead of a pending retry.
+- No code path cycles a socket without proof the transport is broken.
+```
+
+### v2 — hardening and polish
+
+```
+PROMPT 3.13 — Log rotation (fix the known defect)
+
+Add size-based rotation to every log in §3.15.1: per-file cap of 10–20 MB, a
+small number of retained generations, safe for append handles held open by
+several processes concurrently, never on the boot path, and never able to block
+startup. Sweep stale boot-status files at startup as well as in the stop script.
+
+Acceptance:
+- After a synthetic month of heavy use, total log size is bounded and
+  predictable.
+- Rotation while the launcher, the entry point, and the engine all hold append
+  handles loses no lines and raises nothing.
+```
+
+```
+PROMPT 3.14 — Pre-login boot access (opt-in)
+
+Ship idempotent one-time setup scripts, clearly separated from the always-on
+machinery, with an honest README covering per-OS coverage AND the gaps.
+
+Windows: a boot-time scheduled task running the helper windowless as the user
+whether or not they are logged on; credentials prompted once and never written
+to disk; execution time limit set to none; battery start enabled; fast-startup
+detected and warned about; pre-boot-PIN encryption named as out of scope.
+
+Linux: enable lingering and re-register the unit for unencrypted homes; for an
+encrypted home, offer a system-level unlock-and-start page installed outside the
+home — loopback-only, password piped once to the stock unlock helpers' stdin
+(never stored, logged, or in argv), 5 failed attempts → 15-minute lockout, and
+dormant the moment the home is mounted by any means.
+
+macOS: document that there is no safe pre-login path and give the two honest
+options.
+
+Acceptance:
+- Power the machine off and on. Without touching it, the phone shows either the
+  Start page or the Unlock page.
+- The README states every uncovered case explicitly rather than implying full
+  coverage.
+```
+
+```
+PROMPT 3.15 — Documentation and generated-artifact automation
+
+Ship the machine-readable API description with a static reference viewer, plus
+prose documents for the engine IPC protocol and the real-time event catalogue —
+the IPC document opening with the "external consumers must not use this" warning.
+
+Ship the marketing screenshot script (headless browser, pure DOM injection,
+zero API writes, zero database changes, must not disturb production ports,
+fixed deterministic dataset) and the splash/video renderers.
+
+Acceptance:
+- Every published artifact regenerates from a committed script with no manual
+  steps.
+- No generation script writes production data or binds a production port.
+- No screenshot can contain real user data, by construction.
+```
+
+---
+
+### The ordering principle
+
+**Build in incident order, not in architectural order.**
+
+Every item above exists because something broke in a specific way on a specific day, and the sequence of the prompts is roughly the sequence in which those failures actually hurt: first the user could not start the application, then they could start it but closed a window and lost it, then they could keep it running but their browser silently dropped a feature, then they could restart it but the restart killed the wrong process, then everything worked until they walked away from the machine.
+
+You will be tempted to build the resilience layer early because it is the interesting part. Do not. **A healer built before the failure it heals is a guess** — and the eight mechanisms in §3.11 are valuable precisely because each one is shaped around an observed incident rather than an imagined one. Ship §3.1–§3.10 first, run it on real machines, and let the incidents tell you which healer to build next.
+
+And when you build them, hold every one of them to the single rule that governs this entire chapter:
+
+> **A safety net must never be able to break what it protects.**
+
+A watchdog that kills healthy long turns, a reaper that matches too loosely, a supervisor that restart-loops, a socket healer that cycles a working connection, a duplicate instance that hijacks a mutex port — each of these converts a rare failure into a frequent one, and each of them is a *plausible* implementation of a *correct* idea. The difference between the two is always the same thing: an invariant that is stated, justified with its incident, and pinned with a test.
 
 
 ---
@@ -13020,6 +14781,5443 @@ You have built the right thing when all of the following are true at once:
 - Two sessions asked to edit the same file notice each other and one backs off.
 - Closing the launcher window, locking the screen, and returning an hour later leaves everything running and the UI showing current truth.
 - The phone works, and the server is still bound to loopback.
+
+
+---
+
+## 13.12 Component catalogue
+
+Every value below is normative. Where a colour has a token, the token name is given; literal hex appears only where the source hardcodes a value outside the token layer (this is itself design debt — see 13.19).
+
+### 13.12.1 Buttons
+
+There are five distinct button families. They do not share a base class; the clone should unify them behind one, but must reproduce all five appearances.
+
+**Family A — the workhorse `.btn`**
+
+| State | Background | Border (1px) | Text | Other |
+|---|---|---|---|---|
+| default | `--bg-btn` | `--border-btn` | `--accent-btn-text` | padding 5px 12px, radius 6px, 12px, `white-space: nowrap` |
+| hover | `--bg-btn-hover` | `--border-btn-hover` | `--text-heading` | — |
+| `.primary` | `--bg-btn-primary` | `--border-btn-primary` | `--accent-text` | — |
+| `.primary:hover` | `--bg-btn-primary-hover` | `--border-btn-primary-hover` | `--accent-light` | — |
+| `.danger` | inherits `--bg-btn` | `#4a2020` | `#ff6b6b` | — |
+| `.danger:hover` | `#2e1515` | `#883333` | `#ff6b6b` | — |
+| `:disabled` | unchanged | unchanged | unchanged | `opacity: 0.4; cursor: default` |
+
+Transition: `background 0.15s, border-color 0.15s`. No active/pressed state. No focus ring.
+
+**Family B — the modal button `.pm-btn`** (the most complete button in the system; adopt this as the base)
+
+Padding 8px 20px, radius 8px, 13px/600, `border: 1px solid transparent`, `outline: none`.
+Transition `background 0.15s, border-color 0.15s, transform 0.1s`.
+
+| State | Treatment |
+|---|---|
+| `:active` | `transform: scale(0.97)` |
+| `:disabled` | `opacity: 0.4; cursor: default; pointer-events: none` |
+| `:focus-visible` | `box-shadow: 0 0 0 2px var(--accent)` |
+| `.pm-btn-primary` | bg + border `--accent`, text `#fff`; hover → `--accent-hover` both |
+| `.pm-btn-secondary` | bg `--bg-btn`, border `--border-btn`, text `--text-secondary`; hover → `--bg-btn-hover` / `--border-btn-hover` / `--text-heading` |
+| `.pm-btn-danger` | bg + border `#cc3333`, text `#fff`; hover `#dd4444` |
+
+**Family C — the capsule header pill.** One shape used across the top bar and toolbars: `height: 26px; border-radius: 13px; background: var(--bg-card); border: 1px solid var(--border-light); color: var(--text-muted); font-size: 11px; padding: 5px 10px; line-height: 1; display: inline-flex; align-items: center; box-sizing: border-box`. Hover uniformly `border-color: var(--border-hover); color: var(--text-heading)`.
+
+| Member | Deviation |
+|---|---|
+| `.hdr-sys-btn` | canonical |
+| `#btn-theme` | padding 5px 8px, `line-height: 0` (icon only) |
+| `#btn-git-publish` / `-update` / `-sync` | padding 4px 10px, gap 5px, `display: none` until relevant; `:disabled` → `opacity: 0.5; cursor: default` |
+| `.toolbar-close` | 14px font, padding 5px 8px, `margin-left: auto; order: 99` |
+| `.btn-group-label` | padding 5px 10px, 11px/500, gap 3px, `user-select: none`; open state `.grp-open` → bg `--bg-active`, border `--accent`, text `--accent-text`; transition 0.12s |
+| `#btn-memory`, `#btn-help` | gap 5px; `#btn-help` 13px/700, padding 5px 10px |
+| `.live-load-more-btn` | radius 14px, padding 5px 14px, 11px, border `--border-subtle`; `:disabled` opacity 0.6 |
+
+**Family D — icon-only ghost buttons.** `background: none; border: none; padding: 4px (or 4px 5px, 2px); border-radius: 4–6px; line-height: 0; color: var(--text-faint); transition: color 0.12s, background 0.12s`. Hover → `color: var(--text-heading); background: var(--bg-hover)`. Members: `.sidebar-collapse-btn`, `.sidebar-menu-btn`, `.kanban-colcfg-btn`, `.kanban-detail-close-btn`, `.compose-settings-btn`, `.kanban-col-gear-btn`, `.overlay-close` (absolute top 16 right 16, 22px, padding 4px 8px, radius 6px).
+
+Hover-revealed variants start at `opacity: 0` and go to 1 when the *parent card* is hovered (`transition: opacity 0.15s`): `.ws-hide-btn`, `.ws-folder-menu-btn` (→ 0.5, then 1 on its own hover), `.kanban-context-btn`, `.compose-sort-gear` (0.5 → 1), `.kanban-drill-subtask-actions` (0 → 1), `.kanban-drill-ver-action`, `.invoke-dept-use`, `.project-item-actions`. **On touch devices `.project-item-actions` is forced to `opacity: 1` via `@media (hover: none)`** — reproduce this or first-tap-reveals/second-tap-acts breaks touch.
+
+**Family E — full-width CTA.**
+
+| Class | Size | Radius | Type | Hover | Active |
+|---|---|---|---|---|---|
+| `.dash-new-btn` | 100% × padding 12px | 10px | 14px/600, `#fff` on `--accent` | `--accent-hover` | `scale(0.98)` |
+| `.planner-accept-btn` | 100% × padding 10px | 8px | 14px/600, `#fff` on `--accent` | `filter: brightness(1.15)` | — |
+| `.hb-btn` | padding 10px 28px | 8px | 13px/600 display-font, `#fff` on `--accent` | `opacity: 0.85` | — |
+| `.ws-empty-primary` | padding 10px 24px | 10px | 13px/600 | `opacity: 0.85; translateY(-1px)` | — |
+| `.mc-cta` | padding 13px 22px | 12px | 15px/600 | lighter accent | `scale(0.97)` |
+| `.kanban-create-ai-btn` | 100% × padding 10px 12px | 8px | 13px/600 on `--bg-hover` | bg+border `--accent`, `#fff` | — |
+
+**Circular / square send buttons.** `background: var(--accent); color: #fff; border: none; display: flex; align-items: center; justify-content: center; flex-shrink: 0`.
+
+| Class | Size | Radius | Hover | Active |
+|---|---|---|---|---|
+| `.dash-new-send` | 42×42 | 10px | `--accent-hover` | `scale(0.93)` |
+| `.chat-send-btn` | 36×36 | 10px | `--accent-hover` | `scale(0.93)`; disabled opacity 0.4 |
+| `.kanban-create-submit` | 40 wide, stretch | 8px | `brightness(1.15)` | — |
+| `.kanban-planner-send` | 36×36 | 8px | `brightness(1.15)` | — |
+| dense-card send | 36×36 | 50% | `#409cff` | `scale(0.86)` |
+
+The dense-card send uses hardcoded `#0a84ff` with `box-shadow: 0 2px 10px rgba(10,132,255,0.5)` (hover `0 3px 14px …0.6`, active `0 1px 5px …0.3`).
+
+**Ghost / dashed buttons.** Two dashed idioms:
+- *Add-card tiles* (`.ws-add-folder-card`, `.ws-add-session-card`): `border-style: dashed; border-color: rgba(255,255,255,0.12); background: rgba(255,255,255,0.02)`; blur and shadow explicitly removed. Hover → border `--accent`, bg `rgba(124,124,255,0.06)`, `translateY(-2px)`. Light theme: border `rgba(0,0,0,0.1)`, hover bg `rgba(100,100,220,0.04)`.
+- *Add-row buttons* (`.kanban-add-card`, `.kanban-add-subtask`, `.kanban-drill-spawner-btn`, `.wf-config-add-dept`, `.ws-ai-assist-btn`): `border: 1px dashed var(--border)`, radius 6–10px, padding 8–12px, 11–13px, text `--text-faint`; hover → border and text both `--accent`. `.kanban-drill-spawner-btn` additionally flips `border-style: solid` on hover. `.ws-ai-assist-btn:disabled` → `opacity: 0.7; cursor: wait; border-style: solid; border-color/color: var(--accent)` (this is the loading state).
+
+**Toggle chips.** A selected-state chip always reads: tinted background + coloured border + coloured text.
+
+| Class | Radius | Padding | Font | Active state |
+|---|---|---|---|---|
+| `.view-toggle-btn` | 5px | 4px 8px | 13px | bg `--bg-sort-active`, border `#5555aa`, text `--accent-text` |
+| `.wf-sort-btn` | 12px | 3px 10px | 11px | same as above |
+| `.kanban-create-pos-btn` | 10px | 3px 10px | 11px/600 | bg+border `--accent-dim`, `#fff` |
+| `.kanban-ai-autonomy-pill` | 10px | 2px 8px | 10px | bg+border `--accent-dim`, `#fff` |
+| `.chat-suggestion` | 18px | 6px 14px | 12px | (no active; hover = `--bg-btn-hover`) |
+| `.respond-opt` | 6px | 7px 18px | 13px/600 | rest: `#ffb700` on `--bg-question-label` with `#ff9500` border; hover *inverts* to `#ff9500` bg + `#000` text |
+| `.live-opt-btn` | 5px | 4px 10px | 11px | rest bg `--bg-active`, border `#4444aa`, text `--accent-text`; `.opt-allow` → `--idle-border`/`--idle-label`, `.opt-deny` → `--result-err`, `.opt-always` → `--border-light`/`--text-muted` at 10px, `.opt-secondary` → `opacity: 0.7` |
+| `.compose-shared-prompts-pill` | 20px | 4px 10px 4px 12px | 12px/500 | border `--accent`, bg `--status-working-dim`, plus `box-shadow: 0 0 0 1px var(--accent) inset`; has a real `:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }` |
+
+**The gradient special-effect button `.invoke-btn`.** This is the one deliberately "premium" control.
+
+| Property | Value |
+|---|---|
+| padding / radius | `3px 10px 3px 7px` / 8px |
+| background | `linear-gradient(135deg, rgba(168,85,247,0.15), rgba(59,130,246,0.15))` |
+| typography | 11px/700, monospace stack, `letter-spacing: 0.03em` |
+| label fill | `linear-gradient(135deg, #a855f7, #3b82f6)` + `background-clip: text` + transparent text fill |
+| transition | `all 0.2s ease` |
+| hover | gradient alphas → 0.3/0.3; `translateY(-1px)`; `box-shadow: 0 2px 12px rgba(139,92,246,0.25)`; text `--text-primary` |
+| active | `translateY(0)` |
+| light theme | gradient alphas 0.1 rest / 0.2 hover |
+
+Two companions share its palette: `.invoke-pill` (rendered in the message stream — radius 20px, padding 4px 14px, solid `linear-gradient(135deg, #a855f7, #6366f1, #3b82f6)`, `#fff` 12px/700, `box-shadow: 0 2px 8px rgba(139,92,246,0.3)`), and `.invoke-float-label` (radius 8px, 0.2-alpha gradient, `1px solid rgba(168,85,247,0.3)`, entrance `invokeFloat 0.25s ease`).
+
+When invoke is armed the composer textarea gets a **gradient border** via the two-background trick: `background-image: linear-gradient(bg, bg), linear-gradient(135deg,#a855f7,#6366f1,#3b82f6)`, `background-origin: border-box`, `background-clip: padding-box, border-box`, `border: 2px solid transparent`, plus `box-shadow: 0 0 0 2px rgba(139,92,246,0.15), 0 0 20px rgba(139,92,246,0.1)`.
+
+### 13.12.2 Inputs, textareas and selects
+
+Universal conventions: `outline: none` everywhere; focus is signalled by **border colour alone** in all but three components; placeholder is always `--text-faint`; textareas that grow use `resize: none` plus a JS-driven height with `transition: height 0.15s ease`; anything editable inside a modal uses `font-family: inherit`.
+
+| Class | Radius | Padding | Font | Background | Border | Focus |
+|---|---|---|---|---|---|---|
+| `.modal input` | 6px | 8px 12px | 13px | `--bg-input-alt` | `--border-light` | `--border-focus` |
+| `.pm-input` | 8px | 10px 14px | 14px | `--bg-input` | `--border-input` | `--border-focus` |
+| `.ns-select` | 8px | 9px 12px | 13px | `--bg-input` | `--border-input` | `--border-focus`; `appearance: auto` |
+| `.ns-textarea` | 8px | 9px 12px | 13px mono | `--bg-input` | `--border-input` | `--border-focus`; min-height 80, `resize: vertical` |
+| `.live-textarea` | **12px** | 14px 16px | 14px / 1.6 / ls .01em | `--bg-input-alt` | `--border-secondary` | `--accent` + `box-shadow: 0 0 0 3px rgba(124,124,255,0.1)`; min 56 / max 300 |
+| `.live-textarea.waiting-focus` | — | — | — | — | — | `#ff9500` + `0 0 0 3px rgba(255,149,0,0.1)` |
+| `.chat-input` | 10px | 10px 14px | 13px | `--bg-input` | `--border-input` | `--border-focus`; min 20 / max 120 |
+| `.dash-new-input` | 10px | 10px 14px | 13px | `--bg-input` | `--border-input` | `--border-focus`; min 48 / max 120 |
+| `.kanban-create-input` | 8px | 10px 12px | 14px | `--bg-input` | `--border` | `--accent` |
+| `.kanban-create-textarea` | 8px | 10px 12px | 13px | `--bg-input` | `--border` | `--accent`; min 60, `resize: vertical` |
+| `.kanban-detail-input` / `-textarea` | 6px | 8px 10px | 13px | `--bg-secondary` | `--border` | `--accent`; textarea min 80 |
+| `.kanban-drill-add-input` | 8px | 9px 12px | 13px | `--bg-primary` | `--border` | `--accent` + `0 0 0 2px rgba(88,166,255,0.12)` |
+| `.kanban-settings-input` | 6px | 8px 10px | 13px | `--bg-secondary` | `--border` | `--accent` |
+| `.te-input` | 6px | 6px 8px | 12px | `--bg-input` | `--border-input` | `--border-focus` |
+| `#find-input` | 5px | 5px 10px | 12px | `--bg-input-alt` | `--border-light` | `--border-focus` |
+| `#respond-input` | 6px | 10px | 13px | `--bg-input-alt` | `--border-light` | `#ff9500`; min 70 / max 300 |
+| `.invoke-search` | 10px | 8px 12px | 13px | `--bg-input-alt` | `--border-subtle` | `--accent` |
+| `.compose-sidebar-search` | 6px | 6px 8px | 11px | `--bg-input` | `--border` | `--accent` |
+| `.compose-empty-hero-input` | 10px | 12px 16px | 14px | `--bg-input` | `--border` | `--accent`; min 60 |
+| `#inline-rename-input` | 5px | 3px 8px | 14px/600 | `--bg-active` | `--accent` (already) | — |
+| `.mc-search-input` | 12px | 8px 12px 8px 32px | 13.5px | `rgba(118,118,128,0.22)` | **none** | background lifts to `0.3` |
+| `.mc-input` | 14px | 8px 12px | 13px | `rgba(118,118,128,0.2)` | **none** | background lifts to `0.3`; min 36 / max 120 |
+| `.kanban-inline-edit` | 3px | 2px 4px | 13px/500 | `--bg-primary` | `--accent` | — |
+| `.kanban-tag-inline-input` | — | 2px 4px | 11px | none | none | width animates **64px → 120px** (`transition: width 0.2s`) and colour → `--text-primary` |
+
+The borderless `rgba(118,118,128,α)` fields are the iOS-styled surfaces (dense card grid + its top bar). Their light-theme alphas are 0.12 rest / 0.18 focus.
+
+Native form controls (`input[type=checkbox]`) are styled only with `accent-color: var(--accent)`; the compose selection checkbox is 14×14.
+
+### 13.12.3 Toggles and switches
+
+| Class | Track | Radius | Off | On | Knob | Travel | Transitions |
+|---|---|---|---|---|---|---|---|
+| `.pref-toggle` | 40×22 | 999px | `--bg-btn` | `--accent` | 18×18, `#fff`, inset 2px, `box-shadow: 0 1px 3px rgba(0,0,0,0.3)` | `translateX(18px)` | track `background 0.18s ease`; knob `transform 0.18s cubic-bezier(0.16,1,0.3,1)` |
+| `.kanban-toggle` | 36×20 | 20px | `--bg-tertiary` | `--accent` | 16×16 `::before`, `#fff`, left/bottom 2px | `translateX(16px)` | `background 0.2s`; `transform 0.2s` |
+| `.compose-settings-toggle` | 36×20 | 10px | `--bg-subtle` | `--green` | 16×16, `#fff`, `0 1px 3px rgba(0,0,0,0.2)` | `translateX(16px)` | `0.2s` both |
+
+`.pref-toggle` is the only one with `:focus-visible { box-shadow: 0 0 0 2px var(--accent) }`. `.kanban-toggle` is a hidden-checkbox pattern (`input { opacity:0; width:0; height:0 }` + `input:checked + .kanban-toggle-slider`); the other two are buttons driven by an `.on`/`.active` class.
+
+### 13.12.4 Cards
+
+**Launcher card `.homepage-card`** — the largest, most decorated surface.
+
+| Property | Value |
+|---|---|
+| radius / padding | 20px / `44px 36px 36px` |
+| background | `linear-gradient(160deg, var(--bg-card) 0%, var(--bg) 100%)` |
+| border | 1px `--border-light` |
+| top hairline | `::before` 1px full-width `linear-gradient(90deg, transparent, rgba(255,255,255,0.06), transparent)` |
+| transition | `border-color 0.25s, transform 0.2s, box-shadow 0.25s` |
+| hover (all) | `translateY(-4px)` |
+| hover (per variant) | border → variant hue; `box-shadow: 0 12px 40px rgba(hue,0.12), 0 0 0 1px rgba(hue,0.15)` |
+| icon wrap | 52×52, radius 14px, `rgba(hue,0.1)` fill, icon in hue, `margin-bottom: 28px` |
+| title | 24px/700, `--text-heading`, `letter-spacing: -0.3px` |
+| description | 14px / 1.65, `--text-muted`, `margin-bottom: 28px`, `flex: 1` |
+| CTA row | 13px/600 in the hue, `gap: 6px` → **10px on card hover** (`transition: gap 0.2s`) |
+
+Variant hues (hardcoded): sessions `#58a6ff` glow with `--accent` border; workflow `#d29922`; compose `#39d2c0`; workforce `#bc8cff`.
+Grid: `repeat(4, 1fr)`, gap 20px, max-width 1400px. Mobile: radius 16px, padding 20px 18px, `:active { transform: scale(0.985) }` replaces hover.
+
+**Glass session tile `.ws-card`** — 180×140, radius 16px, padding 12px 10px, gap 6px, centred column.
+
+| Layer | Value |
+|---|---|
+| background | `--bg-wf-card` = `rgba(22,22,22,0.6)` dark / `rgba(255,255,255,0.55)` light |
+| border | 1px `--border-secondary` (light theme overrides to `rgba(0,0,0,0.06)`) |
+| blur | `backdrop-filter: blur(16px) saturate(1.5)` |
+| shadow | `0 2px 8px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.06)` (light: inset highlight → `rgba(255,255,255,0.8)`) |
+| transition | `background 0.15s, border-color 0.15s, transform 0.12s` |
+| hover | bg `--bg-wf-hover`, border `--border-light`, `translateY(-2px)`, `0 8px 24px rgba(0,0,0,0.12), inset 0 1px 0 rgba(255,255,255,0.1)` |
+| dragging | `opacity: 0.4` |
+
+**Compact grid tile `.wf-card`** — 120×130, radius 14px, `backdrop-filter: blur(12px) saturate(1.4)`, shadow `0 1px 3px rgba(0,0,0,0.1), inset 0 1px 0 rgba(255,255,255,0.06)`, `transition: all 0.2s cubic-bezier(.4,0,.2,1)`, hover `translateY(-1px)` + `0 4px 16px rgba(0,0,0,0.12)`. Selected: `border-color: var(--accent); background: var(--bg-active); box-shadow: 0 0 0 2px var(--accent), 0 6px 20px rgba(124,124,255,0.2)`. Multi-selected uses `outline: 2px solid var(--accent); outline-offset: -2px` instead (composes cleanly with the per-status backgrounds).
+
+**Folder tile `.ws-folder-card`** — radius 12px, padding 16px, min-width 180px, `rgba(20,20,30,0.6)` + `blur(12px)` (light `rgba(255,255,255,0.7)`), 1px `--border-light`. Hover: border `--accent`, `translateY(-1px)`, `0 4px 16px rgba(0,0,0,0.2)`. `.ws-drop-target` → border `--accent` + `rgba(124,124,255,0.08)`. `.ws-dragging` → `opacity: 0.4`.
+
+**Task card `.kanban-card`** — deliberately plain: `background: var(--bg-primary); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin-bottom: 6px`.
+
+| State | Treatment |
+|---|---|
+| hover | `border-color: var(--border-hover)`, `box-shadow: 0 2px 8px rgba(0,0,0,0.15)`; reveals kebab and drag handle; expands description `max-height: 0 → 18px` |
+| `.dragging` | `opacity: 0.4; cursor: grabbing` |
+| `.kanban-card-focused` | `border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), 0 2px 8px var(--status-working-dim)` |
+| `.kanban-card-desc.expanded` | `max-height: 200px` (transition `max-height 0.2s ease`) |
+| newly AI-created | see `kanban-task-highlight` in 13.13 |
+
+Transition: `box-shadow 0.15s, opacity 0.15s, border-color 0.15s`.
+
+**Dense iOS-style card `.mc-card`** — the heaviest glass in the product.
+
+| Property | Value |
+|---|---|
+| radius | 22px |
+| size | `min-height: 240px; max-height: 370px` |
+| background | `rgba(38,38,42,0.65)` dark / `rgba(255,255,255,0.82)` light |
+| blur | `backdrop-filter: blur(48px) saturate(180%) brightness(1.1)` |
+| border | **0.5px** `rgba(255,255,255,0.15)` (light `rgba(0,0,0,0.07)`) |
+| shadow | four layers: `inset 0 1px 0 rgba(255,255,255,0.2)`, `inset 0 -0.5px 0 rgba(0,0,0,0.15)`, `0 10px 40px rgba(0,0,0,0.6)`, `0 2px 8px rgba(0,0,0,0.4)` |
+| transition | `transform 0.45s cubic-bezier(0.34,1.56,0.64,1), box-shadow 0.3s cubic-bezier(0.4,0,0.2,1), border-color 0.25s` |
+| hover | `translateY(-5px) scale(1.01)`, inset highlight → 0.25, outer shadows → `0 24px 56px rgba(0,0,0,0.7)`, `0 6px 18px rgba(0,0,0,0.45)` |
+| left accent strip | absolute, 3px wide, `top/bottom: 18px`, `border-radius: 0 3px 3px 0`, `opacity: 0` by default, per-state gradient + glow (see 13.15) |
+
+Its header is 14px 16px 13px with a **0.5px** bottom hairline `rgba(84,84,88,0.4)`; hover tints `rgba(255,255,255,0.035)`. Its preview region is `rgba(0,0,0,0.16)` at 12.5px / 1.62 / `rgba(235,235,245,0.5)`, min-height 90, scrollbar width 0. Its input row is `rgba(0,0,0,0.18)` with a matching 0.5px top hairline. The grid behind it is pure `#000000` (light `#f2f2f7`) — the only OLED-black surface in the app.
+
+**Modal cards.**
+
+| Class | Width | Radius | Padding | Max-height | Shadow |
+|---|---|---|---|---|---|
+| `.modal` (legacy) | 400px / 90vw | 10px | 24px | — | none |
+| `.pm-card` (premium) | 420px / 90vw | 18px | 28px 32px 24px | 88dvh, `overflow-y: auto`, `overscroll-behavior: contain` | `0 24px 80px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.05)`; plus `backdrop-filter: blur(40px) saturate(1.6)` |
+| `.project-card` | 480px / 92vw | 14px | 0 (sectioned) | 80vh | `0 20px 60px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.04)` |
+| `.actions-popup` | 480px / 92vw | 12px | sectioned | 85vh | `0 8px 32px var(--shadow)` |
+| `.invoke-modal` | 520px / 92vw | 18px | sectioned | 80vh | `0 24px 80px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.04)` |
+| `.lp-modal` | 440px | 12px | sectioned | 520px | `0 12px 40px rgba(0,0,0,0.35)` |
+| `.kanban-val-card` | 500px / 90vw | 12px | 24px | 80vh | — |
+| `.compose-direct-all-modal` | 460px / 90vw | 12px | 20px | — | — |
+| `.subsession-report-card` | 520px / 92% | 6px | 16px | — | — |
+
+`.pm-card.sm-modal` is a variant that turns the card into a flex column with `overflow: hidden`, an inner `.sm-scroll-body { flex: 1 1 0; overflow-y: auto; min-height: 0 }`, and a pinned `.pm-actions` with `flex: 0 0 auto; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.06)`. Use this whenever a dialog's content can exceed the viewport.
+
+**Content cards** (non-interactive or lightly interactive containers):
+
+| Class | Radius | Padding | Notes |
+|---|---|---|---|
+| `.dash-stat` | 10px | 18px 8px | flex column centre; count 22px/700, label 10px/600 uppercase ls .04em |
+| `.wf-cc-stat` | 14px | 20px 14px | `rgba(22,22,30,0.5)` + `blur(16px) saturate(1.5)`, 1px `rgba(255,255,255,0.06)`, hover `translateY(-1px)`; number 28px/700 ls -0.03em |
+| `.report-card` | 10px | 16px 20px | header 13px/600 uppercase ls .3px with 0.6-opacity icon |
+| `.report-kpi` | 8px | 10px 6px | on `--bg-hover`; value 20px/700, label 10px uppercase |
+| `.template-card` | 12px | 10px 12px | transparent bg, `transition: all .2s cubic-bezier(.4,0,.2,1)`, hover `--bg-wf-hover` + `translateY(-1px)`, icon `--text-faint` → `--accent` |
+| `.add-mode-card` | 10px | 14px 16px | active → border `--accent`, bg `--bg-active`, title `--accent` |
+| `.dev-tool-row` | 9px | 10px 14px | transparent, 1px `--border`; `.danger` label + hover border `--danger` |
+| `.kanban-drill-chooser-card` | 12px | 20px 22px | hover border `--accent` + bg `--status-working-dim` + `translateY(-2px)` + `0 4px 16px rgba(0,0,0,0.12)`; `.chosen` → `scale(0.98)` and appends `…` to the title |
+| `.wf-avail-card` | 10px | 16px | hover border `rgba(88,166,255,0.3)` |
+| `.compose-template-card` | 8px | 12px 8px | active → border `--accent` + `box-shadow: 0 0 0 2px var(--accent)` |
+| `.code-block-card` | 8px | 0 (header + pre) | on `--bg-code`; header bar `--bg-active`, 11px |
+
+### 13.12.5 Badges, pills and chips
+
+| Class | Font | Padding | Radius | Fill / text |
+|---|---|---|---|---|
+| `.wf-status-label` | 9px/700 uc ls .06em | 1px 6px | 8px | per session state (13.15) |
+| `.ws-status-label` | 10px/700 uc ls .06em | 2px 8px | 8px | per session state |
+| `.mc-card-status` | 10px/700 uc ls .05em | 3px 9px | 20px | per session state |
+| `.kanban-status-badge` | 9px/700 uc ls .3px | 1px 5px | 6px | `--status-*-dim` fill, `--status-*` text |
+| `.kanban-badge` | 10px/600 | 1px 6px | 8px | `--bg-tertiary` / `--text-secondary` |
+| `.kanban-card-session-badge` | 10px/600 | 2px 7px | 10px | status-derived |
+| `.kanban-card-subtask-text` | 10px/600 | 2px 7px | 10px | `--bg-subtle` / `--text-dim` |
+| `.kanban-drill-status` | 11px/700 uc ls .5px | 5px 12px | 6px | status-derived |
+| `.kanban-drill-subtask-status` | 10px/600 capitalise ls .2px | 3px 0 | 10px | **fixed `width: 72px`, centred** |
+| `.kanban-drill-session-badge` | 10px/600 ls .2px | 3px 9px | 10px | status-derived |
+| `.kanban-subtask-badge` | 9px/600 | 1px 5px | 6px | status-derived |
+| `.kanban-detail-status` | 11px/600 | 3px 8px | 6px | status-derived |
+| `.count-badge` | 10px | 1px 7px | 10px | `--bg-hover` / `--text-faint` |
+| `.project-item-count` | 11px | 2px 8px | 10px | `--bg-btn` / `--text-muted` |
+| `.kanban-column-count` | 11px/600 | 2px 7px | 10px | `--bg-tertiary` / `--text-faint` |
+| `.planner-sub-count` | 10px | 0 5px | 8px | `--bg-hover` / `--text-faint` |
+| `.toolbar-badge` | 11px tabular | 3px 8px | 6px | `--bg-card`, 1px `--border-subtle` |
+| `.code-lang-badge` | 10px/700 uc | 2px 7px | 4px | `#7c7cff22` / `--accent` |
+| `.code-shell-badge` | 10px/700 | 2px 7px | 4px | `#ff950022` / `#ff9500` |
+| `.code-dup-badge` | 10px | 2px 7px | 4px | `#55555522` / `--text-muted` |
+| `.wf-tier-role` / `-skill` / `-pipeline` | 10px/600 uc ls .3px | 1px 8px | 12px | `rgba(63,185,80,.12)/#3fb950`, `rgba(88,166,255,.12)/#58a6ff`, `rgba(154,106,255,.12)/#bc8cff` |
+| `.msel-tag` | 9.5px/700 uc ls .04em | 2px 6px | 5px | `rgba(80,140,220,0.15)` / `#8fb4e6` |
+| `.ws-crumb-skill` | 11px/600 ls .02em | 4px 12px | 20px | `rgba(124,124,255,.12)` + 1px `rgba(124,124,255,.2)` / `--accent` |
+| `.ws-add-session-pill` | 10px/600 | 3px 10px | 20px | same violet wash |
+| `.ws-skill-badge` | 10px | 2px 8px | 10px | `rgba(68,170,102,0.1)` / `--idle-label` |
+| `.wf-cc-recent-dept`, `.wf-status-row-dept` | 10px/500 | 1px 8px | 12px | `rgba(124,124,255,.08)` + 1px `rgba(124,124,255,.15)` / `--accent` |
+| `.subsession-inbox-badge` | 10px/600 | 1px 6px | 8px | `rgba(255,149,0,.18)` / `#ff9500`; hover → `.28` |
+| `.role-badge-sub` / `-main` | 10px/700 ls .04em | 2px 7px | 5px | `#ff9500` on `#1a1300` / `#4a90e2` on `#061626` |
+| `#git-badge-push` / `-pull` / `-sync` | 10px/700 | 1px 4px | 8px | `#4a6abf` / `#3a8a5a` / `#8a6abf`, all `#fff` |
+| `.kanban-ai-badge` | 9px/700 uc ls .5px | 1px 6px | 4px | purple 12% wash; animated (13.13) |
+| `.kanban-sidebar-tag-badge` | 10px/700, line-height 16px | 0 5px | 8px | `--accent` fill, `--bg-card` text |
+| `.compose-ready-badge` | 10px/600 | 1px 6px | 4px | `rgba(88,166,255,0.1)` / `--accent` |
+| `.compose-shared-badge` | 10px/600 | 1px 6px | 4px | `rgba(63,185,80,.12)` / `--green` |
+| `.compose-card-status` | 10px/600 | 1px 7px | 8px | status-derived |
+| `.lp-row-status` | 10px/600 uc ls .3px | 2px 6px | 4px | status-derived |
+| `.vnp-type` | 10.5px/700 | 2px 8px | 20px | browser `rgba(94,92,230,.22)`, image `rgba(48,209,88,.18)` |
+| `.diff-status-badge` | 10px/700 | 2px 6px | 4px | added `#44cc88`, removed `#cc4444`, changed `#cccc44`, same `--text-faint` |
+
+**Larger pills.** `.sub-agent-pill` — radius 20px, padding `4px 10px 4px 7px`, 11px/500, `max-width: 220px`, `transition: all 0.3s ease`. Active: `linear-gradient(135deg,#7c7cff20,#9a6aff18)`, 1px `#7c7cff35`, text `--accent`, `box-shadow: 0 0 12px #7c7cff12, inset 0 0 8px #7c7cff08`. Done: `#22c55e12` fill, `1px #22c55e28`, `#22c55e` text with a popped checkmark. `.live-interrupted-pill` — radius 20px, padding 5px 14px, 11px/600 ls .03em, `--bg-code` fill with `--border-light`.
+
+**Tag pills.** `.kanban-tag-pill` / `.compose-tag-pill`: 10px, padding 1px 6px, radius 3px, `border: 1px solid` (colour set per-tag inline), inline-flex gap 3px, with a `✕` remove button at `opacity: 0.6` → 1. In the filter bar the active tag adds `outline: 2px solid currentColor; outline-offset: 1px` (kanban) or `box-shadow: 0 0 0 1.5px currentColor; font-weight: 600` (compose), and `:hover { transform: scale(1.05) }`.
+
+### 13.12.6 Status dots
+
+All are `border-radius: 50%` with `flex-shrink: 0`.
+
+| Size | Instances |
+|---|---|
+| 5px | `.naming-dot`, `.has-title-dot`, `.psl-dots span` |
+| 6px | `.hp-dot`, `.kanban-session-dot`, `.kanban-subtask-dot`, `.kanban-subtask-status-dot`, `.compose-status-dot`, `.compose-session-dot`, `.compose-pin-dot`, `.compose-ready-dot`, `.scan-dots span` |
+| 7px | `.msel-dot` |
+| 8px | `.atc-dot`, `.adhoc-dot`, `.hb-dot`, `.kanban-context-move-dot`, `.kanban-status-menu-dot`, `.kanban-drill-status-dot`, `.compose-changing-dot` |
+| 9px | `.kanban-history-dot`, `.mc-status-dot` |
+| 10px | `.kanban-column-color-bar` |
+| 26px | `.mc-step-dot` (wizard stepper — numbered, 12px/700, 1.5px border) |
+
+Glow conventions:
+- Kanban: `box-shadow: 0 0 4px var(--status-*-dim)` on an active dot only.
+- Dense card: a two-ring halo — `box-shadow: 0 0 0 2.5px rgba(hue,0.22), 0 0 10px rgba(hue,0.6)` for working/question, `0 0 0 2px rgba(48,209,88,0.18), 0 0 7px rgba(48,209,88,0.45)` for idle, and *no* glow for sleeping.
+- Compose: no glow; motion carries the signal (`compose-pulse`).
+
+### 13.12.7 Modals and overlays — three coexisting generations
+
+**Generation 1 (legacy).** `.overlay` (`display: none` → `flex` on `.show`, `position: fixed; inset: 0; background: var(--overlay); z-index: 100`) wrapping `.modal`. No blur, no enter animation, no exit animation, no focus trap. **Its z-index of 100 is below dropdowns (200) and every context menu (9999–10000)** — this is a live bug, see 13.19. Do not reproduce.
+
+**Generation 2 (premium) — adopt this one.** `#pm-overlay`: `z-index: 5000`, `background: var(--overlay)`, `backdrop-filter: blur(4px)`, `display: none` → `flex` on `.show`. `.pm-card` as specified above, with:
+
+| Class | Transform | Opacity | Duration |
+|---|---|---|---|
+| resting | `scale(1)` | 1 | — |
+| `.pm-enter` | `scale(0.95)` | 0 | 0.2s `cubic-bezier(0.16,1,0.3,1)` (transform) + 0.2s ease (opacity) |
+| `.pm-exit` | `scale(0.97)` | 0 | 0.15s |
+
+The pattern is: mount with `.pm-enter`, remove the class on the next frame to animate in; add `.pm-exit`, wait 150 ms, unmount.
+
+**Generation 3 (bespoke per-feature overlays).** Each rolls its own z-index and backdrop. Consolidate these onto generation 2 in the clone; the table is here so you can reproduce stacking order if you keep them.
+
+| Overlay | z-index | Backdrop | Enter |
+|---|---|---|---|
+| `.overlay` (legacy) | 100 | `--overlay` | none |
+| `.invoke-overlay` | 1000 | `rgba(0,0,0,0.6)` + `blur(20px) saturate(1.4)`, animated from transparent over 0.25s | card `scale(0.95)` → 1 over 0.25s |
+| `.kanban-detail-overlay` | 999 | `rgba(0,0,0,0.4)`, opacity 0 → 1 over 0.2s | drawer slide |
+| `.kanban-validation-modal` | 1001 | `rgba(0,0,0,0.5)` | none |
+| `#extract-drawer` | 300 | none | slide |
+| `#respond-overlay`, `#compare-overlay` | 400 | `--overlay` | none |
+| `.kanban-planner-panel` | 500 | none | slide |
+| `#file-drop-zone` | 600 | `rgba(0,0,0,0.75)` | none |
+| `.grp-popup` | 2000 | none | none |
+| `#project-overlay` | 4000 | `--overlay` + `blur(4px)` | `.pm-enter` reused |
+| `#pm-overlay` | 5000 | `--overlay` + `blur(4px)` | `.pm-enter`/`.pm-exit` |
+| `.lp-overlay`, `.compose-*-overlay`, context menus | 9998–10000 | `rgba(0,0,0,0.4–0.55)` | 0.1s fade for menus |
+| `#health-blocker` | 99999 | opaque `--bg-body` | none |
+| `#project-switch-loader` | 100000 | `rgba(0,0,0,0.65)` + `blur(24px) saturate(1.3)`, faded in over 0.35–0.5s | content `scale(0.92) translateY(10px)` → `scale(1)` over 0.45s `cubic-bezier(0.16,1,0.3,1)`; on `.done` → `scale(1.04) translateY(-6px)` while fading out over 0.75s |
+
+Modal close affordance: `.overlay-close` (absolute 16/16, 22px glyph) or a 26–28px square ghost button.
+
+### 13.12.8 Dropdowns and menus
+
+**Shared panel spec** (`.hdr-sys-dropdown`, `.sidebar-menu-dropdown`, `.sidebar-sort-dropdown`, `.grp-popup`, `.ws-ctx-menu`, `.kanban-status-menu`, `.compose-ctx-menu`, `.compose-sort-menu`, `.kanban-history-dropdown`, `.kanban-col-config-dropdown`):
+
+| Property | Value |
+|---|---|
+| background | `--bg-dropdown` (or `--bg-card` / `--bg-primary` in the newer kanban/compose menus) |
+| border | 1px `--border-light` (kanban uses `--border`) |
+| radius | 8px |
+| padding | 4px (menus that pad their own items use `4px 0`) |
+| min-width | 110px (sort) / 150–180px (typical) / 220px (mobile context menu) |
+| shadow | `0 4px 16px var(--shadow)` for anchored dropdowns; `0 8px 24px rgba(0,0,0,0.3)` for floating context menus (light theme `…0.12`) |
+| visibility | `display: none` → `block`/`flex` via `.open`; context menus are `position: fixed` and JS-positioned |
+
+**Item spec:** `display: block` (or flex with `gap: 8px`), `width: 100%`, `text-align: left`, `background: none`, `border: none`, `font-size: 12px` (13px in `.ws-ctx-menu`), `padding: 7px 12px` (6px 12px in kanban, 8px 12px in ws-ctx), `border-radius: 5px` (4px in ws-ctx), `color: var(--text-secondary)` or `--text-primary`, `transition: background 0.1s`. Hover: `background: var(--bg-hover)`, `color: var(--text-heading)`. In `.ws-ctx-menu` the hover fill is the violet wash `rgba(124,124,255,0.1)` instead.
+
+**Icons in items** (`.grp-popup .btn svg`, `.actions-item svg`): `color: var(--text-faint)` at rest, `var(--accent)` on item hover, `flex-shrink: 0`.
+
+**Danger items:** `color: #cc4444` (or `--result-err` / `--red`), hover fill `rgba(204,68,68,0.1)` or `#cc444415`. The icon inherits (`color: inherit`).
+
+**Section labels:** 9px/700 uppercase, `letter-spacing: 0.06em`, `--text-faint`, padding `6px 12px 3px`. Larger variants exist at 10px/700 ls 0.5–1px (`.ws-section-label`, `.kanban-sidebar-label`, `.invoke-section-label` — the last is `position: sticky; top: 0` with the modal background so it pins while its list scrolls).
+
+**Dividers:** `height: 1px; background: var(--border-subtle)` with `margin: 2px 8px` (sort menus) or `background: var(--border-light); margin: 4px 0` (system dropdown, context menus).
+
+**Submenus:** `.kanban-context-submenu` is `position: absolute; left: 100%; top: -4px`, hidden by `display: none`, shown by `.kanban-context-submenu-trigger:hover > .kanban-context-submenu`, `z-index: 10000`, min-width 150px, same panel chrome. It is hover-only — no keyboard path.
+
+**Disclosure flyout:** `.sidebar-view-flyout` animates open by height rather than display — `max-height: 0 → 220px`, `opacity: 0 → 0.7`, `padding: 0 4px → 4px 4px 8px`, `transition: max-height 0.25s ease, opacity 0.2s ease, padding 0.25s ease`. Options are 12px rows, radius 7px, padding 7px 8px; the active one is `--accent` on `rgba(124,124,255,0.1)` with its icon opacity lifted 0.6 → 1.
+
+**Collapsible tree groups:** `.invoke-dept-children` uses `max-height: 2000px` open / `0` collapsed with `transition: max-height 0.2s ease`; chevrons rotate `90deg` (`transition: transform 0.15–0.2s`).
+
+### 13.12.9 Tooltips
+
+Only one true tooltip: `#session-tooltip`.
+
+| Property | Value |
+|---|---|
+| position | `fixed`, JS-placed, `pointer-events: none`, `z-index: 9999` |
+| box | `--bg-card`, 1px `--border-light`, radius 7px, padding 9px 12px |
+| size | `min-width: 160px; max-width: 280px` |
+| shadow | `0 4px 18px var(--shadow-heavy)` |
+| show | `opacity: 0` → 1 via `.visible`, `transition: opacity 0.12s` |
+| title | 12px/600 `--text-primary`, `line-height: 1.3`, mb 5 |
+| preview | 11px/1.5 `--text-muted`, mb 6 |
+| meta | 10px `--text-faint`, flex, gap 8px, wraps |
+| state | 10px/700 uppercase ls .05em, coloured per session state |
+
+Everywhere else, hover explanation is delegated to the native `title` attribute (and `cursor: help` on `.wf-cc-opinionated-icon` / `.compose-changing-dot`).
+
+### 13.12.10 Toasts
+
+**Desktop `.toast`** — `position: fixed; bottom: 20px; right: 20px; z-index: 9999; pointer-events: none`. Background `--bg-toast`, 1px `--border-toast`, text `--text-toast`, padding 10px 16px, radius 8px, 13px. Hidden at `opacity: 0`; `.show` sets `opacity: 1`; `transition: opacity 0.3s`. No slide, no icon, no dismiss button. `.error` swaps to `--bg-toast-error` / `--border-toast-error` / `--text-toast-error`.
+
+**Mobile capsule (relocated at ≤768px)** — the same element is re-anchored to the top so it clears the composer keys:
+
+| Property | Value |
+|---|---|
+| position | `top: calc(env(safe-area-inset-top) + 58px); left: 50%; bottom/right: auto` |
+| transform | hidden `translateX(-50%) translateY(-12px)` → shown `translateX(-50%) translateY(0)` |
+| size | `max-width: calc(100vw - 32px)`, padding 11px 18px, centred text |
+| shape | `border-radius: 999px` |
+| type | 13.5px/500, `#fff` |
+| fill | `rgba(28,28,32,0.92)`, 1px `rgba(255,255,255,0.12)` |
+| blur | `backdrop-filter: blur(20px) saturate(180%)` |
+| shadow | `0 10px 34px rgba(0,0,0,0.4)` |
+| transition | `opacity 0.25s ease, transform 0.28s cubic-bezier(.32,.72,0,1)` |
+| error | fill `rgba(58,20,22,0.92)`, border `rgba(255,90,90,0.40)`, text `#ffd9d9` |
+
+**Undo toast `.compose-undo-toast`** — bottom-centred: `bottom: 24px; left: 50%`, hidden `translateX(-50%) translateY(20px)` → `translateY(0)`, radius 8px, padding 10px 16px, 13px, `0 4px 16px rgba(0,0,0,0.3)`, `transition: opacity 0.2s, transform 0.2s`. Contains a bordered `--accent` text button that inverts to accent-fill on hover.
+
+**Minimized-progress pill `.git-sync-mini`** — a long-running modal minimises into this.
+
+| Property | Value |
+|---|---|
+| position | `fixed; bottom: 20px; right: 20px; z-index: 200`, `max-width: 280px` |
+| box | `--bg-modal`, 1px `--border-modal`, radius 12px, padding 10px 14px, gap 8px |
+| shadow | `0 4px 24px rgba(0,0,0,0.4), 0 0 12px rgba(124,111,224,0.15)` |
+| entrance | `miniSlideIn 0.35s ease-out both` — from `translateY(16px) scale(0.9)`, opacity 0 |
+| hover | `translateY(-2px)`, shadow → `0 4px 28px rgba(0,0,0,0.5), 0 0 20px rgba(124,111,224,0.25)`, border `--accent`; `transition: all 0.25s ease` |
+| attention | `.flash` runs `miniFlash 0.4s ease 3` — a glow pulse to `0 0 24px rgba(124,111,224,0.4)` |
+| label | 12px/500, ellipsised |
+
+Its 12–14px status indicator has three forms: **working** = `2px solid rgba(124,111,224,0.3)` ring with `--accent` top edge spinning at `spin 0.7s linear infinite`; **done** = 14px `#22c55e` disc with a CSS checkmark (`4×7` box, `border-width: 0 2px 2px 0`, `rotate(45deg)`, `#fff`); **error** = 14px `#ef4444` disc with a centred `!` at 10px/700.
+
+### 13.12.11 Tabs
+
+**Underline tabs** — `background: none; border: none; border-bottom: 2px solid transparent`, colour `--text-muted`, hover `--text-heading`/`--text-primary`, active colour + `border-bottom-color`. Transition `color 0.12–0.15s, border-color 0.12–0.15s`.
+
+| Class | Padding | Font | Active colour |
+|---|---|---|---|
+| `.actions-tab` | 8px 10px 10px | 12px/500 | `--accent-text` text, `--accent` underline |
+| `.wf-config-tab` | 10px 16px | 13px/500 | `--accent` both; `margin-bottom: -1px` to overlap the container rule |
+| `.kanban-settings-tab` | 8px 16px | 13px/500 | `--accent` both |
+| `.lp-tab` | 8px 0, `flex: 1`, centred | 12px/600 | `--accent` both |
+
+The tab strip scrolls horizontally with a zero-height scrollbar (`.actions-tabs::-webkit-scrollbar { height: 0 }`).
+
+**Filled tabs** — `.mem-tab`: `--bg-btn` fill, 1px `--border-btn`, radius 6px, padding 5px 16px, 12px/500; active = `--accent` fill, `#fff`, `--accent` border. `.wf-mode-btn`: sits inside a 1px-bordered, radius-8, `overflow: hidden` group; padding 6px 16px, 12px/600, no border of its own; active = `--accent` fill, `#fff`.
+
+**Soft-pill tabs** — `.subsessions-tab`: `background: none; border: 1px solid transparent`, radius 6px, padding 5px 12px, 12px/500, `--text-muted`; hover = `--bg-hover` fill; active = elevated tint fill + visible border. `.subsessions-tab-affordance` pushes right with `margin-left: auto` and is accent-coloured. Also in this family: `.view-toggle-btn`, `.wf-sort-btn`, `.kanban-create-pos-btn`.
+
+### 13.12.12 Tables and lists
+
+**Markdown tables in assistant output** — `border-collapse: collapse`, `width: 100%`, `border-radius: 6px` with `overflow: hidden`, `border: 1px solid var(--border)`.
+
+| Part | Message view | Live-log view |
+|---|---|---|
+| font | 12px | 11px |
+| `th` | `--bg-code` fill, `--accent-md-heading`, 11px/600 uppercase ls .04em, padding 8px 14px, `border-bottom: 2px solid var(--border-light)` | 10px, padding 6px 12px |
+| `td` | padding 7px 14px, `--text-secondary`, `vertical-align: top`, 1px `--border` bottom + right | padding 5px 12px |
+| zebra | `tr:nth-child(even) td { background: var(--bg-code) }` | same |
+| hover | `tr:hover td { background: var(--bg-active) }` | same |
+| edges | last row loses its bottom rule; last cell loses its right rule | same |
+
+**`.report-table`** — 12px; `th` 10px/600 uppercase ls .3px, left-aligned, `--text-faint`, 1px bottom rule; every column except the first is right-aligned with `font-variant-numeric: tabular-nums`; row hover `--bg-hover`; last row loses its rule.
+
+**`.help-table`** — `td` padding 7px 10px, 13px, 1px `--border-subtle` bottom rule; first column `width: 110px; text-align: right; padding-right: 16px`. `kbd`: inline-block, `--bg-code` fill, 1px `--border-light`, radius 4px, padding 2px 7px, 12px mono, `--text-code`, `min-width: 20px`, centred.
+
+**The shared row-list pattern.** Roughly twenty list components resolve to the same recipe; implement it once.
+
+```
+display: flex; align-items: center; gap: 6–10px;
+padding: 3–10px vertical / 6–12px horizontal;
+border-radius: 4–8px; font-size: 11–13px; cursor: pointer;
+transition: background 0.1–0.15s;
+:hover { background: var(--bg-hover) }   /* or var(--bg-subtle-faint) in drill views */
+```
+
+Slot order: **[optional grip, opacity 0→0.5 on row hover] → [status dot 6–9px] → [title, `flex: 1`, ellipsised, `--text-primary`] → [metadata, 10–11px, `--text-faint`, `flex-shrink: 0`] → [action buttons, opacity 0→1 on row hover]**. Instances: `.kanban-session-row`, `.kanban-detail-child`, `.kanban-detail-session`, `.kanban-drill-subtask-row`, `.kanban-drill-session-row`, `.wf-status-row`, `.wf-cc-recent-row`, `.lp-row`, `.compose-link-session-row`, `.msel-row`, `.tl-row`, `.invoke-item`, `.project-item`, `.fd-tree-item`, `.planner-node-row`, `.adhoc-subsession-row`, `.compose-sort-item`, `.kanban-status-menu-item`, `.report-log-entry`, `.bulk-ops-item`.
+
+Selected variants layer one of three cues: a **left inset bar** (`box-shadow: inset 3px 0 0 var(--accent)` on `.session-item.multi-selected`; `border-left: 3px solid var(--accent)` with `padding-left` reduced by 3px on `.tl-row.selected`), an **outline** (`outline: 1.5px solid var(--accent)` on `.lp-row.selected`; `outline: 2px solid var(--accent); outline-offset: -2px` on cards), or a **tint + border** (`.msel-row.active` → `--bg-active` fill + `--accent` border).
+
+**The session list** is a 3-column CSS grid: `grid-template-columns: var(--col-name,1fr) var(--col-date,70px) var(--col-size,47px)`, shared by the header row, data rows and skeleton rows so all three stay aligned. Cells: padding 7px 8px, 12px, `nowrap` + `ellipsis`. Header row is `position: sticky; top: 0; z-index: 5` on `--bg-sidebar` with a `--border-subtle` bottom rule; sortable headers hover to `--text-heading` and the active sort is `--accent-text` at 600. Column resize grips are 5px wide, `cursor: col-resize`, transparent until hover/drag when they become `#7c7cff55`. The size column is deliberately de-emphasised: 9px, `--text-faint`, `opacity: 0.5`, right-aligned.
+
+### 13.12.13 Progress bars and bar charts
+
+| Class | Height | Track | Fill | Radius | Transition |
+|---|---|---|---|---|---|
+| `.kanban-subtask-bar` | 3px, `max-width: 60px` | `--bg-tertiary` | `--status-complete` | 2px | `width 0.2s` |
+| `.kanban-card-progress-bar` | 4px | `--bg-subtle` | `--green` | 2px | `width 0.3s` |
+| `.kanban-drill-inline-bar` | 3px, `width: 48px` | `--bg-subtle` | `--green` | 2px | `width 0.4s ease` |
+| `.scan-progress-bar` | 4px | `rgba(255,255,255,0.08)` | `linear-gradient(90deg, var(--accent), var(--accent-green))` + `box-shadow: 0 0 8px var(--accent)` | 2px | `width 0.08s linear` |
+| `.report-dist-bar-track` | 6px | `--bg-hover` | status hue | 3px | `width 0.4s ease` |
+| `.report-tag-bar` | 4px | `--bg-hover` | status hue | 3px | — |
+| `.compose-progress-bar` | 6px, `max-width: 240px` | `--bg-input` | segmented flex, 1px gaps: complete `--green`, reviewing `#f0883e`, drafting `--accent` | 3px | `width 0.3s ease` |
+| `.hp-bar` | 6px | — | flex of segments, 3px gap | 4px | — |
+
+All tracks use `overflow: hidden` so the fill's own radius is clipped at the ends.
+
+**Bar chart `.report-barchart`** — `display: flex; align-items: flex-end; gap: 3px; height: 100px` (`.report-barchart-tall` 120px). Each `.report-bar` is a column: `flex: 1; min-width: 0`, contents bottom-aligned. `.report-bar-fill` is full-width, `border-radius: 3px 3px 0 0`, `min-height: 2px`, `transition: height 0.3s`. Value label 9px/600 `--text-muted` with `min-height: 12px` so bars stay aligned when a value is absent; category label 9px `--text-faint`, ellipsised. Stacked variant overlays a `.report-bar-bg` absolutely at `bottom: 18px`.
+
+Legend: `.report-legend` flex gap 14px, 11px `--text-muted`; swatch 8×8 with `border-radius: 2px` (a square, not a dot — this distinguishes chart legends from status dots).
+
+The launcher's decorative mini-chart `.hp-columns` is `height: 48px; gap: 6px` with `.hp-col { border-radius: 4px 4px 0 0 }`.
+
+### 13.12.14 Skeletons, spinners and dot loaders
+
+**List skeleton** — `.skel-row` reuses the session-list grid so the placeholder lines up with real rows exactly. `.skel-bar`: `height: 11px; border-radius: 4px; background: linear-gradient(90deg, var(--bg-skel-1) 25%, var(--bg-skel-2) 50%, var(--bg-skel-1) 75%); background-size: 800px 100%; animation: shimmer 1.5s infinite linear`. Widths per column: name 70%, date 85%, size 40% (`margin-left: auto`).
+
+**Board skeleton** — `.skel-shimmer`: `linear-gradient(90deg, var(--bg-hover) 0%, var(--border) 40%, var(--bg-hover) 80%)`, `background-size: 600px 100%`, `animation: skel-shimmer 1.8s ease-in-out infinite`, radius 4px. A skeleton column is `opacity: 0.6; pointer-events: none`; title bar 80×12, count 20×12, card title 12px tall, card meta 8px tall at `opacity: 0.6`.
+
+**Spinners** — a single ring recipe: square, `border-radius: 50%`, a low-contrast border with one contrasting edge, `animation: spin <d> linear infinite`.
+
+| Class | Size | Border | Duration |
+|---|---|---|---|
+| `.spinner` | 10×10 | 2px `--spinner-border`, top `--spinner-top` | 0.6s |
+| `.planner-spinner` | 14×14 | 2px `--border`, top `--accent` | 0.6s |
+| `.report-loading-spinner` | 16×16 | 2px `--border`, top `--accent` | 0.6s |
+| `.sub-agent-spinner` | 8×8 | 1.5px `#7c7cff40`, top `--accent` | 0.7s |
+| `.git-sync-mini-spinner.working` | 12×12 | 2px `rgba(124,111,224,0.3)`, top `--accent` | 0.7s |
+
+**Dot loaders** — three staggered dots, always `border-radius: 50%`.
+
+| Class | Size | Colour | Keyframe | Stagger |
+|---|---|---|---|---|
+| `.hb-dot` | 8px | `--accent` at `opacity: 0.3` | `hbPulse 1.4s ease-in-out infinite` (0/80/100% → opacity .3, `scale(.8)`; 40% → opacity 1, `scale(1)`) | 0 / 0.2s / 0.4s |
+| `.scan-dots span` | 6px | `--accent` at 0.3 | `scan-dot 1.2s ease-in-out infinite` (0/100% → .3, `scale(1)`; 50% → 1, `scale(1.4)`) | 0 / 0.2s / 0.4s |
+| `.psl-dots span` | 5px | `rgba(255,255,255,0.35)` | `psl-dot 1.2s ease-in-out infinite` (0/80/100% → .25, `scale(.85)`; 40% → 1, `scale(1.2)`) | 0 / 0.15s / 0.3s |
+
+**The project-switch orb** — a 72×72 stack: an inner disc (`inset: 16px`, `radial-gradient(circle at 35% 35%, var(--accent), #7c3aed 60%, #ec4899)`, `box-shadow: 0 0 30px rgba(88,166,255,0.4), 0 0 60px rgba(124,58,237,0.2)`, `psl-pulse 1.8s`), plus two counter-rotating rings: ring 1 at `inset: 0`, 1.5px `rgba(255,255,255,0.12)` with an accent top edge and transparent right edge, `psl-spin 2.4s linear infinite`; ring 2 at `inset: -8px`, `rgba(255,255,255,0.06)` with a `rgba(124,58,237,0.5)` top and transparent left, 3.2s, `animation-direction: reverse`.
+
+### 13.12.15 Drawers
+
+Every drawer slides on `right` (desktop) or `transform` (mobile). Desktop drawers park at negative offsets so the shadow never leaks.
+
+| Drawer | Width | Closed | Open | Transition |
+|---|---|---|---|---|
+| `#extract-drawer` | 500px | `right: -520px` | `right: 0` | `right 0.25s ease` |
+| `.kanban-detail-panel` | 440px | `right: -450px` | `right: 0` | `right 0.25s ease` |
+| `.kanban-planner-panel` | 420px | `right: -420px` | `right: 0` | `right 0.3s ease`; `box-shadow: -4px 0 24px rgba(0,0,0,0.3)` |
+| mobile sidebar | 100vw | `translateX(-100%)` | `translateX(0)` | `transform 0.28s cubic-bezier(.32,.72,0,1)` |
+| `#mobile-sheet` | `left/right: 8px` | `translateY(130%)` | `translateY(0)` | `transform 0.3s cubic-bezier(.32,.72,0,1)` |
+| preview sheet `#vnp-sheet` | `height: 92%`, max-width 720px | `translateY(100%)` + `visibility: hidden` | snap points: full `translateY(0)`, half `46%`, peek `72%` | `transform 0.34s cubic-bezier(.32,.72,0,1), visibility 0s linear 0.34s` |
+
+`visibility` on the preview sheet is load-bearing: without it the closed sheet's upward `box-shadow` paints a permanent dark band across the bottom of the viewport.
+
+The planner drawer has a **minimised** state: `right: 0; top: auto; bottom: 0; height: auto; width: 320px; border-radius: 10px 10px 0 0; box-shadow: -2px -2px 16px rgba(0,0,0,0.25)`, with its body and footer hidden and its header made clickable.
+
+All drawer backdrops share the same idiom: `position: fixed; inset: 0; background: rgba(0,0,0,0.4–0.5); opacity: 0; pointer-events: none; transition: opacity 0.25s ease`, flipped by a `.show` class.
+
+Mobile bottom-sheet items: `.sheet-card` radius 16px on `--bg-modal`; `.sheet-item` padding 13px 16px, 15px, full-width, with a `--border-subtle` bottom rule that the last child drops, `:active { background: var(--bg-hover) }`, `:disabled { opacity: 0.4 }`; `.sheet-cancel` is a separate 14px-padded, radius-14px card in `--accent-text`.
+
+### 13.12.16 Breadcrumbs
+
+| Class | Container | Crumb | Separator | Current |
+|---|---|---|---|---|
+| `.ws-breadcrumbs` | `height: 42px`, padding 8px 20px, 13px, `--bg-card`, 1px `--border-light` bottom, `nowrap` + `overflow: hidden` | `--accent`, padding 2px 6px, radius 4px, hover `rgba(124,124,255,0.1)` + underline, `transition: background 0.15s` | `--text-faint`, 12px, margin 0 2px, `user-select: none` | `--text-primary`, 600 |
+| `.kanban-breadcrumb` | padding 8px 16px, 11px, `--text-faint`, 1px `--border` bottom, wraps | `--accent`, hover `opacity: 0.8` + underline | `--text-faint` | `--text-primary`, 500 |
+| `.kanban-drill-crumb` | inside the drill titlebar, 12–13px, horizontally scrollable | `--accent`, padding 2px 4px, radius 3px, hover fill `--status-working-dim` | `--text-dim`, 11px | `--text-primary`, 600, `cursor: default`, no hover fill |
+| `.fd-breadcrumb` | 12px, wraps, `min-height: 20px` | `--accent-text`, padding 1px 3px, radius 3px | `--text-faint` | `--text-primary`, 600 |
+| `.subsession-breadcrumb` | 12px `--text-muted` at `opacity: 0.85` | underline appears as `border-bottom: 1px dotted` on hover | — | deleted parents get `line-through` + `cursor: not-allowed` |
+
+A crumb can be a drop target: `.ws-crumb.ws-drop-hover` → `rgba(124,124,255,0.2)` fill + `outline: 2px dashed var(--accent)`.
+
+### 13.12.17 Empty states
+
+| Class | Layout | Type | Extras |
+|---|---|---|---|
+| `.empty-state` | flex column, centred, gap 8px | 14px `--text-empty` | icon 36px, `margin-bottom: 4px` |
+| `.ws-empty-state` | flex column, centred, padding `80px 20px 60px` | skill label 14px/600 `--accent`; body 13px `--text-faint`, mb 24 | icon at `opacity: 0.15`; primary CTA (accent, radius 10px, padding 10px 24px); secondary text link 11px `--text-faint` with hover underline |
+| `.ws-empty-folder` | flex column, padding `60px 20px` | 13px `--text-faint` | icon `opacity: 0.3` |
+| `.kanban-empty-state` | centred block, `margin: 80px auto 0`, `max-width: 400px` | 13px `--text-muted` | `border: 1px dashed var(--border)`, radius 10px, padding 40px |
+| `.mc-empty` | `grid-column: 1 / -1`, padding `100px 24px` | 15px/500 `rgba(235,235,245,0.22)` | — |
+| `.lp-empty` / `.report-empty` / `.kanban-report-empty` | centred, padding 16–20px | 12px `--text-faint`, italic | — |
+| `.invoke-empty` | padding 12px 16px | 12px `--text-faint`, 1.5 | inline `code` on `rgba(255,255,255,0.06)` |
+
+The empty state also has an **exit animation**: `.empty-state.fading-out` runs `emptyFadeOut 0.25s ease-out forwards` (to `opacity: 0`, `translateY(-8px) scale(0.98)`) and sets `pointer-events: none`, so sending the first message dissolves the placeholder instead of cutting it.
+
+### 13.12.18 Chat and message components
+
+**User bubble** — the message wrapper is `display: flex; flex-direction: column; align-items: flex-end`.
+
+| Property | Value |
+|---|---|
+| max-width | 80% of the 760px column |
+| background / border | `--bg-user-msg` / 1px `--border-user-msg` |
+| text | `--text-user-msg`, 14px / 1.7, `letter-spacing: 0.005em` |
+| radius / padding | 14px / 14px 18px |
+| shadow | `0 1px 3px rgba(0,0,0,0.06)` |
+| `pre` inside | inherits the body font (not mono), `white-space: pre-wrap`, `margin: 0` |
+| footer `.vn-msg-footer` | 9px, right-aligned, `--text-faint`, ls .3px, `opacity: 0` → 1 on message hover or when it is the last message; `transition: opacity 0.2s ease` |
+
+**Assistant bubble** — same radius/padding, `--bg-asst-msg` / `--border-asst-msg` / `--text-asst-msg`, `box-shadow: 0 1px 3px rgba(0,0,0,0.04)`. Full markdown treatment: headings at 1.15/1.05/0.95em in `--accent-md-heading` with `margin: .6em 0 .3em`; paragraphs `.4em 0`; lists `padding-left: 1.4em`; inline `code` 12px on `--bg-code`, radius 3px, padding 1px 5px, `--text-code`; `pre` radius 6px, padding 10px 14px, `overflow-x: auto`; `blockquote` with a `3px solid #4a4a8a` left rule, padding `.2em .8em`, `--text-muted`; `hr` = 1px `--border`.
+
+**Role label** `.msg-role` — 10px/600 uppercase, `letter-spacing: 0.06em`, mb 6. User = `--accent`, assistant = `--accent-green`. **Timestamp** `.msg-time` — 10px/400, `opacity: 0` → `0.35` (transition 0.2s) on hover, or persistently on the last user and last assistant message (`.show-time`).
+
+**Compact bubbles** (`.chat-msg-bubble`, used in embedded assistants) — `max-width: 85%`, padding 10px 14px, radius 12px, 13px / 1.55, with the tail corner squared: user `border-bottom-right-radius: 4px`, assistant `border-bottom-left-radius: 4px`. Same colour tokens as above. The planner's chat variant squares its tail to 2px instead (`border-radius: 12px 12px 2px 12px`).
+
+**Sticky pinned-message bar `.sticky-user-bar`** — an overlay *outside* the scroll container so it never perturbs message layout.
+
+| Property | Value |
+|---|---|
+| position | `absolute; top: 0; left: -1px; right: 0`, `width: 100%; max-width: 760px; margin: 0 auto`, `z-index: 20` |
+| shape | `border-radius: 0 0 14px 14px`, `border-top: none`, otherwise user-message colours and border |
+| padding / type | 5px 18px / 12px, `line-height: 1.5` |
+| hidden | `opacity: 0; pointer-events: none` |
+| visible | `.visible` → `opacity: 1; pointer-events: auto`; `transition: opacity 0.15s ease` |
+| collapsed text | single line, ellipsised |
+| `.expanded` | flex column, gap 4px; text becomes `pre-wrap` and scrolls to `max-height: 40vh` |
+
+**Live-log entry types** — the log is `font-family: 'Consolas','Courier New',monospace`, 12px / 1.5, padding 10px 14px. Each `.live-entry` has `margin-bottom: 10px` and a `.live-label` at 9px/700 uppercase, `letter-spacing: 0.08em`, in the **system** font (deliberately non-mono).
+
+| Type | Label colour | Body |
+|---|---|---|
+| user | `--accent` | `--live-user-text`, `white-space: pre-wrap` |
+| assistant | `--accent-green` | `--live-text`, full markdown at one step smaller than the message view (code 11px, `pre` radius 5px / padding 8px 12px) |
+| tool | `--tool-accent` | a clickable flex row (`align-items: baseline; gap: 5px; user-select: none`): icon `--tool-accent` 11px, name `--tool-accent-dim` 11px/600, description `--text-faint` 11px ellipsised and `flex: 1` |
+| tool detail | — | hidden until `.open`; then `--bg-body` fill, `border-left: 2px solid var(--border)`, padding 5px 8px, 11px `--text-faint`, `pre-wrap`, `max-height: 200px` scroll |
+| agent | `--accent`, 700 | the tool row is promoted to a card: `linear-gradient(135deg,#7c7cff10,#9a6aff08)`, 1px `#7c7cff20`, radius 8px, padding 6px 10px (light theme: `#5555cc08`/`#7755cc05` on `#5555cc15`) |
+| result | `--text-faint` | 11px; `.live-result-ok` → `--result-ok`, `.live-result-err` → `--result-err` |
+| interrupted | — | a centred capsule pill, `margin: 12px 0` |
+| question | `#ff9500` | `.live-waiting-label` 10px/700 uppercase; question text on `--bg-question-label` with `1px solid #553300`, radius 10px, padding 14px 18px, 13px `#ddaa55`, `max-height: 200px` scroll |
+| directive conflict | `#d29922` | card: radius 8px, 1px `#d29922`, `rgba(210,153,34,0.06)` fill, header strip `rgba(210,153,34,0.10)`; resolved state flips to `--result-ok` / `rgba(63,185,80,0.06)` at `opacity: 0.85` |
+
+**Working-status bar `.live-working-status`** — padding 12px 16px, radius 10px, mb 10, `border: 1px solid #7c7cff20`, `position: relative; overflow: hidden`. Its background is a five-stop violet gradient `linear-gradient(135deg, #7c7cff15, #7c7cff08, #9a6aff10, #7c7cff15, #5555cc10)` at `background-size: 300% 300%`, animated by `working-gradient 4s ease infinite`. A `::before` pseudo-element adds a second, faster sweep: `linear-gradient(90deg, transparent, #7c7cff08, transparent)` at `200% 100%` running `shimmer 2s infinite linear`, `pointer-events: none`. The label (13px/600 `--accent`) and meta (12px `--text-faint`, tabular-nums) sit at `z-index: 1`. The interrupt button is transparent with `1px solid #cc444488`, `#cc6666` text, padding 3px 10px, radius 5px; hover `#cc444430` / `#ff6666`.
+
+When sub-agents are present, `.live-working-status.has-agents` squares its bottom corners and drops its bottom border, and the following `.sub-agent-strip` squares its top corners with `margin-top: -1px` — the two fuse into one unit.
+
+**Composer** — `.live-input-bar` is `max-width: 760px; margin: 0 auto; padding: 12px 0 16px`, borderless and transparent. The controls row `.live-bar-row` is `justify-content: flex-end; gap: 8px; margin-top: 8px`, with a left-pinned `.bar-left-group` (`margin-right: auto`). Send button `.live-send-btn`: `--bg-sort-active` fill, 1px `--border-btn-primary`, radius 10px, padding 8px 16px, 13px/600, `--accent-text`; hover `--bg-btn-primary-hover` / `--accent-light`; `:disabled` opacity 0.4. State variants: `.waiting` → orange fill with black text; `.danger` → transparent with `--result-err` border and text, inverting to solid on hover; `.recording` → transparent with `--result-err` border and `recording-pulse 1.2s`.
+
+**Queue banner `.live-queue-banner`** — `#ff950012` fill, `1px #ff950040`, radius 8px, padding 8px 12px, mb 8. Label 11px/600 `#ff9500`; body 12px mono at `opacity: 0.85`, `max-height: 120px` scroll; cancel/nav buttons are `#ff9500`-on-transparent with `#ff950030–40` borders, radius 3–4px.
+
+**Output shelf `.live-output-shelf`** — a horizontal scroll row of file cards, `max-width: 760px`, gap 8px, padding 8px 14px, `:empty { display: none }`. Each `.live-output-card`: `--bg-card`, 1px `--border-subtle`, radius 6px, padding 6px 10px, `max-width: 220px`, hover border `--accent`. The inline variant is larger (radius 8px, padding 8px 12px, `max-width: 400px`, name 12px/600).
+
+---
+
+## 13.13 Motion
+
+### 13.13.1 The easing vocabulary
+
+| Curve | Name | Use it for |
+|---|---|---|
+| `cubic-bezier(.32,.72,0,1)` | **sheet** | Anything that slides in from a screen edge on touch: the mobile drawer, bottom sheets, the mobile toast, the preview sheet, the chat entrance. This is the single most important curve for the mobile feel. |
+| `cubic-bezier(0.16,1,0.3,1)` | **settle** (expo-out) | Modal enter/exit, toggle knobs, the project-switch loader content. Fast start, long graceful stop. |
+| `cubic-bezier(.4,0,.2,1)` | **standard** | Glass card and stat hover; template cards. Symmetric, neutral. |
+| `cubic-bezier(0.34,1.56,0.64,1)` | **spring** | Overshoot moments: dense-card hover lift, new-task highlight entrance, AI badge pop. |
+| `cubic-bezier(0.175,0.885,0.32,1.1)` | **send** | The outgoing-message animation only. |
+| `cubic-bezier(0.25,0.46,0.45,0.94)` | ease-out-quad | Composer state cross-fade. |
+| `ease` / `ease-out` / `ease-in-out` | — | Everything else: colour changes, opacity, right-edge drawer slides, all infinite pulses. |
+| `linear` | — | Rotation and shimmer only. Never for anything the eye reads as movement of an object. |
+
+### 13.13.2 The duration ladder
+
+| Duration | Applies to |
+|---|---|
+| 0.08–0.1s | Progress-fill width during a fast scan; menu-item background |
+| 0.12s | Default colour/border transition on toolbar and sidebar controls |
+| 0.15s | The house standard for button, card and input state changes |
+| 0.2–0.25s | Panels, overlays, disclosure max-height, modal enter |
+| 0.28–0.35s | Drawers and sheets |
+| 0.45s | Dense-card hover lift; project-switch content scale |
+| 1.2–1.5s | Attention pulses (question, naming, dot loaders) |
+| 1.8–2.8s | Ambient pulses (working, breathing dots, glass card glow) |
+| 4s | The working-status gradient drift |
+
+Property-specific rule: transition `background`, `border-color`, `color`, `opacity`, `transform` and `box-shadow` explicitly. `transition: all` appears in the source (`.wf-card`, `.invoke-btn`, `.kanban-header-btn`, several kanban buttons) — do not carry that habit forward.
+
+### 13.13.3 Transitions worth naming
+
+| Element | Property | Duration / easing | Trigger |
+|---|---|---|---|
+| `.homepage-card` | `border-color`, `transform`, `box-shadow` | 0.25s / 0.2s / 0.25s | hover → `translateY(-4px)` + hue glow |
+| `.homepage-card .hp-cta` | `gap` (6px → 10px) | 0.2s | card hover — the arrow slides away from its label |
+| `.mc-card` | `transform` / `box-shadow` / `border-color` | 0.45s spring / 0.3s standard / 0.25s | hover → `translateY(-5px) scale(1.01)` |
+| `.ws-card`, `.wf-card` | `background`, `border-color`, `transform` | 0.12–0.2s | hover → `translateY(-1…-2px)` |
+| `.live-textarea` | `border-color`, `box-shadow`, `height` | 0.2s / 0.2s / 0.15s ease | focus and auto-grow |
+| `.pref-toggle-knob` | `transform` | 0.18s settle | on/off |
+| `.kanban-card-desc` | `max-height` | 0.2s ease | 0 → 18px on card hover, → 200px when expanded |
+| `.sidebar-view-flyout` | `max-height`, `opacity`, `padding` | 0.25s / 0.2s / 0.25s ease | flyout open |
+| `.kanban-tag-inline-input` | `width` (64 → 120px) | 0.2s | focus |
+| `.resize-handle` | `background` | 0.15s | hover/drag → `--accent` |
+| `.msg-time`, `.vn-msg-footer` | `opacity` | 0.2s | hover / last message |
+| any hover-revealed icon button | `opacity` | 0.15s | parent hover |
+| `.compose-status-dot` | `background-color` | 0.3s ease | state change |
+| `.invoke-overlay` | `background`, `backdrop-filter` | 0.25s ease | open — the blur builds rather than snapping |
+| `#project-switch-loader` | `opacity` 0.35s, `backdrop-filter` 0.5s, `background` 0.5s | ease | project switch; on completion, `opacity` over 0.75s |
+
+### 13.13.4 Keyframe catalogue
+
+| Name | Animates | Duration / easing / repeat | When it plays |
+|---|---|---|---|
+| `spin` | `rotate(360deg)` | 0.6s / 0.7s linear, infinite | Every ring spinner |
+| `shimmer` | `background-position` −400px → 400px | 1.5s linear infinite (2s on the working-status sweep) | List skeletons; the working-status `::before` sweep |
+| `skel-shimmer` | `background-position` −300px → 300px | 1.8s ease-in-out infinite | Board skeletons |
+| `waitpulse` | row background `--border-subtle` ↔ `--bg-question-pulse`; left border `#ff9500` ↔ `#ffb700` | 1.4s ease-in-out infinite | A sidebar row whose session is waiting on the user |
+| `wf-pulse` | card background `--bg-wf-card` ↔ `--bg-question-pulse`; border `#ff9500` ↔ `#ffb700` | 1.4s ease-in-out infinite | Grid/workspace tile, waiting |
+| `wf-question-pulse-selected` | `--bg-active` ↔ `--bg-question-pulse`; border `--accent` ↔ `#9a9aff` | 1.4s ease-in-out infinite | Waiting **and** selected — keeps the selection ring readable |
+| `wf-work-pulse` | background `--bg-wf-card` ↔ `--bg-working-pulse`; border `#4a4aaa` ↔ `#6a6acc` | 2s ease-in-out infinite | Grid/workspace tile, working |
+| `wf-work-pulse-selected` | `--bg-active` ↔ `--bg-working-pulse`; border `--accent` ↔ `#9a9aff` | 2s ease-in-out infinite | Working and selected |
+| `mc-work-pulse` | border alpha 0.3 → 0.5; outer glow 0 → `0 0 36px rgba(10,132,255,0.16)` | 2.8s ease-in-out infinite | Dense card, working |
+| `mc-q-pulse` | border `rgba(255,159,10,.32)` → `rgba(255,191,36,.55)`; glow → `0 0 32px rgba(255,159,10,0.18)` | 1.8s ease-in-out infinite | Dense card, waiting |
+| `mc-dot-breathe` | `scale(1)` ↔ `scale(0.65)`, opacity 1 ↔ 0.5 | 2s working / 1.4s waiting, ease-in-out infinite | The dense-card status dot. **Note it shrinks rather than grows** — a contraction reads calmer than an expansion at 9px |
+| `mc-caret` | `opacity` 1 ↔ 0 | 0.85s **step-end** infinite | The `▋` streaming caret appended to `.mc-stream-live::after` in `#0a84ff`. `step-end` is mandatory — a smooth fade reads as a glow, not a cursor |
+| `working-gradient` | `background-position` 0% → 100% → 0% | 4s ease infinite | The working-status bar's five-stop violet drift |
+| `agentPulse` | `box-shadow` `0 0 12px #7c7cff12, inset 0 0 8px #7c7cff08` ↔ `0 0 18px #7c7cff22, inset 0 0 12px #7c7cff12` | 2.5s ease-in-out infinite | An active sub-agent pill (composed with its entrance animation) |
+| `pillSlideIn` | opacity 0 → 1, `translateX(-8px) scale(0.9)` → `translateX(0) scale(1)` | 0.3s ease-out both | A sub-agent pill mounting |
+| `agentStripIn` | opacity 0 → 1, `translateY(8px) scale(0.97)` → normal | 0.35s ease-out both | The sub-agent strip appearing |
+| `agentFooterIn` | opacity 0 → 0.8, `translateY(4px)` → 0 | 0.35s ease-out both | The collapsed "agents finished" footer |
+| `checkPop` | `scale(0)` → `scale(1.3)` at 60% → `scale(1)` | 0.3s ease-out both | The green check when a sub-agent completes |
+| `naming-pulse` | opacity 0.3 ↔ 1 | 1.2s ease-in-out infinite | The dot shown while a session is being auto-titled |
+| `hbPulse` | opacity 0.3 → 1, `scale(0.8)` → `scale(1)` at 40% | 1.4s ease-in-out infinite, staggered 0.2s | Health-blocker dot loader |
+| `scan-dot` | opacity 0.3 → 1, `scale(1)` → `scale(1.4)` | 1.2s ease-in-out infinite, staggered 0.2s | Security-scan dot loader |
+| `psl-dot` | opacity 0.25 → 1, `scale(0.85)` → `scale(1.2)` | 1.2s ease-in-out infinite, staggered 0.15s | Project-switch dot loader |
+| `psl-pulse` | `scale(1)` ↔ `scale(1.12)`, opacity 1 ↔ 0.85 | 1.8s ease-in-out infinite | The project-switch orb core |
+| `psl-spin` | `rotate(360deg)` | 2.4s (ring 1) / 3.2s reversed (ring 2), linear infinite | The orb's counter-rotating rings |
+| `scan-pulse` | `scale(1)` ↔ `scale(1.06)` | 2s ease-in-out infinite | The security-scan shield glyph |
+| `scan-sweep` | `top: 12px → 40px`, opacity 0 → 1 (10%) → 1 (90%) → 0 | 1.4s ease-in-out infinite | The 2px scan beam crossing the shield |
+| `recording-pulse` | `box-shadow: 0 0 0 0 rgba(204,68,68,0.3)` → `0 0 0 6px rgba(204,68,68,0)` | 1.2s ease-in-out infinite | Voice recording — an expanding ring that dissipates |
+| `compacting-pulse` | opacity 1 ↔ 0.4 | 1.2s ease-in-out infinite | The context-compaction icon |
+| `msgSendIn` | opacity 0 → 1 (by 50%), `translateY(12px) scale(0.97)` → normal | 0.35s **send** curve, both | A user message being appended after submit |
+| `emptyFadeOut` | → opacity 0, `translateY(-8px) scale(0.98)` | 0.25s ease-out forwards | The empty state dissolving when the first message is sent |
+| `barFadeIn` | opacity 0 → 1, `translateY(4px)` → 0 | 0.3s ease-out-quad both | Children of the composer when it swaps between idle/working/waiting layouts |
+| `permSlideIn` | opacity 0 → 1, `translateY(6px)` → 0 | 0.3s ease-out; staggered 0s / 0.05s / 0.1s | The permission prompt: label, question text, then option buttons |
+| `miniSlideIn` | opacity 0 → 1, `translateY(16px) scale(0.9)` → normal | 0.35s ease-out both | The minimized-progress pill appearing |
+| `miniFlash` | glow 12px → 24px and back | 0.4s ease, **3 iterations** | Demanding attention on the minimized pill |
+| `hp-dot-in` | opacity 0 → 1, `scale(0)` → `scale(1)` | 0.4s ease both | Launcher-card decorative dots |
+| `kanban-ctx-in` | opacity 0 → 1, `translateY(-4px)` → 0 | 0.1s ease-out | A task context menu opening |
+| `kanban-highlight-entrance` | opacity 0 → 1, `scale(0.92) translateY(8px)` → normal | 0.6s **spring** forwards | A task card created by the AI planner |
+| `kanban-sparkle-burst` | opacity 1 → 0, `scale(0.5)` → `scale(1.2)` at 30% → `scale(2.5) translateY(-10px)` | 1.8s ease-out forwards | Particle burst on the same card — two pseudo-elements each carrying 4–5 offset `box-shadow` "particles" in the purple token |
+| `kanban-shimmer` | `left: -60% → 120%` | 1.2s ease, **0.3s delay**, forwards | A 60%-wide `linear-gradient(90deg, transparent, purple 12%, transparent)` sweeping across the same card, after the entrance |
+| `kanban-badge-pop` | opacity 0 → 1, `scale(0.3)` → `scale(1)` | 0.5s spring forwards | The "AI" badge appearing |
+| `kanban-badge-fade` | opacity 1 → 0 | 4s ease, **2s delay**, forwards | The same badge self-retiring |
+| `kanban-pulse` | opacity 1 ↔ 0.4 | (author-supplied duration) | Active session badge on a task card |
+| `compose-pulse` | opacity 1 ↔ 0.4 | 2s active / 1.5s conflict, ease-in-out infinite | Compose status dot |
+| `compose-changing-pulse` | opacity 1 ↔ 0.7, `box-shadow: 0 0 0 0 rgba(210,153,34,0.4)` → `0 0 0 4px rgba(210,153,34,0)` | 1.5s ease-in-out infinite | The amber "content is changing under you" dot |
+| `compose-badge-flash` | colour `--accent` → `--text-faint`, `scale(1.15)` → `scale(1)` | 0.6s ease | A sidebar status badge whose value just changed |
+| `invokeFloat` | opacity 0 → 1, `translateY(4px)` → 0 | 0.25s ease | The invoke target label appearing above the composer |
+| `subsession-spawn-pulse-anim` | `background-color: rgba(255,230,120,0.35)` → transparent | 600ms ease-out | A newly spawned child session and its parent row |
+| `subsession-slide-in-anim` | `translateY(-6px)`, opacity 0 → normal | 180ms ease-out | The new child row itself (composed with the pulse) |
+| `vnChatEnter` (mobile) | opacity 0 → 1, `translateY(6px)` → 0 | 0.32s **sheet** curve, both | The chat panel or empty state mounting after the drawer slides away. Deliberately longer than the drawer's 0.28s so the two motions overlap |
+| `vnSheetUp` / `vnSheetDown` (mobile) | `translateY(130%)` ↔ `translateY(0)` | 0.3s / 0.25s sheet curve | The actions popup used as a bottom sheet. Keyframes, not transitions, because the element toggles `display` — which cancels transitions but still runs animations |
+| `vnSheetBackdrop` / `…Out` (mobile) | opacity 0 ↔ 1 | 0.25s / 0.22s ease | The same sheet's backdrop |
+
+---
+
+## 13.14 Iconography
+
+**System.** Every icon is inline SVG written directly into the markup. There is no icon font, no sprite sheet, and no image asset. The universal attribute set is:
+
+```
+viewBox="0 0 24 24"  fill="none"  stroke="currentColor"
+stroke-width="2"  stroke-linecap="round"  stroke-linejoin="round"
+```
+
+The consequence — and the reason to keep it — is that an icon needs no colour rule of its own: it inherits whatever `color` the surrounding row, button or state has already resolved. Colour an icon only when it must differ from its label.
+
+**Weights.** 2 is the default. 1.5 is used for large decorative marks and for the wizard's step dots (which are bordered circles, not glyphs). 3 appears once, in the data-URI checkmark stamped onto a completed compose card. Do not introduce filled icons; the one exception in the source is `.kanban-execute-btn svg`, which explicitly sets `fill: #fff; stroke: none` for a 10×10 play triangle.
+
+**Sizes.**
+
+| Size | Where |
+|---|---|
+| 10–12px | Chevrons, inline affordance marks, the execute triangle, drill-crumb glyphs |
+| 14px | The dominant size — list rows, menu items, toolbar pills, drag handles, checkmarks |
+| 16px | Card headers, section headers, output-card icons |
+| 19px | Mobile toolbar buttons (`.toolbar-close`, `.toolbar-more`) |
+| 20px | Mobile sidebar expand button |
+| 26px | Mobile drawer close (X) — sized up to meet the 44px touch target with padding |
+| 52px | Launcher-card icon wraps (the icon inside is ~24px) |
+| 64px | The health-blocker illustration |
+
+**Alignment.** Three board containers apply a blanket rule so icons never shift baselines: `#kanban-board svg, #kanban-sidebar svg, #compose-board svg { vertical-align: middle; flex-shrink: 0 }`. Apply this globally in the clone rather than per-container. Icon-only buttons also set `line-height: 0` so the button box collapses to the glyph.
+
+**The hover-colour convention.** In every menu, popup and card that pairs an icon with a label, the icon rests at `--text-faint` — one step dimmer than its label — and rises to `--accent` when the row is hovered: `.grp-popup .btn svg`, `.actions-item svg`, `.template-card-icon`, `.sidebar-view-opt svg` (which uses `opacity: 0.6 → 1` instead of a colour change), `.ws-add-folder-card .ws-folder-icon`. Disabled rows suppress the lift (`.actions-item:disabled:hover svg { color: var(--text-faint) }`).
+
+**Rotation.** Disclosure chevrons rotate rather than swap glyphs: `.kanban-expand-btn.expanded`, `.wf-config-chevron.expanded`, `.planner-node:not(.collapsed) .planner-chevron` all apply `transform: rotate(90deg)`; `.ns-collapse-btn.expanded svg` uses `rotate(180deg)`. Transition `transform 0.15–0.2s`.
+
+**Emoji as avatars.** Session and agent identity is an emoji rendered as text, not an icon: `.ws-avatar` 32px, `.wf-avatar` 28px, `.compose-template-icon` 22px, `.live-output-card-icon` 16px, `.pm-icon` 32px, `.empty-state .icon` 36px. Mobile shrinks `.ws-avatar` to 24px. A sleeping session's avatar is desaturated with `filter: grayscale(1) opacity(.4)`. `.state-icon` (a small inline state glyph) gets `vertical-align: middle; margin-right: 4px`, and `[data-theme="dark"] .sleeping-icon` receives `filter: invert(1); opacity: 0.3` because the underlying asset is a dark-on-light glyph.
+
+---
+
+## 13.15 The status visual language
+
+This is the product's central visual idea: **a session's state is legible from any surface, at any size, without reading a word.** Four session states and five task states each own a hue, a dot, a fill, a border and (for the two "live" states) a motion.
+
+### 13.15.1 Session states — the canonical mapping
+
+| | **SLEEPING** | **IDLE** | **WORKING** | **WAITING (question)** |
+|---|---|---|---|---|
+| Meaning | Not running | Running, nothing to do | Model is producing | Blocked on the user |
+| Primary hue | `--text-faint` (grey) | `--idle-*` (green) | `--accent` (violet) / `#0a84ff` on dense cards | `#ff9500` (amber) |
+| Motion | none | none | slow 2–2.8s pulse | urgent 1.4–1.8s pulse |
+| Label text | `SLEEPING` | `IDLE` | `WORKING` | `WAITING` |
+
+### 13.15.2 Per-surface rendering
+
+**Sidebar list row (`.session-item.si-*`)** — a 3px left border plus a text-colour shift on all three columns.
+
+| State | Left border | Name | Date + size | Animation |
+|---|---|---|---|---|
+| sleeping | none | `--text-secondary` (default) | `--text-secondary` / `--text-faint` | — |
+| idle | 3px `--idle-border` | `--idle-text` | `--idle-text-dim` | — |
+| working | 3px `#5555bb` | `#aaaaee` | `#7777aa` | — |
+| waiting | 3px `#ff9500` | `#ffb700`, **600** | `#cc8800` | `waitpulse 1.4s` on the whole row |
+
+Row-level overrides that compose on top: `.active` → `--bg-active` fill + `border-left: 2px solid var(--accent)` and all text to `--text-heading`; `.multi-selected` → `--bg-active` fill + `box-shadow: inset 3px 0 0 var(--accent)`; hover → `--bg-hover` (`transition: background 0.1s`).
+
+**Compact grid tile (`.wf-card.wf-*`)**
+
+| State | Border | Background | Animation | Status chip |
+|---|---|---|---|---|
+| sleeping | `--border` | `--bg-wf-card`; avatar `grayscale(1) opacity(.4)` | — | `--bg-hover` / `--text-faint` |
+| idle | `--border-secondary` | `--bg-wf-card` | — | `--idle-label-bg` / `--idle-label` |
+| working | `#4a4aaa` | pulses to `--bg-working-pulse` | `wf-work-pulse 2s` | `--bg-sort-active` / `--accent` |
+| waiting | `#ff9500` | pulses to `--bg-question-pulse` | `wf-pulse 1.4s` | `--bg-question-label` / `#ff9500` |
+
+Chip geometry: 9px/700 uppercase, `letter-spacing: 0.06em`, padding 1px 6px, radius 8px. Selected replaces the pulse with the `-selected` variant (which pulses `--bg-active` ↔ the state fill and `--accent` ↔ `#9a9aff`) and adds `box-shadow: 0 0 0 2px var(--accent), 0 6px 20px rgba(124,124,255,0.2–0.25)`.
+
+**Workspace tile (`.ws-card.ws-*`)** — identical hues and animations to the grid tile, with two differences: the **idle** state gets a visible fill (`background: var(--idle-bg)` with `border-color: var(--idle-border)`) rather than staying neutral, and the chip is one step larger (10px/700, padding 2px 8px, radius 8px).
+
+**Dense iOS card** — four coordinated signals per state.
+
+| State | Card border | Card animation | Left accent strip (3px) | Dot (9px) | Pill |
+|---|---|---|---|---|---|
+| sleeping | `rgba(255,255,255,0.05)`; card `opacity: 0.48` + `saturate(0.55)`, hover → 0.75 / 0.8 | — | hidden (`opacity: 0`) | `rgba(235,235,245,0.18)`, no glow | `rgba(235,235,245,0.28)` on `rgba(120,120,128,0.14)` |
+| idle | `rgba(255,255,255,0.09)` | — | `linear-gradient(180deg,#30d158,#25a244)` at `opacity: 0.75`, glow `0 0 8px rgba(48,209,88,0.45)` | `#30d158`, `0 0 0 2px rgba(48,209,88,0.18), 0 0 7px rgba(48,209,88,0.45)` | `#30d158` on `rgba(48,209,88,0.13)` |
+| working | `rgba(10,132,255,0.3)` → 0.5 mid-pulse | `mc-work-pulse 2.8s` | `linear-gradient(180deg,#409cff,#0a84ff)`, glow `0 0 12px rgba(10,132,255,0.75)` | `#0a84ff`, double ring, `mc-dot-breathe 2s` | `#409cff` on `rgba(10,132,255,0.16)` |
+| waiting | `rgba(255,159,10,0.32)` → `rgba(255,191,36,0.55)` mid-pulse | `mc-q-pulse 1.8s` | `linear-gradient(180deg,#ffd60a,#ff9f0a)`, glow `0 0 12px rgba(255,159,10,0.7)` | `#ff9f0a`, double ring, `mc-dot-breathe 1.4s` | `#ffd60a` on `rgba(255,159,10,0.15)` |
+
+Pill geometry: 10px/700 uppercase, `letter-spacing: 0.05em`, padding 3px 9px, radius 20px.
+
+**Tooltip state line (`.tt-state`)** — 10px/700 uppercase ls 0.05em: question `#ff9500`, working `--accent`, idle `--idle-label`, sleeping `--text-faint`.
+
+**Command-centre counters (`.wf-cc-stat-*`)** — the 28px/700 number is tinted: working `--accent`, waiting `#ff9500`, idle `--idle-label`, sleeping `--text-faint`. The label under it stays 10px/600 uppercase `--text-faint` in every case.
+
+**Folder rollup (`.ws-folder-status`)** — a 10px flex row of counts, each tinted: working `--accent`, question `#ff9500`, idle `#44aa66`, sleeping `--text-faint`.
+
+**Ad-hoc subsession tree (`.adhoc-dot`, 8px)** — working `#4a90e2`, waiting `#e2a23b`, idle `#44aa66`, default `--text-muted`. These are *different* hues from the main palette for the same states; unify them in the clone on the canonical set.
+
+### 13.15.3 Session sub-roles
+
+| Role | Sidebar | Grid | Live panel |
+|---|---|---|---|
+| **parent** | name `#4a90e2` (light `#2f6fb3`), 600 | `.wf-card.wf-parent .wf-name` same blue, 600 | `.session-role-banner.role-parent`: fill `rgba(74,144,226,0.14)`, bottom border `rgba(74,144,226,0.35)`, badge `#4a90e2` on `#061626` |
+| **subsession** | name `#ff9500` (light `#c8780a`); name cell gets `border-left: 2px solid rgba(255,149,0,0.55)`, `margin-left: 6px`, `padding-left: 14px` | `.wf-card.wf-child` gets a matching 2px amber left border | `.session-role-banner.role-subsession`: fill `rgba(255,149,0,0.14)`, border `rgba(255,149,0,0.35)`, badge `#ff9500` on `#1a1300` |
+| **family group** | wrapped in `.subsession-family`: 1px `--border`, radius 8px, `margin: 4px 6px`, `padding: 2px`, fill `rgba(120,150,255,0.05)` (light `rgba(60,100,220,0.05)`) | — | — |
+| **naming in progress** | 5px `--accent` dot at `opacity: 0.7` running `naming-pulse 1.2s`, plus a 9px/400 `--text-faint` label at `opacity: 0.8` | — | — |
+| **has custom title** | 5px `--accent` dot, `margin-right: 5px`, `top: -1px` | — | — |
+| **parent has unread report** | `.subsession-inbox-badge`: `rgba(255,149,0,0.18)` fill, `#ff9500`, 10px/600, radius 8px | — | `.subsession-inbox-strip`: full-width `rgba(255,149,0,0.15)` band with 1px `rgba(255,149,0,0.3)` top and bottom rules |
+
+Base indentation for any subsession row (outside a family box): `.session-col-name { padding-left: 16px; border-left: 1px solid rgba(255,255,255,0.12) }` plus a `↳` glyph at `opacity: 0.6`, 12px, `pointer-events: none`.
+
+### 13.15.4 Task states
+
+Five states, each with a solid token and a dim companion (15% alpha in dark, 12% in light). The dim token is *always* the fill and the solid token is *always* the text or the dot.
+
+| State | Dark solid | Light solid | Dim token |
+|---|---|---|---|
+| `not_started` | `#8b949e` | `#656d76` | `--status-not-started-dim` |
+| `working` | `#58a6ff` | `#0969da` | `--status-working-dim` |
+| `validating` | `#d29922` | `#9a6700` | `--status-validating-dim` |
+| `remediating` | `#f85149` | `#cf222e` | `--status-remediating-dim` |
+| `complete` | `#3fb950` | `#1a7f37` | `--status-complete-dim` |
+
+Renderings:
+
+| Surface | Treatment |
+|---|---|
+| Column header bar | 10px circle in the column's configured colour |
+| Card badge `.kanban-status-badge[data-status]` | 9px/700 uppercase ls .3px, padding 1px 5px, radius 6px, dim fill + solid text |
+| Card focus ring | `0 0 0 1px var(--accent), 0 2px 8px var(--status-working-dim)` |
+| Drill header `.kanban-drill-status` | 11px/700 uppercase ls .5px, padding 5px 12px, radius 6px; clickable (`.kanban-status-clickable:hover { filter: brightness(1.2) }`) |
+| Subtask row `.kanban-drill-subtask-status` | 10px/600 capitalised, radius 10px, **fixed 72px width, centred** so a column of rows aligns |
+| Subtask dot | 6–8px, solid token |
+| History timeline dot | 9px, solid token, with a 1px `--border` connector line running from `top: 18px` to `bottom: -6px` on every entry but the last |
+| Status-change menu | 8px dot + 13px label per row |
+| Move-to submenu | 8px dot per destination |
+| Distribution bar | 6px track on `--bg-hover`, fill in the solid token, `width` transition 0.4s ease |
+| Subtask progress fill | `--status-complete` / `--green` |
+| Linked-session dot | idle → `--status-complete` + `0 0 4px var(--status-complete-dim)`; working → `--accent` + `0 0 4px var(--status-working-dim)`; otherwise `--text-faint`, no glow |
+
+### 13.15.5 Compose states
+
+Compose runs its own teal accent (`#4ecdc4` dark / `#2ba89e` light, scoped by `#compose-board { --accent: … }`) and its own five-state dot vocabulary:
+
+| State | Colour | Motion |
+|---|---|---|
+| done | `#4caf50` | — |
+| active | `#f59e0b` | `compose-pulse 2s ease-in-out infinite` |
+| idle | `--text-faint` | — |
+| empty | `--border` | — |
+| conflict | `#ef4444` | `compose-pulse 1.5s` (faster = more urgent) |
+
+Two extra compose signals: the **changing dot** (8px `#d29922` running `compose-changing-pulse 1.5s`, which pairs an opacity blink with an expanding `0 → 4px` ring — meaning "this content is being rewritten under you"), and the **completed card**, which drops to `opacity: 0.7` and stamps an 18px `--green` disc with an inline-SVG checkmark at `top: 8px; right: 8px`.
+
+Progress across a composition is a segmented bar: complete `--green`, reviewing `#f0883e`, drafting `--accent`, 1px gaps, 6px tall, radius 3px.
+
+---
+
+> **⚠ THIS CHAPTER IS AN INCOMPLETE DRAFT.** It ends here rather than at its
+> intended conclusion, and is missing its later sections. Treat the material
+> above as accurate but partial, and do not read the absence of a topic as a
+> statement that it does not exist. A completed version follows separately.
+
+
+---
+
+# Part 14 — Screens, Modals, and Interaction Reference
+
+## 14.1 How to use this chapter
+
+This chapter is the completeness backstop for the `<App>` rebuild. Everything else in the
+specification describes *why* the product works the way it does; this chapter enumerates
+*what is on screen*, down to the exact strings a user reads.
+
+Read it in three passes.
+
+**Pass 1 — shape.** Read §14.2 (the app frame), §14.3 (navigation model) and §14.4
+(screen-by-screen). These give you the skeleton: one header, one collapsible sidebar, one
+main panel, five top-level views. Build that skeleton first and make view switching work
+before you build anything inside a view. A rebuild that starts with the chat panel and
+bolts navigation on afterwards will get the state-teardown rules in §14.3 wrong, and those
+rules are the difference between "switching views is instant and correct" and "switching
+views leaves a dead session panel behind."
+
+**Pass 2 — inventory.** §14.7 (modals and overlays), §14.8 (menus), §14.9 (toasts and
+banners), §14.16 (empty states) and §14.17 (error UX) are lookup tables. They are not meant
+to be read start to finish; they are meant to be *diffed against your build*. When you think
+a screen is done, open the relevant table and check every row. If a row has no
+implementation, the screen is not done.
+
+**Pass 3 — feel.** §14.10 through §14.15 and §14.20–§14.21 describe the behaviors that make
+the product feel like a finished tool rather than a prototype: which loading treatment goes
+where, what updates optimistically and how it rolls back, exactly when auto-scroll
+disengages, and the twenty micro-details that are individually trivial and collectively
+decisive.
+
+### Conventions used in this chapter
+
+| Convention | Meaning |
+|---|---|
+| `#element-id` | A DOM element id. These are load-bearing — several subsystems look elements up by id. Reuse them. |
+| `.class-name` | A CSS class name. Also load-bearing where state is toggled by class. |
+| "Exact copy" | Every string in double quotes or a table cell marked *copy* is verbatim user-visible text. Reproduce it character for character, including the ellipsis character `…` (U+2026) rather than three periods, the em dash `—` (U+2014), and the middle dot `·` (U+00B7). |
+| `<App>` | The product name. Substitute your own; it appears in the header, the page title, the greeting string, several toasts, and every health-check overlay. |
+| CTA | Call to action — the primary button or link on a card or empty state. |
+
+### What is deliberately *not* in this chapter
+
+- Server API shapes, socket event payloads, and persistence formats (see the data chapters).
+- Colour token values and typography scales (see the visual-design chapter). This chapter
+  names semantic tokens like `var(--accent)` but does not define them.
+- The reasoning behind product decisions. Where a behaviour looks strange, §14.23 records
+  the failure mode that produced it. Trust those; every one of them is a bug that shipped.
+
+### The single most important instruction
+
+Do not simplify. Many of the behaviours here look redundant — three separate watchdog
+tiers, two different context-menu render modes, a user-stop intent registry that shadows a
+server-side guard. Each exists because the simpler version failed in production. §14.23
+lists the non-negotiables with their failure modes. If you must deviate, deviate somewhere
+else.
+
+---
+
+## 14.2 The app frame
+
+Everything the user sees lives inside one persistent frame. The frame never unmounts; views
+swap inside the main panel. There is no full-page navigation anywhere in the product except
+two deliberate `location.reload()` recovery paths (§14.17).
+
+### 14.2.1 Desktop wireframe
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│ HEADER  (fixed, 14px vertical padding, 15px horizontal, flex row, gap 10px)           │
+│ ┌────┐                                                                                │
+│ │LOGO│ <App>              ← hdr-spacer (flex:1) →   [System ▾] [Update App] [Publish  │
+│ └────┘                                               App Update] [Sync App] [☾]       │
+│  28×22   21px Space Grotesk 700                                                       │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────┬─┬────────────────────────────────────────────────────────┐
+│ SIDEBAR                   │▮│ MAIN PANEL  (#main-panel, flex:1, column, overflow      │
+│ .sidebar                  │▮│  hidden, radial-gradient background wash)              │
+│ width: var(--sidebar-w)   │▮│                                                        │
+│ default 320px             │▮│ ┌────────────────────────────────────────────────────┐ │
+│ min 180px  max 600px      │▮│ │ MAIN TOOLBAR  #main-toolbar (10px 15px, bottom     │ │
+│                           │▮│ │ border, flex row wrap, gap 8px) — hidden until a   │ │
+│ ┌───────────────────────┐ │▮│ │ session is open; NEVER shown in Workflow view      │ │
+│ │ SIDEBAR HEADER        │ │▮│ │ [✕] Session title…………  [Actions] [Analyze ▾]      │ │
+│ │ .sidebar-header       │ │▮│ └────────────────────────────────────────────────────┘ │
+│ │ padding 10px 28px     │ │▮│ ┌────────────────────────────────────────────────────┐ │
+│ │         10px 12px     │ │▮│ │ FIND BAR  #find-bar (hidden until Ctrl/⌘+F)        │ │
+│ │ FIXED — never scrolls │ │▮│ └────────────────────────────────────────────────────┘ │
+│ │                       │ │▮│                                                        │
+│ │ [‹] collapse (abs.    │ │▮│  ONE OF (mutually exclusive, toggled by display):      │
+│ │     top:8 right:8)    │ │▮│   • #homepage-container   (Home)                       │
+│ │ 📁 <project> project  │ │▮│   • #main-body            (Sessions grid/list + chat)  │
+│ │ 🏠 Home        view   │ │▮│   • #mission-control      (Sessions ▸ Mission Control) │
+│ │ ＋ New Session         │ │▮│   • #kanban-board         (Workflow)                   │
+│ │ 🔍 Search transcripts…│ │▮│   • #compose-board        (Subsessions)                │
+│ │                  [⋯]  │ │▮│                                                        │
+│ └───────────────────────┘ │▮│                                                        │
+│ ┌───────────────────────┐ │▮│                                                        │
+│ │ SCROLLABLE REGION     │ │▮│                                                        │
+│ │ #session-list         │ │▮│                                                        │
+│ │ (list mode) or        │ │▮│                                                        │
+│ │ #workforce-grid       │ │▮│                                                        │
+│ │ (grid mode) or        │ │▮│                                                        │
+│ │ #kanban-sidebar or    │ │▮│                                                        │
+│ │ #compose-sidebar      │ │▮│                                                        │
+│ │                       │ │▮│                                                        │
+│ │ ⌃ only this scrolls   │ │▮│                                                        │
+│ └───────────────────────┘ │▮│                                                        │
+│ ┌───────────────────────┐ │▮│                                                        │
+│ │ #sidebar-perm-panel   │ │▮│                                                        │
+│ │ (permission approvals,│ │▮│                                                        │
+│ │  hidden when empty)   │ │▮│                                                        │
+│ └───────────────────────┘ │▮│                                                        │
+│ ┌───────────────────────┐ │▮│                                                        │
+│ │ .sidebar-footer FIXED │ │▮│                                                        │
+│ │ "Press and hold a     │ │▮│                                                        │
+│ │  session for the menu"│ │▮│                                                        │
+│ │ © <year> <Company>    │ │▮│                                                        │
+│ └───────────────────────┘ │▮│                                                        │
+└───────────────────────────┴─┴────────────────────────────────────────────────────────┘
+                             ↑
+                  #resize-handle — 1px visible,
+                  ±4px invisible hit area via ::after,
+                  cursor: col-resize, z-index 10
+```
+
+### 14.2.2 Region reference
+
+| Region | Element | Fixed or scrollable | Notes |
+|---|---|---|---|
+| Header | `<header>` | Fixed, `flex-shrink: 0` | Never scrolls, never hides. Height is content-driven (~50px). |
+| Brand | `.hdr-brand` | — | Logo image (28×22) + `<h1>` with the product name. **Both are clickable and both navigate to Home.** `cursor: pointer` on each. |
+| Spacer | `.hdr-spacer` | `flex: 1` | Pushes system controls right. |
+| System menu | `#hdr-sys` → `#hdr-sys-dropdown` | — | Trigger label is `"System ▾"`. Full contents in §14.8. |
+| Git buttons | `#btn-git-update`, `#btn-git-publish`, `#btn-git-sync` | — | Labels `"Update App"`, `"Publish App Update"`, `"Sync App"`, each with a numeric badge span (`#git-badge-pull`, `#git-badge-push`, `#git-badge-sync`) that shows the pending commit count and is empty when zero. |
+| Theme toggle | `#btn-theme` | — | Icon-only crescent-moon SVG. `title` attribute reflects the current theme, e.g. `"Dark theme"`. Cycles dark → light → auto. |
+| Layout | `.layout` | `display: flex; flex: 1; overflow: hidden` | The two-column body. |
+| Sidebar | `.sidebar` | Column flex; only the middle region scrolls | Width `var(--sidebar-w, 320px)`, clamped 180–600px. |
+| Sidebar header | `.sidebar-header` | Fixed (`flex-shrink: 0`) | Stacked controls, `gap: 8px`. Right padding is 28px to leave room for the absolutely-positioned collapse button. |
+| Session list | `#session-list` | **Scrollable** | The only scrolling region of the sidebar in Sessions/list mode. |
+| Sidebar footer | `.sidebar-footer` | Fixed, `margin-top: auto` | 9px text, 0.5 opacity. |
+| Resize handle | `#resize-handle` | Fixed | See §14.2.4. |
+| Main panel | `.main` / `#main-panel` | Column flex, `overflow: hidden` | Two soft radial gradients (top-left and bottom-right) provide a subtle depth wash; without them the panel reads as flat grey. |
+| Main toolbar | `#main-toolbar` | Fixed | `display: none` until a session is selected. |
+| Conversation | `.conversation` | **Scrollable** | `flex: 1; overflow-y: auto; padding: 24px 32px`. Children are centred and clamped to `max-width: 760px`. Custom 8px scrollbar. |
+| Input bar | `.live-input-bar` | Fixed at the bottom of the panel | Also `max-width: 760px`, centred, so the composer aligns with the transcript column. |
+
+### 14.2.3 Collapsed sidebar
+
+Toggling collapse adds `.collapsed` to `.sidebar`, which on desktop sets
+`width: 0 !important; min-width: 0 !important` and hides the header, session list and grid
+with `display: none`. The state persists in `localStorage.sidebarCollapsed` (`"1"` or empty
+string) and is re-applied synchronously during page boot so there is no flash of an expanded
+sidebar.
+
+When collapsed, a floating expand affordance appears: `#btn-sidebar-expand`, gaining
+`.visible`. It is a chevron-right + horizontal-line SVG with `title="Expand sidebar"`. The
+collapse button inside the header (`#btn-sidebar-toggle`) is the mirror image
+(chevron-left + line) with `title="Collapse sidebar"`.
+
+**On Home the sidebar is not collapsed — it is removed.** `setViewMode('homepage')` sets
+`display: none` on `.sidebar`, `.resize-handle` and `#btn-sidebar-expand`. Home is a
+full-bleed landing screen. This is also applied by an inline boot script before any
+JavaScript module loads, so a reload directly onto Home never flashes a sidebar.
+
+### 14.2.4 The resize handle
+
+- Visual width **1px**, coloured `var(--border)`.
+- An invisible `::after` pseudo-element extends the hit area 4px to each side (total 9px
+  grab zone). Without this the handle is effectively un-grabbable with a mouse.
+- `cursor: col-resize`, `z-index: 10`.
+- On hover **or** while dragging it turns `var(--accent)`. The dragging state is a
+  `.dragging` class, not `:active`, so the highlight survives the pointer leaving the 1px
+  strip mid-drag.
+- Drag maths: capture `startX` and `sidebar.offsetWidth` on mousedown; on mousemove set
+  `--sidebar-w` to `clamp(180, startW + (clientX - startX), 600)` px.
+- During the drag, `document.body.style.cursor = 'col-resize'` and
+  `userSelect = 'none'` are set globally and cleared on mouseup. Skipping the global cursor
+  makes the cursor flicker back to `default` whenever the pointer outruns the handle;
+  skipping `userSelect` selects text across the whole app while dragging.
+- The width is **not** persisted. This is intentional and matches the original: a session's
+  sidebar width is ephemeral.
+
+### 14.2.5 Status-bar slots
+
+There is no permanent status bar. Two status slots exist and are written into by the live
+session machinery when present:
+
+| Slot | Element | Reset value on session switch |
+|---|---|---|
+| Session cost | `#session-cost` | `"$0.00"` |
+| Status-bar cost | `#sb-cost` | `"$0.00"` |
+| Status-bar model | `#sb-model` | `"—"` (em dash) |
+
+These are cleared on every `setToolbarSession()` call so a newly-opened session never
+inherits the previous session's cost figure — a stale cost badge is one of the most
+corrosive small bugs in a multi-session tool.
+
+### 14.2.6 The mobile frame (≤768px)
+
+The mobile layer changes **no DOM and no components**. It re-skins the same frame.
+
+```
+┌────────────────────────────────┐        Drawer open (translateX(0)):
+│ [☰]  <App>            [Sys][☾] │      ┌────────────────────────────────┐
+├────────────────────────────────┤      │ SIDEBAR — position:fixed       │
+│                                │      │ inset 0, width 100vw           │
+│  MAIN PANEL (full width)       │      │ z-index 500                    │
+│                                │      │                                │
+│                                │      │ [✕] 46×46 tap target           │
+│                                │      │ project / view / New Session   │
+│                                │      │ session list…                  │
+│                                │      │                                │
+│                                │      │ "Press and hold a session      │
+│  ┌──────────────────────────┐  │      │  for the menu"                 │
+│  │ composer                 │  │      └────────────────────────────────┘
+│  └──────────────────────────┘  │        + #mobile-backdrop rgba(0,0,0,.5)
+└────────────────────────────────┘          z-index 480, fades over 250ms
+```
+
+- The sidebar becomes a **full-screen slide-in drawer**: `position: fixed; inset 0;
+  width: 100vw; z-index: 500`, transitioned with
+  `transform .28s cubic-bezier(.32,.72,0,1)`; `.collapsed` is `translateX(-100%)`.
+- Critically, mobile CSS **overrides** the desktop `.collapsed { width: 0 }` rule back to
+  `width: 100vw !important` and restores `display: flex` on the header and list. Without
+  this override the drawer's children vanish instantly and there is nothing left for the
+  transform to animate — users describe it as "the drawer just disappears, it feels sudden."
+- `#resize-handle` is hidden.
+- `#btn-sidebar-expand` becomes a fixed 40×40 hamburger at `top: 8px; left: 8px`,
+  `z-index: 3000`, and its icon is swapped to a three-line burger. The collapse button's
+  icon is swapped to a 26px ✕. The originals are captured once and restored exactly when
+  crossing back above the breakpoint, so a window resize never requires a refresh.
+- `body.mob-drilled` is toggled on whenever the current view is not Home; it hides the
+  header branding to make room and reveals the burger.
+- The drawer **auto-opens** only for the Sessions view *and only while no session is open*.
+  Every other view starts closed (content first).
+- Edge-swipe gestures: see §14.13.4.
+
+---
+
+## 14.3 Navigation model
+
+### 14.3.1 The five top-level views
+
+| Internal mode | Sidebar label | Card title | One-line description (*copy*, used on Home cards and in the view registry) |
+|---|---|---|---|
+| `homepage` | `Home` | `Home` | `<App> homepage` |
+| `sessions` | `Sessions View` | `Sessions` | `Run and interact with your Claude Code sessions` |
+| `kanban` | `Workflow View` | `Workflow` | `Task board with workflow columns and AI session orchestration` |
+| `workplace` | `Workforce View` | `Workforce` | `Knowledge asset library — manage skills and agent definitions` |
+| `compose` | `Subsessions View` | `Subsessions` | `Documents, diagrams, and knowledge creation board` |
+
+The short names shown on the sidebar trigger are `Home`, `Sessions`, `Workflow`,
+`Workforce`, `Subsessions`.
+
+Within `sessions` there is a **display sub-mode** with three values, persisted separately:
+
+| Sub-mode | Menu label (*copy*) | What it shows |
+|---|---|---|
+| `grid` (default) | `Grid cards` | Sidebar becomes a card grid (`#workforce-grid`); main panel shows the chat/dashboard. |
+| `list` | `List table` | Sidebar becomes a three-column sortable table (`#session-list`); main panel shows chat/dashboard. |
+| `control` | `Mission Control` | Full-screen dense multi-session grid (`#mission-control`); sidebar search row and main body hidden; `body.mc-mode` added. |
+
+### 14.3.2 How the user switches views
+
+There are five entry points, all landing on the same `setViewMode(mode)`:
+
+1. **Sidebar view flyout.** A trigger button (`#sidebar-view-trigger`) showing the current
+   view icon, its short name, and a tiny secondary label reading `view`. Hovering the
+   wrapper opens `#sidebar-view-flyout` after a **200ms** delay; leaving closes it after a
+   **300ms** delay. Clicking the trigger toggles it immediately (touch devices fire
+   `mouseenter` but never `mouseleave`, so hover alone would strand the flyout open).
+   Clicking outside closes it. Picking an option closes it.
+2. **Home cards.** Each of the four cards on the Home screen is a click target for its view.
+3. **Header brand.** Clicking the logo *or* the product wordmark returns to Home.
+4. **URL hash.** `#kanban…` forces Workflow, `#compose…` forces Subsessions, on load and via
+   `popstate`.
+5. **Programmatic.** Creating a new session from Home first switches to `sessions`.
+
+### 14.3.3 The view transition
+
+`setViewMode` is a two-phase animated switch unless it is a no-op or a project-switch
+loader is already covering the screen:
+
+1. Fade **out** `#homepage-container`, `#main-body`, `#kanban-board`, `#main-toolbar` and
+   `.sidebar` to `opacity: 0` over **150ms**.
+2. After 150ms, run the immediate switch (teardown + setup, below).
+3. Re-collect the now-visible containers, set them to `opacity: 0`, then on the next frame
+   animate to `1` over **200ms**.
+4. After a further 250ms, strip the inline `transition` and `opacity` styles so they do not
+   interfere with later state changes.
+
+Skipping step 4 leaves inline styles that fight every subsequent show/hide — a classic
+source of "the panel is there in the DOM but invisible" bugs.
+
+### 14.3.4 What is torn down on a view switch
+
+This is the part rebuilds get wrong. Leaving a view is not just hiding a container.
+
+| Leaving | Teardown |
+|---|---|
+| `sessions` → anything | Clear the sidebar multi-selection. Remove `body.mc-mode` and hide `#mission-control`. |
+| `kanban` → anything | Stop the live panel; null `activeId` and the live session id; remove `activeSessionId` from storage; reset board state; remove the drill-down session bar; empty **and** hide `#kanban-board`; restore `#main-body` (re-rendering the dashboard unless going Home); hide the toolbar; empty and hide `#kanban-sidebar` and `#sidebar-perm-panel`; restore the `New Session` button; strip the hash and the `?chat=` query param. |
+| `compose` → anything | Same shape as kanban, against `#compose-board` / `#compose-sidebar`. |
+| `workplace` → anything | Collapse any expanded workspace card, remove the back button, stop the live panel, null `activeId`, hide the toolbar, restore the dashboard, empty the permission panel, restore `New Session`. |
+| `homepage` → anything | Hide `#homepage-container`; restore `display` on `#main-body`, `.sidebar`, `.resize-handle`; restore `#btn-sidebar-expand` and re-apply its `.visible` state from the sidebar's collapsed state. |
+| anything → `workplace` | Stop the live panel and null `activeId` *before* entering — Workforce has no session concept. |
+
+### 14.3.5 What persists across a switch
+
+| Thing | Storage key | Scope |
+|---|---|---|
+| Current view | `viewMode` | Global |
+| Current view, per project | `projectView_<project>` | Per project |
+| Session display sub-mode | `sessionDisplayMode` | Global |
+| Active session id | `activeSessionId` | Global |
+| Active session, per project | `projectSession_<project>` and `pvs_<project>_sessions` | Per project |
+| Workflow drill-down position | `pvs_<project>_kanban` (the `#kanban…` hash with any `/session/…` suffix stripped) | Per project |
+| Subsessions sub-route | `pvs_<project>_compose` | Per project |
+| Sidebar collapsed | `sidebarCollapsed` | Global |
+| Sort field/direction | `sortMode`, `sortAsc` | Global |
+| Grid sort | `wfSort` | Global |
+| Composer drafts | `vibenode_drafts` (object keyed by session id) | Global |
+| Send-key preference | `sendBehavior` | Global, mirrored to the server |
+
+**Returning to Sessions restores the last-open session for that project**, but only when
+arriving from a different view and only when nothing is already active — deferred one tick
+so the view finishes rendering first. Restoring into a half-rendered view produces a chat
+panel with no scroll height and the transcript pinned to the top.
+
+### 14.3.6 URL model
+
+- `?chat=<session-id>` — the open session in Sessions/Workplace views. Pushed via
+  `history.pushState` on select, deleted on deselect.
+- `#kanban`, `#kanban/task/<id>` — Workflow board and drill-down.
+- `#compose`, `#compose/section/<id>` — Subsessions board and section detail.
+- Switching to Home, Workflow, Workforce or Subsessions always deletes `?chat=`.
+  Switching to anything other than Workflow/Subsessions clears the hash.
+- All of the above use `replaceState` on mode change (no history entry for a mode switch)
+  and `pushState` only for opening a session or drilling into a task, so Back means "go up
+  a level," never "undo a tab click."
+
+### 14.3.7 The Home / command-centre screen
+
+Home is the landing screen and the first thing a new user sees (a missing `viewMode`
+key forces `homepage`). It is deliberately not a dashboard of numbers: it is four large
+cards, each a doorway, each carrying a live micro-visualisation of its own domain so the
+screen answers "what is going on?" at a glance without a single chart.
+
+Wireframe:
+
+```
+        ┌───────────────────────────────────────────────────────────────┐
+        │  📁 Project:  <project-name>  ⌄        ← .hp-project-trigger  │
+        └───────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+  │  ▢ (icon tile)   │ │  ▢               │ │  ▢               │ │  ▢               │
+  │                  │ │                  │ │                  │ │                  │
+  │  Sessions        │ │  Workflow        │ │  Workforce       │ │  Subsessions     │
+  │                  │ │                  │ │                  │ │                  │
+  │  Interactive     │ │  Hierarchical    │ │  Knowledge asset │ │  Spawn parallel  │
+  │  Claude Code     │ │  task board …    │ │  library — …     │ │  subsessions …   │
+  │  terminals …     │ │                  │ │                  │ │                  │
+  │                  │ │                  │ │                  │ │                  │
+  │  ▬▬▬▬▬▭▭▭▭       │ │  ▉ ▆ ▃ ▅ ▂       │ │  ●●●●●●●●●●●●    │ │  ▅ ▇ ▃ ▅         │
+  │  segmented bar   │ │  column bars     │ │  agent dot grid  │ │  section bars    │
+  │                  │ │                  │ │                  │ │                  │
+  │  2 working ·     │ │  4 tasks · 3 not │ │  72 agents ·     │ │  No sections yet │
+  │  0 waiting ·     │ │  started,        │ │  17 departments  │ │                  │
+  │  0 idle          │ │  1 working       │ │                  │ │                  │
+  │                  │ │                  │ │                  │ │                  │
+  │  Open Sessions › │ │  Open Workflow › │ │  Open Workforce ›│ │  Open Subsessions│
+  └──────────────────┘ └──────────────────┘ └──────────────────┘ └──────────────────┘
+```
+
+Card copy (*exact*):
+
+| Card | `<h3>` | `.hp-desc` | `.hp-cta` |
+|---|---|---|---|
+| Sessions | `Sessions` | `Interactive Claude Code terminals with live streaming, voice input, and permission management.` | `Open Sessions` |
+| Workflow | `Workflow` | `Hierarchical task board where your roadmap terminates in working Claude sessions at the leaves.` | `Open Workflow` |
+| Workforce | `Workforce` | `Knowledge asset library — skills and agent definitions organized into a department hierarchy.` | `Open Workforce` |
+| Subsessions | `Subsessions` | `Spawn parallel subsessions from any session — children inherit parent context and report conclusions back up.` | `Open Subsessions` |
+
+Each CTA is followed by a small chevron-right SVG (14×14).
+
+**Stat lines** (`.hp-stat`) are computed live and have three shapes each:
+
+| Card | No data | Has active items | All quiet |
+|---|---|---|---|
+| Sessions | `No sessions yet` | `N working · N waiting · N idle` | `N sessions · all sleeping` |
+| Workflow | `No tasks yet` | `N tasks · N not started, N working` (one clause per non-empty column, column name lowercased) | — |
+| Workforce | — | `N agents · N departments` (both singularised at 1) | — |
+| Subsessions | `No sections yet` | `N sections · N drafting, N reviewing` | — |
+
+**Micro-visualisations:**
+
+- *Sessions* — a single horizontal bar (`.hp-bar`) segmented by flex weight into
+  working (accent), waiting (`#ff9500`), idle (idle-label token), sleeping (border token).
+  When there are no sessions at all, one full-width neutral segment is drawn so the bar is
+  never empty.
+- *Workflow* and *Subsessions* — a row of vertical bars (`.hp-col`), one per board column,
+  height proportional to that column's task count with an **8% floor** so an empty column is
+  still visible, coloured with the column's own colour at 0.8 opacity. With no data, four
+  neutral placeholder bars at 0.3 opacity.
+- *Workforce* — a grid of up to **36** coloured dots (`.hp-dot`), one per agent, cycling a
+  14-colour department palette, each with a staggered entrance delay of `index × 0.02s`.
+  With zero agents, twelve neutral dots at 0.5 opacity.
+
+**Loading state.** Workflow and Subsessions fetch their board data asynchronously the first
+time Home renders. Until that resolves, the bars are replaced with shimmer placeholders at
+fixed heights (60/40/75/30/55% for Workflow; 55/70/35/50% for Subsessions) with staggered
+animation delays of 0.15s, and the stat line is replaced by a 120×13px shimmer pill. When
+the fetch lands, Home re-renders in place. **Do not show `0 tasks` while loading** — a
+loading zero is indistinguishable from a real zero and makes the product look broken.
+
+**Project trigger.** Above the cards sits `.hp-project-trigger`: a folder icon, the literal
+label `Project:`, the current project's short name, and a chevron. Clicking opens the
+project overlay (§14.7). Short name = the project's custom name if set, else the last two
+path segments joined with `/`, else `No project`.
+
+---
+
+## 14.4 Screen-by-screen specification
+
+### 14.4.1 Home / command centre
+
+Covered structurally in §14.3.7. Remaining states:
+
+| State | Treatment |
+|---|---|
+| Loaded | Four cards, live stats, live micro-viz. |
+| Loading (first paint) | Cards render immediately with real session stats (already in memory) and shimmer viz for the two board-backed cards. |
+| Empty project (no sessions, no tasks, no agents) | Every card still renders. Stat lines read `No sessions yet` / `No tasks yet` / `0 agents · 0 departments` / `No sections yet`; viz areas show neutral placeholders. **Cards are never hidden or disabled** — Home is the map, and a map with missing roads is worse than a map with empty roads. |
+| No project selected | Project trigger reads `Project: No project`. Cards still render with zeroed stats. |
+| Backend unreachable | Home renders from cached in-memory state; the blocking health-check overlay (§14.17) covers the screen. |
+
+### 14.4.2 Sessions view — grid cards (default)
+
+The sidebar is replaced by a card grid; the main panel carries the chat or the dashboard.
+
+```
+SIDEBAR (#workforce-grid, .visible)
+┌───────────────┬───────────────┐
+│ ┌───────────┐ │ ┌───────────┐ │   .wf-card
+│ │    ⛏      │ │ │    ⛏      │ │   • 28×28 status icon (.wf-avatar)
+│ │  WORKING  │ │ │  WORKING  │ │   • uppercase status label
+│ │ OAuth2 p… │ │ │ Rate lim… │ │   • name, truncated to 22 chars + …
+│ │  2:31 PM  │ │ │  2:28 PM  │ │   • short date
+│ └───────────┘ │ └───────────┘ │
+│ ┌───────────┐ │ ┌───────────┐ │
+│ │    ❓      │ │ │    ✓      │ │
+│ │ QUESTION  │ │ │   IDLE    │ │
+│ │ Fix WebS… │ │ │ Frontend… │ │
+│ └───────────┘ │ └───────────┘ │
+└───────────────┴───────────────┘
+```
+
+Status vocabulary on the card (`.wf-status-label`, *copy*):
+
+| Status | Label | Icon | Card animation |
+|---|---|---|---|
+| `question` | `Question` | Amber question-mark circle (`#ff9500`) | `wf-pulse` 1.4s ease-in-out infinite — background and border pulse to amber |
+| `working` | `Working` | Pickaxe glyph, hue-rotated to the accent blue | `wf-work-pulse` 2s ease-in-out infinite — subtle blue breathing |
+| `working` + compacting substatus | `Compacting` | Purple collapse-arrows icon (`#aa88ff`) | as working |
+| any + `auto-resuming` substatus | `Awaiting wake-up` | Moon glyph | as its base state |
+| `idle` | `Idle` | Green check (`#44aa66`) | none |
+| `sleeping` | `Sleeping` | Sleeping "z" glyph | none |
+
+Selected card gets `.wf-selected`; multi-selected gets `.multi-selected`; parent/child
+subsession roles get `.wf-parent` / `.wf-child` with a `↳ ` glyph prefix on children.
+
+Card `title` attribute: `<full title> — double-click to open in <App>`.
+
+Subsession families are kept contiguous: the flat sorted list is re-ordered so each parent
+is immediately followed by its children, regardless of the active sort. Sort order among
+top-level rows and among each parent's children is preserved.
+
+**Empty state:** `No sessions found` (12px, muted, 20px padding).
+
+**Loading state:** twenty shimmer rows (`.skel-row` with `.skel-bar` name/date/size bars,
+random name widths between 40% and 85%, staggered `animation-delay: index × 0.06s`).
+
+### 14.4.3 Sessions view — list table
+
+```
+SIDEBAR (#session-list)
+┌────────────────────────┬────────┬───────┐
+│ Name ↓                 │ Date   │ Size  │  .col-header-row — click to sort,
+│              ⋮grip     │  ⋮grip │       │  grip to resize (name & date only)
+├────────────────────────┼────────┼───────┤
+│ 🕘 OAuth2 provider in… │ 2:31 PM│ 148 KB│  .session-item.active (accent left border)
+│ 🕘 Rate limiting mid…  │ 2:28 PM│  92 KB│
+│ ❓ Fix WebSocket reco… │ 2:10 PM│  67 KB│  .si-question — amber, waitpulse 1.4s
+│ ✓ Frontend bundle an…  │ 1:45 PM│ 312 KB│  .si-idle
+│   OpenAPI spec gener…  │11:30 AM│ 134 KB│  no icon = sleeping
+│ ▾ Parent session       │ 3:02 PM│  40 KB│  ┐ .subsession-family box
+│   ↳ Child subsession   │ 3:03 PM│  12 KB│  │ indented, "from: Parent session"
+└────────────────────────┴────────┴───────┘  ┘
+```
+
+- Grid template: `var(--col-name, 1fr) var(--col-date, 70px) var(--col-size, 47px)`.
+- Header cells are `.col-header.sortable`; the active one gains `.sort-active` and shows
+  `↑` (ascending) or `↓` (descending) appended to its label. `title` attributes:
+  `Sort by name`, `Sort by date`, `Sort by size`.
+- Clicking the same header toggles direction; clicking a new header resets to **descending**.
+- Name and Date carry a `.col-resize-grip`; dragging sets `--col-name` / `--col-date` with
+  a 60px minimum. Size is not resizable (it is the flexible remainder).
+- **Row click targets differ by cell.** The name cell opens *or* inline-renames (see
+  §14.4.4); the date and size cells always open the session. This is deliberate — it gives
+  the user a safe place to click that can never start an edit.
+- Row state classes: `.waiting` (amber, pulsing), `.running` (working or idle), `.active`,
+  `.multi-selected`, `.subsession-row`, `.family-parent`, `.family-child`.
+- **Naming badge:** while an auto-name request is in flight, a `.naming-badge` is appended
+  to the name cell reading `Naming…` preceded by a pulsing dot (`naming-pulse` 1.2s).
+- **Inbox badge:** a parent with pending subsession reports shows `📬 N` with
+  `title="Subsession reports waiting — included on your next message"`.
+- **Disclosure caret:** parents with children show `▾` / `▸`, keyboard-activatable
+  (Enter/Space), `aria-label="Toggle subsessions"`, `title="Collapse subsessions"` /
+  `"Expand subsessions"`. State persists per parent in `localStorage` under
+  `vn.subsession.caret.<parent-id>`, defaulting to expanded.
+
+**Hover tooltip** (`#session-tooltip`): follows the cursor with a 12px offset, flipping to
+the other side when it would overflow the viewport (8px margin). Contents: the full title,
+then a metadata row with an icon + state word, the relative date, and the size. State
+words: `Question`, `Working`, `Idle`, `Compacting`, `Awaiting wake-up`.
+
+**Empty state:** `No sessions found`.
+**Loading:** the same twenty-row shimmer as grid mode.
+
+### 14.4.4 The session dashboard (main panel with no session open)
+
+When Sessions view is active but nothing is selected, `#main-body` shows the dashboard:
+
+```
+┌───────────────────────────────────────────────┐
+│  ┌─────────────────────────────────────────┐  │
+│  │ 📁  <project short name>             ⌄  │  │  .dash-project → project overlay
+│  │     N sessions                          │  │
+│  └─────────────────────────────────────────┘  │
+│                                               │
+│   ⛏        ❓        ✓        z              │  .dash-stats
+│   2        0         4        8              │
+│ Working  Waiting   Idle   Sleeping           │
+│                                               │
+│           [ ＋  New Session ]                 │  .dash-new-btn
+│                                               │
+│  ‹  Select a session from the sidebar to      │  .dash-hint
+│     view its conversation                     │
+└───────────────────────────────────────────────┘
+```
+
+Stat labels (*copy*): `Working`, `Waiting`, `Idle`, `Sleeping`.
+Button label (*copy*): `New Session`.
+Hint (*copy*): `Select a session from the sidebar to view its conversation` when at least
+one session exists; `Select a project to get started` when there are none.
+
+Before the first state poll completes, all four counts render as `-` rather than `0`.
+
+The simplest placeholder — `#main-body`'s static fallback — is:
+
+```
+💬
+Select a session to preview it
+```
+
+### 14.4.5 Mission Control (dense grid)
+
+A full-screen, full-width command surface for driving many sessions at once. Sidebar search
+row hidden, `#main-body` hidden, `body.mc-mode` applied.
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│ [MC] Mission Control │ <project>    🔍 Filter sessions…      12 sessions          │
+│                                                        [＋ New session][▦ Grid]  │
+│                                                                        [☰ List]  │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│ ┌──────────────────────┐ ┌──────────────────────┐ ┌──────────────────────┐        │
+│ ▌│● OAuth2 provider i… │ ▌│● Rate limiting mid… │ ▌│● Frontend bundle a… │        │  ← .mc-card-accent
+│ ▌│  42 msgs · 3m ago   │ ▌│  18 msgs · 6m ago   │ ▌│  9 msgs · 1h ago    │        │    (status colour)
+│ ▌│            [Working]│ ▌│        [Needs input]│ ▌│               [Idle]│        │
+│  ├──────────────────────┤ ├──────────────────────┤ ├──────────────────────┤        │
+│  │ me   …               │ │ …                    │ │ …                    │        │
+│  │ claude …             │ │                      │ │                      │        │  ← .mc-preview
+│  │ (live transcript,    │ │                      │ │                      │        │    scrolls, tail-follows
+│  │  last ~20 entries)   │ │                      │ │                      │        │
+│  ├──────────────────────┤ ├──────────────────────┤ ├──────────────────────┤        │
+│  │ Message…        [🎤] │ │ Message…        [🎤] │ │ Message…        [🎤] │        │  ← .mc-card-input
+│  └──────────────────────┘ └──────────────────────┘ └──────────────────────┘        │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Top bar (`.mc-topbar`), left to right:
+
+| Element | Content |
+|---|---|
+| `.mc-logo-mark` | Literal text `MC` |
+| `.mc-topbar-label` | `Mission Control` |
+| `.mc-topbar-divider` | 1px rule |
+| `#mc-project-label` | Project display name, or `All Projects` when none |
+| `#mc-search` | Placeholder `Filter sessions…`, filters by title substring, case-insensitive, re-renders on every keystroke |
+| `#mc-session-count` | `1 session` / `N sessions` |
+| `.mc-btn-new` | `New session` with a plus glyph |
+| Grid button | `Grid`, `title="Grid view"` |
+| List button | `List`, `title="List view"` |
+
+Card anatomy:
+
+- `.mc-card-accent` — a coloured left strip driven by the `.mc-card-<status>` class.
+- Header (`title="Click to open in normal view"`, click opens the session in grid mode):
+  status dot, title (with full title as `title` attribute), meta line, and a status pill.
+- Meta line: `N msgs · <relative time>`, joined with ` · `, omitting empty parts.
+  Relative time vocabulary: `just now` (<60s), `Nm ago`, `Nh ago`, `Nd ago`.
+- Status pill labels (*copy*): `Compacting…`, `Resuming…`, `Working`, `Needs input`,
+  `Idle`, `Sleeping`. Note that Mission Control says **`Needs input`** where the rest of the
+  product says `Question` / `Waiting for input` — this is intentional; the dense grid needs
+  the most actionable phrasing.
+- Preview area: the last **20** user/assistant entries, rendered with the same entry
+  renderer as the live panel but with expand buttons, message footers and copy buttons
+  stripped. Tail-scrolled. Placeholder before data arrives:
+  `No recent messages`.
+- Input row: a 1-row auto-growing textarea, placeholder `Message…`, capped at **120px**
+  height, plus a mic button (`title="Voice input"`). The row gains `.has-text` while
+  non-empty so the send affordance can light up.
+- **Enter sends** in Mission Control (Shift+Enter for newline) regardless of the global
+  send-key preference. The dense grid is a rapid-fire surface; requiring a modifier there
+  defeats its purpose.
+
+Sending from a card: optimistically set the session to working, add it to the running set,
+re-render the grid, then either `send_message` (already running) or `start_session` with
+`resume: true` (sleeping).
+
+**Empty state:** a single centred `.mc-empty` block reading `No sessions`.
+**Update behaviour:** cards are diffed, not rebuilt — existing cards are updated in place
+and re-appended to maintain sort order, and cards for sessions that no longer match the
+filter are removed. Rebuilding the grid wholesale would destroy in-progress typing in every
+card's textarea.
+
+### 14.4.6 The live chat panel
+
+Full detail in §14.6. Structurally:
+
+```
+#main-body
+└── .live-panel #live-panel
+    ├── .session-role-banner            (only for subsessions / parents)
+    ├── .conversation.live-log #live-log     ← scrollable
+    ├── .live-output-shelf #live-output-shelf
+    ├── .subsession-actions-bar         (subsessions only)
+    ├── .subsession-inbox-strip         (parents with pending reports)
+    ├── #live-queue-area                ← queue banner renders here
+    └── .live-input-bar #live-input-bar      ← state machine, five states
+```
+
+### 14.4.7 The workflow board
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│ ● NOT STARTED  3 │ ● WORKING  5 │ ● VALIDATING 2 │ ● REMEDIATING 1 │ ● COMPLETE  4    │
+├──────────────────┼──────────────┼───────────────┼─────────────────┼──────────────────┤
+│┌────────────────┐│┌────────────┐│┌─────────────┐│┌───────────────┐│┌────────────────┐│
+││Mobile respon…  │││Auth System │││Rate limiting│││WebSocket rec… │││Session token   ││
+││        Mar 30 M│││  Today   A │││   Today   K │││    Today    J │││   Mar 29     A ││
+││[frontend][des…]│││2/4 subtasks│││[backend]    │││[frontend]     │││[backend][secu…]││
+│└────────────────┘││• 1 session │││             │││[reliability]  ││└────────────────┘│
+│┌────────────────┐││[epic][secu…]│└─────────────┘│└───────────────┘│┌────────────────┐│
+││Database migra… ││└────────────┘│               │                 ││Frontend bundle ││
+│└────────────────┘│              │               │                 │└────────────────┘│
+└──────────────────┴──────────────┴───────────────┴─────────────────┴──────────────────┘
+```
+
+Sidebar in Workflow view:
+
+```
+│ 📁 <project>                │
+│ ▥ Workflow View       view  │
+│                             │
+│ KANBAN                      │   ← .kanban-sidebar-section label, uppercase, tiny
+│ ┌─────────────────────────┐ │
+│ │ ＋  New Task            │ │
+│ ├─────────────────────────┤ │
+│ │ ▥  Report               │ │
+│ ├─────────────────────────┤ │
+│ │ ⚙  Settings             │ │
+│ └─────────────────────────┘ │
+│                             │
+│ PERMISSIONS                 │
+│ ┌─────────────────────────┐ │
+│ │ 🛡  Manual              │ │
+│ └─────────────────────────┘ │
+```
+
+The default five columns (*copy*): `Not Started`, `Working`, `Validating`, `Remediating`,
+`Complete`. Column headers render the name uppercased with a coloured status dot and a
+right-aligned count badge.
+
+Card anatomy: title (bold, wraps to two lines then truncates), a right-aligned relative
+date (`Today`, `Yesterday`, `Mar 28`), a single-letter assignee initial, an optional
+subtask progress chip (`2/4 subtasks`), an optional session chip (`• 1 session`), and a row
+of tag pills in their tag colours.
+
+**Empty state (no tasks at all):** a centred prompt with a `+ Create your first task`
+style CTA (`.kanban-create-first-btn`).
+**Empty column:** the column body is simply empty — no per-column placeholder text — but it
+remains a valid drop target with a visible insertion indicator (§14.13).
+**Loading:** five skeleton columns, each with a shimmer title and count and 2–4 shimmer
+cards with randomised widths. This skeleton is painted by an inline boot script *before*
+any JavaScript module loads whenever the persisted view is Workflow, so a cold reload into
+the board never shows an empty screen.
+
+### 14.4.8 Task drill-down
+
+Reached by clicking a card. Replaces the board within `#kanban-board`; the sidebar is
+unchanged. Two-column layout: task detail left, contextual panel right.
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│ ☰ Board  ›  Authentication System Overhaul                                           │  breadcrumb
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│  [ WORKING › ]                              │  SUBTASKS                       ▬▬  25%│
+│                                             │ ┌──────────────────────────────────────┐│
+│  Authentication System Overhaul             │ │[Not Started] User role permissions  ›││
+│  Created 2:25 PM · Updated 2:26 PM          │ │[Working]     OAuth2 provider  1 sess›││
+│                                             │ │[Validating]  Rate limiting middlew. ›││
+│  Modernize auth: OAuth2+PKCE, encrypted     │ │[Complete]    Session token encrypt. ›││
+│  tokens, rate limiting, RBAC.               │ │[New]         Add subtask…            ││
+│                                             │ └──────────────────────────────────────┘│
+│  [epic] [security]                          │ ┌──────────────────────────────────────┐│
+│  + Add tag                                  │ │ ▤  Plan with AI                      ││
+│                                             │ └──────────────────────────────────────┘│
+└─────────────────────────────────────────────┴──────────────────────────────────────────┘
+```
+
+Left column: a status pill that is itself a dropdown trigger (`WORKING ›`), the task title
+as an editable H1, a `Created <time> · Updated <time>` meta line, the description (click to
+edit), the tag pills, and an `+ Add tag` affordance.
+
+Right column is **contextual and this is the screen's whole idea** — it shows one of three
+things depending on what the task already has:
+
+1. **Has subtasks** → the `SUBTASKS` panel with a progress meter and percentage on the
+   right of the header, a row per subtask (status pill, title, optional `N session` chip,
+   chevron), and a trailing `New` row with placeholder `Add subtask…`. Below it, a full-width
+   `Plan with AI` button.
+2. **Has sessions but no subtasks** → the `SESSIONS` panel, same shape: status word,
+   session name, chevron, plus a trailing `New` row with placeholder `Spawn session…`.
+3. **Has neither** → the `HOW TO PROCEED` chooser, three large option cards:
+
+| Card title (*copy*) | Description (*copy*) |
+|---|---|
+| `Break into subtasks` | `Subdivide into smaller pieces. Each subtask gets its own status and sessions.` |
+| `Spawn sessions` | `Start working directly. Spawn Claude sessions scoped to this task.` |
+| `Plan with AI` | `Describe a goal and Claude will break it down into a structured set of subtasks.` |
+
+The third card is visually emphasised (accent border and accent title) as the recommended
+path. This chooser is the single best affordance in the product: it replaces an empty panel
+with three verbs.
+
+**Loading:** breadcrumb renders immediately from cached card data; the panels shimmer.
+**Error:** `Failed to load task` toast, and the drill-down returns to the board.
+
+### 14.4.9 Session-inside-a-task
+
+Opening a session from a task keeps you inside the board shell and swaps the breadcrumb to
+three levels:
+
+```
+☰ Board  ›  Auth System Overhaul  ›  OAuth2 provider integration        [Actions][Analyze ▾]
+```
+
+The live chat panel then renders in the space below. Crucially the **sidebar stays in
+Workflow mode** — you are still in the board, drilled two levels down. Closing the session
+returns to the task, not to the board (`_kanbanSessionClose(taskId)`); this is the only
+"go up one level" that is not simply "go back."
+
+### 14.4.10 The agent-library browser (Workforce)
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  Workforce                                                                            │
+│  5 departments · 3 sub-departments · 16 sessions                                      │
+│                                                                                       │
+│ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐                  │
+│ │      🕘      │ │      ❓      │ │      ✓      │ │      z       │                   │
+│ │      3       │ │      1       │ │      4       │ │      8       │                  │
+│ │   WORKING    │ │   WAITING    │ │     IDLE     │ │   SLEEPING   │                  │
+│ └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘                  │
+│                                                                                       │
+│  DEPARTMENTS                                                                          │
+│ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐                     │
+│ │ 📁       │ │ 📁       │ │ 📁       │ │ 📁       │ │ 📁       │                     │
+│ │ Backend  │ │ Frontend │ │ DevOps   │ │ Security │ │ QA       │                     │
+│ │ 6 agents │ │ 4 agents │ │ 3 agents │ │ 2 agents │ │ 3 agents │                     │
+│ │ · 3 activ│ │ · 1 activ│ │ · 1 activ│ │ · 1 activ│ │ · 0 activ│                     │
+│ └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘                     │
+│                                                                                       │
+│  RECENT SESSIONS                                                                      │
+│  🕘  OAuth2 provider integration                        [Backend]        2:31 PM      │
+│  🕘  Rate limiting middleware                           [Security]       2:28 PM      │
+│  ❓  Fix WebSocket reconnect bug                        [Frontend]       2:10 PM      │
+│  ✓   Frontend bundle analysis                           [Frontend]       1:45 PM      │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+The sidebar in Workforce view carries only the project selector, the view selector, and —
+when permission requests are pending — the permission-approval panel. `New Session`, the
+search row and the options menu are all hidden, because Workforce is a library, not a
+session surface.
+
+Subtitle format (*copy* pattern): `N departments · N sub-departments · N sessions`.
+Section labels (*copy*): `DEPARTMENTS`, `RECENT SESSIONS`.
+Stat tile labels (*copy*): `WORKING`, `WAITING`, `IDLE`, `SLEEPING`.
+Department card meta (*copy* pattern): `N agents · N active`.
+
+**Empty state:** when no departments are installed, the body offers a configure path;
+attempting to use a department feature without one toasts
+`No departments installed. Go to Workforce > Configure to add some.` or
+`Set up a workspace template first`.
+
+### 14.4.11 The composition board (Subsessions)
+
+Two tabs at the top (`#subsessions-tab-strip`):
+
+| Button | Label (*copy*) | Visibility |
+|---|---|---|
+| `#subsessions-tab-adhoc-btn` | `Ad-hoc` | Always; the default tab |
+| `#subsessions-tab-structured-btn` | `Structured` | Hidden until the project has at least one composition on disk |
+| `#subsessions-tab-new-structured-btn` | `+ New structured composition` | Always; `title="Create a Structured composition"` |
+
+**Ad-hoc tab (default)** is a first-class empty state, not a blank panel:
+
+```
+                    ✎  (36px pencil outline, muted)
+
+              Ad-hoc subsessions                       ← 16px, weight 500
+
+   Spawn lightweight subsessions from any active       ← 13px, muted, max-width 440px,
+   session and see the parent-child tree here.            centred
+   (Available in a coming update.)
+```
+
+**Structured tab** shows the composition board:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│ ✎ <composition name>      0 sections     [⚙][Plan with AI][Launch All][Direct All]   │
+│                                          [Export][+ Add Section]  ⚠ N conflicts       │
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│ Talking to: <target name>  [Shared]                                                   │
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│ #compose-sections-board — section cards                                               │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Header controls (*copy*, in DOM order): settings gear (`title="Composition settings"`),
+`Plan with AI` (`title="Plan with AI"`), `Launch All`
+(`title="Launch sessions for all sections without one"`, hidden until applicable),
+`Direct All` (`title="Send a directive to all sections via root orchestrator"`, hidden
+until applicable), `Export` (`title="Export composition"`), `+ Add Section`, and a conflict
+badge reading `N conflicts` with a warning triangle (hidden at zero).
+
+Root name placeholder when nothing is loaded (*copy*): `No composition`, with
+`title="Click to open root session"`. Status line placeholder: `0 sections`.
+
+Input-target strip: literal label `Talking to:` followed by the target name (default
+`composition`) and an optional `Shared` badge.
+
+**Loading:** three skeleton columns titled after `Drafting`, `Reviewing`, `Complete`, again
+painted by an inline boot script — but **only when the persisted tab is Structured**. If
+the persisted tab is Ad-hoc, no skeleton is painted at all, because flashing card shimmers
+under a tab that will render an empty state is worse than showing nothing.
+
+**Stale-composition recovery.** If the saved active composition id points at something that
+no longer exists, the board must clear the stale id and retry with just the project filter.
+Without this the panel renders completely empty even though valid compositions exist.
+
+### 14.4.12 The reports dashboard
+
+Reached from the Workflow sidebar's `Report` button. A read-only analytics surface over the
+task board:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  ‹ Back to board          Report                              [Export]  [Refresh]     │
+├──────────────────────────────────────────────────────────────────────────────────────┤
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐                                 │
+│  │  Total   │ │ Complete │ │In progress│ │ Blocked │      ← KPI tiles: big number,   │
+│  │    27    │ │    11    │ │     9     │ │    2    │        small uppercase label     │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘                                 │
+│                                                                                       │
+│  BY COLUMN                            BY TAG                                          │
+│  ▇▇▇▇▇▇▇▇ Not Started    8            frontend  ▇▇▇▇▇▇  6                            │
+│  ▇▇▇▇▇▇   Working        6            backend   ▇▇▇▇▇▇▇▇ 8                            │
+│  ▇▇       Validating     2            security  ▇▇▇     3                            │
+│                                                                                       │
+│  SESSION ACTIVITY                                                                     │
+│  <horizontal bars or sparkline per session/day>                                       │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Empty state:** when there are no tasks, the report renders its tiles with zeros and a
+single centred line rather than hiding sections — a report that disappears when empty
+teaches users that the button is broken.
+**Loading:** shimmer tiles and shimmer bars.
+**Error:** `Export failed` / `Failed to load task` toasts as applicable.
+
+---
+
+## 14.5 The sidebar in detail
+
+### 14.5.1 Element inventory, top to bottom
+
+| # | Element | Id / class | Content and behaviour |
+|---|---|---|---|
+| 1 | Collapse button | `#btn-sidebar-toggle` `.sidebar-collapse-btn` | Absolutely positioned `top: 8px; right: 8px`, `z-index: 2`. Chevron-left + line. `title="Collapse sidebar"`. Hover changes colour and adds a background. On mobile it becomes a 46×46 ✕. |
+| 2 | Project selector | `#btn-project` `.sidebar-action-btn` | Folder icon + `#project-label`. Label is the project short name followed by a tiny secondary caption reading `project`. Default label: `Select project`. `title="Switch project"`. Opens the project overlay. |
+| 3 | View selector | `#sidebar-view-trigger` inside `.sidebar-view-wrap` | Current view icon + `#sidebar-view-label` + tiny caption `view`. Opens `#sidebar-view-flyout`. |
+| 4 | New Session | `#btn-add-agent` | Plus icon + label `New Session`. `title="Start a new Claude session"`. **Hidden in Workflow, Subsessions and Workforce views.** |
+| 5 | Search row | `.sidebar-search-row` | Contains the deep-search button and the options menu. **Hidden in Workflow, Subsessions, and Mission Control.** |
+| 5a | Deep search | `.sidebar-search-btn` | Magnifier icon + label `Search transcripts…`. `title="Search all transcripts"`. Opens the deep-search modal. |
+| 5b | Hidden filter input | `#search` | `type="hidden"`. Retained because ~100 call sites read its value; an empty value means no client-side filtering. Its `placeholder` is still updated to `Search N sessions…` and is read by nothing visible — but keep it, because it is the canonical session count for several code paths. |
+| 5c | Options menu | `#sidebar-menu-btn` | Three-dot horizontal icon, `title="Options"`. Opens `#sidebar-menu-dropdown`. |
+| 6 | Session list | `#session-list` | The scroll region. Holds the multi-select badge, column header row, and rows. |
+| 7 | Grid | `#workforce-grid` | Card grid; `display: none` unless it has `.visible`. |
+| 8 | Workflow sidebar | `#kanban-sidebar` | Board actions; `display: none` outside Workflow. |
+| 9 | Subsessions sidebar | `#compose-sidebar` | `display: none` outside Subsessions. |
+| 10 | Permission panel | `#sidebar-perm-panel` | `display: none` when empty. See §14.5.4. |
+| 11 | Footer | `.sidebar-footer` | Two stacked lines: `Press and hold a session for the menu` (`.sidebar-footer-tip`, **hidden on desktop, shown on mobile** — desktop has right-click, touch has nothing) and `© <year> <Company>`. |
+
+### 14.5.2 Multi-selection badge
+
+Ctrl/⌘-clicking rows builds a transient selection. When the selection is non-empty a badge
+is inserted as the **first child** of `#session-list`, above the column header, so it never
+scrolls out of view:
+
+```
+┌───────────────────────────┐
+│  3 selected            ✕  │   #sidebar-multi-badge, aria-live="polite"
+└───────────────────────────┘
+```
+
+Text (*copy*): `N selected`. Clear button `title="Clear selection (Esc)"`.
+The badge is re-rendered after every list re-render (which destroys it via `innerHTML`) and
+the selection is pruned to still-existing session ids after any bulk mutation, so the count
+can never lie. Selection is **not** persisted across reloads.
+
+Selection lifecycle:
+
+| Event | Effect |
+|---|---|
+| Ctrl/⌘+click a row | Toggle that row's membership |
+| Plain click any row or name cell | Clear the entire selection, then act on the clicked row |
+| Escape | Clear the selection — but only when no modal is open and focus is not in an input |
+| Right-click a row **in** a selection of ≥2 | Open the bulk menu |
+| Right-click a row **not** in the selection | Clear the selection, open the single-row menu |
+| Leaving the Sessions view | Clear |
+| Project switch | Clear |
+| Bulk delete / duplicate / auto-name completes | Clear |
+
+Ctrl+click must `preventDefault()` on mousedown *and* raise a one-shot suppression flag,
+because `preventDefault` on mousedown does **not** cancel the subsequent click. The flag
+auto-clears after 200ms as a safety net for the case where the pointer drags off the row.
+
+### 14.5.3 Status indicators
+
+The single source of truth is a status resolver with this precedence:
+
+1. Explicit live kind (`question` → `working` → `idle`).
+2. Membership of the running set → `working`.
+3. Membership of the GUI-open set → `idle`.
+4. Restart memory (the state the session held before the last server restart) → that state.
+5. Otherwise `sleeping`.
+
+Step 4 matters: idle sessions are not auto-relaunched after a restart, so without restart
+memory every session collapses to "sleeping" after a restart and the user believes their
+work was lost.
+
+A **substatus** overlays the base state: `compacting` (purple collapse icon, purple
+spinner, label `Compacting`) and `auto-resuming` (moon icon, label `Awaiting wake-up`).
+`auto-resuming` is honoured *regardless of the base state* — during a wake-up the base
+state flips idle→working, and if the icon followed it the sidebar would show a pickaxe
+while the chat panel still said "Awaiting wake-up…".
+
+### 14.5.4 The permission-approval panel
+
+When one or more sessions are blocked on a tool-permission request, the panel appears at the
+bottom of the sidebar:
+
+```
+│ PERMISSIONS                             │  ← section label
+│ ┌─────────────────────────────────────┐ │
+│ │ 🛡  Manual                          │ │  ← policy chip; click to change policy
+│ └─────────────────────────────────────┘ │
+│ ┌─────────────────────────────────────┐ │
+│ │ Fix WebSocket reconnect bug   [Bash]│ │  ← session name + tool badge
+│ │ npm test -- --grep reconnect        │ │  ← the exact command / path, monospace
+│ │ [  Allow  ][  Deny  ][  Always  ]   │ │  ← three buttons, green / red / neutral
+│ └─────────────────────────────────────┘ │
+│ ┌─────────────────────────────────────┐ │
+│ │ OAuth2 provider integration  [Write]│ │
+│ │ app/auth/oauth2.py                  │ │
+│ │ [  Allow  ][  Deny  ][  Always  ]   │ │
+│ └─────────────────────────────────────┘ │
+```
+
+Button labels (*copy*): `Allow`, `Deny`, `Always`. In the chat panel's inline option row the
+same actions carry richer labels: `✓ Yes`, `✕ No`, `🛡 Auto Most`, `★ Always`.
+
+Each card slides in with `permSlideIn` (300ms). The panel is emptied and hidden whenever the
+view changes, so a stale approval from a previous project can never be answered.
+
+### 14.5.5 Menus and flyouts in the sidebar
+
+See §14.8 for the full item lists. Summary of triggers:
+
+| Trigger | Opens | Dismiss |
+|---|---|---|
+| `#sidebar-view-trigger` (click or 200ms hover) | View flyout | Click outside, pick an option, 300ms after mouseleave |
+| `#sidebar-menu-btn` | Options dropdown (`.open` class) | Click outside, pick an item |
+| `#btn-project` | Project overlay (a modal, not a menu) | Backdrop click, ✕ |
+| Right-click / long-press a session row | Session context menu (desktop popup or mobile sheet) | Click outside, pick an item, Cancel |
+
+---
+
+## 14.6 The live chat panel in detail
+
+### 14.6.1 Wireframe
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│ [✕] Concurrent project sessions                          [Actions] [Analyze ▾]     │  #main-toolbar
+├────────────────────────────────────────────────────────────────────────────────────┤
+│ [SUBSESSION] from Parent session name                                              │  .session-role-banner
+├────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│                          ⌃ Load older messages (240 more)                          │  .live-load-more
+│                                                                                     │
+│                                                            ┌──────────────────────┐│
+│                                                            │  ME          2:31 PM ││  .msg.user
+│                                                            │  Implement rate      ││  right-aligned bubble
+│                                                            │  limiting middleware ││  accent-tinted
+│                                                            └──────────────────────┘│
+│                                                              ⚡ Sent at 2:31 PM     │  .vn-msg-footer
+│                                                                                     │
+│  🔧 Read  app/middleware/__init__.py                                    ▾          │  .live-entry-tool
+│  ✓  Success                                                                         │  .live-entry-result
+│  🔧 Write app/middleware/rate_limit.py                                  ▾          │
+│  ✓  Success                                                                         │
+│                                                                                     │
+│  CLAUDE                                                                             │  .msg.assistant
+│  ┌───────────────────────────────────────────────────────────────────┐             │  left-aligned bubble
+│  │ I've created the rate limiting middleware with the following…     │             │
+│  │ …                                                                  │             │
+│  │                                                          … show more│             │
+│  └───────────────────────────────────────────────────────────────────┘             │
+│                                                                                     │
+│  📋 quarterly-report.xlsx   24 KB                       [↗] [⤓]                     │  output card
+│                                                                                     │
+├────────────────────────────────────────────────────────────────────────────────────┤
+│  🕘 Queued (2) — will send when idle          ‹ 1/2 ›  [✎ Edit] [✕ Remove]         │  queue banner
+│  run the integration tests after this                                               │  #live-queue-area
+├────────────────────────────────────────────────────────────────────────────────────┤
+│ ┌─────────────────────────────────────────────────────────────────────────────────┐│
+│ │ Describe what you want Claude to do…                                            ││  .live-textarea
+│ │                                                                                 ││  rows=2 or 3,
+│ └─────────────────────────────────────────────────────────────────────────────────┘│  grows to 300px
+│ [⚡Invoke][Opus 4.7][◔]     Enter to send · Ctrl+Enter for new line ⇄     [ Send ]  │  .live-bar-row
+└────────────────────────────────────────────────────────────────────────────────────┘
+   ↑ bar-left-group              ↑ send-hint (+ toggle)              ↑ send/voice button
+```
+
+### 14.6.2 Header and breadcrumb
+
+In Sessions view the header is `#main-toolbar`:
+
+| Element | Content |
+|---|---|
+| `.toolbar-close` | ✕ icon, `title="Close session"`. Deselects the session (saves the draft first; **never** auto-sends). |
+| `#main-title` | The session title. `data-editable="true"` when a session is open; `title="Click to rename"`. Untitled sessions render in italic faint text via `.untitled`. Clicking starts a rename. |
+| `#btn-open-gui` | Hidden by default; contextual. |
+| `Actions` | A label-style button that opens the Actions popup (§14.7). |
+| `Analyze ▾` | A button group whose contents are cloned into a floating popup on click: `Summary`, `Find`, `Extract Code`, `Export`, `Compare`. |
+
+In Workflow view the toolbar is replaced by a **breadcrumb bar**:
+
+```
+☰ Board  ›  Auth System Overhaul  ›  OAuth2 provider integration
+```
+
+Each crumb except the last is a link; the last is `.current` and is updated in place when
+the session is renamed or auto-named. The `Actions` and `Analyze` controls move into this
+bar; `#main-toolbar` is *never* displayed in Workflow view.
+
+### 14.6.3 Role banner
+
+Rendered as the very first child of `#live-panel` for sessions that are part of a family:
+
+| Case | Class | Badge (*copy*) | Text |
+|---|---|---|---|
+| Subsession, parent alive | `.session-role-banner.role-subsession` | `SUBSESSION` | `from <parent name>` where the name is a link that opens the parent |
+| Subsession, parent deleted | same | `SUBSESSION` | `parent <name> (deleted)` — name in a strikethrough/dimmed span |
+| Parent with children | `.session-role-banner.role-parent` | `MAIN SESSION` | `N subsessions running in parallel` (singular `subsession` at 1) |
+| Plain session | — | — | No banner |
+
+This banner exists because a subtle breadcrumb was not enough: users typed into the wrong
+session. The banner is loud on purpose — amber for subsessions, blue for parents.
+
+### 14.6.4 Transcript entry types
+
+Every entry is one element appended to `#live-log`. The log is monospace (12px,
+line-height 1.5), the message bubbles inside it are not.
+
+| Kind | Class | Visual treatment |
+|---|---|---|
+| User message | `.msg.user` | Right-aligned column; role line reads `me` in accent colour, uppercase, 10px, letter-spaced, with the timestamp appearing on hover (opacity 0 by default; always visible on the newest user and newest assistant message via `.show-time`). Body is a tinted bubble with a 14px radius and `white-space: pre-wrap`. Truncated at **800** characters with a `… show more` button. |
+| Assistant message | `.msg.assistant` | Left-aligned; role line reads `claude`. Body is markdown-rendered into a bubble. Truncated at **600** characters. Smart-copy buttons are attached to the body. The **most recent** assistant message renders fully expanded (no truncation) and is tagged `.msg-recent-expanded`; when a newer assistant message arrives, the previous one is collapsed back. Messages the user expanded by hand are never auto-collapsed. |
+| Streaming partial | `.msg.assistant.streaming-bubble` | Same as assistant but the role line reads `claude streaming…` in faint 10px. While a streaming bubble exists, auto-scroll always follows the tail. |
+| Tool use | `.live-entry.live-entry-tool` | A single collapsed line: gear icon, tool name (bold), description truncated to **120** chars, and a `▾` expander. Clicking the line toggles `.open` on the detail block below it, which shows the full description as plain text. |
+| Agent tool use | `.live-entry.live-entry-tool.live-entry-agent` | Identical but with a robot icon instead of a gear, and its own accent treatment. |
+| Tool result | `.live-entry.live-entry-result` | Collapsed line with a green ✓ (`.live-result-ok`) or red ✕ (`.live-result-err`) and the first **80** characters followed by `…`. Expanding reveals markdown-rendered output with **diff colourisation**: `+` lines green, `-` lines red, `@@` hunk headers accent, all at 0.6–0.8 opacity. |
+| System | `.live-entry.live-entry-result` | Info circle (or warning triangle when it is an error), first **120** chars, expandable to a `<pre>` block. Muted colour unless it is an error. |
+| Interrupted | `.live-entry.live-interrupted` | A centred pill. For a system interrupt: a stop-square icon and the text `Request stopped by user`. For a bracketed user message like `[Request interrupted by user]`, the brackets are stripped and the inner text becomes the pill. |
+| Permission audit | `.live-entry.live-entry-permission` | 11px shield icon + the first line of the audit text, expandable. Faint by default, red when it records a denial. |
+| Invoke pill | inside `.msg.user` | `[[invoke::…]]` markers are replaced by a gradient pill showing the invoked asset name; any remaining text renders as a `<pre>` below it. |
+| Output file card | `.live-output-card-inline` | Icon by extension, basename, an async-loaded file size, an open button (`title="Open file"`) and a save button (`title="Save to..."`). |
+| Directive conflict | `.live-entry.live-directive-conflict` | A card: warning icon + title `Directive Conflict`; two side-by-side directive blocks separated by a literal `vs`, each with id, scope and time; an optional recommendation/reason line; three buttons `Supersede` / `Scope` / `Keep Both` with tooltips `New directive (B) replaces old (A)`, `Both apply to different sections`, `Keep both active`; and a free-form input with placeholder `Or describe how to resolve…`. On resolution the buttons are replaced by `Resolving…` and then a green check badge reading `Superseded`, `Scoped separately` or `Kept both`. On failure the buttons are restored with a `Failed: <message>` prefix so the user can retry. |
+| Message footer | `.vn-msg-footer` | Under user messages: `⚡ Sent at 2:31 PM`, or `🎙️ Transcribed from voice · Sent at 2:31 PM`. |
+
+Pagination control: `.live-load-more` renders a pill button reading
+`Load older messages` followed by a faint `(N more)`. While loading it is disabled and its
+text becomes `Loading…`. It is separated from the transcript by a hairline rule drawn with
+an `::after` pseudo-element.
+
+### 14.6.5 The input bar as a state machine
+
+The input bar (`#live-input-bar`) has **five** states. It re-renders only when its computed
+state key changes — this is critical, because a re-render replaces the textarea and would
+otherwise destroy whatever the user is typing.
+
+```
+                        ┌──────────────┐
+                        │ 1. NEW       │  session created but never sent to the server
+                        └──────┬───────┘
+                       submit  │
+                               ▼
+     ┌──────────────┐   ┌──────────────┐   tool/question   ┌──────────────┐
+     │ 5. ENDED     │◀──│ 4. WORKING   │──────────────────▶│ 3. QUESTION  │
+     │ (not running)│   │              │◀──────────────────│              │
+     └──────┬───────┘   └──────┬───────┘     answered      └──────┬───────┘
+            │  type+send       │ turn ends                        │
+            │                  ▼                                  │
+            │           ┌──────────────┐                          │
+            └──────────▶│ 2. IDLE      │◀─────────────────────────┘
+                        └──────────────┘
+```
+
+State key composition (this determines when a re-render happens):
+
+| State | Key |
+|---|---|
+| Ended | `ended` |
+| Question | `question:<question text>` |
+| Idle | `idle:<substatus>` + `:retry:<retry_at>:<attempt>` if a retry is armed, or `:err:1` if an error is showing |
+| Working | `working:<queue length>:sa:<comma-joined sub-agent statuses>` |
+
+**State 1 — NEW.** A brand-new session that has not been dispatched.
+
+- Transcript area shows an empty state: a code-brackets glyph (32px, 40% opacity) above the
+  greeting **`What will we <App> today?`** (the product name used as a verb), followed by
+  the template grid.
+- Textarea `rows="3"`, placeholder `Describe what you want Claude to do…`, `autofocus`.
+- Left group: invoke button, an **interactive** model badge, no context ring.
+- Submitting starts the session with the typed text as the first prompt and immediately
+  auto-names the session from that text.
+- Typing hides the template grid on first input.
+
+**State 2 — IDLE.** The session is alive and waiting for you.
+
+- Textarea `rows="2"`, placeholder `Type your next command…`.
+- If the substatus is `auto-resuming`, a banner precedes the textarea: a moon icon and
+  `Awaiting wake-up…` followed by faint `(send a message to take over)`, and the placeholder
+  changes to `Type to override the scheduled wake-up…`.
+- If an auto-retry is armed, a warning-bordered banner shows a rotating-arrows icon and
+  `Auto-retrying in <countdown>` where the countdown ticks every second in place (never a
+  full re-render), optionally followed by ` · attempt 2/5` and ` · <reason>`, with two
+  buttons: `Retry now` and `Cancel`. Countdown formatting: `45s`, `12m 30s`, `1h 5m`.
+- If the session settled on a non-retrying error, an error-bordered banner shows the error
+  text and a single `Retry` button.
+- Left group: invoke button, informational model badge, context ring.
+
+**State 3 — QUESTION.** Claude is blocked on input.
+
+- A label above everything: an amber, uppercase, letter-spaced `Claude has a question`,
+  entering with `permSlideIn` (300ms).
+- The question text, markdown-rendered; if longer than 400 characters it is truncated from
+  the **front** with a leading `…` so the actual ask (which is always at the end) is visible.
+  Entering at +50ms.
+- Option buttons (entering at +100ms). For tool-permission prompts, single-token options are
+  expanded into rich labels: `✓ Yes`, `✕ No`, `🛡 Auto Most`, `★ Always`. Numbered options
+  like `1. Do X` display in full but send only `1`.
+- Textarea `rows="2"` with `.waiting-focus`, placeholder
+  `Type your response… (or click an option above)`.
+- Send button carries `.waiting` styling.
+
+**State 4 — WORKING.** Claude is producing output.
+
+- Status row: a spinner (purple variant when compacting) plus one of `Working…`,
+  `Compacting…`, `Awaiting wake-up…`, then an elapsed timer in faint 10px, updated **in
+  place** every second (`12s`, `2m 05s`). A `■ Stop` button sits at the right
+  (`title="Interrupt session"`).
+- **Sub-agent team strip** when the turn spawned agents:
+  - Any still running → a strip with a team icon, the label
+    `N agents active · N done` (`agents`/`agent` singularised; the `· N done` clause omitted
+    at zero), and a row of pills. Each pill: a spinner or a green check, the agent's
+    description, and its own elapsed time. Pills enter staggered by `index × 0.06s`; the
+    strip itself enters with `agentStripIn` (350ms).
+  - All finished → the strip collapses to a one-line footer: a check plus
+    `N agents completed`.
+- Textarea is `#live-queue-ta`, placeholder
+  `Type your next command — will send when Claude finishes…`, or
+  `Queue another command…` when something is already queued.
+- Hint line (replacing the send hint): `Will send automatically when done`, or
+  `N queued • will send in order when idle`.
+- Context ring is rendered **disabled** (not clickable) — compacting mid-turn is not offered.
+
+**State 5 — ENDED.** The session is not running.
+
+- A bordered notice above the textarea: a minus-in-circle icon and
+  `Session not running. Type a message to resume.`
+- Textarea `rows="2"`, placeholder `Type a message to continue…`.
+- Submitting resumes the session with the typed text.
+- The toolbar's Stop button is disabled.
+
+**Rules that apply to every state:**
+
+- Text is preserved across state transitions: the current textarea's value is captured
+  before the re-render and restored afterwards; if empty, the saved draft is restored.
+- The bar does **not** re-render while voice dictation is targeting a textarea inside it —
+  the innerHTML swap would destroy the recognition target mid-sentence. A deferred refresh
+  catches up when dictation ends.
+- Focus is preserved: if focus was inside the bar before the re-render, it is restored
+  synchronously afterwards to avoid a visible focus flash.
+- Autofocus is only granted for a *deliberate* GUI open, consumed once, and **never on
+  mobile** — a programmatic focus on a phone pops the keyboard over the session the user
+  just wanted to look at.
+- All four state-transition renders schedule a settle-scroll at +50ms.
+- Transitions (but not the first render) add `.bar-transitioning` for 350ms, animating the
+  bar's children in with a 4px rise.
+
+### 14.6.6 The bar's left group
+
+`.bar-left-group` is pinned left and contains, in order:
+
+1. **Invoke button** — opens the Invoke Workforce modal.
+2. **Model badge** — shows the effective model label (e.g. `Opus 4.7`). Interactive only for
+   brand-new sessions; informational for running sessions.
+3. **Context ring** — an 18×18 SVG donut (radius 7) showing context-window usage as a
+   filled arc, rotated −90° so it fills clockwise from twelve o'clock. Colour thresholds:
+   accent below 70%, `#ffb700` at 70–89%, error red at 90%+. `title` reads
+   `Context N% — click to compact` when clickable, `Context N%` when not. Hidden entirely
+   when there is no usage data, when the token count is zero, or when it exceeds 1.5× the
+   window (a nonsense value that would otherwise render a full red ring).
+
+### 14.6.7 The send hint and send-key toggle
+
+To the right of the left group sits `.send-hint`, 10px faint text:
+
+| Preference | Text (*copy*) |
+|---|---|
+| `ctrl-enter` (default) | `Ctrl+Enter, Shift+Enter, or Alt+Enter to send` (`⌘` substituted for `Ctrl` on Mac) |
+| `enter` | `Enter to send · Ctrl+Enter, Shift+Enter, or Alt+Enter for new line` |
+
+Followed by a small swap-arrows icon button (`.send-hint-btn`, `title="Change send
+shortcut"`) that toggles the preference, persists it to `localStorage` **and** to the
+server, refreshes every visible hint on the page, and toasts
+`Send: Enter to send` or `Send: Ctrl+Enter to send`.
+
+**On mobile the hint and the toggle are suppressed entirely** and Enter is always a newline.
+
+### 14.6.8 The queue banner
+
+Rendered into `#live-queue-area`, between the transcript and the input bar:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ 🕘 Queued (2) — will send when idle    ‹ 1/2 ›  [✎ Edit]  [✕ Remove]  │
+│ run the integration tests after this                                    │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+- Label (*copy*): `Queued` — with ` (N)` appended when more than one — then a suffix span
+  reading ` — will send when idle`.
+- Navigation `‹ N/M ›` appears only when there is more than one queued item; the arrows are
+  disabled at the ends. Tooltips `Previous` / `Next`.
+- `Edit` (`title="Edit this command"`) removes the item from the queue and drops its text
+  back into the composer for editing.
+- `Remove` (`title="Remove this command"`) deletes just the currently-viewed item and is
+  rendered in error red.
+- The banner disappears when the queue empties.
+
+Queue toasts: `Command queued (N)`, `Removed — N remaining`, `Queue cleared`.
+
+The queue is **server-backed** with optimistic local updates: adding pushes to the local
+array immediately and emits to the server, which echoes an authoritative update.
+
+### 14.6.9 The output / file shelf
+
+`#live-output-shelf` sits between the transcript and the queue area. Output cards are
+detected three ways:
+
+1. Direct file tools (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`) — the path is taken from
+   the tool description, with trailing `(write N chars)` and a leading `file_path:` stripped.
+2. `Bash` tool descriptions are scanned for absolute paths.
+3. Tool results and assistant text are scanned for absolute paths.
+
+Only these extensions produce a card: `xlsx xlsm xls docx doc pptx ppt pdf png jpg jpeg gif
+svg bmp csv json zip html txt`. Paths are de-duplicated per session; the shelf is cleared on
+every session switch.
+
+Icons are colour-coded by family: spreadsheets green, documents blue, presentations orange,
+PDF red, images purple, archives grey, JSON amber (rendered as `{}`), HTML red-orange.
+
+Two actions per card: open (`title="Open file"`) which asks the server to open it in the
+OS, and save (`title="Save to..."`) which opens the folder picker and copies the file, with
+a fallback that copies straight to Downloads and toasts `Copied to Downloads: <name>`.
+
+### 14.6.10 Scroll affordances
+
+Covered in full in §14.15. In the panel specifically:
+
+- The scroll container is `#live-log`.
+- A scroll listener recomputes "am I at the bottom?" with a **60px** tolerance and sets the
+  auto-follow flag accordingly.
+- Programmatic top-aligns stamp a timestamp and the listener ignores scroll events within
+  **150ms** of one, so the app's own scrolling never looks like the user scrolling away.
+- Custom 6px scrollbar in the log, 8px in the standard conversation view.
+
+---
+
+## 14.7 Complete modal and overlay inventory
+
+Three overlay hosts exist. Understand them before reading the tables.
+
+| Host | Mechanism | Dismissal | Notes |
+|---|---|---|---|
+| `#pm-overlay` | One persistent element whose `innerHTML` is replaced. Shown with `.show`. Cards are `.pm-card` with an entry class `.pm-enter` removed on the next animation frame. | `_closePm()` adds `.pm-exit`, then after **150ms** removes `.show` and empties the HTML. Backdrop click closes. | **Contended** — any two features targeting it overwrite each other. No focus trap, no global Escape handler. |
+| Runtime-created overlays | A `div` appended to `<body>`, removed with `.remove()`. Typical inline style `position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:9999; display:flex; align-items:center; justify-content:center`. | Backdrop click (`e.target === overlay`) plus an explicit button. | Used where a dialog must survive a `#pm-overlay` takeover. |
+| Bespoke overlays | Purpose-built elements with their own classes and animations. | Varies — documented per row. | Health blocker, mobile sheet, slide-out panels, restart overlay, undo toast. |
+
+Standard card anatomy: `<h2 class="pm-title">`, `<div class="pm-body">`, optional `<input class="pm-input">`, `<div class="pm-actions">` holding `.pm-btn` with the variants `.pm-btn-primary`, `.pm-btn-secondary`, `.pm-btn-danger`.
+
+### 14.7.1 Core primitives
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 1 | Alert | `showAlert(title, message, opts)` | Acknowledge-only message | Optional icon, title, HTML body | `OK` (or `opts.buttonText`) / none | OK, backdrop | none |
+| 2 | Confirm | `showConfirm(title, message, opts)` | Yes/no decision | Optional icon, title, HTML body | `Confirm` (or `opts.confirmText`; `.pm-btn-danger` when `opts.danger`) / `Cancel` | Cancel and backdrop both resolve false | none; confirm button autofocused |
+| 3 | Prompt | `showPrompt(title, message, opts)` | Single-line text entry | `#pm-input` with placeholder and prefilled value, `autocomplete="off"`, `spellcheck="false"` | `OK` (or `opts.confirmText`) / `Cancel` | Cancel, backdrop, **Escape** — all resolve null | none; caller checks. Enter confirms. Input autofocused, text pre-selected |
+
+### 14.7.2 Session lifecycle
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 4 | Rename Session (toolbar) | Click `#main-title` | Rename the open session | Prompt input, placeholder `Session name`, prefilled with the current title, body `Enter a new name for this session.` | `Save` / `Cancel` | Cancel, Escape, backdrop | Empty is accepted and reverts to untitled |
+| 5 | Rename Session (static modal) | `openRename(id, title)` | Same, via `#rename-overlay` | `#rename-input`, placeholder `Enter a name…` | `Save` / `Cancel` | Cancel, Escape, backdrop click | Empty or unchanged is a silent no-op |
+| 6 | Delete Session | Actions ▸ Delete; context menu ▸ Delete | Permanently remove a session | Trash icon; body `Delete <name>?` then `This cannot be undone.` | `Delete` (danger) / `Cancel` | Cancel, backdrop | none |
+| 7 | Delete Empty Sessions | Sidebar menu ▸ `Delete empty sessions` | Bulk-remove zero-message sessions | Trash-with-slashes icon; body `Delete N empty session(s)?` | `Delete All` (danger) / `Cancel` | Cancel, backdrop | No empties gives toast `No empty sessions found` and no modal |
+| 8 | Delete All Sessions (first) | Sidebar menu ▸ `Delete all sessions` | Wipe the project | Warning-triangle icon; body `Permanently delete all N sessions in this workspace?` then `This cannot be undone.` | `Delete All` (danger) / `Cancel` | Cancel, backdrop | Zero sessions gives toast `No sessions to delete` |
+| 9 | Delete All Sessions (second) | Confirming row 8 | Double confirmation | Title `Are you sure?`; body `This will permanently delete N sessions and all their history.` | `Yes, delete everything` (danger) / `Cancel` | Cancel, backdrop | — |
+| 10 | Sleep All Sessions | Sidebar menu ▸ `Sleep all sessions`; Bulk Operations | Stop every running session | Moon icon; body `Close N running session(s) in this workspace?` | `Sleep All` (danger) / `Cancel` | Cancel, backdrop | Zero running gives toast `No running sessions` |
+| 11 | Close Session | Actions ▸ Stop Session; context menu ▸ Stop Session | Terminate one running session | Stop-square icon; body `Close <name>?` then `This will stop the running Claude process and close the terminal window.` | `Close` (danger) / `Cancel` | Cancel, backdrop | none |
+| 12 | Auto-name All Sessions | Bulk Operations ▸ Run | AI-name every untitled session | Pencil icon; body `Auto-name N untitled session(s)?` then `This uses AI to generate meaningful names based on each session's content. Sessions with user-set names will be skipped.` | `Name All` / `Cancel` | Cancel, backdrop | Zero untitled gives toast `All sessions already named` |
+| 13 | Delete sessions (bulk) | Multi-select ▸ right-click ▸ `Delete all` | Delete the selection | Trash icon; body lists the first three names then `and N more…`, then `This cannot be undone.` | `Delete N` (danger) / `Cancel` | Cancel, backdrop | Empty selection returns silently |
+| 14 | Auto-name sessions (bulk) | Multi-select ▸ `Auto-name all` | AI-name the selection | Body `Auto-name N session(s)?` then `This will cost API tokens (one short LLM call per session).` | `Auto-name N` / `Cancel` | Cancel, backdrop | — |
+| 15 | Wrong session? | Sending a prompt whose keywords match a different active session better | Prevent typing into the wrong window | Swap-arrows icon; body `This prompt seems more related to <other>.` then `Send to <current> anyway?` | `Send anyway` / `Cancel` | Cancel restores the text into the composer | Gate: at least 3 keyword overlap elsewhere, greater than here, and at most 1 overlap here |
+| 16 | Message picker — Fork | Actions ▸ Branch ▸ Fork | Choose a fork point | Body `Create a new session forked from the selected message. All messages after it will be excluded.` plus a scrollable `#msg-timeline` of `.tl-row` rows carrying an index `#N`, a role chip (`me` / `claude`), a preview, file badges, `+N` / `-N` change counts, a snapshot marker with `title="File snapshot available"`, and a time | `Fork Conversation`, disabled until a row is selected / `Cancel` | Cancel, backdrop | Row selection required |
+| 17 | Message picker — Rewind Code | Actions ▸ Branch ▸ Rewind Code | Choose a restore point | Body `Restore source files to the state they were in at the selected message.` with all roles shown | `Rewind Code` / `Cancel` | Cancel, backdrop | Refuses with `This session has no file snapshots. Code rewind is not available.` |
+| 18 | Message picker — Fork + Rewind | Actions ▸ Branch ▸ Fork + Rewind | Both at once | Body `Fork the conversation AND restore source files to the selected message.` with the timeline filtered to user messages | `Fork + Rewind Code` / `Cancel` | Cancel, backdrop | Both of the above; no user messages gives `No user messages found in this session.` |
+| 19 | Subsessions orphaned by rewind | Rewinding past a subsession anchor | Re-parent or detach orphans | Title `Subsessions orphaned by rewind`; help `These subsessions were spawned past the line you rewound to. Pick an action for each.`; one row per orphan | Per row `Re-anchor at current parent tip` and `Detach`; footer `Close` | Close; auto-closes when the last row resolves | none |
+| 20 | Report to Parent | Subsession toolbar ▸ `Report to Parent` | Send a summary up | Title `Report to Parent`; help `This summary will appear at the top of the parent's next message.`; a six-row textarea pre-filled from the last assistant message, then replaced by the authoritative last conclusion unless the user already edited it | `Send report` / `Cancel` | Cancel | Empty gives toast `Summary cannot be empty` |
+
+### 14.7.3 Projects
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 21 | Projects overlay | Sidebar project button; Home project trigger; dashboard project card | Switch, rename, delete, add | Heading `Projects`; explainer `Select a Claude Code project to view its sessions. Each project corresponds to a directory where you've used Claude.`; rows with a short name, the full path, a `N sessions` count and hover-revealed `Rename` / `Delete` icon buttons; footer `+ Add Project` | Row click selects | Close button `×` with `title="Close"`, backdrop | Empty list shows `Loading projects…`, then on failure `Couldn't load projects. Check your connection and tap "Select project" again.` |
+| 22 | Add project — mode picker | Projects ▸ `+ Add Project` | Choose how to add | Three cards: `Browse` / `Pick a folder from your computer`; `Find Projects` / `Scan your computer for code projects`; `Create New` / `Start a new empty project` | Card click / `Back to Projects` | Back, backdrop | — |
+| 23 | Add project — Find (chat) | Mode picker ▸ Find Projects | Conversational search | Embedded chat with the system message `Tell me what project you're looking for — I'll search your computer. Try something like "my Python web app" or "the React project I was working on".`; suggestion chips `Python projects`, `Node.js apps`, `Git repositories`, `Recent code projects`; input placeholder `Describe the project you're looking for…` | Send / `Back to Projects` | Back | Loading bubble reads `Thinking…`; handler failure renders `Something went wrong. Please try again.` |
+| 24 | Create Project | Mode picker ▸ Create New | Name a new project | Prompt input with placeholder `My Project` and body `Enter a name for your new project.` | `Create` / `Cancel` | Cancel, Escape | Empty returns silently |
+| 25 | Rename Project | Project row ▸ pencil | Set a display name | Prompt input with placeholder `Project name` and body `Enter a display name for this project. The directory stays the same.` | `Rename` / `Cancel` | Cancel, Escape | Unchanged is a no-op |
+| 26 | Delete Project | Project row ▸ trash | Remove a project and its sessions | Trash icon; body `Delete <name> and all its sessions?` then `This cannot be undone.` | `Delete` (danger) / `Cancel` | Cancel, backdrop | — |
+| 27 | Project switch loader | Selecting a project | Cover the teardown and rebuild | An animated orb with two expanding rings, the label `Switching to`, the project name, and three pulsing dots | none | Auto-dismisses once the switch completes and a 1800ms minimum has elapsed, then fades over 900ms | — |
+
+### 14.7.4 System menu
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 28 | Select Model | System ▸ Model | Default model for new sessions | Body `Choose the default model for new sessions.`; a grouped list with a `.msel-group-hd` per family (`Fable`, `Opus`, `Sonnet`, `Haiku`) carrying a coloured dot, then a `.msel-row` per version with a check glyph and an optional `1M` tag | Row click applies immediately / `Close` | Close, backdrop | — |
+| 29 | Thinking Level | System ▸ Thinking | Default extended thinking | Body `Set the extended thinking level for new sessions.`; cards `Default` / `Use model default`, `None` / `No extended thinking`, `Low` / `Brief reasoning step`, `Medium` / `Moderate reasoning`, `High` / `Deep reasoning for hard tasks` | Card click applies / `Close` | Close, backdrop | — |
+| 30 | Preferences | System ▸ Preferences | Four toggles | `<App> Voice` / `Local, codebase-aware voice that works in every browser (Firefox & Safari too). Downloads a small model on first enable.`; `Enter to send` / `Press Enter to send. When off, Ctrl+Enter sends and Enter adds a new line.`; `Sticky chats` / `Keep your most recent message pinned at the top while scrolling long replies.`; `Wrong-session detection` / `Warn before sending a prompt that looks meant for a different active session.` | Toggles apply immediately and the modal stays open so several can be flipped / `Close` | Close, backdrop | — |
+| 31 | Permission Policy | System ▸ Permission Policy; sidebar permission chip | Choose approval behaviour | Body `Choose how tool permission requests are handled.`; five cards `Manual` / `Review and approve each tool use individually`, `Auto Approve Most` / `Auto-approve all tools except destructive commands (rm -rf, force push, DROP TABLE, etc.)`, `Claude Auto` / `Use Claude's built-in approval logic for file edits, plus the destructive-command guard for shell. Edits are decided by Claude itself, not a regex.`, `Auto-Approve All` / `Automatically approve all permission requests`, `Custom Rules` / `Define per-tool auto-approve rules` | Card click applies / `Close` | Close, backdrop | Choosing Custom Rules opens row 32 after 200ms so the close animation finishes first |
+| 32 | Custom Auto-Approve Rules | Permission Policy ▸ Custom Rules | Per-tool rules | Lead `Select which tool types to auto-approve:`; checkboxes `Approve all Read operations`, `Approve Glob (file search)`, `Approve Grep (content search)`, `Approve Write/Edit operations`, `Approve Bash commands`; then the label `Custom regex pattern (matches question text):` and an input with placeholder `e.g. safe_directory.*` | `Save` / `Cancel` | Cancel, backdrop | None; an invalid regex is swallowed at match time so it never breaks approvals |
+| 33 | Persistent Storage | System ▸ Persistent Storage | Choose the task backend | Explainer `Controls where your kanban tasks are stored. This applies to all projects — not sessions. Sessions always stay local. Switching copies all existing tasks to the new backend.`; two option cards `Local (SQLite)` / `Tasks stay on this machine. Zero config.` and `Cloud (Supabase)` / `Tasks sync to a hosted PostgreSQL database.`, the live one labelled `Currently active`; a cloud panel with `Project URL` (placeholder `https://your-project.supabase.co`), `Secret Key` with an orange `(service_role)` note (placeholder `eyJhbGciOi...`), a `Step 1: Test Connection` button, a decision area, a bordered `Step 2: Create database tables` block with a three-step ordered list plus an `Access Token` field (placeholder `sbp_...`) and a `Setup Database` button, and a `Backups` section with `Download Backup` and a `Saved Backups` list | `Close` | Close, backdrop | Connection statuses are listed in 14.17 |
+| 34 | Mobile Command wizard | System ▸ Mobile Command | Set up private phone access | Title `Set up phone access`; a four-rung stepper `Install`, `Sign in`, `Enable HTTPS`, `Your phone`; per-step copy given in 14.17.4 | A step-specific CTA / `Close` | Close, backdrop | Closing stops the poll timer |
+| 35 | Bulk Operations | System ▸ Bulk Operations | Workspace-wide actions | Body `Perform actions across all sessions in this workspace.`; five rows each with an icon, a title, a live count and a `Run` button: `Unhide All Sessions`, `Sleep All Sessions`, `Auto-name All Sessions`, `Delete Empty Sessions` (danger), `Delete All Sessions` (danger) | `Run` per row / `×` | `×` | A zero count disables the row and its description reads `No hidden sessions`, `No running sessions`, `All sessions named`, `No empty sessions` or `No sessions` |
+| 36 | Keyboard Shortcuts | System ▸ Keyboard Shortcuts; `?` | Cheat sheet | A table of `N`, `↑`/`K`, `↓`/`J`, `Enter`, `Esc`, `Ctrl+F`, `Ctrl+Enter`, `?` | `Close` | Close, backdrop | — |
+| 37 | Recently Deleted | System ▸ Recently Deleted | Restore or purge deleted sessions | Title `Recently Deleted`; explainer `Items are kept for the period you choose below. Restore brings the conversation back; permanent delete cannot be undone.`; a retention row labelled `Keep deleted sessions for:` with `30 days`, `60 days`, `90 days`, `Forever`; rows showing the title or `Untitled session`, then `deleted <ago> · <size> · <purge label>`, each with `Restore` and `Delete forever` | `Empty trash` (danger, hidden when the list is empty) / `Close` | Close, backdrop | Purge and empty both use a native confirm |
+| 38 | Developer Tools | System ▸ Developer Tools | Maintenance actions | Section `Server` with `Restart Server` / `Choose what to restart.` and `Turn Off Server` / `Stop the server entirely.` (danger); section `Diagnostics` with `Run Tests (Fast)` / `Quick test suite.`, `Run Tests (Full)` / `Complete test suite.`, `Server Scan` / `Scan the codebase for issues.`, `Scrub Phantom Names` / `Remove name entries that point to deleted sessions.` carrying a count badge | Row click closes the popup first, then opens its own dialog / `Close` | Close, backdrop | — |
+| 39 | Restart Server | Developer Tools ▸ Restart Server | Pick a scope | Title `Restart Server`; three option buttons `Application` / `Quick refresh. Your running sessions stay alive.`, `Session Engine` / `Restarts the AI session engine. All running sessions will stop.`, `Everything` / `Full restart. All running sessions will stop.` | Option click / `Cancel` | Cancel, backdrop | — |
+| 40 | Restarting overlay | Confirming row 39 | Cover the restart | Full page: a spinner, `Restarting <scope>`, a status line cycling `Shutting down…`, `Starting up…`, `Almost there…`, then `Back online — reloading` or `Taking longer than expected — reloading`, plus a live elapsed seconds counter | none | Auto-reloads | The spinner turns green on success |
+| 41 | Turn Off Server | Developer Tools ▸ Turn Off Server | Full shutdown | Title `Turn Off Server`; body `This will kill both the web server (5050) and session daemon (5051). All running sessions and agents will be terminated. You will need to manually restart <App> to use it again.` | `Turn Off` (danger) / `Cancel` | Cancel, backdrop | — |
+| 42 | Shutdown notice | After row 41 | Terminal state | Replaces the whole page with `Server has been turned off` and `Restart <App> manually to continue.` | none | none | — |
+| 43 | Scrub phantom names | Developer Tools ▸ Scrub Phantom Names | Confirm cleanup | Native confirm reading `Remove N session-name entries that point to deleted sessions?` then `No actual sessions will be deleted. A backup of each project's session-name file will be written before any change.` | OK / Cancel | — | Zero gives toast `No phantom session names to remove.` and no dialog |
+| 44 | Memory editor | `_showMemoryEditor()` | Edit project and global memory files | Two tabs `Project` and `Global`, each with a path line and a 16-row textarea (placeholders `Project CLAUDE.md content...` and `Global CLAUDE.md content...`) | `Save` / `Cancel` | Cancel, backdrop | — |
+| 45 | Add Department (catalogue) | `openAddDepartment()` | Add a preset department | Body `Select a department to add to your workspace.`; one card per available department with a `N sub-folders` count | Card click / `Close` | Close, backdrop | No tree gives toast `Set up a workspace template first`; none left gives `All departments already added` |
+
+### 14.7.5 Session analysis and utilities
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 46 | Actions popup | Toolbar `Actions`; the Workflow and Subsessions breadcrumb `Actions` | The session action hub | Four tabs `Organize`, `Branch`, `Subsession`, `Session`; a live status badge; rich rows listed in 14.8.4 | Row click performs and closes / `×` | `×`, backdrop | Rows are disabled without an active session |
+| 47 | Session Summary | Analyze ▸ Summary | AI summary | Title `Session Summary`; body shows a spinner and `Building summary…`, then rendered HTML | `×` | `×`, backdrop | Failure renders `No summary available` |
+| 48 | Extract Code drawer | Analyze ▸ Extract Code | Collect every code block | Header `Code Blocks`; per-block cards with a language badge (fallback `text`, or `shell`), an optional `duplicate of #N` badge, a filename, a 2000-character preview, and a `Copy` button that becomes `Copied!` | `Copy All`, `Export ZIP`, `×` | `×` | Empty gives `No code blocks found in this session.`; loading `Loading…`; failure `Error loading code blocks.` |
+| 49 | Compare Sessions | Analyze ▸ Compare | Diff two sessions | Header `Compare Sessions`; a picker row with the label `Compare with:`, a select of the other sessions, and a `Compare` button; a body area | `Compare` / `×` | `×`, backdrop click | Initial `Select a session above and click Compare.`; running `Comparing…`; failure `Error comparing sessions.`; nothing to diff `No code blocks to compare.` |
+| 50 | Find bar | `Ctrl/⌘+F`; Analyze ▸ Find | In-session search | `#find-input` with placeholder `Search in session…`; a match counter; `↑`, `↓` and `✕` buttons | — | `✕`, Escape | Under two characters the counter clears; no hits gives `No matches`; hits give `N / M` |
+| 51 | Deep search | Sidebar `Search transcripts…` | Search titles and message bodies project-wide | Title `Search transcripts`; help `Searches session titles and full message content across every session in this project. Use file:name.py to find sessions that edited a file.`; input placeholder `Search all sessions… (add file:path to filter by edited file)`; a status line; result rows with title, date, highlighted snippets and up to four edited-file chips | Row click opens the session / `Close` | Close, backdrop, **Escape** | Under two characters gives `Keep typing…`; all statuses are in 14.17 |
+| 52 | Manage Templates | Template grid ▸ `Manage Templates` | Custom starter templates | Title `Manage Templates`; a list of custom templates each with `Edit` and `Delete`; a form with `Template name`, `Short description`, `System prompt (instructions for Claude)`, `Starter prompt (pre-filled in text box)` and a checkbox `Show file picker on select` | `Save` / `Cancel` | `×` | Empty name gives toast `Template name is required` |
+| 53 | Invoke Workforce | The `/invoke` button; the slash commands `/invoke`, `/team`, `/departments` | Pick a skill or agent to prepend | Title `Invoke Workforce`; search placeholder `Search skills, agents, departments…`; three independently scrollable sections `Local Skills`, `Local Agents`, `Departments` (a collapsible tree indented 16px per level); footer `Manage Workforce` | Item click stages the invoke and closes / `×` | `×`, backdrop, **Escape** | Empty sections use the copy in 14.16 |
+| 54 | Session Model | The input-bar model badge | Per-session model and thinking | Title `Session Model` for a pending session or `Switch Session Model` for a running one; a grouped model list; a `Thinking Level` section shown only for pending sessions with rows `Default` / `Model default`, `None` / `No extended thinking`, `Low` / `Brief reasoning`, `Medium` / `Moderate reasoning`, `High` / `Deep reasoning` | Pending: `Apply` / `Reset to Default`. Running: `Switch Model` / `Cancel` | Backdrop | Apply is disabled until a row is clicked. A live switch shows `Switching…` and hard-fails after **20s** with `Model switch timed out — model NOT changed` |
+| 55 | Save dropped file | Dragging a file onto the window | Pick a destination folder | Title `Save dropped file`; the filename, or `Choose a file location` when opened without a file; a breadcrumb; a folder tree | `Save here`, which becomes `Saving...` / `Cancel` | Cancel, backdrop | Tree states `Loading...`, `No subfolders`, `Error loading directory` |
+| 56 | Respond to waiting session | `openRespond(id)` | Answer a blocked session without opening it | Heading `⏳ Session waiting for input`; the question rendered as markdown; option buttons; a separator reading `— or type a custom response —`; a textarea with placeholder `Type your response…` | `Send ↵` / `Cancel` | Cancel, `×`, backdrop | Empty text does nothing |
+| 57 | File-drop overlay | Dragging files over the window | Drop affordance | A full-window overlay with an upload icon and the text `Drop file here` | — | Auto-hides on dragleave or drop | Only shown when the drag payload contains files |
+
+### 14.7.6 Workflow (task board)
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 58 | Add to Board | Sidebar `New Task`; the empty-state CTA; context menu `Add Subtask`; the key `n` | Create a task or plan several | The title row carries an insert-position control: the label `Insert` with `Top` (default) and `Bottom`. Section `Quick add` with an input placeholder `Task title…` and an icon-only submit. A divider reading `or`. Section `Plan with AI` with the description `Describe a goal or feature and Claude will break it into tasks`, a three-row textarea placeholder `e.g. Build user authentication with OAuth, session management, and password reset…`, and a mic button. If a plan is stashed, a `Resume previous plan` button appears first with a trailing `(N tasks)` | Submit; there is no Cancel button | Backdrop | An empty title or empty plan text simply refocuses the field |
+| 59 | Validation URLs setup | The first AI plan when the setting is unset | Offer clickable verification links | Title `Validation URLs`; body `The AI planner can generate clickable validation URLs on each task so you can quickly verify features in your browser. Where does your development server run?`; an input with placeholder `http://localhost:8000`; helper `You can change this later in Workflow Settings → Validation.` | `Enable` / `Not now` / `Don't ask again` pushed to the left | Backdrop behaves as "not now" and the modal will ask again | Enable with an empty URL refocuses the field |
+| 60 | Switch to Sessions | Task drill-down ▸ the panel switch icon | Convert a parent task into a session task | Title `Switch to Sessions`; rationale `You're choosing to work on this task directly with Claude sessions instead of breaking it into subtasks.`; a red warning box `All subtasks (and their children) will be permanently deleted.`; footnote `This cannot be undone.` | `Delete subtasks & switch` (danger) / `Cancel` | Cancel, backdrop | — |
+| 61 | Switch to Subtasks | The same switch icon in Sessions mode | The inverse | Rationale `You're choosing to break this task into subtasks instead of working on it directly with sessions.`; warning `All linked sessions will be unlinked from this task. The sessions themselves are not deleted — they just won't be associated with this task anymore.` | `Unlink sessions & switch` (danger) / `Cancel` | Cancel, backdrop | — |
+| 62 | Delete Subtask | A subtask row ▸ trash | Delete a child task | Title `Delete Subtask`; the subtask title; `This subtask and all of its children will be permanently deleted.`; `This cannot be undone.` | `Delete` (danger, becomes `Deleting...`) / `Cancel` | Cancel, backdrop | — |
+| 63 | Replace subtasks? | Running the scoped AI planner on a task that already has subtasks | Warn before replacing | `This will replace the N existing subtask(s) with AI-generated ones.` | `Continue` / `Cancel` | Cancel, backdrop | Only shown when the existing count is above zero |
+| 64 | Clear session / planner | A leaf task ▸ trash on the session or planner row | Unlink | Title `Clear session?` or `Clear planner?`; body `This will unlink the session/planner from this task. You can create a new one afterward.` | `Clear` (red) / `Cancel` | Cancel, backdrop | — |
+| 65 | Active Session Exists | Executing a task that already has a live session | Confirm a second session | `This task already has an active session. Launch another?` | `Launch` / `Cancel` | Cancel, backdrop | — |
+| 66 | Batch Execute | The batch bar ▸ `Execute Selected` | Confirm a multi-session launch | `Execute N task(s)? This will create N session(s) and start them all immediately.`, or above ten `Launch N sessions simultaneously? This may be slow.` | `Launch All` / `Cancel` | Cancel, backdrop | A hard cap of 20 gives toast `Maximum 20 tasks per batch` |
+| 67 | Active Sessions Detected | Batch execute where some tasks already have sessions | Confirm duplicates | `X of N selected task(s) already have active sessions. Launch additional sessions for all?` | `Launch All` / `Cancel` | Cancel, backdrop | — |
+| 68 | Validation Ceremony | Validating a task | Structured approve or reject | Intro `Review <title> before marking as complete:`; an optional `Verification URL` section with an `Open` link; an optional `Subtask Checklist`; an `Issues Found (optional)` textarea with placeholder `Describe any issues found...` | `Approve` / `Cancel` / `Reject` (danger) | Cancel, backdrop | — |
+| 69 | Workflow Settings | Sidebar `Settings` | Board configuration | Tabs `Columns`, `Preferences`, `Validation`. Columns shows the hint `Drag to reorder · Click color to change · Double-click name to rename`, draggable rows with a colour swatch (`Change color`), a name, a status key, and `Rename` and `Remove` buttons, plus an add row with placeholder `New column name...` and `+ Add`, and a fifteen-swatch colour picker. Preferences holds the grouped toggles listed in 14.8.9. Validation holds an `Enable validation URLs` toggle and a `Dev server base URL` field with placeholder `http://localhost:8000` | `Save` / `Cancel` | Cancel discards and reloads the board | The last column gives toast `Cannot remove the last column`; a duplicate derived key gives `A column with that key already exists` |
+| 70 | Remove column (inline) | A column row ▸ `Remove` | Confirm in place | The row content is replaced by `Remove "<name>"?` | `Remove` / `Cancel` | Cancel restores the row | — |
+| 71 | Delete task (inline) | Card context menu ▸ Delete | Confirm on the card | The card content becomes `Delete "<first 30 chars>"?` | `Delete` / `Cancel` | Cancel restores the original card HTML | — |
+| 72 | Workflow shortcuts | `?` on the board | Cheat sheet | `n` / `New task`, `r` / `Refresh board`, `Esc` / `Close panel`, `?` / `Toggle this help` | `Close` | Close, backdrop, `?` again | — |
+| 73 | AI planner panel (Workflow) | `Plan with AI` | Streamed task breakdown | A slide-out titled `Plan with AI` with a minimise `―` (`title="Minimize"`) and a close `×` (`title="Close"`). The body cycles `Breaking down your plan…`, then `Building task breakdown…` or `Exploring project…` with a live `N task(s) so far` and an elapsed timer, then the proposal tree. When tool steps appear, the hint `Tip: minimize to keep working — it'll notify you when complete` is shown. The footer holds a two-row textarea with placeholder `Ask for changes…` and a mic button | `Add N tasks to Board`, which becomes `Creating…` / minimise / close | `×` | A parse failure shows `Couldn't parse a task structure. Try rephrasing below.` plus a raw dump; a network failure shows the message then `Try rephrasing your request below.` |
+
+### 14.7.7 Subsessions (compositions)
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 74 | New Composition | Sidebar `+ New Composition`; the empty CTA; the tab `+ New structured composition`; the key `n` | Create a composition | Section `Project name` with an input placeholder `e.g. Blog Series, Product Launch…` and an icon submit; section `Start from template` with six cards `Business Proposal` / `5 sections`, `Annual Report` / `5 sections`, `Product Launch` / `5 sections`, `Research Paper` / `5 sections`, `Pitch Deck` / `7 sections`, `Meeting Notes` / `3 sections` | Submit; no Cancel | Backdrop | Empty name refocuses. Selecting a template auto-fills the name when the field is empty |
+| 75 | Choose a Template | Empty board ▸ `Start from a template` | Apply a template | The same six cards | Card click / `Cancel` | Cancel, backdrop | — |
+| 76 | Add Section / Add Subsection | `+ Add Section`; sidebar `+ New Section`; context menu `Add Subsection`; the drill-down ghost row | Create a section | An insert toggle labelled `Insert` with `Top` and `Bottom`; a `Quick add` input with placeholder `Section name…`; a `Type` select grouped into `Documents`, `Data`, `Presentations`, `Diagrams`, `Code`, `Structured`, `Communication` covering 48 artifact types, defaulting to `Report` | Submit; no Cancel | Backdrop | Empty name refocuses |
+| 77 | Plan with AI (compose) | Header `Plan with AI`; the drill-down chooser card | Prompt for a composition plan | A three-row textarea with placeholder `Describe what you want to compose… e.g. 'A quarterly business review with financials, product updates, and team highlights'` | `Plan` / `Cancel` | Cancel, backdrop | Empty returns silently |
+| 78 | Plan Composition panel | Submitting row 77, or the hero field | Streamed section plan | A slide-out titled `Plan Composition` with a close `×`. The body cycles `Building content plan…` then `Building plan… N section(s) so far (Ns)`; the refine state reads `Refining plan…`; the result reads `N sections proposed` above a tree. The footer holds a textarea with placeholder `Ask for changes…` | `Add N sections to Board` / `×` | `×` | A parse failure shows `Couldn't parse a section structure. Try rephrasing below.` |
+| 79 | Direct All Sections | Header `Direct All` | Broadcast an instruction | Title `Direct All Sections`; explainer `This instruction will be sent to the root orchestrator, which will distribute it to all section agents with context-appropriate guidance.`; a textarea with placeholder `Type an instruction for all sections... e.g. 'Change the tone to formal throughout' or 'Update the company name from Acme to Nexus everywhere'` | `Send Directive`, which becomes `Sending...` / `Cancel` | Cancel, backdrop, **Escape** | No root session gives toast `Root orchestrator is not running. Launch it first.` and no modal opens |
+| 80 | Link Existing Session | The drill-down chooser; the card context menu | Attach a running session | Title `Link Existing Session`; a search input with placeholder `Search sessions…`; rows with a status dot and the session title | Row click / `Cancel` | Cancel, backdrop | Empty candidate list shows `No unlinked sessions available.` |
+| 81 | Cascade delete section | Deleting a section that has children | Confirm the blast radius | Title `Delete section and N subsection?` (pluralised); body `Deleting <name> will also remove:` above a list of child names; warning `This cannot be undone.` | `Delete All` (red) / `Cancel` | Cancel, backdrop | — |
+| 82 | Resolve Directive Conflicts | The conflict banner ▸ `Review` | Reconcile contradictory instructions | Title `Resolve Directive Conflicts`; per conflict a card with a `Directive A:` block and a `Directive B:` block, relative timestamps, and an optional `AI recommendation: <text>` | `Supersede (B replaces A)`, `Keep Both`, `Let me clarify…` which reveals an input with placeholder `Type clarifying directive…` and a `Submit` button; footer `Close` | Close, backdrop; auto-closes when the last conflict is resolved | — |
+| 83 | Compose shortcuts | `?` in Subsessions | Cheat sheet | `↑ ↓` / `Move focus`, `Enter` / `Open composition`, `Space` / `Toggle selection`, `Shift+↑↓` / `Extend selection`, `Delete` / `Delete focused`, `Esc` / `Clear selection / close`, `n` / `New section`, `r` / `Refresh`, `?` / `Toggle this help` | `Close` | Close, backdrop, Escape, `?` | While open, every key except Escape and `?` is swallowed |
+| 84 | Composition settings popover | The header gear | Rename and sharing | A `Name` field saved on blur and on Enter; a `Shared Prompts` toggle with `title="When on, user prompts are shared across all agents"`; a hint `When on, user prompts are logged and shared across all section agents.` | Saves on blur or Enter | Mousedown outside | Empty or unchanged names are ignored |
+| 85 | Add to Structured composition | Session context menu ▸ `Add to Structured composition` | Attach a session to a section | With zero compositions an inline create appears with the label `No compositions yet. Create one:`, an input with placeholder `Composition name`, and a `Create` button. With one, the tree opens directly. With several, a chooser lists each composition and dims other-project entries with the tag `(other project)`. The tree shows indented sections with a status dot, name and status word; unlinked sections offer `Attach here` while linked ones show `linked`; insertion markers read `+ Add here` and `+ Add as child`; a naming panel appears with the label `New section name:` or `Add as child — section name:` plus an input, `Add` and `Cancel` | Attach or Add | Backdrop | An empty name refocuses. A server 409 gives toast `Session already linked to "<section>"` |
+| 86 | Delete composition (undo toast) | Sidebar context menu ▸ Delete; the `Delete` key | Delete with a grace period | A bespoke toast reading `Deleted "<name>"` or `Deleted N composition(s)` with an `Undo` button. Multiple toasts stack upward at 52px intervals | `Undo` | Auto-commits after **5000ms**; leaving the view flushes and commits immediately | **No confirmation dialog** — the undo window is the confirmation |
+
+### 14.7.8 Workforce (department manager)
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 87 | New Department | The `New Department` card; the `Add sub-department` link; the Configure action bar | Create a department | `Name` with placeholder `e.g. Frontend, QA, Marketing`; `Role Title` marked `(optional)` with placeholder `e.g. Senior Frontend Engineer`; `System Prompt` marked `(optional)`, a four-row textarea with placeholder `Describe the expertise for sessions in this department...` | `Create` / `Cancel` | Cancel, Escape, backdrop | An empty name gives toast `Enter a department name` and the modal stays open |
+| 88 | Edit Skill | Folder context menu ▸ `Edit Skill` | Edit a department persona | Title `Edit Skill — <folder>`; `Skill Label` with placeholder `e.g. Frontend Engineer`; `System Prompt`, a ten-row textarea with placeholder `System prompt for Claude sessions in this folder...` | `Save` / `Cancel` | Cancel, backdrop | — |
+| 89 | Rename Folder | Folder context menu ▸ `Rename` | Rename | Prompt input with placeholder `Department name` | `Rename` / `Cancel` | Cancel, Escape | Unchanged is a no-op |
+| 90 | Add Sub-department | Folder context menu ▸ `Add Sub-department` | Create a child | Prompt input with placeholder `Department name` | `Create` / `Cancel` | Cancel, Escape | — |
+| 91 | Delete Department | Folder context menu ▸ `Delete` | Remove a department | Body `Delete <name>?` then `Sub-departments and sessions will be moved to the parent.` | `Delete` (danger) / `Cancel` | Cancel, backdrop | — |
+| 92 | Status Sessions popup | Any Command Center stat tile | List sessions in one state | Title `<Working / Waiting / Idle / Sleeping> Sessions` followed by a `N sessions` count; a search input with placeholder `Search sessions...`; a sort select with `Newest`, `Oldest`, `Name A-Z`, `Name Z-A`, `Department A-Z`; rows showing the name, the department and the date | Row click opens the session / `Close` | Close, backdrop | Empty list shows `No sessions` |
+| 93 | Choose a Template (workspace) | First entry with no folder tree; `openWorkspaceTemplateSelector()` | Seed the department hierarchy | Body `Select a folder template for your workplace. You can add or remove departments later.`; four cards `Personal` / `Writing, coding, documents, research` / `5 folders`, `Small Team` / `Engineering, product, docs, QA` / `17 folders` with a `Recommended` badge, `Enterprise` / `Full org chart with 60+ departments` / `70+ folders`, `Empty` / `Start from scratch` / `0 folders` | Card click; there are no buttons | Backdrop, which still fires the completion callback | — |
+| 94 | Workforce AI — Organize | Configure ▸ `Organize with AI` | AI hierarchy suggestions | A slide-out titled `Organize Departments`; a status line reading `Working...`; a footer textarea with placeholder `Follow up...` | Send / minimise `―` / close `×` | `×` | See 14.16 for the timeout and empty messages |
+| 95 | Workforce AI — Find Skills | Discovery ▸ `Find More with AI` | AI skill discovery | The same shell titled `Find Skills` | Send / minimise / close | `×` | — |
+| 96 | Delete workforce asset | A Configure leaf ▸ `Delete` | Remove a definition file | Native confirm `Delete "<id>"? This removes the .md file from your workforce directory.` | OK / Cancel | — | — |
+| 97 | Uninstall skill pack | Available ▸ `Uninstall` | Remove an imported pack | Native confirm `Remove all imported assets from "<pack>" and delete the cloned directory?` | OK / Cancel | — | — |
+| 98 | Uninstall built-in library | Available ▸ built-in `Uninstall` | Reset to empty | Native confirm `Remove all built-in departments and assets? You can reinstall anytime from the Available tab.` | OK / Cancel | — | — |
+
+### 14.7.9 App maintenance, git and tests
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 99 | Update App | Header `Update App` | Pull remote updates | Title `Update App`; body `N update(s) are available from remote.` then `Your app will be updated to the latest version. Your local changes are safe.` — or `Your app is already up to date.` | `Update Now` / `Cancel`, or just `OK` | Buttons only. A backdrop click while work is in progress **minimises** instead of closing | — |
+| 100 | Publish App Update | Header `Publish App Update` | Push local changes | Title `Publish App Update`; body `Your local changes are ready to publish.` then `They will be saved and uploaded to remote automatically.` plus, when behind, `N remote update(s) will be pulled in first, then your changes pushed.` and finally `Run regression tests before publishing?` — or `Nothing to publish — your app is already up to date on remote.` | `Fast Tests + Publish` (primary) / `Full Tests + Publish` / `Skip & Publish` / `Cancel` | Buttons | — |
+| 101 | Sync App | Header `Sync App` | Pull then push | Title `Sync App`; body `N update(s) to pull and M change(s) to push.` then `Remote updates will be pulled first, merge conflicts resolved automatically, then your changes pushed.` and `Run regression tests before syncing?` | `Fast Tests + Sync` / `Full Tests + Sync` / `Skip & Sync` / `Cancel` | Buttons | — |
+| 102 | Wrong Branch? | Publishing or syncing while not on the default branch | Prevent publishing to the wrong branch | Title `Wrong Branch?`; body `⚠ You are on branch "<branch>", not "<default>".` then `Syncing now publishes your work to <branch> — not your main app. Most of the time you want to be on <default>.` and `If you didn't mean to be here, cancel and switch back to <default> first.` | `Cancel` is **primary and listed first**; `Sync to "<branch>" anyway` is secondary | Buttons | A detached HEAD renders as `a detached HEAD (no branch)`; the default falls back to `main` |
+| 103 | Tests in progress | Any tests-first git action; Developer Tools ▸ Run Tests | Live test output | A title such as `Fast Tests Before Publish` or `Run Tests (Full)`; a scanning animation; a status line reading `Running unit and API tests...`, `Running full test suite including e2e...`, `Running fast tests before publish...` or `Running full tests before sync...`; a scrolling output pane showing the last 40 lines | No buttons at all, which is exactly what reveals the minimise control | Minimise `−` | — |
+| 104 | Tests Passed | Tests finish clean | Report | Title `Tests Passed ✓` or `Run Tests (Fast) ✓`; body `All Tests Passed` then `N passed` plus `, M skipped` when non-zero | `OK` | OK | Git flows auto-proceed after **1200ms** with the line `N tests passed — proceeding to publish...` |
+| 105 | Tests Failed | Tests finish with failures | Block, with an override | Title `Publish Blocked — Tests Failed`, `Sync Blocked — Tests Failed`, or `Run Tests (Fast) — Failures Found`; body `N Test(s) Failed` then `P passed, F failed` plus errors and skips, and a preformatted block of failing lines | `Publish Anyway` or `Sync Anyway`, then `Cancel` as primary | Buttons | — |
+| 106 | Test Error | Tests could not run | Offer an override | Title `Test Error`; body `Could not run tests. Publish anyway?` or `Could not run tests. Sync anyway?` | `Publish Anyway` / `Cancel` | Buttons | — |
+| 107 | Tests Running already | Starting tests twice | Prevent overlap | Title `Tests Running`; body `Tests are already running.` or `Tests are already running. Cancel the current run first.` | `Cancel Tests` / `OK` | OK | — |
+| 108 | Push Blocked — Security Issue | The pre-push scan finds secrets | Prevent a leak | Title `Push Blocked — Security Issue`; a findings block headed `Security Scan Results` with `<summary> (N files scanned)` and the sections `Blocked Files:` and `Potential Secrets:`, truncated at fifteen entries with `...and N more` | `Fix with AI` (primary) / `Close` | Close | `Fix with AI` spawns a session titled `Security Remediation` |
+| 109 | Server Scan | Developer Tools ▸ Server Scan | On-demand secret scan | While running, the title `Server Scan` with a shield-and-beam animation and a progress line moving from `Connecting...` to `<current> / <total> files`. On completion the title `Server Scan Results` with either `All Clear` and `N files scanned — no secrets or sensitive data detected.` or the findings block | `OK`, or `Fix with AI` / `Close` | Buttons | Failure gives title `Error` and body `Could not run scan. Try again.` |
+| 110 | Git minimised indicator | Minimising any git or test modal | Keep the job visible without blocking | A floating pill with a spinner, a label defaulting to `Working...`, and a `×` with `title="Dismiss"` | Click restores the modal; `×` dismisses | `×` | On completion it flashes for **1500ms** |
+| 111 | Voice setup progress | Preferences ▸ voice toggle on | Install the local voice model | Title `<App> Voice`; a progress bar; one of `Downloading the model (~150 MB, one time)…`, `Loading the model into memory…`, `Installing the … engine…`, `Setting up …`; sub-copy `One-time setup, fully local — nothing leaves your machine. You can keep working or close this; we'll finish in the background and switch the mic on automatically.` | `Close` | Close, backdrop | The bar is clamped between 4% and 100% |
+| 112 | Voice ready | Install completes | Confirm | `✓ … is ready` then `Voice now works in every browser, knows your project's vocabulary, and punctuates automatically. Model: <model>.` | `Done` | — | — |
+| 113 | Voice error | Install fails | Offer a retry | `⚠ <error>` falling back to `… setup failed.` plus an optional remediation block | `Try again` (primary) / `Close` | Close | — |
+| 114 | Voice needs restart | Engine installed but not loaded | Ask for a web-layer restart | `…'s engine was just installed and needs a one-time restart of the web layer to switch on. Your running sessions stay alive — only the web server reloads, the page refreshes itself when it's back, and setup then finishes automatically.` | `Restart & finish setup` (primary) / `Later` | Later | — |
+| 115 | Voice unsupported | The browser lacks MediaRecorder | Explain | `… needs a modern browser with microphone recording (MediaRecorder). Please update your browser — standard voice input still works.` | `Close` | Close | — |
+
+### 14.7.10 Blocking and full-screen overlays
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 116 | Health blocker — No Internet | The connectivity probe fails | Block use | A 64px wifi-off icon; label `No Internet Connection`; message `<App> requires an active internet connection to communicate with Claude. Please check your WiFi or network settings.`; a three-dot spinner; the footer `Retrying automatically…` | none | **Unkillable** — it clears only when the check passes | — |
+| 117 | Health blocker — Server Unreachable | Four consecutive failed pings, about 12s | Block use | A monitor icon; label `<App> Server Unreachable`; message `The <App> web server is not responding. Your running sessions are likely safe in the session daemon — relaunch <App> from your desktop shortcut or launcher to reconnect. If this overlay persists after relaunch, check the server log.` | none | Unkillable | A 503 bypasses the threshold and reloads immediately |
+| 118 | Health blocker — Engine Stopped | Five consecutive failed daemon probes, about 25s | Block use and offer repair | A power-symbol icon; label `<App> Engine Stopped`; message `The <App> engine that runs your sessions has stopped. Tap Restart to bring it back — your session history is safe.` | `Restart <App>`, which becomes `Restarting…` and disables | Unkillable | Waits up to about 90s for readiness, then force-reloads |
+| 119 | Health blocker — Not Logged In | The auth-status check fails | Block use and offer login | A padlock icon; label `Not Logged In to Claude`; message `<App> requires an active Claude Code login. Click below to open the login flow, then come back here — it will reconnect automatically.` | `Log In to Claude` | Unkillable | — |
+| 120 | Mobile action sheet | The `•••` toolbar button on a phone | Toolbar actions on a phone | A rounded card of full-width rows built from the toolbar's own buttons, plus a final `Actions…` row | Row tap / `Cancel` | Backdrop, Cancel | Disabled toolbar buttons render disabled |
+| 121 | Mobile session sheet | Long-pressing a session row for 500ms | The context menu on touch | The same items as the desktop context menu with dividers collapsed | Row tap / `Cancel` | Backdrop, Cancel | — |
+| 122 | Mobile System sheet | `System ▾` on a phone | The System menu as a sheet | Groups mirrored from the desktop dropdown, including each item's value badge right-aligned | Row tap / `Cancel` | Backdrop, Cancel | The original handler fires **80ms** after the tap so the slide-down starts first |
+| 123 | Mobile preview sheet | Tapping a preview card; the toolbar preview button | View a render on a phone | A grab handle; a header with `All`, a title, a fullscreen button, `↻` and `Done`; a sub-line; then either a grid of preview tiles or a single stage holding an image or a sandboxed iframe with a fake URL bar | `Done` | Backdrop, dragging past 88%, `Done`. Escape only exits fullscreen | Snap points at 0%, 46% and 72% |
+
+**Native dialogs still in the product.** Composition rename (`Rename composition:`), composition duplicate (`Name for the duplicate:` prefilled `Copy of <name>`), section rename (`Rename section:`), session rename inside a composition (`Rename session:`), compose bulk delete (`Delete N section(s)?` followed by the names), unlink session (`Unlink this session from the section? The session will still exist in the sessions view.`), trash purge (`Permanently delete this session? This cannot be undone.`), trash empty (`Permanently delete all N session(s) in the trash? This cannot be undone.`) and the three workforce confirms in rows 96–98. These are the only unstyled dialogs in the app. Reproduce their strings, but a rebuild should render them through the `showConfirm` / `showPrompt` primitives.
+
+---
+
+## 14.8 Complete menu inventory
+
+### 14.8.1 Header — System dropdown (`#hdr-sys-dropdown`)
+
+Trigger: the `System ▾` button. Opens by adding `.open`; closes on any click outside `#hdr-sys`. On phones it renders as a bottom sheet with the same groups and each item's value badge right-aligned.
+
+| Order | Item | Value badge | Effect |
+|---|---|---|---|
+| 1 | `Model` | the current model label, e.g. `Opus 4.7` | Open the model selector |
+| 2 | `Thinking` | `Default` / `None` / `Low` / `Medium` / `High` | Open the thinking selector |
+| 3 | `Preferences` | — | Open Preferences |
+| — | separator | | |
+| 4 | `Permission Policy` | — | Open the policy selector |
+| 5 | `Persistent Storage` | `Local` or `Cloud` | Open storage settings |
+| 6 | `Mobile Command` | `Off`, `On…` or `On` | Open the phone wizard |
+| — | separator | | |
+| 7 | `Bulk Operations` | — | Open bulk operations |
+| 8 | `Keyboard Shortcuts` | — | Open the cheat sheet |
+| — | separator | | |
+| 9 | `Recently Deleted` | — | Open the trash. `title="View and restore recently deleted sessions"` |
+| 10 | `Developer Tools` | the phantom-name count, or empty | Open dev tools. `title="Tests, scans, and server controls"` |
+
+### 14.8.2 Sidebar — view flyout (`#sidebar-view-flyout`)
+
+Trigger: hovering the wrapper for 200ms, or clicking the trigger. Items in order, each with an icon; the active one carries `.active`:
+
+`Home` · `Sessions` · `Workflow` · `Workforce` · `Subsessions`
+
+### 14.8.3 Sidebar — options dropdown (`#sidebar-menu-dropdown`)
+
+Trigger: the `⋯` button (`title="Options"`). Three labelled sections separated by dividers; picking any item closes the dropdown.
+
+| Section label | Items in order |
+|---|---|
+| `Sort` | `Newest first` · `Oldest first` · `Name A–Z` · `Name Z–A` · `Largest first` · `Smallest first` |
+| `Display` | `Grid cards` · `List table` · `Mission Control` |
+| `Actions` | `Sleep all sessions` · `Delete empty sessions` · `Delete all sessions` — all three styled `.danger` |
+
+### 14.8.4 Actions popup (`#actions-overlay`)
+
+Four tabs. A live status badge sits between the tab strip and the close button, showing an icon plus one of `Waiting for input`, `Working`, `Idle`, `Not running`.
+
+**Tab `Organize`**
+
+| Item | Description |
+|---|---|
+| `Auto-name` | `Generate a descriptive name using AI` |
+| `Delete` (danger) | `Permanently remove this session and its data` |
+
+**Tab `Branch`**
+
+| Item | Description |
+|---|---|
+| `Continue` | `Start a new session with context carried forward` |
+| `Duplicate` | `Create an exact copy of this session` |
+| `Fork` | `Branch the conversation from a specific message` |
+| `Rewind Code` | `Restore files to their state at a chosen message` |
+| `Fork + Rewind` | `Fork conversation and restore files in one step` |
+
+**Tab `Subsession`**
+
+| Item | Description |
+|---|---|
+| `Spawn Subsession` | `Start a child session that reports back to this one (Ctrl+Shift+S)` |
+
+**Tab `Session`**
+
+| Item | Description |
+|---|---|
+| `Open in Terminal` | `Launch this session in the Claude CLI` |
+| `Compact Context` | `Summarize history to free up the context window` |
+| `Clear Display` | `Clear the log view without affecting the session` |
+| `Stop Session` (danger) | `Shut down the running session process` |
+
+On phones the whole popup becomes a bottom sheet that animates down over **250ms** on dismiss rather than vanishing.
+
+### 14.8.5 Toolbar — Analyze dropdown
+
+The group's children are **cloned** into a floating `.grp-popup` positioned 4px below the label and right-aligned to it. Items in order: `Summary` · `Find` · `Extract Code` · `Export` · `Compare`. Clicking any item closes the popup; clicking outside closes it; opening another group closes the first; clicking the same group toggles it shut. Permanently hidden children are skipped during the clone.
+
+### 14.8.6 Session context menu (right-click a row or card; long-press on touch)
+
+| Order | Item | Effect |
+|---|---|---|
+| 1 | `Open` — only when the session is not already active | Open it in the live panel |
+| 2 | `Auto-name` | AI-name the session |
+| 3 | `Rename` | Open it if needed, then start the inline rename |
+| — | divider | |
+| 4 | `Link to Workflow Task` | Open the task picker |
+| 5 | `Add to Structured composition` | Open the composition tree picker |
+| 6 | `Spawn Subsession` | Create a child session |
+| 7 | `Create Workflow Task` | Make a task from this session |
+| — | divider | |
+| 8 | `Continue` | New session with context carried forward |
+| 9 | `Duplicate` | Copy the session |
+| 10 | `Save as Template` | Create a starter template from it |
+| 11 | `Open in Terminal` | Launch in the CLI |
+| — | divider, only when this is the active session | |
+| 12 | `Compact Context` | Summarise the history |
+| — | divider, only when the session appears active | |
+| 13 | `Stop Session` (danger) | Stop the process |
+| — | divider | |
+| 14 | `Delete` (danger) | Delete the session |
+
+Desktop renders a floating `.session-ctx-menu.ws-ctx-menu` at the pointer, clamped 8px inside the viewport on the next animation frame, closing on any outside click. Mobile renders the identical list as a bottom sheet with dividers collapsed and a `Cancel` button.
+
+### 14.8.7 Bulk session context menu (right-click inside a selection of two or more)
+
+Header row: a grid icon followed by `N selected`.
+
+| Order | Item |
+|---|---|
+| 1 | `Stop all` |
+| 2 | `Auto-name all` |
+| 3 | `Duplicate all` |
+| 4 | `Add all to Structured composition` |
+| — | divider |
+| 5 | `Delete all` (danger) |
+| — | divider |
+| 6 | `Clear selection` |
+
+### 14.8.8 Workflow — task card context menu
+
+Trigger: the `⋮` button (`title="Actions"`) or right-click anywhere on a card.
+
+| Order | Item |
+|---|---|
+| 1 | `Rename` |
+| 2 | `Edit` — opens the drill-down |
+| 3 | `Add Subtask` |
+| 4 | `Spawn Session` |
+| 5 | `Execute Task` — only for leaf tasks in Not Started, Working or Remediating |
+| 6 | `Execute + Validate` — same condition |
+| — | separator |
+| 7…n | `Move to <Column Name>` — one per configured column |
+| — | separator |
+| last | `Delete` (danger) |
+
+### 14.8.9 Workflow — other menus
+
+**Status menu** — trigger: a status badge on a task or a subtask row (`title="Click to change status"`). One row per column with a coloured dot and the column name; the current one carries `.current` and a trailing check icon.
+
+**Column sort dropdown** — trigger: the gear in a column header (`title="Sort settings"`). Field `Sort by` with `Manual (drag)`, `Last updated`, `Date created`, `Alphabetical`; field `Direction` with `Ascending`, `Descending`; a `Save` button. The dropdown flips above the trigger when it would overflow the bottom of the viewport and is clamped 8px from the edges.
+
+**Recent history dropdown** — trigger: hovering the `Board` breadcrumb crumb. Header `Recent`, then up to ten entries, most recent first, each with a type icon (a chat bubble for sessions, a board icon for tasks) and a title truncated to 40 characters. The entry you are currently on is non-clickable and carries a trailing pill reading `here`. It closes 300ms after leaving the crumb and 150ms after leaving the dropdown.
+
+**Tag filter popup** — trigger: the sidebar `Tags` button. One pill per known tag with active tags highlighted, plus a trailing `clear` pill whenever a filter is active.
+
+**Workflow Settings ▸ Preferences toggles**
+
+| Group | Toggle | Description |
+|---|---|---|
+| `Automatic Status Changes` | `Session starts → Working` | `When a session is linked, move the task to Working` |
+| | `Child Working → Parent Working` | `When a subtask starts, move its parent to Working too` |
+| | `Child Remediating → Reopen Parent` | `If a subtask needs rework, reopen the parent task` |
+| | `All done → Validating` | `When all sessions and subtasks finish, move to Validating` |
+| `AI Behavior` | `AI can modify task status` | `Allow AI sessions to change task statuses (working, validating, etc.)` |
+| | `AI can mark tasks complete` | `Allow AI to mark tasks as complete (otherwise stops at validating)` — indented 20px, dimmed to 50% and forced off when the parent toggle is off |
+| `Session Awareness` | `Cross-session awareness` | `Tell AI sessions what other sessions are doing — names, status, and recently edited files` |
+| | `Wrong-session detection` | `Warn before sending a prompt that seems unrelated to the current session's conversation` |
+| `Performance` | `File tracking` | `Track file changes each turn for undo/rewind. Disable to speed up sessions on large repos.` |
+| `General` | `Column page size` | `Max tasks per column before pagination` — a number input defaulting to 50 |
+
+### 14.8.10 Subsessions menus
+
+**Section card context menu** — right-click a card, or the `⋯` button: `Open` · `Rename` · `Add Subsession` · then either `Open Session` with a live status dot **or** the pair `Launch Session` and `Link Session` · separator · the status moves, where the current status renders as `✓ <Label> (current)` at 40% opacity and non-clickable while the others read `Move to Drafting`, `Move to Reviewing`, `Move to Complete` · separator · `Add Tag…`, which replaces the menu item in place with an input placeholder `Tag name...` committed on Enter or blur · separator · `Delete` (danger).
+
+**Column sort menu** — per-column gear (`title="Sort"`): `Manual (drag)` · `A → Z` · `Z → A` · `Newest first` · `Oldest first`.
+
+**Export menu** — the header `Export` button: `Word document (.docx)` · `PDF document` · `Markdown bundle` · `Zip archive`.
+
+**Composition context menu** — right-click a sidebar composition: `Rename` · `Duplicate` · `Pin` or `Unpin` (the label is computed from the current state) · `Delete` (danger).
+
+**Board bulk Move-to menu** — the bulk bar's `Move to ▾`: `Drafting` · `Reviewing` · `Complete`. Positioned **above** its trigger because the bulk bar sits at the bottom.
+
+**Section status dropdown** — the drill-down status badge: `Drafting` · `Reviewing` · `Complete`, each with a coloured dot, the current one marked `.active`.
+
+### 14.8.11 Workforce — folder context menu
+
+Trigger: right-click a `.ws-folder-card`, or its `⋯` button (`title="Options"`).
+
+`Rename` · `Edit Skill` · `Add Sub-department` · divider · `Delete` (danger).
+
+Positioned at the pointer and clamped 8px inside the viewport on the next animation frame.
+
+### 14.8.12 Sidebar list column headers
+
+Not a menu, but the same discoverability contract: `Name`, `Date` and `Size` are each a sort toggle with the tooltips `Sort by name`, `Sort by date`, `Sort by size`, and the first two carry a drag-to-resize grip.
+
+---
+
+## 14.9 Toasts, banners, and inline feedback
+
+### 14.9.1 The toast primitive
+
+One element, `#toast`, positioned `fixed; bottom: 20px; right: 20px`, `z-index: 9999`, `pointer-events: none`. It has two variants: neutral (`.toast.show`) and error (`.toast.show.error`, a red-tinted background and border). It fades in and out over **0.3s** and auto-hides after exactly **3000ms**. Calling it again replaces the text and restarts the timer — there is no queue and no stacking.
+
+Signature: `showToast(message, isError)`. Note that the codebase passes the second argument inconsistently (sometimes the boolean `true`, sometimes the string `'error'`); a rebuild should accept only a boolean and normalise every call site.
+
+### 14.9.2 Session lifecycle toasts
+
+| String | Trigger | Severity |
+|---|---|---|
+| `Type a message first` | Submitting an empty composer | neutral |
+| `Stopping session…` | Deleting a session that is still running | neutral |
+| `Deleting session…` | Delete confirmed | neutral |
+| `Session deleted` | Delete succeeded | neutral |
+| `Delete failed` | Delete failed | error |
+| `Session closed` | Stop confirmed | neutral |
+| `N session(s) closed` | Sleep All completed | neutral |
+| `No running sessions` | Sleep All with nothing running | neutral |
+| `No sessions to delete` | Delete All with nothing to delete | neutral |
+| `No empty sessions found` | Delete Empty with nothing empty | neutral |
+| `Deleted N empty session(s)` | Delete Empty succeeded | neutral |
+| `Deleting N sessions…` | Delete All confirmed | neutral |
+| `N sessions deleted` | Delete All completed | neutral |
+| `Session duplicated` | Duplicate succeeded | neutral |
+| `Duplicate failed: <reason>` | Duplicate failed | error |
+| `New continuation session created — open it in Claude to continue` | Continue succeeded | neutral |
+| `Opening session in Claude…` | Open in Terminal succeeded | neutral |
+| `Failed to open: <reason>` | Open in Terminal failed | error |
+| `Renamed` | Toolbar rename succeeded | neutral |
+| `Renamed to "<name>"` | Inline or modal rename succeeded | neutral |
+| `Rename failed` | Rename failed | error |
+| `Auto-named: "<name>"` | Auto-name succeeded | neutral |
+| `Auto-name failed: <reason>` | Auto-name failed | error |
+| `Naming N session(s)…` / `Named N session(s)` | Auto-name All | neutral |
+| `All sessions already named` | Auto-name All with nothing to do | neutral |
+| `Session forked` and `Session forked and N file(s) restored` | Fork succeeded | neutral |
+| `N file(s) restored to earlier state`, `Rewind complete (no files to restore)`, plus ` (N skipped)` | Rewind succeeded | neutral |
+| `Display cleared` | Clear Display | neutral |
+| `Compacting context…` | Compact Context | neutral |
+| `Command queued (N)` | Queueing while working | neutral |
+| `Removed — N remaining` / `Queue cleared` | Removing a queued item | neutral |
+| `Sending queued command…` plus ` (N remaining)` | The server dispatched a queued message | neutral |
+
+### 14.9.3 Multi-select and bulk toasts
+
+`Another bulk action is in progress` (error) · `Stopped N session(s)` · `Deleting N session(s)…` · `Deleted N session(s)` · `Delete failed for N session(s)` (error) · `Deleted N of M. K failed.` (error) · `Auto-naming N session(s)…` · `Auto-named N session(s)` · `Auto-named N of M. K failed.` (error) · `Duplicating N session(s)…` · `Duplicated N session(s)` · `Duplicated N of M. K failed.` (error) · `Add to Structured composition finished (N processed, M skipped)` · `Add to Structured composition timed out — bulk halted` (error) · `Cannot open Add to Structured composition picker` (error).
+
+### 14.9.4 Subsession toasts
+
+`Subsession spawned under "<parent>"` · the one-time intro `This is a subsession. It knows everything its parent knew when it was spawned. Reports flow back to the parent on your next message there.` · `Subsession reports waiting. Open the parent session to see and Pull updates.` · `Pulling subsession updates…` · `No subsession reports waiting.` · `Pull queued — fires when the session goes idle.` · `Pull updates failed: <reason>` (error) · `Pull updates failed: network error` (error) · `Reported to parent (N pending)` · `Report failed: <reason>` (error) · `Summary cannot be empty` (error) · `Re-anchored at line N` · `Re-anchor failed: <reason>` (error) · `Subsession detached.` · `Detach failed: <reason>` (error) · `Spawn failed: <reason>` (error).
+
+### 14.9.5 Project, settings and system toasts
+
+`Opening folder picker…` · `Added <path>` · `Created <name>` · `Create failed` (error) · `Project deleted` · `Delete failed` (error) · `Renamed to "<name>"` · `Model: <label>` · `Thinking: <level>` · `Send: Enter to send` / `Send: Ctrl+Enter to send` · `Enter to send: On|Off` · `Sticky chats: On|Off` · `Wrong-session detection: On|Off` · `Policy: <Title>` · `Custom policies saved` · `Shutting down server...` · `No phantom session names to remove.` · `Removed N phantom session-name entries.` · `Scrub preview failed.` / `Scrub failed.` · `CLAUDE.md files saved` · `Failed to load CLAUDE.md files` (error) · `Failed to save` (error) · `Restored: <title>` · `Restore failed` (error) · `Permanently deleted` · `Emptied trash: N deleted, M failed` · `Workspace template applied` · `Added <department>` · `All departments already added` · `Set up a workspace template first` · `Folder system not loaded` · `Dark theme` / `Light theme` / `Auto theme (sunrise/sunset)`.
+
+### 14.9.6 Workflow toasts
+
+`Task created` · `Subtask created` · `Task deleted` · `Failed to delete task` · `Created N task(s)` · `Task approved` · `Rejected — moved to Remediating` · `Executing task: <title>` · `Launching N sessions...` · `N sessions launched` · `N/M sessions launched (K failed)` (error) · `Session cleared` / `Planner cleared` · `Plan accepted! Subtasks created.` · `Refreshed` · `Task no longer exists — returned to board` · `Launched without task context (fetch failed)` · `Validation URLs enabled` · `Validation URL saved` / `Validation URL removed` · `Cannot execute a parent task — execute its subtasks instead` (error) · `Task is already complete` (error) · `Maximum 20 tasks per batch` (error) · `No plan to accept` (error) · `Cannot remove the last column` (error) · `A column with that key already exists` (error) · `Reorder failed` (error) · `Session spawner not available` (error) · `Tag added` / `Failed to add tag` (error) · `Failed to remove tag` (error) · `Please enter a URL (http/https/file) or a local file path` (error) · `Could not open file: <reason>` (error) · `Failed to save: <reason>` (error) · `Columns updated`.
+
+### 14.9.7 Subsessions (composition) toasts
+
+`Created composition: <name>` · `Applied template: <name>` · `Failed to create composition` (error) · `Failed to apply template` (error) · `Added section: <name>` · `Failed to add section` (error) · `Renamed to "<name>"` · `Renamed section` · `Failed to rename` (error) · `Duplicated as "<name>"` · `Pinned` / `Unpinned` · `Pinned N composition(s)` / `Unpinned N composition(s)` · `Refreshed` · `Sending coordination message to root orchestrator...` · `Root orchestrator is coordinating` · `No root session to coordinate` · `Failed to contact root` (error) · `Launching N section agent(s)...` · `N agent(s) launched` plus `, M failed` and `. Root orchestrator is coordinating.` · `Launch failed` (error) · `Root orchestrator is not running. Launch it first.` (error) · `Directive sent to root orchestrator for distribution` · `Failed to send directive` (error) · `Export downloaded` · `Export failed` (error) · `Created N section(s)` · `Moved N section(s) to <Label>` · `All selected sections already have sessions` · `Launching N session(s)...` · `N session(s) launched` · `Deleted N section(s)` · `Move failed` (error) · `Failed to update status` (error) · `Moved to <Label>` · `Failed to move section` (error) · `Launching session for: <section>` · `Session started for: <section>` · `Failed to launch session` (error) · `Session renamed` · `Session unlinked` / `Unlink failed` (error) · `Session linked` / `Failed to link session` (error) · `Section deleted` / `Section and subsections deleted` / `Failed to delete section` (error) · `Conflict resolved` / `Failed to resolve conflict` (error) · `Clarification submitted` / `Failed to submit clarification` (error) · `Added to Structured composition: <name>` · `Session already linked to "<section>"` (error) · `Session attached to section` · `Failed to attach` (error).
+
+### 14.9.8 Workforce toasts
+
+`Folder created` · `Folder deleted` · `Folder restored` · `Folder permanently deleted` · `Enter a department name` · `Department created: <name>` · `Skill updated` / `Skill updated: <label>` · `Cannot move folder into its own descendant` · `Editing coming soon — edit the workforce definition file directly for now` · `Deleted: <id>` / `Delete failed` · `Asset not found` / `Imported: <name>` / `Import failed` · `Removed: <id>` / `Remove failed: <reason>` · `Uninstalled: <pack> (N assets, directory removed)` · `Uninstall failed` · `Templates not available` / `Template not found` / `Template system not loaded` · `Installed: <template>` · `Built-in library removed` · `Unknown pack: <id>` · `Installed <pack>: N assets imported` · `Install failed: <reason>` · `All sessions unhidden`.
+
+### 14.9.9 Invoke, voice and model toasts
+
+`Usage: /as <asset-id>` · `No departments loaded` · `Asset not found: <id>` · `No active session to switch` · `Session: <Model>` plus ` + <Level> thinking` · `Session model reset to system default` · `Already running on <Model>` · `Model switch timed out — model NOT changed` (error) · `Model switched to <Model> — applies from the next message` · `Model switch FAILED: <reason>` (error) · `Not connected — model NOT changed` (error) · `Listening...` (Web Speech) and `Listening…` (local engine) · `Voice error: <code>` (error) · `Your dictation is ready — press Enter to send.` (error styling, deliberately, because the send did not happen) · `Didn't catch that — try speaking louder or closer to the mic.` (error) · `Didn't catch that — try again.` (error) · `Recording is not supported in this browser.` (error) · `Microphone permission denied.` (error) · `Could not access the microphone.` (error) · `<App> Voice is unavailable.` (error) · `<App> Voice disabled — using standard voice.` · `<App> Voice is ready — voice is on.`.
+
+### 14.9.10 File and template toasts
+
+`File saved and session notified` · `File saved to <path>` · `Upload failed` (error) · `Saved to <path>` / `Save failed` (error) · `Copied to Downloads: <name>` / `Download failed` (error) · `Failed to open file` (error) · `Template saved` / `Template deleted` / `Template name is required` / `Template not found` / `Template system not available` (error) · `Session has no messages to save`.
+
+### 14.9.11 Banners and inline strips (non-transient)
+
+| Banner | Location | Copy | Controls |
+|---|---|---|---|
+| Queue banner | Between transcript and composer | `Queued` plus ` (N)` and the suffix ` — will send when idle`, then the queued text | `‹ N/M ›`, `Edit`, `Remove` |
+| Session-not-running notice | Above the composer in the Ended state | `Session not running. Type a message to resume.` | — |
+| Sleeping banner | Above the composer in the Idle state with a scheduled wake-up | `Awaiting wake-up…` then faint `(send a message to take over)` | — |
+| Auto-retry banner | Above the composer in the Idle state | `Auto-retrying in <countdown>` plus ` · attempt N/M` and ` · <reason>` | `Retry now`, `Cancel` |
+| Error banner | Above the composer in the Idle state | the error text | `Retry` |
+| Subsession role banner | Top of the live panel | `SUBSESSION` + `from <parent>`, or `SUBSESSION` + `parent <name> (deleted)`, or `MAIN SESSION` + `N subsessions running in parallel` | The parent name is a link |
+| Subsession inbox strip | Above the composer | `N subsession reports will be included with your next message.` or `Subsession reports will be included with your next message.` | `Pull updates now`, `Dismiss` |
+| Subsession actions bar | Above the composer | — | `Report to Parent` (or the disabled `Report to Parent (parent deleted)`), and a checkbox `Auto-report on idle` |
+| Sub-agent team strip | Above the composer while working | `N agents active · M done`, or the collapsed footer `N agents completed` | — |
+| Multi-select badge | Top of the session list | `N selected` | `×` with `title="Clear selection (Esc)"` |
+| Hidden-sessions bar | Workforce canvas | `N hidden session(s)` | `Show all` |
+| Tag filter banner | Compose board | `Filtering by: ` plus pills | `Clear` |
+| Conflict banner | Compose board | `⚠ N directive conflict(s) need your attention` | `Review` |
+| Compose bulk bar | Below the compose columns | `N selected` | `Move to ▾`, `Launch All`, `Delete`, `Clear selection` |
+| Batch bar | Workflow drill-down | `N task(s) selected` | `Execute Selected`, `Execute + Validate`, `Clear` |
+| AI autonomy bar | Inside the composer for board-scoped sessions | label `AI:` | pills `Modify status`, `Mark complete` |
+| Opinionated notice | Workforce Command Center | `<App> organizes your knowledge assets into departments — not skills, not agents. Drop any .md file into a department and invoke it as either. We handle both.` | an ⓘ with a tooltip |
+| Local-assets notice | Workforce Command Center | `Local project skills/ and agents/ folders are dynamically aggregated into the Invoke Workforce menu and included in session context.` | — |
+| Undo toast | Bottom-left, stacked | `Deleted "<name>"` or `Deleted N composition(s)` | `Undo` |
+| Minimised git pill | Floating | `Working...` or the current operation title | click to restore, `×` to dismiss |
+
+### 14.9.12 Inline field feedback
+
+- **Copy buttons** swap their icon to a check, add `.copied`, change `title` to `Copied!`, and revert after **1500ms** (**1200ms** for per-block copies in the code drawer).
+- **Retention save status** shows `Saved.`, or `Saved. (Claude settings file unreadable — cleanup period there unchanged.)`, or `Saved. (Could not update Claude cleanup setting right now.)`.
+- **Naming badge** appends `Naming…` with a pulsing dot to a session row while an auto-name request is in flight.
+- **Spawn pulse** briefly tints the new child row and its parent row for **600–700ms** after a subsession is spawned.
+- **Sidebar badge pulse** adds a highlight class for **600ms** whenever a composition's completed fraction changes.
+
+---
+
+## 14.10 Feedback taxonomy and loading states
+
+### 14.10.1 The six signals
+
+| Signal | Use it when | Treatment |
+|---|---|---|
+| **Toast** | A discrete action finished and the result is not visible on screen | 3s, bottom-right, neutral or error |
+| **Inline label swap** | A button initiated the work and the button is still on screen | Replace the label with a gerund: `Creating…`, `Deleting...`, `Switching…`, `Sending...`, `Saving...`, `Naming…`, `Building…`, `Working…`, `Restoring…`, `Installing...`, `Searching cloud…`, `Testing...`, `Migrating...`, `Loading…`. Disable the button while it is in that state |
+| **Skeleton** | A whole region is about to be replaced and its shape is known | Shimmer blocks matching the final layout, with staggered delays |
+| **Spinner** | Something indeterminate is running inside an otherwise-populated region | A 10px inline spinner, usually beside text |
+| **Optimistic placeholder** | The user created something and the server has not confirmed | Render the real element at 50–60% opacity with a spinner and the word `Creating...` |
+| **Streaming indicator** | Tokens are arriving | A live bubble whose role line reads `claude streaming…` |
+
+### 14.10.2 Which loading treatment goes where
+
+| Region | Treatment |
+|---|---|
+| Session list / grid | 20 shimmer rows, name width randomised 40–85%, `animation-delay: i × 0.06s`. Painted by an inline boot script before any module loads |
+| Workflow board | 5 shimmer columns, each with a shimmer title and count and 2–4 shimmer cards with randomised widths. Also painted pre-boot |
+| Compose board | 3 shimmer columns — **only** when the persisted tab is Structured |
+| Task drill-down | A breadcrumb of three shimmer bars, a left column of five shimmer blocks, a right column with a header bar and three row shimmers |
+| Section drill-down | The same shape, painted synchronously before the fetch |
+| Chat transcript | Six alternating message skeletons (user 2, assistant 4, user 1, assistant 6, user 2, assistant 5 lines) with randomised bubble widths and per-line delays of `0.04s` |
+| Home viz | Shimmer bars at fixed heights with 0.15s stagger, plus a 120×13px shimmer pill for the stat line |
+| Sidebar (Workflow/Compose) | A label shimmer plus four 36px row shimmers |
+| Modal bodies | An inline spinner plus text: `Loading models...`, `Loading workforce…`, `Loading messages…`, `Building summary…`, `Loading sections...`, `Loading…` |
+| Mission Control card preview | The literal placeholder `No recent messages` until history lands |
+| Expanded card | Two shimmer bars at 100% and 85% width |
+| Reports | Shimmer KPI tiles and shimmer bars, with `Loading reports…` |
+
+### 14.10.3 Delay thresholds
+
+| Threshold | Behaviour |
+|---|---|
+| 0ms | Skeletons appear immediately on any navigation that will replace a region. There is **no** delay before showing a skeleton — a blank region for even 200ms reads as a crash |
+| 50ms | Post-render settle: focus, auto-resize and scroll are applied on a 50ms timeout so layout has settled |
+| 80ms | Streaming markdown re-parse throttle, and the mobile-sheet action delay |
+| 500ms / 2000ms | The live input bar re-renders twice after opening a panel, to catch state events that arrived before the DOM existed |
+| 3000ms | Ghost-recovery arm time after a submit |
+| 8000ms | Skeleton-stuck watchdog stage 1 |
+| 10000ms | Message watchdog tier 1 |
+| 20000ms | Model-switch hard timeout |
+| 30000ms | The AI slide-out shows `Taking longer than expected.` |
+
+### 14.10.4 Progress that is not a spinner
+
+- **Elapsed timers.** The working bar shows `12s` then `2m 05s`, updated in place every second — never by re-rendering the bar.
+- **Countdowns.** The auto-retry banner ticks `45s`, `12m 30s`, `1h 5m` in place.
+- **Determinate bars.** The security scan shows `N / M files`; the voice install shows a percentage bar; the restart overlay shows a raw seconds counter so a slow restart never looks frozen.
+- **Counters during streaming.** The planners show `N task(s) so far` and `N section(s) so far (Ns)` derived from the partial JSON — this is the single best "it is actually working" signal in the product.
+
+---
+
+## 14.11 Optimistic UI
+
+| # | Action | What updates before the server confirms | Rollback |
+|---|---|---|---|
+| 1 | New session | A placeholder titled `New Session` is unshifted into the session list, the id is added to the lookup set, the toolbar title is set, and the URL gains `?chat=<id>` | None needed — the session only reaches the server on first submit. A concurrent list reload explicitly **preserves** the optimistic entry when it is the live session |
+| 2 | Send a message | An optimistic user bubble is appended with a `msg-entering` animation and a timestamp; the session is marked `working`; the input bar re-renders into the Working state | The bubble is replaced when the server echoes the entry, matched by **position** (the last optimistic bubble), never by text — matching on text would eat legitimate duplicate messages like `yes`. On `send_failed`, the bubble is removed, the session reverts to `idle`, and the text is restored into the composer if it is empty |
+| 3 | Answer a permission prompt | `waitingData` is cleared, the session flips to `working`, the bar re-renders, and the sidebar permission card is removed | None. A stale prompt is corrected by the next state snapshot |
+| 4 | Queue a message | The text is pushed into the local queue array and the banner re-renders, then the server is told | The authoritative `queue_updated` event replaces the local array wholesale |
+| 5 | Interrupt | The session flips to `idle` immediately and the merged queued text is placed into the idle composer | None; the real state event confirms |
+| 6 | Rename (inline) | The name cell is replaced with the new text before the request | On failure the original cell HTML is restored and a toast fires |
+| 7 | Rename (drill-down title) | The DOM text changes before the request, but the underlying record is only updated after success | On failure the original text is restored |
+| 8 | Delete session | The session is removed from the list and the lookup set, drafts are cleared, folder membership is removed, task links are unlinked best-effort, and the panel deselects | A non-JSON 500 and a network error are both treated as success, because the server-side tombstone is already written and a reload reconciles |
+| 9 | Sleep all | Every matched session is removed from the running set, its kind and restart memory are deleted | None; the snapshot corrects |
+| 10 | Mission Control send | The textarea is cleared and collapsed, the session flips to working, and the grid re-renders — all before the emit | **None, and the typed text is lost.** This is the weakest optimistic path in the product; a rebuild should retain the text until an ack arrives |
+| 11 | Task drag between columns | The card node is moved and its `data-status` rewritten before the request | On failure the board is refreshed and an error toast fires |
+| 12 | Task reorder within a column | The DOM is reordered, then the request is sent fire-and-forget | On failure a `Reorder failed` toast fires; the order corrects on the next load |
+| 13 | Create task | A ghost card at 50% opacity with a spinner and `Creating...` is inserted at the chosen end and the column count increments | The ghost is removed on failure. **Known defect: the count is not decremented** — fix this in the rebuild |
+| 14 | Create subtask | An optimistic row at 60% opacity with the badge `new` and a spinner | Removed on failure |
+| 15 | Delete task / section | The card is removed and the column count recomputed before the request | On failure a full board refetch restores it |
+| 16 | Compose section drag | The section status is mutated locally and the whole board re-renders before the request | **Full rollback** — the status is restored, the board re-renders, and `Move failed` fires. This is the reference implementation |
+| 17 | Compose bulk move | Each status is mutated before its request | **No rollback**; failures are swallowed. Fix in the rebuild |
+| 18 | Compose sidebar reorder | The DOM and the in-memory list are reordered before the request | **No rollback and no toast.** Fix in the rebuild |
+| 19 | Shared-prompts toggle | The flag flips and the badge updates before the request | **None** — the response is never inspected |
+| 20 | Composition rename via settings | The header and sidebar re-render before the request | **None** |
+| 21 | Delete composition | The row disappears immediately and, if it was active, the next composition loads — with **no server call for 5s** | `Undo` restores the record, the active-composition pointer and the storage key. Navigating away commits |
+| 22 | Permission answer from the sidebar | The queue entry is removed, waiting data is deleted, the session flips to working, the panel re-renders and the card's class is rewritten — all before the emit | None |
+| 23 | Compact context | The substatus is set to `compacting` so the bar reads `Compacting…` immediately instead of `Working…` | The real substatus arrives with the next state event |
+| 24 | Retry now | The session flips to `working` so the bar does not flash an empty idle state | The real state event confirms |
+| 25 | Live model switch | **Deliberately pessimistic.** Nothing changes until the daemon confirms; on failure or the 20s timeout the badge keeps showing the true model and an explicit error toast fires | N/A by design — treat this as the pattern to copy, not the exception |
+
+**The rule.** Optimism is correct where the action is cheap to reverse and the user's next action depends on it feeling instant. It is wrong where the truth is expensive to discover — which is why the model switch is honest and the message send is not.
+
+---
+
+## 14.12 Destructive actions and confirmation
+
+### 14.12.1 The wording pattern
+
+Every destructive confirmation follows the same three-part shape:
+
+1. **Title** — a verb phrase naming exactly what will happen: `Delete Session`, `Delete All Sessions`, `Switch to Sessions`, `Delete section and 3 subsections?`
+2. **Body** — the target in bold, then the blast radius as a separate sentence: `Delete <name>?` / `Sub-departments and sessions will be moved to the parent.`
+3. **Irreversibility line** — the literal sentence `This cannot be undone.` on its own line, present if and only if the action is genuinely irreversible.
+
+The confirm button repeats the verb (`Delete`, `Delete All`, `Delete N`, `Sleep All`, `Close`, `Clear`, `Launch All`, `Turn Off`) rather than saying `OK`. Danger actions use `.pm-btn-danger`. Cancel is always the left button and is always the safe default — **except** in the Wrong Branch dialog, where Cancel is deliberately promoted to primary and listed first, because the destructive option there is publishing to the wrong branch.
+
+### 14.12.2 The full list
+
+| Action | Confirmation | Undoable? | Notes |
+|---|---|---|---|
+| Delete session | Single confirm | **Yes** — goes to Recently Deleted | Retention default is `Forever` |
+| Delete empty sessions | Single confirm | Yes, same trash | — |
+| Delete all sessions | **Double confirm** | Yes, same trash | Second dialog is titled `Are you sure?` |
+| Bulk delete sessions | Single confirm listing three names | Yes | — |
+| Purge from trash | Native confirm | **No** | `This cannot be undone.` |
+| Empty trash | Native confirm with the count | **No** | — |
+| Stop / sleep a session | Single confirm | N/A — non-destructive | Bulk stop has **no** confirmation, deliberately: nothing is lost |
+| Delete project | Single confirm | **No** | Deletes every session in it |
+| Delete task | Inline on-card confirm | **No** | — |
+| Delete subtask | Modal confirm | **No** | Explicitly warns about children |
+| Switch task to Sessions | Modal confirm with a red warning box | **No** | Deletes every subtask |
+| Switch task to Subtasks | Modal confirm | **Partly** — sessions survive, only the link is cut | Says so explicitly |
+| Remove a board column | Inline confirm in the row | **No** | Blocked at the last column |
+| Delete section (leaf) | Inline on-card confirm | **No** | — |
+| Delete section (with children) | Modal listing every child | **No** | — |
+| Delete composition | **No dialog at all** — a 5s undo toast | **Yes, for 5s** | Navigating away commits immediately |
+| Bulk delete compositions | Native confirm listing names, then the undo toast | Yes, for 5s | — |
+| Delete department | Modal confirm | **Partly** — children and sessions are re-parented, not deleted | — |
+| Archive department | No confirm | **Yes** — appears under `Archived Folders (N)` with `Restore` | — |
+| Delete an archived department | Row button | **No** | `title="Delete permanently"` |
+| Delete a workforce asset | Native confirm | **No** — removes the file | — |
+| Uninstall a skill pack | Native confirm | **No** — deletes the cloned directory | — |
+| Uninstall the built-in library | Native confirm | **Yes** — reinstallable from the Available tab, and the copy says so | — |
+| Rewind code | Modal picker | **No** | Files are overwritten from a snapshot |
+| Clear display | No confirm | N/A — cosmetic only | The copy says `without affecting the session` |
+| Restart the session engine | Modal with a scope choice | N/A | Every option states its consequence for running sessions |
+| Turn off the server | Modal confirm | **No** | Requires a manual relaunch |
+| Publish / sync on a non-default branch | The Wrong Branch dialog | N/A | Cancel is primary |
+| Push with a failed security scan | Blocked; override is explicit | N/A | Offers `Fix with AI` first |
+| Push with failing tests | Blocked; override is explicit | N/A | Cancel is primary |
+| Replace subtasks with an AI plan | Modal confirm | **No** | Only shown when subtasks exist |
+
+### 14.12.3 Typed confirmation
+
+One flow requires typing: the cloud-data replacement path uses an input with the placeholder `Type REPLACE` and keeps its button disabled until the exact word is entered. Use this pattern only where an undo is impossible *and* the blast radius is data the user did not create in this app.
+
+### 14.12.4 Tombstones
+
+Deleted sessions get a server-side tombstone so they cannot reappear after a reload even when the file unlink failed. This is why a non-JSON 500 from the delete endpoint is treated as success in the client — the record is already gone from the user's point of view, and leaving the card on screen would be the actual bug.
+
+---
+
+## 14.13 Drag and drop
+
+### 14.13.1 Everything draggable
+
+| Item | Handle | Payload | Valid targets |
+|---|---|---|---|
+| Task card | The whole card, with a visible six-dot grip | `text/plain` = task id | Any column body |
+| Subtask row | The whole row, with a grip carrying `title="Drag to reorder"` | in-memory | Other subtask rows in the same list |
+| Section card | The whole card, with a decorative `⋮⋮` grip | `text/plain` = section id | Any of the three column bodies |
+| Composition row | The whole row | `text/plain` | Other composition rows |
+| Session card (Workforce) | The whole card | `text/plain` = session id | Another session card (reorder), a folder card, a breadcrumb crumb |
+| Folder card | The whole card | `text/plain` = `folder:<id>` | Another folder card, a breadcrumb crumb |
+| Settings column row | The whole row | in-memory | Other column rows |
+| Sidebar resize handle | `#resize-handle` | — | — |
+| Column resize grips | `.col-resize-grip` | — | — |
+| Mobile sheet | The whole sheet header | — | Snap points |
+
+### 14.13.2 Drag visuals
+
+- The source gains `.dragging` (or `.compose-dragging`, or `.ws-dragging`) **on the next animation frame**, never synchronously — otherwise the browser captures the faded style into the drag image and the user drags a ghost of a ghost.
+- `effectAllowed` and `dropEffect` are both `move`.
+- Settings column rows use an inline `opacity: 0.4` instead of a class.
+- A long-press that has armed the context menu **cancels** any `dragstart`, so holding a card opens the menu rather than starting a drag.
+
+### 14.13.3 Drop affordances
+
+- A valid column gains `.kanban-drop-target` on `dragover` and loses it on `dragleave` — but only when the `relatedTarget` is genuinely outside the column, otherwise moving across the column's own children flickers the highlight.
+- A valid folder card gains `.ws-drop-target`.
+- A valid composition row gains `.compose-drag-over`, cleared from every sibling first.
+- **Insertion indicator:** the Workflow board inserts a `.kanban-drop-indicator` element before the first non-dragging card whose vertical midpoint sits below the cursor, else before the add-card affordance, else at the end. It is removed and recreated on every `dragover`.
+- **No indicator is shown for auto-sorted columns.** If a column's sort mode is anything other than manual, `dragover` returns early: promising an insertion position the board will immediately re-sort away is worse than showing nothing.
+- Subtask rows use **live reordering** instead of an indicator — the row is physically moved as you drag over siblings, so the list you see is the list you will get.
+- Compose cards have **no** insertion indicator and **no** within-column reordering; only the column matters.
+
+### 14.13.4 Reorder rules and rejections
+
+| Rule | Behaviour |
+|---|---|
+| Same column, manual sort | Reorder; compute `after_id`/`before_id` from the cursor position |
+| Same column, auto sort | No-op |
+| Different column | Move and set the new status |
+| Compose card to the same column | No-op |
+| Folder into its own descendant | Rejected with toast `Cannot move folder into its own descendant`. Guarded by an upward walk capped at 50 hops |
+| Composition reorder while a search filter is active | `dragstart` is prevented entirely — a filtered DOM would submit an incomplete order |
+| Composition row that is cross-project pinned | Not draggable and not a valid target |
+| Folder reorder across different parents | Silently ignored |
+
+### 14.13.5 Cancel and cleanup
+
+`dragend` always runs and always clears every state class globally — `.dragging` from all cards, `.kanban-drop-target` from all columns, every `.kanban-drop-indicator` node, `.ws-drop-target` and `.compose-drag-over` from everything. Never rely on `drop` to clean up: pressing Escape mid-drag or dropping outside the window fires only `dragend`.
+
+After a Workflow drag, a flag suppresses the trailing click for **50ms** so releasing over a card does not also navigate into it.
+
+### 14.13.6 Auto-scroll
+
+The board columns and the sidebar are native scroll containers, so the browser's own drag auto-scroll applies at the edges. There is no custom auto-scroll implementation; do not add one unless you also handle the sub-pixel jitter it introduces on trackpads.
+
+### 14.13.7 The mobile drawer gesture
+
+Not drag-and-drop, but the same class of interaction and it must feel native:
+
+- A rightward drag starting anywhere except the first **8px** (reserved for the browser's back gesture) opens the drawer; any drag on an open drawer closes it.
+- The gesture locks to horizontal only after **8px** of movement, and abandons if vertical movement dominates — otherwise every vertical scroll would fight the drawer.
+- It bails if the drag begins inside an element that can genuinely scroll horizontally, so a wide code block keeps its own scrolling.
+- While dragging, the drawer transform follows the finger 1:1 with transitions disabled, and the backdrop opacity interpolates from 0 to 0.5.
+- On release, it snaps open or closed depending on whether the gesture passed **30%** of the drawer width, then hands the final animation back to the app's own collapse state so persistence stays correct.
+
+---
+
+## 14.14 Keyboard reference
+
+### 14.14.1 Global (no modal open, focus not in a field)
+
+| Key | Action |
+|---|---|
+| `N` | New session |
+| `↑` or `K` | Previous session |
+| `↓` or `J` | Next session |
+| `Enter` | Open the live panel for the selected session |
+| `Esc` | Close the live panel; or clear the multi-selection |
+| `?` (Shift+/) | Open the shortcuts modal |
+| `Ctrl/⌘+F` | Open the find bar |
+| `Ctrl+Shift+S` | Spawn a subsession from the active session |
+
+Guards: the global handler returns immediately when `ctrlKey` or `metaKey` is held (so browser shortcuts are never stolen), when the event target is an `input`, `textarea`, `select` or `contenteditable`, and when `#pm-overlay` is showing.
+
+### 14.14.2 Workflow board scope
+
+| Key | Action |
+|---|---|
+| `n` | Open Add to Board |
+| `r` | Refresh the board, with the toast `Refreshed` |
+| `Esc` | Close the drill-down panel |
+| `?` | Toggle the shortcuts overlay |
+
+Suppressed when the view is not Workflow, when focus is in a field, and on any `Ctrl`/`Meta` chord or `F5`.
+
+### 14.14.3 Subsessions scope
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` | Move focus between compositions |
+| `Enter` | Open the focused composition |
+| `Space` | Toggle its selection |
+| `Shift+↑` / `Shift+↓` | Extend the selection |
+| `Delete` | Delete the focused composition — **with no confirmation**, straight into the 5s undo toast |
+| `Esc` | Clear the selection, or close |
+| `n` | New section, or new composition when none is loaded |
+| `r` | Refresh |
+| `?` | Toggle the shortcuts overlay |
+
+While the shortcuts overlay is open, every key except `Escape` and `?` is swallowed.
+
+### 14.14.4 Field-scoped keys
+
+| Field | Enter | Escape | Other |
+|---|---|---|---|
+| Composer (desktop) | Sends or newlines per the send-key policy | — | Shift/Alt/Ctrl+Enter per policy |
+| Composer (mobile) | **Always a newline** | — | Sending is only via the send button |
+| Mission Control card input | **Always sends** (Shift+Enter newlines) | — | Overrides the global policy |
+| Inline rename | Commit | Revert to the original text | Blur also commits |
+| Prompt modal input | Confirm | Cancel, resolving `null` | Autofocused and pre-selected |
+| Find input | Next match | Close the find bar | Shift+Enter goes to the previous match |
+| Deep-search input | Search immediately, cancelling the debounce | Close the modal | — |
+| Quick-add inputs (task, subtask, section, column, tag) | Submit | Cancel or close | — |
+| Verification URL input | Save | Cancel and re-render | — |
+| Device-name input | Save | — | — |
+| Planner textareas | Per the send-key policy | — | — |
+| Direct All textarea | Ctrl/⌘+Enter submits | Close the modal | The only compose modal with an Escape handler |
+| Compose hero textarea | Ctrl/⌘+Enter plans | — | — |
+| Subsession caret | Enter or Space toggles | — | `aria-label="Toggle subsessions"` |
+
+### 14.14.5 The send-key policy
+
+A single preference, `sendBehavior`, with two values.
+
+| Value | Enter | Modifier+Enter | Hint text |
+|---|---|---|---|
+| `ctrl-enter` (default) | Newline | **Ctrl, Shift, Alt or Meta** + Enter sends | `Ctrl+Enter, Shift+Enter, or Alt+Enter to send` |
+| `enter` | Sends, but only with no modifier held | Any modifier + Enter inserts a newline | `Enter to send · Ctrl+Enter, Shift+Enter, or Alt+Enter for new line` |
+
+On macOS the hint substitutes `⌘` for `Ctrl`. The preference is toggled from the swap-arrows button next to the hint or from Preferences, is written to local storage **and** pushed to the server, and every visible hint on the page is refreshed immediately.
+
+**The mobile override is absolute.** Below 768px, Enter is always a newline regardless of the preference, the hint and its toggle are suppressed entirely, and sending happens only through the visible send button next to the mic. Modifier combinations are impractical on a touch keyboard, and a preference that silently does nothing is worse than no preference.
+
+**The iOS keyboard-dismiss heuristic.** Tapping the iPhone keyboard's Done chevron fires a blur — and so does tapping anywhere else on the page. The distinguishing signal is that keyboard chrome is system UI and produces no `pointerdown` on the document. Every pointer event stamps a timestamp in the capture phase; a blur is treated as "the keyboard dismissed itself, therefore send" only when no page pointer event occurred in the previous **250ms**. Desktop always returns false. Get this wrong and tapping away from a half-typed message sends it.
+
+### 14.14.6 Focus management
+
+| Moment | Behaviour |
+|---|---|
+| Alert opens | The OK button is focused |
+| Confirm opens | The **confirm** button is focused — note this makes Enter destructive on danger dialogs; a rebuild should focus Cancel when `opts.danger` is set |
+| Prompt opens | The input is focused and its text selected |
+| New-session composer | Focused **synchronously**, never inside a timeout — a deferred focus breaks the user-gesture chain and the mobile keyboard never appears |
+| Mobile programmatic focus | After focusing, wait for the visual viewport to resize (the keyboard opening) and then scroll the field into view; fall back to a 350ms timeout. Without this the field only jumps into view on the first keystroke |
+| Input bar re-render | If focus was inside the bar, it is restored synchronously after the `innerHTML` swap so there is no focus flash |
+| Deliberate GUI open | Autofocus is granted once and consumed, and **never on mobile** |
+| Modal closes | Focus is not explicitly restored — a known gap; a rebuild should return focus to the trigger |
+| Focus trap | **There is none on any overlay.** Tab escapes into the page behind. This is the single largest accessibility gap in the product and a rebuild should fix it: trap Tab within `.pm-card`, and make Escape close every overlay uniformly |
+
+### 14.14.7 Tab order
+
+Within a modal the natural DOM order is correct: title, body, fields top to bottom, then the actions row left to right (secondary then primary). In the app frame the order is header, sidebar controls top to bottom, session list, main toolbar, transcript, composer. The composer's left group (invoke, model, context ring) precedes the send button.
+
+---
+
+## 14.15 Scroll behavior
+
+### 14.15.1 Stick-to-bottom
+
+The live log maintains an auto-follow flag. On every scroll event it recomputes whether the user is at the bottom using a **60px** tolerance:
+
+```
+atBottom = scrollHeight - scrollTop - clientHeight < 60
+```
+
+The flag is set to that value. So auto-follow **disengages** the moment the user scrolls more than 60px away from the bottom, and **re-arms automatically** when they scroll back into that band. There is no separate "jump to bottom" button; scrolling back down is the affordance.
+
+### 14.15.2 The programmatic-scroll exemption
+
+The app top-aligns long assistant messages, which fires a scroll event that would otherwise look exactly like the user scrolling up. Each programmatic top-align stamps a timestamp, and the scroll listener ignores any event within **150ms** of that stamp. Without this exemption, auto-follow switches itself off the first time a long reply arrives and the user never sees the rest of the stream.
+
+### 14.15.3 The top-align rule
+
+After rendering, the app decides between two behaviours:
+
+- **If a streaming bubble is present** — always scroll to the bottom. The partial bubble is what the user is watching.
+- **Else, if the most recent assistant message is taller than the viewport** — position its first line `8px` below the top edge, so the user starts reading from the beginning and scrolls down as they read.
+- **Otherwise** — scroll to the bottom.
+
+The fallback target (used by settle-scrolls that do not know which element just rendered) is only adopted when it is genuinely the last message in the log. If anything newer follows it — most importantly an optimistic user bubble that was just appended — the app scrolls to the bottom instead, because top-aligning an older reply would hide the message the user just sent.
+
+### 14.15.4 The sticky user message
+
+While scrolling a long reply, the most recent user message that has scrolled above the viewport is pinned as a bar at the top of the transcript container (`.sticky-user-bar`, a sibling inserted before the scroll container, with the parent given `position: relative`).
+
+- It appears with `.visible` and shows the message text on one line.
+- Clicking it toggles `.expanded` to reveal the full text.
+- The pinned message is chosen by walking the user messages newest-to-oldest and taking the first whose bottom edge sits at or above the scroll position, with a 4px tolerance.
+- The scroll handler is throttled with `requestAnimationFrame` (each frame cancels the previous) and registered passive.
+- Disabled entirely when `stickyUserMsgs` is `off`; toggling the preference off removes any active pin immediately.
+
+This exists because a long reply scrolls the question off screen and the user loses the thread of what they asked.
+
+### 14.15.5 Pagination
+
+- The live panel loads **100** entries per page. When more exist, a `.live-load-more` pill reading `Load older messages (N more)` sits at the top of the log, separated from the transcript by a hairline drawn with a pseudo-element.
+- Clicking it disables the button, changes its text to `Loading…`, and requests the previous page.
+- On arrival, entries are **prepended** and the scroll position is corrected by the height delta (`prevScroll + (newHeight - prevHeight)`) so the viewport does not jump.
+- A watchdog re-enables the button after **8s** if no response arrives. It deliberately does **not** cycle the socket — a stuck button is better than dropping in-flight stream entries.
+- The static preview path uses a different limit: **200** messages, with a `Load all N messages` button.
+- Workflow columns paginate at a configurable page size, default **50**.
+- Mission Control previews fetch the last **20** entries.
+- Status history pages at **50**.
+
+### 14.15.6 Destructive-refresh guards
+
+Three independent guards prevent a re-fetch from wiping already-rendered content:
+
+1. A log response covering fewer entries than the DOM currently shows is discarded rather than rendered.
+2. A state snapshot only triggers a log re-fetch when the log is genuinely empty.
+3. A state event only triggers a re-fetch when the server's entry count exceeds the rendered count.
+
+### 14.15.7 Scroll restoration
+
+- **Session switch:** the transcript scrolls to the bottom 50ms after render.
+- **View switch:** each view re-renders from scratch; scroll position is not preserved, but the *navigation position* is (§14.3.5) — the drill-down you were in, the session you had open.
+- **List re-render:** the sidebar list is rebuilt with `innerHTML`, which resets its scroll. The multi-select badge is re-inserted afterwards specifically so it is not lost.
+- **Sheet and modal:** the deep-search modal opens anchored `9vh` from the top so results are near the eye line rather than centred.
+- **Question truncation:** a permission question longer than 400 characters is truncated from the **front** with a leading ellipsis, because the actual ask is always at the end.
+
+---
+
+## 14.16 Empty states
+
+Every empty state in the product, with exact copy. The rule the product follows: **an empty state names the thing, explains what it will contain, and offers the action that fills it.** A bare "No data" appears nowhere except in the two densest surfaces, where the label is the whole card.
+
+| Location | Headline | Subtext | Call to action |
+|---|---|---|---|
+| Main panel, no session selected (static fallback) | `Select a session to preview it` | — | A 💬 glyph above the line |
+| Dashboard hint, sessions exist | — | `Select a session from the sidebar to view its conversation` | — |
+| Dashboard hint, no sessions | — | `Select a project to get started` | — |
+| Session list / grid, no matches | `No sessions found` | — | — |
+| Session list, no projects | `No projects found.` | `Click the project selector above to get started.` | — |
+| Main panel, no project | `Select a project to begin` | — | A folder glyph |
+| Session list, backend never came up | `Reconnecting to <App>…` | — | — |
+| Projects overlay, still loading | `Loading projects…` | — | — |
+| Projects overlay, fetch failed | `Couldn't load projects. Check your connection and tap "Select project" again.` | — | — |
+| New session transcript | `What will we <App> today?` | — | The template grid below it |
+| Transcript with no messages | `No messages yet` | — | — |
+| After deleting sessions | `Sessions deleted` | — | A trash glyph |
+| Mission Control, no sessions | `No sessions` | — | — |
+| Mission Control card, no history | `No recent messages` | — | — |
+| Workflow board, no tasks | `Welcome to your Kanban board` | `This project doesn't have any tasks yet.` | `+ Create your first task`, plus a secondary `Find tasks for this project in cloud` |
+| Workflow board, load failed | `Failed to load board` | the error text | `Retry` |
+| Workflow column, empty | — | — | Nothing at all — the column stays a valid drop target |
+| Task detail, load failed | `Failed to load task` | the error text | `Retry` and `Back to Board` |
+| Task drill-down, no children and no sessions | `How to proceed` | — | Three cards: `Break into subtasks` / `Subdivide into smaller pieces. Each subtask gets its own status and sessions.`; `Spawn sessions` / `Start working directly. Spawn Claude sessions scoped to this task.`; `Plan with AI` / `Describe a goal and Claude will break it down into a structured set of subtasks.` |
+| Expanded card, load failed | `Failed to load` | — | — |
+| Status history, none | `No status changes recorded` | — | — |
+| Status history, failed | `Failed to load history` | — | — |
+| Cloud discovery, none | `No other projects found in the active backend. If you're expecting tasks from a teammate, double-check that you're connected to the right Supabase project (System → Persistent Storage).` | — | — |
+| Backups, none | `No backups yet.` | — | — |
+| Report — Status Distribution | `No tasks yet` | — | — |
+| Report — Velocity | `No completion data yet` | — | — |
+| Report — Cycle Time | `No cycle time data yet` | — | — |
+| Report — Time in Status | `No status transition data yet` | — | — |
+| Report — Remediation | `No task data yet` | — | — |
+| Report — Session Efficiency | `No session data yet` | — | — |
+| Report — Owner Activity | `No owner data` | — | — |
+| Report — Tag Breakdown | `No tags yet` | — | — |
+| Report — Cumulative Flow | `No completion trend data yet` | — | — |
+| Report — Activity Log | `No activity recorded yet` | — | — |
+| Report — Stale Tasks | `No stale tasks` | — | preceded by a check glyph |
+| Report, load failed | `Failed to load reports` | the error text | — |
+| Subsessions, no composition | `Welcome to Subsessions` | `Orchestrate multiple sections with AI-powered composition.` | `+ Create your first composition` |
+| Composition with no sections (hero) | `What would you like to create?` | `Describe your project and AI will plan the sections, assign artifact types, and write briefs for each agent.` | A textarea placeholder `e.g. A quarterly business review with financial summary, market analysis, product updates, and next-quarter goals...`, a primary `Plan with AI`, and the secondary links `Start from a template` · `Add a section manually` |
+| Ad-hoc subsessions tab (hydrated) | `No subsessions yet` | `Right-click any session and choose **Spawn Subsession** (or press Ctrl+Shift+S) to peel off a focused side task. It inherits the parent's full context and reports its conclusion back up. The family tree appears here.` | — |
+| Ad-hoc tab (pre-hydration placeholder) | `Ad-hoc subsessions` | `Spawn lightweight subsessions from any active session and see the parent-child tree here. (Available in a coming update.)` | — |
+| Orphaned subsessions group | `Orphaned subsessions (parent deleted)` | — | — |
+| Section not found | `Section not found` | — | `Back to Board` |
+| Section output preview, empty | `No output yet — the agent hasn't started writing.` | — | — |
+| Section output preview, failed | `Failed to load preview.` | — | — |
+| Section summary, empty | `No summary yet. The AI agent will update this as it works.` | — | — |
+| Link-session modal, nothing to link | `No unlinked sessions available.` | — | — |
+| Workforce flat canvas, nothing visible | `No sessions to display. Start a new session or unhide existing ones.` | — | — |
+| Workforce folder, empty | `No sessions yet` | the folder's skill label when set | `New Session`, or `Chat with <SkillLabel>` when the folder has a skill; plus the secondary `or add a sub-department` |
+| Workforce Configure ▸ My Departments, empty | `No departments configured yet` | `Pick a starter template to get going instantly, or add departments one at a time.` | Three template cards: `Personal` / `5 departments · Coding, writing, docs, research`; `Small Team` / `17 departments · Eng, product, QA, docs, marketing`; `Enterprise` / `72 assets · Full org chart across 17 departments` |
+| Workforce Discovery, nothing found | `No agent or skill definitions found on your system. Install a skill pack (like gstack) or create agents in ~/.claude/agents/.` | — | — |
+| Status Sessions popup, empty | `No sessions` | — | — |
+| Workforce AI, no response | `Session completed but no response was received. The assistant may have timed out. Try again or use a simpler request.` | — | — |
+| Workforce AI, slow | `Taking longer than expected. The assistant is still working — you can wait or close and try again.` | — | — |
+| Invoke ▸ Local Skills, empty | `No local skills found. Add .md files to your project's skills/ folder.` | — | — |
+| Invoke ▸ Local Agents, empty | `No local agents found. Add .md files to your project's agents/ folder.` | — | — |
+| Invoke ▸ Departments, empty | `No departments configured. Visit the Workforce view to set them up.` | — | — |
+| Deep search, no hits | `No matches` | — | — |
+| Find bar, no hits | `No matches` | — | — |
+| Extract Code, none | `No code blocks found in this session.` | — | — |
+| Compare, initial | `Select a session above and click Compare.` | — | — |
+| Compare, nothing to diff | `No code blocks to compare.` | — | — |
+| Manage Templates, none | `No custom templates yet.` | — | — |
+| Recently Deleted, empty | `No recently deleted sessions.` | — | — |
+| Recently Deleted, failed | `Failed to load trash.` | — | — |
+| Folder tree browse, no subfolders | `No subfolders` | — | — |
+| Mobile preview grid, empty | `No previews yet.` | — | — |
+| Timeline picker, no messages | `No messages found in this session.` | — | — |
+| Timeline picker, fork with no user messages | `No user messages found in this session.` | — | — |
+
+**Home never shows an empty state.** All four cards always render, with neutral placeholder visualisations and stat lines reading `No sessions yet`, `No tasks yet`, `0 agents · 0 departments` and `No sections yet`. Home is the map; a map with missing roads is worse than a map with empty roads.
+
+---
+
+## 14.17 Error UX
+
+### 14.17.1 The four blocking health checks
+
+A single unkillable overlay (`#health-blocker`) covers the app whenever any check fails. There is no close button, no Escape handler and no backdrop dismissal — it clears only when the failing check passes again. The first failing check **in registration order** wins, and a check that throws counts as failing. The overlay's content is only rewritten when the failing check's identity changes, so a persistent failure does not flicker.
+
+Structure: a 64px icon, a label, a message, an optional action button, a three-dot spinner, and the footer `Retrying automatically…`.
+
+| Order | Id | Label | Threshold | Poll | Action |
+|---|---|---|---|---|---|
+| 1 | `wifi` | `No Internet Connection` | single probe | every 10s, and every 3s while blocking | none |
+| 2 | `server-reachable` | `<App> Server Unreachable` | **4** consecutive failures (~12s) | every 3s | none |
+| 3 | `daemon-reachable` | `<App> Engine Stopped` | **5** consecutive failures (~25s) | every 5s | `Restart <App>` → `Restarting…` |
+| 4 | `claude-auth` | `Not Logged In to Claude` | single result | every 5s while blocking, every 30s otherwise | `Log In to Claude` |
+
+Additional rules:
+
+- A **503** from the server probe bypasses the threshold entirely and reloads the page immediately — a 503 is the server telling you it is being replaced.
+- A "decisive" foreground probe (fired on `visibilitychange`, `focus`, `pageshow` and `online`) bypasses the counter but retries once after **1200ms** for the server and **1500ms** for the daemon, so a single dropped packet on wake does not blank the app.
+- Every recovery path bails when a restart overlay is present, so the health system never fights an in-app restart.
+- The daemon restart waits up to about **90s** for readiness, then force-reloads.
+- A `vn-daemon-status` event from the socket layer clears the daemon failure state instantly, so a reconnect does not have to wait for the next poll.
+- The polling interval accelerates to **1s** while blocked and relaxes to **10s** after recovery, so recovery feels instant and the healthy state is cheap.
+
+### 14.17.2 Connection and transport errors
+
+| Situation | What the user sees |
+|---|---|
+| Socket disconnects | Nothing for **4s**. Only if still disconnected does the status dot turn red with `title="Disconnected"`. Mobile networks drop the socket for 1–3s on a wifi-to-cellular handoff, and flashing "Disconnected" on every handoff reads as a broken product |
+| Socket reconnects | The dot turns green with `title="Connected"`, and the open session's log is re-fetched unconditionally — the socket layer does not replay missed events, so anything pushed during the outage is otherwise lost forever |
+| Daemon reconnecting | Toast with the server's message (default `Daemon connection issue`), dot turns orange |
+| Daemon connected | Toast with the message, dot turns accent |
+| Tab restored from bfcache | A **full page reload**. The JavaScript runtime was frozen and thawed with a dead transport underneath; nothing short of a reload reliably recovers |
+| Wake from background | A passive resync only: reconnect if the socket claims to be disconnected, otherwise just request a state snapshot. **Never** cycle a socket that reports connected |
+| Boot with broken assets | After the load event plus 400ms, if the stylesheet sentinel or a known global is missing, reload once — capped at two attempts via session storage so a genuinely broken build cannot loop |
+
+### 14.17.3 Session-level errors
+
+| Situation | What the user sees |
+|---|---|
+| Server error for a session | An error toast with the message (default `Unknown error`); the watchdog is cancelled; a state snapshot is requested; an HTTP fallback check runs 2s later; and the session is immediately demoted from `working` to `idle` so the user can retry rather than staring at a spinner |
+| Message not delivered (timeout) | An inline system entry: `⚠️ Message not delivered — the server was busy processing other sessions. This can happen when running many long sessions at once. Try closing some idle sessions or sending again in a moment.` followed by `Your message (also restored to the input box):` and the quoted text. The optimistic bubble is removed and the text is restored |
+| Message not delivered (other) | `⚠️ Message not delivered. Error: <error>` with the same restore behaviour |
+| Session silently dropped | Ghost recovery: 3s after a submit with no state event, close the session, wait 1.5s, then restart it with `resume: true` and re-send the prompt — **unless** the user explicitly slept it (§14.23) |
+| Session stuck "working" | A three-tier watchdog at 10s, 16s and 22s (§14.20) that escalates from a socket resync to an HTTP ground-truth check to a forced UI state correction |
+| API error with a retry armed | The Idle bar shows the auto-retry banner with a live countdown, the attempt number, the reason, and `Retry now` / `Cancel` |
+| API error, retries exhausted | The Idle bar shows an error banner with the message and a single `Retry` |
+| Session not found on open | `Session not found` centred in the main panel |
+| Transcript never arrives | The skeleton watchdog: re-request at 8s, probe HTTP and cycle the socket once at 16s (rate-limited to once per 60s), full reload at 28s (rate-limited to once per 120s) |
+
+### 14.17.4 Setup and configuration errors
+
+**Mobile Command wizard**, per step:
+
+| Step | Copy |
+|---|---|
+| Error | `Couldn't reach <App>` / `It'll retry automatically…` / button `Check again now` |
+| Install | `<App> reaches your phone privately through Tailscale — a free, secure connector. First, install it on <OS>. It's a one-time thing.` with the CTA `Download Tailscale for <OS>`, an ordered list `Click the button above and run the installer.` / `Open Tailscale and sign in (create a free account if it asks).`, and the waiting line `Waiting for Tailscale to be installed… this screen moves on by itself.` |
+| Sign in | `Tailscale is installed — nice. Now open it and sign in on this computer (create a free account if it asks). Remember which account you use — you'll sign your phone into the same one in a moment.` with the CTA `Open Tailscale sign-in` and `Waiting for you to sign in… this screen moves on by itself.` |
+| Intro | `You're signed in. Flip on phone access — do this once and it stays on every time <App> runs. Your sessions never leave this machine; this only opens a private door for your own devices.` with `Signed in as <account>` and the CTA `Turn on phone access`, which shows the interstitial `Turning on…` |
+| HTTPS | `Almost there. Turn on HTTPS for your Tailscale network — one switch, one time. This is what lets your phone use voice input (the microphone only works over HTTPS).` with the CTA `Open Tailscale HTTPS settings` and the list `On the page that opens, find HTTPS Certificates.` / `Click Enable HTTPS.` |
+| Bridge | `Opening the private door for your phone… this only takes a moment.` with `Starting…`, an error block, and a `Retry` button |
+| Phone | The live banner `● On — your phone can reach <App>` with a `Turn off` button; lead `Do this once on your phone. After that, just tap the icon — it always works.`; column one `① Get the Tailscale app` with a QR code, the link `Open the App Store`, and the note `Scan with the phone camera → install Tailscale → sign in → tap Allow for VPN.`; column two `② Open <App>` with a QR code, a `Copy link` button, and the note `Scan to open, then Share → Add to Home Screen. The icon is named <device>.`; an account box reading `On your phone, sign Tailscale into this exact same account:` with a `Copy` button; a phone status of either `✓ <phone> is connected to your network` or `Waiting for your phone to join your network…`; and a name row labelled `Name this computer (so multiple machines are easy to tell apart on your phone):` with an input placeholder `e.g. Studio Mac` and a `Save` button |
+
+**Cloud storage connection statuses:** `Connecting...`, `✓ Connected — checking data…`, `✓ Connected — ready to choose`, `Step 2: Set up the database`, `✗ <error>`, `Enter URL and key first`, `Creating tables...`, `✓ Tables created! Switching...`, `Paste your access token first`, `Copying tasks to local...`, `✓ Switched to Local! All tasks migrated.`, `✓ Saved <filename> (N records)`, `✗ Could not inspect cloud data`.
+
+**Voice errors:** the four setup states in §14.7.9 rows 111–115, plus the runtime toasts in §14.9.9.
+
+### 14.17.5 Search and input errors
+
+| Situation | Copy |
+|---|---|
+| Query under 2 characters | `Keep typing…` |
+| Search in flight | `Searching… (first search may take a moment while indexing)` |
+| Non-OK HTTP | the server's error, else `Search failed (HTTP <status>)` |
+| Non-JSON response | `Search failed — bad response` |
+| Fetch threw | `Search failed — server unreachable` |
+| Results | `N session(s) · M messages indexed · T ms` |
+| No results | `No matches` |
+| Invalid verification URL | Toast `Please enter a URL (http/https/file) or a local file path` and the field refocuses |
+| Empty required name | The field refocuses silently, except the department name which toasts `Enter a department name` |
+| Duplicate column key | Toast `A column with that key already exists` |
+| Last column removal | Toast `Cannot remove the last column` |
+| Session already linked | Toast `Session already linked to "<section>"` |
+| Batch over the cap | Toast `Maximum 20 tasks per batch` |
+| Bulk action already running | Toast `Another bulk action is in progress` |
+
+### 14.17.6 Silent failures a rebuild should fix
+
+Three failures currently produce nothing the user can see: folder-tree persistence failures (console only), composition reorder failures (console only), and the shared-prompts toggle (the response is never inspected). Each should surface a toast and revert.
+
+---
+
+## 14.18 State persistence
+
+### 14.18.1 Local storage
+
+| Key | Meaning |
+|---|---|
+| `theme` | `dark`, `light` or `auto` |
+| `_sunriseMin` / `_sunsetMin` | Cached sunrise and sunset minutes for auto theme, read by the pre-boot script |
+| `viewMode` | The current top-level view |
+| `projectView_<project>` | The last view used in a given project |
+| `pvs_<project>_sessions` | The last session opened in that project |
+| `pvs_<project>_kanban` | The Workflow drill-down hash, with any session suffix stripped |
+| `pvs_<project>_compose` | The Subsessions sub-route hash |
+| `activeProject` | The encoded active project directory |
+| `activeSessionId` | The open session |
+| `projectSession_<project>` | The last session per project |
+| `sessionDisplayMode` | `grid`, `list` or `control` |
+| `sortMode` / `sortAsc` | List sort field and direction |
+| `wfSort` | Grid sort: `status`, `recent` or `name` |
+| `sidebarCollapsed` | `"1"` or empty |
+| `sendBehavior` | `enter` or `ctrl-enter`; also mirrored to the server |
+| `defaultModel` / `defaultThinking` | System defaults |
+| `stickyUserMsgs` | `off` disables the sticky bar; absent means on |
+| `permPolicy` | The permission policy |
+| `customPolicies` | The five booleans plus a custom regex |
+| `vibenode_drafts` | Unsent composer text, keyed by session id |
+| `guiOpenSessions` | Session ids opened in the panel |
+| `wsHiddenSessions` | Hidden session ids — cleared on project switch |
+| `wsCardPositions` | Manual card ordering — cleared on project switch |
+| `vn.subsession.caret.<parent>` | Per-parent disclosure state, default expanded |
+| `vn.tip.subsession_intro` | One-shot flag for the subsession intro toast |
+| `vn.compose.activeTab` | `adhoc` or `structured` |
+| `activeComposition:<project>` | The active composition |
+| `composeColumnSorts` | Per-column sort modes |
+| `kanbanExpanded` | Expanded tasks — cleared on project switch |
+| `kanbanRecentHistory` | Up to ten recent board destinations |
+| `plannerState` / `plannerStash` / `plannerSessionId` / `plannerDebugRaw` | Planner panel state, proposal, backing session and last raw parse failure |
+| `vibenode_custom_templates` | User-defined starter templates |
+| `recentDeptAssets` | Recently invoked department assets, capped at eight |
+| `_sessionQueues` | Legacy; migrated to the server and then removed |
+| `_sessionModelOverride` / `_sessionThinkingOverride` | Obsolete; actively deleted on load because they leaked a choice from one session into the next |
+
+### 14.18.2 Session storage
+
+| Key | Meaning |
+|---|---|
+| `vnHealTries` | Boot self-heal reload counter, capped at 2 |
+| `vn_skel_reload_at` | Timestamp of the last skeleton-watchdog reload, rate-limiting to one per 120s |
+| `kanbanTagFilter` | Active board tag filter — cleared on project switch |
+
+### 14.18.3 Server-side
+
+The folder tree (persisted with a **500ms** debounce), the permission policy and custom rules, the send-key preference, session retention days, per-session message queues, board and composition data, session names, and workforce assets. The server is authoritative for all of these; local storage is a cache that seeds the first render.
+
+### 14.18.4 URL
+
+`?chat=<session-id>`, `?folder=<folder-id>`, `#kanban`, `#kanban/task/<id>`, `#kanban/task/<id>/session/<sid>`, `#kanban/task/<id>/planner/<sid>`, `#compose`, `#compose/section/<id>`, and `?planner=` for the planner panel state.
+
+`pushState` is used for opening a session and drilling into a task or section. `replaceState` is used for view switches, for hash cleanup, and — critically — when a temporary client-generated session id is remapped to the canonical server id, so the throwaway id never enters the back/forward history.
+
+### 14.18.5 Not persisted, deliberately
+
+The sidebar width, the multi-select set, the mobile preview store, the scroll position of any list, and open/closed state of context menus. Each of these is ephemeral by design; persisting them produces the "why is my app in a weird state" class of bug.
+
+---
+
+## 14.19 Attention and notification
+
+The product deliberately uses **no** operating-system notifications, no title-bar flashing, no favicon badge and no sound. Everything happens inside the window. A rebuild should keep that constraint unless it also builds a permission-request flow and a mute control, because an agent tool that beeps unpredictably gets muted permanently within a day.
+
+The attention ladder, weakest to strongest:
+
+1. **Colour and motion in the list.** A session waiting for input turns amber and pulses (`waitpulse`, 1.4s ease-in-out, infinite) with a left border in `#ffb700`. A working session breathes blue (`wf-work-pulse`, 2s). The pulse is what draws the eye in peripheral vision; a static colour change does not.
+2. **The status icon.** A clock for waiting, a pickaxe for working, a green check for idle, a moon for awaiting wake-up, a purple collapse glyph for compacting.
+3. **Aggregate counts.** The dashboard and Home stat rows show `Waiting` counts in the same amber; the Workforce Command Center shows four big clickable tiles; Mission Control's status pill reads `Needs input` in its most actionable phrasing.
+4. **The sidebar permission panel.** When any session is blocked on a tool permission, cards slide in at the bottom of the sidebar (`permSlideIn`, 300ms) showing the session name, the tool badge, the exact command or path, and four buttons — `Allow`, `Deny`, `Always`, `Auto Most`. This is the key move: **you can approve a blocked session from anywhere in the app without navigating to it.**
+5. **The inbox badge.** A parent session with pending subsession reports shows a 📬 badge with a count and the tooltip `Subsession reports waiting — included on your next message`. Tapping it toasts `Subsession reports waiting. Open the parent session to see and Pull updates.` and opens the parent — it deliberately does **not** pull, because a tap that silently sends a message is a surprise.
+6. **The inbox strip.** Inside the parent's panel, a strip above the composer reads `N subsession reports will be included with your next message.` with `Pull updates now` and `Dismiss`.
+7. **The respond modal.** A dedicated overlay headed `⏳ Session waiting for input` that renders the question and its options so a blocked session can be answered without leaving the current view.
+8. **The connection dot.** A small `●` in the status area, green when connected and red when not, with a tooltip — and a deliberate 4s grace period before turning red.
+9. **The blocking overlay.** Reserved for conditions where nothing in the app can work (§14.17.1).
+
+**Cross-view propagation.** State changes patch in place across every surface simultaneously: the sidebar row class, the grid card class, the Mission Control dot and pill, the Workflow drill-down session badge, and the composition card dot. A rename patches one row rather than reloading the list, because auto-naming fires often and a full reload would make the sidebar flicker constantly.
+
+**Haptics.** On touch devices a long-press that opens the context menu fires a 20ms vibration, so the user knows the hold registered before the menu paints.
+
+---
+
+## 14.20 Timing constants
+
+| Value | Scope | Purpose |
+|---|---|---|
+| 0ms | Global | Deferred attachment of outside-click dismissal listeners, so the opening click does not immediately close the menu |
+| 0ms | Drag | Deferred `.dragging` class so the drag image is captured un-faded |
+| 50ms | Live panel | Post-render settle: focus, auto-resize and scroll |
+| 50ms | Transcript | Scroll to bottom after a static render |
+| 50ms | Subsession | Delay before applying the spawn-pulse class |
+| 60ms | Respond modal | Delay before focusing and scrolling the question |
+| 80ms | Streaming | Markdown re-parse throttle for the live bubble, with a trailing render |
+| 80ms | Mobile sheet | Delay before dispatching the tapped action so the slide-down starts |
+| 80ms | Mission Control | Stream-preview flush throttle; keeps only the last 600 characters |
+| 100ms | Templates | Auto-submit delay for the two Workflow quick-start cards |
+| 100ms | Live panel | Scroll settle after a state change repaints the bar |
+| 120ms–150ms | CSS | Hover colour transitions |
+| 150ms | Modals | `_closePm` teardown after the exit class |
+| 150ms | View switch | Fade-out duration |
+| 150ms | Live log | Programmatic-scroll exemption window |
+| 150ms | Tags | Autocomplete debounce |
+| 150ms | Workflow | History dropdown close delay after leaving the dropdown |
+| 180ms | Validation setup | Custom close teardown |
+| 200ms | View flyout | Hover-open delay |
+| 200ms | Multi-select | Safety clear of the click-suppression flag |
+| 200ms | Policy | Delay before opening Custom Rules after the policy modal closes |
+| 200ms | Invoke / dept flyout | Removal delay after the close animation |
+| 200ms | View switch | Fade-in duration |
+| 220ms | Workflow | Delay before the validation-URL setup modal appears |
+| 250ms | View switch | Inline-style cleanup after the fade-in |
+| 250ms | Actions popup | Mobile slide-down duration |
+| 250ms | iOS keyboard | Window used to distinguish a keyboard-dismiss blur from a page-tap blur |
+| 250ms | Validation setup | Focus delay |
+| 280ms | Mobile drawer | Slide transition |
+| 300ms | Modals | Slide-out panel removal after the open class is dropped |
+| 300ms | View flyout | Hover-close delay |
+| 300ms | Workflow | History dropdown close delay after leaving the crumb |
+| 300ms | Toast | Fade in and out |
+| 300ms | Permission card | `permSlideIn` entrance |
+| 320ms | Workflow | Delay before re-rendering the drill-down after the planner closes |
+| 340ms | Mobile preview | Sheet fade-out after send |
+| 350ms | Input bar | `bar-transitioning` animation window |
+| 350ms | Message entrance | `msgSendIn` animation |
+| 350ms | Mobile focus | Fallback delay for revealing the composer above the keyboard |
+| 350ms | Workflow | Planner voice wiring, and the post-accept board re-render |
+| 400ms | Boot | Delay after the load event before the asset self-heal check |
+| 400ms | Voice | Recorder timeslice, and the first partial pump |
+| 500ms | Live panel | First deferred input-bar re-render after opening |
+| 500ms | Send | `_liveSending` reset that keeps entry de-duplication working |
+| 500ms | Folders | Debounce before persisting the folder tree |
+| 500ms | Workflow | Backend-sync wait after a mode switch; session-link delay |
+| 500ms | Socket | Resync delay after a daemon reconnect |
+| 600ms | Compose | Sidebar badge pulse duration |
+| 600ms–700ms | Subsession | Spawn-pulse duration |
+| 750ms | Socket | Wake-resync debounce |
+| 750ms | Boot | Retry interval for the projects and sessions fetches |
+| 800ms | Workflow | Task-detail retry backoff base (800 / 1600 / 2400) |
+| 800ms | Multi-select | Click-suppression window after a long-press |
+| 900ms | Project loader | Fade-out before removal |
+| 1000ms | Workflow / Compose | Description auto-save debounce; planner elapsed ticker |
+| 1000ms | Live panel | Elapsed-timer and retry-countdown tick |
+| 1200ms | Copy | Per-block `Copied!` revert in the code drawer |
+| 1200ms | Git | Delay after `Tests Passed ✓` before proceeding |
+| 1200ms | Voice install | Status poll interval |
+| 1200ms | Health | Decisive server-probe retry delay |
+| 1400ms | Mobile Command | `Copied ✓` revert |
+| 1500ms | Copy | Standard `Copied!` revert |
+| 1500ms | Git | Minimised-pill completion flash |
+| 1500ms | Health | Decisive daemon-probe retry delay |
+| 1500ms | Ghost recovery | Gap between close and restart |
+| 1800ms | Project switch | Minimum loader display time |
+| 2000ms | Live panel | Second deferred input-bar re-render |
+| 2000ms | Socket | HTTP fallback state check after a server error |
+| 2000ms | Health | Post-restart readiness poll interval |
+| 2500ms | Mobile Command | Default step poll |
+| 3000ms | Toast | Auto-hide |
+| 3000ms | Ghost recovery | Arm time after a submit |
+| 3000ms | Socket | Snapshot retry after connect; auto-name reschedule after an id remap |
+| 3000ms | Health | Base evaluation interval; extra connectivity probe while blocking |
+| 4000ms | Socket | Disconnect grace before the dot turns red |
+| 4000ms | Health | Decisive probe timeout |
+| 4000ms | Workflow | New-task highlight window |
+| 5000ms | Compose | Undo window for composition deletion |
+| 5000ms | Socket | Freshness window protecting incremental state from snapshot reversion |
+| 5000ms | Workflow | Board auto-retry after a load failure |
+| 5000ms | Health | Auth poll while blocking |
+| 8000ms | Live panel | Skeleton watchdog stage 1; load-more watchdog |
+| 8000ms | Live panel | Skeleton watchdog stage 2 offset (16s total) |
+| 10000ms | Live panel | Message watchdog tier 1 |
+| 10000ms | Health | Steady-state connectivity probe; relaxed evaluation interval |
+| 10000ms | Socket | Continuous stuck-session sweep |
+| 12000ms | Live panel | Skeleton watchdog stage 3 offset (28s total) |
+| 15000ms | Invoke / Workflow | Local-asset discovery cache TTL; AI-autonomy config cache |
+| 20000ms | Model switch | Hard timeout |
+| 20000ms | Socket | No-state-event threshold while working |
+| 22000ms | Live panel | Message watchdog tier 3 |
+| 30000ms | Workforce AI | "Taking longer than expected" fallback |
+| 30000ms | Socket | Periodic state-snapshot heartbeat; auth poll while healthy; status-marker dedup window |
+| 60000ms | Time labels | Relative-date refresh interval |
+| 60000ms | Theme | Auto-theme re-evaluation |
+| 60000ms | Git | Status poll |
+| 60000ms | Live panel | User-stop intent TTL |
+| 60000ms | Live panel | Skeleton zombie-cycle rate limit |
+| 90000ms | Health | Hard cap on the post-restart wait |
+| 120000ms | Live panel | Skeleton-reload rate limit |
+| 300000ms | Voice | Maximum single recording length |
+
+Animation durations worth naming separately: `waitpulse` 1.4s, `wf-work-pulse` 2s, `naming-pulse` 1.2s, `agentStripIn` 350ms, sub-agent pill stagger `index × 0.06s`, skeleton row stagger `index × 0.06s`, skeleton line stagger `0.04s`, Home dot stagger `index × 0.02s`, `spin` 1s linear infinite, `shimmer` continuous.
+
+---
+
+## 14.21 The twenty micro-details that make it feel finished
+
+1. **Pre-boot skeletons.** The session list, the Workflow board and the Subsessions board paint their skeletons from an inline script that runs before any module loads, driven by the persisted view mode. A cold reload therefore never shows an empty frame. Omit this and every reload starts with a flash of nothing.
+
+2. **The 4-second disconnect grace.** The connection dot does not turn red the instant the socket drops. Mobile networks drop it for one to three seconds on every wifi-to-cellular handoff, and a product that flashes "Disconnected" during normal use trains the user to distrust it.
+
+3. **The 150ms programmatic-scroll exemption.** The app's own top-align fires a scroll event indistinguishable from a user scroll. Without the exemption, auto-follow disables itself the first time a long reply arrives.
+
+4. **Optimistic bubbles matched by position, never by text.** Replacing the optimistic user bubble by matching its text would eat the second of two identical messages — and "yes", "ok" and "go ahead" are the most common messages in the product.
+
+5. **Only the newest assistant message is auto-expanded.** When a newer one arrives the previous auto-expansion is collapsed back — but a message the user expanded by hand is tagged differently and is never collapsed. The distinction between "we expanded this" and "you expanded this" is what makes the behaviour feel considerate rather than arbitrary.
+
+6. **Question truncation from the front.** A permission question over 400 characters is cut from the beginning with a leading ellipsis, because the actual ask is always at the end.
+
+7. **The name cell renames, the date and size cells open.** Giving the row two different click meanings by column means there is always a safe place to click that cannot start an edit.
+
+8. **Synchronous focus on mobile.** Focusing the new-session composer inside a `setTimeout` breaks the user-gesture chain and the on-screen keyboard never appears. It must be synchronous — and then, separately, the field must be scrolled above the keyboard once the visual viewport reports the resize.
+
+9. **The iOS keyboard-dismiss heuristic.** Distinguishing "the user tapped Done on the keyboard" from "the user tapped elsewhere" by checking whether any pointer event landed on the document in the previous 250ms. Without it, tapping away from a half-typed message sends it.
+
+10. **Elapsed timers tick in place.** The working timer and the retry countdown update a single text node every second. Re-rendering the bar to update a number would destroy whatever the user is typing.
+
+11. **The input bar refuses to re-render during dictation.** If voice is targeting a textarea inside the bar, the state machine returns without updating its state key, so a deferred call catches up when dictation ends. Otherwise a turn ending mid-sentence silently swallows the message.
+
+12. **Focus is restored synchronously after a bar re-render.** Captured before the swap, reapplied immediately after — so a state transition mid-typing produces no visible focus flash.
+
+13. **`dragging` applied on the next animation frame.** Applied synchronously, the browser snapshots the faded element into the drag image and the user drags a ghost of a ghost.
+
+14. **No insertion indicator in auto-sorted columns.** Promising a drop position the board will immediately re-sort away is worse than showing nothing.
+
+15. **The multi-select badge is re-inserted after every list re-render.** The list is rebuilt with `innerHTML`, which destroys the badge; re-rendering it and pruning the selection to still-existing ids means the count can never lie.
+
+16. **The sidebar width is not persisted.** It is genuinely ephemeral, and persisting it means one accidental drag follows the user forever.
+
+17. **Sort is state-driven, never click-driven.** Opening a session does not bump it to the top of the list. Sessions move when you work in them, not when you look at them — otherwise the list reorders under your cursor as you browse.
+
+18. **Subsession families stay contiguous under every sort.** The flat sorted list is reordered so each parent is immediately followed by its children, and children keep their own sort order within the family.
+
+19. **The `auto-resuming` substatus overrides the base state everywhere.** During a wake-up the base state flips idle to working; if the icon followed it, the sidebar would show a pickaxe while the chat panel still said "Awaiting wake-up…". Every surface honours the substatus instead.
+
+20. **Copy confirmation reverts, it does not persist.** Every copy button swaps to a check for 1.2–1.5 seconds and then returns. A permanently checked button tells you nothing the second time.
+
+**Three more worth the effort:** the mobile drawer's `.collapsed` width override, without which the slide-out animation silently does nothing; the 1800ms minimum display on the project-switch loader, which makes a fast switch feel deliberate rather than glitchy; and the empty-state fade-out animation when the first message is sent, which turns a hard swap into a transition.
+
+---
+
+## 14.22 Screenshot observations
+
+**`homepage.png`** — A near-black canvas with three large cards centred vertically and horizontally, occupying roughly the middle 75% of the width and 55% of the height. Each card is a soft-cornered panel with a barely-lighter fill and a hairline border; the spacing between them is generous enough that the screen reads as calm rather than dense. Inside each, the hierarchy is unambiguous: a small rounded icon tile in the card's own accent colour (blue, amber, purple), then a large bold heading in a geometric sans, then two or three lines of muted body copy, then a visualisation, then a single stat line, then an accent-coloured CTA with a chevron. The visualisations are what make the screen: a two-segment progress bar for Sessions, five stubby coloured columns for Workflow, and a dense two-row grid of small coloured dots for Workforce. The header is almost empty — a small logo, the wordmark, and two controls pushed far right — which is what lets the cards carry the whole screen.
+
+**`session-grid.png`** — A three-region layout: a narrow sidebar of roughly 320px, a hairline divider, and a very wide main panel. The sidebar holds five stacked controls and then a two-column card grid where each card is a small square with a circular status icon, an uppercase status pill (`WORKING`, `QUESTION`, `IDLE`, `SLEEPING`), a truncated title and a time. Colour does all the work: working cards glow violet, the question card is ringed in orange, idle cards are green, sleeping cards are neutral grey — you can read the state of ten sessions in one glance without reading a word. The main panel is dominated by a centred transcript column that is far narrower than the panel itself, leaving wide empty gutters; the conversation itself alternates a right-aligned violet user bubble with monospace tool lines (`Write tests/test_rate_limit.py`, a green `Success`) and a left-aligned assistant bubble. At the bottom sits a large rounded composer with the placeholder `Describe what you want Claude to do...`, a tiny send-hint line, and a filled `Send` button.
+
+**`session-list.png`** — Identical frame, but the sidebar becomes a dense three-column table. Sixteen rows fit where eight cards did. Each row is a status icon, a name, a right-aligned time, and a faint size — and the name column is coloured by state, so working rows read violet, the question row orange, idle rows green, and dormant rows plain grey. The column header row (`Name`, `Date`, `Size`) is small and quiet with the active sort indicated in accent blue. The overall impression is a file browser rather than a dashboard: it trades the grid's glanceability for roughly twice the scan density, which is exactly the trade a power user wants.
+
+**`workflow-board.png`** — Five equal-width columns spanning the full main panel, each headed by a coloured dot, an uppercase column name, and a right-aligned count. Cards are compact: a bold title, a right-aligned relative date and a single-letter assignee initial on the same line, an optional progress chip (`2/4 subtasks`) and session chip (`• 1 session`), then a row of small coloured tag pills. The colour language is disciplined — grey for Not Started, blue for Working, amber for Validating, red for Remediating, green for Complete — and the tag pills reuse the same hues at low saturation so they read as metadata rather than status. Empty columns are genuinely empty with no placeholder. The sidebar has switched entirely: no session list, just three large full-width buttons (`New Task`, `Report`, `Settings`) under a `KANBAN` label, and a `PERMISSIONS` section with a single `Manual` chip.
+
+**`task-hierarchy.png`** — A two-column drill-down under a breadcrumb reading `Board › Authentication System Overhaul`. The left column is almost editorial in its restraint: a small blue `WORKING ›` status pill, then a very large bold title, a faint `Created … · Updated …` line, a single sentence of description, two tag pills and a faint `+ Add tag`. It uses only the top third of its column and the rest is empty — deliberately, so the eye moves right. The right column holds the `SUBTASKS` panel: a header with a thin progress meter and `25%` right-aligned, then four rows each with a coloured status pill, a title, an optional `1 session` chip and a chevron, then a ghost row with a grey `New` pill and the placeholder `Add subtask...`. Below it, a full-width `Plan with AI` button in purple. The whole screen is one clear sentence: this is the task, these are its parts, here is how to add more.
+
+**`task-sessions.png`** — The same frame in its other mode. The right panel is headed `SESSIONS` and lists three rows, each a lowercase-ish status word in its state colour (`Working` violet, `Idle` green, `Sleeping` grey), a session name and a chevron, closing with a ghost row reading `Spawn session...`. The left column is identical in structure to the subtask variant. Seeing the two side by side makes the design decision obvious: the panel is a single component whose contents switch between subtasks and sessions, which is why the mode-switch confirmation has to be so explicit about what gets destroyed.
+
+**`task-chooser.png`** — The same shell with the right panel showing `HOW TO PROCEED` instead of a list: three tall cards, each an icon tile, a bold title and a line of explanation. The third, `Plan with AI`, is visually promoted — its border and title are accent purple while the other two are neutral. This is the single best screen in the product: where a lesser design would show an empty panel and an `+ Add` button, it shows three verbs and quietly recommends one.
+
+**`workforce.png`** — A full-width content page with no card grid in the main panel. It opens with a large `Workforce` heading and a faint `5 departments · 3 sub-departments · 16 sessions` subtitle, then four wide stat tiles — a small icon, a very large coloured number, and a tiny uppercase label (`WORKING`, `WAITING`, `IDLE`, `SLEEPING`). Below, a `DEPARTMENTS` label and five small folder cards each with a coloured folder glyph, a name, and a `6 agents · 3 active` meta line. Below that, `RECENT SESSIONS` as a simple list with a status icon, a name, a right-aligned department pill and a time. The sidebar is the striking part: it has become a permission queue, showing two cards each with a session name, a tool badge (`Bash`, `Write`), the exact command in monospace, and three buttons — green `Allow`, red `Deny`, neutral `Always`. That layout is the whole argument for the permission panel: you can unblock two sessions without leaving a screen that has nothing to do with either of them.
+
+**`kanban-session.png`** — A live chat rendered inside the board shell. The breadcrumb reads `Board › Auth System Overhaul › OAuth2 provider integration`, with `Actions` and `Analyze ▾` pushed right; the sidebar is still in Workflow mode. The transcript is the same centred narrow column, opening with a monospace right-aligned user bubble, then interleaved tool lines and `Success` markers, then a long left-aligned assistant reply with bold sub-headings and a bulleted list. What stands out is that nothing about the chat has been redesigned for this context — it is exactly the same component in exactly the same proportions, which is why drilling three levels into a board and finding a chat feels continuous rather than jarring.
+
+---
+
+## 14.23 Non-negotiable rules
+
+1. **Never call an auto-send function on a session switch.** Switching sessions must save the composer text as a draft, never submit it. *Failure mode if violated: the user types, clicks another session, the text is submitted, an unwanted session starts, they switch again, and a cascade of unwanted sessions with random text is created. This has broken multiple times in production.*
+
+2. **Record explicit user-stop intent before emitting a stop.** Every sleep, stop, delete and bulk-stop path must mark the session as user-stopped before the emit, and ghost recovery must check that flag twice — once when its 3s timer fires and again inside the 1.5s close-restart gap. *Failure mode if violated: sleeping a session within ~3s of sending silently resurrects it and re-sends the last prompt. Sleep appears not to work.*
+
+3. **Never cancel ghost recovery on a `stopped` state alone.** A genuinely dead session also reports stopped, and that is precisely the case recovery exists to repair. The discriminator is the cause, not the state. *Failure mode if violated: sessions the daemon silently dropped stay dead and the user's message vanishes.*
+
+4. **Never cycle a socket that reports connected, on any heuristic.** Only cycle on a failed response to an actively-emitted probe or on an explicit disconnect event. *Failure mode if violated: in-flight stream entries are dropped mid-response (there is no replay), reconnect handshakes flood the server, and the engine-down overlay flashes spuriously.*
+
+5. **The input bar must not re-render unless its computed state key changed.** *Failure mode if violated: every incidental state event wipes whatever the user is typing.*
+
+6. **The input bar must not re-render while voice is targeting one of its textareas.** *Failure mode if violated: a turn ending mid-dictation replaces the textarea, the captured submit closure goes stale, and the message is dropped every time.*
+
+7. **Match optimistic bubbles by position, never by text.** *Failure mode if violated: sending "yes" twice makes the second one disappear.*
+
+8. **Never let a log re-fetch render over a populated transcript with fewer entries than the DOM holds.** *Failure mode if violated: an arriving response wipes the visible conversation and re-renders a truncated version, slicing off the tail the user was reading.*
+
+9. **Enter is always a newline below 768px, and the send hint and its toggle are hidden there.** *Failure mode if violated: mobile users cannot insert line breaks, and a visible preference silently does nothing.*
+
+10. **Focus the composer synchronously on creation, then reveal it above the keyboard on the visual-viewport resize.** *Failure mode if violated: the mobile keyboard never opens, or the field stays hidden behind it until the first keystroke.*
+
+11. **Apply the drag class on the next animation frame, not synchronously.** *Failure mode if violated: the drag image is a faded ghost of the faded element.*
+
+12. **Clear every drag state class in `dragend`, not in `drop`.** *Failure mode if violated: pressing Escape mid-drag or dropping outside the window leaves highlight classes and orphan insertion indicators on screen permanently.*
+
+13. **Show no insertion indicator in auto-sorted columns.** *Failure mode if violated: the card lands somewhere other than where the indicator promised.*
+
+14. **Re-render the multi-select badge after every list re-render and prune the selection to existing ids.** *Failure mode if violated: the badge vanishes on sort and the count reports sessions that no longer exist.*
+
+15. **Ignore scroll events within 150ms of a programmatic top-align.** *Failure mode if violated: auto-follow switches itself off the first time a long reply arrives.*
+
+16. **Only top-align the fallback target when it is genuinely the last message.** *Failure mode if violated: sending a message top-aligns the previous reply and hides what the user just typed.*
+
+17. **On a project switch, clear every per-session map, the cross-project cache, the multi-selection, the folder cache, workspace state, and the board and composition state — and scrub the session id from both the URL and storage.** *Failure mode if violated: sessions from the previous project bleed into the new one's sidebar and a stale session id opens a conversation that does not belong to the project.*
+
+18. **Guard every async callback with a project-switch generation counter and discard stale responses.** *Failure mode if violated: a slow fetch for the old project lands after the switch and repopulates the new project's UI with the wrong data.*
+
+19. **Never clear the parent container of a board that holds static children looked up by id — clear only the dynamic child area.** *Failure mode if violated: the initialiser silently writes to null and the panel renders blank even though the API returned valid data.*
+
+20. **Always pass the project filter when fetching compositions.** *Failure mode if violated: the picker lists every composition across every project.*
+
+21. **Recover from a stale active-composition id by clearing it and retrying with only the project filter.** *Failure mode if violated: the board renders empty even though valid compositions exist.*
+
+22. **Reset the cost and model status slots on every session switch.** *Failure mode if violated: the previous session's cost is attributed to the new one.*
+
+23. **Never show a loading zero.** Board-backed stats must show a shimmer until their fetch resolves. *Failure mode if violated: a real zero and a pending fetch look identical and the product looks broken on first paint.*
+
+24. **The health blocker must be dismissible only by the check passing.** No close button, no Escape, no backdrop. *Failure mode if violated: users dismiss it and then operate an app whose backend is gone, losing work.*
+
+25. **Rate-limit every self-healing reload.** At most one skeleton-triggered reload per 120s and one socket cycle per 60s, and never while a restart overlay is present. *Failure mode if violated: a reload storm that never converges.*
+
+26. **Treat a non-JSON error and a network failure on delete as success and clean up locally.** *Failure mode if violated: the card stays on screen after the server-side tombstone is already written, and the user deletes it again.*
+
+27. **A rename patches one row; it never reloads the list.** *Failure mode if violated: auto-naming makes the sidebar flicker continuously.*
+
+28. **Opening a session must not change its position in any list.** *Failure mode if violated: the list reorders under the cursor while browsing.*
+
+29. **Honour the `auto-resuming` substatus regardless of the base state, on every surface.** *Failure mode if violated: the sidebar shows a working icon while the panel says "Awaiting wake-up", and the user believes the two disagree.*
+
+30. **Intercept CLI slash commands client-side.** They are never forwarded; each either triggers the equivalent in-app action or explains that it is unsupported. *Failure mode if violated: the command is silently swallowed, the session appears to hang, and the user retries.*
+
+---
+
+## 14.24 Implementation prompts
+
+```
+PROMPT 14.1 — Build the app frame
+Build the persistent shell: a fixed header (brand, spacer, system menu, three git
+buttons with count badges, theme toggle), a two-column body, and a main panel.
+The sidebar width is driven by a CSS custom property defaulting to 320px and
+clamped to 180-600px, resized by a 1px handle whose hit area is widened to 9px
+with a pseudo-element. Collapse state persists; Home hides the sidebar entirely
+rather than collapsing it, applied by an inline pre-boot script.
+
+Acceptance criteria:
+- Dragging the handle resizes smoothly; the body cursor stays col-resize for the
+  whole drag and text is never selected.
+- Reloading with the sidebar collapsed shows no flash of an expanded sidebar.
+- Reloading onto Home shows no flash of a sidebar.
+- Only the session list scrolls; the sidebar header and footer stay fixed.
+- The transcript column is centred and clamped to 760px inside a much wider panel.
+```
+
+```
+PROMPT 14.2 — Implement view switching with correct teardown
+Implement five views and the three-mode Sessions sub-mode. Switching fades the
+view containers out over 150ms, runs teardown plus setup, fades in over 200ms,
+then strips the inline transition and opacity styles after 250ms.
+
+Each leave-transition must perform its full teardown as specified: stop the live
+panel, null the active session, clear the stored session id, reset board state,
+remove drill-down bars, empty AND hide the leaving view's containers, restore the
+default main body, and scrub both the hash and the chat query parameter.
+
+Acceptance criteria:
+- Switching Workflow -> Sessions -> Workflow twice leaves no orphan session bar.
+- No container is left with an inline opacity after any switch.
+- Returning to Sessions restores the last-open session for that project, but only
+  when arriving from another view and only if nothing is already active.
+- Per-project view, drill-down position and open session all survive a project
+  switch and a reload.
+```
+
+```
+PROMPT 14.3 — Build the live chat panel and its five-state input bar
+Implement the panel structure (role banner, log, output shelf, subsession strips,
+queue area, input bar) and the input-bar state machine with the states New, Idle,
+Question, Working and Ended.
+
+Compute a state key per the spec and re-render only when it changes. Preserve the
+current textarea value across transitions, falling back to the saved draft.
+Restore focus synchronously when focus was inside the bar. Refuse to re-render
+while voice is targeting a textarea in the bar. Tick the elapsed timer and the
+retry countdown in place, never by re-rendering.
+
+Acceptance criteria:
+- Typing during an idle-to-working transition never loses a character.
+- The elapsed timer updates every second while typing continues uninterrupted.
+- Dictating across a turn boundary still submits the finished transcript.
+- The Question state renders the label, the question and the options with 0ms,
+  50ms and 100ms entrance offsets.
+- Autofocus happens at most once per deliberate open, and never below 768px.
+```
+
+```
+PROMPT 14.4 — Implement the modal system and the full inventory
+Build showAlert, showConfirm and showPrompt against a single overlay host with a
+150ms exit animation, plus the runtime-overlay pattern for dialogs that must
+survive a host takeover. Then implement every row of section 14.7 with its exact
+copy.
+
+Add what the original lacks: a focus trap inside the card, a uniform Escape
+handler, focus return to the trigger on close, and Cancel focused by default on
+danger confirms.
+
+Acceptance criteria:
+- Tab cannot leave an open modal.
+- Escape closes every overlay, resolving the safe outcome.
+- Every string in 14.7 appears verbatim.
+- Opening a second modal over an existing one does not leave a stuck backdrop.
+```
+
+```
+PROMPT 14.5 — Implement menus and context menus
+Build every menu in 14.8 with its exact item order. Desktop menus are floating
+elements positioned at the pointer or under the trigger, clamped 8px inside the
+viewport on the next animation frame, dismissed by an outside-click listener
+attached on a zero-delay timeout. Below 768px the session and system menus render
+as bottom sheets with dividers collapsed and a Cancel button.
+
+Long-press (500ms, 20px slop, 20ms haptic) opens the context menu on touch and on
+mouse hold, suppresses the trailing click for 800ms, and cancels any dragstart.
+
+Acceptance criteria:
+- A menu opened near any edge stays fully on screen.
+- The click that opened a menu never closes it.
+- Long-pressing a card opens the menu and does not open the session or start a drag.
+- Tapping a sheet row or its backdrop is never swallowed by click suppression.
+```
+
+```
+PROMPT 14.6 — Implement scroll behavior
+Implement stick-to-bottom with a 60px tolerance, the 150ms programmatic-scroll
+exemption, the top-align rule for long assistant messages, the sticky user-message
+bar, and prepend pagination with scroll-height compensation.
+
+Acceptance criteria:
+- Scrolling up mid-stream stops auto-follow; scrolling back within 60px resumes it.
+- A reply taller than the viewport is top-aligned with an 8px gap; a shorter one
+  scrolls to the bottom.
+- Sending a message always scrolls to the bottom, never top-aligns the prior reply.
+- Loading older messages does not move the viewport by a single pixel.
+- The sticky bar shows the most recent user message that has scrolled off the top,
+  expands on click, and disappears when that message scrolls back into view.
+```
+
+```
+PROMPT 14.7 — Implement optimistic UI with correct rollback
+Implement every row of section 14.11. Match optimistic bubbles by position.
+Fix the four defects the original carries: decrement the column count when a ghost
+card fails, roll back compose bulk moves, roll back and toast on sidebar reorder
+failure, and inspect the response for the shared-prompts toggle.
+
+Acceptance criteria:
+- Sending the same word twice renders two bubbles.
+- A failed send removes the bubble, reverts to idle, and restores the text.
+- A failed drag returns the card to its original column with an error toast.
+- A failed create leaves no ghost and no inflated count.
+```
+
+```
+PROMPT 14.8 — Implement the loading, empty and error states
+Implement every skeleton in 14.10.2, every empty state in 14.16 with exact copy,
+and every error path in 14.17 including the four blocking health checks with their
+thresholds and poll intervals.
+
+Acceptance criteria:
+- No region is ever blank while loading.
+- No stat shows a real-looking zero while its fetch is pending.
+- Each health check fires only at its threshold; a 503 reloads immediately.
+- The blocking overlay cannot be dismissed by any user action.
+- Self-healing reloads respect their rate limits.
+```
+
+```
+PROMPT 14.9 — Implement keyboard, focus and the send-key policy
+Implement every shortcut in 14.14 by scope with the documented guards. Implement
+the two-value send policy with the mobile override, the hint strings, the toggle,
+and dual persistence. Implement the iOS keyboard-dismiss heuristic with the 250ms
+pointer window.
+
+Acceptance criteria:
+- No shortcut fires while focus is in a field or a modal is open.
+- No browser shortcut is ever intercepted.
+- Toggling the send key updates every visible hint immediately and survives reload.
+- Below 768px, Enter always inserts a newline and no hint or toggle is visible.
+- Tapping away from a half-typed message on iOS does not send it; tapping the
+  keyboard's own dismiss control does.
+```
+
+```
+PROMPT 14.10 — Implement drag and drop
+Implement every draggable in 14.13 with its visuals, drop affordances, insertion
+indicator rules, reorder rules and rejections. Clear all state in dragend.
+Suppress the post-drag click for 50ms.
+
+Acceptance criteria:
+- Escape mid-drag leaves no highlight class and no orphan indicator.
+- Auto-sorted columns accept drops but show no indicator.
+- Dropping a folder into its own descendant is rejected with the exact toast.
+- Reordering compositions is blocked while a filter is active.
+- Releasing a card over a column does not also open it.
+```
+
+```
+PROMPT 14.11 — Implement the mobile layer
+Re-skin the same DOM below 768px: the sidebar becomes a full-screen drawer with
+the collapsed-width override, the expand button becomes a fixed hamburger, icons
+swap and restore on breakpoint crossing, and the drawer auto-opens only in the
+Sessions view with no session open. Implement the edge-swipe gesture with its
+8px dead zone, 8px direction lock, horizontal-scroller bail, 1:1 tracking and
+30% commit threshold.
+
+Acceptance criteria:
+- The drawer slides; it never snaps out of existence.
+- Crossing the breakpoint in either direction needs no refresh.
+- A vertical scroll inside the drawer never drags it.
+- A horizontal scroll inside a code block never opens the drawer.
+- Opening a session or creating one closes the drawer and it stays closed.
+```
+
+```
+PROMPT 14.12 — Implement attention and cross-view state propagation
+Implement the attention ladder in 14.19: pulsing row and card states, status
+icons, aggregate counts, the sidebar permission panel with its four buttons, the
+inbox badge and strip, and the respond overlay. Propagate every state change to
+all surfaces by patching in place.
+
+Acceptance criteria:
+- A waiting session pulses amber in the sidebar, the grid, Mission Control and any
+  board drill-down simultaneously.
+- A permission can be answered from the sidebar in any view without navigating.
+- A rename updates the row, the toolbar and any breadcrumb without a list reload.
+- Tapping the inbox badge opens the parent and does not send anything.
+- No OS notification, title flash, favicon change or sound is ever produced.
+```
+
+```
+PROMPT 14.13 — Wire the timing constants
+Centralise every value in 14.20 as named constants in one module. No timing
+literal may appear inline anywhere else in the codebase.
+
+Acceptance criteria:
+- A single grep for numeric setTimeout and setInterval literals returns only the
+  constants module.
+- Each constant carries a comment naming the failure it prevents.
+- Changing the disconnect grace in one place changes the behaviour everywhere.
+```
+
+
+---
+
+
+## 14.7 Complete modal and overlay inventory
+
+Three overlay hosts exist. Understand them before reading the tables.
+
+| Host | Mechanism | Dismissal | Notes |
+|---|---|---|---|
+| `#pm-overlay` | One persistent element whose `innerHTML` is replaced. Shown with `.show`. Cards are `.pm-card` with an entry class `.pm-enter` removed on the next animation frame. | `_closePm()` adds `.pm-exit`, then after **150ms** removes `.show` and empties the HTML. Backdrop click closes. | **Contended** — any two features targeting it overwrite each other. No focus trap, no global Escape handler. |
+| Runtime-created overlays | A `div` appended to `<body>`, removed with `.remove()`. Typical inline style `position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:9999; display:flex; align-items:center; justify-content:center`. | Backdrop click (`e.target === overlay`) plus an explicit button. | Used where a dialog must survive a `#pm-overlay` takeover. |
+| Bespoke overlays | Purpose-built elements with their own classes and animations. | Varies — documented per row. | Health blocker, mobile sheet, slide-out panels, restart overlay, undo toast. |
+
+Standard card anatomy: `<h2 class="pm-title">`, `<div class="pm-body">`, optional `<input class="pm-input">`, `<div class="pm-actions">` holding `.pm-btn` with the variants `.pm-btn-primary`, `.pm-btn-secondary`, `.pm-btn-danger`.
+
+### 14.7.1 Core primitives
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 1 | Alert | `showAlert(title, message, opts)` | Acknowledge-only message | Optional icon, title, HTML body | `OK` (or `opts.buttonText`) / none | OK, backdrop | none |
+| 2 | Confirm | `showConfirm(title, message, opts)` | Yes/no decision | Optional icon, title, HTML body | `Confirm` (or `opts.confirmText`; `.pm-btn-danger` when `opts.danger`) / `Cancel` | Cancel and backdrop both resolve false | none; confirm button autofocused |
+| 3 | Prompt | `showPrompt(title, message, opts)` | Single-line text entry | `#pm-input` with placeholder and prefilled value, `autocomplete="off"`, `spellcheck="false"` | `OK` (or `opts.confirmText`) / `Cancel` | Cancel, backdrop, **Escape** — all resolve null | none; caller checks. Enter confirms. Input autofocused, text pre-selected |
+
+### 14.7.2 Session lifecycle
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 4 | Rename Session (toolbar) | Click `#main-title` | Rename the open session | Prompt input, placeholder `Session name`, prefilled with the current title, body `Enter a new name for this session.` | `Save` / `Cancel` | Cancel, Escape, backdrop | Empty is accepted and reverts to untitled |
+| 5 | Rename Session (static modal) | `openRename(id, title)` | Same, via `#rename-overlay` | `#rename-input`, placeholder `Enter a name…` | `Save` / `Cancel` | Cancel, Escape, backdrop click | Empty or unchanged is a silent no-op |
+| 6 | Delete Session | Actions ▸ Delete; context menu ▸ Delete | Permanently remove a session | Trash icon; body `Delete <name>?` then `This cannot be undone.` | `Delete` (danger) / `Cancel` | Cancel, backdrop | none |
+| 7 | Delete Empty Sessions | Sidebar menu ▸ `Delete empty sessions` | Bulk-remove zero-message sessions | Trash-with-slashes icon; body `Delete N empty session(s)?` | `Delete All` (danger) / `Cancel` | Cancel, backdrop | No empties gives toast `No empty sessions found` and no modal |
+| 8 | Delete All Sessions (first) | Sidebar menu ▸ `Delete all sessions` | Wipe the project | Warning-triangle icon; body `Permanently delete all N sessions in this workspace?` then `This cannot be undone.` | `Delete All` (danger) / `Cancel` | Cancel, backdrop | Zero sessions gives toast `No sessions to delete` |
+| 9 | Delete All Sessions (second) | Confirming row 8 | Double confirmation | Title `Are you sure?`; body `This will permanently delete N sessions and all their history.` | `Yes, delete everything` (danger) / `Cancel` | Cancel, backdrop | — |
+| 10 | Sleep All Sessions | Sidebar menu ▸ `Sleep all sessions`; Bulk Operations | Stop every running session | Moon icon; body `Close N running session(s) in this workspace?` | `Sleep All` (danger) / `Cancel` | Cancel, backdrop | Zero running gives toast `No running sessions` |
+| 11 | Close Session | Actions ▸ Stop Session; context menu ▸ Stop Session | Terminate one running session | Stop-square icon; body `Close <name>?` then `This will stop the running Claude process and close the terminal window.` | `Close` (danger) / `Cancel` | Cancel, backdrop | none |
+| 12 | Auto-name All Sessions | Bulk Operations ▸ Run | AI-name every untitled session | Pencil icon; body `Auto-name N untitled session(s)?` then `This uses AI to generate meaningful names based on each session's content. Sessions with user-set names will be skipped.` | `Name All` / `Cancel` | Cancel, backdrop | Zero untitled gives toast `All sessions already named` |
+| 13 | Delete sessions (bulk) | Multi-select ▸ right-click ▸ `Delete all` | Delete the selection | Trash icon; body lists the first three names then `and N more…`, then `This cannot be undone.` | `Delete N` (danger) / `Cancel` | Cancel, backdrop | Empty selection returns silently |
+| 14 | Auto-name sessions (bulk) | Multi-select ▸ `Auto-name all` | AI-name the selection | Body `Auto-name N session(s)?` then `This will cost API tokens (one short LLM call per session).` | `Auto-name N` / `Cancel` | Cancel, backdrop | — |
+| 15 | Wrong session? | Sending a prompt whose keywords match a different active session better | Prevent typing into the wrong window | Swap-arrows icon; body `This prompt seems more related to <other>.` then `Send to <current> anyway?` | `Send anyway` / `Cancel` | Cancel restores the text into the composer | Gate: at least 3 keyword overlap elsewhere, greater than here, and at most 1 overlap here |
+| 16 | Message picker — Fork | Actions ▸ Branch ▸ Fork | Choose a fork point | Body `Create a new session forked from the selected message. All messages after it will be excluded.` plus a scrollable `#msg-timeline` of `.tl-row` rows carrying an index `#N`, a role chip (`me` / `claude`), a preview, file badges, `+N` / `-N` change counts, a snapshot marker with `title="File snapshot available"`, and a time | `Fork Conversation`, disabled until a row is selected / `Cancel` | Cancel, backdrop | Row selection required |
+| 17 | Message picker — Rewind Code | Actions ▸ Branch ▸ Rewind Code | Choose a restore point | Body `Restore source files to the state they were in at the selected message.` with all roles shown | `Rewind Code` / `Cancel` | Cancel, backdrop | Refuses with `This session has no file snapshots. Code rewind is not available.` |
+| 18 | Message picker — Fork + Rewind | Actions ▸ Branch ▸ Fork + Rewind | Both at once | Body `Fork the conversation AND restore source files to the selected message.` with the timeline filtered to user messages | `Fork + Rewind Code` / `Cancel` | Cancel, backdrop | Both of the above; no user messages gives `No user messages found in this session.` |
+| 19 | Subsessions orphaned by rewind | Rewinding past a subsession anchor | Re-parent or detach orphans | Title `Subsessions orphaned by rewind`; help `These subsessions were spawned past the line you rewound to. Pick an action for each.`; one row per orphan | Per row `Re-anchor at current parent tip` and `Detach`; footer `Close` | Close; auto-closes when the last row resolves | none |
+| 20 | Report to Parent | Subsession toolbar ▸ `Report to Parent` | Send a summary up | Title `Report to Parent`; help `This summary will appear at the top of the parent's next message.`; a six-row textarea pre-filled from the last assistant message, then replaced by the authoritative last conclusion unless the user already edited it | `Send report` / `Cancel` | Cancel | Empty gives toast `Summary cannot be empty` |
+
+### 14.7.3 Projects
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 21 | Projects overlay | Sidebar project button; Home project trigger; dashboard project card | Switch, rename, delete, add | Heading `Projects`; explainer `Select a Claude Code project to view its sessions. Each project corresponds to a directory where you've used Claude.`; rows with a short name, the full path, a `N sessions` count and hover-revealed `Rename` / `Delete` icon buttons; footer `+ Add Project` | Row click selects | Close button `×` with `title="Close"`, backdrop | Empty list shows `Loading projects…`, then on failure `Couldn't load projects. Check your connection and tap "Select project" again.` |
+| 22 | Add project — mode picker | Projects ▸ `+ Add Project` | Choose how to add | Three cards: `Browse` / `Pick a folder from your computer`; `Find Projects` / `Scan your computer for code projects`; `Create New` / `Start a new empty project` | Card click / `Back to Projects` | Back, backdrop | — |
+| 23 | Add project — Find (chat) | Mode picker ▸ Find Projects | Conversational search | Embedded chat with the system message `Tell me what project you're looking for — I'll search your computer. Try something like "my Python web app" or "the React project I was working on".`; suggestion chips `Python projects`, `Node.js apps`, `Git repositories`, `Recent code projects`; input placeholder `Describe the project you're looking for…` | Send / `Back to Projects` | Back | Loading bubble reads `Thinking…`; handler failure renders `Something went wrong. Please try again.` |
+| 24 | Create Project | Mode picker ▸ Create New | Name a new project | Prompt input with placeholder `My Project` and body `Enter a name for your new project.` | `Create` / `Cancel` | Cancel, Escape | Empty returns silently |
+| 25 | Rename Project | Project row ▸ pencil | Set a display name | Prompt input with placeholder `Project name` and body `Enter a display name for this project. The directory stays the same.` | `Rename` / `Cancel` | Cancel, Escape | Unchanged is a no-op |
+| 26 | Delete Project | Project row ▸ trash | Remove a project and its sessions | Trash icon; body `Delete <name> and all its sessions?` then `This cannot be undone.` | `Delete` (danger) / `Cancel` | Cancel, backdrop | — |
+| 27 | Project switch loader | Selecting a project | Cover the teardown and rebuild | An animated orb with two expanding rings, the label `Switching to`, the project name, and three pulsing dots | none | Auto-dismisses once the switch completes and a 1800ms minimum has elapsed, then fades over 900ms | — |
+
+### 14.7.4 System menu
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 28 | Select Model | System ▸ Model | Default model for new sessions | Body `Choose the default model for new sessions.`; a grouped list with a `.msel-group-hd` per family (`Fable`, `Opus`, `Sonnet`, `Haiku`) carrying a coloured dot, then a `.msel-row` per version with a check glyph and an optional `1M` tag | Row click applies immediately / `Close` | Close, backdrop | — |
+| 29 | Thinking Level | System ▸ Thinking | Default extended thinking | Body `Set the extended thinking level for new sessions.`; cards `Default` / `Use model default`, `None` / `No extended thinking`, `Low` / `Brief reasoning step`, `Medium` / `Moderate reasoning`, `High` / `Deep reasoning for hard tasks` | Card click applies / `Close` | Close, backdrop | — |
+| 30 | Preferences | System ▸ Preferences | Four toggles | `<App> Voice` / `Local, codebase-aware voice that works in every browser (Firefox & Safari too). Downloads a small model on first enable.`; `Enter to send` / `Press Enter to send. When off, Ctrl+Enter sends and Enter adds a new line.`; `Sticky chats` / `Keep your most recent message pinned at the top while scrolling long replies.`; `Wrong-session detection` / `Warn before sending a prompt that looks meant for a different active session.` | Toggles apply immediately and the modal stays open so several can be flipped / `Close` | Close, backdrop | — |
+| 31 | Permission Policy | System ▸ Permission Policy; sidebar permission chip | Choose approval behaviour | Body `Choose how tool permission requests are handled.`; five cards `Manual` / `Review and approve each tool use individually`, `Auto Approve Most` / `Auto-approve all tools except destructive commands (rm -rf, force push, DROP TABLE, etc.)`, `Claude Auto` / `Use Claude's built-in approval logic for file edits, plus the destructive-command guard for shell. Edits are decided by Claude itself, not a regex.`, `Auto-Approve All` / `Automatically approve all permission requests`, `Custom Rules` / `Define per-tool auto-approve rules` | Card click applies / `Close` | Close, backdrop | Choosing Custom Rules opens row 32 after 200ms so the close animation finishes first |
+| 32 | Custom Auto-Approve Rules | Permission Policy ▸ Custom Rules | Per-tool rules | Lead `Select which tool types to auto-approve:`; checkboxes `Approve all Read operations`, `Approve Glob (file search)`, `Approve Grep (content search)`, `Approve Write/Edit operations`, `Approve Bash commands`; then the label `Custom regex pattern (matches question text):` and an input with placeholder `e.g. safe_directory.*` | `Save` / `Cancel` | Cancel, backdrop | None; an invalid regex is swallowed at match time so it never breaks approvals |
+| 33 | Persistent Storage | System ▸ Persistent Storage | Choose the task backend | Explainer `Controls where your kanban tasks are stored. This applies to all projects — not sessions. Sessions always stay local. Switching copies all existing tasks to the new backend.`; two option cards `Local (SQLite)` / `Tasks stay on this machine. Zero config.` and `Cloud (Supabase)` / `Tasks sync to a hosted PostgreSQL database.`, the live one labelled `Currently active`; a cloud panel with `Project URL` (placeholder `https://your-project.supabase.co`), `Secret Key` with an orange `(service_role)` note (placeholder `eyJhbGciOi...`), a `Step 1: Test Connection` button, a decision area, a bordered `Step 2: Create database tables` block with a three-step ordered list plus an `Access Token` field (placeholder `sbp_...`) and a `Setup Database` button, and a `Backups` section with `Download Backup` and a `Saved Backups` list | `Close` | Close, backdrop | Connection statuses are listed in 14.17 |
+| 34 | Mobile Command wizard | System ▸ Mobile Command | Set up private phone access | Title `Set up phone access`; a four-rung stepper `Install`, `Sign in`, `Enable HTTPS`, `Your phone`; per-step copy given in 14.17.4 | A step-specific CTA / `Close` | Close, backdrop | Closing stops the poll timer |
+| 35 | Bulk Operations | System ▸ Bulk Operations | Workspace-wide actions | Body `Perform actions across all sessions in this workspace.`; five rows each with an icon, a title, a live count and a `Run` button: `Unhide All Sessions`, `Sleep All Sessions`, `Auto-name All Sessions`, `Delete Empty Sessions` (danger), `Delete All Sessions` (danger) | `Run` per row / `×` | `×` | A zero count disables the row and its description reads `No hidden sessions`, `No running sessions`, `All sessions named`, `No empty sessions` or `No sessions` |
+| 36 | Keyboard Shortcuts | System ▸ Keyboard Shortcuts; `?` | Cheat sheet | A table of `N`, `↑`/`K`, `↓`/`J`, `Enter`, `Esc`, `Ctrl+F`, `Ctrl+Enter`, `?` | `Close` | Close, backdrop | — |
+| 37 | Recently Deleted | System ▸ Recently Deleted | Restore or purge deleted sessions | Title `Recently Deleted`; explainer `Items are kept for the period you choose below. Restore brings the conversation back; permanent delete cannot be undone.`; a retention row labelled `Keep deleted sessions for:` with `30 days`, `60 days`, `90 days`, `Forever`; rows showing the title or `Untitled session`, then `deleted <ago> · <size> · <purge label>`, each with `Restore` and `Delete forever` | `Empty trash` (danger, hidden when the list is empty) / `Close` | Close, backdrop | Purge and empty both use a native confirm |
+| 38 | Developer Tools | System ▸ Developer Tools | Maintenance actions | Section `Server` with `Restart Server` / `Choose what to restart.` and `Turn Off Server` / `Stop the server entirely.` (danger); section `Diagnostics` with `Run Tests (Fast)` / `Quick test suite.`, `Run Tests (Full)` / `Complete test suite.`, `Server Scan` / `Scan the codebase for issues.`, `Scrub Phantom Names` / `Remove name entries that point to deleted sessions.` carrying a count badge | Row click closes the popup first, then opens its own dialog / `Close` | Close, backdrop | — |
+| 39 | Restart Server | Developer Tools ▸ Restart Server | Pick a scope | Title `Restart Server`; three option buttons `Application` / `Quick refresh. Your running sessions stay alive.`, `Session Engine` / `Restarts the AI session engine. All running sessions will stop.`, `Everything` / `Full restart. All running sessions will stop.` | Option click / `Cancel` | Cancel, backdrop | — |
+| 40 | Restarting overlay | Confirming row 39 | Cover the restart | Full page: a spinner, `Restarting <scope>`, a status line cycling `Shutting down…`, `Starting up…`, `Almost there…`, then `Back online — reloading` or `Taking longer than expected — reloading`, plus a live elapsed seconds counter | none | Auto-reloads | The spinner turns green on success |
+| 41 | Turn Off Server | Developer Tools ▸ Turn Off Server | Full shutdown | Title `Turn Off Server`; body `This will kill both the web server (5050) and session daemon (5051). All running sessions and agents will be terminated. You will need to manually restart <App> to use it again.` | `Turn Off` (danger) / `Cancel` | Cancel, backdrop | — |
+| 42 | Shutdown notice | After row 41 | Terminal state | Replaces the whole page with `Server has been turned off` and `Restart <App> manually to continue.` | none | none | — |
+| 43 | Scrub phantom names | Developer Tools ▸ Scrub Phantom Names | Confirm cleanup | Native confirm reading `Remove N session-name entries that point to deleted sessions?` then `No actual sessions will be deleted. A backup of each project's session-name file will be written before any change.` | OK / Cancel | — | Zero gives toast `No phantom session names to remove.` and no dialog |
+| 44 | Memory editor | `_showMemoryEditor()` | Edit project and global memory files | Two tabs `Project` and `Global`, each with a path line and a 16-row textarea (placeholders `Project CLAUDE.md content...` and `Global CLAUDE.md content...`) | `Save` / `Cancel` | Cancel, backdrop | — |
+| 45 | Add Department (catalogue) | `openAddDepartment()` | Add a preset department | Body `Select a department to add to your workspace.`; one card per available department with a `N sub-folders` count | Card click / `Close` | Close, backdrop | No tree gives toast `Set up a workspace template first`; none left gives `All departments already added` |
+
+### 14.7.5 Session analysis and utilities
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 46 | Actions popup | Toolbar `Actions`; the Workflow and Subsessions breadcrumb `Actions` | The session action hub | Four tabs `Organize`, `Branch`, `Subsession`, `Session`; a live status badge; rich rows listed in 14.8.4 | Row click performs and closes / `×` | `×`, backdrop | Rows are disabled without an active session |
+| 47 | Session Summary | Analyze ▸ Summary | AI summary | Title `Session Summary`; body shows a spinner and `Building summary…`, then rendered HTML | `×` | `×`, backdrop | Failure renders `No summary available` |
+| 48 | Extract Code drawer | Analyze ▸ Extract Code | Collect every code block | Header `Code Blocks`; per-block cards with a language badge (fallback `text`, or `shell`), an optional `duplicate of #N` badge, a filename, a 2000-character preview, and a `Copy` button that becomes `Copied!` | `Copy All`, `Export ZIP`, `×` | `×` | Empty gives `No code blocks found in this session.`; loading `Loading…`; failure `Error loading code blocks.` |
+| 49 | Compare Sessions | Analyze ▸ Compare | Diff two sessions | Header `Compare Sessions`; a picker row with the label `Compare with:`, a select of the other sessions, and a `Compare` button; a body area | `Compare` / `×` | `×`, backdrop click | Initial `Select a session above and click Compare.`; running `Comparing…`; failure `Error comparing sessions.`; nothing to diff `No code blocks to compare.` |
+| 50 | Find bar | `Ctrl/⌘+F`; Analyze ▸ Find | In-session search | `#find-input` with placeholder `Search in session…`; a match counter; `↑`, `↓` and `✕` buttons | — | `✕`, Escape | Under two characters the counter clears; no hits gives `No matches`; hits give `N / M` |
+| 51 | Deep search | Sidebar `Search transcripts…` | Search titles and message bodies project-wide | Title `Search transcripts`; help `Searches session titles and full message content across every session in this project. Use file:name.py to find sessions that edited a file.`; input placeholder `Search all sessions… (add file:path to filter by edited file)`; a status line; result rows with title, date, highlighted snippets and up to four edited-file chips | Row click opens the session / `Close` | Close, backdrop, **Escape** | Under two characters gives `Keep typing…`; all statuses are in 14.17 |
+| 52 | Manage Templates | Template grid ▸ `Manage Templates` | Custom starter templates | Title `Manage Templates`; a list of custom templates each with `Edit` and `Delete`; a form with `Template name`, `Short description`, `System prompt (instructions for Claude)`, `Starter prompt (pre-filled in text box)` and a checkbox `Show file picker on select` | `Save` / `Cancel` | `×` | Empty name gives toast `Template name is required` |
+| 53 | Invoke Workforce | The `/invoke` button; the slash commands `/invoke`, `/team`, `/departments` | Pick a skill or agent to prepend | Title `Invoke Workforce`; search placeholder `Search skills, agents, departments…`; three independently scrollable sections `Local Skills`, `Local Agents`, `Departments` (a collapsible tree indented 16px per level); footer `Manage Workforce` | Item click stages the invoke and closes / `×` | `×`, backdrop, **Escape** | Empty sections use the copy in 14.16 |
+| 54 | Session Model | The input-bar model badge | Per-session model and thinking | Title `Session Model` for a pending session or `Switch Session Model` for a running one; a grouped model list; a `Thinking Level` section shown only for pending sessions with rows `Default` / `Model default`, `None` / `No extended thinking`, `Low` / `Brief reasoning`, `Medium` / `Moderate reasoning`, `High` / `Deep reasoning` | Pending: `Apply` / `Reset to Default`. Running: `Switch Model` / `Cancel` | Backdrop | Apply is disabled until a row is clicked. A live switch shows `Switching…` and hard-fails after **20s** with `Model switch timed out — model NOT changed` |
+| 55 | Save dropped file | Dragging a file onto the window | Pick a destination folder | Title `Save dropped file`; the filename, or `Choose a file location` when opened without a file; a breadcrumb; a folder tree | `Save here`, which becomes `Saving...` / `Cancel` | Cancel, backdrop | Tree states `Loading...`, `No subfolders`, `Error loading directory` |
+| 56 | Respond to waiting session | `openRespond(id)` | Answer a blocked session without opening it | Heading `⏳ Session waiting for input`; the question rendered as markdown; option buttons; a separator reading `— or type a custom response —`; a textarea with placeholder `Type your response…` | `Send ↵` / `Cancel` | Cancel, `×`, backdrop | Empty text does nothing |
+| 57 | File-drop overlay | Dragging files over the window | Drop affordance | A full-window overlay with an upload icon and the text `Drop file here` | — | Auto-hides on dragleave or drop | Only shown when the drag payload contains files |
+
+
+### 14.7.6 Workflow (task board)
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 58 | Add to Board | Sidebar `New Task`; the empty-state CTA; context menu `Add Subtask`; the key `n` | Create a task or plan several | The title row carries an insert-position control: the label `Insert` with `Top` (default) and `Bottom`. Section `Quick add` with an input placeholder `Task title…` and an icon-only submit. A divider reading `or`. Section `Plan with AI` with the description `Describe a goal or feature and Claude will break it into tasks`, a three-row textarea placeholder `e.g. Build user authentication with OAuth, session management, and password reset…`, and a mic button. If a plan is stashed, a `Resume previous plan` button appears first with a trailing `(N tasks)` | Submit; there is no Cancel button | Backdrop | An empty title or empty plan text simply refocuses the field |
+| 59 | Validation URLs setup | The first AI plan when the setting is unset | Offer clickable verification links | Title `Validation URLs`; body `The AI planner can generate clickable validation URLs on each task so you can quickly verify features in your browser. Where does your development server run?`; an input with placeholder `http://localhost:8000`; helper `You can change this later in Workflow Settings → Validation.` | `Enable` / `Not now` / `Don't ask again` pushed to the left | Backdrop behaves as "not now" and the modal will ask again | Enable with an empty URL refocuses the field |
+| 60 | Switch to Sessions | Task drill-down ▸ the panel switch icon | Convert a parent task into a session task | Title `Switch to Sessions`; rationale `You're choosing to work on this task directly with Claude sessions instead of breaking it into subtasks.`; a red warning box `All subtasks (and their children) will be permanently deleted.`; footnote `This cannot be undone.` | `Delete subtasks & switch` (danger) / `Cancel` | Cancel, backdrop | — |
+| 61 | Switch to Subtasks | The same switch icon in Sessions mode | The inverse | Rationale `You're choosing to break this task into subtasks instead of working on it directly with sessions.`; warning `All linked sessions will be unlinked from this task. The sessions themselves are not deleted — they just won't be associated with this task anymore.` | `Unlink sessions & switch` (danger) / `Cancel` | Cancel, backdrop | — |
+| 62 | Delete Subtask | A subtask row ▸ trash | Delete a child task | Title `Delete Subtask`; the subtask title; `This subtask and all of its children will be permanently deleted.`; `This cannot be undone.` | `Delete` (danger, becomes `Deleting...`) / `Cancel` | Cancel, backdrop | — |
+| 63 | Replace subtasks? | Running the scoped AI planner on a task that already has subtasks | Warn before replacing | `This will replace the N existing subtask(s) with AI-generated ones.` | `Continue` / `Cancel` | Cancel, backdrop | Only shown when the existing count is above zero |
+| 64 | Clear session / planner | A leaf task ▸ trash on the session or planner row | Unlink | Title `Clear session?` or `Clear planner?`; body `This will unlink the session/planner from this task. You can create a new one afterward.` | `Clear` (red) / `Cancel` | Cancel, backdrop | — |
+| 65 | Active Session Exists | Executing a task that already has a live session | Confirm a second session | `This task already has an active session. Launch another?` | `Launch` / `Cancel` | Cancel, backdrop | — |
+| 66 | Batch Execute | The batch bar ▸ `Execute Selected` | Confirm a multi-session launch | `Execute N task(s)? This will create N session(s) and start them all immediately.`, or above ten `Launch N sessions simultaneously? This may be slow.` | `Launch All` / `Cancel` | Cancel, backdrop | A hard cap of 20 gives toast `Maximum 20 tasks per batch` |
+| 67 | Active Sessions Detected | Batch execute where some tasks already have sessions | Confirm duplicates | `X of N selected task(s) already have active sessions. Launch additional sessions for all?` | `Launch All` / `Cancel` | Cancel, backdrop | — |
+| 68 | Validation Ceremony | Validating a task | Structured approve or reject | Intro `Review <title> before marking as complete:`; an optional `Verification URL` section with an `Open` link; an optional `Subtask Checklist`; an `Issues Found (optional)` textarea with placeholder `Describe any issues found...` | `Approve` / `Cancel` / `Reject` (danger) | Cancel, backdrop | — |
+| 69 | Workflow Settings | Sidebar `Settings` | Board configuration | Tabs `Columns`, `Preferences`, `Validation`. Columns shows the hint `Drag to reorder · Click color to change · Double-click name to rename`, draggable rows with a colour swatch (`Change color`), a name, a status key, and `Rename` and `Remove` buttons, plus an add row with placeholder `New column name...` and `+ Add`, and a fifteen-swatch colour picker. Preferences holds the grouped toggles listed in 14.8.9. Validation holds an `Enable validation URLs` toggle and a `Dev server base URL` field with placeholder `http://localhost:8000` | `Save` / `Cancel` | Cancel discards and reloads the board | The last column gives toast `Cannot remove the last column`; a duplicate derived key gives `A column with that key already exists` |
+| 70 | Remove column (inline) | A column row ▸ `Remove` | Confirm in place | The row content is replaced by `Remove "<name>"?` | `Remove` / `Cancel` | Cancel restores the row | — |
+| 71 | Delete task (inline) | Card context menu ▸ Delete | Confirm on the card | The card content becomes `Delete "<first 30 chars>"?` | `Delete` / `Cancel` | Cancel restores the original card HTML | — |
+| 72 | Workflow shortcuts | `?` on the board | Cheat sheet | `n` / `New task`, `r` / `Refresh board`, `Esc` / `Close panel`, `?` / `Toggle this help` | `Close` | Close, backdrop, `?` again | — |
+| 73 | AI planner panel (Workflow) | `Plan with AI` | Streamed task breakdown | A slide-out titled `Plan with AI` with a minimise `―` (`title="Minimize"`) and a close `×` (`title="Close"`). The body cycles `Breaking down your plan…`, then `Building task breakdown…` or `Exploring project…` with a live `N task(s) so far` and an elapsed timer, then the proposal tree. When tool steps appear, the hint `Tip: minimize to keep working — it'll notify you when complete` is shown. The footer holds a two-row textarea with placeholder `Ask for changes…` and a mic button | `Add N tasks to Board`, which becomes `Creating…` / minimise / close | `×` | A parse failure shows `Couldn't parse a task structure. Try rephrasing below.` plus a raw dump; a network failure shows the message then `Try rephrasing your request below.` |
+
+### 14.7.7 Subsessions (compositions)
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 74 | New Composition | Sidebar `+ New Composition`; the empty CTA; the tab `+ New structured composition`; the key `n` | Create a composition | Section `Project name` with an input placeholder `e.g. Blog Series, Product Launch…` and an icon submit; section `Start from template` with six cards `Business Proposal` / `5 sections`, `Annual Report` / `5 sections`, `Product Launch` / `5 sections`, `Research Paper` / `5 sections`, `Pitch Deck` / `7 sections`, `Meeting Notes` / `3 sections` | Submit; no Cancel | Backdrop | Empty name refocuses. Selecting a template auto-fills the name when the field is empty |
+| 75 | Choose a Template | Empty board ▸ `Start from a template` | Apply a template | The same six cards | Card click / `Cancel` | Cancel, backdrop | — |
+| 76 | Add Section / Add Subsection | `+ Add Section`; sidebar `+ New Section`; context menu `Add Subsection`; the drill-down ghost row | Create a section | An insert toggle labelled `Insert` with `Top` and `Bottom`; a `Quick add` input with placeholder `Section name…`; a `Type` select grouped into `Documents`, `Data`, `Presentations`, `Diagrams`, `Code`, `Structured`, `Communication` covering 48 artifact types, defaulting to `Report` | Submit; no Cancel | Backdrop | Empty name refocuses |
+| 77 | Plan with AI (compose) | Header `Plan with AI`; the drill-down chooser card | Prompt for a composition plan | A three-row textarea with placeholder `Describe what you want to compose… e.g. 'A quarterly business review with financials, product updates, and team highlights'` | `Plan` / `Cancel` | Cancel, backdrop | Empty returns silently |
+| 78 | Plan Composition panel | Submitting row 77, or the hero field | Streamed section plan | A slide-out titled `Plan Composition` with a close `×`. The body cycles `Building content plan…` then `Building plan… N section(s) so far (Ns)`; the refine state reads `Refining plan…`; the result reads `N sections proposed` above a tree. The footer holds a textarea with placeholder `Ask for changes…` | `Add N sections to Board` / `×` | `×` | A parse failure shows `Couldn't parse a section structure. Try rephrasing below.` |
+| 79 | Direct All Sections | Header `Direct All` | Broadcast an instruction | Title `Direct All Sections`; explainer `This instruction will be sent to the root orchestrator, which will distribute it to all section agents with context-appropriate guidance.`; a textarea with placeholder `Type an instruction for all sections... e.g. 'Change the tone to formal throughout' or 'Update the company name from Acme to Nexus everywhere'` | `Send Directive`, which becomes `Sending...` / `Cancel` | Cancel, backdrop, **Escape** | No root session gives toast `Root orchestrator is not running. Launch it first.` and no modal opens |
+| 80 | Link Existing Session | The drill-down chooser; the card context menu | Attach a running session | Title `Link Existing Session`; a search input with placeholder `Search sessions…`; rows with a status dot and the session title | Row click / `Cancel` | Cancel, backdrop | Empty candidate list shows `No unlinked sessions available.` |
+| 81 | Cascade delete section | Deleting a section that has children | Confirm the blast radius | Title `Delete section and N subsection?` (pluralised); body `Deleting <name> will also remove:` above a list of child names; warning `This cannot be undone.` | `Delete All` (red) / `Cancel` | Cancel, backdrop | — |
+| 82 | Resolve Directive Conflicts | The conflict banner ▸ `Review` | Reconcile contradictory instructions | Title `Resolve Directive Conflicts`; per conflict a card with a `Directive A:` block and a `Directive B:` block, relative timestamps, and an optional `AI recommendation: <text>` | `Supersede (B replaces A)`, `Keep Both`, `Let me clarify…` which reveals an input with placeholder `Type clarifying directive…` and a `Submit` button; footer `Close` | Close, backdrop; auto-closes when the last conflict is resolved | — |
+| 83 | Compose shortcuts | `?` in Subsessions | Cheat sheet | `↑ ↓` / `Move focus`, `Enter` / `Open composition`, `Space` / `Toggle selection`, `Shift+↑↓` / `Extend selection`, `Delete` / `Delete focused`, `Esc` / `Clear selection / close`, `n` / `New section`, `r` / `Refresh`, `?` / `Toggle this help` | `Close` | Close, backdrop, Escape, `?` | While open, every key except Escape and `?` is swallowed |
+| 84 | Composition settings popover | The header gear | Rename and sharing | A `Name` field saved on blur and on Enter; a `Shared Prompts` toggle with `title="When on, user prompts are shared across all agents"`; a hint `When on, user prompts are logged and shared across all section agents.` | Saves on blur or Enter | Mousedown outside | Empty or unchanged names are ignored |
+| 85 | Add to Structured composition | Session context menu ▸ `Add to Structured composition` | Attach a session to a section | With zero compositions an inline create appears with the label `No compositions yet. Create one:`, an input with placeholder `Composition name`, and a `Create` button. With one, the tree opens directly. With several, a chooser lists each composition and dims other-project entries with the tag `(other project)`. The tree shows indented sections with a status dot, name and status word; unlinked sections offer `Attach here` while linked ones show `linked`; insertion markers read `+ Add here` and `+ Add as child`; a naming panel appears with the label `New section name:` or `Add as child — section name:` plus an input, `Add` and `Cancel` | Attach or Add | Backdrop | An empty name refocuses. A server 409 gives toast `Session already linked to "<section>"` |
+| 86 | Delete composition (undo toast) | Sidebar context menu ▸ Delete; the `Delete` key | Delete with a grace period | A bespoke toast reading `Deleted "<name>"` or `Deleted N composition(s)` with an `Undo` button. Multiple toasts stack upward at 52px intervals | `Undo` | Auto-commits after **5000ms**; leaving the view flushes and commits immediately | **No confirmation dialog** — the undo window is the confirmation |
+
+### 14.7.8 Workforce (department manager)
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 87 | New Department | The `New Department` card; the `Add sub-department` link; the Configure action bar | Create a department | `Name` with placeholder `e.g. Frontend, QA, Marketing`; `Role Title` marked `(optional)` with placeholder `e.g. Senior Frontend Engineer`; `System Prompt` marked `(optional)`, a four-row textarea with placeholder `Describe the expertise for sessions in this department...` | `Create` / `Cancel` | Cancel, Escape, backdrop | An empty name gives toast `Enter a department name` and the modal stays open |
+| 88 | Edit Skill | Folder context menu ▸ `Edit Skill` | Edit a department persona | Title `Edit Skill — <folder>`; `Skill Label` with placeholder `e.g. Frontend Engineer`; `System Prompt`, a ten-row textarea with placeholder `System prompt for Claude sessions in this folder...` | `Save` / `Cancel` | Cancel, backdrop | — |
+| 89 | Rename Folder | Folder context menu ▸ `Rename` | Rename | Prompt input with placeholder `Department name` | `Rename` / `Cancel` | Cancel, Escape | Unchanged is a no-op |
+| 90 | Add Sub-department | Folder context menu ▸ `Add Sub-department` | Create a child | Prompt input with placeholder `Department name` | `Create` / `Cancel` | Cancel, Escape | — |
+| 91 | Delete Department | Folder context menu ▸ `Delete` | Remove a department | Body `Delete <name>?` then `Sub-departments and sessions will be moved to the parent.` | `Delete` (danger) / `Cancel` | Cancel, backdrop | — |
+| 92 | Status Sessions popup | Any Command Center stat tile | List sessions in one state | Title `<Working / Waiting / Idle / Sleeping> Sessions` followed by a `N sessions` count; a search input with placeholder `Search sessions...`; a sort select with `Newest`, `Oldest`, `Name A-Z`, `Name Z-A`, `Department A-Z`; rows showing the name, the department and the date | Row click opens the session / `Close` | Close, backdrop | Empty list shows `No sessions` |
+| 93 | Choose a Template (workspace) | First entry with no folder tree; `openWorkspaceTemplateSelector()` | Seed the department hierarchy | Body `Select a folder template for your workplace. You can add or remove departments later.`; four cards `Personal` / `Writing, coding, documents, research` / `5 folders`, `Small Team` / `Engineering, product, docs, QA` / `17 folders` with a `Recommended` badge, `Enterprise` / `Full org chart with 60+ departments` / `70+ folders`, `Empty` / `Start from scratch` / `0 folders` | Card click; there are no buttons | Backdrop, which still fires the completion callback | — |
+| 94 | Workforce AI — Organize | Configure ▸ `Organize with AI` | AI hierarchy suggestions | A slide-out titled `Organize Departments`; a status line reading `Working...`; a footer textarea with placeholder `Follow up...` | Send / minimise `―` / close `×` | `×` | See 14.16 for the timeout and empty messages |
+| 95 | Workforce AI — Find Skills | Discovery ▸ `Find More with AI` | AI skill discovery | The same shell titled `Find Skills` | Send / minimise / close | `×` | — |
+| 96 | Delete workforce asset | A Configure leaf ▸ `Delete` | Remove a definition file | Native confirm `Delete "<id>"? This removes the .md file from your workforce directory.` | OK / Cancel | — | — |
+| 97 | Uninstall skill pack | Available ▸ `Uninstall` | Remove an imported pack | Native confirm `Remove all imported assets from "<pack>" and delete the cloned directory?` | OK / Cancel | — | — |
+| 98 | Uninstall built-in library | Available ▸ built-in `Uninstall` | Reset to empty | Native confirm `Remove all built-in departments and assets? You can reinstall anytime from the Available tab.` | OK / Cancel | — | — |
+
+### 14.7.9 App maintenance, git and tests
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 99 | Update App | Header `Update App` | Pull remote updates | Title `Update App`; body `N update(s) are available from remote.` then `Your app will be updated to the latest version. Your local changes are safe.` — or `Your app is already up to date.` | `Update Now` / `Cancel`, or just `OK` | Buttons only. A backdrop click while work is in progress **minimises** instead of closing | — |
+| 100 | Publish App Update | Header `Publish App Update` | Push local changes | Title `Publish App Update`; body `Your local changes are ready to publish.` then `They will be saved and uploaded to remote automatically.` plus, when behind, `N remote update(s) will be pulled in first, then your changes pushed.` and finally `Run regression tests before publishing?` — or `Nothing to publish — your app is already up to date on remote.` | `Fast Tests + Publish` (primary) / `Full Tests + Publish` / `Skip & Publish` / `Cancel` | Buttons | — |
+| 101 | Sync App | Header `Sync App` | Pull then push | Title `Sync App`; body `N update(s) to pull and M change(s) to push.` then `Remote updates will be pulled first, merge conflicts resolved automatically, then your changes pushed.` and `Run regression tests before syncing?` | `Fast Tests + Sync` / `Full Tests + Sync` / `Skip & Sync` / `Cancel` | Buttons | — |
+| 102 | Wrong Branch? | Publishing or syncing while not on the default branch | Prevent publishing to the wrong branch | Title `Wrong Branch?`; body `⚠ You are on branch "<branch>", not "<default>".` then `Syncing now publishes your work to <branch> — not your main app. Most of the time you want to be on <default>.` and `If you didn't mean to be here, cancel and switch back to <default> first.` | `Cancel` is **primary and listed first**; `Sync to "<branch>" anyway` is secondary | Buttons | A detached HEAD renders as `a detached HEAD (no branch)`; the default falls back to `main` |
+| 103 | Tests in progress | Any tests-first git action; Developer Tools ▸ Run Tests | Live test output | A title such as `Fast Tests Before Publish` or `Run Tests (Full)`; a scanning animation; a status line reading `Running unit and API tests...`, `Running full test suite including e2e...`, `Running fast tests before publish...` or `Running full tests before sync...`; a scrolling output pane showing the last 40 lines | No buttons at all, which is exactly what reveals the minimise control | Minimise `−` | — |
+| 104 | Tests Passed | Tests finish clean | Report | Title `Tests Passed ✓` or `Run Tests (Fast) ✓`; body `All Tests Passed` then `N passed` plus `, M skipped` when non-zero | `OK` | OK | Git flows auto-proceed after **1200ms** with the line `N tests passed — proceeding to publish...` |
+| 105 | Tests Failed | Tests finish with failures | Block, with an override | Title `Publish Blocked — Tests Failed`, `Sync Blocked — Tests Failed`, or `Run Tests (Fast) — Failures Found`; body `N Test(s) Failed` then `P passed, F failed` plus errors and skips, and a preformatted block of failing lines | `Publish Anyway` or `Sync Anyway`, then `Cancel` as primary | Buttons | — |
+| 106 | Test Error | Tests could not run | Offer an override | Title `Test Error`; body `Could not run tests. Publish anyway?` or `Could not run tests. Sync anyway?` | `Publish Anyway` / `Cancel` | Buttons | — |
+| 107 | Tests Running already | Starting tests twice | Prevent overlap | Title `Tests Running`; body `Tests are already running.` or `Tests are already running. Cancel the current run first.` | `Cancel Tests` / `OK` | OK | — |
+| 108 | Push Blocked — Security Issue | The pre-push scan finds secrets | Prevent a leak | Title `Push Blocked — Security Issue`; a findings block headed `Security Scan Results` with `<summary> (N files scanned)` and the sections `Blocked Files:` and `Potential Secrets:`, truncated at fifteen entries with `...and N more` | `Fix with AI` (primary) / `Close` | Close | `Fix with AI` spawns a session titled `Security Remediation` |
+| 109 | Server Scan | Developer Tools ▸ Server Scan | On-demand secret scan | While running, the title `Server Scan` with a shield-and-beam animation and a progress line moving from `Connecting...` to `<current> / <total> files`. On completion the title `Server Scan Results` with either `All Clear` and `N files scanned — no secrets or sensitive data detected.` or the findings block | `OK`, or `Fix with AI` / `Close` | Buttons | Failure gives title `Error` and body `Could not run scan. Try again.` |
+| 110 | Git minimised indicator | Minimising any git or test modal | Keep the job visible without blocking | A floating pill with a spinner, a label defaulting to `Working...`, and a `×` with `title="Dismiss"` | Click restores the modal; `×` dismisses | `×` | On completion it flashes for **1500ms** |
+| 111 | Voice setup progress | Preferences ▸ voice toggle on | Install the local voice model | Title `<App> Voice`; a progress bar; one of `Downloading the model (~150 MB, one time)…`, `Loading the model into memory…`, `Installing the … engine…`, `Setting up …`; sub-copy `One-time setup, fully local — nothing leaves your machine. You can keep working or close this; we'll finish in the background and switch the mic on automatically.` | `Close` | Close, backdrop | The bar is clamped between 4% and 100% |
+| 112 | Voice ready | Install completes | Confirm | `✓ … is ready` then `Voice now works in every browser, knows your project's vocabulary, and punctuates automatically. Model: <model>.` | `Done` | — | — |
+| 113 | Voice error | Install fails | Offer a retry | `⚠ <error>` falling back to `… setup failed.` plus an optional remediation block | `Try again` (primary) / `Close` | Close | — |
+| 114 | Voice needs restart | Engine installed but not loaded | Ask for a web-layer restart | `…'s engine was just installed and needs a one-time restart of the web layer to switch on. Your running sessions stay alive — only the web server reloads, the page refreshes itself when it's back, and setup then finishes automatically.` | `Restart & finish setup` (primary) / `Later` | Later | — |
+| 115 | Voice unsupported | The browser lacks MediaRecorder | Explain | `… needs a modern browser with microphone recording (MediaRecorder). Please update your browser — standard voice input still works.` | `Close` | Close | — |
+
+### 14.7.10 Blocking and full-screen overlays
+
+| # | Name | Trigger | Purpose | Fields / controls | Primary / secondary | Dismissal | Validation |
+|---|---|---|---|---|---|---|---|
+| 116 | Health blocker — No Internet | The connectivity probe fails | Block use | A 64px wifi-off icon; label `No Internet Connection`; message `<App> requires an active internet connection to communicate with Claude. Please check your WiFi or network settings.`; a three-dot spinner; the footer `Retrying automatically…` | none | **Unkillable** — it clears only when the check passes | — |
+| 117 | Health blocker — Server Unreachable | Four consecutive failed pings, about 12s | Block use | A monitor icon; label `<App> Server Unreachable`; message `The <App> web server is not responding. Your running sessions are likely safe in the session daemon — relaunch <App> from your desktop shortcut or launcher to reconnect. If this overlay persists after relaunch, check the server log.` | none | Unkillable | A 503 bypasses the threshold and reloads immediately |
+| 118 | Health blocker — Engine Stopped | Five consecutive failed daemon probes, about 25s | Block use and offer repair | A power-symbol icon; label `<App> Engine Stopped`; message `The <App> engine that runs your sessions has stopped. Tap Restart to bring it back — your session history is safe.` | `Restart <App>`, which becomes `Restarting…` and disables | Unkillable | Waits up to about 90s for readiness, then force-reloads |
+| 119 | Health blocker — Not Logged In | The auth-status check fails | Block use and offer login | A padlock icon; label `Not Logged In to Claude`; message `<App> requires an active Claude Code login. Click below to open the login flow, then come back here — it will reconnect automatically.` | `Log In to Claude` | Unkillable | — |
+| 120 | Mobile action sheet | The `•••` toolbar button on a phone | Toolbar actions on a phone | A rounded card of full-width rows built from the toolbar's own buttons, plus a final `Actions…` row | Row tap / `Cancel` | Backdrop, Cancel | Disabled toolbar buttons render disabled |
+| 121 | Mobile session sheet | Long-pressing a session row for 500ms | The context menu on touch | The same items as the desktop context menu with dividers collapsed | Row tap / `Cancel` | Backdrop, Cancel | — |
+| 122 | Mobile System sheet | `System ▾` on a phone | The System menu as a sheet | Groups mirrored from the desktop dropdown, including each item's value badge right-aligned | Row tap / `Cancel` | Backdrop, Cancel | The original handler fires **80ms** after the tap so the slide-down starts first |
+| 123 | Mobile preview sheet | Tapping a preview card; the toolbar preview button | View a render on a phone | A grab handle; a header with `All`, a title, a fullscreen button, `↻` and `Done`; a sub-line; then either a grid of preview tiles or a single stage holding an image or a sandboxed iframe with a fake URL bar | `Done` | Backdrop, dragging past 88%, `Done`. Escape only exits fullscreen | Snap points at 0%, 46% and 72% |
+
+**Native dialogs still in the product.** Composition rename (`Rename composition:`), composition duplicate (`Name for the duplicate:` prefilled `Copy of <name>`), section rename (`Rename section:`), session rename inside a composition (`Rename session:`), compose bulk delete (`Delete N section(s)?` followed by the names), unlink session (`Unlink this session from the section? The session will still exist in the sessions view.`), trash purge (`Permanently delete this session? This cannot be undone.`), trash empty (`Permanently delete all N session(s) in the trash? This cannot be undone.`) and the three workforce confirms in rows 96–98. These are the only unstyled dialogs in the app. Reproduce their strings, but a rebuild should render them through the `showConfirm` / `showPrompt` primitives.
+
+
+---
+
+## 14.8 Complete menu inventory
+
+### 14.8.1 Header — System dropdown (`#hdr-sys-dropdown`)
+
+Trigger: the `System ▾` button. Opens by adding `.open`; closes on any click outside `#hdr-sys`. On phones it renders as a bottom sheet with the same groups and each item's value badge right-aligned.
+
+| Order | Item | Value badge | Effect |
+|---|---|---|---|
+| 1 | `Model` | the current model label, e.g. `Opus 4.7` | Open the model selector |
+| 2 | `Thinking` | `Default` / `None` / `Low` / `Medium` / `High` | Open the thinking selector |
+| 3 | `Preferences` | — | Open Preferences |
+| — | separator | | |
+| 4 | `Permission Policy` | — | Open the policy selector |
+| 5 | `Persistent Storage` | `Local` or `Cloud` | Open storage settings |
+| 6 | `Mobile Command` | `Off`, `On…` or `On` | Open the phone wizard |
+| — | separator | | |
+| 7 | `Bulk Operations` | — | Open bulk operations |
+| 8 | `Keyboard Shortcuts` | — | Open the cheat sheet |
+| — | separator | | |
+| 9 | `Recently Deleted` | — | Open the trash. `title="View and restore recently deleted sessions"` |
+| 10 | `Developer Tools` | the phantom-name count, or empty | Open dev tools. `title="Tests, scans, and server controls"` |
+
+### 14.8.2 Sidebar — view flyout (`#sidebar-view-flyout`)
+
+Trigger: hovering the wrapper for 200ms, or clicking the trigger. Items in order, each with an icon; the active one carries `.active`:
+
+`Home` · `Sessions` · `Workflow` · `Workforce` · `Subsessions`
+
+### 14.8.3 Sidebar — options dropdown (`#sidebar-menu-dropdown`)
+
+Trigger: the `⋯` button (`title="Options"`). Three labelled sections separated by dividers; picking any item closes the dropdown.
+
+| Section label | Items in order |
+|---|---|
+| `Sort` | `Newest first` · `Oldest first` · `Name A–Z` · `Name Z–A` · `Largest first` · `Smallest first` |
+| `Display` | `Grid cards` · `List table` · `Mission Control` |
+| `Actions` | `Sleep all sessions` · `Delete empty sessions` · `Delete all sessions` — all three styled `.danger` |
+
+### 14.8.4 Actions popup (`#actions-overlay`)
+
+Four tabs. A live status badge sits between the tab strip and the close button, showing an icon plus one of `Waiting for input`, `Working`, `Idle`, `Not running`.
+
+**Tab `Organize`**
+
+| Item | Description |
+|---|---|
+| `Auto-name` | `Generate a descriptive name using AI` |
+| `Delete` (danger) | `Permanently remove this session and its data` |
+
+**Tab `Branch`**
+
+| Item | Description |
+|---|---|
+| `Continue` | `Start a new session with context carried forward` |
+| `Duplicate` | `Create an exact copy of this session` |
+| `Fork` | `Branch the conversation from a specific message` |
+| `Rewind Code` | `Restore files to their state at a chosen message` |
+| `Fork + Rewind` | `Fork conversation and restore files in one step` |
+
+**Tab `Subsession`**
+
+| Item | Description |
+|---|---|
+| `Spawn Subsession` | `Start a child session that reports back to this one (Ctrl+Shift+S)` |
+
+**Tab `Session`**
+
+| Item | Description |
+|---|---|
+| `Open in Terminal` | `Launch this session in the Claude CLI` |
+| `Compact Context` | `Summarize history to free up the context window` |
+| `Clear Display` | `Clear the log view without affecting the session` |
+| `Stop Session` (danger) | `Shut down the running session process` |
+
+On phones the whole popup becomes a bottom sheet that animates down over **250ms** on dismiss rather than vanishing.
+
+### 14.8.5 Toolbar — Analyze dropdown
+
+The group's children are **cloned** into a floating `.grp-popup` positioned 4px below the label and right-aligned to it. Items in order: `Summary` · `Find` · `Extract Code` · `Export` · `Compare`. Clicking any item closes the popup; clicking outside closes it; opening another group closes the first; clicking the same group toggles it shut. Permanently hidden children are skipped during the clone.
+
+### 14.8.6 Session context menu (right-click a row or card; long-press on touch)
+
+| Order | Item | Effect |
+|---|---|---|
+| 1 | `Open` — only when the session is not already active | Open it in the live panel |
+| 2 | `Auto-name` | AI-name the session |
+| 3 | `Rename` | Open it if needed, then start the inline rename |
+| — | divider | |
+| 4 | `Link to Workflow Task` | Open the task picker |
+| 5 | `Add to Structured composition` | Open the composition tree picker |
+| 6 | `Spawn Subsession` | Create a child session |
+| 7 | `Create Workflow Task` | Make a task from this session |
+| — | divider | |
+| 8 | `Continue` | New session with context carried forward |
+| 9 | `Duplicate` | Copy the session |
+| 10 | `Save as Template` | Create a starter template from it |
+| 11 | `Open in Terminal` | Launch in the CLI |
+| — | divider, only when this is the active session | |
+| 12 | `Compact Context` | Summarise the history |
+| — | divider, only when the session appears active | |
+| 13 | `Stop Session` (danger) | Stop the process |
+| — | divider | |
+| 14 | `Delete` (danger) | Delete the session |
+
+Desktop renders a floating `.session-ctx-menu.ws-ctx-menu` at the pointer, clamped 8px inside the viewport on the next animation frame, closing on any outside click. Mobile renders the identical list as a bottom sheet with dividers collapsed and a `Cancel` button.
+
+### 14.8.7 Bulk session context menu (right-click inside a selection of two or more)
+
+Header row: a grid icon followed by `N selected`.
+
+| Order | Item |
+|---|---|
+| 1 | `Stop all` |
+| 2 | `Auto-name all` |
+| 3 | `Duplicate all` |
+| 4 | `Add all to Structured composition` |
+| — | divider |
+| 5 | `Delete all` (danger) |
+| — | divider |
+| 6 | `Clear selection` |
+
+### 14.8.8 Workflow — task card context menu
+
+Trigger: the `⋮` button (`title="Actions"`) or right-click anywhere on a card.
+
+| Order | Item |
+|---|---|
+| 1 | `Rename` |
+| 2 | `Edit` — opens the drill-down |
+| 3 | `Add Subtask` |
+| 4 | `Spawn Session` |
+| 5 | `Execute Task` — only for leaf tasks in Not Started, Working or Remediating |
+| 6 | `Execute + Validate` — same condition |
+| — | separator |
+| 7…n | `Move to <Column Name>` — one per configured column |
+| — | separator |
+| last | `Delete` (danger) |
+
+### 14.8.9 Workflow — other menus
+
+**Status menu** — trigger: a status badge on a task or a subtask row (`title="Click to change status"`). One row per column with a coloured dot and the column name; the current one carries `.current` and a trailing check icon.
+
+**Column sort dropdown** — trigger: the gear in a column header (`title="Sort settings"`). Field `Sort by` with `Manual (drag)`, `Last updated`, `Date created`, `Alphabetical`; field `Direction` with `Ascending`, `Descending`; a `Save` button. The dropdown flips above the trigger when it would overflow the bottom of the viewport and is clamped 8px from the edges.
+
+**Recent history dropdown** — trigger: hovering the `Board` breadcrumb crumb. Header `Recent`, then up to ten entries, most recent first, each with a type icon (a chat bubble for sessions, a board icon for tasks) and a title truncated to 40 characters. The entry you are currently on is non-clickable and carries a trailing pill reading `here`. It closes 300ms after leaving the crumb and 150ms after leaving the dropdown.
+
+**Tag filter popup** — trigger: the sidebar `Tags` button. One pill per known tag with active tags highlighted, plus a trailing `clear` pill whenever a filter is active.
+
+**Workflow Settings ▸ Preferences toggles**
+
+| Group | Toggle | Description |
+|---|---|---|
+| `Automatic Status Changes` | `Session starts → Working` | `When a session is linked, move the task to Working` |
+| | `Child Working → Parent Working` | `When a subtask starts, move its parent to Working too` |
+| | `Child Remediating → Reopen Parent` | `If a subtask needs rework, reopen the parent task` |
+| | `All done → Validating` | `When all sessions and subtasks finish, move to Validating` |
+| `AI Behavior` | `AI can modify task status` | `Allow AI sessions to change task statuses (working, validating, etc.)` |
+| | `AI can mark tasks complete` | `Allow AI to mark tasks as complete (otherwise stops at validating)` — indented 20px, dimmed to 50% and forced off when the parent toggle is off |
+| `Session Awareness` | `Cross-session awareness` | `Tell AI sessions what other sessions are doing — names, status, and recently edited files` |
+| | `Wrong-session detection` | `Warn before sending a prompt that seems unrelated to the current session's conversation` |
+| `Performance` | `File tracking` | `Track file changes each turn for undo/rewind. Disable to speed up sessions on large repos.` |
+| `General` | `Column page size` | `Max tasks per column before pagination` — a number input defaulting to 50 |
+
+### 14.8.10 Subsessions menus
+
+**Section card context menu** — right-click a card, or the `⋯` button: `Open` · `Rename` · `Add Subsession` · then either `Open Session` with a live status dot **or** the pair `Launch Session` and `Link Session` · separator · the status moves, where the current status renders as `✓ <Label> (current)` at 40% opacity and non-clickable while the others read `Move to Drafting`, `Move to Reviewing`, `Move to Complete` · separator · `Add Tag…`, which replaces the menu item in place with an input placeholder `Tag name...` committed on Enter or blur · separator · `Delete` (danger).
+
+**Column sort menu** — per-column gear (`title="Sort"`): `Manual (drag)` · `A → Z` · `Z → A` · `Newest first` · `Oldest first`.
+
+**Export menu** — the header `Export` button: `Word document (.docx)` · `PDF document` · `Markdown bundle` · `Zip archive`.
+
+**Composition context menu** — right-click a sidebar composition: `Rename` · `Duplicate` · `Pin` or `Unpin` (the label is computed from the current state) · `Delete` (danger).
+
+**Board bulk Move-to menu** — the bulk bar's `Move to ▾`: `Drafting` · `Reviewing` · `Complete`. Positioned **above** its trigger because the bulk bar sits at the bottom.
+
+**Section status dropdown** — the drill-down status badge: `Drafting` · `Reviewing` · `Complete`, each with a coloured dot, the current one marked `.active`.
+
+### 14.8.11 Workforce — folder context menu
+
+Trigger: right-click a `.ws-folder-card`, or its `⋯` button (`title="Options"`).
+
+`Rename` · `Edit Skill` · `Add Sub-department` · divider · `Delete` (danger).
+
+Positioned at the pointer and clamped 8px inside the viewport on the next animation frame.
+
+### 14.8.12 Sidebar list column headers
+
+Not a menu, but the same discoverability contract: `Name`, `Date` and `Size` are each a sort toggle with the tooltips `Sort by name`, `Sort by date`, `Sort by size`, and the first two carry a drag-to-resize grip.
+
+---
+
+## 14.9 Toasts, banners, and inline feedback
+
+### 14.9.1 The toast primitive
+
+One element, `#toast`, positioned `fixed; bottom: 20px; right: 20px`, `z-index: 9999`, `pointer-events: none`. It has two variants: neutral (`.toast.show`) and error (`.toast.show.error`, a red-tinted background and border). It fades in and out over **0.3s** and auto-hides after exactly **3000ms**. Calling it again replaces the text and restarts the timer — there is no queue and no stacking.
+
+Signature: `showToast(message, isError)`. Note that the codebase passes the second argument inconsistently (sometimes the boolean `true`, sometimes the string `'error'`); a rebuild should accept only a boolean and normalise every call site.
+
+### 14.9.2 Session lifecycle toasts
+
+| String | Trigger | Severity |
+|---|---|---|
+| `Type a message first` | Submitting an empty composer | neutral |
+| `Stopping session…` | Deleting a session that is still running | neutral |
+| `Deleting session…` | Delete confirmed | neutral |
+| `Session deleted` | Delete succeeded | neutral |
+| `Delete failed` | Delete failed | error |
+| `Session closed` | Stop confirmed | neutral |
+| `N session(s) closed` | Sleep All completed | neutral |
+| `No running sessions` | Sleep All with nothing running | neutral |
+| `No sessions to delete` | Delete All with nothing to delete | neutral |
+| `No empty sessions found` | Delete Empty with nothing empty | neutral |
+| `Deleted N empty session(s)` | Delete Empty succeeded | neutral |
+| `Deleting N sessions…` | Delete All confirmed | neutral |
+| `N sessions deleted` | Delete All completed | neutral |
+| `Session duplicated` | Duplicate succeeded | neutral |
+| `Duplicate failed: <reason>` | Duplicate failed | error |
+| `New continuation session created — open it in Claude to continue` | Continue succeeded | neutral |
+| `Opening session in Claude…` | Open in Terminal succeeded | neutral |
+| `Failed to open: <reason>` | Open in Terminal failed | error |
+| `Renamed` | Toolbar rename succeeded | neutral |
+| `Renamed to "<name>"` | Inline or modal rename succeeded | neutral |
+| `Rename failed` | Rename failed | error |
+| `Auto-named: "<name>"` | Auto-name succeeded | neutral |
+| `Auto-name failed: <reason>` | Auto-name failed | error |
+| `Naming N session(s)…` / `Named N session(s)` | Auto-name All | neutral |
+| `All sessions already named` | Auto-name All with nothing to do | neutral |
+| `Session forked` and `Session forked and N file(s) restored` | Fork succeeded | neutral |
+| `N file(s) restored to earlier state`, `Rewind complete (no files to restore)`, plus ` (N skipped)` | Rewind succeeded | neutral |
+| `Display cleared` | Clear Display | neutral |
+| `Compacting context…` | Compact Context | neutral |
+| `Command queued (N)` | Queueing while working | neutral |
+| `Removed — N remaining` / `Queue cleared` | Removing a queued item | neutral |
+| `Sending queued command…` plus ` (N remaining)` | The server dispatched a queued message | neutral |
+
+### 14.9.3 Multi-select and bulk toasts
+
+`Another bulk action is in progress` (error) · `Stopped N session(s)` · `Deleting N session(s)…` · `Deleted N session(s)` · `Delete failed for N session(s)` (error) · `Deleted N of M. K failed.` (error) · `Auto-naming N session(s)…` · `Auto-named N session(s)` · `Auto-named N of M. K failed.` (error) · `Duplicating N session(s)…` · `Duplicated N session(s)` · `Duplicated N of M. K failed.` (error) · `Add to Structured composition finished (N processed, M skipped)` · `Add to Structured composition timed out — bulk halted` (error) · `Cannot open Add to Structured composition picker` (error).
+
+### 14.9.4 Subsession toasts
+
+`Subsession spawned under "<parent>"` · the one-time intro `This is a subsession. It knows everything its parent knew when it was spawned. Reports flow back to the parent on your next message there.` · `Subsession reports waiting. Open the parent session to see and Pull updates.` · `Pulling subsession updates…` · `No subsession reports waiting.` · `Pull queued — fires when the session goes idle.` · `Pull updates failed: <reason>` (error) · `Pull updates failed: network error` (error) · `Reported to parent (N pending)` · `Report failed: <reason>` (error) · `Summary cannot be empty` (error) · `Re-anchored at line N` · `Re-anchor failed: <reason>` (error) · `Subsession detached.` · `Detach failed: <reason>` (error) · `Spawn failed: <reason>` (error).
+
+### 14.9.5 Project, settings and system toasts
+
+`Opening folder picker…` · `Added <path>` · `Created <name>` · `Create failed` (error) · `Project deleted` · `Delete failed` (error) · `Renamed to "<name>"` · `Model: <label>` · `Thinking: <level>` · `Send: Enter to send` / `Send: Ctrl+Enter to send` · `Enter to send: On|Off` · `Sticky chats: On|Off` · `Wrong-session detection: On|Off` · `Policy: <Title>` · `Custom policies saved` · `Shutting down server...` · `No phantom session names to remove.` · `Removed N phantom session-name entries.` · `Scrub preview failed.` / `Scrub failed.` · `CLAUDE.md files saved` · `Failed to load CLAUDE.md files` (error) · `Failed to save` (error) · `Restored: <title>` · `Restore failed` (error) · `Permanently deleted` · `Emptied trash: N deleted, M failed` · `Workspace template applied` · `Added <department>` · `All departments already added` · `Set up a workspace template first` · `Folder system not loaded` · `Dark theme` / `Light theme` / `Auto theme (sunrise/sunset)`.
+
+### 14.9.6 Workflow toasts
+
+`Task created` · `Subtask created` · `Task deleted` · `Failed to delete task` · `Created N task(s)` · `Task approved` · `Rejected — moved to Remediating` · `Executing task: <title>` · `Launching N sessions...` · `N sessions launched` · `N/M sessions launched (K failed)` (error) · `Session cleared` / `Planner cleared` · `Plan accepted! Subtasks created.` · `Refreshed` · `Task no longer exists — returned to board` · `Launched without task context (fetch failed)` · `Validation URLs enabled` · `Validation URL saved` / `Validation URL removed` · `Cannot execute a parent task — execute its subtasks instead` (error) · `Task is already complete` (error) · `Maximum 20 tasks per batch` (error) · `No plan to accept` (error) · `Cannot remove the last column` (error) · `A column with that key already exists` (error) · `Reorder failed` (error) · `Session spawner not available` (error) · `Tag added` / `Failed to add tag` (error) · `Failed to remove tag` (error) · `Please enter a URL (http/https/file) or a local file path` (error) · `Could not open file: <reason>` (error) · `Failed to save: <reason>` (error) · `Columns updated`.
+
+### 14.9.7 Subsessions (composition) toasts
+
+`Created composition: <name>` · `Applied template: <name>` · `Failed to create composition` (error) · `Failed to apply template` (error) · `Added section: <name>` · `Failed to add section` (error) · `Renamed to "<name>"` · `Renamed section` · `Failed to rename` (error) · `Duplicated as "<name>"` · `Pinned` / `Unpinned` · `Pinned N composition(s)` / `Unpinned N composition(s)` · `Refreshed` · `Sending coordination message to root orchestrator...` · `Root orchestrator is coordinating` · `No root session to coordinate` · `Failed to contact root` (error) · `Launching N section agent(s)...` · `N agent(s) launched` plus `, M failed` and `. Root orchestrator is coordinating.` · `Launch failed` (error) · `Root orchestrator is not running. Launch it first.` (error) · `Directive sent to root orchestrator for distribution` · `Failed to send directive` (error) · `Export downloaded` · `Export failed` (error) · `Created N section(s)` · `Moved N section(s) to <Label>` · `All selected sections already have sessions` · `Launching N session(s)...` · `N session(s) launched` · `Deleted N section(s)` · `Move failed` (error) · `Failed to update status` (error) · `Moved to <Label>` · `Failed to move section` (error) · `Launching session for: <section>` · `Session started for: <section>` · `Failed to launch session` (error) · `Session renamed` · `Session unlinked` / `Unlink failed` (error) · `Session linked` / `Failed to link session` (error) · `Section deleted` / `Section and subsections deleted` / `Failed to delete section` (error) · `Conflict resolved` / `Failed to resolve conflict` (error) · `Clarification submitted` / `Failed to submit clarification` (error) · `Added to Structured composition: <name>` · `Session already linked to "<section>"` (error) · `Session attached to section` · `Failed to attach` (error).
+
+### 14.9.8 Workforce toasts
+
+`Folder created` · `Folder deleted` · `Folder restored` · `Folder permanently deleted` · `Enter a department name` · `Department created: <name>` · `Skill updated` / `Skill updated: <label>` · `Cannot move folder into its own descendant` · `Editing coming soon — edit the workforce definition file directly for now` · `Deleted: <id>` / `Delete failed` · `Asset not found` / `Imported: <name>` / `Import failed` · `Removed: <id>` / `Remove failed: <reason>` · `Uninstalled: <pack> (N assets, directory removed)` · `Uninstall failed` · `Templates not available` / `Template not found` / `Template system not loaded` · `Installed: <template>` · `Built-in library removed` · `Unknown pack: <id>` · `Installed <pack>: N assets imported` · `Install failed: <reason>` · `All sessions unhidden`.
+
+### 14.9.9 Invoke, voice and model toasts
+
+`Usage: /as <asset-id>` · `No departments loaded` · `Asset not found: <id>` · `No active session to switch` · `Session: <Model>` plus ` + <Level> thinking` · `Session model reset to system default` · `Already running on <Model>` · `Model switch timed out — model NOT changed` (error) · `Model switched to <Model> — applies from the next message` · `Model switch FAILED: <reason>` (error) · `Not connected — model NOT changed` (error) · `Listening...` (Web Speech) and `Listening…` (local engine) · `Voice error: <code>` (error) · `Your dictation is ready — press Enter to send.` (error styling, deliberately, because the send did not happen) · `Didn't catch that — try speaking louder or closer to the mic.` (error) · `Didn't catch that — try again.` (error) · `Recording is not supported in this browser.` (error) · `Microphone permission denied.` (error) · `Could not access the microphone.` (error) · `<App> Voice is unavailable.` (error) · `<App> Voice disabled — using standard voice.` · `<App> Voice is ready — voice is on.`.
+
+### 14.9.10 File and template toasts
+
+`File saved and session notified` · `File saved to <path>` · `Upload failed` (error) · `Saved to <path>` / `Save failed` (error) · `Copied to Downloads: <name>` / `Download failed` (error) · `Failed to open file` (error) · `Template saved` / `Template deleted` / `Template name is required` / `Template not found` / `Template system not available` (error) · `Session has no messages to save`.
+
+### 14.9.11 Banners and inline strips (non-transient)
+
+| Banner | Location | Copy | Controls |
+|---|---|---|---|
+| Queue banner | Between transcript and composer | `Queued` plus ` (N)` and the suffix ` — will send when idle`, then the queued text | `‹ N/M ›`, `Edit`, `Remove` |
+| Session-not-running notice | Above the composer in the Ended state | `Session not running. Type a message to resume.` | — |
+| Sleeping banner | Above the composer in the Idle state with a scheduled wake-up | `Awaiting wake-up…` then faint `(send a message to take over)` | — |
+| Auto-retry banner | Above the composer in the Idle state | `Auto-retrying in <countdown>` plus ` · attempt N/M` and ` · <reason>` | `Retry now`, `Cancel` |
+| Error banner | Above the composer in the Idle state | the error text | `Retry` |
+| Subsession role banner | Top of the live panel | `SUBSESSION` + `from <parent>`, or `SUBSESSION` + `parent <name> (deleted)`, or `MAIN SESSION` + `N subsessions running in parallel` | The parent name is a link |
+| Subsession inbox strip | Above the composer | `N subsession reports will be included with your next message.` or `Subsession reports will be included with your next message.` | `Pull updates now`, `Dismiss` |
+| Subsession actions bar | Above the composer | — | `Report to Parent` (or the disabled `Report to Parent (parent deleted)`), and a checkbox `Auto-report on idle` |
+| Sub-agent team strip | Above the composer while working | `N agents active · M done`, or the collapsed footer `N agents completed` | — |
+| Multi-select badge | Top of the session list | `N selected` | `×` with `title="Clear selection (Esc)"` |
+| Hidden-sessions bar | Workforce canvas | `N hidden session(s)` | `Show all` |
+| Tag filter banner | Compose board | `Filtering by: ` plus pills | `Clear` |
+| Conflict banner | Compose board | `⚠ N directive conflict(s) need your attention` | `Review` |
+| Compose bulk bar | Below the compose columns | `N selected` | `Move to ▾`, `Launch All`, `Delete`, `Clear selection` |
+| Batch bar | Workflow drill-down | `N task(s) selected` | `Execute Selected`, `Execute + Validate`, `Clear` |
+| AI autonomy bar | Inside the composer for board-scoped sessions | label `AI:` | pills `Modify status`, `Mark complete` |
+| Opinionated notice | Workforce Command Center | `<App> organizes your knowledge assets into departments — not skills, not agents. Drop any .md file into a department and invoke it as either. We handle both.` | an ⓘ with a tooltip |
+| Local-assets notice | Workforce Command Center | `Local project skills/ and agents/ folders are dynamically aggregated into the Invoke Workforce menu and included in session context.` | — |
+| Undo toast | Bottom-left, stacked | `Deleted "<name>"` or `Deleted N composition(s)` | `Undo` |
+| Minimised git pill | Floating | `Working...` or the current operation title | click to restore, `×` to dismiss |
+
+### 14.9.12 Inline field feedback
+
+- **Copy buttons** swap their icon to a check, add `.copied`, change `title` to `Copied!`, and revert after **1500ms** (**1200ms** for per-block copies in the code drawer).
+- **Retention save status** shows `Saved.`, or `Saved. (Claude settings file unreadable — cleanup period there unchanged.)`, or `Saved. (Could not update Claude cleanup setting right now.)`.
+- **Naming badge** appends `Naming…` with a pulsing dot to a session row while an auto-name request is in flight.
+- **Spawn pulse** briefly tints the new child row and its parent row for **600–700ms** after a subsession is spawned.
+- **Sidebar badge pulse** adds a highlight class for **600ms** whenever a composition's completed fraction changes.
+
+
+---
+
+## 14.10 Feedback taxonomy and loading states
+
+### 14.10.1 The six signals
+
+| Signal | Use it when | Treatment |
+|---|---|---|
+| **Toast** | A discrete action finished and the result is not visible on screen | 3s, bottom-right, neutral or error |
+| **Inline label swap** | A button initiated the work and the button is still on screen | Replace the label with a gerund: `Creating…`, `Deleting...`, `Switching…`, `Sending...`, `Saving...`, `Naming…`, `Building…`, `Working…`, `Restoring…`, `Installing...`, `Searching cloud…`, `Testing...`, `Migrating...`, `Loading…`. Disable the button while it is in that state |
+| **Skeleton** | A whole region is about to be replaced and its shape is known | Shimmer blocks matching the final layout, with staggered delays |
+| **Spinner** | Something indeterminate is running inside an otherwise-populated region | A 10px inline spinner, usually beside text |
+| **Optimistic placeholder** | The user created something and the server has not confirmed | Render the real element at 50–60% opacity with a spinner and the word `Creating...` |
+| **Streaming indicator** | Tokens are arriving | A live bubble whose role line reads `claude streaming…` |
+
+### 14.10.2 Which loading treatment goes where
+
+| Region | Treatment |
+|---|---|
+| Session list / grid | 20 shimmer rows, name width randomised 40–85%, `animation-delay: i × 0.06s`. Painted by an inline boot script before any module loads |
+| Workflow board | 5 shimmer columns, each with a shimmer title and count and 2–4 shimmer cards with randomised widths. Also painted pre-boot |
+| Compose board | 3 shimmer columns — **only** when the persisted tab is Structured |
+| Task drill-down | A breadcrumb of three shimmer bars, a left column of five shimmer blocks, a right column with a header bar and three row shimmers |
+| Section drill-down | The same shape, painted synchronously before the fetch |
+| Chat transcript | Six alternating message skeletons (user 2, assistant 4, user 1, assistant 6, user 2, assistant 5 lines) with randomised bubble widths and per-line delays of `0.04s` |
+| Home viz | Shimmer bars at fixed heights with 0.15s stagger, plus a 120×13px shimmer pill for the stat line |
+| Sidebar (Workflow/Compose) | A label shimmer plus four 36px row shimmers |
+| Modal bodies | An inline spinner plus text: `Loading models...`, `Loading workforce…`, `Loading messages…`, `Building summary…`, `Loading sections...`, `Loading…` |
+| Mission Control card preview | The literal placeholder `No recent messages` until history lands |
+| Expanded card | Two shimmer bars at 100% and 85% width |
+| Reports | Shimmer KPI tiles and shimmer bars, with `Loading reports…` |
+
+### 14.10.3 Delay thresholds
+
+| Threshold | Behaviour |
+|---|---|
+| 0ms | Skeletons appear immediately on any navigation that will replace a region. There is **no** delay before showing a skeleton — a blank region for even 200ms reads as a crash |
+| 50ms | Post-render settle: focus, auto-resize and scroll are applied on a 50ms timeout so layout has settled |
+| 80ms | Streaming markdown re-parse throttle, and the mobile-sheet action delay |
+| 500ms / 2000ms | The live input bar re-renders twice after opening a panel, to catch state events that arrived before the DOM existed |
+| 3000ms | Ghost-recovery arm time after a submit |
+| 8000ms | Skeleton-stuck watchdog stage 1 |
+| 10000ms | Message watchdog tier 1 |
+| 20000ms | Model-switch hard timeout |
+| 30000ms | The AI slide-out shows `Taking longer than expected.` |
+
+### 14.10.4 Progress that is not a spinner
+
+- **Elapsed timers.** The working bar shows `12s` then `2m 05s`, updated in place every second — never by re-rendering the bar.
+- **Countdowns.** The auto-retry banner ticks `45s`, `12m 30s`, `1h 5m` in place.
+- **Determinate bars.** The security scan shows `N / M files`; the voice install shows a percentage bar; the restart overlay shows a raw seconds counter so a slow restart never looks frozen.
+- **Counters during streaming.** The planners show `N task(s) so far` and `N section(s) so far (Ns)` derived from the partial JSON — this is the single best "it is actually working" signal in the product.
+
+---
+
+## 14.11 Optimistic UI
+
+| # | Action | What updates before the server confirms | Rollback |
+|---|---|---|---|
+| 1 | New session | A placeholder titled `New Session` is unshifted into the session list, the id is added to the lookup set, the toolbar title is set, and the URL gains `?chat=<id>` | None needed — the session only reaches the server on first submit. A concurrent list reload explicitly **preserves** the optimistic entry when it is the live session |
+| 2 | Send a message | An optimistic user bubble is appended with a `msg-entering` animation and a timestamp; the session is marked `working`; the input bar re-renders into the Working state | The bubble is replaced when the server echoes the entry, matched by **position** (the last optimistic bubble), never by text — matching on text would eat legitimate duplicate messages like `yes`. On `send_failed`, the bubble is removed, the session reverts to `idle`, and the text is restored into the composer if it is empty |
+| 3 | Answer a permission prompt | `waitingData` is cleared, the session flips to `working`, the bar re-renders, and the sidebar permission card is removed | None. A stale prompt is corrected by the next state snapshot |
+| 4 | Queue a message | The text is pushed into the local queue array and the banner re-renders, then the server is told | The authoritative `queue_updated` event replaces the local array wholesale |
+| 5 | Interrupt | The session flips to `idle` immediately and the merged queued text is placed into the idle composer | None; the real state event confirms |
+| 6 | Rename (inline) | The name cell is replaced with the new text before the request | On failure the original cell HTML is restored and a toast fires |
+| 7 | Rename (drill-down title) | The DOM text changes before the request, but the underlying record is only updated after success | On failure the original text is restored |
+| 8 | Delete session | The session is removed from the list and the lookup set, drafts are cleared, folder membership is removed, task links are unlinked best-effort, and the panel deselects | A non-JSON 500 and a network error are both treated as success, because the server-side tombstone is already written and a reload reconciles |
+| 9 | Sleep all | Every matched session is removed from the running set, its kind and restart memory are deleted | None; the snapshot corrects |
+| 10 | Mission Control send | The textarea is cleared and collapsed, the session flips to working, and the grid re-renders — all before the emit | **None, and the typed text is lost.** This is the weakest optimistic path in the product; a rebuild should retain the text until an ack arrives |
+| 11 | Task drag between columns | The card node is moved and its `data-status` rewritten before the request | On failure the board is refreshed and an error toast fires |
+| 12 | Task reorder within a column | The DOM is reordered, then the request is sent fire-and-forget | On failure a `Reorder failed` toast fires; the order corrects on the next load |
+| 13 | Create task | A ghost card at 50% opacity with a spinner and `Creating...` is inserted at the chosen end and the column count increments | The ghost is removed on failure. **Known defect: the count is not decremented** — fix this in the rebuild |
+| 14 | Create subtask | An optimistic row at 60% opacity with the badge `new` and a spinner | Removed on failure |
+| 15 | Delete task / section | The card is removed and the column count recomputed before the request | On failure a full board refetch restores it |
+| 16 | Compose section drag | The section status is mutated locally and the whole board re-renders before the request | **Full rollback** — the status is restored, the board re-renders, and `Move failed` fires. This is the reference implementation |
+| 17 | Compose bulk move | Each status is mutated before its request | **No rollback**; failures are swallowed. Fix in the rebuild |
+| 18 | Compose sidebar reorder | The DOM and the in-memory list are reordered before the request | **No rollback and no toast.** Fix in the rebuild |
+| 19 | Shared-prompts toggle | The flag flips and the badge updates before the request | **None** — the response is never inspected |
+| 20 | Composition rename via settings | The header and sidebar re-render before the request | **None** |
+| 21 | Delete composition | The row disappears immediately and, if it was active, the next composition loads — with **no server call for 5s** | `Undo` restores the record, the active-composition pointer and the storage key. Navigating away commits |
+| 22 | Permission answer from the sidebar | The queue entry is removed, waiting data is deleted, the session flips to working, the panel re-renders and the card's class is rewritten — all before the emit | None |
+| 23 | Compact context | The substatus is set to `compacting` so the bar reads `Compacting…` immediately instead of `Working…` | The real substatus arrives with the next state event |
+| 24 | Retry now | The session flips to `working` so the bar does not flash an empty idle state | The real state event confirms |
+| 25 | Live model switch | **Deliberately pessimistic.** Nothing changes until the daemon confirms; on failure or the 20s timeout the badge keeps showing the true model and an explicit error toast fires | N/A by design — treat this as the pattern to copy, not the exception |
+
+**The rule.** Optimism is correct where the action is cheap to reverse and the user's next action depends on it feeling instant. It is wrong where the truth is expensive to discover — which is why the model switch is honest and the message send is not.
+
+---
+
+## 14.12 Destructive actions and confirmation
+
+### 14.12.1 The wording pattern
+
+Every destructive confirmation follows the same three-part shape:
+
+1. **Title** — a verb phrase naming exactly what will happen: `Delete Session`, `Delete All Sessions`, `Switch to Sessions`, `Delete section and 3 subsections?`
+2. **Body** — the target in bold, then the blast radius as a separate sentence: `Delete <name>?` / `Sub-departments and sessions will be moved to the parent.`
+3. **Irreversibility line** — the literal sentence `This cannot be undone.` on its own line, present if and only if the action is genuinely irreversible.
+
+The confirm button repeats the verb (`Delete`, `Delete All`, `Delete N`, `Sleep All`, `Close`, `Clear`, `Launch All`, `Turn Off`) rather than saying `OK`. Danger actions use `.pm-btn-danger`. Cancel is always the left button and is always the safe default — **except** in the Wrong Branch dialog, where Cancel is deliberately promoted to primary and listed first, because the destructive option there is publishing to the wrong branch.
+
+### 14.12.2 The full list
+
+| Action | Confirmation | Undoable? | Notes |
+|---|---|---|---|
+| Delete session | Single confirm | **Yes** — goes to Recently Deleted | Retention default is `Forever` |
+| Delete empty sessions | Single confirm | Yes, same trash | — |
+| Delete all sessions | **Double confirm** | Yes, same trash | Second dialog is titled `Are you sure?` |
+| Bulk delete sessions | Single confirm listing three names | Yes | — |
+| Purge from trash | Native confirm | **No** | `This cannot be undone.` |
+| Empty trash | Native confirm with the count | **No** | — |
+| Stop / sleep a session | Single confirm | N/A — non-destructive | Bulk stop has **no** confirmation, deliberately: nothing is lost |
+| Delete project | Single confirm | **No** | Deletes every session in it |
+| Delete task | Inline on-card confirm | **No** | — |
+| Delete subtask | Modal confirm | **No** | Explicitly warns about children |
+| Switch task to Sessions | Modal confirm with a red warning box | **No** | Deletes every subtask |
+| Switch task to Subtasks | Modal confirm | **Partly** — sessions survive, only the link is cut | Says so explicitly |
+| Remove a board column | Inline confirm in the row | **No** | Blocked at the last column |
+| Delete section (leaf) | Inline on-card confirm | **No** | — |
+| Delete section (with children) | Modal listing every child | **No** | — |
+| Delete composition | **No dialog at all** — a 5s undo toast | **Yes, for 5s** | Navigating away commits immediately |
+| Bulk delete compositions | Native confirm listing names, then the undo toast | Yes, for 5s | — |
+| Delete department | Modal confirm | **Partly** — children and sessions are re-parented, not deleted | — |
+| Archive department | No confirm | **Yes** — appears under `Archived Folders (N)` with `Restore` | — |
+| Delete an archived department | Row button | **No** | `title="Delete permanently"` |
+| Delete a workforce asset | Native confirm | **No** — removes the file | — |
+| Uninstall a skill pack | Native confirm | **No** — deletes the cloned directory | — |
+| Uninstall the built-in library | Native confirm | **Yes** — reinstallable from the Available tab, and the copy says so | — |
+| Rewind code | Modal picker | **No** | Files are overwritten from a snapshot |
+| Clear display | No confirm | N/A — cosmetic only | The copy says `without affecting the session` |
+| Restart the session engine | Modal with a scope choice | N/A | Every option states its consequence for running sessions |
+| Turn off the server | Modal confirm | **No** | Requires a manual relaunch |
+| Publish / sync on a non-default branch | The Wrong Branch dialog | N/A | Cancel is primary |
+| Push with a failed security scan | Blocked; override is explicit | N/A | Offers `Fix with AI` first |
+| Push with failing tests | Blocked; override is explicit | N/A | Cancel is primary |
+| Replace subtasks with an AI plan | Modal confirm | **No** | Only shown when subtasks exist |
+
+### 14.12.3 Typed confirmation
+
+One flow requires typing: the cloud-data replacement path uses an input with the placeholder `Type REPLACE` and keeps its button disabled until the exact word is entered. Use this pattern only where an undo is impossible *and* the blast radius is data the user did not create in this app.
+
+### 14.12.4 Tombstones
+
+Deleted sessions get a server-side tombstone so they cannot reappear after a reload even when the file unlink failed. This is why a non-JSON 500 from the delete endpoint is treated as success in the client — the record is already gone from the user's point of view, and leaving the card on screen would be the actual bug.
+
+---
+
+## 14.13 Drag and drop
+
+### 14.13.1 Everything draggable
+
+| Item | Handle | Payload | Valid targets |
+|---|---|---|---|
+| Task card | The whole card, with a visible six-dot grip | `text/plain` = task id | Any column body |
+| Subtask row | The whole row, with a grip carrying `title="Drag to reorder"` | in-memory | Other subtask rows in the same list |
+| Section card | The whole card, with a decorative `⋮⋮` grip | `text/plain` = section id | Any of the three column bodies |
+| Composition row | The whole row | `text/plain` | Other composition rows |
+| Session card (Workforce) | The whole card | `text/plain` = session id | Another session card (reorder), a folder card, a breadcrumb crumb |
+| Folder card | The whole card | `text/plain` = `folder:<id>` | Another folder card, a breadcrumb crumb |
+| Settings column row | The whole row | in-memory | Other column rows |
+| Sidebar resize handle | `#resize-handle` | — | — |
+| Column resize grips | `.col-resize-grip` | — | — |
+| Mobile sheet | The whole sheet header | — | Snap points |
+
+### 14.13.2 Drag visuals
+
+- The source gains `.dragging` (or `.compose-dragging`, or `.ws-dragging`) **on the next animation frame**, never synchronously — otherwise the browser captures the faded style into the drag image and the user drags a ghost of a ghost.
+- `effectAllowed` and `dropEffect` are both `move`.
+- Settings column rows use an inline `opacity: 0.4` instead of a class.
+- A long-press that has armed the context menu **cancels** any `dragstart`, so holding a card opens the menu rather than starting a drag.
+
+### 14.13.3 Drop affordances
+
+- A valid column gains `.kanban-drop-target` on `dragover` and loses it on `dragleave` — but only when the `relatedTarget` is genuinely outside the column, otherwise moving across the column's own children flickers the highlight.
+- A valid folder card gains `.ws-drop-target`.
+- A valid composition row gains `.compose-drag-over`, cleared from every sibling first.
+- **Insertion indicator:** the Workflow board inserts a `.kanban-drop-indicator` element before the first non-dragging card whose vertical midpoint sits below the cursor, else before the add-card affordance, else at the end. It is removed and recreated on every `dragover`.
+- **No indicator is shown for auto-sorted columns.** If a column's sort mode is anything other than manual, `dragover` returns early: promising an insertion position the board will immediately re-sort away is worse than showing nothing.
+- Subtask rows use **live reordering** instead of an indicator — the row is physically moved as you drag over siblings, so the list you see is the list you will get.
+- Compose cards have **no** insertion indicator and **no** within-column reordering; only the column matters.
+
+### 14.13.4 Reorder rules and rejections
+
+| Rule | Behaviour |
+|---|---|
+| Same column, manual sort | Reorder; compute `after_id`/`before_id` from the cursor position |
+| Same column, auto sort | No-op |
+| Different column | Move and set the new status |
+| Compose card to the same column | No-op |
+| Folder into its own descendant | Rejected with toast `Cannot move folder into its own descendant`. Guarded by an upward walk capped at 50 hops |
+| Composition reorder while a search filter is active | `dragstart` is prevented entirely — a filtered DOM would submit an incomplete order |
+| Composition row that is cross-project pinned | Not draggable and not a valid target |
+| Folder reorder across different parents | Silently ignored |
+
+### 14.13.5 Cancel and cleanup
+
+`dragend` always runs and always clears every state class globally — `.dragging` from all cards, `.kanban-drop-target` from all columns, every `.kanban-drop-indicator` node, `.ws-drop-target` and `.compose-drag-over` from everything. Never rely on `drop` to clean up: pressing Escape mid-drag or dropping outside the window fires only `dragend`.
+
+After a Workflow drag, a flag suppresses the trailing click for **50ms** so releasing over a card does not also navigate into it.
+
+### 14.13.6 Auto-scroll
+
+The board columns and the sidebar are native scroll containers, so the browser's own drag auto-scroll applies at the edges. There is no custom auto-scroll implementation; do not add one unless you also handle the sub-pixel jitter it introduces on trackpads.
+
+### 14.13.7 The mobile drawer gesture
+
+Not drag-and-drop, but the same class of interaction and it must feel native:
+
+- A rightward drag starting anywhere except the first **8px** (reserved for the browser's back gesture) opens the drawer; any drag on an open drawer closes it.
+- The gesture locks to horizontal only after **8px** of movement, and abandons if vertical movement dominates — otherwise every vertical scroll would fight the drawer.
+- It bails if the drag begins inside an element that can genuinely scroll horizontally, so a wide code block keeps its own scrolling.
+- While dragging, the drawer transform follows the finger 1:1 with transitions disabled, and the backdrop opacity interpolates from 0 to 0.5.
+- On release, it snaps open or closed depending on whether the gesture passed **30%** of the drawer width, then hands the final animation back to the app's own collapse state so persistence stays correct.
+
+---
+
+## 14.14 Keyboard reference
+
+### 14.14.1 Global (no modal open, focus not in a field)
+
+| Key | Action |
+|---|---|
+| `N` | New session |
+| `↑` or `K` | Previous session |
+| `↓` or `J` | Next session |
+| `Enter` | Open the live panel for the selected session |
+| `Esc` | Close the live panel; or clear the multi-selection |
+| `?` (Shift+/) | Open the shortcuts modal |
+| `Ctrl/⌘+F` | Open the find bar |
+| `Ctrl+Shift+S` | Spawn a subsession from the active session |
+
+Guards: the global handler returns immediately when `ctrlKey` or `metaKey` is held (so browser shortcuts are never stolen), when the event target is an `input`, `textarea`, `select` or `contenteditable`, and when `#pm-overlay` is showing.
+
+### 14.14.2 Workflow board scope
+
+| Key | Action |
+|---|---|
+| `n` | Open Add to Board |
+| `r` | Refresh the board, with the toast `Refreshed` |
+| `Esc` | Close the drill-down panel |
+| `?` | Toggle the shortcuts overlay |
+
+Suppressed when the view is not Workflow, when focus is in a field, and on any `Ctrl`/`Meta` chord or `F5`.
+
+### 14.14.3 Subsessions scope
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` | Move focus between compositions |
+| `Enter` | Open the focused composition |
+| `Space` | Toggle its selection |
+| `Shift+↑` / `Shift+↓` | Extend the selection |
+| `Delete` | Delete the focused composition — **with no confirmation**, straight into the 5s undo toast |
+| `Esc` | Clear the selection, or close |
+| `n` | New section, or new composition when none is loaded |
+| `r` | Refresh |
+| `?` | Toggle the shortcuts overlay |
+
+While the shortcuts overlay is open, every key except `Escape` and `?` is swallowed.
+
+### 14.14.4 Field-scoped keys
+
+| Field | Enter | Escape | Other |
+|---|---|---|---|
+| Composer (desktop) | Sends or newlines per the send-key policy | — | Shift/Alt/Ctrl+Enter per policy |
+| Composer (mobile) | **Always a newline** | — | Sending is only via the send button |
+| Mission Control card input | **Always sends** (Shift+Enter newlines) | — | Overrides the global policy |
+| Inline rename | Commit | Revert to the original text | Blur also commits |
+| Prompt modal input | Confirm | Cancel, resolving `null` | Autofocused and pre-selected |
+| Find input | Next match | Close the find bar | Shift+Enter goes to the previous match |
+| Deep-search input | Search immediately, cancelling the debounce | Close the modal | — |
+| Quick-add inputs (task, subtask, section, column, tag) | Submit | Cancel or close | — |
+| Verification URL input | Save | Cancel and re-render | — |
+| Device-name input | Save | — | — |
+| Planner textareas | Per the send-key policy | — | — |
+| Direct All textarea | Ctrl/⌘+Enter submits | Close the modal | The only compose modal with an Escape handler |
+| Compose hero textarea | Ctrl/⌘+Enter plans | — | — |
+| Subsession caret | Enter or Space toggles | — | `aria-label="Toggle subsessions"` |
+
+### 14.14.5 The send-key policy
+
+A single preference, `sendBehavior`, with two values.
+
+| Value | Enter | Modifier+Enter | Hint text |
+|---|---|---|---|
+| `ctrl-enter` (default) | Newline | **Ctrl, Shift, Alt or Meta** + Enter sends | `Ctrl+Enter, Shift+Enter, or Alt+Enter to send` |
+| `enter` | Sends, but only with no modifier held | Any modifier + Enter inserts a newline | `Enter to send · Ctrl+Enter, Shift+Enter, or Alt+Enter for new line` |
+
+On macOS the hint substitutes `⌘` for `Ctrl`. The preference is toggled from the swap-arrows button next to the hint or from Preferences, is written to local storage **and** pushed to the server, and every visible hint on the page is refreshed immediately.
+
+**The mobile override is absolute.** Below 768px, Enter is always a newline regardless of the preference, the hint and its toggle are suppressed entirely, and sending happens only through the visible send button next to the mic. Modifier combinations are impractical on a touch keyboard, and a preference that silently does nothing is worse than no preference.
+
+**The iOS keyboard-dismiss heuristic.** Tapping the iPhone keyboard's Done chevron fires a blur — and so does tapping anywhere else on the page. The distinguishing signal is that keyboard chrome is system UI and produces no `pointerdown` on the document. Every pointer event stamps a timestamp in the capture phase; a blur is treated as "the keyboard dismissed itself, therefore send" only when no page pointer event occurred in the previous **250ms**. Desktop always returns false. Get this wrong and tapping away from a half-typed message sends it.
+
+### 14.14.6 Focus management
+
+| Moment | Behaviour |
+|---|---|
+| Alert opens | The OK button is focused |
+| Confirm opens | The **confirm** button is focused — note this makes Enter destructive on danger dialogs; a rebuild should focus Cancel when `opts.danger` is set |
+| Prompt opens | The input is focused and its text selected |
+| New-session composer | Focused **synchronously**, never inside a timeout — a deferred focus breaks the user-gesture chain and the mobile keyboard never appears |
+| Mobile programmatic focus | After focusing, wait for the visual viewport to resize (the keyboard opening) and then scroll the field into view; fall back to a 350ms timeout. Without this the field only jumps into view on the first keystroke |
+| Input bar re-render | If focus was inside the bar, it is restored synchronously after the `innerHTML` swap so there is no focus flash |
+| Deliberate GUI open | Autofocus is granted once and consumed, and **never on mobile** |
+| Modal closes | Focus is not explicitly restored — a known gap; a rebuild should return focus to the trigger |
+| Focus trap | **There is none on any overlay.** Tab escapes into the page behind. This is the single largest accessibility gap in the product and a rebuild should fix it: trap Tab within `.pm-card`, and make Escape close every overlay uniformly |
+
+### 14.14.7 Tab order
+
+Within a modal the natural DOM order is correct: title, body, fields top to bottom, then the actions row left to right (secondary then primary). In the app frame the order is header, sidebar controls top to bottom, session list, main toolbar, transcript, composer. The composer's left group (invoke, model, context ring) precedes the send button.
+
+---
+
+## 14.15 Scroll behavior
+
+### 14.15.1 Stick-to-bottom
+
+The live log maintains an auto-follow flag. On every scroll event it recomputes whether the user is at the bottom using a **60px** tolerance:
+
+```
+atBottom = scrollHeight - scrollTop - clientHeight < 60
+```
+
+The flag is set to that value. So auto-follow **disengages** the moment the user scrolls more than 60px away from the bottom, and **re-arms automatically** when they scroll back into that band. There is no separate "jump to bottom" button; scrolling back down is the affordance.
+
+### 14.15.2 The programmatic-scroll exemption
+
+The app top-aligns long assistant messages, which fires a scroll event that would otherwise look exactly like the user scrolling up. Each programmatic top-align stamps a timestamp, and the scroll listener ignores any event within **150ms** of that stamp. Without this exemption, auto-follow switches itself off the first time a long reply arrives and the user never sees the rest of the stream.
+
+### 14.15.3 The top-align rule
+
+After rendering, the app decides between two behaviours:
+
+- **If a streaming bubble is present** — always scroll to the bottom. The partial bubble is what the user is watching.
+- **Else, if the most recent assistant message is taller than the viewport** — position its first line `8px` below the top edge, so the user starts reading from the beginning and scrolls down as they read.
+- **Otherwise** — scroll to the bottom.
+
+The fallback target (used by settle-scrolls that do not know which element just rendered) is only adopted when it is genuinely the last message in the log. If anything newer follows it — most importantly an optimistic user bubble that was just appended — the app scrolls to the bottom instead, because top-aligning an older reply would hide the message the user just sent.
+
+### 14.15.4 The sticky user message
+
+While scrolling a long reply, the most recent user message that has scrolled above the viewport is pinned as a bar at the top of the transcript container (`.sticky-user-bar`, a sibling inserted before the scroll container, with the parent given `position: relative`).
+
+- It appears with `.visible` and shows the message text on one line.
+- Clicking it toggles `.expanded` to reveal the full text.
+- The pinned message is chosen by walking the user messages newest-to-oldest and taking the first whose bottom edge sits at or above the scroll position, with a 4px tolerance.
+- The scroll handler is throttled with `requestAnimationFrame` (each frame cancels the previous) and registered passive.
+- Disabled entirely when `stickyUserMsgs` is `off`; toggling the preference off removes any active pin immediately.
+
+This exists because a long reply scrolls the question off screen and the user loses the thread of what they asked.
+
+### 14.15.5 Pagination
+
+- The live panel loads **100** entries per page. When more exist, a `.live-load-more` pill reading `Load older messages (N more)` sits at the top of the log, separated from the transcript by a hairline drawn with a pseudo-element.
+- Clicking it disables the button, changes its text to `Loading…`, and requests the previous page.
+- On arrival, entries are **prepended** and the scroll position is corrected by the height delta (`prevScroll + (newHeight - prevHeight)`) so the viewport does not jump.
+- A watchdog re-enables the button after **8s** if no response arrives. It deliberately does **not** cycle the socket — a stuck button is better than dropping in-flight stream entries.
+- The static preview path uses a different limit: **200** messages, with a `Load all N messages` button.
+- Workflow columns paginate at a configurable page size, default **50**.
+- Mission Control previews fetch the last **20** entries.
+- Status history pages at **50**.
+
+### 14.15.6 Destructive-refresh guards
+
+Three independent guards prevent a re-fetch from wiping already-rendered content:
+
+1. A log response covering fewer entries than the DOM currently shows is discarded rather than rendered.
+2. A state snapshot only triggers a log re-fetch when the log is genuinely empty.
+3. A state event only triggers a re-fetch when the server's entry count exceeds the rendered count.
+
+### 14.15.7 Scroll restoration
+
+- **Session switch:** the transcript scrolls to the bottom 50ms after render.
+- **View switch:** each view re-renders from scratch; scroll position is not preserved, but the *navigation position* is (§14.3.5) — the drill-down you were in, the session you had open.
+- **List re-render:** the sidebar list is rebuilt with `innerHTML`, which resets its scroll. The multi-select badge is re-inserted afterwards specifically so it is not lost.
+- **Sheet and modal:** the deep-search modal opens anchored `9vh` from the top so results are near the eye line rather than centred.
+- **Question truncation:** a permission question longer than 400 characters is truncated from the **front** with a leading ellipsis, because the actual ask is always at the end.
+
+
+---
+
+## 14.16 Empty states
+
+Every empty state in the product, with exact copy. The rule the product follows: **an empty state names the thing, explains what it will contain, and offers the action that fills it.** A bare "No data" appears nowhere except in the two densest surfaces, where the label is the whole card.
+
+| Location | Headline | Subtext | Call to action |
+|---|---|---|---|
+| Main panel, no session selected (static fallback) | `Select a session to preview it` | — | A 💬 glyph above the line |
+| Dashboard hint, sessions exist | — | `Select a session from the sidebar to view its conversation` | — |
+| Dashboard hint, no sessions | — | `Select a project to get started` | — |
+| Session list / grid, no matches | `No sessions found` | — | — |
+| Session list, no projects | `No projects found.` | `Click the project selector above to get started.` | — |
+| Main panel, no project | `Select a project to begin` | — | A folder glyph |
+| Session list, backend never came up | `Reconnecting to <App>…` | — | — |
+| Projects overlay, still loading | `Loading projects…` | — | — |
+| Projects overlay, fetch failed | `Couldn't load projects. Check your connection and tap "Select project" again.` | — | — |
+| New session transcript | `What will we <App> today?` | — | The template grid below it |
+| Transcript with no messages | `No messages yet` | — | — |
+| After deleting sessions | `Sessions deleted` | — | A trash glyph |
+| Mission Control, no sessions | `No sessions` | — | — |
+| Mission Control card, no history | `No recent messages` | — | — |
+| Workflow board, no tasks | `Welcome to your Kanban board` | `This project doesn't have any tasks yet.` | `+ Create your first task`, plus a secondary `Find tasks for this project in cloud` |
+| Workflow board, load failed | `Failed to load board` | the error text | `Retry` |
+| Workflow column, empty | — | — | Nothing at all — the column stays a valid drop target |
+| Task detail, load failed | `Failed to load task` | the error text | `Retry` and `Back to Board` |
+| Task drill-down, no children and no sessions | `How to proceed` | — | Three cards: `Break into subtasks` / `Subdivide into smaller pieces. Each subtask gets its own status and sessions.`; `Spawn sessions` / `Start working directly. Spawn Claude sessions scoped to this task.`; `Plan with AI` / `Describe a goal and Claude will break it down into a structured set of subtasks.` |
+| Expanded card, load failed | `Failed to load` | — | — |
+| Status history, none | `No status changes recorded` | — | — |
+| Status history, failed | `Failed to load history` | — | — |
+| Cloud discovery, none | `No other projects found in the active backend. If you're expecting tasks from a teammate, double-check that you're connected to the right Supabase project (System → Persistent Storage).` | — | — |
+| Backups, none | `No backups yet.` | — | — |
+| Report — Status Distribution | `No tasks yet` | — | — |
+| Report — Velocity | `No completion data yet` | — | — |
+| Report — Cycle Time | `No cycle time data yet` | — | — |
+| Report — Time in Status | `No status transition data yet` | — | — |
+| Report — Remediation | `No task data yet` | — | — |
+| Report — Session Efficiency | `No session data yet` | — | — |
+| Report — Owner Activity | `No owner data` | — | — |
+| Report — Tag Breakdown | `No tags yet` | — | — |
+| Report — Cumulative Flow | `No completion trend data yet` | — | — |
+| Report — Activity Log | `No activity recorded yet` | — | — |
+| Report — Stale Tasks | `No stale tasks` | — | preceded by a check glyph |
+| Report, load failed | `Failed to load reports` | the error text | — |
+| Subsessions, no composition | `Welcome to Subsessions` | `Orchestrate multiple sections with AI-powered composition.` | `+ Create your first composition` |
+| Composition with no sections (hero) | `What would you like to create?` | `Describe your project and AI will plan the sections, assign artifact types, and write briefs for each agent.` | A textarea placeholder `e.g. A quarterly business review with financial summary, market analysis, product updates, and next-quarter goals...`, a primary `Plan with AI`, and the secondary links `Start from a template` · `Add a section manually` |
+| Ad-hoc subsessions tab (hydrated) | `No subsessions yet` | `Right-click any session and choose **Spawn Subsession** (or press Ctrl+Shift+S) to peel off a focused side task. It inherits the parent's full context and reports its conclusion back up. The family tree appears here.` | — |
+| Ad-hoc tab (pre-hydration placeholder) | `Ad-hoc subsessions` | `Spawn lightweight subsessions from any active session and see the parent-child tree here. (Available in a coming update.)` | — |
+| Orphaned subsessions group | `Orphaned subsessions (parent deleted)` | — | — |
+| Section not found | `Section not found` | — | `Back to Board` |
+| Section output preview, empty | `No output yet — the agent hasn't started writing.` | — | — |
+| Section output preview, failed | `Failed to load preview.` | — | — |
+| Section summary, empty | `No summary yet. The AI agent will update this as it works.` | — | — |
+| Link-session modal, nothing to link | `No unlinked sessions available.` | — | — |
+| Workforce flat canvas, nothing visible | `No sessions to display. Start a new session or unhide existing ones.` | — | — |
+| Workforce folder, empty | `No sessions yet` | the folder's skill label when set | `New Session`, or `Chat with <SkillLabel>` when the folder has a skill; plus the secondary `or add a sub-department` |
+| Workforce Configure ▸ My Departments, empty | `No departments configured yet` | `Pick a starter template to get going instantly, or add departments one at a time.` | Three template cards: `Personal` / `5 departments · Coding, writing, docs, research`; `Small Team` / `17 departments · Eng, product, QA, docs, marketing`; `Enterprise` / `72 assets · Full org chart across 17 departments` |
+| Workforce Discovery, nothing found | `No agent or skill definitions found on your system. Install a skill pack (like gstack) or create agents in ~/.claude/agents/.` | — | — |
+| Status Sessions popup, empty | `No sessions` | — | — |
+| Workforce AI, no response | `Session completed but no response was received. The assistant may have timed out. Try again or use a simpler request.` | — | — |
+| Workforce AI, slow | `Taking longer than expected. The assistant is still working — you can wait or close and try again.` | — | — |
+| Invoke ▸ Local Skills, empty | `No local skills found. Add .md files to your project's skills/ folder.` | — | — |
+| Invoke ▸ Local Agents, empty | `No local agents found. Add .md files to your project's agents/ folder.` | — | — |
+| Invoke ▸ Departments, empty | `No departments configured. Visit the Workforce view to set them up.` | — | — |
+| Deep search, no hits | `No matches` | — | — |
+| Find bar, no hits | `No matches` | — | — |
+| Extract Code, none | `No code blocks found in this session.` | — | — |
+| Compare, initial | `Select a session above and click Compare.` | — | — |
+| Compare, nothing to diff | `No code blocks to compare.` | — | — |
+| Manage Templates, none | `No custom templates yet.` | — | — |
+| Recently Deleted, empty | `No recently deleted sessions.` | — | — |
+| Recently Deleted, failed | `Failed to load trash.` | — | — |
+| Folder tree browse, no subfolders | `No subfolders` | — | — |
+| Mobile preview grid, empty | `No previews yet.` | — | — |
+| Timeline picker, no messages | `No messages found in this session.` | — | — |
+| Timeline picker, fork with no user messages | `No user messages found in this session.` | — | — |
+
+**Home never shows an empty state.** All four cards always render, with neutral placeholder visualisations and stat lines reading `No sessions yet`, `No tasks yet`, `0 agents · 0 departments` and `No sections yet`. Home is the map; a map with missing roads is worse than a map with empty roads.
+
+---
+
+## 14.17 Error UX
+
+### 14.17.1 The four blocking health checks
+
+A single unkillable overlay (`#health-blocker`) covers the app whenever any check fails. There is no close button, no Escape handler and no backdrop dismissal — it clears only when the failing check passes again. The first failing check **in registration order** wins, and a check that throws counts as failing. The overlay's content is only rewritten when the failing check's identity changes, so a persistent failure does not flicker.
+
+Structure: a 64px icon, a label, a message, an optional action button, a three-dot spinner, and the footer `Retrying automatically…`.
+
+| Order | Id | Label | Threshold | Poll | Action |
+|---|---|---|---|---|---|
+| 1 | `wifi` | `No Internet Connection` | single probe | every 10s, and every 3s while blocking | none |
+| 2 | `server-reachable` | `<App> Server Unreachable` | **4** consecutive failures (~12s) | every 3s | none |
+| 3 | `daemon-reachable` | `<App> Engine Stopped` | **5** consecutive failures (~25s) | every 5s | `Restart <App>` → `Restarting…` |
+| 4 | `claude-auth` | `Not Logged In to Claude` | single result | every 5s while blocking, every 30s otherwise | `Log In to Claude` |
+
+Additional rules:
+
+- A **503** from the server probe bypasses the threshold entirely and reloads the page immediately — a 503 is the server telling you it is being replaced.
+- A "decisive" foreground probe (fired on `visibilitychange`, `focus`, `pageshow` and `online`) bypasses the counter but retries once after **1200ms** for the server and **1500ms** for the daemon, so a single dropped packet on wake does not blank the app.
+- Every recovery path bails when a restart overlay is present, so the health system never fights an in-app restart.
+- The daemon restart waits up to about **90s** for readiness, then force-reloads.
+- A `vn-daemon-status` event from the socket layer clears the daemon failure state instantly, so a reconnect does not have to wait for the next poll.
+- The polling interval accelerates to **1s** while blocked and relaxes to **10s** after recovery, so recovery feels instant and the healthy state is cheap.
+
+### 14.17.2 Connection and transport errors
+
+| Situation | What the user sees |
+|---|---|
+| Socket disconnects | Nothing for **4s**. Only if still disconnected does the status dot turn red with `title="Disconnected"`. Mobile networks drop the socket for 1–3s on a wifi-to-cellular handoff, and flashing "Disconnected" on every handoff reads as a broken product |
+| Socket reconnects | The dot turns green with `title="Connected"`, and the open session's log is re-fetched unconditionally — the socket layer does not replay missed events, so anything pushed during the outage is otherwise lost forever |
+| Daemon reconnecting | Toast with the server's message (default `Daemon connection issue`), dot turns orange |
+| Daemon connected | Toast with the message, dot turns accent |
+| Tab restored from bfcache | A **full page reload**. The JavaScript runtime was frozen and thawed with a dead transport underneath; nothing short of a reload reliably recovers |
+| Wake from background | A passive resync only: reconnect if the socket claims to be disconnected, otherwise just request a state snapshot. **Never** cycle a socket that reports connected |
+| Boot with broken assets | After the load event plus 400ms, if the stylesheet sentinel or a known global is missing, reload once — capped at two attempts via session storage so a genuinely broken build cannot loop |
+
+### 14.17.3 Session-level errors
+
+| Situation | What the user sees |
+|---|---|
+| Server error for a session | An error toast with the message (default `Unknown error`); the watchdog is cancelled; a state snapshot is requested; an HTTP fallback check runs 2s later; and the session is immediately demoted from `working` to `idle` so the user can retry rather than staring at a spinner |
+| Message not delivered (timeout) | An inline system entry: `⚠️ Message not delivered — the server was busy processing other sessions. This can happen when running many long sessions at once. Try closing some idle sessions or sending again in a moment.` followed by `Your message (also restored to the input box):` and the quoted text. The optimistic bubble is removed and the text is restored |
+| Message not delivered (other) | `⚠️ Message not delivered. Error: <error>` with the same restore behaviour |
+| Session silently dropped | Ghost recovery: 3s after a submit with no state event, close the session, wait 1.5s, then restart it with `resume: true` and re-send the prompt — **unless** the user explicitly slept it (§14.23) |
+| Session stuck "working" | A three-tier watchdog at 10s, 16s and 22s (§14.20) that escalates from a socket resync to an HTTP ground-truth check to a forced UI state correction |
+| API error with a retry armed | The Idle bar shows the auto-retry banner with a live countdown, the attempt number, the reason, and `Retry now` / `Cancel` |
+| API error, retries exhausted | The Idle bar shows an error banner with the message and a single `Retry` |
+| Session not found on open | `Session not found` centred in the main panel |
+| Transcript never arrives | The skeleton watchdog: re-request at 8s, probe HTTP and cycle the socket once at 16s (rate-limited to once per 60s), full reload at 28s (rate-limited to once per 120s) |
+
+### 14.17.4 Setup and configuration errors
+
+**Mobile Command wizard**, per step:
+
+| Step | Copy |
+|---|---|
+| Error | `Couldn't reach <App>` / `It'll retry automatically…` / button `Check again now` |
+| Install | `<App> reaches your phone privately through Tailscale — a free, secure connector. First, install it on <OS>. It's a one-time thing.` with the CTA `Download Tailscale for <OS>`, an ordered list `Click the button above and run the installer.` / `Open Tailscale and sign in (create a free account if it asks).`, and the waiting line `Waiting for Tailscale to be installed… this screen moves on by itself.` |
+| Sign in | `Tailscale is installed — nice. Now open it and sign in on this computer (create a free account if it asks). Remember which account you use — you'll sign your phone into the same one in a moment.` with the CTA `Open Tailscale sign-in` and `Waiting for you to sign in… this screen moves on by itself.` |
+| Intro | `You're signed in. Flip on phone access — do this once and it stays on every time <App> runs. Your sessions never leave this machine; this only opens a private door for your own devices.` with `Signed in as <account>` and the CTA `Turn on phone access`, which shows the interstitial `Turning on…` |
+| HTTPS | `Almost there. Turn on HTTPS for your Tailscale network — one switch, one time. This is what lets your phone use voice input (the microphone only works over HTTPS).` with the CTA `Open Tailscale HTTPS settings` and the list `On the page that opens, find HTTPS Certificates.` / `Click Enable HTTPS.` |
+| Bridge | `Opening the private door for your phone… this only takes a moment.` with `Starting…`, an error block, and a `Retry` button |
+| Phone | The live banner `● On — your phone can reach <App>` with a `Turn off` button; lead `Do this once on your phone. After that, just tap the icon — it always works.`; column one `① Get the Tailscale app` with a QR code, the link `Open the App Store`, and the note `Scan with the phone camera → install Tailscale → sign in → tap Allow for VPN.`; column two `② Open <App>` with a QR code, a `Copy link` button, and the note `Scan to open, then Share → Add to Home Screen. The icon is named <device>.`; an account box reading `On your phone, sign Tailscale into this exact same account:` with a `Copy` button; a phone status of either `✓ <phone> is connected to your network` or `Waiting for your phone to join your network…`; and a name row labelled `Name this computer (so multiple machines are easy to tell apart on your phone):` with an input placeholder `e.g. Studio Mac` and a `Save` button |
+
+**Cloud storage connection statuses:** `Connecting...`, `✓ Connected — checking data…`, `✓ Connected — ready to choose`, `Step 2: Set up the database`, `✗ <error>`, `Enter URL and key first`, `Creating tables...`, `✓ Tables created! Switching...`, `Paste your access token first`, `Copying tasks to local...`, `✓ Switched to Local! All tasks migrated.`, `✓ Saved <filename> (N records)`, `✗ Could not inspect cloud data`.
+
+**Voice errors:** the four setup states in §14.7.9 rows 111–115, plus the runtime toasts in §14.9.9.
+
+### 14.17.5 Search and input errors
+
+| Situation | Copy |
+|---|---|
+| Query under 2 characters | `Keep typing…` |
+| Search in flight | `Searching… (first search may take a moment while indexing)` |
+| Non-OK HTTP | the server's error, else `Search failed (HTTP <status>)` |
+| Non-JSON response | `Search failed — bad response` |
+| Fetch threw | `Search failed — server unreachable` |
+| Results | `N session(s) · M messages indexed · T ms` |
+| No results | `No matches` |
+| Invalid verification URL | Toast `Please enter a URL (http/https/file) or a local file path` and the field refocuses |
+| Empty required name | The field refocuses silently, except the department name which toasts `Enter a department name` |
+| Duplicate column key | Toast `A column with that key already exists` |
+| Last column removal | Toast `Cannot remove the last column` |
+| Session already linked | Toast `Session already linked to "<section>"` |
+| Batch over the cap | Toast `Maximum 20 tasks per batch` |
+| Bulk action already running | Toast `Another bulk action is in progress` |
+
+### 14.17.6 Silent failures a rebuild should fix
+
+Three failures currently produce nothing the user can see: folder-tree persistence failures (console only), composition reorder failures (console only), and the shared-prompts toggle (the response is never inspected). Each should surface a toast and revert.
+
+---
+
+## 14.18 State persistence
+
+### 14.18.1 Local storage
+
+| Key | Meaning |
+|---|---|
+| `theme` | `dark`, `light` or `auto` |
+| `_sunriseMin` / `_sunsetMin` | Cached sunrise and sunset minutes for auto theme, read by the pre-boot script |
+| `viewMode` | The current top-level view |
+| `projectView_<project>` | The last view used in a given project |
+| `pvs_<project>_sessions` | The last session opened in that project |
+| `pvs_<project>_kanban` | The Workflow drill-down hash, with any session suffix stripped |
+| `pvs_<project>_compose` | The Subsessions sub-route hash |
+| `activeProject` | The encoded active project directory |
+| `activeSessionId` | The open session |
+| `projectSession_<project>` | The last session per project |
+| `sessionDisplayMode` | `grid`, `list` or `control` |
+| `sortMode` / `sortAsc` | List sort field and direction |
+| `wfSort` | Grid sort: `status`, `recent` or `name` |
+| `sidebarCollapsed` | `"1"` or empty |
+| `sendBehavior` | `enter` or `ctrl-enter`; also mirrored to the server |
+| `defaultModel` / `defaultThinking` | System defaults |
+| `stickyUserMsgs` | `off` disables the sticky bar; absent means on |
+| `permPolicy` | The permission policy |
+| `customPolicies` | The five booleans plus a custom regex |
+| `vibenode_drafts` | Unsent composer text, keyed by session id |
+| `guiOpenSessions` | Session ids opened in the panel |
+| `wsHiddenSessions` | Hidden session ids — cleared on project switch |
+| `wsCardPositions` | Manual card ordering — cleared on project switch |
+| `vn.subsession.caret.<parent>` | Per-parent disclosure state, default expanded |
+| `vn.tip.subsession_intro` | One-shot flag for the subsession intro toast |
+| `vn.compose.activeTab` | `adhoc` or `structured` |
+| `activeComposition:<project>` | The active composition |
+| `composeColumnSorts` | Per-column sort modes |
+| `kanbanExpanded` | Expanded tasks — cleared on project switch |
+| `kanbanRecentHistory` | Up to ten recent board destinations |
+| `plannerState` / `plannerStash` / `plannerSessionId` / `plannerDebugRaw` | Planner panel state, proposal, backing session and last raw parse failure |
+| `vibenode_custom_templates` | User-defined starter templates |
+| `recentDeptAssets` | Recently invoked department assets, capped at eight |
+| `_sessionQueues` | Legacy; migrated to the server and then removed |
+| `_sessionModelOverride` / `_sessionThinkingOverride` | Obsolete; actively deleted on load because they leaked a choice from one session into the next |
+
+### 14.18.2 Session storage
+
+| Key | Meaning |
+|---|---|
+| `vnHealTries` | Boot self-heal reload counter, capped at 2 |
+| `vn_skel_reload_at` | Timestamp of the last skeleton-watchdog reload, rate-limiting to one per 120s |
+| `kanbanTagFilter` | Active board tag filter — cleared on project switch |
+
+### 14.18.3 Server-side
+
+The folder tree (persisted with a **500ms** debounce), the permission policy and custom rules, the send-key preference, session retention days, per-session message queues, board and composition data, session names, and workforce assets. The server is authoritative for all of these; local storage is a cache that seeds the first render.
+
+### 14.18.4 URL
+
+`?chat=<session-id>`, `?folder=<folder-id>`, `#kanban`, `#kanban/task/<id>`, `#kanban/task/<id>/session/<sid>`, `#kanban/task/<id>/planner/<sid>`, `#compose`, `#compose/section/<id>`, and `?planner=` for the planner panel state.
+
+`pushState` is used for opening a session and drilling into a task or section. `replaceState` is used for view switches, for hash cleanup, and — critically — when a temporary client-generated session id is remapped to the canonical server id, so the throwaway id never enters the back/forward history.
+
+### 14.18.5 Not persisted, deliberately
+
+The sidebar width, the multi-select set, the mobile preview store, the scroll position of any list, and open/closed state of context menus. Each of these is ephemeral by design; persisting them produces the "why is my app in a weird state" class of bug.
+
+---
+
+## 14.19 Attention and notification
+
+The product deliberately uses **no** operating-system notifications, no title-bar flashing, no favicon badge and no sound. Everything happens inside the window. A rebuild should keep that constraint unless it also builds a permission-request flow and a mute control, because an agent tool that beeps unpredictably gets muted permanently within a day.
+
+The attention ladder, weakest to strongest:
+
+1. **Colour and motion in the list.** A session waiting for input turns amber and pulses (`waitpulse`, 1.4s ease-in-out, infinite) with a left border in `#ffb700`. A working session breathes blue (`wf-work-pulse`, 2s). The pulse is what draws the eye in peripheral vision; a static colour change does not.
+2. **The status icon.** A clock for waiting, a pickaxe for working, a green check for idle, a moon for awaiting wake-up, a purple collapse glyph for compacting.
+3. **Aggregate counts.** The dashboard and Home stat rows show `Waiting` counts in the same amber; the Workforce Command Center shows four big clickable tiles; Mission Control's status pill reads `Needs input` in its most actionable phrasing.
+4. **The sidebar permission panel.** When any session is blocked on a tool permission, cards slide in at the bottom of the sidebar (`permSlideIn`, 300ms) showing the session name, the tool badge, the exact command or path, and four buttons — `Allow`, `Deny`, `Always`, `Auto Most`. This is the key move: **you can approve a blocked session from anywhere in the app without navigating to it.**
+5. **The inbox badge.** A parent session with pending subsession reports shows a 📬 badge with a count and the tooltip `Subsession reports waiting — included on your next message`. Tapping it toasts `Subsession reports waiting. Open the parent session to see and Pull updates.` and opens the parent — it deliberately does **not** pull, because a tap that silently sends a message is a surprise.
+6. **The inbox strip.** Inside the parent's panel, a strip above the composer reads `N subsession reports will be included with your next message.` with `Pull updates now` and `Dismiss`.
+7. **The respond modal.** A dedicated overlay headed `⏳ Session waiting for input` that renders the question and its options so a blocked session can be answered without leaving the current view.
+8. **The connection dot.** A small `●` in the status area, green when connected and red when not, with a tooltip — and a deliberate 4s grace period before turning red.
+9. **The blocking overlay.** Reserved for conditions where nothing in the app can work (§14.17.1).
+
+**Cross-view propagation.** State changes patch in place across every surface simultaneously: the sidebar row class, the grid card class, the Mission Control dot and pill, the Workflow drill-down session badge, and the composition card dot. A rename patches one row rather than reloading the list, because auto-naming fires often and a full reload would make the sidebar flicker constantly.
+
+**Haptics.** On touch devices a long-press that opens the context menu fires a 20ms vibration, so the user knows the hold registered before the menu paints.
+
+---
+
+## 14.20 Timing constants
+
+| Value | Scope | Purpose |
+|---|---|---|
+| 0ms | Global | Deferred attachment of outside-click dismissal listeners, so the opening click does not immediately close the menu |
+| 0ms | Drag | Deferred `.dragging` class so the drag image is captured un-faded |
+| 50ms | Live panel | Post-render settle: focus, auto-resize and scroll |
+| 50ms | Transcript | Scroll to bottom after a static render |
+| 50ms | Subsession | Delay before applying the spawn-pulse class |
+| 60ms | Respond modal | Delay before focusing and scrolling the question |
+| 80ms | Streaming | Markdown re-parse throttle for the live bubble, with a trailing render |
+| 80ms | Mobile sheet | Delay before dispatching the tapped action so the slide-down starts |
+| 80ms | Mission Control | Stream-preview flush throttle; keeps only the last 600 characters |
+| 100ms | Templates | Auto-submit delay for the two Workflow quick-start cards |
+| 100ms | Live panel | Scroll settle after a state change repaints the bar |
+| 120ms–150ms | CSS | Hover colour transitions |
+| 150ms | Modals | `_closePm` teardown after the exit class |
+| 150ms | View switch | Fade-out duration |
+| 150ms | Live log | Programmatic-scroll exemption window |
+| 150ms | Tags | Autocomplete debounce |
+| 150ms | Workflow | History dropdown close delay after leaving the dropdown |
+| 180ms | Validation setup | Custom close teardown |
+| 200ms | View flyout | Hover-open delay |
+| 200ms | Multi-select | Safety clear of the click-suppression flag |
+| 200ms | Policy | Delay before opening Custom Rules after the policy modal closes |
+| 200ms | Invoke / dept flyout | Removal delay after the close animation |
+| 200ms | View switch | Fade-in duration |
+| 220ms | Workflow | Delay before the validation-URL setup modal appears |
+| 250ms | View switch | Inline-style cleanup after the fade-in |
+| 250ms | Actions popup | Mobile slide-down duration |
+| 250ms | iOS keyboard | Window used to distinguish a keyboard-dismiss blur from a page-tap blur |
+| 250ms | Validation setup | Focus delay |
+| 280ms | Mobile drawer | Slide transition |
+| 300ms | Modals | Slide-out panel removal after the open class is dropped |
+| 300ms | View flyout | Hover-close delay |
+| 300ms | Workflow | History dropdown close delay after leaving the crumb |
+| 300ms | Toast | Fade in and out |
+| 300ms | Permission card | `permSlideIn` entrance |
+| 320ms | Workflow | Delay before re-rendering the drill-down after the planner closes |
+| 340ms | Mobile preview | Sheet fade-out after send |
+| 350ms | Input bar | `bar-transitioning` animation window |
+| 350ms | Message entrance | `msgSendIn` animation |
+| 350ms | Mobile focus | Fallback delay for revealing the composer above the keyboard |
+| 350ms | Workflow | Planner voice wiring, and the post-accept board re-render |
+| 400ms | Boot | Delay after the load event before the asset self-heal check |
+| 400ms | Voice | Recorder timeslice, and the first partial pump |
+| 500ms | Live panel | First deferred input-bar re-render after opening |
+| 500ms | Send | `_liveSending` reset that keeps entry de-duplication working |
+| 500ms | Folders | Debounce before persisting the folder tree |
+| 500ms | Workflow | Backend-sync wait after a mode switch; session-link delay |
+| 500ms | Socket | Resync delay after a daemon reconnect |
+| 600ms | Compose | Sidebar badge pulse duration |
+| 600ms–700ms | Subsession | Spawn-pulse duration |
+| 750ms | Socket | Wake-resync debounce |
+| 750ms | Boot | Retry interval for the projects and sessions fetches |
+| 800ms | Workflow | Task-detail retry backoff base (800 / 1600 / 2400) |
+| 800ms | Multi-select | Click-suppression window after a long-press |
+| 900ms | Project loader | Fade-out before removal |
+| 1000ms | Workflow / Compose | Description auto-save debounce; planner elapsed ticker |
+| 1000ms | Live panel | Elapsed-timer and retry-countdown tick |
+| 1200ms | Copy | Per-block `Copied!` revert in the code drawer |
+| 1200ms | Git | Delay after `Tests Passed ✓` before proceeding |
+| 1200ms | Voice install | Status poll interval |
+| 1200ms | Health | Decisive server-probe retry delay |
+| 1400ms | Mobile Command | `Copied ✓` revert |
+| 1500ms | Copy | Standard `Copied!` revert |
+| 1500ms | Git | Minimised-pill completion flash |
+| 1500ms | Health | Decisive daemon-probe retry delay |
+| 1500ms | Ghost recovery | Gap between close and restart |
+| 1800ms | Project switch | Minimum loader display time |
+| 2000ms | Live panel | Second deferred input-bar re-render |
+| 2000ms | Socket | HTTP fallback state check after a server error |
+| 2000ms | Health | Post-restart readiness poll interval |
+| 2500ms | Mobile Command | Default step poll |
+| 3000ms | Toast | Auto-hide |
+| 3000ms | Ghost recovery | Arm time after a submit |
+| 3000ms | Socket | Snapshot retry after connect; auto-name reschedule after an id remap |
+| 3000ms | Health | Base evaluation interval; extra connectivity probe while blocking |
+| 4000ms | Socket | Disconnect grace before the dot turns red |
+| 4000ms | Health | Decisive probe timeout |
+| 4000ms | Workflow | New-task highlight window |
+| 5000ms | Compose | Undo window for composition deletion |
+| 5000ms | Socket | Freshness window protecting incremental state from snapshot reversion |
+| 5000ms | Workflow | Board auto-retry after a load failure |
+| 5000ms | Health | Auth poll while blocking |
+| 8000ms | Live panel | Skeleton watchdog stage 1; load-more watchdog |
+| 8000ms | Live panel | Skeleton watchdog stage 2 offset (16s total) |
+| 10000ms | Live panel | Message watchdog tier 1 |
+| 10000ms | Health | Steady-state connectivity probe; relaxed evaluation interval |
+| 10000ms | Socket | Continuous stuck-session sweep |
+| 12000ms | Live panel | Skeleton watchdog stage 3 offset (28s total) |
+| 15000ms | Invoke / Workflow | Local-asset discovery cache TTL; AI-autonomy config cache |
+| 20000ms | Model switch | Hard timeout |
+| 20000ms | Socket | No-state-event threshold while working |
+| 22000ms | Live panel | Message watchdog tier 3 |
+| 30000ms | Workforce AI | "Taking longer than expected" fallback |
+| 30000ms | Socket | Periodic state-snapshot heartbeat; auth poll while healthy; status-marker dedup window |
+| 60000ms | Time labels | Relative-date refresh interval |
+| 60000ms | Theme | Auto-theme re-evaluation |
+| 60000ms | Git | Status poll |
+| 60000ms | Live panel | User-stop intent TTL |
+| 60000ms | Live panel | Skeleton zombie-cycle rate limit |
+| 90000ms | Health | Hard cap on the post-restart wait |
+| 120000ms | Live panel | Skeleton-reload rate limit |
+| 300000ms | Voice | Maximum single recording length |
+
+Animation durations worth naming separately: `waitpulse` 1.4s, `wf-work-pulse` 2s, `naming-pulse` 1.2s, `agentStripIn` 350ms, sub-agent pill stagger `index × 0.06s`, skeleton row stagger `index × 0.06s`, skeleton line stagger `0.04s`, Home dot stagger `index × 0.02s`, `spin` 1s linear infinite, `shimmer` continuous.
+
+
+---
+
+## 14.21 The twenty micro-details that make it feel finished
+
+1. **Pre-boot skeletons.** The session list, the Workflow board and the Subsessions board paint their skeletons from an inline script that runs before any module loads, driven by the persisted view mode. A cold reload therefore never shows an empty frame. Omit this and every reload starts with a flash of nothing.
+
+2. **The 4-second disconnect grace.** The connection dot does not turn red the instant the socket drops. Mobile networks drop it for one to three seconds on every wifi-to-cellular handoff, and a product that flashes "Disconnected" during normal use trains the user to distrust it.
+
+3. **The 150ms programmatic-scroll exemption.** The app's own top-align fires a scroll event indistinguishable from a user scroll. Without the exemption, auto-follow disables itself the first time a long reply arrives.
+
+4. **Optimistic bubbles matched by position, never by text.** Replacing the optimistic user bubble by matching its text would eat the second of two identical messages — and "yes", "ok" and "go ahead" are the most common messages in the product.
+
+5. **Only the newest assistant message is auto-expanded.** When a newer one arrives the previous auto-expansion is collapsed back — but a message the user expanded by hand is tagged differently and is never collapsed. The distinction between "we expanded this" and "you expanded this" is what makes the behaviour feel considerate rather than arbitrary.
+
+6. **Question truncation from the front.** A permission question over 400 characters is cut from the beginning with a leading ellipsis, because the actual ask is always at the end.
+
+7. **The name cell renames, the date and size cells open.** Giving the row two different click meanings by column means there is always a safe place to click that cannot start an edit.
+
+8. **Synchronous focus on mobile.** Focusing the new-session composer inside a `setTimeout` breaks the user-gesture chain and the on-screen keyboard never appears. It must be synchronous — and then, separately, the field must be scrolled above the keyboard once the visual viewport reports the resize.
+
+9. **The iOS keyboard-dismiss heuristic.** Distinguishing "the user tapped Done on the keyboard" from "the user tapped elsewhere" by checking whether any pointer event landed on the document in the previous 250ms. Without it, tapping away from a half-typed message sends it.
+
+10. **Elapsed timers tick in place.** The working timer and the retry countdown update a single text node every second. Re-rendering the bar to update a number would destroy whatever the user is typing.
+
+11. **The input bar refuses to re-render during dictation.** If voice is targeting a textarea inside the bar, the state machine returns without updating its state key, so a deferred call catches up when dictation ends. Otherwise a turn ending mid-sentence silently swallows the message.
+
+12. **Focus is restored synchronously after a bar re-render.** Captured before the swap, reapplied immediately after — so a state transition mid-typing produces no visible focus flash.
+
+13. **`dragging` applied on the next animation frame.** Applied synchronously, the browser snapshots the faded element into the drag image and the user drags a ghost of a ghost.
+
+14. **No insertion indicator in auto-sorted columns.** Promising a drop position the board will immediately re-sort away is worse than showing nothing.
+
+15. **The multi-select badge is re-inserted after every list re-render.** The list is rebuilt with `innerHTML`, which destroys the badge; re-rendering it and pruning the selection to still-existing ids means the count can never lie.
+
+16. **The sidebar width is not persisted.** It is genuinely ephemeral, and persisting it means one accidental drag follows the user forever.
+
+17. **Sort is state-driven, never click-driven.** Opening a session does not bump it to the top of the list. Sessions move when you work in them, not when you look at them — otherwise the list reorders under your cursor as you browse.
+
+18. **Subsession families stay contiguous under every sort.** The flat sorted list is reordered so each parent is immediately followed by its children, and children keep their own sort order within the family.
+
+19. **The `auto-resuming` substatus overrides the base state everywhere.** During a wake-up the base state flips idle to working; if the icon followed it, the sidebar would show a pickaxe while the chat panel still said "Awaiting wake-up…". Every surface honours the substatus instead.
+
+20. **Copy confirmation reverts, it does not persist.** Every copy button swaps to a check for 1.2–1.5 seconds and then returns. A permanently checked button tells you nothing the second time.
+
+**Three more worth the effort:** the mobile drawer's `.collapsed` width override, without which the slide-out animation silently does nothing; the 1800ms minimum display on the project-switch loader, which makes a fast switch feel deliberate rather than glitchy; and the empty-state fade-out animation when the first message is sent, which turns a hard swap into a transition.
+
+---
+
+## 14.22 Screenshot observations
+
+**`homepage.png`** — A near-black canvas with three large cards centred vertically and horizontally, occupying roughly the middle 75% of the width and 55% of the height. Each card is a soft-cornered panel with a barely-lighter fill and a hairline border; the spacing between them is generous enough that the screen reads as calm rather than dense. Inside each, the hierarchy is unambiguous: a small rounded icon tile in the card's own accent colour (blue, amber, purple), then a large bold heading in a geometric sans, then two or three lines of muted body copy, then a visualisation, then a single stat line, then an accent-coloured CTA with a chevron. The visualisations are what make the screen: a two-segment progress bar for Sessions, five stubby coloured columns for Workflow, and a dense two-row grid of small coloured dots for Workforce. The header is almost empty — a small logo, the wordmark, and two controls pushed far right — which is what lets the cards carry the whole screen.
+
+**`session-grid.png`** — A three-region layout: a narrow sidebar of roughly 320px, a hairline divider, and a very wide main panel. The sidebar holds five stacked controls and then a two-column card grid where each card is a small square with a circular status icon, an uppercase status pill (`WORKING`, `QUESTION`, `IDLE`, `SLEEPING`), a truncated title and a time. Colour does all the work: working cards glow violet, the question card is ringed in orange, idle cards are green, sleeping cards are neutral grey — you can read the state of ten sessions in one glance without reading a word. The main panel is dominated by a centred transcript column that is far narrower than the panel itself, leaving wide empty gutters; the conversation itself alternates a right-aligned violet user bubble with monospace tool lines (`Write tests/test_rate_limit.py`, a green `Success`) and a left-aligned assistant bubble. At the bottom sits a large rounded composer with the placeholder `Describe what you want Claude to do...`, a tiny send-hint line, and a filled `Send` button.
+
+**`session-list.png`** — Identical frame, but the sidebar becomes a dense three-column table. Sixteen rows fit where eight cards did. Each row is a status icon, a name, a right-aligned time, and a faint size — and the name column is coloured by state, so working rows read violet, the question row orange, idle rows green, and dormant rows plain grey. The column header row (`Name`, `Date`, `Size`) is small and quiet with the active sort indicated in accent blue. The overall impression is a file browser rather than a dashboard: it trades the grid's glanceability for roughly twice the scan density, which is exactly the trade a power user wants.
+
+**`workflow-board.png`** — Five equal-width columns spanning the full main panel, each headed by a coloured dot, an uppercase column name, and a right-aligned count. Cards are compact: a bold title, a right-aligned relative date and a single-letter assignee initial on the same line, an optional progress chip (`2/4 subtasks`) and session chip (`• 1 session`), then a row of small coloured tag pills. The colour language is disciplined — grey for Not Started, blue for Working, amber for Validating, red for Remediating, green for Complete — and the tag pills reuse the same hues at low saturation so they read as metadata rather than status. Empty columns are genuinely empty with no placeholder. The sidebar has switched entirely: no session list, just three large full-width buttons (`New Task`, `Report`, `Settings`) under a `KANBAN` label, and a `PERMISSIONS` section with a single `Manual` chip.
+
+**`task-hierarchy.png`** — A two-column drill-down under a breadcrumb reading `Board › Authentication System Overhaul`. The left column is almost editorial in its restraint: a small blue `WORKING ›` status pill, then a very large bold title, a faint `Created … · Updated …` line, a single sentence of description, two tag pills and a faint `+ Add tag`. It uses only the top third of its column and the rest is empty — deliberately, so the eye moves right. The right column holds the `SUBTASKS` panel: a header with a thin progress meter and `25%` right-aligned, then four rows each with a coloured status pill, a title, an optional `1 session` chip and a chevron, then a ghost row with a grey `New` pill and the placeholder `Add subtask...`. Below it, a full-width `Plan with AI` button in purple. The whole screen is one clear sentence: this is the task, these are its parts, here is how to add more.
+
+**`task-sessions.png`** — The same frame in its other mode. The right panel is headed `SESSIONS` and lists three rows, each a lowercase-ish status word in its state colour (`Working` violet, `Idle` green, `Sleeping` grey), a session name and a chevron, closing with a ghost row reading `Spawn session...`. The left column is identical in structure to the subtask variant. Seeing the two side by side makes the design decision obvious: the panel is a single component whose contents switch between subtasks and sessions, which is why the mode-switch confirmation has to be so explicit about what gets destroyed.
+
+**`task-chooser.png`** — The same shell with the right panel showing `HOW TO PROCEED` instead of a list: three tall cards, each an icon tile, a bold title and a line of explanation. The third, `Plan with AI`, is visually promoted — its border and title are accent purple while the other two are neutral. This is the single best screen in the product: where a lesser design would show an empty panel and an `+ Add` button, it shows three verbs and quietly recommends one.
+
+**`workforce.png`** — A full-width content page with no card grid in the main panel. It opens with a large `Workforce` heading and a faint `5 departments · 3 sub-departments · 16 sessions` subtitle, then four wide stat tiles — a small icon, a very large coloured number, and a tiny uppercase label (`WORKING`, `WAITING`, `IDLE`, `SLEEPING`). Below, a `DEPARTMENTS` label and five small folder cards each with a coloured folder glyph, a name, and a `6 agents · 3 active` meta line. Below that, `RECENT SESSIONS` as a simple list with a status icon, a name, a right-aligned department pill and a time. The sidebar is the striking part: it has become a permission queue, showing two cards each with a session name, a tool badge (`Bash`, `Write`), the exact command in monospace, and three buttons — green `Allow`, red `Deny`, neutral `Always`. That layout is the whole argument for the permission panel: you can unblock two sessions without leaving a screen that has nothing to do with either of them.
+
+**`kanban-session.png`** — A live chat rendered inside the board shell. The breadcrumb reads `Board › Auth System Overhaul › OAuth2 provider integration`, with `Actions` and `Analyze ▾` pushed right; the sidebar is still in Workflow mode. The transcript is the same centred narrow column, opening with a monospace right-aligned user bubble, then interleaved tool lines and `Success` markers, then a long left-aligned assistant reply with bold sub-headings and a bulleted list. What stands out is that nothing about the chat has been redesigned for this context — it is exactly the same component in exactly the same proportions, which is why drilling three levels into a board and finding a chat feels continuous rather than jarring.
+
+---
+
+## 14.23 Non-negotiable rules
+
+1. **Never call an auto-send function on a session switch.** Switching sessions must save the composer text as a draft, never submit it. *Failure mode if violated: the user types, clicks another session, the text is submitted, an unwanted session starts, they switch again, and a cascade of unwanted sessions with random text is created. This has broken multiple times in production.*
+
+2. **Record explicit user-stop intent before emitting a stop.** Every sleep, stop, delete and bulk-stop path must mark the session as user-stopped before the emit, and ghost recovery must check that flag twice — once when its 3s timer fires and again inside the 1.5s close-restart gap. *Failure mode if violated: sleeping a session within ~3s of sending silently resurrects it and re-sends the last prompt. Sleep appears not to work.*
+
+3. **Never cancel ghost recovery on a `stopped` state alone.** A genuinely dead session also reports stopped, and that is precisely the case recovery exists to repair. The discriminator is the cause, not the state. *Failure mode if violated: sessions the daemon silently dropped stay dead and the user's message vanishes.*
+
+4. **Never cycle a socket that reports connected, on any heuristic.** Only cycle on a failed response to an actively-emitted probe or on an explicit disconnect event. *Failure mode if violated: in-flight stream entries are dropped mid-response (there is no replay), reconnect handshakes flood the server, and the engine-down overlay flashes spuriously.*
+
+5. **The input bar must not re-render unless its computed state key changed.** *Failure mode if violated: every incidental state event wipes whatever the user is typing.*
+
+6. **The input bar must not re-render while voice is targeting one of its textareas.** *Failure mode if violated: a turn ending mid-dictation replaces the textarea, the captured submit closure goes stale, and the message is dropped every time.*
+
+7. **Match optimistic bubbles by position, never by text.** *Failure mode if violated: sending "yes" twice makes the second one disappear.*
+
+8. **Never let a log re-fetch render over a populated transcript with fewer entries than the DOM holds.** *Failure mode if violated: an arriving response wipes the visible conversation and re-renders a truncated version, slicing off the tail the user was reading.*
+
+9. **Enter is always a newline below 768px, and the send hint and its toggle are hidden there.** *Failure mode if violated: mobile users cannot insert line breaks, and a visible preference silently does nothing.*
+
+10. **Focus the composer synchronously on creation, then reveal it above the keyboard on the visual-viewport resize.** *Failure mode if violated: the mobile keyboard never opens, or the field stays hidden behind it until the first keystroke.*
+
+11. **Apply the drag class on the next animation frame, not synchronously.** *Failure mode if violated: the drag image is a faded ghost of the faded element.*
+
+12. **Clear every drag state class in `dragend`, not in `drop`.** *Failure mode if violated: pressing Escape mid-drag or dropping outside the window leaves highlight classes and orphan insertion indicators on screen permanently.*
+
+13. **Show no insertion indicator in auto-sorted columns.** *Failure mode if violated: the card lands somewhere other than where the indicator promised.*
+
+14. **Re-render the multi-select badge after every list re-render and prune the selection to existing ids.** *Failure mode if violated: the badge vanishes on sort and the count reports sessions that no longer exist.*
+
+15. **Ignore scroll events within 150ms of a programmatic top-align.** *Failure mode if violated: auto-follow switches itself off the first time a long reply arrives.*
+
+16. **Only top-align the fallback target when it is genuinely the last message.** *Failure mode if violated: sending a message top-aligns the previous reply and hides what the user just typed.*
+
+17. **On a project switch, clear every per-session map, the cross-project cache, the multi-selection, the folder cache, workspace state, and the board and composition state — and scrub the session id from both the URL and storage.** *Failure mode if violated: sessions from the previous project bleed into the new one's sidebar and a stale session id opens a conversation that does not belong to the project.*
+
+18. **Guard every async callback with a project-switch generation counter and discard stale responses.** *Failure mode if violated: a slow fetch for the old project lands after the switch and repopulates the new project's UI with the wrong data.*
+
+19. **Never clear the parent container of a board that holds static children looked up by id — clear only the dynamic child area.** *Failure mode if violated: the initialiser silently writes to null and the panel renders blank even though the API returned valid data.*
+
+20. **Always pass the project filter when fetching compositions.** *Failure mode if violated: the picker lists every composition across every project.*
+
+21. **Recover from a stale active-composition id by clearing it and retrying with only the project filter.** *Failure mode if violated: the board renders empty even though valid compositions exist.*
+
+22. **Reset the cost and model status slots on every session switch.** *Failure mode if violated: the previous session's cost is attributed to the new one.*
+
+23. **Never show a loading zero.** Board-backed stats must show a shimmer until their fetch resolves. *Failure mode if violated: a real zero and a pending fetch look identical and the product looks broken on first paint.*
+
+24. **The health blocker must be dismissible only by the check passing.** No close button, no Escape, no backdrop. *Failure mode if violated: users dismiss it and then operate an app whose backend is gone, losing work.*
+
+25. **Rate-limit every self-healing reload.** At most one skeleton-triggered reload per 120s and one socket cycle per 60s, and never while a restart overlay is present. *Failure mode if violated: a reload storm that never converges.*
+
+26. **Treat a non-JSON error and a network failure on delete as success and clean up locally.** *Failure mode if violated: the card stays on screen after the server-side tombstone is already written, and the user deletes it again.*
+
+27. **A rename patches one row; it never reloads the list.** *Failure mode if violated: auto-naming makes the sidebar flicker continuously.*
+
+28. **Opening a session must not change its position in any list.** *Failure mode if violated: the list reorders under the cursor while browsing.*
+
+29. **Honour the `auto-resuming` substatus regardless of the base state, on every surface.** *Failure mode if violated: the sidebar shows a working icon while the panel says "Awaiting wake-up", and the user believes the two disagree.*
+
+30. **Intercept CLI slash commands client-side.** They are never forwarded; each either triggers the equivalent in-app action or explains that it is unsupported. *Failure mode if violated: the command is silently swallowed, the session appears to hang, and the user retries.*
+
+---
+
+## 14.24 Implementation prompts
+
+```
+PROMPT 14.1 — Build the app frame
+Build the persistent shell: a fixed header (brand, spacer, system menu, three git
+buttons with count badges, theme toggle), a two-column body, and a main panel.
+The sidebar width is driven by a CSS custom property defaulting to 320px and
+clamped to 180-600px, resized by a 1px handle whose hit area is widened to 9px
+with a pseudo-element. Collapse state persists; Home hides the sidebar entirely
+rather than collapsing it, applied by an inline pre-boot script.
+
+Acceptance criteria:
+- Dragging the handle resizes smoothly; the body cursor stays col-resize for the
+  whole drag and text is never selected.
+- Reloading with the sidebar collapsed shows no flash of an expanded sidebar.
+- Reloading onto Home shows no flash of a sidebar.
+- Only the session list scrolls; the sidebar header and footer stay fixed.
+- The transcript column is centred and clamped to 760px inside a much wider panel.
+```
+
+```
+PROMPT 14.2 — Implement view switching with correct teardown
+Implement five views and the three-mode Sessions sub-mode. Switching fades the
+view containers out over 150ms, runs teardown plus setup, fades in over 200ms,
+then strips the inline transition and opacity styles after 250ms.
+
+Each leave-transition must perform its full teardown as specified: stop the live
+panel, null the active session, clear the stored session id, reset board state,
+remove drill-down bars, empty AND hide the leaving view's containers, restore the
+default main body, and scrub both the hash and the chat query parameter.
+
+Acceptance criteria:
+- Switching Workflow -> Sessions -> Workflow twice leaves no orphan session bar.
+- No container is left with an inline opacity after any switch.
+- Returning to Sessions restores the last-open session for that project, but only
+  when arriving from another view and only if nothing is already active.
+- Per-project view, drill-down position and open session all survive a project
+  switch and a reload.
+```
+
+```
+PROMPT 14.3 — Build the live chat panel and its five-state input bar
+Implement the panel structure (role banner, log, output shelf, subsession strips,
+queue area, input bar) and the input-bar state machine with the states New, Idle,
+Question, Working and Ended.
+
+Compute a state key per the spec and re-render only when it changes. Preserve the
+current textarea value across transitions, falling back to the saved draft.
+Restore focus synchronously when focus was inside the bar. Refuse to re-render
+while voice is targeting a textarea in the bar. Tick the elapsed timer and the
+retry countdown in place, never by re-rendering.
+
+Acceptance criteria:
+- Typing during an idle-to-working transition never loses a character.
+- The elapsed timer updates every second while typing continues uninterrupted.
+- Dictating across a turn boundary still submits the finished transcript.
+- The Question state renders the label, the question and the options with 0ms,
+  50ms and 100ms entrance offsets.
+- Autofocus happens at most once per deliberate open, and never below 768px.
+```
+
+```
+PROMPT 14.4 — Implement the modal system and the full inventory
+Build showAlert, showConfirm and showPrompt against a single overlay host with a
+150ms exit animation, plus the runtime-overlay pattern for dialogs that must
+survive a host takeover. Then implement every row of section 14.7 with its exact
+copy.
+
+Add what the original lacks: a focus trap inside the card, a uniform Escape
+handler, focus return to the trigger on close, and Cancel focused by default on
+danger confirms.
+
+Acceptance criteria:
+- Tab cannot leave an open modal.
+- Escape closes every overlay, resolving the safe outcome.
+- Every string in 14.7 appears verbatim.
+- Opening a second modal over an existing one does not leave a stuck backdrop.
+```
+
+```
+PROMPT 14.5 — Implement menus and context menus
+Build every menu in 14.8 with its exact item order. Desktop menus are floating
+elements positioned at the pointer or under the trigger, clamped 8px inside the
+viewport on the next animation frame, dismissed by an outside-click listener
+attached on a zero-delay timeout. Below 768px the session and system menus render
+as bottom sheets with dividers collapsed and a Cancel button.
+
+Long-press (500ms, 20px slop, 20ms haptic) opens the context menu on touch and on
+mouse hold, suppresses the trailing click for 800ms, and cancels any dragstart.
+
+Acceptance criteria:
+- A menu opened near any edge stays fully on screen.
+- The click that opened a menu never closes it.
+- Long-pressing a card opens the menu and does not open the session or start a drag.
+- Tapping a sheet row or its backdrop is never swallowed by click suppression.
+```
+
+```
+PROMPT 14.6 — Implement scroll behavior
+Implement stick-to-bottom with a 60px tolerance, the 150ms programmatic-scroll
+exemption, the top-align rule for long assistant messages, the sticky user-message
+bar, and prepend pagination with scroll-height compensation.
+
+Acceptance criteria:
+- Scrolling up mid-stream stops auto-follow; scrolling back within 60px resumes it.
+- A reply taller than the viewport is top-aligned with an 8px gap; a shorter one
+  scrolls to the bottom.
+- Sending a message always scrolls to the bottom, never top-aligns the prior reply.
+- Loading older messages does not move the viewport by a single pixel.
+- The sticky bar shows the most recent user message that has scrolled off the top,
+  expands on click, and disappears when that message scrolls back into view.
+```
+
+```
+PROMPT 14.7 — Implement optimistic UI with correct rollback
+Implement every row of section 14.11. Match optimistic bubbles by position.
+Fix the four defects the original carries: decrement the column count when a ghost
+card fails, roll back compose bulk moves, roll back and toast on sidebar reorder
+failure, and inspect the response for the shared-prompts toggle.
+
+Acceptance criteria:
+- Sending the same word twice renders two bubbles.
+- A failed send removes the bubble, reverts to idle, and restores the text.
+- A failed drag returns the card to its original column with an error toast.
+- A failed create leaves no ghost and no inflated count.
+```
+
+```
+PROMPT 14.8 — Implement the loading, empty and error states
+Implement every skeleton in 14.10.2, every empty state in 14.16 with exact copy,
+and every error path in 14.17 including the four blocking health checks with their
+thresholds and poll intervals.
+
+Acceptance criteria:
+- No region is ever blank while loading.
+- No stat shows a real-looking zero while its fetch is pending.
+- Each health check fires only at its threshold; a 503 reloads immediately.
+- The blocking overlay cannot be dismissed by any user action.
+- Self-healing reloads respect their rate limits.
+```
+
+```
+PROMPT 14.9 — Implement keyboard, focus and the send-key policy
+Implement every shortcut in 14.14 by scope with the documented guards. Implement
+the two-value send policy with the mobile override, the hint strings, the toggle,
+and dual persistence. Implement the iOS keyboard-dismiss heuristic with the 250ms
+pointer window.
+
+Acceptance criteria:
+- No shortcut fires while focus is in a field or a modal is open.
+- No browser shortcut is ever intercepted.
+- Toggling the send key updates every visible hint immediately and survives reload.
+- Below 768px, Enter always inserts a newline and no hint or toggle is visible.
+- Tapping away from a half-typed message on iOS does not send it; tapping the
+  keyboard's own dismiss control does.
+```
+
+```
+PROMPT 14.10 — Implement drag and drop
+Implement every draggable in 14.13 with its visuals, drop affordances, insertion
+indicator rules, reorder rules and rejections. Clear all state in dragend.
+Suppress the post-drag click for 50ms.
+
+Acceptance criteria:
+- Escape mid-drag leaves no highlight class and no orphan indicator.
+- Auto-sorted columns accept drops but show no indicator.
+- Dropping a folder into its own descendant is rejected with the exact toast.
+- Reordering compositions is blocked while a filter is active.
+- Releasing a card over a column does not also open it.
+```
+
+```
+PROMPT 14.11 — Implement the mobile layer
+Re-skin the same DOM below 768px: the sidebar becomes a full-screen drawer with
+the collapsed-width override, the expand button becomes a fixed hamburger, icons
+swap and restore on breakpoint crossing, and the drawer auto-opens only in the
+Sessions view with no session open. Implement the edge-swipe gesture with its
+8px dead zone, 8px direction lock, horizontal-scroller bail, 1:1 tracking and
+30% commit threshold.
+
+Acceptance criteria:
+- The drawer slides; it never snaps out of existence.
+- Crossing the breakpoint in either direction needs no refresh.
+- A vertical scroll inside the drawer never drags it.
+- A horizontal scroll inside a code block never opens the drawer.
+- Opening a session or creating one closes the drawer and it stays closed.
+```
+
+```
+PROMPT 14.12 — Implement attention and cross-view state propagation
+Implement the attention ladder in 14.19: pulsing row and card states, status
+icons, aggregate counts, the sidebar permission panel with its four buttons, the
+inbox badge and strip, and the respond overlay. Propagate every state change to
+all surfaces by patching in place.
+
+Acceptance criteria:
+- A waiting session pulses amber in the sidebar, the grid, Mission Control and any
+  board drill-down simultaneously.
+- A permission can be answered from the sidebar in any view without navigating.
+- A rename updates the row, the toolbar and any breadcrumb without a list reload.
+- Tapping the inbox badge opens the parent and does not send anything.
+- No OS notification, title flash, favicon change or sound is ever produced.
+```
+
+```
+PROMPT 14.13 — Wire the timing constants
+Centralise every value in 14.20 as named constants in one module. No timing
+literal may appear inline anywhere else in the codebase.
+
+Acceptance criteria:
+- A single grep for numeric setTimeout and setInterval literals returns only the
+  constants module.
+- Each constant carries a comment naming the failure it prevents.
+- Changing the disconnect grace in one place changes the behaviour everywhere.
+```
+
 
 
 ---
