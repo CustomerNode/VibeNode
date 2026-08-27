@@ -114,6 +114,9 @@ async function handleNameClick(id) {
 }
 
 async function selectSession(id) {
+  // Viewing a session counts as reading it — drop the unread dot.
+  if (typeof clearSessionUnread === 'function') clearSessionUnread(id);
+
   // Opening a session must NOT change its sidebar position — the sort is
   // driven by state and real activity only, never by the act of clicking.
   // (Previously a "touch" call bumped effective_ts to now here, yanking the

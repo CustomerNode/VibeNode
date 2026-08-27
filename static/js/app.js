@@ -2002,6 +2002,7 @@ function openPreferences() {
   const enterToSend = sendBehavior === 'enter';
   const stickyOn = localStorage.getItem('stickyUserMsgs') !== 'off';
   const wsdOn = window._wrongSessionDetectionEnabled !== false;
+  const unreadOn = typeof unreadDotsEnabled === 'function' ? unreadDotsEnabled() : true;
 
   const snOn = !!(window.SpeechNode && window.SpeechNode.isEnabled());
 
@@ -2015,6 +2016,8 @@ function openPreferences() {
      hint: 'Keep your most recent message pinned at the top while scrolling long replies.'},
     {key: 'wsd', label: 'Wrong-session detection', on: wsdOn,
      hint: 'Warn before sending a prompt that looks meant for a different active session.'},
+    {key: 'unread', label: 'Unread indicators', on: unreadOn,
+     hint: 'Show a small dot on idle chats that replied while you were looking elsewhere.'},
   ];
 
   let html = '<div class="pm-card pm-enter" style="width:400px;">'
@@ -2074,6 +2077,23 @@ function openPreferences() {
             body: JSON.stringify({wrong_session_detection: on})
           }).catch(() => { /* fail-open: in-memory flag is already set */ });
           showToast('Wrong-session detection: ' + (on ? 'On' : 'Off'));
+          break;
+        case 'unread':
+          // localStorage-only, like 'sticky' — this is a per-device display
+          // preference, not something the server or other clients need.
+          if (on) {
+            localStorage.removeItem('unreadDots');
+          } else {
+            localStorage.setItem('unreadDots', 'off');
+            // Drop every existing flag so re-enabling later doesn't resurrect a
+            // stale backlog of dots for sessions the user has since read.
+            if (typeof clearAllUnread === 'function') clearAllUnread();
+          }
+          // Keep the <body> class in step so the reserved dot gutter appears
+          // and disappears with the preference.
+          if (typeof _applyUnreadBodyClass === 'function') _applyUnreadBodyClass();
+          if (typeof filterSessions === 'function') filterSessions();
+          showToast('Unread indicators: ' + (on ? 'On' : 'Off'));
           break;
         case 'speechnode':
           if (!window.SpeechNode) { showToast('SpeechNode is unavailable.', true); break; }

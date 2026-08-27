@@ -1145,6 +1145,69 @@ header h1:hover { opacity: 0.7; }
   position: relative; top: -1px;
 }
 
+/* ---- Unread indicator (iOS Mail semantic) ----
+   A quiet accent dot marking sessions that replied while you were elsewhere.
+   Rendered only on IDLE sessions — see the unread section at the top of
+   static/js/sessions.js for why.
+
+   Deliberately static (no pulse/animation): a working session already has the
+   animated pickaxe row, and an unread dot is a passive "there's something here"
+   marker, not a call to action.  Animating it would make a sidebar of finished
+   sessions feel like an alarm.
+
+   No glow/halo. An earlier version had a translucent accent box-shadow ring,
+   which at real size rendered as a fuzzy bloom rather than a crisp badge. A
+   solid dot with clean edges is what reads as deliberate. */
+.unread-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
+}
+
+/* ---- List mode: a reserved gutter, not an inline dot ----
+   The dot MUST NOT displace row content. Inline, it pushed unread rows ~13px
+   right of read rows, so the name column no longer lined up down the list —
+   the single most obviously-wrong thing about the first cut.
+
+   iOS Mail solves this with a permanent lane that is simply empty when read.
+   Same here: every row reserves the space and the dot is absolutely positioned
+   into it, so read and unread rows align exactly.
+
+   Gated behind body.unread-enabled so that turning the preference off restores
+   the original sidebar metrics precisely, rather than leaving a dead gutter. */
+body.unread-enabled .session-item .session-col-name {
+  position: relative;
+  padding-left: 17px;
+}
+body.unread-enabled .session-item .unread-dot {
+  position: absolute;
+  left: 5px;
+  /* Anchored to the first text line rather than the cell centre: subsession
+     rows carry a second "from:" line, and centring would drift on those. */
+  top: 13px;
+  transform: translateY(-50%);
+}
+/* Colour lift only — no font-weight change. Bolding re-flows the text and
+   shifts where the ellipsis truncates, which makes the row twitch as it goes
+   read/unread. The dot is already the primary signal; the title just warms up. */
+.session-item.has-unread .session-col-name { color: var(--text-heading); }
+
+/* ---- Grid mode (the DEFAULT sidebar view) ----
+   The card is a centred column with no leading text edge, so the dot becomes a
+   corner badge. Inset to clear the 14px corner radius. */
+.wf-card .unread-dot {
+  position: absolute;
+  top: 9px; right: 9px;
+}
+.wf-card.has-unread .wf-name { color: var(--text-heading); }
+
+/* Reduced-motion users get the identical treatment (nothing here animates),
+   but forced-colors mode needs an explicit non-accent fill or the dot vanishes. */
+@media (forced-colors: active) {
+  .unread-dot { background: Highlight; box-shadow: none; }
+}
+
 /* ===== Main panel ===== */
 .main {
   flex: 1;

@@ -1298,6 +1298,20 @@ socket.on('session_entry', (data) => {
         }
     }
 
+    // ── Unread flag (iOS-style dot) ──
+    // Assistant output landed. Raise the flag here, ABOVE the `_sidMatch`
+    // bail-out below, so background sessions (which return early) are covered.
+    //
+    // Deliberately does NOT filter on `!== liveSessionId`: the live session
+    // earns a dot too, which is the "parked in one chat, never navigate away,
+    // so nothing ever marks it read" case. It is cleared by interacting with
+    // the thread rather than by never being set. Re-adding a liveSessionId
+    // guard here makes that whole path unreachable — it already did once.
+    if (data.session_id && data.entry && data.entry.kind === 'asst'
+        && typeof markSessionUnread === 'function') {
+        markSessionUnread(data.session_id);
+    }
+
     // Session ID match — also check aliases. The daemon resolves session IDs
     // through its alias table, so entries can arrive under the canonical (new)
     // ID while liveSessionId still holds the old pre-remap ID. Auto-heal.
@@ -1804,6 +1818,11 @@ function _updateRowState(sessionId, state) {
     if (state === 'waiting') row.classList.add('si-question');
     else if (state === 'working' || state === 'starting') row.classList.add('si-working');
     else if (state === 'idle') row.classList.add('si-idle');
+    // The unread dot is idle-only, so it has to be re-evaluated on every state
+    // change: the flag is raised while the session is still working and only
+    // becomes visible when it settles. This is the surgical path — a full
+    // filterSessions() also renders it, but not every state change triggers one.
+    if (typeof _syncUnreadDom === 'function') _syncUnreadDom(sessionId, state);
 }
 
 // Helper: get the active project's filesystem path

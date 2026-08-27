@@ -3,6 +3,250 @@
 // _shortDate() extracted to time-utils.js per plan Section 14 line 2894
 
 // ===========================================================================
+// Unread indicator (iOS-style dot)
+// ===========================================================================
+//
+// A session is "unread" when it produced assistant output while the user was
+// NOT looking at it.  The dot is deliberately conservative:
+//
+//   * Only set from `session_entry` for a session that is not the live one
+//     (see socket.js — the flag is raised next to the entry-consistency block).
+//   * Only RENDERED when the session has settled to `idle`.  A working session
+//     already advertises itself with the pickaxe icon and a moving row; adding
+//     a second "look at me" signal there is noise.  The dot is the quiet
+//     "this one finished and you haven't read it" cue, which is exactly the
+//     iOS Mail semantic the user asked for.
+//   * Never rendered on the active session — you're looking at it.
+//
+// Persisted to localStorage so a refresh (or a phone waking up) doesn't lose
+// the "you haven't read this" state.  Storage is bounded by a size cap on save
+// (see `_saveUnreadSessions`) so deleted sessions can't accumulate forever.
+const _UNREAD_STORAGE_KEY = 'vn_unread_sessions';
+const _UNREAD_PREF_KEY = 'unreadDots';   // 'off' disables; absent/anything else = on
+
+/** Session IDs with unread assistant output. @type {Set<string>} */
+let _unreadSessions = (function () {
+  try {
+    const raw = JSON.parse(localStorage.getItem(_UNREAD_STORAGE_KEY) || '[]');
+    return new Set(Array.isArray(raw) ? raw : []);
+  } catch (_e) {
+    return new Set();
+  }
+})();
+
+/**
+ * Is the unread-dot feature turned on?  Controlled by the "Unread indicators"
+ * toggle in Preferences.  Defaults to ON when the key has never been written.
+ * @returns {boolean}
+ */
+function unreadDotsEnabled() {
+  return localStorage.getItem(_UNREAD_PREF_KEY) !== 'off';
+}
+
+/**
+ * Mirror the preference onto <body> so CSS can reserve the list-mode dot lane.
+ *
+ * The gutter that keeps read and unread rows aligned has to exist on EVERY row,
+ * including read ones — but only when the feature is on, otherwise disabling
+ * the preference would leave a permanent empty margin in the sidebar. CSS can't
+ * read localStorage, hence the class.
+ */
+function _applyUnreadBodyClass() {
+  if (document.body) document.body.classList.toggle('unread-enabled', unreadDotsEnabled());
+}
+window._applyUnreadBodyClass = _applyUnreadBodyClass;
+
+/** Hard cap on stored unread IDs, so deleted sessions can't grow the key forever. */
+const _UNREAD_MAX = 300;
+
+/**
+ * Persist the unread set, trimming the OLDEST entries past `_UNREAD_MAX`.
+ *
+ * Deliberately does NOT prune against `allSessionIds`: that set only holds the
+ * ACTIVE project's sessions, so pruning by it would silently wipe every unread
+ * flag belonging to other projects the moment the user switched projects.
+ * A size cap bounds storage without needing cross-project knowledge, and Set
+ * preserves insertion order so the trim drops the least-recent flags first.
+ */
+function _saveUnreadSessions() {
+  try {
+    if (_unreadSessions.size > _UNREAD_MAX) {
+      _unreadSessions = new Set(Array.from(_unreadSessions).slice(-_UNREAD_MAX));
+    }
+    localStorage.setItem(_UNREAD_STORAGE_KEY, JSON.stringify(Array.from(_unreadSessions)));
+  } catch (_e) { /* quota / private mode — in-memory set still works */ }
+}
+
+/**
+ * Does this session have unread output the user hasn't opened?
+ * @param {string} sessionId
+ * @returns {boolean}
+ */
+function hasUnread(sessionId) {
+  return unreadDotsEnabled() && _unreadSessions.has(sessionId);
+}
+
+/**
+ * Flag a session as unread and paint its dot immediately (no full re-render).
+ *
+ * This is the SINGLE place that decides whether something counts as unread,
+ * and the rule is deliberately simple: ANY session that produces assistant
+ * output gets a dot, including the one you are currently sitting in.
+ *
+ * Why no "is the user actually looking" gate (tab hidden / window unfocused)?
+ * It was tried and removed. It made the dot invisible for the most common
+ * situation — parked in one chat at a focused window — which is precisely the
+ * case that has no other way to get marked read, since you never navigate away
+ * and back. Presence is also unknowable: a focused window says nothing about
+ * whether a human is in front of it. Clearing on interaction (see
+ * `_initUnreadInteractionClearing`) is the honest signal, because it is
+ * evidence the user was actually there rather than a guess that they were.
+ *
+ * The renderers just reflect the flag — they do not re-test `activeId`.
+ * @param {string} sessionId
+ */
+function markSessionUnread(sessionId) {
+  if (!sessionId || !unreadDotsEnabled()) return;
+  if (_unreadSessions.has(sessionId)) return;
+  _unreadSessions.add(sessionId);
+  _saveUnreadSessions();
+  _syncUnreadDom(sessionId);
+}
+
+/**
+ * Clear a session's unread flag — called wherever the user actually opens it.
+ * @param {string} sessionId
+ */
+function clearSessionUnread(sessionId) {
+  if (!sessionId || !_unreadSessions.has(sessionId)) return;
+  _unreadSessions.delete(sessionId);
+  _saveUnreadSessions();
+  _syncUnreadDom(sessionId);
+}
+
+/** Wipe every unread flag (used when the preference is switched off). */
+function clearAllUnread() {
+  if (!_unreadSessions.size) return;
+  const ids = Array.from(_unreadSessions);
+  _unreadSessions.clear();
+  _saveUnreadSessions();
+  // Wrap the call — a bare `forEach(_syncUnreadDom)` would leak the array index
+  // into the `stateHint` parameter.
+  ids.forEach(id => _syncUnreadDom(id));
+}
+
+/**
+ * Surgically add/remove the dot on one row without re-rendering the sidebar.
+ * Mirrors the `_updateRowState` pattern in socket.js: a full `filterSessions()`
+ * on every assistant entry would be a per-token re-render of the whole list.
+ *
+ * The dot only appears once the row is idle, so raising the flag mid-turn
+ * paints nothing; the row's own idle transition calls `filterSessions()`
+ * (socket.js) which renders the dot through `_renderSessionRow`.
+ *
+ * @param {string} sessionId
+ * @param {string} [stateHint] Authoritative state from the caller. `_updateRowState`
+ *   passes the state it was handed, because a few of its call sites (e.g. the
+ *   permission-resolved path) update the row BEFORE `sessionKinds` catches up —
+ *   reading `getSessionStatus()` there would see a stale kind and skip the dot.
+ */
+function _syncUnreadDom(sessionId, stateHint) {
+  // Both sidebar surfaces carry the dot: `.session-item` (list mode) and
+  // `.wf-card` (grid mode — the DEFAULT, see app.js `sessionDisplayMode`).
+  // Querying both here is what keeps the surgical path in step with the two
+  // renderers; missing `.wf-card` made the feature invisible by default.
+  const els = document.querySelectorAll(
+    '.session-item[data-sid="' + sessionId + '"], .wf-card[data-sid="' + sessionId + '"]');
+  if (!els.length) return;
+  const state = stateHint
+    || (typeof getSessionStatus === 'function' ? getSessionStatus(sessionId) : '');
+  // No `activeId` test here on purpose: `markSessionUnread` already decided
+  // whether the flag was earned, including for the session you're sitting in.
+  const want = hasUnread(sessionId) && state === 'idle';
+  els.forEach(el => {
+    el.classList.toggle('has-unread', want);
+    const isCard = el.classList.contains('wf-card');
+    // List rows anchor the dot inside the name cell; cards pin it to the
+    // card corner (no leading text edge to sit against).
+    const host = isCard ? el : el.querySelector('.session-col-name');
+    if (!host) return;
+    const existing = host.querySelector(':scope > .unread-dot');
+    if (want && !existing) {
+      const dot = document.createElement('span');
+      dot.className = 'unread-dot';
+      dot.setAttribute('aria-label', 'Unread');
+      dot.title = 'Unread — new response you haven’t opened';
+      if (isCard) {
+        host.insertBefore(dot, host.firstChild);
+      } else {
+        // Ahead of the state icon, so the dot sits at the leading edge of the
+        // label but after any subsession caret/glyph.
+        const icon = host.querySelector('.state-icon');
+        if (icon) host.insertBefore(dot, icon);
+        else host.insertBefore(dot, host.firstChild);
+      }
+    } else if (!want && existing) {
+      existing.remove();
+    }
+  });
+}
+
+/**
+ * "Any interaction marks it read" for the session you never navigate away from.
+ *
+ * Clicking a sidebar row is the normal mark-read gesture, but it is unreachable
+ * when you stay parked in one chat: you were away, the reply landed, the dot went
+ * up — and you come back to the panel already on screen with nothing to click.
+ * So touching the thread itself counts.
+ *
+ * Scoped to `.live-panel` rather than the document: a bare document-level
+ * listener would clear the dot when you click a DIFFERENT session in the
+ * sidebar, marking the parked chat read without you ever having looked at it.
+ *
+ * Note for future maintainers: the visibilitychange/focus handlers here are
+ * display-only — they touch localStorage and DOM classes, never the socket.
+ * See the mobile socket-recovery section in CLAUDE.md for why anything that
+ * cycles a connection off these events is a foot-gun.
+ */
+function _initUnreadInteractionClearing() {
+  const clearLiveIfInPanel = (e) => {
+    if (!_unreadSessions.size) return;   // cheap bail — the common case
+    const sid = (typeof liveSessionId !== 'undefined' && liveSessionId) || activeId;
+    if (!sid || !_unreadSessions.has(sid)) return;
+    const t = e && e.target;
+    if (!t || typeof t.closest !== 'function') return;
+    if (!t.closest('.live-panel, #live-log, .live-input-bar')) return;
+    clearSessionUnread(sid);
+  };
+  ['pointerdown', 'keydown', 'wheel', 'touchstart'].forEach(ev => {
+    document.addEventListener(ev, clearLiveIfInPanel, {passive: true, capture: true});
+  });
+
+  // Deliberately NO visibilitychange/focus handler here.
+  //
+  // An earlier version cleared the live session's dot on tab return whenever
+  // its panel was mounted. That destroyed the feature's whole point: you switch
+  // away, a reply lands, the dot goes up — and the instant you come back it is
+  // wiped before you can see it. Returning to a tab is not an interaction, it
+  // is the exact moment the user needs the dot to still be there to learn what
+  // happened while they were gone.
+  //
+  // Only real input (above) counts as reading. Same class of mistake as the
+  // removed _userIsAway() gate: inferring "they must have seen it" from
+  // window state rather than from evidence the user actually did something.
+}
+_initUnreadInteractionClearing();
+_applyUnreadBodyClass();
+
+// Exported for cross-script use (socket.js, live-panel.js, toolbar.js, app.js).
+window.markSessionUnread = markSessionUnread;
+window.clearSessionUnread = clearSessionUnread;
+window.clearAllUnread = clearAllUnread;
+window.hasUnread = hasUnread;
+window.unreadDotsEnabled = unreadDotsEnabled;
+window._syncUnreadDom = _syncUnreadDom;
+
+// ===========================================================================
 // Sidebar multi-selection (Ctrl/Cmd+click)
 // ===========================================================================
 //
@@ -435,10 +679,20 @@ function _renderSessionRow(s, extraClass) {
             title="${isExpanded ? 'Collapse' : 'Expand'} subsessions">${isExpanded ? '\u25be' : '\u25b8'}</span>`
     : '';
 
+  // Unread dot — idle sessions only, and never the one you're looking at.
+  // Working/waiting/sleeping rows already carry their own state icon; adding a
+  // second attention cue there would compete with it.  See the unread section
+  // at the top of this file for the full rationale.
+  const isUnread = isIdle && hasUnread(s.id);
+  const unreadClass = isUnread ? ' has-unread' : '';
+  const unreadDot = isUnread
+    ? '<span class="unread-dot" aria-label="Unread" title="Unread — new response you haven’t opened"></span>'
+    : '';
+
   return `
-  <div class="session-item${activeClass}${stateClass}${msClass}${subsessionClass}${extraClass || ''}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" oncontextmenu="sessionContextMenu(event,'${s.id}')">
+  <div class="session-item${activeClass}${stateClass}${msClass}${subsessionClass}${unreadClass}${extraClass || ''}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" oncontextmenu="sessionContextMenu(event,'${s.id}')">
     <div class="session-col-name" onclick="handleNameClick('${s.id}')" style="cursor:text;" title="Click to rename">
-      ${caretSpan}${subsessionGlyph}${icon}${escHtml(s.display_title)}${_autoNamingInFlight.has(s.id) ? '<span class="naming-badge"><span class="naming-dot"></span>Naming\u2026</span>' : ''}${inboxBadge}
+      ${caretSpan}${subsessionGlyph}${unreadDot}${icon}${escHtml(s.display_title)}${_autoNamingInFlight.has(s.id) ? '<span class="naming-badge"><span class="naming-dot"></span>Naming\u2026</span>' : ''}${inboxBadge}
       ${subsessionFromLine}
     </div>
     <div class="session-col-date" ${colClick} title="${escHtml(s.last_activity)}" data-short-date="${escHtml(s.last_activity)}">${escHtml(_shortDate(s.last_activity))}</div>

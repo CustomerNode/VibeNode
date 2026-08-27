@@ -849,6 +849,10 @@ function guiOpenDelete(id) {
 }
 
 async function openInGUI(id) {
+  // Opening a session is what "reading" it means — drop the unread dot before
+  // the kanban/compose early-returns below so every view marks it read.
+  if (typeof clearSessionUnread === 'function') clearSessionUnread(id);
+
   // Opening a session is intentionally sort-neutral: clicking a row (in any
   // view) must not bubble it to the top of the sidebar.  The order is driven
   // by state and real activity only.  Sessions move when you actually work in
@@ -956,6 +960,10 @@ async function openInGUI(id) {
 function startLivePanel(id, opts) {
   stopLivePanel();
   liveSessionId = id;
+  // Catch-all mark-as-read: startLivePanel is the single funnel every view
+  // (sidebar, kanban, compose, URL restore) passes through to mount a session,
+  // so clearing here covers entry points that bypass openInGUI/selectSession.
+  if (typeof clearSessionUnread === 'function') clearSessionUnread(id);
   // Mobile visual channel: point the preview nav button at the newly-active
   // session (hides it if that session has no previews yet).
   if (window.MobilePreview) { try { MobilePreview.onSessionActivated(id); } catch (e) {} }

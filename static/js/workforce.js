@@ -893,7 +893,19 @@ function renderWorkforce(sessions) {
       ? '<span class="wf-sub-glyph" aria-hidden="true">\u21b3 </span>' : '';
     const name = escHtml((s.display_title||s.id).slice(0,22) + ((s.display_title||'').length>22?'\u2026':''));
     const date = _shortDate(s.last_activity);
-    return `<div class="wf-card wf-${st}${selClass}${msClass}${familyClass}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" onclick="singleOrDouble('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')" title="${escHtml(s.display_title)} \u2014 double-click to open in VibeNode">
+    // Unread dot \u2014 idle cards only, never the selected one.  Grid is the
+    // DEFAULT sidebar mode (app.js: sessionDisplayMode defaults to 'grid'),
+    // so this is the primary surface for the indicator, not an afterthought.
+    // Rendered as a corner badge rather than an inline dot because the card
+    // has no leading text edge to anchor to.
+    const _isUnread = st === 'idle'
+      && typeof hasUnread === 'function' && hasUnread(s.id);
+    const unreadClass = _isUnread ? ' has-unread' : '';
+    const unreadDot = _isUnread
+      ? '<span class="unread-dot" aria-label="Unread" title="Unread \u2014 new response you haven\u2019t opened"></span>'
+      : '';
+    return `<div class="wf-card wf-${st}${selClass}${msClass}${familyClass}${unreadClass}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" onclick="singleOrDouble('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')" title="${escHtml(s.display_title)} \u2014 double-click to open in VibeNode">
+      ${unreadDot}
       <div class="wf-avatar">${emoji}</div>
       <div class="wf-status-label">${label}</div>
       <div class="wf-name">${childGlyph}${name}</div>
