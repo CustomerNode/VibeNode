@@ -2302,6 +2302,61 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
 .live-log::-webkit-scrollbar { width:6px; }
 .live-log::-webkit-scrollbar-track { background:transparent; }
 .live-log::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius:2px; }
+
+/* ===== Thread scroll state machine (thread-scroll.js) ===== */
+
+/* Bottom sentinel. An IntersectionObserver watches this to decide "caught up"
+   instead of doing scrollHeight/scrollTop/clientHeight arithmetic, which iOS
+   Safari's address-bar resize and sub-pixel rounding both defeat. Kept as the
+   last child of the log by a MutationObserver. Zero height: never affects
+   layout, never gets a scroll position of its own. */
+.vn-thread-sentinel {
+  height:1px; width:100%; margin:0; padding:0;
+  flex-shrink:0; pointer-events:none; visibility:hidden;
+}
+
+/* Jump-to-latest pill. Zero-height sticky wrapper so it floats above the
+   newest content without occupying a single pixel of flow — the visible button
+   is lifted out of the wrapper with translateY(-100%). `bottom` sticky pins it
+   to the viewport bottom whenever its natural position is below the fold, i.e.
+   exactly when the user has scrolled up, and releases at the true bottom. */
+.vn-jump-wrap {
+  position:sticky; bottom:10px; height:0;
+  display:flex; justify-content:center;
+  z-index:5; pointer-events:none;
+  opacity:0; visibility:hidden;
+  transition:opacity .16s ease;
+}
+.vn-jump-wrap.visible { opacity:1; visibility:visible; }
+/* Deliberately understated: this is an ambient hint, not a call to action.
+   Muted text, hairline border, translucent blurred fill so thread content
+   reads through it. It resolves to full contrast only on hover/focus. */
+.vn-jump-pill {
+  position:relative;
+  pointer-events:auto; transform:translateY(-100%);
+  display:inline-flex; align-items:center; gap:5px;
+  background: var(--bg-dropdown);
+  background: color-mix(in srgb, var(--bg-dropdown) 80%, transparent);
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+  color: var(--text-faint);
+  border:1px solid var(--border); border-radius:999px;
+  padding:5px 11px; font-size:10.5px; font-weight:500; letter-spacing:.01em;
+  font-family:-apple-system,'SF Pro Text','Inter',system-ui,sans-serif;
+  cursor:pointer; white-space:nowrap;
+  box-shadow:0 2px 8px var(--shadow);
+  opacity:.82;
+  transition:opacity .15s ease, color .15s ease, border-color .15s ease;
+}
+.vn-jump-pill:hover,
+.vn-jump-pill:focus-visible {
+  opacity:1; color: var(--text-secondary); border-color: var(--border-hover);
+}
+.vn-jump-pill:active { transform:translateY(-100%) scale(.97); }
+.vn-jump-pill svg { flex-shrink:0; opacity:.6; }
+@media (prefers-reduced-motion: reduce) {
+  .vn-jump-wrap { transition:none; }
+}
+
 /* Load older messages pagination button */
 .live-load-more {
   text-align:center; padding:10px 0 14px; position:relative;

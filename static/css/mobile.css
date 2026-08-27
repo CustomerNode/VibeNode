@@ -457,6 +457,22 @@
     overscroll-behavior: contain;
   }
 
+  /* Jump-to-latest pill. It stays visually understated on touch too, so the
+     44px tap target comes from a transparent overlay rather than from
+     inflating the pill — big enough to hit, small enough to ignore. */
+  .vn-jump-wrap { bottom: 14px; }
+  .vn-jump-pill {
+    padding: 6px 13px;
+    font-size: 11.5px;
+  }
+  .vn-jump-pill::before {
+    content: '';
+    position: absolute;
+    left: -8px; right: -8px;
+    top: 50%; transform: translateY(-50%);
+    height: 44px;
+  }
+
   /* ---- Composer: don't touch the edges, respect the home indicator, and cap
      the auto-growing textarea so long input can't push the chat out of view --- */
   .live-input-bar {

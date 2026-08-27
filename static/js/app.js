@@ -1142,9 +1142,14 @@ async function addNewAgent() {
   // Show idle input bar immediately — user types their first message here
   liveSessionId = newId;
   liveLineCount = 0;
-  liveAutoScroll = true;
   liveBarState = null;
   _optimisticMsgId = 0;
+  // This path builds the live panel inline instead of going through
+  // startLivePanel(), so bind the scroll/collapse state machine here too —
+  // otherwise a brand-new session's thread has no scroll state at all.
+  // ThreadScroll.attach() also resets liveAutoScroll to true.
+  if (window.ThreadScroll) ThreadScroll.attach(document.getElementById('live-log'), newId);
+  else liveAutoScroll = true;
 
   const bar = document.getElementById('live-input-bar');
   if (bar) {

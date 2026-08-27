@@ -484,12 +484,18 @@ function _formatMsgTime(tsStr) {
 
 let liveLineCount = 0;
 let _liveSending = false;
+// Legacy mirror of the scroll state machine, kept because many call sites here
+// and in socket.js still guard raw `scrollTop = scrollHeight` with it.
+// ThreadScroll (thread-scroll.js) OWNS this value and maps READING -> false;
+// do NOT assign to it from anywhere else or the machine and the DOM disagree.
+//
+// There is deliberately no `_autoScrollTopAlignTs` here anymore. That 150ms
+// blind spot existed only because intent was inferred from `scroll` events,
+// which a programmatic top-align fires indistinguishably from a user scroll.
+// ThreadScroll derives intent from input events (wheel/touch/keydown) instead,
+// so programmatic scrolls are structurally invisible to it and no time-based
+// guard is needed. See thread-scroll.js §A.
 let liveAutoScroll = true;
-// Timestamp (ms) of the last *programmatic* top-align auto-scroll. The live-log
-// scroll listener uses it to ignore the scroll event our own top-align fires —
-// otherwise it would mistake "scrolled to the AI message's top" for the user
-// manually scrolling up and disable auto-scroll. See _autoScrollLiveLog().
-let _autoScrollTopAlignTs = 0;
 // Monotonic counter used to tag optimistic user bubbles so they can be
 // matched/replaced when the server echoes the entry back — without any
 // text-based comparison that would eat legitimate duplicate messages.
@@ -954,7 +960,8 @@ function startLivePanel(id, opts) {
   // session (hides it if that session has no previews yet).
   if (window.MobilePreview) { try { MobilePreview.onSessionActivated(id); } catch (e) {} }
   liveLineCount = 0;
-  liveAutoScroll = true;
+  // (liveAutoScroll is reset by ThreadScroll.attach() further down — the state
+  // machine owns it, so don't set it here.)
   if (!(opts && opts.skipLog)) _optimisticMsgId = 0;
   // Clear any pending invoke from a different session
   if (window._pendingInvoke) {
@@ -987,15 +994,9 @@ function startLivePanel(id, opts) {
 
   _clearOutputShelf();
   const logEl = document.getElementById('live-log');
-  logEl.addEventListener('scroll', () => {
-    // Ignore the scroll event triggered by our own programmatic top-align of
-    // the most-recent AI message — that is an auto-scroll, not the user
-    // scrolling up, so it must NOT disable auto-scroll. (Window is short so a
-    // genuine user scroll right afterward is still honored.)
-    if (Date.now() - _autoScrollTopAlignTs < 150) return;
-    const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 60;
-    liveAutoScroll = atBottom;
-  });
+  // Bind the scroll/collapse state machine to this log. Resets to LIVE, so
+  // READING never leaks across a session switch (the old global boolean did).
+  if (window.ThreadScroll) ThreadScroll.attach(logEl, id);
 
   // Initialize sticky user message bar on the live log container
   if (typeof initStickyUserMessages === 'function') initStickyUserMessages(logEl);
@@ -1248,6 +1249,15 @@ function _savePendingInputAsDraft() {
 const _MSG_TRUNCATE_LIMIT = { asst: 600, user: 800 };
 
 /**
+ * Opening (or closing) a tool/result/permission detail is a reading signal —
+ * you clicked to read something, so the thread must stop scrolling out from
+ * under you. Drops the scroll state machine to READING.
+ */
+function _noteDetailToggle() {
+  if (window.ThreadScroll) ThreadScroll.noteUserExpand();
+}
+
+/**
  * Populate (or re-populate) a chat message's `.msg-body`, managing truncation
  * and the "show more" control.
  *
@@ -1314,6 +1324,10 @@ function _fillMsgBody(div, kind, fullText, expanded) {
     btn.className = 'live-expand-btn';
     btn.textContent = '… show more';
     btn.onclick = () => {
+      // Expanding is an explicit reading signal: stop moving the viewport.
+      // (A manually expanded message is also never auto-collapsed — it carries
+      // no `msg-recent-expanded` tag, so _collapseRecentAsst can't target it.)
+      if (window.ThreadScroll) ThreadScroll.noteUserExpand();
       if (isAsst) {
         bodyEl.innerHTML = mdParse(renderFull);
         if (typeof addSmartCopyButtons === 'function') addSmartCopyButtons(bodyEl, renderFull);
@@ -1337,15 +1351,36 @@ function _fillMsgBody(div, kind, fullText, expanded) {
  * Messages the user manually expanded (via "show more") are NOT tagged
  * `msg-recent-expanded`, so they are never collapsed by this.
  *
+ * Routed through ThreadScroll.requestCollapse() rather than collapsing inline,
+ * which enforces two things this used to violate:
+ *   1. Auto-collapse only happens in the LIVE state (in FOLLOW/READING the
+ *      user's expanded content is left alone).
+ *   2. A message intersecting the viewport is NEVER collapsed, in any state —
+ *      it is queued and collapsed once it scrolls off. This is the actual fix
+ *      for "I was reading a message and it shrank": reading a tall new message
+ *      means scrolling DOWN, which no scroll-position heuristic can distinguish
+ *      from following along, so state alone was never enough to prevent it.
+ * When a queued collapse does fire above the viewport, requestCollapse anchors
+ * scrollTop against the height delta so the reader's position holds.
+ *
  * @param {HTMLElement} logEl  the live-log container to search within
  */
 function _collapseRecentAsst(logEl) {
   if (!logEl) return;
-  const prev = logEl.querySelector('.msg.assistant.msg-recent-expanded');
-  if (!prev) return;
-  const fullText = prev._vnFullText;
-  if (typeof fullText !== 'string') { prev.classList.remove('msg-recent-expanded'); return; }
-  _fillMsgBody(prev, 'asst', fullText, false);
+  // querySelectorAll, not querySelector: a deferred collapse keeps its
+  // `msg-recent-expanded` tag until it actually runs, so while the user is
+  // reading (or in FOLLOW) several tagged messages can pile up. Collapsing only
+  // the first would leave the rest permanently expanded once we returned to
+  // LIVE. Called before the new entry is appended, so everything tagged here is
+  // by definition superseded.
+  const stale = logEl.querySelectorAll('.msg.assistant.msg-recent-expanded');
+  for (const prev of stale) {
+    const fullText = prev._vnFullText;
+    if (typeof fullText !== 'string') { prev.classList.remove('msg-recent-expanded'); continue; }
+    const doCollapse = () => _fillMsgBody(prev, 'asst', fullText, false);
+    if (window.ThreadScroll) ThreadScroll.requestCollapse(prev, doCollapse);
+    else doCollapse();
+  }
 }
 
 // Small gap (px) left above a top-aligned AI message so its first line isn't
@@ -1398,6 +1433,11 @@ function _isLastMessageEl(logEl, el) {
 function _autoScrollLiveLog(logEl, msgEl) {
   if (!logEl) return;
 
+  // READING means the user owns the viewport — do not move it for any reason.
+  // (LIVE and FOLLOW both tail-follow; they differ only in whether auto-collapse
+  // is allowed, which is decided in _collapseRecentAsst, not here.)
+  if (window.ThreadScroll && !ThreadScroll.mayAutoScroll()) return;
+
   // While a response is actively streaming, always follow the tail — the
   // partial streaming bubble is what the user is watching, not the previous
   // completed message.
@@ -1437,9 +1477,8 @@ function _autoScrollLiveLog(logEl, msgEl) {
               - logEl.getBoundingClientRect().top
               + logEl.scrollTop
               - _MSG_SCROLL_TOP_PAD;
-    // Mark this as a programmatic top-align so the scroll listener doesn't
-    // misread the resulting scroll event as a manual scroll-up.
-    _autoScrollTopAlignTs = Date.now();
+    // No blind-spot guard needed: ThreadScroll reads intent from input events,
+    // so this programmatic scroll cannot be mistaken for a manual scroll-up.
     logEl.scrollTop = Math.max(0, top);
   } else {
     logEl.scrollTop = logEl.scrollHeight;
@@ -1528,7 +1567,7 @@ function renderLiveEntry(e, opts) {
     detail.className = 'live-tool-detail';
     detail.textContent = e.desc || '';
 
-    toolLine.onclick = () => detail.classList.toggle('open');
+    toolLine.onclick = () => { _noteDetailToggle(); detail.classList.toggle('open'); };
     div.appendChild(toolLine);
     div.appendChild(detail);
 
@@ -1548,7 +1587,7 @@ function renderLiveEntry(e, opts) {
     detail.className = 'live-tool-detail';
     detail.innerHTML = mdParse(_colorDiffLines(escHtml(text)));
 
-    line.onclick = () => detail.classList.toggle('open');
+    line.onclick = () => { _noteDetailToggle(); detail.classList.toggle('open'); };
     div.appendChild(line);
     div.appendChild(detail);
 
@@ -1583,7 +1622,7 @@ function renderLiveEntry(e, opts) {
     detail.className = 'live-tool-detail';
     detail.innerHTML = '<pre style="white-space:pre-wrap;margin:0;color:' + (isErr ? 'var(--result-err)' : 'var(--text-muted)') + ';">' + escHtml(text) + '</pre>';
 
-    line.onclick = () => detail.classList.toggle('open');
+    line.onclick = () => { _noteDetailToggle(); detail.classList.toggle('open'); };
     div.appendChild(line);
     div.appendChild(detail);
 
@@ -1613,7 +1652,7 @@ function renderLiveEntry(e, opts) {
     detail.className = 'live-tool-detail';
     detail.innerHTML = '<pre style="white-space:pre-wrap;margin:0;font-size:11px;color:' + (isErr ? 'var(--result-err)' : 'var(--text-faint)') + ';">' + escHtml(text) + '</pre>';
 
-    line.onclick = () => detail.classList.toggle('open');
+    line.onclick = () => { _noteDetailToggle(); detail.classList.toggle('open'); };
     div.appendChild(line);
     div.appendChild(detail);
 
@@ -2659,6 +2698,23 @@ async function _liveSubmitDirect(sid, text, opts) {
   // An explicit send is an explicit "I want this session running" — it
   // supersedes any earlier sleep, so recovery is armed normally again.
   clearUserStopped(sid);
+
+  // ...and it supersedes an earlier READING/FOLLOW scroll state for the same
+  // reason: a clean send is unambiguous "I'm driving again" intent. Restores
+  // full LIVE from ANY scroll position and jumps to the bottom — if you
+  // scrolled up to copy something and then sent, you want to see the reply.
+  //
+  // ONLY clean sends belong here, and _liveSubmitDirect is exactly that
+  // boundary. The two non-clean paths reach the model without passing through
+  // this function, so neither can hijack your scroll position:
+  //   - QUEUING a message goes through _addQueue(), which never calls this.
+  //     Stacking up work is not a request to watch it happen.
+  //   - DRAINING the queue is server-side (see the note by _shiftQueue: "server
+  //     auto-dispatches from queue on idle"). The message arrives as a plain
+  //     session_entry, with no client-side send call at all — correct, since a
+  //     drain is not a user action in the first place.
+  // Do NOT add ThreadScroll.onSend() to _addQueue or any queue-drain handler.
+  if (window.ThreadScroll && sid === liveSessionId) ThreadScroll.onSend();
 
   // Mobile: drop keyboard on send. Callers vary (liveSubmitIdle, the
   // direct-send branch of liveQueueSave, and liveSubmitWaiting's fallback)

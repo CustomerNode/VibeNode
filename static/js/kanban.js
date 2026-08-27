@@ -3331,9 +3331,12 @@ async function openSessionSpawner(taskId) {
     '</div></div>' +
     '<div class="live-input-bar" id="live-input-bar"></div></div>';
   liveLineCount = 0;
-  liveAutoScroll = true;
   liveBarState = null;
   _optimisticMsgId = 0;
+  // Inline panel build (not via startLivePanel) — bind the scroll/collapse
+  // state machine here too. attach() also resets liveAutoScroll to true.
+  if (window.ThreadScroll) ThreadScroll.attach(document.getElementById('live-log'), newId);
+  else liveAutoScroll = true;
   const bar = document.getElementById('live-input-bar');
   if (bar) {
     bar.innerHTML =
