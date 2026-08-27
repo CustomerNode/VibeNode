@@ -169,19 +169,53 @@ _augment_path_for_cli()
 # Fix: never let AskUserQuestion execute.  Intercept it in can_use_tool and DENY
 # it WITHOUT interrupt.  A non-interrupting deny message is fed back to the model
 # as the tool result, so instead of an empty answer the model receives a
-# directive: proceed faithfully with what it was already asked, decide judgment
-# calls yourself, and surface any open question at the END of the response where
-# the user can revise it after the fact.  The turn keeps moving.
+# directive telling it how to resolve the question without the tool.  The turn
+# keeps moving either way.
+#
+# Refined 2026-08-27: the original directive ("just decide and keep going")
+# was correct for HOW questions but wrong for WHAT questions.
+#
+#   • HOW — "how should this be implemented?"  Which approach, which library,
+#     where the code lives, what to name it.  These are the model's job.  Pick
+#     the best option and finish the work.  The safety valve is REVERSIBILITY:
+#     a wrong reversible choice costs one follow-up message, so guessing is
+#     cheap.  An irreversible one (deleting data, force-push, dropping a table,
+#     rewriting history) is not, so that stops and gets described instead.
+#   • WHAT — "what should I do?"  Which task, which feature, what the user
+#     actually wants, scope and priority.  Guessing here burns a whole turn
+#     building the wrong thing.  The model must NOT silently pick; it ends the
+#     turn with a plain prose message listing the options and its recommendation.
+#     That is the AskUserQuestion UX, delivered as a normal reply the user can
+#     answer by simply typing back — which VibeNode's UI actually supports.
+#
+# The discriminator is what the answer changes: an implementation detail (HOW,
+# decide it) versus the direction of the work itself (WHAT, present options).
 INTERCEPT_ASK_USER_QUESTION = True
 ASK_USER_QUESTION_TOOL_NAME = "AskUserQuestion"
 ASK_USER_QUESTION_REDIRECT_MESSAGE = (
-    "You do not have the right to ask the user a question until you have "
-    "produced work. You have already been given the task — execute it to the "
-    "best of your ability, choosing the most reasonable options available at "
-    "every decision point, and carry it all the way through to completion. Do "
-    "not pause to ask. Once your work is done, you may retroactively present "
-    "these options to the user as alternative directions you could pursue, and "
-    "they can redirect you then. Proceed with the task now."
+    "This tool is unavailable — VibeNode has no interactive question UI, so it "
+    "can never be answered. You do not have the right to ask the user a question "
+    "until you have produced work. Resolve your question yourself, based on which "
+    "kind it is:\n"
+    "\n"
+    "1. A HOW question — how something gets implemented: which approach, which "
+    "library, where the code goes, what to call it. DO NOT ask. Choose the best "
+    "available option and carry the work all the way through to completion, so "
+    "long as the choice is REVERSIBLE. A reversible wrong guess costs one "
+    "follow-up message; asking costs the whole turn. Only if a step is genuinely "
+    "irreversible or destructive (deleting data, force-pushing, dropping a "
+    "table, rewriting history) do you stop short of it and describe it instead.\n"
+    "\n"
+    "2. A WHAT question — what to do: which task to take on, which feature to "
+    "build, what the user actually wants, scope or priority. Do NOT guess your "
+    "way through a large build, and do NOT use this tool. Instead, finish "
+    "whatever part of the work is already unambiguous, then end your turn with a "
+    "NORMAL text message that concisely lays out the options and states your "
+    "recommendation. No tool call, no multiple-choice widget — just prose the "
+    "user can reply to.\n"
+    "\n"
+    "If you are unsure which kind it is, treat it as a HOW question and proceed. "
+    "Continue with the task now."
 )
 
 
@@ -4213,11 +4247,12 @@ class SessionManager:
             # result that silently ends the turn, and prompting for it shows the
             # user an unanswerable allow/deny dialog.  Instead, DENY without
             # interrupt — the message below is fed back to the model as the tool
-            # result, telling it to proceed and surface the question at the end
-            # of its response rather than blocking.  This runs BEFORE every
-            # auto-approval path so the policy ("auto", "almost_always", etc.)
-            # can't let the question through.  See the module-level
-            # ASK_USER_QUESTION_REDIRECT_MESSAGE for the full rationale.
+            # result, telling it to decide HOW questions itself and to answer
+            # WHAT questions with a plain prose message (options + recommendation)
+            # rather than blocking.  This runs BEFORE every auto-approval path so
+            # the policy ("auto", "almost_always", etc.) can't let the question
+            # through.  See the module-level ASK_USER_QUESTION_REDIRECT_MESSAGE
+            # for the full rationale.
             if INTERCEPT_ASK_USER_QUESTION and tool_name == ASK_USER_QUESTION_TOOL_NAME:
                 logger.info(
                     "AskUserQuestion intercepted for %s — redirecting model to "
@@ -4232,9 +4267,11 @@ class SessionManager:
                         kind="permission",
                         text=(
                             "AskUserQuestion intercepted — VibeNode doesn't ask "
-                            "mid-task questions. The agent was told to proceed "
-                            "with its best judgment and surface the question at "
-                            "the end of its response."
+                            "mid-task questions. The agent was told to decide "
+                            "implementation details itself (any reversible "
+                            "choice) and, if the question was about what to do "
+                            "rather than how, to reply with the options and its "
+                            "recommendation in a normal message."
                         ),
                         name=tool_name,
                         is_error=False,

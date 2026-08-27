@@ -606,6 +606,44 @@ class TestAskUserQuestionInterception:
             for e in info.entries
         )
 
+    def test_redirect_message_distinguishes_how_from_what_questions(self, sm_module):
+        """The redirect must give the model two different answers, not one.
+
+        Regression guard for 2026-08-27: the original message told the model to
+        decide EVERYTHING itself and keep going.  That is right for a HOW
+        question (an implementation detail — pick the best reversible option and
+        finish) but wrong for a WHAT question (which task/feature/direction —
+        guessing burns the turn building the wrong thing).  A WHAT question must
+        come back as a normal prose message with the options and a
+        recommendation, since that is a reply the user can actually answer.
+
+        Asserted on the message text because the message IS the mechanism: it is
+        fed to the model verbatim as the tool result.  If a future edit collapses
+        the two branches back into one directive, this fails.
+        """
+        msg = sm_module.ASK_USER_QUESTION_REDIRECT_MESSAGE
+        low = msg.lower()
+
+        # Both branches must be named and distinguished.
+        assert "how question" in low
+        assert "what question" in low
+
+        # HOW branch: decide it yourself, gated on reversibility.
+        assert "reversible" in low
+        assert "irreversible" in low
+
+        # WHAT branch: a normal message with options + a recommendation,
+        # explicitly NOT another tool call.
+        assert "recommendation" in low
+        assert "options" in low
+        assert "normal" in low and "message" in low
+
+        # The original "don't block, keep working" spine must survive.
+        assert "produced work" in msg
+
+        # Ambiguity must resolve toward acting, not toward stalling.
+        assert "unsure" in low
+
     def test_redirect_beats_auto_policy_but_other_tools_still_approve(
         self, session_manager, sm_module
     ):
