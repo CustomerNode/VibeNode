@@ -226,6 +226,9 @@ data/chatgpt-debug/
 # Mobile visual channel — headless-rendered preview screenshots (app/routes/preview_api.py)
 data/previews/
 
+# Composer image attachments — pasted/picked images (app/routes/live_api.py)
+data/uploads/
+
 # Backups
 backups/
 

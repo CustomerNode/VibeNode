@@ -1847,6 +1847,16 @@ body.unread-enabled .session-item .unread-dot {
   transition: opacity 0.3s;
   pointer-events: none;
   z-index: 9999;
+  /* Without a left bound the box grows leftward off a phone screen and the
+     start of a long message is unreadable. Diagnostic toasts depend on being
+     fully legible. */
+  left: 20px;
+  max-width: calc(100vw - 40px);
+  text-align: right;
+  overflow-wrap: break-word;
+}
+@media (min-width: 769px) {
+  .toast { left: auto; max-width: 480px; }
 }
 .toast.show { opacity: 1; }
 .toast.error { background: var(--bg-toast-error); border-color: var(--border-toast-error); color: var(--text-toast-error); }
@@ -2951,6 +2961,52 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
 }
 .live-send-btn:hover { background: var(--bg-btn-primary-hover); color: var(--accent-light); }
 .live-send-btn:disabled { opacity:0.4; cursor:default; }
+/* Composer image attach (image-attach.js). A <label> so the hidden file input
+   opens the iOS photo sheet on tap; tighter padding because the content is a
+   16px icon rather than a text label. */
+.live-image-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 7px 11px;
+}
+.live-image-btn.is-busy { opacity: 0.45; pointer-events: none; }
+/* Long-press affordance in the composer (image-attach.js). Rendered ALONGSIDE
+   the native iOS edit menu, never in place of it. */
+.vn-attach-chip {
+  position: fixed;
+  z-index: 100000;
+  display: inline-flex;
+  align-items: stretch;
+  padding: 0;
+  overflow: hidden;
+  border-radius: 20px;
+  background: var(--bg-sort-active, #2f3d54);
+  color: var(--accent-text, #fff);
+  border: 1px solid var(--border-btn-primary, #4a5f80);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  white-space: nowrap;
+  animation: vn-chip-in 0.13s ease-out;
+}
+.vn-chip-act {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 10px 14px;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+}
+.vn-chip-act + .vn-chip-act { border-left: 1px solid var(--border-btn-primary, #4a5f80); }
+.vn-chip-act:active { background: rgba(255, 255, 255, 0.12); }
+@keyframes vn-chip-in {
+  from { opacity: 0; transform: translateY(4px) scale(0.96); }
+  to   { opacity: 1; transform: none; }
+}
 .live-send-btn.recording {
   background: transparent;
   border-color: var(--result-err, #c44);

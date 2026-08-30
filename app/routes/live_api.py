@@ -1680,6 +1680,163 @@ def api_file_drop():
     return jsonify({"ok": True, "path": str(dest), "filename": filename})
 
 
+@bp.route('/api/attach-image', methods=['POST'])
+def api_attach_image():
+    """Accept a pasted or picked image and save it where a session can read it.
+
+    Unlike /api/file-drop this picks its own destination, because the caller is
+    the composer (which has no target directory to offer) and the only thing the
+    client needs back is a path to hand to Claude.
+    """
+    if 'file' not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    f = request.files['file']
+    raw_name = f.filename or 'pasted-image.png'
+
+    ext = Path(raw_name).suffix.lower()
+    allowed = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.heic', '.heif', '.bmp'}
+    if ext not in allowed:
+        return jsonify({"error": f"Unsupported image type: {ext or 'none'}"}), 400
+
+    upload_dir = Path(__file__).resolve().parents[2] / "data" / "uploads"
+    try:
+        upload_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return jsonify({"error": f"Cannot create upload directory: {e}"}), 500
+
+    stem = Path(secure_filename(raw_name) or 'image').stem[:40] or 'image'
+    filename = _dedup_filename(upload_dir, f"{time.strftime('%Y%m%d-%H%M%S')}-{stem}{ext}")
+    dest = upload_dir / filename
+    try:
+        f.save(str(dest))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ok": True, "path": str(dest), "filename": filename})
+
+
+@bp.route('/attach')
+def attach_page():
+    """Standalone image-attach page for phones.
+
+    Exists because the SPA holds its JS in memory across server updates, which
+    makes iterating on clipboard behavior against a mobile client miserable.
+    This page is self-contained, tiny, and served with no-store so every visit
+    runs current code. It uploads via /api/attach-image; the receiving session
+    reads the newest file in data/uploads.
+    """
+    html = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Attach an image</title>
+<style>
+ *{box-sizing:border-box}
+ body{margin:0;padding:28px 18px;background:#0f1720;color:#e8eef5;
+      font-family:-apple-system,'Segoe UI',sans-serif;text-align:center}
+ h1{font-size:18px;margin:0 0 6px}
+ p{color:#8fa0b5;font-size:13px;margin:0 0 22px}
+ .btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;
+      padding:20px;margin:0 0 14px;font-size:18px;font-weight:600;border:0;
+      border-radius:14px;background:#1C4587;color:#fff;font-family:inherit}
+ .btn:active{background:#2a5aa8}
+ .btn.alt{background:#22304a}
+ #out{margin-top:18px;font-size:14px;line-height:1.5;word-break:break-all}
+ .ok{color:#7fe0a0}.err{color:#ff9090}
+ img.preview{max-width:100%;max-height:38vh;margin-top:14px;border-radius:10px;
+      border:1px solid #2b3a4a}
+</style></head><body>
+<h1>Attach an image</h1>
+<p>It lands on the PC where Claude can read it.</p>
+<button class="btn" id="paste">&#128203;&nbsp; Paste from clipboard</button>
+<label class="btn alt" for="pick">&#128247;&nbsp; Photo library / camera
+  <input id="pick" type="file" accept="image/*" style="display:none"></label>
+<div id="out"></div>
+<script>
+var out=document.getElementById('out');
+function diag(m){try{fetch('/api/client-log',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({tag:'attach-page',msg:m})}).catch(function(){});}catch(e){}}
+function show(cls,msg){out.className=cls;out.textContent=msg;}
+function preview(file){var old=document.querySelector('img.preview');
+  if(old)old.remove();var im=document.createElement('img');im.className='preview';
+  im.src=URL.createObjectURL(file);document.body.appendChild(im);}
+function upload(file){
+  if(!file){show('err','No image to upload');return;}
+  show('','Uploading\\u2026');
+  var fd=new FormData();
+  var name=file.name||('pasted-image.'+(((file.type||'').split('/')[1])||'png'));
+  fd.append('file',file,name);
+  fetch('/api/attach-image',{method:'POST',body:fd})
+    .then(function(r){return r.json().then(function(d){return{ok:r.ok,d:d};});})
+    .then(function(x){
+      if(x.ok&&x.d.path){show('ok','Done. Saved as '+x.d.filename+
+        '. Go back to your chat and tell Claude to look at it.');
+        preview(file);diag('uploaded '+x.d.filename+' ('+file.size+' bytes)');}
+      else{show('err',x.d.error||'Upload failed');diag('upload failed: '+(x.d.error||'?'));}
+    })
+    .catch(function(e){show('err','Upload failed: '+e.message);diag('upload exception: '+e.message);});
+}
+document.getElementById('pick').addEventListener('change',function(){
+  var f=this.files&&this.files[0];this.value='';if(f)upload(f);});
+document.getElementById('paste').addEventListener('click',function(){
+  diag('paste tapped; ua='+navigator.userAgent.slice(0,110));
+  if(!navigator.clipboard||!navigator.clipboard.read){
+    show('err','This browser cannot read the clipboard. Use Photo library.');
+    diag('clipboard.read unavailable');return;}
+  navigator.clipboard.read().then(function(items){
+    var seen=[];
+    for(var i=0;i<items.length;i++){
+      var ts=items[i].types||[];
+      for(var j=0;j<ts.length;j++){
+        seen.push(ts[j]);
+        if(/^image\\//.test(ts[j])||/^public\\.(png|jpeg|jpg|heic|heif|tiff|image)/.test(ts[j])){
+          var t=ts[j];
+          return items[i].getType(t).then(function(b){
+            diag('got '+t+' size='+b.size);
+            var ext=((b.type||t).split('/')[1]||'png').replace('jpeg','jpg');
+            var f;try{f=new File([b],'pasted-image.'+ext,{type:b.type||'image/png'});}
+            catch(e){b.name='pasted-image.'+ext;f=b;}
+            upload(f);});}}}
+    diag('no image; clipboard types: '+(seen.join(', ')||'(none)'));
+    show('err',seen.length?('Clipboard has '+seen.join(', ')+' \\u2014 no image. Copy the image again, then tap Paste.')
+                          :'Clipboard is empty or unreadable. Use Photo library.');
+  }).catch(function(e){
+    diag('read FAILED: '+(e.name||'')+' '+(e.message||''));
+    show('err',e.name==='NotAllowedError'
+      ?'Safari blocked it. Tap Paste again and allow when asked.'
+      :'Clipboard error: '+(e.message||e.name));});
+});
+</script></body></html>"""
+    resp = current_app.response_class(html, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
+
+
+@bp.route('/api/client-log', methods=['POST'])
+def api_client_log():
+    """Append a small client-side diagnostic line to logs/client_diag.log.
+
+    Exists so mobile-side failures (e.g. clipboard reads) can be diagnosed by
+    reading a file on this machine instead of relaying toast text through the
+    user. Size-capped and content-truncated; no secrets, no echo back.
+    """
+    data = request.get_json(silent=True) or {}
+    tag = str(data.get('tag', ''))[:40]
+    msg = str(data.get('msg', ''))[:500]
+
+    log_dir = Path(__file__).resolve().parents[2] / "logs"
+    log_file = log_dir / "client_diag.log"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        if log_file.exists() and log_file.stat().st_size > 256 * 1024:
+            log_file.write_text("", encoding="utf-8")   # simple cap: truncate
+        with open(log_file, "a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{tag}] {msg}\n")
+    except OSError:
+        pass
+    return jsonify({"ok": True})
+
+
 @bp.route('/api/browse-dir')
 def api_browse_dir():
     """Return immediate subdirectory names for the given path."""
