@@ -423,6 +423,36 @@ socket.on('error', (data) => {
     }
 });
 
+/**
+ * THE single write path for per-session usage-limit state.
+ *
+ * The daemon reports an exhausted plan quota as two always-present fields on
+ * session state: `limited_model` (which model ran out) and `limit_reset_at`
+ * (absolute epoch SECONDS when it frees up, or 0 when the CLI gave no
+ * machine-readable time).  `limited_model` is the presence flag — an empty
+ * string means "not limited".
+ *
+ * Both `session_state` and `state_snapshot` funnel through here so the two
+ * paths can never drift, which is exactly how `_sessionError` ended up
+ * surviving on one path and vanishing on the other.
+ *
+ * @param {string} id  session id
+ * @param {object} s   the state payload (session_state data or a snapshot row)
+ */
+function _ingestLimitState(id, s) {
+    if (!window._sessionLimitState) window._sessionLimitState = {};
+    if (s && s.limited_model) {
+        window._sessionLimitState[id] = {
+            limited_model: s.limited_model,
+            // 0 is a legitimate value meaning "reset time unknown" — the banner
+            // then renders without a countdown instead of inventing one.
+            limit_reset_at: Number(s.limit_reset_at) || 0,
+        };
+    } else {
+        delete window._sessionLimitState[id];
+    }
+}
+
 // Full state snapshot on connect
 // Track when each session last got an incremental state update so
 // heartbeat snapshots don't revert fresher data.
@@ -479,6 +509,18 @@ socket.on('state_snapshot', (data) => {
             };
         } else {
             delete window._sessionRetryState[id];
+        }
+        // Sync the usage-limit CTA + the plain error banner from the snapshot.
+        // Without this pair, a refresh (or any reconnect that rebuilds state
+        // from a snapshot rather than an incremental event) silently dropped
+        // BOTH — you came back to a session that looked merely idle with no
+        // hint that it had stopped because the quota ran out.
+        _ingestLimitState(id, s);
+        if (!window._sessionError) window._sessionError = {};
+        if (s.error) {
+            window._sessionError[id] = s.error;
+        } else {
+            delete window._sessionError[id];
         }
         if (s.usage) {
             window._sessionUsage[id] = s.usage;
@@ -836,6 +878,10 @@ socket.on('session_state', (data) => {
     } else {
         delete window._sessionError[session_id];
     }
+    // Track an exhausted plan quota per session.  When set, the live panel
+    // replaces the generic error banner (whose only action, "Retry", re-hits
+    // the same wall) with a model-switch CTA — the one action that unblocks.
+    _ingestLimitState(session_id, data);
 
     // Track token usage per session for context window indicator
     if (!window._sessionUsage) window._sessionUsage = {};
@@ -1088,10 +1134,15 @@ socket.on('send_failed', (data) => {
             if (typeof _resetTextareaHeight === 'function') _resetTextareaHeight(ta);
         }
 
-        // Remove the optimistic bubble — it didn't go through
+        // Remove the optimistic bubble — it didn't go through.
+        // Tail-aware lookup: ThreadScroll pins its pill/sentinel as the last
+        // children of #live-log, so `:last-child` can never match. See
+        // _findTrailingOptimisticBubble() in live-panel.js.
         const logEl = document.getElementById('live-log');
         if (logEl) {
-            const optimistic = logEl.querySelector('.msg.user.optimistic-bubble:last-child');
+            const optimistic = (typeof _findTrailingOptimisticBubble === 'function')
+                ? _findTrailingOptimisticBubble(logEl)
+                : logEl.querySelector('.msg.user.optimistic-bubble:last-child');
             if (optimistic) optimistic.remove();
         }
 
@@ -1369,8 +1420,15 @@ socket.on('session_entry', (data) => {
     // the optimistic bubble and render the server-confirmed version instead.
     // Uses position (last optimistic bubble), NOT text matching — so
     // legitimate duplicate messages ("yes", "ok") always render.
+    //
+    // Do NOT go back to `:last-child` here. ThreadScroll pins .vn-jump-wrap and
+    // .vn-thread-sentinel as the last children of #live-log and re-pins them on
+    // every append, so `:last-child` never matches a message and every sent
+    // message renders twice. See _findTrailingOptimisticBubble() in live-panel.js.
     if (data.entry.kind === 'user') {
-        const optimistic = logEl.querySelector('.msg.user.optimistic-bubble:last-child');
+        const optimistic = (typeof _findTrailingOptimisticBubble === 'function')
+            ? _findTrailingOptimisticBubble(logEl)
+            : logEl.querySelector('.msg.user.optimistic-bubble:last-child');
         if (optimistic) {
             // The last element is our optimistic bubble — replace it with
             // the server-confirmed entry (which has correct formatting/index).

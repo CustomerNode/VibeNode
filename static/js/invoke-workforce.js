@@ -354,6 +354,15 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
         // Route through the store's single write path, then the single badge
         // renderer.  Never write model text to the DOM directly here.
         if (typeof SessionModel !== 'undefined') SessionModel.ingestConfirmed(liveSid, data.model);
+        // Mirror the choice into `desiredModel` as well.  The wake path
+        // (liveSubmitContinue) sends `desiredModel` on resume, so leaving it
+        // un-updated here would mean: switch live to model B, let the session
+        // sleep, type to wake it — and it comes back on a STALE earlier
+        // choice instead of B.  Keeping the two fields in step is what makes
+        // "the model I picked is the model it wakes up on" actually true.
+        if (typeof SessionModel !== 'undefined' && SessionModel.setDesired) {
+          SessionModel.setDesired(liveSid, data.model, '');
+        }
         _renderSessionModelBadge(liveSid);
         _closePm();
         if (typeof showToast === 'function') {

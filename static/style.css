@@ -1433,8 +1433,11 @@ body.unread-enabled .session-item .unread-dot {
   opacity: 0;
   transition: opacity 0.2s ease;
 }
+/* "no .msg after it" == the newest message. NOT :last-child — ThreadScroll pins
+   .vn-jump-wrap / .vn-thread-sentinel after the final message, so :last-child
+   never matches a bubble and this footer stayed invisible. */
 .msg.user:hover .vn-msg-footer,
-.msg.user:last-child .vn-msg-footer { opacity: 1; }
+.msg.user:not(:has(~ .msg)) .vn-msg-footer { opacity: 1; }
 .vn-msg-footer-icon {
   font-size: 8px;
   margin-right: 2px;

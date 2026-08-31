@@ -285,6 +285,178 @@ class TestClassifier:
         assert sm_module.SessionManager._classify_result_error("error_max_turns", "") == "permanent"
         assert sm_module.SessionManager._classify_result_error("error_max_turns", "anything") == "permanent"
 
+
+# ===========================================================================
+# Usage limit (plan/quota exhaustion) — a class of its own
+#
+# Why this is NOT "transient": a quota stands for HOURS.  Arming the
+# exponential backoff against it burns the whole bounded retry budget
+# (_API_RETRY_MAX) re-hitting the same wall, and leaves nothing for the
+# genuine transient outage that comes later.  The only action that actually
+# unblocks the user is switching to a model with headroom, so this class
+# exists to drive the model-switch CTA instead of a useless Retry button.
+# ===========================================================================
+
+class TestUsageLimitClassification:
+    # Every string below was extracted from the INSTALLED CLI BINARY (its
+    # billing/rate-limit copy and the `rateLimitType` enum), not invented.  If
+    # a future CLI reworks this copy, these are the cases to re-derive.
+    @pytest.mark.parametrize("text", [
+        # Rendered by the CLI as "<rateLimitType> reached".
+        "Usage limit reached",
+        "Usage limit reached · continuing automatically",
+        "usage limit reached — check plan",
+        # Weekly/5-hour phrasing — note this does NOT contain "weekly limit
+        # reached", which is why literal matching failed on it.
+        "Lower-priority mode ended · you have reached your weekly usage limit",
+        # Credit exhaustion.  The CLI's own remedy here is "Switch to another
+        # model to continue" — exactly what our CTA offers.
+        "You're out of usage credits. Switch to another model to continue.",
+        "Your organization is out of usage credits. Contact your admin to add more.",
+        "usage_cap_reached",
+        # The CLI splices "org's monthly usage limit" into a composed sentence;
+        # the fragment alone carries no exhaustion verb, so test the real shape.
+        "You've reached your org's monthly usage limit",
+        # API-side billing.
+        "Your credit balance is too low to access the API",
+        "quota exceeded",
+        # Legacy pipe form kept working for older CLI builds.
+        "Claude AI usage limit reached|1756612800",
+    ])
+    def test_usage_limits_get_their_own_class(self, sm_module, text):
+        assert sm_module.SessionManager._classify_result_error(
+            "error_during_execution", text) == "usage_limit"
+
+    @pytest.mark.parametrize("text", [
+        # These MENTION a limit without being one.  Misclassifying any of them
+        # parks a healthy session behind a CTA it can never dismiss.
+        "Your usage limit has reset · press enter to continue",
+        "Usage limit has reset · press enter to continue",
+        "Usage limit available again · continuing now",
+        "Approaching your 5-hour usage limit — Claude will wrap up the current step.",
+        "Server is temporarily limiting requests (not your usage limit)",
+        "/upgrade to increase your usage limit.",
+    ])
+    def test_limit_adjacent_strings_are_not_limits(self, sm_module, text):
+        assert sm_module.SessionManager._parse_usage_limit(text)[0] is False
+        assert sm_module.SessionManager._classify_result_error("", text) != "usage_limit"
+
+    @pytest.mark.parametrize("raw,expected", [
+        ('{"resetsAtSeconds":1756612800}', 1756612800.0),
+        ('{"resetsAt": 1756612800}', 1756612800.0),
+        ('{"resets_at_seconds": 1756612800}', 1756612800.0),
+        ("Claude AI usage limit reached|1756612800", 1756612800.0),
+    ])
+    def test_reset_instant_parsed_from_every_known_encoding(self, sm_module,
+                                                            raw, expected):
+        """The installed CLI uses `resetsAtSeconds`, NOT the legacy pipe form.
+        Both (and the API's `resetsAt`) must yield the same countdown."""
+        text = "Usage limit reached " + raw
+        is_limit, reset = sm_module.SessionManager._parse_usage_limit(text)
+        assert is_limit is True
+        assert reset == expected
+
+    def test_usage_limit_outranks_a_cooccurring_429(self, sm_module):
+        """A quota message frequently ALSO carries a 429.  Matching the
+        transient signature first would arm a seconds-scale backoff against an
+        hours-long wall — the precedence here is the whole point."""
+        text = "429: Claude AI usage limit reached|1756612800"
+        assert sm_module.SessionManager._classify_result_error("", text) == "usage_limit"
+
+    @pytest.mark.parametrize("text", [
+        "429 Too Many Requests",
+        "rate limit exceeded",
+        "API Error: 529 Overloaded",
+    ])
+    def test_plain_throttles_stay_transient(self, sm_module, text):
+        """Guard against over-matching: a server-side throttle IS fixed by the
+        backoff and must keep its auto-retry."""
+        assert sm_module.SessionManager._classify_result_error("", text) == "transient"
+
+    def test_parses_epoch_seconds_reset(self, sm_module):
+        is_limit, reset = sm_module.SessionManager._parse_usage_limit(
+            "Claude AI usage limit reached|1756612800")
+        assert is_limit is True
+        assert reset == 1756612800.0
+
+    def test_parses_epoch_millis_reset(self, sm_module):
+        """Some CLI builds emit milliseconds; a value implausible as seconds is
+        scaled down rather than rendered as a countdown in the year 57000."""
+        is_limit, reset = sm_module.SessionManager._parse_usage_limit(
+            "Claude AI usage limit reached|1756612800000")
+        assert is_limit is True
+        assert reset == 1756612800.0
+
+    def test_prose_variant_has_no_reset_time(self, sm_module):
+        """No machine-readable instant → 0.0, so the banner omits the countdown
+        rather than inventing a number."""
+        is_limit, reset = sm_module.SessionManager._parse_usage_limit(
+            "Claude usage limit reached. Your limit will reset at 6pm.")
+        assert is_limit is True
+        assert reset == 0.0
+
+    def test_non_limit_text_is_not_a_limit(self, sm_module):
+        assert sm_module.SessionManager._parse_usage_limit(
+            "503 service unavailable") == (False, 0.0)
+        assert sm_module.SessionManager._parse_usage_limit("") == (False, 0.0)
+        assert sm_module.SessionManager._parse_usage_limit(None) == (False, 0.0)
+
+    def test_apply_usage_limit_disarms_retry_and_records_model(self, sm_module):
+        """_apply_usage_limit must leave NO armed backoff behind — that is the
+        difference between "park with a CTA" and "burn 5 retries on a wall"."""
+        sm = sm_module.SessionManager.__new__(sm_module.SessionManager)
+        info = sm_module.SessionInfo(session_id="ul-1")
+        info.model = "claude-opus-5"
+        info._api_retry_needed = True
+        info.retry_at = time.time() + 600
+        info.retry_attempt = 2
+        info.retry_max = 5
+        info.retry_reason = "Rate limited"
+
+        sm._apply_usage_limit(info, "Claude AI usage limit reached|%d"
+                              % int(time.time() + 3600))
+
+        assert info.limited_model == "claude-opus-5"
+        assert info.limit_reset_at > time.time()
+        assert info._api_retry_needed is False
+        assert info.retry_at == 0.0
+        assert info.retry_attempt == 0
+        assert info.retry_max == 0
+        assert info.retry_reason == ""
+        assert "usage limit" in info.error.lower()
+
+    def test_flag_api_retry_records_limit_and_refuses_to_arm(self, sm_module):
+        """Channel (b): the quota surfaced as a raised exception rather than an
+        is_error RESULT.  It must still populate the CTA fields and still
+        refuse to arm a backoff."""
+        sm = sm_module.SessionManager.__new__(sm_module.SessionManager)
+        info = sm_module.SessionInfo(session_id="ul-2")
+        info.model = "claude-fable-5"
+        armed = sm._flag_api_retry_if_transient(
+            info, "Claude AI usage limit reached|1756612800")
+        assert armed is False
+        assert info._api_retry_needed is False
+        assert info.limited_model == "claude-fable-5"
+        assert info.limit_reset_at == 1756612800.0
+
+    def test_state_dict_always_carries_limit_fields(self, sm_module):
+        """Always-present (like retry_at) so the client can tell "not limited"
+        from "old daemon that doesn't send the key"."""
+        info = sm_module.SessionInfo(session_id="ul-3")
+        d = info.to_state_dict()
+        assert d["limited_model"] == ""
+        assert d["limit_reset_at"] == 0.0
+
+    def test_clear_usage_limit_is_idempotent(self, sm_module):
+        sm = sm_module.SessionManager.__new__(sm_module.SessionManager)
+        info = sm_module.SessionInfo(session_id="ul-4")
+        info.limited_model = "claude-opus-5"
+        info.limit_reset_at = 123.0
+        sm._clear_usage_limit(info)
+        sm._clear_usage_limit(info)
+        assert info.limited_model == ""
+        assert info.limit_reset_at == 0.0
+
     @pytest.mark.parametrize("text", [
         "invalid request: messages must be non-empty",
         "401 unauthorized",

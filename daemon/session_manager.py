@@ -319,6 +319,15 @@ class SessionInfo:
     _api_retry_needed: bool = False                 # set on a transient error (RESULT is_error, non-transport exception, or escalated stream-heal); consumed by the drive-loop finally to arm the timer
     _retry_needs_reconnect: bool = False            # True when the retry follows a dead transport (CLI crash / connectivity loss) so the timer must _reconnect_client before resending
     _ever_got_result: bool = False                  # True once the session has produced at least one RESULT (so the SDK id was remapped to a real UUID and the session is --resume-able).  A transport crash BEFORE this can't reconnect, so we don't escalate it to the long backoff.
+    # ── Account usage limit (see _parse_usage_limit / _apply_usage_limit) ──
+    # A plan/quota limit is NOT a transient API hiccup: it does not clear on a
+    # backoff measured in seconds, and retrying the SAME model is guaranteed to
+    # fail again until the reset instant.  The only action that actually
+    # unblocks the user is switching to a model they still have headroom on,
+    # so these two fields are serialized in to_state_dict() to let the UI
+    # render a model-switch CTA instead of a useless "Retry" button.
+    limit_reset_at: float = 0.0    # epoch time.time() when the quota resets; 0 == unknown (banner then omits the countdown)
+    limited_model: str = ""        # the model id that hit the limit, so the CTA can exclude it from the offered alternatives
     # ── Subsessions (spec §4.1) ────────────────────────────────────────────
     # parent_session_id: None for top-level sessions; UUID of the parent
     # session for subsessions.  subsession_origin_turn: parent JSONL line
@@ -383,6 +392,12 @@ class SessionInfo:
         d["retry_attempt"] = self.retry_attempt
         d["retry_max"] = self.retry_max
         d["retry_reason"] = self.retry_reason
+        # Usage-limit fields — always present (like retry_at) so the client can
+        # distinguish "not limited" (limited_model == "") from "key absent" on
+        # an older daemon.  limit_reset_at is an absolute epoch so the browser
+        # renders its own live countdown without a per-second emit.
+        d["limit_reset_at"] = self.limit_reset_at
+        d["limited_model"] = self.limited_model
         if self.usage:
             d["usage"] = self.usage
         # Include permission details for WAITING sessions so reconnecting
@@ -998,6 +1013,11 @@ class SessionManager:
             if not _self_heal and not _auto_retry:
                 self._clear_api_retry(info, reset_count=True)
                 info.error = ""
+                # A genuine new user message retracts the usage-limit CTA too:
+                # either the quota reset, or the user switched models, or they
+                # simply want to try anyway.  If the limit is still in force the
+                # next RESULT re-applies it with a fresh reset instant.
+                self._clear_usage_limit(info)
             # Read (but do NOT clear) the interrupted flag. Clearing it
             # here races: the old task's CancelledError/finally handler
             # runs on the event loop and checks _interrupted — if we clear
@@ -1351,8 +1371,106 @@ class SessionManager:
             self._schedule_registry_save()
         return changed
 
-    def set_session_model(self, session_id: str, model: str) -> dict:
+    def _resume_with_model(self, session_id: str, model: str,
+                           info: Optional["SessionInfo"] = None,
+                           resume_turn: bool = False) -> dict:
+        """Switch a NOT-LIVE session's model by resuming it with ``--model``.
+
+        Covers every shape of "there is no CLI to send a control request to":
+        dormant (no in-memory SessionInfo), STOPPED, or in-memory with a dead
+        client.  ``--model`` at resume is as authoritative as a live
+        ``set_model`` control request, and the CLI's ``init`` message confirms
+        the resolved id through ``_set_confirmed_model`` exactly as it would
+        after a live switch.
+
+        By default the session is resumed with an EMPTY prompt: switching the
+        model must not silently spend a turn.  That is the right behaviour for
+        the model badge, where the user asked only to change models.
+
+        ``resume_turn=True`` (the usage-limit CTA) additionally re-runs the turn
+        the error interrupted, because there the user's intent is "get me
+        unblocked and carry on", and making them retype the message a quota ate
+        is exactly the misery this feature exists to remove.  The prompt is
+        resumed ATOMICALLY as part of the resume rather than by nudging the
+        session afterwards: a client-side "wait for idle, then fire" cannot tell
+        the resume reaching idle apart from the user typing something new, and
+        would eventually re-send a stale message into the wrong turn.
+
+        Only an in-memory session can resume its turn — a dormant one has no
+        ``entries`` loaded to derive the prompt from, so it resumes cold.
+
+        Returns the same ``{"ok", "model", "resumed"}`` shape as
+        ``set_session_model`` so the socket handler needs no special case, plus
+        ``turn_resumed`` so the UI can say what actually happened.
+        """
+        # Prefer live in-memory metadata over the on-disk registry: for a
+        # STOPPED session the registry can lag behind a rename or a cwd change.
+        cwd = (info.cwd if info else "") or ""
+        name = (info.name if info else "") or ""
+        if not (cwd and name):
+            reg = {}
+            try:
+                reg = self._reg.load_registry().get("sessions", {}).get(
+                    session_id, {}
+                ) or {}
+            except Exception:
+                pass
+            cwd = cwd or reg.get("cwd") or ""
+            name = name or reg.get("name", "")
+        if cwd:
+            cwd = os.path.normpath(cwd)
+        if info is None:
+            # Dormant: verify the transcript actually exists before resuming,
+            # otherwise start_session would create a NEW session under this id.
+            try:
+                jsonl = self._store.find_session_path(session_id)
+            except Exception:
+                jsonl = None
+            if not (jsonl and jsonl.exists()):
+                return {"ok": False, "error": "Session not found"}
+        prompt = ""
+        if info is not None:
+            # The user is explicitly moving off the model that hit the wall, so
+            # the recorded limit no longer describes this session.  Clear it
+            # BEFORE the resume so the restart doesn't re-emit a stale CTA.
+            self._clear_usage_limit(info)
+            info.error = ""
+            if resume_turn:
+                prompt = self._resume_turn_prompt(info)
+                # A fresh turn must not inherit the failed turn's retry budget,
+                # so a later genuine outage still gets its full backoff chain.
+                if prompt:
+                    self._clear_api_retry(info, reset_count=True)
+        logger.info("set_session_model: resuming not-live session %s on %s "
+                    "(state=%s, resume_turn=%s)", session_id, model,
+                    info.state if info else "dormant", bool(prompt))
+        start_result = self.start_session(
+            session_id=session_id,
+            prompt=prompt,
+            cwd=cwd,
+            name=name,
+            resume=True,
+            model=model,
+        )
+        if not start_result.get("ok"):
+            return {"ok": False,
+                    "error": start_result.get("error",
+                                              "Failed to resume session")}
+        try:
+            from app.routes.live_api import record_confirmed_model
+            record_confirmed_model(model)
+        except Exception:
+            pass
+        return {"ok": True, "model": model, "resumed": True,
+                "turn_resumed": bool(prompt)}
+
+    def set_session_model(self, session_id: str, model: str,
+                          resume_turn: bool = False) -> dict:
         """Switch a running session's model for all subsequent turns.
+
+        ``resume_turn=True`` also re-runs the turn an error interrupted, for
+        the usage-limit CTA (see ``_resume_with_model``).  It is ignored when
+        there is nothing to resume.
 
         Honesty contract (this exists because the UI once lied about it):
         ``info.model`` is updated ONLY after the CLI confirms the switch
@@ -1368,56 +1486,23 @@ class SessionManager:
             return {"ok": False, "error": "No model specified"}
         with self._lock:
             info = self._sessions.get(session_id)
-        if not info:
-            # Dormant session: the daemon restarted since this session went
-            # idle, so it lives on disk (.jsonl + registry) but has no
-            # in-memory task yet — the same situation send_message handles
-            # with its auto-resume fallback.  Mirror that fallback, but
-            # launch with the REQUESTED model: ``--model`` at resume is just
-            # as authoritative as a live set_model control request, and the
-            # init message will confirm the resolved id as usual.
-            try:
-                jsonl = self._store.find_session_path(session_id)
-            except Exception:
-                jsonl = None
-            if not (jsonl and jsonl.exists()):
-                return {"ok": False, "error": "Session not found"}
-            reg = {}
-            try:
-                reg = self._reg.load_registry().get("sessions", {}).get(
-                    session_id, {}
-                ) or {}
-            except Exception:
-                pass
-            cwd = reg.get("cwd") or ""
-            if cwd:
-                cwd = os.path.normpath(cwd)
-            logger.info(
-                "set_session_model: auto-resuming dormant session %s on %s",
-                session_id, model,
-            )
-            start_result = self.start_session(
-                session_id=session_id,
-                prompt="",
-                cwd=cwd,
-                name=reg.get("name", ""),
-                resume=True,
-                model=model,
-            )
-            if not start_result.get("ok"):
-                return {"ok": False,
-                        "error": start_result.get("error",
-                                                  "Failed to resume session")}
-            try:
-                from app.routes.live_api import record_confirmed_model
-                record_confirmed_model(model)
-            except Exception:
-                pass
-            return {"ok": True, "model": model, "resumed": True}
-        if info.state == SessionState.STOPPED:
-            return {"ok": False, "error": "Session is stopped"}
-        if not info.client:
-            return {"ok": False, "error": "Session has no connected client"}
+        # A session that is not live has no CLI to accept a control request, so
+        # the switch is performed by RESUMING it with ``--model`` instead.  All
+        # three not-live shapes route to the same helper:
+        #
+        #   * ``not info``            — dormant (daemon restarted since it idled)
+        #   * ``state == STOPPED``    — slept, killed, or died mid-turn
+        #   * ``not info.client``     — in memory but the transport is gone
+        #
+        # STOPPED used to hard-fail with "Session is stopped", which is exactly
+        # the dead end a usage limit puts the user in: the limit stops the
+        # session, and stopping the session removes the only way to switch off
+        # the limited model.  Resuming with the requested model is just as
+        # authoritative as a live set_model — the CLI's init message confirms
+        # the resolved id through the same sink either way.
+        if (not info) or info.state == SessionState.STOPPED or (not info.client):
+            return self._resume_with_model(session_id, model, info,
+                                           resume_turn=resume_turn)
 
         # Guard the extended listener from misinterpreting the CLI's init
         # message (emitted after set_model) as an auto-resume signal.
@@ -1437,6 +1522,12 @@ class SessionManager:
 
         # CLI confirmed — now (and only now) record it, via the single sink.
         self._set_confirmed_model(info, model, save_registry=True)
+        # The session is no longer on the model that hit the wall, so retract
+        # the usage-limit CTA and its error banner.  (The limit itself is
+        # account+model scoped, so switching genuinely resolves it here.)
+        if info.limited_model or info.limit_reset_at:
+            self._clear_usage_limit(info)
+            info.error = ""
         logger.info("Session %s model switched to %s (CLI confirmed)",
                     session_id, model)
         # NOTE: do NOT call _emit_state here.  _emit_state on an IDLE session
@@ -2651,7 +2742,9 @@ class SessionManager:
                         info.error = ""
                         # Detection channel (b): flag a backoff auto-retry for a
                         # transient API error.  The finally block arms it.
-                        if self._flag_api_retry_if_transient(info, err_str):
+                        _retry_flagged = self._flag_api_retry_if_transient(
+                            info, err_str)
+                        if _retry_flagged:
                             _txt = "API error (%s) — auto-retry scheduled…" % info.retry_reason
                         else:
                             _txt = "Reconnected successfully"
@@ -2660,7 +2753,19 @@ class SessionManager:
                             info.entries.append(entry)
                             entry_index = len(info.entries) - 1
                         self._emit_entry(session_id, entry, entry_index)
-                        self._emit_state(info)
+                        # ORDERING (hardening): do NOT emit state while a retry is
+                        # flagged but not yet ARMED.  retry_at is still 0 here
+                        # (only _arm_api_retry sets it), so _emit_state →
+                        # _try_dispatch_queue sees an OPEN queue gate on an IDLE
+                        # session and can dispatch a queued follow-up AHEAD of the
+                        # retry.  That flips the session to WORKING, and the
+                        # finally's _arm_api_retry then drops the retry — the
+                        # failed turn is abandoned and the queue jumps the line.
+                        # _arm_api_retry emits the countdown state itself a moment
+                        # later.  Channel (c) (the heal escalation below) already
+                        # skips its emit for exactly this reason.
+                        if not _retry_flagged:
+                            self._emit_state(info)
                     else:
                         info.error = err_str
                         info.state = SessionState.STOPPED
@@ -3339,7 +3444,9 @@ class SessionManager:
                         info.error = ""
                         # Detection channel (b): flag a backoff auto-retry for a
                         # transient API error.  The finally block arms it.
-                        if self._flag_api_retry_if_transient(info, err_str):
+                        _retry_flagged = self._flag_api_retry_if_transient(
+                            info, err_str)
+                        if _retry_flagged:
                             _txt = "API error (%s) — auto-retry scheduled…" % info.retry_reason
                         else:
                             _txt = "Reconnected successfully"
@@ -3348,7 +3455,19 @@ class SessionManager:
                             info.entries.append(entry)
                             entry_index = len(info.entries) - 1
                         self._emit_entry(session_id, entry, entry_index)
-                        self._emit_state(info)
+                        # ORDERING (hardening): do NOT emit state while a retry is
+                        # flagged but not yet ARMED.  retry_at is still 0 here
+                        # (only _arm_api_retry sets it), so _emit_state →
+                        # _try_dispatch_queue sees an OPEN queue gate on an IDLE
+                        # session and can dispatch a queued follow-up AHEAD of the
+                        # retry.  That flips the session to WORKING, and the
+                        # finally's _arm_api_retry then drops the retry — the
+                        # failed turn is abandoned and the queue jumps the line.
+                        # _arm_api_retry emits the countdown state itself a moment
+                        # later.  Channel (c) (the heal escalation below) already
+                        # skips its emit for exactly this reason.
+                        if not _retry_flagged:
+                            self._emit_state(info)
                     else:
                         info.error = err_str
                         entry = LogEntry(kind="system", text=f"Reconnect failed: {e}", is_error=True)
@@ -5029,6 +5148,20 @@ class SessionManager:
                 except Exception:
                     _result_text = ""
                 _err_class = self._classify_result_error(message.subtype, _result_text)
+                # SELF-REPORTING MISS DETECTOR.  The usage-limit patterns are
+                # derived from the CLI binary's strings, but the CLI rewords
+                # this copy between releases.  If an error mentions a quota yet
+                # did NOT classify as one, say so loudly with the raw text — a
+                # missed limit silently degrades to a useless backoff, and
+                # without this line the only way to find out is a user noticing
+                # "Auto-retrying" where the model-switch CTA should have been.
+                if _err_class != "usage_limit" and _result_text:
+                    if self._LIMIT_NOUN_RE.search(_result_text):
+                        logger.warning(
+                            "Possible UNRECOGNISED usage limit on %s — classified "
+                            "as %r. Raw result text: %r",
+                            session_id[:12], _err_class, _result_text[:500],
+                        )
                 # Never arm a retry if there's no user message to replay (e.g. a
                 # bare connect failure with an empty transcript).
                 _has_user_msg = False
@@ -5055,6 +5188,18 @@ class SessionManager:
                              % info.retry_reason,
                         is_error=True,
                     )
+                elif _err_class == "usage_limit":
+                    # Quota exhausted.  No backoff is armed (see
+                    # _apply_usage_limit); the UI turns limit_reset_at +
+                    # limited_model into a one-click model-switch CTA, which is
+                    # the only action that can actually unblock the user.
+                    self._apply_usage_limit(info, _result_text)
+                    logger.info(
+                        "Session %s hit a usage limit on %s (resets_at=%s)",
+                        session_id, info.limited_model or "?",
+                        info.limit_reset_at or "unknown",
+                    )
+                    entry = LogEntry(kind="system", text=info.error, is_error=True)
                 else:
                     info._api_retry_needed = False
                     if (_err_class == "transient" and _has_user_msg
@@ -5084,6 +5229,10 @@ class SessionManager:
                     info.retry_attempt = 0
                     info.retry_max = 0
                     info.retry_reason = ""
+                # A turn that completed proves the quota is no longer blocking
+                # this session (either it reset, or the user switched models),
+                # so the usage-limit CTA must retract with the error banner.
+                self._clear_usage_limit(info)
                 # A turn that completed successfully resolves any prior error
                 # banner.  info.error is otherwise cleared ONLY on a genuine new
                 # user message (send_message L786) — NOT on an auto-retry or
@@ -5352,11 +5501,144 @@ class SessionManager:
         h, mm = divmod(m, 60)
         return "%dh %dm" % (h, mm) if mm else "%dh" % h
 
+    # ── Usage-limit detection ────────────────────────────────────────────
+    #
+    # These patterns are derived from the STRINGS IN THE INSTALLED CLI BINARY,
+    # not guessed.  Verified present (see the `rateLimitType` enum and the
+    # billing copy inside the CLI bundle):
+    #
+    #   rateLimitType : five_hour | seven_day | seven_day_opus |
+    #                   seven_day_sonnet | seven_day_overage_included | overage
+    #   rendered      : "Usage limit reached", "<Type> reached"
+    #                   "you have reached your weekly usage limit"
+    #                   "You're out of usage credits. Switch to another model…"
+    #                   "Your organization is out of usage credits."
+    #                   "org's monthly usage limit", "usage_cap_reached"
+    #
+    # A LITERAL list is the wrong shape here — the CLI renders the same
+    # condition a dozen ways ("Usage limit reached" vs "you have reached your
+    # weekly usage limit" vs "out of usage credits"), and a literal list misses
+    # every phrasing nobody thought to enumerate.  So we test the SHAPE:
+    # a limit noun AND an exhaustion verb, with explicit negative guards for
+    # the strings that mention a limit while NOT being one.
+    #
+    # Note the CLI's own remedy for running out of credits is literally
+    # "Switch to another model to continue" — which is exactly what this
+    # classification drives the UI to offer.
+
+    # Things that name a quota/allowance.
+    _LIMIT_NOUN_RE = re.compile(
+        r"usage limit|usage credits?|usage[_ ]cap|monthly usage|weekly usage"
+        r"|quota|credit balance|spend limit|credit limit|usage-credits",
+        re.I,
+    )
+    # Things that say it is EXHAUSTED (as opposed to merely mentioned).
+    _LIMIT_EXHAUSTED_RE = re.compile(
+        r"reached|exceed(?:ed)?|out of|used up|too low|insufficient"
+        r"|cap_reached|exhausted|no (?:remaining|more)",
+        re.I,
+    )
+    # Strings that mention a limit but are NOT an exhaustion — checked first.
+    # Without these, the CLI's own reset/approaching notices would be
+    # misclassified as limits and park a perfectly healthy session behind a CTA.
+    # NOTE ON SCOPE: these must stay NARROW.  An earlier draft also excluded
+    # /resets? (at|in)/ and /limit reset/, which broke the most common real
+    # phrasing there is — "Usage limit reached. Your limit will reset at 6pm."
+    # states its reset time and is unambiguously a limit.  Requiring an
+    # exhaustion verb already rejects the reset/approaching notices on its own
+    # (none of them say "reached"/"out of"), so these guards only need to cover
+    # strings that pair a limit noun WITH an exhaustion word while still not
+    # being a failure.
+    _LIMIT_NEGATIVE_RE = re.compile(
+        r"has reset|have reset|available again"
+        r"|not your usage limit"          # "Server is temporarily limiting requests (not your usage limit)"
+        r"|upgrade to increase",          # marketing copy, not a failure
+        re.I,
+    )
+    # Reset instant, in every encoding the CLI/API is known to use:
+    #   "…|1756612800"                      (legacy pipe form, older builds)
+    #   "resetsAtSeconds":1756612800        (current CLI internal field)
+    #   "resetsAt": 1756612800              (API/analytics field)
+    #   "resets_at_seconds": 1756612800
+    _LIMIT_RESET_RE = re.compile(
+        r"(?:resets?[_ ]?at(?:[_ ]?seconds)?\"?\s*[:=]\s*|\|\s*)(\d{9,16})",
+        re.I,
+    )
+
+    @staticmethod
+    def _parse_usage_limit(result_text: str):
+        """Detect a plan/quota exhaustion and extract its reset instant.
+
+        Returns ``(is_usage_limit, reset_epoch)``.  ``reset_epoch`` is 0.0 when
+        the message carries no machine-readable reset time — the UI then shows
+        the CTA without a countdown rather than inventing a number.
+
+        Pure function — no clock, no I/O — so it is trivially unit-testable.
+        """
+        txt = (result_text or "").strip()
+        if not txt:
+            return (False, 0.0)
+        # Negative guards win: "Usage limit has reset", "Approaching your
+        # 5-hour usage limit" and "Server is temporarily limiting requests
+        # (not your usage limit)" all name a limit without being one.
+        if SessionManager._LIMIT_NEGATIVE_RE.search(txt):
+            return (False, 0.0)
+        if not (SessionManager._LIMIT_NOUN_RE.search(txt)
+                and SessionManager._LIMIT_EXHAUSTED_RE.search(txt)):
+            return (False, 0.0)
+        reset = 0.0
+        m = SessionManager._LIMIT_RESET_RE.search(txt)
+        if m:
+            try:
+                val = float(m.group(1))
+                # Heuristic: anything past ~year 2286 in seconds is really ms.
+                if val > 1e11:
+                    val /= 1000.0
+                reset = val
+            except (TypeError, ValueError):
+                reset = 0.0
+        return (True, reset)
+
+    def _apply_usage_limit(self, info: "SessionInfo", result_text: str) -> None:
+        """Record a detected usage limit on the session and disarm auto-retry.
+
+        Auto-retry is explicitly NOT armed: a quota does not clear on a backoff
+        measured in seconds, so retrying only burns the bounded retry budget
+        (``_API_RETRY_MAX``) that a genuine transient outage later needs.  The
+        session parks IDLE with a structured error the UI turns into a
+        one-click model-switch CTA.
+        """
+        _is_limit, reset = self._parse_usage_limit(result_text)
+        info.limit_reset_at = reset if _is_limit else 0.0
+        # Remember WHICH model ran out so the CTA can exclude it from the
+        # alternatives it offers.  info.model is the CLI-confirmed id.
+        info.limited_model = info.model or ""
+        info._api_retry_needed = False
+        info.retry_at = 0.0
+        info.retry_attempt = 0
+        info.retry_max = 0
+        info.retry_reason = ""
+        when = ""
+        if reset:
+            remaining = reset - time.time()
+            if remaining > 0:
+                when = " — resets in %s" % self._fmt_duration(remaining)
+        info.error = "Usage limit reached%s. Switch models to keep working." % when
+
+    def _clear_usage_limit(self, info: "SessionInfo") -> None:
+        """Forget a recorded usage limit (new user message / successful turn /
+        model switch).  Safe to call unconditionally."""
+        info.limit_reset_at = 0.0
+        info.limited_model = ""
+
     @staticmethod
     def _classify_result_error(subtype: str, result_text: str) -> str:
         """Classify an ``is_error`` ResultMessage as retryable or not.
 
         Returns:
+            "usage_limit" — an account/plan quota is exhausted.  Retrying the
+                           same model cannot succeed until the reset instant,
+                           so no backoff is armed; the UI offers a model switch.
             "transient"  — a temporary, retryable failure (API overload, rate
                            limit, 5xx, network/timeout).  Auto-retry is armed.
             "permanent"  — retrying will not help (max-turns reached, invalid
@@ -5376,6 +5658,12 @@ class SessionManager:
         if "max_turns" in st or "max turns" in st:
             return "permanent"
         txt = (result_text or "").lower()
+        # Quota exhaustion is checked FIRST and deliberately outranks the
+        # transient signatures below: a usage-limit message frequently also
+        # contains "429" or "rate limit", and matching those first would arm an
+        # exponential backoff against a wall that stands for hours.
+        if SessionManager._parse_usage_limit(result_text)[0]:
+            return "usage_limit"
         # Well-known permanent failures — retrying cannot succeed.
         _permanent = (
             "invalid request", "invalid_request", "400 bad request",
@@ -5446,6 +5734,37 @@ class SessionManager:
                     return True
         return False
 
+    def _resume_turn_prompt(self, info: SessionInfo) -> str:
+        """The prompt that re-runs the turn an error interrupted, or "" if the
+        transcript has nothing to resume.
+
+        Mirrors the prompt choice documented on ``_fire_api_retry`` — this is
+        the same decision, factored out so the usage-limit model switch resumes
+        a turn exactly the way an auto-retry does instead of inventing a second
+        (inevitably divergent) rule:
+
+          * the failed turn ran a TOOL → side-effectful work already happened,
+            so re-sending the instruction would duplicate it.  Send the CONTINUE
+            prompt and let the transcript carry the context.
+          * the failed turn produced no tool calls → nothing was done yet, so
+            re-send the original request for a clean redo ("continue" with
+            nothing to continue makes the model ramble).
+        """
+        with info._lock:
+            last_user_idx = -1
+            last_user_text = ""
+            for i in range(len(info.entries) - 1, -1, -1):
+                if info.entries[i].kind == "user":
+                    last_user_idx = i
+                    last_user_text = info.entries[i].text
+                    break
+            if last_user_idx < 0 or not last_user_text:
+                return ""
+            for j in range(last_user_idx + 1, len(info.entries)):
+                if info.entries[j].kind in ("tool_use", "tool_result"):
+                    return self._API_RETRY_CONTINUE_PROMPT
+        return last_user_text
+
     def _flag_api_retry_if_transient(self, info: SessionInfo, err_str: str) -> bool:
         """Detection for channel (b): a non-transport stream exception.
 
@@ -5456,7 +5775,15 @@ class SessionManager:
         max-turns) are NOT flagged — they keep the plain reconnect-and-idle
         behavior.  Returns True if a retry was flagged.
         """
-        if self._classify_result_error("", err_str) != "transient":
+        _cls = self._classify_result_error("", err_str)
+        if _cls == "usage_limit":
+            # Channel (b) saw the quota message as a raised exception rather
+            # than an is_error RESULT.  Record it the same way so the CTA shows
+            # up regardless of which channel surfaced it, and return False so
+            # no pointless backoff is armed against it.
+            self._apply_usage_limit(info, err_str)
+            return False
+        if _cls != "transient":
             return False
         if info._api_retry_count >= self._API_RETRY_MAX:
             return False
@@ -5544,8 +5871,24 @@ class SessionManager:
         # Eligibility: never arm over a stopped session or one that already has a
         # new turn in flight (e.g. a queued message dispatched on the post-turn
         # IDLE) — that turn supersedes the retry.
+        # HARDENING: this used to return with no trace whatsoever, which is
+        # indistinguishable from "the retry silently never happened" — the single
+        # most confusing way this feature fails.  A WORKING/WAITING/STARTING drop
+        # is legitimate (a newer turn owns the session and supersedes the retry);
+        # a STOPPED drop means the failed turn was abandoned outright.  Both are
+        # now visible in the log, with the attempt budget, so a "why didn't it
+        # retry?" report can be answered from logs/_server.log.
         if info.state in (SessionState.STOPPED, SessionState.WORKING,
                           SessionState.WAITING, SessionState.STARTING):
+            logger.info(
+                "Auto-retry NOT armed for %s — session is %s (%s); "
+                "reason=%r attempts_used=%d/%d",
+                session_id[:12], info.state,
+                "session stopped, failed turn abandoned"
+                if info.state == SessionState.STOPPED
+                else "a newer turn supersedes the retry",
+                info.retry_reason, info._api_retry_count, self._API_RETRY_MAX,
+            )
             return
         attempt = info._api_retry_count  # 0-based index of the attempt to schedule
         if attempt >= self._API_RETRY_MAX:
@@ -5573,16 +5916,103 @@ class SessionManager:
             entry_index = len(info.entries) - 1
         self._emit_entry(session_id, entry, entry_index)
         self._emit_state(info)
+        # HARDENING: _arm_api_retry is reachable BOTH from the manager loop (the
+        # drive-loop finally blocks, the timer's reconnect-failed re-arm) and from
+        # off-loop callers (a failed auto-retry send re-arming from a Flask
+        # thread).  The old unconditional asyncio.create_task() only works on the
+        # loop thread; off-loop it raised RuntimeError and fell through to firing
+        # the retry INLINE — which, if that send also failed, could ping-pong
+        # between fire and re-arm.  Pick the scheduling primitive by thread.
+        coro = self._api_retry_timer(session_id, delay)
         try:
-            info._api_retry_task = asyncio.create_task(
-                self._api_retry_timer(session_id, delay)
-            )
+            running = asyncio.get_running_loop()
         except RuntimeError:
-            # No running loop (shouldn't happen on the manager loop) — fire
-            # immediately rather than silently stranding the session.
-            logger.warning("_arm_api_retry: no running loop for %s — firing now",
-                           session_id)
-            self._fire_api_retry(session_id, info)
+            running = None
+        try:
+            if running is not None:
+                info._api_retry_task = running.create_task(coro)
+            elif self._loop is not None and self._loop.is_running():
+                # Off-loop caller: hand the coroutine to the manager loop.  The
+                # returned concurrent Future exposes the .cancel()/.done() that
+                # _cancel_api_retry_task relies on.
+                info._api_retry_task = asyncio.run_coroutine_threadsafe(
+                    coro, self._loop)
+            else:
+                raise RuntimeError("no running manager event loop")
+        except Exception as sched_err:
+            # Nothing can run the timer (daemon shutting down / loop gone).  Do
+            # NOT fire inline here: a failing send re-arms, so an inline fire is
+            # a recursion hazard.  Surface a manual Retry rather than leaving a
+            # countdown ticking toward a timer that does not exist.
+            coro.close()
+            logger.warning("_arm_api_retry: cannot schedule the backoff timer for "
+                           "%s (%s) — surfacing manual Retry instead",
+                           session_id[:12], sched_err)
+            self._fail_retry_open(
+                session_id,
+                "Auto-retry could not be scheduled — use Retry to resume.")
+
+    # Slice length for the backoff sleep.  See _await_retry_deadline: the timer
+    # wakes at least this often to re-check the WALL clock, so a machine suspend
+    # can push a retry late by at most one slice instead of by the whole
+    # suspended duration.
+    _API_RETRY_TICK = float(os.environ.get("VIBENODE_API_RETRY_TICK", "30"))
+
+    async def _await_retry_deadline(self, deadline: float) -> None:
+        """Sleep until the wall-clock ``deadline`` (an epoch time.time() value).
+
+        HARDENING (suspend/resume).  ``asyncio.sleep`` is driven by the event
+        loop's MONOTONIC clock, which does not advance while the machine is
+        suspended, but ``retry_at`` is WALL clock.  A laptop closed for two hours
+        in the middle of a 30-minute backoff used to resume with the UI countdown
+        long expired (stuck rendering "Auto-retrying in now…") while the timer
+        still had its full remaining monotonic sleep left to run — and because
+        ``retry_at`` was still > 0 the centralized queue gate in
+        ``_try_dispatch_queue`` stayed shut for that entire extra window.  That is
+        one of the ways the auto-retry "just doesn't fire".
+
+        Sleeping in bounded slices and re-deriving the remaining time from
+        ``time.time()`` on every wake makes the timer fire when the countdown
+        actually said it would.
+        """
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, max(1.0, self._API_RETRY_TICK)))
+
+    def _fail_retry_open(self, session_id: str, message: str) -> None:
+        """Unwedge a session whose auto-retry could not be completed.
+
+        Clears the countdown fields (which RE-OPENS the queue gate), surfaces a
+        manual Retry, and drains anything that was held behind the countdown.
+
+        This is the safety net for every "the retry died on its way to firing"
+        path.  Leaving ``retry_at > 0`` with no live timer is the worst possible
+        end state: the UI shows a countdown that will never complete and
+        ``_try_dispatch_queue`` suppresses every queued message forever.  Called
+        from except handlers, so it must never raise.
+        """
+        try:
+            with self._lock:
+                info = self._sessions.get(self._resolve_id(session_id))
+            if info is None:
+                return
+            self._clear_api_retry(info, reset_count=True)
+            info.error = message
+            if info.state not in (SessionState.WORKING, SessionState.WAITING,
+                                  SessionState.STARTING, SessionState.STOPPED):
+                info.state = SessionState.IDLE
+            entry = LogEntry(kind="system", text=message, is_error=True)
+            with info._lock:
+                info.entries.append(entry)
+                entry_index = len(info.entries) - 1
+            self._emit_entry(info.session_id, entry, entry_index)
+            self._emit_state(info)
+            # The countdown is gone — let anything queued behind it through.
+            self._try_dispatch_queue(info.session_id)
+        except Exception:
+            logger.exception("_fail_retry_open failed for %s", session_id)
 
     async def _api_retry_timer(self, session_id: str, delay: float) -> None:
         """Sleep for the backoff delay, then fire the retry — unless cancelled
@@ -5593,11 +6023,37 @@ class SessionManager:
         reconnect the client first.  If the reconnect itself fails (the outage is
         still ongoing), count the attempt and re-arm the next backoff rather than
         giving up — that is what lets a session ride out a multi-hour outage.
+
+        HARDENING: the entire body is exception-contained.  Previously only the
+        sleep was guarded (for CancelledError) and ``_fire_api_retry`` was called
+        bare, so anything raising below became an un-retrieved asyncio task
+        exception — silent in the logs and leaving the session pinned at
+        ``retry_at > 0`` with no timer alive to ever clear it.  Any escape now
+        routes to _fail_retry_open so the session ends up with a usable manual
+        Retry instead of a dead countdown.
         """
         try:
-            await asyncio.sleep(delay)
+            await self._await_retry_deadline(time.time() + delay)
         except asyncio.CancelledError:
             return
+        try:
+            await self._api_retry_timer_fire(session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Auto-retry timer crashed for %s — clearing the countdown so the "
+                "session is not stranded behind a dead timer", session_id)
+            self._fail_retry_open(
+                session_id,
+                "Auto-retry failed unexpectedly — use Retry to resume.")
+
+    async def _api_retry_timer_fire(self, session_id: str) -> None:
+        """Deadline reached: re-check eligibility, reconnect if needed, fire.
+
+        Split out of _api_retry_timer so the timer can wrap it in a single
+        exception boundary (see the HARDENING note there).
+        """
         with self._lock:
             info = self._sessions.get(self._resolve_id(session_id))
         if not info:
@@ -5717,11 +6173,63 @@ class SessionManager:
         # (real race observed: the queued message ran and the resend got queued
         # behind it).  send_message uses _auto_retry so it does NOT reset the
         # accumulated counter (only a genuine new user message does).
-        self.send_message(info.session_id, retry_text, _auto_retry=True)
-        info.retry_at = 0.0
-        info.retry_attempt = 0
-        info.retry_max = 0
-        info.retry_reason = ""
+        # HARDENING: this send used to be unguarded.  If it raised, the four
+        # lines below never ran and the session was left pinned at
+        # retry_at > 0 with its timer already cleared — a countdown that can
+        # never complete, a queue gate (_try_dispatch_queue) closed forever, and
+        # a UI banner stuck on "Auto-retrying in now…".  A returned
+        # {"ok": False} (e.g. "Session is stopped") was likewise discarded, so
+        # the chain just stopped mid-way with no error and no further attempts.
+        # Now: the countdown is always cleared (try/finally preserves the
+        # CRITICAL ORDERING above), and a failed send re-arms the next backoff
+        # instead of ending the chain silently.
+        send_result = None
+        send_error = None
+        try:
+            send_result = self.send_message(info.session_id, retry_text,
+                                            _auto_retry=True)
+        except Exception as send_err:
+            send_error = "%s: %s" % (type(send_err).__name__, send_err)
+            logger.exception("Auto-retry send_message raised for %s", session_id)
+        finally:
+            info.retry_at = 0.0
+            info.retry_attempt = 0
+            info.retry_max = 0
+            info.retry_reason = ""
+        if send_error is None and isinstance(send_result, dict) \
+                and not send_result.get("ok", True):
+            send_error = str(send_result.get("error") or "send rejected")
+        if send_error is not None:
+            self._handle_retry_send_failure(info, send_error)
+
+    def _handle_retry_send_failure(self, info: SessionInfo, send_error: str) -> None:
+        """An auto-retry's resend did not take.  Keep the chain alive.
+
+        The attempt has already been consumed (_fire_api_retry incremented the
+        counter before sending), so if budget remains we re-arm the next backoff
+        rather than abandoning the session.  A send failure usually means the
+        transport is dead, so the next attempt reconnects first — this is the
+        same shape as the timer's reconnect-failed re-arm and is what lets a
+        session ride out an outage that kills the CLI mid-chain.
+        """
+        logger.warning("Auto-retry resend failed for %s (%s) — attempts_used=%d/%d",
+                       info.session_id[:12], send_error,
+                       info._api_retry_count, self._API_RETRY_MAX)
+        if info.state in (SessionState.WORKING, SessionState.WAITING,
+                          SessionState.STARTING):
+            # Something else already owns the session — nothing to recover.
+            logger.info("Auto-retry resend failure for %s ignored — session is %s",
+                        info.session_id[:12], info.state)
+            return
+        if (info._api_retry_count < self._API_RETRY_MAX
+                and self._has_user_message(info)):
+            info._retry_needs_reconnect = True
+            info.state = SessionState.IDLE
+            self._arm_api_retry(info.session_id, info)
+            return
+        self._fail_retry_open(
+            info.session_id,
+            "Auto-retry gave up — could not resume the session. Use Retry to try again.")
 
     @classmethod
     def _is_scheduled_wakeup(cls, tool_name: str) -> bool:

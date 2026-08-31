@@ -730,9 +730,15 @@ def register_ws_events(socketio, app):
             })
             return
 
+        # resume_turn: also re-run the turn an error interrupted.  Sent only by
+        # the usage-limit CTA ("switch AND carry on"), never by the plain model
+        # badge — changing models there must not silently spend a turn.
+        resume_turn = bool(data.get('resume_turn'))
+
         sm = app.session_manager
         try:
-            result = sm.set_session_model(session_id, model)
+            result = sm.set_session_model(session_id, model,
+                                          resume_turn=resume_turn)
         except Exception as e:
             result = {'ok': False, 'error': str(e)}
 
@@ -740,6 +746,17 @@ def register_ws_events(socketio, app):
             'ok': bool(result.get('ok')),
             'session_id': session_id,
             'model': result.get('model', model),
+            # True when the daemon had to RESUME a not-live session with
+            # --model rather than send a live set_model control request.  The
+            # usage-limit CTA needs this: a resumed session is already coming
+            # back up on its own, so firing retry_now at it would be rejected
+            # for not being idle, whereas a live switch leaves the interrupted
+            # turn unfinished and does need that nudge.
+            'resumed': bool(result.get('resumed')),
+            # True when that resume ALSO carried the interrupted turn's prompt,
+            # so the UI can say "resuming your request" honestly instead of
+            # claiming a continuation that did not happen.
+            'turn_resumed': bool(result.get('turn_resumed')),
         }
         if not payload['ok']:
             payload['error'] = result.get('error', 'Model switch failed')

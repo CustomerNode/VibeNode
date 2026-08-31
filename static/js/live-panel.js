@@ -839,6 +839,224 @@ function _fmtRetrySecs(s) {
   return mm ? (h + 'h ' + mm + 'm') : (h + 'h');
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// USAGE-LIMIT CTA
+// ═══════════════════════════════════════════════════════════════════════
+//
+// THE PROBLEM THIS SOLVES.  Hitting a plan quota used to be a dead end with a
+// nasty circular dependency: the limit stops the session, and the ONLY way to
+// change models was the badge's live `set_model` control request, which
+// requires a running CLI.  So you could not switch off the limited model
+// without running a turn, and you could not run a turn because you were
+// limited.  Meanwhile the daemon classified the quota message as a transient
+// error and burned its bounded retry budget re-hitting the same wall.
+//
+// The fix is three-part; this is the UI third:
+//   * daemon `_classify_result_error` → "usage_limit" (no backoff armed)
+//   * daemon `set_session_model` → resumes a STOPPED session with `--model`
+//   * this banner → one click picks a model AND resumes the interrupted turn
+//
+// `_liveRetryTimer` is deliberately REUSED for this banner's countdown rather
+// than adding a second interval: the two banners are mutually exclusive (see
+// the precedence comment in updateLiveInputBar), the bar teardown already
+// clears `_liveRetryTimer` on every rebuild, and a second timer variable would
+// be one more thing to forget to clear.
+
+// Fallback ladder used when the live /api/models list has not loaded yet.
+// Ordered best-alternative-first WITHIN each tier so the two chips we surface
+// are the ones a user would most plausibly want. Kept deliberately short —
+// this is a "get unblocked now" affordance, not a model browser. "More
+// models…" opens the full selector for anything else.
+const _LIMIT_ALT_LADDER = {
+  // Limited on a top-tier model → step down to something with its own quota.
+  fable:  ['claude-opus-5', 'claude-sonnet-5'],
+  opus:   ['claude-sonnet-5', 'claude-haiku-4-5'],
+  // Limited on a mid model → offer both a step up and a step down.
+  sonnet: ['claude-opus-5', 'claude-haiku-4-5'],
+  haiku:  ['claude-sonnet-5', 'claude-opus-5'],
+};
+const _LIMIT_ALT_DEFAULT = ['claude-sonnet-5', 'claude-haiku-4-5'];
+
+/**
+ * Pick up to two alternative model ids to offer for a limited model.
+ * Never offers the limited model's own family — that is the whole point.
+ *
+ * @param {string} limitedModel - the model id that hit the quota
+ * @returns {string[]} up to two model ids
+ */
+function _limitAlternatives(limitedModel) {
+  const m = /^claude-([a-z]+)/.exec(limitedModel || '');
+  const family = m ? m[1] : '';
+  const ladder = _LIMIT_ALT_LADDER[family] || _LIMIT_ALT_DEFAULT;
+  // Defensive: never suggest the same family we just ran out of, even if the
+  // ladder above is later edited into an inconsistent state.
+  return ladder.filter(id => !family || id.indexOf('claude-' + family) !== 0).slice(0, 2);
+}
+
+/**
+ * Build the usage-limit CTA banner, or '' when the session is not limited.
+ *
+ * Returns a full banner element (same visual language as the retry/error
+ * banners it replaces) with one chip per alternative model plus an escape
+ * hatch into the full model selector.
+ *
+ * @param {string} id       - session id the banner belongs to
+ * @param {object|null} st  - entry from window._sessionLimitState
+ * @returns {string} HTML, or '' if not limited
+ */
+function _buildUsageLimitBanner(id, st) {
+  if (!st || !st.limited_model) return '';
+  const _label = (typeof _modelLabel === 'function') ? _modelLabel : (x => x);
+  // Reset time is optional — the CLI does not always give a machine-readable
+  // instant. Render the countdown only when we genuinely know it, rather than
+  // inventing a number the user would (correctly) stop trusting.
+  let _resetStr = '';
+  if (st.limit_reset_at > 0) {
+    const secs = Math.max(0, Math.ceil(st.limit_reset_at - Date.now() / 1000));
+    _resetStr = ' \u00b7 resets in <strong id="live-limit-countdown" style="color:var(--text);">' +
+      _fmtRetrySecs(secs) + '</strong>';
+  }
+  const chips = _limitAlternatives(st.limited_model).map(mid =>
+    '<button class="live-mini-btn" onclick="liveSwitchModelAndResume(\'' +
+    String(mid).replace(/['"\\]/g, '') + '\')" ' +
+    'style="font-size:11px;padding:3px 10px;border-radius:6px;' +
+    'border:1px solid var(--border-subtle);background:var(--bg-elevated,var(--bg-card));' +
+    'color:var(--text);cursor:pointer;white-space:nowrap;">' +
+    escHtml(_label(mid)) + '</button>'
+  ).join('');
+  return '<div class="live-retry-banner limit" style="display:flex;align-items:center;' +
+    'flex-wrap:wrap;gap:8px;margin-bottom:8px;padding:8px 12px;background:var(--bg-card);' +
+    'border:1px solid var(--warn-border,#8a6d3b);border-radius:8px;">' +
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--warn,#d9a441)" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+    '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>' +
+    '<span style="font-size:12px;color:var(--text-muted);flex:1;min-width:180px;">' +
+    '<strong style="color:var(--text);">' + escHtml(_label(st.limited_model)) +
+    '</strong> usage limit reached' + _resetStr + '</span>' +
+    '<span style="font-size:11px;color:var(--text-faint);">Switch to:</span>' +
+    chips +
+    '<button class="live-mini-btn" onclick="_openSessionModelSelector(true)" ' +
+    'style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid var(--border-subtle);' +
+    'background:transparent;color:var(--text-muted);cursor:pointer;white-space:nowrap;">More\u2026</button>' +
+    '</div>';
+}
+
+/**
+ * Tick the usage-limit banner's "resets in …" text in place.
+ *
+ * Mutates only the `#live-limit-countdown` text node — never re-renders the
+ * bar — so it cannot destroy a textarea the user is typing into. Self-clears
+ * once the element or the limit state is gone, and swaps to "resetting…" at
+ * zero rather than sitting on a stale "0s".
+ */
+function _startLimitCountdown() {
+  if (_liveRetryTimer) { clearInterval(_liveRetryTimer); }
+  _liveRetryTimer = setInterval(() => {
+    const ls = (window._sessionLimitState && window._sessionLimitState[liveSessionId]) || null;
+    const el = document.getElementById('live-limit-countdown');
+    if (!ls || !el) {
+      if (_liveRetryTimer) { clearInterval(_liveRetryTimer); _liveRetryTimer = null; }
+      return;
+    }
+    const secs = Math.max(0, Math.ceil(ls.limit_reset_at - Date.now() / 1000));
+    el.textContent = secs > 0 ? _fmtRetrySecs(secs) : 'any moment';
+  }, 1000);
+}
+
+/**
+ * One-click escape from a usage limit: switch the live session to `model` and
+ * resume the turn the limit interrupted.
+ *
+ * The daemon's `set_session_model` handles BOTH shapes transparently — a live
+ * session gets a `set_model` control request, a stopped/dormant one is resumed
+ * with `--model` — so this does not need to branch on session state. It only
+ * has to know whether to re-fire the interrupted turn afterwards.
+ *
+ * HONESTY CONTRACT (inherited from _applyLiveSessionModel): nothing in the UI
+ * claims success until the daemon confirms via `session_model_result`. On
+ * failure or timeout the user gets an explicit error and the banner stays put.
+ */
+function liveSwitchModelAndResume(model) {
+  const sid = (typeof liveSessionId !== 'undefined') ? liveSessionId : null;
+  if (!sid || !model) return;
+  if (typeof socket === 'undefined') {
+    if (typeof showToast === 'function') showToast('Not connected — model NOT changed', true);
+    return;
+  }
+  // Disable every chip in the banner so a double-click can't fire two
+  // switches (the second would race the first's resume).
+  document.querySelectorAll('.live-retry-banner.limit .live-mini-btn')
+    .forEach(b => { b.disabled = true; b.style.opacity = '0.5'; });
+
+  let settled = false;
+  const finish = () => { settled = true; clearTimeout(timer); socket.off('session_model_result', onResult); };
+  const timer = setTimeout(() => {
+    if (settled) return;
+    finish();
+    document.querySelectorAll('.live-retry-banner.limit .live-mini-btn')
+      .forEach(b => { b.disabled = false; b.style.opacity = ''; });
+    if (typeof showToast === 'function') showToast('Model switch timed out — model NOT changed', true);
+  }, 20000);
+
+  function onResult(data) {
+    if (settled || !data || data.session_id !== sid) return;
+    finish();
+    if (!data.ok) {
+      document.querySelectorAll('.live-retry-banner.limit .live-mini-btn')
+        .forEach(b => { b.disabled = false; b.style.opacity = ''; });
+      if (typeof showToast === 'function') {
+        showToast('Model switch FAILED: ' + (data.error || 'unknown error'), true);
+      }
+      return;
+    }
+    // Confirmed. Route through the store's single write path, then the single
+    // badge renderer — never write model text to the DOM directly here.
+    if (typeof SessionModel !== 'undefined') SessionModel.ingestConfirmed(sid, data.model);
+    // Record it as this session's desired model too, so the wake path
+    // (liveSubmitContinue) carries it if the session sleeps again before the
+    // switch is reflected in daemon-confirmed state.
+    if (typeof SessionModel !== 'undefined' && SessionModel.setDesired) {
+      SessionModel.setDesired(sid, data.model, '');
+    }
+    if (typeof _renderSessionModelBadge === 'function') _renderSessionModelBadge(sid);
+    // The limit no longer applies on the new model — retract the CTA locally
+    // so the bar repaints immediately instead of waiting for the next state
+    // push. The daemon clears the same fields server-side.
+    if (window._sessionLimitState) delete window._sessionLimitState[sid];
+    if (window._sessionError) delete window._sessionError[sid];
+    const _name = (typeof _modelLabel === 'function') ? _modelLabel(data.model) : data.model;
+    // Resume the interrupted turn.
+    //
+    // `resumed: true` means the session was NOT live, so the daemon restarted
+    // it with --model and — because we asked for resume_turn — carried the
+    // interrupted prompt into that same start. It is already working; firing
+    // retry_now at a STARTING session would just be rejected.
+    //
+    // A LIVE switch, by contrast, leaves the session idle with the failed turn
+    // still unfinished, so that one needs an explicit nudge. retry_now is the
+    // same mechanism the Retry button uses, and it is safe here because the
+    // switch confirmed synchronously and the session is known idle.
+    if (!data.resumed && typeof liveRetryNow === 'function') {
+      if (typeof showToast === 'function') showToast('Switched to ' + _name + ' — resuming');
+      liveRetryNow();
+    } else {
+      if (typeof showToast === 'function') {
+        showToast('Switched to ' + _name +
+          (data.turn_resumed ? ' — resuming your request' : ''));
+      }
+      liveBarState = null;
+      updateLiveInputBar();
+    }
+  }
+
+  socket.on('session_model_result', onResult);
+  // resume_turn: this CTA's whole promise is "switch AND carry on", so the
+  // daemon re-runs the interrupted turn as part of the same operation.
+  socket.emit('set_session_model', {
+    session_id: sid, model: model, resume_turn: true,
+  });
+}
+
 function guiOpenAdd(id) {
   guiOpenSessions.add(id);
   localStorage.setItem('guiOpenSessions', JSON.stringify([...guiOpenSessions]));
@@ -1985,11 +2203,23 @@ function updateLiveInputBar() {
   // error appears (which surfaces the manual Retry button).
   const _retrySt = (window._sessionRetryState && window._sessionRetryState[id]) || null;
   const _sessErr = (window._sessionError && window._sessionError[id]) || '';
+  // Usage-limit CTA state.  Folded into BOTH the idle and the not-running
+  // state keys: a quota that kills the session lands in the `!isRunning`
+  // branch, whose key used to be the constant 'ended' — so the CTA would
+  // never have repainted there.  That constant key is the same reason a
+  // stopped session shows no error banner at all today.
+  const _limitSt = (window._sessionLimitState && window._sessionLimitState[id]) || null;
+  const _limitKey = _limitSt ? ':limit:' + _limitSt.limited_model + ':' + _limitSt.limit_reset_at : '';
   let stateKey;
-  if (!isRunning) stateKey = 'ended';
+  // Only _limitKey is folded in here — NOT _sessErr.  The !isRunning branch
+  // renders the limit CTA but not the generic error banner, so keying off the
+  // error would force a repaint that changes nothing visible while destroying
+  // any text the user had typed into the resume box.
+  if (!isRunning) stateKey = 'ended' + _limitKey;
   else if (kind === 'question') stateKey = 'question:' + (wd ? wd.question || '' : '');
   else if (kind === 'idle') stateKey = 'idle:' + _idleSub
     + (_retrySt ? ':retry:' + _retrySt.retry_at + ':' + _retrySt.retry_attempt : '')
+    + _limitKey
     + (!_retrySt && _sessErr ? ':err:1' : '');
   else {
     // Include sub-agent count + status in state key so bar re-renders when agents change
@@ -2044,11 +2274,17 @@ function updateLiveInputBar() {
   }
 
   if (!isRunning) {
+    // A usage limit that kills the session lands here.  Show the model-switch
+    // CTA INSTEAD of the generic "not running" strip — "type a message to
+    // resume" is actively wrong advice when the quota is the thing blocking
+    // you, because resuming on the same model just hits the wall again.
+    const _limitBanner = _buildUsageLimitBanner(id, _limitSt);
     bar.innerHTML =
+      (_limitBanner ||
       '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;padding:8px 12px;background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:8px;">' +
       '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--text-faint)" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="8" y1="12" x2="16" y2="12"/></svg>' +
       '<span style="font-size:12px;color:var(--text-muted);">Session not running. Type a message to resume.</span>' +
-      '</div>' +
+      '</div>') +
       '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="Type a message to continue\u2026"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitContinue(\'' + id + '\')}"' +
       ' onblur="if(_wasKeyboardDismissBlur()){liveSubmitContinue(\'' + id + '\')}"></textarea>' +
@@ -2059,6 +2295,8 @@ function updateLiveInputBar() {
       '</div>';
     const btnClose = document.getElementById('btn-close');
     if (btnClose) btnClose.disabled = true;
+    // Tick the "resets in …" text if the CTA is showing with a known reset.
+    if (_limitBanner && _limitSt && _limitSt.limit_reset_at > 0) _startLimitCountdown();
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => liveSubmitContinue(id));
     if (_barHadFocus) { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }
     setTimeout(() => {
@@ -2158,7 +2396,16 @@ function updateLiveInputBar() {
       'style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid var(--border-subtle);' +
       'background:transparent;color:var(--text-muted);cursor:pointer;">Cancel</button>';
     let _retryBanner = '';
-    if (_retrySt) {
+    // The usage-limit CTA outranks BOTH the retry countdown and the generic
+    // error banner: when the quota is what's blocking you, "Retry" is the one
+    // button guaranteed not to work, so offering it first is worse than
+    // offering nothing.  (The daemon also refuses to arm a backoff for a
+    // usage limit, so in practice _retrySt is null here anyway — this
+    // ordering just makes the precedence explicit rather than incidental.)
+    const _limitBannerIdle = _buildUsageLimitBanner(id, _limitSt);
+    if (_limitBannerIdle) {
+      _retryBanner = _limitBannerIdle;
+    } else if (_retrySt) {
       const _secs = Math.max(0, Math.ceil(_retrySt.retry_at - Date.now() / 1000));
       const _attemptStr = (_retrySt.retry_attempt && _retrySt.retry_max)
         ? ' \u00b7 attempt ' + _retrySt.retry_attempt + '/' + _retrySt.retry_max : '';
@@ -2208,10 +2455,13 @@ function updateLiveInputBar() {
       '</div>';
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), liveSubmitIdle);
     if (_barHadFocus) { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }
-    // Live auto-retry countdown: tick the seconds text in place (no full
-    // re-render) until the retry fires or is cleared.  Mirrors the working-bar
-    // elapsed-timer pattern — update only the text node.
-    if (_retrySt) {
+    // Usage-limit countdown, same in-place text-node pattern as the retry
+    // countdown below.  Shares _liveRetryTimer because the two banners are
+    // mutually exclusive (the limit banner wins) and the bar teardown already
+    // clears that one variable on every rebuild.
+    if (_limitBannerIdle && _limitSt && _limitSt.limit_reset_at > 0) {
+      _startLimitCountdown();
+    } else if (_retrySt) {
       _liveRetryTimer = setInterval(() => {
         const rs = (window._sessionRetryState && window._sessionRetryState[liveSessionId]) || null;
         const el = document.getElementById('live-retry-countdown');
@@ -3096,6 +3346,54 @@ function _addOptimisticBubble(sid, text, isVoice) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
+// ── Optimistic bubble lookup — MUST ignore ThreadScroll's tail nodes ────────
+//
+// ThreadScroll (thread-scroll.js, added 2026-08-27) pins two bookkeeping nodes
+// as the LAST children of #live-log — the jump-to-latest pill wrapper
+// (.vn-jump-wrap) and the IntersectionObserver sentinel (.vn-thread-sentinel) —
+// and a MutationObserver re-pins them after every single append. They are not
+// messages, but they do occupy the `:last-child` slot.
+//
+// That silently broke the positional optimistic-bubble dedup in socket.js,
+// which used `.msg.user.optimistic-bubble:last-child`. After ThreadScroll
+// landed that selector could never match, so the optimistic bubble was never
+// removed when the server echoed the user entry back — every sent message
+// rendered TWICE until the next full log re-render cleaned it up.
+//
+// Any future "is this the last message?" test against #live-log must go through
+// a tail-aware check like this one, never `:last-child`.
+const _THREAD_TAIL_CLASSES = ['vn-thread-sentinel', 'vn-jump-wrap'];
+
+function _isThreadTailNode(el) {
+  if (!el || !el.classList) return false;
+  return _THREAD_TAIL_CLASSES.some(c => el.classList.contains(c));
+}
+
+/**
+ * Returns the pending optimistic user bubble — the last `.msg.user.optimistic-bubble`
+ * in `logEl`, but only if nothing except ThreadScroll's tail nodes follows it.
+ *
+ * Deliberately position-based, NOT text-matching: sending the same text twice
+ * ("yes", "ok") must still render two bubbles.
+ *
+ * @param {HTMLElement} logEl  the #live-log container
+ * @returns {HTMLElement|null}
+ */
+function _findTrailingOptimisticBubble(logEl) {
+  if (!logEl) return null;
+  const kids = logEl.children;
+  for (let i = kids.length - 1; i >= 0; i--) {
+    const el = kids[i];
+    if (_isThreadTailNode(el)) continue;
+    // First real (non-tail) node from the bottom: it's the bubble or nothing.
+    return (el.classList && el.classList.contains('msg')
+            && el.classList.contains('user')
+            && el.classList.contains('optimistic-bubble')) ? el : null;
+  }
+  return null;
+}
+window._findTrailingOptimisticBubble = _findTrailingOptimisticBubble;
+
 // On mobile, drop focus after sending so the iOS keyboard dismisses and the reply is
 // visible immediately. No-op on desktop and when the composer isn't the focused element.
 function _defocusComposerMobile() {
@@ -3136,13 +3434,24 @@ function liveSubmitContinue(fromId) {
   delete _sessionQueues[sid];
   _renderQueueBanner();
 
-  // If session is not running, resume it via WebSocket
+  // If session is not running, resume it via WebSocket.
+  //
+  // Carry the model the user explicitly chose for this session. Without this,
+  // waking a session always used the daemon's previously-recorded model — so
+  // picking a new model on a stopped session (the exact thing you do after
+  // hitting a usage limit) was silently discarded the moment you typed, and
+  // the session came back on the model that had just run out. `undefined` is
+  // omitted from the payload, so a session with no explicit choice keeps the
+  // existing "resume on whatever it was" behaviour.
   if (!runningIds.has(sid)) {
+    const _desiredModel = (typeof SessionModel !== 'undefined')
+      ? (SessionModel.getDesired(sid) || '') : '';
     socket.emit('start_session', {
       session_id: sid,
       prompt: text,
       cwd: _currentProjectDir(),
       resume: true,
+      model: _desiredModel || undefined,
       voice: wasVoice || undefined,
     });
     runningIds.add(sid);

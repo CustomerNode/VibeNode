@@ -363,24 +363,139 @@ class TestSetSessionModel:
         assert result["ok"] is False
         assert "not found" in result["error"].lower()
 
-    def test_stopped_session_rejected(self, session_manager, sm_module):
+    def test_stopped_session_resumes_with_requested_model(self, session_manager,
+                                                          sm_module):
+        """A STOPPED session must SWITCH BY RESUMING, not hard-fail.
+
+        This used to return {"ok": False, "error": "Session is stopped"}, which
+        created the usage-limit dead end: the limit stops the session, and a
+        stopped session refused to change models, so the only escape from a
+        limited model required a running session you could not start.  The
+        switch is now performed by resuming with ``--model``, which the CLI's
+        init message confirms through the same sink as a live switch.
+        """
         self._make_session(session_manager, sm_module, "sm-stopped",
                            state=sm_module.SessionState.STOPPED)
-        result = session_manager.set_session_model("sm-stopped", "claude-sonnet-4-6")
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}) as mock_start:
+            result = session_manager.set_session_model("sm-stopped",
+                                                       "claude-sonnet-4-6")
+        assert result["ok"] is True
+        assert result["model"] == "claude-sonnet-4-6"
+        assert result["resumed"] is True
+        # Resumed with the REQUESTED model and an empty prompt — switching a
+        # model must never silently spend a turn.
+        kwargs = mock_start.call_args.kwargs
+        assert kwargs["model"] == "claude-sonnet-4-6"
+        assert kwargs["resume"] is True
+        assert kwargs["prompt"] == ""
+
+    def test_stopped_session_default_does_not_resume_the_turn(
+            self, session_manager, sm_module):
+        """The plain model badge must NOT spend a turn.  Without resume_turn
+        the resume carries an empty prompt even when the transcript has an
+        unfinished turn sitting in it."""
+        info = self._make_session(session_manager, sm_module, "sm-noresume",
+                                  state=sm_module.SessionState.STOPPED)
+        info.entries.append(sm_module.LogEntry(kind="user", text="do the thing"))
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}) as mock_start:
+            result = session_manager.set_session_model("sm-noresume",
+                                                       "claude-sonnet-4-6")
+        assert result["ok"] is True
+        assert result.get("turn_resumed") is False
+        assert mock_start.call_args.kwargs["prompt"] == ""
+
+    def test_stopped_session_resume_turn_resends_original(self, session_manager,
+                                                          sm_module):
+        """The usage-limit CTA's promise: switching models also re-runs the turn
+        the limit ate, so the user never retypes it.  No tool ran, so the
+        original request is re-sent rather than a meaningless "continue"."""
+        info = self._make_session(session_manager, sm_module, "sm-resume",
+                                  state=sm_module.SessionState.STOPPED)
+        info.entries.append(sm_module.LogEntry(kind="user", text="do the thing"))
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}) as mock_start:
+            result = session_manager.set_session_model(
+                "sm-resume", "claude-sonnet-4-6", resume_turn=True)
+        assert result["ok"] is True
+        assert result["turn_resumed"] is True
+        assert mock_start.call_args.kwargs["prompt"] == "do the thing"
+        assert mock_start.call_args.kwargs["model"] == "claude-sonnet-4-6"
+
+    def test_resume_turn_continues_when_a_tool_already_ran(self, session_manager,
+                                                           sm_module):
+        """If the interrupted turn already ran a tool, re-sending the request
+        would duplicate side effects (edits, commits).  Continue instead."""
+        info = self._make_session(session_manager, sm_module, "sm-resume-tool",
+                                  state=sm_module.SessionState.STOPPED)
+        info.entries.append(sm_module.LogEntry(kind="user", text="edit the file"))
+        info.entries.append(sm_module.LogEntry(kind="tool_use", text="Edit"))
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}) as mock_start:
+            session_manager.set_session_model(
+                "sm-resume-tool", "claude-sonnet-4-6", resume_turn=True)
+        assert (mock_start.call_args.kwargs["prompt"]
+                == sm_module.SessionManager._API_RETRY_CONTINUE_PROMPT)
+
+    def test_resume_turn_with_empty_transcript_resumes_cold(self, session_manager,
+                                                            sm_module):
+        """Nothing to resume → resume cold rather than sending a bogus prompt."""
+        self._make_session(session_manager, sm_module, "sm-resume-empty",
+                           state=sm_module.SessionState.STOPPED)
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}) as mock_start:
+            result = session_manager.set_session_model(
+                "sm-resume-empty", "claude-sonnet-4-6", resume_turn=True)
+        assert result["turn_resumed"] is False
+        assert mock_start.call_args.kwargs["prompt"] == ""
+
+    def test_resume_turn_clears_the_retry_budget(self, session_manager, sm_module):
+        """The resumed turn is a fresh start — it must not inherit the failed
+        turn's consumed attempts, or a later genuine outage gets a short chain."""
+        info = self._make_session(session_manager, sm_module, "sm-resume-budget",
+                                  state=sm_module.SessionState.STOPPED)
+        info.entries.append(sm_module.LogEntry(kind="user", text="go"))
+        info._api_retry_count = 4
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}):
+            session_manager.set_session_model(
+                "sm-resume-budget", "claude-sonnet-4-6", resume_turn=True)
+        assert info._api_retry_count == 0
+
+    def test_stopped_session_resume_failure_surfaces_error(self, session_manager,
+                                                           sm_module):
+        """If the resume itself fails, the switch must report ok=False rather
+        than claiming a model change that never happened (honesty contract)."""
+        info = self._make_session(session_manager, sm_module, "sm-stopped-fail",
+                                  state=sm_module.SessionState.STOPPED)
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": False, "error": "boom"}):
+            result = session_manager.set_session_model("sm-stopped-fail",
+                                                       "claude-sonnet-4-6")
         assert result["ok"] is False
-        assert "stopped" in result["error"].lower()
+        assert "boom" in result["error"]
+        assert info.model == "claude-fable-5"  # untouched
 
     def test_empty_model_rejected(self, session_manager, sm_module):
         self._make_session(session_manager, sm_module, "sm-empty")
         result = session_manager.set_session_model("sm-empty", "   ")
         assert result["ok"] is False
 
-    def test_session_without_client_rejected(self, session_manager, sm_module):
-        info = self._make_session(session_manager, sm_module, "sm-noclient",
-                                  client=None)
-        result = session_manager.set_session_model("sm-noclient", "claude-sonnet-4-6")
-        assert result["ok"] is False
-        assert info.model == "claude-fable-5"  # untouched
+    def test_session_without_client_resumes_with_requested_model(
+            self, session_manager, sm_module):
+        """An in-memory session whose transport died has no CLI to accept a
+        control request, so it takes the same resume-with-``--model`` path as a
+        STOPPED session rather than dead-ending."""
+        self._make_session(session_manager, sm_module, "sm-noclient",
+                           client=None)
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}) as mock_start:
+            result = session_manager.set_session_model("sm-noclient",
+                                                       "claude-sonnet-4-6")
+        assert result["ok"] is True
+        assert result["resumed"] is True
+        assert mock_start.call_args.kwargs["model"] == "claude-sonnet-4-6"
 
     def test_success_updates_model_and_logs(self, session_manager, sm_module):
         info = self._make_session(session_manager, sm_module, "sm-ok")
