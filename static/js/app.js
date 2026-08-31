@@ -80,6 +80,36 @@ function _pushChatUrl(chatId) {
   }, '', url);
 }
 
+// Tell the server which project is active. NEVER throws.
+//
+// Both call sites sit between showSkeletonLoader() and loadSessions(). An
+// unguarded `await fetch` here means a single transient failure -- the server
+// mid-restart, a dropped Tailscale connection, a phone waking up -- aborts the
+// whole chain: loadSessions() never runs, so the skeleton shimmers forever with
+// no error and no way out but a manual reload. That is exactly the failure
+// loadProjects() below was hardened against, and it was still live one level
+// down.
+//
+// Failing is survivable, so we continue rather than give up: loadSessions()
+// passes ?project= explicitly and does not depend on this call having landed.
+// Resolving the skeleton to a real (possibly stale) list always beats leaving
+// the user staring at placeholders.
+async function _syncActiveProject(encoded, attempts = 8) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await fetch('/api/set-project', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({project: encoded})
+      });
+      if (r.ok) return true;
+    } catch (e) { /* server mid-boot / connection reset -- retry below */ }
+    await new Promise(r => setTimeout(r, 400));
+  }
+  console.warn('[setProject] server never accepted active project', encoded,
+               '- continuing so the skeleton still resolves');
+  return false;
+}
+
 async function loadProjects() {
   // Resilient fetch of the project list. This is the boot entry point, and it
   // can run against a backend that is still coming up — most importantly when
@@ -125,10 +155,7 @@ async function loadProjects() {
     // Just sync the server and load sessions without the nuclear reset.
     if (saved && saved === target) {
       localStorage.setItem('activeProject', target);
-      await fetch('/api/set-project', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({project: target})
-      });
+      await _syncActiveProject(target);
       await loadSessions();
     } else {
       await setProject(target, true);
@@ -279,10 +306,7 @@ async function setProject(encoded, reload = true) {
   if (typeof _kanbanHistory !== 'undefined') { _kanbanHistory = []; localStorage.removeItem('kanbanRecentHistory'); }
   // Show skeleton immediately
   if (reload) showSkeletonLoader();
-  await fetch('/api/set-project', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({project: encoded})
-  });
+  await _syncActiveProject(encoded);
   // Reset agent catalog so it gets re-written for the new project
   _agentCatalogPath = null;
   _agentCatalogPromise = null;
