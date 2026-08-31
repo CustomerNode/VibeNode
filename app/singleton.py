@@ -16,7 +16,9 @@ indirectly caused that whole class of failure.
 """
 
 import os
+import socket
 import sys
+import time
 
 # Keep handles alive for the entire process lifetime.
 # Do NOT close these — let Windows clean up on exit.
@@ -45,6 +47,54 @@ def _daemon_port() -> int:
 
 def acquire_web_singleton() -> bool:
     return acquire_singleton(f"Global\\VibeNode_WebServer_{_web_port()}")
+
+
+def port_has_listener(port: int, timeout: float = 0.6) -> bool:
+    """True if something is accepting TCP connections on 127.0.0.1:<port>.
+
+    A *connect* probe, deliberately -- not a bind probe.  A failing bind does
+    not prove anyone is serving: a listener holding the port with SO_REUSEADDR,
+    or leftover sockets in TIME_WAIT, both make a fresh bind fail with nothing
+    alive behind it.  A successful connect is unambiguous on every platform,
+    which is exactly what the caller needs to tell a live incumbent apart from
+    an abandoned mutex.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(timeout)
+    try:
+        probe.connect(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            probe.close()
+        except Exception:
+            pass
+
+
+def wait_for_web_singleton(attempts: int = 20, delay: float = 0.25) -> bool:
+    """Acquire the web singleton, tolerating a just-killed incumbent.
+
+    The caller kills whatever holds the web port immediately before this runs.
+    The kernel releases the dead process's mutex handle promptly but not
+    instantaneously, so a single failed acquisition proves nothing -- retry
+    across a short window before concluding that someone is genuinely alive.
+
+    Returns True if the mutex was acquired.  A False return means the mutex is
+    still held after the full window, which the caller must then disambiguate
+    with ``port_has_listener`` -- a held mutex ALONE is not grounds to start a
+    second web server.  Assuming it was ("stale mutex, start anyway") is what
+    produced two live servers fighting over the daemon connection, surfacing to
+    the user as a "VibeNode Engine Stopped" overlay that Restart never cleared.
+    """
+    if acquire_web_singleton():
+        return True
+    for _ in range(attempts):
+        time.sleep(delay)
+        if acquire_web_singleton():
+            return True
+    return False
 
 
 def acquire_daemon_singleton() -> bool:

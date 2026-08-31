@@ -17,6 +17,7 @@ so running sessions continue uninterrupted when you restart the server.
 import _early_boot
 _early_boot.arm_hang_dump(120, "web-boot")
 
+import errno
 import importlib.util
 import logging
 import os
@@ -131,7 +132,7 @@ threading.Thread(target=_boot_watchdog, name="boot-watchdog", daemon=True).start
 # code actually is (this gap used to display the previous step, "cache",
 # which is why a freeze here looked like a stuck cache purge).
 _update_boot_status("STEP:loading")
-from app.singleton import acquire_web_singleton
+from app.singleton import port_has_listener, wait_for_web_singleton
 
 
 def ensure_daemon():
@@ -381,9 +382,40 @@ if not _TEST_PORT:
     time.sleep(0.05)  # brief pause for ports to release
 
     # ---- Singleton gate: only one web server allowed ----
-    if not acquire_web_singleton():
-        # Mutex held but we just killed the ports — stale mutex. Proceed.
-        print("  Stale singleton detected. Starting anyway.", flush=True)
+    if not wait_for_web_singleton():
+        # The mutex is still held after the retry window.  Two very
+        # different situations look identical at this line, and telling them
+        # apart is the whole job:
+        #
+        #   (a) STALE -- _kill_port() above just killed the incumbent and the
+        #       kernel has not finished tearing down its handles yet.  The
+        #       mutex releases itself within milliseconds.  Retrying is enough.
+        #   (b) LIVE  -- a healthy VibeNode owns the web port right now.
+        #       _kill_port() missed it: it was still booting and not yet
+        #       listening, or the kill was refused.
+        #
+        # This branch used to ASSUME (a) and start anyway.  When it was really
+        # (b), Windows let the second server co-bind the port (werkzeug sets
+        # SO_REUSEADDR) instead of failing, so BOTH stayed alive and both
+        # opened an IPC client to the daemon.  The user saw a permanent
+        # "VibeNode Engine Stopped" overlay that Restart could not clear --
+        # Restart just spawned a third instance.  Nothing was down; the two
+        # servers were fighting over the daemon connection.
+        #
+        # wait_for_web_singleton() has already absorbed (a) by retrying across
+        # a ~5s window.  Reaching here means the mutex outlived that, so ask
+        # the port whether anyone is actually serving.  If yes it is (b) --
+        # exit rather than co-bind, leaving the running instance and its
+        # sessions untouched.
+        if port_has_listener(_WEB_PORT):
+            print("  VibeNode is already running on port %d -- "
+                  "not starting a second copy." % _WEB_PORT, flush=True)
+            _update_boot_status("DONE")
+            sys.exit(0)
+        # Mutex held but nothing is listening: genuinely stale (an abandoned
+        # handle with no server behind it).  Safe to proceed.
+        print("  Stale singleton detected (nothing listening on %d). "
+              "Starting anyway." % _WEB_PORT, flush=True)
 
 # ---------------------------------------------------------------------------
 # Self-healing desktop shortcut.
@@ -1227,4 +1259,45 @@ if __name__ == "__main__":
         # and Socket.IO will auto-reconnect — no duplicate window needed.
         if os.environ.get("VIBENODE_PRESERVE_DAEMON") != "1":
             threading.Thread(target=open_browser, daemon=True).start()
-    socketio.run(app, host="127.0.0.1", port=_port, debug=False, allow_unsafe_werkzeug=True)
+    # Bind the web port EXCLUSIVELY on Windows.
+    #
+    # The daemon has always done this for 5051 (SO_EXCLUSIVEADDRUSE in
+    # daemon_server.start), which is exactly why a second daemon can never
+    # exist.  The web port had no equivalent: werkzeug sets SO_REUSEADDR on
+    # its listener, and on Windows SO_REUSEADDR permits a *second live
+    # process* to bind a port that is already in use -- it does not merely
+    # reclaim TIME_WAIT as it does on Unix.  So a duplicate web server bound
+    # 5050 silently, alongside the first, and the OS handed connections to
+    # whichever socket it felt like.
+    #
+    # Clearing allow_reuse_address makes that bind fail with WSAEADDRINUSE
+    # instead: loud, immediate, and impossible to mistake for a healthy boot.
+    # The singleton mutex above is the primary guard; this is the socket-level
+    # backstop for any path that reaches here without passing through it.
+    #
+    # Windows only.  On Unix, SO_REUSEADDR means the ordinary "rebind over
+    # TIME_WAIT" and removing it would reintroduce the EADDRINUSE-on-restart
+    # bug that the daemon comments describe.
+    if sys.platform == "win32":
+        try:
+            from werkzeug.serving import BaseWSGIServer
+            BaseWSGIServer.allow_reuse_address = 0
+        except Exception:
+            pass   # non-werkzeug server: the mutex gate still applies
+
+    try:
+        socketio.run(app, host="127.0.0.1", port=_port, debug=False,
+                     allow_unsafe_werkzeug=True)
+    except OSError as bind_err:
+        # With the exclusive bind above, losing a race for the port raises here
+        # instead of quietly producing a second server on the same port.  Under
+        # pythonw there is no console, so an unhandled traceback would be an
+        # invisible death; say plainly what happened and leave the winner alone.
+        if getattr(bind_err, "errno", None) in (errno.EADDRINUSE, errno.EACCES) or \
+                getattr(bind_err, "winerror", None) == 10048:
+            print("  Port %d is already served by another VibeNode -- "
+                  "this copy is exiting so the running one keeps the port."
+                  % _port, flush=True)
+            _update_boot_status("DONE")
+            sys.exit(0)
+        raise

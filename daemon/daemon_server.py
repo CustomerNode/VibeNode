@@ -80,6 +80,13 @@ def _enable_tcp_keepalive(sock):
                 pass
 
 
+# Upper bound on simultaneous Web UI IPC connections.  Normal operation uses
+# exactly one; a web restart can briefly overlap two.  Anything beyond this is
+# a connection leak, not real usage, so the daemon trims the oldest rather than
+# accumulating sockets forever.
+MAX_IPC_CLIENTS = 8
+
+
 class SessionDaemon:
     """Long-lived process that manages Claude Code SDK sessions via TCP IPC."""
 
@@ -87,9 +94,24 @@ class SessionDaemon:
         self.port = port
         self.session_manager = SessionManager()
         self._server_socket = None
-        self._client_socket = None
-        self._client_lock = threading.Lock()
-        self._write_lock = threading.Lock()   # serialize all socket writes
+        # Every live Web UI connection, in accept order: sock -> write lock.
+        #
+        # This used to be a SINGLE ``_client_socket`` slot that each new
+        # connection overwrote, closing whoever held it.  That made the daemon
+        # hostile to its own callers: any second connection silently killed the
+        # first one's IPC link.  With two web servers alive (the failure the
+        # singleton gate in run.py now prevents) the two of them evicted each
+        # other on a 2-second reconnect cycle indefinitely, so ``/api/health``
+        # reported daemon:false about half the time and the UI sat in a
+        # permanent "VibeNode Engine Stopped" flap that Restart could not
+        # clear.  Nothing was actually down -- the daemon was healthy and every
+        # session kept running the whole time.
+        #
+        # Connections are now additive: a new client never disturbs an existing
+        # one.  Dead peers are reaped where they are actually detected (recv
+        # EOF, send failure, TCP keepalive) instead of guessed at on accept.
+        self._clients = {}                    # sock -> per-connection write lock
+        self._client_lock = threading.Lock()  # guards _clients
         self._running = False
 
     def start(self):
@@ -137,7 +159,7 @@ class SessionDaemon:
             logger.error("Port %d already in use — another daemon is running? %s", self.port, e)
             print(f"ERROR: Port {self.port} already in use. Kill the existing daemon first.", flush=True)
             sys.exit(1)
-        self._server_socket.listen(1)
+        self._server_socket.listen(MAX_IPC_CLIENTS)
         self._server_socket.settimeout(1.0)  # Allow periodic check for shutdown
 
         logger.info("Session daemon listening on port %d", self.port)
@@ -184,34 +206,81 @@ class SessionDaemon:
             pass
         logger.info("Session daemon stopped")
 
-    def _push_event(self, event_name, data):
-        """Called by SessionManager to push events to the Web UI."""
-        with self._client_lock:
-            sock = self._client_socket
-        if not sock:
-            return  # No client connected, discard event
-        msg = json.dumps({"event": event_name, "data": data}) + "\n"
-        try:
-            with self._write_lock:
-                sock.sendall(msg.encode("utf-8"))
-        except Exception as push_err:
-            logger.warning("Push event %s failed: %s", event_name, push_err)
-            with self._client_lock:
-                # Only clear if no new client has connected since we grabbed the ref
-                if self._client_socket is sock:
-                    self._client_socket = None
+    def _send(self, sock, line):
+        """Write one framed line to one client.  False if the peer is gone.
 
-    def _handle_client(self, sock):
-        """Handle one Web UI TCP connection."""
-        # Replace any existing client
+        The write lock is PER CONNECTION, not global: a wedged client must not
+        be able to stall delivery to a healthy one.  A failed write is proof
+        the peer is gone, so the connection is dropped here rather than left in
+        the registry for the next push to trip over again.
+        """
         with self._client_lock:
-            old = self._client_socket
-            self._client_socket = sock
-        if old:
+            wlock = self._clients.get(sock)
+        if wlock is None:
+            return False   # already dropped
+        try:
+            with wlock:
+                sock.sendall(line.encode("utf-8"))
+            return True
+        except Exception as send_err:
+            logger.info("Client send failed, dropping connection: %s", send_err)
+            self._drop_client(sock)
+            return False
+
+    def _drop_client(self, sock):
+        """Deregister and close one client.  Idempotent."""
+        with self._client_lock:
+            known = self._clients.pop(sock, None) is not None
+            remaining = len(self._clients)
+        if known:
             try:
-                old.close()
+                sock.close()
             except Exception:
                 pass
+            logger.info("Web UI disconnected (%d still connected)", remaining)
+        return known
+
+    def _push_event(self, event_name, data):
+        """Called by SessionManager to push events to every connected Web UI."""
+        with self._client_lock:
+            socks = list(self._clients)
+        if not socks:
+            return  # No client connected, discard event
+        msg = json.dumps({"event": event_name, "data": data}) + "\n"
+        for sock in socks:
+            self._send(sock, msg)
+
+    def _handle_client(self, sock):
+        """Handle one Web UI TCP connection.
+
+        Registers the connection alongside any existing ones.  It deliberately
+        does NOT evict the incumbent -- see the ``_clients`` comment in
+        ``__init__`` for the "Engine Stopped" flap that eviction caused.
+        """
+        with self._client_lock:
+            self._clients[sock] = threading.Lock()
+            count = len(self._clients)
+            # Backstop against a caller that leaks connections.  The cap is set
+            # well above real usage (one web server, plus headroom for a
+            # restart overlap and a few probes), and always trims the OLDEST:
+            # a leak accumulates at the young end, so the long-lived real
+            # client is the last thing this would ever drop.
+            stale = []
+            while len(self._clients) > MAX_IPC_CLIENTS:
+                oldest = next(iter(self._clients))
+                del self._clients[oldest]
+                stale.append(oldest)
+        if stale:
+            logger.warning(
+                "More than %d IPC clients connected -- dropping %d oldest. "
+                "Something is leaking daemon connections.",
+                MAX_IPC_CLIENTS, len(stale))
+            for old in stale:
+                try:
+                    old.close()
+                except Exception:
+                    pass
+        logger.info("IPC client registered (%d connected)", count)
 
         # Send initial state snapshot (includes all queues).
         # Queues + lock moved into SessionManager._mq (a MessageQueue) during
@@ -263,14 +332,7 @@ class SessionDaemon:
         except Exception as e:
             logger.warning("Client connection ended with exception: %s", e, exc_info=True)
         finally:
-            with self._client_lock:
-                if self._client_socket is sock:
-                    self._client_socket = None
-            try:
-                sock.close()
-            except Exception:
-                pass
-            logger.info("Web UI disconnected")
+            self._drop_client(sock)
 
     def _dispatch(self, sock, msg):
         """Route a JSON request to the appropriate SessionManager method."""
@@ -288,8 +350,9 @@ class SessionDaemon:
             return
 
         # Run ALL dispatches in threads so one slow/blocked handler can
-        # never stall the entire request pipeline.  The _write_lock in
-        # _dispatch_sync already serialises socket writes, so this is safe.
+        # never stall the entire request pipeline.  _send() holds that
+        # connection's write lock for the duration of each sendall, so
+        # concurrent dispatches can never interleave a half-written frame.
         threading.Thread(
             target=self._dispatch_sync,
             args=(sock, req_id, method, params),
@@ -353,12 +416,7 @@ class SessionDaemon:
                 logger.exception("Dispatch error for %s", method)
                 resp = {"req_id": req_id, "error": str(e)}
 
-        line = json.dumps(resp) + "\n"
-        try:
-            with self._write_lock:
-                sock.sendall(line.encode("utf-8"))
-        except Exception:
-            pass
+        self._send(sock, json.dumps(resp) + "\n")
 
     def _dispatch_blocking(self, sock, req_id, method, params):
         """Blocking dispatch — for long-running calls like hook_pre_tool."""
@@ -368,12 +426,7 @@ class SessionDaemon:
         except Exception as e:
             resp = {"req_id": req_id, "error": str(e)}
 
-        line = json.dumps(resp) + "\n"
-        try:
-            with self._write_lock:
-                sock.sendall(line.encode("utf-8"))
-        except Exception:
-            pass
+        self._send(sock, json.dumps(resp) + "\n")
 
 
 def _cmdline_of(pid: int) -> str:
