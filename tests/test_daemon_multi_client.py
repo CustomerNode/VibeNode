@@ -167,28 +167,42 @@ def test_push_with_no_clients_is_a_noop(daemon):
 # Leak backstop
 # ---------------------------------------------------------------------------
 
-def test_client_registry_is_capped_and_trims_oldest(daemon):
-    """A connection leak must not grow the registry without bound.
+def test_cap_refuses_the_newcomer_and_never_evicts_an_incumbent(daemon):
+    """A connection leak must not grow the registry without bound -- and the
+    established client must survive the leak.
 
-    The cap is a backstop, not a policy: it sits far above real usage, and it
-    trims the OLDEST connection because a leak piles up at the young end -- so
-    the long-lived real client is the last thing that would ever be dropped.
+    The first version of this cap trimmed the OLDEST connection, reasoning that
+    a leak piles up at the young end.  Backwards: the oldest connection IS the
+    long-lived web server.  A burst of short-lived connections (the test suite
+    opening clients against the running daemon) evicted it repeatedly -- "Lost
+    connection to daemon" every 10s, UI unusable.  The cap must refuse the
+    newcomer instead, so connecting can never disturb a client already on.
     """
-    made = []
+    incumbent_srv, incumbent_cli = _pair()
+    made = [(incumbent_srv, incumbent_cli)]
     try:
-        for _ in range(MAX_IPC_CLIENTS + 3):
+        _register(daemon, incumbent_srv)
+
+        refused = 0
+        for _ in range(MAX_IPC_CLIENTS + 4):
             srv, cli = _pair()
             made.append((srv, cli))
-            # Go through the real registration path, including the trim.
             with daemon._client_lock:
-                daemon._clients[srv] = threading.Lock()
-                while len(daemon._clients) > MAX_IPC_CLIENTS:
-                    del daemon._clients[next(iter(daemon._clients))]
+                at_capacity = len(daemon._clients) >= MAX_IPC_CLIENTS
+                if not at_capacity:
+                    daemon._clients[srv] = threading.Lock()
+            if at_capacity:
+                refused += 1
 
-        assert len(daemon._clients) == MAX_IPC_CLIENTS
-        # The three oldest were trimmed; the newest survive.
-        assert made[0][0] not in daemon._clients
-        assert made[-1][0] in daemon._clients
+        assert len(daemon._clients) == MAX_IPC_CLIENTS, "registry must stay capped"
+        assert refused > 0, "the cap must actually refuse someone"
+        assert incumbent_srv in daemon._clients, (
+            "the established client was evicted to make room -- this is the "
+            "exact regression that broke the live web server")
+
+        # And it is still usable, which is the point.
+        daemon._push_event("session_update", {"id": "still-here"})
+        assert _read_event(incumbent_cli)["event"] == "session_update"
     finally:
         for srv, cli in made:
             srv.close()

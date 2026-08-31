@@ -257,29 +257,34 @@ class SessionDaemon:
         does NOT evict the incumbent -- see the ``_clients`` comment in
         ``__init__`` for the "Engine Stopped" flap that eviction caused.
         """
+        # Backstop against a caller that leaks connections.  At the cap the
+        # NEWCOMER is refused -- an already-established client is never thrown
+        # out to make room.
+        #
+        # An earlier version of this trimmed the OLDEST connection instead, on
+        # the reasoning that a leak accumulates at the young end.  That is
+        # exactly backwards: the oldest connection is the long-lived real web
+        # server, so a burst of short-lived connections (the test suite opening
+        # clients against the running daemon) evicted the one client that
+        # mattered, over and over.  The web server logged "Lost connection to
+        # daemon" every 10 seconds and the UI went unusable -- the same
+        # eviction failure this registry exists to prevent, reintroduced under
+        # another name.  Refusing the newcomer keeps the invariant honest:
+        # connecting to the daemon can never disturb a client already on it.
         with self._client_lock:
-            self._clients[sock] = threading.Lock()
+            at_capacity = len(self._clients) >= MAX_IPC_CLIENTS
+            if not at_capacity:
+                self._clients[sock] = threading.Lock()
             count = len(self._clients)
-            # Backstop against a caller that leaks connections.  The cap is set
-            # well above real usage (one web server, plus headroom for a
-            # restart overlap and a few probes), and always trims the OLDEST:
-            # a leak accumulates at the young end, so the long-lived real
-            # client is the last thing this would ever drop.
-            stale = []
-            while len(self._clients) > MAX_IPC_CLIENTS:
-                oldest = next(iter(self._clients))
-                del self._clients[oldest]
-                stale.append(oldest)
-        if stale:
+        if at_capacity:
             logger.warning(
-                "More than %d IPC clients connected -- dropping %d oldest. "
-                "Something is leaking daemon connections.",
-                MAX_IPC_CLIENTS, len(stale))
-            for old in stale:
-                try:
-                    old.close()
-                except Exception:
-                    pass
+                "Refusing IPC client: already at the %d-connection cap. "
+                "Something is leaking daemon connections.", MAX_IPC_CLIENTS)
+            try:
+                sock.close()
+            except Exception:
+                pass
+            return
         logger.info("IPC client registered (%d connected)", count)
 
         # Send initial state snapshot (includes all queues).
