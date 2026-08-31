@@ -73,6 +73,57 @@ def port_has_listener(port: int, timeout: float = 0.6) -> bool:
             pass
 
 
+def reclaim_port(port: int, timeout: float = 25.0) -> bool:
+    """Ensure nothing else holds the web port at the instant we bind it.
+
+    The reviver (reviver.py) deliberately parks a "Start VibeNode" page on the
+    web port whenever the real server is down, so a phone can bring VibeNode
+    back with one tap.  It releases the port on request, synchronously, via a
+    POST to its loopback control port -- without the reviver process dying.
+
+    session_manager.py already sends that yield.  It is not sufficient on its
+    own: it fires at LAUNCH, and a cold boot spends the better part of a minute
+    in imports and dependency checks before reaching the bind below.  The
+    reviver's own loop sees the port free during that window and re-takes it,
+    so by the time we bind, the yield we asked for is long stale.
+
+    That race used to be invisible: werkzeug sets SO_REUSEADDR, and on Windows
+    that lets a second live process bind a port already in use, so the web
+    server simply co-bound alongside the reviver and appeared to work.  Now
+    that the bind is exclusive (which is what stops two web servers existing at
+    all), losing this race is fatal -- the server exits and the user is left
+    tapping Start and landing back on the Start page.
+
+    So ask again here, at the only moment that matters, and wait for the port
+    to actually come free.  Returns True if the port is clear to bind.
+    """
+    if not port_has_listener(port):
+        return True
+
+    control_port = int(os.environ.get("VIBENODE_REVIVER_PORT", 0) or 5052)
+    deadline = time.monotonic() + timeout
+    asked = 0
+    while time.monotonic() < deadline:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "http://127.0.0.1:%d/yield" % control_port, data=b"",
+                method="POST")
+            urllib.request.urlopen(req, timeout=2)  # noqa: S310 (loopback only)
+            asked += 1
+        except Exception:
+            # No reviver on the control port.  Whatever holds the web port is
+            # not something we can negotiate with -- keep polling in case it is
+            # a dying process whose socket has not closed yet.
+            pass
+        time.sleep(0.5)
+        if not port_has_listener(port):
+            if asked:
+                print("  Reviver yielded port %d" % port, flush=True)
+            return True
+    return False
+
+
 def wait_for_web_singleton(attempts: int = 20, delay: float = 0.25) -> bool:
     """Acquire the web singleton, tolerating a just-killed incumbent.
 

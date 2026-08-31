@@ -17,7 +17,6 @@ so running sessions continue uninterrupted when you restart the server.
 import _early_boot
 _early_boot.arm_hang_dump(120, "web-boot")
 
-import errno
 import importlib.util
 import logging
 import os
@@ -132,7 +131,8 @@ threading.Thread(target=_boot_watchdog, name="boot-watchdog", daemon=True).start
 # code actually is (this gap used to display the previous step, "cache",
 # which is why a freeze here looked like a stuck cache purge).
 _update_boot_status("STEP:loading")
-from app.singleton import port_has_listener, wait_for_web_singleton
+from app.singleton import (port_has_listener, reclaim_port,
+                          wait_for_web_singleton)
 
 
 def ensure_daemon():
@@ -1285,19 +1285,21 @@ if __name__ == "__main__":
         except Exception:
             pass   # non-werkzeug server: the mutex gate still applies
 
-    try:
-        socketio.run(app, host="127.0.0.1", port=_port, debug=False,
-                     allow_unsafe_werkzeug=True)
-    except OSError as bind_err:
-        # With the exclusive bind above, losing a race for the port raises here
-        # instead of quietly producing a second server on the same port.  Under
-        # pythonw there is no console, so an unhandled traceback would be an
-        # invisible death; say plainly what happened and leave the winner alone.
-        if getattr(bind_err, "errno", None) in (errno.EADDRINUSE, errno.EACCES) or \
-                getattr(bind_err, "winerror", None) == 10048:
-            print("  Port %d is already served by another VibeNode -- "
-                  "this copy is exiting so the running one keeps the port."
-                  % _port, flush=True)
-            _update_boot_status("DONE")
-            sys.exit(0)
-        raise
+    # Reclaim the port from the reviver immediately before binding.  See
+    # reclaim_port for why asking again HERE is what closes the race.
+    if not _TEST_PORT and not reclaim_port(_port):
+        # Something still holds the port and would not yield.  werkzeug would
+        # now fail its own bind and print a generic "identify and stop that
+        # program" message before exiting, which tells the user nothing about
+        # what actually happened.  Say it plainly instead.
+        print("  Could not take port %d -- something else is holding it and "
+              "did not respond to a yield request.  VibeNode is not starting. "
+              "Run 'netstat -ano | findstr :%d' to see what has it."
+              % (_port, _port), flush=True)
+        _update_boot_status(
+            "ERROR:Port %d is held by another program that would not release "
+            "it. VibeNode could not start." % _port)
+        sys.exit(1)
+
+    socketio.run(app, host="127.0.0.1", port=_port, debug=False,
+                 allow_unsafe_werkzeug=True)

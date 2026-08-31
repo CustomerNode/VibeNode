@@ -187,3 +187,100 @@ def test_run_py_binds_the_web_port_exclusively_on_windows():
     src = _run_py_source()
     assert "BaseWSGIServer.allow_reuse_address = 0" in src
     assert 'sys.platform == "win32"' in src
+
+
+# ---------------------------------------------------------------------------
+# reclaim_port: taking the web port back from the reviver at bind time
+# ---------------------------------------------------------------------------
+#
+# The reviver parks a "Start VibeNode" page on the web port while the real
+# server is down.  session_manager.py asks it to yield at LAUNCH, but a cold
+# boot takes the better part of a minute to reach the bind, and the reviver's
+# loop re-takes the free port in that window -- so the yield is stale by the
+# time it matters.
+#
+# That race was invisible while the bind used SO_REUSEADDR: the web server just
+# co-bound alongside the reviver.  Once the bind became exclusive, losing the
+# race became fatal -- VibeNode exited and left the user tapping Start and
+# landing back on the Start page.  Observed in the wild on 2026-08-31:
+#
+#   reviver.log  [14:40:00] serving Start page on 127.0.0.1:5050
+#   _server.log  Port 5050 is in use by another program.
+#
+# These tests pin the re-ask.
+
+def test_reclaim_port_returns_immediately_when_port_is_free(monkeypatch):
+    """The common case must cost nothing -- no yield request, no sleeping."""
+    monkeypatch.setattr(singleton, "port_has_listener", lambda p, **kw: False)
+    monkeypatch.setattr(singleton.time, "sleep",
+                        lambda _: pytest.fail("must not sleep on a free port"))
+
+    assert singleton.reclaim_port(5050) is True
+
+
+def test_reclaim_port_waits_for_the_holder_to_let_go(monkeypatch):
+    """Occupied, then free after the yield lands."""
+    states = iter([True, False, False, False])
+    monkeypatch.setattr(singleton, "port_has_listener",
+                        lambda p, **kw: next(states, False))
+    monkeypatch.setattr(singleton.time, "sleep", lambda _: None)
+
+    import urllib.request
+    posted = []
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, timeout=None: posted.append(req) or None)
+
+    assert singleton.reclaim_port(5050, timeout=5) is True
+    assert posted, "must POST /yield to the reviver control port"
+    assert posted[0].full_url.endswith("/yield")
+    assert "127.0.0.1" in posted[0].full_url
+
+
+def test_reclaim_port_gives_up_on_a_holder_that_will_not_yield(monkeypatch):
+    """A non-reviver squatter must not hang boot forever.
+
+    Returning False lets run.py print something specific instead of letting
+    werkzeug die with a generic 'identify and stop that program' message.
+    """
+    monkeypatch.setattr(singleton, "port_has_listener", lambda p, **kw: True)
+    monkeypatch.setattr(singleton.time, "sleep", lambda _: None)
+
+    import urllib.request
+
+    def refuse(req, timeout=None):
+        raise OSError("connection refused")   # nothing on the control port
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+
+    assert singleton.reclaim_port(5050, timeout=0.3) is False
+
+
+def test_reclaim_port_survives_a_dead_control_port(monkeypatch):
+    """No reviver running is normal (Mobile Command off) -- not an error.
+
+    The port can still free up on its own if a dying process is closing it.
+    """
+    states = iter([True, True, False])
+    monkeypatch.setattr(singleton, "port_has_listener",
+                        lambda p, **kw: next(states, False))
+    monkeypatch.setattr(singleton.time, "sleep", lambda _: None)
+
+    import urllib.request
+    monkeypatch.setattr(
+        urllib.request, "urlopen",
+        lambda req, timeout=None: (_ for _ in ()).throw(OSError("refused")))
+
+    assert singleton.reclaim_port(5050, timeout=5) is True
+
+
+def test_run_py_reclaims_the_port_before_binding():
+    """The reclaim must sit between the exclusive-bind setup and socketio.run.
+
+    Ordering is the whole point: asking earlier (as session_manager.py does) is
+    what left the yield stale.
+    """
+    src = _run_py_source()
+    assert "reclaim_port(_port)" in src
+    reclaim_at = src.index("reclaim_port(_port)")
+    bind_at = src.index("socketio.run(app")
+    assert reclaim_at < bind_at, "reclaim must happen before the bind"
