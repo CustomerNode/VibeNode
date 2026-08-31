@@ -568,6 +568,7 @@ from .session_store import (  # noqa: E402, F401
     _get_deleted_ids,
     _unmark_deleted,
     move_to_trash,
+    move_session,
     list_trash,
     restore_from_trash,
     purge_from_trash,

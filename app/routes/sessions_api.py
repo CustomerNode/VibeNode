@@ -28,6 +28,7 @@ from ..config import (
     _mark_deleted_bulk,
     _unmark_deleted,
     move_to_trash,
+    move_session,
     list_trash,
     restore_from_trash,
     purge_from_trash,
@@ -956,6 +957,102 @@ def api_duplicate(session_id):
         f.write("\n".join(lines_out) + "\n")
 
     return jsonify({"ok": True, "new_id": new_id})
+
+
+@bp.route("/api/move-session/<session_id>", methods=["POST"])
+def api_move_session(session_id):
+    """Move a session from one project to another.
+
+    A session is bound to a project only by which ``~/.claude/projects/<enc>/``
+    directory its ``.jsonl`` lives in.  The working directory used on resume is
+    resolved live from the *active* project on the client, so relocating the
+    file (plus its display name) is a complete move — when the user opens the
+    session under the target project it resumes in that project's directory.
+
+    Body (JSON): ``{"from_project": "<encoded>", "to_project": "<encoded>"}``.
+    ``from_project`` defaults to the ``?project=`` query arg (the sidebar's
+    active project).  Both encoded names are validated against path traversal
+    here because the blueprint-level guard only inspects the ``project`` key.
+    """
+    data = request.get_json(silent=True) or {}
+    from_project = (data.get("from_project") or request.args.get("project", "") or "").strip()
+    to_project = (data.get("to_project") or "").strip()
+
+    if not to_project:
+        return jsonify({"ok": False, "error": "to_project is required"}), 400
+
+    # Traversal guard for the encoded names this route uses (the before_request
+    # hook only checks the generic ``project`` key).
+    for value in (from_project, to_project):
+        if value and ("/" in value or "\\" in value or ".." in value):
+            return jsonify({"ok": False, "error": "invalid project name"}), 400
+
+    # Both projects must be real directories under ~/.claude/projects.
+    if to_project and not (_CLAUDE_PROJECTS / to_project).is_dir():
+        return jsonify({"ok": False, "error": "target project not found"}), 404
+    if from_project and not (_CLAUDE_PROJECTS / from_project).is_dir():
+        return jsonify({"ok": False, "error": "source project not found"}), 404
+
+    if from_project == to_project:
+        return jsonify({"ok": False, "error": "session is already in that project"}), 400
+
+    # Stop the session first so no CLI subprocess holds the .jsonl open and the
+    # daemon's stale (old-project) cwd can't be reused on a later resume. Mirror
+    # the delete path's synchronous close.
+    sm = current_app.session_manager
+    if sm.has_session(session_id):
+        sm.close_session_sync(session_id)
+        sm.remove_session(session_id)
+
+    # Resolve the source's effective display name so it travels with the
+    # session: the user-set names-file entry wins; when absent, fall back to the
+    # latest custom/AI title embedded in the .jsonl. Passing this to
+    # move_session also makes it CLEAR any stale name a prior occupant of this
+    # id left in the target, so the moved session never shows the wrong title.
+    src_path = _sessions_dir(from_project) / f"{session_id}.jsonl"
+    source_display = _load_names(from_project).get(session_id, "")
+    if not source_display:
+        try:
+            source_display = _latest_custom_title_in_jsonl(src_path) or ""
+        except Exception:
+            source_display = ""
+
+    result = move_session(session_id, from_project, to_project,
+                          source_display=source_display)
+    if not result.get("ok"):
+        return jsonify(result), 409
+
+    # Tombstone in the SOURCE project so the row disappears immediately and a
+    # dying CLI process can't recreate a zombie .jsonl there. The tombstone
+    # file is per-project, so this never hides the session in its new home.
+    _mark_deleted(session_id, from_project)
+
+    # Bump the moved session's access time in the target so it sorts sensibly
+    # (recently touched) in its new project's sidebar.
+    try:
+        _record_session_access(session_id, to_project)
+    except Exception:
+        pass
+
+    # Evict stale summary-cache entries for both source and target paths.
+    for proj in (from_project, to_project):
+        pstr = str(_sessions_dir(proj) / f"{session_id}.jsonl")
+        for key in [k for k in _summary_cache if k[0] == pstr]:
+            del _summary_cache[key]
+
+    try:
+        sm._save_registry_now()
+    except Exception:
+        pass
+
+    return jsonify({
+        "ok": True,
+        "session_id": session_id,
+        "from_project": from_project,
+        "to_project": to_project,
+        "to_project_display": _decode_project(to_project),
+        "name": result.get("name", ""),
+    })
 
 
 @bp.route("/api/continue/<session_id>", methods=["POST"])

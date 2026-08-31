@@ -1079,6 +1079,7 @@ var _ICONS = {
   trash:    '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
   grid:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
   x:        '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+  folder:   '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
 };
 
 // Downscaled 14×14 icon variant for the tighter desktop popup.
@@ -1154,6 +1155,7 @@ function sessionContextMenu(e, sessionId) {
   items.push({ divider: true });
   items.push({ label: 'Continue',                   icon: _ICONS.cont,     action: 'continue' });
   items.push({ label: 'Duplicate',                  icon: _ICONS.dup,      action: 'duplicate' });
+  items.push({ label: 'Move to Project…',           icon: _ICONS.folder,   action: 'move-project' });
   items.push({ label: 'Save as Template',           icon: _ICONS.template, action: 'save-template' });
   items.push({ label: 'Open in Terminal',           icon: _ICONS.terminal, action: 'terminal' });
   if (isActive) {
@@ -1250,6 +1252,9 @@ function _sessCtx(action, sessionId) {
       break;
     case 'duplicate':
       duplicateSession(sessionId);
+      break;
+    case 'move-project':
+      _moveSessionToProject(sessionId);
       break;
     case 'save-template':
       if (typeof _saveSessionAsTemplate === 'function') {
@@ -1495,6 +1500,187 @@ function _atcSessionName() {
     ? allSessions.find(s => s.id === _atcSessionId) : null;
   if (!sess) return 'Untitled Session';
   return sess.custom_title || sess.display_title || 'Untitled Session';
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Move to Project — relocate a session into another project
+// ═══════════════════════════════════════════════════════════════
+//
+// A session belongs to a project purely by which
+// ~/.claude/projects/<encoded-cwd>/ directory its .jsonl lives in.  The working
+// directory used on resume is resolved live from the ACTIVE project on the
+// client (_currentProjectDir in socket.js), so relocating the .jsonl (backend:
+// POST /api/move-session/<id>) is a complete, correct move — when the user
+// opens the session under the target project it resumes in that project's dir.
+//
+// Flow: right-click → "Move to Project…" → pick an existing project or create a
+// new one → the session leaves the current project and is cleaned out of the
+// current view (mirrors the delete cleanup, minus the trash semantics).
+let _mtpSessionId = null;
+
+async function _moveSessionToProject(sessionId) {
+  const overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+  _mtpSessionId = sessionId;
+
+  const current = localStorage.getItem('activeProject') || '';
+
+  // Prefer the app-wide cached list; refetch if empty (same self-heal as
+  // openProjectOverlay, where a slow/failed startup fetch leaves it empty).
+  let projects = Array.isArray(_allProjects) ? _allProjects.slice() : [];
+  if (!projects.length) {
+    try {
+      const res = await fetch('/api/projects', { cache: 'no-store' });
+      if (res.ok) projects = await res.json();
+    } catch (e) { /* offline — the create-new path still works */ }
+  }
+  _mtpRenderPicker(overlay, projects, current);
+}
+
+function _mtpRenderPicker(overlay, projects, current) {
+  const others = (projects || []).filter(p => p && p.encoded !== current);
+  const esc = (typeof escHtml === 'function') ? escHtml : (s => s);
+
+  let html = '<div class="pm-card pm-enter" style="max-width:480px;">';
+  html += '<h2 class="pm-title">Move to Project</h2>';
+  html += '<div class="pm-body" style="padding:0;"><div class="kanban-create-section">';
+
+  if (!others.length) {
+    html += '<div class="kanban-create-section-label">No other projects yet. Create one:</div>';
+  } else {
+    html += '<div class="kanban-create-section-label">Choose a destination</div>';
+    for (const p of others) {
+      const name = (typeof _projectShortName === 'function')
+        ? _projectShortName(p) : (p.custom_name || p.display || p.encoded);
+      html += '<div class="kanban-drill-chooser-card" style="cursor:pointer;" '
+        + 'onclick="_mtpDoMove(\'' + encodeURIComponent(p.encoded) + '\')">'
+        + '<div class="kanban-drill-chooser-icon" style="color:var(--accent);">' + _ICONS.folder + '</div>'
+        + '<div style="min-width:0;"><div class="kanban-drill-chooser-title">' + esc(name) + '</div>'
+        + '<div style="font-size:11px;color:var(--text-faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(p.display || '') + '</div></div></div>';
+    }
+  }
+
+  // Create-new row (always offered).
+  html += '<div class="kanban-drill-chooser-card" style="cursor:pointer;margin-top:6px;" onclick="_mtpShowCreate()">'
+    + '<div class="kanban-drill-chooser-icon" style="color:var(--accent);">' + _ICONS.plus + '</div>'
+    + '<div><div class="kanban-drill-chooser-title">Create new project…</div></div></div>';
+
+  html += '</div></div></div>';
+  _atcShowOverlay(overlay, html);
+}
+
+function _mtpShowCreate() {
+  const overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+  let html = '<div class="pm-card pm-enter" style="max-width:420px;">';
+  html += '<h2 class="pm-title">Create New Project</h2>';
+  html += '<div class="pm-body">';
+  html += '<div class="kanban-create-section-label">A new folder is created under your Documents folder, then the session is moved into it.</div>';
+  html += '<input type="text" id="mtp-new-name" class="kanban-input" placeholder="Project name" style="width:100%;margin:8px 0;">';
+  html += '<button class="kanban-sidebar-btn" style="width:100%;" onclick="_mtpCreateAndMove()">Create &amp; Move</button>';
+  html += '</div></div>';
+  _atcShowOverlay(overlay, html);
+  setTimeout(() => {
+    const i = document.getElementById('mtp-new-name');
+    if (i) { i.focus(); i.onkeydown = e => { if (e.key === 'Enter') _mtpCreateAndMove(); }; }
+  }, 60);
+}
+
+async function _mtpCreateAndMove() {
+  const inp = document.getElementById('mtp-new-name');
+  const name = (inp ? inp.value : '').trim();
+  if (!name) { if (inp) inp.focus(); return; }
+
+  let encoded = '';
+  try {
+    const resp = await fetch('/api/add-project', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode: 'create', name}),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!data.ok || !data.encoded) {
+      showToast((data && data.error) || 'Failed to create project', true);
+      return;
+    }
+    encoded = data.encoded;
+  } catch (e) {
+    showToast('Failed to create project', true);
+    return;
+  }
+
+  // Refresh the app-wide project cache so the new project is known everywhere
+  // (project switcher, counts) after the move completes.
+  try {
+    const r = await fetch('/api/projects');
+    if (r.ok) _allProjects = await r.json();
+  } catch (e) { /* non-fatal — move still proceeds */ }
+
+  _mtpDoMove(encodeURIComponent(encoded));
+}
+
+async function _mtpDoMove(encEncoded) {
+  const toProject = decodeURIComponent(encEncoded || '');
+  const sessionId = _mtpSessionId;
+  if (!sessionId || !toProject) return;
+  const fromProject = localStorage.getItem('activeProject') || '';
+  _closePm();
+
+  // If the session is running, stop it client-side too and block ghost
+  // recovery from resurrecting it — the backend stops it as well, but the
+  // client owns runningIds and the ghost-recovery timers. Mirrors delete.
+  if (typeof runningIds !== 'undefined' && runningIds.has && runningIds.has(sessionId)) {
+    if (typeof markUserStopped === 'function') markUserStopped(sessionId);
+    try { socket.emit('close_session', {session_id: sessionId}); } catch (e) {}
+    if (typeof guiOpenDelete === 'function') guiOpenDelete(sessionId);
+    runningIds.delete(sessionId);
+  }
+
+  showToast('Moving session…');
+  let ok = false, dispName = '';
+  try {
+    const url = '/api/move-session/' + encodeURIComponent(sessionId)
+      + (fromProject ? '?project=' + encodeURIComponent(fromProject) : '');
+    const resp = await fetch(url, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({from_project: fromProject, to_project: toProject}),
+    });
+    const data = await resp.json().catch(() => ({}));
+    ok = !!(data && data.ok);
+    dispName = (data && data.to_project_display) || '';
+    if (!ok) showToast((data && data.error) || 'Move failed', true);
+  } catch (e) {
+    showToast('Move failed: network error', true);
+  }
+  if (!ok) return;
+
+  // The session left the current project — clean it out of the current view,
+  // matching delete's local cleanup (minus the trash/kanban-unlink semantics;
+  // the session and its kanban links still exist, just under another project).
+  if (typeof allSessions !== 'undefined') allSessions = allSessions.filter(x => x.id !== sessionId);
+  if (typeof allSessionIds !== 'undefined' && allSessionIds.delete) allSessionIds.delete(sessionId);
+  if (typeof multiSelectedIds !== 'undefined' && multiSelectedIds.has(sessionId)) {
+    multiSelectedIds.delete(sessionId);
+    if (typeof _renderMultiSelectionBadge === 'function') _renderMultiSelectionBadge();
+  }
+  if (typeof _clearDraft === 'function') _clearDraft(sessionId);
+  if (typeof removeSessionFromAllFolders === 'function') removeSessionFromAllFolders(sessionId);
+  if (typeof liveSessionId !== 'undefined' && liveSessionId === sessionId && typeof stopLivePanel === 'function') {
+    stopLivePanel();
+  }
+  if (typeof viewMode !== 'undefined' && viewMode === 'kanban' && window._kanbanSessionTaskId) {
+    if (typeof _kanbanSessionClose === 'function') _kanbanSessionClose(window._kanbanSessionTaskId);
+  } else if (typeof deselectSession === 'function') {
+    deselectSession();
+  }
+  const searchEl = document.getElementById('search');
+  if (searchEl && typeof allSessions !== 'undefined') {
+    searchEl.placeholder = 'Search ' + allSessions.length + ' sessions…';
+  }
+  if (typeof filterSessions === 'function') filterSessions();   // repaint sidebar
+  if (typeof loadProjects === 'function') loadProjects();       // refresh project counts
+
+  const shortDest = dispName ? (dispName.split(/[\\/]/).filter(Boolean).pop() || dispName) : 'project';
+  showToast('Moved to ' + shortDest);
 }
 
 async function _addToCompose(sessionId) {

@@ -437,6 +437,119 @@ def restore_from_trash(session_id: str, project: str = ""):
     return meta.get("name", "")
 
 
+# Serializes the cross-project file move so two concurrent moves of the same
+# session id (double-click, two tabs) can't both win the src->dest race and
+# leave a half-moved state.
+_move_lock = threading.Lock()
+
+
+def move_session(session_id: str, from_project: str, to_project: str,
+                 source_display: "str | None" = None,
+                 retries: int = 5, delay: float = 0.2) -> dict:
+    """Move a session's ``<sid>.jsonl`` from one project dir to another and
+    reconcile its display name across the two projects.
+
+    A session belongs to a project purely by which ``~/.claude/projects/<enc>/``
+    directory its ``.jsonl`` lives in; the working directory used on resume is
+    resolved live from the active project (see ``_currentProjectDir`` on the
+    client), so relocating the file is a complete, semantically-correct move.
+
+    ``source_display`` is the source session's effective display name as the
+    caller resolved it (typically the source ``_session_names.json`` entry, or
+    — when that is absent — the latest custom/AI title embedded in the source
+    ``.jsonl``).  When ``None`` the source names-file entry is used.  This name
+    is REPLACED onto the target so a moved session shows the name it had in its
+    old project.  Critically, when the resolved name is empty, any PRE-EXISTING
+    name entry for this id in the target is DELETED — otherwise a session id
+    that once lived in the target would inherit a stale, unrelated old name
+    (the "shows up as the wrong title after moving" bug).
+
+    Returns ``{"ok": True, "name": <name applied to target>}`` on success, or
+    ``{"ok": False, "error": <reason>}`` on any failure.  Never raises for the
+    common cases (missing source, id collision in target, Windows file lock);
+    those are reported as structured errors so the route can surface them.
+    """
+    src = _sessions_dir(from_project) / f"{session_id}.jsonl"
+    dest_dir = _sessions_dir(to_project)
+    dest = dest_dir / f"{session_id}.jsonl"
+
+    with _move_lock:
+        if not src.exists():
+            return {"ok": False, "error": "source session not found"}
+        if src.resolve() == dest.resolve():
+            return {"ok": False, "error": "source and target are the same project"}
+        if dest.exists():
+            # A session with this id already lives in the target — refuse to
+            # clobber it rather than silently merge two histories.
+            return {"ok": False, "error": "a session with this id already exists in the target project"}
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return {"ok": False, "error": f"target project unavailable: {e}"}
+
+        # Resolve the display name to re-home. Prefer the caller's resolved
+        # value (which may fall back to the .jsonl's own title); otherwise read
+        # the source names-file entry. Captured BEFORE the move so a concurrent
+        # prune of the source names file can't lose it.
+        if source_display is None:
+            saved_name = _load_names(from_project).get(session_id, "")
+        else:
+            saved_name = source_display or ""
+
+        moved = False
+        for attempt in range(retries):
+            if not src.exists():
+                break
+            try:
+                src.replace(dest)
+                moved = True
+                break
+            except PermissionError:
+                if attempt < retries - 1:
+                    time.sleep(delay)
+                    continue
+                # Last-ditch: copy bytes then unlink the source (handles a
+                # lingering AV/CLI handle on the source on Windows).
+                try:
+                    dest.write_bytes(src.read_bytes())
+                    src.unlink()
+                    moved = True
+                except Exception:
+                    moved = False
+                break
+            except Exception:
+                # Cross-device move or other failure — copy+unlink once.
+                try:
+                    dest.write_bytes(src.read_bytes())
+                    src.unlink()
+                    moved = True
+                except Exception:
+                    moved = False
+                break
+
+        if not moved:
+            return {"ok": False, "error": "could not move session file (locked or missing)"}
+
+        # Reconcile the display name on the TARGET, then drop the source entry.
+        # If we have a name, write it (overwriting any stale target entry). If
+        # we don't, DELETE any pre-existing target entry so the moved session
+        # can't inherit an unrelated old name left behind by a prior occupant
+        # of this id — it falls back to the .jsonl's own title instead.
+        try:
+            if saved_name:
+                _save_name(session_id, saved_name, to_project)
+            else:
+                _delete_name(session_id, to_project)
+        except Exception:
+            pass
+        try:
+            _delete_name(session_id, from_project)
+        except Exception:
+            pass
+
+        return {"ok": True, "name": saved_name}
+
+
 def purge_from_trash(session_id: str, project: str = "") -> bool:
     """Permanently delete a single trashed session (file + index entry)."""
     with _trash_lock:
