@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Callable, Dict
 
 from .config import _VIBENODE_DIR
 
@@ -95,7 +95,21 @@ _SECRET_PATTERNS = [
     # ── Sensitive document content ──
     ("Confidential Marker", re.compile(r'(?i)\b(CONFIDENTIAL|DO NOT DISTRIBUTE|INTERNAL USE ONLY|TRADE SECRET|ATTORNEY[\s\-]CLIENT PRIVILEGED|NOT FOR PUBLIC RELEASE|STRICTLY PRIVATE)\b'), "Document contains confidentiality marker"),
     ("SSN Pattern", re.compile(r'\b\d{3}-\d{2}-\d{4}\b'), "Possible Social Security Number"),
-    ("Credit Card", re.compile(r'\b(?:4\d{3}|5[1-5]\d{2}|3[47]\d{2}|6(?:011|5\d{2}))[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b'), "Possible credit card number"),
+    # Two layers keep this off UUIDs/GUIDs, which are everywhere in this
+    # codebase (session ids, test fixtures). A UUID like
+    # "beef1111-2222-3333-4444-555566667777" contains "4444-555566667777",
+    # which is 16 digits with an issuer-shaped "4xxx" prefix — a textbook
+    # false positive.
+    #   1. The lookarounds: real card numbers are not preceded by "<hex>-"
+    #      nor followed by "-<hex>"; UUID groups always are.
+    #   2. The Luhn check in _MATCH_VALIDATORS below: every real card number
+    #      passes the Luhn checksum, arbitrary digit runs almost never do.
+    # Do NOT drop either guard to "simplify" the pattern — it re-breaks the
+    # pre-push scan on any file containing a hex UUID whose 4th group starts
+    # with 4, 5, 3 or 6. Because Luhn carries the accuracy, the pattern itself
+    # can afford to be broad: the first branch covers 15-digit Amex in its
+    # natural 4-6-5 grouping, which a 16-digit-only pattern missed entirely.
+    ("Credit Card", re.compile(r'(?<![0-9A-Fa-f]-)\b(?:3[47]\d{2}[- ]?\d{6}[- ]?\d{5}|(?:4\d{3}|5[1-5]\d{2}|3[47]\d{2}|6(?:011|5\d{2}))[- ]?\d{4}[- ]?\d{4}[- ]?\d{4})\b(?!-[0-9A-Fa-f])'), "Possible credit card number"),
     ("EIN/Tax ID", re.compile(r'\b\d{2}-\d{7}\b'), "Possible EIN/Tax ID number"),
     ("Phone Number", re.compile(r'\b(?:\+1[- ]?)?\(\d{3}\)[- ]?\d{3}[- ]?\d{4}\b'), "Possible phone number (with area code parens)"),
     ("Date of Birth", re.compile(r'(?i)\b(date[_\s\-]?of[_\s\-]?birth|dob)\s*[=:]\s*'), "Date of birth field"),
@@ -113,6 +127,37 @@ _MATCH_ALLOWLIST = {
     "127.0.0.1", "0.0.0.0",                     # standard bind/localhost
     "localhost:5050", "localhost:5051",           # VibeNode's own ports
     "http://localhost:", "https://localhost:",    # localhost URLs generally OK in source
+}
+
+
+def _luhn_ok(matched: str) -> bool:
+    """True if the digits in ``matched`` satisfy the Luhn checksum.
+
+    Every issued payment card number carries a Luhn check digit. A digit run
+    that merely looks card-shaped — a UUID fragment, a timestamp, a test
+    fixture id — passes only by ~1-in-10 chance. Requiring Luhn therefore
+    removes the bulk of this pattern's false positives without ever
+    suppressing a real card.
+    """
+    digits = [int(c) for c in matched if c.isdigit()]
+    if not 13 <= len(digits) <= 19:
+        return False
+    total = 0
+    for i, d in enumerate(reversed(digits)):
+        if i % 2:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+# Per-finding-type validators. A finding is reported only if its validator
+# returns True. Types absent from this map are reported on regex match alone.
+# Use this for patterns that have a real checksum or structural rule — it is
+# far more precise than widening the regex or blanket-skipping a file.
+_MATCH_VALIDATORS: Dict[str, Callable[[str], bool]] = {
+    "Credit Card": _luhn_ok,
 }
 
 # Files (normalized forward-slash paths) to skip content scanning entirely.
@@ -336,6 +381,10 @@ def scan_staged_files(proj: Path = None) -> Dict:
                 # Check match allowlist — skip known-safe values
                 if any(safe in matched for safe in _MATCH_ALLOWLIST):
                     continue
+                # Check type validator (e.g. Luhn for card numbers)
+                _validator = _MATCH_VALIDATORS.get(label)
+                if _validator is not None and not _validator(matched):
+                    continue
                 line_start = content[:match.start()].count('\n') + 1
                 # Redact aggressively — show minimal context
                 if len(matched) > 12:
@@ -471,6 +520,10 @@ def scan_staged_files_stream(proj: Path = None):
                 matched = match.group(0)
                 # Check match allowlist — skip known-safe values
                 if any(safe in matched for safe in _MATCH_ALLOWLIST):
+                    continue
+                # Check type validator (e.g. Luhn for card numbers)
+                _validator = _MATCH_VALIDATORS.get(label)
+                if _validator is not None and not _validator(matched):
                     continue
                 line_start = content[:match.start()].count('\n') + 1
                 if len(matched) > 12:
