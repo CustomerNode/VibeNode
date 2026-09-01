@@ -191,15 +191,33 @@ def create_app(testing=False) -> Flask:
             return f"/static/{filename}?v={mtime}"
         return dict(versioned_static=versioned_static)
 
-    # Prevent aggressive browser caching of static JS/CSS
+    # Baseline for send_file; the after_request below sets the real policy.
     app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
     @app.after_request
-    def _no_cache_static(response):
+    def _static_cache_policy(response):
         if request.path.startswith('/static/'):
-            response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-            response.headers['Pragma'] = 'no-cache'
-            response.headers['Expires'] = '0'
+            # A ?v= URL came from versioned_static() and is content-addressed by
+            # mtime: the URL cannot outlive the bytes it names, so the response
+            # is safe to cache permanently.  This is what stops the browser
+            # re-downloading ~2 MB of JS on every load -- previously 'no-store'
+            # forbade keeping a copy at all, which defeated the whole point of
+            # stamping the URL in the first place.
+            #
+            # Only for a 200: a 404/500 with a ?v= on it must never be pinned
+            # into the cache for a year.
+            if request.args.get('v') and response.status_code == 200:
+                response.headers['Cache-Control'] = (
+                    'public, max-age=31536000, immutable')
+                response.headers.pop('Pragma', None)
+                response.headers.pop('Expires', None)
+            else:
+                # Un-versioned asset: still always revalidate, but 'no-cache'
+                # (revalidate, then 304 with an empty body) instead of
+                # 'no-store' (re-ship the whole file).  Identical freshness.
+                response.headers['Cache-Control'] = 'no-cache'
+                response.headers['Pragma'] = 'no-cache'
+                response.headers['Expires'] = '0'
         elif response.mimetype == 'text/html':
             # The SPA shell must revalidate every load. Without this the browser
             # (esp. iOS Safari / home-screen PWA) serves a cached HTML that points

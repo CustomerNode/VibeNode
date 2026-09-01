@@ -942,7 +942,13 @@ def _chrome_running():
 def open_browser():
     import time
     import urllib.request
-    url = f"http://localhost:{_WEB_PORT}"
+    # 127.0.0.1, never "localhost": the name resolves to ::1 first, nothing
+    # listens there, and the SYN is dropped rather than refused -- so it is a
+    # timeout, not a fast error.  ~209ms per connection, and werkzeug sends
+    # Connection: close, so that is paid per ASSET, not per page.  Measured
+    # over the real 43-asset load: 11.3s via localhost vs 2.3s via 127.0.0.1.
+    # Pinned by tests/test_static_cache_headers.py.
+    url = f"http://127.0.0.1:{_WEB_PORT}"
     log_path = Path(__file__).resolve().parent / "logs" / "browser_open.log"
     log_path.parent.mkdir(exist_ok=True)
 
@@ -1226,7 +1232,7 @@ if __name__ == "__main__":
           "  =========================================================\n"
           "    VIBENODE RUNNING - KEEP THIS TERMINAL OPEN\n"
           "  =========================================================\n\n"
-          "  Open your browser to: http://localhost:5050\n\n"
+          "  Open your browser to: http://127.0.0.1:5050\n\n"
           "  This is a local server for personal use.\n"
           "  Close it or press Ctrl+C to stop.\n\n"
           "  ---------------------------------------------------------\n\n"

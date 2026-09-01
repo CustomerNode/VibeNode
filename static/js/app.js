@@ -445,10 +445,13 @@ async function selectProjectFromOverlay(encoded) {
   const p = _allProjects.find(x => x.encoded === encoded);
   const name = p ? _projectShortName(p) : 'project';
 
-  // Show full-screen loading overlay — enforce a minimum display time
-  // so the animation feels intentional, not just a flash.
+  // Show full-screen loading overlay.  The floor only exists to stop a very
+  // fast switch flashing the overlay up and straight back down; it is NOT a
+  // pacing device.  It used to be 1800ms, which meant every switch waited on
+  // the animation long after the data was ready -- the switch was done in
+  // ~150ms and the user still sat through 1.8s of orb.
   _showProjectSwitchLoader(name);
-  const _minDisplay = new Promise(r => setTimeout(r, 1800));
+  const _minDisplay = new Promise(r => setTimeout(r, 250));
 
   await setProject(encoded, true);
 
