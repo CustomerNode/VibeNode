@@ -645,13 +645,37 @@ class DaemonClient:
             "session_id": session_id,
         })
 
-    def set_session_model(self, session_id, model):
+    def set_session_model(self, session_id, model, resume_turn=False):
         """Switch a running session's model mid-session (next turn onward).
         Returns the daemon's honest result — {"ok": True, "model": ...} only
-        if the CLI confirmed the switch, else {"ok": False, "error": ...}."""
-        return self._send_request("set_session_model", {
-            "session_id": session_id, "model": model,
-        })
+        if the CLI confirmed the switch, else {"ok": False, "error": ...}.
+
+        ``resume_turn`` (usage-limit CTA only) additionally re-runs the turn the
+        error interrupted.  It is sent ONLY when true, for the same reason
+        ``start_session`` withholds ``session_type``: a daemon started before
+        the param existed rejects any unknown key outright
+        (``daemon_server`` dispatches with ``handler(**params)``), and the
+        plain model badge — which never asks to resume a turn — must keep
+        working against a long-running daemon.  If an older daemon does reject
+        the key, retry without it: switching the model is the part the user
+        asked for, and the client reads ``turn_resumed`` to say honestly
+        whether the turn came back with it.
+        """
+        params = {"session_id": session_id, "model": model}
+        if resume_turn:
+            params["resume_turn"] = True
+        result = self._send_request("set_session_model", params)
+        if resume_turn and isinstance(result, dict) and not result.get("ok") \
+                and "resume_turn" in str(result.get("error", "")):
+            logger.warning(
+                "Daemon rejected resume_turn for set_session_model — retrying "
+                "without it (model will switch, interrupted turn will not "
+                "auto-resume)"
+            )
+            result = self._send_request("set_session_model", {
+                "session_id": session_id, "model": model,
+            })
+        return result
 
     def cancel_auto_retry(self, session_id):
         """Cancel a pending API-error auto-retry countdown (Cancel button)."""

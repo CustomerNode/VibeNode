@@ -22,6 +22,8 @@ three-way contract holds:
 Discovered + added 2026-05-29.
 """
 
+import ast
+import inspect
 import re
 from pathlib import Path
 
@@ -31,8 +33,12 @@ from app.daemon_client import DaemonClient
 
 _ROOT = Path(__file__).resolve().parents[1]
 _ROUTES = _ROOT / "app" / "routes" / "sessions_api.py"
+_WS_EVENTS = _ROOT / "app" / "routes" / "ws_events.py"
 _CLIENT = _ROOT / "app" / "daemon_client.py"
 _SERVER = _ROOT / "daemon" / "daemon_server.py"
+
+# Every route module that calls through the ``sm`` proxy alias.
+_PROXY_CALLERS = (_ROUTES, _WS_EVENTS)
 
 
 def _routes_sm_calls() -> set:
@@ -111,6 +117,117 @@ class TestClientToDaemonParity:
         handlers = _daemon_handler_keys()
         missing = sorted(SUBSESSION_METHODS - handlers)
         assert not missing, f"daemon has no handler for subsession RPCs: {missing}"
+
+
+def _routes_sm_call_kwargs():
+    """Every ``sm.<method>(..., <kw>=...)`` keyword passed from the routes.
+
+    Yields ``(module, lineno, method, kwarg)``.  Name-level parity is not
+    enough: ``set_session_model`` existed on the proxy but did not accept the
+    ``resume_turn`` kwarg the socket handler started passing, so EVERY model
+    switch raised ``TypeError: ... got an unexpected keyword argument
+    'resume_turn'`` and the handler's ``except Exception`` turned it into a
+    "Model switch failed" toast.  (Shipped 2026-08-31, found 2026-09-02.)
+    """
+    for path in _PROXY_CALLERS:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)):
+                continue
+            base = node.func.value
+            basename = getattr(base, "id", None) or getattr(base, "attr", None)
+            if basename not in ("sm", "session_manager"):
+                continue
+            for kw in node.keywords:
+                if kw.arg:
+                    yield path.name, node.lineno, node.func.attr, kw.arg
+
+
+class TestRouteToClientSignatureParity:
+    def test_every_kwarg_the_routes_pass_is_accepted_by_the_proxy(self):
+        """A proxy method that EXISTS can still reject the call.  The routes
+        run against DaemonClient in production, so any keyword they pass must
+        be in its signature (or absorbed by **kwargs)."""
+        bad = []
+        for module, lineno, method, kwarg in _routes_sm_call_kwargs():
+            fn = getattr(DaemonClient, method, None)
+            if fn is None:
+                continue  # covered by the name-parity test above
+            params = inspect.signature(fn).parameters
+            if any(p.kind is inspect.Parameter.VAR_KEYWORD
+                   for p in params.values()):
+                continue
+            if kwarg not in params:
+                bad.append(f"{module}:{lineno} "
+                           f"DaemonClient.{method}() has no '{kwarg}' param")
+        assert not bad, (
+            "routes pass keywords the IPC proxy does not accept (TypeError in "
+            "production, surfaced to the user as a failure toast):\n  "
+            + "\n  ".join(sorted(bad))
+        )
+
+
+class TestSetSessionModelResumeTurn:
+    """The model-switch proxy specifically."""
+
+    @staticmethod
+    def _client(reply=None):
+        client = DaemonClient.__new__(DaemonClient)  # no __init__/socket
+        client._planner_ids = set()
+        client._connected = True
+        sent = []
+
+        def fake_send(method, params=None, timeout=30):
+            sent.append((method, params or {}))
+            if callable(reply):
+                return reply(len(sent))
+            return reply if reply is not None else {"ok": True}
+
+        client._send_request = fake_send
+        return client, sent
+
+    def test_plain_switch_omits_resume_turn(self):
+        """The model badge never asks to spend a turn, and a daemon started
+        before the param existed rejects unknown keys outright — so the common
+        path must not send it at all."""
+        client, sent = self._client()
+        client.set_session_model("s1", "claude-sonnet-4-6")
+        assert sent == [("set_session_model",
+                         {"session_id": "s1", "model": "claude-sonnet-4-6"})]
+
+    def test_cta_forwards_resume_turn(self):
+        client, sent = self._client()
+        client.set_session_model("s1", "claude-sonnet-4-6", resume_turn=True)
+        assert sent[0][1].get("resume_turn") is True
+
+    def test_old_daemon_rejecting_resume_turn_falls_back_to_plain_switch(self):
+        """An old in-flight daemon replies with the TypeError text.  Switching
+        the model is the part the user asked for, so retry without the param
+        rather than failing the whole operation."""
+        err = ("set_session_model() got an unexpected keyword argument "
+               "'resume_turn'")
+        client, sent = self._client(
+            reply=lambda n: {"ok": False, "error": err} if n == 1
+            else {"ok": True, "model": "claude-sonnet-4-6"}
+        )
+        result = client.set_session_model("s1", "claude-sonnet-4-6",
+                                          resume_turn=True)
+        assert len(sent) == 2
+        assert "resume_turn" not in sent[1][1]
+        assert result["ok"] is True
+        # Honesty: the turn did NOT resume, and the payload must not claim it.
+        assert not result.get("turn_resumed")
+
+    def test_genuine_failure_is_not_retried(self):
+        """Only the unknown-param rejection gets a second attempt — a real
+        rejection (bad model id) must surface as-is, not be tried twice."""
+        client, sent = self._client(
+            reply={"ok": False, "error": "Model switch rejected: no such model"}
+        )
+        result = client.set_session_model("s1", "bogus", resume_turn=True)
+        assert len(sent) == 1
+        assert result["ok"] is False
 
 
 class TestStartSessionForwardsSubsessionKwargs:
