@@ -1199,7 +1199,7 @@ def planner_chat():
                 import anthropic
                 client = anthropic.Anthropic()
                 resp = client.messages.create(
-                    model="claude-sonnet-4-20250514",
+                    model="claude-sonnet-5",
                     max_tokens=4096,
                     system=sys_prompt,
                     messages=messages,

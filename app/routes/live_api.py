@@ -455,6 +455,7 @@ _CONFIRMED_MODELS_FILE = Path(__file__).resolve().parents[2] / "confirmed_models
 # no past sessions cached). Ensures the UI always offers a sensible choice.
 # Ordered: Fable (most capable), Opus, Sonnet, Haiku.
 _FALLBACK_KNOWN_MODELS = [
+    {"id": "claude-fable-5-1", "name": "Fable 5.1"},
     {"id": "claude-fable-5", "name": "Fable 5"},
     {"id": "claude-opus-5", "name": "Opus 5"},
     {"id": "claude-opus-4-8", "name": "Opus 4.8"},
@@ -480,6 +481,7 @@ _MODELS_CACHE_TTL = 3600
 # existing Sonnet 4.6 in the confirmed cache) would otherwise never appear.
 # Merged in by id (deduped), so it never duplicates an API/CLI/cache entry.
 _ALWAYS_OFFER_MODELS = [
+    {"id": "claude-fable-5-1", "name": "Fable 5.1"},
     {"id": "claude-opus-5", "name": "Opus 5"},
     {"id": "claude-sonnet-5", "name": "Sonnet 5"},
 ]
@@ -541,6 +543,34 @@ def _model_id_to_display_name(model_id: str) -> str:
     return f"{family} {version}".strip()
 
 
+# Family rank used by every model sort: fable > opus > sonnet > haiku/other.
+_FAMILY_RANK = ("fable", "opus", "sonnet")
+
+
+def _model_sort_key(model_id: str):
+    """Newest/most-capable-first sort key for a raw model id.
+
+    Version components are zero-PADDED to a fixed width before being negated.
+    Without padding, Python's list comparison treats a shorter list as a prefix
+    and sorts it FIRST, so "claude-fable-5" ([-5]) would rank above
+    "claude-fable-5-1" ([-5, -1]) — i.e. a new point release would be buried
+    below the model it supersedes. Padding makes the missing minor a 0, and
+    -1 < 0 puts 5.1 correctly ahead of 5.
+
+    An 8-digit date suffix is excluded from the version comparison and instead
+    breaks ties LAST, so the clean alias ("claude-haiku-4-5") wins over its
+    dated snapshot ("claude-haiku-4-5-20251001") in the dedup-by-display-name
+    pass downstream.
+    """
+    import re as _re
+    base = _re.sub(r"-\d{8}$", "", model_id)
+    family = next((i for i, f in enumerate(_FAMILY_RANK) if f in model_id), len(_FAMILY_RANK))
+    nums = [int(x) for x in _re.findall(r"\d+", base.replace("claude-", ""))]
+    nums = (nums + [0, 0, 0, 0])[:4]
+    dated = 1 if _re.search(r"-\d{8}$", model_id) else 0
+    return (family, [-n for n in nums], dated)
+
+
 def _fetch_models_from_anthropic_api() -> list:
     """Try calling /v1/models with ANTHROPIC_API_KEY if set. Returns [] on failure."""
     import os as _os
@@ -561,18 +591,7 @@ def _fetch_models_from_anthropic_api() -> list:
             if mid.startswith("claude-"):
                 result.append({"id": mid, "name": m.get("display_name") or _model_id_to_display_name(mid)})
         # Sort: newest/most capable first (fable > opus > sonnet > haiku, higher version first)
-        def _sort_key(m):
-            mid = m["id"]
-            if "fable" in mid:
-                family = 0
-            elif "opus" in mid:
-                family = 1
-            elif "sonnet" in mid:
-                family = 2
-            else:
-                family = 3
-            return (family, [-int(x) for x in mid.replace("claude-", "").split("-") if x.isdigit()])
-        result.sort(key=_sort_key)
+        result.sort(key=lambda m: _model_sort_key(m["id"]))
         return result
     except Exception:
         return []
@@ -606,22 +625,7 @@ def _finalize_model_list(result: list, cli_model: str) -> list:
     Shared by the fast sync path and the background refresh so both produce
     identically structured output.
     """
-    import re as _re
-
     _KNOWN_FAMILIES = ("fable", "opus", "sonnet", "haiku")
-
-    def _sort_key(m):
-        mid = m["id"]
-        if "fable" in mid:
-            family = 0
-        elif "opus" in mid:
-            family = 1
-        elif "sonnet" in mid:
-            family = 2
-        else:
-            family = 3
-        nums = [-int(x) for x in _re.findall(r"\d+", mid)]
-        return (family, nums)
 
     # 3.5. Always offer current models (e.g. newly launched Sonnet 5) even when a
     #      same-family model is already present from the API/CLI/confirmed cache.
@@ -645,7 +649,7 @@ def _finalize_model_list(result: list, cli_model: str) -> list:
             present_families.add(fam)
             existing_ids.add(fallback["id"])
 
-    result.sort(key=_sort_key)
+    result.sort(key=lambda m: _model_sort_key(m["id"]))
 
     # Dedup by display name — keep the first (shortest/cleanest ID per name).
     seen_names: set = set()
