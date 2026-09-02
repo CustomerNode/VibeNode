@@ -690,7 +690,7 @@ function _renderSessionRow(s, extraClass) {
     : '';
 
   return `
-  <div class="session-item${activeClass}${stateClass}${msClass}${subsessionClass}${unreadClass}${extraClass || ''}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" oncontextmenu="sessionContextMenu(event,'${s.id}')">
+  <div class="session-item${activeClass}${stateClass}${msClass}${subsessionClass}${unreadClass}${extraClass || ''}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" ondblclick="_dblclickSleepIfIdle('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')">
     <div class="session-col-name" onclick="handleNameClick('${s.id}')" style="cursor:text;" title="Click to rename">
       ${caretSpan}${subsessionGlyph}${unreadDot}${icon}${escHtml(s.display_title)}${_autoNamingInFlight.has(s.id) ? '<span class="naming-badge"><span class="naming-dot"></span>Naming\u2026</span>' : ''}${inboxBadge}
       ${subsessionFromLine}
@@ -951,6 +951,193 @@ function singleOrDouble(id, e) {
   }
   openInGUI(id);
 }
+
+/**
+ * Double-click gesture on a session row (list-table view) or card (grid view)
+ * puts an IDLE session to sleep.  Rationale: idle sessions are the "cheap to
+ * discard" state — no work in flight, safe to sleep, and resumable at any time
+ * with full context.  Working/waiting/sleeping sessions ignore the gesture
+ * (working could be interrupted mid-response; waiting has a pending question;
+ * sleeping is already asleep) — sleeping those needs the explicit Stop action
+ * from the context menu so the user makes a deliberate choice.
+ *
+ * Fires BESIDE the two single-click `singleOrDouble()` invocations that
+ * precede any dblclick — the session briefly opens in the live panel before
+ * the sleep completes.  That's acceptable and gives visual confirmation the
+ * right session was targeted; the alternative (a 250ms debounce on every
+ * single click just to detect a double) would add latency to the far more
+ * common single-click-to-open path for every user, everywhere.
+ *
+ * No confirmation modal — sleep is non-destructive (session resumes with full
+ * context) and matches the "fire and forget" pattern used by `_bulkStop()`.
+ * Instead of a modal, we surface a **bottom-left Undo toast** that gives the
+ * user ~6 seconds to reverse an accidental gesture.  If they hit Undo we
+ * restore the exact local state the sleep clobbered (runningIds membership,
+ * sessionKinds, guiOpenSessions, sessionLastState, user-stop intent) — the
+ * daemon session actually did stop, but the next action against the session
+ * transparently resumes it via the existing send-message error fallback in
+ * live-panel.js (see the `is stopped` branch there).
+ *
+ * The sleep itself mirrors the client-side stop steps in `closeSession()`
+ * (live-panel.js) and `_bulkStop()`: mark user-stop intent to block ghost-
+ * recovery timers, emit `close_session`, then clear all local state that
+ * would otherwise cause `getSessionStatus()` to keep reporting idle.
+ */
+function _dblclickSleepIfIdle(sessionId, e) {
+  if (e && typeof e.preventDefault === 'function') e.preventDefault();
+  if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+  if (!sessionId) return;
+  const status = (typeof getSessionStatus === 'function')
+    ? getSessionStatus(sessionId) : null;
+  if (status !== 'idle') {
+    // Give the user feedback so the gesture doesn't feel broken on
+    // working/waiting/sleeping rows.  A silent no-op reads as a bug.
+    if (typeof showToast === 'function') {
+      if (status === 'working') showToast('Session is working — use Stop from the menu to interrupt');
+      else if (status === 'question') showToast('Session is waiting for input — answer or use Stop from the menu');
+      else if (status === 'sleeping') showToast('Session is already asleep');
+    }
+    return;
+  }
+
+  // ── Snapshot the pre-sleep state so Undo can restore it exactly ──
+  // Idle can mean any of three flavors (see workforce.js getSessionStatus):
+  // in runningIds, in guiOpenSessions, or restored via window.sessionLastState.
+  // We capture all three so Undo doesn't downgrade an in-runningIds session to
+  // only a restart-memory one.
+  const wasInRunning = (typeof runningIds !== 'undefined' && runningIds.has)
+    ? runningIds.has(sessionId) : false;
+  const priorKind = (typeof sessionKinds !== 'undefined')
+    ? sessionKinds[sessionId] : undefined;
+  const wasInGuiOpen = (typeof guiOpenSessions !== 'undefined' && guiOpenSessions.has)
+    ? guiOpenSessions.has(sessionId) : false;
+  const priorLastState = (window.sessionLastState) ? window.sessionLastState[sessionId] : undefined;
+  const wasActive = (typeof activeId !== 'undefined' && activeId === sessionId);
+
+  // ── Perform the sleep ──
+  if (typeof markUserStopped === 'function') markUserStopped(sessionId);
+  if (typeof socket !== 'undefined') {
+    try { socket.emit('close_session', { session_id: sessionId }); } catch (err) {}
+  }
+  if (typeof guiOpenDelete === 'function') guiOpenDelete(sessionId);
+  if (typeof runningIds !== 'undefined' && runningIds.delete) runningIds.delete(sessionId);
+  if (typeof sessionKinds !== 'undefined') delete sessionKinds[sessionId];
+  if (window.sessionLastState) delete window.sessionLastState[sessionId];
+  // If this was the active/open session, reset the live input bar state so
+  // the panel reflects the stopped session rather than lingering on the old
+  // input mode.  Mirrors closeSession() in live-panel.js.
+  if (wasActive) {
+    if (typeof liveBarState !== 'undefined') liveBarState = null;
+    if (typeof updateLiveInputBar === 'function') updateLiveInputBar();
+  }
+  if (typeof filterSessions === 'function') filterSessions();
+
+  // ── Show bottom-left Undo toast ──
+  const displayName = (typeof allSessions !== 'undefined' && allSessions.find)
+    ? (function() {
+        const s = allSessions.find(x => x.id === sessionId);
+        return (s && s.display_title) || sessionId.slice(0, 8);
+      })()
+    : sessionId.slice(0, 8);
+  _showUndoToast(
+    'Session asleep — ' + displayName,
+    'Undo',
+    function undo() {
+      // Clear user-stop intent so the client no longer suppresses ghost
+      // recovery / send-message auto-resume for this session.
+      if (typeof clearUserStopped === 'function') clearUserStopped(sessionId);
+      // Restore every flavor of local state we cleared.  The daemon session
+      // is genuinely stopped; the next real interaction with the session
+      // triggers the send-message error fallback in live-panel.js which
+      // resumes it transparently.  Until then the UI shows the session as
+      // it appeared before the accidental double-click.
+      if (wasInRunning && typeof runningIds !== 'undefined' && runningIds.add) {
+        runningIds.add(sessionId);
+      }
+      if (priorKind !== undefined && typeof sessionKinds !== 'undefined') {
+        sessionKinds[sessionId] = priorKind;
+      }
+      if (wasInGuiOpen && typeof guiOpenAdd === 'function') {
+        guiOpenAdd(sessionId);
+      }
+      if (priorLastState !== undefined) {
+        if (!window.sessionLastState) window.sessionLastState = {};
+        window.sessionLastState[sessionId] = priorLastState;
+      }
+      if (typeof filterSessions === 'function') filterSessions();
+      if (wasActive && typeof updateLiveInputBar === 'function') updateLiveInputBar();
+      if (typeof showToast === 'function') showToast('Sleep undone');
+    },
+    6000
+  );
+}
+// Expose for cross-script use (workforce.js's grid card ondblclick).
+if (typeof window !== 'undefined') window._dblclickSleepIfIdle = _dblclickSleepIfIdle;
+
+/**
+ * Bottom-left toast with an actionable button that auto-times-out.  Used by
+ * `_dblclickSleepIfIdle()` — kept generic so future flows (delete, move,
+ * batch actions) can reuse the same visual pattern without each rebuilding
+ * their own DOM.
+ *
+ * A single toast is shown at a time: calling this while one is up dismisses
+ * the prior one first (its onUndo is NOT invoked — replacement means "the
+ * prior action stands").  This avoids two toasts stacking in the same corner
+ * and makes it obvious which action Undo would reverse.
+ *
+ * @param {string} msg           — plain-text message (no HTML; escaped).
+ * @param {string} actionLabel   — button label, e.g. "Undo".
+ * @param {Function} onAction    — called when the button is clicked. Not
+ *                                 called on timeout or replacement.
+ * @param {number}  timeoutMs    — auto-dismiss timer (5-8s is typical).
+ */
+let _vnUndoToastEl = null;
+let _vnUndoToastTimer = null;
+function _showUndoToast(msg, actionLabel, onAction, timeoutMs) {
+  // Dismiss any prior undo toast without invoking its handler — see comment above.
+  if (_vnUndoToastEl) {
+    try { _vnUndoToastEl.remove(); } catch (e) {}
+    _vnUndoToastEl = null;
+  }
+  if (_vnUndoToastTimer) {
+    clearTimeout(_vnUndoToastTimer);
+    _vnUndoToastTimer = null;
+  }
+
+  const el = document.createElement('div');
+  el.className = 'vn-undo-toast';
+  const msgSpan = document.createElement('span');
+  msgSpan.className = 'vn-undo-toast-msg';
+  msgSpan.textContent = msg;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'vn-undo-toast-btn';
+  btn.textContent = actionLabel;
+  el.appendChild(msgSpan);
+  el.appendChild(btn);
+  document.body.appendChild(el);
+  // Trigger CSS enter transition on next frame — appending with .show already
+  // set would skip the transition entirely (opacity/transform start at target).
+  requestAnimationFrame(() => { el.classList.add('show'); });
+  _vnUndoToastEl = el;
+
+  const dismiss = function() {
+    if (_vnUndoToastTimer) { clearTimeout(_vnUndoToastTimer); _vnUndoToastTimer = null; }
+    if (_vnUndoToastEl !== el) return;  // already replaced
+    el.classList.remove('show');
+    // Let the fade-out play before removing so the last frame doesn't clip.
+    setTimeout(() => { try { el.remove(); } catch (e) {} if (_vnUndoToastEl === el) _vnUndoToastEl = null; }, 250);
+  };
+
+  btn.addEventListener('click', function(ev) {
+    ev.stopPropagation();
+    try { if (typeof onAction === 'function') onAction(); }
+    finally { dismiss(); }
+  });
+
+  _vnUndoToastTimer = setTimeout(dismiss, Math.max(1500, timeoutMs || 5000));
+}
+if (typeof window !== 'undefined') window._showUndoToast = _showUndoToast;
 
 /* ---- Right-click / long-press context menu ----
  *

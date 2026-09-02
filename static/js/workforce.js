@@ -904,7 +904,13 @@ function renderWorkforce(sessions) {
     const unreadDot = _isUnread
       ? '<span class="unread-dot" aria-label="Unread" title="Unread \u2014 new response you haven\u2019t opened"></span>'
       : '';
-    return `<div class="wf-card wf-${st}${selClass}${msClass}${familyClass}${unreadClass}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" onclick="singleOrDouble('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')" title="${escHtml(s.display_title)} \u2014 double-click to open in VibeNode">
+    // Double-click on an idle card puts it to sleep \u2014 see
+    // `_dblclickSleepIfIdle()` in sessions.js.  Working/waiting/sleeping cards
+    // ignore the gesture (with a toast explaining why).  Single click still
+    // opens the session; the two-click prefix runs first and the panel briefly
+    // opens before the sleep completes, which doubles as visual confirmation
+    // that the right card was targeted.
+    return `<div class="wf-card wf-${st}${selClass}${msClass}${familyClass}${unreadClass}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" onclick="singleOrDouble('${s.id}',event)" ondblclick="_dblclickSleepIfIdle('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')" title="${escHtml(s.display_title)} \u2014 click to open, double-click to sleep (if idle)">
       ${unreadDot}
       <div class="wf-avatar">${emoji}</div>
       <div class="wf-status-label">${label}</div>

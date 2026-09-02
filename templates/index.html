@@ -19,7 +19,14 @@
 <meta name="apple-mobile-web-app-title" content="{{ a2hs_title|default('VibeNode', true) }}">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<!-- Inter is the body face. The CSS font stack asked for 'Inter' long before
+     anything loaded it, so the stack silently fell through to Segoe UI on
+     Windows and SF Pro on macOS — the same UI rendered in two different
+     typefaces depending on the machine. Loading it here makes body text
+     identical everywhere. display=swap means an offline/blocked load simply
+     falls through to the system stack exactly as it did before, so this is
+     safe for local-first / air-gapped use. -->
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="{{ versioned_static('style.css') }}">
 <link rel="stylesheet" href="{{ versioned_static('css/mobile.css') }}">   <!-- mobile responsive layer (<=768px only) -->
 <link rel="stylesheet" href="{{ versioned_static('css/mobile-preview.css') }}">   <!-- mobile visual channel: preview cards + sheet -->
@@ -712,6 +719,10 @@
 <script src="{{ versioned_static('js/theme.js') }}"></script>
 <script src="{{ versioned_static('js/healthchecks.js') }}"></script>
 <script src="{{ versioned_static('js/socket.js') }}"></script>
+<!-- Themed replacement for native OS tooltips. Fully delegated off document,
+     so it covers every existing title="" and anything rendered later without
+     touching call sites. Self-disables on touch-only devices. -->
+<script src="{{ versioned_static('js/tooltip.js') }}"></script>
 
 <div id="session-tooltip"></div>
 <script>
