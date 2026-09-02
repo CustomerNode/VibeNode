@@ -127,13 +127,24 @@
   var EXCLUDED = '.session-item';
 
   function tipTargetFrom(node) {
+    if (!node || node.nodeType !== 1) return null;
+
+    // Ancestry check FIRST, before looking at any title. The titled elements
+    // inside a session row are its CHILDREN (state icon, unread dot,
+    // subsession chevron), not the row itself — so testing for the exclusion
+    // during the walk-up would always hit the child's own title and return it
+    // before ever reaching the row. `closest` asks the question that actually
+    // matters: is this anywhere inside an excluded region?
+    try {
+      if (node.closest(EXCLUDED)) return null;
+      if (node.closest('[data-no-tip]')) return null;
+    } catch (_) {}
+
     // Walk up from the event target: `title` is inherited visually by children
     // (hovering the <svg> inside a button shows the button's tooltip), so the
     // nearest ancestor carrying a non-empty title is the real anchor.
     var el = node;
     while (el && el !== document.body && el.nodeType === 1) {
-      if (el.hasAttribute('data-no-tip')) return null;
-      try { if (el.matches(EXCLUDED)) return null; } catch (_) {}
       var t = el.getAttribute('title');
       if (t && t.trim()) return el;
       el = el.parentElement;
@@ -256,28 +267,46 @@
   // ---------------------------------------------------------------------------
   // Event wiring (delegated — works for dynamically created elements)
   // ---------------------------------------------------------------------------
-  document.addEventListener('mouseover', function (e) {
-    var el = tipTargetFrom(e.target);
-    if (!el || el === anchor) return;
+  // Is this node the active anchor, or inside it? Crossing from a button into
+  // its own <svg> must NOT be treated as leaving.
+  function withinAnchor(node) {
+    return !!(anchor && node && node.nodeType === 1 && anchor.contains(node));
+  }
 
-    clearTimeout(hideTimer); hideTimer = null;
-    clearTimeout(showTimer);
+  // All hover state is driven from `mouseover` alone.
+  //
+  // The obvious implementation — hide on `mouseout` of the anchor — CANNOT
+  // work here, and this is subtle enough to be worth spelling out: by the time
+  // the pointer leaves, we have already blanked the anchor's `title` to
+  // suppress the native tooltip. So a `mouseout` handler that re-derives the
+  // anchor via tipTargetFrom() finds an element with no title, concludes it is
+  // not a tooltip target, and bails — leaving the tooltip stuck on screen and
+  // the borrowed title never restored. Resolving against the live `anchor`
+  // reference instead of re-deriving from the DOM is what makes this correct.
+  document.addEventListener('mouseover', function (e) {
+    // Still over the same anchor (or one of its children): nothing to do.
+    if (withinAnchor(e.target)) { clearTimeout(hideTimer); hideTimer = null; return; }
+
+    var el = tipTargetFrom(e.target);
+
+    // We have moved off whatever we were tracking, so cancel any pending show
+    // and put back the title of the element we were holding.
+    clearTimeout(showTimer); showTimer = null;
+    if (anchor) hide(true);
+
+    if (!el) return;   // moved onto chrome with no tooltip
 
     // If a tooltip was visible very recently, skip the delay so moving along a
     // toolbar feels continuous rather than stuttering.
     var warm = (Date.now() - lastHiddenAt) < WARM_MS;
-
-    if (anchor) hide(true);
     showTimer = setTimeout(function () { show(el); }, warm ? 0 : SHOW_DELAY);
   }, true);
 
+  // `mouseover` cannot fire when the pointer leaves the document entirely
+  // (out of the window, or onto browser chrome), so that one case still needs
+  // mouseout. A null relatedTarget is the signal.
   document.addEventListener('mouseout', function (e) {
-    var el = tipTargetFrom(e.target);
-    if (!el) return;
-    // Ignore moves that stay inside the same anchor (e.g. crossing from the
-    // button into its own <svg>), otherwise the tooltip flickers.
-    if (e.relatedTarget && el.contains(e.relatedTarget)) return;
-
+    if (e.relatedTarget) return;
     clearTimeout(showTimer); showTimer = null;
     clearTimeout(hideTimer);
     hideTimer = setTimeout(function () { hide(); }, HIDE_DELAY);
