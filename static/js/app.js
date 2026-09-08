@@ -1510,11 +1510,11 @@ async function _showMemoryEditor() {
         </div>
         <div id="mem-project" style="display:flex;flex-direction:column;flex:1;min-height:0;">
           <p class="mem-path" id="mem-project-path" style="font-size:10px;color:var(--text-faint);margin-bottom:6px;">Loading...</p>
-          <textarea class="ns-textarea" id="mem-project-content" rows="16" placeholder="Project CLAUDE.md content..." style="flex:1;min-height:200px;"></textarea>
+          <textarea class="ns-textarea" id="mem-project-content" rows="16" placeholder="Project CLAUDE.md content…" style="flex:1;min-height:200px;"></textarea>
         </div>
         <div id="mem-global" style="display:none;flex-direction:column;flex:1;min-height:0;">
           <p class="mem-path" id="mem-global-path" style="font-size:10px;color:var(--text-faint);margin-bottom:6px;">~/.claude/CLAUDE.md</p>
-          <textarea class="ns-textarea" id="mem-global-content" rows="16" placeholder="Global CLAUDE.md content..." style="flex:1;min-height:200px;"></textarea>
+          <textarea class="ns-textarea" id="mem-global-content" rows="16" placeholder="Global CLAUDE.md content…" style="flex:1;min-height:200px;"></textarea>
         </div>
       </div>
       <div class="pm-actions" style="margin-top:14px;">

@@ -84,7 +84,7 @@ function _openDeptPickerFlyout() {
 
   let h = '';
   h += '<div class="dept-picker-header">';
-  h += '<input type="text" class="dept-picker-search" id="dept-picker-search" placeholder="Search departments..." oninput="_filterDeptPicker(this.value)">';
+  h += '<input type="text" class="dept-picker-search" id="dept-picker-search" placeholder="Search departments…" oninput="_filterDeptPicker(this.value)">';
   h += '<button class="dept-picker-close" onclick="_closeDeptPickerFlyout()">&times;</button>';
   h += '</div>';
 

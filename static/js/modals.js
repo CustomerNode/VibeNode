@@ -494,7 +494,7 @@ function shutdownServer() {
 
   overlay.querySelector('#shutdown-confirm').onclick = async () => {
     overlay.remove();
-    if (typeof showToast === 'function') showToast('Shutting down server...');
+    if (typeof showToast === 'function') showToast('Shutting down server…');
     try {
       await fetch('/api/shutdown', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
     } catch (e) { /* expected — server going down */ }
@@ -638,7 +638,7 @@ async function openPersistentStorage() {
       <div id="kb-supabase-config" style="${isSupa ? '' : 'display:none;'}padding:16px;border:1px solid var(--border);border-radius:8px;">
         <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:var(--text-muted);">Supabase Connection</div>
         <div class="kanban-settings-field"><label>Project URL</label><input type="text" id="kb-supa-url" value="${typeof escHtml === 'function' ? escHtml(config.supabase_url || '') : (config.supabase_url || '')}" placeholder="https://your-project.supabase.co"></div>
-        <div class="kanban-settings-field"><label>Secret Key <span style="font-size:10px;color:var(--orange);">(service_role)</span></label><input type="password" id="kb-supa-key" value="${typeof escHtml === 'function' ? escHtml(config.supabase_secret_key || '') : (config.supabase_secret_key || '')}" placeholder="eyJhbGciOi..."></div>
+        <div class="kanban-settings-field"><label>Secret Key <span style="font-size:10px;color:var(--orange);">(service_role)</span></label><input type="password" id="kb-supa-key" value="${typeof escHtml === 'function' ? escHtml(config.supabase_secret_key || '') : (config.supabase_secret_key || '')}" placeholder="eyJhbGciOi…"></div>
         <div style="display:flex;gap:8px;margin-top:10px;align-items:center;">
           <button class="kanban-settings-btn-accent" id="kb-test-btn" onclick="testConnection()" style="padding:8px 18px;font-size:13px;">Step 1: Test Connection</button>
           <span id="kb-conn-status" style="font-size:12px;margin-left:4px;"></span>
@@ -655,7 +655,7 @@ async function openPersistentStorage() {
             <li>Click <strong>Generate new token</strong>, copy it</li>
             <li>Paste it below and click <strong>Setup Database</strong></li>
           </ol>
-          <div class="kanban-settings-field" style="margin-bottom:10px;"><label style="font-weight:600;">Access Token</label><input type="password" id="kb-access-token" placeholder="sbp_..." style="font-size:13px;"></div>
+          <div class="kanban-settings-field" style="margin-bottom:10px;"><label style="font-weight:600;">Access Token</label><input type="password" id="kb-access-token" placeholder="sbp_…" style="font-size:13px;"></div>
           <div style="display:flex;gap:8px;align-items:center;">
             <button class="kanban-settings-btn-accent" onclick="setupSupabaseSchema()" id="kb-setup-btn" style="padding:8px 18px;font-size:13px;">Setup Database</button>
             <span id="kb-setup-status" style="font-size:12px;"></span>

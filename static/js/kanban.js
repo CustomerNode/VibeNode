@@ -4386,7 +4386,7 @@ async function showValidationCeremony(taskId) {
       <div class="pm-body"><p>Review <strong>${escHtml(task.title)}</strong> before marking as complete:</p></div>
       ${verUrl ? `<div class="kanban-val-section"><h4>Verification URL</h4><div class="kanban-val-ver-row"><code>${escHtml(verUrl)}</code>${_isLocalPath(verUrl) ? `<a href="#" data-local-path="${escHtml(verUrl)}" onclick="event.preventDefault();event.stopPropagation();_openLocalFile(this.dataset.localPath)" class="kanban-val-open-btn">Open</a>` : `<a href="${escHtml(verUrl)}" target="_blank" rel="noopener" class="kanban-val-open-btn">Open</a>`}</div></div>` : ''}
       ${children.length > 0 ? `<div class="kanban-val-section"><h4>Subtask Checklist</h4><div class="kanban-val-checklist">${subtaskHtml}</div></div>` : ''}
-      <div class="kanban-val-section"><h4>Issues Found (optional)</h4><textarea id="kanban-val-issues" class="kanban-val-textarea" rows="3" placeholder="Describe any issues found..."></textarea></div>
+      <div class="kanban-val-section"><h4>Issues Found (optional)</h4><textarea id="kanban-val-issues" class="kanban-val-textarea" rows="3" placeholder="Describe any issues found…"></textarea></div>
       <div class="pm-actions">
         <button class="pm-btn pm-btn-danger" id="kanban-val-reject">Reject</button>
         <button class="pm-btn pm-btn-secondary" id="kanban-val-cancel">Cancel</button>
@@ -4739,7 +4739,7 @@ async function _openColumnSettingsLegacy_UNUSED() {
 
     html += `</div>
         <div class="kanban-colcfg-add">
-          <input type="text" id="kanban-colcfg-new-name" placeholder="New column name..." onkeydown="if(event.key==='Enter')addNewColumn();">
+          <input type="text" id="kanban-colcfg-new-name" placeholder="New column name…" onkeydown="if(event.key==='Enter')addNewColumn();">
           <button onclick="addNewColumn()">+ Add</button>
         </div>
       </div>
@@ -4950,7 +4950,7 @@ async function openKanbanSettings(initialTab) {
   }
   html += '</div>';
   html += `<div class="kanban-colcfg-add">
-    <input type="text" id="kanban-colcfg-new-name" placeholder="New column name..." onkeydown="if(event.key==='Enter')addNewColumn();">
+    <input type="text" id="kanban-colcfg-new-name" placeholder="New column name…" onkeydown="if(event.key==='Enter')addNewColumn();">
     <button onclick="addNewColumn()">+ Add</button>
   </div>`;
   html += '</div>';

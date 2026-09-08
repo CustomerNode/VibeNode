@@ -1633,7 +1633,7 @@ async function _composeLaunchAll() {
 
   // If all sections already have sessions, just re-orchestrate root
   if (unlinked.length === 0) {
-    if (typeof showToast === 'function') showToast('Sending coordination message to root orchestrator...');
+    if (typeof showToast === 'function') showToast('Sending coordination message to root orchestrator…');
     try {
       const resp = await fetch('/api/compose/projects/' + encodeURIComponent(projId) + '/launch-all', {
         method: 'POST',
@@ -1655,7 +1655,7 @@ async function _composeLaunchAll() {
   _composeLaunching = true;
   _composeUpdateLaunchBtn();
   const total = unlinked.length;
-  if (typeof showToast === 'function') showToast('Launching ' + total + ' section agent' + (total !== 1 ? 's' : '') + '...');
+  if (typeof showToast === 'function') showToast('Launching ' + total + ' section agent' + (total !== 1 ? 's' : '') + '…');
 
   try {
     const resp = await fetch('/api/compose/projects/' + encodeURIComponent(projId) + '/launch-all', {
@@ -2360,7 +2360,7 @@ function _renderComposeSectionCards() {
         </svg>
         <div style="font-size:18px;font-weight:600;color:var(--text-heading, #fff);margin:4px 0 6px;">What would you like to create?</div>
         <div style="font-size:13px;color:var(--text-muted);margin-bottom:16px;max-width:400px;">Describe your project and AI will plan the sections, assign artifact types, and write briefs for each agent.</div>
-        <textarea id="compose-hero-input" class="compose-empty-hero-input" placeholder="e.g. A quarterly business review with financial summary, market analysis, product updates, and next-quarter goals..." rows="3"></textarea>
+        <textarea id="compose-hero-input" class="compose-empty-hero-input" placeholder="e.g. A quarterly business review with financial summary, market analysis, product updates, and next-quarter goals…" rows="3"></textarea>
         <button id="compose-hero-plan-btn" class="pm-btn pm-btn-primary" style="font-size:14px;padding:10px 32px;margin-bottom:14px;" onclick="_composeHeroPlan()">Plan with AI</button>
         <div style="display:flex;gap:16px;align-items:center;">
           <span style="font-size:12px;color:var(--text-muted);cursor:pointer;text-decoration:underline;opacity:0.8;" onclick="_composeShowTemplates()">Start from a template</span>
@@ -2690,7 +2690,7 @@ async function _composeBoardBulkLaunch() {
     if (typeof showToast === 'function') showToast('All selected sections already have sessions');
     return;
   }
-  if (typeof showToast === 'function') showToast('Launching ' + unlinked.length + ' session' + (unlinked.length !== 1 ? 's' : '') + '...');
+  if (typeof showToast === 'function') showToast('Launching ' + unlinked.length + ' session' + (unlinked.length !== 1 ? 's' : '') + '…');
   let ok = 0;
   for (const sid of unlinked) {
     try {

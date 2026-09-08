@@ -329,7 +329,7 @@ function setupVoiceButton(textarea, button, onSubmit) {
 
     recognition.start();
     updateIcon();
-    showToast('Listening...');
+    showToast('Listening…');
   };
 }
 
