@@ -822,11 +822,30 @@ class SessionManager:
         # Normalize cwd to OS-native path separators (cross-platform)
         if cwd:
             cwd = os.path.normpath(cwd)
+        # Seed info.model from the registry on a bare resume so the badge
+        # doesn't briefly show "" (or fall back to the client's system
+        # default) between STARTING and the CLI's ``init`` message.  The
+        # init handler remains authoritative — if the CLI resolves to a
+        # different model, ``_set_confirmed_model`` overwrites this seed
+        # and broadcasts the correction.  Only applied for ``resume=True``
+        # with no explicit ``model`` (the wake path); a caller-supplied
+        # model always wins so nothing overrides an explicit choice.
+        _seeded_model = model or ""
+        if resume and not model:
+            try:
+                _reg_meta = (self._reg.load_registry()
+                             .get("sessions", {})
+                             .get(session_id, {})) or {}
+                _reg_model = (_reg_meta.get("model") or "").strip()
+                if _reg_model:
+                    _seeded_model = _reg_model
+            except Exception:
+                pass
         info = SessionInfo(
             session_id=session_id,
             name=name,
             cwd=cwd,
-            model=model or "",
+            model=_seeded_model,
             state=SessionState.STARTING,
             session_type=session_type or "",
             parent_session_id=parent_session_id,
@@ -1355,10 +1374,28 @@ class SessionManager:
         registry persisted (e.g. an explicit mid-session switch) pass
         ``save_registry=True``; the periodic init path does not, to avoid an
         extra disk write on every turn's init message.
+
+        [1m] suffix preservation: the CLI reports a trailing ``[1m]`` marker
+        when 1M context is active (e.g. ``claude-opus-5[1m]``).  A live
+        set_model switches to the SAME base model id but drops that marker
+        (the picker sends bare ids), which briefly stripped ``[1m]`` from
+        the badge before the follow-up CLI init reinstated it.  Carry the
+        marker forward in that specific case so the switch never lies about
+        the active context length.  A genuinely different base model
+        overrides the marker as usual; the init handler remains the ultimate
+        authority.
         """
+        import re as _re
         model = (model or "").strip()
         if not model:
             return False
+        _old = info.model or ""
+        _old_base = _re.sub(r"\[[^\]]*\]$", "", _old)
+        _old_marker_m = _re.search(r"\[[^\]]*\]$", _old)
+        _new_has_marker = bool(_re.search(r"\[[^\]]*\]$", model))
+        if (_old_marker_m and not _new_has_marker
+                and _old_base and _old_base == model):
+            model = model + _old_marker_m.group(0)
         changed = info.model != model
         if changed:
             info.model = model
@@ -1535,16 +1572,35 @@ class SessionManager:
         # message the user had queued while the session was busy.  That
         # caused a surprise WORKING state immediately after the switch, with
         # the first turn on the new model appearing "hung" (cold cache hit).
-        # The badge update is handled client-side from the socket result, and
-        # the next natural _emit_state (from the next turn's state transition)
-        # will carry the updated model field to all clients.
+        # ─── Broadcast the switch to all clients ───────────────────────────
+        # Prior to this broadcast, only the tab that initiated the switch
+        # received ``session_model_result`` (reply-only emit).  Other tabs
+        # or devices kept showing the OLD model until the next natural
+        # state transition, which for an idle session can be hours away.
+        # ``session_model_changed`` is a queue-neutral push — no state or
+        # queue-dispatch machinery attached — so every client can update
+        # its badge without any risk of tripping ``_try_dispatch_queue``.
+        if self._push_callback:
+            try:
+                self._push_callback('session_model_changed', {
+                    'session_id': session_id,
+                    'model': info.model,
+                    'limit_reset_at': info.limit_reset_at,
+                    'limited_model': info.limited_model,
+                    'error': info.error,
+                })
+            except Exception as _cb_err:
+                logger.warning(
+                    "session_model_changed broadcast failed for %s: %s",
+                    session_id, _cb_err,
+                )
         # Human-readable log entry so the transcript records the switch.
         entry = LogEntry(kind="system", text=f"Model switched to {model}")
         with info._lock:
             info.entries.append(entry)
             entry_index = len(info.entries) - 1
         self._emit_entry(session_id, entry, entry_index)
-        return {"ok": True, "model": model}
+        return {"ok": True, "model": info.model}
 
     def close_session(self, session_id: str) -> dict:
         """Close and disconnect an SDK session.

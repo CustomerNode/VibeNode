@@ -499,6 +499,8 @@ class TestSetSessionModel:
 
     def test_success_updates_model_and_logs(self, session_manager, sm_module):
         info = self._make_session(session_manager, sm_module, "sm-ok")
+        pushes = []
+        session_manager._push_callback = lambda name, data: pushes.append((name, data))
         with patch.object(session_manager._sdk, 'set_model',
                           new=AsyncMock(return_value=None)) as mock_set, \
              patch.object(session_manager, '_emit_state') as mock_emit:
@@ -515,6 +517,42 @@ class TestSetSessionModel:
         # _try_dispatch_queue which causes a surprise WORKING state immediately
         # after the switch.  Badge updates go via the socket result instead.
         mock_emit.assert_not_called()
+        # But MUST broadcast a queue-neutral session_model_changed so other
+        # tabs / devices see the switch without needing a state transition.
+        model_events = [d for name, d in pushes if name == "session_model_changed"]
+        assert len(model_events) == 1
+        assert model_events[0]["session_id"] == "sm-ok"
+        assert model_events[0]["model"] == "claude-sonnet-4-6"
+
+    def test_1m_suffix_preserved_across_same_base_switch(self, session_manager, sm_module):
+        """Live switch to the SAME base model must keep the [1m] marker.
+
+        The picker sends bare ids (``claude-opus-5``), and the CLI's follow-up
+        init reinstates the [1m] marker for 1M-context sessions.  Without
+        preservation the badge briefly loses [1m] before the reinstate — a
+        cosmetic lie about the active context length.  A genuinely different
+        base id (a real model switch) drops the marker as expected.
+        """
+        info = self._make_session(session_manager, sm_module, "sm-1m",
+                                  model="claude-opus-5[1m]")
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(return_value=None)), \
+             patch.object(session_manager, '_emit_state'):
+            result = session_manager.set_session_model("sm-1m", "claude-opus-5")
+        assert result["ok"] is True
+        # Same base id → marker preserved
+        assert info.model == "claude-opus-5[1m]"
+        assert result["model"] == "claude-opus-5[1m]"
+
+        # A different base id genuinely drops the marker.
+        info2 = self._make_session(session_manager, sm_module, "sm-1m-2",
+                                   model="claude-opus-5[1m]")
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(return_value=None)), \
+             patch.object(session_manager, '_emit_state'):
+            result2 = session_manager.set_session_model("sm-1m-2", "claude-sonnet-5")
+        assert info2.model == "claude-sonnet-5"
+        assert result2["model"] == "claude-sonnet-5"
 
     def test_backend_rejection_leaves_model_untouched(self, session_manager, sm_module):
         info = self._make_session(session_manager, sm_module, "sm-reject")

@@ -690,11 +690,27 @@ socket.on('state_snapshot', (data) => {
     // Without this, idle/dormant sessions show "assumed system default" in
     // the model badge until a state-change session_state event fires — which
     // may never happen for truly dormant sessions.
+    //
+    // Route through SessionModel.ingestConfirmed (the single writer for
+    // .model) instead of writing the field directly, and REPLACE any prior
+    // value rather than only filling empties.  The old "only if empty" guard
+    // meant a snapshot could never repair a stale client — once a mid-session
+    // model switch on another tab had made the local .model wrong, no
+    // reconnect or refresh could correct it.  Repaint the badge if the
+    // change applies to the currently-live session.
+    var _liveChanged = false;
     (data.sessions || []).forEach(function(s) {
         if (!s.model) return;
-        var _smRec = allSessions.find(function(x) { return x.id === s.session_id; });
-        if (_smRec && !_smRec.model) _smRec.model = s.model;
+        if (typeof SessionModel !== 'undefined') {
+            if (SessionModel.ingestConfirmed(s.session_id, s.model)
+                    && s.session_id === liveSessionId) {
+                _liveChanged = true;
+            }
+        }
     });
+    if (_liveChanged && typeof _renderSessionModelBadge === 'function') {
+        _renderSessionModelBadge(liveSessionId);
+    }
 
     // Update sidebar row classes
     document.querySelectorAll('.session-item[data-sid]').forEach(row => {
@@ -1096,6 +1112,31 @@ socket.on('session_state', (data) => {
             sessRow.style.borderRadius = '';
         }
     }
+});
+
+// Cross-tab / cross-device model sync.  Fired by SessionManager.set_session_model
+// AFTER the CLI has confirmed the switch.  The switch itself deliberately does
+// NOT call _emit_state (that would auto-dispatch any queued message on the
+// freshly-switched idle session and produce a surprise WORKING turn), so this
+// dedicated broadcast is the only signal every non-initiating tab receives.
+// Without it, the badge on other tabs kept showing the OLD model until the
+// next natural state transition, which for an idle session can be hours away.
+socket.on('session_model_changed', (data) => {
+    if (!data || !data.session_id || !data.model) return;
+    if (_isHiddenSession(data.session_id, data)) return;
+    // Mirror the same limit-CTA cleanup set_session_model does server-side,
+    // so a switch from the usage-limit banner clears the CTA on every tab.
+    if (window._sessionLimitState) delete window._sessionLimitState[data.session_id];
+    if (window._sessionError) delete window._sessionError[data.session_id];
+    if (typeof SessionModel !== 'undefined') {
+        const _changed = SessionModel.ingestConfirmed(data.session_id, data.model);
+        if (_changed && data.session_id === liveSessionId &&
+                typeof _renderSessionModelBadge === 'function') {
+            _renderSessionModelBadge(data.session_id);
+        }
+    }
+    // Refresh any visible session row so the sidebar model column stays honest.
+    if (typeof filterSessions === 'function') filterSessions();
 });
 
 // Server confirms it received and accepted our send_message.

@@ -329,6 +329,13 @@ def api_sessions():
             s["session_type"] = "subsession"
         if st.get("inbox_dirty"):
             s["inbox_dirty"] = True
+        # Propagate the live-known model onto the disk-sourced row.  Without
+        # this the sidebar model badge falls back to the client's system
+        # default for stopped/dormant sessions and can persistently lie
+        # about the session's last-run model.  Live state wins; the dormant
+        # snapshot is a fallback layer added below.
+        if st.get("model") and not s.get("model"):
+            s["model"] = st["model"]
 
     # ── Restart memory ──────────────────────────────────────────────────
     # Sessions that were idle/working before the last restart are NOT
@@ -344,8 +351,16 @@ def api_sessions():
     if dormant:
         for s in sessions:
             info = dormant.get(s["id"])
-            if info and info.get("last_state"):
+            if not info:
+                continue
+            if info.get("last_state"):
                 s["last_state"] = info["last_state"]
+            # Second-chance model fill for dormant sessions that no live
+            # state covered above.  Registry-sourced model is honest — it's
+            # what the session actually ran on last, not the client's
+            # current system default.
+            if info.get("model") and not s.get("model"):
+                s["model"] = info["model"]
 
     return jsonify(sessions)
 

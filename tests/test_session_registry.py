@@ -949,3 +949,26 @@ class TestLoadLastKnownStates:
             out = reg.load_last_known_states()
         assert "s-old" in out
         assert out["s-old"]["last_state"] == "idle"
+
+    def test_model_included_when_present(self, tmp_path):
+        """Restart memory carries the last-confirmed model.
+
+        WHY: without this, /api/sessions renders stopped/dormant sessions
+        with the client's system default in the model badge, which
+        frequently disagrees with what the session actually last ran on.
+        """
+        reg = SessionRegistry()
+        registry_file = tmp_path / "registry.json"
+        _write_registry(registry_file, {
+            "s-with-model": {"state": "idle", "model": "claude-opus-5"},
+            "s-with-1m": {"state": "idle", "model": "claude-opus-5[1m]"},
+            "s-no-model": {"state": "idle"},
+        })
+        with patch('daemon.session_registry.REGISTRY_PATH', registry_file):
+            out = reg.load_last_known_states()
+        assert out["s-with-model"]["model"] == "claude-opus-5"
+        assert out["s-with-1m"]["model"] == "claude-opus-5[1m]"
+        # Missing model in the registry surfaces as an empty string, never a
+        # KeyError — /api/sessions treats "" as "no info" and falls through
+        # to the system-default fallback rather than crashing.
+        assert out["s-no-model"]["model"] == ""

@@ -116,6 +116,12 @@ class SessionRegistry:
                     "cwd": meta.get("cwd", ""),
                     "session_type": meta.get("session_type", ""),
                     "last_activity": meta.get("last_activity", 0),
+                    # Include the last-confirmed model so /api/sessions can
+                    # render an honest badge for stopped/dormant sessions
+                    # instead of falling back to the client's system default
+                    # (which frequently disagrees with what the session
+                    # actually last ran on).
+                    "model": meta.get("model", ""),
                 }
         except Exception as e:
             logger.warning("Failed to snapshot last-known session states: %s", e)
