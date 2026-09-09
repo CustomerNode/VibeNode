@@ -370,10 +370,12 @@ def export_pdf(project_id: str) -> Optional[bytes]:
         # Try subprocess with LibreOffice
         try:
             import subprocess
+            from app.platform_utils import NO_WINDOW as _nw_soffice
             result = subprocess.run(
                 ['soffice', '--headless', '--convert-to', 'pdf',
                  '--outdir', str(Path(tmp_docx.name).parent), tmp_docx.name],
                 capture_output=True, timeout=60,
+                creationflags=_nw_soffice,
             )
             pdf_path = Path(tmp_pdf_path)
             if pdf_path.exists():

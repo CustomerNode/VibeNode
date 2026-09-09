@@ -1343,12 +1343,14 @@ def install_pack():
     skills_dir = Path.home() / '.claude' / 'skills' / safe_id
 
     # Step 1: Clone if not already present
+    from ..platform_utils import NO_WINDOW as _nw_install
     cloned = False
     if not skills_dir.is_dir():
         try:
             result = subprocess.run(
                 ['git', 'clone', '--single-branch', '--depth', '1', git_url, str(skills_dir)],
-                capture_output=True, text=True, timeout=120
+                capture_output=True, text=True, timeout=120,
+                creationflags=_nw_install,
             )
             if result.returncode != 0:
                 return jsonify({"ok": False, "error": f"git clone failed: {result.stderr[:200]}"}), 500
@@ -1363,7 +1365,8 @@ def install_pack():
         try:
             subprocess.Popen(
                 setup_cmd, shell=True, cwd=str(skills_dir),
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=_nw_install,
             )
         except Exception:
             pass  # setup is optional

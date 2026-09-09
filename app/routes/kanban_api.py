@@ -1660,9 +1660,11 @@ def _get_user_identity():
     except Exception:
         pass
     try:
+        from ..platform_utils import NO_WINDOW as _NO_WINDOW
         result = subprocess.run(
             ["git", "config", "user.email"],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, timeout=5,
+            creationflags=_NO_WINDOW,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()

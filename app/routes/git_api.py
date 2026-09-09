@@ -88,7 +88,7 @@ def project_git_status():
         try:
             br = subprocess.run(
                 ["git", "-C", proj_str, "branch", "--show-current"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW,
             )
             if br.returncode == 0:
                 branch = br.stdout.strip()
@@ -100,7 +100,7 @@ def project_git_status():
         try:
             st = subprocess.run(
                 ["git", "-C", proj_str, "status", "--porcelain"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW,
             )
             if st.returncode == 0:
                 lines = [l for l in st.stdout.splitlines() if l.strip()]
@@ -113,7 +113,7 @@ def project_git_status():
         try:
             lg = subprocess.run(
                 ["git", "-C", proj_str, "log", "--oneline", "-5"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW,
             )
             if lg.returncode == 0:
                 for line in lg.stdout.strip().splitlines():
