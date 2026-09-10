@@ -151,17 +151,36 @@ class TestFileDropEndpoint:
         )
         assert resp.status_code == 400
 
-    def test_no_target_dir_returns_400(self, client):
+    def test_no_target_dir_auto_saves_to_uploads(self, client):
+        """Omitting target_dir triggers auto-save to <project>/data/uploads/.
+
+        This is the drag-from-File-Explorer flow: the browser cannot expose
+        the source file's path, so VibeNode makes a local copy under
+        data/uploads/ with a timestamped, dedup'd filename and returns it.
+        """
         data = {
-            "file": (io.BytesIO(b"content"), "test.txt"),
+            "file": (io.BytesIO(b"auto content"), "auto_test.txt"),
         }
         resp = client.post(
             "/api/file-drop",
             data=data,
             content_type="multipart/form-data",
         )
-        assert resp.status_code == 400
-        assert "target_dir" in resp.get_json()["error"]
+        rj = resp.get_json()
+        assert resp.status_code == 200, rj
+        assert rj["ok"] is True
+        saved = Path(rj["path"])
+        try:
+            assert saved.exists()
+            assert saved.read_bytes() == b"auto content"
+            # Landed under data/uploads (project-local, not the caller's dir).
+            assert saved.parent.name == "uploads"
+            assert saved.parent.parent.name == "data"
+            # Filename was timestamp-prefixed.
+            assert "auto_test" in rj["filename"]
+        finally:
+            if saved.exists():
+                saved.unlink()
 
     def test_target_outside_home_returns_403(self, client):
         import sys

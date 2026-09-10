@@ -37,18 +37,66 @@ document.addEventListener('drop', function(e) {
   if (!e.dataTransfer || !e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
   e.preventDefault();
 
-  // Queue all dropped files
+  // Queue all dropped files and auto-save each to data/uploads/. Browsers do
+  // not expose a dropped file's source path (security), so we make a local
+  // copy and hand its path to the composer. If a template or the download
+  // flow needs the picker instead, it calls _fdShowPicker() directly.
   for (var i = 0; i < e.dataTransfer.files.length; i++) {
     _fdQueue.push(e.dataTransfer.files[i]);
   }
   if (!_fdProcessing) _fdProcessNext();
 });
 
+function _fdActiveTextarea() {
+  return document.getElementById('live-input-ta') ||
+         document.getElementById('live-queue-ta');
+}
+
+function _fdInsertPathRef(ta, path) {
+  if (!ta || !path) return;
+  var ref = 'File: ' + path;
+  var cur = ta.value || '';
+  ta.value = cur ? (cur.replace(/\s+$/, '') + '\n' + ref + '\n') : (ref + '\n');
+  ta.dispatchEvent(new Event('input', {bubbles: true}));
+  try {
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+  } catch (e) { /* focus is best-effort */ }
+}
+
+async function _fdAutoSaveAndInsert(file) {
+  var formData = new FormData();
+  formData.append('file', file);
+  // No target_dir → server auto-saves to data/uploads/ with a timestamp prefix.
+  try {
+    var res = await fetch('/api/file-drop', {method: 'POST', body: formData});
+    var data = await res.json();
+    if (!res.ok || !data.ok) {
+      showToast(data.error || 'File save failed', true);
+      return;
+    }
+    var ta = _fdActiveTextarea();
+    if (ta) {
+      _fdInsertPathRef(ta, data.path);
+      showToast('File saved: ' + data.filename);
+    } else {
+      // No composer open — copy the path to the clipboard as a fallback so
+      // the user can still paste it wherever they need.
+      try { await navigator.clipboard.writeText(data.path); } catch (e) {}
+      showToast('Saved to ' + data.path + ' (path copied)');
+    }
+  } catch (e) {
+    showToast('File save failed: ' + (e.message || e), true);
+  }
+}
+
 function _fdProcessNext() {
   if (_fdQueue.length === 0) { _fdProcessing = false; return; }
   _fdProcessing = true;
-  _fdFile = _fdQueue.shift();
-  _fdShowPicker(_fdFile);
+  var file = _fdQueue.shift();
+  _fdAutoSaveAndInsert(file).finally(function() {
+    _fdProcessNext();
+  });
 }
 
 // --- Folder picker modal ---

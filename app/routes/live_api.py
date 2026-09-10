@@ -1660,7 +1660,15 @@ def api_copy_file_to():
 
 @bp.route('/api/file-drop', methods=['POST'])
 def api_file_drop():
-    """Accept a multipart file upload and save to target_dir."""
+    """Accept a multipart file upload and save it.
+
+    Two modes:
+      1. target_dir provided → save under that dir (folder-picker flow).
+      2. target_dir omitted  → auto-save to <project>/data/uploads/ with a
+         timestamped, dedup'd name. This is the drag-from-Explorer flow: the
+         browser refuses to expose the source path for security reasons, so
+         VibeNode makes a local copy and hands its path back to the composer.
+    """
     if 'file' not in request.files:
         return jsonify({"error": "No file provided"}), 400
 
@@ -1668,9 +1676,31 @@ def api_file_drop():
     if not f.filename:
         return jsonify({"error": "Empty filename"}), 400
 
-    target_dir = request.form.get('target_dir', '')
+    target_dir = request.form.get('target_dir', '').strip()
+
     if not target_dir:
-        return jsonify({"error": "No target_dir provided"}), 400
+        # Auto-save path: mirror /api/attach-image's destination pattern so a
+        # dropped file lands somewhere the session can Read.
+        upload_dir = Path(__file__).resolve().parents[2] / "data" / "uploads"
+        try:
+            upload_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return jsonify({"error": f"Cannot create upload directory: {e}"}), 500
+
+        raw = f.filename
+        safe = secure_filename(raw) or raw
+        ext = Path(safe).suffix
+        stem = Path(safe).stem[:60] or 'file'
+        filename = _dedup_filename(
+            upload_dir,
+            f"{time.strftime('%Y%m%d-%H%M%S')}-{stem}{ext}",
+        )
+        dest = upload_dir / filename
+        try:
+            f.save(str(dest))
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        return jsonify({"ok": True, "path": str(dest), "filename": filename})
 
     target = Path(target_dir).resolve()
     if not _is_within_home(target):
