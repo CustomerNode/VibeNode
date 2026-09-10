@@ -44,9 +44,13 @@ def chatgpt_ask():
     data = request.get_json(silent=True) or {}
     prompt = data.get("prompt", "")
     files = data.get("files") or []
+    chat_url = data.get("chat_url") or ""
     if not isinstance(files, list):
-        return jsonify({"ok": False, "result": None,
+        return jsonify({"ok": False, "result": None, "chat_url": "",
                         "error": "'files' must be a list of file paths."}), 400
-    result = chatgpt_bridge.ask(prompt, files=files)
+    if chat_url and not isinstance(chat_url, str):
+        return jsonify({"ok": False, "result": None, "chat_url": "",
+                        "error": "'chat_url' must be a string."}), 400
+    result = chatgpt_bridge.ask(prompt, files=files, chat_url=chat_url)
     status_code = 200 if result.get("ok") else 502
     return jsonify(result), status_code

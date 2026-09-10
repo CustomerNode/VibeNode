@@ -281,34 +281,70 @@ def _upload_files(page, files: list) -> None:
         time.sleep(1.0)
 
 
-def ask(prompt: str, files=None, headless: bool = False) -> dict:
-    """Send ``prompt`` (and optional ``files``) to ChatGPT in a fresh chat and
-    return the reply text.
+def _is_chatgpt_url(url: str) -> bool:
+    """True iff ``url`` is a chatgpt.com URL we're willing to navigate to.
+
+    Guards against open redirects: the external-AI connector accepts a
+    caller-supplied ``chat_url`` (or ``project_url``), and we do NOT want to
+    hand Playwright an arbitrary URL that a caller could point at, e.g., a
+    credential-harvest page.  Only chatgpt.com over https is allowed.
+    """
+    if not isinstance(url, str) or not url:
+        return False
+    low = url.strip().lower()
+    return low.startswith("https://chatgpt.com/") or low == "https://chatgpt.com"
+
+
+def ask(prompt: str, files=None, headless: bool = False,
+        chat_url: str = "") -> dict:
+    """Send ``prompt`` (and optional ``files``) to ChatGPT and return the reply.
+
+    ``chat_url`` (optional) targets a specific ChatGPT conversation or a
+    project's "new chat" landing page:
+      * If it's a ``/c/<uuid>`` chat URL, the message is appended there —
+        a natural continuation of that thread.
+      * If it's a project landing URL (``/g/g-p-...``), a new chat is opened
+        inside that project.
+      * If empty, a fresh chat is opened at the ChatGPT root (v1 behavior).
 
     ``files`` is an optional list of absolute paths (max ``MAX_FILES``) attached
     to the message exactly as a drag-and-drop would.  Runs HEADED (visible) —
     Cloudflare blocks headless, so ``headless`` is accepted for API
-    compatibility but ignored.  Returns ``{"ok", "result", "error"}``.
+    compatibility but ignored.
+
+    Returns ``{"ok", "result", "error", "chat_url"}``.  ``chat_url`` is the
+    conversation's canonical URL after the reply lands, which the caller can
+    persist and pass back on the next call to keep the thread going.
     """
     prompt = (prompt or "").strip()
     if not prompt:
-        return {"ok": False, "result": None, "error": "Empty prompt."}
+        return {"ok": False, "result": None, "error": "Empty prompt.",
+                "chat_url": ""}
 
     files = list(files or [])
     if len(files) > MAX_FILES:
-        return {"ok": False, "result": None,
+        return {"ok": False, "result": None, "chat_url": "",
                 "error": f"Too many files ({len(files)}); ChatGPT allows "
                          f"at most {MAX_FILES} per message."}
     missing = [f for f in files if not Path(f).is_file()]
     if missing:
-        return {"ok": False, "result": None,
+        return {"ok": False, "result": None, "chat_url": "",
                 "error": "File(s) not found: " + ", ".join(missing)}
 
+    # Validate chat_url up front so we fail cleanly before launching Chrome.
+    target_url = CHATGPT_URL
+    if chat_url:
+        if not _is_chatgpt_url(chat_url):
+            return {"ok": False, "result": None, "chat_url": "",
+                    "error": f"chat_url must be an https://chatgpt.com URL; "
+                             f"got: {chat_url}"}
+        target_url = chat_url
+
     if _login_active.is_set():
-        return {"ok": False, "result": None,
+        return {"ok": False, "result": None, "chat_url": "",
                 "error": "A login window is open — finish logging in first."}
     if not _PROFILE_LOCK.acquire(timeout=_LOCK_ACQUIRE_TIMEOUT):
-        return {"ok": False, "result": None,
+        return {"ok": False, "result": None, "chat_url": "",
                 "error": "ChatGPT browser is busy with another request."}
     try:
         from playwright.sync_api import sync_playwright
@@ -318,15 +354,15 @@ def ask(prompt: str, files=None, headless: bool = False) -> dict:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             try:
                 if not _has_session_cookie(ctx):
-                    return {"ok": False, "result": None,
+                    return {"ok": False, "result": None, "chat_url": "",
                             "error": "Not logged in to ChatGPT. Click "
                                      "'Log in to ChatGPT' first."}
 
-                page.goto(CHATGPT_URL, timeout=_NAV_TIMEOUT,
+                page.goto(target_url, timeout=_NAV_TIMEOUT,
                           wait_until="domcontentloaded")
                 if not _wait_cloudflare_clear(page):
                     _dump_debug(page, "cloudflare-blocked")
-                    return {"ok": False, "result": None,
+                    return {"ok": False, "result": None, "chat_url": "",
                             "error": "Cloudflare blocked the request. Try again, "
                                      "or re-run the login to refresh clearance."}
 
@@ -345,7 +381,7 @@ def ask(prompt: str, files=None, headless: bool = False) -> dict:
                         _upload_files(page, files)
                     except Exception as e:
                         _dump_debug(page, "upload-error")
-                        return {"ok": False, "result": None,
+                        return {"ok": False, "result": None, "chat_url": "",
                                 "error": f"File upload failed: {e}"}
 
                 before = page.locator(SEL_ASSISTANT_MSG).count()
@@ -375,11 +411,22 @@ def ask(prompt: str, files=None, headless: bool = False) -> dict:
                 text = msgs.last.inner_text().strip()
                 if not text:
                     raise RuntimeError("Assistant reply was empty.")
-                return {"ok": True, "result": text, "error": None}
+                # Capture the resulting chat URL so the caller can persist it
+                # and thread the conversation across future calls.  For a fresh
+                # chat this is the newly-minted /c/<uuid>; for a resumed chat
+                # it's the same URL we navigated to.
+                result_url = ""
+                try:
+                    result_url = page.url or ""
+                except Exception:
+                    result_url = ""
+                return {"ok": True, "result": text, "error": None,
+                        "chat_url": result_url}
             except Exception as e:
                 _dump_debug(page, "ask-error")
                 logger.warning("chatgpt ask failed: %s", e)
-                return {"ok": False, "result": None, "error": str(e)}
+                return {"ok": False, "result": None, "chat_url": "",
+                        "error": str(e)}
             finally:
                 try:
                     ctx.close()
@@ -387,7 +434,7 @@ def ask(prompt: str, files=None, headless: bool = False) -> dict:
                     pass
     except Exception as e:
         logger.exception("chatgpt ask launch failed")
-        return {"ok": False, "result": None, "error": str(e)}
+        return {"ok": False, "result": None, "chat_url": "", "error": str(e)}
     finally:
         _PROFILE_LOCK.release()
 
