@@ -23,7 +23,7 @@
 
   // Bump on every behavioural change. Diagnostic toasts carry it so a bug
   // report identifies the running build instead of guessing about caching.
-  var BUILD = 'b5';
+  var BUILD = 'b6';
 
   // Ship every clipboard diagnostic to the server too (logs/client_diag.log).
   // Mobile toasts get paraphrased or missed; the log is exact and readable
@@ -113,13 +113,36 @@
                      (t.id === 'live-input-ta' || t.id === 'live-queue-ta');
     if (!inComposer) return;
 
-    var items = (ev.clipboardData && ev.clipboardData.items) || [];
+    var cd = ev.clipboardData;
+    var items = (cd && cd.items) || [];
+
+    // Office apps (PowerPoint, Word, Excel) put BOTH text/plain AND an image
+    // bitmap of the selection on the clipboard when you Ctrl+C text. If we
+    // upload the image blindly, the user's actual text paste is replaced
+    // with "Image: <saved-path>". So: only hijack the paste for the image
+    // when there is no usable text alongside it. This preserves the pasted-
+    // screenshot flow (image-only clipboard) and normal text paste (text
+    // present, image ignored).
+    var hasText = false;
+    try {
+      var types = (cd && cd.types) || [];
+      for (var ti = 0; ti < types.length; ti++) {
+        var typ = types[ti];
+        if (typ === 'text/plain' || typ === 'text/html' ||
+            typ === 'text/rtf' || typ === 'text/uri-list') {
+          var val = cd.getData(typ);
+          if (val && val.length) { hasText = true; break; }
+        }
+      }
+    } catch (e) { /* getData can throw in some browsers — treat as no-text */ }
+
+    if (hasText) return;   // let the native text paste happen
+
     for (var i = 0; i < items.length; i++) {
       if (items[i].kind === 'file' && /^image\//.test(items[i].type)) {
         var f = items[i].getAsFile();
         if (f) {
-          // Only swallow the event once we know we have an image, so pasting
-          // text into the composer keeps working normally.
+          // Only swallow the event once we know we have an image AND no text.
           ev.preventDefault();
           upload(f);
           return;
