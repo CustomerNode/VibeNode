@@ -1711,6 +1711,67 @@ function _autoScrollLiveLog(logEl, msgEl) {
   }
 }
 
+// ── PERF FIX #5: cap the rendered `.msg` DOM in #live-log ─────────────
+//
+// Long-lived sessions (hours on one thread) grow #live-log unbounded — every
+// session_entry push does logEl.appendChild(...) with no eviction, and
+// several helpers (_updateLastMessageTimes, _collapseRecentAsst,
+// _autoScrollLiveLog, sticky-user-msg.js, thread-scroll.js MutationObserver)
+// run querySelectorAll('.msg…') on every append. Append cost scales with
+// rendered DOM size and eventually produces visible jank.
+//
+// See docs/plans/runs/2026-09-10-1501-dom-cap/03-design.md.
+//
+// The cap is 400 `.msg` children (~40 viewports of history on a laptop);
+// beyond that, the oldest .msg nodes are trimmed on each append. Trim is
+// skipped when the user is scrolled up viewing older content
+// (ThreadScroll.atBottom() === false). Trimmed entries remain reachable via
+// the existing "Load older" pagination (get_session_log with a `before`
+// cursor). Streaming/optimistic bubbles are protected from trim.
+//
+// NOTE: this changes only DOM state. `liveLineCount` is a server-side
+// entry offset (used to fetch older pages) and is deliberately NOT
+// decremented on trim — the entries still exist server-side.
+window._LIVE_LOG_DOM_CAP = 400;
+
+/**
+ * Trim #live-log down to ~_LIVE_LOG_DOM_CAP direct-child `.msg` nodes when
+ * it exceeds the cap, but only when the user is currently at the bottom of
+ * the log. Called synchronously from the session_entry append path and the
+ * session_log prepend path in socket.js. Cheap O(1) amortized when cap is
+ * engaged (typically 1 excess node per real-time push).
+ *
+ * Never removes:
+ *   - `.msg.assistant.streaming-bubble` (partial content still arriving)
+ *   - `.msg.user.optimistic-bubble`     (server echo pending)
+ *   - `.live-load-more`, `.vn-jump-wrap`, `.vn-thread-sentinel`
+ *     (implicitly — they don't have `.msg` class)
+ *
+ * @param {HTMLElement} logEl  the #live-log container
+ * @returns {number}  count of nodes actually trimmed (0 if no-op)
+ */
+function _trimLiveLogIfOversized(logEl) {
+  if (!logEl) return 0;
+  // Reader is looking at older content — do not rip nodes out under the
+  // cursor. Trim resumes automatically the next time an append fires
+  // while the user is back at the bottom.
+  if (window.ThreadScroll && !window.ThreadScroll.atBottom()) return 0;
+  const cap = window._LIVE_LOG_DOM_CAP || 400;
+  const msgs = logEl.querySelectorAll(':scope > .msg');
+  const excess = msgs.length - cap;
+  if (excess <= 0) return 0;
+  let removed = 0;
+  for (let i = 0; i < msgs.length && removed < excess; i++) {
+    const n = msgs[i];
+    if (!n) continue;
+    if (n.classList.contains('streaming-bubble')) continue;
+    if (n.classList.contains('optimistic-bubble')) continue;
+    n.remove();
+    removed++;
+  }
+  return removed;
+}
+
 function renderLiveEntry(e, opts) {
   const div = document.createElement('div');
   if (!e) return div;

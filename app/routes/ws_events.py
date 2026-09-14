@@ -13,6 +13,7 @@ Client -> Server events:
 
 import json
 import logging
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +22,22 @@ from flask import request as flask_request
 from flask_socketio import emit
 
 logger = logging.getLogger(__name__)
+
+# TTFT wall-clock instrumentation. When VIBENODE_TIMING_TTFT=1 the socket
+# handler captures a wall-clock timestamp before the IPC hop to the daemon
+# and passes it through so the daemon can compute T0->T1. Zero cost when
+# unset (single environ.get() per send_message).
+# See docs/plans/runs/2026-09-10-1625-ttft-instrumentation/.
+#
+# NOTE: use an explicit token match, NOT ``bool(os.environ.get(...))`` — the
+# latter treats "0", "false", "no" as truthy simply because they are non-empty
+# strings, silently INVERTING the user's intent to disable the flag.  Accepts
+# the standard on-tokens (case-insensitive); everything else — unset, empty,
+# "0", "false", "no" — evaluates to False.
+_TTFT_TIMING_ENABLED = (
+    (os.environ.get("VIBENODE_TIMING_TTFT", "") or "").strip().lower()
+    in ("1", "true", "yes", "on")
+)
 
 # Conditional profiling flag — matches daemon's _PROFILE_PIPELINE pattern.
 # Set to False to disable WebSocket handler timing logs.
@@ -607,6 +624,11 @@ def register_ws_events(socketio, app):
     @socketio.on('send_message')
     def handle_send_message(data):
         """Send a follow-up message to an idle session."""
+        # TTFT #0: capture T0 (wall-clock) BEFORE any parsing/validation, so
+        # the measured delta faithfully includes even the small guard cost.
+        # time.time_ns() is comparable across processes (server↔daemon), which
+        # perf_counter() is not. Zero cost when instrumentation is disabled.
+        _ttft_t0_ns = time.time_ns() if _TTFT_TIMING_ENABLED else 0
         if not isinstance(data, dict):
             emit('error', {'message': 'Invalid data'})
             return
@@ -629,7 +651,7 @@ def register_ws_events(socketio, app):
             text = _with_mobile_preamble(text)
 
         sm = app.session_manager
-        result = sm.send_message(session_id, text, voice=voice)
+        result = sm.send_message(session_id, text, voice=voice, _ttft_t0_ns=_ttft_t0_ns)
 
         # Record interaction even on failure — the user touched this session,
         # they expect the sidebar to reflect that regardless of IPC outcome.
@@ -894,20 +916,136 @@ def register_ws_events(socketio, app):
 
         sm = app.session_manager
 
-        # JSONL is the single source of truth — the SDK writes it and
-        # it's complete for any idle session.
-        #
-        # For WORKING sessions, the SDK hasn't flushed the current turn
-        # yet, so the JSONL is missing the latest entries. In that case
-        # the daemon's in-memory entries (which include the current turn)
-        # are more complete — use those instead.  No merge, no
-        # fingerprinting: just pick the source that has more data.
+        # PERF-CRITICAL: initial-page fast path. Reading the WHOLE JSONL and
+        # fetching ALL daemon entries on every session switch / reconnect is
+        # O(N-entries) even though the UI only paints the last LIVE_PAGE_SIZE
+        # entries. For managed sessions we ask the daemon for its cheap
+        # `get_entry_count()` (0-1ms per CLAUDE.md #6) and then fetch just the
+        # last `limit` entries via a bounded `since=count-limit`. For dormant
+        # sessions we tail-read the JSONL instead of the entire file.
+        # Design + measurements: docs/plans/runs/2026-09-10-1715-session-log-tail/.
+        # Invariant: initial-page reads must tail the JSONL, not read whole.
+        # Load-more (`before` set) keeps its full-parse path — an accurate
+        # `total` is required for older-page pagination and the user has
+        # explicitly asked for older data.
+        initial_page = (before is None
+                        and limit is not None
+                        and limit > 0
+                        and since == 0)
+        managed = sm.has_session(session_id)
+
+        if initial_page and managed:
+            # Prefer the combined status call (count + sticky "was ever
+            # trimmed" flag).  If a rolling-upgrade window exposes an older
+            # daemon that doesn't yet know the method, the client returns
+            # (0, False) which safely falls through to the legacy path.
+            # See docs/plans/runs/2026-09-11-1546-load-older-fix.
+            if hasattr(sm, "get_entry_trim_status"):
+                daemon_count, daemon_trimmed = sm.get_entry_trim_status(session_id)
+            else:
+                daemon_count = sm.get_entry_count(session_id)
+                daemon_trimmed = False
+            if _PROFILE_WS:
+                logger.info("PROFILE get_session_log [%s] daemon_count: %.3fs "
+                            "(count=%d trimmed=%s)",
+                            session_id[:12], time.perf_counter() - _t0,
+                            daemon_count, daemon_trimmed)
+            # Fast path is safe ONLY when the daemon has the full history.
+            # Two ways it may not:
+            #   (a) sticky trim flag -- info.entries was trimmed to 200 while
+            #       the JSONL grew unbounded (2000+).  daemon_count is then
+            #       strictly < JSONL entry count, so a fast-path response
+            #       would emit total=daemon_count and hide the older entries.
+            #   (b) daemon just resumed and info.entries hasn't been hydrated
+            #       yet -- daemon_count could be 0 or smaller than the JSONL.
+            # For (b) we cheaply consult the module-level _entry_cache: if a
+            # warm entry exists for this session it IS the JSONL length; if
+            # cold we fall through to the legacy full-parse path (which
+            # warms the cache).  Cold-cache fall-through preserves
+            # correctness at the cost of one legacy-parse per session; every
+            # subsequent visit hits the fast path.
+            if daemon_count > 0 and not daemon_trimmed:
+                _cached = _entry_cache.get(session_id)
+                jsonl_len_hint = len(_cached[2]) if _cached else None
+                # BUGFIX 2026-09-11: prior condition `jsonl_len_hint is None
+                # or daemon_count >= jsonl_len_hint` accidentally took the
+                # fast path on cold cache, contradicting the comment above
+                # and reintroducing the same class of coordinate-mismatch
+                # bug that the trim-flag fix addressed. Cold cache => cannot
+                # verify daemon has full history => fall through to legacy
+                # parse (which warms the cache; subsequent visits fast).
+                # See docs/plans/runs/2026-09-11-1600-regression-audit/.
+                if jsonl_len_hint is not None and daemon_count >= jsonl_len_hint:
+                    start_idx = max(0, daemon_count - limit)
+                    page = sm.get_entries(session_id, since=start_idx)
+                    if page:
+                        if _PROFILE_WS:
+                            logger.info("PROFILE get_session_log [%s] fast-managed total: %.3fs "
+                                        "(returned=%d of total=%d, offset=%d)",
+                                        session_id[:12], time.perf_counter() - _t0,
+                                        len(page), daemon_count, start_idx)
+                        emit('session_log', {
+                            'session_id': session_id,
+                            'entries': page,
+                            'total': daemon_count,
+                            'offset': start_idx,
+                            'has_more': start_idx > 0,
+                        })
+                        return
+            # Trimmed / cache-mismatch / daemon_count == 0 / empty page:
+            # fall through to the legacy full-parse path below.
+
+        if initial_page and not managed:
+            # Dormant session initial page: only take the fast path when the
+            # entry cache is warm (i.e. a previous full parse for this exact
+            # (mtime,fsize) is available). Otherwise fall through to the
+            # legacy full-parse path — a cold-cache tail parse cannot advertise
+            # an accurate `total`, and if we report an approximated offset
+            # the subsequent load-more emits `before=offset` into the
+            # full-parse path with a truncated `end`, causing the client to
+            # receive far fewer than `limit` older entries. Correctness beats
+            # a marginal first-hit win here; the second visit is served from
+            # the (now warm) cache below by the legacy path's own cache hit.
+            from ..config import _sessions_dir as _sd
+            import os as _os
+            _p = _sd(project) / f"{session_id}.jsonl"
+            try:
+                _st = _os.stat(_p)
+                _cached = _entry_cache.get(session_id)
+            except OSError:
+                _st = None
+                _cached = None
+            if (_cached
+                    and _st is not None
+                    and _cached[0] == _st.st_mtime
+                    and _cached[1] == _st.st_size):
+                total = len(_cached[2])
+                page = _cached[2][-limit:] if total > limit else _cached[2]
+                start_idx = max(0, total - len(page))
+                if _PROFILE_WS:
+                    logger.info("PROFILE get_session_log [%s] dormant-cache-warm: %.3fs "
+                                "(returned=%d of total=%d)",
+                                session_id[:12], time.perf_counter() - _t0,
+                                len(page), total)
+                emit('session_log', {
+                    'session_id': session_id,
+                    'entries': page,
+                    'total': total,
+                    'offset': start_idx,
+                    'has_more': start_idx > 0,
+                })
+                return
+            # Cold cache: fall through to legacy path (does the full parse,
+            # populates the cache, and returns accurate total/offset).
+
+        # ---- Legacy full-parse path (load-more, no-limit callers, or a
+        # fast-path fall-through). Preserved verbatim for compatibility.
         entries = _parse_jsonl_entries(app, session_id, since, project=project)
         if _PROFILE_WS:
             logger.info("PROFILE get_session_log [%s] jsonl_parsed: %.3fs (%d entries)",
                         session_id[:12], time.perf_counter() - _t0, len(entries))
 
-        if sm.has_session(session_id):
+        if managed:
             sdk_entries = sm.get_entries(session_id, since=0)
             if len(sdk_entries) > len(entries):
                 # Daemon has current-turn data not yet on disk — use it
@@ -917,7 +1055,7 @@ def register_ws_events(socketio, app):
                             session_id[:12], time.perf_counter() - _t0)
         if not entries:
             # Fallback: brand-new session with no JSONL file yet
-            entries = sm.get_entries(session_id, since=0) if sm.has_session(session_id) else []
+            entries = sm.get_entries(session_id, since=0) if managed else []
 
         total = len(entries)
 

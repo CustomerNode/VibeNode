@@ -629,10 +629,18 @@ class DaemonClient:
             params["subsession_origin_turn"] = kwargs["subsession_origin_turn"]
         return self._send_request("start_session", params)
 
-    def send_message(self, session_id, text, voice=False):
-        return self._send_request("send_message", {
-            "session_id": session_id, "text": text,
-        })
+    def send_message(self, session_id, text, voice=False, _ttft_t0_ns=0):
+        # TTFT: pass-through of the server-captured wall-clock T0 timestamp,
+        # only when the caller supplied one (VIBENODE_TIMING_TTFT=1). The
+        # param is only added to the IPC payload when nonzero, so a
+        # legacy-signature daemon (no _ttft_t0_ns kwarg) is only ever asked
+        # to accept it when the caller has already opted into instrumentation
+        # — in which case the daemon has been restarted with the matching
+        # code. See docs/plans/runs/2026-09-10-1625-ttft-instrumentation/.
+        params = {"session_id": session_id, "text": text}
+        if _ttft_t0_ns:
+            params["_ttft_t0_ns"] = int(_ttft_t0_ns)
+        return self._send_request("send_message", params)
 
     def resolve_permission(self, session_id, allow, always=False, almost_always=False):
         return self._send_request("resolve_permission", {
@@ -791,6 +799,33 @@ class DaemonClient:
         if isinstance(result, dict) and result.get("ok") is False:
             return 0
         return result if isinstance(result, int) else 0
+
+    def get_entry_trim_status(self, session_id):
+        """Return (count, trimmed_ever) for a managed session.
+
+        Companion to get_entry_count -- one IPC roundtrip that carries both
+        the O(1) entry count AND the sticky "was ever trimmed" flag.  The
+        ws_events fast path uses ``trimmed`` to decide whether the daemon's
+        count is an authoritative total for the on-disk JSONL.
+        See docs/plans/runs/2026-09-11-1546-load-older-fix.
+
+        Returns (0, False) on IPC failure or unmanaged session.  Defensive:
+        if a rolling-upgrade window exposes an old daemon without this
+        method the request will error and we return (0, False), which the
+        fast path treats as "fall through to legacy" -- correct behavior.
+        """
+        try:
+            result = self._send_request("get_entry_trim_status", {"session_id": session_id})
+        except Exception:
+            return (0, False)
+        if isinstance(result, dict):
+            if result.get("ok") is False:
+                return (0, False)
+            count = result.get("count", 0)
+            trimmed = result.get("trimmed", False)
+            if isinstance(count, int) and isinstance(trimmed, bool):
+                return (count, trimmed)
+        return (0, False)
 
     def has_session(self, session_id):
         result = self._send_request("has_session", {

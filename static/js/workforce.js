@@ -904,13 +904,18 @@ function renderWorkforce(sessions) {
     const unreadDot = _isUnread
       ? '<span class="unread-dot" aria-label="Unread" title="Unread \u2014 new response you haven\u2019t opened"></span>'
       : '';
-    // Double-click on an idle card puts it to sleep \u2014 see
-    // `_dblclickSleepIfIdle()` in sessions.js.  Working/waiting/sleeping cards
-    // ignore the gesture (with a toast explaining why).  Single click still
-    // opens the session; the two-click prefix runs first and the panel briefly
-    // opens before the sleep completes, which doubles as visual confirmation
+    // Double-click on a card TOGGLES sleep: idle \u2192 sleep, sleeping \u2192 wake.
+    // See `_dblclickSleepIfIdle()` in sessions.js.  Working/waiting cards ignore
+    // the gesture (with a toast explaining why).  Single click still opens the
+    // session; the two-click prefix runs first and the panel briefly opens
+    // before the sleep/wake completes, which doubles as visual confirmation
     // that the right card was targeted.
-    return `<div class="wf-card wf-${st}${selClass}${msClass}${familyClass}${unreadClass}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" onclick="singleOrDouble('${s.id}',event)" ondblclick="_dblclickSleepIfIdle('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')" title="${escHtml(s.display_title)} \u2014 click to open, double-click to sleep (if idle)">
+    const _dblTitle = (st === 'sleeping')
+      ? 'click to open, double-click to wake'
+      : (st === 'idle')
+        ? 'click to open, double-click to sleep'
+        : 'click to open';
+    return `<div class="wf-card wf-${st}${selClass}${msClass}${familyClass}${unreadClass}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" onclick="singleOrDouble('${s.id}',event)" ondblclick="_dblclickSleepIfIdle('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')" title="${escHtml(s.display_title)} \u2014 ${_dblTitle}">
       ${unreadDot}
       <div class="wf-avatar">${emoji}</div>
       <div class="wf-status-label">${label}</div>

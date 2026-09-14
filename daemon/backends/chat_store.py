@@ -99,6 +99,32 @@ class ChatStore(ABC):
         """
         ...
 
+    def read_tracked_files_cached(
+        self, session_id: str, cwd: str = ""
+    ) -> tuple:
+        """Ordered + sidecar-cached variant of ``read_tracked_files``.
+
+        Fix #4 (see docs/plans/runs/2026-09-10-1522-tracked-files-cache/):
+        the daemon calls this on the hot path (session recovery, daemon
+        restart, first open of a stale session).  Backends that support
+        caching override this method to consult a next-to-storage
+        sidecar; the default implementation below wraps
+        ``read_tracked_files`` to preserve the ORDERED-list contract
+        the caller expects, at no performance benefit.
+
+        Returns:
+            ``(found_ordered_list, max_version_dict,
+            last_user_uuid, last_asst_uuid)``.
+
+            ``found_ordered_list`` is a list (NOT a set) so callers can
+            drive an LRU-bounded collection with insertion-order
+            semantics.  Iteration order of a plain set is
+            implementation-defined; a list is not.
+        """
+        found_set, max_version, u, a = self.read_tracked_files(session_id, cwd)
+        # Fallback: no ordering info available; deterministic sort.
+        return sorted(found_set), max_version, u, a
+
     @abstractmethod
     def read_tail_uuids(
         self, session_id: str, cwd: str = ""

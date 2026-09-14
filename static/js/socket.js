@@ -1484,6 +1484,11 @@ socket.on('session_entry', (data) => {
     if (_isAsstEntry && typeof _collapseRecentAsst === 'function') _collapseRecentAsst(logEl);
     const _newEntryEl = renderLiveEntry(data.entry, _isAsstEntry ? { forceExpand: true } : undefined);
     logEl.appendChild(_newEntryEl);
+    // PERF FIX #5: cap #live-log at ~400 `.msg` children so long-lived
+    // sessions don't grow the DOM unbounded. See _trimLiveLogIfOversized()
+    // in live-panel.js and docs/plans/runs/2026-09-10-1501-dom-cap/03-design.md.
+    // No-op when the user is scrolled up viewing older content.
+    if (typeof _trimLiveLogIfOversized === 'function') _trimLiveLogIfOversized(logEl);
     if (typeof _tryAddOutputCard === 'function') _tryAddOutputCard(data.entry);
     liveLineCount = (data.index != null) ? data.index + 1 : liveLineCount + 1;
     if (typeof _updateLastMessageTimes === 'function') _updateLastMessageTimes();
@@ -1806,6 +1811,12 @@ socket.on('session_log', (data) => {
         // Restore scroll position so viewport stays on the same messages
         const newHeight = logEl.scrollHeight;
         logEl.scrollTop = prevScroll + (newHeight - prevHeight);
+        // PERF FIX #5: attempt trim (a defensive no-op in the common case,
+        // because the user is scrolled up to the top to have clicked "Load
+        // older", so ThreadScroll.atBottom() is false and the helper bails).
+        // Once they return to the bottom, subsequent session_entry appends
+        // will trim the excess. See docs/plans/runs/2026-09-10-1501-dom-cap.
+        if (typeof _trimLiveLogIfOversized === 'function') _trimLiveLogIfOversized(logEl);
         return;
     }
 

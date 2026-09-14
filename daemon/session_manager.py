@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import uuid as uuid_mod
+from collections import OrderedDict
 from datetime import datetime, timezone
 from enum import Enum
 from dataclasses import dataclass, field
@@ -141,6 +142,166 @@ def _augment_path_for_cli() -> None:
 
 _augment_path_for_cli()
 
+# ---------------------------------------------------------------------------
+# TTFT (time-to-first-token) wall-clock instrumentation.
+# Opt-in via VIBENODE_TIMING_TTFT=1 in the daemon's environment.
+# When disabled (default), every helper below is a fast no-op — zero cost.
+# See docs/plans/runs/2026-09-10-1625-ttft-instrumentation/ for the run brief.
+#
+# CLAUDE.md invariants respected (per stamp comment):
+#   #1 is_post_turn guard — not touched (no pre-turn _detect_changed_files call).
+#   #2 asyncio.gather — T2 stamps AFTER the gather completes, never between.
+#   #3 _turn_had_direct_edit reset placement — not touched.
+#   #4 mtime carry-forward — not touched.
+#   #5 First-turn mtime overlap — not touched (this file only instruments
+#      the follow-up-turn path; T1 stamp is a pure clock read).
+#   #6 get_entry_count semantics — we compute len(info.entries) directly, not
+#      via get_entries.
+#   #7 tracked_files snowball — we read len() of the LRU without mutating it.
+#
+# The log file lives at logs/first_token_timing.jsonl (repo root), gitignored
+# via the "logs/" line in .gitignore.
+# ---------------------------------------------------------------------------
+def _parse_env_flag(name: str) -> bool:
+    """Parse a boolean-ish env var without the ``bool(str)`` footgun.
+
+    ``bool(os.environ.get("X"))`` treats "0", "false", "no" as truthy simply
+    because they are non-empty strings, which silently INVERTS the user's
+    intent when they try to disable the flag by setting X=0.  This helper
+    accepts the standard on-tokens ("1", "true", "yes", "on"; case-insensitive)
+    and treats anything else — including unset, empty, "0", "false", "no" —
+    as False.
+    """
+    return (os.environ.get(name, "") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+_TTFT_TIMING_ENABLED = _parse_env_flag("VIBENODE_TIMING_TTFT")
+
+
+def _ttft_log_path() -> Path:
+    # Repo root == parent of the daemon/ package directory (this file lives
+    # at daemon/session_manager.py).
+    return Path(__file__).resolve().parents[1] / "logs" / "first_token_timing.jsonl"
+
+
+def _ttft_start_turn(info) -> None:
+    """Allocate the per-turn timing dict and stamp T1.
+
+    T1 = daemon entered _send_query (after the sleep(0) yield and interrupt
+    clear). Zero-cost no-op when disabled — one attribute-read + early return.
+    """
+    if not _TTFT_TIMING_ENABLED:
+        return
+    try:
+        info._ttft_turn_counter = getattr(info, "_ttft_turn_counter", 0) + 1
+        info._ttft_turn = {
+            "turn_no": info._ttft_turn_counter,
+            "t1_perf_ns": time.perf_counter_ns(),
+            "t0_wall_ns": int(getattr(info, "_ttft_pending_t0_ns", 0) or 0),
+            "t1_wall_ns": time.time_ns(),
+            "entry_count_pre": len(info.entries),  # CLAUDE.md #6 — plain len
+            "tracked_files_pre": len(info.tracked_files),  # CLAUDE.md #7 — read only
+            "project": os.path.basename(info.cwd or "") if info.cwd else "",
+            "notes": [],
+            "jsonl_bytes": 0,
+            "first_msg_kind": "",
+        }
+        info._ttft_pending_t0_ns = 0  # consumed
+        info._ttft_await_first_emit = False
+    except Exception:
+        # Instrumentation must never break the caller.
+        info._ttft_turn = None
+
+
+def _ttft_stamp(info, phase: str) -> None:
+    """Stamp a perf_counter_ns() timestamp on the current turn dict."""
+    if not _TTFT_TIMING_ENABLED:
+        return
+    d = getattr(info, "_ttft_turn", None)
+    if d is None:
+        return
+    d[phase] = time.perf_counter_ns()
+
+
+def _ttft_note(info, note: str) -> None:
+    """Append a short marker string to the current turn's notes."""
+    if not _TTFT_TIMING_ENABLED:
+        return
+    d = getattr(info, "_ttft_turn", None)
+    if d is None:
+        return
+    try:
+        d["notes"].append(note)
+    except Exception:
+        pass
+
+
+def _ttft_flush(info, session_id: str, status: str = "ok") -> None:
+    """Write ONE JSONL line + emit ONE INFO log line for the current turn.
+
+    Idempotent: after flush info._ttft_turn is None, so calling again is a
+    no-op (used by the _send_query finally to catch turns that never emit).
+    """
+    if not _TTFT_TIMING_ENABLED:
+        return
+    d = getattr(info, "_ttft_turn", None)
+    if d is None:
+        return
+    info._ttft_turn = None
+    info._ttft_await_first_emit = False
+
+    def _dms(a: str, b: str):
+        va, vb = d.get(a), d.get(b)
+        if va is None or vb is None:
+            return None
+        return round((vb - va) / 1_000_000.0, 3)
+
+    t0_wall = d.get("t0_wall_ns") or 0
+    t1_wall = d.get("t1_wall_ns") or 0
+    t0_t1_ms = round((t1_wall - t0_wall) / 1_000_000.0, 3) if t0_wall else None
+
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "sid": session_id,
+        "project": d.get("project", ""),
+        "turn_no": d.get("turn_no", 0),
+        "jsonl_bytes": int(d.get("jsonl_bytes", 0) or 0),
+        "entry_count_pre": int(d.get("entry_count_pre", 0) or 0),
+        "tracked_files_pre": int(d.get("tracked_files_pre", 0) or 0),
+        "T0_T1_ms": t0_t1_ms,
+        "T1_T2_ms": _dms("t1_perf_ns", "t2_perf_ns"),
+        "T2_T3_ms": _dms("t2_perf_ns", "t3_perf_ns"),
+        "T3_T4_ms": _dms("t3_perf_ns", "t4_perf_ns"),
+        "T4_T5_ms": _dms("t4_perf_ns", "t5_perf_ns"),
+        "status": status,
+        "first_msg_kind": d.get("first_msg_kind", ""),
+        "notes": ";".join(d.get("notes", []) or []),
+    }
+    try:
+        p = _ttft_log_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning("TTFT flush failed for %s: %s", session_id, e)
+
+    pre_ms = (t0_t1_ms or 0.0) + (record["T1_T2_ms"] or 0.0) + (record["T2_T3_ms"] or 0.0)
+    model_ms = record["T3_T4_ms"] or 0.0
+    emit_ms = record["T4_T5_ms"] or 0.0
+    total_ms = pre_ms + model_ms + emit_ms
+    logger.info(
+        "[TTFT] sid=%s turn=%d status=%s T0->T5=%.1fms "
+        "(pre=%.1fms, model=%.1fms, emit=%.1fms) jsonl=%dB entries=%d tracked=%d%s",
+        session_id[:12], record["turn_no"], status,
+        total_ms, pre_ms, model_ms, emit_ms,
+        record["jsonl_bytes"], record["entry_count_pre"],
+        record["tracked_files_pre"],
+        (" notes=" + record["notes"]) if record["notes"] else "",
+    )
+
+
 # SDK Patches — now applied by AgentSDK.apply_patches() in SessionManager.__init__().
 # See daemon/backends/claude.py for the Claude implementation.
 
@@ -227,6 +388,122 @@ class SessionState(str, Enum):
     STOPPED = "stopped"
 
 
+# ---------------------------------------------------------------------------
+# PERF-CRITICAL: tracked_files LRU cap.
+# ---------------------------------------------------------------------------
+# _write_file_snapshot iterates ``info.tracked_files`` twice per turn (pre +
+# post) and pays at least one ``os.stat()`` per member (see 6881-6903 outer
+# early-exit).  Direct ``Edit``/``Write``/``MultiEdit``/``NotebookEdit`` tool
+# uses ``.add()`` to this set and never remove; a long session that touches
+# many unique files accumulates monotonically and every turn pays for the
+# whole history.  Baseline benchmark showed per-turn cost scaling roughly
+# linearly with the set size: N=200 → 63ms, N=500 → 129ms, N=1000 → 221ms
+# on Windows.  See docs/plans/runs/2026-09-10-1827-tracked-files-lru/.
+#
+# ``_TrackedFilesLRU`` bounds the set at _TRACKED_FILES_LRU_CAP entries using
+# insertion-order semantics: ``.add(fp)`` re-touches an existing entry
+# (move_to_end) or appends a new one; when the cap is exceeded, the least-
+# recently-touched entry is evicted.  An evicted file is NOT permanently
+# forgotten — the JSONL still has its backup history, and the next direct
+# Edit/Write re-enters it.  Cache dicts (_last_mtime_size / _last_hashes /
+# file_versions) are NOT evicted in parallel: file_versions must remain
+# monotonic to prevent backup-file name collisions, and the two others are
+# pure caches whose stale entries have zero perf cost (only accessed while
+# iterating tracked_files itself).
+#
+# Related CLAUDE.md items (all preserved):
+#   #7 — fs_changed still separate from tracked_files (snapshot-only).
+#   #4 — mtime carry-forward is keyed by CWD-wide git ls-files, not by
+#        tracked_files, so LRU eviction does not touch _pre/_post_turn_mtimes.
+
+_TRACKED_FILES_LRU_CAP = 200
+
+
+class _TrackedFilesLRU:
+    """Insertion-ordered, LRU-bounded set of file paths.
+
+    Supports the set-like operations that current call sites use:
+    add / discard / update / __contains__ / __iter__ / __len__ / __bool__ /
+    __eq__ / __or__ / __ror__ / __repr__.
+
+    Internally an ``OrderedDict[str, None]``.  ``.add(fp)``:
+      - if fp already present: move to end (most-recently-touched).
+      - else: append; if len > cap, ``popitem(last=False)`` evicts LRU.
+
+    Iteration yields keys in insertion order (oldest first).  Union with a
+    set via ``|`` returns a plain ``set`` (unordered), so downstream behaviour
+    is unchanged.
+
+    Test tolerance: ``__eq__`` compares equal to a plain ``set`` with the same
+    contents, and ``iter``/``len``/``__contains__`` are transparent, so
+    existing tests that treat ``tracked_files`` set-like continue to pass.
+    """
+    __slots__ = ("_data", "_cap")
+
+    def __init__(self, iterable=None, cap: int = _TRACKED_FILES_LRU_CAP):
+        self._data: "OrderedDict[str, None]" = OrderedDict()
+        self._cap = cap
+        if iterable:
+            for x in iterable:
+                self.add(x)
+
+    def add(self, fp: str) -> None:
+        if fp in self._data:
+            self._data.move_to_end(fp, last=True)
+            return
+        self._data[fp] = None
+        if len(self._data) > self._cap:
+            self._data.popitem(last=False)
+
+    def discard(self, fp: str) -> None:
+        self._data.pop(fp, None)
+
+    def update(self, iterable) -> None:
+        for x in iterable:
+            self.add(x)
+
+    def clear(self) -> None:
+        self._data.clear()
+
+    def __contains__(self, fp) -> bool:
+        return fp in self._data
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __bool__(self) -> bool:
+        return bool(self._data)
+
+    def __eq__(self, other):
+        if isinstance(other, _TrackedFilesLRU):
+            return set(self._data) == set(other._data)
+        if isinstance(other, (set, frozenset)):
+            return set(self._data) == other
+        return NotImplemented
+
+    def __ne__(self, other):
+        eq = self.__eq__(other)
+        if eq is NotImplemented:
+            return NotImplemented
+        return not eq
+
+    def __or__(self, other):  # info.tracked_files | fs_extras
+        if isinstance(other, _TrackedFilesLRU):
+            return set(self._data) | set(other._data)
+        return set(self._data) | (other if isinstance(other, (set, frozenset)) else set(other))
+
+    def __ror__(self, other):
+        if isinstance(other, _TrackedFilesLRU):
+            return set(other._data) | set(self._data)
+        return (other if isinstance(other, (set, frozenset)) else set(other)) | set(self._data)
+
+    def __repr__(self):
+        return f"_TrackedFilesLRU({list(self._data)!r}, cap={self._cap})"
+
+
 @dataclass
 class LogEntry:
     """A single log entry for the session timeline."""
@@ -279,7 +556,7 @@ class SessionInfo:
     working_since: float = 0.0  # time.time() when state last became WORKING
     substatus: str = ""  # e.g. "compacting" — sub-state shown in UI while WORKING
     usage: dict = field(default_factory=dict)  # token usage from last ResultMessage
-    tracked_files: set = field(default_factory=set)      # absolute paths modified by tools
+    tracked_files: "_TrackedFilesLRU" = field(default_factory=_TrackedFilesLRU)  # absolute paths modified by tools (LRU-capped at _TRACKED_FILES_LRU_CAP)
     file_versions: dict = field(default_factory=dict)    # file_path -> backup version counter
     _last_hashes: dict = field(default_factory=dict)     # file_path -> last backed-up content hash
     _last_mtime_size: dict = field(default_factory=dict) # file_path -> (mtime, size) when content was last hashed; lets _write_file_snapshot skip read+md5 for unchanged files (Windows file-IO is the bottleneck)
@@ -328,6 +605,13 @@ class SessionInfo:
     # render a model-switch CTA instead of a useless "Retry" button.
     limit_reset_at: float = 0.0    # epoch time.time() when the quota resets; 0 == unknown (banner then omits the countdown)
     limited_model: str = ""        # the model id that hit the limit, so the CTA can exclude it from the offered alternatives
+    # ── TTFT wall-clock instrumentation (opt-in) ──
+    # Populated only when VIBENODE_TIMING_TTFT=1; otherwise stays at defaults
+    # with zero allocations. See _ttft_* helpers near top of module.
+    _ttft_turn: Optional[dict] = None                    # per-turn timing dict, or None if not in a timed turn
+    _ttft_turn_counter: int = 0                          # per-session monotonic counter (correlation, not for uniqueness across sessions)
+    _ttft_await_first_emit: bool = False                 # set at T4; _emit_entry stamps T5 and flushes on the very next fire
+    _ttft_pending_t0_ns: int = 0                         # T0 wall-clock ns passed through from the server socket handler via send_message IPC
     # ── Subsessions (spec §4.1) ────────────────────────────────────────────
     # parent_session_id: None for top-level sessions; UUID of the parent
     # session for subsessions.  subsession_origin_turn: parent JSONL line
@@ -880,7 +1164,7 @@ class SessionManager:
         return {"ok": True}
 
     def send_message(self, session_id: str, text: str, _self_heal: bool = False,
-                     _auto_retry: bool = False) -> dict:
+                     _auto_retry: bool = False, _ttft_t0_ns: int = 0) -> dict:
         """Send a follow-up message to an idle session.
 
         If the session is busy (WORKING/WAITING/STARTING), the message is
@@ -1096,6 +1380,12 @@ class SessionManager:
             # Also clear any stale model-switch flag so a real turn starting
             # never gets misclassified by the post-turn listener.
             info._model_switch_in_progress = False
+            # TTFT #0: stash T0 wall-clock ns (captured server-side in
+            # handle_send_message before the IPC hop) so _ttft_start_turn can
+            # anchor T0→T1 later. Zero-cost when disabled (defaults to 0).
+            # No effect on state semantics — pure timestamp storage.
+            if _TTFT_TIMING_ENABLED and _ttft_t0_ns:
+                info._ttft_pending_t0_ns = int(_ttft_t0_ns)
             info.state = SessionState.WORKING
             # Reset any stale substatus from the previous turn, then re-set
             # if this turn is a /compact command.
@@ -1814,6 +2104,33 @@ class SessionManager:
         if not info:
             return 0
         return len(info.entries)
+
+    # Companion to get_entry_count that also reports whether the in-memory
+    # entries list has been trimmed at any point in this session's lifetime.
+    # Same O(1) shape as get_entry_count -- adds only a single getattr.
+    # Consumed by app/routes/ws_events.py::handle_get_session_log's fast path,
+    # which must refuse to trust ``count`` as an authoritative total for the
+    # on-disk JSONL once ``trimmed`` is True (the JSONL is never trimmed, so
+    # daemon.count < JSONL.len from that point on).  See CLAUDE.md #6 and
+    # docs/plans/runs/2026-09-11-1546-load-older-fix.
+    def get_entry_trim_status(self, session_id: str) -> dict:
+        """Return {"count": N, "trimmed": bool} for a managed session.
+
+        ``count``   -- len(info.entries), same value as get_entry_count.
+        ``trimmed`` -- True iff the in-memory entries were ever trimmed
+                       (sticky flag; see the IDLE/STOPPED trim block).
+        Returns {"count": 0, "trimmed": False} for unmanaged sessions.
+        (Dict rather than tuple so JSON IPC round-trips cleanly.)
+        """
+        session_id = self._resolve_id(session_id)
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if not info:
+            return {"count": 0, "trimmed": False}
+        return {
+            "count": len(info.entries),
+            "trimmed": bool(getattr(info, "_entries_trimmed", False)),
+        }
 
     def has_session(self, session_id: str) -> bool:
         """Check if a session is managed by the SDK."""
@@ -3039,6 +3356,12 @@ class SessionManager:
             # would make the NEXT listener bail spuriously the first time
             # something cancels it.
             info._listener_superseded = False
+            # TTFT #1: anchor T1 = daemon entered _send_query. This is a
+            # pure clock read + dict allocation on `info`; it does NOT touch
+            # tracked_files, _pre_turn_mtimes, _turn_had_direct_edit, or
+            # info.client, so CLAUDE.md #2/#3/#4/#5 are all preserved.
+            # No-op when VIBENODE_TIMING_TTFT is unset.
+            _ttft_start_turn(info)
 
         _t0 = time.perf_counter()
         _profile_log = (lambda label: logger.info(
@@ -3225,6 +3548,10 @@ class SessionManager:
             loop.run_in_executor(None, self._record_pre_turn_mtimes, info),
         )
         _profile_log("write_snapshot+record_mtimes")
+        # TTFT #2: stamp AFTER the gather completes. Runs strictly outside the
+        # parallel awaits, so CLAUDE.md #2 (parallel snapshot+mtimes) and #3
+        # (_turn_had_direct_edit reset placement) are untouched. Pure clock read.
+        _ttft_stamp(info, "t2_perf_ns")
 
         # ── Drain stale messages from interrupted turn ──────────────
         #
@@ -3282,6 +3609,10 @@ class SessionManager:
             #     seen (let the in-progress cycle complete).
             _quick = bool(getattr(info, '_drain_stale_quick', False))
             info._drain_stale_quick = False
+            # TTFT: annotate the record so we can tell drain-stale turns
+            # apart in the log (they have an extra 0–5 s wait between T2
+            # and T3 that is NOT model TTFT).
+            _ttft_note(info, "drain_stale_quick" if _quick else "drain_stale")
             try:
                 if _quick:
                     # Adaptive multi-cycle drain.  ``receive_response()`` is
@@ -3345,6 +3676,9 @@ class SessionManager:
         result_handled = False
         _first_msg_logged = False
         try:
+            # TTFT #3: last daemon moment before handing the prompt off to
+            # the CLI. Pure clock read; does not reorder anything.
+            _ttft_stamp(info, "t3_perf_ns")
             await self._sdk.send_query(info.client, text)
             _profile_log("query_sent")
 
@@ -3363,6 +3697,25 @@ class SessionManager:
                     if not _first_msg_logged:
                         _profile_log("first_stream_message (%s)" % message.kind.value)
                         _first_msg_logged = True
+                        # TTFT #4: first non-user message received from the CLI
+                        # stream. This is THE critical delta anchor — everything
+                        # before it is VibeNode/CLI/model TTFT, everything after
+                        # it is streaming render. Arms _ttft_await_first_emit so
+                        # the very next _emit_entry stamps T5 and flushes.
+                        # Pure clock read + a few dict writes; no state change.
+                        if _TTFT_TIMING_ENABLED and getattr(info, "_ttft_turn", None) is not None:
+                            info._ttft_turn["t4_perf_ns"] = time.perf_counter_ns()
+                            try:
+                                info._ttft_turn["first_msg_kind"] = message.kind.value
+                            except Exception:
+                                pass
+                            try:
+                                p = self._store.find_session_path(session_id)
+                                if p and p.exists():
+                                    info._ttft_turn["jsonl_bytes"] = p.stat().st_size
+                            except Exception:
+                                pass
+                            info._ttft_await_first_emit = True
                     if message.kind == MessageKind.RESULT:
                         got_result = True
                         _profile_log("result_message")
@@ -3541,6 +3894,12 @@ class SessionManager:
                 info.task is not asyncio.current_task()
                 or getattr(info, '_listener_superseded', False)
             )
+            # TTFT #6: if T5 never fired (empty stream, error, interrupt),
+            # flush a "no_reply" record so the diagnostic sees the turn.
+            # Idempotent — _ttft_flush is a no-op when the dict is already
+            # None (i.e. T5 already fired and flushed). No behavior change.
+            if info is not None:
+                _ttft_flush(info, session_id, status="no_reply")
             if _superseded or (info and getattr(info, '_interrupted', False)):
                 return
 
@@ -4815,7 +5174,7 @@ class SessionManager:
                         fp = inp.get('file_path', '') or inp.get('path', '')
                         logger.info("  File tracking: tool=%s fp=%s", tool_name, fp[:80] if fp else "(empty)")
                         if fp:
-                            info.tracked_files.add(fp)
+                            self._touch_tracked_file(info, fp)
                             info._turn_had_direct_edit = True
                             logger.info("  tracked_files now has %d entries", len(info.tracked_files))
 
@@ -6731,6 +7090,22 @@ class SessionManager:
         info._post_turn_mtimes = post_mtimes
         return changed
 
+    def _touch_tracked_file(self, info: "SessionInfo", fp: str) -> None:
+        """Mark ``fp`` as directly edited this turn.
+
+        PERF-CRITICAL: bounded via ``_TRACKED_FILES_LRU_CAP``.  ``.add`` on
+        the LRU either moves ``fp`` to the most-recently-touched end (if
+        already present) or appends it and evicts the least-recently-touched
+        entry when the cap would be exceeded.  See
+        ``docs/plans/runs/2026-09-10-1827-tracked-files-lru/03-design.md``.
+
+        Do NOT bypass this helper for direct-edit tool_use blocks —
+        ``info.tracked_files.add`` works but centralising the touch call site
+        keeps the audit trail explicit and lets a future maintainer hook
+        counters/telemetry in one place.
+        """
+        info.tracked_files.add(fp)
+
     def _prepopulate_tracked_files(self, info: SessionInfo) -> None:
         """Scan the session storage for tracked files from two sources:
 
@@ -6746,13 +7121,27 @@ class SessionManager:
         Re-parsing a 38MB JSONL on every follow-up message was blocking
         the asyncio event loop and starving all other sessions.
 
-        Delegates the actual JSONL scanning to self._store.read_tracked_files().
+        Delegates the actual JSONL scanning to
+        ``self._store.read_tracked_files_cached()`` (fix #4), which
+        consults a next-to-JSONL sidecar keyed on the JSONL's
+        ``(st_mtime_ns, st_size)`` — an O(1) JSON read on the hot path
+        (daemon restart, session recovery, first open of a stale
+        session).  On sidecar miss/corruption it falls back to the full
+        JSONL walk and best-effort writes a fresh sidecar for next time.
+
+        The cached method returns ``found`` as an encounter-ordered
+        LIST so ``_TrackedFilesLRU.update`` (fix #3, cap=200) evicts the
+        OLDEST-encountered entries when the count exceeds the cap —
+        matching the semantics of a fresh cold walk fed into the same
+        LRU.  See docs/plans/runs/2026-09-10-1522-tracked-files-cache/.
         """
         if info._tracked_files_populated:
             return
         try:
             found, max_version, last_user_uuid, last_asst_uuid = \
-                self._store.read_tracked_files(info.session_id, cwd=info.cwd or "")
+                self._store.read_tracked_files_cached(
+                    info.session_id, cwd=info.cwd or "",
+                )
 
             # Cache user/assistant UUIDs so _write_file_snapshot
             # doesn't have to re-parse the entire JSONL every turn.
@@ -6762,6 +7151,9 @@ class SessionManager:
                 info._last_asst_uuid = last_asst_uuid
 
             if found:
+                # ``found`` is encounter-ordered; ``update`` iterates and
+                # calls ``add`` on the LRU, so if len(found) > cap the
+                # oldest-encountered entries are evicted.
                 info.tracked_files.update(found)
                 # Restore version counters so new backups don't collide
                 for fp, v in max_version.items():
@@ -6841,6 +7233,66 @@ class SessionManager:
         if not all_snapshot_files:
             logger.info("_write_file_snapshot(%s): skipped (no tracked files)", session_id)
             return
+
+        # ── PERF-CRITICAL: snapshot dedup — early-exit when nothing changed. ──
+        #
+        # See docs/plans/runs/2026-09-10-1743-snapshot-dedup/03-design.md.
+        #
+        # The full pool path below classifies each file as skip / missing /
+        # unchanged / backup, populates ``tracked_backups`` only from the
+        # ``missing`` and ``backup`` branches, and gates the JSONL write on
+        # ``has_valid`` (any real backup produced).  On a turn where no
+        # tracked file has changed, every file returns "skip", ``tracked_backups``
+        # is empty, ``has_valid=False``, and the snapshot line is not written.
+        # That existing write-side dedup is what keeps the JSONL from growing
+        # by one full-inventory line per turn.
+        #
+        # This outer short-circuit reaches the same "no snapshot" verdict
+        # WITHOUT paying for the ThreadPoolExecutor setup, the parallel stat
+        # sweep, or the 64 KB tail read in ``_store.read_tail_uuids``.  It
+        # composes with (does not replace) the inner ``_process_one`` fast
+        # path: when the outer check bails, the pool runs unchanged.
+        #
+        # Preconditions to attempt the check:
+        #   - no external edits detected this turn (``fs_snapshot_extras``
+        #     is empty — the ``_detect_changed_files`` guard has already
+        #     been evaluated),
+        #   - ``_last_mtime_size`` is populated (some file has been backed
+        #     up in this SessionInfo's lifetime; empty on first turn AND
+        #     first turn after daemon restart per ``_prepopulate_tracked_files``
+        #     which does not persist ``_last_mtime_size``).
+        #
+        # Bail on the first mismatch: cache miss, stat failure, or
+        # (mtime, size) differ.  Worst-case adds one serial stat per file
+        # for change-heavy turns — but the pool below would have stat'd
+        # every file anyway.
+        #
+        # Do NOT extend this to also skip the ``_process_one`` scan when
+        # some files DID change: the scan is what keeps ``_last_mtime_size``
+        # and ``_last_hashes`` current (mtime bump + hash unchanged case).
+        if not fs_snapshot_extras and info._last_mtime_size:
+            _all_unchanged = True
+            for _fp in all_snapshot_files:
+                _cached = info._last_mtime_size.get(_fp)
+                if _cached is None:
+                    _all_unchanged = False
+                    break
+                try:
+                    _st = os.stat(_fp)
+                except (OSError, FileNotFoundError):
+                    _all_unchanged = False
+                    break
+                if _cached != (_st.st_mtime, _st.st_size):
+                    _all_unchanged = False
+                    break
+            if _all_unchanged:
+                if self._PROFILE_PIPELINE:
+                    logger.info(
+                        "PROFILE _write_file_snapshot(%s): dedup early-exit "
+                        "(all %d files unchanged, no fs extras)",
+                        session_id[:12], len(all_snapshot_files),
+                    )
+                return
 
         # ── Profiling (gated by _PROFILE_PIPELINE) ──
         # Tracks loop wall-clock + cache-hit rate so the same metric the
@@ -7672,6 +8124,14 @@ class SessionManager:
                 if len(info.entries) > _ENTRY_TRIM_THRESHOLD:
                     trimmed = len(info.entries) - _ENTRY_KEEP_AFTER_TRIM
                     info.entries = info.entries[-_ENTRY_KEEP_AFTER_TRIM:]
+                    # Permanent sticky flag consumed by the ws_events fast path
+                    # (docs/plans/runs/2026-09-11-1546-load-older-fix).  Once
+                    # trimmed the JSONL always has strictly more entries than
+                    # ``info.entries``, so the fast path can no longer trust
+                    # ``get_entry_count`` as an authoritative total.  Reads use
+                    # ``getattr(info, "_entries_trimmed", False)`` for defensive
+                    # compatibility with older SessionInfo instances.
+                    info._entries_trimmed = True
                     logger.info("Trimmed %d in-memory entries for %s (kept last %d)",
                                 trimmed, info.session_id[:12], _ENTRY_KEEP_AFTER_TRIM)
             # NOTE (2026-05-14): we deliberately do NOT wipe
@@ -7771,6 +8231,17 @@ class SessionManager:
 
     def _emit_entry(self, session_id: str, entry: LogEntry, index: int) -> None:
         """Push a new log entry to all connected WebSocket clients."""
+        # TTFT #5: if this session is awaiting its first emit after T4, stamp
+        # T5 now and flush the per-turn record. This is the moment the client
+        # would see the first session_entry event. Fast no-op when disabled.
+        if _TTFT_TIMING_ENABLED:
+            with self._lock:
+                _info = self._sessions.get(session_id)
+            if _info is not None and getattr(_info, "_ttft_await_first_emit", False):
+                d = getattr(_info, "_ttft_turn", None)
+                if d is not None and d.get("t5_perf_ns") is None:
+                    d["t5_perf_ns"] = time.perf_counter_ns()
+                    _ttft_flush(_info, session_id, status="ok")
         if self._push_callback:
             data = {
                 'session_id': session_id,

@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
@@ -218,6 +219,187 @@ class ClaudeJsonlStore(ChatStore):
 
     # ── Read Operations ──────────────────────────────────────────────
 
+    # ── Sidecar cache for tracked_files (fix #4, see
+    # ── docs/plans/runs/2026-09-10-1522-tracked-files-cache/). ──
+    #
+    # PERF-CRITICAL: sidecar cache MUST invalidate on any JSONL mtime OR
+    # size change.  The ``(st_mtime_ns, st_size)`` key is the SOLE
+    # invalidation trigger.  Do NOT store additional cache fields
+    # without also proving they invalidate correctly on every JSONL
+    # mutation path (append, ``repair_incomplete_turn``,
+    # ``prepare_for_resume``, truncate).  Do NOT switch to
+    # ``st_mtime`` (float, second-precision) — nanosecond precision
+    # catches sub-second rewrites that ``repair_incomplete_turn`` can
+    # produce within one mtime second.
+    _SIDECAR_VERSION = 1
+    _SIDECAR_SUFFIX = ".tracked_files.json"
+
+    def _sidecar_path(self, jsonl_path: Path) -> Path:
+        return jsonl_path.with_name(jsonl_path.name + self._SIDECAR_SUFFIX)
+
+    def _sidecar_load(self, jsonl_path: Path) -> Optional[tuple]:
+        """Try to load the tracked-files sidecar for ``jsonl_path``.
+
+        Returns ``(found_ordered_list, max_version, last_user_uuid,
+        last_asst_uuid)`` on a valid cache hit, else ``None``.  Never
+        raises — a corrupt / permission-denied / mismatched-key sidecar
+        yields ``None`` so the caller falls back to a full walk.
+        """
+        sidecar = self._sidecar_path(jsonl_path)
+        if not sidecar.exists():
+            return None
+        try:
+            st = jsonl_path.stat()
+            key_now = [st.st_mtime_ns, st.st_size]
+            with open(sidecar, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return None
+            if data.get("version") != self._SIDECAR_VERSION:
+                return None
+            stored_key = data.get("key")
+            if not isinstance(stored_key, list) or list(stored_key) != key_now:
+                return None
+            found = data.get("found")
+            if not isinstance(found, list):
+                return None
+            # Coerce and validate.
+            found_ordered = [str(x) for x in found]
+            mv = data.get("max_version") or {}
+            if not isinstance(mv, dict):
+                mv = {}
+            u = str(data.get("last_user_uuid") or "")
+            a = str(data.get("last_asst_uuid") or "")
+            return found_ordered, mv, u, a
+        except Exception:
+            return None
+
+    def _sidecar_write(self, jsonl_path: Path, found_ordered,
+                       max_version, u: str, a: str) -> None:
+        """Best-effort write of the tracked-files sidecar.
+
+        Atomic via ``os.replace`` — either a reader sees the old sidecar
+        or the new one, never a half-written file.  A failed write
+        costs a walk next time but never crashes the daemon.
+        """
+        sidecar = self._sidecar_path(jsonl_path)
+        try:
+            st = jsonl_path.stat()
+            payload = {
+                "version": self._SIDECAR_VERSION,
+                "key": [st.st_mtime_ns, st.st_size],
+                "found": list(found_ordered),
+                "max_version": dict(max_version or {}),
+                "last_user_uuid": u or "",
+                "last_asst_uuid": a or "",
+            }
+            tmp = sidecar.with_name(sidecar.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp, sidecar)
+        except Exception as e:
+            logger.debug("sidecar write failed for %s: %s", jsonl_path, e)
+
+    def _scan_jsonl_ordered(self, jsonl_path: Path) -> tuple:
+        """Walk the JSONL and return
+        ``(found_ordered_list, max_version_dict, last_user_uuid, last_asst_uuid)``.
+
+        ``found`` is an encounter-ordered list of file paths from
+        Source-1 (Edit/Write/MultiEdit/NotebookEdit ``tool_use`` blocks)
+        with duplicates removed.  A ``dict`` is used internally as an
+        insertion-order-preserving set (Py 3.7+).
+
+        Source-2 (``file-history-snapshot.trackedFileBackups``) is
+        consulted ONLY for ``max_version``; NEVER contributes to
+        ``found`` (CLAUDE.md #7 snowball prevention).
+
+        Raises nothing — a failed open logs and returns empty results.
+        """
+        edit_tools = {'Edit', 'Write', 'MultiEdit', 'NotebookEdit'}
+        found_od: "OrderedDict[str, None]" = OrderedDict()
+        max_version: dict = {}
+        last_user_uuid = ""
+        last_asst_uuid = ""
+
+        try:
+            with open(jsonl_path, "r", encoding="utf-8",
+                      errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+
+                    t = obj.get("type", "")
+                    uid = obj.get("uuid", "")
+                    if uid:
+                        if t == "user":
+                            last_user_uuid = uid
+                        elif t == "assistant":
+                            last_asst_uuid = uid
+
+                    if t == "assistant":
+                        msg = obj.get("message", {})
+                        content = msg.get("content", [])
+                        if not isinstance(content, list):
+                            continue
+                        for block in content:
+                            if not isinstance(block, dict):
+                                continue
+                            if block.get("type") != "tool_use":
+                                continue
+                            if block.get("name") not in edit_tools:
+                                continue
+                            inp = block.get("input", {})
+                            fp = inp.get("file_path", "") or inp.get("path", "")
+                            if fp and fp not in found_od:
+                                found_od[fp] = None
+                    elif t == "file-history-snapshot":
+                        snap = obj.get("snapshot", {})
+                        for fp, binfo in snap.get(
+                                "trackedFileBackups", {}).items():
+                            if isinstance(binfo, dict):
+                                v = binfo.get("version", 0)
+                                if v > max_version.get(fp, 0):
+                                    max_version[fp] = v
+        except Exception as e:
+            logger.warning("read_tracked_files failed for %s: %s",
+                           jsonl_path, e)
+
+        return list(found_od.keys()), max_version, last_user_uuid, last_asst_uuid
+
+    def read_tracked_files_cached(
+        self, session_id: str, cwd: str = ""
+    ) -> tuple:
+        """Sidecar-cached variant of ``read_tracked_files``.
+
+        On a valid sidecar hit: O(1) JSON read, no JSONL walk.
+        On miss/mismatch/corrupt sidecar: full walk, then best-effort
+        sidecar write for the next run.
+
+        Returns ``(found_ordered_list, max_version_dict,
+        last_user_uuid, last_asst_uuid)``.  The ordered list preserves
+        first-encounter order so LRU-capped rehydration (fix #3,
+        ``_TrackedFilesLRU``, cap=200) drops the OLDEST-encountered
+        entries — matching the semantics of a fresh cold walk that
+        goes through the same LRU.
+        """
+        jsonl_path = self.find_session_path(session_id, cwd)
+        if not jsonl_path or not jsonl_path.exists():
+            return [], {}, "", ""
+
+        cached = self._sidecar_load(jsonl_path)
+        if cached is not None:
+            return cached
+
+        found_list, max_version, u, a = self._scan_jsonl_ordered(jsonl_path)
+        # Best-effort sidecar write.  Failures logged but never fatal.
+        self._sidecar_write(jsonl_path, found_list, max_version, u, a)
+        return found_list, max_version, u, a
+
     def read_tracked_files(
         self, session_id: str, cwd: str = ""
     ) -> tuple:
@@ -252,83 +434,19 @@ class ClaudeJsonlStore(ChatStore):
         Returns:
             (tracked_files: set, file_versions: dict,
              last_user_uuid: str, last_asst_uuid: str)
+
+        Note: this method does NOT consult the sidecar cache (fix #4).
+        The daemon's hot path uses ``read_tracked_files_cached`` which
+        returns the ORDERED variant needed for LRU rehydration.  This
+        legacy set-returning shim is preserved for existing tests and
+        any external caller assuming a set contract.
         """
         jsonl_path = self.find_session_path(session_id, cwd)
         if not jsonl_path or not jsonl_path.exists():
             return set(), {}, "", ""
 
-        # The set of tool names whose file_path/path input indicates a tracked
-        # file.  These are the tools that create or modify files -- their
-        # targets need file-history snapshots for the rewind feature.
-        edit_tools = {'Edit', 'Write', 'MultiEdit', 'NotebookEdit'}
-        found = set()
-        max_version = {}
-        last_user_uuid = ""
-        last_asst_uuid = ""
-
-        try:
-            # UTF-8 with errors="replace" prevents crashes on sessions that
-            # contain binary data or truncated multi-byte sequences (which
-            # can happen if the daemon was killed mid-write).
-            with open(jsonl_path, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except Exception:
-                        continue
-
-                    t = obj.get("type", "")
-
-                    # Cache user/assistant UUIDs as we scan.  We overwrite on
-                    # each occurrence so at the end of the scan we have the
-                    # LAST user and assistant UUIDs -- needed for inserting
-                    # file-history-snapshot entries at the correct position
-                    # in the JSONL conversation flow.
-                    uid = obj.get("uuid", "")
-                    if uid:
-                        if t == "user":
-                            last_user_uuid = uid
-                        elif t == "assistant":
-                            last_asst_uuid = uid
-
-                    # Source 1: tool_use blocks in assistant messages.
-                    # This is the ONLY source that contributes to ``found``.
-                    if t == "assistant":
-                        msg = obj.get("message", {})
-                        content = msg.get("content", [])
-                        if not isinstance(content, list):
-                            continue
-                        for block in content:
-                            if not isinstance(block, dict):
-                                continue
-                            if block.get("type") != "tool_use":
-                                continue
-                            if block.get("name") not in edit_tools:
-                                continue
-                            inp = block.get("input", {})
-                            fp = inp.get("file_path", "") or inp.get("path", "")
-                            if fp:
-                                found.add(fp)
-
-                    # Source 2: existing file-history-snapshot entries —
-                    # used ONLY to recover version counters so newly written
-                    # backup file names don't collide.  Files in this dict
-                    # are NOT added to ``found`` (snowball prevention; see
-                    # docstring + CLAUDE.md #7).
-                    elif t == "file-history-snapshot":
-                        snap = obj.get("snapshot", {})
-                        for fp, binfo in snap.get("trackedFileBackups", {}).items():
-                            if isinstance(binfo, dict):
-                                v = binfo.get("version", 0)
-                                if v > max_version.get(fp, 0):
-                                    max_version[fp] = v
-        except Exception as e:
-            logger.warning("read_tracked_files failed for %s: %s", session_id, e)
-
-        return found, max_version, last_user_uuid, last_asst_uuid
+        found_list, max_version, u, a = self._scan_jsonl_ordered(jsonl_path)
+        return set(found_list), max_version, u, a
 
     def read_tail_uuids(
         self, session_id: str, cwd: str = ""

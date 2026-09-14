@@ -954,34 +954,42 @@ function singleOrDouble(id, e) {
 
 /**
  * Double-click gesture on a session row (list-table view) or card (grid view)
- * puts an IDLE session to sleep.  Rationale: idle sessions are the "cheap to
- * discard" state — no work in flight, safe to sleep, and resumable at any time
- * with full context.  Working/waiting/sleeping sessions ignore the gesture
- * (working could be interrupted mid-response; waiting has a pending question;
- * sleeping is already asleep) — sleeping those needs the explicit Stop action
- * from the context menu so the user makes a deliberate choice.
+ * TOGGLES a session between IDLE and SLEEPING:
+ *
+ *   • IDLE       → sleep it (safe: no work in flight, resumable with full context)
+ *   • SLEEPING   → wake it to idle (start_session with resume=true, no prompt)
+ *   • WORKING    → ignored with an explanatory toast (interrupt via menu Stop)
+ *   • QUESTION   → ignored with an explanatory toast (answer, or menu Stop)
+ *
+ * The idle→sleep and sleeping→wake paths are exact inverses of each other so
+ * the same double-click gesture flips between the two states repeatedly.  Both
+ * paths use the SAME undo-toast pattern (bottom-left, ~6s) so an accidental
+ * gesture is one click away from being reversed in either direction.
  *
  * Fires BESIDE the two single-click `singleOrDouble()` invocations that
  * precede any dblclick — the session briefly opens in the live panel before
- * the sleep completes.  That's acceptable and gives visual confirmation the
- * right session was targeted; the alternative (a 250ms debounce on every
+ * the sleep/wake completes.  That's acceptable and gives visual confirmation
+ * the right session was targeted; the alternative (a 250ms debounce on every
  * single click just to detect a double) would add latency to the far more
  * common single-click-to-open path for every user, everywhere.
  *
- * No confirmation modal — sleep is non-destructive (session resumes with full
- * context) and matches the "fire and forget" pattern used by `_bulkStop()`.
- * Instead of a modal, we surface a **bottom-left Undo toast** that gives the
- * user ~6 seconds to reverse an accidental gesture.  If they hit Undo we
- * restore the exact local state the sleep clobbered (runningIds membership,
- * sessionKinds, guiOpenSessions, sessionLastState, user-stop intent) — the
- * daemon session actually did stop, but the next action against the session
- * transparently resumes it via the existing send-message error fallback in
- * live-panel.js (see the `is stopped` branch there).
+ * No confirmation modal — neither sleep nor wake is destructive (a slept
+ * session resumes with full context; a woken session is one Sleep click away
+ * from being asleep again).  Instead we surface a **bottom-left Undo toast**
+ * that gives the user ~6 seconds to reverse an accidental gesture.
  *
- * The sleep itself mirrors the client-side stop steps in `closeSession()`
+ * The sleep leg mirrors the client-side stop steps in `closeSession()`
  * (live-panel.js) and `_bulkStop()`: mark user-stop intent to block ghost-
  * recovery timers, emit `close_session`, then clear all local state that
  * would otherwise cause `getSessionStatus()` to keep reporting idle.
+ *
+ * The wake leg mirrors the resume path used by `_liveSubmitDirect()` for a
+ * sleeping session (live-panel.js, ~line 3510): clear user-stop intent so
+ * ghost-recovery/send-message auto-resume no longer suppress the session,
+ * emit `start_session` with `resume: true` and no prompt, then optimistically
+ * update local state (runningIds/guiOpenSessions/sessionKinds='working') so
+ * the row reflects the wake immediately.  The daemon's session_state stream
+ * (starting → idle) takes over from there.
  */
 function _dblclickSleepIfIdle(sessionId, e) {
   if (e && typeof e.preventDefault === 'function') e.preventDefault();
@@ -989,13 +997,16 @@ function _dblclickSleepIfIdle(sessionId, e) {
   if (!sessionId) return;
   const status = (typeof getSessionStatus === 'function')
     ? getSessionStatus(sessionId) : null;
+  if (status === 'sleeping') {
+    _dblclickWakeSleeping(sessionId);
+    return;
+  }
   if (status !== 'idle') {
     // Give the user feedback so the gesture doesn't feel broken on
-    // working/waiting/sleeping rows.  A silent no-op reads as a bug.
+    // working/waiting rows.  A silent no-op reads as a bug.
     if (typeof showToast === 'function') {
       if (status === 'working') showToast('Session is working — use Stop from the menu to interrupt');
       else if (status === 'question') showToast('Session is waiting for input — answer or use Stop from the menu');
-      else if (status === 'sleeping') showToast('Session is already asleep');
     }
     return;
   }
@@ -1073,6 +1084,91 @@ function _dblclickSleepIfIdle(sessionId, e) {
 }
 // Expose for cross-script use (workforce.js's grid card ondblclick).
 if (typeof window !== 'undefined') window._dblclickSleepIfIdle = _dblclickSleepIfIdle;
+
+/**
+ * Inverse of the sleep leg above: wake a SLEEPING session back to idle.
+ * Called by `_dblclickSleepIfIdle` when the double-clicked session is asleep.
+ *
+ * Resume path is identical to `_liveSubmitDirect()` in live-panel.js (the
+ * live panel's "type a message on a sleeping session" flow) minus the prompt:
+ * emit `start_session` with `resume: true` and no prompt, and let the daemon's
+ * session_state stream (starting → idle) drive the UI transition.  Optimistic
+ * local state (runningIds, guiOpenSessions, sessionKinds='working') fills the
+ * gap until the first state event arrives so the row doesn't flash-sleep for
+ * a beat before the wake registers.
+ *
+ * Undo restores the sleeping state via the same close_session/markUserStopped
+ * combo the sleep leg uses, so a double-click there → Undo here → double-click
+ * again round-trips cleanly.
+ */
+function _dblclickWakeSleeping(sessionId) {
+  // Snapshot pre-wake state — currently sleeping means we do NOT restore any
+  // active local state on Undo (that IS what sleeping means).  We only need
+  // the display name for the toast.
+  const displayName = (typeof allSessions !== 'undefined' && allSessions.find)
+    ? (function() {
+        const s = allSessions.find(x => x.id === sessionId);
+        return (s && s.display_title) || sessionId.slice(0, 8);
+      })()
+    : sessionId.slice(0, 8);
+
+  // ── Perform the wake ──
+  // Clear user-stop intent so ghost-recovery / send-message auto-resume no
+  // longer suppress this session (mirror of the sleep leg's markUserStopped).
+  if (typeof clearUserStopped === 'function') clearUserStopped(sessionId);
+
+  // Resolve model preference the same way _liveSubmitDirect does so a wake
+  // via double-click honors an explicit per-session model choice.
+  let _desiredModel = '';
+  try {
+    if (typeof SessionModel !== 'undefined' && SessionModel.getDesired) {
+      _desiredModel = SessionModel.getDesired(sessionId) || '';
+    }
+  } catch (_) { /* SessionModel may not be defined in some views */ }
+
+  if (typeof socket !== 'undefined') {
+    try {
+      socket.emit('start_session', {
+        session_id: sessionId,
+        cwd: (typeof _currentProjectDir === 'function') ? _currentProjectDir() : '',
+        resume: true,
+        model: _desiredModel || undefined,
+      });
+    } catch (err) { /* transport dead — the wake toast still shows */ }
+  }
+
+  // Optimistic local state so the row updates immediately (before the daemon's
+  // first session_state broadcast).  Mirror of the sleep leg's clears.
+  if (typeof runningIds !== 'undefined' && runningIds.add) runningIds.add(sessionId);
+  if (typeof guiOpenAdd === 'function') guiOpenAdd(sessionId);
+  if (typeof sessionKinds !== 'undefined') sessionKinds[sessionId] = 'working';
+  if (window.sessionLastState) window.sessionLastState[sessionId] = 'working';
+  if (typeof filterSessions === 'function') filterSessions();
+
+  // ── Show bottom-left Undo toast ──
+  _showUndoToast(
+    'Session waking — ' + displayName,
+    'Undo',
+    function undo() {
+      // Reverse the wake exactly the way the sleep leg would: user-stop
+      // intent + close_session + clear local state.  Matches _dblclickSleepIfIdle's
+      // sleep block so a rapid wake→undo puts the session back in the same
+      // "sleeping" bucket getSessionStatus() reports.
+      if (typeof markUserStopped === 'function') markUserStopped(sessionId);
+      if (typeof socket !== 'undefined') {
+        try { socket.emit('close_session', { session_id: sessionId }); } catch (err) {}
+      }
+      if (typeof guiOpenDelete === 'function') guiOpenDelete(sessionId);
+      if (typeof runningIds !== 'undefined' && runningIds.delete) runningIds.delete(sessionId);
+      if (typeof sessionKinds !== 'undefined') delete sessionKinds[sessionId];
+      if (window.sessionLastState) delete window.sessionLastState[sessionId];
+      if (typeof filterSessions === 'function') filterSessions();
+      if (typeof showToast === 'function') showToast('Wake undone');
+    },
+    6000
+  );
+}
+if (typeof window !== 'undefined') window._dblclickWakeSleeping = _dblclickWakeSleeping;
 
 /**
  * Bottom-left toast with an actionable button that auto-times-out.  Used by

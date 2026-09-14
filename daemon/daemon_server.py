@@ -381,6 +381,12 @@ class SessionDaemon:
             "get_all_states": lambda **kw: self.session_manager.get_all_states(),
             "get_entries": self.session_manager.get_entries,
             "get_entry_count": lambda **kw: self.session_manager.get_entry_count(kw["session_id"]),
+            # Companion to get_entry_count that also reports the sticky
+            # ``_entries_trimmed`` flag.  Consumed by ws_events fast path so
+            # it can refuse to trust daemon count as an authoritative total
+            # once in-memory entries have been trimmed (JSONL is never trimmed).
+            # See docs/plans/runs/2026-09-11-1546-load-older-fix.
+            "get_entry_trim_status": lambda **kw: self.session_manager.get_entry_trim_status(kw["session_id"]),
             "has_session": self.session_manager.has_session,
             "get_session_state": self.session_manager.get_session_state,
             "get_dormant_states": lambda **kw: self.session_manager.get_dormant_states(),
