@@ -35,6 +35,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -259,16 +260,31 @@ def _rewrite_html(body: str, base: str) -> str:
     return _ATTR_RE.sub(repl, body)
 
 
-@bp.route("/api/preview/proxy")
+@bp.route("/api/preview/proxy", methods=["GET", "POST"])
 def proxy():
     u = (request.args.get("u") or "").strip()
     if not (u.startswith("http://") or u.startswith("https://")):
         abort(400)
     try:
-        req = urllib.request.Request(u, headers={"User-Agent": "VibeNode-Preview"})
+        # Forward POSTs (method + body + content type) so proxied pages can
+        # submit forms — e.g. an agent-served localhost form the phone fills
+        # in.  GET-only here used to 405 any proxied <form method="post">.
+        body = request.get_data() if request.method == "POST" else None
+        fwd_headers = {"User-Agent": "VibeNode-Preview"}
+        if body is not None and request.content_type:
+            fwd_headers["Content-Type"] = request.content_type
+        req = urllib.request.Request(u, data=body, headers=fwd_headers,
+                                     method=request.method)
         with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310 (user-driven, tailnet-gated)
+            status = resp.status
             ctype = resp.headers.get("Content-Type", "application/octet-stream")
             raw = resp.read()
+    except urllib.error.HTTPError as e:
+        # A non-2xx reply IS the target's response (e.g. a form validation
+        # error page) — relay it instead of masking it as a proxy failure.
+        status = e.code
+        ctype = e.headers.get("Content-Type", "application/octet-stream")
+        raw = e.read()
     except Exception as e:  # noqa: BLE001
         return Response("Preview proxy could not reach %s: %s" % (u, str(e)[:160]),
                         status=502, mimetype="text/plain")
@@ -279,4 +295,4 @@ def proxy():
             raw = html.encode("utf-8")
         except Exception:  # noqa: BLE001
             pass
-    return Response(raw, mimetype=ctype.split(";")[0].strip() or "text/html")
+    return Response(raw, status=status, mimetype=ctype.split(";")[0].strip() or "text/html")
