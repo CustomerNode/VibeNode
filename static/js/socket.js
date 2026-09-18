@@ -977,6 +977,15 @@ socket.on('session_state', (data) => {
         if (workspaceActive && typeof _updatePermissionQueue === 'function') {
             _updatePermissionQueue(waitingData);
         }
+        // Clear the approval-notification flash/badge if the pending
+        // permission has been resolved (locally, from another device, or by
+        // auto-approval). Without this the title/favicon could stay in
+        // "alert" state after the request has already been answered.
+        try {
+            if (window.VNNotify && typeof window.VNNotify.clearPending === 'function') {
+                window.VNNotify.clearPending(session_id);
+            }
+        } catch (e) {}
     }
 
     // Sync queue cache from server state event (authoritative source).
@@ -1563,6 +1572,28 @@ socket.on('session_permission', (data) => {
         _updatePermissionQueue(waitingData);
     }
     if (viewMode === 'sessions' || viewMode === 'workplace' || viewMode === 'homepage') filterSessions();
+
+    // General approval-notification ping (chime + title flash + favicon dot +
+    // vibrate + best-effort Notification). Fires for EVERY project's sessions
+    // that reach this handler, including CustomerNode — which is an ordinary
+    // VibeNode-managed project (see project_id_aliases in kanban_config.json)
+    // whose Claude sessions already emit session_permission through the same
+    // daemon path. No project-side code change is required. See notify.js
+    // header for the iOS/Android/desktop capability matrix.
+    try {
+        if (window.VNNotify && typeof window.VNNotify.approvalNeeded === 'function') {
+            var _s = (typeof allSessions !== 'undefined' && Array.isArray(allSessions))
+                ? allSessions.find(function (x) { return x && x.id === data.session_id; })
+                : null;
+            var _name = _s ? (_s.custom_title || _s.display_title || 'Claude session')
+                           : 'Claude session';
+            window.VNNotify.approvalNeeded({
+                sessionId: data.session_id,
+                sessionName: _name,
+                toolName: data.tool_name || 'a tool',
+            });
+        }
+    } catch (e) { /* notify failures never break the permission UI */ }
 });
 
 // Server-side queue updates — replaces client-side localStorage queue

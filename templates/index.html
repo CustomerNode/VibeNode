@@ -718,6 +718,11 @@
 <script src="{{ versioned_static('js/voice.js') }}"></script>
 <script src="{{ versioned_static('js/theme.js') }}"></script>
 <script src="{{ versioned_static('js/healthchecks.js') }}"></script>
+<!-- Approval notification capability: chime + title flash + favicon dot +
+     vibrate + Notification (opportunistic). Consumed by the session_permission
+     handler in socket.js, so it must load BEFORE socket.js. See notify.js
+     header for the layered iOS/Android/desktop capability matrix. -->
+<script src="{{ versioned_static('js/notify.js') }}"></script>
 <script src="{{ versioned_static('js/socket.js') }}"></script>
 <!-- Themed replacement for native OS tooltips. Fully delegated off document,
      so it covers every existing title="" and anything rendered later without

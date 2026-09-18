@@ -40,7 +40,21 @@ async function pollGitStatus() {
   } catch(e) {}
 }
 
+// Arm the approval-notification capability on any git-button press. This is
+// the reliable "user gesture on their phone" moment for iOS Safari — pressing
+// the Update button unlocks the WebAudio context and opportunistically
+// requests Notification permission, so later approval pings can actually
+// make sound. Idempotent, safe to call every time. See notify.js.
+function _armNotifyOnGesture() {
+  try {
+    if (window.VNNotify && typeof window.VNNotify.arm === 'function') {
+      window.VNNotify.arm();
+    }
+  } catch (e) {}
+}
+
 function openGitPublish() {
+  _armNotifyOnGesture();
   const s = _gitStatus;
   const hasPush = s.ahead > 0 || s.uncommitted;
   if (!hasPush) {
@@ -74,6 +88,7 @@ function _testThenPublish(mode) {
 }
 
 function openGitSyncBoth() {
+  _armNotifyOnGesture();
   const s = _gitStatus;
   // Branch guard FIRST — before any sync/test options are shown.
   if (s.on_default === false) {
@@ -193,6 +208,7 @@ function _testThenAction(mode, actionType, actionLabel, btnId) {
 }
 
 function openGitUpdate() {
+  _armNotifyOnGesture();
   const s = _gitStatus;
   if (s.behind === 0) {
     showGitSyncModal('Update App', '<p style="color:var(--text-muted)">Your app is already up to date.</p>',
