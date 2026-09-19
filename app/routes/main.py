@@ -10,6 +10,7 @@ import sys
 from flask import Blueprint, Response, jsonify, render_template, request, send_from_directory
 from ..platform_utils import NO_WINDOW as _NO_WINDOW
 from .. import mobile_command
+from .. import socketio
 
 bp = Blueprint('main', __name__)
 
@@ -78,6 +79,55 @@ def ping():
     (which shells out to the Claude CLI) and decoupled from auth semantics,
     so a slow auth check never produces a false 'server unreachable' overlay.
     """
+    return jsonify(ok=True)
+
+
+@bp.route("/api/notify/approval", methods=["POST"])
+def notify_approval():
+    """Broadcast a generic 'approval needed' ping to every connected browser.
+
+    Purpose
+    -------
+    Some external processes (notably CustomerNode's agentic release pipeline,
+    which serves a branded approval page on 127.0.0.1 and opens a browser tab
+    for a human YES/NO click) need to alert the user that human action is
+    required. On desktop, the browser tab opening is obvious; on mobile, or
+    when the user has switched away, it's easy to miss for hours.
+
+    This endpoint accepts a lightweight JSON POST and re-broadcasts it as the
+    Socket.IO event ``approval_needed`` to every connected VibeNode client —
+    including the user's phone connected over Tailscale, which will then
+    chime / flash the title / show a favicon dot via static/js/notify.js.
+
+    Body (all optional):
+        {
+          "title": "Production Release",       // short label for banner
+          "message": "Release v1.2.3 ready",   // longer body text
+          "source": "customernode",            // slug for filtering / grouping
+          "url": "http://127.0.0.1:PORT/"      // where the human should go
+        }
+
+    Response: ``{"ok": true}`` on success (204-cheap; kept 200 for symmetry
+    with the rest of the API). This endpoint deliberately never returns 4xx
+    for malformed input — a broken alert must not break the release script
+    that emitted it.
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+    except Exception:
+        payload = {}
+    data = {
+        "title": str(payload.get("title") or "Approval needed"),
+        "message": str(payload.get("message") or ""),
+        "source": str(payload.get("source") or ""),
+        "url": str(payload.get("url") or ""),
+    }
+    try:
+        socketio.emit("approval_needed", data)
+    except Exception:
+        # Never let a failed broadcast propagate — the caller (a release
+        # script) does not care whether the ping actually reached a client.
+        pass
     return jsonify(ok=True)
 
 
