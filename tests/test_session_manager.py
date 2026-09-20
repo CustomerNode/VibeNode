@@ -883,6 +883,78 @@ class TestGetDormantStates:
 
 
 # ---------------------------------------------------------------------------
+# 17c. Registry save carries forward dormant restart-memory
+# ---------------------------------------------------------------------------
+
+class TestRegistrySaveCarriesDormant:
+    """_save_registry_now() must re-persist dormant restart-memory, not just
+    live sessions.  Otherwise idle-session display state has a one-restart
+    lifespan: recover_sessions() never relaunches idle sessions, so the first
+    save after a reboot erases them from disk and the NEXT reboot shows them as
+    "sleeping" instead of "idle" (the reported bug)."""
+
+    def _capture_snapshot(self, session_manager):
+        """Call _save_registry_now with the registry write mocked; return the
+        snapshot dict it would have written to disk."""
+        captured = {}
+        with patch.object(
+            session_manager._reg, "save_registry_now",
+            side_effect=lambda data: captured.update({"data": data}),
+        ):
+            session_manager._save_registry_now()
+        return captured.get("data", {})
+
+    def test_dormant_idle_persisted_alongside_live(self, session_manager, sm_module):
+        """A live session AND a dormant idle session both land in the snapshot,
+        so the idle marker survives to the next boot."""
+        with session_manager._lock:
+            session_manager._sessions["s-live"] = sm_module.SessionInfo(
+                session_id="s-live", state=sm_module.SessionState.WORKING, name="Live"
+            )
+        session_manager._last_known_states = {
+            "s-dormant": {
+                "last_state": "idle", "name": "Dormant",
+                "cwd": "/tmp/x", "model": "opus", "last_activity": 123.0,
+            }
+        }
+
+        data = self._capture_snapshot(session_manager)
+
+        assert "s-live" in data
+        assert data["s-live"]["state"] == "working"
+        assert "s-dormant" in data, "dormant idle session was dropped from disk"
+        assert data["s-dormant"]["state"] == "idle"
+        # Original last_activity is preserved (not restamped to now) so
+        # recover_sessions' max_age guard stays honest.
+        assert data["s-dormant"]["last_activity"] == 123.0
+
+    def test_live_wins_over_dormant_same_id(self, session_manager, sm_module):
+        """When a session is both live and in the dormant snapshot, the live
+        state is authoritative — the dormant copy must not overwrite it."""
+        with session_manager._lock:
+            session_manager._sessions["s1"] = sm_module.SessionInfo(
+                session_id="s1", state=sm_module.SessionState.WORKING, name="Live"
+            )
+        session_manager._last_known_states = {"s1": {"last_state": "idle"}}
+
+        data = self._capture_snapshot(session_manager)
+
+        assert data["s1"]["state"] == "working"
+
+    def test_dormant_survives_repeated_saves(self, session_manager):
+        """Idempotence: carrying forward must not lose the entry across
+        successive saves (the multi-reboot case)."""
+        session_manager._last_known_states = {
+            "s-dormant": {"last_state": "idle", "name": "D", "last_activity": 50.0}
+        }
+        first = self._capture_snapshot(session_manager)
+        second = self._capture_snapshot(session_manager)
+        assert "s-dormant" in first
+        assert "s-dormant" in second
+        assert second["s-dormant"]["state"] == "idle"
+
+
+# ---------------------------------------------------------------------------
 # 18. Get entries with since
 # ---------------------------------------------------------------------------
 

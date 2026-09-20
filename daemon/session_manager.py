@@ -7505,6 +7505,7 @@ class SessionManager:
         """Prepare a snapshot of active sessions and save via SessionRegistry."""
         sessions_data = {}
         with self._lock:
+            live = set(self._sessions.keys())
             for sid, info in self._sessions.items():
                 if info.state == SessionState.STOPPED:
                     continue
@@ -7529,6 +7530,47 @@ class SessionManager:
                     # daemon restart preserves the user's preference.
                     "auto_report_on_idle": info.auto_report_on_idle,
                 }
+
+        # Carry forward dormant restart-memory so idle-session display state
+        # survives MORE THAN ONE restart.  recover_sessions() deliberately does
+        # NOT relaunch pure-idle sessions, so they never enter self._sessions
+        # and the loop above omits them.  Without this merge, the first save
+        # after a reboot rewrites the registry with ONLY the relaunched (live)
+        # sessions, erasing every dormant idle session from disk — so the NEXT
+        # reboot has no record and the UI collapses them from "idle" to
+        # "sleeping".  That gave restart-memory a one-restart lifespan and made
+        # the idle/sleeping distinction look intermittent.  _last_known_states
+        # is pruned by forget_dormant() on every explicit user stop/delete, so
+        # re-persisting it here never resurrects a session the user slept.
+        try:
+            dormant = self._last_known_states or {}
+            for sid, meta in list(dormant.items()):
+                if not isinstance(meta, dict):
+                    continue
+                try:
+                    rid = self._resolve_id(sid)
+                except Exception:
+                    rid = sid
+                # Live state is authoritative — never let stale memory shadow a
+                # session that has since gone live under either id form.
+                if sid in live or rid in live or sid in sessions_data or rid in sessions_data:
+                    continue
+                sessions_data[rid] = {
+                    "name": meta.get("name", ""),
+                    "cwd": meta.get("cwd", ""),
+                    "model": meta.get("model", ""),
+                    "session_type": meta.get("session_type", ""),
+                    # last_state is collapsed to "idle" | "working"; "working"
+                    # here means "was mid-task, failed to auto-recover".  Writing
+                    # it back keeps recover_sessions' max_age guard honest via
+                    # the ORIGINAL last_activity (below) instead of stamping now.
+                    "state": meta.get("last_state", "idle"),
+                    "started_at": meta.get("last_activity", 0) or time.time(),
+                    "last_activity": meta.get("last_activity", 0),
+                }
+        except Exception:
+            logger.exception("Failed to carry forward dormant restart-memory")
+
         self._reg.save_registry_now(sessions_data)
 
     def _schedule_registry_save(self) -> None:
