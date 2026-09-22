@@ -1334,6 +1334,57 @@ socket.on('stream_event', (data) => {
     }
 });
 
+// Bump a session's last-activity timestamp in memory AND in the sidebar DOM.
+// The server derives `last_activity` from the newest message it can find in
+// the .jsonl on disk; live entries streaming over the socket haven't been
+// scanned yet, so a session resumed today from an older .jsonl keeps showing
+// its OLD date (e.g. "Friday") in the sidebar even while the current turn
+// is in flight. Fix: on every real-time entry, refresh the row's date so
+// active sessions display "just now" instead of their file's stale mtime.
+function _bumpSessionActivity(sid) {
+    if (!sid) return;
+    const now = new Date();
+    const epoch = now.getTime() / 1000;
+    const isoStr = now.toISOString();
+
+    // Pretty string matching the server's "%b %d, %Y  %I:%M %p" format so
+    // tooltips read like the rest of the app.
+    const months = ['Jan','Feb','Mar','Apr','May','Jun',
+                    'Jul','Aug','Sep','Oct','Nov','Dec'];
+    let h12 = now.getHours();
+    const ampm = h12 >= 12 ? 'PM' : 'AM';
+    h12 = h12 % 12 || 12;
+    const pretty = months[now.getMonth()] + ' ' + now.getDate() + ', ' + now.getFullYear()
+        + '  ' + String(h12).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0')
+        + ' ' + ampm;
+
+    // 1. In-memory record — keeps sort order fresh and survives re-renders.
+    if (typeof allSessions !== 'undefined' && Array.isArray(allSessions)) {
+        for (let i = 0; i < allSessions.length; i++) {
+            if (allSessions[i].id === sid) {
+                allSessions[i].last_activity = pretty;
+                allSessions[i].last_activity_ts = epoch;
+                allSessions[i].effective_ts = epoch;
+                break;
+            }
+        }
+    }
+    // 2. Live DOM patch on the visible row(s) — sidebar list + workforce grid,
+    //    so the update lands without waiting for the next loadSessions() poll.
+    try {
+        const rows = document.querySelectorAll(
+            '.session-item[data-sid="' + sid + '"], .wf-card[data-sid="' + sid + '"]');
+        for (let j = 0; j < rows.length; j++) {
+            const cell = rows[j].querySelector('.session-col-date');
+            if (cell) {
+                cell.setAttribute('data-short-date', isoStr);
+                cell.setAttribute('title', pretty);
+                if (typeof _shortDate === 'function') cell.textContent = _shortDate(isoStr);
+            }
+        }
+    } catch (e) { /* DOM update is best-effort */ }
+}
+
 // Live log entries pushed in real-time
 socket.on('session_entry', (data) => {
     // Never process entries for hidden utility sessions (planner, title).
@@ -1344,6 +1395,11 @@ socket.on('session_entry', (data) => {
     // and isn't in allSessions, it's cross-project — drop it entirely so the
     // consistency check below doesn't inject it into the sidebar.
     if (data.session_id !== liveSessionId && !allSessionIds.has(data.session_id)) return;
+
+    // Bump last-activity for THIS session on every real-time entry, before
+    // the live-session sid-match bail-out below so background sessions get
+    // the same freshness treatment as the live one.
+    _bumpSessionActivity(data.session_id);
 
     // NOTE: Watchdog reset moved AFTER session_id match check below.
     // Previously it was here, so entries for a mismatched session_id (e.g.
