@@ -286,7 +286,9 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
   window._smSelectModel = function(row) {
     document.querySelectorAll('#sm-model-list .msel-row').forEach(c => c.classList.remove('active'));
     row.classList.add('active');
-    pendingModel = row.dataset.model;
+    // Strip display markers like "[1m]" — they render as a tag on the row
+    // but are not part of a valid SDK model id (sending one is an API 400).
+    pendingModel = (row.dataset.model || '').replace(/\[[^\]]*\]/g, '');
     _refreshApply();
   };
   window._smSelectThinking = function(row) {
@@ -331,60 +333,118 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
       return;
     }
     const btn = document.getElementById('sm-apply-btn');
-    if (btn) { btn.disabled = true; btn.textContent = 'Switching…'; }
 
-    let settled = false;
-    const finish = () => {
-      settled = true;
-      clearTimeout(timer);
-      if (typeof socket !== 'undefined') socket.off('session_model_result', onResult);
-    };
-    const timer = setTimeout(() => {
-      if (settled) return;
-      finish();
-      if (btn) { btn.disabled = false; btn.textContent = 'Switch Model'; }
-      if (typeof showToast === 'function') {
-        showToast('Model switch timed out — model NOT changed');
-      }
-    }, 20000);
+    // STALE-CLI FALLBACK.  A live set_model control request is answered by
+    // the session's already-running CLI process, which only knows the models
+    // that existed when it was spawned.  A model released after that (e.g. a
+    // day-one switch to a brand-new Opus) is rejected with a "… not
+    // supported …" error even though the CLI binary on disk has since
+    // auto-updated.  The daemon already resumes a STOPPED session with
+    // --model on a FRESH CLI, so on that specific error we sleep the session
+    // and re-apply exactly once — the second attempt takes the resume path
+    // and succeeds.  One-shot: a "not supported" from a freshly spawned CLI
+    // means the model genuinely isn't available, and that error must surface.
+    let resumeFallbackUsed = false;
 
-    function onResult(data) {
-      if (settled || !data || data.session_id !== liveSid) return;
-      finish();
-      if (data.ok) {
-        // Daemon confirmed via the CLI control protocol — safe to display.
-        // Route through the store's single write path, then the single badge
-        // renderer.  Never write model text to the DOM directly here.
-        if (typeof SessionModel !== 'undefined') SessionModel.ingestConfirmed(liveSid, data.model);
-        // Mirror the choice into `desiredModel` as well.  The wake path
-        // (liveSubmitContinue) sends `desiredModel` on resume, so leaving it
-        // un-updated here would mean: switch live to model B, let the session
-        // sleep, type to wake it — and it comes back on a STALE earlier
-        // choice instead of B.  Keeping the two fields in step is what makes
-        // "the model I picked is the model it wakes up on" actually true.
-        if (typeof SessionModel !== 'undefined' && SessionModel.setDesired) {
-          SessionModel.setDesired(liveSid, data.model, '');
-        }
-        _renderSessionModelBadge(liveSid);
-        _closePm();
-        if (typeof showToast === 'function') {
-          showToast('Model switched to ' + _modelLabel(data.model) + ' — applies from the next message');
-        }
-      } else {
+    function attempt() {
+      if (btn) { btn.disabled = true; btn.textContent = 'Switching…'; }
+
+      let settled = false;
+      const finish = () => {
+        settled = true;
+        clearTimeout(timer);
+        if (typeof socket !== 'undefined') socket.off('session_model_result', onResult);
+      };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        finish();
         if (btn) { btn.disabled = false; btn.textContent = 'Switch Model'; }
         if (typeof showToast === 'function') {
-          showToast('Model switch FAILED: ' + (data.error || 'unknown error'));
+          showToast('Model switch timed out — model NOT changed');
+        }
+      }, 20000);
+
+      function onResult(data) {
+        if (settled || !data || data.session_id !== liveSid) return;
+        finish();
+        if (data.ok) {
+          // Daemon confirmed via the CLI control protocol — safe to display.
+          // Route through the store's single write path, then the single badge
+          // renderer.  Never write model text to the DOM directly here.
+          if (typeof SessionModel !== 'undefined') SessionModel.ingestConfirmed(liveSid, data.model);
+          // Mirror the choice into `desiredModel` as well.  The wake path
+          // (liveSubmitContinue) sends `desiredModel` on resume, so leaving it
+          // un-updated here would mean: switch live to model B, let the session
+          // sleep, type to wake it — and it comes back on a STALE earlier
+          // choice instead of B.  Keeping the two fields in step is what makes
+          // "the model I picked is the model it wakes up on" actually true.
+          if (typeof SessionModel !== 'undefined' && SessionModel.setDesired) {
+            SessionModel.setDesired(liveSid, data.model, '');
+          }
+          // The fallback's sleep was plumbing, not user intent — let ghost
+          // recovery protect the resumed session again.
+          if (resumeFallbackUsed && typeof clearUserStopped === 'function') {
+            clearUserStopped(liveSid);
+          }
+          _renderSessionModelBadge(liveSid);
+          _closePm();
+          if (typeof showToast === 'function') {
+            showToast('Model switched to ' + _modelLabel(data.model) + ' — applies from the next message');
+          }
+        } else if (!resumeFallbackUsed && /not supported/i.test(String(data.error || ''))) {
+          resumeFallbackUsed = true;
+          _sleepThenRetry();
+        } else {
+          if (btn) { btn.disabled = false; btn.textContent = 'Switch Model'; }
+          if (typeof showToast === 'function') {
+            showToast('Model switch FAILED: ' + (data.error || 'unknown error'));
+          }
         }
       }
+
+      if (typeof socket === 'undefined') {
+        finish();
+        if (typeof showToast === 'function') showToast('Not connected — model NOT changed');
+        return;
+      }
+      socket.on('session_model_result', onResult);
+      socket.emit('set_session_model', { session_id: liveSid, model: pendingModel });
     }
 
-    if (typeof socket === 'undefined') {
-      finish();
-      if (typeof showToast === 'function') showToast('Not connected — model NOT changed');
-      return;
+    // Sleep the session, wait for the daemon to confirm it stopped, then
+    // re-apply the switch (which now takes the resume-with---model path).
+    function _sleepThenRetry() {
+      if (btn) { btn.disabled = true; btn.textContent = 'Restarting session…'; }
+      if (typeof showToast === 'function') {
+        showToast('Session’s CLI predates ' + _modelLabel(pendingModel) +
+          ' — restarting the session on it…');
+      }
+      // Explicit stop path — mark intent BEFORE close_session so a pending
+      // ghost-recovery timer can never resurrect the session mid-fallback
+      // (see the sleep-must-stick rules in live-panel.js).
+      if (typeof markUserStopped === 'function') markUserStopped(liveSid);
+
+      let done = false;
+      const onState = (d) => {
+        if (done || !d || d.session_id !== liveSid || d.state !== 'stopped') return;
+        done = true;
+        clearTimeout(guard);
+        socket.off('session_state', onState);
+        attempt();
+      };
+      // If the stopped push never arrives (dropped event), retry anyway —
+      // worst case the session is still live and the real error surfaces.
+      const guard = setTimeout(() => {
+        if (done) return;
+        done = true;
+        socket.off('session_state', onState);
+        attempt();
+      }, 8000);
+      socket.on('session_state', onState);
+      socket.emit('close_session', { session_id: liveSid });
     }
-    socket.on('session_model_result', onResult);
-    socket.emit('set_session_model', { session_id: liveSid, model: pendingModel });
+
+    attempt();
   };
 }
 

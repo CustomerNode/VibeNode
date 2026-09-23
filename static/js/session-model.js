@@ -50,6 +50,18 @@ window.SessionModel = (function () {
   // hardcoded fallbacks in app.js/openModelSelector and /api/models.
   var FALLBACK_MODEL = 'claude-opus-4-7';
 
+  // The CLI reports "[1m]" (1M context active) as a display suffix on model
+  // ids (e.g. "claude-opus-5-5[1m]"). That suffix is NOT part of a valid SDK
+  // model id — sending one as --model / set_model fails with an API 400 —
+  // but bracketed ids can reach us through the /api/models confirmed cache
+  // or an old localStorage value. Strip markers from every id this store
+  // HANDS OUT for starting/switching, so no start path can ever send one.
+  // Confirmed ids (daemon ground truth, `.model`) are deliberately NOT
+  // stripped — the badge honestly displays "[1m]".
+  function _cleanId(id) {
+    return (id || '').replace(/\[[^\]]*\]/g, '');
+  }
+
   // One-time migration: the pre-rebuild architecture armed a GLOBAL one-shot
   // override in localStorage that leaked across sessions. Remove it so a stale
   // value saved before this upgrade can never attach to a new session.
@@ -74,9 +86,9 @@ window.SessionModel = (function () {
   /** The system-default model id used by any session that hasn't chosen one. */
   function getDefault() {
     try {
-      return localStorage.getItem(DEFAULT_MODEL_KEY) || FALLBACK_MODEL;
+      return _cleanId(localStorage.getItem(DEFAULT_MODEL_KEY)) || FALLBACK_MODEL;
     } catch (e) {
-      return (typeof defaultModel !== 'undefined' && defaultModel) || FALLBACK_MODEL;
+      return _cleanId(typeof defaultModel !== 'undefined' && defaultModel) || FALLBACK_MODEL;
     }
   }
 
@@ -94,7 +106,7 @@ window.SessionModel = (function () {
   /** The model explicitly chosen for this pending session, or '' if none. */
   function getDesired(id) {
     var s = _sess(id);
-    return (s && s.desiredModel) || '';
+    return _cleanId((s && s.desiredModel) || '');
   }
 
   /** The thinking level chosen for this pending session, else system default. */
@@ -112,6 +124,7 @@ window.SessionModel = (function () {
   function setDesired(id, model, thinking) {
     var s = _sess(id);
     if (!s) return false;
+    model = _cleanId(model);
     if (model) s.desiredModel = model; else delete s.desiredModel;
     if (thinking) s.desiredThinking = thinking; else delete s.desiredThinking;
     return true;

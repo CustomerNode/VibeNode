@@ -1935,7 +1935,9 @@ async function openModelSelector() {
   overlay.onclick = e => { if (e.target === overlay) _closePm(); };
   overlay.querySelectorAll('.msel-row').forEach(row => {
     row.onclick = () => {
-      defaultModel = row.dataset.model;
+      // Strip display markers like "[1m]" — they render as a tag on the row
+      // but are not part of a valid SDK model id (sending one is an API 400).
+      defaultModel = (row.dataset.model || '').replace(/\[[^\]]*\]/g, '');
       localStorage.setItem('defaultModel', defaultModel);
       _closePm();
       _updateModelLabel();

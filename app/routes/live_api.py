@@ -723,14 +723,14 @@ def _refresh_models_background() -> None:
 
         if not result:
             # No API results — fall back to confirmed-models cache.
-            confirmed = _load_confirmed_models()
+            # Record the CLI-reported model through record_confirmed_model —
+            # NEVER verbatim: the CLI reports display markers like "[1m]"
+            # that are not valid SDK ids, and a verbatim write here polluted
+            # the cache with "claude-opus-5-5[1m]", which the picker then
+            # offered and the API rejected with a 400 (hit 2026-09-23).
             if cli_model and cli_model.startswith("claude-"):
-                if cli_model not in confirmed:
-                    confirmed[cli_model] = _model_id_to_display_name(cli_model)
-                    try:
-                        _CONFIRMED_MODELS_FILE.write_text(json.dumps(confirmed, indent=2))
-                    except Exception:
-                        pass
+                record_confirmed_model(cli_model)
+            confirmed = _load_confirmed_models()
             if confirmed:
                 result = [{"id": mid, "name": name} for mid, name in confirmed.items()]
 
