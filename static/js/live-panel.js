@@ -869,11 +869,11 @@ function _fmtRetrySecs(s) {
 // models…" opens the full selector for anything else.
 const _LIMIT_ALT_LADDER = {
   // Limited on a top-tier model → step down to something with its own quota.
-  fable:  ['claude-opus-5', 'claude-sonnet-5'],
+  fable:  ['claude-opus-5-5', 'claude-sonnet-5'],
   opus:   ['claude-sonnet-5', 'claude-haiku-4-5'],
   // Limited on a mid model → offer both a step up and a step down.
-  sonnet: ['claude-opus-5', 'claude-haiku-4-5'],
-  haiku:  ['claude-sonnet-5', 'claude-opus-5'],
+  sonnet: ['claude-opus-5-5', 'claude-haiku-4-5'],
+  haiku:  ['claude-sonnet-5', 'claude-opus-5-5'],
 };
 const _LIMIT_ALT_DEFAULT = ['claude-sonnet-5', 'claude-haiku-4-5'];
 

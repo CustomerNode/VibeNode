@@ -1912,7 +1912,8 @@ async function openModelSelector() {
     models = [
       {id: 'claude-fable-5-1', name: 'Fable 5.1',  desc: 'Most capable, 1M context'},
       {id: 'claude-fable-5',   name: 'Fable 5',    desc: 'Deep reasoning, 1M context'},
-      {id: 'claude-opus-5',    name: 'Opus 5',     desc: 'Newest Opus, agentic coding, 1M context'},
+      {id: 'claude-opus-5-5',  name: 'Opus 5.5',   desc: 'Newest Opus, Fable-level, faster + cheaper'},
+      {id: 'claude-opus-5',    name: 'Opus 5',     desc: 'Agentic coding, 1M context'},
       {id: 'claude-opus-4-8',  name: 'Opus 4.8',   desc: 'Deep reasoning, 1M context'},
       {id: 'claude-opus-4-7',  name: 'Opus 4.7',   desc: '1M context, deepest reasoning'},
       {id: 'claude-opus-4-6',  name: 'Opus 4.6',   desc: 'Deep reasoning, 200K context'},

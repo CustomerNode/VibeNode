@@ -457,6 +457,7 @@ _CONFIRMED_MODELS_FILE = Path(__file__).resolve().parents[2] / "confirmed_models
 _FALLBACK_KNOWN_MODELS = [
     {"id": "claude-fable-5-1", "name": "Fable 5.1"},
     {"id": "claude-fable-5", "name": "Fable 5"},
+    {"id": "claude-opus-5-5", "name": "Opus 5.5"},
     {"id": "claude-opus-5", "name": "Opus 5"},
     {"id": "claude-opus-4-8", "name": "Opus 4.8"},
     {"id": "claude-opus-4-7", "name": "Opus 4.7"},
@@ -482,6 +483,7 @@ _MODELS_CACHE_TTL = 3600
 # Merged in by id (deduped), so it never duplicates an API/CLI/cache entry.
 _ALWAYS_OFFER_MODELS = [
     {"id": "claude-fable-5-1", "name": "Fable 5.1"},
+    {"id": "claude-opus-5-5", "name": "Opus 5.5"},
     {"id": "claude-opus-5", "name": "Opus 5"},
     {"id": "claude-sonnet-5", "name": "Sonnet 5"},
 ]
