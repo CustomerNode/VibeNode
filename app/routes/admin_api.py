@@ -52,6 +52,7 @@ from datetime import datetime, timezone
 from flask import Blueprint, current_app, jsonify, request
 
 from .. import socketio
+from ..claude_updater import run_update, status_snapshot
 from ..config import (
     _CLAUDE_PROJECTS,
     _SYSTEM_UTILITY_CWD,
@@ -318,3 +319,64 @@ def api_scrub_phantoms():
 
     finally:
         _scrub_lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Claude CLI update endpoints
+# ---------------------------------------------------------------------------
+#
+# The daily background updater in run.py handles the passive path. These
+# routes back the on-demand paths in the UI:
+#
+#   * A startup banner reads /api/admin/claude-status. If ``stale`` is true
+#     or ``restart_pending`` is true, the banner shows "Update Claude Code"
+#     as a one-click action.
+#   * The model-switch error handler in static/js/invoke-workforce.js
+#     reacts to ``claude_code_version_too_old`` — the exact 400 in the
+#     screenshot that motivated this — by opening the same one-click UI.
+#
+# Both endpoints are read-most; only POST mutates. Neither talks to the
+# network directly (subprocess calls do), so a caller with no internet
+# gets a fast failure from `claude update` itself.
+#
+# Localhost-only enforcement rides on the Flask host binding (127.0.0.1)
+# — same posture as /api/restart.
+
+
+@bp.route("/api/admin/claude-status", methods=["GET"])
+def api_claude_status():
+    """Return a snapshot of Claude CLI install state.
+
+    Shape: see ``claude_updater.status_snapshot``. Never blocks on the
+    network; safe to poll on page load.
+    """
+    sm = getattr(current_app, "session_manager", None)
+    return jsonify({"ok": True, **status_snapshot(sm)})
+
+
+@bp.route("/api/admin/claude-update", methods=["POST"])
+def api_claude_update():
+    """Run ``claude update`` on demand. Blocks until the child exits.
+
+    Request body (all optional):
+      - ``force``: bool. When true, updates even if the daemon has live
+        sessions. The caller (UI) must have already warned the user that
+        this interrupts them. Default false.
+
+    Response: see ``claude_updater.run_update``. Status codes:
+      - 200 on success or a "nothing to do" outcome.
+      - 409 when blocked by live sessions (``blocked=sessions_running``)
+        or a concurrent update (``blocked=in_progress``).
+      - 500 on any other failure. The body still carries the full result
+        dict so the UI can render a useful message.
+    """
+    data = request.get_json(silent=True) or {}
+    force = bool(data.get("force", False))
+    sm = getattr(current_app, "session_manager", None)
+
+    result = run_update(session_manager=sm, force=force)
+    if result.get("blocked") in ("sessions_running", "in_progress"):
+        return jsonify(result), 409
+    if not result.get("ok"):
+        return jsonify(result), 500
+    return jsonify(result), 200

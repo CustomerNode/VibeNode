@@ -680,6 +680,10 @@
 <!-- JavaScript files — load order matters -->
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script src="{{ versioned_static('js/utils.js') }}"></script>
+<!-- Startup banner: warns when the Claude CLI is stale so new models don't
+     fail with claude_code_version_too_old at the moment of use. Depends on
+     showConfirm/showToast from utils.js — load right after it. -->
+<script src="{{ versioned_static('js/claude-update-banner.js') }}"></script>
 <script src="{{ versioned_static('js/markdown.js') }}"></script>
 <script src="{{ versioned_static('js/smart-copy.js') }}"></script>
 <script src="{{ versioned_static('js/chat-component.js') }}"></script>

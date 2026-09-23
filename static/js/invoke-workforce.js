@@ -321,6 +321,97 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
     if (typeof showToast === 'function') showToast('Session model reset to system default');
   };
 
+  // ─────────────────────────────────────────────────────────────────────
+  // CLI-version-too-old recovery
+  // ─────────────────────────────────────────────────────────────────────
+  //
+  // When Anthropic ships a new model, the API rejects requests from a CLI
+  // that predates it with a 400 whose ``details.error_code`` is exactly
+  // ``claude_code_version_too_old``. That is a distinct failure from the
+  // "not supported" case handled by _sleepThenRetry above — no amount of
+  // restarting the *session* fixes it, because the *binary* on disk is
+  // stale. Match either the specific error code or the human-readable
+  // "version X.Y.Z or newer is required" line the API returns.
+  function _isClaudeVersionTooOldError(err) {
+    if (!err) return false;
+    const s = String(err);
+    return /claude_code_version_too_old/i.test(s)
+        || /or newer is required/i.test(s)
+        || /run\s+['"`]?claude update['"`]?/i.test(s);
+  }
+
+  // Show the one-click "Update Claude Code" modal, run the update, and
+  // resolve to true iff the caller should retry the model switch.
+  //
+  // Confirms with the user first — running `claude update` closes any
+  // live session's CLI on that binary. The backend refuses to update
+  // when the daemon reports live sessions unless force=true, and we
+  // pass force=true only after this explicit confirmation.
+  function _offerClaudeUpdate(errorText, pendingModel) {
+    if (typeof showConfirm !== 'function') {
+      // Bare-toast fallback: no modal system loaded (e.g. an early boot
+      // race). Surface the raw error so the user still sees the reason.
+      if (typeof showToast === 'function') {
+        showToast('Model switch FAILED: ' + errorText);
+      }
+      return Promise.resolve(false);
+    }
+    const modelLabel = _modelLabel(pendingModel);
+    const body =
+      '<p>The Claude Code CLI installed on this machine is too old to ' +
+      'run <strong>' + escHtml(modelLabel) + '</strong>. ' +
+      'Update it now to unlock the model.</p>' +
+      '<p style="opacity:.75;font-size:12px;margin-top:8px">' +
+      'Running <code>claude update</code> will interrupt any live ' +
+      'Claude sessions on this machine. They can be resumed afterward.' +
+      '</p>';
+    return showConfirm('Update Claude Code', body, {
+      confirmText: 'Update Now',
+      cancelText: 'Not Now',
+    }).then((ok) => {
+      if (!ok) return false;
+      if (typeof showToast === 'function') {
+        showToast('Updating Claude Code — this can take up to a minute…');
+      }
+      return fetch('/api/admin/claude-update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force: true }),
+      })
+        .then((r) => r.json().then((data) => ({ ok: r.ok, data: data || {} })))
+        .then(({ ok, data }) => {
+          if (!ok || !data.ok) {
+            const msg = data && data.error
+              ? ('Update failed: ' + data.error)
+              : 'Update failed — try running `claude update` from a terminal.';
+            if (typeof showToast === 'function') showToast(msg, true);
+            return false;
+          }
+          const before = data.before || '?';
+          const after = data.after || '?';
+          if (data.updated) {
+            if (typeof showToast === 'function') {
+              showToast('Claude CLI updated: ' + before + ' → ' + after);
+            }
+            return true;
+          }
+          // No version change — usually means the CLI was already current.
+          // Retry the switch anyway; if the API still refuses, the caller
+          // will surface the raw error normally.
+          if (typeof showToast === 'function') {
+            showToast('Claude CLI already at ' + after + ' — retrying switch…');
+          }
+          return true;
+        })
+        .catch((e) => {
+          if (typeof showToast === 'function') {
+            showToast('Update request failed: ' + (e && e.message || e), true);
+          }
+          return false;
+        });
+    });
+  }
+
   // Live mid-session switch.  HONESTY CONTRACT: nothing in the UI changes
   // until the daemon confirms the CLI accepted the set_model control
   // request.  On failure or timeout the badge keeps showing the real model
@@ -418,6 +509,14 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
         } else if (!resumeFallbackUsed && /not supported/i.test(String(data.error || ''))) {
           resumeFallbackUsed = true;
           _sleepThenRetry();
+        } else if (_isClaudeVersionTooOldError(data.error)) {
+          // CLI binary predates this model. The daemon-restart fallback
+          // above can't fix this — the CLI itself needs updating. Offer
+          // one-click `claude update`, then re-attempt the switch.
+          if (btn) { btn.disabled = false; btn.textContent = 'Switch Model'; }
+          _offerClaudeUpdate(String(data.error), pendingModel).then((didUpdate) => {
+            if (didUpdate) attempt();
+          });
         } else {
           if (btn) { btn.disabled = false; btn.textContent = 'Switch Model'; }
           if (typeof showToast === 'function') {
