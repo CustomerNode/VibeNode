@@ -95,6 +95,37 @@ class TestSingleOwnerWiring:
         assert "SessionModel.ingestConfirmed(" in src, \
             "socket.js must funnel confirmed models through the store"
 
+    def test_wake_paths_pin_daemon_truth_first(self):
+        """Hardening 2026-09-23 ("the model I picked doesn't stick").
+
+        Every path that WAKES a sleeping session must resolve the model to pin
+        via SessionModel.resumeModel — daemon-confirmed truth first, this
+        tab's local pending choice second.  Sending getDesired alone re-sent
+        a STALE local choice (picked here, then switched from the phone) and
+        silently undid the switch.  The store must expose the resolver, and
+        no wake path may bypass it for a bare getDesired.
+        """
+        assert "resumeModel:" in _read_js("session-model.js"), \
+            "SessionModel must expose resumeModel"
+        for name in ("live-panel.js", "sessions.js"):
+            src = _read_js(name)
+            assert "SessionModel.resumeModel(" in src, (
+                f"{name} wakes sessions without SessionModel.resumeModel — a "
+                "stale local desiredModel can undo a switch made elsewhere"
+            )
+
+    def test_switch_flows_accept_broadcast_as_confirmation(self):
+        """The socket reply is socket-scoped and can be lost across a mobile
+        reconnect; both switch flows must ALSO accept the daemon's
+        session_model_changed broadcast as confirmation, or a successful
+        switch surfaces as a bogus 'NOT changed' toast."""
+        for name in ("invoke-workforce.js", "live-panel.js"):
+            src = _read_js(name)
+            assert "socket.on('session_model_changed', onChanged)" in src, (
+                f"{name} no longer listens for session_model_changed as a "
+                "confirmation fallback"
+            )
+
     def test_index_loads_store_before_consumers(self):
         html = (TEMPLATES / "index.html").read_text(encoding="utf-8")
         pos_store = html.find("session-model.js")
@@ -193,6 +224,23 @@ class TestResolverLogic:
             SessionModel.setDesired('a', 'claude-haiku-4-5');
             assert.strictEqual(SessionModel.effectivePending('a'), 'claude-haiku-4-5');
             assert.strictEqual(SessionModel.getDesired('a'), 'claude-haiku-4-5');
+        """)
+
+    def test_resume_model_prefers_confirmed_and_strips_markers(self, tmp_path):
+        # The wake pin: daemon truth (any device) beats this tab's stale local
+        # choice; '' when neither is known so the daemon uses its registry;
+        # never a bracketed display id (that is an API 400 as --model).
+        self._run(tmp_path, """
+            allSessions.push({ id: 'a' }, { id: 'b' }, { id: 'c' });
+            assert.strictEqual(SessionModel.resumeModel('a'), '');           // nothing known
+            SessionModel.setDesired('a', 'claude-haiku-4-5');
+            assert.strictEqual(SessionModel.resumeModel('a'), 'claude-haiku-4-5'); // pending only
+            SessionModel.ingestConfirmed('a', 'claude-sonnet-4-6');          // phone switched it
+            assert.strictEqual(SessionModel.resumeModel('a'), 'claude-sonnet-4-6'); // truth wins
+            SessionModel.ingestConfirmed('b', 'claude-opus-5[1m]');
+            assert.strictEqual(SessionModel.resumeModel('b'), 'claude-opus-5'); // marker stripped
+            assert.strictEqual(SessionModel.getConfirmed('b'), 'claude-opus-5[1m]'); // badge keeps it
+            assert.strictEqual(SessionModel.resumeModel('ghost'), '');
         """)
 
     def test_desired_does_not_leak_across_sessions(self, tmp_path):

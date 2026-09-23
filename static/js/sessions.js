@@ -1118,11 +1118,14 @@ function _dblclickWakeSleeping(sessionId) {
   if (typeof clearUserStopped === 'function') clearUserStopped(sessionId);
 
   // Resolve model preference the same way _liveSubmitDirect does so a wake
-  // via double-click honors an explicit per-session model choice.
+  // via double-click honors the session's model: daemon-confirmed truth first
+  // (fresh from every device), else this tab's explicit pending choice.
   let _desiredModel = '';
   try {
-    if (typeof SessionModel !== 'undefined' && SessionModel.getDesired) {
-      _desiredModel = SessionModel.getDesired(sessionId) || '';
+    if (typeof SessionModel !== 'undefined') {
+      _desiredModel = (SessionModel.resumeModel
+        ? SessionModel.resumeModel(sessionId)
+        : (SessionModel.getDesired ? SessionModel.getDesired(sessionId) : '')) || '';
     }
   } catch (_) { /* SessionModel may not be defined in some views */ }
 

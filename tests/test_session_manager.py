@@ -497,6 +497,187 @@ class TestSetSessionModel:
         assert result["resumed"] is True
         assert mock_start.call_args.kwargs["model"] == "claude-sonnet-4-6"
 
+    def test_resume_switch_broadcasts_session_model_changed(
+            self, session_manager, sm_module):
+        """The NOT-LIVE resume path must broadcast ``session_model_changed``
+        just like the live path does.
+
+        This is the desktop→phone bug: a session started on the computer goes
+        idle/slept, then its model is switched from the phone through this
+        resume path.  The live-switch path broadcasts so other devices update
+        their badge; the resume path used to stay silent, leaving the desktop
+        (and the sidebar model column) showing the OLD model.  The broadcast
+        must carry the REQUESTED model — ``info.model`` still holds the old id
+        here until the CLI's init message reconciles it.
+        """
+        info = self._make_session(session_manager, sm_module, "sm-bcast",
+                                  state=sm_module.SessionState.STOPPED)
+        pushes = []
+        session_manager._push_callback = lambda name, data: pushes.append((name, data))
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}):
+            result = session_manager.set_session_model("sm-bcast",
+                                                       "claude-sonnet-4-6")
+        assert result["ok"] is True
+        model_events = [d for name, d in pushes if name == "session_model_changed"]
+        assert len(model_events) == 1
+        assert model_events[0]["session_id"] == "sm-bcast"
+        # The REQUESTED model, not the stale mirror (still "claude-fable-5").
+        assert model_events[0]["model"] == "claude-sonnet-4-6"
+
+    def test_failed_resume_does_not_broadcast_model_change(
+            self, session_manager, sm_module):
+        """If the resume itself fails, no ``session_model_changed`` may go out —
+        broadcasting a switch that never happened would make other devices lie
+        (the honesty contract that governs the whole feature)."""
+        self._make_session(session_manager, sm_module, "sm-bcast-fail",
+                           state=sm_module.SessionState.STOPPED)
+        pushes = []
+        session_manager._push_callback = lambda name, data: pushes.append((name, data))
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": False, "error": "boom"}):
+            result = session_manager.set_session_model("sm-bcast-fail",
+                                                       "claude-sonnet-4-6")
+        assert result["ok"] is False
+        assert not [d for name, d in pushes if name == "session_model_changed"]
+
+    # ── Hardening (2026-09-23): the model must STICK across devices/reloads ──
+
+    def test_broadcast_carries_resumed_hint(self, session_manager, sm_module):
+        """Both broadcast origins must say whether the switch RESUMED the
+        session, so a client forced to treat the broadcast as its confirmation
+        (lost socket reply on mobile) can act exactly as it would on the reply
+        — the usage-limit CTA must not nudge a session that is already coming
+        back up on its own."""
+        # Live path → resumed False
+        self._make_session(session_manager, sm_module, "sm-hint-live")
+        pushes = []
+        session_manager._push_callback = lambda n, d: pushes.append((n, d))
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(return_value=None)):
+            session_manager.set_session_model("sm-hint-live", "claude-sonnet-4-6")
+        ev = [d for n, d in pushes if n == "session_model_changed"]
+        assert len(ev) == 1 and ev[0]["resumed"] is False
+        # Resume path → resumed True
+        info = self._make_session(session_manager, sm_module, "sm-hint-resume",
+                                  state=sm_module.SessionState.STOPPED)
+        info.entries.append(sm_module.LogEntry(kind="user", text="go"))
+        pushes.clear()
+        with patch.object(session_manager, 'start_session',
+                          return_value={"ok": True}):
+            session_manager.set_session_model("sm-hint-resume",
+                                              "claude-sonnet-4-6",
+                                              resume_turn=True)
+        ev = [d for n, d in pushes if n == "session_model_changed"]
+        assert len(ev) == 1
+        assert ev[0]["resumed"] is True
+        assert ev[0]["turn_resumed"] is True
+
+    def test_bare_wake_pins_registry_model_on_cli(self, session_manager):
+        """A bare wake (resume, no explicit model) must launch the CLI on the
+        model the registry recorded — not just paint it on the badge.
+
+        ``claude --resume`` does not remember a session's model; without
+        ``--model`` it comes back on the CLI default.  Seeding only
+        ``info.model`` made the badge claim one model while the session ran on
+        another — the "my switch didn't stick" report, which only held when
+        the initiating tab still had the choice in memory and re-sent it.
+        The launch id must be marker-stripped (``[1m]`` is display-only); the
+        badge keeps the marker because it is honest about context length.
+        """
+        sid = "sm-wake-pin"
+        with patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": {sid: {
+                              "cwd": "/tmp", "name": "Pinned",
+                              "model": "claude-opus-5[1m]"}}}), \
+             patch.object(session_manager, '_drive_session',
+                          new=AsyncMock(return_value=None)) as mock_drive:
+            result = session_manager.start_session(sid, prompt="", cwd="/tmp",
+                                                   resume=True)
+            assert result["ok"] is True
+            wait_for(lambda: mock_drive.await_count == 1, timeout=5)
+        assert mock_drive.call_args.kwargs["model"] == "claude-opus-5"
+        assert session_manager._sessions[sid].model == "claude-opus-5[1m]"
+
+    def test_explicit_wake_model_beats_registry(self, session_manager):
+        """A caller-supplied model always wins over the registry seed."""
+        sid = "sm-wake-explicit"
+        with patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": {sid: {
+                              "cwd": "/tmp", "model": "claude-opus-5"}}}), \
+             patch.object(session_manager, '_drive_session',
+                          new=AsyncMock(return_value=None)) as mock_drive:
+            session_manager.start_session(sid, prompt="", cwd="/tmp",
+                                          resume=True, model="claude-sonnet-4-6")
+            wait_for(lambda: mock_drive.await_count == 1, timeout=5)
+        assert mock_drive.call_args.kwargs["model"] == "claude-sonnet-4-6"
+
+    def test_cli_model_id_strips_display_markers(self, session_manager):
+        f = session_manager._cli_model_id
+        assert f("claude-opus-5[1m]") == "claude-opus-5"
+        assert f("  claude-sonnet-4-6 ") == "claude-sonnet-4-6"
+        assert f("") == "" and f(None) == ""
+
+    def test_init_model_change_broadcasts_and_persists(self, session_manager,
+                                                        sm_module):
+        """When the CLI's init resolves a DIFFERENT model than the mirror,
+        every client must be told (otherwise other devices wait for the next
+        state transition) and the registry seed must be updated (otherwise the
+        next bare wake pins a stale model).  A steady-state init that reports
+        the same model must stay silent."""
+        from daemon.backends.messages import VibeNodeMessage, MessageKind
+        info = self._make_session(session_manager, sm_module, "sm-init-bcast",
+                                  model="claude-fable-5")
+        pushes = []
+        session_manager._push_callback = lambda n, d: pushes.append((n, d))
+
+        def _init(model):
+            msg = VibeNodeMessage(kind=MessageKind.SYSTEM, subtype="init",
+                                  data={"model": model})
+            asyncio.run_coroutine_threadsafe(
+                session_manager._process_message("sm-init-bcast", msg),
+                session_manager._loop,
+            ).result(timeout=5)
+
+        _init("claude-fable-5")            # unchanged → silent
+        assert not [d for n, d in pushes if n == "session_model_changed"]
+        # Persistence: the sink must be asked to save when the id changes.
+        # (The init branch schedules registry saves for other reasons too, so
+        # spy on the sink's kwargs rather than counting save calls.)
+        with patch.object(session_manager, '_set_confirmed_model',
+                          wraps=session_manager._set_confirmed_model) as spy:
+            _init("claude-sonnet-4-6")     # changed → broadcast + persist
+        assert spy.call_args.kwargs.get("save_registry") is True
+        ev = [d for n, d in pushes if n == "session_model_changed"]
+        assert len(ev) == 1
+        assert ev[0]["model"] == "claude-sonnet-4-6"
+        assert info.model == "claude-sonnet-4-6"
+
+    def test_model_switch_flag_self_expires(self, session_manager, sm_module):
+        """A live switch arms ``_model_switch_in_progress`` so the CLI's
+        side-effect init isn't mistaken for an auto-resume.  If that init never
+        comes, the flag must not linger and swallow the NEXT real auto-resume
+        signal (session shown IDLE while working)."""
+        info = self._make_session(session_manager, sm_module, "sm-flag")
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(return_value=None)):
+            session_manager.set_session_model("sm-flag", "claude-sonnet-4-6")
+        assert info._model_switch_in_progress is True
+        assert session_manager._model_switch_pending(info) is True   # fresh
+        info._model_switch_at = time.time() - (
+            session_manager._MODEL_SWITCH_INIT_WINDOW_S + 1)
+        assert session_manager._model_switch_pending(info) is False  # stale
+        assert info._model_switch_in_progress is False               # cleared
+
+    def test_failed_live_switch_clears_flag(self, session_manager, sm_module):
+        """No switch → no side-effect init is coming → the flag must not stay
+        armed, or the next genuine auto-resume gets misfiled."""
+        info = self._make_session(session_manager, sm_module, "sm-flag-fail")
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(side_effect=Exception("nope"))):
+            session_manager.set_session_model("sm-flag-fail", "claude-sonnet-4-6")
+        assert getattr(info, '_model_switch_in_progress', False) is False
+
     def test_success_updates_model_and_logs(self, session_manager, sm_module):
         info = self._make_session(session_manager, sm_module, "sm-ok")
         pushes = []

@@ -185,7 +185,7 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
   overlay.innerHTML = '<div class="pm-card pm-enter" style="width:400px;">' +
     '<h2 class="pm-title">' + (liveMode ? 'Switch Session Model' : 'Session Model') + '</h2>' +
     '<div class="pm-body"><p>' + (liveMode
-      ? 'Switch the model of <strong>this running session</strong>. Applies from the next message. Currently running on <strong>' + (currentLiveModel ? _modelLabel(currentLiveModel) : 'unknown') + '</strong>.'
+      ? 'Switch the model of <strong>this running session</strong>. Applies from the next message. Currently running on <strong>' + (currentLiveModel ? _modelLabel(currentLiveModel) : 'a model not yet confirmed by the daemon') + '</strong>.'
       : 'Choose model and thinking level for <strong>this session</strong>. System default is unchanged.') + '</p></div>' +
     '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;max-height:35vh;overflow-y:auto;" id="sm-model-list">' +
     '<span class="spinner"></span></div>' +
@@ -353,16 +353,40 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
       const finish = () => {
         settled = true;
         clearTimeout(timer);
-        if (typeof socket !== 'undefined') socket.off('session_model_result', onResult);
+        if (typeof socket !== 'undefined') {
+          socket.off('session_model_result', onResult);
+          socket.off('session_model_changed', onChanged);
+        }
       };
+      // 30s covers the daemon's own 15s CLI control-request timeout plus IPC
+      // and a slow mobile link.  The old 20s could fire while the daemon was
+      // still legitimately working, reporting "NOT changed" for a switch
+      // that then went through.
       const timer = setTimeout(() => {
         if (settled) return;
         finish();
         if (btn) { btn.disabled = false; btn.textContent = 'Switch Model'; }
         if (typeof showToast === 'function') {
-          showToast('Model switch timed out — model NOT changed');
+          showToast('No confirmation from the server — if the model badge updates, the switch went through; otherwise try again');
         }
-      }, 20000);
+      }, 30000);
+
+      // CONFIRMATION FALLBACK.  `session_model_result` is a reply-only emit
+      // — it goes to the exact socket that asked.  On a phone the transport
+      // can silently reconnect between the request and the reply (tab
+      // backgrounded, wifi↔cellular handoff), and the reply is lost.  The
+      // daemon ALSO broadcasts `session_model_changed` to every client, this
+      // one included, and that broadcast survives a reconnect.  Accept it as
+      // confirmation when it names this session and the model we asked for,
+      // so a lost reply can never turn a successful switch into a bogus
+      // "NOT changed" toast while the badge quietly updates behind it.
+      const _base = m => String(m || '').replace(/\[[^\]]*\]/g, '').replace(/-\d{8}$/, '');
+      function onChanged(data) {
+        if (settled || !data || data.session_id !== liveSid || !data.model) return;
+        if (_base(data.model) !== _base(pendingModel)) return;
+        onResult({ ok: true, session_id: liveSid, model: data.model,
+                   resumed: !!data.resumed, turn_resumed: !!data.turn_resumed });
+      }
 
       function onResult(data) {
         if (settled || !data || data.session_id !== liveSid) return;
@@ -408,6 +432,7 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
         return;
       }
       socket.on('session_model_result', onResult);
+      socket.on('session_model_changed', onChanged);
       socket.emit('set_session_model', { session_id: liveSid, model: pendingModel });
     }
 

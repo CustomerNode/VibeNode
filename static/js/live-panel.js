@@ -989,14 +989,33 @@ function liveSwitchModelAndResume(model) {
     .forEach(b => { b.disabled = true; b.style.opacity = '0.5'; });
 
   let settled = false;
-  const finish = () => { settled = true; clearTimeout(timer); socket.off('session_model_result', onResult); };
+  const finish = () => {
+    settled = true;
+    clearTimeout(timer);
+    socket.off('session_model_result', onResult);
+    socket.off('session_model_changed', onChanged);
+  };
+  // 30s: covers the daemon's 15s CLI control-request timeout plus IPC and a
+  // slow mobile link (see the same constant in _applyLiveSessionModel).
   const timer = setTimeout(() => {
     if (settled) return;
     finish();
     document.querySelectorAll('.live-retry-banner.limit .live-mini-btn')
       .forEach(b => { b.disabled = false; b.style.opacity = ''; });
-    if (typeof showToast === 'function') showToast('Model switch timed out — model NOT changed', true);
-  }, 20000);
+    if (typeof showToast === 'function') showToast('No confirmation from the server — if the model badge updates, the switch went through; otherwise try again', true);
+  }, 30000);
+
+  // CONFIRMATION FALLBACK — same rationale as _applyLiveSessionModel: the
+  // reply is socket-scoped and can be lost across a mobile reconnect, while
+  // the daemon's `session_model_changed` broadcast (which carries the same
+  // `resumed` / `turn_resumed` hints) reaches this client regardless.
+  const _base = m => String(m || '').replace(/\[[^\]]*\]/g, '').replace(/-\d{8}$/, '');
+  function onChanged(data) {
+    if (settled || !data || data.session_id !== sid || !data.model) return;
+    if (_base(data.model) !== _base(model)) return;
+    onResult({ ok: true, session_id: sid, model: data.model,
+               resumed: !!data.resumed, turn_resumed: !!data.turn_resumed });
+  }
 
   function onResult(data) {
     if (settled || !data || data.session_id !== sid) return;
@@ -1050,6 +1069,7 @@ function liveSwitchModelAndResume(model) {
   }
 
   socket.on('session_model_result', onResult);
+  socket.on('session_model_changed', onChanged);
   // resume_turn: this CTA's whole promise is "switch AND carry on", so the
   // daemon re-runs the interrupted turn as part of the same operation.
   socket.emit('set_session_model', {
@@ -3497,16 +3517,19 @@ function liveSubmitContinue(fromId) {
 
   // If session is not running, resume it via WebSocket.
   //
-  // Carry the model the user explicitly chose for this session. Without this,
-  // waking a session always used the daemon's previously-recorded model — so
-  // picking a new model on a stopped session (the exact thing you do after
-  // hitting a usage limit) was silently discarded the moment you typed, and
-  // the session came back on the model that had just run out. `undefined` is
-  // omitted from the payload, so a session with no explicit choice keeps the
-  // existing "resume on whatever it was" behaviour.
+  // Carry the model this session should wake on. `SessionModel.resumeModel`
+  // prefers the DAEMON-CONFIRMED model (kept fresh from every device) over
+  // this tab's local pending choice, which can be stale — picked here, then
+  // switched from the phone. Sending the stale local choice woke the session
+  // on the old model and silently undid the switch. `undefined` is omitted
+  // from the payload; the daemon then pins the model it has recorded for the
+  // session, so an unknown-here model is never replaced by the CLI default.
   if (!runningIds.has(sid)) {
     const _desiredModel = (typeof SessionModel !== 'undefined')
-      ? (SessionModel.getDesired(sid) || '') : '';
+      ? ((SessionModel.resumeModel
+          ? SessionModel.resumeModel(sid)
+          : SessionModel.getDesired(sid)) || '')
+      : '';
     socket.emit('start_session', {
       session_id: sid,
       prompt: text,

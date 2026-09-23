@@ -1123,6 +1123,22 @@ class SessionManager:
                 _reg_model = (_reg_meta.get("model") or "").strip()
                 if _reg_model:
                     _seeded_model = _reg_model
+                    # PIN the recorded model on the CLI too, not just the
+                    # badge.  ``claude --resume`` does NOT remember a
+                    # session's model — without ``--model`` it comes back on
+                    # the CLI's configured default.  Seeding only
+                    # ``info.model`` meant the badge claimed the recorded
+                    # model while the session actually ran on the default
+                    # until the init message "corrected" the badge — the
+                    # "my model switch didn't stick" report.  It only ever
+                    # stuck when the initiating browser tab still held the
+                    # choice in memory and re-sent it; any other device, or
+                    # a reload, woke the session on the wrong model.  The
+                    # send_message auto-resume path already pins the
+                    # registry model (see below); this makes the wake path
+                    # match.  Marker-stripped: ``[1m]`` is a display suffix,
+                    # not a valid --model id.
+                    model = self._cli_model_id(_reg_model) or None
             except Exception:
                 pass
         info = SessionInfo(
@@ -1232,7 +1248,10 @@ class SessionManager:
                     cwd=cwd,
                     name=reg.get("name", ""),
                     resume=True,
-                    model=reg.get("model") or None,
+                    # Marker-stripped: the registry mirrors ``info.model``
+                    # verbatim, which can carry the CLI's ``[1m]`` display
+                    # suffix — not a valid --model id (API 400).
+                    model=self._cli_model_id(reg.get("model")) or None,
                 )
                 if not start_result.get("ok"):
                     # start_session can return ok=False if e.g. another race
@@ -1645,6 +1664,78 @@ class SessionManager:
         )
         return {"ok": True}
 
+    @staticmethod
+    def _cli_model_id(model: Optional[str]) -> str:
+        """Turn a recorded/confirmed model id into one safe to hand the CLI.
+
+        The CLI reports display markers on resolved ids — ``claude-opus-5[1m]``
+        when 1M context is active — and those flow verbatim into ``info.model``
+        and the registry.  A bracketed id is NOT a valid ``--model`` value (the
+        API rejects it with a 400), so every path that turns a recorded model
+        back into a launch argument must strip markers first.  Mirrors
+        ``SessionModel._cleanId`` on the client.
+        """
+        import re as _re
+        return _re.sub(r"\[[^\]]*\]", "", (model or "").strip())
+
+    # How long after a live ``set_model`` the CLI's side-effect ``init`` is
+    # still expected.  Past this, ``_model_switch_in_progress`` is stale: the
+    # CLI either never emitted the init (version-dependent) or it was consumed
+    # elsewhere, and honoring the flag would swallow the NEXT real auto-resume
+    # signal — leaving the session shown IDLE while it is actually working.
+    _MODEL_SWITCH_INIT_WINDOW_S = 20.0
+
+    def _model_switch_pending(self, info) -> bool:
+        """True while a live model switch's side-effect init is still expected.
+
+        Self-expiring: the flag is only honored within
+        ``_MODEL_SWITCH_INIT_WINDOW_S`` of the switch, and is cleared here the
+        first time it is found stale so later checks are cheap.
+        """
+        if not getattr(info, '_model_switch_in_progress', False):
+            return False
+        _at = getattr(info, '_model_switch_at', 0.0) or 0.0
+        if _at and (time.time() - _at) > self._MODEL_SWITCH_INIT_WINDOW_S:
+            info._model_switch_in_progress = False
+            return False
+        return True
+
+    def _broadcast_model_changed(self, session_id: str, info, model: str, *,
+                                 resumed: bool = False,
+                                 turn_resumed: bool = False) -> None:
+        """Push ``session_model_changed`` to EVERY connected client.
+
+        The socket reply (``session_model_result``) goes only to the tab that
+        asked.  Every other tab/device — and the asking tab itself, when its
+        mobile transport silently reconnected and lost the reply — learns of
+        a switch ONLY through this broadcast.  It is queue-neutral (no state
+        or dispatch machinery), so it is safe to fire from any path: a live
+        switch, a resume-with-``--model``, or the CLI's own init reconciling
+        the resolved id.  Never raises; a failed push is logged.
+
+        ``resumed``/``turn_resumed`` mirror the reply's fields so a client
+        that has to treat this broadcast AS its confirmation can act exactly
+        as it would have on the reply (the usage-limit CTA needs ``resumed``
+        to decide whether to nudge the interrupted turn).
+        """
+        if not self._push_callback:
+            return
+        try:
+            self._push_callback('session_model_changed', {
+                'session_id': session_id,
+                'model': model,
+                'limit_reset_at': info.limit_reset_at if info else None,
+                'limited_model': info.limited_model if info else None,
+                'error': info.error if info else "",
+                'resumed': bool(resumed),
+                'turn_resumed': bool(turn_resumed),
+            })
+        except Exception as _cb_err:
+            logger.warning(
+                "session_model_changed broadcast failed for %s: %s",
+                session_id, _cb_err,
+            )
+
     def _set_confirmed_model(self, info, model: str, *,
                              save_registry: bool = False) -> bool:
         """Single sink for a CLI/daemon-confirmed session model.
@@ -1788,6 +1879,30 @@ class SessionManager:
             record_confirmed_model(model)
         except Exception:
             pass
+        # ─── Broadcast the switch to all clients ───────────────────────────
+        # Symmetry with the live-switch path (set_session_model): the tab that
+        # initiated the switch already learns the outcome via the reply-only
+        # ``session_model_result`` emit, but EVERY OTHER client/device needs a
+        # dedicated push or it keeps showing the OLD model.  This is exactly the
+        # desktop→phone case: a session started on the computer goes idle/slept,
+        # then its model is switched from the phone through THIS resume path.
+        # Without this broadcast the desktop's badge and the sidebar model
+        # column stay stale (the restart's own state events can lag or, for a
+        # client not currently viewing the session, never repaint the badge).
+        # ``session_model_changed`` is queue-neutral — no state/dispatch
+        # machinery attached — and ``ingestConfirmed`` on the client is
+        # idempotent, so this can never conflict with the restart's own events.
+        #
+        # Broadcast the REQUESTED model, not the mirror: on the resume path
+        # ``info.model`` still holds the OLD id until the CLI's init message
+        # reconciles it through ``_set_confirmed_model``.  ``model`` is what
+        # the session is resuming ON (it was passed as ``--model``), so it is
+        # the honest value to show now; a later init that resolves to a
+        # dated/[1m] id broadcasts its own correction.
+        self._broadcast_model_changed(
+            session_id, self._sessions.get(session_id), model,
+            resumed=True, turn_resumed=bool(prompt),
+        )
         return {"ok": True, "model": model, "resumed": True,
                 "turn_resumed": bool(prompt)}
 
@@ -1835,14 +1950,24 @@ class SessionManager:
         # message (emitted after set_model) as an auto-resume signal.
         # See _extended_post_turn_listener / _post_turn_compact_drain pre-detect.
         info._model_switch_in_progress = True
+        # Timestamp so the flag self-expires (see _model_switch_pending): if
+        # the CLI never emits the side-effect init, a stale flag would swallow
+        # the next REAL auto-resume signal and leave the session shown IDLE
+        # while it is working.
+        info._model_switch_at = time.time()
         try:
             fut = asyncio.run_coroutine_threadsafe(
                 self._sdk.set_model(info.client, model), self._loop
             )
             fut.result(timeout=15)
         except NotImplementedError as e:
+            info._model_switch_in_progress = False
             return {"ok": False, "error": str(e)}
         except Exception as e:
+            # The switch did not happen, so no side-effect init is coming —
+            # clear the flag now rather than letting it linger and misfile
+            # the next genuine auto-resume signal.
+            info._model_switch_in_progress = False
             logger.warning("set_session_model failed for %s -> %s: %s",
                            session_id, model, e)
             return {"ok": False, "error": f"Model switch rejected: {e}"}
@@ -1870,20 +1995,7 @@ class SessionManager:
         # ``session_model_changed`` is a queue-neutral push — no state or
         # queue-dispatch machinery attached — so every client can update
         # its badge without any risk of tripping ``_try_dispatch_queue``.
-        if self._push_callback:
-            try:
-                self._push_callback('session_model_changed', {
-                    'session_id': session_id,
-                    'model': info.model,
-                    'limit_reset_at': info.limit_reset_at,
-                    'limited_model': info.limited_model,
-                    'error': info.error,
-                })
-            except Exception as _cb_err:
-                logger.warning(
-                    "session_model_changed broadcast failed for %s: %s",
-                    session_id, _cb_err,
-                )
+        self._broadcast_model_changed(session_id, info, info.model)
         # Human-readable log entry so the transcript records the switch.
         entry = LogEntry(kind="system", text=f"Model switched to {model}")
         with info._lock:
@@ -5406,8 +5518,19 @@ class SessionManager:
                 resolved_model = data.get("model", "")
                 if resolved_model and resolved_model.startswith("claude-"):
                     # Init message is the CLI's ground truth for the resolved
-                    # model id — funnel it through the single sink.
-                    self._set_confirmed_model(info, resolved_model)
+                    # model id — funnel it through the single sink.  When it
+                    # actually CHANGES the mirror (a resume that pinned a new
+                    # model, a live switch resolving to a dated/[1m] id, or a
+                    # CLI default that differs from what we recorded), tell
+                    # every client and persist it: the badge on other devices
+                    # otherwise waits for the next state transition, and the
+                    # registry seed for the next bare wake would be stale.
+                    # ``changed`` is False on a steady-state turn, so this
+                    # costs nothing on the hot path.
+                    if self._set_confirmed_model(info, resolved_model,
+                                                 save_registry=True):
+                        self._broadcast_model_changed(
+                            session_id, info, info.model)
 
                 # End of the SDK's compaction phase (or session re-init).
                 # Substatus handling is subtle — the UI's "Compacting…" label
@@ -7638,7 +7761,7 @@ class SessionManager:
                         elif msg.kind != MessageKind.RESULT:
                             is_resume = True
                         if is_resume:
-                            if not getattr(info, '_model_switch_in_progress', False):
+                            if not self._model_switch_pending(info):
                                 auto_resume_seen = True
                                 self._enter_auto_resume(info)
                             else:
@@ -7866,7 +7989,7 @@ class SessionManager:
                                 # turn content is already flowing in.
                                 is_resume_signal = True
                             if is_resume_signal:
-                                if not getattr(info, '_model_switch_in_progress', False):
+                                if not self._model_switch_pending(info):
                                     self._enter_auto_resume(info)
                                 else:
                                     # CLI emitted init as a side-effect of set_model —

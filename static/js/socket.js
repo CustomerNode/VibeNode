@@ -1124,16 +1124,26 @@ socket.on('session_state', (data) => {
 socket.on('session_model_changed', (data) => {
     if (!data || !data.session_id || !data.model) return;
     if (_isHiddenSession(data.session_id, data)) return;
-    // Mirror the same limit-CTA cleanup set_session_model does server-side,
-    // so a switch from the usage-limit banner clears the CTA on every tab.
-    if (window._sessionLimitState) delete window._sessionLimitState[data.session_id];
-    if (window._sessionError) delete window._sessionError[data.session_id];
+    // Mirror the limit-CTA cleanup set_session_model does server-side, so a
+    // switch from the usage-limit banner clears the CTA on every tab.  Honor
+    // the payload rather than clearing unconditionally: this event is also
+    // sent when the CLI's init merely refines the resolved id (e.g. adds the
+    // [1m] marker), and a still-limited session must keep its CTA then.
+    if (!data.limited_model && !data.limit_reset_at) {
+        if (window._sessionLimitState) delete window._sessionLimitState[data.session_id];
+        if (window._sessionError) delete window._sessionError[data.session_id];
+    }
     if (typeof SessionModel !== 'undefined') {
         const _changed = SessionModel.ingestConfirmed(data.session_id, data.model);
         if (_changed && data.session_id === liveSessionId &&
                 typeof _renderSessionModelBadge === 'function') {
             _renderSessionModelBadge(data.session_id);
         }
+    }
+    // Keep the status-bar model label honest too (session_state does this).
+    if (typeof activeId !== 'undefined' && data.session_id === activeId) {
+        const _sbModel = document.getElementById('sb-model');
+        if (_sbModel) _sbModel.textContent = data.model;
     }
     // Refresh any visible session row so the sidebar model column stays honest.
     if (typeof filterSessions === 'function') filterSessions();

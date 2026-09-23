@@ -180,6 +180,24 @@ window.SessionModel = (function () {
     return getDesired(id) || getDefault();
   }
 
+  /**
+   * The model id to PIN when waking a sleeping session ('' = send nothing and
+   * let the daemon resume on the model it has recorded).
+   *
+   * Daemon-confirmed truth wins over this client's local pending choice. The
+   * confirmed mirror is kept fresh from EVERY device (session_model_changed
+   * broadcasts, reconnect snapshots, state events); `desiredModel` is only
+   * ever written on the tab that made a choice and never persists. So when
+   * the two disagree — picked A here, then switched to B from the phone —
+   * `desiredModel` is the stale one, and sending it would wake the session on
+   * A and silently undo the switch. That was the "doesn't stick" bug.
+   *
+   * Marker-stripped so it is always a valid --model id.
+   */
+  function resumeModel(id) {
+    return _cleanId(getConfirmed(id)) || getDesired(id);
+  }
+
   return {
     getDefault: getDefault,
     getDefaultThinking: getDefaultThinking,
@@ -191,5 +209,6 @@ window.SessionModel = (function () {
     ingestConfirmed: ingestConfirmed,
     effective: effective,
     effectivePending: effectivePending,
+    resumeModel: resumeModel,
   };
 })();
