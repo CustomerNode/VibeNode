@@ -27,6 +27,16 @@ def mc(tmp_path, monkeypatch):
     import app.mobile_command as m
     importlib.reload(m)
     m._WARM_CERT_ENABLED = False   # keep unit runs network-free (no cert warm-up thread)
+    # SAFETY (Step 1, 2026-09-26): mobile_command.enable()/disable() spawn the real
+    # reviver.py (and reviver.py --unregister), which registers or DELETES the real
+    # \VibeNodeReviver_0d5a41d4 scheduled task and Startup VBS on this machine. That is
+    # not what these tests want to exercise — they cover the Tailscale-facing logic. The
+    # tests were previously monkeypatching only _run_ts and tailscale_bin, leaving the
+    # reviver spawn as a real subprocess. Neutralize both spawn helpers here. The
+    # conftest.py `_forbid_reviver_and_autostart_spawn` autouse guard is the second
+    # layer and fires with a loud AssertionError if this mock is ever forgotten.
+    monkeypatch.setattr(m, "_spawn_reviver", lambda: None)
+    monkeypatch.setattr(m, "_retire_reviver", lambda: None)
     return m
 
 

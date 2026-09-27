@@ -193,9 +193,58 @@ def _something_listening(port: int) -> bool:
 # Launching the real VibeNode (same entry point the desktop shortcut uses)
 # ---------------------------------------------------------------------------
 
+def _local_python_override() -> str | None:
+    """Return the interpreter path from ``.local/python.txt`` if the file
+    exists and names an existing file; otherwise None.
+
+    Step 6 ARM64 stabilization (2026-09-26). Purpose:
+
+    * Every process the reviver spawns (session_manager, and any respawn of
+      itself) inherits this interpreter, so a machine-specific runtime pin
+      (e.g. an ARM64 venv) survives even when the reviver got started under
+      the wrong interpreter after a git update or PATH reshuffle.
+    * ``register_supervisor`` writes the OS supervisor (Windows task +
+      Startup VBS on this platform) using this same value, so the pin also
+      survives reboot/logon paths that bypass launch.bat entirely.
+
+    The file is gitignored (see ``.gitignore``) so a machine's private
+    choice never travels through the public repo.
+    """
+    try:
+        p = _HERE / ".local" / "python.txt"
+        if not p.is_file():
+            return None
+        for raw in p.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if Path(line).is_file():
+                return line
+            # Named a path that doesn't exist -- fall through to the default
+            # rather than leave the reviver with a dead interpreter.
+            return None
+    except Exception:
+        return None
+    return None
+
+
 def _python_for_spawn() -> str:
-    """Prefer a windowless interpreter on Windows (pythonw) so the spawned
-    server has no stray console; otherwise the current interpreter."""
+    """Interpreter used to spawn session_manager and to register the OS
+    supervisor. Selection order:
+
+      1. ``.local/python.txt`` (Step 6 local runtime pin, see
+         :func:`_local_python_override`). Gitignored; machine-specific.
+      2. ``pythonw.exe`` next to :data:`sys.executable` on Windows
+         (windowless spawn — no stray console).
+      3. :data:`sys.executable`.
+
+    Any downstream artifact ``register_supervisor`` writes uses the same
+    return value, so an ARM64 (or any other) pin cascades through the
+    entire startup chain without a tracked file needing to know about it.
+    """
+    override = _local_python_override()
+    if override:
+        return override
     exe = sys.executable or "python"
     if sys.platform == "win32":
         pythonw = Path(exe).parent / "pythonw.exe"

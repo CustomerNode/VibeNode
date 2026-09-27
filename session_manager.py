@@ -4,25 +4,59 @@
 On Windows, when launched via pythonw.exe (no console), stdout/stderr are None.
 We redirect them to a log file so nothing crashes on print().
 Shows a boot splash so the user sees startup progress.
+
+IMPORT SAFETY (added 2026-09-26, Step 4 Gate 4B):
+    Importing this module is a NO-OP. The entire startup sequence
+    (working-directory pinning, PATH augmentation, stdio redirection under
+    pythonw.exe, spawn-mode probe log line, boot splash, reviver hook,
+    handoff to run.py) fires ONLY when this file is executed as a script,
+    which is how every real launch path invokes it:
+
+        - launch.bat:            pythonw session_manager.py
+        - launch.bat (fallback): python  session_manager.py
+        - launch.sh / .command:  nohup $PY session_manager.py
+        - Scheduled task:        (via reviver.py, which respawns launch.bat)
+        - Desktop shortcut:      launch.bat
+        - /api/restart web:      launch.bat
+
+    Before this guard, `import session_manager` at inspection time would
+    execute the top-level runpy call and launch the full web server (see
+    Step 3 report §13 item 5). The `if __name__ == "__main__":` guard at
+    the bottom keeps ALL side effects behind the script-execution
+    contract, so tooling can safely inspect the module.
+
+CLAUDE.md invariants preserved (see "Detached web-server launch"):
+    1. launch.bat's `start "" pythonw` -> `_startup()` -> `_launch_splash()`
+       -> `_reviver_hook()` -> `runpy.run_path("run.py")` still fires in
+       the same order and with the same behavior when invoked as a script.
+    2. The `spawn` line written to logs/_server.log (item 3 of that
+       CLAUDE.md section) is still emitted at the same point in startup.
+    3. Nothing about the "pythonw is detached" behavior changes.
 """
 import os
 import sys
 import tempfile
 from pathlib import Path
 
-# Lock down the working directory to this script's folder regardless
-# of how/where the shortcut launches us.
+# Module-level constant — safe under import. Every helper below reads it.
 _HERE = Path(__file__).resolve().parent
-os.chdir(_HERE)
+
 
 # ---------------------------------------------------------------------------
-# Augment PATH so claude CLI is findable regardless of launch method.
-# When launched via a .desktop file or pythonw.exe the login shell is not
-# sourced, so nvm shims, npm-global bins, and Volta are absent from PATH.
-# This runs once before any imports so auth_api.py's shutil.which("claude")
-# resolves correctly and the daemon subprocess inherits the corrected PATH.
+# Helper functions. Definitions are pure (no side effects at module load);
+# they only *do* something when _startup() invokes them from the __main__
+# guard at the bottom of the file.
 # ---------------------------------------------------------------------------
-if sys.platform != "win32":
+
+def _augment_path_posix() -> None:
+    """POSIX-only PATH fix so the `claude` CLI is findable regardless of launch method.
+
+    When launched via a .desktop file or headless spawn, the login shell is
+    not sourced, so nvm shims, npm-global bins, Volta, and homebrew are
+    absent from PATH. Run once before any imports so auth_api.py's
+    ``shutil.which("claude")`` resolves correctly and the daemon subprocess
+    inherits the corrected PATH.
+    """
     _extra = [
         str(Path.home() / ".local" / "bin"),
         str(Path.home() / ".npm-global" / "bin"),
@@ -54,45 +88,59 @@ if sys.platform != "win32":
     if _add:
         os.environ["PATH"] = os.pathsep.join(_add) + os.pathsep + _cur
 
-# pythonw.exe sets stdout and stderr to None — any print() would crash.
-# Detect this and redirect to a log file.
-if sys.stdout is None or sys.stderr is None:
-    (_HERE / "logs").mkdir(exist_ok=True)
-    _log = open(_HERE / "logs" / "_server.log", "a", encoding="utf-8")
-    if sys.stdout is None:
-        sys.stdout = _log
-    if sys.stderr is None:
-        sys.stderr = _log
 
-# Spawn-mode probe — surfaces in logs/_server.log whether this process is
-# running detached (pythonw on Windows, nohup/setsid on POSIX) or attached
-# to a controlling terminal. The dead-window failure mode we fixed in
-# launch.bat / launch.sh stops being silent here: if a future change ever
-# regresses the launcher and the server ends up foregrounded again, this
-# line tells anyone reading the log immediately.
-try:
-    import time as _time
-    _spawn_facts = []
-    _exe = (sys.executable or "").lower()
-    _spawn_facts.append("exe=" + (Path(_exe).name if _exe else "?"))
-    if sys.platform == "win32":
-        # pythonw has no console; python.exe attaches one.
-        _spawn_facts.append("mode=" + ("detached(pythonw)" if "pythonw" in _exe else "attached(python)"))
-    else:
-        try:
-            _sid = os.getsid(0)
-            _pgid = os.getpgrp()
-            _detached = (_sid == os.getpid())
-            _spawn_facts.append("mode=" + ("detached(setsid)" if _detached else "attached(tty)"))
-            _spawn_facts.append("sid=%d pgid=%d pid=%d" % (_sid, _pgid, os.getpid()))
-        except Exception:
-            pass
-    (_HERE / "logs").mkdir(exist_ok=True)
-    with open(_HERE / "logs" / "_server.log", "a", encoding="utf-8") as _slog:
-        _slog.write("[%s] session_manager spawn %s\n" % (
-            _time.strftime("%Y-%m-%d %H:%M:%S"), " ".join(_spawn_facts)))
-except Exception:
-    pass
+def _redirect_stdio_for_pythonw() -> None:
+    """Under pythonw.exe (no console) stdout/stderr are None — redirect to log file.
+
+    Any bare print() would raise AttributeError otherwise. The log file is
+    the same one launch.bat / launch.sh append to, so a single tail gives
+    the full picture.
+    """
+    if sys.stdout is None or sys.stderr is None:
+        (_HERE / "logs").mkdir(exist_ok=True)
+        _log = open(_HERE / "logs" / "_server.log", "a", encoding="utf-8")
+        if sys.stdout is None:
+            sys.stdout = _log
+        if sys.stderr is None:
+            sys.stderr = _log
+
+
+def _log_spawn_probe() -> None:
+    """Write the spawn-mode probe line to logs/_server.log.
+
+    Surfaces in logs/_server.log whether this process is running detached
+    (pythonw on Windows, nohup/setsid on POSIX) or attached to a
+    controlling terminal. The dead-window failure mode we fixed in
+    launch.bat / launch.sh stops being silent here: if a future change
+    ever regresses the launcher and the server ends up foregrounded
+    again, this line tells anyone reading the log immediately.
+
+    CLAUDE.md ("Detached web-server launch") item 3 explicitly requires
+    this log line — DO NOT REMOVE.
+    """
+    try:
+        import time as _time
+        _spawn_facts = []
+        _exe = (sys.executable or "").lower()
+        _spawn_facts.append("exe=" + (Path(_exe).name if _exe else "?"))
+        if sys.platform == "win32":
+            # pythonw has no console; python.exe attaches one.
+            _spawn_facts.append("mode=" + ("detached(pythonw)" if "pythonw" in _exe else "attached(python)"))
+        else:
+            try:
+                _sid = os.getsid(0)
+                _pgid = os.getpgrp()
+                _detached = (_sid == os.getpid())
+                _spawn_facts.append("mode=" + ("detached(setsid)" if _detached else "attached(tty)"))
+                _spawn_facts.append("sid=%d pgid=%d pid=%d" % (_sid, _pgid, os.getpid()))
+            except Exception:
+                pass
+        (_HERE / "logs").mkdir(exist_ok=True)
+        with open(_HERE / "logs" / "_server.log", "a", encoding="utf-8") as _slog:
+            _slog.write("[%s] session_manager spawn %s\n" % (
+                _time.strftime("%Y-%m-%d %H:%M:%S"), " ".join(_spawn_facts)))
+    except Exception:
+        pass
 
 
 def _show_notification(title, message, icon_path=None):
@@ -185,19 +233,6 @@ def _launch_splash():
         return False
 
 
-# Try the splash first; fall back to a simple OS notification.
-# On Linux, if tkinter is the missing piece, surface the apt hint in the
-# toast itself \u2014 otherwise the user just sees a generic "starting up" with
-# no indication that the splash *would* work after one apt-get away.
-if not _launch_splash():
-    _msg = "Starting up\u2026"
-    if sys.platform == "linux":
-        try:
-            import tkinter  # noqa: F401
-        except ImportError:
-            _msg = "Starting up\u2026 (install python3-tk for the boot splash)"
-    _show_notification("VibeNode", _msg)
-
 # ---------------------------------------------------------------------------
 # Mobile Command reviver hook.
 # The reviver (reviver.py) keeps a "Start VibeNode" page reachable from the
@@ -263,8 +298,144 @@ def _reviver_hook():
         pass  # best effort — never block startup
 
 
-_reviver_hook()
+def _load_local_env() -> None:
+    """Load machine-specific env vars from ``.local/env.txt`` (Step 6
+    ARM64 stabilization, 2026-09-26).
 
-# Now import and run the real app.
-import runpy
-runpy.run_path(str(_HERE / "run.py"), run_name='__main__')
+    Format is one ``KEY=VALUE`` per line. Blank lines and lines that
+    start with ``#`` are ignored. Values are treated as literal strings
+    (no shell expansion, no quote stripping). Whitespace around ``=``
+    is tolerated; leading/trailing whitespace on the value is stripped.
+
+    A key already present in ``os.environ`` takes precedence -- the
+    file NEVER overrides an explicitly-set environment variable. This
+    lets an operator temporarily override a pinned setting for one
+    launch (``$env:VIBENODE_NO_AUTO_UPDATE=0; launch.bat``) without
+    editing the file.
+
+    Purpose:
+
+    * Persist auto-update policy (``VIBENODE_NO_AUTO_UPDATE=1``) across
+      every startup path -- desktop launcher, phone Start button,
+      Startup VBS, and scheduled task -- because they all funnel through
+      session_manager._startup(). No SETX, no per-shell profile changes.
+    * Machine-specific and gitignored (see ``.gitignore``): a public
+      commit can never carry a locally-pinned env var to other users.
+
+    Best-effort: never raises. A malformed file line is skipped with a
+    single log write; the rest of startup continues normally.
+    """
+    env_path = _HERE / ".local" / "env.txt"
+    if not env_path.is_file():
+        return
+    try:
+        text = env_path.read_text(encoding="utf-8")
+    except Exception:
+        return
+    loaded: list[str] = []
+    skipped: list[str] = []
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            skipped.append("line %d (no '='): %r" % (lineno, raw[:80]))
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if not key or not key.replace("_", "").isalnum():
+            skipped.append("line %d (bad key): %r" % (lineno, raw[:80]))
+            continue
+        if key in os.environ:
+            # Explicit process env wins over the file. This is the
+            # documented "one-launch override" escape hatch.
+            continue
+        os.environ[key] = value
+        loaded.append(key)
+    try:
+        (_HERE / "logs").mkdir(exist_ok=True)
+        with open(_HERE / "logs" / "_server.log", "a", encoding="utf-8") as fh:
+            import time as _time
+            fh.write("[%s] local_env: loaded=%s skipped=%s\n" % (
+                _time.strftime("%Y-%m-%d %H:%M:%S"),
+                ",".join(loaded) if loaded else "-",
+                ";".join(skipped) if skipped else "-",
+            ))
+    except Exception:
+        pass
+
+
+def _startup() -> None:
+    """Full VibeNode startup sequence.
+
+    Only runs when this file is executed as a script (see the
+    ``if __name__ == "__main__":`` guard at the bottom of the file).
+    Order of operations is preserved verbatim from the pre-Gate-4B
+    top-level flow so behavior at launch time is byte-equivalent:
+
+        1. Pin the working directory (protects code that reads
+           relative paths regardless of how the launcher was invoked).
+        2. Fix PATH on POSIX so `claude` is findable.
+        3. Redirect stdout/stderr under pythonw.exe.
+        4. Write the spawn-mode probe line to logs/_server.log.
+        5. Load machine-specific env vars from .local/env.txt so the
+           auto-update policy (and any other pinned flag) survives
+           every startup path. Added Step 6 (2026-09-26).
+        6. Try the boot splash; fall back to a system notification.
+        7. Run the Mobile Command reviver hook (best effort).
+        8. Hand off to run.py via runpy so run.py's ``__name__`` is
+           ``__main__`` (Flask blueprint registration relies on it).
+
+    NOTHING in this function is safe to call from an ``import
+    session_manager`` — the runpy call in step 8 is what starts the
+    Flask web server.
+    """
+    # Lock down the working directory to this script's folder regardless
+    # of how/where the shortcut launches us.
+    os.chdir(_HERE)
+
+    # POSIX PATH augmentation happens before any imports so downstream
+    # shutil.which("claude") calls succeed.
+    if sys.platform != "win32":
+        _augment_path_posix()
+
+    # pythonw stdio redirect happens before the spawn probe so its log
+    # write never risks printing to a None stream.
+    _redirect_stdio_for_pythonw()
+
+    # Spawn-mode probe log line — required by CLAUDE.md invariant.
+    _log_spawn_probe()
+
+    # Load machine-specific env vars BEFORE the boot splash and reviver
+    # hook, so any downstream helper that reads os.environ (auto-update
+    # gates in run.py, transport tweaks, feature flags) sees the same
+    # environment on every startup path.
+    _load_local_env()
+
+    # Try the splash first; fall back to a simple OS notification.
+    # On Linux, if tkinter is the missing piece, surface the apt hint in
+    # the toast itself — otherwise the user just sees a generic
+    # "starting up" with no indication that the splash *would* work
+    # after one apt-get away.
+    if not _launch_splash():
+        _msg = "Starting up…"
+        if sys.platform == "linux":
+            try:
+                import tkinter  # noqa: F401
+            except ImportError:
+                _msg = "Starting up… (install python3-tk for the boot splash)"
+        _show_notification("VibeNode", _msg)
+
+    # Mobile Command reviver hook (no-op unless mobile_command_enabled).
+    _reviver_hook()
+
+    # Now import and run the real app. runpy hands run.py the
+    # ``__main__`` name so its own ``if __name__ == "__main__":`` block
+    # fires and the Flask + SocketIO server binds.
+    import runpy
+    runpy.run_path(str(_HERE / "run.py"), run_name='__main__')
+
+
+if __name__ == "__main__":
+    _startup()

@@ -16,11 +16,36 @@ default-path SqliteRepository() ran ``clear_all_data()`` against the
 user's live DB and wiped it. Individual tests should still use the
 ``kanban_app`` fixture or explicit monkeypatching, but this is a hard
 backstop for that whole class of bug — present and future.
+
+REVIVER / AUTOSTART GUARD
+=========================
+The autouse ``_forbid_reviver_and_autostart_spawn`` fixture below makes it
+physically impossible for any test to launch the real ``reviver.py`` or
+``schtasks.exe``, or to write inside the real Windows Startup folder.
+
+Background (Step 1, 2026-09-26): ``test_mobile_command.py`` used to call the
+real ``mobile_command.enable()`` / ``.disable()`` — which spawns real
+``reviver.py`` and ``reviver.py --unregister`` from the production checkout.
+Because the reviver's task name and Startup VBS path are salted from the
+checkout path alone, every such run addressed production's real
+``\\VibeNodeReviver_0d5a41d4`` scheduled task and Startup VBS, deleting
+and rewriting them with whatever interpreter ran the tests. This actually
+happened during the 2026-09-25 investigation: production autostart was gone
+for ~20 minutes. See STEP1_TEST_SAFETY_REPORT.md.
+
+The affected tests now mock ``_spawn_reviver`` / ``_retire_reviver`` in their
+own fixtures. This conftest layer is the safety net: if any test — present or
+future — slips a ``subprocess.Popen`` call for ``reviver.py`` or ``schtasks``
+past its own mock, the guard raises loudly with the test's node ID. Silent
+regression is impossible.
 """
 
 import json
 import os
+import shlex
 import sqlite3
+import subprocess
+import sys
 import pytest
 from pathlib import Path
 from datetime import datetime, timezone
@@ -115,6 +140,21 @@ def _isolate_daemon_home(request, tmp_path_factory, monkeypatch):
     (fake_home / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
     (fake_home / "Downloads").mkdir(exist_ok=True)
     monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    # Sandbox the Windows-specific env vars that Path.home() doesn't cover.
+    # reviver.py._startup_dir() reads os.environ["APPDATA"], NOT Path.home(),
+    # so monkeypatching Path.home alone would leave a hole. USERPROFILE
+    # matches Path.home() on Windows and is inherited by any subprocess a
+    # test might spawn — pinning it here means even a subprocess whose Popen
+    # slipped past the guard below still cannot resolve to the real user
+    # folder. LOCALAPPDATA is deliberately NOT redirected: Playwright reads
+    # it to locate its browsers under ``%LOCALAPPDATA%\ms-playwright``, and
+    # nothing in the reviver/autostart path uses it.
+    fake_appdata = fake_home / "AppData" / "Roaming"
+    (fake_appdata / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("APPDATA", str(fake_appdata))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setenv("HOME", str(fake_home))
 
     # Several daemon modules capture ``Path.home()``-derived paths at IMPORT
     # time (module-level constants), so by the time this per-test fixture
@@ -216,6 +256,100 @@ def _block_production_paths(request, monkeypatch):
         return real_write_text(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "write_text", _guarded_write_text)
+    yield
+
+
+# ---------------------------------------------------------------------------
+# Reviver / autostart spawn guard
+# ---------------------------------------------------------------------------
+# Command-substring markers that must never appear in any subprocess launched
+# by a test. If a test needs to *reference* one of these in a string constant
+# (e.g. the leak-detector allowlist tests), that's fine — the guard only fires
+# on actual subprocess invocations.
+_FORBIDDEN_SUBPROCESS_MARKERS = (
+    "reviver.py",       # reviver launch: register/rewrite autostart
+    "schtasks.exe",     # scheduled-task register/delete on Windows
+    "schtasks ",        # bare schtasks (via shell=True)
+)
+
+
+def _command_string(cmd) -> str:
+    """Best-effort rendering of a Popen ``args`` argument to a searchable str."""
+    if cmd is None:
+        return ""
+    if isinstance(cmd, (list, tuple)):
+        try:
+            return " ".join(str(x) for x in cmd)
+        except Exception:  # noqa: BLE001
+            return repr(cmd)
+    return str(cmd)
+
+
+def _is_forbidden_command(cmd_str: str) -> bool:
+    low = cmd_str.lower()
+    # Match reviver.py either as a bare token or with a path prefix. Match
+    # schtasks either bare or with .exe. Matching on substring is safe here
+    # because these tokens don't appear inside legitimate helper commands
+    # tests do run (git, pytest, playwright, ffmpeg, etc.).
+    if "reviver.py" in low:
+        return True
+    # schtasks.exe or schtasks with a following space/end.
+    if "schtasks.exe" in low:
+        return True
+    # Bare "schtasks" as a full path component or as arg 0. Wrap shlex.split
+    # in a try/except: exotic quoting can raise ValueError, and we'd rather
+    # miss an edge case than mask a legitimate command with a parse error.
+    try:
+        tokens = shlex.split(cmd_str, posix=False) if cmd_str else []
+    except ValueError:
+        tokens = cmd_str.split()
+    for tok in tokens:
+        base = os.path.basename(tok.strip('"').strip("'")).lower()
+        if base in ("schtasks", "schtasks.exe"):
+            return True
+    return False
+
+
+@pytest.fixture(autouse=True)
+def _forbid_reviver_and_autostart_spawn(request, monkeypatch):
+    """Hard-fail any test that tries to spawn the real reviver or schtasks.
+
+    Wraps ``subprocess.Popen`` (which ``subprocess.run`` also routes through
+    on CPython) and raises ``AssertionError`` if the command touches
+    ``reviver.py`` or ``schtasks``. This is the belt-and-suspenders layer:
+    ``test_mobile_command.py`` already mocks ``_spawn_reviver`` /
+    ``_retire_reviver`` in its own ``mc`` fixture. This guard exists so a
+    future test — or a future refactor that reintroduces the direct spawn
+    path — cannot silently start deleting production autostart again.
+
+    A test that legitimately needs to test reviver-related string handling
+    (allowlist regex, leak detector) is unaffected: the guard only fires on
+    the actual subprocess call, not on string literals or in-process
+    function calls.
+    """
+    real_popen = subprocess.Popen
+
+    def _guarded_popen(cmd, *args, **kwargs):
+        rendered = _command_string(cmd)
+        if _is_forbidden_command(rendered):
+            raise AssertionError(
+                f"\n\nTEST {request.node.nodeid} tried to spawn a forbidden "
+                f"subprocess:\n    {rendered}\n\n"
+                f"This is the reviver / autostart safety guard. The command "
+                f"contains 'reviver.py' or 'schtasks', either of which can "
+                f"register, rewrite, or DELETE the production "
+                f"\\\\VibeNodeReviver_0d5a41d4 scheduled task and Startup VBS.\n\n"
+                f"If this call originated from mobile_command.enable() / "
+                f".disable(), your test needs to monkeypatch "
+                f"app.mobile_command._spawn_reviver and _retire_reviver in "
+                f"its fixture — see the `mc` fixture in test_mobile_command.py.\n\n"
+                f"If this is a new legitimate use case, extend "
+                f"_FORBIDDEN_SUBPROCESS_MARKERS in tests/conftest.py, or add "
+                f"a narrow opt-out. Do NOT weaken the guard globally.\n"
+            )
+        return real_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _guarded_popen)
     yield
 
 

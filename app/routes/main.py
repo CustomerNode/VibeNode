@@ -217,18 +217,59 @@ def restart_server():
 
             port_list = ",".join(str(p) for p in ports)
             env_set = "$env:VIBENODE_PRESERVE_DAEMON='1'; " if preserve_daemon else ""
+            # PORT-5050 RESTART-RACE FIX (Step 5, 2026-09-26, part 2 of 2).
+            #
+            # The kill loop MUST capture the target PIDs upfront and never
+            # re-query port owners between iterations.  The moment the web
+            # process on 5050 dies, reviver.py (polling every 2s) can bind
+            # 5050 to serve the Start page while VibeNode is between web
+            # PIDs.  The pre-fix loop then saw the reviver as a "port
+            # owner" and killed it on the next iteration — the guardian
+            # respawned the reviver with a new PID, self-healing but
+            # tripping the strict Step 5 cutover assertion (`[RECOVERY]
+            # reviver unaffected`), and briefly leaving the phone with
+            # no Start page.
+            #
+            # By capturing PIDs before killing and polling only those PIDs
+            # for death, the reviver's bystander bind never enters the
+            # kill decision.  ``reclaim_port()`` in run.py negotiates the
+            # reviver's yield later via the /yield control endpoint —
+            # no kill required.
             restart_cmd = (
                 "powershell -NoProfile -Command \""
+                f"$targetPids = @(Get-NetTCPConnection -LocalPort {port_list} -ErrorAction SilentlyContinue | "
+                "  Select-Object -ExpandProperty OwningProcess -Unique); "
                 "$maxTries = 10; "
                 "for ($i = 0; $i -lt $maxTries; $i++) { "
-                f"  $pids = @(Get-NetTCPConnection -LocalPort {port_list} -ErrorAction SilentlyContinue | "
-                "    Select-Object -ExpandProperty OwningProcess -Unique); "
-                "  if ($pids.Count -eq 0) { break }; "
-                "  $pids | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }; "
+                "  $alive = @($targetPids | Where-Object { "
+                "    (Get-Process -Id $_ -ErrorAction SilentlyContinue) -ne $null "
+                "  }); "
+                "  if ($alive.Count -eq 0) { break }; "
+                "  $alive | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }; "
                 "  Start-Sleep -Milliseconds 500 "
                 "}; "
-                f"Get-ChildItem -Path '{project_dir}' -Recurse -Directory -Filter '__pycache__' | "
-                "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue; "
+                # __pycache__ cleanup MUST NOT descend into .venv* trees.
+                # Get-ChildItem -Recurse walks every subdirectory even
+                # with -Exclude, and .venv-arm64-candidate (used during
+                # ARM64 cutover) lives inside the project tree with tens
+                # of thousands of __pycache__ dirs under site-packages.
+                # Walking that tree stretched the restart window enough
+                # for reviver.py to bind port 5050 as a bystander; the
+                # kill loop then killed the reviver, and the strict
+                # Step 5 cutover assertion tripped even though the
+                # guardian respawned it. Stack-based traversal here
+                # prunes any .venv* subtree BEFORE descending, so no
+                # virtualenv's bytecode is touched or scanned.
+                f"$stk = [System.Collections.Stack]::new(); "
+                f"$stk.Push('{project_dir}'); "
+                "while ($stk.Count -gt 0) { "
+                "  $d = $stk.Pop(); "
+                "  Get-ChildItem -LiteralPath $d -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object { "
+                "    if ($_.Name -like '.venv*') { return }; "
+                "    if ($_.Name -eq '__pycache__') { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } "
+                "    else { $stk.Push($_.FullName) } "
+                "  } "
+                "}; "
                 "Start-Sleep -Seconds 1; "
                 f"{env_set}"
                 f"Start-Process -FilePath '{pythonw}' -ArgumentList '\"{entry_script}\"' "
@@ -267,8 +308,36 @@ def restart_server():
             # ``start_new_session=True`` in place, the launched python
             # already lives outside the dying web server's session, so
             # nohup+& is sufficient detachment for the inner spawn.
-            kill_cmds = " ".join(
-                f"lsof -ti :{p} | xargs kill -9 2>/dev/null;" for p in ports
+            # PORT-5050 RESTART-RACE FIX (Step 5, 2026-09-26, part 2 of 2).
+            #
+            # Mirror the Windows change: capture the target PIDs upfront
+            # and never re-query port owners between iterations.  The
+            # pre-fix loop ran ``lsof -ti :5050 | xargs kill -9`` in a
+            # tight loop, which caught reviver.py as a bystander the
+            # instant it re-bound 5050 to serve the Start page.  Now
+            # we track only the initial PIDs and stop as soon as they
+            # are all dead, regardless of who owns the port after.
+            # See the Windows branch above for full rationale.
+            port_list_bash = " ".join(str(p) for p in ports)
+            # NOTE ON QUOTING: this entire block will be spliced inside
+            # ``bash -c '...'`` (single-quoted outer).  A single quote
+            # inside these strings would terminate the outer shell
+            # quoting.  Do not use ``tr '\n' ' '`` or any ``sed`` with
+            # single-quoted args here.  Newlines in ``target_pids`` are
+            # handled by word-splitting in ``for _pid in $target_pids``,
+            # which is bash's default IFS behavior.
+            kill_cmds = (
+                f"target_pids=$(for _pp in {port_list_bash}; do "
+                "lsof -ti :$_pp 2>/dev/null; done | sort -u); "
+                "for _i in $(seq 1 10); do "
+                "_alive=; "
+                "for _pid in $target_pids; do "
+                "kill -0 $_pid 2>/dev/null && _alive=\"$_alive $_pid\"; "
+                "done; "
+                "[ -z \"$_alive\" ] && break; "
+                "for _pid in $_alive; do kill -9 $_pid 2>/dev/null; done; "
+                "sleep 0.5; "
+                "done;"
             )
             # BUGFIX: ``nohup VAR=value cmd`` is NOT valid — env-prefix syntax
             # is a bash builtin (only works for "simple commands"), but here
@@ -290,10 +359,23 @@ def restart_server():
                 os.makedirs(os.path.dirname(restart_log), exist_ok=True)
             except Exception:
                 pass
+            # __pycache__ cleanup MUST NOT descend into .venv* trees.
+            # A ``.venv-arm64-candidate`` or similar virtualenv inside the
+            # project tree carries tens of thousands of __pycache__ dirs
+            # under site-packages; a plain recursive ``find`` walks all of
+            # them. On the Windows equivalent that stretched the restart
+            # window enough for reviver.py to bind port 5050 as a
+            # bystander (see Step 5 cutover diagnosis); the same risk
+            # applies on POSIX, so mirror the pruning here. ``-prune``
+            # on .venv* short-circuits the descent BEFORE any of the
+            # virtualenv's bytecode is scanned.
             restart_cmd = (
                 f"bash -c '"
-                f"for i in $(seq 1 10); do {kill_cmds} sleep 0.5; done; "
-                f"find \"{project_dir}\" -type d -name __pycache__ -exec rm -rf {{}} + 2>/dev/null; "
+                # kill_cmds is now the complete kill loop (initial-PID
+                # capture + poll-for-death), so no outer for/sleep
+                # wrapper is required. See the Step 5 fix comment above.
+                f"{kill_cmds} "
+                f"find \"{project_dir}\" \\( -type d -name \".venv*\" -prune \\) -o \\( -type d -name __pycache__ -exec rm -rf {{}} + \\) 2>/dev/null; "
                 f"sleep 1; "
                 f"{env_export}"
                 f"nohup \"{sys.executable}\" \"{entry_script}\" "

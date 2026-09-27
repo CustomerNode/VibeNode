@@ -263,3 +263,9 @@ kanban_config.json
 kanban_config.json.test_backup
 confirmed_models.json
 .gstack/
+
+# Machine-local runtime overrides (Step 6 ARM64 stabilization, 2026-09-26).
+# Contents are strictly per-machine (interpreter pins, env vars) and MUST
+# never be published through the public repo. See launch.bat,
+# reviver._python_for_spawn, and session_manager._load_local_env.
+.local/

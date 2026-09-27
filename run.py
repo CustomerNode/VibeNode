@@ -370,7 +370,35 @@ def _kill_port(port):
 
 if not _TEST_PORT:
     _update_boot_status("STEP:ports")
-    _kill_port(_WEB_PORT)
+    # PORT-5050 RESTART-RACE FIX (Step 5, 2026-09-26).
+    #
+    # ``VIBENODE_PRESERVE_DAEMON=1`` is set on exactly two paths, both of
+    # which have ALREADY handled the outgoing web process before this
+    # boot begins:
+    #   1. ``/api/restart`` with ``scope="web"`` — restart_server kills the
+    #      prior web PID synchronously via a Stop-Process / lsof kill loop
+    #      before launching this replacement.
+    #   2. The phone's Start button on the reviver's Start page — the
+    #      reviver only opens the Start page when 5050 is already down.
+    #
+    # In BOTH cases, if anything is bound to _WEB_PORT at the moment we
+    # reach this line, it is the reviver (reviver.py) legitimately serving
+    # the Start page while VibeNode is between web PIDs. Killing it would
+    # be a bystander kill: the guardian respawns the reviver immediately,
+    # so the system self-heals — but the reviver's PID changes, which trips
+    # the strict Step 5 ARM64 cutover assertion ("reviver unaffected"),
+    # and briefly leaves the phone with no Start page. ``reclaim_port()``
+    # further down NEGOTIATES the yield synchronously via the reviver's
+    # loopback ``/yield`` control endpoint without killing the process.
+    #
+    # A cold start (VIBENODE_PRESERVE_DAEMON unset) still runs the kill —
+    # a stale/abandoned process squatting on 5050 with no reviver
+    # supervision is exactly what _kill_port exists to clear.
+    if os.environ.get("VIBENODE_PRESERVE_DAEMON") == "1":
+        print("  VIBENODE_PRESERVE_DAEMON=1 -- skipping web port kill "
+              "(reclaim_port will negotiate with reviver)", flush=True)
+    else:
+        _kill_port(_WEB_PORT)
     # Only kill the daemon port on a cold start.  When the web server is
     # restarted via /api/restart with scope="web", it sets
     # VIBENODE_PRESERVE_DAEMON=1 so the living daemon (and all its active
@@ -705,13 +733,51 @@ def _check_claude_updates():
             print("  WARNING: claude CLI update check failed: %s" % e, flush=True)
 
     # 2. Python SDK — the daemon's interface to the CLI.  requirements.txt
-    #    only pins a floor (>=), so a plain upgrade is always safe here.
+    #    only pins a floor (>=). The upgrade is delegated to
+    #    ``app.update_safety.upgrade_sdk_safely``, which:
+    #      * uses ``pip install --upgrade --no-deps`` when the current
+    #        interpreter is a SHARED global Python (today's x64 setup), so
+    #        the daily update never mutates packages other apps depend on
+    #        AND never triggers a cryptography build attempt on ARM64
+    #        (there is no Windows ARM64 wheel; a plain --upgrade would
+    #        silently fail forever).
+    #      * uses a normal ``pip install --upgrade`` when the interpreter
+    #        is a dedicated venv (Step 3+ future state), where mutating
+    #        deps is safe and desired.
+    #      * captures full pip output (never --quiet), surfaces the reason
+    #        for any failure, and returns a structured result we log below.
+    sdk_result = None
     try:
-        _run_captured(
-            [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade",
-             "claude-code-sdk"],
+        from app.update_safety import upgrade_sdk_safely
+        sdk_result = upgrade_sdk_safely(
+            interpreter=sys.executable,
+            runner=_run_captured,
             timeout=120,
         )
+        # Print a single line the operator can grep. Full pip output is
+        # captured on the state file below.
+        print(
+            "  claude-code-sdk update: status=%s isolated=%s (%s)"
+            % (sdk_result["status"], sdk_result["isolated"], sdk_result["reason"]),
+            flush=True,
+        )
+        # Surface pip's own output for any non-clean outcome. Blocked
+        # statuses put the real complaint on the dry-run's tail; failed
+        # puts it on the real-install tail; either way an operator wants
+        # to see it in the log rather than dig into the state file.
+        _bad = ("failed", "blocked_missing_wheel",
+                "blocked_shared_env_dep_change", "blocked_inconsistent")
+        if sdk_result["status"] in _bad:
+            for label, tail_key in (
+                ("dry-run", "dry_run_output_tail"),
+                ("install", "pip_output_tail"),
+                ("pip check", "pip_check_output_tail"),
+            ):
+                tail = sdk_result.get(tail_key) or ""
+                if tail.strip():
+                    print(f"  pip {label} output (last lines):", flush=True)
+                    for line in tail.splitlines()[-10:]:
+                        print("    " + line, flush=True)
     except Exception as e:
         print("  WARNING: claude-code-sdk upgrade failed: %s" % e, flush=True)
 
@@ -729,11 +795,28 @@ def _check_claude_updates():
 
     try:
         _UPDATE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Persist the SDK upgrade outcome too — otherwise a shared-env
+        # failure (e.g. "cryptography wheel missing" on ARM64) is only
+        # visible in the boot log and lost on the next boot.
+        sdk_summary = None
+        if sdk_result is not None:
+            sdk_summary = {
+                "status": sdk_result.get("status"),
+                "isolated": sdk_result.get("isolated"),
+                "before_version": sdk_result.get("before_version"),
+                "after_version": sdk_result.get("after_version"),
+                "dry_run_returncode": sdk_result.get("dry_run_returncode"),
+                "dry_run_plan": sdk_result.get("dry_run_plan"),
+                "pip_returncode": sdk_result.get("pip_returncode"),
+                "pip_check_returncode": sdk_result.get("pip_check_returncode"),
+                "reason": sdk_result.get("reason"),
+            }
         _UPDATE_STATE_FILE.write_text(json.dumps({
             "last_check": time.time(),
             "cli_version": after or before,
             "updated_last_check": updated,
             "daemon_restart_pending": updated and daemon_was_running,
+            "sdk_upgrade": sdk_summary,
         }, indent=2))
     except Exception:
         pass
