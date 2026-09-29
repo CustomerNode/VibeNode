@@ -111,20 +111,77 @@ def test_status_snapshot_no_state_marks_stale(state_file, monkeypatch):
 
 def test_status_snapshot_fresh_state_not_stale(state_file, monkeypatch):
     import time
+    now = time.time()
     state_file.parent.mkdir(parents=True)
     state_file.write_text(json.dumps({
-        "last_check": time.time() - 3600,
+        "last_check": now - 3600,
         "cli_version": "2.1.280",
         "updated_last_check": True,
         "daemon_restart_pending": True,
+        "restart_pending_since": now - 3600,
     }))
     monkeypatch.setattr(claude_updater, "_claude_path", lambda: "/fake/claude")
     monkeypatch.setattr(claude_updater, "current_version", lambda path=None: "2.1.280")
+    # Daemon started BEFORE the upgrade armed the flag → restart genuinely
+    # pending.
+    monkeypatch.setattr(claude_updater, "_daemon_start_time", lambda: now - 86400)
     snap = claude_updater.status_snapshot(None)
     assert snap["stale"] is False
     assert snap["restart_pending"] is True
     assert snap["last_recorded_version"] == "2.1.280"
     assert snap["updated_last_check"] is True
+
+
+def test_restart_pending_clears_after_daemon_restart(state_file, monkeypatch):
+    """The flag self-heals once the daemon has restarted since the upgrade.
+
+    This is the 2026-09-29 bug: the flag was write-only truth, so doing the
+    restart the banner demanded never cleared the banner.
+    """
+    import time
+    now = time.time()
+    state_file.parent.mkdir(parents=True)
+    state_file.write_text(json.dumps({
+        "last_check": now - 3600,
+        "daemon_restart_pending": True,
+        "restart_pending_since": now - 3600,
+    }))
+    monkeypatch.setattr(claude_updater, "_claude_path", lambda: "/fake/claude")
+    monkeypatch.setattr(claude_updater, "current_version", lambda path=None: "2.1.284")
+    # Daemon started AFTER the upgrade → the restart already happened.
+    monkeypatch.setattr(claude_updater, "_daemon_start_time", lambda: now - 60)
+    snap = claude_updater.status_snapshot(None)
+    assert snap["restart_pending"] is False
+    # Self-heal must persist so every later reader agrees.
+    written = json.loads(state_file.read_text())
+    assert written["daemon_restart_pending"] is False
+
+
+def test_restart_pending_clears_when_daemon_down(state_file, monkeypatch):
+    """No daemon listening → nothing pending (next start applies it all)."""
+    import time
+    state_file.parent.mkdir(parents=True)
+    state_file.write_text(json.dumps({
+        "last_check": time.time() - 3600,
+        "daemon_restart_pending": True,
+        "restart_pending_since": time.time() - 3600,
+    }))
+    monkeypatch.setattr(claude_updater, "_claude_path", lambda: "/fake/claude")
+    monkeypatch.setattr(claude_updater, "current_version", lambda path=None: "2.1.284")
+    monkeypatch.setattr(claude_updater, "_daemon_start_time", lambda: None)
+    snap = claude_updater.status_snapshot(None)
+    assert snap["restart_pending"] is False
+
+
+def test_restart_pending_since_fallback_to_last_check(state_file, monkeypatch):
+    """Legacy state without restart_pending_since falls back to last_check."""
+    import time
+    now = time.time()
+    state = {"last_check": now - 3600, "daemon_restart_pending": True}
+    monkeypatch.setattr(claude_updater, "_daemon_start_time", lambda: now - 86400)
+    assert claude_updater.resolve_restart_pending(state) is True
+    monkeypatch.setattr(claude_updater, "_daemon_start_time", lambda: now - 60)
+    assert claude_updater.resolve_restart_pending(state) is False
 
 
 def test_status_snapshot_not_installed(state_file, monkeypatch):

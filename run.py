@@ -784,14 +784,44 @@ def _check_claude_updates():
     after = _claude_cli_version(claude_path)
     updated = bool(before and after and before != after)
     if updated:
-        print("  Claude CLI updated: %s -> %s" % (before, after), flush=True)
-        if daemon_was_running:
-            print(
-                "  NOTE: the session daemon is already running and keeps the old\n"
-                "  version until its next restart. To apply now (this ends all\n"
-                "  running sessions): System -> Restart Server -> Session Daemon.",
-                flush=True,
-            )
+        print(
+            "  Claude CLI updated: %s -> %s (new and woken sessions pick\n"
+            "  this up automatically; already-running session processes keep\n"
+            "  the old binary until they sleep/wake)." % (before, after),
+            flush=True,
+        )
+
+    # Restart-pending: ONLY a Python-SDK bump makes a daemon restart
+    # meaningful — the daemon holds the imported SDK in memory. A CLI bump
+    # does NOT: sessions spawn the claude binary fresh from disk, so tying
+    # the flag to CLI bumps produced a banner that re-armed on every
+    # release and could not be cleared by the restart it demanded
+    # (2026-09-29). An earlier still-valid flag is carried forward; both
+    # cases resolve through app.claude_updater.resolve_restart_pending so
+    # the flag clears itself once the daemon actually restarts.
+    sdk_bumped = bool(sdk_result and sdk_result.get("status") == "upgraded")
+    prior_state = {}
+    try:
+        prior_state = json.loads(_UPDATE_STATE_FILE.read_text())
+    except Exception:
+        prior_state = {}
+    try:
+        from app.claude_updater import resolve_restart_pending
+        carried = resolve_restart_pending(prior_state)
+    except Exception:
+        carried = bool(prior_state.get("daemon_restart_pending"))
+    restart_pending = daemon_was_running and (sdk_bumped or carried)
+    if sdk_bumped and daemon_was_running:
+        pending_since = time.time()
+        print(
+            "  NOTE: claude-code-sdk was upgraded but the running daemon keeps\n"
+            "  the old version in memory until its next restart. To apply now\n"
+            "  (this ends all running sessions): System -> Restart Server ->\n"
+            "  Session Daemon.",
+            flush=True,
+        )
+    else:
+        pending_since = prior_state.get("restart_pending_since") or 0
 
     try:
         _UPDATE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -815,7 +845,8 @@ def _check_claude_updates():
             "last_check": time.time(),
             "cli_version": after or before,
             "updated_last_check": updated,
-            "daemon_restart_pending": updated and daemon_was_running,
+            "daemon_restart_pending": restart_pending,
+            "restart_pending_since": pending_since,
             "sdk_upgrade": sdk_summary,
         }, indent=2))
     except Exception:

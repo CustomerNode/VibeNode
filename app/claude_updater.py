@@ -63,6 +63,10 @@ _update_lock = threading.Lock()
 _VERSION_TIMEOUT = 15
 _UPDATE_TIMEOUT = 180
 
+# Daemon port — keep in sync with run.py's DAEMON_PORT (test-asserted there
+# for the state-file path; the port is stable enough to mirror manually).
+_DAEMON_PORT = 5051
+
 
 def _run_captured(cmd: list[str], timeout: int) -> tuple[int | None, str]:
     """Run *cmd* with output captured to a temp file (no pipes).
@@ -172,6 +176,52 @@ def count_active_sessions(session_manager) -> int:
 STALE_AFTER_SECONDS = 30 * 24 * 3600
 
 
+def _daemon_start_time() -> float | None:
+    """Unix start time of the process listening on the daemon port, or None.
+
+    None means "no listener found" — either the daemon is down or psutil
+    could not enumerate connections. Callers treat both as "nothing is
+    pending" (a down daemon applies everything on its next start).
+    """
+    try:
+        import psutil
+    except Exception:
+        return None
+    try:
+        for c in psutil.net_connections(kind="tcp"):
+            if (c.status == psutil.CONN_LISTEN and c.laddr
+                    and c.laddr.port == _DAEMON_PORT and c.pid):
+                return psutil.Process(c.pid).create_time()
+    except Exception as e:
+        log.debug("_daemon_start_time failed: %s", e)
+    return None
+
+
+def resolve_restart_pending(state: dict[str, Any]) -> bool:
+    """True only while a recorded restart-pending flag is STILL meaningful.
+
+    The flag means "the running daemon predates an in-memory upgrade (the
+    Python SDK)". It stops being true the moment the daemon restarts — an
+    event the flag's writers never observe. Before this resolver existed,
+    the flag was write-only truth: users restarted the daemon exactly as
+    the banner demanded and the banner came back anyway, forever
+    (2026-09-29). Every reader must go through here, never the raw key.
+
+    Cleared when:
+      * the flag isn't set, or
+      * no daemon is listening (its next start applies everything), or
+      * the daemon started AFTER the upgrade that armed the flag.
+    """
+    if not state.get("daemon_restart_pending"):
+        return False
+    started = _daemon_start_time()
+    if started is None:
+        return False
+    since = float(state.get("restart_pending_since")
+                  or state.get("last_check") or 0)
+    return started <= since
+
+
 def status_snapshot(session_manager=None) -> dict[str, Any]:
     """A single dict summarising CLI state, for /api/admin/claude-status.
 
@@ -192,6 +242,14 @@ def status_snapshot(session_manager=None) -> dict[str, Any]:
     now = time.time()
     last_check = float(st.get("last_check") or 0)
     age = int(now - last_check) if last_check else None
+    raw_pending = bool(st.get("daemon_restart_pending"))
+    pending = resolve_restart_pending(st) if raw_pending else False
+    if raw_pending and not pending:
+        # Self-heal: the daemon restarted (or is down) since the upgrade
+        # that armed the flag. Persist the cleared value so no other
+        # reader ever sees the stale truth again.
+        st["daemon_restart_pending"] = False
+        _write_state(st)
     return {
         "installed": bool(_claude_path()),
         "current_version": current_version(),
@@ -199,7 +257,7 @@ def status_snapshot(session_manager=None) -> dict[str, Any]:
         "last_check_age_seconds": age,
         "last_recorded_version": st.get("cli_version") or "",
         "updated_last_check": bool(st.get("updated_last_check")),
-        "restart_pending": bool(st.get("daemon_restart_pending")),
+        "restart_pending": pending,
         "stale": (age is None) or (age >= STALE_AFTER_SECONDS),
         "active_sessions": count_active_sessions(session_manager),
     }
@@ -291,9 +349,12 @@ def run_update(session_manager=None, force: bool = False) -> dict[str, Any]:
             "last_check": time.time(),
             "cli_version": after or before,
             "updated_last_check": updated,
-            "daemon_restart_pending": (
-                updated and count_active_sessions(session_manager) > 0
-            ),
+            # A CLI bump does NOT arm the daemon-restart flag: sessions
+            # spawn the claude binary fresh from disk, so new and woken
+            # sessions pick the update up with no daemon involvement. The
+            # flag is armed only by run.py's SDK-upgrade path; here we
+            # carry it forward only while still genuinely pending.
+            "daemon_restart_pending": resolve_restart_pending(st),
         })
         _write_state(st)
 

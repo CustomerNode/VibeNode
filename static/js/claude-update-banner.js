@@ -50,10 +50,15 @@
 
     var msg;
     if (restartPending) {
-      // Update already downloaded; daemon still on the old binary. This is
-      // the case the daily worker flags after it updates and can't restart.
-      msg = 'Claude Code was updated to ' + (status.current_version || 'a new version')
-          + '. Restart the session daemon to apply it.';
+      // An SDK upgrade landed while the daemon was running; the daemon
+      // keeps the old version in memory until ITS restart (server-side
+      // logic guarantees this only shows while that is genuinely true —
+      // it self-clears once the daemon restarts). Name the exact menu
+      // path: "restart the daemon" with no directions sent users to the
+      // Update button in circles (2026-09-29).
+      msg = 'A Claude Code update is waiting for a daemon restart. Apply it '
+          + 'via System → Restart Server → Session Daemon (ends running '
+          + 'sessions — they can be resumed after).';
     } else {
       // Straight-up stale. Frame it around the concrete failure mode so
       // the user knows why they should care.
@@ -70,16 +75,21 @@
       'display:flex', 'align-items:center', 'gap:12px', 'font-size:13px',
       'box-shadow:0 2px 6px rgba(0,0,0,.3)',
     ].join(';');
+    // restartPending means the download already happened — offering
+    // "Update Now" there is a no-op that reads like a broken button.
+    // Only the stale case has an action we can take from here.
     bar.innerHTML =
       '<span style="flex:1">' + _esc(msg) + '</span>' +
-      '<button id="cub-update" class="pm-btn pm-btn-primary" style="padding:4px 12px">Update Now</button>' +
+      (restartPending ? ''
+        : '<button id="cub-update" class="pm-btn pm-btn-primary" style="padding:4px 12px">Update Now</button>') +
       '<button id="cub-later" class="pm-btn pm-btn-secondary" style="padding:4px 12px">Later</button>';
 
     document.body.appendChild(bar);
 
-    document.getElementById('cub-update').onclick = function () {
-      _runUpdate(restartPending);
-    };
+    var updateBtn = document.getElementById('cub-update');
+    if (updateBtn) {
+      updateBtn.onclick = function () { _runUpdate(restartPending); };
+    }
     document.getElementById('cub-later').onclick = function () {
       // 24-hour snooze. Long enough not to nag, short enough that a truly
       // stale CLI can’t sit quietly for a week.
@@ -133,8 +143,9 @@
               showToast('Claude CLI already at ' + (d.after || '?'));
             }
           }
-          // Clear the banner regardless — the daily-check state was refreshed.
-          _dismiss(0);
+          // Clear the banner and snooze an hour — _dismiss(0) set the
+          // snooze to "now", so any re-check could re-render immediately.
+          _dismiss(1);
         })
         .catch(function (e) {
           if (typeof showToast === 'function') {
