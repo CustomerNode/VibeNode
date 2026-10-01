@@ -700,6 +700,14 @@ socket.on('state_snapshot', (data) => {
     // change applies to the currently-live session.
     var _liveChanged = false;
     (data.sessions || []).forEach(function(s) {
+        if (typeof s.effort === 'string' && typeof SessionModel !== 'undefined'
+                && SessionModel.ingestConfirmedThinking) {
+            if (SessionModel.ingestConfirmedThinking(s.session_id, s.effort)
+                    && s.session_id === liveSessionId
+                    && typeof _renderSessionThinkingBadge === 'function') {
+                _renderSessionThinkingBadge(s.session_id);
+            }
+        }
         if (!s.model) return;
         if (typeof SessionModel !== 'undefined') {
             if (SessionModel.ingestConfirmed(s.session_id, s.model)
@@ -968,6 +976,16 @@ socket.on('session_state', (data) => {
         if (_changed && session_id === liveSessionId &&
             typeof _renderSessionModelBadge === 'function') {
             _renderSessionModelBadge(session_id);
+        }
+    }
+    // Launch effort (daemon truth).  Absent on a daemon that predates it, in
+    // which case the store keeps reporting "unknown" rather than guessing.
+    if (typeof data.effort === 'string' && typeof SessionModel !== 'undefined'
+            && SessionModel.ingestConfirmedThinking) {
+        if (SessionModel.ingestConfirmedThinking(session_id, data.effort)
+                && session_id === liveSessionId
+                && typeof _renderSessionThinkingBadge === 'function') {
+            _renderSessionThinkingBadge(session_id);
         }
     }
 

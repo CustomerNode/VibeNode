@@ -136,6 +136,30 @@ class TestStartSession:
         assert len(started) == 1
         assert started[0]['args'][0]['session_id'] == 'new-session'
 
+    @pytest.mark.parametrize("level,expected_args,expected_reset", [
+        # Exactly the values `claude --effort` accepts (CLI 2.1.283).
+        ("low", {"effort": "low"}, False),
+        ("medium", {"effort": "medium"}, False),
+        ("high", {"effort": "high"}, False),
+        ("xhigh", {"effort": "xhigh"}, False),
+        ("max", {"effort": "max"}, False),
+        # Not CLI values: the CLI would silently ignore them and run at default.
+        ("auto", None, False),
+        ("none", None, False),  # legacy "None" option; never disabled thinking
+        ("", None, False),
+        # Explicit reset to the model default (the live thinking switch).
+        ("default", None, True),
+    ])
+    def test_thinking_level_maps_to_effort(self, app_and_client, mock_session_manager,
+                                           level, expected_args, expected_reset):
+        app, socketio, client = app_and_client
+        client.get_received()
+        client.emit('start_session', {'session_id': 'eff-' + (level or 'blank'),
+                                      'prompt': 'Hi', 'thinking_level': level})
+        kwargs = mock_session_manager.start_session.call_args.kwargs
+        assert kwargs['extra_args'] == expected_args
+        assert bool(kwargs.get('effort_reset')) is expected_reset
+
     def test_start_session_missing_id(self, app_and_client, mock_session_manager):
         """start_session without session_id should emit error."""
         app, socketio, client = app_and_client

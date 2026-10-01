@@ -66,7 +66,7 @@ These events are sent by the browser to the server.
 | `resume` | boolean | No | Resume existing session |
 | `model` | string | No | Model alias (sonnet, opus, haiku) or full ID |
 | `system_prompt` | string | No | Custom system prompt override |
-| `thinking_level` | string | No | Thinking level override |
+| `thinking_level` | string | No | CLI `--effort` level: `low`, `medium`, `high`, `xhigh`, `max`. Omitted: new sessions use the model default, resumed sessions keep the effort the daemon remembers. `default`: explicit reset to the model default on a resume. Any other value is ignored. |
 | `max_turns` | integer | No | Max conversation turns |
 | `allowed_tools` | string[] | No | Restrict to these tools |
 | `permission_mode` | string | No | One of: default, plan, acceptEdits, bypassPermissions |

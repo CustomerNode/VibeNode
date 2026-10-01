@@ -70,6 +70,46 @@ window.SessionModel = (function () {
     localStorage.removeItem('_sessionThinkingOverride');
   } catch (e) { /* localStorage unavailable — nothing to clean */ }
 
+  // ── Thinking (effort) levels — THE one list every picker renders ────────
+  // Keys are exactly what `claude --effort` accepts (verified against
+  // `claude --help`, CLI 2.1.283); '' sends no flag (the model's default,
+  // which varies: `medium` on Opus 5.5, `high` on most others). There is no
+  // "None": no current flag disables thinking, and Fable 5/5.1 and Opus 5.5
+  // cannot disable it at all.
+  var THINKING_LEVELS = [
+    {key: '',       label: 'Default', desc: "Model's own default"},
+    {key: 'low',    label: 'Low',     desc: 'Fast and cheap, for simple tasks'},
+    {key: 'medium', label: 'Medium',  desc: 'Balanced speed and depth'},
+    {key: 'high',   label: 'High',    desc: 'Deep reasoning'},
+    {key: 'xhigh',  label: 'xHigh',   desc: 'Best for coding and agentic work'},
+    {key: 'max',    label: 'Max',     desc: 'Maximum depth, highest cost'},
+  ];
+  var _VALID_THINKING = {};
+  THINKING_LEVELS.forEach(function (l) { _VALID_THINKING[l.key] = true; });
+
+  /** A stored level coerced to a valid key ('' for legacy 'none' / junk). */
+  function _cleanThinking(level) {
+    level = (level || '').trim();
+    return _VALID_THINKING[level] ? level : '';
+  }
+
+  /** Display label for a level key, e.g. 'xhigh' -> 'xHigh'. */
+  function thinkingLabel(level) {
+    level = _cleanThinking(level);
+    for (var i = 0; i < THINKING_LEVELS.length; i++) {
+      if (THINKING_LEVELS[i].key === level) return THINKING_LEVELS[i].label;
+    }
+    return 'Default';
+  }
+
+  // One-time migration: the removed "None" option stored 'none', which never
+  // disabled anything (it sent the same request as Default).
+  try {
+    if (!_cleanThinking(localStorage.getItem(DEFAULT_THINKING_KEY))) {
+      localStorage.removeItem(DEFAULT_THINKING_KEY);
+    }
+  } catch (e) { /* localStorage unavailable */ }
+
   /** Look up a session object in the global registry, or null. */
   function _sess(id) {
     if (!id || typeof allSessions === 'undefined' || !Array.isArray(allSessions)) {
@@ -95,9 +135,9 @@ window.SessionModel = (function () {
   /** The system-default thinking level ('' means "model default"). */
   function getDefaultThinking() {
     try {
-      return localStorage.getItem(DEFAULT_THINKING_KEY) || '';
+      return _cleanThinking(localStorage.getItem(DEFAULT_THINKING_KEY));
     } catch (e) {
-      return (typeof defaultThinking !== 'undefined' && defaultThinking) || '';
+      return _cleanThinking(typeof defaultThinking !== 'undefined' && defaultThinking);
     }
   }
 
@@ -112,7 +152,7 @@ window.SessionModel = (function () {
   /** The thinking level chosen for this pending session, else system default. */
   function getDesiredThinking(id) {
     var s = _sess(id);
-    if (s && typeof s.desiredThinking === 'string') return s.desiredThinking;
+    if (s && typeof s.desiredThinking === 'string') return _cleanThinking(s.desiredThinking);
     return getDefaultThinking();
   }
 
@@ -198,7 +238,48 @@ window.SessionModel = (function () {
     return _cleanId(getConfirmed(id)) || getDesired(id);
   }
 
+  // ── Running-session effort (owner: the daemon, mirrored here) ──────────
+
+  /**
+   * The effort a RUNNING session was launched with, as reported by the daemon
+   * (`effort` on session state), or undefined when this daemon doesn't report
+   * it. '' is meaningful: the session runs at the model default.
+   */
+  function getConfirmedThinking(id) {
+    var s = _sess(id);
+    return (s && typeof s.effort === 'string') ? _cleanThinking(s.effort) : undefined;
+  }
+
+  /** Single write path for a daemon-reported effort. Returns true if changed. */
+  function ingestConfirmedThinking(id, effort) {
+    if (typeof effort !== 'string') return false;
+    var s = _sess(id);
+    effort = _cleanThinking(effort);
+    if (!s || s.effort === effort) return false;
+    s.effort = effort;
+    return true;
+  }
+
+  /**
+   * The effort to PIN when waking a sleeping session ('' = send nothing; the
+   * daemon re-pins the effort it remembers). Same precedence as resumeModel:
+   * daemon-confirmed truth, else this tab's explicit per-session choice.
+   * Never the system default: that is for NEW sessions, and sending it here
+   * would silently overwrite a level chosen for this session on another device.
+   */
+  function resumeThinking(id) {
+    var confirmed = getConfirmedThinking(id);
+    if (confirmed) return confirmed;
+    var s = _sess(id);
+    return (s && typeof s.desiredThinking === 'string') ? _cleanThinking(s.desiredThinking) : '';
+  }
+
   return {
+    THINKING_LEVELS: THINKING_LEVELS,
+    thinkingLabel: thinkingLabel,
+    getConfirmedThinking: getConfirmedThinking,
+    ingestConfirmedThinking: ingestConfirmedThinking,
+    resumeThinking: resumeThinking,
     getDefault: getDefault,
     getDefaultThinking: getDefaultThinking,
     getDesired: getDesired,

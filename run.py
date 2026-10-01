@@ -139,7 +139,7 @@ def ensure_daemon():
     """Make sure the session daemon is running. Start it if not.
 
     Failure modes are LOUD on purpose.  The historic Linux bug was that
-    ``Restart Server → Session Daemon`` would fail here silently: the new
+    ``Developer Tools → Restart Server → Session Engine`` would fail here silently: the new
     web came up without a daemon, the user saw "everything looks normal"
     in the UI, then tool calls failed mysteriously a minute later.  We
     now:

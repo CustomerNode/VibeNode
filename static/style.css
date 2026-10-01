@@ -4279,6 +4279,13 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
 }
 .msel-row.active .msel-name { color: var(--accent-light); }
 .msel-sub { font-size: var(--fs-sm); color: var(--text-faint); font-weight: 500; }
+/* Compact chip grid (per-session thinking levels): every option stays visible
+   without scrolling, however long the model list above it is. */
+.msel-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.msel-row.msel-chip { justify-content: center; padding: 7px 6px; }
+.msel-row.msel-chip .msel-check { display: none; }
+.msel-row.msel-chip .msel-name { flex: 0 1 auto; font-size: var(--fs-md, 13px); }
+.msel-hint { margin-top: 6px; min-height: 1.3em; font-size: var(--fs-sm); color: var(--text-faint); }
 .msel-tag {
   font-size: var(--fs-2xs);
   font-weight: 700;
@@ -11340,6 +11347,12 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
   color: #2563eb;
   background: rgba(37,99,235,0.07);
 }
+
+/* ── Thinking level shown inside the model bubble: "Opus 5.5 · xHigh" ── */
+.smb-think { display: inline-flex; align-items: center; }
+.smb-think[hidden] { display: none; }
+.smb-sep { margin: 0 5px; opacity: .45; font-weight: 400; }
+.smb-think-lbl { opacity: .85; }
 
 /* ── Invoke Modal Overlay ── */
 .invoke-overlay {

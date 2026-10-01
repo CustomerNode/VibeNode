@@ -596,6 +596,34 @@ class TestUserStopBeatsSelfHeal:
         assert result is False
         session_manager._sdk.create_session.assert_not_called()
 
+    @pytest.mark.parametrize("effort,model,want_args,want_model", [
+        ("xhigh", "claude-opus-5[1m]", {"effort": "xhigh"}, "claude-opus-5"),
+        ("", "claude-sonnet-5", {}, "claude-sonnet-5"),
+        ("bogus", "", {}, None),
+    ])
+    def test_reconnect_repins_effort_and_strips_model_marker(
+            self, session_manager, sm_module, effort, model, want_args, want_model):
+        """A self-heal reconnect relaunches the CLI.  It must carry the
+        session's effort (dropping it fell back to the CLI default level, seen
+        live 2026-10-01) and a marker-free --model ("[1m]" is an API 400)."""
+        sid = "reconnect-effort"
+        info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
+        info.cwd, info.model, info.effort = "/tmp", model, effort
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+        captured = {}
+        async def _create(opts):
+            captured["opts"] = opts
+            return MagicMock()
+        session_manager._sdk = MagicMock()
+        session_manager._sdk.create_session = _create
+        session_manager._sdk.connect = AsyncMock()
+        session_manager._sdk.extract_process_pid = MagicMock(return_value=1)
+        with patch.object(session_manager, "_prepare_resume_transcript"):
+            assert asyncio.run(session_manager._reconnect_client(sid, info)) is True
+        assert captured["opts"].extra_args == want_args
+        assert captured["opts"].model == want_model
+
     def test_both_self_heal_sites_guard_on_user_stop(self, sm_module):
         """Both the drive and query self-heal blocks must consult
         _user_stopped before (and after) the reconnect backoff."""

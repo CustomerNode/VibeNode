@@ -301,3 +301,43 @@ class TestResolverLogic:
             localStorage.setItem('defaultModel', 'claude-opus-4-7');
             assert.strictEqual(SessionModel.effectivePending('a'), 'claude-opus-4-7');
         """)
+
+    # --- Thinking (effort) levels, added 2026-09-30 -----------------------
+
+    def test_thinking_levels_match_cli_effort_values(self, tmp_path):
+        # Exactly what `claude --effort` accepts (CLI 2.1.283) plus '' (no
+        # flag). No "None": it never disabled thinking.
+        self._run(tmp_path, """
+            const keys = SessionModel.THINKING_LEVELS.map(l => l.key);
+            assert.deepStrictEqual(keys, ['', 'low', 'medium', 'high', 'xhigh', 'max']);
+            assert.strictEqual(SessionModel.thinkingLabel('xhigh'), 'xHigh');
+            assert.strictEqual(SessionModel.thinkingLabel(''), 'Default');
+        """)
+
+    def test_legacy_none_default_reads_as_model_default(self, tmp_path):
+        self._run(tmp_path, """
+            localStorage.setItem('defaultThinking', 'none');
+            assert.strictEqual(SessionModel.getDefaultThinking(), '');
+            localStorage.setItem('defaultThinking', 'auto');
+            assert.strictEqual(SessionModel.getDefaultThinking(), '');
+            localStorage.setItem('defaultThinking', 'xhigh');
+            assert.strictEqual(SessionModel.getDefaultThinking(), 'xhigh');
+        """)
+
+    def test_resume_thinking_prefers_confirmed_never_system_default(self, tmp_path):
+        # Wake pin for effort mirrors resumeModel: daemon truth, else this
+        # tab's per-session choice, else '' so the daemon re-pins its own
+        # record. The system default is for NEW sessions only.
+        self._run(tmp_path, """
+            localStorage.setItem('defaultThinking', 'max');
+            allSessions.push({ id: 'a' });
+            assert.strictEqual(SessionModel.resumeThinking('a'), '');
+            assert.strictEqual(SessionModel.getConfirmedThinking('a'), undefined);
+            SessionModel.setDesired('a', '', 'high');
+            assert.strictEqual(SessionModel.resumeThinking('a'), 'high');
+            assert.strictEqual(SessionModel.ingestConfirmedThinking('a', 'xhigh'), true);
+            assert.strictEqual(SessionModel.resumeThinking('a'), 'xhigh');
+            assert.strictEqual(SessionModel.ingestConfirmedThinking('a', 'xhigh'), false);
+            assert.strictEqual(SessionModel.ingestConfirmedThinking('a', undefined), false);
+            assert.strictEqual(SessionModel.resumeThinking('ghost'), '');
+        """)

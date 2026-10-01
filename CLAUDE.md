@@ -55,7 +55,7 @@ The daemon manages ALL active Claude sessions and agents. Restarting it destroys
 
 - NEVER use `scope: "daemon"` or `scope: "both"` in the restart endpoint.
 - NEVER kill, stop, or restart the daemon process by any means.
-- If a user asks you to restart the daemon, **warn them** that doing so will terminate all active sessions and agents across the entire application. Direct them to do it manually if they still want to: **System → Restart Server → Session Daemon**.
+- If a user asks you to restart the daemon, **warn them** that doing so will terminate all active sessions and agents across the entire application. Direct them to do it manually if they still want to: **System → Developer Tools → Restart Server → Session Engine**.
 
 The `/api/restart` endpoint accepts a `scope` parameter: `"web"` (default), `"daemon"`, or `"both"`. AI agents must only ever use `"web"`, and only when the user has explicitly asked for a restart.
 

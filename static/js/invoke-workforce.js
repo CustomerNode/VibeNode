@@ -133,10 +133,13 @@ function _buildSessionModelBtn(isNewSession, sessionModel, sessionId) {
       ? SessionModel.effectivePending(sessionId)
       : ((typeof defaultModel !== 'undefined' ? defaultModel : '')));
     const _safeId = (sessionId || '').replace(/['"\\]/g, '');
-    return '<button class="session-model-btn' + (isOverridden ? ' session-model-overridden' : '') + '" ' +
+    const _chosen = isOverridden || _hasChosenThinking(sessionId);
+    return '<button class="session-model-btn' + (_chosen ? ' session-model-overridden' : '') + '" ' +
       'id="session-model-btn" onclick="_openSessionModelSelector(false, \'' + _safeId + '\')" ' +
-      'title="' + (isOverridden ? 'Model overridden — click to change' : 'Click to choose model for this session') + '">' +
-      label + '</button>';
+      'title="' + _bubbleTitle(label, _sessionThinkingFor(true, sessionId), _chosen
+        ? 'Chosen for this session' : 'Click to choose model and thinking for this session') + '">' +
+      '<span class="smb-model">' + escHtml(label) + '</span>' +
+      _thinkingSegment(true, sessionId) + '</button>';
   }
   // Running/idle session: show the confirmed session model when known.
   // If not yet confirmed (dormant/sleeping session that hasn't sent an init
@@ -152,9 +155,12 @@ function _buildSessionModelBtn(isNewSession, sessionModel, sessionId) {
   const title = confirmed
     ? 'Session model: ' + label + ' — click to switch (applies from the next message)'
     : 'Will use system default (' + label + ') — click to switch before waking';
+  const _liveSid = (typeof liveSessionId !== 'undefined') ? liveSessionId : '';
   return '<button class="session-model-badge' + (!confirmed ? ' session-model-default' : '') + '" ' +
-    'onclick="_openSessionModelSelector(true)" title="' + title + '">' +
-    label + '</button>';
+    'onclick="_openSessionModelSelector(true)" title="' +
+    _bubbleTitle(label, _sessionThinkingFor(false, _liveSid), title) + '">' +
+    '<span class="smb-model">' + escHtml(label) + '</span>' +
+    _thinkingSegment(false, _liveSid) + '</button>';
 }
 
 /**
@@ -181,22 +187,33 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
   // Normalize "claude-fable-5[1m]" / dated ids to the base id so the
   // matching card in the list pre-selects correctly.
   const currentLiveBase = currentLiveModel.replace(/\[1m\]$/, '').replace(/-\d{8}$/, '');
+  // The effort the live session is running at: daemon-reported when this
+  // daemon reports it (undefined otherwise), else this tab's recorded choice.
+  const _confirmedLiveThinking = (liveSid && typeof SessionModel !== 'undefined')
+    ? SessionModel.getConfirmedThinking(liveSid) : undefined;
+  const currentLiveThinking = (liveSid && typeof SessionModel !== 'undefined')
+    ? SessionModel.resumeThinking(liveSid) : '';
+  const _liveThinkingKnown = _confirmedLiveThinking !== undefined || !!currentLiveThinking;
+  const _thinkingLbl = k => (typeof SessionModel !== 'undefined') ? SessionModel.thinkingLabel(k) : (k || 'Default');
 
   overlay.innerHTML = '<div class="pm-card pm-enter" style="width:400px;">' +
-    '<h2 class="pm-title">' + (liveMode ? 'Switch Session Model' : 'Session Model') + '</h2>' +
+    '<h2 class="pm-title">' + (liveMode ? 'Session Model &amp; Thinking' : 'Session Model') + '</h2>' +
     '<div class="pm-body"><p>' + (liveMode
-      ? 'Switch the model of <strong>this running session</strong>. Applies from the next message. Currently running on <strong>' + (currentLiveModel ? _modelLabel(currentLiveModel) : 'a model not yet confirmed by the daemon') + '</strong>.'
+      ? 'Currently running on <strong>' + (currentLiveModel ? _modelLabel(currentLiveModel) : 'a model not yet confirmed by the daemon') + '</strong>' +
+        (_liveThinkingKnown ? ' at <strong>' + _thinkingLbl(currentLiveThinking) + '</strong> thinking' : '') +
+        '. A model change applies from the next message. A thinking change restarts the session (history is kept) and needs it to be idle.'
       : 'Choose model and thinking level for <strong>this session</strong>. System default is unchanged.') + '</p></div>' +
     '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;max-height:35vh;overflow-y:auto;" id="sm-model-list">' +
     '<span class="spinner"></span></div>' +
-    '<div id="sm-thinking-section" style="display:none;margin-bottom:16px;max-height:20vh;overflow-y:auto;">' +
+    '<div id="sm-thinking-section" style="display:none;margin-bottom:16px;">' +
     '<div style="font-size:11px;font-weight:600;color:var(--text-faint);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;">Thinking Level</div>' +
-    '<div class="msel-list" id="sm-thinking-list"></div>' +
+    '<div class="msel-grid" id="sm-thinking-list"></div>' +
+    '<div class="msel-hint" id="sm-thinking-hint"></div>' +
     '</div>' +
     '<div class="pm-actions">' +
     (liveMode
       ? '<button class="pm-btn pm-btn-secondary" onclick="_closePm()">Cancel</button>' +
-        '<button class="pm-btn pm-btn-primary" id="sm-apply-btn" disabled onclick="_applyLiveSessionModel()">Switch Model</button>'
+        '<button class="pm-btn pm-btn-primary" id="sm-apply-btn" disabled onclick="_applyLiveSessionChoice()">Apply</button>'
       : '<button class="pm-btn pm-btn-secondary" onclick="_clearSessionModelOverrideAndClose()">Reset to Default</button>' +
         '<button class="pm-btn pm-btn-primary" id="sm-apply-btn" disabled onclick="_applySessionModelOverride()">Apply</button>') +
     '</div></div>';
@@ -233,9 +250,14 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
     : ((typeof SessionModel !== 'undefined')
         ? SessionModel.effectivePending(pendingSessionId)
         : _effectiveModel());
-  let pendingThinking = (!liveMode && typeof SessionModel !== 'undefined')
-    ? SessionModel.getDesiredThinking(pendingSessionId)
-    : (typeof defaultThinking !== 'undefined' ? defaultThinking : '');
+  let pendingThinking = liveMode
+    ? currentLiveThinking
+    : ((typeof SessionModel !== 'undefined')
+        ? SessionModel.getDesiredThinking(pendingSessionId)
+        : (typeof defaultThinking !== 'undefined' ? defaultThinking : ''));
+  // Live mode restarts the session only when the user actually picked a
+  // different level; merely opening the modal must never restart anything.
+  let thinkingTouched = false;
 
   function _renderModels() {
     const list = document.getElementById('sm-model-list');
@@ -250,31 +272,38 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
     const list = document.getElementById('sm-thinking-list');
     if (!section || !list) return;
     section.style.display = '';
-    const levels = [
-      {key: '', label: 'Default', desc: 'Model default'},
-      {key: 'none', label: 'None', desc: 'No extended thinking'},
-      {key: 'low', label: 'Low', desc: 'Brief reasoning'},
-      {key: 'medium', label: 'Medium', desc: 'Moderate reasoning'},
-      {key: 'high', label: 'High', desc: 'Deep reasoning'},
-    ];
+    const levels = SessionModel.THINKING_LEVELS;
     let html = '';
     for (const l of levels) {
-      const active = l.key === pendingThinking;
-      html += '<div class="msel-row' + (active ? ' active' : '') + '" data-level="' + l.key + '" role="button" tabindex="0">' +
+      // Live session with an unknown current level (older daemon): pre-select
+      // nothing rather than claim a level we can't verify.
+      const active = (!liveMode || _liveThinkingKnown) && l.key === pendingThinking;
+      html += '<div class="msel-row msel-chip' + (active ? ' active' : '') + '" data-level="' + l.key + '" role="button" tabindex="0" title="' + l.desc + '">' +
         _MSEL_CHECK +
         '<span class="msel-name">' + l.label + '</span>' +
-        '<span class="msel-sub">' + l.desc + '</span>' +
         '</div>';
     }
     list.innerHTML = html;
     list.querySelectorAll('.msel-row').forEach(row =>
       row.onclick = () => window._smSelectThinking(row));
+    _renderThinkingHint();
+  }
+
+  // One-line description of the selected level under the chip grid.
+  function _renderThinkingHint() {
+    const hint = document.getElementById('sm-thinking-hint');
+    if (!hint) return;
+    const known = !liveMode || _liveThinkingKnown || thinkingTouched;
+    const l = SessionModel.THINKING_LEVELS.find(x => x.key === pendingThinking);
+    hint.textContent = (known && l) ? l.label + ': ' + l.desc
+      : 'Current level not reported by this server version. Pick one to set it.';
   }
 
   _renderModels();
-  // Thinking level is launch-time configuration — it cannot be changed on a
-  // running session, so live mode honestly hides it instead of pretending.
-  if (!liveMode) _renderThinking();
+  // Thinking level is launch-time configuration (the CLI's --effort flag), so
+  // in live mode a change is applied by restarting the session's CLI with
+  // --resume --effort.  The modal text says so; see _applyLiveSessionChoice.
+  _renderThinking();
 
   // Enable apply only when a selection differs from current state
   function _refreshApply() {
@@ -295,6 +324,8 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
     document.querySelectorAll('#sm-thinking-list .msel-row').forEach(c => c.classList.remove('active'));
     row.classList.add('active');
     pendingThinking = row.dataset.level;
+    thinkingTouched = true;
+    _renderThinkingHint();
     _refreshApply();
   };
   window._applySessionModelOverride = function() {
@@ -309,7 +340,7 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
     _refreshSessionModelBtn(pendingSessionId);
     const label = _modelLabel(pendingModel);
     const thinking = pendingThinking
-      ? ' + ' + pendingThinking.charAt(0).toUpperCase() + pendingThinking.slice(1) + ' thinking'
+      ? ' + ' + _thinkingLbl(pendingThinking) + ' thinking'
       : '';
     if (typeof showToast === 'function') showToast('Session: ' + label + thinking);
   };
@@ -416,6 +447,120 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
   // until the daemon confirms the CLI accepted the set_model control
   // request.  On failure or timeout the badge keeps showing the real model
   // and the user gets an explicit error — never silent fake success.
+  // Live-mode Apply.  A thinking change (effort is a launch flag) takes the
+  // restart path, which also carries any model change in the same restart.
+  // A model-only change keeps the existing live set_model path.
+  window._applyLiveSessionChoice = function() {
+    if (!liveMode || !liveSid) return;
+    const thinkingChanged = thinkingTouched &&
+      (!_liveThinkingKnown || pendingThinking !== currentLiveThinking);
+    if (thinkingChanged) { _applyLiveSessionThinking(); return; }
+    window._applyLiveSessionModel();
+  };
+
+  // Restart the session's CLI with --resume --effort <level> (and --model if
+  // that changed too).  Honest by construction: nothing is recorded until the
+  // daemon confirms the session came back idle.
+  function _applyLiveSessionThinking() {
+    const btn = document.getElementById('sm-apply-btn');
+    const kind = (typeof sessionKinds !== 'undefined') ? sessionKinds[liveSid] : '';
+    const running = (typeof runningIds !== 'undefined') && runningIds.has(liveSid);
+    if (running && (kind === 'working' || kind === 'question')) {
+      // Restarting mid-turn would kill the turn in flight.
+      if (typeof showToast === 'function') {
+        showToast('Session is busy. Change thinking once the current turn finishes.');
+      }
+      return;
+    }
+    if (typeof socket === 'undefined') {
+      if (typeof showToast === 'function') showToast('Not connected, thinking NOT changed');
+      return;
+    }
+    const level = pendingThinking || '';
+    const modelChanged = !!pendingModel && pendingModel !== currentLiveBase;
+    const resumeModel = modelChanged ? pendingModel
+      : ((SessionModel.resumeModel ? SessionModel.resumeModel(liveSid) : '') || '');
+    if (btn) { btn.disabled = true; btn.textContent = 'Restarting…'; }
+
+    let settled = false;
+    let started = false;
+    const cleanup = () => {
+      settled = true;
+      clearTimeout(timer);
+      socket.off('session_state', onState);
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      cleanup();
+      if (btn) { btn.disabled = false; btn.textContent = 'Apply'; }
+      if (typeof showToast === 'function') {
+        showToast('No confirmation from the server. Check the session before retrying.');
+      }
+    }, 30000);
+
+    function startAtLevel() {
+      if (started) return;
+      started = true;
+      // Explicit restart supersedes the sleep intent marked below.
+      if (typeof clearUserStopped === 'function') clearUserStopped(liveSid);
+      socket.emit('start_session', {
+        session_id: liveSid,
+        cwd: (typeof _currentProjectDir === 'function') ? _currentProjectDir() : '',
+        resume: true,
+        model: resumeModel || undefined,
+        // 'default' = explicit reset to the model default, so the daemon
+        // does not re-pin the level the session was running at.
+        thinking_level: level || 'default',
+      });
+    }
+
+    function onState(d) {
+      if (settled || !d || d.session_id !== liveSid) return;
+      if (!started) {
+        if (d.state === 'stopped') startAtLevel();
+        return;
+      }
+      if (d.state === 'stopped' && d.error) {
+        cleanup();
+        if (btn) { btn.disabled = false; btn.textContent = 'Apply'; }
+        if (typeof showToast === 'function') showToast('Restart FAILED: ' + d.error);
+        return;
+      }
+      if (d.state !== 'idle' && d.state !== 'working') return;
+      cleanup();
+      // Daemon brought the session back.  Record the level on the session so
+      // the next wake from this tab pins it; a daemon that reports `effort`
+      // overwrites this with ground truth through the same write path.
+      SessionModel.setDesired(liveSid, resumeModel, level);
+      if (typeof d.effort === 'string') {
+        SessionModel.ingestConfirmedThinking(liveSid, d.effort);
+      } else {
+        SessionModel.ingestConfirmedThinking(liveSid, level);
+      }
+      _renderSessionThinkingBadge(liveSid);
+      if (modelChanged) _renderSessionModelBadge(liveSid);
+      _closePm();
+      if (typeof showToast === 'function') {
+        showToast('Thinking set to ' + _thinkingLbl(level) +
+          (modelChanged ? ' on ' + _modelLabel(pendingModel) : '') +
+          '. Applies from the next message.');
+      }
+    }
+    socket.on('session_state', onState);
+
+    if (running) {
+      // Explicit stop path: mark intent BEFORE close_session so a pending
+      // ghost-recovery timer can't resurrect the session mid-restart (see the
+      // sleep-must-stick rules in live-panel.js).
+      if (typeof markUserStopped === 'function') markUserStopped(liveSid);
+      socket.emit('close_session', { session_id: liveSid });
+      // If the stopped push is lost, start anyway after a grace period.
+      setTimeout(() => { if (!settled) startAtLevel(); }, 8000);
+    } else {
+      startAtLevel();
+    }
+  }
+
   window._applyLiveSessionModel = function() {
     if (!liveMode || !liveSid || !pendingModel) return;
     if (pendingModel === currentLiveBase) {
@@ -456,7 +601,7 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
       const timer = setTimeout(() => {
         if (settled) return;
         finish();
-        if (btn) { btn.disabled = false; btn.textContent = 'Switch Model'; }
+        if (btn) { btn.disabled = false; btn.textContent = 'Apply'; }
         if (typeof showToast === 'function') {
           showToast('No confirmation from the server — if the model badge updates, the switch went through; otherwise try again');
         }
@@ -494,7 +639,10 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
           // choice instead of B.  Keeping the two fields in step is what makes
           // "the model I picked is the model it wakes up on" actually true.
           if (typeof SessionModel !== 'undefined' && SessionModel.setDesired) {
-            SessionModel.setDesired(liveSid, data.model, '');
+            // Keep the session's thinking level: a model switch must not
+            // silently reset it on the next wake.
+            SessionModel.setDesired(liveSid, data.model,
+              SessionModel.resumeThinking ? SessionModel.resumeThinking(liveSid) : '');
           }
           // The fallback's sleep was plumbing, not user intent — let ghost
           // recovery protect the resumed session again.
@@ -513,12 +661,12 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
           // CLI binary predates this model. The daemon-restart fallback
           // above can't fix this — the CLI itself needs updating. Offer
           // one-click `claude update`, then re-attempt the switch.
-          if (btn) { btn.disabled = false; btn.textContent = 'Switch Model'; }
+          if (btn) { btn.disabled = false; btn.textContent = 'Apply'; }
           _offerClaudeUpdate(String(data.error), pendingModel).then((didUpdate) => {
             if (didUpdate) attempt();
           });
         } else {
-          if (btn) { btn.disabled = false; btn.textContent = 'Switch Model'; }
+          if (btn) { btn.disabled = false; btn.textContent = 'Apply'; }
           if (typeof showToast === 'function') {
             showToast('Model switch FAILED: ' + (data.error || 'unknown error'));
           }
@@ -582,17 +730,19 @@ function _refreshSessionModelBtn(sessionId) {
   // so it can never show a value another session chose.
   const btn = document.getElementById('session-model-btn');
   if (btn && typeof SessionModel !== 'undefined') {
-    const isOverridden = !!SessionModel.getDesired(sessionId);
-    btn.textContent = _modelLabel(SessionModel.effectivePending(sessionId));
+    const isOverridden = !!SessionModel.getDesired(sessionId) || _hasChosenThinking(sessionId);
+    const _lbl = _modelLabel(SessionModel.effectivePending(sessionId));
+    const _seg = btn.querySelector('.smb-model');
+    if (_seg) _seg.textContent = _lbl; else btn.textContent = _lbl;
     btn.classList.toggle('session-model-overridden', isOverridden);
-    btn.title = isOverridden
-      ? 'Model overridden — click to change'
-      : 'Click to choose model for this session';
+    btn.title = _bubbleTitle(_lbl, _sessionThinkingFor(true, sessionId), isOverridden
+      ? 'Chosen for this session' : 'Click to choose model and thinking for this session');
   }
 
   // Running-session badge shows only the session's ACTUAL (confirmed) model —
   // delegate to the single badge renderer so there is exactly one DOM writer.
   _renderSessionModelBadge(typeof liveSessionId !== 'undefined' ? liveSessionId : '');
+  _renderSessionThinkingBadge();
 }
 
 /**
@@ -616,8 +766,10 @@ function _renderSessionModelBadge(sessionId) {
     : '';
   if (!model) return;
   const lbl = _modelLabel(model);
-  badge.textContent = lbl;
-  badge.title = 'Session model: ' + lbl + ' — click to switch (applies from the next message)';
+  const seg = badge.querySelector('.smb-model');
+  if (seg) seg.textContent = lbl; else badge.textContent = lbl;
+  badge.title = _bubbleTitle(lbl, _sessionThinkingFor(false, liveSessionId),
+    'Click to switch (model applies from the next message)');
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -643,6 +795,71 @@ function _buildInvokeBtn() {
  * @param {string}  [sessionModel=''] - model of the current live session
  *   (used in idle/waiting/working bars for display purposes).
  */
+/**
+ * The thinking level a bar should show: for a pending session its chosen
+ * level (else the system default it WILL start at); for a running session the
+ * daemon-reported launch level (else this tab's recorded choice).  Returns
+ * {key, known}; known=false when a running session's level can't be verified.
+ */
+function _sessionThinkingFor(isNewSession, sessionId) {
+  if (typeof SessionModel === 'undefined') return { key: '', known: false };
+  if (isNewSession) return { key: SessionModel.getDesiredThinking(sessionId), known: true };
+  const confirmed = SessionModel.getConfirmedThinking(sessionId);
+  const recorded = SessionModel.resumeThinking(sessionId);
+  return { key: recorded, known: confirmed !== undefined || !!recorded };
+}
+
+/** True when this pending session has its own thinking choice (vs default). */
+function _hasChosenThinking(sid) {
+  if (typeof allSessions === 'undefined' || !Array.isArray(allSessions)) return false;
+  const s = allSessions.find(x => x && x.id === sid);
+  return !!(s && typeof s.desiredThinking === 'string');
+}
+
+/**
+ * Thinking segment inside the model bubble: "Opus 5.5 · xHigh".  Hidden when a
+ * running session's level can't be verified (older daemon) rather than guess.
+ */
+function _thinkingSegment(isNewSession, sessionId) {
+  if (typeof SessionModel === 'undefined') return '';
+  const t = _sessionThinkingFor(isNewSession, sessionId);
+  return '<span class="smb-think" data-new="' + (isNewSession ? '1' : '') + '" data-sid="' +
+    escHtml(sessionId || '') + '"' + (t.known ? '' : ' hidden') + '>' +
+    '<span class="smb-sep" aria-hidden="true">·</span>' +
+    '<span class="smb-think-lbl">' + escHtml(t.known ? SessionModel.thinkingLabel(t.key) : '') +
+    '</span></span>';
+}
+
+/** Combined tooltip for the bubble. */
+function _bubbleTitle(modelLabel, t, hint) {
+  const think = (t && t.known && typeof SessionModel !== 'undefined')
+    ? SessionModel.thinkingLabel(t.key) : 'unknown';
+  return 'Model: ' + modelLabel + ' · Thinking: ' + think + (hint ? ' — ' + hint : '');
+}
+
+/** THE single DOM writer for the bubble's thinking segment.  Reads the store. */
+function _renderSessionThinkingBadge(sessionId) {
+  const seg = document.querySelector('.smb-think');
+  if (!seg || typeof SessionModel === 'undefined') return;
+  const isNew = seg.dataset.new === '1';
+  const sid = seg.dataset.sid || '';
+  if (sessionId && sid && sessionId !== sid) return;
+  const t = _sessionThinkingFor(isNew, sid);
+  seg.hidden = !t.known;
+  seg.querySelector('.smb-think-lbl').textContent = t.known ? SessionModel.thinkingLabel(t.key) : '';
+  const btn = seg.closest('button');
+  if (!btn) return;
+  const modelLbl = (btn.querySelector('.smb-model') || btn).textContent;
+  if (isNew) {
+    const chosen = !!SessionModel.getDesired(sid) || _hasChosenThinking(sid);
+    btn.classList.toggle('session-model-overridden', chosen);
+    btn.title = _bubbleTitle(modelLbl, t, chosen
+      ? 'Chosen for this session' : 'Click to choose model and thinking for this session');
+  } else {
+    btn.title = _bubbleTitle(modelLbl, t, 'Click to switch (model applies from the next message)');
+  }
+}
+
 function _buildBarLeftGroup(ctxHtml, isNewSession, sessionModel, sessionId) {
   return '<div class="bar-left-group">' +
     (typeof _buildInvokeBtn === 'function' ? _buildInvokeBtn() : '') +

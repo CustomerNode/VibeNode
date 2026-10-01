@@ -1977,26 +1977,25 @@ function _updateModelLabel() {
 _updateModelLabel();
 
 // --- Thinking Level Selector ---
-let defaultThinking = localStorage.getItem('defaultThinking') || '';
+// Sanitized through SessionModel: the removed "None" option stored 'none',
+// which never disabled thinking.
+let defaultThinking = (typeof SessionModel !== 'undefined')
+  ? SessionModel.getDefaultThinking()
+  : ((localStorage.getItem('defaultThinking') || '').replace(/^none$/, ''));
 
 function openThinkingSelector() {
   const overlay = document.getElementById('pm-overlay');
-  const levels = [
-    {key: '', name: 'Default', desc: 'Use model default'},
-    {key: 'none', name: 'None', desc: 'No extended thinking'},
-    {key: 'low', name: 'Low', desc: 'Brief reasoning step'},
-    {key: 'medium', name: 'Medium', desc: 'Moderate reasoning'},
-    {key: 'high', name: 'High', desc: 'Deep reasoning for hard tasks'},
-  ];
+  const levels = SessionModel.THINKING_LEVELS;
   let html = '<div class="pm-card pm-enter" style="width:380px;">'
     + '<h2 class="pm-title">Thinking Level</h2>'
-    + '<div class="pm-body"><p>Set the extended thinking level for new sessions.</p></div>'
+    + '<div class="pm-body"><p>Effort level for new sessions. Higher levels think longer and cost more. '
+    + 'Change a running session from its model badge.</p></div>'
     + '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:20px;">';
   for (const l of levels) {
     const isActive = l.key === defaultThinking;
     html += `<div class="add-mode-card${isActive ? ' active' : ''}" data-level="${l.key}">
       <div class="add-mode-info">
-        <div class="add-mode-title">${l.name}</div>
+        <div class="add-mode-title">${l.label}</div>
         <div class="add-mode-desc">${l.desc}</div>
       </div>
     </div>`;
@@ -2021,7 +2020,12 @@ function openThinkingSelector() {
 function _updateThinkingLabel() {
   const el = document.getElementById('sys-thinking-label');
   if (!el) return;
-  el.textContent = defaultThinking ? defaultThinking.charAt(0).toUpperCase() + defaultThinking.slice(1) : 'Default';
+  // app.js loads BEFORE session-model.js, so this first runs without the store.
+  el.textContent = (typeof SessionModel !== 'undefined')
+    ? SessionModel.thinkingLabel(defaultThinking)
+    : (defaultThinking === 'xhigh' ? 'xHigh'
+      : defaultThinking ? defaultThinking.charAt(0).toUpperCase() + defaultThinking.slice(1)
+      : 'Default');
 }
 _updateThinkingLabel();
 

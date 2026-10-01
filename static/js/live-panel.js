@@ -1447,7 +1447,10 @@ function _autoSendPendingInput() {
       filterSessions();
     } else if (!isRunning) {
       // Ended session — resume with the typed text
-      socket.emit('start_session', { session_id: id, prompt: text, cwd: _currentProjectDir(), resume: true });
+      const _endedThinking = (typeof SessionModel !== 'undefined' && SessionModel.resumeThinking)
+        ? SessionModel.resumeThinking(id) : '';
+      socket.emit('start_session', { session_id: id, prompt: text, cwd: _currentProjectDir(), resume: true,
+        thinking_level: _endedThinking || undefined });
       runningIds.add(id);
       guiOpenAdd(id);
     } else if (kind === 'question' && waitingData[id]) {
@@ -3530,12 +3533,17 @@ function liveSubmitContinue(fromId) {
           ? SessionModel.resumeModel(sid)
           : SessionModel.getDesired(sid)) || '')
       : '';
+    // Same precedence for effort; '' omits it and the daemon re-pins the
+    // level it remembers for this session.
+    const _resumeThinking = (typeof SessionModel !== 'undefined' && SessionModel.resumeThinking)
+      ? SessionModel.resumeThinking(sid) : '';
     socket.emit('start_session', {
       session_id: sid,
       prompt: text,
       cwd: _currentProjectDir(),
       resume: true,
       model: _desiredModel || undefined,
+      thinking_level: _resumeThinking || undefined,
       voice: wasVoice || undefined,
     });
     runningIds.add(sid);

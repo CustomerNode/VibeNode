@@ -542,6 +542,10 @@ class SessionInfo:
     name: str = ""
     cwd: str = ""
     model: str = ""
+    # CLI ``--effort`` level this session was launched with ('' == none sent,
+    # i.e. the model's own default).  Pinned again on every resume — see
+    # SessionManager._resolve_resume_effort.
+    effort: str = ""
     session_type: str = ""  # "planner" for AI task planner sessions
     cost_usd: float = 0.0
     error: Optional[str] = None
@@ -660,8 +664,9 @@ class SessionInfo:
             "name": self.name,
             "cwd": self.cwd,
             "model": self.model,
+            "effort": self.effort,
             "session_type": self.session_type,
-            "working_since": self.working_since if self.state == SessionState.WORKING else 0,
+            "working_since":self.working_since if self.state == SessionState.WORKING else 0,
             "created_ts": self.created_ts,
             "tracked_files": list(self.tracked_files)[-5:],
         }
@@ -1063,12 +1068,34 @@ class SessionManager:
         subsession_origin_turn: int = 0,
         parent_deleted_at: Optional[str] = None,
         auto_report_on_idle: bool = False,
+        effort_reset: bool = False,
     ) -> dict:
-        """Start or resume an SDK session. Returns immediately."""
+        """Start or resume an SDK session. Returns immediately.
+
+        ``effort_reset=True`` means the caller explicitly chose "model default"
+        effort: no ``--effort`` flag is sent and the session's remembered
+        effort is NOT re-pinned on this resume.
+        """
         _forward_to_send = False
+        # Follow the temp-id -> CLI-id remap FIRST.  After a session's first
+        # RESULT it lives under the CLI's id and the client's temp id becomes an
+        # alias.  A start/wake that still carries the temp id (stale tab,
+        # another device, a reload racing the remap event) used to miss the
+        # existing SessionInfo entirely and create a SECOND session under the
+        # temp id, resuming a transcript that doesn't exist; the duplicate then
+        # self-healed into an orphan CLI no close could reach (seen live
+        # 2026-10-01).  Every other entry point (send_message, close_session,
+        # get_session_state) already resolves; start_session was the gap.
+        session_id = self._resolve_id(session_id)
+        # Effort the session was running at before this (re)start, captured
+        # from the in-memory SessionInfo before it is replaced below.  A slept
+        # session is STOPPED and absent from the registry snapshot, so this is
+        # the only record of its effort within one daemon lifetime.
+        _prev_effort = ""
         with self._lock:
             if session_id in self._sessions:
                 existing = self._sessions[session_id]
+                _prev_effort = getattr(existing, "effort", "") or ""
                 # Detect zombie: task coroutine finished but state never
                 # transitioned to STOPPED/IDLE.  Force cleanup so the
                 # session can be restarted instead of stuck forever.
@@ -1141,11 +1168,14 @@ class SessionManager:
                     model = self._cli_model_id(_reg_model) or None
             except Exception:
                 pass
+        extra_args, _effort = self._resolve_resume_effort(
+            session_id, resume, extra_args, _prev_effort, effort_reset)
         info = SessionInfo(
             session_id=session_id,
             name=name,
             cwd=cwd,
             model=_seeded_model,
+            effort=_effort,
             state=SessionState.STARTING,
             session_type=session_type or "",
             parent_session_id=parent_session_id,
@@ -1678,6 +1708,51 @@ class SessionManager:
         import re as _re
         return _re.sub(r"\[[^\]]*\]", "", (model or "").strip())
 
+    # Values ``claude --effort`` accepts (verified against ``claude --help``,
+    # CLI 2.1.283).  The CLI only warns on anything else and silently runs at
+    # the default, so the session would record a level it is not running at.
+    # A stale/garbage remembered value is therefore dropped, not forwarded.
+    VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+    def _resolve_resume_effort(self, session_id: str, resume: bool,
+                               extra_args: Optional[dict], prev_effort: str,
+                               effort_reset: bool) -> tuple:
+        """Decide the ``--effort`` for a (re)start; return (extra_args, effort).
+
+        ``claude --resume`` does NOT remember a session's effort, exactly as it
+        does not remember its model.  Before this, every wake, auto-resume, and
+        resume-with-``--model`` silently dropped the session back to the CLI
+        default effort.  Precedence:
+
+          1. an explicit effort in ``extra_args`` (the caller chose) wins;
+          2. ``effort_reset`` — the caller explicitly chose "model default";
+          3. on resume only: the effort the in-memory session last ran at,
+             else the registry's record (dormant after a daemon restart).
+        """
+        args = dict(extra_args or {})
+        explicit = str(args.get("effort") or "").strip()
+        if explicit:
+            if explicit not in self.VALID_EFFORTS:
+                args.pop("effort", None)
+                return args, ""
+            return args, explicit
+        args.pop("effort", None)
+        if effort_reset or not resume:
+            return args, ""
+        effort = (prev_effort or "").strip()
+        if not effort:
+            try:
+                _reg_sessions = self._reg.load_registry().get("sessions", {})
+                _meta = (_reg_sessions.get(session_id)
+                         or _reg_sessions.get(self._resolve_id(session_id)) or {})
+                effort = str(_meta.get("effort") or "").strip()
+            except Exception:
+                effort = ""
+        if effort in self.VALID_EFFORTS:
+            args["effort"] = effort
+            return args, effort
+        return args, ""
+
     # How long after a live ``set_model`` the CLI's side-effect ``init`` is
     # still expected.  Past this, ``_model_switch_in_progress`` is stale: the
     # CLI either never emitted the init (version-dependent) or it was consumed
@@ -2147,9 +2222,20 @@ class SessionManager:
         return {"ok": True}
 
     def remove_session(self, session_id: str) -> None:
-        """Remove a session from the in-memory dict entirely."""
+        """Remove a session from the in-memory dict entirely.
+
+        Follows the temp-id -> CLI-id remap.  Callers usually hold the id they
+        started the session with, but after the first RESULT the session lives
+        under the CLI's id, so popping only the raw id silently left the
+        session (and, for title sessions, its idle CLI) registered forever.
+        Callers must close the session first (close_session_sync) to stop
+        its CLI; this only forgets it.
+        """
         with self._lock:
             self._sessions.pop(session_id, None)
+            resolved = self._resolve_id(session_id)
+            if resolved != session_id:
+                self._sessions.pop(resolved, None)
 
     def get_all_states(self) -> list:
         """Return snapshot of all session states for initial WebSocket connect.
@@ -2843,9 +2929,17 @@ class SessionManager:
                         resume=resolved,
                         permission_callback=self._make_permission_callback(session_id),
                         pre_compact_callback=self._make_pre_compact_callback(session_id),
-                        model=info.model or None,
+                        # Marker-stripped: info.model can carry the CLI's
+                        # "[1m]" display suffix, which is an API 400 as --model.
+                        model=self._cli_model_id(info.model) or None,
                         permission_mode=_mode_override or "default",
                         include_partial_messages=True,
+                        # Re-pin the session's effort.  Without this every
+                        # self-heal reconnect silently dropped the session to
+                        # the CLI default level (seen live 2026-10-01).
+                        extra_args=({"effort": info.effort}
+                                    if getattr(info, "effort", "") in self.VALID_EFFORTS
+                                    else {}),
                     )
                     client = await self._sdk.create_session(options)
                     await self._sdk.connect(client)
@@ -7636,6 +7730,7 @@ class SessionManager:
                     "name": info.name,
                     "cwd": info.cwd,
                     "model": info.model,
+                    "effort": info.effort,
                     "session_type": info.session_type,
                     "state": info.state.value,
                     "started_at": (
@@ -7682,6 +7777,7 @@ class SessionManager:
                     "name": meta.get("name", ""),
                     "cwd": meta.get("cwd", ""),
                     "model": meta.get("model", ""),
+                    "effort": meta.get("effort", ""),
                     "session_type": meta.get("session_type", ""),
                     # last_state is collapsed to "idle" | "working"; "working"
                     # here means "was mid-task, failed to auto-recover".  Writing

@@ -1410,3 +1410,165 @@ class TestGetAllStatesCwdFillIn:
         assert "s2" in ids, (
             "Brand-new session with empty cwd must still pass through (may belong to active project)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Effort (thinking level) is pinned across resumes (added 2026-09-30)
+# ---------------------------------------------------------------------------
+
+class TestResumeEffortPinning:
+    """``claude --resume`` does not remember ``--effort``, just as it does not
+    remember ``--model``.  Before this, every wake, auto-resume, and
+    resume-with-``--model`` silently dropped a session to the CLI default
+    effort.  The daemon now records the launch effort and re-pins it."""
+
+    def _start(self, session_manager, sid, registry=None, **kw):
+        with patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": registry or {}}), \
+             patch.object(session_manager, '_drive_session',
+                          new=AsyncMock(return_value=None)) as mock_drive:
+            result = session_manager.start_session(sid, prompt="", cwd="/tmp", **kw)
+            assert result["ok"] is True
+            wait_for(lambda: mock_drive.await_count == 1, timeout=5)
+        return (mock_drive.call_args.kwargs.get("extra_args") or {}), \
+            session_manager._sessions[session_manager._resolve_id(sid)]
+
+    def _stopped(self, session_manager, sm_module, sid, effort):
+        info = sm_module.SessionInfo(session_id=sid,
+                                     state=sm_module.SessionState.STOPPED)
+        info.effort = effort
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+    def test_new_session_records_explicit_effort(self, session_manager):
+        args, info = self._start(session_manager, "ef-new",
+                                 extra_args={"effort": "xhigh"})
+        assert args == {"effort": "xhigh"}
+        assert info.effort == "xhigh"
+        assert info.to_state_dict()["effort"] == "xhigh"
+
+    def test_new_session_without_effort_sends_no_flag(self, session_manager):
+        args, info = self._start(session_manager, "ef-none")
+        assert "effort" not in args
+        assert info.effort == ""
+        assert info.to_state_dict()["effort"] == ""
+
+    def test_wake_repins_effort_of_slept_session(self, session_manager, sm_module):
+        """A slept session is STOPPED and absent from the registry snapshot;
+        its in-memory effort is the record that must survive the wake."""
+        self._stopped(session_manager, sm_module, "ef-wake", "max")
+        args, info = self._start(session_manager, "ef-wake", resume=True)
+        assert args["effort"] == "max"
+        assert info.effort == "max"
+
+    def test_dormant_resume_uses_registry_effort(self, session_manager):
+        args, info = self._start(session_manager, "ef-dormant", resume=True,
+                                 registry={"ef-dormant": {"cwd": "/tmp",
+                                                          "effort": "high"}})
+        assert args["effort"] == "high"
+        assert info.effort == "high"
+
+    def test_explicit_effort_beats_remembered(self, session_manager, sm_module):
+        self._stopped(session_manager, sm_module, "ef-explicit", "max")
+        args, info = self._start(session_manager, "ef-explicit", resume=True,
+                                 extra_args={"effort": "low"})
+        assert args["effort"] == "low"
+        assert info.effort == "low"
+
+    def test_effort_reset_drops_remembered(self, session_manager, sm_module):
+        """The live switch to "Default" must not be undone by re-pinning."""
+        self._stopped(session_manager, sm_module, "ef-reset", "xhigh")
+        args, info = self._start(session_manager, "ef-reset", resume=True,
+                                 effort_reset=True)
+        assert "effort" not in args
+        assert info.effort == ""
+
+    def test_invalid_effort_never_reaches_cli(self, session_manager, sm_module):
+        """The CLI silently ignores an unknown --effort value, so forwarding
+        one would record a level the session is not actually running at."""
+        args, info = self._start(session_manager, "ef-bad-explicit",
+                                 extra_args={"effort": "auto"})
+        assert "effort" not in args and info.effort == ""
+        self._stopped(session_manager, sm_module, "ef-bad-mem", "none")
+        args, info = self._start(session_manager, "ef-bad-mem", resume=True)
+        assert "effort" not in args and info.effort == ""
+
+    def test_other_extra_args_preserved(self, session_manager, sm_module):
+        self._stopped(session_manager, sm_module, "ef-keep", "medium")
+        args, _ = self._start(session_manager, "ef-keep", resume=True,
+                              extra_args={"verbose": None})
+        assert args == {"verbose": None, "effort": "medium"}
+
+    def test_registry_snapshot_persists_effort(self, session_manager, sm_module):
+        info = sm_module.SessionInfo(session_id="ef-reg",
+                                     state=sm_module.SessionState.IDLE)
+        info.effort = "xhigh"
+        with session_manager._lock:
+            session_manager._sessions["ef-reg"] = info
+        with patch.object(session_manager._reg, 'save_registry_now') as save:
+            session_manager._save_registry_now()
+        assert save.call_args.args[0]["ef-reg"]["effort"] == "xhigh"
+
+    def test_wake_under_pre_remap_id_finds_effort(self, session_manager, sm_module):
+        """After the first RESULT the daemon remaps temp id -> CLI id.  A wake
+        that still uses the temp id (stale tab, other device) must find the
+        level stored on the remapped session."""
+        self._stopped(session_manager, sm_module, "real-cli-id", "xhigh")
+        session_manager._id_aliases["temp-id"] = "real-cli-id"
+        args, info = self._start(session_manager, "temp-id", resume=True)
+        assert args["effort"] == "xhigh"
+        assert info.effort == "xhigh"
+
+    def test_dormant_registry_lookup_follows_alias(self, session_manager):
+        session_manager._id_aliases["temp-2"] = "real-2"
+        args, _ = self._start(session_manager, "temp-2", resume=True,
+                              registry={"real-2": {"effort": "max"}})
+        assert args["effort"] == "max"
+
+
+# ---------------------------------------------------------------------------
+# Pre-remap ids resolve to the real session (fixed 2026-10-01)
+# ---------------------------------------------------------------------------
+
+class TestRemapAliasEntryPoints:
+    """After the first RESULT a session lives under the CLI's id and the
+    client's temp id is an alias.  start_session and remove_session must
+    follow the alias like every other entry point already did."""
+
+    def test_wake_under_temp_id_reuses_real_session(self, session_manager, sm_module):
+        info = sm_module.SessionInfo(session_id="real-id",
+                                     state=sm_module.SessionState.STOPPED)
+        with session_manager._lock:
+            session_manager._sessions["real-id"] = info
+        session_manager._id_aliases["temp-id"] = "real-id"
+        with patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": {}}), \
+             patch.object(session_manager, '_drive_session',
+                          new=AsyncMock(return_value=None)) as mock_drive:
+            assert session_manager.start_session("temp-id", prompt="", cwd="/tmp",
+                                                 resume=True)["ok"] is True
+            wait_for(lambda: mock_drive.await_count == 1, timeout=5)
+        # No duplicate under the temp id; the CLI resumes the REAL transcript.
+        assert "temp-id" not in session_manager._sessions
+        assert "real-id" in session_manager._sessions
+        assert mock_drive.call_args.args[0] == "real-id"
+
+    def test_message_to_live_session_via_temp_id_is_delivered(self, session_manager, sm_module):
+        info = sm_module.SessionInfo(session_id="live-real",
+                                     state=sm_module.SessionState.IDLE)
+        with session_manager._lock:
+            session_manager._sessions["live-real"] = info
+        session_manager._id_aliases["live-temp"] = "live-real"
+        with patch.object(session_manager, 'send_message',
+                          return_value={"ok": True}) as send:
+            session_manager.start_session("live-temp", prompt="hi", cwd="/tmp")
+        send.assert_called_once()
+        assert send.call_args.args[0] == "live-real"
+
+    def test_remove_session_follows_alias(self, session_manager, sm_module):
+        info = sm_module.SessionInfo(session_id="rm-real")
+        with session_manager._lock:
+            session_manager._sessions["rm-real"] = info
+        session_manager._id_aliases["rm-temp"] = "rm-real"
+        session_manager.remove_session("rm-temp")
+        assert "rm-real" not in session_manager._sessions

@@ -562,3 +562,53 @@ class TestSmartTitle:
             title = smart_title(messages)
         assert isinstance(title, str)
         assert title == "Untitled Session"
+
+
+# ---------------------------------------------------------------------------
+# Title sessions must not leak their CLI process (fixed 2026-10-01)
+# ---------------------------------------------------------------------------
+
+class TestDaemonTitleDisposesSession:
+    """An IDLE session keeps its `claude` process alive.  _daemon_title used to
+    call only remove_session, which forgets the session but never stops the
+    process, so every title leaked one idle CLI until the daemon restarted."""
+
+    def _run(self, state_seq):
+        from unittest.mock import MagicMock, patch
+        from flask import Flask
+        import app.titling as titling
+        calls = []
+        sm = MagicMock()
+        sm.is_connected = True
+        sm.start_session.return_value = {"ok": True}
+        sm.get_session_state.side_effect = list(state_seq)
+        sm.get_entries.return_value = []
+        sm.close_session_sync.side_effect = lambda sid, *a, **k: calls.append(("close", sid))
+        sm.remove_session.side_effect = lambda sid: calls.append(("remove", sid))
+        app = Flask(__name__)
+        app.session_manager = sm
+        msgs = [{"role": "user", "content": "please refactor the payment retry logic"}]
+        with app.app_context(), \
+             patch.object(titling, "_cleanup_title_jsonl"), \
+             patch.object(titling, "_extract_title_from_entries", return_value="T"), \
+             patch("time.sleep"):
+            titling._daemon_title(msgs)
+        return calls
+
+    def test_finished_title_closes_cli_before_forgetting(self):
+        calls = self._run(["working", "idle"])
+        assert [c[0] for c in calls] == ["close", "remove"]
+        assert calls[0][1] == calls[1][1] and calls[0][1].startswith("_title_")
+
+    def test_timed_out_title_is_also_closed(self):
+        calls = self._run(["working"] * 60)
+        assert [c[0] for c in calls] == ["close", "remove"]
+
+    def test_close_failure_still_forgets_session(self):
+        from unittest.mock import MagicMock, patch
+        from flask import Flask
+        import app.titling as titling
+        sm = MagicMock()
+        sm.close_session_sync.side_effect = RuntimeError("daemon gone")
+        titling._dispose_title_session(sm, "_title_x")
+        sm.remove_session.assert_called_once_with("_title_x")

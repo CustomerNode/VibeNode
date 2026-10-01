@@ -627,7 +627,19 @@ class DaemonClient:
             params["parent_session_id"] = kwargs["parent_session_id"]
         if kwargs.get("subsession_origin_turn") is not None:
             params["subsession_origin_turn"] = kwargs["subsession_origin_turn"]
-        return self._send_request("start_session", params)
+        # Explicit "model default" effort on a resume.  Sent ONLY when true: a
+        # daemon started before the param existed rejects unknown keys
+        # (``handler(**params)``).  That older daemon never re-pins a
+        # remembered effort anyway, so dropping the key there is equivalent.
+        if kwargs.get("effort_reset"):
+            params["effort_reset"] = True
+        result = self._send_request("start_session", params)
+        if params.get("effort_reset") and isinstance(result, dict) \
+                and not result.get("ok") \
+                and "effort_reset" in str(result.get("error", "")):
+            params.pop("effort_reset", None)
+            result = self._send_request("start_session", params)
+        return result
 
     def send_message(self, session_id, text, voice=False, _ttft_t0_ns=0):
         # TTFT: pass-through of the server-captured wall-clock T0 timestamp,

@@ -163,7 +163,7 @@ def main() -> int:
     print()
     print("NOTE: This script does NOT restart any server.  Per VibeNode CLAUDE.md, AI tools")
     print("      cannot restart the daemon.  You must restart it manually via the GUI:")
-    print("        System -> Restart Server -> Session Daemon")
+    print("        System -> Developer Tools -> Restart Server -> Session Engine")
     return 0
 
 

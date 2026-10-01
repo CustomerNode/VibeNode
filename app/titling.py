@@ -412,15 +412,35 @@ def _daemon_title(messages: list) -> str | None:
         if done:
             entries = sm.get_entries(sid, since=0)
             title = _extract_title_from_entries(entries, texts)
-            sm.remove_session(sid)
+            _dispose_title_session(sm, sid)
             _cleanup_title_jsonl(sid, sm, utility_project)
             return title
 
     # Timeout — grab whatever we have
     entries = sm.get_entries(sid, since=0)
-    sm.remove_session(sid)
+    _dispose_title_session(sm, sid)
     _cleanup_title_jsonl(sid, sm, utility_project)
     return _extract_title_from_entries(entries, texts)
+
+
+def _dispose_title_session(sm, sid: str) -> None:
+    """Shut the title session's CLI down, THEN forget the session.
+
+    An IDLE session keeps its ``claude`` process alive waiting for the next
+    turn.  This used to call only ``remove_session``, which drops the daemon's
+    record but never stops the process, so every generated title leaked one
+    idle ``claude --model haiku --effort low`` until the daemon restarted
+    (13 were alive at once on 2026-09-30).  Same close-then-remove contract
+    every other remove_session caller in sessions_api.py follows.
+    """
+    try:
+        sm.close_session_sync(sid)
+    except Exception as e:
+        log.debug("_dispose_title_session: close %s failed: %s", sid, e)
+    try:
+        sm.remove_session(sid)
+    except Exception as e:
+        log.debug("_dispose_title_session: remove %s failed: %s", sid, e)
 
 
 # First-line signature used to identify title-utility JSONL files in the

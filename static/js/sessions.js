@@ -1128,6 +1128,12 @@ function _dblclickWakeSleeping(sessionId) {
         : (SessionModel.getDesired ? SessionModel.getDesired(sessionId) : '')) || '';
     }
   } catch (_) { /* SessionModel may not be defined in some views */ }
+  let _resumeThinking = '';
+  try {
+    if (typeof SessionModel !== 'undefined' && SessionModel.resumeThinking) {
+      _resumeThinking = SessionModel.resumeThinking(sessionId) || '';
+    }
+  } catch (_) { /* store unavailable — daemon re-pins remembered effort */ }
 
   if (typeof socket !== 'undefined') {
     try {
@@ -1136,6 +1142,7 @@ function _dblclickWakeSleeping(sessionId) {
         cwd: (typeof _currentProjectDir === 'function') ? _currentProjectDir() : '',
         resume: true,
         model: _desiredModel || undefined,
+        thinking_level: _resumeThinking || undefined,
       });
     } catch (err) { /* transport dead — the wake toast still shows */ }
   }

@@ -571,14 +571,21 @@ def register_ws_events(socketio, app):
         if prompt and session_type not in ('planner', 'title') and _is_tailnet_turn(data):
             prompt = _with_mobile_preamble(prompt)
 
-        # Build extra_args from thinking_level — maps to --effort CLI flag.
-        # Values: 'low', 'medium', 'high', 'auto', 'max' are forwarded;
-        # '' or 'none' mean "no explicit effort setting" (use model default).
+        # Build extra_args from thinking_level — maps to the --effort CLI flag.
+        # The allowlist is exactly what `claude --effort` accepts (verified
+        # against `claude --help`, CLI 2.1.283); the CLI only warns on anything
+        # else and silently runs at the default (verified live 2026-10-01 with
+        # `--effort auto`), so it is filtered here.  '' / missing sends no flag: a new session runs
+        # at the model's default and a resumed one keeps the effort the daemon
+        # remembers.  'default' is an explicit reset to the model default on a
+        # resume (the live effort switch), so the remembered effort is dropped.
+        # 'none' is a legacy value from the removed "None" option; it never
+        # disabled thinking and is treated as no flag.
         extra_args: dict = {}
-        if thinking_level and thinking_level not in ('', 'none'):
-            valid_effort = ('low', 'medium', 'high', 'auto', 'max')
-            if thinking_level in valid_effort:
-                extra_args['effort'] = thinking_level
+        effort_reset = thinking_level == 'default'
+        if thinking_level in ('low', 'medium', 'high', 'xhigh', 'max'):
+            extra_args['effort'] = thinking_level
+        _start_kwargs = {'effort_reset': True} if effort_reset else {}
 
         sm = app.session_manager
         if _PROFILE_WS:
@@ -597,6 +604,7 @@ def register_ws_events(socketio, app):
             permission_mode=permission_mode,
             session_type=session_type,
             extra_args=extra_args or None,
+            **_start_kwargs,
         )
 
         if result.get('ok'):

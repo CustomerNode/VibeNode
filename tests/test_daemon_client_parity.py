@@ -259,3 +259,38 @@ class TestStartSessionForwardsSubsessionKwargs:
         assert p.get("session_type") == "subsession"
         assert p.get("parent_session_id") == "parent-1"
         assert p.get("subsession_origin_turn") == 42
+
+
+class TestStartSessionEffortReset:
+    """The live thinking switch's explicit "model default" reset.
+
+    Sent only when true, and retried without it against a daemon that
+    predates the param (which never re-pins a remembered effort, so dropping
+    the key there is equivalent)."""
+
+    _client = staticmethod(TestSetSessionModelResumeTurn._client)
+
+    def test_plain_start_omits_effort_reset(self):
+        client, sent = self._client()
+        client.start_session("s1", resume=True)
+        assert "effort_reset" not in sent[0][1]
+
+    def test_reset_is_forwarded(self):
+        client, sent = self._client()
+        client.start_session("s1", resume=True, effort_reset=True)
+        assert sent[0][1].get("effort_reset") is True
+
+    def test_old_daemon_rejecting_effort_reset_retries_without_it(self):
+        err = "start_session() got an unexpected keyword argument 'effort_reset'"
+        client, sent = self._client(
+            reply=lambda n: {"ok": False, "error": err} if n == 1 else {"ok": True})
+        result = client.start_session("s1", resume=True, effort_reset=True)
+        assert len(sent) == 2
+        assert "effort_reset" not in sent[1][1]
+        assert result["ok"] is True
+
+    def test_genuine_failure_is_not_retried(self):
+        client, sent = self._client(reply={"ok": False, "error": "spawn failed"})
+        result = client.start_session("s1", resume=True, effort_reset=True)
+        assert len(sent) == 1
+        assert result["ok"] is False

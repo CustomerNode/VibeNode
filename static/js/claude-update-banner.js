@@ -57,7 +57,7 @@
       // path: "restart the daemon" with no directions sent users to the
       // Update button in circles (2026-09-29).
       msg = 'A Claude Code update is waiting for a daemon restart. Apply it '
-          + 'via System → Restart Server → Session Daemon (ends running '
+          + 'via System → Developer Tools → Restart Server → Session Engine (ends running '
           + 'sessions — they can be resumed after).';
     } else {
       // Straight-up stale. Frame it around the concrete failure mode so

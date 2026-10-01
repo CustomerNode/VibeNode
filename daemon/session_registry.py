@@ -122,6 +122,9 @@ class SessionRegistry:
                     # (which frequently disagrees with what the session
                     # actually last ran on).
                     "model": meta.get("model", ""),
+                    # Launch effort, so a dormant session resumes at the level
+                    # it was running at rather than the CLI default.
+                    "effort": meta.get("effort", ""),
                 }
         except Exception as e:
             logger.warning("Failed to snapshot last-known session states: %s", e)
