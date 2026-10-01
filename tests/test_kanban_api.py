@@ -483,9 +483,17 @@ class TestTaskTreeSummary:
 
 class TestDetectedUrls:
 
-    def test_returns_200(self, kanban_client):
-        resp = kanban_client.get('/api/kanban/detected-urls')
+    def test_returns_200(self, kanban_client, tmp_path):
+        # Point the scanner at a tiny project.  Without ?cwd= it walks the
+        # process cwd, which under pytest is the whole VibeNode checkout
+        # (including data/chrome-profile); that took >60s and the timeout
+        # aborted the ENTIRE test run, not just this test.
+        (tmp_path / "server.py").write_text(
+            '@app.route("/api/widgets")\ndef widgets():\n    return "ok"\n',
+            encoding="utf-8")
+        resp = kanban_client.get('/api/kanban/detected-urls', query_string={"cwd": str(tmp_path)})
         assert resp.status_code == 200
+        assert "/api/widgets" in resp.get_json()["urls"]
 
 
 # ---------------------------------------------------------------------------

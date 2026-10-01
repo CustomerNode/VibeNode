@@ -461,6 +461,23 @@ Status values: `disconnected`, `connecting`, `restarting`, `connected`
 
 ---
 
+### `usage_limits`
+
+**Triggered:** Broadcast to all clients when a Claude turn reports a changed account usage window (session, weekly, or Fable limit). Same shape as `GET /api/usage-limits`.  
+**Payload:**
+```json
+{
+  "updated_at": 1790866000.0,
+  "windows": {
+    "five_hour": {"label": "Session", "percent": 16, "resets_at": 1790871000, "seen_at": 1790866000.0, "expired": false},
+    "seven_day": {"label": "Week", "percent": 46, "resets_at": 1790964000, "seen_at": 1790866000.0, "expired": false},
+    "seven_day_overage_included": {"label": "Fable", "percent": 14, "resets_at": 1790964000, "seen_at": 1790866000.0, "expired": false}
+  }
+}
+```
+
+---
+
 ### `error`
 
 **Triggered:** On any WebSocket handler error  

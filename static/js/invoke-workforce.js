@@ -860,10 +860,118 @@ function _renderSessionThinkingBadge(sessionId) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// USAGE LIMITS PILL — "Session 16% · Week 46% · Fable 14%"
+//
+// Account-wide, so every bar shows the same values.  Source of truth is the
+// daemon (daemon/usage_limits.py), fed by the CLI's rate_limit_event on every
+// turn: loaded once from /api/usage-limits, then kept live by the
+// `usage_limits` socket event.  Values are "as of the last Claude reply";
+// usage elsewhere (claude.ai, other machines) shows up on the next reply.
+// ═══════════════════════════════════════════════════════════════════════
+
+window._usageLimits = window._usageLimits || null;
+
+const _USAGE_WINDOW_ORDER = [
+  {key: 'five_hour', label: 'Session', name: 'Session (5-hour) limit'},
+  {key: 'seven_day', label: 'Week', name: 'Weekly limit'},
+  {key: 'seven_day_overage_included', label: 'Fable', name: 'Weekly Fable limit'},
+];
+
+function _fmtUsageTime(sec) {
+  if (!sec) return '';
+  const d = new Date(sec * 1000);
+  const sameDay = d.toDateString() === new Date().toDateString();
+  const t = d.toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'});
+  return sameDay ? t : d.toLocaleDateString([], {weekday: 'short'}) + ' ' + t;
+}
+
+/** Inner markup + tooltip for the pill, or null when nothing is known yet. */
+function _usageLimitsParts() {
+  const data = window._usageLimits;
+  const windows = (data && data.windows) || {};
+  const known = _USAGE_WINDOW_ORDER.filter(w => windows[w.key]);
+  if (!known.length) return null;  // no turn seen yet: show nothing, not zeros
+  const nowSec = Date.now() / 1000;
+  // Phones only have room for one value: the window closest to its limit.
+  let topKey = null, topPct = -1;
+  for (const w of _USAGE_WINDOW_ORDER) {
+    const v = windows[w.key];
+    if (v && !(v.resets_at && v.resets_at <= nowSec) && v.percent > topPct) {
+      topPct = v.percent; topKey = w.key;
+    }
+  }
+  const segs = [];
+  const tips = [];
+  for (const w of _USAGE_WINDOW_ORDER) {
+    const v = windows[w.key];
+    let cls = 'ulp-seg' + (w.key === topKey ? ' ulp-top' : '');
+    let val = '—';
+    if (!v) {
+      cls += ' ulp-stale';
+      tips.push(w.name + ': not reported yet' +
+        (w.key === 'seven_day_overage_included' ? ' (appears after a Fable reply)' : ''));
+    } else if (v.resets_at && v.resets_at <= nowSec) {
+      cls += ' ulp-stale';
+      tips.push(w.name + ': reset at ' + _fmtUsageTime(v.resets_at) + ', updates after the next reply');
+    } else {
+      const pct = Math.max(0, Math.round(v.percent));
+      val = pct + '%';
+      if (pct >= 95) cls += ' ulp-crit';
+      else if (pct >= 80) cls += ' ulp-warn';
+      tips.push(w.name + ': ' + pct + '% used' +
+        (v.resets_at ? ', resets ' + _fmtUsageTime(v.resets_at) : ''));
+    }
+    segs.push('<span class="' + cls + '"><span class="ulp-lbl">' + w.label + '</span> ' +
+      '<span class="ulp-val">' + val + '</span></span>');
+  }
+  if (data.updated_at) tips.push('As of ' + _fmtUsageTime(data.updated_at) + ' (updates after each Claude reply)');
+  return {
+    html: segs.join('<span class="smb-sep ulp-sep" aria-hidden="true">·</span>'),
+    title: tips.join('\n'),
+  };
+}
+
+function _usageLimitsPillHtml() {
+  const p = _usageLimitsParts();
+  return '<span class="usage-limits-pill"' + (p ? '' : ' hidden') +
+    ' title="' + escHtml(p ? p.title : '') + '">' + (p ? p.html : '') + '</span>';
+}
+
+/** THE single DOM writer for every visible pill. */
+function _renderUsageLimits() {
+  const p = _usageLimitsParts();
+  document.querySelectorAll('.usage-limits-pill').forEach(el => {
+    el.hidden = !p;
+    el.innerHTML = p ? p.html : '';
+    el.title = p ? p.title : '';
+  });
+}
+
+/** Store a snapshot (from the REST load or the socket event) and repaint. */
+function _ingestUsageLimits(data) {
+  if (!data || typeof data !== 'object' || !data.windows) return;
+  window._usageLimits = data;
+  _renderUsageLimits();
+}
+
+function _loadUsageLimits() {
+  fetch('/api/usage-limits').then(r => r.json()).then(_ingestUsageLimits).catch(() => {});
+}
+
+// A window can expire while the page sits open; re-evaluate once a minute.
+// DOM-only (no network, no socket), so it cannot disturb the connection.
+if (!window._usageLimitsTicker) {
+  window._usageLimitsTicker = setInterval(() => {
+    if (window._usageLimits) _renderUsageLimits();
+  }, 60000);
+}
+
 function _buildBarLeftGroup(ctxHtml, isNewSession, sessionModel, sessionId) {
   return '<div class="bar-left-group">' +
     (typeof _buildInvokeBtn === 'function' ? _buildInvokeBtn() : '') +
     _buildSessionModelBtn(isNewSession || false, sessionModel || '', sessionId || '') +
+    _usageLimitsPillHtml() +
     (ctxHtml || '') +
     '</div>';
 }

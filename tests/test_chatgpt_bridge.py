@@ -83,7 +83,10 @@ class TestAskValidation:
 
     def test_empty_prompt(self):
         r = cg.ask("")
-        assert r == {"ok": False, "result": None, "error": "Empty prompt."}
+        # ask() always returns chat_url (its documented return shape since the
+        # per-conversation targeting change); "" when no conversation was used.
+        assert r == {"ok": False, "result": None, "error": "Empty prompt.",
+                     "chat_url": ""}
 
     def test_whitespace_prompt(self):
         r = cg.ask("   \n\t ")

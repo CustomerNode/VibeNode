@@ -282,7 +282,12 @@ class TestHappyPathTransitions:
 
         with patch.object(sm_module, 'ClaudeSDKClient', return_value=mock_client):
             session_manager.start_session(sid, prompt="init", cwd="/tmp")
-            wait_for(lambda: session_manager.get_session_state(sid) == "idle")
+            # Must really be IDLE before the follow-up, or send_message queues
+            # it behind a still-starting session and WORKING never appears.
+            # Under a loaded full-suite run the 5s default timeout expired
+            # (the flake); the turn itself is fast, the machine was busy.
+            assert wait_for(lambda: session_manager.get_session_state(sid) == "idle",
+                            timeout=20), "session never reached IDLE after the first turn"
 
             # Capture states after sending
             states_after_send = []
@@ -298,7 +303,10 @@ class TestHappyPathTransitions:
             result = session_manager.send_message(sid, "Follow-up")
             assert result["ok"] is True
 
-            wait_for(lambda: session_manager.get_session_state(sid) == "idle")
+            # Wait for the transition itself, not just "idle" (which can be
+            # true before the follow-up turn has even started).
+            wait_for(lambda: "working" in states_after_send, timeout=20)
+            wait_for(lambda: session_manager.get_session_state(sid) == "idle", timeout=20)
 
         assert "working" in states_after_send
 

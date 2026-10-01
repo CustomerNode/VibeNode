@@ -925,6 +925,17 @@ class SessionManager:
             return
         self._push_callback = push_callback
         self._mq.set_push_callback(push_callback)
+        # Account usage windows (session / weekly / Fable) from the CLI's
+        # rate_limit_event.  Seeded from disk so the last-seen Fable window
+        # survives a daemon restart.  See daemon/usage_limits.py.
+        try:
+            from daemon import usage_limits as _ul
+            from daemon import sdk_patches as _sp
+            self._usage_lock = threading.Lock()
+            self._usage_state = _ul.load()
+            _sp.set_rate_limit_sink(self._on_rate_limit_info)
+        except Exception as _ul_err:
+            logger.warning("usage limits disabled: %s", _ul_err)
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="session-manager-loop"
@@ -2220,6 +2231,30 @@ class SessionManager:
         except Exception as e:
             logger.warning("Timed-out or failed waiting for close of %s: %s", session_id, e)
         return {"ok": True}
+
+    def _on_rate_limit_info(self, rate_limit_info) -> None:
+        """Sink for the CLI's rate_limit_event (called from the SDK parser).
+
+        Merges the windows, and only on a real change persists them and pushes
+        ``usage_limits`` to every browser.  Cheap and never raises: it runs on
+        the session's receive path, once per turn.
+        """
+        from daemon import usage_limits as _ul
+        lock = getattr(self, "_usage_lock", None)
+        if lock is None:
+            return
+        with lock:
+            new_state, changed = _ul.merge(getattr(self, "_usage_state", {}) or {},
+                                           rate_limit_info)
+            self._usage_state = new_state
+        if not changed:
+            return
+        _ul.save(new_state)
+        if self._push_callback:
+            try:
+                self._push_callback("usage_limits", _ul.public_view(new_state))
+            except Exception as e:
+                logger.debug("usage_limits broadcast failed: %s", e)
 
     def remove_session(self, session_id: str) -> None:
         """Remove a session from the in-memory dict entirely.

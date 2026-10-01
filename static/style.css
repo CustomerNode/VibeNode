@@ -11348,6 +11348,33 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
   background: rgba(37,99,235,0.07);
 }
 
+/* ── Usage limits pill: "Session 16% · Week 46% · Fable 14%" ── */
+.usage-limits-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--border);
+  color: var(--text-faint);
+  white-space: nowrap;
+  letter-spacing: .03em;
+  cursor: default;
+}
+.usage-limits-pill[hidden] { display: none; }
+.ulp-seg { display: inline-flex; align-items: center; gap: 3px; }
+.ulp-lbl { font-weight: 500; opacity: .8; }
+.ulp-val { font-variant-numeric: tabular-nums; }
+.ulp-seg.ulp-warn .ulp-val { color: #d97706; }
+.ulp-seg.ulp-crit .ulp-val { color: #dc2626; }
+.ulp-seg.ulp-stale { opacity: .55; }
+@media (max-width: 600px) {
+  /* Phone bar fits one value: show only the window closest to its limit. */
+  .usage-limits-pill .ulp-seg:not(.ulp-top),
+  .usage-limits-pill .ulp-sep { display: none; }
+}
+
 /* ── Thinking level shown inside the model bubble: "Opus 5.5 · xHigh" ── */
 .smb-think { display: inline-flex; align-items: center; }
 .smb-think[hidden] { display: none; }

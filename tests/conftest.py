@@ -353,6 +353,82 @@ def _forbid_reviver_and_autostart_spawn(request, monkeypatch):
     yield
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# REAL CLAUDE CLI GUARD + FAKE-SDK BACKEND ISOLATION (2026-10-01)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Many daemon test files build a SessionManager inside
+# ``patch.dict('sys.modules', <fake claude_code_sdk>)`` and believe it then
+# drives fake clients.  Since the backend refactor, SessionManager() gets its
+# client from ``daemon.backends.claude``, imported lazily.  That module binds
+# to the fake SDK ONLY if it is first imported inside the patch.  If any
+# earlier test module imported the real backend (test_claude_normalization
+# does, at load time), every later "mocked" SessionManager in the run quietly
+# launched the REAL ``claude`` CLI: slow (a real process per session), flaky
+# (real output such as "Not logged in"), and the source of order-dependent
+# failures that passed when each file ran alone.
+#
+# Two layers, same pattern as the guards above:
+#   1. _isolate_claude_backend_for_fake_sdk: for tests that use a
+#      ``mock_sdk_types`` fixture, hide the cached real backend so the
+#      SessionManager re-imports one bound to the fake, then put the real one
+#      back so later tests are unaffected.
+#   2. _forbid_real_claude_cli: hard-fail any test that reaches the real CLI
+#      transport, naming the test.  Opt out with
+#      ``@pytest.mark.allow_real_claude_cli`` (no test needs it today).
+
+try:
+    from claude_code_sdk._internal.transport import subprocess_cli as _real_cli_transport
+except Exception:  # SDK missing: nothing can launch it, so nothing to guard
+    _real_cli_transport = None
+
+
+@pytest.fixture(autouse=True)
+def _isolate_claude_backend_for_fake_sdk(request):
+    if "mock_sdk_types" not in request.fixturenames:
+        yield
+        return
+    import daemon.backends as _backends_pkg
+    saved_mod = sys.modules.pop("daemon.backends.claude", None)
+    had_attr = "claude" in vars(_backends_pkg)
+    saved_attr = vars(_backends_pkg).get("claude")
+    try:
+        yield
+    finally:
+        sys.modules.pop("daemon.backends.claude", None)
+        if saved_mod is not None:
+            sys.modules["daemon.backends.claude"] = saved_mod
+        if had_attr:
+            _backends_pkg.claude = saved_attr
+        elif "claude" in vars(_backends_pkg):
+            delattr(_backends_pkg, "claude")
+
+
+@pytest.fixture(autouse=True)
+def _forbid_real_claude_cli(request, monkeypatch):
+    if _real_cli_transport is None or request.node.get_closest_marker("allow_real_claude_cli"):
+        yield
+        return
+    attempts = []
+    nodeid = request.node.nodeid
+
+    async def _blocked_connect(self, *args, **kwargs):
+        attempts.append(1)
+        raise AssertionError(
+            f"TEST {nodeid} tried to launch the real Claude CLI. Tests must "
+            f"drive a fake SDK client; see the guard notes in tests/conftest.py.")
+
+    monkeypatch.setattr(_real_cli_transport.SubprocessCLITransport, "connect", _blocked_connect)
+    yield
+    if attempts:
+        # The daemon catches transport errors on its own thread, so the raise
+        # above can be swallowed.  Fail here so the leak is never silent.
+        pytest.fail(
+            f"{nodeid} tried to launch the real Claude CLI {len(attempts)} time(s). "
+            f"Use a fake SDK client (see tests/conftest.py guard notes).",
+            pytrace=False)
+
+
 def _make_session_line(msg_type, content="", timestamp=None):
     """Build a single JSONL line for a mock session file."""
     ts = timestamp or datetime.now(timezone.utc).isoformat()

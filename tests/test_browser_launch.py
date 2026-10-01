@@ -96,12 +96,22 @@ def _get_windows_browser_block():
             block_start = i
             break
 
-    # Walk forward to find the elif (next platform block)
-    block_end = block_start + 1
-    for i in range(block_start + 1, min(len(lines), block_start + 40)):
+    # Walk forward to the next platform branch (elif).  No fixed line cap:
+    # the old 40-line window silently truncated the block to ONE line once
+    # the Windows branch grew to 47 lines (tab-mode _chrome_running branch,
+    # 2026-07-13), turning every assertion below into a false failure.  Stop
+    # at the end of open_browser() instead, and fail loudly if not found.
+    assert block_start is not None, "open_browser() has no win32 block"
+    block_end = None
+    for i in range(block_start + 1, len(lines)):
         if lines[i].strip().startswith('elif') and 'platform' in lines[i]:
             block_end = i
             break
+        if lines[i].startswith('def ') or lines[i].startswith('class '):
+            break  # left open_browser() without finding the next branch
+    assert block_end is not None, (
+        "Could not find the platform branch after open_browser()'s win32 "
+        "block; the source guard can't locate the Windows launch code.")
 
     # Find os.startfile within the block for backwards compat
     startfile_idx = block_start

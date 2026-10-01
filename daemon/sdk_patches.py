@@ -119,6 +119,18 @@ def _assert_patch_parse_message_preconditions() -> None:
     assert hasattr(err, "data"), "MessageParseError missing .data attribute"
 
 
+# Receiver for the CLI's rate_limit_event (account usage windows).  The SDK has
+# no type for it, so the safe-parse wrapper below is the only place it is ever
+# seen.  Set by SessionManager.start(); read at call time.
+_rate_limit_sink = None
+
+
+def set_rate_limit_sink(fn) -> None:
+    """Register ``fn(rate_limit_info: dict)`` to receive every rate_limit_event."""
+    global _rate_limit_sink
+    _rate_limit_sink = fn
+
+
 def _apply_patch_safe_parse_message() -> bool:
     """Wrap parse_message to tolerate unknown message types."""
     _assert_patch_parse_message_preconditions()
@@ -135,6 +147,11 @@ def _apply_patch_safe_parse_message() -> bool:
         except MessageParseError as e:
             # Unknown-but-valid message: has a type field the SDK doesn't recognise
             if isinstance(getattr(e, "data", None), dict) and e.data.get("type"):
+                if e.data.get("type") == "rate_limit_event" and _rate_limit_sink:
+                    try:
+                        _rate_limit_sink(e.data.get("rate_limit_info"))
+                    except Exception as sink_err:  # never break the stream
+                        logger.debug("rate_limit sink failed: %s", sink_err)
                 logger.debug(
                     "Skipping unrecognised SDK message type: %s", e.data.get("type")
                 )

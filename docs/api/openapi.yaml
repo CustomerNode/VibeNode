@@ -136,6 +136,12 @@ tags:
     description: ChatGPT bridge — relay prompts to a logged-in ChatGPT via Playwright
   - name: Preview
     description: Mobile Visual Channel — headless render, thumbnails, asset serving, live-page proxy
+  - name: Admin
+    description: Claude Code CLI install status and one-click update
+  - name: Mobile
+    description: Mobile Command, private phone access over Tailscale
+  - name: Voice
+    description: SpeechNode local speech-to-text (optional package)
 
 paths:
   # ==========================================================================
@@ -6189,6 +6195,498 @@ paths:
           description: Missing or non-http(s) target
         "502":
           description: The upstream URL could not be reached
+
+    post:
+      tags: [Preview]
+      summary: Reverse-proxy a form POST to the target URL
+      operationId: proxyPreviewPost
+      description: |
+        Forwards the method, raw body and Content-Type so a proxied page can
+        submit forms. A non-2xx reply from the target is relayed as-is rather
+        than masked as a proxy failure.
+      parameters:
+        - name: u
+          in: query
+          required: true
+          schema:
+            type: string
+          description: The absolute http(s) URL to POST to
+      requestBody:
+        content:
+          "*/*":
+            schema:
+              type: string
+      responses:
+        "200":
+          description: The target's response (HTML rewritten to route assets back through the proxy)
+        "400":
+          description: Missing or non-http(s) target
+        "502":
+          description: The upstream URL could not be reached
+
+  /api/health:
+    get:
+      tags: [App]
+      summary: Full-stack readiness (web server AND session daemon)
+      operationId: health
+      description: |
+        Unlike /api/ping, reports whether the session daemon is connected, so
+        the UI can tell "up but broken" (web alive, daemon dead) from ready.
+        Side-effect-free: reads the cached connection flag, no daemon round-trip.
+      responses:
+        "200":
+          description: Readiness snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  web:
+                    type: boolean
+                  daemon:
+                    type: boolean
+                  ready:
+                    type: boolean
+                    description: True only when the daemon is connected
+
+  /api/usage-limits:
+    get:
+      tags: [App]
+      summary: Account usage windows (session, weekly, Fable) for the input-bar pill
+      operationId: usageLimits
+      description: |
+        Percent used of the 5-hour session limit, the weekly limit and the
+        weekly Fable limit, as reported by the Claude CLI's rate_limit_event on
+        the most recent turn. Reads a persisted snapshot (no daemon round-trip).
+        A window is omitted until it has been seen; the Fable window appears
+        after the first Fable turn. Live updates arrive as the usage_limits
+        Socket.IO event with the same shape.
+      responses:
+        "200":
+          description: Usage snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  updated_at:
+                    type: number
+                  windows:
+                    type: object
+                    description: Keyed by five_hour, seven_day, seven_day_overage_included
+                    additionalProperties:
+                      type: object
+                      properties:
+                        label:
+                          type: string
+                        percent:
+                          type: integer
+                        resets_at:
+                          type: integer
+                          description: Unix seconds
+                        seen_at:
+                          type: number
+                        expired:
+                          type: boolean
+                          description: The window has reset since this value was seen
+
+  /manifest.webmanifest:
+    get:
+      tags: [App]
+      summary: Per-machine PWA manifest
+      operationId: webManifest
+      description: Served dynamically so the installed app name matches this computer's device label.
+      responses:
+        "200":
+          description: Web app manifest
+          content:
+            application/manifest+json:
+              schema:
+                type: object
+
+  /api/notify/approval:
+    post:
+      tags: [App]
+      summary: Broadcast an "approval needed" alert to every connected browser
+      operationId: notifyApproval
+      description: |
+        Re-broadcasts the body as the Socket.IO event approval_needed so an
+        external process (e.g. a release pipeline waiting on a human yes/no)
+        can alert the user on any device. Never returns 4xx for malformed
+        input; missing fields get defaults.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                message:
+                  type: string
+                source:
+                  type: string
+                url:
+                  type: string
+      responses:
+        "200":
+          description: Broadcast attempted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+
+  /api/client-log:
+    post:
+      tags: [App]
+      summary: Append a client-side diagnostic line to logs/client_diag.log
+      operationId: clientLog
+      description: Size-capped (the log truncates past 256 KB); tag cut to 40 chars, message to 500.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tag:
+                  type: string
+                msg:
+                  type: string
+      responses:
+        "200":
+          description: Logged (write failures are swallowed)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+
+  /api/attach-image:
+    post:
+      tags: [Live]
+      summary: Save a pasted or picked image where a session can read it
+      operationId: attachImage
+      description: Saves to data/uploads under a timestamped, de-duplicated filename.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: png, jpg, jpeg, gif, webp, heic, heif or bmp
+      responses:
+        "200":
+          description: Saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  path:
+                    type: string
+                    description: Absolute path of the saved file
+                  filename:
+                    type: string
+        "400":
+          description: No file, or unsupported image type
+        "500":
+          description: Upload directory or save failed
+
+  /attach:
+    get:
+      tags: [Live]
+      summary: Standalone image-attach page for phones
+      operationId: attachPage
+      description: Self-contained HTML page served with no-store; uploads via /api/attach-image.
+      responses:
+        "200":
+          description: HTML page
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /api/move-session/{session_id}:
+    post:
+      tags: [Sessions]
+      summary: Move a session to another project
+      operationId: moveSession
+      description: |
+        Stops the session, relocates its transcript and display name to the
+        target project, and tombstones it in the source project.
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+          description: Encoded source project (used when from_project is omitted)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_project]
+              properties:
+                from_project:
+                  type: string
+                to_project:
+                  type: string
+      responses:
+        "200":
+          description: Moved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        "400":
+          description: Missing or invalid project name, or session already in that project
+        "404":
+          description: Source or target project not found
+        "409":
+          description: Move failed
+
+  /api/admin/claude-status:
+    get:
+      tags: [Admin]
+      summary: Claude Code CLI install state
+      operationId: getClaudeStatus
+      description: Never blocks on the network; safe to poll on page load. Drives the update banner.
+      responses:
+        "200":
+          description: Status snapshot (see claude_updater.status_snapshot)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/admin/claude-update:
+    post:
+      tags: [Admin]
+      summary: Run claude update on demand
+      operationId: runClaudeUpdate
+      description: Blocks until the update process exits.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                force:
+                  type: boolean
+                  description: Update even if the daemon has live sessions (interrupts them). Default false.
+      responses:
+        "200":
+          description: Updated, or nothing to do
+        "409":
+          description: Blocked by live sessions or a concurrent update
+        "500":
+          description: Update failed (body carries the full result)
+
+  /api/mobile/status:
+    get:
+      tags: [Mobile]
+      summary: Mobile Command status
+      operationId: mobileStatus
+      responses:
+        "200":
+          description: Status dict (enabled, installed, logged_in, serving, url, needs, device_name, ...)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/mobile/enable:
+    post:
+      tags: [Mobile]
+      summary: Turn Mobile Command on (tailscale serve for the local port)
+      operationId: mobileEnable
+      description: Persists the ON flag even if serving fails this instant; returns the full status dict.
+      responses:
+        "200":
+          description: Status dict after enabling
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/mobile/disable:
+    post:
+      tags: [Mobile]
+      summary: Turn Mobile Command off
+      operationId: mobileDisable
+      responses:
+        "200":
+          description: Status dict after disabling
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/mobile/name:
+    post:
+      tags: [Mobile]
+      summary: Set this computer's Home-Screen label
+      operationId: mobileSetName
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  description: Empty resets to the hostname default
+      responses:
+        "200":
+          description: The resulting label
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  device_name:
+                    type: string
+
+  /api/speechnode/status:
+    get:
+      tags: [Voice]
+      summary: SpeechNode engine status (deps, install phase, progress, ready)
+      operationId: speechnodeStatus
+      responses:
+        "200":
+          description: Engine status
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/speechnode/syscheck:
+    get:
+      tags: [Voice]
+      summary: Machine suitability for local transcription (disk, CPU, recommendation)
+      operationId: speechnodeSyscheck
+      responses:
+        "200":
+          description: System check result
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/speechnode/install:
+    post:
+      tags: [Voice]
+      summary: Start or resume the background model install
+      operationId: speechnodeInstall
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                model:
+                  type: string
+                  description: Optional model to install
+      responses:
+        "200":
+          description: Install state
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/speechnode/transcribe:
+    post:
+      tags: [Voice]
+      summary: Transcribe an audio clip
+      operationId: speechnodeTranscribe
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [audio]
+              properties:
+                audio:
+                  type: string
+                  format: binary
+                cwd:
+                  type: string
+                  description: Project directory used to bias vocabulary
+                extra:
+                  type: string
+                  description: Extra vocabulary terms (comma or space separated, max 30)
+                fast:
+                  type: string
+                  description: Set to 1 or true for the faster, lower-accuracy path
+      responses:
+        "200":
+          description: Transcript
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  text:
+                    type: string
+                    description: Cleaned transcript
+                  raw:
+                    type: string
+                  gap:
+                    type: number
+        "400":
+          description: No audio uploaded
+        "500":
+          description: Transcription failed
+
+  /speechnode/{path:filename}:
+    get:
+      tags: [Voice]
+      summary: SpeechNode web assets (speechnode.js, speechnode.css)
+      operationId: speechnodeAsset
+      description: The key uses Flask's path converter so the docs-coverage test matches the route; filename may contain slashes.
+      parameters:
+        - name: filename
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Static asset
+        "404":
+          description: Not found
 
 components:
   parameters:

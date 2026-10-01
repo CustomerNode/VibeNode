@@ -69,6 +69,10 @@ function _sessionBelongsToActiveProject(cwd) {
 socket.on('connect', () => {
     _wsConnected = true;
     console.log('[WS] Connected');
+    // Usage-limits pill: one cheap REST read per (re)connect.  Socket.IO does
+    // not replay events, so a `usage_limits` push sent while disconnected is
+    // otherwise lost.  Passive: never touches the socket itself.
+    if (typeof _loadUsageLimits === 'function') _loadUsageLimits();
     // Cancel any pending "flash red" from a recent short disconnect \u2014
     // the socket came back inside the grace window, so the user never
     // needs to see a "Disconnected" state.
@@ -1743,6 +1747,11 @@ socket.on('session_started', (data) => {
 if (!window._idRemaps) window._idRemaps = {};  // oldId -> newId
 
 // Session ID remapped — SDK assigned a different ID than the one we generated
+// Account usage windows changed (broadcast by the daemon on a real change).
+socket.on('usage_limits', (data) => {
+    if (typeof _ingestUsageLimits === 'function') _ingestUsageLimits(data);
+});
+
 socket.on('session_id_remapped', (data) => {
     const oldId = data.old_id;
     const newId = data.new_id;

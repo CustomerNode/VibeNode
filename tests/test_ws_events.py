@@ -9,14 +9,13 @@ import pytest
 import sys as _tsys
 from unittest.mock import MagicMock, patch
 
-# Pre-install SDK mocks BEFORE first ws_events import. This ensures a stable
-# module identity across every test in this file, so per-test `patch.dict`
-# blocks below don't inadvertently drop app.routes.ws_events from sys.modules
-# on exit (which caused cache-priming tests to see a stale module).
-if 'claude_code_sdk' not in _tsys.modules:
-    _tsys.modules['claude_code_sdk'] = MagicMock()
-    _tsys.modules['claude_code_sdk.types'] = MagicMock()
-# Force import now so subsequent per-test patch.dict blocks are no-ops for us.
+# Import ws_events once, up front, with the REAL SDK (claude-code-sdk is a
+# declared dependency).  This keeps a stable module identity across the file,
+# so per-test `patch.dict` blocks below never drop app.routes.ws_events from
+# sys.modules on exit.  It used to install a MagicMock as claude_code_sdk
+# PERMANENTLY when the SDK wasn't loaded yet, which poisoned every later test
+# file in the run (test_claude_backend saw MagicMocks for every SDK type, 76
+# failures) whenever the run order put this file first.
 from app.routes import ws_events as _ws_events_module  # noqa: F401,E402
 
 

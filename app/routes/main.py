@@ -82,6 +82,19 @@ def ping():
     return jsonify(ok=True)
 
 
+@bp.route("/api/usage-limits")
+def usage_limits():
+    """Account usage windows (session / weekly / Fable) for the input-bar pill.
+
+    Reads the daemon's persisted snapshot (daemon/usage_limits.py) instead of
+    making an IPC round-trip, so it is cheap on page load and still answers
+    while the daemon restarts.  Live changes arrive as the ``usage_limits``
+    Socket.IO event.  Values are as of the last Claude turn on this machine.
+    """
+    from daemon import usage_limits as _ul
+    return jsonify(ok=True, **_ul.public_view(_ul.load()))
+
+
 @bp.route("/api/notify/approval", methods=["POST"])
 def notify_approval():
     """Broadcast a generic 'approval needed' ping to every connected browser.
