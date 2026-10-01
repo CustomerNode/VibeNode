@@ -7884,12 +7884,26 @@ class SessionManager:
                     # subsequent _emit_state can't dispatch a queued message
                     # mid-wake-up.  compact_boundary stays its own path.
                     if info.state == SessionState.IDLE:
+                        # Only messages that genuinely open a turn count as a
+                        # resume signal: SYSTEM init / task_notification, or
+                        # real conversation content (ASSISTANT / USER).
+                        # Metadata (status, turn_duration, STREAM_EVENT) also
+                        # arrives as post-sleep transport chatter on sessions
+                        # with no turn at all (2026-09-29); flipping on it
+                        # left sessions in a phantom WORKING state that the
+                        # health watchdog then "recovered" with a spurious
+                        # nudge. A real turn always delivers init or content
+                        # within a message or two, so the flip is at most
+                        # delayed by one metadata message — which cannot
+                        # trigger the init-handler IDLE-emit race this
+                        # pre-detect exists to prevent.
                         is_resume = False
                         if msg.kind == MessageKind.SYSTEM:
                             sub_pre = msg.subtype or ''
-                            if sub_pre != 'compact_boundary':
+                            if sub_pre in ('init', 'task_notification'):
                                 is_resume = True
-                        elif msg.kind != MessageKind.RESULT:
+                        elif msg.kind in (MessageKind.ASSISTANT,
+                                          MessageKind.USER):
                             is_resume = True
                         if is_resume:
                             if not self._model_switch_pending(info):
@@ -8109,15 +8123,25 @@ class SessionManager:
                             is_resume_signal = False
                             if msg.kind == MessageKind.SYSTEM:
                                 sub = msg.subtype or ''
-                                # compact_boundary is its own path; everything
-                                # else system-side (init, task_notification,
-                                # status, turn_duration) accompanies a new
-                                # turn, so treat as resume.
-                                if sub != 'compact_boundary':
+                                # Only init / task_notification open a real
+                                # auto-resume turn. Other system metadata
+                                # (status, turn_duration) ALSO arrives as
+                                # post-sleep transport chatter on sessions
+                                # with no turn at all (2026-09-29): flipping
+                                # on it left sessions in a phantom WORKING
+                                # state the health watchdog then "recovered"
+                                # with a spurious nudge on every laptop wake.
+                                if sub in ('init', 'task_notification'):
                                     is_resume_signal = True
-                            elif msg.kind != MessageKind.RESULT:
-                                # ASSISTANT / USER / STREAM_EVENT — auto-resume
-                                # turn content is already flowing in.
+                            elif msg.kind in (MessageKind.ASSISTANT,
+                                              MessageKind.USER):
+                                # Real conversation content — an auto-resume
+                                # turn is already flowing in. STREAM_EVENT is
+                                # deliberately excluded: bare stream chatter
+                                # cannot trigger the init-handler IDLE-emit
+                                # race this pre-detect exists to prevent, and
+                                # a real turn always follows it with content
+                                # or init within a message.
                                 is_resume_signal = True
                             if is_resume_signal:
                                 if not self._model_switch_pending(info):

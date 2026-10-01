@@ -107,6 +107,32 @@ def test_healthy_working_session_not_restarted():
     assert sm.sent == []
 
 
+def test_phantom_working_state_corrected_without_nudge():
+    """A session flipped WORKING by post-sleep transport chatter — no entry
+    appended since the flip — is corrected to IDLE quietly: interrupt to fix
+    the state, but NO nudge message and NO visible announce (2026-09-29)."""
+    sm = FakeManager()
+    info = FakeInfo("s1")
+    sm._sessions["s1"] = info
+    mon = HealthMonitor(sm)
+
+    # Phantom discriminator: the WORKING flip happened AFTER the last entry
+    # was written (no turn content since the flip). Age the entry BEFORE the
+    # first tick — the fingerprint includes its timestamp, so mutating it
+    # between ticks would read as progress and reset the stall clock.
+    info.working_since = time.time() - STALL_AFTER_SECONDS - 5
+    info.entries[-1].timestamp = info.working_since - 3600
+    mon.tick()
+    fp, _ts = mon._progress["s1"]
+    mon._progress["s1"] = (fp, time.time() - STALL_AFTER_SECONDS - 5)
+    mon.tick()
+
+    assert sm.interrupts == [("s1", False)]  # state corrected, queue kept
+    assert sm.sent == []                     # the whole point: no nudge
+    assert sm.emitted == []                  # no visible watchdog announce
+    assert "s1" not in mon._restarts         # no restart budget consumed
+
+
 def test_stalled_session_interrupted_and_nudged():
     sm = FakeManager()
     sm._sessions["s1"] = FakeInfo("s1")

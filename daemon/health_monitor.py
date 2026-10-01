@@ -237,6 +237,40 @@ class HealthMonitor:
         """Interrupt a wedged turn and resume the conversation."""
         sm = self._sm
         sid = info.session_id
+
+        # ── PHANTOM-TURN GUARD (2026-09-29) ─────────────────────────────
+        # The post-turn listeners' resume pre-detect can flip an idle
+        # session to WORKING on post-sleep transport chatter with NO turn
+        # behind it. No RESULT ever comes, entries stay frozen, and this
+        # watchdog then "recovered" a healthy-idle session — interrupting
+        # it and injecting the nudge as a user-visible message. Observed
+        # as mass simultaneous stalls ~10 min after every laptop wake,
+        # and users being spammed with watchdog nudges on idle sessions.
+        #
+        # Discriminator: every REAL turn appends at least one entry at or
+        # after the WORKING flip (the user/nudge message, the wake-up's
+        # task_notification, streamed content). If nothing was appended
+        # since ``working_since``, there is no turn to restart — quietly
+        # correct the state to IDLE (via the same thread-safe interrupt
+        # path) and send NO nudge: nudging a phantom burns a real model
+        # turn and spams the transcript of a session that was never stuck.
+        last_entry_ts = 0.0
+        try:
+            if info.entries:
+                last_entry_ts = float(info.entries[-1].timestamp or 0.0)
+        except Exception:
+            last_entry_ts = 0.0
+        if info.working_since and last_entry_ts < info.working_since:
+            logger.warning(
+                "Session %s: WORKING for %.0f min with no turn content since "
+                "the flip — phantom auto-resume; correcting to IDLE without "
+                "a nudge", sid, stalled_for / 60.0,
+            )
+            sm.interrupt_session(sid, clear_queue=False)
+            self._progress.pop(sid, None)
+            self._restarts.pop(sid, None)
+            return
+
         attempts = self._restarts.get(sid, 0)
 
         if attempts >= MAX_AUTO_RESTARTS:
