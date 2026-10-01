@@ -67,31 +67,81 @@ function runTests(mode) {
   });
 }
 
+// Ring geometry for the progress circle (r=52 in a 120x120 box).
+const _TRUN_RING_R = 52;
+const _TRUN_RING_C = 2 * Math.PI * _TRUN_RING_R;
+
 function _testRunnerHtml(desc) {
-  return '<div style="text-align:center;padding:12px 0;">'
-    + '<div class="scan-anim">'
-    + '<div class="scan-shield">'
-    +   '<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">'
-    +     '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>'
-    +   '</svg>'
-    +   '<div class="scan-beam"></div>'
-    + '</div>'
-    + '<div class="scan-label" id="test-status">' + desc + '</div>'
-    + '</div>'
-    + '<pre id="test-output" style="text-align:left;font-size:11px;font-family:monospace;'
-    + 'max-height:300px;overflow-y:auto;background:rgba(0,0,0,0.2);border-radius:6px;'
-    + 'padding:8px 10px;margin-top:10px;color:var(--text-secondary);white-space:pre-wrap;'
-    + 'word-break:break-all;"></pre>'
+  return '<div class="trun">'
+    + '<svg class="trun-ring" viewBox="0 0 120 120" aria-hidden="true">'
+    +   '<circle class="trun-ring-track" cx="60" cy="60" r="' + _TRUN_RING_R + '"/>'
+    +   '<circle class="trun-ring-fill" id="test-progress-ring" cx="60" cy="60" r="' + _TRUN_RING_R + '"'
+    +     ' stroke-dasharray="' + _TRUN_RING_C.toFixed(2) + '" stroke-dashoffset="' + _TRUN_RING_C.toFixed(2) + '"/>'
+    + '</svg>'
+    + '<div class="trun-pct" id="test-progress-pct">0%</div>'
+    + '<div class="trun-desc" id="test-status">' + desc + '</div>'
+    + '<div class="trun-counts" id="test-progress-counts">Starting…</div>'
     + '</div>';
 }
 
+// pytest -q progress rows: a run of result characters, optionally followed by
+// "[ NN%]".  Rows are sized for an 80-column terminal, wider than the dialog,
+// so they are summarized as a progress ring + counts instead of shown raw.
+// A run of result characters that ENDS at a boundary: end of line, space,
+// "[", or "_" (daemon log lines start with "_").  The boundary keeps words
+// such as "Exception" or "FAILED" from being read as results.
+const _TRUN_RESULT_RUN = /^[.sFEx]+(?=$|\s|\[|_)/;
+// Not anchored to the end: daemon log text can print right after "[100%]".
+const _TRUN_PCT = /\[\s*(\d+)%\]/;
+
+/** Fold raw pytest output into {pct, passed, failed, errors, skipped, other}. */
+function _summarizeTestProgress(lines) {
+  let pct = 0, passed = 0, failed = 0, errors = 0, skipped = 0;
+  const other = [];
+  for (const raw of lines) {
+    const line = String(raw || '');
+    const m = line.match(_TRUN_PCT);
+    if (m) pct = Math.min(100, parseInt(m[1], 10));
+    const run = line.match(_TRUN_RESULT_RUN);
+    if (run) {
+      // A progress row (daemon log text sometimes prints mid-row; count only
+      // the leading result characters and treat any trailing text as output).
+      for (const ch of run[0]) {
+        if (ch === '.') passed++;
+        else if (ch === 'F') failed++;
+        else if (ch === 'E') errors++;
+        else if (ch === 's' || ch === 'x') skipped++;
+      }
+      const rest = line.slice(run[0].length).replace(_TRUN_PCT, '').trim();
+      if (rest) other.push(rest);
+    } else if (line.trim()) {
+      other.push(line);
+    }
+  }
+  return {pct, passed, failed, errors, skipped, other};
+}
+
 function _updateTestOutput(lines) {
-  const el = document.getElementById('test-output');
-  if (!el) return;
-  // Show last 40 lines to keep it readable
-  const visible = lines.slice(-40);
-  el.textContent = visible.join('\n');
-  el.scrollTop = el.scrollHeight;
+  const s = _summarizeTestProgress(lines);
+  const ring = document.getElementById('test-progress-ring');
+  const pct = document.getElementById('test-progress-pct');
+  const counts = document.getElementById('test-progress-counts');
+  const bad = s.failed + s.errors > 0;
+  if (ring) {
+    ring.setAttribute('stroke-dashoffset', (_TRUN_RING_C * (1 - s.pct / 100)).toFixed(2));
+    ring.classList.toggle('trun-ring-bad', bad);
+  }
+  if (pct) {
+    pct.textContent = s.pct + '%';
+    pct.classList.toggle('trun-bad', bad);
+  }
+  if (counts) {
+    const parts = [s.passed.toLocaleString() + ' passed'];
+    if (s.failed) parts.push('<span class="trun-bad">' + s.failed + ' failed</span>');
+    if (s.errors) parts.push('<span class="trun-bad">' + s.errors + (s.errors === 1 ? ' error' : ' errors') + '</span>');
+    if (s.skipped) parts.push(s.skipped + ' skipped');
+    counts.innerHTML = parts.join(' · ');
+  }
 }
 
 function _showTestResults(label, summary, lines) {

@@ -1824,6 +1824,30 @@ body.unread-enabled .session-item .unread-dot {
   margin-top: 16px;
   padding: 0 20px;
 }
+
+/* ── Test run progress (Publish / test runner dialogs): ring + percent ── */
+.trun { display: flex; flex-direction: column; align-items: center; padding: 14px 0 6px; }
+.trun-ring { width: 120px; height: 120px; transform: rotate(-90deg); }
+.trun-ring-track {
+  fill: none; stroke-width: 9;
+  stroke: var(--bg-hover, rgba(127,127,127,0.18));
+}
+.trun-ring-fill {
+  fill: none; stroke-width: 9; stroke-linecap: round;
+  stroke: var(--accent, #6366f1);
+  transition: stroke-dashoffset 0.4s var(--ease-out, ease-out), stroke 0.2s;
+}
+.trun-ring-fill.trun-ring-bad { stroke: var(--result-err, #ef4444); }
+.trun-pct {
+  margin-top: 12px; font-size: 26px; font-weight: 700; line-height: 1;
+  font-variant-numeric: tabular-nums; color: var(--text-heading, #fff);
+}
+.trun-desc { margin-top: 10px; font-size: var(--fs-md, 13px); font-weight: 600; color: var(--text-secondary); }
+.trun-counts {
+  margin-top: 4px; font-size: var(--fs-sm); color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.trun-bad { color: var(--result-err, #ef4444); font-weight: 600; }
 .scan-progress-bar {
   height: 4px;
   background: rgba(255,255,255,0.08);
