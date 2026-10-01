@@ -118,6 +118,101 @@ function _testThenSync(mode) {
  * @param {string} actionLabel - display label for the git action
  * @param {string} btnId - button ID for executeGitAction
  */
+// Cap on traceback text embedded in the fix prompt.  The full output is always
+// in the saved log file, which the fix session is told to read.
+const _TEST_FIX_DETAIL_CAP = 15000;
+
+/**
+ * Turn raw pytest -q output into what the failure dialog and the fix session
+ * need: the FAILED/ERROR lines, the traceback sections, the run's tail (for
+ * runs that died without a summary, e.g. a timeout abort), a copyable text
+ * blob, and a ready-to-send prompt.
+ */
+function _testFailureReport(lines, d, mode) {
+  const failLines = lines.filter(l => l.startsWith('FAILED') || l.startsWith('ERROR'));
+  // Traceback sections: from "== FAILURES ==" / "== ERRORS ==" up to the
+  // short test summary.
+  let detail = [];
+  let inDetail = false;
+  for (const l of lines) {
+    if (/^=+ (FAILURES|ERRORS) =+$/.test(l)) { inDetail = true; }
+    else if (/^=+ short test summary info =+$/.test(l)) { inDetail = false; }
+    if (inDetail) detail.push(l);
+  }
+  const tail = lines.slice(-40);
+  let detailText = detail.join('\n');
+  let truncated = false;
+  if (detailText.length > _TEST_FIX_DETAIL_CAP) {
+    detailText = detailText.slice(0, _TEST_FIX_DETAIL_CAP);
+    truncated = true;
+  }
+  const failText = failLines.join('\n');
+  const logPath = d.log_path || '';
+  // Same command the Publish gate runs (app/routes/test_api.py), including the
+  // parallel workers, so "passes for the fix session" means "passes Publish".
+  const cmd = 'python -m pytest --tb=short -q --no-header'
+    + (mode === 'fast' ? ' --ignore=tests/e2e --timeout=60' : ' --timeout=120')
+    + ' -n 8 --dist loadfile tests/';
+
+  let prompt = 'TEST FAILURES ARE BLOCKING PUBLISH\n\n';
+  prompt += 'The VibeNode pre-publish test run (' + mode + ' mode) failed. Fix the failures so the developer can publish.\n\n';
+  prompt += '## Result\n';
+  prompt += 'passed ' + (d.passed || 0) + ', failed ' + (d.failed || 0) + ', errors ' + (d.errors || 0)
+    + ', skipped ' + (d.skipped || 0) + ', exit code ' + d.exit_code + '\n';
+  prompt += 'Command: `' + cmd + '`\n';
+  if (logPath) prompt += 'Full output (read this first, it has every traceback): `' + logPath + '`\n';
+  prompt += '\n## Failing tests\n';
+  prompt += (failText || '(no FAILED/ERROR summary lines; the run likely aborted. Last output lines:)\n' + tail.join('\n')) + '\n';
+  if (detailText) {
+    prompt += '\n## Tracebacks' + (truncated ? ' (truncated; see the full log)' : '') + '\n```\n' + detailText + '\n```\n';
+  }
+  prompt += '\n## Instructions\n';
+  prompt += '1. Read the full log, then reproduce each failure by running only that test.\n';
+  prompt += '2. Find the root cause. Decide whether the app code is wrong or the test is stale against intended behavior, and fix the right one.\n';
+  prompt += '3. Do NOT skip, delete, or weaken tests or assertions to get a pass. If a test is genuinely obsolete, say so and explain why before changing it.\n';
+  prompt += '4. Check for order-dependence: a test that passes alone but fails in the full run usually means shared state between test files (see the guard notes in tests/conftest.py).\n';
+  prompt += '5. Re-run the failing tests, then the full command above, and confirm 0 failures.\n';
+  prompt += '6. Report what failed, why, and what you changed. Do not commit or publish; the developer will press Publish again.\n';
+  prompt += '\nFollow CLAUDE.md. This is a public repository, and never restart the session daemon.\n';
+
+  const copyText = (failText || tail.join('\n'))
+    + (detailText ? '\n\n' + detailText : '')
+    + (logPath ? '\n\nFull output: ' + logPath : '');
+  return {failLines, tail, prompt, copyText};
+}
+
+/** Copy the failure text, with visible feedback on the button. */
+function _copyTestErrors(text, btn) {
+  const done = ok => {
+    if (btn) {
+      const old = btn.textContent;
+      btn.textContent = ok ? 'Copied ✓' : 'Copy failed';
+      setTimeout(() => { btn.textContent = old; }, 1600);
+    } else if (typeof showToast === 'function') {
+      showToast(ok ? 'Errors copied' : 'Copy failed');
+    }
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => done(true), () => done(_legacyCopy(text)));
+  } else {
+    done(_legacyCopy(text));
+  }
+}
+
+function _legacyCopy(text) {
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch (e) { return false; }
+}
+
 function _testThenAction(mode, actionType, actionLabel, btnId) {
   closeGitSyncModal();
   const testLabel = mode === 'fast' ? 'Fast Tests' : 'Full Tests';
@@ -172,24 +267,38 @@ function _testThenAction(mode, actionType, actionLabel, btnId) {
                   executeGitAction('both', btnId, actionLabel);
                 }, 1200);
               } else {
+                const report = _testFailureReport(lines, d, mode);
+                const nFail = report.failLines.length;
+                const headline = nFail
+                  ? nFail + ' test(s) failed. Fix the failures before ' + verb + 'ing.'
+                  : 'The test run did not finish cleanly (exit ' + d.exit_code + '). See the output below.';
                 let body = '<div style="text-align:center;padding:8px 0;">'
                   + '<div style="font-weight:600;color:var(--result-err,#ff4444);font-size:16px;">' + Verb + ' Blocked</div>'
-                  + '<div style="font-size:13px;color:var(--text-muted);margin-top:4px;">'
-                  + d.failed + ' test(s) failed. Fix the failures before ' + verb + 'ing.</div></div>';
-                const failLines = lines.filter(l => l.startsWith('FAILED') || l.startsWith('ERROR'));
-                if (failLines.length > 0) {
-                  body += '<pre style="text-align:left;font-size:10px;font-family:monospace;'
+                  + '<div style="font-size:13px;color:var(--text-muted);margin-top:4px;">' + headline + '</div></div>';
+                const shown = nFail ? report.failLines : report.tail;
+                if (shown.length > 0) {
+                  body += '<pre id="test-fail-pre" style="text-align:left;font-size:10px;font-family:monospace;'
                     + 'max-height:200px;overflow-y:auto;background:rgba(255,60,60,0.06);'
                     + 'border:1px solid rgba(255,60,60,0.15);border-radius:6px;'
                     + 'padding:8px 10px;margin-top:10px;color:var(--text-secondary);'
-                    + 'white-space:pre-wrap;word-break:break-all;">'
-                    + failLines.map(l => (typeof _escTestHtml === 'function' ? _escTestHtml(l) : l)).join('\n')
+                    + 'white-space:pre-wrap;word-break:break-all;user-select:text;">'
+                    + shown.map(l => (typeof _escTestHtml === 'function' ? _escTestHtml(l) : l)).join('\n')
                     + '</pre>';
                 }
+                if (d.log_path) {
+                  body += '<div style="font-size:11px;color:var(--text-faint);margin-top:6px;text-align:left;">'
+                    + 'Full output saved to ' + (typeof _escTestHtml === 'function' ? _escTestHtml(d.log_path) : d.log_path)
+                    + '</div>';
+                }
                 showGitSyncModal(Verb + ' Blocked \u2014 Tests Failed', body, [
+                  {label: 'Fix errors', primary: true, onclick: () => {
+                    closeGitSyncModal();
+                    _startFixSession('Fix Test Failures', 'Fixing failing tests...', report.prompt);
+                  }},
+                  {label: 'Copy errors', onclick: (e) => _copyTestErrors(report.copyText, e && e.currentTarget)},
                   {label: Verb + ' Anyway', onclick: () => executeGitAction('both', btnId, actionLabel)},
-                  {label: 'Cancel', primary: true, onclick: closeGitSyncModal}
-                ]);
+                  {label: 'Close', onclick: closeGitSyncModal}
+                ], {sticky: true});
               }
             }
           } catch(_) {}
@@ -232,7 +341,12 @@ let _gitSyncMinimized = false;
 let _gitSyncFinished = false;  // true when operation completed while minimized
 let _gitSyncMiniLabel = '';    // current step label for the mini indicator
 
-function showGitSyncModal(title, body, btns) {
+function showGitSyncModal(title, body, btns, opts) {
+  // sticky: ignore backdrop clicks; only the dialog's own buttons close it.
+  // Used for results the user needs to read or copy (test failures): a text
+  // selection that ends on the backdrop counts as a backdrop click and used to
+  // close the dialog mid-copy.
+  document.getElementById('git-sync-overlay').dataset.sticky = (opts && opts.sticky) ? '1' : '';
   document.getElementById('git-sync-title').textContent = title;
   document.getElementById('git-sync-body').innerHTML = body;
   const acts = document.getElementById('git-sync-actions');
@@ -633,6 +747,16 @@ function _launchRemediationSession(scan) {
   prompt += '6. Verify the scan returns {"ok": true} before considering the task complete\n';
   prompt += '\nIMPORTANT: This is a public repository. Everything committed will be visible on the internet.\n';
 
+  _startFixSession('Security Remediation', 'Fixing security scan violations...', prompt);
+}
+
+/**
+ * Start a new visible session that immediately works on `prompt`.
+ * Shared by the security-scan "Fix with AI" and the test-failure "Fix errors"
+ * buttons.  Uses the system default model and thinking level, like any new
+ * session the user starts.
+ */
+function _startFixSession(title, preview, prompt) {
   // Switch to sessions view and create a new session
   if (typeof setViewMode === 'function' && typeof viewMode !== 'undefined' && viewMode !== 'sessions') {
     setViewMode('sessions');
@@ -642,12 +766,12 @@ function _launchRemediationSession(scan) {
   const newId = crypto.randomUUID();
   const optimistic = {
     id: newId,
-    display_title: 'Security Remediation',
-    custom_title: 'Security Remediation',
+    display_title: title,
+    custom_title: title,
     last_activity: '',
     size: '',
     message_count: 0,
-    preview: 'Fixing security scan violations...',
+    preview: preview,
   };
 
   if (typeof allSessions !== 'undefined') {
@@ -673,8 +797,14 @@ function _launchRemediationSession(scan) {
     session_id: newId,
     prompt: prompt,
     cwd: (typeof _currentProjectDir === 'function') ? _currentProjectDir() : '',
-    name: 'Security Remediation',
+    name: title,
   };
+  if (typeof SessionModel !== 'undefined') {
+    const _m = SessionModel.getDefault();
+    const _t = SessionModel.getDefaultThinking();
+    if (_m) startOpts.model = _m;
+    if (_t) startOpts.thinking_level = _t;
+  }
 
   socket.emit('start_session', startOpts);
 
@@ -689,6 +819,6 @@ function _launchRemediationSession(scan) {
   }
 
   // Update toolbar
-  if (typeof setToolbarSession === 'function') setToolbarSession(newId, 'Security Remediation', false, 'Security Remediation');
+  if (typeof setToolbarSession === 'function') setToolbarSession(newId, title, false, title);
   if (typeof updateLiveInputBar === 'function') updateLiveInputBar();
 }

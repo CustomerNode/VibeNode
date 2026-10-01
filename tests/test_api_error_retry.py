@@ -754,13 +754,15 @@ class TestEndToEndFailureArmsBackoff:
         async def _drive():
             await session_manager._tracked_coro(
                 info, session_manager._send_query(sid, "do the long task"))
-        asyncio.run_coroutine_threadsafe(_drive(), session_manager._loop).result(timeout=8)
+        # Ceiling, not an expectation: ~3s alone, but the Publish gate runs
+        # 8 parallel workers and 8s was exceeded under that load.
+        asyncio.run_coroutine_threadsafe(_drive(), session_manager._loop).result(timeout=30)
 
         # The turn failed → a transient error was detected → the exponential
         # backoff was armed → the timer fired → it re-sent under the _auto_retry
         # flag.  No assistant output was produced before the error, so the retry
         # RE-SENDS THE ORIGINAL request (not the "continue" prompt).
-        wait_for(lambda: len(recorder) >= 1, timeout=4)
+        wait_for(lambda: len(recorder) >= 1, timeout=15)
         s, text, kw = recorder[0]
         assert s == sid
         assert text == "do the long task"  # original re-sent (no output before error)
@@ -789,7 +791,9 @@ class TestEndToEndFailureArmsBackoff:
         async def _drive():
             await session_manager._tracked_coro(
                 info, session_manager._send_query(sid, "x"))
-        asyncio.run_coroutine_threadsafe(_drive(), session_manager._loop).result(timeout=8)
+        # Ceiling, not an expectation: ~3s alone, but the Publish gate runs
+        # 8 parallel workers and 8s was exceeded under that load.
+        asyncio.run_coroutine_threadsafe(_drive(), session_manager._loop).result(timeout=30)
 
         # Give any (erroneously) armed timer a moment — then confirm nothing fired.
         time.sleep(0.4)

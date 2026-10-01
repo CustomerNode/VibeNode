@@ -107,10 +107,24 @@ class TestSdkCapture:
     """The SDK has no type for rate_limit_event; the safe-parse wrapper must
     hand it to the sink and still drop it from the message stream."""
 
+    @staticmethod
+    def _parse():
+        """The patched parse_message for the SDK modules loaded RIGHT NOW.
+
+        Other test files swap claude_code_sdk in and out of sys.modules, so a
+        fresh, unpatched parser module can be loaded while apply_patches()'s
+        one-shot flag says "already applied".  Patch the current module
+        directly when it isn't wrapped, instead of trusting global state.
+        """
+        from daemon import sdk_patches as sp
+        import claude_code_sdk._internal.message_parser as mp
+        if mp.parse_message.__name__ != "_safe_parse_message":
+            sp._apply_patch_safe_parse_message()
+        return mp.parse_message
+
     def test_rate_limit_event_reaches_sink_and_is_dropped(self):
         from daemon import sdk_patches as sp
-        sp.apply_patches()
-        from claude_code_sdk._internal.message_parser import parse_message
+        parse_message = self._parse()
         got = []
         sp.set_rate_limit_sink(got.append)
         try:
@@ -124,8 +138,7 @@ class TestSdkCapture:
 
     def test_sink_failure_never_breaks_the_stream(self):
         from daemon import sdk_patches as sp
-        sp.apply_patches()
-        from claude_code_sdk._internal.message_parser import parse_message
+        parse_message = self._parse()
 
         def boom(_):
             raise RuntimeError("sink broke")
@@ -138,8 +151,7 @@ class TestSdkCapture:
 
     def test_other_unknown_types_do_not_reach_sink(self):
         from daemon import sdk_patches as sp
-        sp.apply_patches()
-        from claude_code_sdk._internal.message_parser import parse_message
+        parse_message = self._parse()
         got = []
         sp.set_rate_limit_sink(got.append)
         try:

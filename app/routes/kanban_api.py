@@ -1815,11 +1815,12 @@ def migrate_backend():
         url = ""
         key = ""
         if target_backend == "supabase":
-            from ..db.supabase_backend import SupabaseRepository
+            # Validate before importing the client (see migrate_preflight).
             url = data.get("supabase_url", "")
             key = data.get("supabase_secret_key", "")
             if not url or not key:
                 return jsonify({"error": "supabase_url and supabase_secret_key required"}), 400
+            from ..db.supabase_backend import SupabaseRepository
             target_repo = SupabaseRepository(url=url, key=key)
         else:
             from ..db.sqlite_backend import SqliteRepository
@@ -1901,11 +1902,14 @@ def migrate_preflight():
         cloud_summary = {"reachable": False, "is_empty": True, "tasks": 0,
                          "columns": 0, "preferences": 0, "total_records": 0}
         if target_backend == "supabase":
-            from ..db.supabase_backend import SupabaseRepository, SchemaNotReady
+            # Validate input BEFORE importing the Supabase client: where that
+            # library (or one of its deps) is missing, importing first turned
+            # an empty-credentials request into a 500 instead of this 400.
             url = data.get("supabase_url", "")
             key = data.get("supabase_secret_key", "")
             if not url or not key:
                 return jsonify({"error": "supabase_url and supabase_secret_key required"}), 400
+            from ..db.supabase_backend import SupabaseRepository, SchemaNotReady
             target_repo = SupabaseRepository(url=url, key=key)
             try:
                 target_repo.initialize()

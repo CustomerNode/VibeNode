@@ -10,6 +10,9 @@ python-pptx
 python-docx
 pytest
 pytest-timeout
+# Parallel test runs for the Publish gate (app/routes/test_api.py uses it when
+# installed and falls back to a serial run when it is not).
+pytest-xdist>=3.5
 
 # SpeechNode — cross-browser, codebase-aware voice input (extracted package:
 # github.com/CustomerNode/SpeechNode). Import-light: NO heavy ASR deps are pulled

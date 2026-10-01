@@ -18,12 +18,27 @@ _DNS = "demohost.tailnet-example.ts.net"
 _SUFFIX = "tailnet-example.ts.net"
 
 
+
+def _point_config_at(monkeypatch, tmp_path):
+    """Send app.config reads and writes to a temp kanban_config.json.
+
+    Patches the path and resets the read cache (both restored after the test)
+    instead of importlib.reload(app.config).  A reload replaces EVERY global in
+    that module, so other modules kept the old objects while later tests got
+    the new ones; e.g. test_admin_scrub_phantoms then checked a different
+    _summary_cache dict than the route cleaned and failed whenever it ran
+    after this file (only visible in a parallel or reordered run).
+    """
+    import app.config as cfg
+    monkeypatch.setattr(cfg, "_KANBAN_CONFIG_FILE", tmp_path / "kanban_config.json")
+    monkeypatch.setattr(cfg, "_kanban_config_cache", None)
+    monkeypatch.setattr(cfg, "_kanban_config_cache_time", 0.0)
+
 @pytest.fixture()
 def mc(tmp_path, monkeypatch):
     monkeypatch.setenv("VIBENODE_CONFIG", str(tmp_path / "kanban_config.json"))
+    _point_config_at(monkeypatch, tmp_path)
     import importlib
-    import app.config as cfg
-    importlib.reload(cfg)
     import app.mobile_command as m
     importlib.reload(m)
     m._WARM_CERT_ENABLED = False   # keep unit runs network-free (no cert warm-up thread)
@@ -204,10 +219,9 @@ def test_status_includes_device_name(mc, monkeypatch):
 
 def test_device_name_flows_into_page_and_manifest(tmp_path, monkeypatch):
     monkeypatch.setenv("VIBENODE_CONFIG", str(tmp_path / "kanban_config.json"))
+    _point_config_at(monkeypatch, tmp_path)
     import importlib
-    import app.config as cfg
     import app.mobile_command as m
-    importlib.reload(cfg)
     importlib.reload(m)
     from app import create_app
     c = create_app(testing=True).test_client()
