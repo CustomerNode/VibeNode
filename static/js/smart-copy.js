@@ -205,6 +205,40 @@ function _addTableCopyButtons(container) {
 // -----------------------------------------------------------------------
 // Shared: create a copy button
 // -----------------------------------------------------------------------
+
+// Copy plain text to the clipboard.
+//
+// Tries a hidden-textarea `execCommand('copy')` first and only falls back to
+// `navigator.clipboard.writeText`. The order is deliberate: on iOS,
+// writeText() hands the string to the system pasteboard, which re-types any
+// text that parses as a URL (anything shaped like "word: more words") as a
+// URL and percent-encodes it — the paste comes out as "Note:%20some%20text".
+// A selection copy from a textarea is always stored as plain text. The
+// textarea path also works on non-HTTPS origins, where navigator.clipboard
+// does not exist at all.
+function vnCopyText(text) {
+  text = String(text == null ? '' : text);
+  let ok = false;
+  const prev = document.activeElement;
+  const ta = document.createElement('textarea');
+  try {
+    ta.value = text;
+    ta.setAttribute('readonly', '');           // no on-screen keyboard
+    ta.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:0;opacity:0;font-size:16px;';
+    document.body.appendChild(ta);
+    ta.focus({ preventScroll: true });
+    ta.select();
+    ta.setSelectionRange(0, text.length);      // iOS needs the explicit range
+    ok = document.execCommand('copy');
+  } catch (e) { ok = false; }
+  ta.remove();
+  if (prev && prev.focus) { try { prev.focus({ preventScroll: true }); } catch (e) {} }
+  if (ok) return Promise.resolve();
+  if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
+  return Promise.reject(new Error('clipboard unavailable'));
+}
+window.vnCopyText = vnCopyText;
+
 function _makeCopyBtn(textToCopy, tooltip) {
   const btn = document.createElement('button');
   btn.className = 'smart-copy-btn';
@@ -213,7 +247,7 @@ function _makeCopyBtn(textToCopy, tooltip) {
   btn.onclick = (e) => {
     e.stopPropagation();
     e.preventDefault();
-    navigator.clipboard.writeText(textToCopy).then(() => {
+    vnCopyText(textToCopy).then(() => {
       btn.innerHTML = _CHECK_ICON;
       btn.classList.add('copied');
       btn.title = 'Copied!';
@@ -222,7 +256,7 @@ function _makeCopyBtn(textToCopy, tooltip) {
         btn.classList.remove('copied');
         btn.title = tooltip || 'Copy';
       }, 1500);
-    });
+    }).catch(() => { btn.title = 'Copy failed'; });
   };
   return btn;
 }

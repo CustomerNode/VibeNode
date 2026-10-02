@@ -28,14 +28,25 @@ function highlightCode(code, lang) {
     const _O = (t) => '\x01' + t;  // open marker
     const _C = '\x02';              // close marker
 
+    // Each pass only touches text OUTSIDE tokens made by earlier passes, so
+    // tokens never nest. Nested tokens (a number inside a string or comment)
+    // used to leave stray \x01/\x02 control characters in the rendered code,
+    // which the copy button then copied — the pasted text came out corrupted.
+    // Do NOT go back to a plain html.replace() per pass.
+    const _TOKEN = /(\x01[SCNK][^\x02]*\x02)/;
+    const _pass = (re, t) => {
+        html = html.split(_TOKEN).map((seg, i) =>
+            (i % 2) ? seg : seg.replace(re, _O(t) + '$&' + _C)).join('');
+    };
+
     // Strings (double and single quoted) — but avoid breaking HTML entities
-    html = html.replace(/(["'])(?:(?!\1|\\).|\\.)*?\1/g, _O('S') + '$&' + _C);
+    _pass(/(["'])(?:(?!\1|\\).|\\.)*?\1/g, 'S');
 
     // Single-line comments
-    html = html.replace(/(\/\/.*$|#(?!include).*$)/gm, _O('C') + '$&' + _C);
+    _pass(/(\/\/.*$|#(?!include).*$)/gm, 'C');
 
     // Numbers
-    html = html.replace(/\b(\d+\.?\d*)\b/g, _O('N') + '$&' + _C);
+    _pass(/\b(\d+\.?\d*)\b/g, 'N');
 
     // Keywords (language-specific)
     const kwMap = {
@@ -53,7 +64,7 @@ function highlightCode(code, lang) {
     if (lang === 'rs') lang = 'rust';
     if (lang === 'c' || lang === 'cc' || lang === 'h') lang = 'cpp';
     const kw = kwMap[lang];
-    if (kw) html = html.replace(kw, _O('K') + '$&' + _C);
+    if (kw) _pass(kw, 'K');
 
     // Now swap placeholders for real HTML spans (single pass, no regex-on-regex)
     const spanMap = { S: 'hl-str', C: 'hl-cmt', N: 'hl-num', K: 'hl-kw' };

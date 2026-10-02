@@ -208,6 +208,20 @@
       }
       return false;
     }
+    // True while the user has text selected (page selection or a range inside
+    // an input/textarea). Dragging to extend a selection — or dragging its
+    // handles — is a horizontal drag too, and must never be read as a
+    // drawer swipe. The drawer swipe comes back as soon as the selection clears.
+    function selectingText() {
+      try {
+        var sel = window.getSelection && window.getSelection();
+        if (sel && !sel.isCollapsed && String(sel).length) return true;
+        var a = document.activeElement;
+        if (a && (a.tagName === "TEXTAREA" || a.tagName === "INPUT") &&
+            typeof a.selectionStart === "number" && a.selectionStart !== a.selectionEnd) return true;
+      } catch (e) { /* some input types throw on selectionStart */ }
+      return false;
+    }
     var startX = 0, startY = 0, dx = 0;
     var tracking = false;       // a candidate gesture is in progress
     var decided = false;        // locked into a horizontal drag (vs vertical scroll)
@@ -222,6 +236,7 @@
       if (!e.touches || e.touches.length !== 1) return;
       var t = e.touches[0];
       var open = drawerOpen();
+      if (!open && selectingText()) return;                     // adjusting a selection, not swiping
       if (!open && t.clientX >= EDGE_MIN && !inHorizontalScroller(e.target)) mode = "open";  // rightward drag anywhere opens
       else if (open) mode = "close";                            // any drag on the drawer closes
       else return;
@@ -237,6 +252,9 @@
       if (!decided) {
         if (Math.abs(dx) < SLOP && Math.abs(dy) < SLOP) return;  // wait for intent
         if (Math.abs(dy) >= Math.abs(dx)) { tracking = false; return; }  // vertical → let it scroll
+        // A long-press that started a selection mid-gesture: the drag is now
+        // extending that selection, so release it.
+        if (mode === "open" && selectingText()) { tracking = false; return; }
         // Direction must match the gesture: open = rightward, close = leftward.
         // A drag the "wrong" way (e.g. leftward scroll inside a code block that
         // happens to start in the open band) is released back to the content.
@@ -274,6 +292,12 @@
       sb.style.transform = "";
       syncFromState();
     }
+
+    // A selection that appears while the finger is still inside the slop zone
+    // (long-press) cancels the candidate before it can lock into a drag.
+    document.addEventListener("selectionchange", function () {
+      if (tracking && !decided && mode === "open" && selectingText()) tracking = false;
+    });
 
     document.addEventListener("touchstart", onStart, { passive: true });
     document.addEventListener("touchmove", onMove, { passive: false });  // preventDefault needs this
