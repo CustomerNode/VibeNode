@@ -1830,7 +1830,7 @@ body.unread-enabled .session-item .unread-dot {
 .trun-ring { width: 120px; height: 120px; transform: rotate(-90deg); }
 .trun-ring-track {
   fill: none; stroke-width: 9;
-  stroke: var(--bg-hover, rgba(127,127,127,0.18));
+  stroke: rgba(127,127,127,0.25);  /* visible on both light and dark cards */
 }
 .trun-ring-fill {
   fill: none; stroke-width: 9; stroke-linecap: round;
