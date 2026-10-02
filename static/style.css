@@ -13573,6 +13573,9 @@ header #git-badge-push svg, header #git-badge-pull svg, header #git-badge-sync s
    hidden, because the main area's own left edge now draws it. */
 @media (min-width: 769px) {
   header { background: var(--bg-sidebar); border-bottom-color: transparent; }
+  /* The rounded corner and the transparent divider show whatever is behind them; that was the page colour, which
+     left a small notch of a different shade in the corner.  Make it the frame's colour. */
+  .layout { background: var(--bg-sidebar); }
   .resize-handle { background: transparent; }
   .main { border-top: 1px solid var(--border); border-left: 1px solid var(--border); border-top-left-radius: 14px; background-color: var(--bg-body); }
 }
