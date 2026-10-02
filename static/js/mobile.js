@@ -569,11 +569,89 @@
   }
 
   // =========================================================================
+  // Composer visibility on iPhone — track the keyboard and the bar's own
+  // height so the fixed-position composer (css/mobile.css) always sits above
+  // the on-screen keyboard and the chat reserves space below it. Setting the
+  // props on all platforms is cheap (desktop CSS doesn't read them); gating
+  // on isMobile() isn't worth the state machine.
+  // =========================================================================
+  function initComposerAnchoring() {
+    var root = document.documentElement;
+    var lastBar = null;
+
+    function updateKeyboardOffset() {
+      var vv = window.visualViewport;
+      if (!vv) {
+        root.style.setProperty("--vn-kb-offset", "0px");
+        return;
+      }
+      // Pixels the keyboard has stolen from the LAYOUT viewport. iOS Safari
+      // shrinks visualViewport but leaves window.innerHeight at the pre-
+      // keyboard value, so (innerHeight - vv.height - vv.offsetTop) is the
+      // amount of layout we need to lift the fixed bar by. Clamped to [0,∞).
+      var hidden = Math.max(0, (window.innerHeight || 0) - vv.height - vv.offsetTop);
+      root.style.setProperty("--vn-kb-offset", hidden + "px");
+    }
+
+    function updateComposerHeight() {
+      var bar = document.getElementById("live-input-bar");
+      if (!bar) {
+        // No bar on screen (homepage, settings, …) — leave the default.
+        return;
+      }
+      var h = bar.offsetHeight;
+      if (h > 0) root.style.setProperty("--vn-composer-height", h + "px");
+    }
+
+    var ro = null;
+    if (window.ResizeObserver) ro = new ResizeObserver(updateComposerHeight);
+
+    function attachBar() {
+      var bar = document.getElementById("live-input-bar");
+      if (bar === lastBar) return;
+      if (lastBar && ro) {
+        try { ro.unobserve(lastBar); } catch (e) {}
+      }
+      lastBar = bar;
+      if (bar && ro) {
+        try { ro.observe(bar); } catch (e) {}
+      }
+      updateComposerHeight();
+    }
+
+    // The composer bar is created/destroyed by live-panel.js on view
+    // transitions (new session, open session, idle→waiting→continue). Watch
+    // the DOM so we always observe the current instance.
+    try {
+      var mo = new MutationObserver(attachBar);
+      mo.observe(document.body, { childList: true, subtree: true });
+    } catch (e) {}
+
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", updateKeyboardOffset);
+      window.visualViewport.addEventListener("scroll", updateKeyboardOffset);
+    }
+    window.addEventListener("resize", function () {
+      updateKeyboardOffset();
+      updateComposerHeight();
+    });
+    window.addEventListener("orientationchange", function () {
+      updateKeyboardOffset();
+      updateComposerHeight();
+    });
+
+    attachBar();
+    updateKeyboardOffset();
+    updateComposerHeight();
+  }
+
+  // =========================================================================
   function init() {
     initSidebar();
     initSwipe();
     ensureMoreButton();
     initSessionLongPress();
+    initComposerAnchoring();
   }
 
   if (MQ.addEventListener) {

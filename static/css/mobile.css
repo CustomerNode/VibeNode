@@ -474,8 +474,33 @@
   }
 
   /* ---- Composer: don't touch the edges, respect the home indicator, and cap
-     the auto-growing textarea so long input can't push the chat out of view --- */
+     the auto-growing textarea so long input can't push the chat out of view ---
+
+     MOBILE PIN (fixed 2026-10-02): on iPhone the composer was a plain flex
+     child of .live-panel inside a chain of overflow:hidden ancestors. Any
+     content growth below .live-log (a non-empty .live-output-shelf, a queued
+     message in #live-queue-area) pushed the bar below the clipped viewport
+     with no way to scroll to it — the user literally could not reach the
+     input. Fix: anchor the bar to the viewport bottom with position:fixed,
+     and reserve space inside .live-panel so the sibling content doesn't hide
+     behind it. The bottom offset tracks the iOS on-screen keyboard via
+     --vn-kb-offset (set in mobile.js from visualViewport), and the reserved
+     space tracks the bar's actual height via --vn-composer-height (set from
+     a ResizeObserver on the bar). Both custom props default to safe values
+     so a tap works even before the observers fire. */
+  .live-panel {
+    /* Reserve space so .live-log, .live-output-shelf, and #live-queue-area
+       end above the fixed bar instead of being covered by it. */
+    padding-bottom: var(--vn-composer-height, 180px);
+    box-sizing: border-box;
+  }
   .live-input-bar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: var(--vn-kb-offset, 0px);
+    z-index: 25;
+    background: var(--bg-body);
     max-width: none;
     /* Split into long-hand so one parser oddity in the 4-value padding
        shorthand can't null out a single side. Base 16px inset then add
@@ -485,6 +510,22 @@
     padding-bottom: calc(12px + env(safe-area-inset-bottom));
     padding-left: calc(16px + env(safe-area-inset-left));
     padding-right: calc(16px + env(safe-area-inset-right));
+    /* Subtle hairline so the bar reads as a distinct surface over the chat. */
+    box-shadow: 0 -1px 0 rgba(255, 255, 255, 0.05);
+    /* Smooth lift when the keyboard opens (visualViewport can fire 'resize'
+       twice during the animation; a short transition hides the step). */
+    transition: bottom 0.18s cubic-bezier(.32, .72, 0, 1);
+  }
+  /* Kanban session body keeps its own flex layout — don't pin inside it. */
+  .kanban-session-body .live-input-bar {
+    position: static;
+    bottom: auto;
+    z-index: auto;
+    box-shadow: none;
+  }
+  .kanban-session-body.live-panel,
+  .kanban-session-body .live-panel {
+    padding-bottom: 0;
   }
   .live-textarea {
     font-size: 16px;            /* typed text stays >=16px so iOS never zooms on focus */
