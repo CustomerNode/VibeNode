@@ -11,6 +11,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -33,6 +34,35 @@ def _get_lock(project_id: str) -> threading.Lock:
         if project_id not in _context_locks:
             _context_locks[project_id] = threading.Lock()
         return _context_locks[project_id]
+
+
+def _atomic_replace(tmp_path: str, dest_path: str) -> None:
+    """`os.replace` with a short retry loop for Windows transient locks.
+
+    On Windows, antivirus scans, the Search indexer, or our own file watcher
+    can briefly hold an OS-level handle on the destination file, causing
+    `os.replace` to raise PermissionError even though no Python code is
+    racing. A ~1s backoff absorbs the usual AV/indexer window; longer locks
+    are escalated to the caller.
+    """
+    # Fast path: single attempt on non-Windows platforms.
+    if os.name != "nt":
+        os.replace(tmp_path, dest_path)
+        return
+
+    delays = (0.02, 0.05, 0.1, 0.2, 0.3, 0.5)
+    last_err: Optional[PermissionError] = None
+    for delay in (0.0, *delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            os.replace(tmp_path, dest_path)
+            return
+        except PermissionError as e:
+            last_err = e
+    # All retries exhausted; re-raise so caller still sees the failure.
+    assert last_err is not None
+    raise last_err
 
 
 # ---------------------------------------------------------------------------
@@ -66,8 +96,9 @@ def write_context(project_id: str, context: dict) -> None:
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 json.dump(context, f, indent=2, ensure_ascii=False)
-            # On Windows, os.rename fails if target exists; use os.replace
-            os.replace(tmp_path, str(ctx_file))
+            # On Windows, os.rename fails if target exists; use os.replace.
+            # _atomic_replace absorbs transient AV/indexer locks.
+            _atomic_replace(tmp_path, str(ctx_file))
         except Exception:
             # Clean up temp file on failure
             try:
@@ -321,7 +352,8 @@ def _write_context_unlocked(project_id: str, context: dict) -> None:
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(context, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, str(ctx_file))
+        # _atomic_replace retries past transient AV/indexer locks on Windows.
+        _atomic_replace(tmp_path, str(ctx_file))
     except Exception:
         try:
             os.unlink(tmp_path)

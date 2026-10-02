@@ -7,6 +7,7 @@ Extracted from SessionManager (Phase 3 OOP decomposition).
 
 import json
 import logging
+import os
 import re
 import threading
 from pathlib import Path
@@ -59,6 +60,35 @@ class PermissionManager:
         r'\bpython[3]?\s+-c\s+.*\brmtree\b',  # python -c with rmtree
     ]
     _DANGEROUS_RE = None  # lazily compiled
+
+    # ── Protected write targets (for "Almost Always") ──
+    #
+    # The shell patterns above only ever saw Bash.  A Write/Edit to .env,
+    # a config file, a migration, a lockfile, or anything under .git/ used
+    # to sail through "Almost Always" with no prompt at all: the regex was
+    # a shell-command classifier, not a tool-risk classifier.  These rules
+    # close that hole.  A write whose TARGET matches is routed to the human
+    # regardless of policy, exactly like a dangerous shell command.
+    #
+    # Same principle as the shell list: prompt only where a bad write is
+    # hard to repair or leaks secrets.  Ordinary source files are never
+    # flagged; flagging them would turn Almost Always into Manual.
+    #
+    # NOT covered: the "claude_auto" policy hands edits to the SDK's
+    # acceptEdits mode before our callback runs, so these rules cannot
+    # apply there.  That is the user's explicit choice when picking it.
+    _WRITE_TOOLS = frozenset({"write", "edit", "multiedit", "notebookedit"})
+    _PROTECTED_BASENAME_PATTERNS = [
+        r'^\.env(\..+)?$',                        # .env, .env.local, .env.production
+        r'config\.json$',                         # kanban_config.json, tsconfig.json, ...
+        r'^(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|'
+        r'Pipfile\.lock|Cargo\.lock|composer\.lock|Gemfile\.lock|go\.sum|uv\.lock)$',
+        r'\.lock$',                               # any other lockfile
+    ]
+    _PROTECTED_BASENAME_RE = None  # lazily compiled
+    # Any DIRECTORY component in this set marks the target (basename excluded,
+    # so a file literally named ".git" is not matched, but .git/config is).
+    _PROTECTED_DIR_PARTS = frozenset({".git", "migrations", "alembic"})
 
     def __init__(self, emit_entry_fn=None):
         """Initialize the PermissionManager.
@@ -219,8 +249,15 @@ class PermissionManager:
     # Auto-approval logic
     # ------------------------------------------------------------------
 
-    def should_auto_approve(self, tool_name: str, tool_input: dict) -> bool:
-        """Check if a tool use should be auto-approved based on the current policy."""
+    def should_auto_approve(self, tool_name: str, tool_input: dict,
+                            cwd: Optional[str] = None) -> bool:
+        """Check if a tool use should be auto-approved based on the current policy.
+
+        ``cwd`` is the session's working directory.  When provided, the
+        protected-write check can also flag writes that land OUTSIDE the
+        project tree.  Callers without a session context may omit it; the
+        basename and directory rules still apply.
+        """
         policy = self._permission_policy
 
         if policy == "manual":
@@ -228,8 +265,10 @@ class PermissionManager:
         if policy == "auto":
             return True
         if policy == "almost_always":
-            # Auto-approve everything EXCEPT dangerous commands
-            if self.is_dangerous(tool_name, tool_input):
+            # Auto-approve everything EXCEPT dangerous shell commands and
+            # writes to protected targets (.env, config, migrations,
+            # lockfiles, .git/, outside the project).
+            if self.is_dangerous(tool_name, tool_input, cwd=cwd):
                 return False
             return True
         if policy == "claude_auto":
@@ -240,7 +279,7 @@ class PermissionManager:
             # is prompted before destructive bash runs (rm -rf, force push,
             # DROP TABLE, etc.).  Net effect: edits handled by Claude,
             # other tools follow the same safety net as "Almost Always".
-            if self.is_dangerous(tool_name, tool_input):
+            if self.is_dangerous(tool_name, tool_input, cwd=cwd):
                 return False
             return True
         if policy == "custom":
@@ -299,10 +338,30 @@ class PermissionManager:
     # ------------------------------------------------------------------
 
     @classmethod
-    def is_dangerous(cls, tool_name: str, tool_input) -> bool:
-        """Return True if tool_input looks destructive (used by Almost Always)."""
-        if (tool_name or "").lower() != "bash":
-            return False
+    def is_dangerous(cls, tool_name: str, tool_input,
+                     cwd: Optional[str] = None) -> bool:
+        """Return True if this tool use should bypass auto-approval.
+
+        Two classes of tool use are flagged (used by "Almost Always"):
+
+        * **Bash** whose command matches ``_DANGEROUS_PATTERNS``.
+        * **Write/Edit/MultiEdit/NotebookEdit** whose target path is a
+          protected file (``_PROTECTED_BASENAME_PATTERNS``), sits under a
+          protected directory (``_PROTECTED_DIR_PARTS``), or, when ``cwd``
+          is given, resolves outside the session's project tree.
+
+        Every other tool returns False.
+        """
+        tool_lower = (tool_name or "").lower()
+        if tool_lower == "bash":
+            return cls._is_dangerous_command(tool_input)
+        if tool_lower in cls._WRITE_TOOLS:
+            return cls._is_protected_write(tool_input, cwd)
+        return False
+
+    @classmethod
+    def _is_dangerous_command(cls, tool_input) -> bool:
+        """Bash branch of ``is_dangerous``: regex over the shell command."""
         command = ""
         if isinstance(tool_input, dict):
             command = tool_input.get("command", "")
@@ -313,6 +372,58 @@ class PermissionManager:
                 "|".join(cls._DANGEROUS_PATTERNS), re.IGNORECASE | re.MULTILINE
             )
         return bool(cls._DANGEROUS_RE.search(command))
+
+    @classmethod
+    def _is_protected_write(cls, tool_input, cwd: Optional[str]) -> bool:
+        """Write branch of ``is_dangerous``: inspect the target path.
+
+        Never raises.  A malformed path is treated as NOT protected so a
+        parsing edge case can never wedge the permission callback; the
+        worst case is one unprompted write, which is today's behaviour.
+        """
+        if not isinstance(tool_input, dict):
+            return False
+        target = (tool_input.get("file_path")
+                  or tool_input.get("notebook_path")
+                  or tool_input.get("path")
+                  or "")
+        if not isinstance(target, str) or not target.strip():
+            return False
+        try:
+            # Normalise separators so one rule set covers both platforms.
+            parts = [p for p in target.replace("\\", "/").split("/") if p]
+            if not parts:
+                return False
+            basename = parts[-1]
+            dir_parts = parts[:-1]
+
+            # Rule 1: protected directory anywhere in the path.
+            if any(p.lower() in cls._PROTECTED_DIR_PARTS for p in dir_parts):
+                return True
+
+            # Rule 2: protected basename.
+            if cls._PROTECTED_BASENAME_RE is None:
+                cls._PROTECTED_BASENAME_RE = re.compile(
+                    "|".join(cls._PROTECTED_BASENAME_PATTERNS), re.IGNORECASE
+                )
+            if cls._PROTECTED_BASENAME_RE.search(basename):
+                return True
+
+            # Rule 3: outside the session's project tree (only when known).
+            if cwd:
+                abs_cwd = os.path.normcase(os.path.abspath(cwd))
+                # os.path.join discards cwd when target is already absolute.
+                abs_target = os.path.normcase(os.path.abspath(os.path.join(cwd, target)))
+                try:
+                    if os.path.commonpath([abs_target, abs_cwd]) != abs_cwd:
+                        return True
+                except ValueError:
+                    # Different drives on Windows: by definition outside cwd.
+                    return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("_is_protected_write: could not classify %r: %s", target, e)
+            return False
+        return False
 
     # ------------------------------------------------------------------
     # Audit logging
@@ -333,7 +444,10 @@ class PermissionManager:
                         or tool_input.get("path", "")
                         or tool_input.get("pattern", ""))
             if policy == "almost-always-blocked":
-                text = f"Dangerous command blocked by Almost Always — prompting for manual approval\n{tool_name}: {desc}"
+                if (tool_name or "").lower() in self._WRITE_TOOLS:
+                    text = f"Protected file write blocked by Almost Always — prompting for manual approval\n{tool_name}: {desc}"
+                else:
+                    text = f"Dangerous command blocked by Almost Always — prompting for manual approval\n{tool_name}: {desc}"
                 is_error = True
             else:
                 text = f"Auto-approved ({policy})\n{tool_name}: {desc}"

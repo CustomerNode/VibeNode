@@ -1539,14 +1539,16 @@ class SessionManager:
         """Merge new preferences into saved UI prefs and persist."""
         self._pm.set_ui_prefs(prefs)
 
-    def _should_auto_approve(self, tool_name: str, tool_input: dict) -> bool:
+    def _should_auto_approve(self, tool_name: str, tool_input: dict,
+                             cwd: Optional[str] = None) -> bool:
         """Check if a tool use should be auto-approved — delegates to PermissionManager."""
-        return self._pm.should_auto_approve(tool_name, tool_input)
+        return self._pm.should_auto_approve(tool_name, tool_input, cwd=cwd)
 
     @classmethod
-    def _is_dangerous(cls, tool_name: str, tool_input) -> bool:
+    def _is_dangerous(cls, tool_name: str, tool_input,
+                      cwd: Optional[str] = None) -> bool:
         """Return True if tool_input looks destructive — delegates to PermissionManager."""
-        return PermissionManager.is_dangerous(tool_name, tool_input)
+        return PermissionManager.is_dangerous(tool_name, tool_input, cwd=cwd)
 
     # ------------------------------------------------------------------
     # Server-side message queue
@@ -5081,8 +5083,10 @@ class SessionManager:
                 )
 
             # "Almost Always" — auto-approve unless the command looks dangerous
+            # or the write targets a protected file (cwd lets the check also
+            # catch writes that land outside this session's project tree).
             if tool_name in info.almost_always_allowed_tools:
-                if manager._is_dangerous(tool_name, tool_input):
+                if manager._is_dangerous(tool_name, tool_input, cwd=info.cwd):
                     logger.warning(
                         "Almost-always BLOCKED dangerous %s: %s",
                         tool_name,
@@ -5102,7 +5106,8 @@ class SessionManager:
                     )
 
             # Server-side policy check -- resolve without browser round-trip
-            if manager._should_auto_approve(tool_name, tool_input if isinstance(tool_input, dict) else {}):
+            if manager._should_auto_approve(tool_name, tool_input if isinstance(tool_input, dict) else {},
+                                            cwd=info.cwd):
                 logger.debug("Auto-approved %s via server policy", tool_name)
                 manager._log_auto_approved(
                     resolved_id, info, tool_name, tool_input, "server-policy"

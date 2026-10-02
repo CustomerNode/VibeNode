@@ -106,18 +106,32 @@ class TestPolicyModes:
         assert pm.should_auto_approve("Bash", {"command": "git push --force"}) is False
         assert pm.should_auto_approve("Bash", {"command": "DROP TABLE users"}) is False
 
-    def test_almost_always_only_checks_bash(self, tmp_path):
-        """Almost-always mode only checks bash commands for danger.
+    def test_almost_always_shell_regex_only_applies_to_bash(self, tmp_path):
+        """The shell-command regex is only consulted for Bash.
 
-        WHY: Non-bash tools (Read, Write, Edit, Glob, Grep) cannot
-        execute arbitrary shell commands, so danger detection is
-        irrelevant for them.  They should always be approved.
+        WHY: Read/Glob/Grep cannot execute shell commands, so the
+        dangerous-command regex must not fire on them even if a field
+        happens to contain dangerous-looking text.  Write/Edit are
+        checked by a DIFFERENT rule (protected target path, see
+        TestProtectedWrites); a Write with no target path and only a
+        stray "command" key is still approved.
         """
         pm = _make_pm(tmp_path, policy="almost_always")
-        # Even if the "command" field contains dangerous text, non-bash
-        # tools are not checked by is_dangerous
         assert pm.should_auto_approve("Read", {"command": "rm -rf /"}) is True
+        assert pm.should_auto_approve("Glob", {"pattern": "rm -rf /"}) is True
         assert pm.should_auto_approve("Write", {"command": "DROP TABLE"}) is True
+
+    def test_almost_always_blocks_protected_writes(self, tmp_path):
+        """Almost-always routes writes to protected targets to the human.
+
+        WHY: This is the hole the protected-write rules close.  Before
+        them an agent under Almost Always could overwrite .env or
+        kanban_config.json with no prompt at all.
+        """
+        pm = _make_pm(tmp_path, policy="almost_always")
+        assert pm.should_auto_approve("Write", {"file_path": "/proj/.env"}) is False
+        assert pm.should_auto_approve("Edit", {"file_path": "/proj/kanban_config.json"}) is False
+        assert pm.should_auto_approve("Write", {"file_path": "/proj/app/main.py"}) is True
 
     def test_claude_auto_approves_safe_commands(self, tmp_path):
         """Claude Auto approves non-dangerous tool uses (mirrors almost_always).
@@ -317,11 +331,13 @@ class TestIsDangerous:
             assert PermissionManager.is_dangerous("Bash", {"command": cmd}) is False, \
                 f"False positive: '{cmd}' was flagged as dangerous"
 
-    def test_non_bash_tools_never_dangerous(self, tmp_path):
-        """is_dangerous only applies to Bash tools.
+    def test_shell_regex_never_fires_on_non_bash_tools(self, tmp_path):
+        """The dangerous-command regex only applies to Bash.
 
-        WHY: Read, Write, Edit, Glob, Grep execute through safe
-        sandboxed paths.  Flagging them would break almost_always mode.
+        WHY: Read/Glob/Grep cannot run shell commands.  Write/Edit are
+        classified by target path instead (TestProtectedWrites), so a
+        "command" key on them is ignored and, with no target, they are
+        not dangerous.
         """
         assert PermissionManager.is_dangerous("Read", {"command": "rm -rf /"}) is False
         assert PermissionManager.is_dangerous("Write", {"command": "DROP TABLE"}) is False
@@ -334,6 +350,184 @@ class TestIsDangerous:
         assert PermissionManager.is_dangerous("Bash", {"command": ""}) is False
         assert PermissionManager.is_dangerous("Bash", {}) is False
         assert PermissionManager.is_dangerous("Bash", "not a dict") is False
+
+
+# =========================================================================
+# Section 2b: Protected Write Targets (is_dangerous for Write/Edit)
+# =========================================================================
+
+
+class TestProtectedWrites:
+    """Write/Edit/MultiEdit/NotebookEdit to protected targets are dangerous.
+
+    WHY: The shell regex never saw Write/Edit, so under Almost Always an
+    agent could silently overwrite .env, config files, migrations,
+    lockfiles, or .git/ internals.  These rules route such writes to the
+    human regardless of policy.  Ordinary source files must stay
+    unprompted or Almost Always degrades into Manual.
+    """
+
+    # ── Protected basenames ──
+
+    @pytest.mark.parametrize("path", [
+        "/proj/.env",
+        "/proj/.env.local",
+        "/proj/.env.production",
+        "C:\\Users\\dev\\proj\\.env",
+        "/proj/kanban_config.json",
+        "/proj/tsconfig.json",
+        "/proj/sub/dir/config.json",
+        "/proj/package-lock.json",
+        "/proj/yarn.lock",
+        "/proj/pnpm-lock.yaml",
+        "/proj/poetry.lock",
+        "/proj/Pipfile.lock",
+        "/proj/Cargo.lock",
+        "/proj/composer.lock",
+        "/proj/Gemfile.lock",
+        "/proj/go.sum",
+        "/proj/uv.lock",
+        "/proj/anything.lock",
+        "/proj/.ENV",                      # case-insensitive
+        "/proj/MyConfig.JSON",             # case-insensitive
+    ])
+    def test_protected_basename_is_dangerous(self, path):
+        assert PermissionManager.is_dangerous("Write", {"file_path": path}) is True
+
+    # ── Protected directories ──
+
+    @pytest.mark.parametrize("path", [
+        "/proj/.git/config",
+        "/proj/.git/hooks/pre-commit",
+        "C:\\proj\\.git\\HEAD",
+        "/proj/app/migrations/0042_add_col.py",
+        "/proj/db/alembic/versions/abc123.py",
+        "/proj/Migrations/0001.sql",       # case-insensitive dir match
+    ])
+    def test_protected_directory_is_dangerous(self, path):
+        assert PermissionManager.is_dangerous("Edit", {"file_path": path}) is True
+
+    def test_dir_rule_excludes_basename(self):
+        """A FILE named .git / migrations is not a protected directory.
+
+        WHY: The dir rule looks at parent components only.  .gitignore
+        and a script called migrations.py are ordinary files.
+        """
+        assert PermissionManager.is_dangerous("Write", {"file_path": "/proj/.gitignore"}) is False
+        assert PermissionManager.is_dangerous("Write", {"file_path": "/proj/migrations.py"}) is False
+        assert PermissionManager.is_dangerous("Write", {"file_path": "/proj/.git"}) is False
+
+    # ── Outside the project tree ──
+
+    def test_outside_cwd_is_dangerous(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        outside = tmp_path / "elsewhere" / "notes.txt"
+        assert PermissionManager.is_dangerous(
+            "Write", {"file_path": str(outside)}, cwd=str(proj)) is True
+
+    def test_inside_cwd_is_safe(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        inside = proj / "src" / "main.py"
+        assert PermissionManager.is_dangerous(
+            "Write", {"file_path": str(inside)}, cwd=str(proj)) is False
+
+    def test_relative_path_resolves_against_cwd(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        assert PermissionManager.is_dangerous(
+            "Edit", {"file_path": "src/main.py"}, cwd=str(proj)) is False
+        # Relative traversal that escapes the project is caught.
+        assert PermissionManager.is_dangerous(
+            "Edit", {"file_path": "../escape.py"}, cwd=str(proj)) is True
+
+    def test_prefix_collision_is_not_inside(self, tmp_path):
+        """/proj-other is NOT inside /proj even though it shares a prefix.
+
+        WHY: A naive startswith() check would approve it.  commonpath
+        compares whole components.
+        """
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        sibling = tmp_path / "proj-other" / "x.py"
+        assert PermissionManager.is_dangerous(
+            "Write", {"file_path": str(sibling)}, cwd=str(proj)) is True
+
+    def test_no_cwd_skips_outside_rule(self):
+        """Without cwd the outside-tree rule cannot run and must not guess.
+
+        WHY: should_auto_approve is also called from paths with no
+        session context.  An absolute path to an ordinary file must stay
+        approved there; only the basename/dir rules apply.
+        """
+        assert PermissionManager.is_dangerous("Write", {"file_path": "/anywhere/main.py"}) is False
+
+    # ── Tool coverage and input shapes ──
+
+    @pytest.mark.parametrize("tool", ["Write", "Edit", "MultiEdit", "NotebookEdit", "write", "EDIT"])
+    def test_all_write_tools_covered(self, tool):
+        assert PermissionManager.is_dangerous(tool, {"file_path": "/proj/.env"}) is True
+
+    def test_notebook_path_key(self):
+        assert PermissionManager.is_dangerous(
+            "NotebookEdit", {"notebook_path": "/proj/.git/x.ipynb"}) is True
+
+    def test_read_tools_ignore_protected_paths(self):
+        """Reading .env is not a write; only writes are gated.
+
+        WHY: Flagging reads would prompt on every config lookup and
+        train the user to click Allow without looking.
+        """
+        assert PermissionManager.is_dangerous("Read", {"file_path": "/proj/.env"}) is False
+        assert PermissionManager.is_dangerous("Grep", {"path": "/proj/.git"}) is False
+
+    def test_ordinary_source_files_are_safe(self):
+        for p in ["/proj/app/main.py", "/proj/static/js/app.js", "/proj/README.md",
+                  "/proj/config.py", "/proj/settings.yaml", "/proj/docs/config.md"]:
+            assert PermissionManager.is_dangerous("Write", {"file_path": p}) is False, \
+                f"False positive: {p} flagged as protected"
+
+    def test_malformed_input_is_not_dangerous(self):
+        """Bad input must never raise; worst case is one unprompted write.
+
+        WHY: is_dangerous runs inside the SDK permission callback.  An
+        exception there wedges the session.
+        """
+        assert PermissionManager.is_dangerous("Write", {}) is False
+        assert PermissionManager.is_dangerous("Write", {"file_path": ""}) is False
+        assert PermissionManager.is_dangerous("Write", {"file_path": "   "}) is False
+        assert PermissionManager.is_dangerous("Write", {"file_path": None}) is False
+        assert PermissionManager.is_dangerous("Write", {"file_path": 123}) is False
+        assert PermissionManager.is_dangerous("Write", "not a dict") is False
+        assert PermissionManager.is_dangerous("Write", None) is False
+
+    # ── Policy wiring ──
+
+    def test_claude_auto_still_gates_bash_not_edits(self, tmp_path):
+        """claude_auto: protected-write rules apply if an edit DOES reach us.
+
+        WHY: Under claude_auto the SDK normally intercepts edits before
+        the callback, so this path is rarely hit.  If it is (future SDK
+        change, different tool name), the safe behaviour is to prompt.
+        """
+        pm = _make_pm(tmp_path, policy="claude_auto")
+        assert pm.should_auto_approve("Write", {"file_path": "/proj/.env"}) is False
+        assert pm.should_auto_approve("Bash", {"command": "ls"}) is True
+
+    def test_auto_policy_ignores_protected_writes(self, tmp_path):
+        """'auto' means auto.  Protected-write rules only apply to the
+        Almost Always family, matching the shell-regex behaviour."""
+        pm = _make_pm(tmp_path, policy="auto")
+        assert pm.should_auto_approve("Write", {"file_path": "/proj/.env"}) is True
+
+    def test_should_auto_approve_threads_cwd(self, tmp_path):
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        pm = _make_pm(tmp_path, policy="almost_always")
+        outside = str(tmp_path / "out.py")
+        assert pm.should_auto_approve("Write", {"file_path": outside}, cwd=str(proj)) is False
+        assert pm.should_auto_approve("Write", {"file_path": outside}) is True
 
 
 # =========================================================================
@@ -784,6 +978,27 @@ class TestLogAutoApproved:
         entry = info.entries[0]
         assert entry.is_error is True
         assert "Dangerous command blocked" in entry.text
+
+    def test_blocked_protected_write_entry_names_the_file(self, tmp_path):
+        """Blocked protected writes say so, and show the target path.
+
+        WHY: The user must be able to tell from the timeline WHY a
+        prompt appeared.  "Dangerous command" would be misleading for a
+        Write to .env; the path is what they need to judge it.
+        """
+        pm = _make_pm(tmp_path)
+        import threading
+        info = MagicMock()
+        info.entries = []
+        info._lock = threading.Lock()
+
+        pm.log_auto_approved("sess-1", info, "Write",
+                             {"file_path": "/proj/.env"}, "almost-always-blocked")
+
+        entry = info.entries[0]
+        assert entry.is_error is True
+        assert "Protected file write blocked" in entry.text
+        assert "/proj/.env" in entry.text
 
     def test_exception_safety(self, tmp_path):
         """log_auto_approved must never raise, even if logging fails.
