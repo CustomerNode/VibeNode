@@ -739,7 +739,19 @@ function _buildPermissionPanel() {
 }
 
 // ---- Permission queue update (called from socket events) ----
-// Auto-approve policies are GLOBAL — apply them regardless of view mode.
+// The DAEMON is the single authority on auto-approval
+// (PermissionManager.should_auto_approve, run inside the can_use_tool callback
+// before anything is pushed to the browser).  A prompt that reaches this
+// function is therefore one the daemon already decided NOT to auto-approve —
+// a dangerous command or protected-file write under "Auto Approve Most" /
+// "Claude Auto", or a tool no custom rule matched.
+//
+// Do NOT re-apply the policy here.  This function used to run a looser client
+// copy of the policy (almost_always / claude_auto => approve everything) and
+// answer 'y' on the spot, which (a) silently approved exactly the commands the
+// daemon escalated for manual review, defeating the dangerous-command gate,
+// and (b) made "Claude has a question" flash in the input bar for a frame
+// before the auto-answer cleared it.
 function _updatePermissionQueue(newWaiting) {
 
   const newQueue = [];
@@ -759,9 +771,9 @@ function _updatePermissionQueue(newWaiting) {
       command: command,
     };
 
-    // Auto-approve check
-    if (_applyPolicies(entry)) {
-      wsPermissionAnswer(sid, 'y');
+    // "Claude Auto" never stops to ask — see _claudeAutoVerdict().
+    if (_claudeAutoActive() && data.kind === 'tool') {
+      wsPermissionAnswer(sid, _claudeAutoVerdict(data.tool_name, data.tool_input));
       continue;
     }
     newQueue.push(entry);
@@ -816,33 +828,67 @@ function _parsePermissionQuestion(text) {
   return { toolName, command };
 }
 
-// ---- Policy matching ----
-function _applyPolicies(entry) {
-  if (permissionPolicy === 'manual') return false;
-  if (permissionPolicy === 'auto') return true;
-  if (permissionPolicy === 'almost_always') return true;  // dangerous-command gate is server-side
-  // "Claude Auto": SDK's acceptEdits already handled edits server-side; anything
-  // that reaches the browser is non-edit (Bash/MCP/etc).  Same safety net as
-  // almost_always — dangerous-command gate is server-side, so approve here.
-  if (permissionPolicy === 'claude_auto') return true;
+// ---- "Claude Auto": decide in the browser, never show a prompt ----
+//
+// HOT FIX that works against a daemon that has NOT been restarted.  The proper
+// implementation is daemon-side (PermissionManager.should_auto_deny rejects a
+// dangerous action inside the permission callback, so nothing is ever pushed
+// to the browser).  A daemon started before that change still escalates the
+// action as a prompt.  In "Claude Auto" the browser answers that prompt itself
+// and the socket handlers never paint the "Claude has a question" bar:
+//
+//   * genuinely destructive  -> 'n'  (deny, turn continues; the agent sees the
+//                                     refusal and takes another route)
+//   * anything else          -> 'y'  (the old daemon over-flags, most notably
+//                                     every `2>/dev/null`)
+//
+// _CLAUDE_AUTO_DANGEROUS mirrors _DANGEROUS_PATTERNS in
+// daemon/permission_manager.py — keep the two in sync.  Once every daemon runs
+// should_auto_deny() no prompt reaches the browser in this mode and this whole
+// block is dead code that can be deleted.
+const _CLAUDE_AUTO_DANGEROUS = new RegExp([
+  '\\brm\\s+.*-[rRf]',
+  '\\brm\\s+.*\\*',
+  '\\bfind\\b.*\\s-delete\\b',
+  '\\bfind\\b.*-exec\\s+rm\\b',
+  '\\bshutil\\.rmtree\\b',
+  '>\\s*/dev/(?!(null|stdout|stderr|tty)\\b|fd/)',
+  '^\\s*>\\s*[\'"]?/',
+  '\\btruncate\\s',
+  '\\bmkfs\\b',
+  '\\bdd\\s+if=',
+  '\\bmv\\s+.*\\s+/dev/null\\b',
+  '\\bgit\\s+push\\s+.*--force',
+  '\\bgit\\s+push\\s+-f\\b',
+  '\\bgit\\s+reset\\s+--hard',
+  '\\bgit\\s+clean\\s+-[fdxe]',
+  '\\bgit\\s+stash\\s+clear\\b',
+  '\\bDROP\\s+(TABLE|DATABASE|SCHEMA|VIEW)',
+  '\\bTRUNCATE\\b',
+  '\\bnpm\\s+publish\\b',
+  '\\bcurl\\b.*\\|\\s*(ba)?sh',
+  '\\bwget\\b.*\\|\\s*(ba)?sh',
+  '\\bpython[3]?\\s+-c\\s+.*\\brmtree\\b',
+].join('|'), 'im');
+const _CLAUDE_AUTO_WRITE_TOOLS = ['write', 'edit', 'multiedit', 'notebookedit'];
 
-  // Custom policy
-  if (permissionPolicy === 'custom') {
-    const tool = (entry.toolName || '').toLowerCase();
-    if (customPolicies.approveAllReads && tool === 'read') return true;
-    if (customPolicies.approveProjectReads && tool === 'read') return true;
-    if (customPolicies.approveAllBash && tool === 'bash') return true;
-    if (customPolicies.approveProjectWrites && (tool === 'write' || tool === 'edit')) return true;
-    if (customPolicies.approveGlob && tool === 'glob') return true;
-    if (customPolicies.approveGrep && tool === 'grep') return true;
-    if (customPolicies.customPattern) {
-      try {
-        const re = new RegExp(customPolicies.customPattern, 'i');
-        if (re.test(entry.question)) return true;
-      } catch(e) {}
-    }
+function _claudeAutoActive() {
+  return typeof permissionPolicy !== 'undefined' && permissionPolicy === 'claude_auto';
+}
+
+// 'y' or 'n' for a tool prompt that reached the browser under Claude Auto.
+function _claudeAutoVerdict(toolName, toolInput) {
+  const tool = (toolName || '').toLowerCase();
+  if (tool === 'bash') {
+    const cmd = (toolInput && typeof toolInput.command === 'string') ? toolInput.command : '';
+    return _CLAUDE_AUTO_DANGEROUS.test(cmd) ? 'n' : 'y';
   }
-  return false;
+  // The SDK's acceptEdits mode approves ordinary edits before the daemon is
+  // consulted, and the daemon approves the rest unless the target is protected
+  // (.env, config, lockfile, .git/, migrations, outside the project).  So an
+  // edit prompt that gets this far is a protected write.
+  if (_CLAUDE_AUTO_WRITE_TOOLS.includes(tool)) return 'n';
+  return 'y';
 }
 
 // ---- Send permission answer via WebSocket ----

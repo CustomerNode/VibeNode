@@ -681,17 +681,20 @@ const _OUTPUT_EXTS = new Set([
 ]);
 const _outputShelfPaths = new Set();
 
+// One clean line icon per file family, drawn in the text colour.  (These used
+// to be a mix of emoji and symbols in six different colours, e.g. a red
+// lozenge for .html, which looked like a stray character next to the name.)
 function _outputFileIcon(ext) {
   ext = (ext || '').toLowerCase();
-  if (['xlsx','xlsm','xls','csv'].includes(ext)) return '<span style="color:#22a55b;">&#128203;</span>';
-  if (['docx','doc','txt'].includes(ext)) return '<span style="color:#4a90d9;">&#128196;</span>';
-  if (['pptx','ppt'].includes(ext)) return '<span style="color:#e07020;">&#128202;</span>';
-  if (ext === 'pdf') return '<span style="color:#cc3333;">&#128213;</span>';
-  if (['png','jpg','jpeg','gif','svg','bmp'].includes(ext)) return '<span style="color:#9b59b6;">&#128444;</span>';
-  if (ext === 'zip') return '<span style="color:#888;">&#128230;</span>';
-  if (ext === 'json') return '<span style="color:#e8a838;">&#123;&#125;</span>';
-  if (ext === 'html') return '<span style="color:#e06050;">&#9674;</span>';
-  return '<span style="color:#888;">&#128196;</span>';
+  const page = '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>';
+  let inner;
+  if (['xlsx','xlsm','xls','csv'].includes(ext)) inner = '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 10h16M4 15h16M10 4v16"/>';
+  else if (['png','jpg','jpeg','gif','svg','bmp'].includes(ext)) inner = '<rect x="4" y="4" width="16" height="16" rx="2"/><circle cx="9" cy="9.5" r="1.5"/><path d="m20 15-4-4-8 8"/>';
+  else if (['pptx','ppt'].includes(ext)) inner = '<rect x="3" y="5" width="18" height="12" rx="2"/><path d="M12 17v3M8 20h8"/>';
+  else if (ext === 'zip') inner = '<path d="M21 8v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8"/><rect x="2" y="4" width="20" height="4" rx="1"/><path d="M10 12h4"/>';
+  else if (['html','json'].includes(ext)) inner = page + '<path d="m10.5 13-2 2 2 2M13.5 13l2 2-2 2"/>';
+  else inner = page + '<path d="M9 13h6M9 17h4"/>';
+  return '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + inner + '</svg>';
 }
 
 function _tryAddOutputCard(entry) {
@@ -1855,7 +1858,7 @@ function renderLiveEntry(e, opts) {
     if (e.kind === 'user' && vnSentAt) {
       const footer = document.createElement('div');
       footer.className = 'vn-msg-footer';
-      footer.innerHTML = (vnIsVoice ? '<span class="vn-msg-footer-icon">\ud83c\udf99\ufe0f</span> Transcribed from voice \u00b7 ' : '<span class="vn-msg-footer-icon">\u26a1</span> ') + 'Sent at ' + _formatSentAt(vnSentAt);
+      footer.innerHTML = _vnMsgFooterHtml(vnIsVoice, _formatSentAt(vnSentAt));
       div.appendChild(footer);
     }
 
@@ -2230,6 +2233,45 @@ function _buildCtxBarCompact(id, disabled) {
     '</svg></div>';
 }
 
+/** Footer under one of your messages: just the time, with a small mic and
+ *  "Voice" when it was dictated.  (Was "⚡ Sent at …" / "🎙️ Transcribed from
+ *  voice · Sent at …".)  One builder for both render paths. */
+function _vnMsgFooterHtml(isVoice, timeStr) {
+  const mic = '<svg class="vn-msg-footer-mic" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3" fill="currentColor" stroke="none"/><path d="M19 11a7 7 0 0 1-14 0"/><path d="M12 19v3"/></svg>';
+  return (isVoice ? mic + 'Voice \u00b7 ' : '') + escHtml(timeStr);
+}
+
+// ── Composer status header ────────────────────────────────────────────────
+// Working / Compacting / Awaiting wake-up / Asleep are shown as a header
+// ATTACHED to the text box, inside one border (".vn-card"), instead of a
+// separate tinted box or banner above it.  Each state uses the same icon the
+// session list uses for it (sessions.js _renderSessionRow), drawn in neutral.
+const _ST_ICONS = {
+  working: '<span class="vn-st-mask vn-st-pick"></span>',
+  compacting: '<svg class="vn-st-squeeze" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>',
+  waking: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',
+  asleep: '<span class="vn-st-mask vn-st-sleep"></span>',
+};
+const _ST_LABELS = {working: 'Working', compacting: 'Compacting', waking: 'Awaiting wake-up', asleep: 'Asleep'};
+/** Session substatus -> header state for a WORKING session. */
+function _stKindFor(sub) { return sub === 'compacting' ? 'compacting' : (sub === 'auto-resuming' ? 'waking' : 'working'); }
+/** The motion that goes with a busy state (nothing while a session merely
+ *  waits to wake).  Working: sparks fly off the pickaxe on each strike.
+ *  Compacting has no strike, so it keeps the light along the card's top edge.
+ *  Both carry .vn-st-fx so the state-change swap can find whichever is there. */
+function _stShimmer(kind) {
+  if (kind === 'working') return '<span class="vn-st-fx vn-st-sparks"><i></i><i></i><i></i><i></i></span>';
+  if (kind === 'compacting') return '<span class="vn-st-fx vn-st-shimmer"></span>';
+  return '';
+}
+/** Header row.  `extra` = html after the label (timer, agent summary, hint);
+ *  `right` = html pinned right (Stop). */
+function _stHeader(kind, extra, right) {
+  return '<div class="vn-st"><span class="vn-st-ico" id="live-st-ico">' + _ST_ICONS[kind] + '</span>' +
+    '<span class="vn-st-lbl" id="live-st-lbl">' + _ST_LABELS[kind] + '</span>' + (extra || '') +
+    (right ? '<span class="vn-st-grow"></span>' + right : '') + '</div>';
+}
+
 function updateLiveInputBar() {
   if (!liveSessionId) return;
   const id = liveSessionId;
@@ -2364,14 +2406,15 @@ function updateLiveInputBar() {
     // you, because resuming on the same model just hits the wall again.
     const _limitBanner = _buildUsageLimitBanner(id, _limitSt);
     bar.innerHTML =
-      (_limitBanner ||
-      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;padding:8px 12px;background:var(--bg-card);border:1px solid var(--border-subtle);border-radius:8px;">' +
-      '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--text-faint)" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="8" y1="12" x2="16" y2="12"/></svg>' +
-      '<span style="font-size:12px;color:var(--text-muted);">Session not running. Type a message to resume.</span>' +
-      '</div>') +
-      '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="Type a message to continue\u2026"' +
+      (_limitBanner || '') +
+      // No limit banner: the "asleep" header is attached to the text box.
+      (_limitBanner ? '' : '<div class="vn-card">' +
+        _stHeader('asleep', '<span class="vn-st-hint">Wakes when you send a message</span>')) +
+      '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="' +
+      (_limitBanner ? 'Type a message to continue\u2026' : 'Type a message to wake it') + '"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitContinue(\'' + id + '\')}"' +
       ' onblur="if(_wasKeyboardDismissBlur()){liveSubmitContinue(\'' + id + '\')}"></textarea>' +
+      (_limitBanner ? '' : '</div>') +
       '<div class="live-bar-row">' +
       (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id), false, _liveSessionModel) : _buildCtxBarCompact(id)) +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
@@ -2457,16 +2500,7 @@ function updateLiveInputBar() {
     // bar so the user can tell apart "really done" vs "asleep, will wake
     // itself up later" \u2014 the latter still accepts manual input (which
     // supersedes the wake-up).
-    const _sleepingBanner = (_idleSub === 'auto-resuming')
-      ? ('<div class="live-sleeping-banner" style="display:flex;align-items:center;' +
-         'gap:8px;margin-bottom:8px;padding:8px 12px;background:var(--bg-card);' +
-         'border:1px solid var(--border-subtle);border-radius:8px;">' +
-         '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" ' +
-         'stroke-width="2" stroke-linecap="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>' +
-         '<span style="font-size:12px;color:var(--text-muted);">Awaiting wake-up\u2026 ' +
-         '<span style="color:var(--text-faint);">(send a message to take over)</span></span>' +
-         '</div>')
-      : '';
+    const _sleeping = (_idleSub === 'auto-resuming');
     // \u2500\u2500 Auto-retry countdown banner \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     // When the server has armed an API-error auto-retry, show a live countdown
     // (ticked by _liveRetryTimer below) with Cancel + Retry-now controls.  If
@@ -2524,14 +2558,16 @@ function updateLiveInputBar() {
     }
     bar.innerHTML =
       _retryBanner +
-      _sleepingBanner +
+      (_sleeping ? '<div class="vn-card">' +
+        _stHeader('waking', '<span class="vn-st-hint">Send a message to take over</span>') : '') +
       '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="' +
-      (_idleSub === 'auto-resuming'
+      (_sleeping
         ? 'Type to override the scheduled wake-up\u2026'
         : 'Type your next command\u2026') +
       '"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitIdle()}"' +
       ' onblur="if(_wasKeyboardDismissBlur()){liveSubmitIdle()}"></textarea>' +
+      (_sleeping ? '</div>' : '') +
       '<div class="live-bar-row">' +
       (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id), false, _liveSessionModel) : _buildCtxBarCompact(id)) +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
@@ -2577,10 +2613,7 @@ function updateLiveInputBar() {
     const _sub = (window._sessionSubstatus && window._sessionSubstatus[id]) || '';
     const _isCompacting = _sub === 'compacting';
     const _isAutoResuming = _sub === 'auto-resuming';
-    const _statusLabel = _isCompacting
-      ? 'Compacting\u2026'
-      : (_isAutoResuming ? 'Awaiting wake-up\u2026' : 'Working\u2026');
-    const _spinnerClass = _isCompacting ? 'spinner compacting-spinner' : 'spinner';
+    const _stKind = _stKindFor(_sub);
 
     // Build sub-agent team strip
     const _agents = (window._subAgents && window._subAgents[id]) || {};
@@ -2594,19 +2627,12 @@ function updateLiveInputBar() {
     if (_agentEntries.length > 0) {
       if (_allDone) {
         // All agents finished — collapse to minimal footer inside the working bar
-        _agentFooterHtml = '<div class="sub-agent-footer">' +
-          '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>' +
-          '<span>' + _doneCount + ' agent' + (_doneCount > 1 ? 's' : '') + ' completed</span>' +
-          '</div>';
+        _agentFooterHtml = '<span class="vn-st-hint">\u00b7 ' + _doneCount + ' agent' + (_doneCount > 1 ? 's' : '') + ' done</span>';
       } else {
         // Some agents still working — show full strip with pills
-        const _teamLabel = _workingCount + ' agent' + (_workingCount > 1 ? 's' : '') + ' active' + (_doneCount > 0 ? ' \u00b7 ' + _doneCount + ' done' : '');
-        _agentStripHtml = '<div class="sub-agent-strip">' +
-          '<div class="sub-agent-header">' +
-          '<svg class="sub-agent-team-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>' +
-          '<span class="sub-agent-team-label">' + _teamLabel + '</span>' +
-          '</div>' +
-          '<div class="sub-agent-pills">';
+        _agentFooterHtml = '<span class="vn-st-hint">\u00b7 ' + _workingCount + ' agent' + (_workingCount > 1 ? 's' : '') +
+          ' running' + (_doneCount > 0 ? ', ' + _doneCount + ' done' : '') + '</span>';
+        _agentStripHtml = '<div class="sub-agent-pills vn-agents">';
         _agentEntries.forEach(([tuId, ag], idx) => {
           const isDone = ag.status === 'done';
           const agentElapsed = isDone && ag.endTime
@@ -2623,27 +2649,23 @@ function updateLiveInputBar() {
             '<span class="sub-agent-time">' + agentTimeStr + '</span>' +
             '</div>';
         });
-        _agentStripHtml += '</div></div>';
+        _agentStripHtml += '</div>';
       }
     }
 
-    const _hasActiveAgents = _agentEntries.length > 0 && !_allDone;
     bar.innerHTML =
-      '<div class="live-working-status' + (_hasActiveAgents ? ' has-agents' : '') + '">' +
-      '<div class="live-working-indicator"><span class="' + _spinnerClass + '"></span> ' + _statusLabel + ' <span id="live-elapsed" style="color:var(--text-faint);font-size:10px;margin-left:6px;">' + _elapsedStr + '</span></div>' +
-      (_agentFooterHtml ? _agentFooterHtml : '') +
-      '<button class="live-stop-btn" onclick="liveSubmitInterrupt()" title="Interrupt session">\u25A0 Stop</button>' +
-      '</div>' +
+      '<div class="vn-card" id="live-st-card" data-st="' + _stKind + '">' + _stShimmer(_stKind) +
+      _stHeader(_stKind,
+        '<span class="vn-st-time" id="live-elapsed">' + _elapsedStr + '</span>' + _agentFooterHtml,
+        '<button class="vn-stop" onclick="liveSubmitInterrupt()" title="Interrupt session"><i></i>Stop</button>') +
       _agentStripHtml +
       '<textarea id="live-queue-ta" class="live-textarea live-queue-ta" rows="2" ' +
-      'placeholder="' + (qCount ? 'Queue another command\u2026' : 'Type your next command \u2014 will send when Claude finishes\u2026') + '"' +
+      'placeholder="' + _queuePlaceholder(qCount) + '"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveQueueSave()}"' +
       ' onblur="if(_wasKeyboardDismissBlur()){liveQueueSave()}"></textarea>' +
+      '</div>' +
       '<div class="live-bar-row">' +
       (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id, true), false, _liveSessionModel) : _buildCtxBarCompact(id, true)) +
-      '<span id="live-queue-hint" style="font-size:10px;color:var(--text-faint);">' +
-      (qCount ? qCount + ' queued \u2022 will send in order when idle' : 'Will send automatically when done') +
-      '</span>' +
       '<button class="live-send-btn" id="live-voice-btn"></button>' +
       '</div>';
     setupVoiceButton(document.getElementById('live-queue-ta'), document.getElementById('live-voice-btn'), liveQueueSave);
@@ -2663,23 +2685,21 @@ function updateLiveInputBar() {
         const s = Math.round((Date.now() - _liveWorkingStart) / 1000);
         el.textContent = s >= 60 ? Math.floor(s/60) + 'm ' + (s%60) + 's' : s + 's';
         // Update compacting / auto-resuming label dynamically without full re-render
-        const indicator = el.closest('.live-working-indicator');
-        if (indicator) {
-          const curSub = (window._sessionSubstatus && window._sessionSubstatus[liveSessionId]) || '';
-          const spinnerEl = indicator.querySelector('.spinner');
-          const textNodes = [...indicator.childNodes].filter(n => n.nodeType === 3);
-          let want;
-          if (curSub === 'compacting') want = ' Compacting\u2026 ';
-          else if (curSub === 'auto-resuming') want = ' Awaiting wake-up\u2026 ';
-          else want = ' Working\u2026 ';
-          if (spinnerEl) {
-            if (curSub === 'compacting') {
-              if (!spinnerEl.classList.contains('compacting-spinner')) spinnerEl.classList.add('compacting-spinner');
-            } else {
-              spinnerEl.classList.remove('compacting-spinner');
-            }
+        const card = document.getElementById('live-st-card');
+        if (card) {
+          const want = _stKindFor((window._sessionSubstatus && window._sessionSubstatus[liveSessionId]) || '');
+          if (card.dataset.st !== want) {
+            card.dataset.st = want;
+            const ico = document.getElementById('live-st-ico'), lbl = document.getElementById('live-st-lbl');
+            // Replace the icon AND the travelling light in the same tick: they
+            // share one animation clock and must restart together to stay in step.
+            if (ico) ico.innerHTML = _ST_ICONS[want];
+            if (lbl) lbl.textContent = _ST_LABELS[want];
+            const old = card.querySelector('.vn-st-fx');
+            if (old) old.remove();
+            const sh = _stShimmer(want);
+            if (sh) card.insertAdjacentHTML('afterbegin', sh);
           }
-          if (textNodes.length && textNodes[0].textContent !== want) textNodes[0].textContent = want;
         }
         // Update sub-agent elapsed times without full re-render
         const agentPills = document.querySelectorAll('.sub-agent-pill.active');
@@ -2753,12 +2773,10 @@ function liveQueueSave() {
   _addQueue(liveSessionId, text);
   ta.value = '';
   _resetTextareaHeight(ta);
-  ta.placeholder = 'Queue another command\u2026';
   const total = _getQueueList(liveSessionId).length;
+  ta.placeholder = _queuePlaceholder(total);
   showToast('Command queued (' + total + ')');
   _renderQueueBanner();
-  const hint = document.getElementById('live-queue-hint');
-  if (hint) hint.textContent = total + ' queued \u2022 will send in order when idle';
   // Scroll chat to bottom so banner is visible
   const logEl = document.getElementById('live-log');
   if (logEl) logEl.scrollTop = logEl.scrollHeight;
@@ -2767,6 +2785,16 @@ function liveQueueSave() {
   // to see; matches the mobile defocus in the other submit paths
   // (liveSubmitContinue / liveSubmitIdle / _newSessionSubmit).
   if (!_isMobileViewport()) ta.focus();
+}
+
+/** Placeholder for the box you type in while Claude is working.  It carries
+ *  what used to be a separate note in the button row ("Will send automatically
+ *  when done" / "2 queued \u2022 will send in order when idle"), so the row holds
+ *  only status and buttons. */
+function _queuePlaceholder(queued) {
+  return queued
+    ? 'Queue another (' + queued + ' queued)'
+    : 'Sends when Claude finishes';
 }
 
 function liveClearQueue() {
@@ -2778,9 +2806,7 @@ function liveClearQueue() {
   showToast(remaining ? 'Removed \u2014 ' + remaining + ' remaining' : 'Queue cleared');
   _renderQueueBanner();
   const ta = document.getElementById('live-queue-ta');
-  if (ta) ta.placeholder = remaining ? 'Queue another command\u2026' : 'Type your next command \u2014 will send when Claude finishes\u2026';
-  const hint = document.getElementById('live-queue-hint');
-  if (hint) hint.textContent = remaining ? remaining + ' queued \u2022 will send in order when idle' : 'Will send automatically when done';
+  if (ta) ta.placeholder = _queuePlaceholder(remaining);
   if (ta) ta.focus();
 }
 
@@ -2796,11 +2822,9 @@ function liveEditQueue() {
   if (ta) {
     ta.value = text;
     _autoResizeTextarea(ta);
-    ta.placeholder = remaining ? 'Queue another command\u2026' : 'Type your next command \u2014 will send when Claude finishes\u2026';
+    ta.placeholder = _queuePlaceholder(remaining);
     ta.focus();
   }
-  const hint = document.getElementById('live-queue-hint');
-  if (hint) hint.textContent = remaining ? remaining + ' queued \u2022 Press Enter to re-queue' : 'Will send automatically when done';
 }
 
 function liveSubmitIdle() {
@@ -3423,7 +3447,7 @@ function _addOptimisticBubble(sid, text, isVoice) {
   vnFooter.className = 'vn-msg-footer';
   const nowH = now.getHours() % 12 || 12;
   const _timeStr = nowH + ':' + String(now.getMinutes()).padStart(2, '0') + ' ' + (now.getHours() >= 12 ? 'PM' : 'AM');
-  vnFooter.innerHTML = (isVoice ? '<span class="vn-msg-footer-icon">\ud83c\udf99\ufe0f</span> Transcribed from voice \u00b7 ' : '<span class="vn-msg-footer-icon">\u26a1</span> ') + 'Sent at ' + _timeStr;
+  vnFooter.innerHTML = _vnMsgFooterHtml(isVoice, _timeStr);
   userMsg.appendChild(vnFooter);
   userMsg.addEventListener('animationend', () => userMsg.classList.remove('msg-entering'), {once: true});
   logEl.appendChild(userMsg);

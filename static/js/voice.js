@@ -1,8 +1,9 @@
 /* voice.js — Web Speech API voice input for textareas */
 
-const _micSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="1" width="6" height="12" rx="3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="23" x2="12" y2="19"/></svg>';
-const _micActiveSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--result-err)" stroke-width="2" stroke-linecap="round"><rect x="9" y="1" width="6" height="12" rx="3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="23" x2="12" y2="19"/></svg>';
-const _sendSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>';
+const _micSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8.5" y="2" width="7" height="13" rx="3.5" fill="currentColor" stroke="none"/><path d="M19 10.5v1.5a7 7 0 0 1-14 0v-1.5"/><path d="M12 19v3"/></svg>';
+const _micActiveSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--result-err)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8.5" y="2" width="7" height="13" rx="3.5" fill="var(--result-err)" stroke="none"/><path d="M19 10.5v1.5a7 7 0 0 1-14 0v-1.5"/><path d="M12 19v3"/></svg>';
+const _sendSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M3.4 20.4 20.85 12.92a1 1 0 0 0 0-1.84L3.4 3.6a1 1 0 0 0-1.38 1.17L4.1 10.6a1 1 0 0 0 .85.68L13 12l-8.05.72a1 1 0 0 0-.85.68l-2.08 5.83A1 1 0 0 0 3.4 20.4z"/></svg>';
+const _cancelSvg = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>';
 
 let _activeRecognition = null;
 let _activeSpeechNode = null;   // active SpeechNode (MediaRecorder) capture controller
@@ -121,8 +122,9 @@ function setupVoiceButton(textarea, button, onSubmit) {
   if (!cancelBtn || !cancelBtn.classList.contains('voice-cancel-btn')) {
     cancelBtn = document.createElement('button');
     cancelBtn.className = 'voice-cancel-btn';
-    cancelBtn.innerHTML = '&times;';
+    cancelBtn.innerHTML = _cancelSvg;
     cancelBtn.title = 'Cancel recording & discard';
+    cancelBtn.setAttribute('aria-label', 'Cancel recording and discard');
     cancelBtn.style.display = 'none';
     button.parentNode.insertBefore(cancelBtn, button);
   }
@@ -156,6 +158,12 @@ function setupVoiceButton(textarea, button, onSubmit) {
     const hasText = textarea.value.trim().length > 0 || !!window._pendingInvoke;
     const isRecording = (_activeRecognition && _activeRecognition._target === textarea)
       || (_activeSpeechNode && _activeSpeechNode._target === textarea);
+
+    // Primary hand-off: the mic is the call to action while the box is empty;
+    // once there is text the send button takes over (styled in style.css,
+    // ".live-bar-row .live-send-btn.vn-primary").  Without voice support this
+    // button IS the send button, so it stays primary.
+    button.classList.toggle('vn-primary', !isRecording && (!hasText || !_hasVoiceSupport()));
 
     if (isRecording) {
       button.innerHTML = _micActiveSvg;

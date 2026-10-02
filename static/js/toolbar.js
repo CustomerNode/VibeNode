@@ -1217,16 +1217,29 @@ async function _confirmPicker() {
   }
 }
 
-/* ---- Sidebar resize ---- */
+/* ---- Sidebar resize / hide (desktop) ----
+   The divider is the one control for the panel's width, including hiding it:
+   drag to resize; drag past the minimum to hide (it snaps shut); drag back out,
+   click the slim edge strip, or double-click the divider to bring it back.
+   This replaced the collapse arrow on desktop.  Phones keep their arrow as the
+   drawer's close button (mobile.css), and their drawer never uses this. */
 (function() {
   const handle = document.getElementById('resize-handle');
   const sidebar = document.querySelector('.sidebar');
-  let dragging = false, startX = 0, startW = 0;
+  const HIDE_BELOW = 110, SHOW_ABOVE = 140;
+  let dragging = false, moved = false, startX = 0, startW = 0, startCollapsed = false;
+  const isCollapsed = () => sidebar.classList.contains('collapsed');
+  const setCollapsed = want => { if (isCollapsed() !== want && typeof toggleSidebar === 'function') toggleSidebar(); };
+  handle.title = 'Drag to resize \u00b7 double-click to hide or show';
+  handle.setAttribute('role', 'separator');
+  handle.setAttribute('aria-orientation', 'vertical');
+  handle.tabIndex = 0;
 
   handle.addEventListener('mousedown', e => {
-    dragging = true;
+    dragging = true; moved = false;
     startX = e.clientX;
-    startW = sidebar.offsetWidth;
+    startCollapsed = isCollapsed();
+    startW = startCollapsed ? 0 : sidebar.offsetWidth;
     handle.classList.add('dragging');
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
@@ -1234,7 +1247,11 @@ async function _confirmPicker() {
 
   document.addEventListener('mousemove', e => {
     if (!dragging) return;
-    const newW = Math.min(600, Math.max(180, startW + e.clientX - startX));
+    const raw = startW + e.clientX - startX;
+    if (Math.abs(e.clientX - startX) > 3) moved = true;
+    if (!isCollapsed() && raw < HIDE_BELOW) { setCollapsed(true); return; }
+    if (isCollapsed()) { if (raw < SHOW_ABOVE) return; setCollapsed(false); }
+    const newW = Math.min(600, Math.max(180, raw));
     document.documentElement.style.setProperty('--sidebar-w', newW + 'px');
   });
 
@@ -1244,5 +1261,12 @@ async function _confirmPicker() {
     handle.classList.remove('dragging');
     document.body.style.cursor = '';
     document.body.style.userSelect = '';
+    // A plain click on the strip of a hidden panel opens it.
+    if (!moved && startCollapsed) setCollapsed(false);
+  });
+
+  handle.addEventListener('dblclick', () => setCollapsed(!isCollapsed()));
+  handle.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setCollapsed(!isCollapsed()); }
   });
 })();

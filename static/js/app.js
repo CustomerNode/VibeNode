@@ -362,6 +362,15 @@ function openProjectOverlay() {
   }
 }
 
+/** Display form of a project path: the home directory becomes "~" (the full
+ *  path is still the row's tooltip).  Shorter, and it keeps a username out of
+ *  the picker when the screen is shared. */
+function _projectShortPath(p) {
+  return String(p || '')
+    .replace(/^\/(?:home|Users)\/[^\/]+/, '~')
+    .replace(/^[A-Za-z]:[\\\/]Users[\\\/][^\\\/]+/, '~');
+}
+
 function _renderProjectOverlay() {
   const list = document.getElementById('project-list');
   if (!list) return;
@@ -380,12 +389,13 @@ function _renderProjectOverlay() {
     const shortName = _projectShortName(p);
     const isActive = p.encoded === saved;
     return `
-    <div class="project-item${isActive ? ' active' : ''}" data-encoded="${escHtml(p.encoded)}" data-name="${escHtml(shortName)}">
+    <div class="project-item${isActive ? ' active' : ''}" data-encoded="${escHtml(p.encoded)}" data-name="${escHtml(shortName)}" title="${escHtml(p.display)}">
+      <span class="project-item-mark" aria-hidden="true">${escHtml((shortName || '?').trim().charAt(0).toUpperCase())}</span>
       <div class="project-item-info">
         <div class="project-item-name">${escHtml(shortName)}</div>
-        <div class="project-item-path">${escHtml(p.display)}</div>
+        <div class="project-item-path">${escHtml(_projectShortPath(p.display))}</div>
       </div>
-      <span class="project-item-count">${p.session_count} sessions</span>
+      <span class="project-item-count">${p.session_count} ${p.session_count === 1 ? 'session' : 'sessions'}</span>
       <div class="project-item-actions">
         <button class="project-act-btn project-rename-btn" title="Rename">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
@@ -1858,6 +1868,18 @@ function _parseModelEntry(m) {
 
 /** Build grouped-by-family selector HTML. Rows carry data-model; caller wires clicks. */
 function _modelSelectorGroupsHtml(models, selectedId) {
+  // Drop the "[1m]" duplicates.  The CLI reports a model as e.g.
+  // "claude-opus-5[1m]" while the 1M context window is active, and that tagged
+  // name gets recorded alongside the plain one.  As a CHOICE the two are the
+  // same thing: the tag is not a valid launch id and every apply path strips
+  // it, so the extra chip only looked like an option.  One row per model
+  // version; a tagged entry survives (untagged) only if its plain twin is absent.
+  const _plain = id => String(id || '').replace(/\[[^\]]*\]/g, '');
+  const _seenPlain = new Set((models || []).filter(m => m && _plain(m.id) === m.id).map(m => m.id));
+  models = (models || []).filter(m => m && (_plain(m.id) === m.id || !_seenPlain.has(_plain(m.id))))
+    .map(m => _plain(m.id) === m.id ? m : Object.assign({}, m, {id: _plain(m.id), name: _plain(m.name)}))
+    .filter((m, i, arr) => arr.findIndex(x => x.id === m.id) === i);
+  selectedId = _plain(selectedId);
   const groups = {};
   const seen = [];
   for (const m of (models || [])) {

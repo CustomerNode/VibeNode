@@ -92,7 +92,32 @@ def usage_limits():
     Socket.IO event.  Values are as of the last Claude turn on this machine.
     """
     from daemon import usage_limits as _ul
-    return jsonify(ok=True, **_ul.public_view(_ul.load()))
+    state = _ul.load()
+    # No Fable reading (it is only reported on a Fable reply)?  Fetch one in
+    # the background; it arrives as a ``usage_limits`` push.  See usage_probe.
+    try:
+        from flask import current_app
+        from .. import usage_probe
+        usage_probe.maybe_start(getattr(current_app, "session_manager", None), state)
+    except Exception:
+        pass
+    return jsonify(ok=True, **_ul.public_view(state))
+
+
+@bp.route("/api/usage-limits/refresh", methods=["POST"])
+def usage_limits_refresh():
+    """User asked for a fresh Fable reading (click on the gauges).
+
+    Starts the hidden one-word Fable turn described in app/usage_probe.py
+    unless one ran in the last minute.  The result arrives as a
+    ``usage_limits`` push, not in this response.
+    """
+    from daemon import usage_limits as _ul
+    from flask import current_app
+    from .. import usage_probe
+    started = usage_probe.maybe_start(
+        getattr(current_app, "session_manager", None), _ul.load(), manual=True)
+    return jsonify(ok=True, started=started)
 
 
 @bp.route("/api/notify/approval", methods=["POST"])

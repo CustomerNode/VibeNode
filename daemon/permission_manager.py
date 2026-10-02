@@ -20,6 +20,43 @@ class PermissionManager:
     """Permission policy storage, auto-approval logic, and dangerous command detection."""
 
     # ------------------------------------------------------------------
+    # "Claude Auto" — reject instead of prompting
+    # ------------------------------------------------------------------
+
+    # Fed back to the model as the tool result when "Claude Auto" rejects a
+    # tool use.  The turn is NOT interrupted: the model reads this and carries
+    # on with a different approach.
+    CLAUDE_AUTO_DENY_MESSAGE = (
+        "Blocked by the Claude Auto permission policy: this action is "
+        "destructive or hard to undo (for example rm -r/-f or rm with a "
+        "wildcard, find -delete, git reset --hard, git clean, a force push, "
+        "DROP/TRUNCATE, npm publish, piping a download into a shell, or a "
+        "write to .env / config / lockfile / .git / migrations / a path "
+        "outside the project). It was NOT run and the user was not asked. "
+        "Do not retry it and do not work around the block with an equivalent "
+        "destructive command. Achieve the goal a safer, reversible way "
+        "instead (e.g. delete specific named files without -r/-f or "
+        "wildcards, move files aside rather than deleting, use git stash or "
+        "git revert/restore on specific paths rather than a hard reset). If "
+        "the task truly cannot be completed without this exact action, keep "
+        "going with everything else and, in your final message, tell the "
+        "user the exact command or edit they need to run themselves and why."
+    )
+
+    def should_auto_deny(self, tool_name: str, tool_input,
+                         cwd: Optional[str] = None) -> bool:
+        """True when the policy REJECTS this tool use outright.
+
+        Only "Claude Auto" does this.  Its contract is hands-off: safe actions
+        run, risky ones are refused and the model is told to find another way
+        (``CLAUDE_AUTO_DENY_MESSAGE``).  It never stops to ask the human;
+        that is what "Auto Approve Most" and "Manual" are for.
+        """
+        if self._permission_policy != "claude_auto":
+            return False
+        return self.is_dangerous(tool_name, tool_input, cwd=cwd)
+
+    # ------------------------------------------------------------------
     # Dangerous-command detection (for "Almost Always")
     # ------------------------------------------------------------------
 
@@ -33,7 +70,11 @@ class PermissionManager:
         r'\bfind\b.*\s-delete\b',         # find ... -delete
         r'\bfind\b.*-exec\s+rm\b',       # find ... -exec rm
         r'\bshutil\.rmtree\b',           # Python rmtree in inline scripts
-        r'>\s*/dev/',                      # redirect to devices
+        # Redirect to a device node (> /dev/sda).  The harmless sinks are
+        # excluded: `2>/dev/null` appears in a large share of ordinary shell
+        # commands, and flagging it turned "Claude Auto" / "Auto Approve Most"
+        # into a prompt on nearly every read-only command.
+        r'>\s*/dev/(?!(null|stdout|stderr|tty)\b|fd/)',
         r'^\s*>\s*[\'"]?/',               # bare redirect truncating a file
         r'\btruncate\s',                  # truncate command
         r'\bmkfs\b',                      # format filesystem
@@ -275,10 +316,11 @@ class PermissionManager:
             # "Claude Auto": SDK's permission_mode="acceptEdits" auto-approves
             # Edit/Write/MultiEdit/NotebookEdit BEFORE our callback runs, so
             # those tool names never reach this function.  For everything
-            # else we still apply the dangerous-command guard so the user
-            # is prompted before destructive bash runs (rm -rf, force push,
-            # DROP TABLE, etc.).  Net effect: edits handled by Claude,
-            # other tools follow the same safety net as "Almost Always".
+            # else the dangerous-command guard still applies, but a flagged
+            # action is REJECTED, not prompted for: the permission callback
+            # consults should_auto_deny() first and never reaches this
+            # branch for a dangerous tool use.  Returning False here is the
+            # fail-safe for any caller that skips that check.
             if self.is_dangerous(tool_name, tool_input, cwd=cwd):
                 return False
             return True
@@ -332,6 +374,43 @@ class PermissionManager:
                     pass
 
         return False
+
+    # ------------------------------------------------------------------
+    # "Claude Auto" — reject instead of prompting
+    # ------------------------------------------------------------------
+
+    # Fed back to the model as the tool result when "Claude Auto" rejects a
+    # tool use.  The turn is NOT interrupted: the model reads this and carries
+    # on with a different approach.
+    CLAUDE_AUTO_DENY_MESSAGE = (
+        "Blocked by the Claude Auto permission policy: this action is "
+        "destructive or hard to undo (for example rm -r/-f or rm with a "
+        "wildcard, find -delete, git reset --hard, git clean, a force push, "
+        "DROP/TRUNCATE, npm publish, piping a download into a shell, or a "
+        "write to .env / config / lockfile / .git / migrations / a path "
+        "outside the project). It was NOT run and the user was not asked. "
+        "Do not retry it and do not work around the block with an equivalent "
+        "destructive command. Achieve the goal a safer, reversible way "
+        "instead (e.g. delete specific named files without -r/-f or "
+        "wildcards, move files aside rather than deleting, use git stash or "
+        "git revert/restore on specific paths rather than a hard reset). If "
+        "the task truly cannot be completed without this exact action, keep "
+        "going with everything else and, in your final message, tell the "
+        "user the exact command or edit they need to run themselves and why."
+    )
+
+    def should_auto_deny(self, tool_name: str, tool_input,
+                         cwd: Optional[str] = None) -> bool:
+        """True when the policy REJECTS this tool use outright.
+
+        Only "Claude Auto" does this.  Its contract is hands-off: safe actions
+        run, risky ones are refused and the model is told to find another way
+        (``CLAUDE_AUTO_DENY_MESSAGE``).  It never stops to ask the human;
+        that is what "Auto Approve Most" and "Manual" are for.
+        """
+        if self._permission_policy != "claude_auto":
+            return False
+        return self.is_dangerous(tool_name, tool_input, cwd=cwd)
 
     # ------------------------------------------------------------------
     # Dangerous-command detection (for "Almost Always")
@@ -448,6 +527,9 @@ class PermissionManager:
                     text = f"Protected file write blocked by Almost Always — prompting for manual approval\n{tool_name}: {desc}"
                 else:
                     text = f"Dangerous command blocked by Almost Always — prompting for manual approval\n{tool_name}: {desc}"
+                is_error = True
+            elif policy == "claude-auto-denied":
+                text = f"Blocked by Claude Auto — agent told to find a safer approach\n{tool_name}: {desc}"
                 is_error = True
             else:
                 text = f"Auto-approved ({policy})\n{tool_name}: {desc}"

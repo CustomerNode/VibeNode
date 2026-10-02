@@ -26,6 +26,7 @@
     if (prev) {
       container.removeEventListener('scroll', prev.handler);
       if (prev.bar && prev.bar.parentNode) prev.bar.remove();
+      container.classList.remove('has-sticky-bar');
     }
 
     // Build the overlay bar as a sibling before the scroll container
@@ -37,6 +38,10 @@
     bar.className = 'sticky-user-bar';
     bar.innerHTML = '<span class="sticky-user-text"></span>';
     parent.insertBefore(bar, container);
+    // While the bar is showing, the thread itself fades out toward its top
+    // edge (a mask on the scroll container, see .has-sticky-bar in style.css),
+    // so nothing scrolls visibly under the bar.  This is a fade of the CONTENT,
+    // not a haze laid over it: an overlay was tried first and read as a glow.
 
     var textEl = bar.querySelector('.sticky-user-text');
     var currentMsg = null;
@@ -65,9 +70,9 @@
           currentMsg = pinned;
           bar.classList.remove('expanded');
         }
-        if (!bar.classList.contains('visible')) bar.classList.add('visible');
+        if (!bar.classList.contains('visible')) { bar.classList.add('visible'); container.classList.add('has-sticky-bar'); }
       } else {
-        if (bar.classList.contains('visible')) bar.classList.remove('visible');
+        if (bar.classList.contains('visible')) { bar.classList.remove('visible'); container.classList.remove('has-sticky-bar'); }
         currentMsg = null;
       }
     }

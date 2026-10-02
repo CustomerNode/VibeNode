@@ -538,7 +538,12 @@ socket.on('state_snapshot', (data) => {
             _liveWorkingStart = null;
         }
         if (s.state === 'waiting') {
-            newKinds[id] = 'question';
+            // Claude Auto with a pending tool prompt: keep showing "working".
+            // newWaiting is still filled so _updatePermissionQueue() below
+            // answers it (this is also the recovery path if the live
+            // session_permission event was lost to a reconnect).
+            const _caAuto = s.permission && typeof _claudeAutoActive === 'function' && _claudeAutoActive();
+            newKinds[id] = _caAuto ? 'working' : 'question';
             if (s.permission) {
                 newWaiting[id] = {
                     question: _formatPermissionQuestion(s.permission.tool_name, s.permission.tool_input),
@@ -826,6 +831,13 @@ socket.on('state_snapshot', (data) => {
 
 // Incremental state updates
 socket.on('session_state', (data) => {
+    // "Claude Auto" never stops to ask: the browser answers the permission
+    // prompt that follows this event on its own (workspace.js
+    // _claudeAutoVerdict), so present the momentary WAITING as WORKING.
+    // Without this the input bar flashes "Claude has a question" for a frame.
+    if (data && data.state === 'waiting' && typeof _claudeAutoActive === 'function' && _claudeAutoActive()) {
+        data = Object.assign({}, data, {state: 'working'});
+    }
     const {session_id, state, cost_usd, error, name, model, working_since} = data;
     if (_isHiddenSession(session_id, data)) return;
     // Cross-project filtering: drop state events from other projects so
@@ -1630,6 +1642,12 @@ socket.on('session_permission', (data) => {
     // it belongs to another project — drop it so permission prompts from
     // other projects don't appear in the current project's UI.
     if (data.session_id !== liveSessionId && !allSessionIds.has(data.session_id)) return;
+    // "Claude Auto": answer immediately and paint nothing.
+    if (typeof _claudeAutoActive === 'function' && _claudeAutoActive()
+            && typeof wsPermissionAnswer === 'function') {
+        wsPermissionAnswer(data.session_id, _claudeAutoVerdict(data.tool_name, data.tool_input));
+        return;
+    }
     waitingData[data.session_id] = {
         question: _formatPermissionQuestion(data.tool_name, data.tool_input),
         options: ['y', 'n', 'aa', 'a'],

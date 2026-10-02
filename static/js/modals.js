@@ -748,6 +748,22 @@ function toggleGrpDropdown(grpId) {
   popup.className = 'grp-popup';
   popup._grpId = grpId;
 
+  // Session header (desktop): ONE menu holds every session action, grouped and
+  // all visible at once.  It used to be an Analyze dropdown plus a separate
+  // Actions button opening a tabbed popup; chaining the two (menu -> popup with
+  // tabs) was confusing.  Built from the existing buttons, which stay the
+  // single source of truth: each row mirrors its source's label, icon and
+  // disabled state and simply clicks it.
+  if (label.classList.contains('toolbar-dots')) {
+    _fillSessionMenu(popup);
+    const r = label.getBoundingClientRect();
+    popup.style.top = (r.bottom + 6) + 'px';
+    popup.style.right = (window.innerWidth - r.right) + 'px';
+    document.body.appendChild(popup);
+    _activeGrpPopup = popup;
+    return;
+  }
+
   Array.from(inner.children).forEach(el => {
     // Skip permanently hidden elements
     if (el.style.display === 'none') return;
@@ -769,6 +785,50 @@ function toggleGrpDropdown(grpId) {
   _activeGrpPopup = popup;
 }
 
+const _SESSION_MENU = [
+  ['Analyze',  ['btn-summary', 'btn-find', 'btn-extract', 'btn-export', 'btn-compare']],
+  ['Branch',   ['btn-continue', 'btn-duplicate', 'btn-fork', 'btn-rewind', 'btn-fork-rewind']],
+  ['Organize', ['btn-autoname', 'btn-spawn-subsession']],
+  ['Session',  ['btn-open', 'btn-compact', 'btn-clear']],
+];
+const _SESSION_MENU_DANGER = ['btn-close', 'btn-delete'];
+
+function _sessionMenuRow(id) {
+  const src = document.getElementById(id);
+  if (!src || src.style.display === 'none') return null;
+  const nameEl = src.querySelector('.actions-item-name');
+  const descEl = src.querySelector('.actions-item-desc');
+  const svg = src.querySelector('svg');
+  const row = document.createElement('button');
+  row.className = 'btn';
+  row.type = 'button';
+  row.disabled = !!src.disabled;
+  row.title = descEl ? descEl.textContent.trim() : (src.title || '');
+  row.innerHTML = (svg ? svg.outerHTML : '') + '<span>' + escHtml((nameEl ? nameEl.textContent : src.textContent).trim()) + '</span>';
+  row.addEventListener('click', () => { closeAllGrpDropdowns(); src.click(); });
+  return row;
+}
+
+function _fillSessionMenu(popup) {
+  popup.classList.add('session-menu');
+  for (const [title, ids] of _SESSION_MENU) {
+    const rows = ids.map(_sessionMenuRow).filter(Boolean);
+    if (!rows.length) continue;
+    const sec = document.createElement('div');
+    sec.className = 'sm-sec-block';
+    sec.innerHTML = '<div class="sm-sec-hd">' + title + '</div>';
+    rows.forEach(r => sec.appendChild(r));
+    popup.appendChild(sec);
+  }
+  const danger = _SESSION_MENU_DANGER.map(_sessionMenuRow).filter(Boolean);
+  if (danger.length) {
+    const foot = document.createElement('div');
+    foot.className = 'sm-danger';
+    danger.forEach(r => { r.classList.add('danger'); foot.appendChild(r); });
+    popup.appendChild(foot);
+  }
+}
+
 function closeAllGrpDropdowns() {
   if (_activeGrpPopup) { _activeGrpPopup.remove(); _activeGrpPopup = null; }
   document.querySelectorAll('.btn-group-label.grp-open').forEach(l => l.classList.remove('grp-open'));
@@ -780,6 +840,37 @@ document.addEventListener('click', e => {
   if (e.target.closest('.grp-popup') || e.target.closest('.btn-group-label')) return;
   closeAllGrpDropdowns();
 });
+
+// The session header's Analyze label becomes the single "•••" trigger.  Done
+// here rather than in the template so the label's click handler and the
+// group markup (which the phone action sheet and kanban reuse) stay untouched.
+(function () {
+  function init() {
+    const l = document.querySelector('#main-toolbar #grp-analyze .btn-group-label');
+    if (!l || l.classList.contains('toolbar-dots')) return;
+    l.classList.add('toolbar-dots');
+    l.title = 'More';
+    l.setAttribute('aria-label', 'More');
+    l.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.9"/><circle cx="12" cy="12" r="1.9"/><circle cx="19" cy="12" r="1.9"/></svg>';
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+})();
+
+// Top nav: the "System ▾" text button becomes a gear icon button, the same
+// shape as the theme toggle next to it.  Same element, same click handler and
+// dropdown; only its face changes.
+(function () {
+  function init() {
+    const b = document.querySelector('header .hdr-sys-btn');
+    if (!b || b.classList.contains('hdr-gear')) return;
+    b.classList.add('hdr-gear');
+    b.title = 'System';
+    b.setAttribute('aria-label', 'System');
+    b.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>';
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+})();
 
 // --- Actions popup ---
 function openActionsPopup() {

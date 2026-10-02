@@ -134,12 +134,12 @@ function _buildSessionModelBtn(isNewSession, sessionModel, sessionId) {
       : ((typeof defaultModel !== 'undefined' ? defaultModel : '')));
     const _safeId = (sessionId || '').replace(/['"\\]/g, '');
     const _chosen = isOverridden || _hasChosenThinking(sessionId);
-    return '<button class="session-model-btn' + (_chosen ? ' session-model-overridden' : '') + '" ' +
-      'id="session-model-btn" onclick="_openSessionModelSelector(false, \'' + _safeId + '\')" ' +
+    return '<span class="session-model-btn' + (_chosen ? ' session-model-overridden' : '') + '" ' +
+      'id="session-model-btn" ' +
       'title="' + _bubbleTitle(label, _sessionThinkingFor(true, sessionId), _chosen
         ? 'Chosen for this session' : 'Click to choose model and thinking for this session') + '">' +
-      '<span class="smb-model">' + escHtml(label) + '</span>' +
-      _thinkingSegment(true, sessionId) + '</button>';
+      '<span class="smb-model">' + _modelLabelHtml(label) + '</span>' +
+      _thinkingSegment(true, sessionId) + '</span>';
   }
   // Running/idle session: show the confirmed session model when known.
   // If not yet confirmed (dormant/sleeping session that hasn't sent an init
@@ -156,11 +156,11 @@ function _buildSessionModelBtn(isNewSession, sessionModel, sessionId) {
     ? 'Session model: ' + label + ' — click to switch (applies from the next message)'
     : 'Will use system default (' + label + ') — click to switch before waking';
   const _liveSid = (typeof liveSessionId !== 'undefined') ? liveSessionId : '';
-  return '<button class="session-model-badge' + (!confirmed ? ' session-model-default' : '') + '" ' +
-    'onclick="_openSessionModelSelector(true)" title="' +
+  return '<span class="session-model-badge' + (!confirmed ? ' session-model-default' : '') + '" ' +
+    'title="' +
     _bubbleTitle(label, _sessionThinkingFor(false, _liveSid), title) + '">' +
-    '<span class="smb-model">' + escHtml(label) + '</span>' +
-    _thinkingSegment(false, _liveSid) + '</button>';
+    '<span class="smb-model">' + _modelLabelHtml(label) + '</span>' +
+    _thinkingSegment(false, _liveSid) + '</span>';
 }
 
 /**
@@ -169,9 +169,15 @@ function _buildSessionModelBtn(isNewSession, sessionModel, sessionId) {
  * the per-session override WITHOUT affecting the system-level defaults
  * stored in localStorage.
  */
-async function _openSessionModelSelector(liveMode, pendingSessionId) {
+async function _openSessionModelSelector(liveMode, pendingSessionId, preset) {
+  // `preset` = {model, thinking, thinkingTouched}: headless mode, used by the
+  // status panel's Apply.  Nothing is shown; the function sets up exactly the
+  // same state and then runs the same live apply path the modal's Apply button
+  // runs, so there is one implementation of the switch/restart logic (and of
+  // its confirmation, fallback and honesty rules), not two.
   const overlay = document.getElementById('pm-overlay');
   if (!overlay) return;
+  if (preset) overlay.innerHTML = '';   // no stale #sm-apply-btn: the panel's Apply button owns that id
 
   // Live mode: switch the model of the CURRENTLY OPEN session via the
   // daemon (CLI control protocol).  Capture the target id NOW so switching
@@ -196,17 +202,23 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
   const _liveThinkingKnown = _confirmedLiveThinking !== undefined || !!currentLiveThinking;
   const _thinkingLbl = k => (typeof SessionModel !== 'undefined') ? SessionModel.thinkingLabel(k) : (k || 'Default');
 
-  overlay.innerHTML = '<div class="pm-card pm-enter" style="width:400px;">' +
-    '<h2 class="pm-title">' + (liveMode ? 'Session Model &amp; Thinking' : 'Session Model') + '</h2>' +
-    '<div class="pm-body"><p>' + (liveMode
-      ? 'Currently running on <strong>' + (currentLiveModel ? _modelLabel(currentLiveModel) : 'a model not yet confirmed by the daemon') + '</strong>' +
-        (_liveThinkingKnown ? ' at <strong>' + _thinkingLbl(currentLiveThinking) + '</strong> thinking' : '') +
-        '. A model change applies from the next message. A thinking change restarts the session (history is kept) and needs it to be idle.'
-      : 'Choose model and thinking level for <strong>this session</strong>. System default is unchanged.') + '</p></div>' +
-    '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px;max-height:35vh;overflow-y:auto;" id="sm-model-list">' +
-    '<span class="spinner"></span></div>' +
-    '<div id="sm-thinking-section" style="display:none;margin-bottom:16px;">' +
-    '<div style="font-size:11px;font-weight:600;color:var(--text-faint);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;">Thinking Level</div>' +
+  // Layout (styles: ".sm-picker" in style.css): a one-line summary, the models
+  // as chips grouped one row per family, and the thinking levels as a single
+  // segmented control.  The caveats about WHEN a change applies sit beside the
+  // section they belong to instead of in a paragraph above everything.
+  if (!preset) {
+  overlay.innerHTML = '<div class="pm-card pm-enter sm-picker">' +
+    '<h2 class="pm-title">Model &amp; thinking</h2>' +
+    '<p class="sm-sub">' + (liveMode
+      ? 'Running <strong>' + (currentLiveModel ? _modelLabel(currentLiveModel) : 'a model not yet confirmed') + '</strong>' +
+        (_liveThinkingKnown ? ' at <strong>' + _thinkingLbl(currentLiveThinking) + '</strong> thinking' : '')
+      : 'For <strong>this session</strong> only. The system default is unchanged.') + '</p>' +
+    '<div class="sm-sec"><span>Model</span>' +
+    (liveMode ? '<span class="sm-note">Applies from the next message</span>' : '') + '</div>' +
+    '<div class="sm-models" id="sm-model-list"><span class="spinner"></span></div>' +
+    '<div id="sm-thinking-section" style="display:none;">' +
+    '<div class="sm-sec"><span>Thinking</span>' +
+    (liveMode ? '<span class="sm-note">Restarts the session once idle, history kept</span>' : '') + '</div>' +
     '<div class="msel-grid" id="sm-thinking-list"></div>' +
     '<div class="msel-hint" id="sm-thinking-hint"></div>' +
     '</div>' +
@@ -214,16 +226,18 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
     (liveMode
       ? '<button class="pm-btn pm-btn-secondary" onclick="_closePm()">Cancel</button>' +
         '<button class="pm-btn pm-btn-primary" id="sm-apply-btn" disabled onclick="_applyLiveSessionChoice()">Apply</button>'
-      : '<button class="pm-btn pm-btn-secondary" onclick="_clearSessionModelOverrideAndClose()">Reset to Default</button>' +
+      : '<button class="pm-btn pm-btn-secondary" onclick="_clearSessionModelOverrideAndClose()">Reset to default</button>' +
         '<button class="pm-btn pm-btn-primary" id="sm-apply-btn" disabled onclick="_applySessionModelOverride()">Apply</button>') +
     '</div></div>';
   overlay.classList.add('show');
   requestAnimationFrame(() => { const c = overlay.querySelector('.pm-card'); if (c) c.classList.remove('pm-enter'); });
   overlay.onclick = e => { if (e.target === overlay) _closePm(); };
+  }
 
-  // Fetch models
+  // Fetch models (only needed to draw the list)
   let models;
-  try {
+  if (preset) models = [];
+  else try {
     const resp = await fetch('/api/models');
     models = await resp.json();
   } catch (e) {
@@ -258,11 +272,17 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
   // Live mode restarts the session only when the user actually picked a
   // different level; merely opening the modal must never restart anything.
   let thinkingTouched = false;
+  if (preset) {
+    if (preset.model) pendingModel = String(preset.model).replace(/\[[^\]]*\]/g, '');
+    if (typeof preset.thinking === 'string') pendingThinking = preset.thinking;
+    thinkingTouched = !!preset.thinkingTouched;
+  }
 
   function _renderModels() {
     const list = document.getElementById('sm-model-list');
     if (!list) return;
     list.innerHTML = _modelSelectorGroupsHtml(models, pendingModel);
+    _groupModelChips(list);
     list.querySelectorAll('.msel-row').forEach(row =>
       row.onclick = () => window._smSelectModel(row));
   }
@@ -718,6 +738,28 @@ async function _openSessionModelSelector(liveMode, pendingSessionId) {
 
     attempt();
   };
+
+  if (preset && liveMode) window._applyLiveSessionChoice();
+}
+
+/** The shared model-list builder emits a flat run (family header, rows, header,
+ *  rows…).  Regroup it into one line per family: header on the left, its
+ *  versions as chips on the right.  Used by the picker and the status panel. */
+function _groupModelChips(list) {
+  let fam = null;
+  Array.from(list.children).forEach(el => {
+    if (el.classList.contains('msel-group-hd')) {
+      fam = document.createElement('div');
+      fam.className = 'sm-fam';
+      const chips = document.createElement('div');
+      chips.className = 'sm-chips';
+      list.insertBefore(fam, el);
+      fam.appendChild(el);
+      fam.appendChild(chips);
+    } else if (fam) {
+      fam.lastChild.appendChild(el);
+    }
+  });
 }
 
 /**
@@ -733,7 +775,7 @@ function _refreshSessionModelBtn(sessionId) {
     const isOverridden = !!SessionModel.getDesired(sessionId) || _hasChosenThinking(sessionId);
     const _lbl = _modelLabel(SessionModel.effectivePending(sessionId));
     const _seg = btn.querySelector('.smb-model');
-    if (_seg) _seg.textContent = _lbl; else btn.textContent = _lbl;
+    if (_seg) _seg.innerHTML = _modelLabelHtml(_lbl); else btn.textContent = _lbl;
     btn.classList.toggle('session-model-overridden', isOverridden);
     btn.title = _bubbleTitle(_lbl, _sessionThinkingFor(true, sessionId), isOverridden
       ? 'Chosen for this session' : 'Click to choose model and thinking for this session');
@@ -756,6 +798,7 @@ function _refreshSessionModelBtn(sessionId) {
  * session; it is a no-op if that badge isn't on screen.
  */
 function _renderSessionModelBadge(sessionId) {
+  _renderStatusPanel();
   const badge = document.querySelector('.session-model-badge');
   if (!badge) return;
   if (typeof liveSessionId === 'undefined' || !liveSessionId) return;
@@ -767,7 +810,7 @@ function _renderSessionModelBadge(sessionId) {
   if (!model) return;
   const lbl = _modelLabel(model);
   const seg = badge.querySelector('.smb-model');
-  if (seg) seg.textContent = lbl; else badge.textContent = lbl;
+  if (seg) seg.innerHTML = _modelLabelHtml(lbl); else badge.textContent = lbl;
   badge.title = _bubbleTitle(lbl, _sessionThinkingFor(false, liveSessionId),
     'Click to switch (model applies from the next message)');
 }
@@ -816,18 +859,45 @@ function _hasChosenThinking(sid) {
   return !!(s && typeof s.desiredThinking === 'string');
 }
 
-/**
- * Thinking segment inside the model bubble: "Opus 5.5 · xHigh".  Hidden when a
- * running session's level can't be verified (older daemon) rather than guess.
- */
+// Thinking level in the bar: a small brain after the model name that fills
+// from the bottom with the level (low 1/5 … max 5/5).  No word, nothing under
+// the name.  "Default" is NOT "no thinking" (the model thinks at its own
+// level), so it is a whole brain in the mid grey used for anything you did not
+// pick; a level you chose fills in the strong neutral.  Never the accent
+// colour: accent is reserved for the bar's one primary action (mic / send).
+const _THINK_STEPS = {low: 1, medium: 2, high: 3, xhigh: 4, max: 5};
+const _BRAIN_D = 'M12 4.2C10.6 2.6 7.6 2.9 6.9 5.1 4.7 5.3 3.5 7.5 4.4 9.4 3 10.7 3.1 13 4.7 14.1 4.4 16.3 6.1 18.2 8.3 18 9.1 19.8 11 20.3 12 19.2 13 20.3 14.9 19.8 15.7 18 17.9 18.2 19.6 16.3 19.3 14.1 20.9 13 21 10.7 19.6 9.4 20.5 7.5 19.3 5.3 17.1 5.1 16.4 2.9 13.4 2.6 12 4.2Z';
+const _BRAIN_FOLDS = '<path class="smb-brain-folds" d="M12 4.6V19M8.2 8.2c1.3.2 2 1 2 2.2M15.8 8.2c-1.3.2-2 1-2 2.2M7.4 13.6c1.2-.5 2.3-.2 2.9.8M16.6 13.6c-1.2-.5-2.3-.2-2.9.8" fill="none" stroke-width="1.3" stroke-linecap="round"/>';
+let _brainSeq = 0;
+
+function _brainSvg(t) {
+  if (!t || !t.known) return '';
+  const n = _THINK_STEPS[t.key] || 0;
+  const open = '<svg class="smb-brain" width="17" height="17" viewBox="0 0 24 24" aria-hidden="true">';
+  if (!n) return open + '<path class="smb-brain-auto" d="' + _BRAIN_D + '"/>' + _BRAIN_FOLDS + '</svg>';
+  const id = 'smb-bc' + (++_brainSeq);
+  const y = 3 + 17.4 * (1 - n / 5);
+  return open + '<defs><clipPath id="' + id + '"><rect x="0" y="' + y.toFixed(2) + '" width="24" height="24"/></clipPath></defs>' +
+    '<path class="smb-brain-trk" d="' + _BRAIN_D + '"/>' +
+    '<path class="smb-brain-fill" d="' + _BRAIN_D + '" clip-path="url(#' + id + ')"/>' + _BRAIN_FOLDS + '</svg>';
+}
+
+/** "Opus 5.5" -> label "Opus" + value "5.5". */
+function _modelLabelHtml(label) {
+  const s = String(label || '').trim();
+  const i = s.indexOf(' ');
+  if (i < 0) return '<span class="smb-val">' + escHtml(s) + '</span>';
+  return '<span class="smb-lbl">' + escHtml(s.slice(0, i)) + '</span> ' +
+    '<span class="smb-val">' + escHtml(s.slice(i + 1)) + '</span>';
+}
+
+/** The brain after the model name.  Hidden when a running session's level
+ *  can't be verified (older daemon) rather than guess. */
 function _thinkingSegment(isNewSession, sessionId) {
   if (typeof SessionModel === 'undefined') return '';
   const t = _sessionThinkingFor(isNewSession, sessionId);
   return '<span class="smb-think" data-new="' + (isNewSession ? '1' : '') + '" data-sid="' +
-    escHtml(sessionId || '') + '"' + (t.known ? '' : ' hidden') + '>' +
-    '<span class="smb-sep" aria-hidden="true">·</span>' +
-    '<span class="smb-think-lbl">' + escHtml(t.known ? SessionModel.thinkingLabel(t.key) : '') +
-    '</span></span>';
+    escHtml(sessionId || '') + '"' + (t.known ? '' : ' hidden') + ' aria-hidden="true">' + _brainSvg(t) + '</span>';
 }
 
 /** Combined tooltip for the bubble. */
@@ -846,9 +916,9 @@ function _renderSessionThinkingBadge(sessionId) {
   if (sessionId && sid && sessionId !== sid) return;
   const t = _sessionThinkingFor(isNew, sid);
   seg.hidden = !t.known;
-  seg.querySelector('.smb-think-lbl').textContent = t.known ? SessionModel.thinkingLabel(t.key) : '';
-  const btn = seg.closest('button');
-  if (!btn) return;
+  seg.innerHTML = _brainSvg(t);
+  const btn = seg.closest('.session-model-badge, .session-model-btn');
+  if (!btn) { _renderStatusPanel(); return; }
   const modelLbl = (btn.querySelector('.smb-model') || btn).textContent;
   if (isNew) {
     const chosen = !!SessionModel.getDesired(sid) || _hasChosenThinking(sid);
@@ -858,10 +928,11 @@ function _renderSessionThinkingBadge(sessionId) {
   } else {
     btn.title = _bubbleTitle(modelLbl, t, 'Click to switch (model applies from the next message)');
   }
+  _renderStatusPanel();
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// USAGE LIMITS PILL — "Session 16% · Week 46% · Fable 14%"
+// USAGE LIMITS GAUGES — "5h 16% · 7d 46% · Fable 14%", each over a hairline meter
 //
 // Account-wide, so every bar shows the same values.  Source of truth is the
 // daemon (daemon/usage_limits.py), fed by the CLI's rate_limit_event on every
@@ -873,8 +944,8 @@ function _renderSessionThinkingBadge(sessionId) {
 window._usageLimits = window._usageLimits || null;
 
 const _USAGE_WINDOW_ORDER = [
-  {key: 'five_hour', label: 'Session', name: 'Session (5-hour) limit'},
-  {key: 'seven_day', label: 'Week', name: 'Weekly limit'},
+  {key: 'five_hour', label: '5h', name: 'Session (5-hour) limit'},
+  {key: 'seven_day', label: '7d', name: 'Weekly limit'},
   {key: 'seven_day_overage_included', label: 'Fable', name: 'Weekly Fable limit'},
 ];
 
@@ -886,50 +957,53 @@ function _fmtUsageTime(sec) {
   return sameDay ? t : d.toLocaleDateString([], {weekday: 'short'}) + ' ' + t;
 }
 
-/** Inner markup + tooltip for the pill, or null when nothing is known yet. */
+/** Collapsed markup + tooltip for the status control, or null when nothing is
+ *  known yet.
+ *
+ * One mini column per window that has a reading, filled to its percentage.
+ * Grey is a normal reading; amber past 80% and red past 95% are the only colours.
+ * No numbers here: the numbers, reset times and everything else are in the
+ * panel the control opens (_statusPanelHtml).  A window the CLI has never
+ * reported is left out; one whose reset time has passed is drawn empty.
+ */
 function _usageLimitsParts() {
+  const rows = _usageRows();
+  const shown = rows.filter(r => r.known);
+  if (!shown.length) return null;  // no turn seen yet: show nothing, not zeros
   const data = window._usageLimits;
-  const windows = (data && data.windows) || {};
-  const known = _USAGE_WINDOW_ORDER.filter(w => windows[w.key]);
-  if (!known.length) return null;  // no turn seen yet: show nothing, not zeros
-  const nowSec = Date.now() / 1000;
-  // Phones only have room for one value: the window closest to its limit.
-  let topKey = null, topPct = -1;
-  for (const w of _USAGE_WINDOW_ORDER) {
-    const v = windows[w.key];
-    if (v && !(v.resets_at && v.resets_at <= nowSec) && v.percent > topPct) {
-      topPct = v.percent; topKey = w.key;
-    }
-  }
-  const segs = [];
-  const tips = [];
-  for (const w of _USAGE_WINDOW_ORDER) {
-    const v = windows[w.key];
-    let cls = 'ulp-seg' + (w.key === topKey ? ' ulp-top' : '');
-    let val = '—';
-    if (!v) {
-      cls += ' ulp-stale';
-      tips.push(w.name + ': not reported yet' +
-        (w.key === 'seven_day_overage_included' ? ' (appears after a Fable reply)' : ''));
-    } else if (v.resets_at && v.resets_at <= nowSec) {
-      cls += ' ulp-stale';
-      tips.push(w.name + ': reset at ' + _fmtUsageTime(v.resets_at) + ', updates after the next reply');
-    } else {
-      const pct = Math.max(0, Math.round(v.percent));
-      val = pct + '%';
-      if (pct >= 95) cls += ' ulp-crit';
-      else if (pct >= 80) cls += ' ulp-warn';
-      tips.push(w.name + ': ' + pct + '% used' +
-        (v.resets_at ? ', resets ' + _fmtUsageTime(v.resets_at) : ''));
-    }
-    segs.push('<span class="' + cls + '"><span class="ulp-lbl">' + w.label + '</span> ' +
-      '<span class="ulp-val">' + val + '</span></span>');
-  }
-  if (data.updated_at) tips.push('As of ' + _fmtUsageTime(data.updated_at) + ' (updates after each Claude reply)');
+  const tips = rows.map(r => r.tip);
+  if (data.updated_at) tips.push('As of ' + _fmtUsageTime(data.updated_at));
   return {
-    html: segs.join('<span class="smb-sep ulp-sep" aria-hidden="true">·</span>'),
+    html: shown.map(r => '<span class="ulp-c' + r.cls + '"><i style="height:' +
+      (r.pct > 0 ? Math.max(8, Math.min(100, r.pct)) : 0) + '%"></i></span>').join(''),
     title: tips.join('\n'),
   };
+}
+
+/** One entry per usage window, shared by the collapsed columns and the panel. */
+function _usageRows() {
+  const windows = (window._usageLimits && window._usageLimits.windows) || {};
+  const nowSec = Date.now() / 1000;
+  return _USAGE_WINDOW_ORDER.map(w => {
+    const v = windows[w.key];
+    const fable = w.key === 'seven_day_overage_included';
+    if (!v) {
+      return {name: w.name, known: false, pct: 0, cls: '', note: 'Not reported yet',
+        tip: w.name + ': not reported yet' + (fable ? ' (appears after a Fable reply)' : '')};
+    }
+    let cls = '';
+    let pct = Math.max(0, Math.round(v.percent));
+    if (v.resets_at && v.resets_at <= nowSec) {
+      return {name: w.name, known: true, pct: 0, cls: cls + ' ulp-stale',
+        note: 'Reset at ' + _fmtUsageTime(v.resets_at) + ', updates after the next reply',
+        tip: w.name + ': reset at ' + _fmtUsageTime(v.resets_at) + ', updates after the next reply'};
+    }
+    if (pct >= 95) cls += ' ulp-crit';
+    else if (pct >= 80) cls += ' ulp-warn';
+    return {name: w.name, known: true, pct: pct, cls: cls,
+      note: v.resets_at ? 'Resets ' + _fmtUsageTime(v.resets_at) : '',
+      tip: w.name + ': ' + pct + '% used' + (v.resets_at ? ', resets ' + _fmtUsageTime(v.resets_at) : '')};
+  });
 }
 
 function _usageLimitsPillHtml() {
@@ -946,6 +1020,7 @@ function _renderUsageLimits() {
     el.innerHTML = p ? p.html : '';
     el.title = p ? p.title : '';
   });
+  _renderStatusPanel();
 }
 
 /** Store a snapshot (from the REST load or the socket event) and repaint. */
@@ -953,6 +1028,23 @@ function _ingestUsageLimits(data) {
   if (!data || typeof data !== 'object' || !data.windows) return;
   window._usageLimits = data;
   _renderUsageLimits();
+}
+
+/** "Refresh" in the status panel: ask the server for a fresh Fable reading (a hidden
+ *  one-word Fable turn; see app/usage_probe.py).  The new numbers arrive on
+ *  the `usage_limits` socket event, so there is nothing to do with the reply
+ *  beyond telling the user whether a refresh actually started. */
+function _refreshUsageLimits() {
+  fetch('/api/usage-limits/refresh', {method: 'POST'}).then(r => {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(d => {
+    if (typeof showToast === 'function') {
+      showToast(d && d.started ? 'Refreshing usage limits…' : 'Usage limits were refreshed a moment ago');
+    }
+  }).catch(() => {
+    if (typeof showToast === 'function') showToast('Could not refresh usage limits', true);
+  });
 }
 
 function _loadUsageLimits() {
@@ -967,13 +1059,228 @@ if (!window._usageLimitsTicker) {
   }, 60000);
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// STATUS CONTROL — the bar's whole left side is ONE small control: the model
+// gauge (name + thinking-level track) and a mini column per usage limit.
+// Clicking it opens a panel with everything in words and numbers: model and
+// thinking (with "Change" → the picker), every limit with its reset time,
+// this session's context (with "Compact"), and a refresh.
+// ═══════════════════════════════════════════════════════════════════════
+
+const _STATUS_CARET = '<svg class="vn-status-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" ' +
+  'stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<path d="m6 15 6-6 6 6"/></svg>';
+
+let _statusPanelFor = null;   // {isNew, sid} of the control that opened the panel
+
 function _buildBarLeftGroup(ctxHtml, isNewSession, sessionModel, sessionId) {
+  // ctxHtml (the context ring) is no longer drawn in the bar: context lives in
+  // the panel.  The parameter stays so the five render paths need no change.
+  const open = !!document.getElementById('vn-status-panel');
   return '<div class="bar-left-group">' +
-    (typeof _buildInvokeBtn === 'function' ? _buildInvokeBtn() : '') +
+    '<div class="vn-status' + (open ? ' open' : '') + '" role="button" tabindex="0" aria-haspopup="dialog"' +
+    ' data-new="' + (isNewSession ? '1' : '') + '" data-sid="' + escHtml(sessionId || '') + '"' +
+    ' onclick="_toggleStatusPanel(this)"' +
+    ' onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();_toggleStatusPanel(this)}">' +
     _buildSessionModelBtn(isNewSession || false, sessionModel || '', sessionId || '') +
     _usageLimitsPillHtml() +
-    (ctxHtml || '') +
-    '</div>';
+    _STATUS_CARET +
+    '</div></div>';
+}
+
+/** What the panel's session is running, and what is staged on top of it. */
+function _statusState() {
+  const c = _statusPanelFor;
+  const SM = (typeof SessionModel !== 'undefined') ? SessionModel : null;
+  const sid = c.isNew ? c.sid : ((typeof liveSessionId !== 'undefined' && liveSessionId) || '');
+  const strip = m => String(m || '').replace(/\[[^\]]*\]/g, '').replace(/-\d{8}$/, '');
+  const model = strip(SM ? (c.isNew ? SM.effectivePending(sid) : (SM.getConfirmed(sid) || SM.getDefault())) : '');
+  const t = _sessionThinkingFor(c.isNew, sid);
+  const think = t.known ? (t.key || '') : null;            // null = level not verifiable
+  const pModel = (c.pModel != null) ? c.pModel : model;    // staged (live sessions only)
+  const pThink = (c.pThink != null) ? c.pThink : think;
+  return {c, SM, sid, model, think, pModel, pThink, strip,
+    dModel: strip(pModel) !== model, dThink: c.pThink != null && c.pThink !== think};
+}
+
+function _statusPanelHtml() {
+  if (!_statusPanelFor) return '';
+  const st = _statusState(), c = st.c, SM = st.SM, sid = st.sid;
+
+  // Model: chips, one row per family.  Selection is strong neutral, never accent.
+  let h = '<div class="vsp-sec"><span>Model</span></div><div class="sm-models vsp-models" id="vsp-models">';
+  const models = window._statusModels;
+  if (!models) h += '<span class="spinner"></span>';
+  else if (!models.length) h += '<div class="vsp-empty">Model list unavailable.</div>';
+  else h += _modelSelectorGroupsHtml(models, st.pModel);
+  h += '</div>';
+
+  if (SM) {
+    h += '<div class="vsp-sec"><span>Thinking</span></div><div class="msel-grid vsp-think">';
+    for (const l of SM.THINKING_LEVELS) {
+      const on = st.pThink !== null && l.key === st.pThink;
+      const was = !on && st.dThink && st.think !== null && l.key === st.think;
+      h += '<div class="msel-row msel-chip' + (on ? ' active' : '') + (was ? ' was' : '') + '" data-level="' + l.key +
+        '" role="button" tabindex="0" title="' + escHtml(l.desc) + '"><span class="msel-name">' + escHtml(l.label) + '</span></div>';
+    }
+    h += '</div>';
+    // No level reported (a sleeping session the engine has not loaded): say so
+    // instead of leaving an unexplained strip with nothing selected.
+    if (st.pThink === null) h += '<div class="vsp-hint">Level not reported while this session is asleep. Pick one to set it.</div>';
+  }
+
+  const at = window._usageLimits && window._usageLimits.updated_at;
+  h += '<div class="vsp-sec"><span>Usage limits</span><em>' + (at ? 'Updated ' + _fmtUsageTime(at) + ' · ' : '') +
+    '<a role="button" tabindex="0" data-act="refresh">Refresh</a></em></div>';
+  const rows = _usageRows();
+  if (!rows.some(r => r.known)) {
+    h += '<div class="vsp-empty">Shown after the first Claude reply.</div>';
+  } else {
+    rows.forEach((r, i) => {
+      h += '<div class="vsp-row' + r.cls + '"' + (i ? '' : ' style="margin-top:0"') + '><span>' + escHtml(r.name) + '</span>' +
+        '<span class="vsp-pct">' + (r.known ? r.pct + '%' : '') + '</span>' +
+        (r.known ? '<span class="vsp-trk"><i style="width:' + Math.min(100, r.pct) + '%"></i></span>' : '') +
+        (r.note ? '<small>' + escHtml(r.note) + '</small>' : '') + '</div>';
+    });
+  }
+
+  // Context: same arithmetic as _buildCtxBarCompact (live-panel.js).
+  const u = (!c.isNew && sid && window._sessionUsage && window._sessionUsage[sid]) || null;
+  const tokens = u ? (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0) : 0;
+  if (tokens > 0 && tokens <= 300000) {
+    const pct = Math.min(100, Math.round((tokens / 200000) * 100));
+    const working = (typeof liveBarState === 'string') && liveBarState.indexOf('working') === 0;
+    const cls = pct >= 90 ? ' ulp-crit' : pct >= 70 ? ' ulp-warn' : '';
+    h += '<div class="vsp-sec"><span>Context</span>' +
+      (working ? '' : '<em><a role="button" tabindex="0" data-act="compact">Compact</a></em>') + '</div>' +
+      '<div class="vsp-row' + cls + '" style="margin-top:0"><span>This session</span><span class="vsp-pct">' + pct + '%</span>' +
+      '<span class="vsp-trk"><i style="width:' + pct + '%"></i></span></div>';
+  }
+
+  // Apply appears only when something staged differs from what is running,
+  // with the consequence next to it.  It is the panel's one accent element.
+  if (!c.isNew && (st.dModel || st.dThink)) {
+    h += '<div class="vsp-foot"><span>' + (st.dThink ? 'Restarts the session once idle. History is kept.'
+      : 'Applies from your next message.') + '</span><span class="vsp-actions">' +
+      '<a role="button" tabindex="0" data-act="cancel">Cancel</a>' +
+      '<button class="vsp-apply" id="sm-apply-btn" data-act="apply">Apply</button></span></div>';
+  }
+  return h;
+}
+
+/** One delegated handler for everything clickable in the panel. */
+function _statusPanelClick(e) {
+  const c = _statusPanelFor;
+  if (!c) return;
+  const row = e.target.closest('.msel-row'), act = e.target.closest('[data-act]');
+  if (act) {
+    const a = act.dataset.act;
+    if (a === 'refresh') _refreshUsageLimits();                       // numbers arrive by push; panel stays open
+    else if (a === 'compact') { _closeStatusPanel(); if (typeof liveCompact === 'function') liveCompact(); }
+    else if (a === 'cancel') { c.pModel = c.pThink = null; _renderStatusPanel(); }
+    else if (a === 'apply') {
+      const st = _statusState();
+      // Same code path as the picker modal's Apply (see `preset` there).
+      _openSessionModelSelector(true, undefined, {model: st.strip(st.pModel),
+        thinking: st.pThink === null ? '' : st.pThink, thinkingTouched: st.dThink});
+    }
+    return;
+  }
+  if (!row) return;
+  const st = _statusState();
+  if (c.isNew) {
+    // A session that has not started: nothing to restart, so a pick applies at
+    // once (it is only recorded on this pending session).
+    const model = row.dataset.model != null ? st.strip(row.dataset.model) : st.model;
+    const think = row.dataset.level != null ? row.dataset.level : (st.think || '');
+    if (st.SM) st.SM.setDesired(st.sid, model, think);
+    _refreshSessionModelBtn(st.sid);
+    _renderStatusPanel();
+    return;
+  }
+  if (row.dataset.model != null) c.pModel = (st.strip(row.dataset.model) === st.model) ? null : row.dataset.model;
+  else if (row.dataset.level != null) c.pThink = (row.dataset.level === st.think) ? null : row.dataset.level;
+  _renderStatusPanel();
+}
+
+function _loadStatusModels() {
+  if (window._statusModels || window._statusModelsLoading) return;
+  window._statusModelsLoading = true;
+  fetch('/api/models').then(r => r.json()).then(m => { window._statusModels = Array.isArray(m) ? m : []; })
+    .catch(() => { window._statusModels = []; })
+    .then(() => { window._statusModelsLoading = false; _renderStatusPanel(); });
+}
+
+/** Anchor the panel above the control, left edges flush (which is also the
+ *  textarea's left edge), growing upward. */
+function _positionStatusPanel() {
+  const p = document.getElementById('vn-status-panel');
+  const trig = document.querySelector('.vn-status');
+  if (!p) return;
+  if (!trig) { _closeStatusPanel(); return; }
+  const r = trig.getBoundingClientRect();
+  p.style.left = Math.max(8, Math.min(r.left, window.innerWidth - p.offsetWidth - 8)) + 'px';
+  p.style.bottom = Math.round(window.innerHeight - r.top + 10) + 'px';
+}
+
+/** THE single writer for an open panel; a no-op when it is closed.  Called by
+ *  every renderer whose data the panel shows (limits, model, thinking). */
+function _renderStatusPanel() {
+  const p = document.getElementById('vn-status-panel');
+  if (!p || !_statusPanelFor) return;
+  // An apply is in flight (the shared apply path disables the button and writes
+  // its progress into it).  Leave the panel alone until it settles: on success
+  // the staged values equal the running ones and the footer goes away; on
+  // failure the apply path re-enables the button.
+  const btn = document.getElementById('sm-apply-btn');
+  const st = _statusState();
+  if (btn && btn.disabled && (st.dModel || st.dThink)) return;
+  if (!st.dModel) _statusPanelFor.pModel = null;     // applied (or picked back): nothing staged
+  if (!st.dThink) _statusPanelFor.pThink = null;
+  p.innerHTML = _statusPanelHtml();
+  const list = document.getElementById('vsp-models');
+  if (list && list.querySelector('.msel-group-hd')) {
+    _groupModelChips(list);
+    // Outline what is running while something else is staged.
+    if (st.dModel) list.querySelectorAll('.msel-row').forEach(r => {
+      if (st.strip(r.dataset.model) === st.model && !r.classList.contains('active')) r.classList.add('was');
+    });
+  }
+  _positionStatusPanel();
+}
+
+function _closeStatusPanel() {
+  const p = document.getElementById('vn-status-panel');
+  if (p) p.remove();
+  _statusPanelFor = null;
+  document.querySelectorAll('.vn-status.open').forEach(el => el.classList.remove('open'));
+}
+
+function _toggleStatusPanel(trig) {
+  if (document.getElementById('vn-status-panel')) { _closeStatusPanel(); return; }
+  _statusPanelFor = {isNew: trig.dataset.new === '1', sid: trig.dataset.sid || ''};
+  const p = document.createElement('div');
+  p.id = 'vn-status-panel';
+  p.className = 'vn-status-panel';
+  p.setAttribute('role', 'dialog');
+  p.setAttribute('aria-label', 'Model, thinking and usage limits');
+  p.addEventListener('click', _statusPanelClick);
+  document.body.appendChild(p);
+  trig.classList.add('open');
+  _loadStatusModels();
+  _renderStatusPanel();
+}
+
+if (!window._statusPanelBound) {
+  window._statusPanelBound = true;
+  document.addEventListener('click', e => {
+    if (!document.getElementById('vn-status-panel')) return;
+    const t = e.target;
+    if (t && t.closest && (t.closest('#vn-status-panel') || t.closest('.vn-status'))) return;
+    _closeStatusPanel();
+  }, true);
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') _closeStatusPanel(); });
+  window.addEventListener('resize', _positionStatusPanel);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

@@ -166,15 +166,14 @@
   function hideChip() {
     if (_chip && _chip.parentNode) _chip.parentNode.removeChild(_chip);
     _chip = null;
+    var open = document.querySelectorAll('.live-image-btn.is-open');
+    for (var i = 0; i < open.length; i++) open[i].classList.remove('is-open');
   }
 
   var IMG_SVG =
     '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" ' +
-    'stroke="currentColor" stroke-width="2" stroke-linecap="round" ' +
-    'stroke-linejoin="round" aria-hidden="true">' +
-    '<rect x="3" y="3" width="18" height="18" rx="2"/>' +
-    '<circle cx="8.5" cy="8.5" r="1.5"/>' +
-    '<path d="M21 15l-5-5L5 21"/></svg>';
+    'stroke="none" aria-hidden="true">' +
+    '<path fill="currentColor" fill-rule="evenodd" d="M6 3h12a3 3 0 0 1 3 3v12a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V6a3 3 0 0 1 3-3zm3 4a2 2 0 1 0 0 4 2 2 0 0 0 0-4zm10 8.4-2.6-2.6a2 2 0 0 0-2.8 0L7.4 19H18a1 1 0 0 0 1-1z"/></svg>';
 
   var CLIP_SVG =
     '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" ' +
@@ -321,7 +320,10 @@
   document.addEventListener('touchstart', function (ev) {
     var t = ev.target;
     if (!t || !t.id || (t.id !== 'live-input-ta' && t.id !== 'live-queue-ta')) {
-      if (_chip && !(_chip.contains && _chip.contains(t))) hideChip();
+      // Not on a tap of the "+" button itself: its click handler toggles, and
+      // closing here first would make that tap re-open the menu it meant to close.
+      var onBtn = t && t.closest && t.closest('#live-image-btn');
+      if (_chip && !onBtn && !(_chip.contains && _chip.contains(t))) hideChip();
       return;
     }
     var p = ev.touches && ev.touches[0];
@@ -348,7 +350,14 @@
   // NOT touchcancel. iOS fires touchcancel precisely when its own long-press
   // selection gesture takes over — which is the case this feature exists for.
   // Cancelling there meant racing iOS for the same gesture and losing.
-  window.addEventListener('scroll', hideChip, {passive: true, capture: true});
+  // Scrolling dismisses the long-press chip (it is anchored to a touch point
+  // that just moved).  The "+" menu is anchored to the bar, which does not
+  // move when the conversation scrolls, and the log auto-scrolls constantly
+  // while Claude is replying, so it must NOT close on scroll.
+  window.addEventListener('scroll', function () {
+    if (_chip && _chip.classList.contains('vn-more-menu')) return;
+    hideChip();
+  }, {passive: true, capture: true});
 
   // Tap anywhere else to dismiss (covers the button-opened chip, which has no
   // touchstart on a composer to close it).
@@ -362,20 +371,132 @@
 
   // The toolbar button opens the SAME two-action menu as the long-press. This
   // is the path that does not depend on iOS gesture timing, so it always works.
+  // --- 4. the "+" menu ------------------------------------------------------
+  //
+  // The toolbar button is the composer's catch-all: Invoke Workforce, the two
+  // image actions (same ones the long-press chip offers), and the Enter-to-send
+  // preference.  These used to be three separate things in the bar (/invoke on
+  // the left, a picture button, and an "Enter to send" hint with a toggle).
+  // The id stays `live-image-btn` because setBusy() and the dismiss handler key
+  // off it.
+
+  var PLUS_SVG =
+    // Grid, not a chevron: the status control on the left of the bar already
+    // uses a chevron for "expand", and two of them said the same thing twice.
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">' +
+    '<rect x="4" y="4" width="6.5" height="6.5" rx="2"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="2"/>' +
+    '<rect x="4" y="13.5" width="6.5" height="6.5" rx="2"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="2"/></svg>';
+  var BOLT_SVG =
+    '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>';
+  var ENTER_SVG =
+    '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>';
+
+  function menuRow(tag, icon, label, sub) {
+    var el = document.createElement(tag);
+    if (tag === 'button') el.type = 'button';
+    el.className = 'vn-more-row';
+    el.innerHTML = '<span class="vn-more-ic">' + icon + '</span>' +
+      '<span class="vn-more-txt"><span class="vn-more-lbl">' + label + '</span>' +
+      (sub ? '<span class="vn-more-sub">' + sub + '</span>' : '') + '</span>';
+    return el;
+  }
+
+  function showMenu(btn) {
+    hideChip();
+    var menu = document.createElement('div');
+    menu.className = 'vn-more-menu';
+    menu.setAttribute('role', 'menu');
+
+    if (typeof window._openInvokeModal === 'function') {
+      var inv = menuRow('button', BOLT_SVG, 'Invoke workforce', 'Skills and agents');
+      inv.addEventListener('click', function (e) {
+        e.preventDefault();
+        hideChip();
+        window._openInvokeModal();
+      });
+      menu.appendChild(inv);
+    }
+
+    var paste = menuRow('button', CLIP_SVG, 'Paste image', 'From the clipboard');
+    paste.addEventListener('click', function (e) {
+      e.preventDefault();
+      hideChip();
+      pasteImageFromClipboard();
+    });
+    menu.appendChild(paste);
+
+    // A <label> so the hidden file input opens the iOS photo sheet on tap.
+    var pick = menuRow('label', IMG_SVG, 'Photos', 'Choose or take a picture');
+    var input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.style.display = 'none';
+    input.addEventListener('change', function () {
+      var f = input.files && input.files[0];
+      input.value = '';
+      hideChip();
+      if (f) upload(f);
+    });
+    pick.appendChild(input);
+    menu.appendChild(pick);
+
+    // Enter-to-send preference.  Desktop only: on phones Enter always inserts a
+    // newline and sending is the send button (see _sendHint in utils.js).
+    var mobile = typeof window._isMobileViewport === 'function' && window._isMobileViewport();
+    if (!mobile && typeof window._toggleSendBehavior === 'function') {
+      var mod = (typeof _MOD !== 'undefined') ? _MOD : 'Ctrl';
+      var pref = menuRow('button', ENTER_SVG, 'Enter to send', '');
+      pref.classList.add('vn-more-pref');
+      pref.setAttribute('role', 'menuitemcheckbox');
+      var sw = document.createElement('span');
+      sw.className = 'vn-more-switch';
+      pref.appendChild(sw);
+      var paint = function () {
+        var on = (typeof sendBehavior !== 'undefined') && sendBehavior === 'enter';
+        pref.classList.toggle('on', on);
+        pref.setAttribute('aria-checked', on ? 'true' : 'false');
+        var subEl = pref.querySelector('.vn-more-sub');
+        var txt = on ? 'Shift+Enter for a new line' : mod + '+Enter sends, Enter is a new line';
+        if (subEl) subEl.textContent = txt;
+        else pref.querySelector('.vn-more-txt').insertAdjacentHTML('beforeend', '<span class="vn-more-sub">' + txt + '</span>');
+      };
+      paint();
+      pref.addEventListener('click', function (e) {
+        e.preventDefault();
+        window._toggleSendBehavior(e);   // persists + toasts; menu stays open so the switch is seen to move
+        paint();
+      });
+      menu.appendChild(pref);
+    }
+
+    document.body.appendChild(menu);
+    // Open upward from the button, right edges aligned, clamped into the viewport.
+    var r = btn.getBoundingClientRect();
+    var w = menu.offsetWidth, h = menu.offsetHeight;
+    menu.style.left = Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8)) + 'px';
+    menu.style.top = Math.max(8, r.top - h - 8) + 'px';
+    btn.classList.add('is-open');
+    _chip = menu;
+  }
+
   function makeButton() {
     var btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'live-send-btn live-image-btn';
     btn.id = 'live-image-btn';
-    btn.title = 'Attach an image';
-    btn.setAttribute('aria-label', 'Attach an image');
-    btn.innerHTML = IMG_SVG.replace(/width="15" height="15"/, 'width="16" height="16"');
+    btn.title = 'More: invoke, attach an image, send shortcut';
+    btn.setAttribute('aria-label', 'More actions');
+    btn.setAttribute('aria-haspopup', 'menu');
+    btn.innerHTML = PLUS_SVG;
 
     btn.addEventListener('click', function (e) {
       e.preventDefault();
       if (_chip) { hideChip(); return; }      // tap again to dismiss
-      var r = btn.getBoundingClientRect();
-      showChip(r.left + r.width / 2, r.top);
+      showMenu(btn);
     });
     return btn;
   }
@@ -384,8 +505,15 @@
     if (!row || row.querySelector('#live-image-btn')) return;
     var voice = row.querySelector('#live-voice-btn');
     var btn = makeButton();
+    // The recording cancel (X) sits immediately before the mic and the two are
+    // drawn as one fused capsule, so attach must go before the PAIR — inserting
+    // straight before the mic wedged it between them (X, picture, mic).
+    var prev = voice && voice.previousElementSibling;
+    if (prev && prev.classList.contains('voice-cancel-btn')) voice = prev;
     if (voice) row.insertBefore(btn, voice);
     else row.appendChild(btn);
+    // The bar was re-rendered under an open menu: keep the new button showing it.
+    if (_chip && _chip.classList.contains('vn-more-menu')) btn.classList.add('is-open');
   }
 
   function scan() {

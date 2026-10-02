@@ -269,3 +269,6 @@ confirmed_models.json
 # never be published through the public repo. See launch.bat,
 # reviver._python_for_spawn, and session_manager._load_local_env.
 .local/
+
+# Design scratch pages (local mockups, served at /static/scratch/, never shipped)
+static/scratch/

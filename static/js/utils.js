@@ -122,7 +122,9 @@ function _sendHint() {
   // send button that appears next to the mic. The keyboard-shortcut toggle
   // below is desktop-only, so suppress the hint (and the toggle) on phones.
   if (_isMobileViewport()) return '';
-  const text = sendBehavior === 'enter' ? `Enter to send · ${_MOD}+Enter, Shift+Enter, or Alt+Enter for new line` : `${_MOD}+Enter, Shift+Enter, or Alt+Enter to send`;
+  const full = sendBehavior === 'enter' ? `Enter to send · ${_MOD}+Enter, Shift+Enter, or Alt+Enter for new line` : `${_MOD}+Enter, Shift+Enter, or Alt+Enter to send`;
+  // The bar shows the short form; the full list of shortcuts is the tooltip.
+  const text = '<span title="' + full + '">' + (sendBehavior === 'enter' ? 'Enter to send' : `${_MOD}+Enter to send`) + '</span>';
   return text + '<span class="send-hint-btn" onclick="_toggleSendBehavior(event)" title="Change send shortcut">'
     + '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">'
     + '<polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/>'

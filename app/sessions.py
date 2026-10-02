@@ -58,7 +58,15 @@ def load_session_summary(path: Path) -> dict:
         # invalidating the file-content cache (clicking a session in the
         # sidebar doesn't change mtime/size), and the sort needs the live
         # value.  See _overlay_access_ts below.
-        return _overlay_access_ts(cached, path)
+        # Return a COPY, never the cached dict itself.  Callers decorate the
+        # summary in place (/api/sessions stamps ``last_state``, ``model``,
+        # ``inbox_dirty``...).  Handing out the cached object made those
+        # per-request decorations permanent: a session tagged
+        # ``last_state="idle"`` kept that tag for the life of the web
+        # process, so a session the user slept came back "idle" on the next
+        # list load (project switch / refresh) — the "Sleep won't stick
+        # across a project switch" bug.
+        return dict(_overlay_access_ts(cached, path))
 
     custom_title = None
     first_user_content = ""
@@ -155,7 +163,9 @@ def load_session_summary(path: Path) -> dict:
         "message_count": message_count,
     }
     _summary_cache[cache_key] = result
-    return _overlay_access_ts(result, path)
+    # Copy for the same reason as the cache-hit path above: the caller must
+    # never be able to mutate the cached summary.
+    return dict(_overlay_access_ts(result, path))
 
 
 def load_session(path: Path) -> dict:

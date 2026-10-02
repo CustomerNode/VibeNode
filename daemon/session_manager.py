@@ -5105,6 +5105,24 @@ class SessionManager:
                         tool_input if isinstance(tool_input, dict) else {}
                     )
 
+            # "Claude Auto" never stops to ask.  A destructive action is
+            # rejected outright and the model is told to find a safer way —
+            # deny WITHOUT interrupt, so the message becomes the tool result
+            # and the turn continues.  Runs after the per-session "Always"
+            # grants above (an explicit user choice still wins) and before
+            # the auto-approve check below.
+            _ti = tool_input if isinstance(tool_input, dict) else {}
+            if manager._pm.should_auto_deny(tool_name, _ti, cwd=info.cwd):
+                logger.info("Claude Auto denied dangerous %s for %s",
+                            tool_name, resolved_id)
+                manager._log_auto_approved(
+                    resolved_id, info, tool_name, tool_input, "claude-auto-denied"
+                )
+                return manager._sdk.make_permission_result_deny(
+                    message=manager._pm.CLAUDE_AUTO_DENY_MESSAGE,
+                    interrupt=False,
+                )
+
             # Server-side policy check -- resolve without browser round-trip
             if manager._should_auto_approve(tool_name, tool_input if isinstance(tool_input, dict) else {},
                                             cwd=info.cwd):

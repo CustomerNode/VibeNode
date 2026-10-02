@@ -185,7 +185,7 @@
   #btn-git-update::before  { content: "Update"; }
   #btn-git-publish::before { content: "Publish"; }
   #btn-git-sync::before    { content: "Sync"; }
-  .hdr-sys-btn { font-size: 13px; padding: 7px 11px; }
+  .hdr-sys-btn:not(.hdr-gear) { font-size: 13px; padding: 7px 11px; }
 
   /* Keep .layout as the desktop flex row (its height feeds .live-log scroll).
      The REAL sidebar (project selector, view selector, New Session, search,
@@ -548,9 +548,16 @@
      already clip anything that would leak past the composer. */
   .live-bar-row {
     flex-wrap: nowrap;
-    gap: 8px;
+    --bar-gap: 8px;
+    --btn-w: 42px;
+    --btn-h: 42px;
+    gap: var(--bar-gap);
     align-items: center;
     overflow: visible;
+    /* Right-hand inset only (keeps the last button clear of the screen edge,
+       and holds when the last button is the hidden send).  NO left padding:
+       the status control must start exactly on the textarea's left edge. */
+    padding: 0 8px 0 0;
   }
   /* If a very long ctx label were ever to push the row wide, let the left
      group shrink and truncate rather than shoving the send button off the
@@ -561,7 +568,6 @@
     overflow: hidden;
   }
   .send-hint { display: none !important; }
-  .session-model-btn { display: none !important; }
   /* The send/voice button gets the 44px touch target (above). Without internal
      flex-centering its icon sits at the TOP of that taller box instead of the middle.
      Center the content so the icon aligns vertically inside the button.
@@ -581,7 +587,7 @@
   }
   /* Symmetric protection for the leftmost element in the row (invoke button)
      so both ends of the row visually breathe the same amount. */
-  .live-bar-row .invoke-btn { margin-left: 8px; }
+  .live-bar-row .invoke-btn { margin-left: 0; }
 
   /* ---- Toasts: iOS-native capsule that drops in from the TOP, clear of the bottom
      composer keys. On desktop they sit bottom-right (padding:10px 16px, bottom:20px;
@@ -622,8 +628,7 @@
 
   /* Align the queue banner's left/right with the topnav (and the chat content):
      drop the desktop 760px centering + 14px inset for a flush 12px inset. */
-  #live-queue-area { max-width: none; margin: 0; padding: 0 12px; }
-  #live-queue-hint { display: none !important; }
+  #live-queue-area { max-width: none; margin: 0; padding: 0 16px; }   /* same 16px inset as the composer */
 
   /* ---- Kill the horizontal scroll: nothing may exceed the viewport width ----
      `overscroll-behavior-y: none` disables the whole-page rubber-band bounce

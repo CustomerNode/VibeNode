@@ -2,6 +2,22 @@
 
 let _gitStatus = {};
 
+// Drawn icons for the three states (were the text characters ↓ ↑ ↓↑ in a badge).
+const _GIT_ICO = (d) => '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + d + '</svg>';
+const _GIT_ICONS = {
+  pull: _GIT_ICO('<path d="M12 4v11"/><path d="m7 10.5 5 5 5-5"/><path d="M5 20h14"/>'),      // down to a line: there is something to bring in
+  push: _GIT_ICO('<path d="M12 20V9"/><path d="m7 13.5 5-5 5 5"/><path d="M5 4h14"/>'),         // up to a line: there is something to send out
+  sync: _GIT_ICO('<path d="M7 4v15"/><path d="m3.5 15.5 3.5 3.5 3.5-3.5"/><path d="M17 20V5"/><path d="m13.5 8.5 3.5-3.5 3.5 3.5"/>'),
+};
+
+/** One state button: icon, a count where there is one, and a tooltip that says exactly what is waiting. */
+function _setGitBtn(btn, badgeId, kind, count, tip) {
+  document.getElementById(badgeId).innerHTML = _GIT_ICONS[kind];
+  if (count > 0) btn.dataset.count = String(count); else delete btn.dataset.count;
+  btn.title = tip;
+  btn.style.display = 'inline-flex';
+}
+
 function _applyGitStatus(s) {
   _gitStatus = s;
   const hasPush = s.ahead > 0 || s.uncommitted;
@@ -9,26 +25,22 @@ function _applyGitStatus(s) {
   const btnUpdate  = document.getElementById('btn-git-update');
   const btnPublish = document.getElementById('btn-git-publish');
   const btnSync    = document.getElementById('btn-git-sync');
+  const n = (k, one, many) => k + ' ' + (k === 1 ? one : many);
+  const pullTip = n(s.behind || 0, 'update', 'updates') + ' available';
+  const pushTip = s.ahead > 0
+    ? n(s.ahead, 'change', 'changes') + ' to publish' + (s.uncommitted ? ', plus unsaved edits' : '')
+    : 'Unsaved edits to publish';
   if (hasPull && hasPush) {
     // Both directions — show single Sync button
     btnUpdate.style.display = 'none';
     btnPublish.style.display = 'none';
-    document.getElementById('git-badge-sync').textContent = '\u2193\u2191';
-    btnSync.style.display = 'inline-flex';
+    _setGitBtn(btnSync, 'git-badge-sync', 'sync', 0, pullTip + ' \u00b7 ' + pushTip);
   } else {
     btnSync.style.display = 'none';
-    if (hasPull) {
-      document.getElementById('git-badge-pull').textContent = '\u2193';
-      btnUpdate.style.display = 'inline-flex';
-    } else {
-      btnUpdate.style.display = 'none';
-    }
-    if (hasPush) {
-      document.getElementById('git-badge-push').textContent = '\u2191';
-      btnPublish.style.display = 'inline-flex';
-    } else {
-      btnPublish.style.display = 'none';
-    }
+    if (hasPull) _setGitBtn(btnUpdate, 'git-badge-pull', 'pull', s.behind, pullTip);
+    else btnUpdate.style.display = 'none';
+    if (hasPush) _setGitBtn(btnPublish, 'git-badge-push', 'push', s.ahead, pushTip);
+    else btnPublish.style.display = 'none';
   }
 }
 

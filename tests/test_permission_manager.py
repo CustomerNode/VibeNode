@@ -160,6 +160,41 @@ class TestPolicyModes:
         assert pm.should_auto_approve("Bash", {"command": "git push --force"}) is False
         assert pm.should_auto_approve("Bash", {"command": "DROP TABLE users"}) is False
 
+    def test_claude_auto_denies_dangerous_instead_of_prompting(self, tmp_path):
+        """claude_auto REJECTS a dangerous action; it never prompts for it.
+
+        WHY: "Claude Auto" is hands-off.  A dangerous command used to be
+        escalated to the browser, which stopped the session on a permission
+        prompt.  The contract is: refuse it and tell the model to find a
+        safer approach, so the turn keeps going without the human.
+        """
+        pm = _make_pm(tmp_path, policy="claude_auto")
+        assert pm.should_auto_deny("Bash", {"command": "rm -rf build"}) is True
+        assert pm.should_auto_deny("Bash", {"command": "git status"}) is False
+        assert "safer" in pm.CLAUDE_AUTO_DENY_MESSAGE
+
+    def test_only_claude_auto_auto_denies(self, tmp_path):
+        """Every other policy keeps prompting; none of them auto-deny.
+
+        WHY: "Auto Approve Most" advertises a manual prompt for destructive
+        commands, and "Manual" prompts for everything.  Auto-deny leaking
+        into those modes would silently take the decision away from the user.
+        """
+        for policy in ("manual", "auto", "almost_always", "custom"):
+            pm = _make_pm(tmp_path, policy=policy)
+            assert pm.should_auto_deny("Bash", {"command": "rm -rf build"}) is False
+
+    def test_dev_null_redirect_is_not_dangerous(self, tmp_path):
+        """`2>/dev/null` must not trip the device-redirect pattern.
+
+        WHY: it appears in a large share of ordinary read-only commands;
+        flagging it blocked nearly everything under the guarded policies.
+        A redirect to a real device node must still be flagged.
+        """
+        assert PermissionManager.is_dangerous("Bash", {"command": "ls x 2>/dev/null"}) is False
+        assert PermissionManager.is_dangerous("Bash", {"command": "grep a b > /dev/null 2>&1"}) is False
+        assert PermissionManager.is_dangerous("Bash", {"command": "echo hi > /dev/sda"}) is True
+
     def test_claude_auto_sdk_mode_override(self, tmp_path):
         """claude_auto returns 'acceptEdits' as the SDK permission_mode.
 

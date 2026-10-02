@@ -245,19 +245,32 @@ window.SessionModel = (function () {
    * (`effort` on session state), or undefined when this daemon doesn't report
    * it. '' is meaningful: the session runs at the model default.
    */
+  // Daemon-reported efforts live in this store-owned map, keyed by session id,
+  // NOT only on the session object.  Two things used to lose the value when it
+  // was kept on the object alone, leaving the bar and the status panel with
+  // "level unknown" (no brain, nothing selected) for a session the daemon had
+  // in fact reported:
+  //   - the state snapshot can arrive before the session list has loaded, so
+  //     there was no object to write to and the report was dropped;
+  //   - every session-list reload replaces the objects (the list API carries
+  //     `model` but not `effort`), wiping the value until the next state push.
+  var _effortById = {};
+
   function getConfirmedThinking(id) {
+    if (id && typeof _effortById[id] === 'string') return _effortById[id];
     var s = _sess(id);
     return (s && typeof s.effort === 'string') ? _cleanThinking(s.effort) : undefined;
   }
 
   /** Single write path for a daemon-reported effort. Returns true if changed. */
   function ingestConfirmedThinking(id, effort) {
-    if (typeof effort !== 'string') return false;
-    var s = _sess(id);
+    if (typeof effort !== 'string' || !id) return false;
     effort = _cleanThinking(effort);
-    if (!s || s.effort === effort) return false;
-    s.effort = effort;
-    return true;
+    var changed = _effortById[id] !== effort;
+    _effortById[id] = effort;
+    var s = _sess(id);
+    if (s) s.effort = effort;
+    return changed;
   }
 
   /**

@@ -40,18 +40,39 @@ class TestLoadSessionSummary:
         _summary_cache.clear()
         r1 = load_session_summary(sample_session_file)
         r2 = load_session_summary(sample_session_file)
-        assert r1 is r2  # same cached object
+        assert r1 == r2
+        assert len(_summary_cache) == 1  # second call was served from cache
+
+    def test_cached_summary_is_not_mutable_by_callers(self, sample_session_file):
+        """Regression: "Sleep won't stick across a project switch".
+
+        /api/sessions decorates each summary in place (``last_state``,
+        ``model``, ...).  When load_session_summary handed out the cached
+        dict itself, a ``last_state="idle"`` tag written on one request
+        survived on every later request — so a session the user slept was
+        reported idle again the next time the list loaded.
+        """
+        from app.sessions import load_session_summary, _summary_cache
+        _summary_cache.clear()
+        first = load_session_summary(sample_session_file)   # cache miss path
+        first["last_state"] = "idle"
+        second = load_session_summary(sample_session_file)  # cache hit path
+        assert "last_state" not in second
+        second["last_state"] = "idle"
+        assert "last_state" not in load_session_summary(sample_session_file)
 
     def test_cache_invalidates_on_file_change(self, sample_session_file):
         from app.sessions import load_session_summary, _summary_cache
         _summary_cache.clear()
         r1 = load_session_summary(sample_session_file)
+        n1 = len(_summary_cache)
         # Append a new message
         with open(sample_session_file, "a", encoding="utf-8") as f:
             f.write(json.dumps({"type": "user", "message": {"content": "new"},
                                 "timestamp": "2026-03-01T11:00:00Z"}) + "\n")
         r2 = load_session_summary(sample_session_file)
-        assert r1 is not r2  # new object, cache busted
+        assert len(_summary_cache) == n1 + 1  # new cache entry, cache busted
+        assert r2["message_count"] == r1["message_count"] + 1
 
     def test_large_file_uses_head_tail(self, large_session_file):
         from app.sessions import load_session_summary
