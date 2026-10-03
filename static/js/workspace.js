@@ -870,25 +870,32 @@ const _CLAUDE_AUTO_DANGEROUS = new RegExp([
   '\\bwget\\b.*\\|\\s*(ba)?sh',
   '\\bpython[3]?\\s+-c\\s+.*\\brmtree\\b',
 ].join('|'), 'im');
-const _CLAUDE_AUTO_WRITE_TOOLS = ['write', 'edit', 'multiedit', 'notebookedit'];
-
 function _claudeAutoActive() {
   return typeof permissionPolicy !== 'undefined' && permissionPolicy === 'claude_auto';
 }
 
+// Drop heredoc BODIES before pattern-matching.  A heredoc fed to cat / python /
+// psql is file content, not shell: a script or test file that merely mentions
+// a destructive command must not get the whole command refused.  A heredoc
+// fed to a shell (bash <<EOF) is real commands and is kept.
+function _claudeAutoStripHeredocs(cmd) {
+  return cmd.replace(
+    /^([^\n]*)<<-?\s*(['"]?)(\w+)\2([^\n]*)\n[\s\S]*?\n[ \t]*\3[ \t]*(?=\n|$)/gm,
+    (m, pre, _q, _tag, post) => /\b(ba|z|da)?sh\b/.test(pre) ? m : pre + post);
+}
+
 // 'y' or 'n' for a tool prompt that reached the browser under Claude Auto.
+//
+// ONLY destructive shell commands are refused.  File edits are ALWAYS approved:
+// Claude Auto means "Claude handles edits".  The SDK's acceptEdits mode only
+// covers targets inside the session's cwd, so the daemon escalates every edit
+// in a git worktree, sibling repo or home-dir path as "outside the project".
+// Refusing those blocked ordinary work (2026-10-03 regression) — do NOT add an
+// edit-tool deny back here.
 function _claudeAutoVerdict(toolName, toolInput) {
-  const tool = (toolName || '').toLowerCase();
-  if (tool === 'bash') {
-    const cmd = (toolInput && typeof toolInput.command === 'string') ? toolInput.command : '';
-    return _CLAUDE_AUTO_DANGEROUS.test(cmd) ? 'n' : 'y';
-  }
-  // The SDK's acceptEdits mode approves ordinary edits before the daemon is
-  // consulted, and the daemon approves the rest unless the target is protected
-  // (.env, config, lockfile, .git/, migrations, outside the project).  So an
-  // edit prompt that gets this far is a protected write.
-  if (_CLAUDE_AUTO_WRITE_TOOLS.includes(tool)) return 'n';
-  return 'y';
+  if ((toolName || '').toLowerCase() !== 'bash') return 'y';
+  const cmd = (toolInput && typeof toolInput.command === 'string') ? toolInput.command : '';
+  return _CLAUDE_AUTO_DANGEROUS.test(_claudeAutoStripHeredocs(cmd)) ? 'n' : 'y';
 }
 
 // ---- Send permission answer via WebSocket ----

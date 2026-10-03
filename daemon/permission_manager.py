@@ -20,43 +20,6 @@ class PermissionManager:
     """Permission policy storage, auto-approval logic, and dangerous command detection."""
 
     # ------------------------------------------------------------------
-    # "Claude Auto" — reject instead of prompting
-    # ------------------------------------------------------------------
-
-    # Fed back to the model as the tool result when "Claude Auto" rejects a
-    # tool use.  The turn is NOT interrupted: the model reads this and carries
-    # on with a different approach.
-    CLAUDE_AUTO_DENY_MESSAGE = (
-        "Blocked by the Claude Auto permission policy: this action is "
-        "destructive or hard to undo (for example rm -r/-f or rm with a "
-        "wildcard, find -delete, git reset --hard, git clean, a force push, "
-        "DROP/TRUNCATE, npm publish, piping a download into a shell, or a "
-        "write to .env / config / lockfile / .git / migrations / a path "
-        "outside the project). It was NOT run and the user was not asked. "
-        "Do not retry it and do not work around the block with an equivalent "
-        "destructive command. Achieve the goal a safer, reversible way "
-        "instead (e.g. delete specific named files without -r/-f or "
-        "wildcards, move files aside rather than deleting, use git stash or "
-        "git revert/restore on specific paths rather than a hard reset). If "
-        "the task truly cannot be completed without this exact action, keep "
-        "going with everything else and, in your final message, tell the "
-        "user the exact command or edit they need to run themselves and why."
-    )
-
-    def should_auto_deny(self, tool_name: str, tool_input,
-                         cwd: Optional[str] = None) -> bool:
-        """True when the policy REJECTS this tool use outright.
-
-        Only "Claude Auto" does this.  Its contract is hands-off: safe actions
-        run, risky ones are refused and the model is told to find another way
-        (``CLAUDE_AUTO_DENY_MESSAGE``).  It never stops to ask the human;
-        that is what "Auto Approve Most" and "Manual" are for.
-        """
-        if self._permission_policy != "claude_auto":
-            return False
-        return self.is_dangerous(tool_name, tool_input, cwd=cwd)
-
-    # ------------------------------------------------------------------
     # Dangerous-command detection (for "Almost Always")
     # ------------------------------------------------------------------
 
@@ -321,7 +284,11 @@ class PermissionManager:
             # consults should_auto_deny() first and never reaches this
             # branch for a dangerous tool use.  Returning False here is the
             # fail-safe for any caller that skips that check.
-            if self.is_dangerous(tool_name, tool_input, cwd=cwd):
+            #
+            # Edits are ALWAYS approved.  acceptEdits only covers targets
+            # inside the session cwd, so edits in a git worktree / sibling
+            # repo DO reach this callback and must not be gated.
+            if self._claude_auto_dangerous(tool_name, tool_input):
                 return False
             return True
         if policy == "custom":
@@ -386,9 +353,8 @@ class PermissionManager:
         "Blocked by the Claude Auto permission policy: this action is "
         "destructive or hard to undo (for example rm -r/-f or rm with a "
         "wildcard, find -delete, git reset --hard, git clean, a force push, "
-        "DROP/TRUNCATE, npm publish, piping a download into a shell, or a "
-        "write to .env / config / lockfile / .git / migrations / a path "
-        "outside the project). It was NOT run and the user was not asked. "
+        "DROP/TRUNCATE, npm publish, or piping a download into a shell). "
+        "It was NOT run and the user was not asked. "
         "Do not retry it and do not work around the block with an equivalent "
         "destructive command. Achieve the goal a safer, reversible way "
         "instead (e.g. delete specific named files without -r/-f or "
@@ -410,7 +376,45 @@ class PermissionManager:
         """
         if self._permission_policy != "claude_auto":
             return False
-        return self.is_dangerous(tool_name, tool_input, cwd=cwd)
+        return self._claude_auto_dangerous(tool_name, tool_input)
+
+    # Heredoc: `cmd <<TAG ... TAG`.  Groups 1/4 = rest of the opening line.
+    _HEREDOC_RE = re.compile(
+        r'^([^\n]*)<<-?\s*([\'"]?)(\w+)\2([^\n]*)\n[\s\S]*?\n[ \t]*\3[ \t]*(?=\n|$)',
+        re.MULTILINE,
+    )
+    _HEREDOC_TO_SHELL_RE = re.compile(r'\b(ba|z|da)?sh\b')
+
+    @classmethod
+    def _claude_auto_dangerous(cls, tool_name: str, tool_input) -> bool:
+        """What "Claude Auto" withholds: destructive SHELL commands only.
+
+        * File edits are never flagged.  Claude Auto means "Claude handles
+          edits"; the protected-write rules (outside-cwd, config, lockfiles,
+          migrations) belong to "Auto Approve Most".  Applying the
+          outside-cwd rule here refused every edit made in a git worktree
+          or sibling repo (2026-10-03 regression).
+        * Heredoc bodies are ignored unless fed to a shell: text written via
+          ``cat <<EOF`` / ``python3 - <<EOF`` is content, not commands, and
+          must not trip the patterns by merely mentioning a destructive one.
+
+        Mirrored in static/js/workspace.js ``_claudeAutoVerdict``.
+        """
+        if (tool_name or "").lower() != "bash" or not isinstance(tool_input, dict):
+            return False
+        command = tool_input.get("command", "")
+        if not isinstance(command, str) or not command:
+            return False
+
+        def _strip(m):
+            pre, post = m.group(1), m.group(4)
+            if cls._HEREDOC_TO_SHELL_RE.search(pre):
+                return m.group(0)
+            return pre + post
+
+        return cls._is_dangerous_command(
+            {"command": cls._HEREDOC_RE.sub(_strip, command)}
+        )
 
     # ------------------------------------------------------------------
     # Dangerous-command detection (for "Almost Always")

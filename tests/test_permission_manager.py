@@ -539,16 +539,42 @@ class TestProtectedWrites:
 
     # ── Policy wiring ──
 
-    def test_claude_auto_still_gates_bash_not_edits(self, tmp_path):
-        """claude_auto: protected-write rules apply if an edit DOES reach us.
+    def test_claude_auto_never_gates_edits(self, tmp_path):
+        """claude_auto: an edit that reaches the callback is approved, never
+        denied and never prompted for.
 
-        WHY: Under claude_auto the SDK normally intercepts edits before
-        the callback, so this path is rarely hit.  If it is (future SDK
-        change, different tool name), the safe behaviour is to prompt.
+        WHY: The SDK's acceptEdits only covers targets inside the session
+        cwd, so edits in a git worktree / sibling repo DO reach us.  Applying
+        the outside-cwd protected-write rule refused every one of them
+        (2026-10-03 regression: "all the edits keep getting denied").
+        """
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        pm = _make_pm(tmp_path, policy="claude_auto")
+        outside = str(tmp_path / "worktree" / "test_x.py")
+        for tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+            assert pm.should_auto_deny(tool, {"file_path": outside}, cwd=str(proj)) is False
+            assert pm.should_auto_approve(tool, {"file_path": outside}, cwd=str(proj)) is True
+        assert pm.should_auto_approve("Bash", {"command": "ls"}) is True
+
+    def test_claude_auto_ignores_heredoc_content(self, tmp_path):
+        """Text inside a heredoc is file content, not a command.
+
+        WHY: `cat >> test.py <<EOF` / `python3 - <<EOF` bodies that merely
+        mention a destructive command were getting the whole call refused.
+        A heredoc fed to a shell is real commands and stays blocked, as does
+        a destructive command outside the heredoc.
         """
         pm = _make_pm(tmp_path, policy="claude_auto")
-        assert pm.should_auto_approve("Write", {"file_path": "/proj/.env"}) is False
-        assert pm.should_auto_approve("Bash", {"command": "ls"}) is True
+        body = "cat >> t.py <<'EOF'\nsubprocess.run('rm -rf build')\nEOF"
+        assert pm.should_auto_deny("Bash", {"command": body}) is False
+        assert pm.should_auto_approve("Bash", {"command": body}) is True
+        py = "python3 - <<'E'\nsql = 'TRUNCATE x'\nE\necho done"
+        assert pm.should_auto_deny("Bash", {"command": py}) is False
+        sh = "bash <<EOF\nrm -rf build\nEOF"
+        assert pm.should_auto_deny("Bash", {"command": sh}) is True
+        after = "cat > a <<EOF\nhi\nEOF\nrm -rf build"
+        assert pm.should_auto_deny("Bash", {"command": after}) is True
 
     def test_auto_policy_ignores_protected_writes(self, tmp_path):
         """'auto' means auto.  Protected-write rules only apply to the
