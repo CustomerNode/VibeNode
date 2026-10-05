@@ -833,8 +833,9 @@ function wfSortedSessions(sessions) {
   } else if (wfSort === 'name') {
     copy.sort((a, b) => (a.display_title||'').localeCompare(b.display_title||''));
   } else {
-    // recent
-    copy.sort((a, b) => dateKey(b) - dateKey(a));
+    // recent — honors the menu's "Oldest first" (sortAsc) as well.
+    const _asc = (typeof sortAsc !== 'undefined') && sortAsc;
+    copy.sort((a, b) => _asc ? dateKey(a) - dateKey(b) : dateKey(b) - dateKey(a));
   }
   return copy;
 }

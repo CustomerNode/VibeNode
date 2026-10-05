@@ -172,6 +172,24 @@ class TestMoveSessionRoute:
         assert tomb.exists()
         assert sid in json.loads(tomb.read_text())
 
+    def test_move_back_clears_target_tombstone(self, client, projects_root):
+        """A→B→A must leave the session visible in A.  The first move
+        tombstones it in A; the return move has to lift that tombstone or the
+        session is invisible in A despite its .jsonl being there."""
+        sid = "5555eeee-6666-ffff-7777-000011112222"
+        _write_session(projects_root, SRC, sid)
+        r1 = client.post(f"/api/move-session/{sid}?project={SRC}",
+                         json={"from_project": SRC, "to_project": DST})
+        assert r1.status_code == 200
+        r2 = client.post(f"/api/move-session/{sid}?project={DST}",
+                         json={"from_project": DST, "to_project": SRC})
+        assert r2.status_code == 200
+        assert (projects_root / SRC / f"{sid}.jsonl").exists()
+        tomb_src = json.loads((projects_root / SRC / "_deleted_sessions.json").read_text())
+        assert sid not in tomb_src
+        tomb_dst = json.loads((projects_root / DST / "_deleted_sessions.json").read_text())
+        assert sid in tomb_dst
+
     def test_move_overwrites_stale_target_name(self, client, projects_root):
         # Full-stack version of the production bug: the same id had a stale
         # "OpenAI"-style name in the target from a previous life. After moving

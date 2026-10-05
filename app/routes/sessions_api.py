@@ -1042,6 +1042,12 @@ def api_move_session(session_id):
     # file is per-project, so this never hides the session in its new home.
     _mark_deleted(session_id, from_project)
 
+    # Clear any tombstone in the TARGET.  A session moved A→B leaves a
+    # tombstone in A; moving it back B→A would otherwise land the .jsonl in A
+    # while A's tombstone keeps it hidden — the session looks lost even though
+    # the file is right there.  all_sessions() honors tombstones over files.
+    _unmark_deleted(session_id, to_project)
+
     # Bump the moved session's access time in the target so it sorts sensibly
     # (recently touched) in its new project's sidebar.
     try:

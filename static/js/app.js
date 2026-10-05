@@ -40,7 +40,13 @@ if (window.location.hash.startsWith('#compose')) viewMode = 'compose';
 // Session display sub-mode (grid vs list vs control within sessions view)
 let sessionDisplayMode = localStorage.getItem('sessionDisplayMode') || 'grid';
 if (!['grid', 'list', 'control'].includes(sessionDisplayMode)) sessionDisplayMode = 'grid';
-let wfSort = localStorage.getItem('wfSort') || 'status';
+// Grid default is time ('recent').  'status' is no longer offered anywhere in
+// the UI (the "…" menu only has Newest/Oldest/Name/Size), so a stored 'status'
+// is a legacy value the user can't see or undo — it grouped sleeping sessions
+// below every idle one, burying today's work under week-old cards while the
+// menu claimed "Newest first".  Migrate it to 'recent'.
+let wfSort = localStorage.getItem('wfSort') || 'recent';
+if (wfSort === 'status') { wfSort = 'recent'; localStorage.setItem('wfSort', 'recent'); }
 let runningIds = new Set();
 let waitingData = {};   // { session_id: {question, options, kind} }
 let sessionKinds = {};   // session_id -> 'question' | 'working' | 'idle'

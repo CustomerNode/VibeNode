@@ -171,6 +171,15 @@ Sleep but breaks recovery for genuinely dead sessions. Do NOT remove the second
 `isUserStopped()` check inside the inner `setTimeout`; without it, sleeping during the
 close→start gap is still ignored.
 
+## Test runs of Claude must never save sessions into a user project (added 2026-10-05)
+
+Any probe, smoke test, or verification that launches Claude (`claude -p`, the Python SDK, `ClaudeSDKClient`, a subprocess, anything) MUST NOT write a transcript into a real project. VibeNode lists every `.jsonl` under `~/.claude/projects/<project>/` as a session, so a "reply ok" probe run from the repo shows up in the user's sidebar as a session they never made. This happened on 2026-10-05: two "reply ok" sessions appeared in Program VibeNode from a model-verification script.
+
+- **CLI:** always pass `--no-session-persistence`.
+- **Python SDK:** pass `extra_args={"no-session-persistence": None}` in the options.
+- **If persistence can't be disabled:** set the working directory to `~/.claude/_system` (VibeNode's hidden utility project), never the repo or any user project folder.
+- If a test session leaks anyway, trash it via `DELETE /api/delete/<id>?project=<encoded>` (recoverable) and say so in your report.
+
 ## Slash commands are intercepted client-side
 Claude CLI slash commands (e.g. `/compact`, `/rewind`, `/clear`) are NOT sent to the SDK. They get silently eaten with no response, leaving the session stuck idle. Instead, `_interceptSlashCommand()` in `live-panel.js` catches them at every submit path and either triggers the GUI equivalent (e.g. `/rewind` clicks the Rewind toolbar button, `/compact` fires `liveCompact()`) or shows a toast explaining the command isn't supported in the GUI. The command map lives in `_slashCommandMap`. Messages with `/` that aren't bare commands (e.g. "fix /etc/config") pass through normally.
 
