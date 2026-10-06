@@ -182,9 +182,16 @@ function _projectShortName(project) {
 
 function _updateProjectLabel(project) {
   const label = document.getElementById('project-label');
-  if (!project) { label.innerHTML = 'Select project <span class="sidebar-mini-label">project</span>'; return; }
+  // The project row's icon is the project's initial in a small outline tile
+  // (drawn in CSS from this attribute).  No project selected -> the folder icon.
+  const btn = document.getElementById('btn-project');
+  if (!project) {
+    if (btn) delete btn.dataset.initial;
+    label.innerHTML = 'Select project <span class="sidebar-mini-label">project</span>'; return;
+  }
   const name = document.createElement('span');
   name.textContent = _projectShortName(project);
+  if (btn) btn.dataset.initial = (name.textContent.trim().charAt(0) || '?').toUpperCase();
   label.innerHTML = name.innerHTML + ' <span class="sidebar-mini-label">project</span>';
 }
 

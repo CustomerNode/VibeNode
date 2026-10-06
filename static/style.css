@@ -13652,3 +13652,94 @@ header #git-badge-push svg, header #git-badge-pull svg, header #git-badge-sync s
   .sidebar.collapsed ~ .resize-handle:hover { background: rgba(128,128,140,.08); }
 }
 
+/* ── Left panel refinements (desktop) ──
+   The existing design, tightened; nothing added, removed or moved.  Phones keep the drawer's own rules. */
+@media (min-width: 769px) {
+  /* ══ Left panel: your design, tightened.  Kept: the three rows, the state pills and their colours, the purple
+     selection, the working / waiting pulse, the list's purple rail.  Changed: proportions, type, thicknesses, shadows. ══ */
+  .sidebar { --bt: 255,255,255; }
+  [data-theme="light"] .sidebar { --bt: 0,0,0; }
+
+  /* Project / View / New Session rows: same rows, tighter and rounder */
+  .sidebar .sidebar-header { gap: 2px; }
+  .sidebar .sidebar-action-btn { border-radius: 10px; padding-top: 8px; padding-bottom: 8px; }
+  .sidebar .sidebar-mini-label { font-size: 9.5px; letter-spacing: .09em; }
+
+  /* Search: a soft field instead of a bare row; the ··· button gets a matching box */
+  /* ONE left edge (12px) and ONE right edge (12px in) for everything in the panel; icons share one column (17px),
+     labels another (39px). */
+  .sidebar .sidebar-header { padding-left: 12px; padding-right: 12px; }
+  .sidebar .sidebar-search-row { gap: 4px; margin-right: 0; }
+  .sidebar .sidebar-search-btn { height: 34px; padding: 0 5px; border-radius: 10px; }   /* no fill at rest; a soft one on hover */
+  .sidebar .sidebar-search-btn:hover { background: rgba(var(--bt), .08); }
+  .sidebar .sidebar-menu-btn { width: 34px; height: 34px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 10px; }
+  /* Sort / display options: a sliders icon, not "···" (that is the session menu in the header) */
+  .sidebar .sidebar-menu-btn svg { display: none; }
+  .sidebar .sidebar-menu-btn::before { content: ''; width: 16px; height: 16px; background: currentColor;
+    -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M4 7h9M18 7h2M4 17h2M11 17h9'/%3E%3Ccircle cx='15.5' cy='7' r='2.5'/%3E%3Ccircle cx='8.5' cy='17' r='2.5'/%3E%3C/svg%3E") center / contain no-repeat;
+    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M4 7h9M18 7h2M4 17h2M11 17h9'/%3E%3Ccircle cx='15.5' cy='7' r='2.5'/%3E%3Ccircle cx='8.5' cy='17' r='2.5'/%3E%3C/svg%3E") center / contain no-repeat; }
+  .sidebar .sidebar-menu-btn:hover { background: rgba(var(--bt), .06); }
+  .sidebar .sidebar-menu-dropdown { border-radius: 12px; padding: 5px; }
+  .sidebar .sidebar-sort-opt, .sidebar .sidebar-view-opt { border-radius: 8px; }
+
+  /* Cards fill the panel's width in equal columns, so their outer edges sit on the same two edges as the rows above */
+  .sidebar #workforce-grid.visible { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; padding: 10px 2px 12px 12px; scrollbar-gutter: stable; scrollbar-width: thin; }   /* 2px + the reserved 10px scrollbar lane = the same 12px right edge, whether or not it scrolls */
+  .sidebar .wf-card { width: auto; }
+  /* Cards: same parts in the same order (icon, pill, title, time).  The title gets two lines. */
+  .sidebar .wf-card { height: 136px; justify-content: flex-start; gap: 5px; padding: 14px 9px 10px;
+    border-color: rgba(var(--bt), .07); box-shadow: 0 1px 2px rgba(0,0,0,.14), inset 0 1px 0 rgba(255,255,255,.04); }
+  [data-theme="light"] .sidebar .wf-card { border-color: rgba(0,0,0,.06); box-shadow: 0 1px 2px rgba(0,0,0,.05), inset 0 1px 0 rgba(255,255,255,.8); }
+  .sidebar .wf-card:hover { border-color: rgba(var(--bt), .12); box-shadow: 0 8px 18px -10px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.06); }
+  [data-theme="light"] .sidebar .wf-card:hover { box-shadow: 0 8px 18px -10px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.9); }
+  .sidebar .wf-card.wf-selected, .sidebar .wf-card.wf-sleeping.wf-selected, .sidebar .wf-card.wf-idle.wf-selected,
+  .sidebar .wf-card.wf-working.wf-selected, .sidebar .wf-card.wf-question.wf-selected {
+    box-shadow: 0 0 0 1.5px var(--accent), 0 8px 22px -12px rgba(124,124,255,.55); }
+  .sidebar .wf-card.wf-working { border-color: rgba(124,124,255,.42); }
+  .sidebar .wf-avatar { font-size: 24px; height: 28px; display: flex; align-items: center; justify-content: center; }
+  .sidebar .wf-status-label { font-size: 9px; letter-spacing: .08em; padding: 2px 7px; margin-bottom: 2px; }
+  .sidebar .wf-name { font-size: 11.5px; line-height: 1.3; max-width: none; width: 100%; white-space: normal; color: var(--text-secondary);
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .sidebar .wf-card.wf-selected .wf-name { color: var(--text-heading); font-weight: 600; }
+  .sidebar .wf-meta { max-width: none; margin-top: auto; font-size: 10.5px; font-variant-numeric: tabular-nums; }
+
+  /* List: same columns, same purple rail and selection.  Small-caps heads, lighter dividers, 2px rail. */
+  .sidebar .col-header { font-size: 9.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; }
+  .sidebar .col-header-row { border-bottom-color: rgba(var(--bt), .06); }
+  .sidebar .session-item { border-bottom-color: rgba(var(--bt), .035); box-shadow: inset 2px 0 0 var(--rail); }
+  .sidebar .session-col-date, .sidebar .session-col-size { font-variant-numeric: tabular-nums; }
+  .sidebar .session-list { padding-left: 12px; padding-right: 2px; scrollbar-gutter: stable; scrollbar-width: thin; }
+  .sidebar .col-header:first-child { padding-left: 17px; }   /* NAME sits over the session titles (rows keep their own 17px lane for the unread dot) */
+  .sidebar .col-header:last-child, .sidebar .session-item > .session-col-size { padding-right: 5px; }
+}
+
+/* ── Left panel: chosen tweaks (desktop) ── */
+@media (min-width: 769px) {
+  /* Quiet sleeping pill: plain small caps; WORKING and IDLE keep their coloured pills */
+  .sidebar .wf-sleeping .wf-status-label { background: none; padding-left: 0; padding-right: 0; }
+  /* Dim sleeping cards: they step back so active and selected sessions stand out */
+  .sidebar .wf-card.wf-sleeping:not(.wf-selected) { background: transparent; box-shadow: none; }
+  .sidebar .wf-card.wf-sleeping:not(.wf-selected) .wf-name { color: var(--text-muted); }
+  /* PROJECT / VIEW tags sit at the right edge of their rows */
+  .sidebar #btn-project > span, .sidebar #sidebar-view-trigger > span { display: flex; flex: 1; align-items: baseline; }
+  .sidebar #btn-project .sidebar-mini-label, .sidebar #sidebar-view-trigger .sidebar-mini-label { margin-left: auto; }
+  /* The project name is the panel's heading: heading typeface, slightly larger */
+  .sidebar #project-label { font-family: 'Space Grotesk', var(--font-sans); font-size: 15px; font-weight: 700; letter-spacing: -.01em; color: var(--text-heading); }
+  /* The row was drawn at 70% opacity, which greyed the heading; the heading is full strength and its icon stays quiet */
+  .sidebar #btn-project { opacity: 1; }
+  .sidebar #btn-project > svg { color: var(--text-muted); }
+  /* Project icon: the project's initial in a rounded outline, drawn like the icons below it (same size, line
+     weight, grey and column).  The initial comes from data-initial, set in _updateProjectLabel. */
+  .sidebar #btn-project[data-initial] > svg { display: none; }
+  .sidebar #btn-project[data-initial]::before { content: attr(data-initial); flex: none; box-sizing: border-box; width: 16px; height: 16px; margin: 0 -1px;
+    display: inline-flex; align-items: center; justify-content: center; font: 700 9.5px/1 var(--font-sans); letter-spacing: 0;
+    border: 1.7px solid currentColor; border-radius: 4.5px; color: var(--text-muted); }
+  /* The view row (Sessions, Workflow, ...) matches the rows under it: same weight, colour and outline icon.
+     Only the project heading is emphasised. */
+  .sidebar #sidebar-view-trigger { color: var(--text-muted); font-weight: 400; opacity: 1; }
+  .sidebar #sidebar-view-trigger > svg, .sidebar #sidebar-view-trigger > svg * { fill: none; stroke: currentColor; stroke-width: 2; }
+  .sidebar #project-label .sidebar-mini-label { font-family: var(--font-sans); }
+  /* Footer fades back until hovered */
+  .sidebar .sidebar-footer { opacity: .25; transition: opacity .15s; }
+  .sidebar .sidebar-footer:hover { opacity: .7; }
+}
+
