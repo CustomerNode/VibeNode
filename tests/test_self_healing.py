@@ -597,15 +597,18 @@ class TestUserStopBeatsSelfHeal:
         session_manager._sdk.create_session.assert_not_called()
 
     @pytest.mark.parametrize("effort,model,want_args,want_model", [
-        ("xhigh", "claude-opus-5[1m]", {"effort": "xhigh"}, "claude-opus-5"),
+        ("xhigh", "claude-opus-5[1m]", {"effort": "xhigh"}, "claude-opus-5[1m]"),
+        ("", "claude-haiku-4-5[1m]", {}, "claude-haiku-4-5"),
         ("", "claude-sonnet-5", {}, "claude-sonnet-5"),
         ("bogus", "", {}, None),
     ])
-    def test_reconnect_repins_effort_and_strips_model_marker(
+    def test_reconnect_repins_effort_and_model(
             self, session_manager, sm_module, effort, model, want_args, want_model):
         """A self-heal reconnect relaunches the CLI.  It must carry the
         session's effort (dropping it fell back to the CLI default level, seen
-        live 2026-10-01) and a marker-free --model ("[1m]" is an API 400)."""
+        live 2026-10-01) and its context window: "[1m]" is kept so a 1M
+        session does not come back on 200K, except on Haiku, where it is an
+        API 400 and is stripped."""
         sid = "reconnect-effort"
         info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
         info.cwd, info.model, info.effort = "/tmp", model, effort

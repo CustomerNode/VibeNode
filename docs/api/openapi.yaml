@@ -708,6 +708,58 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /api/session-context/{session_id}:
+    get:
+      tags: [Sessions]
+      summary: Context size for a session that has no live reading yet
+      operationId: getSessionContext
+      description: |
+        The live context readout comes from session_usage Socket.IO pushes,
+        which only exist once a session replies after the daemon (re)started.
+        An idle session opened after a page load therefore shows no context
+        at all. This endpoint reads the same number from the transcript's
+        last reply. Read-only and cheap (tail read). Returns usage: null when
+        no reading is available.
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+        - name: project
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Context usage snapshot (or null when unavailable)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  usage:
+                    nullable: true
+                    type: object
+                    properties:
+                      input_tokens:
+                        type: integer
+                      cache_read_input_tokens:
+                        type: integer
+                      cache_creation_input_tokens:
+                        type: integer
+                      model:
+                        type: string
+                      source:
+                        type: string
+                        enum: [transcript, compact]
+        "400":
+          description: Malformed session_id
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  usage:
+                    nullable: true
+                    type: object
+
   /api/session-timeline/{session_id}:
     get:
       tags: [Sessions]
@@ -6293,6 +6345,31 @@ paths:
                         expired:
                           type: boolean
                           description: The window has reset since this value was seen
+
+  /api/usage-limits/refresh:
+    post:
+      tags: [App]
+      summary: Request a fresh Fable usage reading (triggered by clicking the gauges)
+      operationId: usageLimitsRefresh
+      description: |
+        Starts the hidden one-word Fable turn described in app/usage_probe.py
+        unless one ran in the last minute. The resulting snapshot arrives as
+        the usage_limits Socket.IO push, not in this response. The started
+        flag indicates whether a probe was actually launched (false when a
+        recent probe is still cooling down).
+      responses:
+        "200":
+          description: Probe launch result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  started:
+                    type: boolean
+                    description: True when a probe turn was launched; false if debounced
 
   /manifest.webmanifest:
     get:

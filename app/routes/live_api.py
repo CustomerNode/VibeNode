@@ -134,6 +134,99 @@ def api_live_state(session_id):
     return jsonify({"state": state, "managed": True, "entry_count": entry_count})
 
 
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+_CTX_TAIL_STEPS = (256 * 1024, 2 * 1024 * 1024, 8 * 1024 * 1024)
+
+
+def _last_context_usage(path: Path):
+    """The context size as of the session's LAST reply, read from the tail of
+    its transcript.  Returns a usage dict shaped like a ``session_usage`` push,
+    or None when no reading exists.
+
+    Scans backward: the newest main-thread assistant message with non-zero
+    usage wins.  A ``compact_boundary`` met first means the session compacted
+    after its last reply, so the post-compaction size is the honest reading.
+    Sidechain (sub-agent) messages and zero-usage API-error stubs are skipped.
+    Reads only the tail, widening if the tail holds no reply, so a multi-MB
+    transcript costs a few hundred KB of IO.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    for step in _CTX_TAIL_STEPS:
+        start = max(0, size - step)
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                chunk = fh.read().decode("utf-8", errors="ignore")
+        except OSError:
+            return None
+        lines = chunk.splitlines()
+        if start > 0 and lines:
+            lines = lines[1:]          # first line is probably cut mid-record
+        for line in reversed(lines):
+            if '"compact_boundary"' not in line and '"assistant"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("isSidechain"):
+                continue
+            if d.get("type") == "system" and d.get("subtype") == "compact_boundary":
+                post = (d.get("compactMetadata") or {}).get("postTokens")
+                if isinstance(post, int) and post > 0:
+                    return {"input_tokens": post, "cache_read_input_tokens": 0,
+                            "cache_creation_input_tokens": 0, "source": "compact"}
+                return None
+            if d.get("type") != "assistant":
+                continue
+            msg = d.get("message") or {}
+            u = msg.get("usage") or {}
+            total = sum(int(u.get(k) or 0) for k in (
+                "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+            if total > 0:
+                return {"input_tokens": int(u.get("input_tokens") or 0),
+                        "cache_read_input_tokens": int(u.get("cache_read_input_tokens") or 0),
+                        "cache_creation_input_tokens": int(u.get("cache_creation_input_tokens") or 0),
+                        "model": msg.get("model") or "",
+                        "source": "transcript"}
+        if start == 0:
+            break
+    return None
+
+
+@bp.route("/api/session-context/<session_id>")
+def api_session_context(session_id):
+    """Context size for a session that has no live reading yet.
+
+    The live readout comes from ``session_usage`` pushes, which only exist once
+    a session replies after the daemon (re)started.  An idle session opened
+    after a page load therefore showed no context at all.  This reads the same
+    number from the transcript's last reply.  Read-only and cheap (tail read).
+    """
+    if not _SESSION_ID_RE.match(session_id or ""):
+        return jsonify({"usage": None}), 400
+    project = request.args.get("project", "").strip()
+    path = _sessions_dir(project=project) / f"{session_id}.jsonl"
+    if not path.exists():
+        # Wrong or missing ?project= (e.g. a session moved between projects):
+        # look in every project rather than report "no reading".
+        path = None
+        try:
+            for d in _CLAUDE_PROJECTS.iterdir():
+                cand = d / f"{session_id}.jsonl"
+                if d.is_dir() and not d.name.startswith("subagents") and cand.exists():
+                    path = cand
+                    break
+        except OSError:
+            pass
+    if path is None:
+        return jsonify({"usage": None})
+    return jsonify({"usage": _last_context_usage(path)})
+
+
 @bp.route("/api/session-log/<session_id>")
 def api_session_log(session_id):
     """Return structured log entries for the live terminal panel.

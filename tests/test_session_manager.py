@@ -582,8 +582,9 @@ class TestSetSessionModel:
         ``info.model`` made the badge claim one model while the session ran on
         another — the "my switch didn't stick" report, which only held when
         the initiating tab still had the choice in memory and re-sent it.
-        The launch id must be marker-stripped (``[1m]`` is display-only); the
-        badge keeps the marker because it is honest about context length.
+        ``[1m]`` is KEPT on the launch id: it is the session's 1M context
+        choice and a valid ``--model`` value, so dropping it would wake a 1M
+        session on 200K.
         """
         sid = "sm-wake-pin"
         with patch.object(session_manager._reg, 'load_registry',
@@ -596,7 +597,7 @@ class TestSetSessionModel:
                                                    resume=True)
             assert result["ok"] is True
             wait_for(lambda: mock_drive.await_count == 1, timeout=5)
-        assert mock_drive.call_args.kwargs["model"] == "claude-opus-5"
+        assert mock_drive.call_args.kwargs["model"] == "claude-opus-5[1m]"
         assert session_manager._sessions[sid].model == "claude-opus-5[1m]"
 
     def test_explicit_wake_model_beats_registry(self, session_manager):
@@ -612,9 +613,16 @@ class TestSetSessionModel:
             wait_for(lambda: mock_drive.await_count == 1, timeout=5)
         assert mock_drive.call_args.kwargs["model"] == "claude-sonnet-4-6"
 
-    def test_cli_model_id_strips_display_markers(self, session_manager):
+    def test_cli_model_id_keeps_1m_and_strips_the_rest(self, session_manager):
         f = session_manager._cli_model_id
-        assert f("claude-opus-5[1m]") == "claude-opus-5"
+        # [1m] is the 1M context choice and a valid --model for Opus/Sonnet.
+        assert f("claude-opus-5[1m]") == "claude-opus-5[1m]"
+        assert f("claude-sonnet-5[1m]") == "claude-sonnet-5[1m]"
+        # Haiku rejects [1m] with an API 400, so it is stripped there.
+        assert f("claude-haiku-4-5[1m]") == "claude-haiku-4-5"
+        # Any other bracketed marker is not a launch id.
+        assert f("claude-opus-5[beta]") == "claude-opus-5"
+        assert f("claude-opus-5[beta][1m]") == "claude-opus-5[1m]"
         assert f("  claude-sonnet-4-6 ") == "claude-sonnet-4-6"
         assert f("") == "" and f(None) == ""
 
@@ -705,25 +713,34 @@ class TestSetSessionModel:
         assert model_events[0]["session_id"] == "sm-ok"
         assert model_events[0]["model"] == "claude-sonnet-4-6"
 
-    def test_1m_suffix_preserved_across_same_base_switch(self, session_manager, sm_module):
-        """Live switch to the SAME base model must keep the [1m] marker.
+    def test_1m_is_a_literal_choice_in_both_directions(self, session_manager, sm_module):
+        """[1m] is the context-window choice, taken literally.
 
-        The picker sends bare ids (``claude-opus-5``), and the CLI's follow-up
-        init reinstates the [1m] marker for 1M-context sessions.  Without
-        preservation the badge briefly loses [1m] before the reinstate — a
-        cosmetic lie about the active context length.  A genuinely different
-        base id (a real model switch) drops the marker as expected.
+        The picker offers 1M as its own chip and sends ``claude-opus-5[1m]``
+        for it.  A BARE same-base id is recorded as bare: the old carry-forward
+        re-attached [1m] by guesswork, while the CLI's own init report (same
+        sink) is what says which window the session actually got.
         """
         info = self._make_session(session_manager, sm_module, "sm-1m",
                                   model="claude-opus-5[1m]")
         with patch.object(session_manager._sdk, 'set_model',
-                          new=AsyncMock(return_value=None)), \
+                          new=AsyncMock(return_value=None)) as mock_set, \
              patch.object(session_manager, '_emit_state'):
             result = session_manager.set_session_model("sm-1m", "claude-opus-5")
         assert result["ok"] is True
-        # Same base id → marker preserved
-        assert info.model == "claude-opus-5[1m]"
-        assert result["model"] == "claude-opus-5[1m]"
+        assert info.model == "claude-opus-5"           # recorded as asked, no guess
+        assert result["model"] == "claude-opus-5"
+
+        # 200K -> 1M: the marker reaches the CLI and the mirror.
+        info_up = self._make_session(session_manager, sm_module, "sm-1m-up",
+                                     model="claude-opus-5")
+        with patch.object(session_manager._sdk, 'set_model',
+                          new=AsyncMock(return_value=None)) as mock_set_up, \
+             patch.object(session_manager, '_emit_state'):
+            result_up = session_manager.set_session_model("sm-1m-up", "claude-opus-5[1m]")
+        assert result_up["ok"] is True
+        assert mock_set_up.await_args.args[1] == "claude-opus-5[1m]"
+        assert info_up.model == "claude-opus-5[1m]"
 
         # A different base id genuinely drops the marker.
         info2 = self._make_session(session_manager, sm_module, "sm-1m-2",
@@ -734,6 +751,31 @@ class TestSetSessionModel:
             result2 = session_manager.set_session_model("sm-1m-2", "claude-sonnet-5")
         assert info2.model == "claude-sonnet-5"
         assert result2["model"] == "claude-sonnet-5"
+
+    @pytest.mark.parametrize("data", [
+        # Current SDK shape (from the daemon log, 2026-10-05): the payload
+        # dict is in ``event`` and ``data`` is empty.
+        {"event": {"type": "message_start", "message": {"model": "claude-opus-5-5",
+            "usage": {"input_tokens": 2, "cache_creation_input_tokens": 496,
+                      "cache_read_input_tokens": 171979}}}, "data": {}},
+        # Older shape: string ``event`` plus the payload in ``data``.
+        {"event": "message_start", "data": {"type": "message_start", "message": {
+            "usage": {"input_tokens": 2, "cache_creation_input_tokens": 496,
+                      "cache_read_input_tokens": 171979}}}},
+    ])
+    def test_message_start_usage_pushed_for_both_sdk_shapes(
+            self, session_manager, sm_module, data):
+        """Per-call usage feeds every context readout.  The string-only match
+        missed the current SDK shape, so no context number ever reached the UI."""
+        from daemon.backends.messages import VibeNodeMessage, MessageKind
+        self._make_session(session_manager, sm_module, "sm-usage")
+        pushes = []
+        session_manager._push_callback = lambda n, d: pushes.append((n, d))
+        asyncio.run(session_manager._process_message(
+            "sm-usage", VibeNodeMessage(kind=MessageKind.STREAM_EVENT, data=data)))
+        usage = [d for n, d in pushes if n == "session_usage"]
+        assert len(usage) == 1
+        assert usage[0]["usage"]["cache_read_input_tokens"] == 171979
 
     def test_backend_rejection_leaves_model_untouched(self, session_manager, sm_module):
         info = self._make_session(session_manager, sm_module, "sm-reject")

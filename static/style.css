@@ -11450,9 +11450,10 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
 .vn-status:active { background: rgba(var(--bt), .14); box-shadow: 0 0 0 6px rgba(var(--bt), .14); }
 .vn-status:focus-visible { box-shadow: 0 0 0 6px rgba(var(--bt), .08), 0 0 0 8px var(--vn-set); }
 .vn-status:hover .smb-lbl, .vn-status.open .smb-lbl { opacity: 1; color: var(--text-muted); }
-.vn-status .smb-brain, .vn-status .usage-limits-pill { transition: filter .14s ease, opacity .14s ease; opacity: .9; }
+.vn-status .smb-brain, .vn-status .usage-limits-pill, .vn-status .context-pill { transition: filter .14s ease, opacity .14s ease; opacity: .9; }
 .vn-status:hover .smb-brain, .vn-status.open .smb-brain,
-.vn-status:hover .usage-limits-pill, .vn-status.open .usage-limits-pill { opacity: 1; filter: contrast(1.25); }
+.vn-status:hover .usage-limits-pill, .vn-status.open .usage-limits-pill,
+.vn-status:hover .context-pill, .vn-status.open .context-pill { opacity: 1; filter: contrast(1.25); }
 .vn-status-caret { flex: none; opacity: .45; transition: transform .18s ease, opacity .15s; }
 .vn-status:hover .vn-status-caret, .vn-status.open .vn-status-caret { opacity: 1; color: var(--text-primary); }
 .vn-status:hover:not(.open) .vn-status-caret { transform: translateY(-1.5px); }
@@ -11643,6 +11644,23 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
 .ulp-c.ulp-warn i { background: #d97706; }
 .ulp-c.ulp-crit i { background: #dc2626; }
 .ulp-c.ulp-stale { opacity: .55; }
+
+/* Context window, collapsed: one mini column showing % of 200K consumed
+   (markup: _contextPillHtml).  Same grammar as .usage-limits-pill — one
+   .ulp-c cell — with a thin divider so the two chips read as two items.
+   The divider is suppressed when either side is hidden so a lone chip
+   doesn't sit next to a floating line. */
+.context-pill { display: inline-flex; align-items: flex-end; gap: 3px; height: 16px;
+  padding-left: 7px; margin-left: 4px; border-left: 1px solid rgba(var(--bt, 255,255,255), .14); }
+.context-pill[hidden] { display: none; }
+/* The number beside the column: readable on a phone, where there is no hover
+   tooltip.  Grey normally, amber/red with the column past 70% / 90%. */
+.context-pill { align-items: center; gap: 4px; }
+.ctx-pct { font-size: 10.5px; font-weight: 650; line-height: 1; letter-spacing: 0;
+  font-variant-numeric: tabular-nums; color: var(--text-muted); }
+.ctx-pct.ulp-warn { color: #d97706; }
+.ctx-pct.ulp-crit { color: #dc2626; }
+.usage-limits-pill[hidden] + .context-pill { padding-left: 0; margin-left: 0; border-left: 0; }
 
 /* Status panel (markup: _statusPanelHtml) */
 .vn-status-panel {

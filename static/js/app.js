@@ -1874,17 +1874,24 @@ function _parseModelEntry(m) {
 
 /** Build grouped-by-family selector HTML. Rows carry data-model; caller wires clicks. */
 function _modelSelectorGroupsHtml(models, selectedId) {
-  // Drop the "[1m]" duplicates.  The CLI reports a model as e.g.
-  // "claude-opus-5[1m]" while the 1M context window is active, and that tagged
-  // name gets recorded alongside the plain one.  As a CHOICE the two are the
-  // same thing: the tag is not a valid launch id and every apply path strips
-  // it, so the extra chip only looked like an option.  One row per model
-  // version; a tagged entry survives (untagged) only if its plain twin is absent.
+  // ONE chip per model, tagged "1M" when that model runs with the 1M context
+  // window.  A separate "5.5" and "5.5 1M" pair was tried (2026-10-05) and was
+  // misleading: on this account Fable, Opus and Sonnet sessions launched on
+  // the plain id already run to ~1M tokens (daemon logs), so the plain chip
+  // was 1M too.  Haiku rejects 1M (API 400), so it is untagged.  The family
+  // rule matches window._ctxWindowFor, so the picker, the model badge and the
+  // context bar all say the same thing.
   const _plain = id => String(id || '').replace(/\[[^\]]*\]/g, '');
-  const _seenPlain = new Set((models || []).filter(m => m && _plain(m.id) === m.id).map(m => m.id));
-  models = (models || []).filter(m => m && (_plain(m.id) === m.id || !_seenPlain.has(_plain(m.id))))
-    .map(m => _plain(m.id) === m.id ? m : Object.assign({}, m, {id: _plain(m.id), name: _plain(m.name)}))
-    .filter((m, i, arr) => arr.findIndex(x => x.id === m.id) === i);
+  const _base = [];
+  (models || []).forEach(m => {
+    if (!m) return;
+    const id = _plain(m.id);
+    if (id && !_base.some(x => x.id === id)) {
+      _base.push(Object.assign({}, m, {id: id, name: _plain(m.name),
+        _ctx1m: /^claude-(fable|opus|sonnet)-/.test(id)}));
+    }
+  });
+  models = _base;
   selectedId = _plain(selectedId);
   const groups = {};
   const seen = [];
@@ -1914,7 +1921,7 @@ function _modelSelectorGroupsHtml(models, selectedId) {
       html += '<div class="msel-row' + (active ? ' active' : '') + '" data-model="' + escHtml(m.id || '') + '" role="button" tabindex="0">'
         + _MSEL_CHECK
         + '<span class="msel-name">' + escHtml(verLabel) + '</span>'
-        + (p.is1m ? '<span class="msel-tag msel-tag-1m">1M</span>' : '')
+        + ((p.is1m || m._ctx1m) ? '<span class="msel-tag msel-tag-1m">1M</span>' : '')
         + '</div>';
     }
   }
@@ -1963,8 +1970,8 @@ async function openModelSelector() {
   overlay.onclick = e => { if (e.target === overlay) _closePm(); };
   overlay.querySelectorAll('.msel-row').forEach(row => {
     row.onclick = () => {
-      // Strip display markers like "[1m]" — they render as a tag on the row
-      // but are not part of a valid SDK model id (sending one is an API 400).
+      // Chips carry plain ids (the 1M window comes with the model; see
+      // _modelSelectorGroupsHtml).  Strip any marker defensively.
       defaultModel = (row.dataset.model || '').replace(/\[[^\]]*\]/g, '');
       localStorage.setItem('defaultModel', defaultModel);
       _closePm();

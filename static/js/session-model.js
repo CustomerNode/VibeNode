@@ -50,16 +50,16 @@ window.SessionModel = (function () {
   // hardcoded fallbacks in app.js/openModelSelector and /api/models.
   var FALLBACK_MODEL = 'claude-opus-4-7';
 
-  // The CLI reports "[1m]" (1M context active) as a display suffix on model
-  // ids (e.g. "claude-opus-5-5[1m]"). That suffix is NOT part of a valid SDK
-  // model id — sending one as --model / set_model fails with an API 400 —
-  // but bracketed ids can reach us through the /api/models confirmed cache
-  // or an old localStorage value. Strip markers from every id this store
-  // HANDS OUT for starting/switching, so no start path can ever send one.
-  // Confirmed ids (daemon ground truth, `.model`) are deliberately NOT
-  // stripped — the badge honestly displays "[1m]".
+  // "[1m]" selects the 1M context window ("claude-opus-5-5[1m]"). It IS a
+  // valid --model / set_model value for Opus and Sonnet (verified 2026-10-05:
+  // launch and live switch both come up in 1M mode), so it is KEPT — it is
+  // the user's context-window choice, and stripping it dropped 1M sessions
+  // back to 200K on every wake. Stripped: any OTHER bracketed marker, and
+  // "[1m]" on Haiku, which the API rejects with a 400. Mirrors the daemon's
+  // SessionManager._cli_model_id.
   function _cleanId(id) {
-    return (id || '').replace(/\[[^\]]*\]/g, '');
+    id = (id || '').replace(/\[(?!1m\])[^\]]*\]/g, '');
+    return /haiku/.test(id) ? id.replace('[1m]', '') : id;
   }
 
   // One-time migration: the pre-rebuild architecture armed a GLOBAL one-shot
@@ -232,7 +232,8 @@ window.SessionModel = (function () {
    * `desiredModel` is the stale one, and sending it would wake the session on
    * A and silently undo the switch. That was the "doesn't stick" bug.
    *
-   * Marker-stripped so it is always a valid --model id.
+   * Cleaned (via _cleanId) so it is always a valid --model id; a 1M choice
+   * keeps its "[1m]" so the session wakes on the same context window.
    */
   function resumeModel(id) {
     return _cleanId(getConfirmed(id)) || getDesired(id);

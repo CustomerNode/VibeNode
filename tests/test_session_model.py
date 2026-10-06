@@ -226,10 +226,11 @@ class TestResolverLogic:
             assert.strictEqual(SessionModel.getDesired('a'), 'claude-haiku-4-5');
         """)
 
-    def test_resume_model_prefers_confirmed_and_strips_markers(self, tmp_path):
+    def test_resume_model_prefers_confirmed_and_keeps_1m(self, tmp_path):
         # The wake pin: daemon truth (any device) beats this tab's stale local
-        # choice; '' when neither is known so the daemon uses its registry;
-        # never a bracketed display id (that is an API 400 as --model).
+        # choice; '' when neither is known so the daemon uses its registry.
+        # "[1m]" is kept (it is the 1M context choice, a valid --model) except
+        # on Haiku, where it is an API 400; other markers are always dropped.
         self._run(tmp_path, """
             allSessions.push({ id: 'a' }, { id: 'b' }, { id: 'c' });
             assert.strictEqual(SessionModel.resumeModel('a'), '');           // nothing known
@@ -238,8 +239,12 @@ class TestResolverLogic:
             SessionModel.ingestConfirmed('a', 'claude-sonnet-4-6');          // phone switched it
             assert.strictEqual(SessionModel.resumeModel('a'), 'claude-sonnet-4-6'); // truth wins
             SessionModel.ingestConfirmed('b', 'claude-opus-5[1m]');
-            assert.strictEqual(SessionModel.resumeModel('b'), 'claude-opus-5'); // marker stripped
-            assert.strictEqual(SessionModel.getConfirmed('b'), 'claude-opus-5[1m]'); // badge keeps it
+            assert.strictEqual(SessionModel.resumeModel('b'), 'claude-opus-5[1m]'); // 1M kept
+            assert.strictEqual(SessionModel.getConfirmed('b'), 'claude-opus-5[1m]');
+            SessionModel.ingestConfirmed('c', 'claude-haiku-4-5[1m]');
+            assert.strictEqual(SessionModel.resumeModel('c'), 'claude-haiku-4-5');  // haiku: 400
+            allSessions.push({ id: 'd', desiredModel: 'claude-sonnet-5[x][1m]' });
+            assert.strictEqual(SessionModel.getDesired('d'), 'claude-sonnet-5[1m]'); // other markers dropped
             assert.strictEqual(SessionModel.resumeModel('ghost'), '');
         """)
 

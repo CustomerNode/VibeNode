@@ -1711,15 +1711,22 @@ class SessionManager:
     def _cli_model_id(model: Optional[str]) -> str:
         """Turn a recorded/confirmed model id into one safe to hand the CLI.
 
-        The CLI reports display markers on resolved ids — ``claude-opus-5[1m]``
-        when 1M context is active — and those flow verbatim into ``info.model``
-        and the registry.  A bracketed id is NOT a valid ``--model`` value (the
-        API rejects it with a 400), so every path that turns a recorded model
-        back into a launch argument must strip markers first.  Mirrors
-        ``SessionModel._cleanId`` on the client.
+        The CLI reports ``claude-opus-5[1m]`` when 1M context is active, and
+        that id flows into ``info.model`` and the registry.  ``[1m]`` IS a
+        valid ``--model`` / ``set_model`` value for Opus and Sonnet (verified
+        2026-10-05 against every model: launch and live switch both come up
+        in 1M mode), so it is KEPT — stripping it silently dropped a 1M
+        session back to 200K on every wake.  Two exceptions are stripped:
+        any other bracketed marker, and ``[1m]`` on Haiku, which the API
+        rejects with a 400 ("long context beta is not yet available").
+        Mirrors ``SessionModel._cleanId`` on the client.
         """
         import re as _re
-        return _re.sub(r"\[[^\]]*\]", "", (model or "").strip())
+        m = (model or "").strip()
+        m = _re.sub(r"\[(?!1m\])[^\]]*\]", "", m)
+        if "haiku" in m:
+            m = m.replace("[1m]", "")
+        return m
 
     # Values ``claude --effort`` accepts (verified against ``claude --help``,
     # CLI 2.1.283).  The CLI only warns on anything else and silently runs at
@@ -1844,27 +1851,17 @@ class SessionManager:
         ``save_registry=True``; the periodic init path does not, to avoid an
         extra disk write on every turn's init message.
 
-        [1m] suffix preservation: the CLI reports a trailing ``[1m]`` marker
-        when 1M context is active (e.g. ``claude-opus-5[1m]``).  A live
-        set_model switches to the SAME base model id but drops that marker
-        (the picker sends bare ids), which briefly stripped ``[1m]`` from
-        the badge before the follow-up CLI init reinstated it.  Carry the
-        marker forward in that specific case so the switch never lies about
-        the active context length.  A genuinely different base model
-        overrides the marker as usual; the init handler remains the ultimate
-        authority.
+        ``[1m]`` is taken literally.  The picker offers 1M as its own choice
+        and sends ``claude-opus-5[1m]`` for it; a BARE id leaves the window to
+        the CLI, which may still enable 1M on its own (seen in the daemon logs
+        2026-10-05).  The old carry-forward, which re-attached a previous
+        ``[1m]`` to a bare same-base id, guessed instead of asking: it was
+        removed, and the CLI's own ``init`` report, which runs through this
+        same sink, says which window the session actually got.
         """
-        import re as _re
         model = (model or "").strip()
         if not model:
             return False
-        _old = info.model or ""
-        _old_base = _re.sub(r"\[[^\]]*\]$", "", _old)
-        _old_marker_m = _re.search(r"\[[^\]]*\]$", _old)
-        _new_has_marker = bool(_re.search(r"\[[^\]]*\]$", model))
-        if (_old_marker_m and not _new_has_marker
-                and _old_base and _old_base == model):
-            model = model + _old_marker_m.group(0)
         changed = info.model != model
         if changed:
             info.model = model
@@ -6016,6 +6013,15 @@ class SessionManager:
             # data is the dict payload with the actual content.
             evt_type = event_data.get('event', '')
             evt_data = event_data.get('data') or {}
+            # Current SDK shape (seen 2026-10-05): ``event`` IS the payload
+            # dict ({'type': 'message_start', 'message': {...}}) and ``data``
+            # is empty.  The string-compare below never matched it, so per-call
+            # usage was silently never extracted: no session_usage push, no
+            # context reading anywhere in the UI.  Normalize to the payload.
+            if isinstance(evt_type, dict):
+                if not (isinstance(evt_data, dict) and evt_data):
+                    evt_data = evt_type
+                evt_type = evt_type.get('type', '')
             is_message_start = (
                 evt_type == 'message_start'
                 or (isinstance(evt_data, dict) and evt_data.get('type') == 'message_start')

@@ -129,9 +129,9 @@ function _buildSessionModelBtn(isNewSession, sessionModel, sessionId) {
     // so nothing another session chose can appear here.
     const _desired = (typeof SessionModel !== 'undefined') ? SessionModel.getDesired(sessionId) : '';
     const isOverridden = !!_desired;
-    const label = _modelLabel((typeof SessionModel !== 'undefined')
+    const label = _runningModelLabel((typeof SessionModel !== 'undefined')
       ? SessionModel.effectivePending(sessionId)
-      : ((typeof defaultModel !== 'undefined' ? defaultModel : '')));
+      : ((typeof defaultModel !== 'undefined' ? defaultModel : '')), '');
     const _safeId = (sessionId || '').replace(/['"\\]/g, '');
     const _chosen = isOverridden || _hasChosenThinking(sessionId);
     return '<span class="session-model-btn' + (_chosen ? ' session-model-overridden' : '') + '" ' +
@@ -151,11 +151,11 @@ function _buildSessionModelBtn(isNewSession, sessionModel, sessionId) {
     : (typeof defaultModel !== 'undefined' ? defaultModel : '');
   const confirmed = !!(sessionModel);
   const effectiveModel = sessionModel || _sysDefault;
-  const label = effectiveModel ? _modelLabel(effectiveModel) : '—';
+  const _liveSid = (typeof liveSessionId !== 'undefined') ? liveSessionId : '';
+  const label = effectiveModel ? _runningModelLabel(effectiveModel, _liveSid) : '—';
   const title = confirmed
     ? 'Session model: ' + label + ' — click to switch (applies from the next message)'
     : 'Will use system default (' + label + ') — click to switch before waking';
-  const _liveSid = (typeof liveSessionId !== 'undefined') ? liveSessionId : '';
   return '<span class="session-model-badge' + (!confirmed ? ' session-model-default' : '') + '" ' +
     'title="' +
     _bubbleTitle(label, _sessionThinkingFor(false, _liveSid), title) + '">' +
@@ -190,9 +190,9 @@ async function _openSessionModelSelector(liveMode, pendingSessionId, preset) {
   const liveSess = (liveSid && typeof allSessions !== 'undefined')
     ? allSessions.find(x => x.id === liveSid) : null;
   const currentLiveModel = (liveSess && liveSess.model) ? liveSess.model : '';
-  // Normalize "claude-fable-5[1m]" / dated ids to the base id so the
-  // matching card in the list pre-selects correctly.
-  const currentLiveBase = currentLiveModel.replace(/\[1m\]$/, '').replace(/-\d{8}$/, '');
+  // Normalize "claude-opus-5[1m]" / dated ids to the base id so the matching
+  // chip pre-selects (one chip per model; 1M comes with the model).
+  const currentLiveBase = currentLiveModel.replace(/\[[^\]]*\]/g, '').replace(/-\d{8}$/, '');
   // The effort the live session is running at: daemon-reported when this
   // daemon reports it (undefined otherwise), else this tab's recorded choice.
   const _confirmedLiveThinking = (liveSid && typeof SessionModel !== 'undefined')
@@ -335,8 +335,7 @@ async function _openSessionModelSelector(liveMode, pendingSessionId, preset) {
   window._smSelectModel = function(row) {
     document.querySelectorAll('#sm-model-list .msel-row').forEach(c => c.classList.remove('active'));
     row.classList.add('active');
-    // Strip display markers like "[1m]" — they render as a tag on the row
-    // but are not part of a valid SDK model id (sending one is an API 400).
+    // Chips carry plain ids; strip any marker defensively.
     pendingModel = (row.dataset.model || '').replace(/\[[^\]]*\]/g, '');
     _refreshApply();
   };
@@ -808,7 +807,7 @@ function _renderSessionModelBadge(sessionId) {
     ? SessionModel.getConfirmed(liveSessionId)
     : '';
   if (!model) return;
-  const lbl = _modelLabel(model);
+  const lbl = _runningModelLabel(model, liveSessionId);
   const seg = badge.querySelector('.smb-model');
   if (seg) seg.innerHTML = _modelLabelHtml(lbl); else badge.textContent = lbl;
   badge.title = _bubbleTitle(lbl, _sessionThinkingFor(false, liveSessionId),
@@ -880,6 +879,21 @@ function _brainSvg(t) {
   return open + '<defs><clipPath id="' + id + '"><rect x="0" y="' + y.toFixed(2) + '" width="24" height="24"/></clipPath></defs>' +
     '<path class="smb-brain-trk" d="' + _BRAIN_D + '"/>' +
     '<path class="smb-brain-fill" d="' + _BRAIN_D + '" clip-path="url(#' + id + ')"/>' + _BRAIN_FOLDS + '</svg>';
+}
+
+/** Badge label for a RUNNING session: the model plus "1M" when the session's
+ *  context window is 1M.  Uses the same rule as the context readouts
+ *  (window._ctxWindowFor), so the badge and the context bar can never
+ *  disagree.  The CLI's "[1m]" marker alone undercounted: it is missing on
+ *  most sessions that are in fact running at 1M. */
+function _runningModelLabel(model, sessionId) {
+  const m = String(model || '');
+  const base = _modelLabel(m.replace(/\[[^\]]*\]/g, ''));
+  const w = (typeof window._ctxWindowFor === 'function' && sessionId) ? window._ctxWindowFor(sessionId) : null;
+  // The family rule is applied to `model` directly too, because a pending or
+  // not-yet-confirmed session has no recorded model for _ctxWindowFor to read.
+  const is1M = /\[1m\]/.test(m) || /^claude-(fable|opus|sonnet)-/.test(m) || !!(w && w.size >= 1000000);
+  return base + (is1M ? ' 1M' : '');
 }
 
 /** "Opus 5.5" -> label "Opus" + value "5.5". */
@@ -1012,6 +1026,83 @@ function _usageLimitsPillHtml() {
     ' title="' + escHtml(p ? p.title : '') + '">' + (p ? p.html : '') + '</span>';
 }
 
+/** The context window size a session runs in.  Exposed on window so
+ *  live-panel's _buildCtxBarCompact, the status panel and the badge share one
+ *  rule (no two places diverging on what % means). */
+window._ctxWindowFor = function (sessionId) {
+  const sess = (typeof allSessions !== 'undefined' && Array.isArray(allSessions))
+    ? allSessions.find(x => x && x.id === sessionId) : null;
+  // The [1m] marker alone is NOT reliable: the CLI turns 1M on by itself, and
+  // the daemon logs show Opus 4.6 through 5.5 and Fable sessions launched on
+  // plain ids running to ~1M tokens (checked 2026-10-05).  So every 1M-capable
+  // family (Fable, Opus, Sonnet) is measured against 1M; Haiku, which rejects
+  // 1M, against 200K.  A reading above 200K proves a 1M window regardless.
+  const u = window._sessionUsage && window._sessionUsage[sessionId];
+  // Session list not loaded yet: the reply's own model (captured with the
+  // reading), else the default it would run on.
+  const m = (sess && sess.model) || (u && u.model) ||
+    ((typeof SessionModel !== 'undefined') ? SessionModel.getDefault() : '');
+  const tokens = u ? (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0) : 0;
+  const is1M = /\[1m\]/.test(m) || /^claude-(fable|opus|sonnet)-/.test(m) || tokens > 200000;
+  return is1M ? {size: 1000000, label: '1M'} : {size: 200000, label: '200K'};
+};
+
+/** No live reading yet (page just loaded, session idle): ask the server for
+ *  the transcript's last reply, once per session per 30s.  A live
+ *  `message_start` reading always wins, because it is written straight into
+ *  window._sessionUsage and this only fills an EMPTY slot. */
+function _fetchContextUsage(sid) {
+  window._ctxFetchAt = window._ctxFetchAt || {};
+  const now = Date.now();
+  if (window._ctxFetchAt[sid] && now - window._ctxFetchAt[sid] < 30000) return;
+  window._ctxFetchAt[sid] = now;
+  const proj = localStorage.getItem('activeProject') || '';
+  fetch('/api/session-context/' + encodeURIComponent(sid) + (proj ? '?project=' + encodeURIComponent(proj) : ''))
+    .then(r => r.ok ? r.json() : null)
+    .then(d => {
+      if (!d || !d.usage) return;
+      window._sessionUsage = window._sessionUsage || {};
+      if (window._sessionUsage[sid]) return;          // a live reading arrived first
+      window._sessionUsage[sid] = d.usage;
+      if (typeof liveSessionId !== 'undefined' && sid === liveSessionId) {
+        if (typeof liveBarState !== 'undefined') liveBarState = null;
+        if (typeof updateLiveInputBar === 'function') updateLiveInputBar();
+        _renderStatusPanel();                           // its Context row too
+      }
+    })
+    .catch(() => {});
+}
+
+/** Context-window pill, drawn as one column matching the usage-limits pill's
+ *  grammar.  Shows how much of the live session's context window is consumed
+ *  (same arithmetic as _buildCtxBarCompact and the panel's Context row).
+ *  Thresholds mirror the panel: amber at 70%, red at 90% — the pill is a
+ *  smaller echo of the same number the panel shows in words.  Hidden
+ *  entirely when no usage reading exists for this session yet, so a pending
+ *  or just-woken session's bar never gets an empty-looking column. */
+function _contextPillParts(sessionId) {
+  const sid = sessionId || (typeof liveSessionId !== 'undefined' ? liveSessionId : '');
+  if (!sid) return null;
+  const u = (window._sessionUsage && window._sessionUsage[sid]) || null;
+  if (!u) { _fetchContextUsage(sid); return null; }
+  const tokens = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+  const w = window._ctxWindowFor(sid);
+  if (tokens <= 0 || tokens > w.size * 1.5) return null;
+  const pct = Math.min(100, Math.round((tokens / w.size) * 100));
+  const cls = pct >= 90 ? ' ulp-crit' : pct >= 70 ? ' ulp-warn' : '';
+  return {pct: pct, cls: cls, title: 'Context: ' + pct + '% of ' + w.label + ' used'};
+}
+
+function _contextPillHtml(sessionId) {
+  const p = _contextPillParts(sessionId);
+  return '<span class="context-pill"' + (p ? '' : ' hidden') +
+    ' title="' + escHtml(p ? p.title : '') + '">' +
+    (p ? '<span class="ulp-c' + p.cls + '"><i style="height:' +
+      (p.pct > 0 ? Math.max(8, Math.min(100, p.pct)) : 0) + '%"></i></span>' +
+      '<span class="ctx-pct' + p.cls + '">' + p.pct + '%</span>' : '') +
+    '</span>';
+}
+
 /** THE single DOM writer for every visible pill. */
 function _renderUsageLimits() {
   const p = _usageLimitsParts();
@@ -1084,6 +1175,7 @@ function _buildBarLeftGroup(ctxHtml, isNewSession, sessionModel, sessionId) {
     ' onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();_toggleStatusPanel(this)}">' +
     _buildSessionModelBtn(isNewSession || false, sessionModel || '', sessionId || '') +
     _usageLimitsPillHtml() +
+    _contextPillHtml(isNewSession ? '' : (sessionId || (typeof liveSessionId !== 'undefined' ? liveSessionId : ''))) +
     _STATUS_CARET +
     '</div></div>';
 }
@@ -1093,6 +1185,8 @@ function _statusState() {
   const c = _statusPanelFor;
   const SM = (typeof SessionModel !== 'undefined') ? SessionModel : null;
   const sid = c.isNew ? c.sid : ((typeof liveSessionId !== 'undefined' && liveSessionId) || '');
+  // Normalizes for comparison and apply: one chip per model, so "[1m]" and a
+  // date suffix must not make the running model look different from its chip.
   const strip = m => String(m || '').replace(/\[[^\]]*\]/g, '').replace(/-\d{8}$/, '');
   const model = strip(SM ? (c.isNew ? SM.effectivePending(sid) : (SM.getConfirmed(sid) || SM.getDefault())) : '');
   const t = _sessionThinkingFor(c.isNew, sid);
@@ -1144,16 +1238,19 @@ function _statusPanelHtml() {
     });
   }
 
-  // Context: same arithmetic as _buildCtxBarCompact (live-panel.js).
+  // Context: same arithmetic as _buildCtxBarCompact (live-panel.js) and
+  // _contextPillParts above.  The window size tracks the CLI's [1m] marker
+  // so a 1M session doesn't read 100% full at 20% actual fill.
   const u = (!c.isNew && sid && window._sessionUsage && window._sessionUsage[sid]) || null;
   const tokens = u ? (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0) : 0;
-  if (tokens > 0 && tokens <= 300000) {
-    const pct = Math.min(100, Math.round((tokens / 200000) * 100));
+  const cw = window._ctxWindowFor(sid);
+  if (tokens > 0 && tokens <= cw.size * 1.5) {
+    const pct = Math.min(100, Math.round((tokens / cw.size) * 100));
     const working = (typeof liveBarState === 'string') && liveBarState.indexOf('working') === 0;
     const cls = pct >= 90 ? ' ulp-crit' : pct >= 70 ? ' ulp-warn' : '';
     h += '<div class="vsp-sec"><span>Context</span>' +
       (working ? '' : '<em><a role="button" tabindex="0" data-act="compact">Compact</a></em>') + '</div>' +
-      '<div class="vsp-row' + cls + '" style="margin-top:0"><span>This session</span><span class="vsp-pct">' + pct + '%</span>' +
+      '<div class="vsp-row' + cls + '" style="margin-top:0"><span>' + cw.label + ' window</span><span class="vsp-pct">' + pct + '%</span>' +
       '<span class="vsp-trk"><i style="width:' + pct + '%"></i></span></div>';
   }
 

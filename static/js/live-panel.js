@@ -1357,6 +1357,10 @@ function startLivePanel(id, opts) {
   // Eagerly fetch this session's state from the daemon so we don't
   // show "sleeping" while waiting for the full state_snapshot.
   if (!runningIds.has(id) && !sessionKinds[id]) {
+    // Local lookup: `_lpProj` used to be read here but is declared inside a
+    // different function, so this branch threw a ReferenceError and aborted
+    // the rest of startLivePanel for any session whose state had not loaded.
+    const _lpProj = localStorage.getItem('activeProject') || '';
     fetch('/api/session/' + id + '?meta_only=1' + (_lpProj ? '&project=' + encodeURIComponent(_lpProj) : ''))
       .then(r => r.ok ? r.json() : null)
       .then(d => {
@@ -2211,7 +2215,13 @@ function _injectDirectiveConflict(data) {
 function _buildCtxBarCompact(id, disabled) {
   const _usage = (window._sessionUsage && window._sessionUsage[id]) || null;
   if (!_usage) return '';
-  const _ctxWindow = 200000;
+  // Window size tracks the CLI's [1m] marker on the session's model id, so a
+  // 1M session doesn't read 100% at 20% fill.  Shared helper lives in
+  // invoke-workforce.js — see _ctxWindowFor.  Fall back to 200K if the
+  // helper hasn't loaded yet (script-order safety).
+  const _cw = (typeof window._ctxWindowFor === 'function')
+    ? window._ctxWindowFor(id) : {size: 200000, label: '200K'};
+  const _ctxWindow = _cw.size;
   let _tokens = (_usage.input_tokens || 0)
     + (_usage.cache_read_input_tokens || 0)
     + (_usage.cache_creation_input_tokens || 0);

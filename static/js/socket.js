@@ -1277,6 +1277,31 @@ socket.on('stream_event', (data) => {
     if (!data || !data.session_id || !data.event) return;
     if (_hiddenSessionIds.has(data.session_id)) return;
 
+    // Context reading, taken from the raw message_start.  The daemon's own
+    // extraction (which feeds `session_usage`) missed the current SDK shape,
+    // where `event` IS the payload dict and `data` is empty, so no context
+    // number ever reached the UI.  Reading it here works with both shapes and
+    // with a daemon that has not been restarted onto the fixed extraction.
+    {
+        const _ev = data.event.event, _dt = data.event.data;
+        const _p = (_ev && typeof _ev === 'object') ? _ev : _dt;
+        const _u = _p && _p.type === 'message_start' && _p.message && _p.message.usage;
+        if (_u && typeof _u === 'object') {
+            if (!window._sessionUsage) window._sessionUsage = {};
+            const _prev = window._sessionUsage[data.session_id] || {};
+            const _same = _prev.input_tokens === _u.input_tokens
+                && _prev.cache_read_input_tokens === _u.cache_read_input_tokens
+                && _prev.cache_creation_input_tokens === _u.cache_creation_input_tokens;
+            if (!_same) {
+                window._sessionUsage[data.session_id] = Object.assign({}, _u, {model: _p.message.model || ''});
+                if (data.session_id === liveSessionId) {
+                    liveBarState = null;
+                    if (typeof updateLiveInputBar === 'function') updateLiveInputBar();
+                }
+            }
+        }
+    }
+
     // ── Session ID match (same alias logic as session_entry) ──
     let _sidMatch = (data.session_id === liveSessionId);
     if (!_sidMatch && liveSessionId && window._idRemaps) {
