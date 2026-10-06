@@ -554,6 +554,7 @@ _FALLBACK_KNOWN_MODELS = [
     {"id": "claude-opus-5", "name": "Opus 5"},
     {"id": "claude-opus-4-8", "name": "Opus 4.8"},
     {"id": "claude-opus-4-7", "name": "Opus 4.7"},
+    {"id": "claude-sonnet-5-5", "name": "Sonnet 5.5"},
     {"id": "claude-sonnet-5", "name": "Sonnet 5"},
     {"id": "claude-haiku-4-5", "name": "Haiku 4.5"},
 ]
@@ -578,6 +579,7 @@ _ALWAYS_OFFER_MODELS = [
     {"id": "claude-fable-5-1", "name": "Fable 5.1"},
     {"id": "claude-opus-5-5", "name": "Opus 5.5"},
     {"id": "claude-opus-5", "name": "Opus 5"},
+    {"id": "claude-sonnet-5-5", "name": "Sonnet 5.5"},
     {"id": "claude-sonnet-5", "name": "Sonnet 5"},
 ]
 

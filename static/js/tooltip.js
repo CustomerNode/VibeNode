@@ -172,14 +172,29 @@
     var vw = document.documentElement.clientWidth;
     var vh = document.documentElement.clientHeight;
 
+    // The chat composer is a clip boundary, not just the viewport bottom.
+    // Tooltips prefer dropping BELOW their anchor, so one anchored on the last
+    // message in the log — or on a control in the composer's own button row —
+    // landed on top of the paste / mic / Send buttons. Nothing is allowed to
+    // sit over those, so the composer's top edge caps the downward direction
+    // exactly the way the viewport edge does, and the existing flip-above logic
+    // takes over. getClientRects() rather than offsetParent: the phone layout
+    // pins the bar with position:fixed, for which offsetParent is always null.
+    var floor = vh;
+    var bar = document.getElementById('live-input-bar');
+    if (bar && bar.getClientRects().length) {
+      var br = bar.getBoundingClientRect();
+      if (br.height > 0 && br.top > 0 && br.top < vh) floor = Math.min(floor, br.top);
+    }
+
     // Prefer below; flip above when the bottom would be clipped. Header
     // controls sit near the top and popovers near the bottom, so both
     // directions are genuinely used.
     var below = r.bottom + GAP;
     var above = r.top - th - GAP;
     var top, dir;
-    if (below + th <= vh - EDGE) { top = below; dir = 'below'; }
-    else if (above >= EDGE)      { top = above; dir = 'above'; }
+    if (below + th <= floor - EDGE) { top = below; dir = 'below'; }
+    else if (above >= EDGE)         { top = above; dir = 'above'; }
     else { top = Math.min(Math.max(EDGE, below), vh - th - EDGE); dir = 'below'; }
 
     // Centre horizontally on the anchor, then clamp into the viewport so a

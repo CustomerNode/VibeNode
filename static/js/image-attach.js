@@ -475,10 +475,20 @@
 
     document.body.appendChild(menu);
     // Open upward from the button, right edges aligned, clamped into the viewport.
+    //
+    // Anchored by `bottom`, not `top`.  A `top: Math.max(8, r.top - h - 8)`
+    // clamp silently pushed the menu BACK DOWN over the bar row whenever it was
+    // taller than the space above the button (short viewport, or a phone in
+    // landscape with the keyboard up) — covering the very paste / mic / Send
+    // buttons it opens from.  Pinning the bottom edge 8px above the button and
+    // capping the height instead means the menu scrolls when it does not fit
+    // and can never reach the button row.  Same pattern as
+    // _positionStatusPanel() in invoke-workforce.js.
     var r = btn.getBoundingClientRect();
-    var w = menu.offsetWidth, h = menu.offsetHeight;
+    var w = menu.offsetWidth;
     menu.style.left = Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8)) + 'px';
-    menu.style.top = Math.max(8, r.top - h - 8) + 'px';
+    menu.style.bottom = Math.round(window.innerHeight - r.top + 8) + 'px';
+    menu.style.maxHeight = Math.max(80, Math.round(r.top - 16)) + 'px';
     btn.classList.add('is-open');
     _chip = menu;
   }

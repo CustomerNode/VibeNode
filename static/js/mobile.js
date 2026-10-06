@@ -591,6 +591,11 @@
       // amount of layout we need to lift the fixed bar by. Clamped to [0,∞).
       var hidden = Math.max(0, (window.innerHeight || 0) - vv.height - vv.offsetTop);
       root.style.setProperty("--vn-kb-offset", hidden + "px");
+      // The keyboard moves the bar's `bottom`, not its size, so the
+      // ResizeObserver behind the float stack (utils.js) never fires. Re-measure
+      // here or the toast / undo / git-sync stack keeps the pre-keyboard offset
+      // and can drift back over the composer's paste / mic / Send buttons.
+      if (typeof window._updateFloatOffset === "function") window._updateFloatOffset();
     }
 
     function updateComposerHeight() {

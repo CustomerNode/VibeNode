@@ -2050,13 +2050,26 @@ body.unread-enabled .session-item .unread-dot {
   align-items: center;
   gap: var(--sp-3);
   box-shadow: 0 4px 24px rgba(0,0,0,0.4), 0 0 12px rgba(124,111,224,0.15);
-  transition: all 0.25s var(--ease-out);
+  /* NOT `transition: all`.  `all` includes `bottom`, which utils.js
+     _layoutFloats() writes — so every time this indicator appeared it animated
+     its own `bottom` from the 20px corner fallback up to its slot in the
+     stack, travelling straight across the paste / mic / Send buttons for
+     250ms.  The position must jump; only the cosmetic properties animate.
+     Same reason the other floats in the stack transition `opacity` and
+     `transform` by name.  Do NOT collapse this back to `all`. */
+  transition: box-shadow 0.25s var(--ease-out), border-color 0.25s var(--ease-out),
+              transform 0.25s var(--ease-out), opacity 0.25s var(--ease-out);
   animation: miniSlideIn 0.35s ease-out both;
   max-width: 280px;
 }
 .git-sync-mini.show { display: inline-flex; }
+/* 10px of travel, not 16px: every float in the shared stack slides up into
+   place from BELOW its final `bottom`, so the travel distance is how far it
+   dips toward the composer mid-animation.  utils.js _FLOAT_CLEARANCE (14px) is
+   sized against 10px; a larger travel here puts this indicator back over the
+   paste / mic / Send buttons for the length of the animation. */
 @keyframes miniSlideIn {
-  from { opacity: 0; transform: translateY(16px) scale(0.9); }
+  from { opacity: 0; transform: translateY(10px) scale(0.9); }
   to   { opacity: 1; transform: translateY(0) scale(1); }
 }
 .git-sync-mini:hover {
@@ -8567,7 +8580,9 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
   bottom: var(--vn-float-bottom, 20px);
   right: 20px;
   max-width: calc(100vw - 40px);
-  transform: translateY(20px);
+  /* 10px, matching the rest of the stack: this is how far the toast dips
+     toward the composer while sliding in (see utils.js _FLOAT_CLEARANCE). */
+  transform: translateY(10px);
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--r-md);
@@ -11618,6 +11633,10 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
   position: fixed; z-index: 100000; min-width: 232px; padding: 6px;
   border-radius: 14px; background: var(--bg-modal); border: 1px solid var(--border-light);
   box-shadow: var(--elev-3); animation: vn-chip-in 0.13s ease-out;
+  /* showMenu() pins `bottom` 8px above the composer's button row and caps
+     max-height to the space above it, so the menu can never be pushed back
+     down over the paste / mic / Send buttons.  It scrolls instead. */
+  overflow-y: auto; overscroll-behavior: contain;
 }
 .vn-more-row {
   display: flex; align-items: center; gap: 11px; width: 100%; box-sizing: border-box;

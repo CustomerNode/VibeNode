@@ -243,7 +243,10 @@ function setupVoiceButton(textarea, button, onSubmit) {
       silenceTimer = setTimeout(() => {
         recognition._intentionalStop = true;
         recognition.stop();
-      }, 7000);  // 7s silence timeout — gives room to pause/think mid-message before auto-send
+      }, 12000);  // 12s silence timeout — generous room to pause/think mid-message before auto-send
+      // Mobile dictation naturally has 3–8s pauses (read a note, think, breathe). The old 7s cut users
+      // off mid-sentence; 12s is still well short of "I forgot I was recording" territory, and the
+      // manual stop button is one tap away for anything shorter.
     };
 
     recognition.onresult = (e) => {
@@ -450,14 +453,17 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
     // When you finish speaking, a short pause ends the turn: stop -> transcribe
     // -> auto-send. Works in EVERY browser (Firefox has no Web Speech VAD), and
     // mirrors the old Web Speech 3s silence behavior. Manual click still stops too.
-    const SILENCE_SHORT = 3000;   // pause-to-send in a quiet room
-    const SILENCE_LONG = 5500;    // pause-to-send when background noise/music is present
+    // Silence thresholds are deliberately generous — mobile dictation has natural 3–6s pauses
+    // (read a note, think, breathe) and tight thresholds read as "it keeps cutting me off."
+    // Manual stop (tap the stop button) is always one tap away for anything shorter.
+    const SILENCE_SHORT = 5000;   // pause-to-send in a quiet room
+    const SILENCE_LONG = 8000;    // pause-to-send when background noise/music is present
     const MAX_MS = 300000;        // hard cap on one recording (5 min); silence detection ends it sooner
     const RMS_THRESHOLD = 0.015;  // absolute speech floor (a fast path for QUIET rooms)
     const QUIET_RMS = 0.02;       // background above this = "noisy" -> use the long window
     const SPEECH_FACTOR = 2.2;    // (reserved)
-    const STABLE_MS = 4000;       // committed words unchanged this long -> end of speech (client fallback)
-    const GAP_S = 3.0;            // Whisper-VAD trailing silence (real, noise-immune) -> end of speech
+    const STABLE_MS = 6000;       // committed words unchanged this long -> end of speech (client fallback)
+    const GAP_S = 5.0;            // Whisper-VAD trailing silence (real, noise-immune) -> end of speech
     // Whisper processes at most 30 seconds of audio per inference call. Sending more
     // is wasteful: the model silently truncates the front, serialization is slower,
     // and the larger blob causes partial-transcription latency to grow unboundedly as
@@ -540,8 +546,8 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
             // Short dictations stay snappy; long ones tolerate natural inter-sentence
             // pauses without prematurely ending mid-thought.
             const wordCount = committedWords.length;
-            const adaptedSilenceMs = wordCount > 30 ? silenceMs + 2000
-                                   : wordCount > 12 ? silenceMs + 1000
+            const adaptedSilenceMs = wordCount > 30 ? silenceMs + 4000
+                                   : wordCount > 12 ? silenceMs + 2000
                                    : silenceMs;
             controller._silenceTimer = setTimeout(maybeFinish, adaptedSilenceMs);
           }
@@ -689,8 +695,8 @@ function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon) {
           //     Same mic-confirmation guard: don't fire if the model was just slow.
           //     Adaptive: require more stable time for longer messages, matching the
           //     longer inter-sentence pauses that long dictations naturally produce.
-          const adaptedStableMs = committedWords.length > 30 ? STABLE_MS + 3000
-                                 : committedWords.length > 12 ? STABLE_MS + 1500
+          const adaptedStableMs = committedWords.length > 30 ? STABLE_MS + 4000
+                                 : committedWords.length > 12 ? STABLE_MS + 2500
                                  : STABLE_MS;
           if (committedWords.length === controller._lastCommitLen) {
             if (haveText && committedWords.length > 0 &&

@@ -32,6 +32,15 @@ function escHtml(str) {
 // hides one of them calls it.  If you add a new floating notice, add it to
 // _floatEls() rather than giving it its own corner.
 const _FLOAT_GAP = 8;
+// Clearance between the bottom of the stack and the top of the composer.
+// It MUST exceed the largest entry-animation travel of any float, because each
+// one slides up into place from below its final `bottom` and is measurably
+// lower for the length of that animation.  At 12px the git-sync indicator
+// (translateY(16px)) and the compose undo toast (translateY(20px)) dipped over
+// the paste / mic / Send buttons for ~350ms every time they appeared.  The
+// travels are normalised to 10px in CSS; 14px keeps a positive gap through the
+// whole animation.  If you raise a float's entry transform, raise this too.
+const _FLOAT_CLEARANCE = 14;
 let _floatLift = 20;
 
 function _floatEls() {
@@ -58,10 +67,23 @@ let _floatRO = null, _floatObserved = null;
 function _updateFloatOffset() {
   const bar = document.getElementById('live-input-bar');
   let lift = 20;
-  if (bar && bar.offsetParent) {
+  // The on-screen test is getClientRects(), NOT offsetParent.  offsetParent is
+  // null for ANY position:fixed element in Blink and WebKit, and the phone
+  // layout pins the composer with position:fixed (mobile.css .live-input-bar).
+  // So on every phone the bar measured as "not on screen", the lift fell back
+  // to 20px, and the whole stack landed squarely on the paste / mic / Send
+  // buttons — the exact overlap this stack exists to prevent (reported
+  // 2026-10-05, hours after the stack itself shipped).  Verified in Chromium:
+  // offsetParent null, lift 20, all three buttons covered; with
+  // getClientRects() the lift clears the bar and nothing intersects.
+  // getClientRects() is empty only for a genuinely unrendered box
+  // (display:none, detached), which is the one case where there is no composer
+  // to clear.  Do NOT go back to offsetParent, :visible-style checks, or
+  // `bar.offsetHeight` guards that read 0 under a hidden ancestor.
+  if (bar && bar.getClientRects().length) {
     const r = bar.getBoundingClientRect();
     if (r.height > 0 && r.top < window.innerHeight) {
-      lift = Math.max(20, Math.round(window.innerHeight - r.top + 12));
+      lift = Math.max(20, Math.round(window.innerHeight - r.top + _FLOAT_CLEARANCE));
     }
   }
   _floatLift = lift;

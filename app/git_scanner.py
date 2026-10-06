@@ -251,6 +251,15 @@ _PRIVATE_DOC_PATTERNS = [
     re.compile(r'(?i)(resume|curriculum[_-]?vitae|cv[_-]|cover[_-]?letter|job[_-]?offer|offer[_-]?letter)'),
 ]
 
+# Max file size to scan for secrets. Larger files are reported as unscannable
+# so a human reviews them. The limit is a scan-budget cap, not a security
+# judgement — regex scanning stays well under a second at this size, and the
+# "Owner Name" / "Hardcoded User Path" patterns still need to run against
+# large legitimate source files (CSS, bundled JS). Raise before adding
+# per-extension skips: skipping by type silently exempts real patterns from
+# the scan, size does not.
+_MAX_SCAN_SIZE = 2_000_000
+
 # Binary/large files that shouldn't be in a repo
 _BINARY_EXTENSIONS = {
     '.exe', '.dll', '.so', '.dylib', '.bin', '.dat', '.db', '.sqlite', '.sqlite3',
@@ -358,7 +367,7 @@ def scan_staged_files(proj: Path = None) -> Dict:
             continue
         try:
             fsize = full.stat().st_size
-            if fsize > 500_000:
+            if fsize > _MAX_SCAN_SIZE:
                 blocked_files.append({"file": fpath, "reason": f"File too large to scan ({fsize:,} bytes) — review manually"})
                 continue
             content = full.read_text(encoding='utf-8', errors='ignore')
@@ -498,7 +507,7 @@ def scan_staged_files_stream(proj: Path = None):
             continue
         try:
             fsize = full.stat().st_size
-            if fsize > 500_000:
+            if fsize > _MAX_SCAN_SIZE:
                 blocked_files.append({"file": fpath, "reason": f"File too large to scan ({fsize:,} bytes) — review manually"})
                 continue
             content = full.read_text(encoding='utf-8', errors='ignore')
