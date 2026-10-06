@@ -1147,6 +1147,7 @@ function _composeFlushPendingDeletes() {
     _composeExecuteDeletes(pd.ids);
   }
   _composePendingDeletes = [];
+  _composeRestackToasts();
 }
 
 async function _composeExecuteDeletes(ids) {
@@ -1159,10 +1160,10 @@ async function _composeExecuteDeletes(ids) {
   }
 }
 
+/** Undo toasts live in the app-wide float stack (utils.js _layoutFloats),
+ *  which stacks them with every other notice so none overlap. */
 function _composeRestackToasts() {
-  _composePendingDeletes.forEach((pd, i) => {
-    if (pd.toastEl) pd.toastEl.style.bottom = (24 + i * 52) + 'px';
-  });
+  if (typeof _layoutFloats === 'function') _layoutFloats();
 }
 
 function _composeScheduleDelete(ids, label) {
@@ -1175,13 +1176,13 @@ function _composeScheduleDelete(ids, label) {
     if (_proj) localStorage.removeItem('activeComposition:' + _proj);
   }
 
-  // Build undo toast — offset vertically when multiple toasts are active
+  // Build undo toast — placed and stacked by the shared float stack.
   const toast = document.createElement('div');
   toast.className = 'compose-undo-toast';
-  toast.style.bottom = (24 + _composePendingDeletes.length * 52) + 'px';
   toast.innerHTML = '<span>' + (typeof escHtml === 'function' ? escHtml(label) : label) + '</span>' +
     '<button class="compose-undo-btn">Undo</button>';
   document.body.appendChild(toast);
+  if (typeof _updateFloatOffset === 'function') _updateFloatOffset();
   requestAnimationFrame(() => toast.classList.add('show'));
 
   const pd = {ids: ids, timer: null, toastEl: toast};

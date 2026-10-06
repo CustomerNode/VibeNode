@@ -15,10 +15,74 @@ function escHtml(str) {
     .replace(/"/g,'&quot;');
 }
 
+// ---------------------------------------------------------------------------
+// Floating notices: ONE place, clear of the chat composer
+// ---------------------------------------------------------------------------
+// Every bottom-of-screen notice lives in one stack on the right, just above
+// the chat composer (or 20px off the corner when no composer is on screen):
+//   - #git-sync-mini       "Pulling & pushing..." (clickable)
+//   - .vn-undo-toast       "Session slept · Undo" (clickable)
+//   - .compose-undo-toast  "Deleted · Undo" in Compose (clickable)
+//   - #toast               plain notices
+// They used to sit in three different corners at fixed offsets, and the
+// bottom-right ones covered the composer's Send button; the clickable ones
+// physically blocked it (reported 2026-10-05).  _layoutFloats() is the ONE
+// writer of their `bottom`: it stacks whatever is showing, nearest-first in
+// the order above, so two notices never overlap.  Anything that shows or
+// hides one of them calls it.  If you add a new floating notice, add it to
+// _floatEls() rather than giving it its own corner.
+const _FLOAT_GAP = 8;
+let _floatLift = 20;
+
+function _floatEls() {
+  const out = [];
+  const mini = document.getElementById('git-sync-mini');
+  if (mini && mini.classList.contains('show')) out.push(mini);
+  document.querySelectorAll('.vn-undo-toast, .compose-undo-toast').forEach(e => out.push(e));
+  const t = document.getElementById('toast');
+  if (t && t.classList.contains('show')) out.push(t);
+  return out;
+}
+
+function _layoutFloats() {
+  let y = _floatLift;
+  _floatEls().forEach(e => {
+    e.style.bottom = y + 'px';
+    y += e.offsetHeight + _FLOAT_GAP;
+  });
+}
+
+// The composer's height changes as you type, so a ResizeObserver keeps the
+// lift current while it is on screen.
+let _floatRO = null, _floatObserved = null;
+function _updateFloatOffset() {
+  const bar = document.getElementById('live-input-bar');
+  let lift = 20;
+  if (bar && bar.offsetParent) {
+    const r = bar.getBoundingClientRect();
+    if (r.height > 0 && r.top < window.innerHeight) {
+      lift = Math.max(20, Math.round(window.innerHeight - r.top + 12));
+    }
+  }
+  _floatLift = lift;
+  document.documentElement.style.setProperty('--vn-float-bottom', lift + 'px');
+  _layoutFloats();
+  if (bar !== _floatObserved && typeof ResizeObserver === 'function') {
+    if (_floatRO) _floatRO.disconnect();
+    _floatObserved = bar;
+    if (bar) {
+      if (!_floatRO) _floatRO = new ResizeObserver(() => _updateFloatOffset());
+      _floatRO.observe(bar);
+    }
+  }
+}
+window.addEventListener('resize', _updateFloatOffset);
+
 function showToast(msg, isError=false) {
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.className = 'toast show' + (isError ? ' error' : '');
+  _updateFloatOffset();                 // measure + place with the new text
   setTimeout(() => { t.classList.remove('show'); }, 3000);
 }
 

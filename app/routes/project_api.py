@@ -28,6 +28,29 @@ from ..config import (
 bp = Blueprint('project_api', __name__)
 
 
+@bp.route("/api/repo-project")
+def api_repo_project():
+    """The VibeNode repo itself, as a project: its path and encoded id.
+
+    The Publish gate's "Fix errors" / "Fix with AI" sessions work on THIS
+    repo's tests and scan results, so they must be created in this repo's
+    project no matter which project the browser happens to be showing.
+    Before this existed, the fix session was spawned in the browser's active
+    project (a "Fix test failures" session landed in CustomerNode, 2026-10-05).
+    ``registered`` says whether the repo already appears in the project list,
+    so the client knows it can switch to it.
+    """
+    from ..config import _VIBENODE_DIR
+    root = str(_VIBENODE_DIR)
+    encoded = _encode_cwd(root)
+    return jsonify({
+        "ok": True,
+        "root": root,
+        "project": encoded,
+        "registered": (_CLAUDE_PROJECTS / encoded).is_dir(),
+    })
+
+
 @bp.route("/api/projects")
 def api_projects():
     # Show all projects under the user's home directory on every platform.

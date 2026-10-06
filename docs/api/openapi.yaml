@@ -1275,6 +1275,36 @@ paths:
   # ==========================================================================
   # Projects (project_api.py)
   # ==========================================================================
+  /api/repo-project:
+    get:
+      tags: [Projects]
+      summary: The VibeNode repo itself, as a project
+      operationId: getRepoProject
+      description: |
+        Path and encoded project id of the running VibeNode repo. The Publish
+        gate's fix sessions ("Fix errors" after a failed test run, "Fix with
+        AI" after a security scan) work on this repo, so the client creates
+        them in this project regardless of which project is active in the
+        browser. `registered` reports whether the repo already appears in
+        the project list, so the client knows it can switch to it.
+      responses:
+        "200":
+          description: Repo project info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  root:
+                    type: string
+                    description: Absolute filesystem path of the repo
+                  project:
+                    type: string
+                    description: Encoded project directory name
+                  registered:
+                    type: boolean
   /api/projects:
     get:
       tags: [Projects]

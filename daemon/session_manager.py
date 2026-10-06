@@ -1067,6 +1067,71 @@ class SessionManager:
         """Resolve a session ID through aliases (old_id -> new_id)."""
         return self._id_aliases.get(session_id, session_id)
 
+    def _remap_session_id(self, old_id: str, new_id: Optional[str],
+                          info: "SessionInfo") -> None:
+        """Adopt the CLI's real session id for a session we launched under a
+        temporary client id, rewriting every reference to it.
+
+        Fired from TWO places: the RESULT handler (as before) AND the ``init``
+        handler, which runs seconds into the turn the moment the CLI announces
+        its id.  The ``init`` trigger is the fix: without it, a first turn that
+        CRASHED before any RESULT (seen 2026-10-05, Windows CLI exit code
+        3221225786) left the launch id stranded in ``_sessions`` as a fileless
+        "working" row, while the real transcript lived under the CLI's id — so
+        the same session showed up TWICE in the sidebar (the duplicate
+        "Source Code Fix" / "Template Fix" rows in CustomerNode).
+
+        Idempotent: a no-op when there is nothing to remap or when this exact
+        remap already ran, so the later RESULT re-firing it costs nothing.
+        """
+        if not new_id or new_id == old_id:
+            return
+        if self._id_aliases.get(old_id) == new_id:
+            return  # already remapped (init did it; RESULT is re-firing)
+        logger.info(
+            "SDK assigned session_id %s (we used %s) — remapping",
+            new_id, old_id,
+        )
+        info.session_id = new_id
+        with self._lock:
+            self._sessions[new_id] = info
+            if old_id in self._sessions:
+                del self._sessions[old_id]
+            self._id_aliases[old_id] = new_id
+
+        # Remap queue to the new id
+        self._mq.remap_session_id(old_id, new_id)
+
+        # Remap user-set name to the new id (server-side, no race)
+        try:
+            from app.config import _remap_name
+            _remap_name(old_id, new_id)
+        except Exception:
+            pass
+
+        # Persist the old temp id so all_sessions() filters it out even if
+        # in-memory aliases haven't synced yet on refresh.
+        try:
+            from app.config import _mark_remapped
+            _mark_remapped(old_id, new_id)
+        except Exception:
+            pass
+
+        # Remap kanban task↔session links so they point to the new id
+        try:
+            from app.db import create_repository
+            repo = create_repository()
+            repo.remap_session(old_id, new_id)
+        except Exception:
+            pass
+
+        # Notify frontend to update its references (URL, activeId, etc.)
+        if self._push_callback:
+            self._push_callback(
+                'session_id_remapped',
+                {'old_id': old_id, 'new_id': new_id},
+            )
+
     def start_session(
         self, session_id: str, prompt: str = "", cwd: str = "",
         name: str = "", resume: bool = False,
@@ -1141,6 +1206,17 @@ class SessionManager:
             return self.send_message(session_id, prompt)
 
 
+        # A resume with no cwd takes it from the session's own transcript.
+        # Without this the CLI started in the daemon's own directory (the
+        # VibeNode repo): a CustomerNode session whose registry entry had an
+        # empty cwd was woken by a model switch, ran in the wrong folder with
+        # the wrong CLAUDE.md, and showed up under VibeNode as "New Session"
+        # (2026-10-05).  The transcript records the real cwd on every line.
+        if resume and not cwd:
+            cwd = self._transcript_cwd(session_id)
+            if cwd:
+                logger.info("start_session: resume of %s had no cwd; using "
+                            "transcript cwd %s", session_id, cwd)
         # Normalize cwd to OS-native path separators (cross-platform)
         if cwd:
             cwd = os.path.normpath(cwd)
@@ -1706,6 +1782,45 @@ class SessionManager:
             self._interrupt_session(session_id, task_to_cancel), self._loop
         )
         return {"ok": True}
+
+    def _transcript_cwd(self, session_id: str) -> str:
+        """The session's home folder, recovered from its transcript, or ''.
+
+        A transcript line's ``cwd`` follows every ``cd`` the session makes, so
+        "the latest cwd" can be a deep subfolder, or the wrong folder a bad
+        wake put it in.  The reliable signal is WHERE the transcript lives:
+        ``~/.claude/projects/<encoded>/`` is the encoding of the session's
+        home folder.  So the answer is the first recorded ``cwd`` whose
+        encoding matches that directory name (seen 2026-10-05: 829 cwd lines
+        across 9 folders, including 41 wrong VibeNode ones, with exactly one
+        folder matching the CustomerNode project directory).  Only an
+        existing directory is returned.
+        """
+        try:
+            path = self._store.find_session_path(session_id)
+        except Exception:
+            path = None
+        if not path:
+            return ""
+        try:
+            from app.config import _encode_cwd
+        except Exception:
+            return ""
+        home = path.parent.name
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    if '"cwd"' not in line:
+                        continue
+                    try:
+                        cwd = (json.loads(line).get("cwd") or "").strip()
+                    except ValueError:
+                        continue
+                    if cwd and _encode_cwd(cwd) == home and os.path.isdir(cwd):
+                        return cwd
+        except OSError:
+            return ""
+        return ""
 
     @staticmethod
     def _cli_model_id(model: Optional[str]) -> str:
@@ -5681,6 +5796,15 @@ class SessionManager:
                         self._broadcast_model_changed(
                             session_id, info, info.model)
 
+                # Adopt the CLI's real session id the instant it announces it,
+                # not only when a turn completes.  A first turn that crashes
+                # before RESULT otherwise strands our launch id as a fileless
+                # phantom "working" row (see _remap_session_id).  Done AFTER the
+                # model broadcast above so that still emits under the launch id
+                # the client currently knows (historical order).  Idempotent,
+                # so the later RESULT re-firing this is harmless.
+                self._remap_session_id(session_id, data.get("session_id"), info)
+
                 # End of the SDK's compaction phase (or session re-init).
                 # Substatus handling is subtle — the UI's "Compacting…" label
                 # must span the *perceived* compaction time, not just the
@@ -5932,53 +6056,10 @@ class SessionManager:
                 if info.error:
                     info.error = ""
 
-            # Remap session ID if the SDK assigned a different one
-            result_session_id = message.session_id
-            if result_session_id and result_session_id != session_id:
-                logger.info(
-                    "SDK assigned session_id %s (we used %s) — remapping",
-                    result_session_id, session_id
-                )
-                # Update the session info and remap in _sessions dict
-                info.session_id = result_session_id
-                with self._lock:
-                    self._sessions[result_session_id] = info
-                    if session_id in self._sessions:
-                        del self._sessions[session_id]
-                    self._id_aliases[session_id] = result_session_id
-
-                # Remap queue to new session ID
-                self._mq.remap_session_id(session_id, result_session_id)
-
-                # Remap user-set name to the new ID (server-side, no race)
-                try:
-                    from app.config import _remap_name
-                    _remap_name(session_id, result_session_id)
-                except Exception:
-                    pass
-
-                # Persist the old temp ID so all_sessions() filters it out
-                # even if in-memory aliases haven't synced yet on refresh.
-                try:
-                    from app.config import _mark_remapped
-                    _mark_remapped(session_id, result_session_id)
-                except Exception:
-                    pass
-
-                # Remap kanban task↔session links so they point to the new ID
-                try:
-                    from app.db import create_repository
-                    repo = create_repository()
-                    repo.remap_session(session_id, result_session_id)
-                except Exception:
-                    pass
-
-                # Notify frontend to update its references (URL, activeId, etc.)
-                if self._push_callback:
-                    self._push_callback(
-                        'session_id_remapped',
-                        {'old_id': session_id, 'new_id': result_session_id}
-                    )
+            # Remap session ID if the SDK assigned a different one.  The init
+            # handler usually did this already (so a first-turn crash can't
+            # strand a phantom); this is the backstop for the no-init path.
+            self._remap_session_id(session_id, message.session_id, info)
 
             # Don't clobber state if the listener has been superseded —
             # ``send_message`` has flipped state to WORKING for a new

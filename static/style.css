@@ -2037,7 +2037,9 @@ body.unread-enabled .session-item .unread-dot {
 .git-sync-mini {
   display: none;
   position: fixed;
-  bottom: 20px;
+  /* Shared float stack above the chat composer, so it never covers Send
+     (utils.js _layoutFloats sets the real `bottom`). */
+  bottom: var(--vn-float-bottom, 20px);
   right: 20px;
   z-index: 200;
   background: var(--bg-modal, #1a1a2e);
@@ -2267,7 +2269,7 @@ body.unread-enabled .session-item .unread-dot {
 /* ===== Toast ===== */
 .toast {
   position: fixed;
-  bottom: 20px; right: 20px;
+  bottom: var(--vn-float-bottom, 20px); right: 20px;   /* clears the composer: utils.js _updateFloatOffset */
   background: var(--bg-toast);
   border: 1px solid var(--border-toast);
   color: var(--text-toast);
@@ -2316,16 +2318,16 @@ body.unread-enabled .session-item .unread-dot {
 }
 .toast.error::before { content: '\26A0\FE0E'; }
 
-/* ===== Undo Toast (bottom-left, actionable) =====
+/* ===== Undo Toast (actionable) =====
    Separate from `.toast` so it doesn't inherit that toast's `pointer-events:none`
    (the plain toast is a fire-and-forget notification; this one has a button and
-   must be clickable) and doesn't fight it for the same corner if both are shown
-   at once. Bottom-left placement puts it out of the way of the normal
-   bottom-right toast stream so a rapid sleep-followed-by-something-else sequence
-   doesn't stack ambiguously in one corner. */
+   must be clickable).  It lives in the shared float stack above the composer
+   (utils.js _layoutFloats), which sets `bottom` and stacks it with the other
+   notices, so it never overlaps them.  It used to sit bottom-left, where on a
+   phone it covered the model/status control. */
 .vn-undo-toast {
   position: fixed;
-  bottom: 20px; left: 20px;
+  bottom: var(--vn-float-bottom, 20px); right: 20px;
   background: var(--bg-toast);
   border: 1px solid var(--border-toast);
   color: var(--text-toast);
@@ -8561,9 +8563,11 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
 }
 .compose-undo-toast {
   position: fixed;
-  bottom: 24px;
-  left: 50%;
-  transform: translateX(-50%) translateY(20px);
+  /* Shared float stack (utils.js _layoutFloats) sets the real `bottom`. */
+  bottom: var(--vn-float-bottom, 20px);
+  right: 20px;
+  max-width: calc(100vw - 40px);
+  transform: translateY(20px);
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--r-md);
@@ -8580,7 +8584,7 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
 }
 .compose-undo-toast.show {
   opacity: 1;
-  transform: translateX(-50%) translateY(0);
+  transform: translateY(0);
 }
 .compose-undo-btn {
   font-size: var(--fs-md);
@@ -13609,7 +13613,9 @@ header #git-badge-push svg, header #git-badge-pull svg, header #git-badge-sync s
 .toast.error::before { content: ''; background: #ff6b6b; opacity: 1; -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='9.5'/%3E%3Cpath d='M12 7.5v5.5'/%3E%3Cpath d='M12 16.6v.1'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='9.5'/%3E%3Cpath d='M12 7.5v5.5'/%3E%3Cpath d='M12 16.6v.1'/%3E%3C/svg%3E"); }
 @media (min-width: 769px) {
   .toast, .toast.error {
-    bottom: 22px; right: 22px; padding: 10px 15px 10px 13px; border-radius: 12px; text-align: left;
+    /* Was `bottom: 22px`, which beat the base rule's lift on desktop and left
+       the toast over the Send button.  The float stack owns `bottom`. */
+    bottom: var(--vn-float-bottom, 20px); right: 20px; padding: 10px 15px 10px 13px; border-radius: 12px; text-align: left;
     font-family: var(--font-sans); font-size: 13px; font-weight: 500; line-height: 1.45; color: #fff;
     background: rgba(26, 26, 30, .94); border: 1px solid rgba(255, 255, 255, .12);
     -webkit-backdrop-filter: blur(20px) saturate(160%); backdrop-filter: blur(20px) saturate(160%);

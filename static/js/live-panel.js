@@ -2287,6 +2287,9 @@ function updateLiveInputBar() {
   const id = liveSessionId;
   const bar = document.getElementById('live-input-bar');
   if (!bar) return;
+  // Keep floating notices (toast, git-sync indicator) above this composer.
+  // Cheap: re-observes only when the bar element itself changed.
+  if (typeof _updateFloatOffset === 'function') _updateFloatOffset();
 
   // Track whether focus was inside this bar before re-render so we can
   // restore it synchronously after innerHTML replacement (avoids focus flash).

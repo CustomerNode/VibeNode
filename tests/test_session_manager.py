@@ -600,6 +600,57 @@ class TestSetSessionModel:
         assert mock_drive.call_args.kwargs["model"] == "claude-opus-5[1m]"
         assert session_manager._sessions[sid].model == "claude-opus-5[1m]"
 
+    def test_resume_without_cwd_uses_transcript_cwd(self, session_manager, tmp_path):
+        """A resume with no cwd must run in the folder the transcript records.
+
+        Seen 2026-10-05: a CustomerNode session whose registry entry had an
+        empty cwd was woken by a model switch.  With no cwd the CLI started in
+        the daemon's own directory (the VibeNode repo), so the session ran in
+        the wrong folder and showed up under VibeNode as "New Session".
+        """
+        import json as _json
+        from app.config import _encode_cwd
+        proj = tmp_path / "CustomerNode"
+        sub = proj / "subprojects" / "migration"
+        wrong = tmp_path / "VibeNode"
+        sub.mkdir(parents=True)
+        wrong.mkdir()
+        sid = "sm-no-cwd"
+        # The transcript lives in the home project's directory, like Claude
+        # Code stores it.  Its lines record cd's into a subfolder and lines
+        # written after a bad wake in the wrong folder; neither is home.
+        home_dir = tmp_path / "projects" / _encode_cwd(str(proj))
+        home_dir.mkdir(parents=True)
+        tx = home_dir / f"{sid}.jsonl"
+        tx.write_text("\n".join([
+            _json.dumps({"type": "user", "cwd": str(sub)}),
+            _json.dumps({"type": "assistant", "cwd": str(proj)}),
+            _json.dumps({"type": "user", "cwd": str(wrong)}),
+            _json.dumps({"type": "assistant", "cwd": str(sub)}),
+        ]) + "\n", encoding="utf-8")
+        with patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": {sid: {"cwd": "", "name": ""}}}), \
+             patch.object(session_manager._store, 'find_session_path', return_value=tx), \
+             patch.object(session_manager, '_drive_session',
+                          new=AsyncMock(return_value=None)) as mock_drive:
+            result = session_manager.start_session(sid, prompt="", cwd="", resume=True)
+            assert result["ok"] is True
+            wait_for(lambda: mock_drive.await_count == 1, timeout=5)
+        assert mock_drive.call_args.args[2] == os.path.normpath(str(proj))
+
+    def test_transcript_cwd_skips_missing_dirs_and_no_transcript(self, session_manager, tmp_path):
+        import json as _json
+        from app.config import _encode_cwd
+        gone = tmp_path / "deleted-folder"
+        d = tmp_path / "projects" / _encode_cwd(str(gone))
+        d.mkdir(parents=True)
+        tx = d / "t.jsonl"
+        tx.write_text(_json.dumps({"cwd": str(gone)}) + "\n", encoding="utf-8")
+        with patch.object(session_manager._store, 'find_session_path', return_value=tx):
+            assert session_manager._transcript_cwd("x") == ""
+        with patch.object(session_manager._store, 'find_session_path', return_value=None):
+            assert session_manager._transcript_cwd("x") == ""
+
     def test_explicit_wake_model_beats_registry(self, session_manager):
         """A caller-supplied model always wins over the registry seed."""
         sid = "sm-wake-explicit"
@@ -660,6 +711,79 @@ class TestSetSessionModel:
         assert len(ev) == 1
         assert ev[0]["model"] == "claude-sonnet-4-6"
         assert info.model == "claude-sonnet-4-6"
+
+    # ── init-time remap prevents the phantom-duplicate session ─────────────
+    # A session launched under a client temp id must adopt the CLI's real id
+    # as soon as the init message announces it — NOT only on a completed
+    # RESULT.  A first turn that crashed before RESULT otherwise stranded the
+    # temp id as a fileless "working" row while the real transcript lived
+    # under the CLI id, so the session showed up twice (2026-10-05,
+    # duplicate "Source Code Fix" / "Template Fix" in CustomerNode).
+
+    def _send(self, session_manager, sid, msg):
+        asyncio.run_coroutine_threadsafe(
+            session_manager._process_message(sid, msg),
+            session_manager._loop,
+        ).result(timeout=5)
+
+    def test_init_remaps_temp_id_to_cli_id(self, session_manager, sm_module):
+        from daemon.backends.messages import VibeNodeMessage, MessageKind
+        info = self._make_session(session_manager, sm_module, "temp-x")
+        pushes = []
+        session_manager._push_callback = lambda n, d: pushes.append((n, d))
+        # init with no "model" key keeps the test to the remap alone.
+        self._send(session_manager, "temp-x", VibeNodeMessage(
+            kind=MessageKind.SYSTEM, subtype="init",
+            data={"session_id": "real-x"}))
+        assert session_manager._id_aliases.get("temp-x") == "real-x"
+        assert "real-x" in session_manager._sessions
+        assert "temp-x" not in session_manager._sessions
+        assert info.session_id == "real-x"
+        assert any(n == "session_id_remapped"
+                   and d == {"old_id": "temp-x", "new_id": "real-x"}
+                   for n, d in pushes)
+
+    def test_phantom_not_stranded_when_turn_crashes_before_result(
+            self, session_manager, sm_module):
+        """init remaps; then NO result arrives (the CLI crashed).  There must
+        be exactly one session, under the CLI id — no temp-id phantom."""
+        from daemon.backends.messages import VibeNodeMessage, MessageKind
+        self._make_session(session_manager, sm_module, "temp-c")
+        session_manager._push_callback = lambda n, d: None
+        self._send(session_manager, "temp-c", VibeNodeMessage(
+            kind=MessageKind.SYSTEM, subtype="init",
+            data={"session_id": "real-c"}))
+        # (no RESULT — the turn died)
+        assert "real-c" in session_manager._sessions
+        assert "temp-c" not in session_manager._sessions
+
+    def test_result_after_init_remap_is_idempotent(self, session_manager, sm_module):
+        """The RESULT backstop re-fires the remap; it must be a no-op, not a
+        second remap or a duplicate push."""
+        from daemon.backends.messages import VibeNodeMessage, MessageKind
+        info = self._make_session(session_manager, sm_module, "temp-i")
+        pushes = []
+        session_manager._push_callback = lambda n, d: pushes.append((n, d))
+        self._send(session_manager, "temp-i", VibeNodeMessage(
+            kind=MessageKind.SYSTEM, subtype="init",
+            data={"session_id": "real-i"}))
+        self._send(session_manager, "temp-i", VibeNodeMessage(
+            kind=MessageKind.RESULT, subtype="success",
+            is_error=False, session_id="real-i"))
+        remaps = [d for n, d in pushes if n == "session_id_remapped"]
+        assert len(remaps) == 1
+        assert info.session_id == "real-i"
+        assert "temp-i" not in session_manager._sessions
+
+    def test_init_without_new_id_or_same_id_is_noop(self, session_manager, sm_module):
+        from daemon.backends.messages import VibeNodeMessage, MessageKind
+        self._make_session(session_manager, sm_module, "keep-id")
+        session_manager._push_callback = lambda n, d: None
+        for data in ({}, {"session_id": ""}, {"session_id": "keep-id"}):
+            self._send(session_manager, "keep-id", VibeNodeMessage(
+                kind=MessageKind.SYSTEM, subtype="init", data=data))
+        assert "keep-id" in session_manager._sessions
+        assert "keep-id" not in session_manager._id_aliases
 
     def test_model_switch_flag_self_expires(self, session_manager, sm_module):
         """A live switch arms ``_model_switch_in_progress`` so the CLI's

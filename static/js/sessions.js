@@ -1201,6 +1201,7 @@ let _vnUndoToastEl = null;
 let _vnUndoToastTimer = null;
 function _showUndoToast(msg, actionLabel, onAction, timeoutMs) {
   // Dismiss any prior undo toast without invoking its handler — see comment above.
+  // (The layout call below, after the new one is appended, restacks.)
   if (_vnUndoToastEl) {
     try { _vnUndoToastEl.remove(); } catch (e) {}
     _vnUndoToastEl = null;
@@ -1222,6 +1223,8 @@ function _showUndoToast(msg, actionLabel, onAction, timeoutMs) {
   el.appendChild(msgSpan);
   el.appendChild(btn);
   document.body.appendChild(el);
+  // Place it in the shared float stack (utils.js) before it fades in.
+  if (typeof _updateFloatOffset === 'function') _updateFloatOffset();
   // Trigger CSS enter transition on next frame — appending with .show already
   // set would skip the transition entirely (opacity/transform start at target).
   requestAnimationFrame(() => { el.classList.add('show'); });
@@ -1232,7 +1235,11 @@ function _showUndoToast(msg, actionLabel, onAction, timeoutMs) {
     if (_vnUndoToastEl !== el) return;  // already replaced
     el.classList.remove('show');
     // Let the fade-out play before removing so the last frame doesn't clip.
-    setTimeout(() => { try { el.remove(); } catch (e) {} if (_vnUndoToastEl === el) _vnUndoToastEl = null; }, 250);
+    setTimeout(() => {
+      try { el.remove(); } catch (e) {}
+      if (_vnUndoToastEl === el) _vnUndoToastEl = null;
+      if (typeof _layoutFloats === 'function') _layoutFloats();
+    }, 250);
   };
 
   btn.addEventListener('click', function(ev) {

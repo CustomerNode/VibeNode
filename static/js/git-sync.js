@@ -406,11 +406,13 @@ function minimizeGitSyncModal() {
   spinner.className = 'git-sync-mini-spinner working';
   closeBtn.style.display = 'none';
   mini.classList.add('show');
+  if (typeof _updateFloatOffset === 'function') _updateFloatOffset();   // shared float stack (utils.js)
 }
 
 function restoreGitSyncModal() {
   _gitSyncMinimized = false;
   document.getElementById('git-sync-mini').classList.remove('show');
+  if (typeof _layoutFloats === 'function') _layoutFloats();
   document.getElementById('git-sync-overlay').classList.add('show');
 }
 
@@ -418,6 +420,7 @@ function _dismissMiniIndicator() {
   _gitSyncMinimized = false;
   _gitSyncFinished = false;
   document.getElementById('git-sync-mini').classList.remove('show');
+  if (typeof _layoutFloats === 'function') _layoutFloats();
 }
 
 function dismissGitSyncMini() {
@@ -439,6 +442,7 @@ function _notifyMiniComplete(title, isOk) {
   label.textContent = title;
   spinner.className = 'git-sync-mini-spinner ' + (isOk ? 'done' : 'error');
   closeBtn.style.display = 'inline-flex';
+  if (typeof _layoutFloats === 'function') _layoutFloats();   // its size just changed
   // Flash the indicator to draw attention
   const mini = document.getElementById('git-sync-mini');
   mini.classList.add('flash');
@@ -768,7 +772,40 @@ function _launchRemediationSession(scan) {
  * buttons.  Uses the system default model and thinking level, like any new
  * session the user starts.
  */
-function _startFixSession(title, preview, prompt) {
+let _repoProjectCache = null;
+/** The VibeNode repo as a project ({root, project, registered}), or null. */
+async function _repoProject() {
+  if (_repoProjectCache) return _repoProjectCache;
+  try {
+    const r = await fetch('/api/repo-project');
+    const d = r.ok ? await r.json() : null;
+    if (d && d.ok && d.root && d.project) _repoProjectCache = d;
+  } catch (_) {}
+  return _repoProjectCache;
+}
+
+async function _startFixSession(title, preview, prompt) {
+  // The fix session works on THIS repo (its tests, its scan), so it is created
+  // in the repo's own project, never in whatever project the browser is
+  // showing.  Using the active project put a "Fix test failures" session in
+  // CustomerNode (2026-10-05).  If the browser is elsewhere, switch first so
+  // the user watches the session where it actually lives.
+  const repo = await _repoProject();
+  let cwd = (typeof _currentProjectDir === 'function') ? _currentProjectDir() : '';
+  let project = localStorage.getItem('activeProject') || '';
+  if (repo) {
+    cwd = repo.root;
+    project = repo.project;
+    if (localStorage.getItem('activeProject') !== repo.project) {
+      const known = (typeof _allProjects !== 'undefined') && _allProjects.some(p => p.encoded === repo.project);
+      if (known && typeof setProject === 'function') {
+        await setProject(repo.project, true);
+      } else if (typeof showToast === 'function') {
+        showToast('Fix session created in the VibeNode project');
+      }
+    }
+  }
+
   // Switch to sessions view and create a new session
   if (typeof setViewMode === 'function' && typeof viewMode !== 'undefined' && viewMode !== 'sessions') {
     setViewMode('sessions');
@@ -808,7 +845,8 @@ function _startFixSession(title, preview, prompt) {
   const startOpts = {
     session_id: newId,
     prompt: prompt,
-    cwd: (typeof _currentProjectDir === 'function') ? _currentProjectDir() : '',
+    cwd: cwd,
+    project: project,
     name: title,
   };
   if (typeof SessionModel !== 'undefined') {
