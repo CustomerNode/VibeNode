@@ -1555,7 +1555,18 @@ function _fillMsgBody(div, kind, fullText, expanded) {
 
   const LIMIT = _MSG_TRUNCATE_LIMIT[kind] != null ? _MSG_TRUNCATE_LIMIT[kind] : 600;
   const truncate = !expanded && renderFull.length > LIMIT;
-  const displayText = truncate ? renderFull.slice(0, LIMIT) : renderFull;
+  // Slicing at exactly LIMIT lands mid-word (e.g. "Review" cut to "Re"), which
+  // reads as corrupted text rather than a deliberate preview. Walk back up to
+  // 120 chars to the nearest whitespace / newline so the cut sits on a word
+  // boundary. If there's no whitespace in the look-back window (very dense
+  // text, URL, etc.), fall back to the hard slice.
+  let displayText = renderFull;
+  if (truncate) {
+    const hard = renderFull.slice(0, LIMIT);
+    const minSoft = Math.max(0, LIMIT - 120);
+    const softCut = Math.max(hard.lastIndexOf('\n'), hard.lastIndexOf(' '));
+    displayText = (softCut >= minSoft) ? renderFull.slice(0, softCut) : hard;
+  }
 
   if (isAsst) {
     bodyEl.innerHTML = mdParse(displayText);

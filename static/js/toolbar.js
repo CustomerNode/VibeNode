@@ -1229,8 +1229,16 @@ async function _confirmPicker() {
   const HIDE_BELOW = 110, SHOW_ABOVE = 140;
   let dragging = false, moved = false, startX = 0, startW = 0, startCollapsed = false;
   const isCollapsed = () => sidebar.classList.contains('collapsed');
-  const setCollapsed = want => { if (isCollapsed() !== want && typeof toggleSidebar === 'function') toggleSidebar(); };
-  handle.title = 'Drag to resize \u00b7 double-click to hide or show';
+  const syncTitle = () => {
+    handle.title = isCollapsed()
+      ? 'Show sessions panel (click or drag right)'
+      : 'Drag to resize \u00b7 double-click to hide';
+  };
+  const setCollapsed = want => {
+    if (isCollapsed() !== want && typeof toggleSidebar === 'function') toggleSidebar();
+    syncTitle();
+  };
+  syncTitle();
   handle.setAttribute('role', 'separator');
   handle.setAttribute('aria-orientation', 'vertical');
   handle.tabIndex = 0;
@@ -1263,6 +1271,7 @@ async function _confirmPicker() {
     document.body.style.userSelect = '';
     // A plain click on the strip of a hidden panel opens it.
     if (!moved && startCollapsed) setCollapsed(false);
+    else syncTitle();
   });
 
   handle.addEventListener('dblclick', () => setCollapsed(!isCollapsed()));

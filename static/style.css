@@ -3030,6 +3030,23 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
   font-family: var(--font-sans);
 }
 .live-expand-btn:hover { color: var(--text-muted); }
+/* The "show more" button under a truncated message bubble is the ONLY way to
+   reveal the rest of a long reply — on mobile the default faint/tiny chevron
+   style disappears into the background. Give it a readable size, an underline,
+   and a 44px touch target so it reads as an action and taps cleanly. Scoped to
+   direct children of .msg so tool-row chevrons keep their minimal styling. */
+.msg > .live-expand-btn {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 8px 12px;
+  min-height: 32px;
+  font-size: var(--fs-md);
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.msg > .live-expand-btn:hover { color: var(--accent); opacity: .8; }
+.msg.user > .live-expand-btn { margin-right: 2px; align-self: flex-end; }
 .live-tool-line { display:flex; align-items:baseline; gap:var(--sp-2); cursor:pointer; user-select:none; }
 .live-tool-icon { color: var(--tool-accent); flex-shrink:0; font-size:var(--fs-sm); }
 .live-tool-name { color: var(--tool-accent-dim); font-weight:600; font-size:var(--fs-sm); flex-shrink:0; }
@@ -13264,7 +13281,11 @@ body.mc-mode #main-panel { width: 100% !important; margin-left: 0 !important; he
 .conversation .live-tool-icon { display: none; }
 .conversation .live-tool-name { font-family: var(--font-sans); font-size: 12px; font-weight: 600; letter-spacing: .01em; line-height: 21px; color: var(--text-muted); }
 .conversation .live-tool-desc { font-family: var(--font-mono); font-size: 11.5px; letter-spacing: 0; line-height: 21px; color: var(--text-muted); opacity: .8; }
-.conversation .live-expand-btn { opacity: 0; padding: 0; justify-self: end; align-self: center; transition: opacity .12s; }
+/* Tool-row chevron only — the message "show more" button lives directly on .msg
+   and must stay visible, otherwise long assistant replies truncate mid-word
+   (fixed 2026-10-06) with no way to expand. Do NOT drop the `.live-tool-line`
+   scope. */
+.conversation .live-tool-line .live-expand-btn { opacity: 0; padding: 0; justify-self: end; align-self: center; transition: opacity .12s; }
 .conversation .live-tool-line:hover .live-expand-btn { opacity: .6; }
 /* result: sits under the command column (38px name column + 10px gap) */
 .conversation .live-result-line { font-family: var(--font-mono); font-size: 11px; line-height: 17px; letter-spacing: 0; padding-left: 48px; position: relative;
@@ -13434,7 +13455,7 @@ body.mc-mode #main-panel { width: 100% !important; margin-left: 0 !important; he
 .conversation .live-result-ok svg { position: static; width: 10px; height: 10px; padding: 5px 0 5px 10px; box-sizing: content-box; margin: 0 !important; opacity: .6;
   pointer-events: auto; cursor: pointer; }
 .conversation .live-result-ok svg:hover { opacity: 1; }
-.conversation .live-expand-btn { display: none; }                    /* the tick sits where the hover arrow was; the row itself still expands on click */
+.conversation .live-tool-line .live-expand-btn { display: none; }    /* tool-row chevron only — a message "show more" button must stay visible, see note at line ~13267 */
 .conversation .live-tool-line { grid-template-columns: minmax(38px, auto) minmax(0, 1fr) 16px; }
 
 /* While the sticky bar is up, the thread is simply cut off just below it
@@ -13666,9 +13687,15 @@ header #git-badge-push svg, header #git-badge-pull svg, header #git-badge-sync s
   .resize-handle:hover::before, .resize-handle.dragging::before, .resize-handle:focus-visible::before { opacity: 1; }
   .resize-handle.dragging::before { height: 56px; margin-top: -28px; }
   .resize-handle:focus-visible { outline: none; }
-  .sidebar.collapsed ~ .resize-handle { width: 12px; cursor: pointer; }
-  .sidebar.collapsed ~ .resize-handle::before { opacity: .6; }
-  .sidebar.collapsed ~ .resize-handle:hover { background: rgba(128,128,140,.08); }
+  /* Hidden panel: the strip must read as a control at a glance.  It used to be a
+     faint 4px pill at 60% opacity, nearly invisible in light theme, so a hidden
+     panel looked like a broken UI.  Now a tinted strip with a chevron. */
+  .sidebar.collapsed ~ .resize-handle { width: 16px; cursor: pointer; background: rgba(128,128,140,.10); border-right: 1px solid var(--border); }
+  .sidebar.collapsed ~ .resize-handle::before { opacity: 1; width: 10px; height: 16px; margin: -8px 0 0 -5px; border-radius: 0; background: var(--text-muted);
+    -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 16' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 3l5 5-5 5'/%3E%3C/svg%3E") center / contain no-repeat;
+    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 16' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 3l5 5-5 5'/%3E%3C/svg%3E") center / contain no-repeat; }
+  .sidebar.collapsed ~ .resize-handle:hover { background: rgba(128,128,140,.20); }
+  .sidebar.collapsed ~ .resize-handle:hover::before, .sidebar.collapsed ~ .resize-handle.dragging::before { height: 16px; margin-top: -8px; background: var(--text-heading); }
 }
 
 /* ── Left panel refinements (desktop) ──
