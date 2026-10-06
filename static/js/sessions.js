@@ -490,13 +490,21 @@ function setSort(mode) {
   }
   localStorage.setItem('sortMode', sortMode);
   localStorage.setItem('sortAsc', sortAsc);
+  // Keep the card grid on the same choice as the list.
+  if (typeof wfSort !== 'undefined') { wfSort = (sortMode === 'date') ? 'recent' : sortMode; localStorage.setItem('wfSort', wfSort); }
   filterSessions();
 }
 
 function sortedSessions(sessions) {
   const copy = [...sessions];
   const dir = sortAsc ? 1 : -1;
-  if (sortMode === 'size') {
+  if (sortMode === 'status') {
+    // "Active first": by state, newest first within each state (same as the cards).
+    const order = {question: 0, working: 1, idle: 2, sleeping: 3};
+    const key = s => s.effective_ts || s.last_activity_ts || s.sort_ts || 0;
+    const rank = s => { const r = order[(typeof getSessionStatus === 'function') ? getSessionStatus(s.id) : 'sleeping']; return r == null ? 3 : r; };
+    copy.sort((a, b) => (rank(a) - rank(b)) || (key(b) - key(a)));
+  } else if (sortMode === 'size') {
     copy.sort((a, b) => dir * ((a.file_bytes || 0) - (b.file_bytes || 0)));
   } else if (sortMode === 'name') {
     copy.sort((a, b) => dir * (a.display_title || '').localeCompare(b.display_title || ''));

@@ -831,7 +831,12 @@ function wfSortedSessions(sessions) {
       return dateKey(b) - dateKey(a);
     });
   } else if (wfSort === 'name') {
-    copy.sort((a, b) => (a.display_title||'').localeCompare(b.display_title||''));
+    const _d = ((typeof sortAsc !== 'undefined') && !sortAsc) ? -1 : 1;
+    copy.sort((a, b) => _d * (a.display_title||'').localeCompare(b.display_title||''));
+  } else if (wfSort === 'size') {
+    // The menu offers Largest / Smallest; the grid used to fall through to "recent" for these.
+    const _d = ((typeof sortAsc !== 'undefined') && sortAsc) ? 1 : -1;
+    copy.sort((a, b) => _d * ((a.file_bytes || 0) - (b.file_bytes || 0)));
   } else {
     // recent — honors the menu's "Oldest first" (sortAsc) as well.
     const _asc = (typeof sortAsc !== 'undefined') && sortAsc;

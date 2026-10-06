@@ -40,13 +40,15 @@ if (window.location.hash.startsWith('#compose')) viewMode = 'compose';
 // Session display sub-mode (grid vs list vs control within sessions view)
 let sessionDisplayMode = localStorage.getItem('sessionDisplayMode') || 'grid';
 if (!['grid', 'list', 'control'].includes(sessionDisplayMode)) sessionDisplayMode = 'grid';
-// Grid default is time ('recent').  'status' is no longer offered anywhere in
-// the UI (the "…" menu only has Newest/Oldest/Name/Size), so a stored 'status'
-// is a legacy value the user can't see or undo — it grouped sleeping sessions
-// below every idle one, burying today's work under week-old cards while the
-// menu claimed "Newest first".  Migrate it to 'recent'.
+// One sort choice for the session panel, shared by cards and list, and
+// remembered per device (localStorage sortMode + sortAsc; wfSort mirrors it for
+// the card grid).  Choices are the ones in the options menu:
+//   status  "Active first": question, working, idle, sleeping; newest first within each
+//   date    Newest / Oldest first        name  A-Z / Z-A        size  Largest / Smallest
+// History: 'status' used to be a hidden default with no menu entry, so on
+// 2026-10-05 it was migrated away to 'recent'.  It is now a visible, selectable
+// option, so a stored 'status' is a real choice and is honoured.
 let wfSort = localStorage.getItem('wfSort') || 'recent';
-if (wfSort === 'status') { wfSort = 'recent'; localStorage.setItem('wfSort', 'recent'); }
 let runningIds = new Set();
 let waitingData = {};   // { session_id: {question, options, kind} }
 let sessionKinds = {};   // session_id -> 'question' | 'working' | 'idle'
@@ -880,6 +882,7 @@ _updateViewModeButton(viewMode);
 
 // --- Sidebar menu (three dots) ---
 function toggleSidebarMenu() {
+  _syncSortMenu();
   document.getElementById('sidebar-menu-dropdown').classList.toggle('open');
 }
 function closeSidebarMenu() {
@@ -898,14 +901,27 @@ function pickSort(mode, asc) {
   });
   const sortLabel = document.getElementById('sidebar-sort-label');
   if (sortLabel) sortLabel.textContent = label;
-  // Apply sort
+  // Apply and REMEMBER the choice.  Both views read the same choice, so it is
+  // written to every key here rather than through setSort()/setWfSort():
+  // setSort() toggles direction when the mode is unchanged (right for a column
+  // header click, wrong for a menu pick) and neither stored the direction.
+  sortMode = mode;
   sortAsc = !!asc;
-  if (viewMode === 'sessions' && sessionDisplayMode === 'grid') {
-    setWfSort(mode === 'date' ? 'recent' : mode);
-  } else {
-    setSort(mode);
-  }
+  wfSort = (mode === 'date') ? 'recent' : mode;
+  localStorage.setItem('sortMode', sortMode);
+  localStorage.setItem('sortAsc', sortAsc);
+  localStorage.setItem('wfSort', wfSort);
   filterSessions();
+}
+
+/** Tick the menu entry that matches the remembered sort. */
+function _syncSortMenu() {
+  const mode = (typeof sessionDisplayMode !== 'undefined' && sessionDisplayMode === 'grid' && viewMode === 'sessions')
+    ? (wfSort === 'recent' ? 'date' : wfSort) : sortMode;
+  document.querySelectorAll('.sidebar-sort-opt[data-sort]').forEach(el => {
+    const sameDir = el.dataset.sort === 'status' || String(el.dataset.asc) === String(!!sortAsc);
+    el.classList.toggle('active', el.dataset.sort === mode && sameDir);
+  });
 }
 
 // Close sidebar menu on outside click
