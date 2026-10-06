@@ -591,6 +591,11 @@ class TestUserStopBeatsSelfHeal:
         session_manager._sdk = MagicMock()
         session_manager._sdk.create_session = MagicMock(
             side_effect=AssertionError("must not reconnect a slept session"))
+        # A bare MagicMock backend returns a MagicMock "pid".  The fixture's
+        # stop() at teardown hands that to the kill path; before the
+        # 2026-10-06 guard fix that became killpg(1) = every process the
+        # user owns.  A fake backend has no process: say so.
+        session_manager._sdk.extract_process_pid = MagicMock(return_value=0)
 
         result = asyncio.run(session_manager._reconnect_client(sid, info))
         assert result is False

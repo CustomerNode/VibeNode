@@ -257,44 +257,41 @@ function _buildDashboard() {
   const question = polled ? allSessions.filter(s => runningIds.has(s.id) && sessionKinds[s.id] === 'question').length : '-';
   const sleeping = polled ? total - (typeof working === 'number' ? working + idle + question : 0) : '-';
 
-  const stats = [
-    {label: 'Working', count: working, color: 'var(--accent)', icon: '<img src="/static/svg/pickaxe.svg" width="16" height="16" style="filter:brightness(0) saturate(100%) invert(55%) sepia(78%) saturate(1000%) hue-rotate(215deg);">'},
-    {label: 'Waiting', count: question, color: '#ff9500', icon: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r=".5" fill="#ff9500"/></svg>'},
-    {label: 'Idle', count: idle, color: 'var(--idle-label)', icon: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--idle-label)" stroke-width="2" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>'},
-    {label: 'Sleeping', count: sleeping, color: 'var(--text-faint)', icon: '<img src="/static/svg/sleeping.svg" width="16" height="16" class="sleeping-icon">'},
-  ];
+  // The empty Sessions view: the project as a heading, four plain status
+  // counts, the sessions waiting on the user (if any), and one primary action.
+  // No boxes; same pieces and type as the homepage's Sessions card (".dx-*").
+  const _n = (n, label, cls) => `<div class="dx-num ${n && n !== '-' ? cls : 'zero'}"><b>${n}</b><span>${label}</span></div>`;
+  const nums = _n(working, 'Working', 'work') + _n(question, 'Waiting on you', 'wait') + _n(idle, 'Idle', '') + _n(sleeping, 'Sleeping', '');
+  const _key = s => s.effective_ts || s.last_activity_ts || s.sort_ts || 0;
+  const waiting = polled ? allSessions.filter(s => runningIds.has(s.id) && sessionKinds[s.id] === 'question')
+    .sort((a, b) => _key(b) - _key(a)).slice(0, 4) : [];
+  const waitingHtml = waiting.map(s => {
+    const sid = String(s.id).replace(/[^A-Za-z0-9_-]/g, '');
+    return `<div class="dx-row" onclick="openInGUI('${sid}')" title="${escHtml(s.display_title || '')}">`
+      + `<span class="dx-dot"></span><span class="t">${escHtml(s.display_title || s.id)}</span>`
+      + `<span class="d">${escHtml(typeof _shortDate === 'function' ? _shortDate(s.last_activity) : '')}</span></div>`;
+  }).join('');
 
   return `
-  <div class="dashboard">
-    <div class="dash-header">
-      <div class="dash-project" onclick="openProjectOverlay()">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-        <div>
-          <div class="dash-project-name">${escHtml(projectName)}</div>
-          <div class="dash-project-sub">${total} sessions</div>
-        </div>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-left:auto;opacity:0.4;"><polyline points="6 9 12 15 18 9"/></svg>
-      </div>
+  <div class="dashboard dx">
+    <div class="dx-head">
+      <div class="dx-label">Project</div>
+      <button class="dx-project" onclick="openProjectOverlay()" title="Switch project">
+        <span class="dx-project-name">${escHtml(projectName)}</span>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
     </div>
 
-    <div class="dash-stats">
-      ${stats.map(s => `
-        <div class="dash-stat">
-          <div class="dash-stat-icon">${s.icon}</div>
-          <div class="dash-stat-count" style="color:${s.color}">${s.count}</div>
-          <div class="dash-stat-label">${s.label}</div>
-        </div>
-      `).join('')}
-    </div>
+    <div class="dx-nums">${nums}</div>
 
-    <button class="dash-new-btn" onclick="addNewAgent()">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-      New Session
-    </button>
+    ${waitingHtml ? `<div class="dx-sec"><div class="dx-label">Waiting on you</div><div class="dx-list">${waitingHtml}</div></div>` : ''}
 
-    <div class="dash-hint">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="opacity:0.3;flex-shrink:0;"><polyline points="15 18 9 12 15 6"/></svg>
-      <span>${total > 0 ? 'Select a session from the sidebar to view its conversation' : 'Select a project to get started'}</span>
+    <div class="dx-actions">
+      <button class="dx-new" onclick="addNewAgent()">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        New session
+      </button>
+      <span class="dx-hint">${total > 0 ? 'or pick one from the list' : (project ? 'to get started' : 'Select a project to get started')}</span>
     </div>
   </div>`;
 }
@@ -466,6 +463,20 @@ function _buildHomepageContent() {
     }
   }
 
+  // Featured Sessions card: four status counts and the five most recent
+  // sessions (click one to open it).  Shown on desktop; see ".hpx-*" in style.css.
+  const _hpNum = (n, label, cls) => `<div class="hpx-num ${n ? cls : 'zero'}"><b>${n}</b><span>${label}</span></div>`;
+  const hpNumsHtml = _hpNum(working, 'Working', 'work') + _hpNum(question, 'Waiting on you', '')
+    + _hpNum(idle, 'Idle', '') + _hpNum(sleeping, 'Sleeping', '');
+  const _hpKey = s => s.effective_ts || s.last_activity_ts || s.sort_ts || 0;
+  const hpRecentHtml = allSessions.slice().sort((a, b) => _hpKey(b) - _hpKey(a)).slice(0, 5).map(s => {
+    const st = (polled && typeof getSessionStatus === 'function') ? (getSessionStatus(s.id) || 'sleeping') : 'sleeping';
+    const sid = String(s.id).replace(/[^A-Za-z0-9_-]/g, '');
+    return `<div class="hpx-row" onclick="event.stopPropagation();_hpOpenSession('${sid}')" title="${escHtml(s.display_title || '')}">`
+      + `<span class="hpx-ico ${st}"></span><span class="t">${escHtml(s.display_title || s.id)}</span>`
+      + `<span class="d">${escHtml(typeof _shortDate === 'function' ? _shortDate(s.last_activity) : '')}</span></div>`;
+  }).join('');
+
   // Project selector for homepage
   const _hpProject = _allProjects ? _allProjects.find(p => p.encoded === localStorage.getItem('activeProject')) : null;
   const _hpProjectName = _hpProject ? _projectShortName(_hpProject) : 'No project';
@@ -480,16 +491,18 @@ function _buildHomepageContent() {
     </div>
     <div class="homepage-cards">
 
-      <div class="homepage-card hp-sessions" onclick="setViewMode('sessions')">
+      <div class="homepage-card hp-sessions hpx" onclick="setViewMode('sessions')">
         <div class="hp-icon-wrap">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
         </div>
         <h3>Sessions</h3>
         <p class="hp-desc">Interactive Claude Code terminals with live streaming, voice input, and permission management.</p>
+        <div class="hpx-nums">${hpNumsHtml}</div>
         <div class="hp-viz">
           <div class="hp-bar">${sessionBar}</div>
         </div>
         <div class="hp-stat">${sessionStat}</div>
+        ${hpRecentHtml ? `<div class="hpx-hd">Recent</div><div class="hpx-list">${hpRecentHtml}</div>` : ''}
         <div class="hp-cta">Open Sessions <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>
       </div>
 
@@ -510,7 +523,7 @@ function _buildHomepageContent() {
         <div class="hp-icon-wrap">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="8" r="4"/><path d="M20 21a8 8 0 1 0-16 0"/><circle cx="20" cy="7" r="2.5"/><path d="M23 15a5 5 0 0 0-6 0"/><circle cx="4" cy="7" r="2.5"/><path d="M7 15a5 5 0 0 0-6 0"/></svg>
         </div>
-        <h3>Workforce</h3>
+        <h3>Workforce <span class="beta-tag">Beta</span></h3>
         <p class="hp-desc">Knowledge asset library — skills and agent definitions organized into a department hierarchy.</p>
         <div class="hp-viz">
           <div class="hp-dots">${dotGridHtml}</div>
@@ -523,7 +536,7 @@ function _buildHomepageContent() {
         <div class="hp-icon-wrap">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
         </div>
-        <h3>Subsessions</h3>
+        <h3>Subsessions <span class="beta-tag">Beta</span></h3>
         <p class="hp-desc">Spawn parallel subsessions from any session — children inherit parent context and report conclusions back up.</p>
         <div class="hp-viz">
           <div class="hp-columns">${composeColBarsHtml}</div>
@@ -534,6 +547,12 @@ function _buildHomepageContent() {
 
     </div>
   </div>`;
+}
+
+/** Homepage "Recent" row: switch to the Sessions view and open that session. */
+function _hpOpenSession(id) {
+  if (typeof setViewMode === 'function') setViewMode('sessions');
+  setTimeout(() => { if (typeof openInGUI === 'function') openInGUI(id); }, 300);
 }
 
 function _updateHomepageStats() {

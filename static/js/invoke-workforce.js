@@ -894,7 +894,10 @@ function _runningModelLabel(model, sessionId) {
   // The family rule is applied to `model` directly too, because a pending or
   // not-yet-confirmed session has no recorded model for _ctxWindowFor to read.
   const is1M = /\[1m\]/.test(m) || /^claude-(fable|opus|sonnet)-/.test(m) || !!(w && w.size >= 1000000);
-  return base + (is1M ? ' 1M' : '');
+  // No "1M" suffix (removed 2026-10-06): nearly every session runs at 1M, so it
+  // was noise on the badge.  The context readout in the status panel still
+  // states the window size.
+  return base;
 }
 
 /** "Opus 5.5" -> label "Opus" + value "5.5". */

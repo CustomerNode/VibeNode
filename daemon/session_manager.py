@@ -4563,6 +4563,14 @@ class SessionManager:
             down).
         """
         try:
+            # Both platforms: only a real, positive int is a pid.  (bool is
+            # an int subclass and is rejected too.)  See GUARD #0 below for
+            # what a mock object did here on Linux.
+            if type(pid) is not int or pid <= 1:
+                logger.error(
+                    "_kill_process_tree(pid=%r): refusing to act — not a "
+                    "valid process id.", pid)
+                return
             if os.name == "nt":
                 # Try taskkill /T first (works when parent is alive)
                 result = _subprocess.run(
@@ -4630,23 +4638,44 @@ class SessionManager:
                 # Returning early here means descendants may leak (the
                 # caller passed a bad pid so we have nothing reliable to
                 # kill), but the daemon survives.
+                #
+                #   not a real int        →  REFUSE.  This guard used to be
+                #                            `pid <= 1` inside a try whose
+                #                            `except Exception: pass` FELL
+                #                            THROUGH.  A non-int (a test's
+                #                            MagicMock backend returned one
+                #                            from extract_process_pid) raised
+                #                            TypeError on the comparison, the
+                #                            guard was skipped, and
+                #                            os.getpgid(mock) coerced the
+                #                            mock to 1 via __index__ and
+                #                            returned pgid 1.  killpg(1) is
+                #                            kill(-1): EVERY process the user
+                #                            owns.  It logged the desktop out
+                #                            and killed every session, three
+                #                            times in one afternoon
+                #                            (2026-10-06).  The guard now
+                #                            fails CLOSED: anything it cannot
+                #                            prove safe is refused.
                 try:
-                    if pid is None or pid <= 1 or pid == os.getpid():
-                        logger.error(
-                            "_kill_process_tree(pid=%r): refusing to act — "
-                            "pid is None/0/1/-1 or equals daemon pid %d. "
-                            "Caller passed a corrupt CLI pid (likely a "
-                            "stale info._cli_pid or an extract_process_pid "
-                            "race during a session close).  Descendants "
-                            "may leak; daemon survives.",
-                            pid, os.getpid(),
-                        )
-                        return
+                    _pid_ok = (
+                        type(pid) is int
+                        and pid > 1
+                        and pid != os.getpid()
+                    )
                 except Exception:
-                    # Even the guard must never raise.  If os.getpid()
-                    # somehow fails, fall through — every downstream call
-                    # is wrapped in its own try/except.
-                    pass
+                    _pid_ok = False
+                if not _pid_ok:
+                    logger.error(
+                        "_kill_process_tree(pid=%r): refusing to act — "
+                        "pid is not a real int, is None/0/1/negative, or "
+                        "equals the daemon pid.  Caller passed a corrupt "
+                        "CLI pid (likely a stale info._cli_pid or an "
+                        "extract_process_pid race during a session "
+                        "close).  Descendants may leak; daemon survives.",
+                        pid,
+                    )
+                    return
 
                 # Resolve the target's pgid first.  If the process is
                 # already gone, getpgid raises ProcessLookupError — nothing
@@ -4654,6 +4683,18 @@ class SessionManager:
                 try:
                     target_pgid = os.getpgid(pid)
                 except (ProcessLookupError, OSError):
+                    return
+
+                # killpg(0) signals OUR group and killpg(1) is kill(-1),
+                # every process this user owns.  No CLI ever legitimately
+                # lives in either; a real process group id is > 1.
+                if type(target_pgid) is not int or target_pgid <= 1:
+                    logger.error(
+                        "_kill_process_tree(%d): target pgid %r is not a "
+                        "real process group. Refusing killpg (would signal "
+                        "every process this user owns).",
+                        pid, target_pgid,
+                    )
                     return
 
                 # CRITICAL: never killpg our own group — that would kill
@@ -4697,7 +4738,7 @@ class SessionManager:
                 except (ProcessLookupError, PermissionError):
                     pass
         except Exception as e:
-            logger.debug("_kill_process_tree(%d) best-effort: %s", pid, e)
+            logger.debug("_kill_process_tree(%r) best-effort: %s", pid, e)
 
     def _schedule_orphan_sweep(self) -> None:
         """Schedule the next orphan process sweep (every 60s)."""

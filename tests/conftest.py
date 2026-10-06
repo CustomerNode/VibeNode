@@ -404,6 +404,132 @@ def _isolate_claude_backend_for_fake_sdk(request):
             delattr(_backends_pkg, "claude")
 
 
+# ---------------------------------------------------------------------------
+# No test may ever signal "everything".
+#
+# 2026-10-06: a test handed the daemon a MagicMock as a CLI pid.  The daemon's
+# kill path coerced it to pid 1, resolved process group 1 and called
+# os.killpg(1, SIGTERM) then SIGKILL, which is kill(-1): every process the
+# user owns.  Running the suite logged the desktop out and killed every
+# running agent session, three times in one afternoon.
+#
+# The daemon's guard is fixed (SessionManager._kill_process_tree), and this is
+# the backstop for the next bug of that shape.  It is installed at import time
+# for the whole pytest process, NOT as a fixture, so no teardown ordering or
+# background thread can ever run a test's kill call without it.
+# ---------------------------------------------------------------------------
+def _install_signal_safety_net():
+    if getattr(os, "_vn_signal_net", False):
+        return
+    _real_kill = os.kill
+    _real_killpg = getattr(os, "killpg", None)
+
+    def _safe_kill(pid, sig, *a, **k):
+        # 0 = our own process group (the pytest run itself), -1 = everything,
+        # 1 = init.  A non-int is a mock leaking into a real syscall.
+        # (Signal 0 to pid 1 is only an existence probe and is let through.)
+        if type(pid) is not int or pid <= 0 or (pid == 1 and sig != 0):
+            raise RuntimeError(
+                f"tests/conftest.py blocked os.kill({pid!r}, {sig!r}): tests "
+                f"may only signal a real, specific process id.")
+        return _real_kill(pid, sig, *a, **k)
+
+    def _safe_killpg(pgid, sig, *a, **k):
+        if type(pgid) is not int or pgid <= 1:
+            raise RuntimeError(
+                f"tests/conftest.py blocked os.killpg({pgid!r}, {sig!r}): "
+                f"that would signal every process this user owns.")
+        try:
+            if pgid == os.getpgid(0):
+                raise RuntimeError(
+                    f"tests/conftest.py blocked os.killpg({pgid!r}, {sig!r}): "
+                    f"that is the test run's own process group.")
+        except OSError:
+            pass
+        return _real_killpg(pgid, sig, *a, **k)
+
+    os.kill = _safe_kill
+    if _real_killpg is not None:
+        os.killpg = _safe_killpg
+    os._vn_signal_net = True
+
+
+_install_signal_safety_net()
+
+
+# ---------------------------------------------------------------------------
+# Every run of this suite puts ITSELF in a PID namespace (Linux).
+#
+# The guard in the daemon and the safety net above each stop the 2026-10-06
+# bug.  This makes the whole class of bug harmless: inside a PID namespace a
+# broadcast signal (kill(-1), killpg(1)) can only reach processes in that
+# namespace, i.e. this test run.  The desktop session, VibeNode and every
+# agent session are not in it and cannot be signalled from it, whatever a test
+# or the code under test does.  Checked with a harmless SIGCONT broadcast: a
+# canary outside the namespace never received it.
+#
+# It is done HERE, not left to whoever starts pytest, because the suite is
+# started from many places (the UI's pre-publish test run, agent sessions,
+# a terminal) and the three desktop logouts all came from a plain `pytest`.
+#
+# How: on the first pytest_configure, re-exec the same command line under
+# `unshare`.  `bash` is pid 1 in the namespace (an init that reaps orphans;
+# with pytest itself as pid 1 the process-group tests fail), `setsid -w` gives
+# pytest its own process group, and `--kill-child` takes the namespace down if
+# the outer process is killed (a cancelled or timed-out run leaves nothing).
+# Where `unshare` is missing or not permitted the run continues unsandboxed
+# behind the two guards above and says so.  Opt out with
+# VIBENODE_TEST_NO_SANDBOX=1.
+# ---------------------------------------------------------------------------
+_SANDBOX_ENV = "VIBENODE_TEST_SANDBOXED"
+_SANDBOX_CMD = ["unshare", "-U", "--map-current-user", "-p", "-f",
+                "--mount-proc", "--kill-child"]
+
+
+def _sandbox_available() -> bool:
+    import shutil
+    if not sys.platform.startswith("linux"):
+        return False
+    if not (shutil.which("unshare") and shutil.which("bash") and shutil.which("setsid")):
+        return False
+    try:
+        return subprocess.run(
+            _SANDBOX_CMD + ["true"], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=10,
+        ).returncode == 0
+    except Exception:
+        return False
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config):
+    if os.environ.get(_SANDBOX_ENV) or os.environ.get("VIBENODE_TEST_NO_SANDBOX"):
+        return
+    if hasattr(config, "workerinput"):      # pytest-xdist worker: the controller is sandboxed
+        return
+    if not sys.platform.startswith("linux"):
+        return
+    if not _sandbox_available():
+        sys.stderr.write(
+            "[conftest] WARNING: could not enter a PID namespace (unshare "
+            "missing or not permitted); running unsandboxed behind the "
+            "kill guards.\n")
+        return
+    env = dict(os.environ)
+    env[_SANDBOX_ENV] = "1"
+    args = list(config.invocation_params.args)
+    cmd = _SANDBOX_CMD + [
+        "bash", "-c", 'setsid -w "$@"; exit $?', "bash",
+        sys.executable, "-m", "pytest", *args,
+    ]
+    # Capture is suspended at this point, so fds 1/2 are the caller's own and
+    # the re-exec'd run reports to the same place.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.chdir(str(config.invocation_params.dir))
+    os.execvpe(cmd[0], cmd, env)
+
+
 @pytest.fixture(autouse=True)
 def _forbid_real_claude_cli(request, monkeypatch):
     if _real_cli_transport is None or request.node.get_closest_marker("allow_real_claude_cli"):

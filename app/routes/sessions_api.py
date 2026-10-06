@@ -683,7 +683,7 @@ def api_delete(session_id):
         # together); our-own-pid would kill the web server.  The "pid > 0"
         # check below already excluded the negative "display-only" sentinel
         # from process_detection.
-        if pid and pid > 1 and pid != os.getpid():
+        if type(pid) is int and pid > 1 and pid != os.getpid():
             try:
                 os.kill(pid, signal.SIGTERM)
             except (OSError, ProcessLookupError):
@@ -906,7 +906,7 @@ def api_delete_empty():
             # filters by /comm in ("claude","node") so a python3 web/daemon
             # pid should never appear here, but the suicide guard is
             # belt-and-suspenders.
-            if pid and pid > 1 and pid != os.getpid():
+            if type(pid) is int and pid > 1 and pid != os.getpid():
                 try:
                     os.kill(pid, signal.SIGTERM)
                 except (OSError, ProcessLookupError):

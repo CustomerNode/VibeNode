@@ -145,6 +145,18 @@ class TestDecodeProjectUnix:
         assert result == str(proj)
 
     @pytest.mark.skipif(sys.platform == "win32", reason="Unix path test")
+    @pytest.mark.parametrize("name", [
+        "my_long_project_name_here",   # five segments: past the old 4-segment lookahead
+        "a_b-c",                        # mixed separators in one name
+        "v1.2_final-build",             # dot, underscore and hyphen together
+    ])
+    def test_unix_path_names_the_lookahead_could_not_resolve(self, tmp_path, name):
+        from app.config import _decode_project, _encode_cwd
+        proj = tmp_path / name
+        proj.mkdir()
+        assert _decode_project(_encode_cwd(str(proj))) == str(proj)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Unix path test")
     def test_unix_path_with_hyphens(self, tmp_path):
         from app.config import _decode_project, _encode_cwd
         proj = tmp_path / "my-project"

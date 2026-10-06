@@ -727,12 +727,24 @@ class TestPosixSubprocessIsolation:
         If Patch 4 is missing, this test would deliver SIGTERM to itself.
         """
         import signal
+        # The child restores default, unblocked SIGTERM for itself.  A blocked
+        # or ignored SIGTERM is inherited across fork/exec, and some launchers
+        # (CI runners, agent shells) start pytest with SIGTERM blocked; the
+        # child then never died and this test timed out for a reason that has
+        # nothing to do with process groups.  It prints once that is done, so
+        # the killpg below can never land before the handler is reset.
         proc = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(10)"],
-            stdout=subprocess.DEVNULL,
+            [sys.executable, "-c",
+             "import signal, sys, time\n"
+             "signal.signal(signal.SIGTERM, signal.SIG_DFL)\n"
+             "signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})\n"
+             "sys.stdout.write('ready\\n'); sys.stdout.flush()\n"
+             "time.sleep(10)"],
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
         try:
+            assert proc.stdout.readline().strip() == b"ready"
             child_pgid = os.getpgid(proc.pid)
             self_pgid = os.getpgid(os.getpid())
             assert child_pgid != self_pgid, (
@@ -743,11 +755,12 @@ class TestPosixSubprocessIsolation:
             os.killpg(child_pgid, signal.SIGTERM)
             proc.wait(timeout=5)
             # Child should be terminated by SIGTERM (negative returncode = signal).
-            assert proc.returncode is not None
+            assert proc.returncode == -signal.SIGTERM
         finally:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=5)
+            proc.stdout.close()
 
 
 # ── _close_session exception-safety contract ────────────────────────────
@@ -1335,6 +1348,23 @@ class TestApiRestartPosixDetachment:
         path = Path(__file__).resolve().parents[1] / "app" / "routes" / "main.py"
         return path.read_text()
 
+    @staticmethod
+    def _posix_branch(src: str) -> str:
+        """The whole POSIX ``elif`` branch of restart_server(): from its
+        ``elif`` line to the first later line indented no deeper than it.  A
+        fixed 4000-character window used to be sliced here; the branch's own
+        comments grew past it and pushed the Popen call out of view, failing
+        these tests against correct code."""
+        start = src.index('sys.platform in ("darwin", "linux")')
+        line_start = src.rfind("\n", 0, start) + 1
+        indent = len(src[line_start:start]) - len(src[line_start:start].lstrip())
+        out = []
+        for n, line in enumerate(src[line_start:].splitlines(keepends=True)):
+            if n and line.strip() and len(line) - len(line.lstrip()) <= indent:
+                break
+            out.append(line)
+        return "".join(out)
+
     def test_restart_posix_uses_start_new_session(self):
         """Outer Popen on POSIX must pass start_new_session=True so the
         bash subprocess survives the kill of the old web server."""
@@ -1346,7 +1376,7 @@ class TestApiRestartPosixDetachment:
         # Locate the Popen invocation following the POSIX branch and
         # confirm it includes start_new_session=True.
         posix_section_start = src.index('sys.platform in ("darwin", "linux")')
-        posix_section = src[posix_section_start:posix_section_start + 4000]
+        posix_section = self._posix_branch(src)
         assert "subprocess.Popen(" in posix_section, (
             "Popen call removed from POSIX restart branch"
         )
@@ -1362,7 +1392,7 @@ class TestApiRestartPosixDetachment:
         breakage in production."""
         src = self._read_main_routes()
         posix_section_start = src.index('sys.platform in ("darwin", "linux")')
-        posix_section = src[posix_section_start:posix_section_start + 4000]
+        posix_section = self._posix_branch(src)
         # The bash command's stdout/stderr redirect must mention
         # restart.log (the agreed log filename) and must NOT redirect
         # everything to /dev/null in the launch line.

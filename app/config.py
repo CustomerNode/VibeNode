@@ -410,6 +410,46 @@ def cwd_matches_active_project(cwd: str, project: str = "") -> bool:
     return _encode_cwd(cwd).lower() == active.lower()
 
 
+def _resolve_encoded_segments(root, parts):
+    """Find the real directory under ``root`` whose encoding is ``parts``.
+
+    ``parts`` is the encoded project name split on "-".  At each level the
+    actual child directories are listed and matched by their own encoding, so
+    a name is found however many "-" it encodes to and whatever mix of
+    ``-`` / ``_`` / ``.`` it really contains.  The fixed four-segment lookahead
+    in ``_decode_project`` cannot do that: ``my_long_project_name_here`` (five
+    segments) or ``a_b-c`` (mixed separators) decoded to a path that does not
+    exist.  Backtracks when a shorter match at one level strands the rest.
+    """
+    def walk(path, i, budget):
+        if i >= len(parts):
+            return path.rstrip("/") or "/"
+        if budget[0] <= 0:
+            return None
+        budget[0] -= 1
+        try:
+            children = {}
+            with _os.scandir(path) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir():
+                            children.setdefault(_encode_cwd(entry.name), []).append(entry.name)
+                    except OSError:
+                        continue
+        except OSError:
+            return None
+        for k in range(len(parts) - i, 0, -1):
+            for name in children.get("-".join(parts[i:i + k]), ()):
+                found = walk(path + name + "/", i + k, budget)
+                if found:
+                    return found
+        return None
+
+    # The budget bounds directory listings so a pathological tree cannot stall
+    # a request; a real project path needs one listing per path component.
+    return walk(root if root.endswith("/") else root + "/", 0, [200])
+
+
 def _decode_project(encoded: str) -> str:
     """Convert encoded project name back to filesystem path.
     Handles ambiguity where '-' could be '/' or '_' or '-' in the original."""
@@ -443,6 +483,9 @@ def _decode_project(encoded: str) -> str:
         result = path.rstrip("/")
         if Path(result).is_dir():
             return result
+        resolved = _resolve_encoded_segments(drive + ":/", parts)
+        if resolved:
+            return resolved
     elif sys.platform != "win32":
         # ---- Unix-style encoding: no drive letter, starts with "-" (e.g. "-home-user-proj") ----
         # Try simple reconstruction: replace all dashes with "/"
@@ -472,6 +515,9 @@ def _decode_project(encoded: str) -> str:
         result = path.rstrip("/")
         if Path(result).is_dir():
             return result
+        resolved = _resolve_encoded_segments("/", parts)
+        if resolved:
+            return resolved
     else:
         # Windows but no "--" — return as-is
         return encoded

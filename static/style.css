@@ -10505,122 +10505,7 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
   }
 }
 
-/* ===== Project Switch Loader ===== */
-#project-switch-loader {
-  position: fixed;
-  inset: 0;
-  z-index: 100000;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: rgba(0,0,0,0);
-  backdrop-filter: blur(0px);
-  -webkit-backdrop-filter: blur(0px);
-  opacity: 0;
-  transition: opacity 0.35s var(--ease-out), backdrop-filter 0.5s var(--ease-out), background 0.5s var(--ease-out);
-}
-#project-switch-loader.visible {
-  opacity: 1;
-  background: rgba(0,0,0,0.65);
-  backdrop-filter: blur(24px) saturate(1.3);
-  -webkit-backdrop-filter: blur(24px) saturate(1.3);
-}
-#project-switch-loader.done {
-  opacity: 0;
-  transition: opacity 0.75s var(--ease-out);
-  pointer-events: none;
-}
-.psl-content {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 28px;
-  transform: scale(0.92) translateY(10px);
-  transition: transform 0.45s cubic-bezier(0.16, 1, 0.3, 1);
-}
-#project-switch-loader.visible .psl-content {
-  transform: scale(1) translateY(0);
-}
-#project-switch-loader.done .psl-content {
-  transform: scale(1.04) translateY(-6px);
-}
-
-/* Orb + rings */
-.psl-orb-wrap {
-  position: relative;
-  width: 72px;
-  height: 72px;
-}
-.psl-orb {
-  position: absolute;
-  inset: 16px;
-  border-radius: 50%;
-  background: radial-gradient(circle at 35% 35%, var(--accent, #58a6ff), #7c3aed 60%, #ec4899);
-  box-shadow: 0 0 30px rgba(88,166,255,0.4), 0 0 60px rgba(124,58,237,0.2);
-  animation: psl-pulse 1.8s ease-in-out infinite;
-}
-.psl-ring {
-  position: absolute;
-  inset: 0;
-  border-radius: 50%;
-  border: 1.5px solid rgba(255,255,255,0.12);
-  animation: psl-spin 2.4s linear infinite;
-  border-top-color: var(--accent, #58a6ff);
-  border-right-color: transparent;
-}
-.psl-ring-2 {
-  inset: -8px;
-  border-color: rgba(255,255,255,0.06);
-  border-top-color: rgba(124,58,237,0.5);
-  border-left-color: transparent;
-  animation-duration: 3.2s;
-  animation-direction: reverse;
-}
-
-/* Text */
-.psl-text {
-  text-align: center;
-}
-.psl-label {
-  font-size: var(--fs-sm);
-  text-transform: uppercase;
-  letter-spacing: 1.5px;
-  color: rgba(255,255,255,0.4);
-  font-weight: 600;
-  margin-bottom: 6px;
-}
-.psl-name {
-  font-size: 20px;
-  font-weight: 600;
-  color: #fff;
-  letter-spacing: -0.3px;
-}
-
-/* Loading dots */
-.psl-dots {
-  display: flex;
-  gap: var(--sp-2);
-}
-.psl-dots span {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: rgba(255,255,255,0.35);
-  animation: psl-dot 1.2s ease-in-out infinite;
-}
-.psl-dots span:nth-child(2) { animation-delay: 0.15s; }
-.psl-dots span:nth-child(3) { animation-delay: 0.3s; }
-
-@keyframes psl-pulse {
-  0%, 100% { transform: scale(1); opacity: 1; }
-  50% { transform: scale(1.12); opacity: 0.85; }
-}
-@keyframes psl-spin {
-  to { transform: rotate(360deg); }
-}
-@keyframes psl-dot {
-  0%, 80%, 100% { opacity: 0.25; transform: scale(0.85); }
-  40% { opacity: 1; transform: scale(1.2); }
+/* The project-switch loader is the shared splash now: ".vn-splash.vn-switch", styled inline in index.html. */
 }
 /* ═══════════════════════════════════════════════════════════════
    Link Picker Modal (shared by session ↔ task linking)
@@ -13789,3 +13674,352 @@ header #git-badge-push svg, header #git-badge-pull svg, header #git-badge-sync s
   .sidebar .sidebar-footer:hover { opacity: .7; }
 }
 
+/* ── Homepage (desktop) ──
+   Sessions is the featured card (status counts + recent sessions; markup in _buildHomepageContent), the other
+   three stack beside it, and the project is a labelled heading.  One neutral style instead of four colour themes.
+   Phones keep the previous homepage: the new blocks are hidden there. */
+.hpx-nums, .hpx-hd, .hpx-list { display: none; }
+@media (min-width: 769px) {
+  .hpx-hd { display: block; } .hpx-list { display: flex; }
+  /* ══ Homepage polish.  Same page, same four cards, same content and live numbers.  One neutral system instead of
+     four colour themes; flat surfaces instead of gradients and glows; type and spacing from the rest of the app. ══ */
+  .homepage { --bt: 255,255,255; justify-content: flex-start; padding: 7vh 40px 48px; }
+  [data-theme="light"] .homepage { --bt: 0,0,0; }
+
+  /* Project: a labelled heading.  Small "PROJECT" label above the name; click to switch. */
+  .hp-project-trigger { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-start; gap: 0 9px; width: fit-content; box-sizing: border-box;
+    margin: 0 0 20px max(0px, calc((100% - 1180px) / 2 - 10px)); padding: 6px 10px 7px; border: 0; border-radius: 10px; background: none; box-shadow: none;
+    -webkit-backdrop-filter: none; backdrop-filter: none; align-self: flex-start; }
+  .hp-project-trigger:hover { background: rgba(var(--bt), .06); box-shadow: none; }
+  .hp-project-trigger > svg:first-child { display: none; }
+  .hp-project-label { order: -1; flex: 0 0 100%; font-size: 0; margin-bottom: 1px; }
+  .hp-project-label::before { content: 'Project'; font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--text-faint); }
+  .hp-project-name { font-family: 'Space Grotesk', var(--font-sans); font-size: 40px; font-weight: 700; letter-spacing: -.02em; color: var(--text-heading); line-height: 1.15; }
+  .hp-project-trigger > svg:last-child { width: 16px; height: 16px; color: var(--text-faint); margin-top: 8px; }
+
+  /* Layout: Sessions is featured (large, left, full height); the other three stack beside it as compact rows. */
+  .homepage-cards { max-width: 1180px; gap: 14px; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); grid-auto-rows: 1fr; }
+  .homepage-card.hp-sessions { grid-column: 1; grid-row: 1 / span 3; padding: 28px 30px 26px; }
+  .hp-sessions .hp-icon-wrap { display: none; }
+  .homepage-card:not(.hp-sessions) { grid-column: 2; display: grid; grid-template-columns: 20px minmax(0, 1fr) 120px; grid-template-areas: "ic t viz" "ic d viz" "ic st cta";
+    column-gap: 14px; row-gap: 3px; align-items: start; padding: 18px 20px 16px; }
+  .homepage-card:not(.hp-sessions) .hp-icon-wrap { grid-area: ic; margin: 2px 0 0; }
+  .homepage-card:not(.hp-sessions) h3 { grid-area: t; margin: 0; font-size: 16px; }
+  .homepage-card:not(.hp-sessions) .hp-desc { grid-area: d; margin: 0 0 8px; font-size: 12px; }
+  .homepage-card:not(.hp-sessions) .hp-viz { grid-area: viz; margin: 2px 0 0; align-self: center; }
+  .homepage-card:not(.hp-sessions) .hp-stat { grid-area: st; margin: 0; }
+  .homepage-card:not(.hp-sessions) .hp-cta { grid-area: cta; justify-self: end; font-size: 0; gap: 0; }
+  .homepage-card:not(.hp-sessions) .hp-cta svg { width: 14px; height: 14px; }
+  /* Featured card content added by the preview script: big status numbers and a list of recent sessions */
+  .hpx-nums { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 4px 0 18px; }
+  .hpx-num b { display: block; font-family: 'Space Grotesk', var(--font-sans); font-size: 40px; font-weight: 500; line-height: 1; letter-spacing: -.03em; color: var(--text-heading); font-variant-numeric: tabular-nums; }
+  .hpx-num span { display: block; margin-top: 6px; font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--text-faint); }
+  .hpx-num.zero b { color: var(--text-faint); }
+  .hpx-num.work b { color: var(--accent-text, var(--accent)); }
+  .hpx-hd { margin: 22px 0 6px; font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--text-faint); }
+  .hpx-list { display: flex; flex-direction: column; margin: 0 -10px 18px; flex: 1; }
+  .hpx-row { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; gap: 11px; align-items: center; height: 36px; padding: 0 10px; border-radius: 9px; cursor: pointer; }
+  .hpx-row:hover { background: rgba(var(--bt), .07); }
+  .hpx-row .t { font-size: 13.5px; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hpx-row .d { font-size: 11.5px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+  .hpx-ico { width: 14px; height: 14px; background: currentColor; color: var(--text-faint); -webkit-mask: var(--src) center / contain no-repeat; mask: var(--src) center / contain no-repeat; }
+  .hpx-ico.working { --src: url(/static/svg/pickaxe.svg); color: var(--accent); }
+  .hpx-ico.sleeping { --src: url(/static/svg/sleeping.svg); }
+  .hpx-ico.idle { -webkit-mask: none; mask: none; background: none; border-radius: 50%; width: 8px; height: 8px; margin: 0 3px; box-shadow: inset 0 0 0 2px #3fa66a; }
+  .hpx-ico.question { -webkit-mask: none; mask: none; background: #d97706; border-radius: 50%; width: 8px; height: 8px; margin: 0 3px; }
+  .hp-sessions.hpx .hp-desc, .hp-sessions.hpx .hp-stat { display: none; }
+  .hp-sessions.hpx .hp-viz { order: 0; margin: 0; }
+  .hp-sessions.hpx h3 { margin-bottom: 18px; }
+  /* Featured card: bigger title and the page's one primary button */
+  .hp-sessions .hp-icon-wrap svg { width: 24px; height: 24px; }
+  .hp-sessions h3 { font-size: 22px !important; font-weight: 500; margin-bottom: 8px; }
+  .hp-sessions .hp-desc { font-size: 13.5px; max-width: 420px; }
+  .hp-sessions .hp-viz { margin-bottom: 14px; }
+  .hp-sessions .hp-bar { height: 8px; border-radius: 4px; }
+  .hp-sessions .hp-stat { font-size: 14px; color: var(--text-secondary); margin-bottom: 22px; }
+  .hp-sessions .hp-cta { align-self: flex-start; padding: 9px 16px; border-radius: 10px; background: var(--accent); color: #fff !important; font-size: 13px; }
+  .homepage-card.hp-sessions:hover .hp-cta { color: #fff; filter: brightness(1.1); }
+  @media (max-width: 860px) { .homepage-cards { grid-template-columns: 1fr; } .homepage-card.hp-sessions, .homepage-card:not(.hp-sessions) { grid-column: 1; grid-row: auto; } }
+
+  /* Cards: flat, hairline, no lift, no coloured glow */
+  .homepage-card { padding: 22px 22px 20px; border-radius: 16px; background: rgba(var(--bt), .03); border: 1px solid rgba(var(--bt), .08); transition: background .15s, border-color .15s; }
+  .homepage-card::before { display: none; }
+  .homepage-card:hover, .hp-sessions:hover, .hp-workflow:hover, .hp-compose:hover, .hp-workforce:hover {
+    transform: none; background: rgba(var(--bt), .055); border-color: rgba(var(--bt), .16); box-shadow: none; }
+
+  /* Icons: one neutral treatment, drawn like the left panel's icons (no coloured tiles) */
+  .hp-icon-wrap, .hp-sessions .hp-icon-wrap, .hp-workflow .hp-icon-wrap, .hp-compose .hp-icon-wrap, .hp-workforce .hp-icon-wrap {
+    width: auto; height: auto; justify-content: flex-start; margin-bottom: 14px; border-radius: 0; background: none; color: var(--text-muted); }
+  .hp-icon-wrap svg { width: 20px; height: 20px; }
+
+  .homepage-card h3 { font-family: 'Space Grotesk', var(--font-sans); font-size: 18px; font-weight: 500; letter-spacing: -.015em; margin-bottom: 6px; }
+  .hp-desc { font-size: 12.5px; line-height: 1.55; color: var(--text-muted); margin-bottom: 22px; }
+
+  /* Live visuals: neutral, with colour only where it means something (the sessions bar keeps working / idle) */
+  .hp-viz { margin-bottom: 12px; }
+  .hp-bar { height: 4px; border-radius: 2px; }
+  .hp-columns { height: 34px; gap: 4px; }
+  .hp-col { border-radius: 3px 3px 0 0; background: rgba(var(--bt), .32) !important; }   /* keeps the app's own opacity: full for real data, faint for an empty placeholder */
+  .hp-dots { gap: 5px; }
+  .hp-dot { width: 5px; height: 5px; background: rgba(var(--bt), .34) !important; animation: none; }
+  .hp-stat { font-size: 11.5px; color: var(--text-faint); margin-bottom: 16px; letter-spacing: 0; font-variant-numeric: tabular-nums; }
+
+  /* Call to action: quiet text; the whole card is the button */
+  .hp-cta, .hp-sessions .hp-cta, .hp-workflow .hp-cta, .hp-compose .hp-cta, .hp-workforce .hp-cta { font-size: 12.5px; font-weight: 600; color: var(--text-secondary); gap: 5px; }
+  .homepage-card:hover .hp-cta { color: var(--text-heading); gap: 8px; }
+  .hp-cta svg { width: 12px; height: 12px; }
+}
+
+/* "Beta" marker: Workforce and Subsessions, in the view picker and on their homepage cards */
+.beta-tag { display: inline-block; vertical-align: middle; margin-left: 6px; padding: 1px 6px 2px; border-radius: 5px;
+  font-family: var(--font-sans); font-size: 9.5px; font-weight: 600; letter-spacing: .07em; line-height: 1.4; text-transform: uppercase;
+  color: var(--text-muted); box-shadow: inset 0 0 0 1px rgba(128,128,140,.38); position: relative; top: -1px; }
+
+
+
+/* ══ Settings window (desktop).  #pm-overlay.sx = the gear's settings: a nav (.sx-nav) and the section's own
+   dialog card side by side, sized as one window.  See openSettings() in modals.js. ══ */
+@media (min-width: 769px) {
+  #pm-overlay.sx { --sx-h: min(680px, 86vh); --bt: 255,255,255; gap: 0; }
+  [data-theme="light"] #pm-overlay.sx { --bt: 0,0,0; }
+  #pm-overlay.sx.show { animation: sx-in .18s var(--ease-out); }
+  @keyframes sx-in { from { opacity: 0; } to { opacity: 1; } }
+  #pm-overlay.sx .sx-nav { flex: 0 0 248px; height: var(--sx-h); box-sizing: border-box; overflow-y: auto; scrollbar-width: thin;
+    padding: 26px 12px 16px; background: var(--bg-sidebar); border: 1px solid rgba(var(--bt), .1); border-right: 0;
+    border-radius: 18px 0 0 18px; box-shadow: 0 24px 80px rgba(0,0,0,.4); }
+  #pm-overlay.sx .sx-nav-title { font: 600 20px/1.25 'Space Grotesk', var(--font-sans); letter-spacing: -.01em; color: var(--text-heading); padding: 0 10px 14px; }
+  #pm-overlay.sx .sx-group + .sx-group { margin-top: 14px; }
+  #pm-overlay.sx .sx-group-label { font-size: 9.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--text-faint); padding: 0 10px 5px; }
+  #pm-overlay.sx .sx-item { all: unset; box-sizing: border-box; display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 10px;
+    border-radius: 9px; cursor: pointer; font-size: 13px; color: var(--text-secondary); }
+  #pm-overlay.sx .sx-item svg { flex: none; color: var(--text-muted); }
+  #pm-overlay.sx .sx-item:hover { background: rgba(var(--bt), .05); color: var(--text-heading); }
+  #pm-overlay.sx .sx-item:focus-visible { box-shadow: 0 0 0 2px rgba(var(--bt), .25); }
+  #pm-overlay.sx .sx-item.active { background: rgba(var(--bt), .09); color: var(--text-heading); font-weight: 600; }
+  #pm-overlay.sx .sx-item.active svg { color: var(--text-heading); }
+  #pm-overlay.sx .sx-item-label { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #pm-overlay.sx .sx-item-value { flex: 0 1 auto; min-width: 0; max-width: 84px; font-size: 11.5px; font-weight: 400; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* The section's dialog becomes the right-hand pane: one fixed size, so switching sections never resizes the window */
+  #pm-overlay.sx .pm-card { flex: 0 1 700px; min-width: 0; width: auto !important; max-width: none !important; height: var(--sx-h);
+    max-height: none !important; box-sizing: border-box; padding: 26px 40px 28px; border-radius: 0 18px 18px 0;
+    border-color: rgba(var(--bt), .1); transform: none !important; opacity: 1 !important; transition: none !important; scrollbar-width: thin; }
+  #pm-overlay.sx .pm-card > .pm-title:first-child, #pm-overlay.sx .pm-card .pm-title { font: 600 20px/1.25 'Space Grotesk', var(--font-sans); letter-spacing: -.01em; padding-right: 36px; }
+  #pm-overlay.sx .sx-hidden { display: none !important; }
+  #pm-overlay.sx .msel-list { max-height: none; overflow: visible; }   /* the pane scrolls, not a list inside it */
+  #pm-overlay.sx .sx-x { flex: 0 0 0; width: 0; height: var(--sx-h); position: relative; }
+  #pm-overlay.sx .sx-close { all: unset; position: absolute; top: 18px; right: 18px; width: 30px; height: 30px; display: inline-flex; align-items: center;
+    justify-content: center; border-radius: 9px; cursor: pointer; color: var(--text-muted); }
+  #pm-overlay.sx .sx-close:hover { background: rgba(var(--bt), .08); color: var(--text-heading); }
+}
+
+
+/* ══ Settings window: the section contents.  One look for all ten sections, scoped to the settings window so the same
+   dialogs opened elsewhere (and on phones) are untouched.  Colour rule as everywhere: a current choice is strong
+   neutral, not accent; accent is kept for switches that are on; red only for destructive actions. ══ */
+@media (min-width: 769px) {
+  #pm-overlay.sx .pm-card { --sx-line: rgba(var(--bt), .08); --sx-fill: rgba(var(--bt), .045); }
+  #pm-overlay.sx .pm-card .pm-title { margin-bottom: 6px; }
+  #pm-overlay.sx .pm-card .pm-body { font-size: 13px; line-height: 1.55; color: var(--text-muted); margin-bottom: 22px; }
+  #pm-overlay.sx .pm-card .pm-body > div:first-child:not([class]):not([id]) { font-size: 13px !important; line-height: 1.55; }
+
+  /* Buttons: quiet neutral by default */
+  #pm-overlay.sx .pm-card .pm-btn, #pm-overlay.sx .pm-card .kanban-settings-btn, #pm-overlay.sx .pm-card .kanban-settings-btn-accent {
+    border-radius: 9px; font-size: 12.5px !important; font-weight: 600; padding: 7px 14px !important; box-shadow: none; }
+  #pm-overlay.sx .pm-card .pm-btn-secondary, #pm-overlay.sx .pm-card .kanban-settings-btn, #pm-overlay.sx .pm-card .kanban-settings-btn-accent {
+    background: rgba(var(--bt), .08); border: 1px solid transparent; color: var(--text-heading); filter: none; }
+  #pm-overlay.sx .pm-card .pm-btn-secondary:hover, #pm-overlay.sx .pm-card .kanban-settings-btn:hover, #pm-overlay.sx .pm-card .kanban-settings-btn-accent:hover {
+    background: rgba(var(--bt), .14); border-color: transparent; color: var(--text-heading); filter: none; }
+
+  /* Fields */
+  #pm-overlay.sx .pm-card input[type="text"], #pm-overlay.sx .pm-card input[type="password"], #pm-overlay.sx .pm-card input[type="url"],
+  #pm-overlay.sx .pm-card input[type="number"], #pm-overlay.sx .pm-card select, #pm-overlay.sx .pm-card textarea {
+    box-sizing: border-box; height: 34px; padding: 0 11px !important; border-radius: 9px !important; border: 1px solid var(--sx-line) !important;
+    background: var(--sx-fill) !important; color: var(--text-primary) !important; font: 13px var(--font-sans) !important; outline: none;
+    transition: border-color .12s, background .12s; }
+  #pm-overlay.sx .pm-card textarea { height: auto; padding: 8px 11px !important; }
+  #pm-overlay.sx .pm-card input:focus, #pm-overlay.sx .pm-card select:focus, #pm-overlay.sx .pm-card textarea:focus { border-color: rgba(var(--bt), .32) !important; background: rgba(var(--bt), .07) !important; }
+  #pm-overlay.sx .pm-card select { padding-right: 26px !important; cursor: pointer; }
+  #pm-overlay.sx .kanban-settings-field { display: grid; grid-template-columns: 150px 1fr; align-items: center; gap: 12px; margin-bottom: 10px; }
+  #pm-overlay.sx .kanban-settings-field label { font-size: 12.5px; color: var(--text-secondary); }
+  #pm-overlay.sx .kanban-settings-field input { width: 100%; }
+
+  /* Default model: family rows of chips, as in the status panel */
+  #pm-overlay.sx .msel-list.sx-chips { display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--sx-line); border-radius: 14px; padding: 6px 16px; }
+  #pm-overlay.sx .sx-chips .sm-fam { grid-template-columns: 96px 1fr; align-items: center; gap: 12px; padding: 10px 0; }
+  #pm-overlay.sx .sx-chips .sm-fam + .sm-fam { border-top: 1px solid var(--sx-line); }
+  #pm-overlay.sx .sx-chips .msel-group-hd { margin: 0; padding: 0; }
+  #pm-overlay.sx .sx-chips .msel-dot { display: none; }
+  #pm-overlay.sx .sx-chips .msel-group-name { font-size: 13px; font-weight: 600; letter-spacing: 0; text-transform: none; color: var(--text-heading); }
+  #pm-overlay.sx .sx-chips .sm-chips { gap: 6px; }
+  #pm-overlay.sx .sx-chips .msel-row { width: auto; min-width: 46px; justify-content: center; gap: 0; padding: 7px 14px; border: 0; border-radius: 9px; background: var(--sx-fill); transition: background .12s; }
+  #pm-overlay.sx .sx-chips .msel-row:hover { background: rgba(var(--bt), .11); }
+  #pm-overlay.sx .sx-chips .msel-row .msel-check { display: none; }
+  #pm-overlay.sx .sx-chips .msel-name { flex: 0 1 auto; font-size: 13px; font-variant-numeric: tabular-nums; }
+  #pm-overlay.sx .sx-chips .msel-row.active { background: var(--text-heading); }
+  #pm-overlay.sx .sx-chips .msel-row.active .msel-name { color: var(--bg-modal); }
+  #pm-overlay.sx .msel-row:focus-visible { box-shadow: 0 0 0 2px rgba(var(--bt), .3); }
+
+  /* Choice lists (Thinking, Permission Policy): the chosen one is marked in neutral, with a tick */
+  #pm-overlay.sx .add-mode-card { position: relative; margin-bottom: 0; gap: 14px; padding: 13px 44px 13px 16px; border-color: var(--sx-line); border-radius: 12px; }
+  #pm-overlay.sx .add-mode-card:hover { background: var(--sx-fill); border-color: rgba(var(--bt), .14); }
+  #pm-overlay.sx .add-mode-card.active { background: rgba(var(--bt), .06); border-color: rgba(var(--bt), .38); }
+  #pm-overlay.sx .add-mode-card.active::after { content: ''; position: absolute; right: 16px; top: 50%; width: 16px; height: 16px; margin-top: -8px; background: var(--text-heading);
+    -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 12.5l4.5 4.5L19 7.5'/%3E%3C/svg%3E") center / contain no-repeat;
+    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 12.5l4.5 4.5L19 7.5'/%3E%3C/svg%3E") center / contain no-repeat; }
+  #pm-overlay.sx .add-mode-title, #pm-overlay.sx .add-mode-card.active .add-mode-title { font-size: 13.5px; color: var(--text-heading); margin-bottom: 1px; }
+  #pm-overlay.sx .add-mode-desc { font-size: 12.5px; line-height: 1.45; }
+  #pm-overlay.sx .add-mode-icon { color: var(--text-muted); }
+  #pm-overlay.sx .add-mode-card.active .add-mode-icon { color: var(--text-heading); }
+
+  /* Preferences: one bordered list of switch rows */
+  #pm-overlay.sx .pref-list { border: 1px solid var(--sx-line); border-radius: 14px; padding: 0 16px; margin-bottom: 0; }
+  #pm-overlay.sx .pref-row, #pm-overlay.sx .pref-row:first-child, #pm-overlay.sx .pref-row:last-child { padding: 14px 0; border-bottom-color: var(--sx-line); }
+  #pm-overlay.sx .pref-row-label { font-size: 13.5px; margin-bottom: 1px; }
+  #pm-overlay.sx .pref-row-hint { font-size: 12.5px; line-height: 1.45; }
+  #pm-overlay.sx .pref-toggle:not(.on) { background: rgba(var(--bt), .16); }
+  #pm-overlay.sx .pref-toggle:focus-visible { box-shadow: 0 0 0 2px rgba(var(--bt), .3); }
+
+  /* Developer Tools */
+  #pm-overlay.sx .dev-tool-section-label { font-size: 9.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--text-faint); margin: 22px 0 8px; }
+  #pm-overlay.sx .dev-tool-section-label:first-of-type { margin-top: 16px; }
+  #pm-overlay.sx .dev-tool-row { position: relative; padding: 12px 40px 12px 16px; margin-bottom: 6px; border-color: var(--sx-line); border-radius: 12px; background: none; }
+  #pm-overlay.sx .dev-tool-row:hover { background: var(--sx-fill); border-color: rgba(var(--bt), .14); }
+  #pm-overlay.sx .dev-tool-row::after { content: ''; position: absolute; right: 16px; top: 50%; width: 6px; height: 6px; margin-top: -4px; border-right: 1.7px solid var(--text-faint); border-top: 1.7px solid var(--text-faint); transform: rotate(45deg); }
+  #pm-overlay.sx .dev-tool-row:hover::after { border-color: var(--text-secondary); }
+  #pm-overlay.sx .dev-tool-row.danger:hover { border-color: rgba(238,85,85,.5); }
+  #pm-overlay.sx .dev-tool-label { font-size: 13.5px; }
+  #pm-overlay.sx .dev-tool-hint { font-size: 12.5px; }
+  #pm-overlay.sx .dev-tool-label .sys-item-value { margin-left: 6px; padding: 1px 7px; border-radius: 99px; background: rgba(var(--bt), .09); font-size: 11px; font-weight: 600; color: var(--text-secondary); }
+
+  /* Bulk Operations: one bordered list */
+  #pm-overlay.sx .bulk-ops-list { border: 1px solid var(--sx-line); border-radius: 14px; padding: 0 16px; gap: 0; }
+  #pm-overlay.sx .bulk-ops-item { padding: 13px 0; border: 0; border-radius: 0; background: none; }
+  #pm-overlay.sx .bulk-ops-item + .bulk-ops-item { border-top: 1px solid var(--sx-line); }
+  #pm-overlay.sx .bulk-ops-item:hover:not(.disabled) { background: none; }
+  #pm-overlay.sx .bulk-ops-icon { background: var(--sx-fill); border-radius: 10px; }
+  #pm-overlay.sx .bulk-ops-title { font-size: 13.5px; }
+  #pm-overlay.sx .bulk-ops-desc { font-size: 12.5px; }
+  #pm-overlay.sx .bulk-ops-btn { min-width: 60px; }
+
+  /* Keyboard Shortcuts: action on the left, keys on the right */
+  #pm-overlay.sx .help-table { width: 100%; border-collapse: collapse; border: 0; }
+  #pm-overlay.sx .help-table tr { display: flex; flex-direction: row-reverse; align-items: center; justify-content: space-between; padding: 11px 0; border-bottom: 1px solid var(--sx-line); }
+  #pm-overlay.sx .help-table tr:last-child { border-bottom: 0; }
+  #pm-overlay.sx .help-table td, #pm-overlay.sx .help-table td:first-child { display: block; width: auto; padding: 0; border: 0; text-align: left; font-size: 13.5px; color: var(--text-primary); white-space: nowrap; }
+  #pm-overlay.sx .help-table td:first-child { color: var(--text-faint); font-size: 12px; }
+  #pm-overlay.sx .help-table kbd { display: inline-block; min-width: 14px; padding: 3px 8px; border-radius: 7px; border: 1px solid var(--sx-line); border-bottom-width: 2px;
+    background: var(--sx-fill); color: var(--text-heading); font: 600 11.5px var(--font-sans); text-align: center; box-shadow: none; }
+
+  /* Persistent Storage */
+  #pm-overlay.sx .kanban-backend-option { padding: 14px 16px; border-color: var(--sx-line); border-radius: 12px; }
+  #pm-overlay.sx .kanban-backend-option:hover { border-color: rgba(var(--bt), .16); }
+  #pm-overlay.sx .kanban-backend-option.active { background: rgba(var(--bt), .06); border-color: rgba(var(--bt), .38); }
+  #pm-overlay.sx .kanban-backend-option > div:first-child { color: var(--text-heading) !important; font-size: 13.5px; }
+  #pm-overlay.sx .kanban-backend-option > div { font-size: 12.5px !important; }
+  #pm-overlay.sx #kb-supabase-config { border-color: var(--sx-line) !important; border-radius: 14px !important; padding: 18px !important; }
+  #pm-overlay.sx #kb-supabase-config > div:first-child, #pm-overlay.sx #kb-supabase-config > div:last-child > div:first-child,
+  #pm-overlay.sx #kb-backup-list-container > div:first-child {
+    font-size: 9.5px !important; font-weight: 600 !important; letter-spacing: .09em; text-transform: uppercase; color: var(--text-faint) !important; margin-bottom: 12px !important; }
+  #pm-overlay.sx #kb-supabase-config > div:last-child { border-top-color: var(--sx-line) !important; }
+
+  /* Recently Deleted */
+  #pm-overlay.sx .retention-control { font-size: 13px !important; gap: 10px !important; padding: 12px 16px; margin-bottom: 14px !important; border: 1px solid var(--sx-line); border-radius: 12px; }
+  #pm-overlay.sx .retention-control label { color: var(--text-primary) !important; flex: 1 1 auto; }
+  #pm-overlay.sx #trash-list > div:only-child { padding: 44px 0 !important; color: var(--text-faint) !important; }
+}
+
+
+/* ══ Sessions view with no session open (.dashboard.dx, built by _buildDashboard in toolbar.js).
+   The project as a heading, four plain counts, one primary action.  No boxes.  Colour: accent only for the
+   Working count and the New session button; amber for sessions waiting on the user. ══ */
+.dashboard.dx { --bt: 255,255,255; align-items: stretch; gap: 40px; max-width: 560px; padding: 48px 40px 72px; }
+[data-theme="light"] .dashboard.dx { --bt: 0,0,0; }
+.dx-label { font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--text-faint); }
+.dx-project { all: unset; box-sizing: border-box; display: inline-flex; align-items: center; gap: 8px; max-width: 100%; margin: 6px -10px 0; padding: 2px 10px;
+  border-radius: 10px; cursor: pointer; color: var(--text-heading); }
+.dx-project:hover { background: rgba(var(--bt), .06); }
+.dx-project:focus-visible { box-shadow: 0 0 0 2px rgba(var(--bt), .25); }
+.dx-project-name { font: 600 34px/1.2 'Space Grotesk', var(--font-sans); letter-spacing: -.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dx-project svg { flex: none; margin-top: 4px; color: var(--text-faint); }
+.dx-project:hover svg { color: var(--text-secondary); }
+.dx-nums { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; padding: 22px 0; border-top: 1px solid rgba(var(--bt), .08); border-bottom: 1px solid rgba(var(--bt), .08); }
+.dx-num b { display: block; font-family: 'Space Grotesk', var(--font-sans); font-size: 40px; font-weight: 500; line-height: 1; letter-spacing: -.03em; color: var(--text-heading); font-variant-numeric: tabular-nums; }
+.dx-num span { display: block; margin-top: 8px; font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--text-faint); }
+.dx-num.zero b { color: var(--text-faint); }
+.dx-num.work b { color: var(--accent-text, var(--accent)); }
+.dx-num.wait b { color: #d97706; }
+.dx-sec { margin-top: -16px; }
+.dx-list { display: flex; flex-direction: column; margin: 6px -10px 0; }
+.dx-row { display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; gap: 10px; align-items: center; height: 36px; padding: 0 10px; border-radius: 9px; cursor: pointer; }
+.dx-row:hover { background: rgba(var(--bt), .07); }
+.dx-row .t { font-size: 13.5px; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dx-row .d { font-size: 11.5px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.dx-dot { width: 8px; height: 8px; margin: 0 3px; border-radius: 50%; background: #d97706; }
+.dx-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.dx-new { all: unset; box-sizing: border-box; display: inline-flex; align-items: center; gap: 8px; height: 40px; padding: 0 18px 0 14px; border-radius: 11px; cursor: pointer;
+  background: var(--accent); color: #fff; font-size: 13.5px; font-weight: 600; transition: filter .12s, transform .08s; }
+.dx-new:hover { filter: brightness(1.1); }
+.dx-new:active { transform: scale(.98); }
+.dx-new:focus-visible { box-shadow: 0 0 0 2px var(--bg-body), 0 0 0 4px var(--accent); }
+.dx-hint { font-size: 13px; color: var(--text-faint); }
+@media (max-width: 768px) {
+  .dashboard.dx { gap: 28px; padding: 28px 20px 40px; }
+  .dx-project-name { font-size: 26px; }
+  .dx-num b { font-size: 30px; }
+  .dx-num span { font-size: 9px; letter-spacing: .06em; }
+  .dx-new { height: 44px; }
+}
+
+
+/* ══ New session, nothing sent yet.  The nine-box template grid is gone: the templates are one quiet row of chips
+   (icon + name; the description is the chip's tooltip), under a plain heading.  The two workflow cards
+   (.template-grid-workflow) keep their card form, in the UI typeface. ══ */
+.live-log > .empty-state { --bt: 255,255,255; font-family: var(--font-sans); }
+[data-theme="light"] .live-log > .empty-state { --bt: 0,0,0; }
+.live-log > .empty-state > svg:first-child { display: none; }
+.vibenode-greeting { font: 600 26px/1.25 'Space Grotesk', var(--font-sans); letter-spacing: -.02em; color: var(--text-heading); margin: 0 0 22px; }
+.template-grid:not(.template-grid-workflow) { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; max-width: 620px; margin: 0 auto; padding: 0; }
+.template-grid:not(.template-grid-workflow) .template-card { display: inline-flex; align-items: center; gap: 7px; width: auto; min-height: 0; height: 34px; padding: 0 13px 0 11px;
+  border: 0; border-radius: 99px; background: rgba(var(--bt), .055); box-shadow: none; text-align: left; transform: none; transition: background .12s; }
+.template-grid:not(.template-grid-workflow) .template-card:hover { background: rgba(var(--bt), .11); border: 0; box-shadow: none; transform: none; }
+.template-grid:not(.template-grid-workflow) .template-card-icon { display: inline-flex; margin: 0; color: var(--text-muted); }
+.template-grid:not(.template-grid-workflow) .template-card-icon svg { width: 14px; height: 14px; }
+.template-grid:not(.template-grid-workflow) .template-card:hover .template-card-icon { color: var(--text-heading); }
+.template-grid:not(.template-grid-workflow) .template-card-label { margin: 0; font: 500 12.5px/1 var(--font-sans); color: var(--text-secondary); white-space: nowrap; }
+.template-grid:not(.template-grid-workflow) .template-card:hover .template-card-label { color: var(--text-heading); }
+.template-grid:not(.template-grid-workflow) .template-card-desc { display: none; }
+.template-card-label, .template-card-desc { font-family: var(--font-sans); }
+.template-manage-link { margin-top: 18px; font: 500 12px var(--font-sans); color: var(--text-faint); }
+.template-manage-link:hover { color: var(--text-secondary); }
+
+
+/* Loading placeholders for the cards view: the same grid and card size as the real cards (.wf-card) */
+.skel-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; padding: 10px 0 12px 0; }
+.skel-card { height: 136px; box-sizing: border-box; display: flex; flex-direction: column; align-items: center; gap: 7px; padding: 16px 12px 12px;
+  border: 1px solid var(--border-subtle); border-radius: 14px; }
+.skel-card .skel-bar { flex: none; margin: 0; }
+.skel-card .skel-bar.ico { width: 26px; height: 26px; border-radius: 8px; }
+.skel-card .skel-bar.pill { width: 54px; height: 13px; border-radius: 99px; margin-bottom: 3px; }
+.skel-card .skel-bar.t1 { width: 86%; height: 9px; }
+.skel-card .skel-bar.t2 { width: 58%; height: 9px; }
+.skel-card .skel-bar.meta { width: 40%; height: 8px; margin-top: auto; }
+
+
+/* ══ Theme-switch splash (see _themeFlash in theme.js).  Background and text colour are set inline from the
+   outgoing theme, then re-read after the swap, so the sheet crossfades between the two themes. ══ */
+.vn-theme-flash { position: fixed; inset: 0; z-index: 2147483646; pointer-events: none; opacity: 0;
+  transition: opacity .35s cubic-bezier(.22,1,.36,1); will-change: opacity; }
+.vn-theme-flash.visible { opacity: 1; transition: opacity .2s cubic-bezier(.22,1,.36,1), background-color .6s cubic-bezier(.22,1,.36,1), color .6s cubic-bezier(.22,1,.36,1); }
+.vtf-reveal { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; }
+.vtf-icon { display: flex; align-items: center; justify-content: center; min-width: 36px; min-height: 36px; opacity: 0;
+  transform: scale(.4) rotate(-180deg); filter: blur(6px); animation: vtf-icon .45s cubic-bezier(.22,1,.36,1) .05s forwards; }
+.vtf-icon svg { width: 28px; height: 28px; }
+.vtf-label { font: 500 13px 'Space Grotesk', var(--font-sans); letter-spacing: 8px; text-transform: uppercase; margin-right: -4px; opacity: 0; filter: blur(4px);
+  animation: vtf-label .4s cubic-bezier(.22,1,.36,1) .12s forwards; }
+.vtf-hint { font-size: 11px; letter-spacing: 1px; opacity: 0; filter: blur(3px); animation: vtf-hint .35s cubic-bezier(.22,1,.36,1) .22s forwards; }
+@keyframes vtf-icon { 0% { opacity: 0; transform: scale(.4) rotate(-180deg); filter: blur(6px); } 60% { opacity: 1; transform: scale(1.08) rotate(15deg); filter: blur(0); }
+  100% { opacity: 1; transform: scale(1) rotate(0deg); filter: blur(0); } }
+@keyframes vtf-label { from { opacity: 0; letter-spacing: 12px; filter: blur(4px); } to { opacity: .85; letter-spacing: 4px; filter: blur(0); } }
+@keyframes vtf-hint { from { opacity: 0; letter-spacing: 4px; filter: blur(3px); } to { opacity: .5; letter-spacing: 1px; filter: blur(0); } }
+html.vn-theme-swapping *:not(.vn-theme-flash), html.vn-theme-swapping *::before, html.vn-theme-swapping *::after { transition: none !important; }

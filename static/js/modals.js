@@ -109,7 +109,142 @@ function _hdrSysOpenSheet() {
 
 function toggleHdrSys() {
   if (_hdrSysIsMobile()) { _hdrSysOpenSheet(); return; }
-  document.getElementById('hdr-sys-dropdown').classList.toggle('open');
+  openSettings();
+}
+
+// --- Settings window (desktop) ---
+// The gear opens ONE large window: the sections down the left, the chosen
+// section's content on the right.  The sections are the #hdr-sys-dropdown
+// buttons (still the single source of truth for labels, values and handlers),
+// and each section's content is the dialog that button already opens, drawn
+// into #pm-overlay as before.  This only adds the nav beside the dialog card
+// and sizes the pair as one window; no dialog was rewritten.
+var _sx = { on: false, key: '', explicit: false, shown: false, obs: null };
+var _SX_ICONS = {
+  'Model': '<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.7 1.8 1.8.7-1.8.7L19 20l-.7-1.8-1.8-.7 1.8-.7z"/>',
+  'Thinking': '<path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-3.6 10.8c.6.5 1 1.2 1.1 2h5c.1-.8.5-1.5 1.1-2A6 6 0 0 0 12 3z"/>',
+  'Preferences': '<path d="M4 7h9M18 7h2M4 17h2M11 17h9"/><circle cx="15.5" cy="7" r="2.5"/><circle cx="8.5" cy="17" r="2.5"/>',
+  'Permission Policy': '<path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6z"/><path d="M9 12l2 2 4-4"/>',
+  'Persistent Storage': '<ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/><path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/>',
+  'Mobile Command': '<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18h2"/>',
+  'Bulk Operations': '<rect x="3" y="4" width="18" height="5" rx="1.5"/><rect x="3" y="15" width="18" height="5" rx="1.5"/><path d="M7 9v6M17 9v6"/>',
+  'Keyboard Shortcuts': '<rect x="2.5" y="6" width="19" height="12" rx="2.5"/><path d="M6.5 10h.01M10 10h.01M13.5 10h.01M17 10h.01M7 14h10"/>',
+  'Recently Deleted': '<path d="M4 7h16M10 3h4M6 7l1 13h10l1-13M10 11v6M14 11v6"/>',
+  'Developer Tools': '<path d="M8 8l-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/>'
+};
+var _SX_GROUPS = ['Defaults', 'Access', 'Tools', 'Maintenance'];
+// Sections that are a list to pick from: choosing closes the dialog, and the
+// window comes back on the same section showing the new choice.
+var _SX_STAY = { 'Model': 1, 'Thinking': 1, 'Permission Policy': 1 };
+
+function _sxNavHtml() {
+  var groups = _hdrSysBuildGroups();
+  var named = groups.length === _SX_GROUPS.length;
+  var html = '<div class="sx-nav-title">Settings</div>';
+  groups.forEach(function(rows, gi) {
+    if (!rows.length) return;
+    html += '<div class="sx-group">' + (named ? '<div class="sx-group-label">' + _SX_GROUPS[gi] + '</div>' : '');
+    rows.forEach(function(r) {
+      html += '<button class="sx-item' + (r.label === _sx.key ? ' active' : '') + '" data-key="' + _hdrSysEsc(r.label) + '">'
+        + '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+        + (_SX_ICONS[r.label] || '<circle cx="12" cy="12" r="3"/>') + '</svg>'
+        + '<span class="sx-item-label">' + _hdrSysEsc(r.label) + '</span>'
+        + (r.value ? '<span class="sx-item-value">' + _hdrSysEsc(r.value) + '</span>' : '')
+        + '</button>';
+    });
+    html += '</div>';
+  });
+  return html;
+}
+function _sxSource(key) {
+  var found = null;
+  _hdrSysBuildGroups().forEach(function(rows) { rows.forEach(function(r) { if (r.label === key) found = r.source; }); });
+  return found;
+}
+function _sxAttach() {
+  var overlay = document.getElementById('pm-overlay');
+  if (!_sx.on || !overlay || overlay.querySelector('.sx-nav') || !overlay.querySelector('.pm-card')) return;
+  var nav = document.createElement('div');
+  nav.className = 'sx-nav';
+  nav.innerHTML = _sxNavHtml();
+  nav.addEventListener('click', function(e) {
+    var it = e.target.closest('.sx-item');
+    if (it) _sxShow(it.getAttribute('data-key'));
+  });
+  overlay.insertBefore(nav, overlay.firstChild);
+  var x = document.createElement('div');
+  x.className = 'sx-x';
+  x.innerHTML = '<button class="sx-close" title="Close" aria-label="Close settings"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>';
+  x.firstChild.addEventListener('click', closeSettings);
+  overlay.appendChild(x);
+  // The window has its own close button, so a footer holding only "Close" is dropped.
+  overlay.querySelectorAll('.pm-card .pm-actions').forEach(function(f) {
+    var bs = f.querySelectorAll('button');
+    if (bs.length === 1 && /^close$/i.test((bs[0].textContent || '').trim())) f.classList.add('sx-hidden');
+  });
+  overlay.querySelectorAll('.pm-card button').forEach(function(b) {
+    var t = (b.textContent || '').trim();
+    if (t === '\u00d7' || t === '\u2715') b.classList.add('sx-hidden');
+  });
+  // Default-model list: the same family rows of chips as the status panel under the composer.
+  var ml = overlay.querySelector('.pm-card > .msel-list');
+  if (ml && !ml.querySelector('.sm-fam') && typeof _groupModelChips === 'function') { _groupModelChips(ml); ml.classList.add('sx-chips'); }
+  var tc = overlay.querySelector('#trash-close');
+  if (tc) tc.classList.add('sx-hidden');
+}
+function _sxShow(key) {
+  var src = _sxSource(key);
+  if (!src) return;
+  _sx.key = key;
+  _sx.explicit = false;
+  _sx.shown = false;
+  try { localStorage.setItem('settingsSection', key); } catch (e) {}
+  // A pending close from the previous section must not wipe the new one.
+  if (typeof _pmCloseTimer !== 'undefined' && _pmCloseTimer) { clearTimeout(_pmCloseTimer); _pmCloseTimer = null; }
+  src.click();
+  _sxAttach();
+}
+function _sxEnd() {
+  _sx.on = false;
+  var overlay = document.getElementById('pm-overlay');
+  if (overlay) overlay.classList.remove('sx');
+}
+function closeSettings() {
+  _sx.explicit = true;
+  if (typeof _closePm === 'function') _closePm();
+}
+function openSettings(key) {
+  var overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+  var dd = document.getElementById('hdr-sys-dropdown');
+  if (dd) dd.classList.remove('open');
+  if (!_sx.obs) {
+    _sx.obs = new MutationObserver(function() {
+      if (!_sx.on) return;
+      if (overlay.classList.contains('show')) { _sx.shown = true; _sxAttach(); return; }
+      if (!_sx.shown) return;   // a section that loads first (storage, mobile) has not drawn yet
+      // The dialog closed.  A pick in a list section returns to that section;
+      // anything else (Close, Esc, the backdrop, an action that leaves) ends it.
+      if (!_sx.explicit && _SX_STAY[_sx.key]) _sxShow(_sx.key); else _sxEnd();
+    });
+    _sx.obs.observe(overlay, { childList: true, attributes: true, attributeFilter: ['class'] });
+    overlay.addEventListener('click', function(e) {
+      if (!_sx.on) return;
+      var b = e.target.closest && e.target.closest('button');
+      if (e.target === overlay || (b && !b.closest('.sx-nav') && /^(close|cancel|done)$/i.test((b.textContent || '').trim()))) _sx.explicit = true;
+    }, true);
+    document.addEventListener('keydown', function(e) {
+      if (_sx.on && e.key === 'Escape' && overlay.classList.contains('show')) closeSettings();
+    }, true);
+  }
+  var saved = '';
+  try { saved = localStorage.getItem('settingsSection') || ''; } catch (e) {}
+  var first = (_hdrSysBuildGroups()[0][0] || {}).label || '';
+  var want = (key && _sxSource(key)) ? key : (_sxSource(saved) ? saved : first);
+  if (!want) return;
+  _sx.on = true;
+  overlay.classList.add('sx');
+  _sxShow(want);
 }
 function closeHdrSys() {
   // On mobile the menu lives in #mobile-sheet, not the dropdown — close both
@@ -149,14 +284,14 @@ function _trashFmtSize(bytes) {
 
 function openTrash() {
   const proj = localStorage.getItem('activeProject') || '';
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.id = 'trash-overlay';
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
+  // Drawn in the shared #pm-overlay like every other System dialog (it used to
+  // build its own overlay), so it also works as a section of the Settings window.
+  const overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
   overlay.innerHTML = `
-    <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:10px;padding:22px 24px;min-width:420px;max-width:560px;max-height:72vh;display:flex;flex-direction:column;color:var(--text-primary);font-family:inherit">
-      <h3 style="margin:0 0 4px;font-size:16px;color:var(--text-heading)">Recently Deleted</h3>
-      <p style="margin:0 0 12px;font-size:12px;color:var(--text-muted)">Items are kept for the period you choose below. Restore brings the conversation back; permanent delete cannot be undone.</p>
+    <div class="pm-card pm-enter" style="width:560px;max-height:72vh;display:flex;flex-direction:column;">
+      <h2 class="pm-title">Recently Deleted</h2>
+      <div class="pm-body" style="margin-bottom:14px;"><p>Items are kept for the period you choose below. Restore brings the conversation back; permanent delete cannot be undone.</p></div>
       <div class="retention-control" style="display:flex;align-items:center;gap:8px;font-size:12px;margin:0 0 12px">
         <label for="retention-select" style="color:var(--text-muted)">Keep deleted sessions for:</label>
         <select id="retention-select" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-primary);cursor:pointer;font-size:12px">
@@ -171,14 +306,15 @@ function openTrash() {
         <div style="padding:18px;text-align:center;color:var(--text-muted);font-size:13px">Loading…</div>
       </div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-top:16px">
-        <button id="trash-empty" style="padding:6px 16px;border-radius:6px;border:1px solid var(--danger,#e55);background:transparent;color:var(--danger,#e55);cursor:pointer;display:none">Empty trash</button>
-        <button id="trash-close" style="padding:6px 16px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-primary);cursor:pointer;margin-left:auto">Close</button>
+        <button id="trash-empty" class="pm-btn pm-btn-secondary" style="color:var(--danger,#e55);border-color:var(--danger,#e55);display:none">Empty trash</button>
+        <button id="trash-close" class="pm-btn pm-btn-secondary" style="margin-left:auto">Close</button>
       </div>
     </div>`;
-  document.body.appendChild(overlay);
-  overlay.querySelector('#trash-close').onclick = () => overlay.remove();
+  overlay.classList.add('show');
+  requestAnimationFrame(() => { const c = overlay.querySelector('.pm-card'); if (c) c.classList.remove('pm-enter'); });
+  overlay.querySelector('#trash-close').onclick = () => _closePm();
   overlay.querySelector('#trash-empty').onclick = () => _trashEmpty(proj);
-  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  overlay.onclick = (e) => { if (e.target === overlay) _closePm(); };
 
   // Retention selector: default to Forever (safe default — never 30), apply
   // any cached pref, then ask the server for the authoritative value.  The

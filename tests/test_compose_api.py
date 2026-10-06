@@ -417,10 +417,23 @@ class TestComposeBoard:
     """Tests for the compose board endpoint."""
 
     def test_board_returns_200(self, client):
-        resp = client.get('/api/compose/board')
+        # The board is `null` when no composition exists (the client handles
+        # that in initCompose), so create one: this used to pass only on a
+        # machine that already had compositions in its real data.
+        pid = client.post('/api/compose/projects',
+                          json={'name': 'test-board-proj'}).get_json()['project']['id']
+        resp = client.get(f'/api/compose/board?project_id={pid}')
         assert resp.status_code == 200
         data = resp.get_json()
         assert isinstance(data, dict)
+        assert data['project']['id'] == pid
+        assert data['sections'] == []
+        assert any(p['id'] == pid for p in data['sibling_projects'])
+
+    def test_board_is_null_for_a_parent_with_no_compositions(self, client):
+        resp = client.get('/api/compose/board?project=-no-such-parent-project')
+        assert resp.status_code == 200
+        assert resp.get_json() is None
 
 
 class TestProjectClone:

@@ -340,7 +340,8 @@ socket.on('disconnect', () => {
 // the underlying congestion worse \u2192 chain of "Engine Stopped" flashes).
 //
 // New rule: this file NEVER cycles a healthy socket. Period.
-//   - If socket.connected is false \u2192 call socket.connect() (harmless).
+//   - If socket.connected is false AND it is not mid-handshake \u2192 call
+//     socket.connect().  Mid-handshake it must be left alone (see below).
 //   - If socket.connected is true \u2192 emit request_state_snapshot only.
 //
 // A genuinely dead socket will surface as either a Socket.IO 'disconnect'
@@ -357,6 +358,21 @@ function _wakeSocketResync() {
     _lastWakeResyncAt = now;
 
     if (!socket.connected) {
+        // A socket that is still CONNECTING is not disconnected, and calling
+        // socket.connect() on it is NOT harmless (fixed 2026-10-06).  While
+        // the transport is open and the namespace handshake is pending,
+        // connect() sends a second CONNECT packet.  The server answers the
+        // duplicate with CONNECT_ERROR ("Unable to connect"), and the client
+        // then destroys the socket's listeners while socket.connected goes
+        // true from the first handshake: a socket that looks connected, still
+        // sends, and never receives.  `pageshow` fires on every page load,
+        // normally before the handshake finishes (handle_connect does a
+        // daemon IPC first), so this hit almost every load: the first chat
+        // thread sat on its skeleton until the 16s watchdog cycled the
+        // socket.  socket.active is true while the socket is connecting or
+        // will reconnect by itself; only a socket that has given up needs us.
+        const mgrState = socket.io && socket.io._readyState;
+        if (socket.active && mgrState !== 'closed') return;
         console.log('[WS] wake: socket disconnected \u2014 forcing reconnect');
         try { socket.connect(); } catch (e) { /* ignore */ }
         return;

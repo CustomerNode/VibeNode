@@ -13,6 +13,7 @@ ARM64 investigation) can silently return.
 
 import os
 import subprocess
+import sys
 
 import pytest
 
@@ -69,7 +70,9 @@ def test_guard_blocks_full_windows_schtasks_path():
 def test_guard_allows_unrelated_subprocess():
     # Bare Python echo — safe, does not touch autostart. Must not raise.
     proc = subprocess.run(
-        ["python", "-c", "print('ok')"],
+        # sys.executable, not "python": Linux and macOS often have no bare
+        # `python` on PATH, only `python3`.
+        [sys.executable, "-c", "print('ok')"],
         capture_output=True, text=True, timeout=15,
     )
     assert proc.returncode == 0

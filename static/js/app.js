@@ -202,6 +202,10 @@ function _updateProjectLabel(project) {
 // that arrived after the user already switched projects.
 let _projectSwitchGen = 0;
 
+// The session-list load the latest setProject() started.  setProject does not
+// wait for it (boot and other callers rely on that); the project-switch splash does.
+let _projectSwitchLoad = null;
+
 async function setProject(encoded, reload = true) {
   ++_projectSwitchGen;  // invalidate all in-flight async for old project
   // Save the current view mode and active session for the OLD project so we
@@ -234,10 +238,6 @@ async function setProject(encoded, reload = true) {
     _cleanUrl.searchParams.delete('chat');
     history.replaceState({ folder: null, chat: null }, '', _cleanUrl);
   }
-  // Reset main body to dashboard so the old chat isn't visible while new
-  // project loads.
-  const _mb = document.getElementById('main-body');
-  if (_mb) _mb.innerHTML = _buildDashboard();
   setToolbarSession(null, 'No session selected', true, '');
 
   const p = _allProjects.find(x => x.encoded === encoded);
@@ -259,6 +259,11 @@ async function setProject(encoded, reload = true) {
   // sidebar/grid during the gap between project switch and loadSessions().
   allSessions = [];
   allSessionIds.clear();
+  // Reset main body to the dashboard so the old chat isn't visible while the
+  // new project loads.  Built here, AFTER activeProject and the session data
+  // are switched: built earlier it showed the OLD project's name and counts.
+  const _mb = document.getElementById('main-body');
+  if (_mb) _mb.innerHTML = _buildDashboard();
   // Clear sidebar multi-selection — the IDs in it belong to the old
   // project and are about to vanish from allSessionIds.  Calling
   // _clearMultiSelect() is also safe when sessions.js hasn't loaded yet
@@ -338,7 +343,7 @@ async function setProject(encoded, reload = true) {
     // hasn't been updated to the target yet at this point.
     const _targetView = localStorage.getItem('projectView_' + encoded) || viewMode;
     _suppressSessionRestore = (_targetView !== 'sessions');
-    loadSessions();
+    _projectSwitchLoad = loadSessions();
   }
 }
 
@@ -470,14 +475,17 @@ async function selectProjectFromOverlay(encoded) {
   const p = _allProjects.find(x => x.encoded === encoded);
   const name = p ? _projectShortName(p) : 'project';
 
-  // Show full-screen loading overlay.  The floor only exists to stop a very
-  // fast switch flashing the overlay up and straight back down; it is NOT a
-  // pacing device.  It used to be 1800ms, which meant every switch waited on
-  // the animation long after the data was ready -- the switch was done in
-  // ~150ms and the user still sat through 1.8s of orb.
+  // Show the full-screen splash.  The floor only exists so the splash can
+  // finish revealing the project name instead of flashing up and straight
+  // back down; it is NOT a pacing device.  It used to be 1800ms, which meant
+  // every switch waited on the animation long after the data was ready.
   _showProjectSwitchLoader(name);
-  const _minDisplay = new Promise(r => setTimeout(r, 250));
+  const _minDisplay = new Promise(r => setTimeout(r, 400));
+  // Let the splash go opaque BEFORE the old project is torn down, so the
+  // teardown itself is never seen.
+  await new Promise(r => setTimeout(r, 170));
 
+  _projectSwitchLoad = null;
   await setProject(encoded, true);
 
   // Restore the view the user was last using in this project, or fall back
@@ -488,41 +496,62 @@ async function selectProjectFromOverlay(encoded) {
   const _targetView = _savedView || viewMode || 'homepage';
   if (typeof setViewMode === 'function') setViewMode(_targetView);
 
-  // Wait for minimum display time before dismissing
+  // Hold the splash until the new project has actually finished drawing:
+  // the session list has loaded (setProject starts that load but does not
+  // wait for it) and any restored session's thread is on screen.  Lifting it
+  // on the timer alone revealed the half-built states underneath.
+  try { if (_projectSwitchLoad) await _projectSwitchLoad; } catch (e) { /* load failures surface in the list itself */ }
+  await _projectSwitchSettled(3000);
   await _minDisplay;
   _hideProjectSwitchLoader();
 }
 
+// Project-switch splash: the loading splash (".vn-splash", styled inline in
+// index.html), naming the project being opened.  It is OPAQUE on purpose.  The
+// old loader was a translucent blur, and a switch tears the old project down
+// and builds the new one in several steps (empty dashboard, sessions known
+// from the live snapshot before the list arrives, the list, the restored
+// session's thread), every one of which showed through it as stale data.
 function _showProjectSwitchLoader(projectName) {
   let overlay = document.getElementById('project-switch-loader');
   if (overlay) overlay.remove();
 
   overlay = document.createElement('div');
   overlay.id = 'project-switch-loader';
-  overlay.innerHTML = `
-    <div class="psl-content">
-      <div class="psl-orb-wrap">
-        <div class="psl-orb"></div>
-        <div class="psl-ring"></div>
-        <div class="psl-ring psl-ring-2"></div>
-      </div>
-      <div class="psl-text">
-        <div class="psl-label">Switching to</div>
-        <div class="psl-name">${escHtml(projectName)}</div>
-      </div>
-      <div class="psl-dots"><span></span><span></span><span></span></div>
-    </div>`;
+  overlay.className = 'vn-splash vn-switch';
+  overlay.setAttribute('aria-hidden', 'true');
+  overlay.innerHTML = '<div class="vns-label">Project</div>'
+    + '<div class="vns-brand">' + escHtml(projectName) + '</div>'
+    + '<div class="vns-track"><div class="vns-bar"></div></div>';
   document.body.appendChild(overlay);
-  // Force reflow then add .visible for transition
-  overlay.offsetHeight;
-  overlay.classList.add('visible');
+  overlay.offsetHeight;   // force reflow so the fade-in runs
+  overlay.classList.add('in');
 }
 
 function _hideProjectSwitchLoader() {
   const overlay = document.getElementById('project-switch-loader');
   if (!overlay) return;
-  overlay.classList.add('done');
-  setTimeout(() => overlay.remove(), 900);
+  overlay.classList.add('ready');   // the bar completes
+  setTimeout(() => {
+    overlay.classList.add('out');
+    setTimeout(() => overlay.remove(), 600);
+  }, 180);
+}
+
+// Resolves once the new project has finished drawing: the session list is
+// loaded and, if a session was restored, its thread has replaced its skeleton.
+// Capped, so a slow or failed load can never leave the splash up.
+function _projectSwitchSettled(maxMs) {
+  const t0 = performance.now();
+  return new Promise(resolve => {
+    (function check() {
+      const sl = document.getElementById('session-list');
+      const listLoading = !!(sl && sl.getClientRects().length && sl.querySelector('.skel-row, .skel-cards'));
+      const threadLoading = !!document.querySelector('#live-log .skel-bar');
+      if ((!listLoading && !threadLoading) || performance.now() - t0 > maxMs) { resolve(); return; }
+      setTimeout(check, 50);
+    })();
+  });
 }
 
 async function renameProjectOverlay(encoded, currentName) {
@@ -1620,6 +1649,18 @@ async function _showMemoryEditor() {
 function showSkeletonLoader() {
   const el = document.getElementById('session-list');
   let html = '';
+  // Cards view: card-shaped placeholders, so the loading state matches what
+  // is about to appear.  Same markup as the inline first-paint skeleton in index.html.
+  if (sessionDisplayMode === 'grid') {
+    html = '<div class="skel-cards">';
+    for (let c = 0; c < 8; c++) {
+      const cd = (c * 0.06).toFixed(2);
+      html += '<div class="skel-card">' + ['ico', 'pill', 't1', 't2', 'meta'].map(k =>
+        '<div class="skel-bar ' + k + '" style="animation-delay:' + cd + 's"></div>').join('') + '</div>';
+    }
+    el.innerHTML = html + '</div>';
+    return;
+  }
   for (let i = 0; i < 20; i++) {
     const nw = 40 + Math.random() * 45;
     const delay = (i * 0.06).toFixed(2);
@@ -1897,8 +1938,8 @@ function _parseModelEntry(m) {
 
 /** Build grouped-by-family selector HTML. Rows carry data-model; caller wires clicks. */
 function _modelSelectorGroupsHtml(models, selectedId) {
-  // ONE chip per model, tagged "1M" when that model runs with the 1M context
-  // window.  A separate "5.5" and "5.5 1M" pair was tried (2026-10-05) and was
+  // ONE chip per model, with no "1M" tag (it sat on nearly every chip and was
+  // noise; removed 2026-10-06).  A separate "5.5" and "5.5 1M" pair was tried (2026-10-05) and was
   // misleading: on this account Fable, Opus and Sonnet sessions launched on
   // the plain id already run to ~1M tokens (daemon logs), so the plain chip
   // was 1M too.  Haiku rejects 1M (API 400), so it is untagged.  The family
@@ -1944,7 +1985,8 @@ function _modelSelectorGroupsHtml(models, selectedId) {
       html += '<div class="msel-row' + (active ? ' active' : '') + '" data-model="' + escHtml(m.id || '') + '" role="button" tabindex="0">'
         + _MSEL_CHECK
         + '<span class="msel-name">' + escHtml(verLabel) + '</span>'
-        + ((p.is1m || m._ctx1m) ? '<span class="msel-tag msel-tag-1m">1M</span>' : '')
+        // No "1M" tag on the chips: nearly every model has the 1M window, so the tag
+        // was on almost all of them and said nothing.  (m._ctx1m is still computed above.)
         + '</div>';
     }
   }

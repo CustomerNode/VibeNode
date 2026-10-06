@@ -193,13 +193,73 @@ function applyTheme(pref) {
   if (logo) logo.src = effective === 'dark' ? '/static/images/logo-dark.png' : '/static/images/logo.png';
 }
 
+/* ── Theme-switch splash ──
+   A full-screen sheet in the OUTGOING theme's background fades in, the
+   incoming theme's icon / name / hint reveal on it, the theme swaps underneath
+   while the sheet is opaque, the sheet crossfades to the new background, then
+   fades out.  About 1.3s.  Styles: ".vn-theme-flash" in style.css. */
+const _themeFlashLabel = {dark: 'Dark', light: 'Light', auto: 'Auto'};
+const _themeFlashHint = {dark: 'Easy on the eyes', light: 'Bright and clean', auto: 'Follows sunrise and sunset'};
+const _THEME_SWAP_DELAY_MS = 200;      // after the sheet is opaque, before the swap
+const _THEME_POST_SWAP_HOLD_MS = 550;  // sheet stays opaque after the swap
+let _themeFlashRun = 0;
+let _themeFlashTimers = [];
+
+function _themeFlash(next, swap) {
+  const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (reduce || !document.body) { swap(); return false; }
+  let el = document.getElementById('vn-theme-flash');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'vn-theme-flash';
+    el.className = 'vn-theme-flash';
+    el.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(el);
+  }
+  // A new click supersedes a running flash: its timers are dropped and the
+  // sheet, already opaque, goes straight to the new badge.
+  _themeFlashTimers.forEach(clearTimeout);
+  _themeFlashTimers = [];
+  const run = ++_themeFlashRun;
+  const later = (fn, ms) => { _themeFlashTimers.push(setTimeout(() => { if (run === _themeFlashRun) fn(); }, ms)); };
+  const paint = () => {
+    const cs = getComputedStyle(document.documentElement);
+    el.style.backgroundColor = cs.getPropertyValue('--bg-sidebar').trim() || '#111';
+    el.style.color = cs.getPropertyValue('--text-heading').trim() || '#fff';
+  };
+  const wasVisible = el.classList.contains('visible');
+  if (!wasVisible) paint();   // freeze the outgoing colours; an opaque sheet keeps what it shows
+  el.innerHTML = '<div class="vtf-reveal"><span class="vtf-icon">' + _themeSvg[next] + '</span>'
+    + '<span class="vtf-label">' + _themeFlashLabel[next] + '</span>'
+    + '<span class="vtf-hint">' + _themeFlashHint[next] + '</span></div>';
+  void el.offsetWidth;
+  el.classList.add('visible');
+  later(() => {
+    // Everything re-themes at once behind the sheet: element transitions are
+    // off for the swap, so nothing is still mid-fade when the sheet lifts.
+    const root = document.documentElement;
+    root.classList.add('vn-theme-swapping');
+    swap();
+    setTimeout(() => root.classList.remove('vn-theme-swapping'), 300);
+    requestAnimationFrame(() => { if (run === _themeFlashRun) paint(); });   // crossfade to the incoming colours
+    later(() => {
+      el.classList.remove('visible');
+      later(() => { el.innerHTML = ''; }, 400);
+    }, _THEME_POST_SWAP_HOLD_MS);
+  }, (wasVisible ? 0 : 200) + _THEME_SWAP_DELAY_MS);
+  return true;
+}
+
 function cycleTheme() {
   var cur = localStorage.getItem('theme') || 'dark';
   var next = _themeOrder[(_themeOrder.indexOf(cur) + 1) % _themeOrder.length];
-  localStorage.setItem('theme', next);
-  applyTheme(next);
-  var labels = {dark: 'Dark theme', light: 'Light theme', auto: 'Auto theme (sunrise/sunset)'};
-  showToast(labels[next]);
+  localStorage.setItem('theme', next);   // saved at once, so rapid clicks keep cycling
+  // The splash names the new theme itself; the toast is only for reduced motion.
+  var flashed = _themeFlash(next, function() { applyTheme(next); });
+  if (!flashed) {
+    var labels = {dark: 'Dark theme', light: 'Light theme', auto: 'Auto theme (sunrise/sunset)'};
+    showToast(labels[next]);
+  }
 }
 
 applyTheme(localStorage.getItem('theme') || 'dark');

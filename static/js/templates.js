@@ -124,7 +124,7 @@ function _renderTemplateGrid(sessionId) {
   var html = '<div class="template-grid" id="template-grid">';
   for (var i = 0; i < templates.length; i++) {
     var t = templates[i];
-    html += '<div class="template-card" onclick="_selectTemplate(\'' + escHtml(sessionId) + '\',\'' + escHtml(t.id) + '\')">' +
+    html += '<div class="template-card" title="' + escHtml(t.description || '') + '" onclick="_selectTemplate(\'' + escHtml(sessionId) + '\',\'' + escHtml(t.id) + '\')">' +
       '<div class="template-card-icon">' + t.icon + '</div>' +
       '<div class="template-card-body">' +
       '<div class="template-card-label">' + escHtml(t.label) + '</div>' +
