@@ -897,7 +897,10 @@ function renderWorkforce(sessions) {
                       : _role === 'child' ? ' wf-child' : '';
     const childGlyph = _role === 'child'
       ? '<span class="wf-sub-glyph" aria-hidden="true">\u21b3 </span>' : '';
-    const name = escHtml((s.display_title||s.id).slice(0,22) + ((s.display_title||'').length>22?'\u2026':''));
+    // The full title: the card's CSS clamps it (two lines on desktop, one
+    // elsewhere).  It used to be cut to 22 characters here, so the ellipsis
+    // landed a few letters into line two with most of that line empty.
+    const name = escHtml(s.display_title||s.id);
     const date = _shortDate(s.last_activity);
     // Unread dot \u2014 idle cards only, never the selected one.  Grid is the
     // DEFAULT sidebar mode (app.js: sessionDisplayMode defaults to 'grid'),
