@@ -388,11 +388,22 @@ class TestUsageLimitClassification:
         assert is_limit is True
         assert reset == 1756612800.0
 
-    def test_prose_variant_has_no_reset_time(self, sm_module):
-        """No machine-readable instant → 0.0, so the banner omits the countdown
+    def test_prose_clock_reset_is_resolved(self, sm_module):
+        """A human clock time ("reset at 6pm") is resolved to the next 6pm in
+        local time (2026-10-07: the CLI only states resets this way now, so
+        returning 0.0 left nothing to schedule the auto-continue against)."""
+        from datetime import datetime
+        now = datetime(2026, 10, 7, 16, 43).astimezone().timestamp()
+        is_limit, reset = sm_module.SessionManager._parse_usage_limit(
+            "Claude usage limit reached. Your limit will reset at 6pm.", now=now)
+        assert is_limit is True
+        assert reset == datetime(2026, 10, 7, 18, 0).astimezone().timestamp()
+
+    def test_no_reset_time_at_all_is_zero(self, sm_module):
+        """No reset of any kind → 0.0, so the banner omits the countdown
         rather than inventing a number."""
         is_limit, reset = sm_module.SessionManager._parse_usage_limit(
-            "Claude usage limit reached. Your limit will reset at 6pm.")
+            "You're out of usage credits. Switch to another model to continue.")
         assert is_limit is True
         assert reset == 0.0
 
@@ -1121,3 +1132,225 @@ class TestQueueDuringRetry:
         tail = src[src.rfind("info._api_retry_count += 1"):]
         assert "_emit_state(info)" not in tail, \
             "_fire_api_retry must not emit IDLE state before send_message (queue race)"
+
+
+# ===========================================================================
+# Usage limit → continue automatically once it resets (added 2026-10-07)
+#
+# The incident: a long autonomous session hit "You've hit your session limit ·
+# resets 5pm (America/New_York)" at 4:43pm and was still dead after 5pm.  Four
+# gaps stacked: the new wording was not recognised as a limit; even a
+# recognised limit only offered a model switch, never a continue-at-reset; the
+# user's message had been trimmed out of the 200-entry in-memory log, so even
+# the transient fallback refused to retry ("nothing to resume"); and the turn
+# was a notification-triggered auto-resume, whose flagged retry the post-turn
+# listener never armed.
+# ===========================================================================
+
+REAL_LIMIT_TEXT = "You've hit your session limit · resets 5pm (America/New_York)"
+
+
+def _epoch(iso):
+    from datetime import datetime
+    return datetime.fromisoformat(iso).timestamp()
+
+
+class TestUsageLimitAutoResume:
+
+    # ── recognition + reset time ──
+
+    def test_real_cli_wording_is_a_usage_limit(self, sm_module):
+        S = sm_module.SessionManager
+        assert S._classify_result_error("success", REAL_LIMIT_TEXT) == "usage_limit"
+
+    def test_real_cli_wording_resets_at_5pm_new_york(self, sm_module):
+        ok, reset = sm_module.SessionManager._parse_usage_limit(
+            REAL_LIMIT_TEXT, now=_epoch("2026-10-07T16:43:48-04:00"))
+        assert ok is True
+        assert reset == _epoch("2026-10-07T17:00:00-04:00")
+
+    @pytest.mark.parametrize("text, now_iso, expected_iso", [
+        ("You've hit your session limit · resets 5:30pm (America/New_York)",
+         "2026-10-07T16:43:48-04:00", "2026-10-07T17:30:00-04:00"),
+        ("You've hit your weekly limit · resets Oct 9, 5pm (America/New_York)",
+         "2026-10-07T16:43:48-04:00", "2026-10-09T17:00:00-04:00"),
+        # Seen just after the reset: the reset just happened, not "tomorrow".
+        (REAL_LIMIT_TEXT, "2026-10-07T17:00:40-04:00", "2026-10-07T17:00:00-04:00"),
+        # Seen hours later: the next 5pm.
+        (REAL_LIMIT_TEXT, "2026-10-07T21:00:00-04:00", "2026-10-08T17:00:00-04:00"),
+        ("You've hit your session limit · resets 9am (Europe/London)",
+         "2026-10-07T08:00:00+01:00", "2026-10-07T09:00:00+01:00"),
+    ])
+    def test_clock_reset_forms(self, sm_module, text, now_iso, expected_iso):
+        ok, reset = sm_module.SessionManager._parse_usage_limit(text, now=_epoch(now_iso))
+        assert ok is True
+        assert reset == _epoch(expected_iso)
+
+    def test_unknown_zone_falls_back_to_local_time(self, sm_module):
+        from datetime import datetime
+        now = datetime(2026, 10, 7, 16, 43).astimezone().timestamp()
+        ok, reset = sm_module.SessionManager._parse_usage_limit(
+            "You've hit your session limit · resets 5pm (Mars/Olympus_Mons)", now=now)
+        assert ok is True
+        assert reset == datetime(2026, 10, 7, 17, 0).astimezone().timestamp()
+
+    @pytest.mark.parametrize("text", [
+        "You'll hit your session limit soon",
+        "Approaching your session limit",
+        "You are about to hit your weekly limit",
+    ])
+    def test_warnings_are_not_limits(self, sm_module, text):
+        assert sm_module.SessionManager._parse_usage_limit(text)[0] is False
+
+    # ── scheduling the continue ──
+
+    def test_schedule_waits_for_a_known_reset(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "lim-ahead")
+        info.limit_reset_at = time.time() + 1000
+        assert session_manager._schedule_limit_resume(info) is True
+        assert info._api_retry_needed is True
+        assert info.retry_reason == "Usage limit"
+        assert info._limit_resume_at == pytest.approx(
+            info.limit_reset_at + session_manager._LIMIT_RESUME_GRACE)
+
+    def test_schedule_after_a_reset_that_just_passed(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "lim-passed")
+        info.limit_reset_at = time.time() - 30
+        assert session_manager._schedule_limit_resume(info) is True
+        assert info._limit_resume_at == pytest.approx(
+            time.time() + session_manager._LIMIT_JUST_RESET_DELAY, abs=5)
+
+    def test_schedule_backs_off_when_the_passed_reset_keeps_failing(self, session_manager, sm_module):
+        """Rounded/stale reset time: every resume lands on the limit again.
+        Waits must double (2, 4, 8, 16 min, then the probe cap) rather than
+        hitting the wall every 2 minutes until the budget is gone."""
+        info = _make_idle_session(sm_module, session_manager, "lim-stale")
+        S = session_manager
+        waits = []
+        for attempt in range(6):
+            info._api_retry_count = attempt
+            info.limit_reset_at = time.time() - 30
+            assert S._schedule_limit_resume(info) is True
+            waits.append(round(info._limit_resume_at - time.time()))
+        expected = [min(S._LIMIT_PROBE_INTERVAL, S._LIMIT_JUST_RESET_DELAY * 2 ** a)
+                    for a in range(6)]
+        assert waits == pytest.approx(expected, abs=3)
+        assert waits[-1] == pytest.approx(S._LIMIT_PROBE_INTERVAL, abs=3)
+
+    def test_schedule_probes_when_reset_unknown(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "lim-unknown")
+        info.limit_reset_at = 0.0
+        assert session_manager._schedule_limit_resume(info) is True
+        assert info._limit_resume_at == pytest.approx(
+            time.time() + session_manager._LIMIT_PROBE_INTERVAL, abs=5)
+
+    def test_schedule_respects_kill_switch_and_budget(self, session_manager, sm_module, monkeypatch):
+        info = _make_idle_session(sm_module, session_manager, "lim-off")
+        info.limit_reset_at = time.time() + 600
+        monkeypatch.setattr(sm_module.SessionManager, "_LIMIT_AUTO_RESUME", False)
+        assert session_manager._schedule_limit_resume(info) is False
+        monkeypatch.setattr(sm_module.SessionManager, "_LIMIT_AUTO_RESUME", True)
+        info._api_retry_count = session_manager._API_RETRY_MAX
+        assert session_manager._schedule_limit_resume(info) is False
+        assert info._api_retry_needed is False
+
+    def test_schedule_needs_a_turn_to_resume(self, session_manager, sm_module):
+        info = sm_module.SessionInfo(session_id="lim-empty", state=sm_module.SessionState.IDLE)
+        info.limit_reset_at = time.time() + 600
+        assert session_manager._schedule_limit_resume(info) is False
+
+    def test_trimmed_log_still_has_a_turn_to_resume(self, session_manager, sm_module):
+        """The incident: a long autonomous turn trimmed the user's message out
+        of memory; that must not read as "nothing to resume"."""
+        info = sm_module.SessionInfo(session_id="lim-trim", state=sm_module.SessionState.IDLE)
+        info.entries.append(sm_module.LogEntry(kind="tool_use", text="Bash"))
+        info._entries_trimmed = True
+        assert session_manager._has_user_message(info) is True
+        info.limit_reset_at = time.time() + 600
+        assert session_manager._schedule_limit_resume(info) is True
+
+    # ── arming: wait for the reset, not the backoff ──
+
+    def test_arm_waits_for_reset_instead_of_backoff(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "lim-arm")
+        info._api_retry_needed = True
+        info.retry_reason = "Usage limit"
+        target = time.time() + 1800
+        info._limit_resume_at = target
+        try:
+            session_manager._arm_api_retry(info.session_id, info)
+            assert target <= info.retry_at <= target + 31   # + spread, not a 10s backoff
+            assert info._limit_resume_at == 0.0               # consumed
+            assert info.retry_attempt == 1
+            assert any("continuing automatically" in (e.text or "") for e in info.entries)
+        finally:
+            session_manager._clear_api_retry(info, reset_count=True)
+
+    def test_arm_flagged_retry_from_post_turn_listener(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "lim-listener")
+        assert session_manager._arm_flagged_retry(info.session_id, info) is False  # nothing flagged
+        info._api_retry_needed = True
+        info.retry_reason = "Usage limit"
+        info._limit_resume_at = time.time() + 600
+        try:
+            assert session_manager._arm_flagged_retry(info.session_id, info) is True
+            assert info.retry_at > time.time() + 500
+        finally:
+            session_manager._clear_api_retry(info, reset_count=True)
+        info._api_retry_needed = True
+        info._stream_heal_needed = True                       # self-heal owns it
+        assert session_manager._arm_flagged_retry(info.session_id, info) is False
+
+    def test_post_turn_listener_arms_what_auto_resume_turns_flag(self, sm_module):
+        """Notification-triggered turns never reach _send_query/_drive_session's
+        finally blocks; the listener must arm their flagged retries (both at
+        its start, for the drain's peek phase, and after each RESULT)."""
+        src = inspect.getsource(sm_module.SessionManager._extended_post_turn_listener)
+        assert src.count("self._arm_flagged_retry(session_id, info)") >= 2
+
+    # ── firing ──
+
+    def test_fire_with_trimmed_log_continues_instead_of_giving_up(self, session_manager, sm_module):
+        info = sm_module.SessionInfo(session_id="lim-fire", state=sm_module.SessionState.IDLE)
+        info._entries_trimmed = True
+        with session_manager._lock:
+            session_manager._sessions[info.session_id] = info
+        info.retry_at = time.time() + 1
+        sent = []
+
+        def fake_send(sid, text, **kw):
+            sent.append((sid, text, kw))
+            return {"ok": True}
+
+        with patch.object(session_manager, "send_message", side_effect=fake_send):
+            session_manager._fire_api_retry(info.session_id, info)
+        assert sent and sent[0][1] == session_manager._API_RETRY_CONTINUE_PROMPT
+        assert sent[0][2].get("_auto_retry") is True
+        assert info.error != "Session ended with error"
+
+    # ── the incident end to end, through _process_message ──
+
+    def test_limit_result_in_a_long_turn_schedules_the_continue(self, session_manager, sm_module):
+        from daemon.backends.messages import MessageKind, VibeNodeMessage
+        info = sm_module.SessionInfo(session_id="lim-e2e", state=sm_module.SessionState.WORKING)
+        info.model = "claude-fable-5-1"
+        info.entries.append(sm_module.LogEntry(kind="tool_use", text="Bash"))
+        info._entries_trimmed = True                          # user message trimmed away
+        with session_manager._lock:
+            session_manager._sessions[info.session_id] = info
+        msg = VibeNodeMessage(kind=MessageKind.RESULT, is_error=True, subtype="success",
+                              data={"result": REAL_LIMIT_TEXT}, session_id=info.session_id)
+        asyncio.run_coroutine_threadsafe(
+            session_manager._process_message(info.session_id, msg), session_manager._loop
+        ).result(10)
+        assert info.limited_model == "claude-fable-5-1"
+        assert info.limit_reset_at > 0
+        assert info._api_retry_needed is True
+        assert info._limit_resume_at >= info.limit_reset_at
+        assert info.error != "Session ended with error"
+
+    def test_exception_channel_schedules_the_continue(self, session_manager, sm_module):
+        info = _make_idle_session(sm_module, session_manager, "lim-exc")
+        assert session_manager._flag_api_retry_if_transient(info, REAL_LIMIT_TEXT) is True
+        assert info.limit_reset_at > 0
+        assert info._limit_resume_at > 0

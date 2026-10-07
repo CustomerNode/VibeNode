@@ -63,6 +63,10 @@
  *     the ping layers. Deduplicated per-session for 3s so a rapid
  *     re-emission of the same event doesn't chain into a strobe.
  *
+ *   window.VNNotify.attention({sessionId, sessionName, title, body})
+ *     Same ping layers for "a session needs you" events that are not tool
+ *     approvals — currently the watchdog's `session_stalled` escalation.
+ *
  *   window.VNNotify.setEnabled(bool)      persist an on/off toggle
  *   window.VNNotify.isEnabled()           read it
  *
@@ -375,19 +379,16 @@
 
   // ── Public trigger ────────────────────────────────────────────────────
 
-  function approvalNeeded(info) {
+  // Shared ping layers for every notification kind (approvals, stalls).
+  function _ping(key, title, body) {
     if (!isEnabled()) return;
-    info = info || {};
-    var sid = info.sessionId || info.session_id || '';
-    var name = info.sessionName || 'Claude session';
-    var tool = info.toolName || info.tool_name || 'a tool';
 
-    // Dedup: don't strobe if the same session's approval event repeats
-    // within DEDUP_MS (some backends can re-emit on reconnect).
+    // Dedup: don't strobe if the same key's event repeats within DEDUP_MS
+    // (some backends can re-emit on reconnect).
     var now = Date.now();
-    var last = _lastFiredAt[sid] || 0;
-    if (sid && (now - last) < DEDUP_MS) return;
-    _lastFiredAt[sid] = now;
+    var last = _lastFiredAt[key] || 0;
+    if (key && (now - last) < DEDUP_MS) return;
+    _lastFiredAt[key] = now;
 
     // Audio always attempts to play — if the ctx is locked (no prior
     // gesture on iOS), it will silently no-op and the other layers still
@@ -395,12 +396,9 @@
     try { _playChime(); } catch (e) {}
     try { _vibrate(); } catch (e) {}
 
-    var title = 'Approval needed';
-    var body = name + ' needs approval for ' + tool;
-
     if (document.hidden) {
       _showNotification(title, body);
-      _startTitleFlash('Approval needed');
+      _startTitleFlash(title);
       _startFaviconDot();
     } else {
       // Foreground: don't spam OS notification. But if the same request
@@ -408,6 +406,27 @@
       // visibilitychange handler below promotes it.
       _pendingWhileForeground = { title: title, body: body };
     }
+  }
+
+  function approvalNeeded(info) {
+    info = info || {};
+    var sid = info.sessionId || info.session_id || '';
+    var name = info.sessionName || 'Claude session';
+    var tool = info.toolName || info.tool_name || 'a tool';
+    _ping(sid, 'Approval needed', name + ' needs approval for ' + tool);
+  }
+
+  // A session needs the user for something other than a tool approval —
+  // e.g. the daemon watchdog found it stalled on background work that is
+  // not running, and a nudge did not fix it (`session_stalled` in
+  // socket.js, daemon/health_monitor.py job 5). Keyed separately from
+  // approvals so one never swallows the other inside the dedup window.
+  function attention(info) {
+    info = info || {};
+    var sid = info.sessionId || info.session_id || '';
+    var name = info.sessionName || 'A session';
+    _ping('attention:' + sid, info.title || 'Session needs you',
+          info.body || (name + ' needs you'));
   }
 
   var _pendingWhileForeground = null;
@@ -459,6 +478,7 @@
   window.VNNotify = {
     arm: arm,
     approvalNeeded: approvalNeeded,
+    attention: attention,
     clearPending: clearPending,
     setEnabled: setEnabled,
     isEnabled: isEnabled,

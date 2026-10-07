@@ -919,6 +919,20 @@ function _buildUsageLimitBanner(id, st) {
     _resetStr = ' \u00b7 resets in <strong id="live-limit-countdown" style="color:var(--text);">' +
       _fmtRetrySecs(secs) + '</strong>';
   }
+  // The daemon continues the turn by itself once the limit resets
+  // (_schedule_limit_resume), riding the auto-retry countdown. Say so, and
+  // offer Cancel, so waiting is a visible choice next to switching models.
+  const _rs = (window._sessionRetryState && window._sessionRetryState[id]) || null;
+  let _autoStr = '';
+  let _cancelBtn = '';
+  if (_rs && _rs.retry_at > 0) {
+    const asecs = Math.max(0, Math.ceil(_rs.retry_at - Date.now() / 1000));
+    _autoStr = ' \u00b7 continues automatically in <strong id="live-retry-countdown" style="color:var(--text);">' +
+      _fmtRetrySecs(asecs) + '</strong>';
+    _cancelBtn = '<button class="live-mini-btn" onclick="liveCancelRetry()" ' +
+      'style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid var(--border-subtle);' +
+      'background:transparent;color:var(--text-muted);cursor:pointer;white-space:nowrap;">Cancel</button>';
+  }
   const chips = _limitAlternatives(st.limited_model).map(mid =>
     '<button class="live-mini-btn" onclick="liveSwitchModelAndResume(\'' +
     String(mid).replace(/['"\\]/g, '') + '\')" ' +
@@ -935,7 +949,8 @@ function _buildUsageLimitBanner(id, st) {
     '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>' +
     '<span style="font-size:12px;color:var(--text-muted);flex:1;min-width:180px;">' +
     '<strong style="color:var(--text);">' + escHtml(_label(st.limited_model)) +
-    '</strong> usage limit reached' + _resetStr + '</span>' +
+    '</strong> usage limit reached' + _resetStr + _autoStr + '</span>' +
+    _cancelBtn +
     '<span style="font-size:11px;color:var(--text-faint);">Switch to:</span>' +
     chips +
     '<button class="live-mini-btn" onclick="_openSessionModelSelector(true)" ' +
@@ -957,12 +972,22 @@ function _startLimitCountdown() {
   _liveRetryTimer = setInterval(() => {
     const ls = (window._sessionLimitState && window._sessionLimitState[liveSessionId]) || null;
     const el = document.getElementById('live-limit-countdown');
-    if (!ls || !el) {
+    // The "continues automatically in …" countdown shares this tick.  It can
+    // be the only one on screen when the CLI gave no reset time.
+    const rs = (window._sessionRetryState && window._sessionRetryState[liveSessionId]) || null;
+    const ael = document.getElementById('live-retry-countdown');
+    if (!ls || (!el && !ael)) {
       if (_liveRetryTimer) { clearInterval(_liveRetryTimer); _liveRetryTimer = null; }
       return;
     }
-    const secs = Math.max(0, Math.ceil(ls.limit_reset_at - Date.now() / 1000));
-    el.textContent = secs > 0 ? _fmtRetrySecs(secs) : 'any moment';
+    if (el) {
+      const secs = Math.max(0, Math.ceil(ls.limit_reset_at - Date.now() / 1000));
+      el.textContent = secs > 0 ? _fmtRetrySecs(secs) : 'any moment';
+    }
+    if (rs && ael) {
+      const asecs = Math.max(0, Math.ceil(rs.retry_at - Date.now() / 1000));
+      ael.textContent = asecs > 0 ? _fmtRetrySecs(asecs) : 'now…';
+    }
   }, 1000);
 }
 
@@ -2447,7 +2472,7 @@ function updateLiveInputBar() {
     const btnClose = document.getElementById('btn-close');
     if (btnClose) btnClose.disabled = true;
     // Tick the "resets in …" text if the CTA is showing with a known reset.
-    if (_limitBanner && _limitSt && _limitSt.limit_reset_at > 0) _startLimitCountdown();
+    if (_limitBanner && _limitSt && (_limitSt.limit_reset_at > 0 || _retrySt)) _startLimitCountdown();
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => liveSubmitContinue(id));
     if (_barHadFocus) { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }
     setTimeout(() => {
@@ -2541,9 +2566,9 @@ function updateLiveInputBar() {
     // The usage-limit CTA outranks BOTH the retry countdown and the generic
     // error banner: when the quota is what's blocking you, "Retry" is the one
     // button guaranteed not to work, so offering it first is worse than
-    // offering nothing.  (The daemon also refuses to arm a backoff for a
-    // usage limit, so in practice _retrySt is null here anyway — this
-    // ordering just makes the precedence explicit rather than incidental.)
+    // offering nothing.  The daemon never arms a seconds-scale backoff for a
+    // usage limit, only a timed continue-at-reset (_schedule_limit_resume,
+    // 2026-10-07).  The limit banner shows that countdown itself, with Cancel.
     const _limitBannerIdle = _buildUsageLimitBanner(id, _limitSt);
     if (_limitBannerIdle) {
       _retryBanner = _limitBannerIdle;
@@ -2603,7 +2628,7 @@ function updateLiveInputBar() {
     // countdown below.  Shares _liveRetryTimer because the two banners are
     // mutually exclusive (the limit banner wins) and the bar teardown already
     // clears that one variable on every rebuild.
-    if (_limitBannerIdle && _limitSt && _limitSt.limit_reset_at > 0) {
+    if (_limitBannerIdle && _limitSt && (_limitSt.limit_reset_at > 0 || _retrySt)) {
       _startLimitCountdown();
     } else if (_retrySt) {
       _liveRetryTimer = setInterval(() => {

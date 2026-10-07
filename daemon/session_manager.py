@@ -584,6 +584,10 @@ class SessionInfo:
     _last_user_uuid: str = ""                            # cached from JSONL, updated by _process_message
     _last_asst_uuid: str = ""                            # cached from JSONL, updated by _process_message
     created_ts: float = 0.0  # time.time() when session was created
+    # ── Silent-wait backstop inputs (HealthMonitor job 5, daemon/silent_wait.py) ──
+    # Plain timestamps, written on paths the daemon already runs (no I/O).
+    _task_started_at: float = 0.0  # time.time() of the last genuine send (user message, queue dispatch, watchdog nudge): where the current task begins.  Self-heal / auto-retry resends do not move it.
+    _bg_work_at: float = 0.0       # time.time() the daemon last saw background work for this session: a background launch (Agent/Task, run_in_background, Monitor) or any CLI task lifecycle event.  task_progress fires per tool use of a running agent, so this doubles as a stream heartbeat.
     _cli_pid: int = 0  # PID of the CLI subprocess, for orphan cleanup
     # ── API-error auto-retry (see SessionManager._API_RETRY_* + _arm_api_retry) ──
     # When a turn ends with a *transient* API error (overload/429/529/5xx/network),
@@ -598,6 +602,7 @@ class SessionInfo:
     _api_retry_count: int = 0                       # attempts already consumed; accumulates until _API_RETRY_MAX, reset on a genuine new user message
     _api_retry_task: Optional[asyncio.Task] = None  # the pending backoff timer task (cancelled by Cancel / new message / interrupt / close)
     _api_retry_needed: bool = False                 # set on a transient error (RESULT is_error, non-transport exception, or escalated stream-heal); consumed by the drive-loop finally to arm the timer
+    _limit_resume_at: float = 0.0                   # epoch at which a usage-limited turn should continue (reset instant + grace, or the next probe); when > 0, _arm_api_retry uses it instead of the exponential backoff.  Set by _schedule_limit_resume, consumed by _arm_api_retry.
     _retry_needs_reconnect: bool = False            # True when the retry follows a dead transport (CLI crash / connectivity loss) so the timer must _reconnect_client before resending
     _ever_got_result: bool = False                  # True once the session has produced at least one RESULT (so the SDK id was remapped to a real UUID and the session is --resume-able).  A transport crash BEFORE this can't reconnect, so we don't escalate it to the long backoff.
     # ── Account usage limit (see _parse_usage_limit / _apply_usage_limit) ──
@@ -1450,6 +1455,10 @@ class SessionManager:
             # the accumulating counter (the cap depends on it); _fire_api_retry
             # has already cleared the countdown fields for it.
             if not _self_heal and not _auto_retry:
+                # A genuine send starts a new task for the silent-wait
+                # backstop (HealthMonitor job 5): background work seen after
+                # this instant belongs to the task the user just asked for.
+                info._task_started_at = time.time()
                 self._clear_api_retry(info, reset_count=True)
                 info.error = ""
                 # A genuine new user message retracts the usage-limit CTA too:
@@ -5641,6 +5650,13 @@ class SessionManager:
                         logger.info("Wake-up pending flagged for %s (tool=%s)",
                                     session_id[:12], tool_name)
 
+                    # Silent-wait backstop input (HealthMonitor job 5): this
+                    # task launched work that outlives the turn, so if the
+                    # session later idles "waiting" on it, the watchdog checks
+                    # whether anything is actually still alive.  Timestamp only.
+                    if self._tool_launches_background(tool_name, inp):
+                        info._bg_work_at = time.time()
+
                 elif bk == BlockKind.THINKING.value:
                     # Skip thinking blocks -- they're internal reasoning
                     pass
@@ -5769,6 +5785,13 @@ class SessionManager:
             subtype = message.subtype or ""
             data = message.data or {}
             logger.info("SystemMessage subtype=%s keys=%s", subtype, list(data.keys())[:10])
+
+            # Silent-wait backstop input (HealthMonitor job 5): a CLI
+            # background-task lifecycle event proves background work exists
+            # for this task, and (task_progress fires per tool use of a
+            # running agent) doubles as a liveness heartbeat.
+            if subtype in self._TASK_EVENT_SUBTYPES:
+                info._bg_work_at = time.time()
 
             # Detect compaction events — CLI sends "compact_boundary" subtype
             if subtype == 'compact_boundary':
@@ -6015,13 +6038,11 @@ class SessionManager:
                             session_id[:12], _err_class, _result_text[:500],
                         )
                 # Never arm a retry if there's no user message to replay (e.g. a
-                # bare connect failure with an empty transcript).
-                _has_user_msg = False
-                with info._lock:
-                    for _e in reversed(info.entries):
-                        if _e.kind == "user":
-                            _has_user_msg = True
-                            break
+                # bare connect failure with an empty transcript).  Uses the
+                # trim-aware helper: a long autonomous turn trims the user's
+                # message out of memory, and the old inline scan then disabled
+                # every retry for exactly the sessions that most need one.
+                _has_user_msg = self._has_user_message(info)
                 _can_retry = (
                     _err_class == "transient"
                     and info._api_retry_count < self._API_RETRY_MAX
@@ -6043,13 +6064,19 @@ class SessionManager:
                 elif _err_class == "usage_limit":
                     # Quota exhausted.  No backoff is armed (see
                     # _apply_usage_limit); the UI turns limit_reset_at +
-                    # limited_model into a one-click model-switch CTA, which is
-                    # the only action that can actually unblock the user.
+                    # limited_model into a one-click model-switch CTA.  The
+                    # turn also continues by itself once the limit resets
+                    # (_schedule_limit_resume): the user should never have to
+                    # notice that the limit expired.
                     self._apply_usage_limit(info, _result_text)
+                    _resume = self._schedule_limit_resume(info)
                     logger.info(
-                        "Session %s hit a usage limit on %s (resets_at=%s)",
+                        "Session %s hit a usage limit on %s (resets_at=%s, "
+                        "auto-continue=%s)",
                         session_id, info.limited_model or "?",
                         info.limit_reset_at or "unknown",
+                        time.strftime("%H:%M:%S", time.localtime(info._limit_resume_at))
+                        if _resume else "off",
                     )
                     entry = LogEntry(kind="system", text=info.error, is_error=True)
                 else:
@@ -6202,6 +6229,16 @@ class SessionManager:
     _WAKEUP_TOOL_NAMES = frozenset({"ScheduleWakeup"})
     _WAKEUP_TOOL_SUBSTRINGS = ("schedulewake", "wakeup", "backgroundtask")
 
+    # CLI background-task lifecycle events (SystemMessage subtypes, observed
+    # in daemon logs for CLI 2.1.29x).  Any of them proves the session has
+    # background work, and they keep arriving while it runs (task_progress
+    # fires per tool use of a running agent).  Feeds ``_bg_work_at`` for the
+    # silent-wait backstop (HealthMonitor job 5).
+    _TASK_EVENT_SUBTYPES = frozenset({
+        "task_started", "task_progress", "task_notification",
+        "task_updated", "background_tasks_changed",
+    })
+
     # ── Starvation watchdog tuning (see _wakeup_queue_watchdog) ──────────
     # The wake-up dispatch gate (_emit_state / queue_message) holds a
     # queued user message while a post-turn listener owns the SDK buffer
@@ -6278,6 +6315,26 @@ class SessionManager:
     _API_RETRY_CONTINUE_PROMPT = os.environ.get(
         "VIBENODE_API_RETRY_CONTINUE_PROMPT", "Continue from where you left off.")
 
+    # ── Auto-continue after a usage limit (added 2026-10-07) ──
+    # A usage limit used to park the session behind a model-switch CTA and
+    # nothing else.  When the limit expired, nothing resumed the turn, and an
+    # overnight session just sat there until the user noticed.  Now the
+    # session also continues by itself once the limit resets.  It rides the
+    # API-retry timer, so the countdown, Cancel and Retry-now all work, and
+    # the CTA stays so the user can still switch models instead of waiting.
+    _LIMIT_AUTO_RESUME = os.environ.get("VIBENODE_LIMIT_AUTO_RESUME", "1") != "0"
+    # Continue this long after the stated reset.  The CLI renders the reset
+    # rounded to the minute, and a request landing exactly on it can still be
+    # refused.
+    _LIMIT_RESUME_GRACE = float(os.environ.get("VIBENODE_LIMIT_RESUME_GRACE", "90"))
+    # No reset time in the message: check again this often.  Each check is a
+    # single request that fails fast while the limit holds, and every attempt
+    # still counts toward _API_RETRY_MAX, so the probing is bounded.
+    _LIMIT_PROBE_INTERVAL = float(os.environ.get("VIBENODE_LIMIT_PROBE_INTERVAL", "1800"))
+    # The stated reset is already in the past (it just happened): continue
+    # after this short pause instead of waiting a full probe interval.
+    _LIMIT_JUST_RESET_DELAY = 120.0
+
     @staticmethod
     def _api_retry_delay(attempt: int) -> float:
         """Deterministic exponential backoff base delay (seconds) for retry index
@@ -6345,15 +6402,22 @@ class SessionManager:
     # classification drives the UI to offer.
 
     # Things that name a quota/allowance.
+    # 2026-10-07: the CLI now renders the 5-hour window as "You've hit your
+    # session limit · resets 5pm (America/New_York)".  Neither "session limit"
+    # nor "hit" was in these lists, so that message was treated as an ordinary
+    # error and the session dead-ended instead of resuming at 5pm.  Hence the
+    # named-window nouns below.
     _LIMIT_NOUN_RE = re.compile(
         r"usage limit|usage credits?|usage[_ ]cap|monthly usage|weekly usage"
-        r"|quota|credit balance|spend limit|credit limit|usage-credits",
+        r"|quota|credit balance|spend limit|credit limit|usage-credits"
+        r"|(?:session|5-hour|five-hour|weekly|daily|monthly|opus|sonnet|fable"
+        r"|haiku|plan) limits?\b",
         re.I,
     )
     # Things that say it is EXHAUSTED (as opposed to merely mentioned).
     _LIMIT_EXHAUSTED_RE = re.compile(
         r"reached|exceed(?:ed)?|out of|used up|too low|insufficient"
-        r"|cap_reached|exhausted|no (?:remaining|more)",
+        r"|cap_reached|exhausted|no (?:remaining|more)|\bhit\b",
         re.I,
     )
     # Strings that mention a limit but are NOT an exhaustion — checked first.
@@ -6370,7 +6434,11 @@ class SessionManager:
     _LIMIT_NEGATIVE_RE = re.compile(
         r"has reset|have reset|available again"
         r"|not your usage limit"          # "Server is temporarily limiting requests (not your usage limit)"
-        r"|upgrade to increase",          # marketing copy, not a failure
+        r"|upgrade to increase"           # marketing copy, not a failure
+        # Warnings ahead of a limit, which matter now that "hit" counts as
+        # exhaustion: "you'll hit your session limit soon" is not a failure.
+        r"|approaching|about to (?:hit|reach)|close to (?:hitting|reaching)"
+        r"|(?:will|you'll|you will) (?:soon )?(?:hit|reach)",
         re.I,
     )
     # Reset instant, in every encoding the CLI/API is known to use:
@@ -6382,16 +6450,80 @@ class SessionManager:
         r"(?:resets?[_ ]?at(?:[_ ]?seconds)?\"?\s*[:=]\s*|\|\s*)(\d{9,16})",
         re.I,
     )
+    # The human clock form the CLI renders today, with an optional date and an
+    # optional IANA zone:
+    #   "resets 5pm (America/New_York)"        (5-hour session window)
+    #   "resets 5:30pm (America/New_York)"
+    #   "resets Oct 9, 5pm (America/New_York)" (weekly windows)
+    #   "Your limit will reset at 6pm."
+    _LIMIT_RESET_CLOCK_RE = re.compile(
+        r"resets?\s+(?:at\s+|on\s+)?"
+        r"(?:(?P<mon>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+"
+        r"(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+(?:at\s+)?)?"
+        r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>[ap])\.?m\b\.?"
+        r"(?:\s*\((?P<tz>[A-Za-z_]+(?:/[A-Za-z0-9_+\-]+)+)\))?",
+        re.I,
+    )
+    _MONTHS = {m: i for i, m in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun",
+         "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+    # A clock time this far in the past is "the reset just happened" (the CLI
+    # rounds the displayed time), not "the same time tomorrow".
+    _LIMIT_CLOCK_RECENT_PAST = 2 * 3600
 
     @staticmethod
-    def _parse_usage_limit(result_text: str):
+    def _parse_reset_clock(txt: str, now: float) -> float:
+        """Epoch of a human "resets 5pm (America/New_York)" clause, or 0.0.
+
+        The next occurrence of that wall-clock time in that zone.  A time
+        already passed today means tomorrow, unless it passed less than
+        ``_LIMIT_CLOCK_RECENT_PAST`` ago: then the reset just happened and the
+        past instant is returned as is (callers resume promptly).  An unknown
+        or unloadable zone falls back to the machine's local time, which is
+        what the CLI renders in anyway.  Never raises.
+        """
+        m = SessionManager._LIMIT_RESET_CLOCK_RE.search(txt or "")
+        if not m:
+            return 0.0
+        try:
+            from datetime import datetime, timedelta
+            hour = int(m.group("hour"))
+            minute = int(m.group("minute") or 0)
+            if not (1 <= hour <= 12 and 0 <= minute <= 59):
+                return 0.0
+            hour = hour % 12 + (12 if m.group("ampm").lower() == "p" else 0)
+            tz = None
+            if m.group("tz"):
+                try:
+                    from zoneinfo import ZoneInfo
+                    tz = ZoneInfo(m.group("tz"))
+                except Exception:
+                    tz = None   # no tzdata on this machine: use local time
+            now_dt = (datetime.fromtimestamp(now, tz) if tz is not None
+                      else datetime.fromtimestamp(now).astimezone())
+            cand = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if m.group("mon"):
+                month = SessionManager._MONTHS[m.group("mon")[:3].lower()]
+                cand = cand.replace(month=month, day=int(m.group("day")))
+                if cand.timestamp() < now - SessionManager._LIMIT_CLOCK_RECENT_PAST:
+                    cand = cand.replace(year=cand.year + 1)
+            elif cand.timestamp() < now - SessionManager._LIMIT_CLOCK_RECENT_PAST:
+                cand = cand + timedelta(days=1)
+            return cand.timestamp()
+        except (ValueError, KeyError, OverflowError, OSError):
+            return 0.0
+
+    @staticmethod
+    def _parse_usage_limit(result_text: str, now: Optional[float] = None):
         """Detect a plan/quota exhaustion and extract its reset instant.
 
         Returns ``(is_usage_limit, reset_epoch)``.  ``reset_epoch`` is 0.0 when
-        the message carries no machine-readable reset time — the UI then shows
-        the CTA without a countdown rather than inventing a number.
+        the message carries no reset time at all.  The UI then shows the CTA
+        without a countdown rather than inventing a number.
 
-        Pure function — no clock, no I/O — so it is trivially unit-testable.
+        Machine-readable epochs are preferred.  Otherwise the human clock form
+        ("resets 5pm (America/New_York)") is resolved against ``now``, which
+        defaults to the current time and is injectable for tests.  No I/O.
         """
         txt = (result_text or "").strip()
         if not txt:
@@ -6415,16 +6547,20 @@ class SessionManager:
                 reset = val
             except (TypeError, ValueError):
                 reset = 0.0
+        if not reset:
+            reset = SessionManager._parse_reset_clock(
+                txt, time.time() if now is None else now)
         return (True, reset)
 
     def _apply_usage_limit(self, info: "SessionInfo", result_text: str) -> None:
         """Record a detected usage limit on the session and disarm auto-retry.
 
-        Auto-retry is explicitly NOT armed: a quota does not clear on a backoff
-        measured in seconds, so retrying only burns the bounded retry budget
-        (``_API_RETRY_MAX``) that a genuine transient outage later needs.  The
-        session parks IDLE with a structured error the UI turns into a
-        one-click model-switch CTA.
+        The exponential backoff is explicitly NOT armed here: a quota does not
+        clear on a backoff measured in seconds, so retrying only burns the
+        bounded retry budget (``_API_RETRY_MAX``) that a genuine transient
+        outage later needs.  The session parks IDLE with a structured error the
+        UI turns into a one-click model-switch CTA.  Continuing once the limit
+        resets is a separate, timed decision: ``_schedule_limit_resume``.
         """
         _is_limit, reset = self._parse_usage_limit(result_text)
         info.limit_reset_at = reset if _is_limit else 0.0
@@ -6448,6 +6584,50 @@ class SessionManager:
         model switch).  Safe to call unconditionally."""
         info.limit_reset_at = 0.0
         info.limited_model = ""
+
+    def _schedule_limit_resume(self, info: "SessionInfo") -> bool:
+        """Arrange for a usage-limited turn to continue once the limit resets.
+
+        Call right after ``_apply_usage_limit``.  Flags the retry the same way
+        a transient error does (``_api_retry_needed``), so the drive-loop
+        ``finally`` arms it through ``_arm_api_retry``.  ``_limit_resume_at``
+        tells that function to wait for the reset instead of backing off:
+
+        * reset known and ahead: continue ``_LIMIT_RESUME_GRACE`` after it;
+        * reset stated but already passed (it just happened): continue after
+          ``_LIMIT_JUST_RESET_DELAY``, doubling per consecutive attempt;
+        * no reset time in the message: check again after
+          ``_LIMIT_PROBE_INTERVAL``.
+
+        Returns True if a resume was flagged.  Not flagged when switched off
+        (``VIBENODE_LIMIT_AUTO_RESUME=0``), when the retry budget is spent, or
+        when there is no turn to resume.
+        """
+        if not self._LIMIT_AUTO_RESUME:
+            return False
+        if info._api_retry_count >= self._API_RETRY_MAX:
+            return False
+        if not self._has_user_message(info):
+            return False
+        now = time.time()
+        reset = float(getattr(info, "limit_reset_at", 0.0) or 0.0)
+        if reset > now:
+            info._limit_resume_at = reset + self._LIMIT_RESUME_GRACE
+        elif reset > 0:
+            # The stated reset already passed.  The first time, it just
+            # happened; resume shortly.  If we keep landing on the limit
+            # anyway (rounded or stale reset time), double the wait each
+            # attempt (2, 4, 8, 16 min, then the probe interval) instead of
+            # hitting the wall every 2 minutes until the budget runs out.
+            info._limit_resume_at = now + min(
+                self._LIMIT_PROBE_INTERVAL,
+                self._LIMIT_JUST_RESET_DELAY * (2 ** min(info._api_retry_count, 10)),
+            )
+        else:
+            info._limit_resume_at = now + self._LIMIT_PROBE_INTERVAL
+        info._api_retry_needed = True
+        info.retry_reason = "Usage limit"
+        return True
 
     @staticmethod
     def _classify_result_error(subtype: str, result_text: str) -> str:
@@ -6545,7 +6725,17 @@ class SessionManager:
     def _has_user_message(self, info: SessionInfo) -> bool:
         """True if the transcript has at least one user message — i.e. there's
         actually a turn to resume.  Guards against arming a retry on a bare
-        connect failure with nothing to continue."""
+        connect failure with nothing to continue.
+
+        Trim-aware (fixed 2026-10-07): idle sessions keep only the last 200
+        in-memory entries, so a long autonomous turn (dozens of background
+        task wake-ups) trims the user's message out of memory.  The answer was
+        then "nothing to resume", and every retry was refused, which is how a
+        usage-limited session dead-ended as "Session ended with error".  A
+        trimmed log had a conversation by definition.
+        """
+        if getattr(info, "_entries_trimmed", False):
+            return True
         with info._lock:
             for e in reversed(info.entries):
                 if e.kind == "user":
@@ -6577,6 +6767,10 @@ class SessionManager:
                     last_user_text = info.entries[i].text
                     break
             if last_user_idx < 0 or not last_user_text:
+                # Trimmed out of memory by a long turn: that turn did work,
+                # so continue it (same rule as _fire_api_retry).
+                if getattr(info, "_entries_trimmed", False):
+                    return self._API_RETRY_CONTINUE_PROMPT
                 return ""
             for j in range(last_user_idx + 1, len(info.entries)):
                 if info.entries[j].kind in ("tool_use", "tool_result"):
@@ -6597,10 +6791,10 @@ class SessionManager:
         if _cls == "usage_limit":
             # Channel (b) saw the quota message as a raised exception rather
             # than an is_error RESULT.  Record it the same way so the CTA shows
-            # up regardless of which channel surfaced it, and return False so
-            # no pointless backoff is armed against it.
+            # up regardless of which channel surfaced it.  No backoff is armed
+            # against it, only the timed continue-at-reset (same as channel a).
             self._apply_usage_limit(info, err_str)
-            return False
+            return self._schedule_limit_resume(info)
         if _cls != "transient":
             return False
         if info._api_retry_count >= self._API_RETRY_MAX:
@@ -6709,14 +6903,27 @@ class SessionManager:
             )
             return
         attempt = info._api_retry_count  # 0-based index of the attempt to schedule
+        # A usage limit waits for its reset (see _schedule_limit_resume)
+        # instead of backing off.  Consumed here whether or not we arm.
+        limit_at = float(getattr(info, "_limit_resume_at", 0.0) or 0.0)
+        info._limit_resume_at = 0.0
         if attempt >= self._API_RETRY_MAX:
             # Budget already exhausted — _process_message normally handles this,
             # but guard here too so we never schedule a no-op timer.
             return
-        # Deterministic base delay, then jitter so sessions don't retry in
-        # lockstep.  The jittered value drives BOTH the timer and retry_at, so
-        # the UI countdown matches when the retry actually fires.
-        delay = self._apply_jitter(self._api_retry_delay(attempt))
+        if limit_at > 0:
+            # Small random spread so every limited session does not hit the
+            # API in the same second the window reopens.
+            delay = max(5.0, limit_at - time.time()) + random.uniform(0.0, 30.0)
+            note = "Usage limit: continuing automatically at %s (in %s)." % (
+                time.strftime("%I:%M %p", time.localtime(time.time() + delay)).lstrip("0"),
+                self._fmt_duration(delay))
+        else:
+            # Deterministic base delay, then jitter so sessions don't retry in
+            # lockstep.  The jittered value drives BOTH the timer and retry_at,
+            # so the UI countdown matches when the retry actually fires.
+            delay = self._apply_jitter(self._api_retry_delay(attempt))
+            note = None
         self._cancel_api_retry_task(info)  # drop any stale timer first
         info.retry_at = time.time() + delay
         info.retry_attempt = attempt + 1
@@ -6726,7 +6933,7 @@ class SessionManager:
         info.state = SessionState.IDLE
         entry = LogEntry(
             kind="system",
-            text="Auto-retrying in %s (attempt %d/%d)…" % (
+            text=note or "Auto-retrying in %s (attempt %d/%d)…" % (
                 self._fmt_duration(delay), info.retry_attempt, info.retry_max),
         )
         with info._lock:
@@ -6958,6 +7165,12 @@ class SessionManager:
                         had_real_output = True
                         break
         info._api_retry_task = None
+        if not last_user_text and getattr(info, "_entries_trimmed", False):
+            # The user's message was trimmed out of memory by a long turn.  A
+            # turn that long has certainly done work, so continue it.  Do not
+            # give up with "nothing to resume" (fixed 2026-10-07).
+            last_user_text = self._API_RETRY_CONTINUE_PROMPT
+            had_real_output = True
         if not last_user_text:
             # Nothing to continue — clear out and surface a manual-retry error.
             self._clear_api_retry(info, reset_count=True)
@@ -7127,6 +7340,30 @@ class SessionManager:
             if tool_input.get("run_in_background") is True:
                 return True
         return False
+
+    @staticmethod
+    def _tool_launches_background(tool_name: str, tool_input) -> bool:
+        """True if this tool call starts work that outlives the turn.
+
+        Input to the silent-wait backstop (HealthMonitor job 5), which must
+        tell "idle and waiting on the user" (no background work in the task)
+        apart from "idle and waiting on background work".  Distinct from
+        :meth:`_tool_creates_wakeup`: that one gates queue dispatch on
+        deferred SDK auto-resumes, and deliberately excludes Agent.
+
+        * ``Agent`` / ``Task``: background by default in current CLIs.  Only
+          an explicit ``run_in_background: false`` is a blocking call.
+        * ``Monitor``: watches in the background by design.
+        * Any tool with ``run_in_background: true`` (Bash, PowerShell, ...).
+        """
+        if not tool_name:
+            return False
+        inp = tool_input if isinstance(tool_input, dict) else {}
+        if tool_name in ("Agent", "Task"):
+            return inp.get("run_in_background") is not False
+        if tool_name == "Monitor":
+            return True
+        return inp.get("run_in_background") is True
 
     @staticmethod
     def _extract_tool_desc(inp: dict) -> str:
@@ -8243,6 +8480,10 @@ class SessionManager:
             # ownership of the IDLE-emit here because we never return
             # normally.
             info._awaiting_compact_drain = False
+            # An auto-resume turn consumed by the drain's peek phase may have
+            # ended in a retryable error.  Arm it here (see _arm_flagged_retry).
+            if not _bailing():
+                self._arm_flagged_retry(session_id, info)
             if not _bailing() and info.state == SessionState.IDLE:
                 self._emit_state(info)
 
@@ -8336,6 +8577,12 @@ class SessionManager:
                             # decide whether to suppress dispatch on THIS
                             # IDLE emit.
                             info._awaiting_compact_drain = False
+                            # The auto-resume turn may have ended in a usage
+                            # limit or transient error.  Arm its retry, which
+                            # _send_query/_drive_session would have done for a
+                            # user-driven turn.
+                            if not _bailing():
+                                self._arm_flagged_retry(session_id, info)
                             if not _bailing() and info.state == SessionState.IDLE:
                                 self._emit_state(info)
                             # receive_response terminates at RESULT; outer
@@ -8442,6 +8689,36 @@ class SessionManager:
             # state and we must not stomp it.
             if info.task is asyncio.current_task():
                 info._in_post_turn = False
+
+    def _arm_flagged_retry(self, session_id: str, info: SessionInfo) -> bool:
+        """Arm an auto-retry that was flagged during a post-turn auto-resume turn.
+
+        User-driven turns arm ``_api_retry_needed`` in the ``_send_query`` /
+        ``_drive_session`` ``finally`` blocks.  Turns started by a background
+        task's notification never pass through those blocks; the post-turn
+        drain and listener consume them.  So an error ending such a turn (a
+        usage limit hit mid-orchestration, a 529) was flagged and then never
+        armed.  The session sat IDLE, sometimes under a banner promising an
+        auto-retry that would never come.  Found 2026-10-07: a session hit its
+        5-hour limit inside a notification-triggered turn and stayed stuck past
+        the reset.
+
+        Safe while the listener owns the SDK buffer: when the timer fires,
+        ``send_message`` supersedes the listener exactly as a user send does,
+        and ``_try_dispatch_queue`` holds queued messages while ``retry_at > 0``.
+        Returns True if a retry was armed.
+        """
+        if not getattr(info, "_api_retry_needed", False):
+            return False
+        if getattr(info, "_stream_heal_needed", False):
+            return False  # the transport self-heal owns this turn
+        try:
+            self._arm_api_retry(session_id, info)
+            return True
+        except Exception:
+            logger.exception("Arming a post-turn auto-retry failed for %s", session_id)
+            info._api_retry_needed = False
+            return False
 
     def _enter_auto_resume(self, info: SessionInfo) -> None:
         """Flip a session back to WORKING when the SDK auto-resumes.

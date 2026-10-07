@@ -1731,6 +1731,25 @@ socket.on('approval_needed', (data) => {
     } catch (e) { /* notify failures never break other handlers */ }
 });
 
+// Watchdog escalation — the daemon found a session idle and "waiting" on
+// background work that is not making progress, and its one nudge did not fix
+// it (daemon/health_monitor.py job 5). Broadcast to every client so the user
+// hears about it even when that session is not on screen.
+socket.on('session_stalled', (data) => {
+    try {
+        if (window.VNNotify && typeof window.VNNotify.attention === 'function') {
+            const d = data || {};
+            const name = d.name || 'A session';
+            window.VNNotify.attention({
+                sessionId: d.session_id || '',
+                sessionName: name,
+                title: 'Session stalled',
+                body: name + ' is stuck waiting on background work that is not running.',
+            });
+        }
+    } catch (e) { /* notify failures never break other handlers */ }
+});
+
 // Server-side queue updates — replaces client-side localStorage queue
 socket.on('queue_updated', (data) => {
     const sid = data.session_id;

@@ -1,9 +1,9 @@
 """Session health monitor: stall auto-restart, sleep/wake healing, keep-awake,
-stranded-worker recovery.
+stranded-worker recovery, silent-wait backstop, usage-limit resume backstop.
 
 This module runs ONE background daemon thread inside the session daemon
 process (started from ``SessionManager.start()``).  Every tick it does
-four independent jobs, all read-mostly and O(number of sessions):
+six independent jobs, all read-mostly and O(number of sessions):
 
 1. **Stall detection + auto-restart.**  A session that sits in WORKING
    state with zero new output for ``STALL_AFTER_SECONDS`` is considered
@@ -52,6 +52,28 @@ four independent jobs, all read-mostly and O(number of sessions):
    forward.  Each stranded result is nudged at most once.  Sessions the user
    stopped, and sessions with queued messages, are left alone.
 
+5. **Silent-wait backstop (any cause).**  Jobs 1 and 4 each recognise
+   one known cause, and every new cause slipped past them until someone
+   diagnosed it.  Job 5 watches the symptom instead
+   (``daemon/silent_wait.py``).  The session is IDLE, its final message says
+   it is waiting on background work it launched in this task, and nothing
+   is alive: no write anywhere in its footprint, no background command
+   running under its CLI, no scheduled wake-up.  It gets ONE nudge.  If it
+   idles "waiting" again with nothing alive, it is escalated to the user
+   (an error entry, plus a ``session_stalled`` push that pings every open
+   VibeNode tab) instead of being nudged again.
+
+6. **Usage-limit resume backstop.**  The user's rule: a session stopped by
+   a usage limit must ALWAYS continue once the limit resets.
+   session_manager's timed resume (Layer 1) is in-memory, so a Session
+   Engine restart loses it, and it depends on recognising the message.
+   Every 2 minutes this job reads the transcripts of the IDLE and dormant
+   sessions the daemon knows (``daemon/limit_watch.py``).  If one still ends
+   on the CLI's structural ``rate_limit`` stop (or a ``server_error`` stop)
+   after its reset time plus grace, it sends the continue prompt.  Sessions
+   the user stopped, slept or deleted are never touched: they are neither
+   live-IDLE nor in the restart memory.
+
 Tuning knobs (environment variables, read once at import):
     VIBENODE_STALL_MINUTES        minutes of zero output before a WORKING
                                   session counts as stalled (default 10)
@@ -63,6 +85,11 @@ Tuning knobs (environment variables, read once at import):
     VIBENODE_ORPHAN_GRACE_SECONDS seconds a session must sit IDLE before
                                   job 4 looks for stranded workers
                                   (default 90, minimum 30)
+    VIBENODE_SILENT_WAIT_RECOVERY set to "0" to disable job 5 (default on)
+    VIBENODE_SILENT_WAIT_MINUTES  minutes of total silence before job 5
+                                  acts when nothing is running (default
+                                  10, minimum 2)
+    VIBENODE_LIMIT_BACKSTOP       set to "0" to disable job 6 (default on)
 
 Design constraints honored here:
 - No changes to any PERF-CRITICAL path.  The monitor only READS session
@@ -84,7 +111,15 @@ import threading
 import time
 from pathlib import Path
 
+from daemon.limit_watch import due_at as limit_due_at
+from daemon.limit_watch import stopped_on_error
 from daemon.orphaned_workers import ScanCache, build_nudge, find_orphaned_workers
+from daemon.silent_wait import (
+    build_nudge as build_silent_wait_nudge,
+    footprint_last_write,
+    live_commands,
+    says_waiting_on_background,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +152,42 @@ ORPHAN_IDLE_GRACE_SECONDS = max(
 # is gated on the root transcript growing (ScanCache.evaluated_size), so an
 # unchanged long-idle session costs one or two stats per re-check.
 ORPHAN_RESCAN_SECONDS = 300.0
+
+# ── Silent-wait backstop (job 5, see daemon/silent_wait.py) ───────────────
+SILENT_WAIT_RECOVERY = os.environ.get("VIBENODE_SILENT_WAIT_RECOVERY", "1") != "0"
+# Total silence before acting when NOTHING is running.  Nothing alive means
+# nothing can ever report back, so there is no reason to wait long.  The
+# longest legitimate gap is a running agent's single API call, which still
+# streams task_progress events (see _bg_work_at).
+SILENT_WAIT_SECONDS = max(
+    120.0, float(os.environ.get("VIBENODE_SILENT_WAIT_MINUTES", "10")) * 60.0
+)
+# Background commands ARE running but nothing has been written anywhere for
+# this long.  Catches a hung command, or a forgotten dev server masking a dead
+# wait.  Long, because quiet-but-healthy runs exist (a suite piped through
+# ``tail`` prints nothing until it ends).
+SILENT_WAIT_LIVE_SECONDS = max(SILENT_WAIT_SECONDS, 45 * 60.0)
+# psutil unavailable: a quiet running command cannot be told from a dead one.
+SILENT_WAIT_UNKNOWN_SECONDS = max(SILENT_WAIT_SECONDS, 30 * 60.0)
+# The footprint stat walk and the process check run at most this often per
+# IDLE session.
+SILENT_WAIT_RECHECK_SECONDS = 60.0
+
+# ── Usage-limit resume backstop (job 6, see daemon/limit_watch.py) ────────
+LIMIT_BACKSTOP = os.environ.get("VIBENODE_LIMIT_BACKSTOP", "1") != "0"
+# How often the transcripts of IDLE + dormant sessions are checked.  Reads are
+# cached by (size, mtime), so an unchanged transcript costs one stat.
+LIMIT_SWEEP_SECONDS = 120.0
+# Skip the first sweeps after startup: crash recovery is still relaunching
+# sessions, and Layer 1 state is being rebuilt.
+LIMIT_STARTUP_GRACE_SECONDS = 120.0
+# After resuming a session for a given stop, do not try again for that same
+# stop sooner than this (the resumed turn normally rewrites the transcript
+# within seconds, so this only matters when a resume did not take).
+LIMIT_REATTEMPT_SECONDS = 1800.0
+# A Layer-1 countdown this far past its fire time has a dead timer (e.g. the
+# loop stalled); the backstop takes over.
+LIMIT_STALE_COUNTDOWN_SECONDS = 600.0
 
 NUDGE_TEXT = (
     "[VibeNode watchdog] Your previous turn produced no output for an "
@@ -167,6 +238,24 @@ class HealthMonitor:
         self._orphan_caches: dict[str, ScanCache] = {}
         # session_id -> resolved root transcript path.
         self._transcript_paths: dict[str, Path] = {}
+        # ── Job 5 bookkeeping (silent-wait backstop) ──
+        # session_id -> wall time of the last silent-wait evaluation in the
+        # current IDLE episode.
+        self._silent_checked_at: dict[str, float] = {}
+        # session_id -> task-start value of the task our nudge started.  An
+        # IDLE episode of that same task (nothing new from the user since)
+        # escalates to the user instead of nudging again.
+        self._silent_nudged: dict[str, float] = {}
+        # session_id -> task-start value already escalated (tell the user
+        # once per task).
+        self._silent_escalated: dict[str, float] = {}
+        # ── Job 6 bookkeeping (usage-limit resume backstop) ──
+        self._started_at = time.time()
+        self._limit_swept_at = 0.0
+        # session_id -> (stop timestamp, when we last resumed it for that stop)
+        self._limit_attempts: dict[str, tuple] = {}
+        # transcript path -> ((size, mtime_ns), stopped_on_error result)
+        self._limit_stop_cache: dict = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -179,8 +268,11 @@ class HealthMonitor:
         self._thread.start()
         logger.info(
             "HealthMonitor started (stall_after=%.0fs, max_restarts=%d, "
-            "keep_awake=%s)",
+            "keep_awake=%s, stranded_workers=%s, silent_wait=%s/%.0fs, "
+            "limit_backstop=%s)",
             STALL_AFTER_SECONDS, MAX_AUTO_RESTARTS, KEEP_AWAKE,
+            ORPHAN_RECOVERY, SILENT_WAIT_RECOVERY, SILENT_WAIT_SECONDS,
+            LIMIT_BACKSTOP,
         )
 
     def stop(self) -> None:
@@ -241,7 +333,11 @@ class HealthMonitor:
                 self._progress.pop(sid, None)
                 if state == "idle":
                     self._restarts.pop(sid, None)
+                    # One IDLE clock shared by jobs 4 and 5 (set here so it
+                    # runs even when either job is switched off).
+                    self._idle_since.setdefault(sid, now)
                     self._check_stranded_workers(info, now)
+                    self._check_silent_wait(info, now)
                 else:
                     self._end_idle_episode(sid)
                 continue
@@ -289,11 +385,20 @@ class HealthMonitor:
             if sid not in live_ids:
                 self._restarts.pop(sid, None)
         for book in (self._idle_since, self._orphan_checked_at,
-                     self._orphan_caches, self._transcript_paths):
+                     self._orphan_caches, self._transcript_paths,
+                     self._silent_checked_at, self._silent_nudged,
+                     self._silent_escalated):
             for sid in list(book):
                 if sid not in live_ids:
                     book.pop(sid, None)
         self._orphan_nudged = {k for k in self._orphan_nudged if k[0] in live_ids}
+
+        # Job 6 runs over live AND dormant sessions, so it is not part of the
+        # per-live-session loop above.
+        try:
+            self._limit_backstop(now, sessions)
+        except Exception:
+            logger.exception("Usage-limit resume backstop failed")
 
         if KEEP_AWAKE and any_working:
             self._pulse_keep_awake()
@@ -383,14 +488,14 @@ class HealthMonitor:
                     sid, send_result.get("error"),
                 )
 
-    def _announce(self, info, text: str) -> None:
+    def _announce(self, info, text: str, is_error: bool = False) -> None:
         """Append a visible system entry to the session timeline."""
         sm = self._sm
         try:
             # Local import: session_manager imports this module lazily in
             # start(), so importing back at call time is cycle-safe.
             from daemon.session_manager import LogEntry
-            entry = LogEntry(kind="system", text=text)
+            entry = LogEntry(kind="system", text=text, is_error=is_error)
             with info._lock:
                 info.entries.append(entry)
                 index = len(info.entries) - 1
@@ -404,6 +509,7 @@ class HealthMonitor:
         """Forget the current IDLE episode's clocks (session left IDLE)."""
         self._idle_since.pop(sid, None)
         self._orphan_checked_at.pop(sid, None)
+        self._silent_checked_at.pop(sid, None)
 
     def _check_stranded_workers(self, info, now: float) -> None:
         """Nudge an IDLE session whose background workers can never report.
@@ -489,6 +595,266 @@ class HealthMonitor:
                 "Stranded-worker nudge for %s failed: %s",
                 sid, result.get("error"),
             )
+
+    # ── Silent-wait backstop (job 5) ──────────────────────────────────
+
+    @staticmethod
+    def _task_start(info) -> float:
+        """When the session's current task began.
+
+        That is the last genuine send, or the moment the daemon took the
+        session on, whichever is later.
+        """
+        return max(float(getattr(info, "_task_started_at", 0.0) or 0.0),
+                   float(getattr(info, "created_ts", 0.0) or 0.0))
+
+    @staticmethod
+    def _last_assistant_text(info) -> str:
+        """Text of the session's most recent assistant entry ('' if none)."""
+        try:
+            entries = info.entries
+            for i in range(len(entries) - 1, max(-1, len(entries) - 60), -1):
+                entry = entries[i]
+                if getattr(entry, "kind", "") == "asst":
+                    return entry.text or ""
+        except (IndexError, AttributeError):
+            pass
+        return ""
+
+    def _check_silent_wait(self, info, now: float) -> None:
+        """Act on an IDLE session waiting on background work that is dead.
+
+        Cause-agnostic backstop: see the module docstring (job 5) and
+        ``daemon/silent_wait.py``.  Cheap in-memory gates run first, and the
+        footprint stat walk plus the process check at most once a minute per
+        IDLE session.  Acts at most once per task: a nudge first, then (same
+        task, still dead) an escalation to the user.
+        """
+        if not SILENT_WAIT_RECOVERY:
+            return
+        if getattr(info.state, "value", str(info.state)) != "idle":
+            return  # e.g. job 4 just started a turn on this tick
+        if getattr(info, "_interrupted", False):
+            return  # the user stopped it: an explicit stop must stick
+        sid = info.session_id
+        task_start = self._task_start(info)
+        if self._silent_escalated.get(sid) == task_start:
+            return  # the user has already been told about this task
+        after_nudge = self._silent_nudged.get(sid) == task_start
+        bg_at = float(getattr(info, "_bg_work_at", 0.0) or 0.0)
+        if not after_nudge and (bg_at <= 0.0 or bg_at < task_start):
+            # No background work in this task.  An idle session "waiting" is
+            # waiting on the user, which is the normal end of a turn.
+            return
+        if getattr(info, "_wakeup_is_scheduled", False) and \
+                float(getattr(info, "_wakeup_deadline", 0.0) or 0.0) > now:
+            return  # a real timer will wake it; the deadline watchdog owns it
+        last = self._silent_checked_at.get(sid)
+        if last is not None and now - last < SILENT_WAIT_RECHECK_SECONDS:
+            return
+        self._silent_checked_at[sid] = now
+        if not says_waiting_on_background(self._last_assistant_text(info)):
+            return
+        try:
+            if self._sm._mq.get_queue_data(sid):
+                return  # a queued message is already the continuation
+        except Exception:
+            return
+
+        idle_since = self._idle_since.get(sid, now)
+        path = self._transcript_path(info)
+        last_write = footprint_last_write(path) if path is not None else 0.0
+        quiet_for = now - max(last_write, bg_at, idle_since)
+        live = live_commands(getattr(info, "_cli_pid", 0))
+        if live is None:
+            threshold = SILENT_WAIT_UNKNOWN_SECONDS
+        elif live:
+            threshold = SILENT_WAIT_LIVE_SECONDS
+        else:
+            threshold = SILENT_WAIT_SECONDS
+        if quiet_for < threshold:
+            return
+        minutes = int(quiet_for // 60)
+        if after_nudge:
+            self._escalate_silent_wait(info, minutes, task_start)
+        else:
+            self._nudge_silent_wait(info, minutes, live, task_start)
+
+    def _nudge_silent_wait(self, info, minutes: int, live, task_start: float) -> None:
+        """First response: tell the session its wait is dead (once per task)."""
+        sid = info.session_id
+        logger.warning(
+            "Session %s: IDLE %d min waiting on background work with nothing "
+            "alive (live commands: %s). Nudging it to check its work.",
+            sid, minutes, live,
+        )
+        self._announce(
+            info,
+            "Watchdog: this session has been waiting %d min on background "
+            "work with nothing making progress. Asked it to check its work "
+            "and continue." % minutes,
+        )
+        result = self._sm.send_message(sid, build_silent_wait_nudge(minutes, live))
+        if result.get("ok"):
+            # send_message stamped a new task start.  Remember it, so the next
+            # IDLE episode of this same task escalates instead of nudging
+            # again.
+            self._silent_nudged[sid] = self._task_start(info)
+        else:
+            logger.error("Silent-wait nudge for %s failed: %s", sid, result.get("error"))
+            self._escalate_silent_wait(info, minutes, task_start)
+
+    def _escalate_silent_wait(self, info, minutes: int, task_start: float) -> None:
+        """Second response: the nudge did not help, so tell the user.
+
+        This adds an error entry in the session, and pushes
+        ``session_stalled`` to every open tab, which chimes and notifies
+        through static/js/notify.js.
+        """
+        sid = info.session_id
+        self._silent_escalated[sid] = task_start
+        text = (
+            "Watchdog: this session is still waiting on background work that "
+            "is not making progress (%d min with no activity, after a nudge). "
+            "It needs you." % minutes
+        )
+        logger.error("Session %s: %s", sid, text)
+        self._announce(info, text, is_error=True)
+        push = getattr(self._sm, "_push_callback", None)
+        if push:
+            try:
+                push("session_stalled", {
+                    "session_id": sid,
+                    "name": getattr(info, "name", "") or "",
+                    "text": text,
+                })
+            except Exception:
+                logger.exception("session_stalled push failed for %s", sid)
+
+    # ── Usage-limit resume backstop (job 6) ───────────────────────────
+
+    def _limit_backstop(self, now: float, sessions: list) -> None:
+        """Resume any session still stopped on a limit after its reset.
+
+        See the module docstring (job 6) and ``daemon/limit_watch.py``.
+        Candidates are only sessions the user has not stopped:
+
+        * live sessions that are IDLE, not interrupted (Stop), and not already
+          counting down to a resume of their own (Layer 1) unless that
+          countdown is long overdue;
+        * dormant sessions in the daemon's restart memory (an explicit stop,
+          sleep or delete removes a session from it).
+        """
+        if not LIMIT_BACKSTOP:
+            return
+        if now - self._started_at < LIMIT_STARTUP_GRACE_SECONDS:
+            return
+        if now - self._limit_swept_at < LIMIT_SWEEP_SECONDS:
+            return
+        self._limit_swept_at = now
+        sm = self._sm
+        parse = getattr(sm, "_parse_usage_limit", None)
+        if getattr(sm, "_store", None) is None or parse is None:
+            return
+        cont = getattr(sm, "_API_RETRY_CONTINUE_PROMPT", "") or \
+            "Continue from where you left off."
+
+        candidates = []   # (session_id, live SessionInfo or None, cwd)
+        seen = set()
+        for info in sessions:
+            sid = info.session_id
+            seen.add(sid)
+            if getattr(info.state, "value", str(info.state)) != "idle":
+                continue
+            if getattr(info, "_interrupted", False):
+                continue
+            if (getattr(info, "session_type", "") or "") not in ("", "normal"):
+                continue
+            retry_at = float(getattr(info, "retry_at", 0.0) or 0.0)
+            if retry_at > 0 and now < retry_at + LIMIT_STALE_COUNTDOWN_SECONDS:
+                continue   # Layer 1 owns this resume
+            candidates.append((sid, info, getattr(info, "cwd", "") or ""))
+        try:
+            dormant = sm.get_dormant_states() or {}
+        except Exception:
+            dormant = {}
+        for sid, meta in dormant.items():
+            meta = meta or {}
+            if sid in seen or (meta.get("session_type", "") or "") not in ("", "normal"):
+                continue
+            candidates.append((sid, None, meta.get("cwd", "") or ""))
+
+        live_or_dormant = {c[0] for c in candidates}
+        for sid in list(self._limit_attempts):
+            if sid not in live_or_dormant and sid not in seen:
+                self._limit_attempts.pop(sid, None)
+
+        for sid, info, cwd in candidates:
+            path = self._limit_path(sid, cwd)
+            if path is None:
+                continue
+            stop = self._cached_stop(path, cont)
+            if stop is None or now < limit_due_at(stop, parse):
+                continue
+            last = self._limit_attempts.get(sid)
+            if last and last[0] == stop["ts"] and now - last[1] < LIMIT_REATTEMPT_SECONDS:
+                continue
+            self._limit_attempts[sid] = (stop["ts"], now)
+            self._resume_after_stop(sid, info, stop, cont)
+
+    def _cached_stop(self, path, cont: str):
+        """``stopped_on_error`` for ``path``, re-read only when the file changed."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            self._limit_stop_cache.pop(path, None)
+            return None
+        key = (st.st_size, st.st_mtime_ns)
+        hit = self._limit_stop_cache.get(path)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        stop = stopped_on_error(path, cont)
+        self._limit_stop_cache[path] = (key, stop)
+        return stop
+
+    def _limit_path(self, sid: str, cwd: str):
+        """Root transcript path for a live or dormant session (cached)."""
+        cached = self._transcript_paths.get(sid)
+        if cached is not None and cached.exists():
+            return cached
+        store = getattr(self._sm, "_store", None)
+        if store is None:
+            return None
+        try:
+            found = store.find_session_path(sid, cwd)
+        except Exception:
+            return None
+        if not found:
+            return None
+        path = Path(found)
+        self._transcript_paths[sid] = path
+        return path
+
+    def _resume_after_stop(self, sid: str, info, stop: dict, cont: str) -> None:
+        """Send the continue prompt to a session nothing else resumed."""
+        what = "usage limit" if stop["error"] == "rate_limit" else "server error"
+        logger.warning(
+            "Session %s: stopped on a %s at %s and nothing resumed it "
+            "(%d consecutive). Continuing it now (limit backstop).",
+            sid, what, time.strftime("%m-%d %H:%M", time.localtime(stop["ts"])),
+            stop["failures"],
+        )
+        if info is not None:
+            self._announce(
+                info,
+                "Watchdog: the %s that stopped this session has passed. "
+                "Continuing automatically." % what,
+            )
+        # send_message also wakes a dormant session from its transcript.
+        result = self._sm.send_message(sid, cont)
+        if not result.get("ok"):
+            logger.error("Limit backstop could not resume %s: %s",
+                         sid, result.get("error"))
 
     def _transcript_path(self, info):
         """The session's root ``.jsonl`` path (cached), or None."""
