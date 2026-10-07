@@ -1,8 +1,9 @@
-"""Session health monitor: stall auto-restart, sleep/wake healing, keep-awake.
+"""Session health monitor: stall auto-restart, sleep/wake healing, keep-awake,
+stranded-worker recovery.
 
 This module runs ONE background daemon thread inside the session daemon
 process (started from ``SessionManager.start()``).  Every tick it does
-three independent jobs, all read-mostly and O(number of sessions):
+four independent jobs, all read-mostly and O(number of sessions):
 
 1. **Stall detection + auto-restart.**  A session that sits in WORKING
    state with zero new output for ``STALL_AFTER_SECONDS`` is considered
@@ -35,6 +36,22 @@ three independent jobs, all read-mostly and O(number of sessions):
    explicit user-initiated sleep or lid close is NOT blocked — job 2
    covers recovery for those.  No-op on Linux/macOS.
 
+4. **Stranded-worker recovery.**  Jobs 1-3 only watch sessions that are
+   WORKING.  This one covers a session that ended its turn normally (IDLE)
+   while it waits on background workers that can never report.  Claude Code
+   delivers a nested agent's completion notice (an agent launched BY a
+   background worker) to the top-level session, never to the worker that
+   launched it.  A worker that stopped to wait for its own reviewer
+   therefore waits forever, and so does the session waiting on that worker.
+   This cost a whole day on 2026-10-06: two workers sat 343 and 317 minutes
+   after their reviewers had finished, and the IDLE session was invisible
+   to job 1.  Once a session has been IDLE for
+   ``ORPHAN_IDLE_GRACE_SECONDS``, the monitor checks the CLI's on-disk
+   transcripts (``daemon/orphaned_workers.py``).  For any stranded worker it
+   sends the session ONE message naming the worker and the result to
+   forward.  Each stranded result is nudged at most once.  Sessions the user
+   stopped, and sessions with queued messages, are left alone.
+
 Tuning knobs (environment variables, read once at import):
     VIBENODE_STALL_MINUTES        minutes of zero output before a WORKING
                                   session counts as stalled (default 10)
@@ -42,6 +59,10 @@ Tuning knobs (environment variables, read once at import):
                                   before giving up (default 2)
     VIBENODE_KEEP_AWAKE           set to "0" to let Windows sleep even
                                   while sessions are working (default on)
+    VIBENODE_ORPHAN_RECOVERY      set to "0" to disable job 4 (default on)
+    VIBENODE_ORPHAN_GRACE_SECONDS seconds a session must sit IDLE before
+                                  job 4 looks for stranded workers
+                                  (default 90, minimum 30)
 
 Design constraints honored here:
 - No changes to any PERF-CRITICAL path.  The monitor only READS session
@@ -61,6 +82,9 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
+
+from daemon.orphaned_workers import ScanCache, build_nudge, find_orphaned_workers
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +101,22 @@ SLEEP_GAP_SECONDS = 120.0
 # idle-to-sleep timer".  Pulsed (without ES_CONTINUOUS) once per tick so
 # the effect ends automatically as soon as the monitor stops pulsing.
 _ES_SYSTEM_REQUIRED = 0x00000001
+
+# ── Stranded-worker recovery (job 4, see daemon/orphaned_workers.py) ──────
+ORPHAN_RECOVERY = os.environ.get("VIBENODE_ORPHAN_RECOVERY", "1") != "0"
+# How long a session must sit IDLE before job 4 looks for stranded workers.
+# This lets the post-turn machinery settle (chained auto-resumes arrive within
+# seconds of RESULT).  It also keeps the nudge from racing a user who is still
+# reading the final message.  The tick interval adds up to 30s on top, so the
+# nudge lands 90-120s after the session goes idle, against the hours lost
+# without it.
+ORPHAN_IDLE_GRACE_SECONDS = max(
+    30.0, float(os.environ.get("VIBENODE_ORPHAN_GRACE_SECONDS", "90"))
+)
+# While a session stays IDLE, re-check at most this often.  The check itself
+# is gated on the root transcript growing (ScanCache.evaluated_size), so an
+# unchanged long-idle session costs one or two stats per re-check.
+ORPHAN_RESCAN_SECONDS = 300.0
 
 NUDGE_TEXT = (
     "[VibeNode watchdog] Your previous turn produced no output for an "
@@ -112,6 +152,21 @@ class HealthMonitor:
         # completed and stayed completed — our own interrupt+nudge flips
         # back to WORKING within the same tick, so it is never observed).
         self._restarts: dict[str, int] = {}
+        # ── Job 4 bookkeeping (stranded-worker recovery) ──
+        # session_id -> wall time this monitor first saw the current IDLE
+        # episode.  Cleared whenever the session is seen in any other state.
+        self._idle_since: dict[str, float] = {}
+        # session_id -> wall time of the last stranded-worker check in the
+        # current IDLE episode.
+        self._orphan_checked_at: dict[str, float] = {}
+        # (session_id, nested_agent_id, delivered_at) already nudged.  Never
+        # nudge the same stranded result twice.  A resumed nested agent that
+        # stops again has a new delivered_at, so it is evaluated afresh.
+        self._orphan_nudged: set[tuple] = set()
+        # session_id -> incremental transcript scan state.
+        self._orphan_caches: dict[str, ScanCache] = {}
+        # session_id -> resolved root transcript path.
+        self._transcript_paths: dict[str, Path] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -186,8 +241,14 @@ class HealthMonitor:
                 self._progress.pop(sid, None)
                 if state == "idle":
                     self._restarts.pop(sid, None)
+                    self._check_stranded_workers(info, now)
+                else:
+                    self._end_idle_episode(sid)
                 continue
 
+            # A turn is running: any IDLE episode is over, and the next one
+            # gets a fresh grace window.
+            self._end_idle_episode(sid)
             any_working = True
             # Sessions awaiting a scheduled wake-up are legitimately quiet.
             if getattr(info, "_wakeup_pending", False):
@@ -227,6 +288,12 @@ class HealthMonitor:
         for sid in list(self._restarts):
             if sid not in live_ids:
                 self._restarts.pop(sid, None)
+        for book in (self._idle_since, self._orphan_checked_at,
+                     self._orphan_caches, self._transcript_paths):
+            for sid in list(book):
+                if sid not in live_ids:
+                    book.pop(sid, None)
+        self._orphan_nudged = {k for k in self._orphan_nudged if k[0] in live_ids}
 
         if KEEP_AWAKE and any_working:
             self._pulse_keep_awake()
@@ -330,6 +397,117 @@ class HealthMonitor:
             sm._emit_entry(info.session_id, entry, index)
         except Exception:
             logger.exception("HealthMonitor announce failed for %s", info.session_id)
+
+    # ── Stranded-worker recovery (job 4) ──────────────────────────────
+
+    def _end_idle_episode(self, sid: str) -> None:
+        """Forget the current IDLE episode's clocks (session left IDLE)."""
+        self._idle_since.pop(sid, None)
+        self._orphan_checked_at.pop(sid, None)
+
+    def _check_stranded_workers(self, info, now: float) -> None:
+        """Nudge an IDLE session whose background workers can never report.
+
+        See the module docstring (job 4) and ``daemon/orphaned_workers.py``
+        for the CLI routing bug this works around.  The decision itself is
+        file-based and exact.  This method only adds the conditions under
+        which acting is appropriate:
+
+        * the session has been IDLE for the grace window (checked again at
+          most every ``ORPHAN_RESCAN_SECONDS`` while it stays IDLE);
+        * the user did not stop it (``_interrupted``: Stop, or the stall
+          watchdog giving up).  An explicit stop must stick;
+        * nothing is queued (a queued message is already the continuation;
+          the next IDLE episode re-checks);
+        * the stranded result reached the session after the daemon took it
+          on (``created_ts``), so history from before a daemon restart can
+          never trigger a nudge.
+        """
+        if not ORPHAN_RECOVERY:
+            return
+        sid = info.session_id
+        idle_since = self._idle_since.setdefault(sid, now)
+        if now - idle_since < ORPHAN_IDLE_GRACE_SECONDS:
+            return
+        last = self._orphan_checked_at.get(sid)
+        if last is not None and now - last < ORPHAN_RESCAN_SECONDS:
+            return
+        self._orphan_checked_at[sid] = now
+
+        if getattr(info, "_interrupted", False):
+            return
+        sm = self._sm
+        try:
+            if sm._mq.get_queue_data(sid):
+                return
+        except Exception:
+            return
+        path = self._transcript_path(info)
+        if path is None:
+            return
+        cache = self._orphan_caches.setdefault(sid, ScanCache())
+        since = float(getattr(info, "created_ts", 0.0) or 0.0)
+        try:
+            stranded = find_orphaned_workers(path, cache, since=since)
+        except Exception:
+            # The detector is written to be exception-free; this is the
+            # belt-and-braces guard that keeps the monitor ticking.
+            logger.exception("Stranded-worker check failed for %s", sid)
+            return
+        fresh = [o for o in stranded
+                 if (sid, o.nested_id, o.delivered_at) not in self._orphan_nudged]
+        if not fresh:
+            return
+        # Mark BEFORE sending: whatever happens next, this result is never
+        # nudged twice (a failed send is logged for manual follow-up).
+        for o in fresh:
+            self._orphan_nudged.add((sid, o.nested_id, o.delivered_at))
+        logger.warning(
+            "Session %s: %d background worker(s) stranded waiting on nested "
+            "agents whose results were delivered to the session instead "
+            "(%s). Nudging the session to forward them.",
+            sid, len(fresh),
+            ", ".join(f"{o.worker_id}<-{o.nested_id} [{o.reason}]" for o in fresh),
+        )
+        # The announce is what the user sees live.  send_message only pushes
+        # the user bubble to clients after an interrupt (the frontend normally
+        # renders its own sends optimistically), and this nudge goes to an
+        # IDLE session with no interrupt, so the nudge text itself shows up
+        # only on the next log load.
+        names = ", ".join(
+            sorted({o.worker_desc or o.worker_id for o in fresh})
+        )
+        self._announce(
+            info,
+            "Watchdog: %d background worker(s) stuck waiting on results that "
+            "were delivered to this session instead (%s). Asked the session "
+            "to forward them." % (len(fresh), names),
+        )
+        result = sm.send_message(sid, build_nudge(fresh))
+        if not result.get("ok"):
+            logger.error(
+                "Stranded-worker nudge for %s failed: %s",
+                sid, result.get("error"),
+            )
+
+    def _transcript_path(self, info):
+        """The session's root ``.jsonl`` path (cached), or None."""
+        sid = info.session_id
+        cached = self._transcript_paths.get(sid)
+        if cached is not None and cached.exists():
+            return cached
+        store = getattr(self._sm, "_store", None)
+        if store is None:
+            return None
+        try:
+            found = store.find_session_path(sid, getattr(info, "cwd", "") or "")
+        except Exception:
+            return None
+        if not found:
+            return None
+        path = Path(found)
+        self._transcript_paths[sid] = path
+        return path
 
     # ── Helpers ───────────────────────────────────────────────────────
 
