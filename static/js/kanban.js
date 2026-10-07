@@ -1484,6 +1484,17 @@ function _closePlannerSlideout() {
   }
   // Clear persisted state
   _persistPlannerState(null);
+  // Defensive clear: an older build of _openPlannerPanel wrote inline
+  // display:none directly on #main-toolbar / #live-input-bar as well as
+  // relying on the body:has() CSS rule. The inline style never got cleared
+  // and the composer disappeared on the active session until page reload
+  // (reported 2026-10-06 on mobile). The current _openPlannerPanel no longer
+  // writes those inline styles, but we clear here too so cached JS or any
+  // future code path that trips the same hazard self-heals.
+  const _tb = document.getElementById('main-toolbar');
+  if (_tb && _tb.style.display === 'none') _tb.style.display = '';
+  const _ib = document.getElementById('live-input-bar');
+  if (_ib && _ib.style.display === 'none') _ib.style.display = '';
   // Re-render drill-down so chooser cards reset from spinning state
   if (kanbanDetailTaskId) {
     setTimeout(() => renderTaskDetail(kanbanDetailTaskId), 320);
@@ -1535,10 +1546,16 @@ function _openPlannerPanel(prefill) {
   requestAnimationFrame(() => panel.classList.add('open'));
   setTimeout(_wirePlannerVoice, 350);
 
-  const tb = document.getElementById('main-toolbar');
-  if (tb) tb.style.display = 'none';
-  const inputBar = document.getElementById('live-input-bar');
-  if (inputBar) inputBar.style.display = 'none';
+  // #main-toolbar and #live-input-bar are hidden by the CSS rule
+  //   body:has(.kanban-planner-panel.open:not(.minimized)) #main-toolbar,
+  //   body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: none !important; }
+  // in style.css while the planner is open. Do NOT set inline display:none here —
+  // it is redundant with the CSS, and any path that removes the planner panel
+  // without re-rendering the session (Escape, navigation, old.remove() in
+  // _openPlannerPanel/_openPlannerSlideout themselves, errors) leaves the inline
+  // style on #live-input-bar and the composer becomes invisible on that session
+  // until page reload. The CSS rule self-heals when the panel leaves the DOM;
+  // inline styles do not.
   _persistPlannerState('open');
 
   // Show empty state with prompt in the textarea
