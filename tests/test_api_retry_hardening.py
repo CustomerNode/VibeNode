@@ -235,21 +235,27 @@ class TestWallClockDeadline:
     def test_sleeps_in_bounded_slices(self, sm_module, monkeypatch):
         """The slice cap is what bounds how late a suspend can push a retry."""
         mgr = sm_module.SessionManager()
-        monkeypatch.setattr(sm_module.SessionManager, "_API_RETRY_TICK", 1.0)
+        tick = 1.0  # the production floor: _await_retry_deadline clamps to >= 1s
+        monkeypatch.setattr(sm_module.SessionManager, "_API_RETRY_TICK", tick)
 
-        real_sleep = asyncio.sleep
+        # Simulated wall clock: each recorded sleep advances it instead of
+        # waiting, so the 3s deadline is exercised without 3 real seconds.
+        clock = [time.time()]
+        deadline = clock[0] + 3.0
         slices = []
 
         async def recording_sleep(d):
             slices.append(d)
-            return await real_sleep(d)
+            clock[0] += d
 
         monkeypatch.setattr(asyncio, "sleep", recording_sleep)
-        asyncio.run(mgr._await_retry_deadline(time.time() + 3.0))
+        monkeypatch.setattr(sm_module.time, "time", lambda: clock[0])
+        asyncio.run(mgr._await_retry_deadline(deadline))
         monkeypatch.undo()
 
         assert len(slices) >= 3, "a 3s wait with a 1s tick must slice, not one-shot"
-        assert max(slices) <= 1.0 + 1e-6, \
+        assert clock[0] >= deadline, "must not return before the deadline"
+        assert max(slices) <= tick + 1e-6, \
             "no slice may exceed the tick — that is the suspend overshoot bound"
 
     def test_deadline_is_still_honored(self, sm_module, monkeypatch):

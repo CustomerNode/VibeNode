@@ -114,8 +114,15 @@ class _FakeProc:
 class TestEndpoint:
     def test_failed_run_reports_exact_counts_and_log(self, paths, monkeypatch):
         captured = {}
+        real_popen = ta.subprocess.Popen
 
-        def fake_popen(cmd, **kw):
+        def fake_popen(cmd, *args, **kw):
+            # ta.subprocess IS the global subprocess module, so this patch is
+            # process-wide.  Background threads left by other test files in
+            # the same xdist worker (e.g. app.git_ops's git refresh) can call
+            # Popen mid-request; intercept only the pytest launch under test.
+            if not (isinstance(cmd, list) and "pytest" in cmd):
+                return real_popen(cmd, *args, **kw)
             captured["cmd"] = cmd
             captured["kw"] = kw
             return _FakeProc(["..F.", "FAILED tests/test_x.py::test_y - boom"], 1, ta.LAST_RUN_JUNIT)

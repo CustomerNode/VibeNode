@@ -18,6 +18,7 @@ import inspect
 import time
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+from tests._empty_cwd import EMPTY_CWD
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +255,7 @@ def wait_for(condition, timeout=5.0, interval=0.02):
 def _make_idle_session(sm_module, manager, sid, user_text="do the thing"):
     """Register an IDLE SessionInfo with one user entry and return it."""
     info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
-    info.cwd = "/tmp"
+    info.cwd = EMPTY_CWD
     info.entries.append(sm_module.LogEntry(kind="user", text=user_text))
     with manager._lock:
         manager._sessions[sid] = info

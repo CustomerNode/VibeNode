@@ -18,6 +18,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, call
 from dataclasses import dataclass, field
 from typing import Optional
+from tests._empty_cwd import EMPTY_CWD
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +491,7 @@ class TestSelfHealingBehavior:
         and reset on normal user message."""
         sid = "heal-counter-test"
         info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
-        info.cwd = "/tmp"
+        info.cwd = EMPTY_CWD
 
         with session_manager._lock:
             session_manager._sessions[sid] = info
@@ -583,7 +584,7 @@ class TestUserStopBeatsSelfHeal:
         sid = "slept-session"
         info = sm_module.SessionInfo(
             session_id=sid, state=sm_module.SessionState.STOPPED)
-        info.cwd = "/tmp"
+        info.cwd = EMPTY_CWD
         with session_manager._lock:
             session_manager._sessions[sid] = info
 
@@ -616,7 +617,7 @@ class TestUserStopBeatsSelfHeal:
         API 400 and is stripped."""
         sid = "reconnect-effort"
         info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
-        info.cwd, info.model, info.effort = "/tmp", model, effort
+        info.cwd, info.model, info.effort = EMPTY_CWD, model, effort
         with session_manager._lock:
             session_manager._sessions[sid] = info
         captured = {}

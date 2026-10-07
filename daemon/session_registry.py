@@ -34,6 +34,10 @@ _MEMORY_ELIGIBLE_STATES = ("working", "waiting", "starting", "idle")
 class SessionRegistry:
     """Persistent session registry for crash recovery."""
 
+    # Debounce window for schedule_registry_save().  A class attribute so tests
+    # can shorten it instead of sleeping through the real 3 seconds.
+    _SAVE_DEBOUNCE_S = 3.0
+
     def __init__(self):
         """Initialize the SessionRegistry.
 
@@ -200,7 +204,7 @@ class SessionRegistry:
         # write, preventing I/O contention during burst activity.
         if self._registry_timer and self._registry_timer.is_alive():
             return
-        self._registry_timer = threading.Timer(3.0, save_fn)
+        self._registry_timer = threading.Timer(self._SAVE_DEBOUNCE_S, save_fn)
         self._registry_timer.daemon = True
         self._registry_timer.start()
 

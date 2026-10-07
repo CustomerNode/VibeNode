@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 from dataclasses import dataclass, field
 from typing import Optional
+from tests._empty_cwd import EMPTY_CWD
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +264,7 @@ class TestHappyPathTransitions:
         ]
 
         with patch.object(sm_module, 'ClaudeSDKClient', return_value=mock_client):
-            session_manager.start_session(sid, prompt="test", cwd="/tmp")
+            session_manager.start_session(sid, prompt="test", cwd=EMPTY_CWD)
             wait_for(lambda: session_manager.get_session_state(sid) == "idle")
 
         assert session_manager.get_session_state(sid) == "idle"
@@ -281,7 +282,7 @@ class TestHappyPathTransitions:
         ]
 
         with patch.object(sm_module, 'ClaudeSDKClient', return_value=mock_client):
-            session_manager.start_session(sid, prompt="init", cwd="/tmp")
+            session_manager.start_session(sid, prompt="init", cwd=EMPTY_CWD)
             # Must really be IDLE before the follow-up, or send_message queues
             # it behind a still-starting session and WORKING never appears.
             # Under a loaded full-suite run the 5s default timeout expired
@@ -317,7 +318,7 @@ class TestHappyPathTransitions:
         mock_client._messages = [MockResultMessage(session_id=sid)]
 
         with patch.object(sm_module, 'ClaudeSDKClient', return_value=mock_client):
-            session_manager.start_session(sid, prompt="x", cwd="/tmp")
+            session_manager.start_session(sid, prompt="x", cwd=EMPTY_CWD)
             wait_for(lambda: session_manager.get_session_state(sid) == "idle")
 
             session_manager.close_session(sid)
@@ -341,7 +342,7 @@ class TestHappyPathTransitions:
         ]
 
         with patch.object(sm_module, 'ClaudeSDKClient', return_value=mock_client):
-            session_manager.start_session(sid, prompt="hi", cwd="/tmp")
+            session_manager.start_session(sid, prompt="hi", cwd=EMPTY_CWD)
             wait_for(lambda: session_manager.get_session_state(sid) == "idle")
 
             result = session_manager.send_message(sid, "More")
@@ -405,7 +406,7 @@ class TestEdgeCaseTransitions:
         mock_client._messages = []  # No messages at all
 
         with patch.object(sm_module, 'ClaudeSDKClient', return_value=mock_client):
-            session_manager.start_session(sid, prompt="x", cwd="/tmp")
+            session_manager.start_session(sid, prompt="x", cwd=EMPTY_CWD)
             wait_for(lambda: session_manager.get_session_state(sid) == "idle")
 
         assert session_manager.get_session_state(sid) == "idle"
@@ -421,7 +422,7 @@ class TestEdgeCaseTransitions:
         ]
 
         with patch.object(sm_module, 'ClaudeSDKClient', return_value=mock_client):
-            session_manager.start_session(sid, prompt="x", cwd="/tmp")
+            session_manager.start_session(sid, prompt="x", cwd=EMPTY_CWD)
             wait_for(lambda: session_manager.get_session_state(sid) == "idle")
 
         assert session_manager.get_session_state(sid) == "idle"
@@ -524,7 +525,7 @@ class TestStateConsistency:
         ]
 
         with patch.object(sm_module, 'ClaudeSDKClient', return_value=mock_client):
-            session_manager.start_session(sid, prompt="x", cwd="/tmp")
+            session_manager.start_session(sid, prompt="x", cwd=EMPTY_CWD)
             wait_for(lambda: session_manager.get_session_state(sid) == "idle")
 
         # Every emitted state should match get_session_state at that moment
@@ -572,7 +573,7 @@ class TestStateConsistency:
         ]
 
         with patch.object(sm_module, 'ClaudeSDKClient', return_value=mock_client):
-            session_manager.start_session(sid, prompt="x", cwd="/tmp")
+            session_manager.start_session(sid, prompt="x", cwd=EMPTY_CWD)
             wait_for(lambda: session_manager.get_session_state(sid) == "idle")
 
         final = session_manager.get_session_state(sid)
@@ -591,7 +592,7 @@ class TestStateConsistency:
                 with patch.object(
                     sm_module, 'ClaudeSDKClient', return_value=mock_client
                 ):
-                    session_manager.start_session(sid, prompt="x", cwd="/tmp")
+                    session_manager.start_session(sid, prompt="x", cwd=EMPTY_CWD)
                     time.sleep(0.05)
                     session_manager.close_session(sid)
             except Exception as e:

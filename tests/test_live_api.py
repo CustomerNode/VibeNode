@@ -63,13 +63,20 @@ class TestHookPreTool:
         assert resp.status_code == 200
         assert resp.get_json()["action"] == "deny"
 
-    def test_hook_pre_tool_default_allow_on_error(self, live_app):
+    def test_hook_pre_tool_default_allow_on_error(self, live_app, monkeypatch):
+        import time
         app, client, _ = live_app
         app.session_manager.hook_pre_tool.side_effect = Exception("IPC failed")
+        # The route waits 1s between its 3 IPC attempts; record the waits
+        # instead of sleeping through them.
+        waits = []
+        monkeypatch.setattr(time, "sleep", lambda s: waits.append(s))
         resp = client.post('/api/hook/pre-tool',
                            json={"tool_name": "Write", "session_id": "s1"})
         assert resp.status_code == 200
         assert resp.get_json()["action"] == "allow"
+        assert app.session_manager.hook_pre_tool.call_count == 3
+        assert waits == [1, 1]
 
 
 # ---------------------------------------------------------------------------

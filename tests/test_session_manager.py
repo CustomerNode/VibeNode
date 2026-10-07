@@ -39,6 +39,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 from dataclasses import dataclass, field
 from typing import Optional
+from tests._empty_cwd import EMPTY_CWD
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +298,7 @@ class TestSendMessage:
         ]
 
         with patch.object(sm_module, 'ClaudeSDKClient', return_value=mock_client):
-            session_manager.start_session(sid, prompt="init", cwd="/tmp")
+            session_manager.start_session(sid, prompt="init", cwd=EMPTY_CWD)
             wait_for(lambda: session_manager.get_session_state(sid) == "idle")
 
             # Now send a follow-up
@@ -589,11 +590,11 @@ class TestSetSessionModel:
         sid = "sm-wake-pin"
         with patch.object(session_manager._reg, 'load_registry',
                           return_value={"sessions": {sid: {
-                              "cwd": "/tmp", "name": "Pinned",
+                              "cwd": EMPTY_CWD, "name": "Pinned",
                               "model": "claude-opus-5[1m]"}}}), \
              patch.object(session_manager, '_drive_session',
                           new=AsyncMock(return_value=None)) as mock_drive:
-            result = session_manager.start_session(sid, prompt="", cwd="/tmp",
+            result = session_manager.start_session(sid, prompt="", cwd=EMPTY_CWD,
                                                    resume=True)
             assert result["ok"] is True
             wait_for(lambda: mock_drive.await_count == 1, timeout=5)
@@ -656,10 +657,10 @@ class TestSetSessionModel:
         sid = "sm-wake-explicit"
         with patch.object(session_manager._reg, 'load_registry',
                           return_value={"sessions": {sid: {
-                              "cwd": "/tmp", "model": "claude-opus-5"}}}), \
+                              "cwd": EMPTY_CWD, "model": "claude-opus-5"}}}), \
              patch.object(session_manager, '_drive_session',
                           new=AsyncMock(return_value=None)) as mock_drive:
-            session_manager.start_session(sid, prompt="", cwd="/tmp",
+            session_manager.start_session(sid, prompt="", cwd=EMPTY_CWD,
                                           resume=True, model="claude-sonnet-4-6")
             wait_for(lambda: mock_drive.await_count == 1, timeout=5)
         assert mock_drive.call_args.kwargs["model"] == "claude-sonnet-4-6"
@@ -1074,7 +1075,7 @@ class TestSetSessionModel:
                           new=AsyncMock(return_value=mock_client)), \
              patch.object(session_manager._sdk, 'receive_response',
                           new=_mock_receive):
-            session_manager.start_session(sid, prompt="", cwd="/tmp", resume=True,
+            session_manager.start_session(sid, prompt="", cwd=EMPTY_CWD, resume=True,
                                           model="claude-sonnet-4-6")
             # Without the drain fix the session would be stuck in WORKING
             # indefinitely; with the fix it resolves to IDLE quickly.
@@ -1153,7 +1154,7 @@ class TestErrorHandling:
         ]
 
         with patch.object(sm_module, 'ClaudeSDKClient', return_value=mock_client):
-            result = session_manager.start_session(sid, prompt="restart", cwd="/tmp")
+            result = session_manager.start_session(sid, prompt="restart", cwd=EMPTY_CWD)
             assert result["ok"] is True
             wait_for(lambda: session_manager.get_session_state(sid) == "idle")
 
@@ -1593,7 +1594,7 @@ class TestResumeEffortPinning:
                           return_value={"sessions": registry or {}}), \
              patch.object(session_manager, '_drive_session',
                           new=AsyncMock(return_value=None)) as mock_drive:
-            result = session_manager.start_session(sid, prompt="", cwd="/tmp", **kw)
+            result = session_manager.start_session(sid, prompt="", cwd=EMPTY_CWD, **kw)
             assert result["ok"] is True
             wait_for(lambda: mock_drive.await_count == 1, timeout=5)
         return (mock_drive.call_args.kwargs.get("extra_args") or {}), \
@@ -1629,7 +1630,7 @@ class TestResumeEffortPinning:
 
     def test_dormant_resume_uses_registry_effort(self, session_manager):
         args, info = self._start(session_manager, "ef-dormant", resume=True,
-                                 registry={"ef-dormant": {"cwd": "/tmp",
+                                 registry={"ef-dormant": {"cwd": EMPTY_CWD,
                                                           "effort": "high"}})
         assert args["effort"] == "high"
         assert info.effort == "high"
@@ -1711,7 +1712,7 @@ class TestRemapAliasEntryPoints:
                           return_value={"sessions": {}}), \
              patch.object(session_manager, '_drive_session',
                           new=AsyncMock(return_value=None)) as mock_drive:
-            assert session_manager.start_session("temp-id", prompt="", cwd="/tmp",
+            assert session_manager.start_session("temp-id", prompt="", cwd=EMPTY_CWD,
                                                  resume=True)["ok"] is True
             wait_for(lambda: mock_drive.await_count == 1, timeout=5)
         # No duplicate under the temp id; the CLI resumes the REAL transcript.
@@ -1727,7 +1728,7 @@ class TestRemapAliasEntryPoints:
         session_manager._id_aliases["live-temp"] = "live-real"
         with patch.object(session_manager, 'send_message',
                           return_value={"ok": True}) as send:
-            session_manager.start_session("live-temp", prompt="hi", cwd="/tmp")
+            session_manager.start_session("live-temp", prompt="hi", cwd=EMPTY_CWD)
         send.assert_called_once()
         assert send.call_args.args[0] == "live-real"
 

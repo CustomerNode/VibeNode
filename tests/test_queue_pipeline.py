@@ -15,6 +15,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import dataclass, field
 from typing import Optional
+from tests._empty_cwd import EMPTY_CWD
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +237,7 @@ class TestInterruptDrainsToQueue:
         """Messages queued while WORKING survive interrupt with clear_queue=False."""
         sid = "drain-test"
         info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.WORKING)
-        info.cwd = "/tmp"
+        info.cwd = EMPTY_CWD
         info.task = MagicMock()
 
         with session_manager._lock:
@@ -261,7 +262,7 @@ class TestInterruptDrainsToQueue:
         """Default interrupt (clear_queue=True) empties the queue."""
         sid = "drain-clear"
         info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.WORKING)
-        info.cwd = "/tmp"
+        info.cwd = EMPTY_CWD
         info.task = MagicMock()
 
         with session_manager._lock:
@@ -290,7 +291,7 @@ class TestQueueAutoDispatchesOnIdle:
         and call send_message with it."""
         sid = "dispatch-test"
         info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
-        info.cwd = "/tmp"
+        info.cwd = EMPTY_CWD
 
         with session_manager._lock:
             session_manager._sessions[sid] = info
@@ -334,7 +335,7 @@ class TestRapidQueueAndInterrupt:
         """Queue multiple messages rapidly, verify they're all stored."""
         sid = "rapid-q"
         info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.WORKING)
-        info.cwd = "/tmp"
+        info.cwd = EMPTY_CWD
         info.task = MagicMock()
 
         with session_manager._lock:
@@ -356,7 +357,7 @@ class TestRapidQueueAndInterrupt:
         are preserved."""
         sid = "rapid-int"
         info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.WORKING)
-        info.cwd = "/tmp"
+        info.cwd = EMPTY_CWD
         info.task = MagicMock()
 
         with session_manager._lock:
@@ -384,7 +385,7 @@ class TestRapidQueueAndInterrupt:
         """Queue messages maintain FIFO order."""
         sid = "order-test"
         info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.WORKING)
-        info.cwd = "/tmp"
+        info.cwd = EMPTY_CWD
 
         with session_manager._lock:
             session_manager._sessions[sid] = info
@@ -399,7 +400,7 @@ class TestRapidQueueAndInterrupt:
         """Queue items can be edited and removed by index."""
         sid = "edit-rm"
         info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.WORKING)
-        info.cwd = "/tmp"
+        info.cwd = EMPTY_CWD
 
         with session_manager._lock:
             session_manager._sessions[sid] = info
@@ -428,7 +429,7 @@ class TestRapidQueueAndInterrupt:
         """clear_queue removes all items."""
         sid = "clear-all"
         info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.WORKING)
-        info.cwd = "/tmp"
+        info.cwd = EMPTY_CWD
 
         with session_manager._lock:
             session_manager._sessions[sid] = info

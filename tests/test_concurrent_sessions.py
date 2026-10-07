@@ -17,6 +17,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import dataclass, field
 from typing import Optional
+from tests._empty_cwd import EMPTY_CWD
 
 
 # ---------------------------------------------------------------------------
@@ -358,11 +359,11 @@ class TestInterruptOneSessionOtherContinues:
 
         # Create two sessions in WORKING state
         info_a = sm_module.SessionInfo(session_id=sid_a, state=sm_module.SessionState.WORKING)
-        info_a.cwd = "/tmp"
+        info_a.cwd = EMPTY_CWD
         info_a.task = MagicMock()  # mock asyncio task
 
         info_b = sm_module.SessionInfo(session_id=sid_b, state=sm_module.SessionState.WORKING)
-        info_b.cwd = "/tmp"
+        info_b.cwd = EMPTY_CWD
         info_b.task = MagicMock()
 
         with session_manager._lock:
@@ -388,7 +389,7 @@ class TestQueueDispatchAfterInterrupt:
         messages should be preserved."""
         sid = "queue-survive"
         info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.WORKING)
-        info.cwd = "/tmp"
+        info.cwd = EMPTY_CWD
         info.task = MagicMock()
 
         with session_manager._lock:
@@ -409,7 +410,7 @@ class TestQueueDispatchAfterInterrupt:
         """Default interrupt clears the queue to prevent auto-dispatch."""
         sid = "queue-clear"
         info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.WORKING)
-        info.cwd = "/tmp"
+        info.cwd = EMPTY_CWD
         info.task = MagicMock()
 
         with session_manager._lock:

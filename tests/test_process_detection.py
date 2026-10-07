@@ -14,6 +14,10 @@ import time
 
 import pytest
 
+# This file tests the enumerator itself, so it opts out of the conftest stub
+# that keeps every other test from scanning the machine's real processes.
+pytestmark = pytest.mark.real_process_scan
+
 
 def _write_jsonl(path, objs):
     """Write a list of dict entries as one JSONL file."""
@@ -282,3 +286,19 @@ class TestEnumerateProcesses:
         monkeypatch.setattr(subprocess, "run",
                             MagicMock(return_value=mock_result))
         assert isinstance(_enumerate_claude_processes(), list)
+
+    def test_real_os_scan_returns_process_records(self):
+        """Run the real OS query (PowerShell CIM on Windows, ps elsewhere).
+
+        The delete-endpoint tests used to exercise this shell-out incidentally
+        on every call; conftest now stubs it for them, so this is the one
+        place the real command, its flags and its output parsing are run.
+        """
+        from app.process_detection import (
+            _enumerate_claude_processes, _get_running_session_ids)
+        procs = _enumerate_claude_processes()
+        assert isinstance(procs, list)
+        for p in procs:
+            assert isinstance(p, dict)
+            assert "ProcessId" in p
+        assert isinstance(_get_running_session_ids(), dict)

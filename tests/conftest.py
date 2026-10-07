@@ -555,6 +555,32 @@ def _forbid_real_claude_cli(request, monkeypatch):
             pytrace=False)
 
 
+# ---------------------------------------------------------------------------
+# No test scans (or kills) the machine's real Claude processes by accident.
+#
+# The delete endpoints call _get_running_session_ids() and kill any CLI whose
+# command line matches the session id.  Underneath, that shells out to
+# PowerShell (Get-CimInstance Win32_Process) or `ps`: 0.5s alone, 2.5s under
+# the 8-worker Publish run, on every delete a route test makes.  The result
+# also depended on what happened to be running on the dev machine.
+#
+# Only the OS shell-out is replaced (with "no processes running", which is
+# what every route test assumes); _get_running_session_ids() and the
+# endpoints' own logic still run.  The real enumerator keeps its coverage in
+# tests/test_process_detection.py, which opts out with
+# ``@pytest.mark.real_process_scan``.
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _no_real_process_scan(request, monkeypatch):
+    if request.node.get_closest_marker("real_process_scan"):
+        return
+    try:
+        import app.process_detection as _pd
+    except Exception:
+        return
+    monkeypatch.setattr(_pd, "_enumerate_claude_processes", lambda: [])
+
+
 def _make_session_line(msg_type, content="", timestamp=None):
     """Build a single JSONL line for a mock session file."""
     ts = timestamp or datetime.now(timezone.utc).isoformat()

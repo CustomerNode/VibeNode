@@ -14,9 +14,6 @@ Covers:
 """
 
 import asyncio
-import atexit
-import shutil
-import tempfile
 import threading
 import time
 import pytest
@@ -24,24 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, call
 
 from dataclasses import dataclass, field
 from typing import Optional
-
-
-# ---------------------------------------------------------------------------
-# Empty tmp cwd for fake SessionManager runs.
-#
-# These tests used to pass ``cwd="/tmp"`` which, on Windows, resolves to
-# ``C:\tmp``.  If that directory happens to exist on the dev machine (it
-# did here, with ~17k files), ``_record_pre_turn_mtimes`` and
-# ``_detect_changed_files`` walk it on every turn and each hit the 2.0s
-# filesystem-traversal budget.  Under full-suite parallel load (8 workers)
-# the 2s + 2s per turn exceeds the 5s wait_for timeout → flaky failures.
-#
-# Create a single empty tmp subdirectory per test process.  Scanning an
-# empty directory is sub-millisecond, so these tests cannot flake on this
-# code path regardless of what else is on disk.
-# ---------------------------------------------------------------------------
-_EMPTY_TMP_CWD = tempfile.mkdtemp(prefix="vn_test_cwd_")
-atexit.register(lambda: shutil.rmtree(_EMPTY_TMP_CWD, ignore_errors=True))
+from tests._empty_cwd import EMPTY_CWD
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +250,7 @@ def _run_session(session_manager, sm_module, sid, messages, prompt="test"):
     mock_client._messages = messages
 
     with patch.object(sm_module, 'ClaudeSDKClient', return_value=mock_client):
-        result = session_manager.start_session(sid, prompt=prompt, cwd=_EMPTY_TMP_CWD)
+        result = session_manager.start_session(sid, prompt=prompt, cwd=EMPTY_CWD)
         assert result["ok"] is True
         wait_for(lambda: session_manager.get_session_state(sid) == "idle")
 
@@ -412,7 +392,7 @@ class TestEdgeCases:
         mock_client._messages = [msg, MockResultMessage(session_id=sid)]
 
         with patch.object(sm_module, 'ClaudeSDKClient', return_value=mock_client):
-            result = session_manager.start_session(sid, prompt="test", cwd=_EMPTY_TMP_CWD)
+            result = session_manager.start_session(sid, prompt="test", cwd=EMPTY_CWD)
             assert result["ok"] is True
             # Wait for session to settle -- it may error and go to stopped,
             # or it may handle None content gracefully
@@ -438,7 +418,7 @@ class TestMultiSessionIndependence:
             ]
 
             with patch.object(sm_module, 'ClaudeSDKClient', return_value=client):
-                session_manager.start_session(sid, prompt="go", cwd=_EMPTY_TMP_CWD)
+                session_manager.start_session(sid, prompt="go", cwd=EMPTY_CWD)
                 wait_for(lambda s=sid: session_manager.get_session_state(s) == "idle", timeout=5)
 
             entries = session_manager.get_entries(sid)
@@ -540,7 +520,7 @@ class TestThreadSafety:
         ]
 
         with patch.object(sm_module, 'ClaudeSDKClient', return_value=client):
-            session_manager.start_session(sid, prompt="init", cwd=_EMPTY_TMP_CWD)
+            session_manager.start_session(sid, prompt="init", cwd=EMPTY_CWD)
             wait_for(lambda: session_manager.get_session_state(sid) == "idle", timeout=5)
 
         # Try both operations -- at least one should succeed or fail gracefully
@@ -572,7 +552,7 @@ class TestEventLoopReliability:
             ]
 
             with patch.object(sm_module, 'ClaudeSDKClient', return_value=client):
-                session_manager.start_session(sid, prompt="go", cwd=_EMPTY_TMP_CWD)
+                session_manager.start_session(sid, prompt="go", cwd=EMPTY_CWD)
                 wait_for(
                     lambda s=sid: session_manager.get_session_state(s) == "idle",
                     timeout=5,

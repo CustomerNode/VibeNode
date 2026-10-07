@@ -224,7 +224,18 @@ class TestScheduleRegistrySave:
     Multiple rapid state changes should batch into a single disk write.
     Without debouncing, every session state change hits disk, which can
     cause I/O contention under load.
+
+    The tests shrink the 3s production window to 0.2s so they don't sleep
+    through it; the window's real value is pinned separately below.
     """
+
+    @pytest.fixture(autouse=True)
+    def _short_debounce(self, monkeypatch):
+        monkeypatch.setattr(SessionRegistry, "_SAVE_DEBOUNCE_S", 0.2)
+
+    def test_production_debounce_window_is_three_seconds(self, monkeypatch):
+        monkeypatch.undo()
+        assert SessionRegistry._SAVE_DEBOUNCE_S == 3.0
 
     def test_calls_save_fn_after_delay(self, tmp_path):
         """The save callback fires after the debounce delay.
