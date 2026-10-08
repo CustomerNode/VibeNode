@@ -222,6 +222,7 @@ function startListInlineRename() {
     const data = await resp.json();
     if (data.ok) {
       _userNamedSessions.add(activeId);  // protect from auto-naming
+      if (typeof _rememberSessionTitle === 'function') _rememberSessionTitle(activeId, data.title);
       if (s) { s.custom_title = data.title; s.display_title = data.title; }
       setToolbarSession(activeId, data.title, false, data.title);
       nameCell.textContent = data.title;
@@ -726,6 +727,7 @@ async function startToolbarRename() {
   const data = await resp.json();
   if (data.ok) {
     _userNamedSessions.add(activeId);  // protect from auto-naming
+    if (typeof _rememberSessionTitle === 'function') _rememberSessionTitle(activeId, data.title || newName);
     setToolbarSession(activeId, newName || activeId, !newName, newName);
     const s = allSessions.find(x => x.id === activeId);
     if (s) { s.custom_title = newName; s.display_title = newName || s.display_title; }
@@ -766,6 +768,7 @@ async function submitRename() {
 
   if (data.ok) {
     _userNamedSessions.add(targetId);  // protect from auto-naming
+    if (typeof _rememberSessionTitle === 'function') _rememberSessionTitle(targetId, data.title);
     // Update local list
     const s = allSessions.find(x => x.id === targetId);
     if (s) { s.custom_title = data.title; s.display_title = data.title; }
@@ -822,6 +825,9 @@ async function autoName(id, silent, reEvaluate, promptText) {
     const remappedId = (window._idRemaps && window._idRemaps[id]) || null;
     const effectiveId = remappedId || id;
 
+    // Remember it so a row created or reloaded after this reply still gets it
+    // (see _knownSessionTitles in app.js).
+    if (data.title && typeof _rememberSessionTitle === 'function') _rememberSessionTitle(effectiveId, data.title);
     const s = allSessions.find(x => x.id === effectiveId) || allSessions.find(x => x.id === id);
     if (s) { s.custom_title = data.title; s.display_title = data.title; }
     filterSessions();

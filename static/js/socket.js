@@ -183,6 +183,9 @@ socket.on('ui_prefs_loaded', (data) => {
 // tabs reload their sidebar so they don't keep displaying scrubbed names.
 socket.on('sessions_refresh', (data) => {
     try {
+        // The server just removed names (e.g. scrubbed phantom titles).  Drop
+        // the page's title memory so the reload can't paint them back.
+        if (typeof _knownSessionTitles !== 'undefined') _knownSessionTitles.clear();
         if (typeof loadSessions === 'function') {
             loadSessions();
         }
@@ -207,11 +210,21 @@ socket.on('session_renamed', (data) => {
         // Follow any old->new ID remap so a name that arrives under a
         // pre-remap ID still lands on the current row.
         const remappedId = (window._idRemaps && window._idRemaps[id]) || null;
+        // Remember it even when this client has no row for the session yet.
+        // A tab that didn't start the session usually gets this broadcast
+        // BEFORE its row exists (the row comes later from a state_snapshot);
+        // the stub picks the title up from here instead of showing
+        // "New Session" until a refresh.  See _knownSessionTitles (app.js).
+        if (typeof _rememberSessionTitle === 'function') {
+            _rememberSessionTitle(remappedId || id, title);
+            if (remappedId) _rememberSessionTitle(id, title);
+        }
         const s = (typeof allSessions !== 'undefined')
             ? (allSessions.find(x => x.id === (remappedId || id)) || allSessions.find(x => x.id === id))
             : null;
         // Scope naturally to the current project: if the session isn't in this
-        // client's list, ignore it (never synthesize a phantom row).
+        // client's list, there is no row to patch (never synthesize a phantom
+        // row).  The title is remembered above for when the row shows up.
         if (!s) return;
 
         // No-op if we already show this title (e.g. the client that just
@@ -683,10 +696,14 @@ socket.on('state_snapshot', (data) => {
                 }
                 if (_hasOld) return;
             }
+            // The daemon's `name` is empty for GUI sessions, so a stub used to
+            // read "New Session" even when this page had already been told
+            // the session's title (it arrived before the row did).
+            const _stubTitle = (typeof _knownSessionTitle === 'function' && _knownSessionTitle(id)) || s.name || '';
             allSessions.unshift({
                 id: id,
-                display_title: s.name || 'New Session',
-                custom_title: s.name || '',
+                display_title: _stubTitle || 'New Session',
+                custom_title: _stubTitle,
                 last_activity: '',
                 last_activity_ts: Date.now() / 1000,
                 sort_ts: Date.now() / 1000,
@@ -710,6 +727,10 @@ socket.on('state_snapshot', (data) => {
         });
     }
     _rebuildSessionIds();
+    // The dedup keeps the FIRST copy, which can be the nameless one.
+    if (typeof _knownSessionTitles !== 'undefined' && _knownSessionTitles.size) {
+        for (const _row of allSessions) _applyKnownSessionTitle(_row);
+    }
 
     // Sync model from daemon snapshot into existing allSessions entries.
     // Without this, idle/dormant sessions show "assumed system default" in
@@ -1802,10 +1823,11 @@ socket.on('session_started', (data) => {
         // current project. Otherwise it bleeds into the sidebar.
         const _isSameProject = !data.cwd || _sessionBelongsToActiveProject(data.cwd);
         if (_isSameProject && !allSessionIds.has(data.session_id)) {
+            const _stubTitle = (typeof _knownSessionTitle === 'function' && _knownSessionTitle(data.session_id)) || data.name || '';
             allSessions.unshift({
                 id: data.session_id,
-                display_title: data.name || 'New Session',
-                custom_title: data.name || '',
+                display_title: _stubTitle || 'New Session',
+                custom_title: _stubTitle,
                 last_activity: '',
                 last_activity_ts: Date.now() / 1000,
                 sort_ts: Date.now() / 1000,
@@ -1843,13 +1865,32 @@ socket.on('session_id_remapped', (data) => {
 
     if (_isHiddenSession(oldId, data)) return;
 
+    // A title learned under the launch id belongs to the new id now.
+    if (typeof _remapSessionTitle === 'function') _remapSessionTitle(oldId, newId);
+
     // Update allSessions array and ID set
-    const s = allSessions.find(x => x.id === oldId);
-    if (s) {
+    let s = allSessions.find(x => x.id === oldId);
+    const _sameSessionRow = s ? allSessions.find(x => x.id === newId) : null;
+    if (s && _sameSessionRow) {
+        // The list already has this session under the new id.  A session-list
+        // reload during the first turn returns it twice: the daemon's stub
+        // under the launch id and the CLI transcript under the CLI's id.
+        // Renaming the stub left two cards with the same id, one titled and
+        // one showing the first message.  Keep the transcript row (it has the
+        // real size and dates), carry the title over, and drop the stub.
+        if (s.custom_title && !_sameSessionRow.custom_title) {
+            _sameSessionRow.custom_title = s.custom_title;
+            _sameSessionRow.display_title = s.custom_title;
+        }
+        allSessions = allSessions.filter(x => x !== s);
+        _rebuildSessionIds();
+        s = _sameSessionRow;
+    } else if (s) {
         s.id = newId;
         allSessionIds.delete(oldId);
         allSessionIds.add(newId);
     }
+    if (s && typeof _applyKnownSessionTitle === 'function') _applyKnownSessionTitle(s);
 
     // Update activeId and URL — use replaceState (not pushState) so the
     // temporary client-generated UUID does not linger in browser history

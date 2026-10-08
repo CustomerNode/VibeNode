@@ -23,6 +23,59 @@ function _rebuildSessionIds() {
     _pruneMultiSelectionToExisting();
   }
 }
+
+// ── Session title memory (fixed 2026-10-08) ──────────────────────────────
+// A session's name reaches the client as a ONE-SHOT event: the auto-name
+// HTTP reply, or the `session_renamed` broadcast.  Both patch the row that
+// exists at that moment and nothing else, so any row created or rebuilt
+// AFTER the event came up with a placeholder and kept it until a manual
+// refresh re-read the names from disk.  Two ways that happened:
+//   • A tab or device that did not start the session gets the broadcast
+//     BEFORE it has the row.  The row arrives later as a state_snapshot stub,
+//     titled from the daemon's `name`, which is empty for GUI sessions:
+//     "New Session".
+//   • A session-list reload computed before the title was saved lands after
+//     it, and replaces the titled row with the server's placeholder.
+// Every title the client learns is remembered here for the life of the page
+// and filled into rows that have NO name of their own.  A name the server
+// returns is never overridden.  Applied wherever rows are created or rebuilt:
+// loadSessions(), the state_snapshot / session_started stubs and the
+// session_id_remapped handler (socket.js).  Tests:
+// tests/test_session_title_memory.py.
+const _knownSessionTitles = new Map();   // session_id -> title
+const _KNOWN_SESSION_TITLES_MAX = 500;
+
+/** Remember a confirmed session title (rename / auto-name). */
+function _rememberSessionTitle(id, title) {
+  if (!id || !title) return;
+  _knownSessionTitles.delete(id);          // re-insert: newest last
+  _knownSessionTitles.set(id, title);
+  if (_knownSessionTitles.size > _KNOWN_SESSION_TITLES_MAX) {
+    _knownSessionTitles.delete(_knownSessionTitles.keys().next().value);
+  }
+}
+
+/** Carry a remembered title across an SDK session-id remap. */
+function _remapSessionTitle(oldId, newId) {
+  const t = _knownSessionTitles.get(oldId);
+  if (t && newId && !_knownSessionTitles.has(newId)) _rememberSessionTitle(newId, t);
+}
+
+/** The remembered title for a session, or ''. */
+function _knownSessionTitle(id) {
+  return (id && _knownSessionTitles.get(id)) || '';
+}
+
+/** Fill a nameless row from memory.  Returns true when the row changed. */
+function _applyKnownSessionTitle(s) {
+  if (!s || s.custom_title) return false;
+  const t = _knownSessionTitle(s.id);
+  if (!t) return false;
+  s.custom_title = t;
+  s.display_title = t;
+  return true;
+}
+
 let activeId = localStorage.getItem('activeSessionId') || null;
 let renameTarget = null;
 let sortMode = localStorage.getItem('sortMode') || 'date';
@@ -1755,6 +1808,11 @@ async function loadSessions() {
     allSessions = allSessions.filter(s => !window._idRemaps[s.id]);
   }
   _rebuildSessionIds();
+  // A reload computed before a title was saved must not wipe a title this
+  // page already received (see _knownSessionTitles).  Fills nameless rows only.
+  if (_knownSessionTitles.size) {
+    for (const s of allSessions) _applyKnownSessionTitle(s);
+  }
   // Populate _userNamedSessions from server so manual names survive page refresh
   if (typeof _userNamedSessions !== 'undefined') {
     for (const s of allSessions) {
