@@ -578,6 +578,9 @@
   function initComposerAnchoring() {
     var root = document.documentElement;
     var lastBar = null;
+    var lastOffset = null;     // last --vn-kb-offset written
+    var unpanTimes = [];       // recent pan-undo attempts (rate limit)
+    var noUnpan = false;       // true during the re-measure that follows one
 
     function updateKeyboardOffset() {
       var vv = window.visualViewport;
@@ -590,7 +593,56 @@
       // keyboard value, so (innerHeight - vv.height - vv.offsetTop) is the
       // amount of layout we need to lift the fixed bar by. Clamped to [0,∞).
       var hidden = Math.max(0, (window.innerHeight || 0) - vv.height - vv.offsetTop);
-      root.style.setProperty("--vn-kb-offset", hidden + "px");
+
+      // UNDO THE BROWSER'S PAN (2026-10-08).  When the composer takes focus,
+      // iOS Safari slides the whole page up by about the keyboard's height to
+      // "reveal" the input: the app header leaves the top of the screen and
+      // everything above the composer is shoved up with it.  The pan is not
+      // needed here, because the composer is position:fixed and this function
+      // already lifts it above the keyboard.  So while the composer has focus
+      // and the keyboard is up, scroll the page back to the top and lift the
+      // bar by the full keyboard height instead; `.live-panel` reserves the
+      // same space (mobile.css), so the content re-fits between the header and
+      // the composer.
+      //   - Only for the composer.  Any other field (rename, find, a dialog)
+      //     still needs the browser's pan to stay visible.
+      //   - Self-correcting: the next frame re-measures with the formula
+      //     above, so on a browser where scrollTo does not undo the pan the
+      //     result is exactly what it was before this change.
+      //   - Rate-limited, so a browser that pans straight back can never be
+      //     fought in a loop.
+      var kb = Math.max(0, (window.innerHeight || 0) - vv.height);
+      var ae = document.activeElement;
+      var inComposer = !!(ae && ae.closest && ae.closest("#live-input-bar"));
+      var panned = vv.offsetTop > 0 || (window.pageYOffset || 0) > 0;
+      if (inComposer && kb > 60 && panned && !noUnpan) {
+        var now = Date.now();
+        unpanTimes = unpanTimes.filter(function (t) { return now - t < 1000; });
+        if (unpanTimes.length < 4) {
+          unpanTimes.push(now);
+          hidden = kb;
+          try { window.scrollTo(0, 0); } catch (e) {}
+          var raf = window.requestAnimationFrame || function (f) { return setTimeout(f, 16); };
+          raf(function () { noUnpan = true; try { updateKeyboardOffset(); } finally { noUnpan = false; } });
+        }
+      }
+
+      // The lift changes how much of the thread is visible.  If the reader
+      // was at the bottom, keep them there, or the newest messages end up
+      // hidden behind the keyboard.
+      var value = hidden + "px";
+      var pin = value !== lastOffset && window.ThreadScroll &&
+        typeof window.ThreadScroll.atBottom === "function" && window.ThreadScroll.atBottom();
+      lastOffset = value;
+      root.style.setProperty("--vn-kb-offset", value);
+      // Lets CSS tighten layouts that would not fit above the keyboard (the
+      // new-session greeting drops its mark and "Manage Templates" link).
+      if (root.classList) root.classList.toggle("vn-kb-open", hidden > 0);
+      if (pin) {
+        (window.requestAnimationFrame || setTimeout)(function () {
+          try { window.ThreadScroll.scrollToBottom(); } catch (e) {}
+        });
+      }
       // The keyboard moves the bar's `bottom`, not its size, so the
       // ResizeObserver behind the float stack (utils.js) never fires. Re-measure
       // here or the toast / undo / git-sync stack keeps the pre-keyboard offset
@@ -644,6 +696,10 @@
       updateKeyboardOffset();
       updateComposerHeight();
     });
+    // Focus moving into or out of the composer changes whether the pan is
+    // undone, and the viewport events do not always fire for it.
+    document.addEventListener("focusin", updateKeyboardOffset);
+    document.addEventListener("focusout", function () { setTimeout(updateKeyboardOffset, 60); });
 
     attachBar();
     updateKeyboardOffset();

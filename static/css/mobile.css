@@ -491,7 +491,10 @@
   .live-panel {
     /* Reserve space so .live-log, .live-output-shelf, and #live-queue-area
        end above the fixed bar instead of being covered by it. */
-    padding-bottom: var(--vn-composer-height, 180px);
+    /* ...plus the keyboard lift: the bar rises by --vn-kb-offset, so the
+       content above it must give up the same space or it sits behind the bar
+       (and the new-session greeting would centre itself under the keyboard). */
+    padding-bottom: calc(var(--vn-composer-height, 180px) + var(--vn-kb-offset, 0px));
     box-sizing: border-box;
   }
   .live-input-bar {
@@ -794,8 +797,8 @@
    * ensures the opening `opacity:0` applies before the first paint,
    * preventing any single-frame flash of fully-visible content.
    *
-   * `.empty-state` (the "Select a session" placeholder + the "What will we
-   * VibeNode today?" new-session greeting) gets the same treatment so every
+   * `.empty-state` (the "Select a session" placeholder + the "What are we
+   * building today?" new-session greeting) gets the same treatment so every
    * transition into main-body feels consistent.
    * ------------------------------------------------------------------------ */
   #main-body > .live-panel,

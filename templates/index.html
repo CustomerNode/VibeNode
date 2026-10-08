@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- interactive-widget=resizes-content: on Android the on-screen keyboard RESIZES the page instead of covering it,
+     so the composer sits above the keyboard without the browser sliding the whole app up.  iOS Safari ignores it;
+     see updateKeyboardOffset() in mobile.js for the iOS half. -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content">
 <title>VibeNode</title>
 <link rel="icon" href="/static/images/logo.png" type="image/png">
 <!-- Mobile Command: install-to-home-screen shell (inert on desktop). Lets the phone

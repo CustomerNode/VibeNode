@@ -13977,7 +13977,7 @@ header #git-badge-push svg, header #git-badge-pull svg, header #git-badge-sync s
    (.template-grid-workflow) keep their card form, in the UI typeface. ══ */
 .live-log > .empty-state { --bt: 255,255,255; font-family: var(--font-sans); }
 [data-theme="light"] .live-log > .empty-state { --bt: 0,0,0; }
-.live-log > .empty-state > svg:first-child { display: none; }
+.live-log > .empty-state > .vibenode-mark { display: block; margin: 0 auto 16px; color: var(--text-muted); }
 .vibenode-greeting { font: 600 26px/1.25 'Space Grotesk', var(--font-sans); letter-spacing: -.02em; color: var(--text-heading); margin: 0 0 22px; }
 .template-grid:not(.template-grid-workflow) { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; max-width: 620px; margin: 0 auto; padding: 0; }
 .template-grid:not(.template-grid-workflow) .template-card { display: inline-flex; align-items: center; gap: 7px; width: auto; min-height: 0; height: 34px; padding: 0 13px 0 11px;
@@ -13992,6 +13992,43 @@ header #git-badge-push svg, header #git-badge-pull svg, header #git-badge-sync s
 .template-card-label, .template-card-desc { font-family: var(--font-sans); }
 .template-manage-link { margin-top: 18px; font: 500 12px var(--font-sans); color: var(--text-faint); }
 .template-manage-link:hover { color: var(--text-secondary); }
+
+/* While that screen is up (a new session with nothing sent) there is no session to act on yet: the header's
+   "New Session" title and its "•••" menu (Analyze, Branch, Organize, Stop, Delete) are hidden, leaving only the
+   close X, and the greeting sits in the optical centre of the space above the composer.  Keyed off the greeting
+   itself with :has(), so it ends the moment the first message replaces it; no state to keep in sync. */
+#main-panel:has(#live-log > .empty-state > .vibenode-greeting) .main-toolbar > :not(.toolbar-close) { visibility: hidden; }
+#main-panel:has(#live-log > .empty-state > .vibenode-greeting) .main-toolbar { border-bottom-color: transparent; background: transparent; box-shadow: none; }
+.live-log:has(> .empty-state > .vibenode-greeting) { display: flex; flex-direction: column; }
+.live-log > .empty-state:has(> .vibenode-greeting) { flex: none; margin: auto; padding: 24px 20px 9vh !important; width: 100%; max-width: 700px; box-sizing: border-box; }
+@media (max-width: 768px) {
+  /* Nothing left in the session bar on a phone in this state, so it goes entirely */
+  #main-panel:has(#live-log > .empty-state > .vibenode-greeting) .main-toolbar { display: none !important; }
+  .live-log > .empty-state:has(> .vibenode-greeting) { padding: 16px 18px 6vh !important; }
+  .live-log > .empty-state > .vibenode-mark { width: 26px; height: 26px; margin-bottom: 12px; }
+  .vibenode-greeting { font-size: 22px; line-height: 1.2; margin-bottom: 18px; text-wrap: balance; }
+  /* Templates: one swipeable row instead of five ragged wrapped rows; the right edge fades to show there is more */
+  .template-grid:not(.template-grid-workflow) { flex-wrap: nowrap; justify-content: flex-start; overflow-x: auto; align-self: stretch; width: auto; max-width: none;
+    box-sizing: border-box; margin: 0 -18px; padding: 2px 18px; scrollbar-width: none; -webkit-overflow-scrolling: touch;
+    -webkit-mask: linear-gradient(90deg, #000 0, #000 calc(100% - 44px), transparent 100%); mask: linear-gradient(90deg, #000 0, #000 calc(100% - 44px), transparent 100%); }
+  .template-grid:not(.template-grid-workflow)::-webkit-scrollbar { display: none; }
+  .template-grid:not(.template-grid-workflow) .template-card { flex: none; height: 38px; padding: 0 15px 0 13px; }
+  .template-grid:not(.template-grid-workflow) .template-card-label { font-size: 13.5px; }
+  .template-manage-link { margin-top: 14px; }
+}
+/* Keyboard up on a phone: only ~250px is left above the composer, so the greeting keeps the heading and the
+   template row and drops the rest.  `html.vn-kb-open` is iOS (mobile.js lifts the composer); the max-height query is
+   Android, where the keyboard resizes the page itself. */
+@media (max-width: 768px) {
+  html.vn-kb-open .live-log > .empty-state:has(> .vibenode-greeting) { padding: 10px 18px !important; }
+  html.vn-kb-open .live-log > .empty-state > .vibenode-mark, html.vn-kb-open .template-manage-link { display: none; }
+  html.vn-kb-open .vibenode-greeting { margin-bottom: 14px; }
+}
+@media (max-width: 768px) and (max-height: 560px) {
+  .live-log > .empty-state:has(> .vibenode-greeting) { padding: 10px 18px !important; }
+  .live-log > .empty-state > .vibenode-mark, .template-manage-link { display: none; }
+  .vibenode-greeting { margin-bottom: 14px; }
+}
 
 
 /* Loading placeholders for the cards view: the same grid and card size as the real cards (.wf-card) */

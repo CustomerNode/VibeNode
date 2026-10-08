@@ -1281,8 +1281,8 @@ async function addNewAgent() {
     '<div class="live-panel" id="live-panel">' +
     '<div class="conversation live-log" id="live-log">' +
     '<div class="empty-state" style="padding:60px 0;text-align:center;">' +
-    '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--text-faint)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:12px;opacity:0.4;"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>' +
-    '<div class="vibenode-greeting">What will we VibeNode today?</div>' +
+    '<svg class="vibenode-mark" width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>' +
+    '<div class="vibenode-greeting">What are we building today?</div>' +
     (typeof _renderTemplateGrid === 'function' ? _renderTemplateGrid(newId) : '') +
     '</div></div>' +
     '<div class="live-input-bar" id="live-input-bar"></div></div>';

@@ -209,6 +209,16 @@ Every bottom-of-screen notice (`#toast`, `#git-sync-mini`, `.vn-undo-toast`, `.c
 
 7. **A float pinned to the TOP opts out with `--vn-float: top`** (fixed 2026-10-08). On phones the toast is a capsule under the header (`mobile.css .toast`, `top` set, `bottom: auto`). `_layoutFloats()` wrote an inline `bottom` on it anyway, which beat `bottom: auto`; with both edges set the toast stretched from the header to the composer, a capsule the height of the screen. `_layoutFloats()` now skips any float whose computed `--vn-float` is `top`, clears its inline `bottom`, and gives it no slot in the stack. Guard test: `test_phone_toast_opts_out_of_the_bottom_stack`.
 
+## The phone keyboard must not push the app up (fixed 2026-10-08)
+
+Focusing the composer on a phone slid the whole app up by about the keyboard's height: the header left the top of the screen and everything above the composer went with it. The browser pans the page to "reveal" a focused input, but the composer is `position: fixed` and is already lifted above the keyboard, so the pan was pure damage. Three pieces, tests in `tests/test_mobile_keyboard_pan.py`:
+
+1. **iOS: `updateKeyboardOffset()` in `static/js/mobile.js` undoes the pan** (`window.scrollTo(0, 0)`) and lifts the bar by the full keyboard height, but ONLY while focus is inside `#live-input-bar`. Other fields (rename, find, dialogs) need the browser's pan to stay visible. It re-measures on the next frame with the original formula, so a browser where `scrollTo` does not undo the pan ends exactly where the old code did, and it is rate-limited (4 per second) so a browser that pans straight back is never fought in a loop. Do NOT remove the re-measure or the rate limit.
+2. **`.live-panel` reserves `--vn-composer-height` + `--vn-kb-offset`** (`static/css/mobile.css`), so the thread re-fits above the raised bar; a reader at the bottom is kept there via `ThreadScroll`. `html.vn-kb-open` (set by the same function) lets CSS compact layouts that would not fit, e.g. the new-session greeting.
+3. **Android: `interactive-widget=resizes-content`** in the viewport meta (`templates/index.html`) makes the keyboard resize the page instead of covering it. iOS ignores it.
+
+A real on-screen keyboard cannot be opened in a test: the tests drive the real function against a fake `visualViewport` under three browser models.
+
 ## Publish-gate fix sessions belong to the VibeNode project (fixed 2026-10-05)
 
 `_startFixSession()` in `static/js/git-sync.js` (the "Fix errors" button after a failed pre-publish test run, and "Fix with AI" after a security scan) creates its session in THIS repo's project, resolved from `GET /api/repo-project` (`app/routes/project_api.py`), switching the browser to that project first when it is registered. It used to use the browser's active project, so pressing Update while viewing CustomerNode put a "Fix test failures" session in CustomerNode. The session works on VibeNode's tests and scan, so it lives in VibeNode's project; do not go back to `_currentProjectDir()` for its `cwd`.
