@@ -2213,6 +2213,120 @@ class SessionManager:
         self._emit_entry(session_id, entry, entry_index)
         return {"ok": True, "model": info.model}
 
+    # Display names for the transcript note, matching the picker's labels
+    # (SessionModel.THINKING_LEVELS in static/js/session-model.js).
+    _EFFORT_LABELS = {"": "Default", "low": "Low", "medium": "Medium",
+                      "high": "High", "xhigh": "xHigh", "max": "Max"}
+
+    def set_session_effort(self, session_id: str, effort: str = "") -> dict:
+        """Change a LIVE session's thinking level (CLI effort) in place.
+
+        The thinking level used to be launch-only (``--effort``), so changing
+        it restarted the session's CLI, and a busy session refused with
+        "Session is busy. Change thinking once the current turn finishes."
+        The CLI's ``apply_flag_settings`` control request changes it in
+        place, mid-turn included (see ``ClaudeAgentSDK.set_effort``), so
+        nothing has to wait and nothing is restarted.
+
+        ``effort`` is a ``VALID_EFFORTS`` level, or '' / 'default' for the
+        model's own default.  Results:
+
+          * ``{"ok": True, "effort", "applied"}``: the CLI confirmed.
+            ``effort`` is what is recorded and re-pinned on every later
+            resume; ``applied`` is what the CLI runs on the CURRENT model
+            (it can be lower, or None on a model without thinking levels).
+          * ``not_live``: asleep (dormant or STOPPED).  The caller resumes
+            the session with ``--effort``.
+          * ``not_ready``: the CLI is still starting.  The caller applies the
+            level once the session is free, by relaunching with ``--effort``.
+          * ``live_unavailable``: this CLI can't change effort live (one that
+            predates the requests), the request failed, or the session is in
+            memory without a connection.  The caller relaunches the CLI with
+            ``--effort`` (close, then resume) once no turn is running.
+
+        Honesty contract, as for ``set_session_model``: ``info.effort`` and
+        the registry change ONLY after the CLI confirmed.  Deliberately no
+        ``_emit_state``: on an IDLE session it dispatches the queue, which
+        would start a queued message the user never sent (see the note in
+        ``set_session_model``).  Clients learn the change from the reply and
+        the queue-neutral ``session_effort_changed`` broadcast.
+        """
+        session_id = self._resolve_id(session_id)
+        level = str(effort or "").strip().lower()
+        if level == "default":
+            level = ""
+        if level and level not in self.VALID_EFFORTS:
+            return {"ok": False, "error": f"Unknown thinking level: {effort}"}
+        with self._lock:
+            info = self._sessions.get(session_id)
+        if (not info) or info.state == SessionState.STOPPED:
+            return {"ok": False, "not_live": True,
+                    "error": "Session is not running"}
+        # Before the client check: a starting session may not have one yet.
+        if info.state == SessionState.STARTING:
+            return {"ok": False, "not_ready": True,
+                    "error": "Session is still starting"}
+        if not info.client:
+            # In memory and not STOPPED, but the transport is gone.  A plain
+            # resume would be refused as "already running", so the caller
+            # relaunches it (close, then resume with --effort).
+            return {"ok": False, "live_unavailable": True,
+                    "error": "Session has no live connection"}
+        fut = None
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._sdk.set_effort(info.client, level or None), self._loop
+            )
+            applied = fut.result(timeout=15)
+        except Exception as e:
+            # Nothing was confirmed, so nothing is recorded.  Every failure is
+            # reported as live_unavailable: relaunching the CLI with --effort
+            # is the remedy for each of them (a CLI that predates the request,
+            # a wedged CLI, a dead transport).
+            if fut is not None and not fut.done():
+                fut.cancel()
+            err = str(e) or e.__class__.__name__
+            logger.warning("set_session_effort: live change unavailable for "
+                           "%s -> %r: %s", session_id, level, err)
+            return {"ok": False, "live_unavailable": True, "error": err}
+
+        info.effort = level
+        self._schedule_registry_save()
+        self._broadcast_effort_changed(session_id, level, applied)
+        label = self._EFFORT_LABELS.get(level, level)
+        note = f"Thinking set to {label}"
+        if level and applied and applied != level:
+            note += f" (runs as {self._EFFORT_LABELS.get(applied, applied)} on this model)"
+        entry = LogEntry(kind="system", text=note)
+        with info._lock:
+            info.entries.append(entry)
+            entry_index = len(info.entries) - 1
+        self._emit_entry(session_id, entry, entry_index)
+        logger.info("Session %s thinking level set to %r live (CLI applies %r)",
+                    session_id, level or "default", applied)
+        return {"ok": True, "effort": level, "applied": applied}
+
+    def _broadcast_effort_changed(self, session_id: str, effort: str,
+                                  applied: Optional[str]) -> None:
+        """Push ``session_effort_changed`` to EVERY connected client.
+
+        The reply (``session_effort_result``) reaches only the asking socket;
+        other tabs and devices, and the asking tab when a mobile reconnect
+        lost the reply, learn of the change only from this.  Queue-neutral
+        like ``_broadcast_model_changed``.  Never raises.
+        """
+        if not self._push_callback:
+            return
+        try:
+            self._push_callback('session_effort_changed', {
+                'session_id': session_id,
+                'effort': effort,
+                'applied': applied,
+            })
+        except Exception as _cb_err:
+            logger.warning("session_effort_changed broadcast failed for %s: %s",
+                           session_id, _cb_err)
+
     def close_session(self, session_id: str) -> dict:
         """Close and disconnect an SDK session.
 

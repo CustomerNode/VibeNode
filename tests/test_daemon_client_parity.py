@@ -230,6 +230,34 @@ class TestSetSessionModelResumeTurn:
         assert result["ok"] is False
 
 
+class TestSetSessionEffortProxy:
+    """The live thinking change.  The Session Engine outlives web-server
+    restarts and app updates, so the proxy routinely talks to a daemon that
+    predates the method; that must read as "relaunch instead", not as a
+    failure the user has to deal with."""
+
+    _client = staticmethod(TestSetSessionModelResumeTurn._client)
+
+    def test_forwards_session_and_level(self):
+        client, sent = self._client(reply={"ok": True, "effort": "high", "applied": "high"})
+        result = client.set_session_effort("s1", "high")
+        assert sent == [("set_session_effort", {"session_id": "s1", "effort": "high"})]
+        assert result["ok"] is True
+
+    def test_daemon_without_the_method_means_live_unavailable(self):
+        client, sent = self._client(
+            reply={"ok": False, "error": "Unknown method: set_session_effort"})
+        result = client.set_session_effort("s1", "high")
+        assert len(sent) == 1
+        assert result["ok"] is False
+        assert result["live_unavailable"] is True
+
+    def test_genuine_failure_passes_through(self):
+        client, _ = self._client(reply={"ok": False, "error": "Unknown thinking level: auto"})
+        result = client.set_session_effort("s1", "auto")
+        assert result == {"ok": False, "error": "Unknown thinking level: auto"}
+
+
 class TestStartSessionForwardsSubsessionKwargs:
     def test_start_session_forwards_parent_linkage(self):
         """A regression on the second half of the bug: even with the methods

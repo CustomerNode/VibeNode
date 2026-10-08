@@ -185,6 +185,80 @@ class TestStartSession:
 
 
 # ---------------------------------------------------------------------------
+# 2b. Live thinking-level change (set_session_effort, added 2026-10-08)
+# ---------------------------------------------------------------------------
+
+class TestSetSessionEffort:
+    """The browser asks to change a session's thinking level in place.  The
+    reply always comes back as session_effort_result, carrying exactly the
+    flags the browser branches on (see _applyThinkingChange)."""
+
+    def _result(self, client):
+        res = [m for m in client.get_received() if m['name'] == 'session_effort_result']
+        assert len(res) == 1
+        return res[0]['args'][0]
+
+    def test_success_is_forwarded(self, app_and_client, mock_session_manager):
+        mock_session_manager.set_session_effort.return_value = {
+            "ok": True, "effort": "high", "applied": "high"}
+        app, socketio, client = app_and_client
+        client.get_received()
+        client.emit('set_session_effort', {'session_id': 's2', 'effort': 'HIGH '})
+        mock_session_manager.set_session_effort.assert_called_once_with('s2', 'high')
+        out = self._result(client)
+        assert out['ok'] is True and out['effort'] == 'high' and out['applied'] == 'high'
+        assert out['not_live'] is False and out['live_unavailable'] is False
+
+    @pytest.mark.parametrize("flag", ["not_live", "not_ready", "live_unavailable"])
+    def test_fallback_flags_reach_the_browser(self, app_and_client,
+                                              mock_session_manager, flag):
+        mock_session_manager.set_session_effort.return_value = {
+            "ok": False, flag: True, "error": "x"}
+        app, socketio, client = app_and_client
+        client.get_received()
+        client.emit('set_session_effort', {'session_id': 's2', 'effort': 'default'})
+        out = self._result(client)
+        assert out['ok'] is False and out[flag] is True and out['error'] == 'x'
+        # The browser only accepts a reply that names the level it asked for,
+        # and asks for '' as 'default': a failure must echo ''.
+        assert out['effort'] == ''
+
+    def test_failure_echoes_the_requested_level(self, app_and_client,
+                                                mock_session_manager):
+        mock_session_manager.set_session_effort.return_value = {
+            "ok": False, "live_unavailable": True, "error": "old engine"}
+        app, socketio, client = app_and_client
+        client.get_received()
+        client.emit('set_session_effort', {'session_id': 's2', 'effort': 'xhigh'})
+        assert self._result(client)['effort'] == 'xhigh'
+
+    def test_non_string_fields_still_get_a_reply(self, app_and_client,
+                                                 mock_session_manager):
+        mock_session_manager.set_session_effort.return_value = {"ok": False, "error": "bad"}
+        app, socketio, client = app_and_client
+        client.get_received()
+        client.emit('set_session_effort', {'session_id': 's2', 'effort': 5})
+        assert self._result(client)['ok'] is False
+
+    def test_proxy_exception_becomes_a_failed_result(self, app_and_client,
+                                                     mock_session_manager):
+        mock_session_manager.set_session_effort.side_effect = RuntimeError("ipc down")
+        app, socketio, client = app_and_client
+        client.get_received()
+        client.emit('set_session_effort', {'session_id': 's2', 'effort': 'low'})
+        out = self._result(client)
+        assert out['ok'] is False and 'ipc down' in out['error']
+
+    def test_missing_session_id(self, app_and_client, mock_session_manager):
+        app, socketio, client = app_and_client
+        client.get_received()
+        client.emit('set_session_effort', {'effort': 'low'})
+        out = self._result(client)
+        assert out['ok'] is False
+        mock_session_manager.set_session_effort.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # 3. Send message event
 # ---------------------------------------------------------------------------
 

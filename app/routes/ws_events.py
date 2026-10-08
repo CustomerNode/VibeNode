@@ -3,12 +3,12 @@ WebSocket event handlers for real-time session communication via Flask-SocketIO.
 
 Server -> Client events:
     state_snapshot, session_state, session_entry, session_permission,
-    session_started, session_log, session_model_result
+    session_started, session_log, session_model_result, session_effort_result
 
 Client -> Server events:
     connect, start_session, send_message, permission_response,
     interrupt_session, close_session, get_session_log, set_permission_policy,
-    set_session_model
+    set_session_model, set_session_effort
 """
 
 import json
@@ -791,6 +791,52 @@ def register_ws_events(socketio, app):
         if not payload['ok']:
             payload['error'] = result.get('error', 'Model switch failed')
         emit('session_model_result', payload)
+
+    @socketio.on('set_session_effort')
+    def handle_set_session_effort(data):
+        """Change a session's thinking level in place, mid-turn included.
+
+        Always replies with 'session_effort_result'.  ``ok`` is True only after
+        the CLI confirmed the level; otherwise exactly one of ``not_live``,
+        ``not_ready`` or ``live_unavailable`` tells the browser which fallback
+        applies (see SessionManager.set_session_effort).  ``effort`` is a CLI
+        level, or 'default' / '' for the model's own default.
+        """
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        # str(): a malformed (non-string) field must still get a reply; the
+        # browser waits for one before it falls back.
+        session_id = str(data.get('session_id') or '').strip()
+        effort = str(data.get('effort') or '').strip().lower()
+        if not session_id:
+            emit('session_effort_result', {
+                'ok': False, 'session_id': session_id,
+                'error': 'session_id is required',
+            })
+            return
+
+        sm = app.session_manager
+        try:
+            result = sm.set_session_effort(session_id, effort)
+        except Exception as e:
+            result = {'ok': False, 'error': str(e)}
+        if not isinstance(result, dict):
+            result = {'ok': False, 'error': 'No reply from the Session Engine'}
+
+        payload = {
+            'ok': bool(result.get('ok')),
+            'session_id': session_id,
+            'effort': result.get('effort', '' if effort == 'default' else effort),
+            'applied': result.get('applied'),
+            'not_live': bool(result.get('not_live')),
+            'not_ready': bool(result.get('not_ready')),
+            'live_unavailable': bool(result.get('live_unavailable')),
+        }
+        if not payload['ok']:
+            payload['error'] = result.get('error', 'Thinking change failed')
+        emit('session_effort_result', payload)
 
     @socketio.on('cancel_auto_retry')
     def handle_cancel_auto_retry(data):

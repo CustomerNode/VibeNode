@@ -335,3 +335,30 @@ The model selector "usually worked" — and failed whenever a session was touche
 6. **`_model_switch_in_progress` self-expires** — `_model_switch_pending()` honors the flag only within `_MODEL_SWITCH_INIT_WINDOW_S` (20s) of a live switch and a failed switch clears it. The flag exists so the CLI's side-effect `init` after `set_model` isn't misread as an auto-resume; a stale flag swallowed the NEXT real auto-resume signal, leaving the session shown IDLE while working. Do NOT read the raw attribute in the listeners.
 
 7. **`session_model_changed` client handler honors the limit fields** — `static/js/socket.js`. It only clears `_sessionLimitState`/`_sessionError` when the payload reports no limit, because the event now also fires on a bare `init` refinement (e.g. `[1m]` added) and a still-limited session must keep its CTA.
+
+## Thinking and model changes are never refused (fixed 2026-10-08)
+
+Changing thinking on a working session was refused with "Session is busy. Change thinking once the current turn finishes." The thinking level is the CLI's `--effort`, which was treated as launch-only, so every change restarted the CLI. `_applyThinkingChange()` in `static/js/invoke-workforce.js` now works as follows:
+
+1. **The level changes in place, mid-turn included.** The browser emits `set_session_effort`. That reaches `SessionManager.set_session_effort` and then `ClaudeAgentSDK.set_effort`, which sends the CLI control request `apply_flag_settings {"effortLevel": <level or null>}` and confirms it with `get_settings` (`applied.effort`).
+   - The read-back is required: `apply_flag_settings` acknowledges values it ignores.
+   - As with `set_session_model`, the daemon method must not call `_emit_state`, because on an idle session that dispatches queued messages. Clients learn the change from the `session_effort_result` reply and the `session_effort_changed` broadcast.
+   - `info.effort` changes only after the CLI confirms, so later resumes re-pin the new level.
+2. **A relaunch (close, then resume with `--effort`/`--model`) is only the fallback.** It is used when the in-place change is unavailable:
+   - a Session Engine started before the method (the proxy maps "Unknown method" to `live_unavailable`);
+   - an older CLI;
+   - no reply within 6 seconds;
+   - a CLI that is still starting.
+
+   The model switch's stale-CLI fallback (`_sleepThenRetry`) uses the same relaunch.
+3. **A relaunch never cuts anything short.** `_sessionFreeForRelaunch()` and `_pushSaysFree()` block it in all of these cases:
+   - a turn is running;
+   - a question or permission prompt is open;
+   - a wake-up is pending (`auto-resuming`);
+   - an auto-retry countdown is armed (`retry_at`), which includes the usage-limit auto-continue;
+   - messages are queued;
+   - the user just slept the session.
+
+   In any of those cases the relaunch waits in `_relaunchQueue`. It runs once the session has been free for 1.5s, and at that moment it re-checks this tab's own view as well. A session that stops keeps its queued change until it wakes, and the queue never wakes a session ("Sleep must stick").
+
+Do NOT bring back the busy refusal, and do NOT add `_emit_state` to `set_session_effort`. Do NOT relaunch a session without `_sessionFreeForRelaunch()`: `close_session` cancels retries, kills background work and drops open prompts. A related store rule: `SessionModel.resumeThinking` treats a daemon-confirmed `''` (model default) as truth, and only `undefined` falls through to this tab's own choice. The in-place path needs a Session Engine running this code, so until it is restarted users get the fallback. Tests: `tests/test_live_thinking_switch.py` (the real page in headless Chromium), `TestSetSessionEffort` in `tests/test_session_manager.py`, and `TestSetEffort` in `tests/test_claude_backend.py`.

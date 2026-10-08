@@ -280,10 +280,16 @@ window.SessionModel = (function () {
    * daemon-confirmed truth, else this tab's explicit per-session choice.
    * Never the system default: that is for NEW sessions, and sending it here
    * would silently overwrite a level chosen for this session on another device.
+   *
+   * A confirmed '' (the daemon reports the session runs at the model default)
+   * is daemon truth too and wins.  Testing it for truthiness let a stale local
+   * choice through: reset to Default live from the phone, then wake from this
+   * tab, and the wake re-pinned this tab's old level, undoing the reset.
+   * Only `undefined` (a daemon that does not report effort) falls through.
    */
   function resumeThinking(id) {
     var confirmed = getConfirmedThinking(id);
-    if (confirmed) return confirmed;
+    if (confirmed !== undefined) return confirmed;
     var s = _sess(id);
     return (s && typeof s.desiredThinking === 'string') ? _cleanThinking(s.desiredThinking) : '';
   }

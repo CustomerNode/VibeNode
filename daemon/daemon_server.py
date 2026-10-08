@@ -372,6 +372,7 @@ class SessionDaemon:
             "resolve_permission": self.session_manager.resolve_permission_unified,
             "interrupt_session": self.session_manager.interrupt_session,
             "set_session_model": self.session_manager.set_session_model,
+            "set_session_effort": self.session_manager.set_session_effort,
             "cancel_auto_retry": self.session_manager.cancel_auto_retry,
             "retry_now": self.session_manager.retry_now,
             "close_session": self.session_manager.close_session,

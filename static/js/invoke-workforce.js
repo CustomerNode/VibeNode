@@ -163,6 +163,415 @@ function _buildSessionModelBtn(isNewSession, sessionModel, sessionId) {
     _thinkingSegment(false, _liveSid) + '</span>';
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// MODEL / THINKING CHANGES: never refused, never cut a running turn short
+//
+// The thinking level is the CLI's effort.  It used to be launch-only, so a
+// change restarted the session's CLI, and a busy session was refused outright
+// ("Session is busy. Change thinking once the current turn finishes.").  Now:
+//
+//   1. LIVE, the normal path, mid-turn included: `set_session_effort` asks the
+//      running CLI to switch in place (SessionManager.set_session_effort), the
+//      way `set_session_model` already switches the model.  No restart; the
+//      turn keeps going and its next step uses the new level.
+//   2. ASLEEP: resume the session with --effort (and --model).
+//   3. NEEDS A RELAUNCH: a Session Engine or Claude CLI from before the live
+//      change, no reply, a CLI still starting, or a CLI too old for the chosen
+//      model (see _applyLiveSessionModel).  The CLI is relaunched with --resume
+//      and the new flags, but only when that cuts nothing short
+//      (_sessionFreeForRelaunch).  Otherwise the relaunch is QUEUED and runs
+//      once the session is free; a session that stops first keeps it queued
+//      until it wakes, so a Sleep is never undone.
+//
+// Honesty contract, as for model switches: nothing is recorded as the
+// session's level or model until the daemon confirms it.
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Relaunches waiting for their session to be free, keyed by session id.  One
+ *  per session: a later change merges into it, so a turn end costs one
+ *  relaunch. */
+const _relaunchQueue = {};
+
+/** How long to wait for `session_effort_result`.  The CLI answers in ~0.1s;
+ *  silence this long means a web server without the handler (it predates the
+ *  live change) or a lost reply, and the relaunch fallback takes over.  A late
+ *  success still lands: its `session_effort_changed` broadcast reaches
+ *  _noteLiveEffort, which stops a queued relaunch from undoing it. */
+const _EFFORT_LIVE_REPLY_MS = 6000;
+
+/** A free report must hold this long before a queued relaunch runs: a queued
+ *  message or a post-turn wake-up flips the session back to working within
+ *  milliseconds, and relaunching under it would kill that turn. */
+const _TURN_END_SETTLE_MS = 1500;
+
+function _thinkingLabelOf(level) {
+  return (typeof SessionModel !== 'undefined') ? SessionModel.thinkingLabel(level) : (level || 'Default');
+}
+
+/**
+ * True when `sid`'s CLI can be relaunched without cutting anything short.  A
+ * relaunch is close_session + resume, and close_session ends more than a turn:
+ * it drops a question or permission prompt, kills background work a wake-up
+ * is waiting on ("auto-resuming"), and cancels an auto-retry countdown,
+ * including the one that continues a usage-limited turn at the reset.  Queued
+ * messages are dispatched as soon as the session is idle, so they come first.
+ * A session the user just put to sleep is not free either ("Sleep must stick").
+ * This tab's own view also catches a Sleep or a send made here a moment ago,
+ * before the server's push arrives.
+ */
+function _sessionFreeForRelaunch(sid) {
+  if (!runningIds.has(sid)) return false;
+  if (typeof isUserStopped === 'function' && isUserStopped(sid)) return false;
+  const kind = (typeof sessionKinds !== 'undefined') ? sessionKinds[sid] : '';
+  if (kind === 'working' || kind === 'question') return false;
+  if (window._sessionSubstatus && window._sessionSubstatus[sid] === 'auto-resuming') return false;
+  const rs = window._sessionRetryState && window._sessionRetryState[sid];
+  if (rs && Number(rs.retry_at) > 0) return false;
+  const queued = (typeof _sessionQueues !== 'undefined') ? _sessionQueues[sid] : null;
+  return !(Array.isArray(queued) && queued.length);
+}
+
+/** The same test on a server push (session_state, or a snapshot entry). */
+function _pushSaysFree(d) {
+  return d.state === 'idle'
+    && !(Array.isArray(d.queue) && d.queue.length)
+    && d.substatus !== 'auto-resuming'
+    && !(Number(d.retry_at) > 0);
+}
+
+/** A relaunch's changes in words.  `when`: 'done' ("Thinking set to High") or
+ *  'queued' ("Thinking switches to High", which the caller completes with
+ *  when it happens). */
+function _changeWords(r, when) {
+  const lvl = _thinkingLabelOf(r.level);
+  if (r.modelChanged) {
+    const what = _modelLabel(r.model) + (r.thinkingChanged ? ' at ' + lvl + ' thinking' : '');
+    return (when === 'done' ? 'Switched to ' : 'The session switches to ') + what;
+  }
+  return (when === 'done' ? 'Thinking set to ' : 'Thinking switches to ') + lvl;
+}
+
+/** When a queued relaunch will run, in words. */
+function _queuedWhen(q) {
+  return q.stopped ? ' after the session wakes' : ' when this turn finishes';
+}
+
+/** Toast text for a confirmed in-place change.  `applied` is what the CLI runs
+ *  on the session's current model: a model can clamp a level it lacks (Sonnet
+ *  4.6 runs xHigh as High), and one without thinking levels reports null. */
+function _thinkingToast(d) {
+  const lvl = (d && d.effort) || '';
+  let msg = 'Thinking set to ' + _thinkingLabelOf(lvl);
+  if (lvl && d && typeof d.applied === 'string' && d.applied && d.applied !== lvl) {
+    msg += ' (this model runs it as ' + _thinkingLabelOf(d.applied) + ')';
+  } else if (lvl && d && d.applied === null) {
+    msg += ' (not used by this model)';
+  }
+  return msg;
+}
+
+/** Forget `sid`'s queued relaunch (and stop watching its state). */
+function _cancelQueuedRelaunch(sid) {
+  const q = _relaunchQueue[sid];
+  if (!q) return false;
+  clearTimeout(q.settle);
+  if (typeof socket !== 'undefined') {
+    socket.off('session_state', q.onState);
+    socket.off('state_snapshot', q.onSnap);
+  }
+  delete _relaunchQueue[sid];
+  if (typeof _renderStatusPanel === 'function') _renderStatusPanel();
+  return true;
+}
+
+/** A thinking level just changed in place (this tab, another tab, or another
+ *  device; socket.js calls this on every `session_effort_changed`).  A queued
+ *  relaunch must not undo it: one that only carried a thinking change is
+ *  dropped, and one that also switches the model keeps the new level. */
+function _noteLiveEffort(sid, effort) {
+  const q = _relaunchQueue[sid];
+  if (!q) return;
+  if (!q.modelChanged) { _cancelQueuedRelaunch(sid); return; }
+  q.level = effort || '';
+  q.thinkingChanged = false;
+  if (typeof _renderStatusPanel === 'function') _renderStatusPanel();
+}
+window._noteLiveEffort = _noteLiveEffort;
+
+/**
+ * Change `sid`'s thinking level by the best path available (see above).
+ *
+ * @param {string} sid
+ * @param {object} o
+ *   level         '' for the model default, else a CLI effort level
+ *   model         the model to switch to as well ('' to keep the current one)
+ *   modelChanged  true when `model` is a change the caller wants applied
+ *   cwd           project folder, used only if the CLI has to be relaunched
+ *   ui            optional {progress(text), reset(), close()} for the Apply button
+ *   onLive        optional fn(result) run instead of the toast after an
+ *                 in-place change (the picker uses it to chain the model switch)
+ */
+function _applyThinkingChange(sid, o) {
+  const ui = o.ui || null;
+  if (typeof socket === 'undefined') {
+    if (typeof showToast === 'function') showToast('Not connected, thinking NOT changed', true);
+    return;
+  }
+  // What a relaunch would carry, if one turns out to be needed.
+  const r = {level: o.level || '', model: o.model || '', modelChanged: !!o.modelChanged,
+             thinkingChanged: true, cwd: o.cwd || '', ui: ui};
+  // Asleep: an explicit change wakes it at the new level, as a model switch does.
+  if (!runningIds.has(sid)) { _relaunchSession(sid, _absorbQueued(sid, Object.assign(r, {running: false}))); return; }
+
+  if (ui) ui.progress('Applying…');
+  const want = r.level;
+  let settled = false;
+  const finish = () => {
+    settled = true;
+    clearTimeout(timer);
+    socket.off('session_effort_result', onResult);
+    socket.off('session_effort_changed', onChanged);
+  };
+  const timer = setTimeout(() => {
+    if (settled) return;
+    finish();
+    if (socket.connected === false) {
+      // Offline: a fallback's close + start would sit in the send buffer and
+      // land after the reconnect, maybe on a turn started meanwhile from
+      // another device.  The request itself may still get through then.
+      if (ui) ui.reset();
+      if (typeof showToast === 'function') showToast('Connection lost: thinking change not confirmed', true);
+      return;
+    }
+    _relaunchWhenFree(sid, r);
+  }, _EFFORT_LIVE_REPLY_MS);
+  // The reply goes only to this socket and can be lost across a mobile
+  // reconnect; the daemon's broadcast reaches every client, so accept it too.
+  function onChanged(d) {
+    if (settled || !d || d.session_id !== sid || (d.effort || '') !== want) return;
+    onResult({ok: true, session_id: sid, effort: d.effort, applied: d.applied});
+  }
+  function onResult(d) {
+    // Replies carry the level they answer, so a reply to an earlier Apply for
+    // the same session (a quick second pick) can't settle this one.
+    if (settled || !d || d.session_id !== sid || (d.effort || '') !== want) return;
+    finish();
+    if (d.ok) {
+      const lvl = d.effort || '';
+      if (typeof SessionModel !== 'undefined') {
+        SessionModel.ingestConfirmedThinking(sid, lvl);
+        // Keep this tab's recorded choice in step so a later wake from here
+        // can never pin a stale level.
+        SessionModel.setDesired(sid, SessionModel.getDesired(sid), lvl);
+      }
+      _noteLiveEffort(sid, lvl);
+      _renderSessionThinkingBadge(sid);
+      if (o.onLive) { o.onLive(d); return; }
+      if (ui) ui.close();
+      if (typeof showToast === 'function') showToast(_thinkingToast(d));
+      return;
+    }
+    if (d.not_live) {
+      // Asleep after all.  Wake it to apply, unless the user put it to sleep
+      // while this request was out: then it waits for the next wake.
+      if (typeof isUserStopped === 'function' && isUserStopped(sid)) _queueRelaunch(sid, r);
+      else _relaunchSession(sid, _absorbQueued(sid, Object.assign(r, {running: false})));
+      return;
+    }
+    // not_ready (the CLI is still starting) waits like a busy session; once
+    // it is free the queued step tries the in-place change again.
+    if (d.not_ready || d.live_unavailable) { _relaunchWhenFree(sid, r); return; }
+    if (ui) ui.reset();
+    if (typeof showToast === 'function') showToast('Thinking NOT changed: ' + (d.error || 'unknown error'), true);
+  }
+  socket.on('session_effort_result', onResult);
+  socket.on('session_effort_changed', onChanged);
+  socket.emit('set_session_effort', {session_id: sid, effort: want || 'default'});
+}
+
+/** Fold `sid`'s queued relaunch into `r` and drop the queue, for a relaunch
+ *  that runs now: `r` wins for what it sets, the queued one supplies the rest,
+ *  and nothing is left to replay an older choice later. */
+function _absorbQueued(sid, r) {
+  const q = _relaunchQueue[sid];
+  if (!q) return r;
+  if (q.modelChanged && !r.modelChanged) { r.model = q.model; r.modelChanged = true; }
+  if (q.thinkingChanged && !r.thinkingChanged) { r.level = q.level; r.thinkingChanged = true; }
+  _cancelQueuedRelaunch(sid);
+  return r;
+}
+
+/** Relaunch now if that cuts nothing short, else queue it until the session
+ *  is free.  `r`: {level, model, modelChanged, thinkingChanged, cwd, ui}. */
+function _relaunchWhenFree(sid, r) {
+  if (_relaunchQueue[sid] || !_sessionFreeForRelaunch(sid)) { _queueRelaunch(sid, r); return; }
+  _relaunchSession(sid, Object.assign({}, r, {running: true}));
+}
+
+/**
+ * Hold a relaunch until `sid` is free, then run it.  Merges into a relaunch
+ * already waiting (the newest choice wins for whatever it changes).  Watches
+ * the session's own pushes and the periodic snapshot, so it keeps working when
+ * the user switches session or project, closes the picker, or a turn-end push
+ * is lost.  A session that stops keeps it queued until it is running again.
+ */
+function _queueRelaunch(sid, r) {
+  let q = _relaunchQueue[sid];
+  if (q) {
+    if (r.thinkingChanged) { q.level = r.level || ''; q.thinkingChanged = true; }
+    if (r.modelChanged) { q.model = r.model; q.modelChanged = true; }
+    if (!q.cwd) q.cwd = r.cwd || '';
+  } else {
+    q = _relaunchQueue[sid] = {
+      level: r.level || '', model: r.model || '', modelChanged: !!r.modelChanged,
+      thinkingChanged: !!r.thinkingChanged, cwd: r.cwd || '',
+      stopped: !runningIds.has(sid), ready: false, settle: null, onState: null, onSnap: null,
+    };
+    q.onState = (d) => {
+      if (!d || d.session_id !== sid || _relaunchQueue[sid] !== q) return;
+      if (d.cwd) q.cwd = d.cwd;                 // the session's own folder beats the page's
+      q.stopped = d.state === 'stopped';
+      q.ready = _pushSaysFree(d);
+      _armQueuedRelaunch(sid, q);
+      if (typeof _renderStatusPanel === 'function') _renderStatusPanel();
+    };
+    q.onSnap = (snap) => {
+      const s = snap && Array.isArray(snap.sessions) ? snap.sessions.find(x => x && x.session_id === sid) : null;
+      if (s) q.onState(Object.assign({}, s, {queue: (snap.queues && snap.queues[sid]) || []}));
+    };
+    socket.on('session_state', q.onState);
+    socket.on('state_snapshot', q.onSnap);
+  }
+  if (r.ui) { r.ui.reset(); r.ui.close(); }
+  // The status panel shows the queued change in place of its Apply footer.
+  if (typeof _statusPanelFor !== 'undefined' && _statusPanelFor && _statusState().sid === sid) {
+    _statusPanelFor.pModel = null;
+    _statusPanelFor.pThink = null;
+  }
+  if (typeof _renderStatusPanel === 'function') _renderStatusPanel();
+  if (typeof showToast === 'function') {
+    showToast((r.toastPrefix || '') + _changeWords(q, 'queued') + _queuedWhen(q));
+  }
+}
+
+/** (Re)start the settle timer of a queued relaunch.  When it runs out the
+ *  session must still be free by the server's last push AND by this tab's own
+ *  view; if not, the next push re-arms it. */
+function _armQueuedRelaunch(sid, q) {
+  clearTimeout(q.settle);
+  if (!q.ready) return;
+  q.settle = setTimeout(() => {
+    if (_relaunchQueue[sid] !== q || !q.ready || !_sessionFreeForRelaunch(sid)) return;
+    // Offline: the reconnect re-syncs state, and its pushes re-arm this.
+    if (typeof socket === 'undefined' || socket.connected === false) return;
+    _cancelQueuedRelaunch(sid);
+    const opts = {level: q.level, model: q.model, modelChanged: q.modelChanged,
+                  thinkingChanged: q.thinkingChanged, cwd: q.cwd};
+    // A thinking-only change tries in place first: the CLI may have finished
+    // starting, the engine may have been restarted, or the earlier reply may
+    // just have been lost.  It falls back to the relaunch by itself.
+    if (!q.modelChanged) _applyThinkingChange(sid, opts);
+    else _relaunchSession(sid, Object.assign(opts, {running: true}));
+  }, _TURN_END_SETTLE_MS);
+}
+
+/** Relaunch (or, when `o.running` is false, resume) the session's CLI with
+ *  --resume plus --effort, and --model when that changed.  Honest by
+ *  construction: nothing is recorded until the session comes back reporting
+ *  the requested level.  `o.level` is always the level to run at, also when
+ *  only the model changes, because a relaunch must re-pin it. */
+function _relaunchSession(sid, o) {
+  const ui = o.ui || null;
+  const level = o.level || '';
+  const resumeModel = o.modelChanged ? o.model
+    : ((typeof SessionModel !== 'undefined' && SessionModel.resumeModel) ? SessionModel.resumeModel(sid) : '') || '';
+  if (ui) ui.progress(o.running ? 'Restarting…' : 'Starting…');
+
+  let settled = false;
+  let started = false;
+  const cleanup = () => {
+    settled = true;
+    clearTimeout(timer);
+    socket.off('session_state', onState);
+    socket.off('error', onError);
+  };
+  const fail = (msg) => {
+    cleanup();
+    if (ui) ui.reset();
+    if (typeof showToast === 'function') showToast(msg, true);
+  };
+  const timer = setTimeout(() => {
+    if (!settled) fail('No confirmation from the server. Check the session before retrying.');
+  }, 30000);
+
+  function startAtLevel() {
+    if (started) return;
+    started = true;
+    // Explicit restart supersedes the sleep intent marked below.
+    if (typeof clearUserStopped === 'function') clearUserStopped(sid);
+    socket.emit('start_session', {
+      session_id: sid,
+      cwd: o.cwd || ((typeof _currentProjectDir === 'function') ? _currentProjectDir() : ''),
+      resume: true,
+      model: resumeModel || undefined,
+      // 'default' = explicit reset to the model default, so the daemon
+      // does not re-pin the level the session was running at.
+      thinking_level: level || 'default',
+    });
+  }
+
+  // The daemon refuses a start it can't do (e.g. "Session already running"
+  // when this tab wrongly thought the session was asleep).
+  function onError(d) {
+    if (settled || !started || !d || d.session_id !== sid) return;
+    fail('Thinking NOT changed: ' + (d.message || 'the session could not be restarted'));
+  }
+
+  function onState(d) {
+    if (settled || !d || d.session_id !== sid) return;
+    if (!started) {
+      if (d.state === 'stopped') startAtLevel();
+      return;
+    }
+    if (d.state === 'stopped' && d.error) { fail('Restart FAILED: ' + d.error); return; }
+    if (d.state !== 'idle' && d.state !== 'working') return;
+    // The daemon reports the level it launched with.  Anything else means
+    // this start did not take, and the push is from the session as it was.
+    if (typeof d.effort === 'string' && d.effort !== level) {
+      fail('Thinking NOT changed: the session is still at ' + _thinkingLabelOf(d.effort));
+      return;
+    }
+    cleanup();
+    // Record the level on the session so the next wake from this tab pins it;
+    // a daemon that reports `effort` overwrites this with ground truth.
+    if (typeof SessionModel !== 'undefined') {
+      SessionModel.setDesired(sid, resumeModel, level);
+      SessionModel.ingestConfirmedThinking(sid, typeof d.effort === 'string' ? d.effort : level);
+    }
+    _renderSessionThinkingBadge(sid);
+    if (o.modelChanged) _renderSessionModelBadge(sid);
+    if (ui) ui.close();
+    if (typeof showToast === 'function') {
+      showToast(_changeWords({level: level, model: resumeModel, modelChanged: !!o.modelChanged,
+        thinkingChanged: o.thinkingChanged !== false}, 'done') + '. Applies from the next message.');
+    }
+  }
+  socket.on('session_state', onState);
+  socket.on('error', onError);
+
+  if (o.running) {
+    // Explicit stop path: mark intent BEFORE close_session so a pending
+    // ghost-recovery timer can't resurrect the session mid-restart (see the
+    // sleep-must-stick rules in live-panel.js).
+    if (typeof markUserStopped === 'function') markUserStopped(sid);
+    socket.emit('close_session', {session_id: sid});
+    // If the stopped push is lost, start anyway after a grace period.
+    setTimeout(() => { if (!settled) startAtLevel(); }, 8000);
+  } else {
+    startAtLevel();
+  }
+}
+
 /**
  * Open a per-session model + thinking level selector popup.
  * Uses the existing pm-overlay.  Selecting a model/thinking level sets
@@ -218,7 +627,7 @@ async function _openSessionModelSelector(liveMode, pendingSessionId, preset) {
     '<div class="sm-models" id="sm-model-list"><span class="spinner"></span></div>' +
     '<div id="sm-thinking-section" style="display:none;">' +
     '<div class="sm-sec"><span>Thinking</span>' +
-    (liveMode ? '<span class="sm-note">Restarts the session once idle, history kept</span>' : '') + '</div>' +
+    (liveMode ? '<span class="sm-note">Never cuts a running turn short</span>' : '') + '</div>' +
     '<div class="msel-grid" id="sm-thinking-list"></div>' +
     '<div class="msel-hint" id="sm-thinking-hint"></div>' +
     '</div>' +
@@ -233,6 +642,13 @@ async function _openSessionModelSelector(liveMode, pendingSessionId, preset) {
   requestAnimationFrame(() => { const c = overlay.querySelector('.pm-card'); if (c) c.classList.remove('pm-enter'); });
   overlay.onclick = e => { if (e.target === overlay) _closePm(); };
   }
+
+  // Close THIS picker and nothing else.  Replies arrive later (up to seconds),
+  // by which time the shared overlay can hold another dialog: a confirm, or a
+  // newer picker.  _closePm() would clear whatever is showing.  Headless
+  // (status panel) mode has no card of its own, so there is nothing to close.
+  const _pickerCard = preset ? null : overlay.querySelector('.pm-card');
+  const _closePicker = () => { if (_pickerCard && _pickerCard.isConnected) _closePm(); };
 
   // Fetch models (only needed to draw the list)
   let models;
@@ -321,9 +737,9 @@ async function _openSessionModelSelector(liveMode, pendingSessionId, preset) {
   }
 
   _renderModels();
-  // Thinking level is launch-time configuration (the CLI's --effort flag), so
-  // in live mode a change is applied by restarting the session's CLI with
-  // --resume --effort.  The modal text says so; see _applyLiveSessionChoice.
+  // In live mode a thinking change is applied in place, mid-turn included, and
+  // falls back to relaunching the CLI with --resume --effort only on an engine
+  // or CLI that can't (queued until the turn ends); see _applyThinkingChange.
   _renderThinking();
 
   // Enable apply only when a selection differs from current state
@@ -467,124 +883,47 @@ async function _openSessionModelSelector(liveMode, pendingSessionId, preset) {
   // until the daemon confirms the CLI accepted the set_model control
   // request.  On failure or timeout the badge keeps showing the real model
   // and the user gets an explicit error — never silent fake success.
-  // Live-mode Apply.  A thinking change (effort is a launch flag) takes the
-  // restart path, which also carries any model change in the same restart.
-  // A model-only change keeps the existing live set_model path.
+  // Live-mode Apply.  A thinking change goes through _applyThinkingChange,
+  // which never refuses a busy session: it switches the level in place
+  // (mid-turn included) and only falls back to a relaunch, queued until the
+  // turn ends, on an engine or CLI that can't.  A model-only change keeps the
+  // live set_model path, which also works mid-turn.
   window._applyLiveSessionChoice = function() {
     if (!liveMode || !liveSid) return;
     const thinkingChanged = thinkingTouched &&
       (!_liveThinkingKnown || pendingThinking !== currentLiveThinking);
     if (thinkingChanged) { _applyLiveSessionThinking(); return; }
-    window._applyLiveSessionModel();
+    _applyLiveSessionModel();
   };
 
-  // Restart the session's CLI with --resume --effort <level> (and --model if
-  // that changed too).  Honest by construction: nothing is recorded until the
-  // daemon confirms the session came back idle.
   function _applyLiveSessionThinking() {
     const btn = document.getElementById('sm-apply-btn');
-    const kind = (typeof sessionKinds !== 'undefined') ? sessionKinds[liveSid] : '';
-    const running = (typeof runningIds !== 'undefined') && runningIds.has(liveSid);
-    if (running && (kind === 'working' || kind === 'question')) {
-      // Restarting mid-turn would kill the turn in flight.
-      if (typeof showToast === 'function') {
-        showToast('Session is busy. Change thinking once the current turn finishes.');
-      }
-      return;
-    }
-    if (typeof socket === 'undefined') {
-      if (typeof showToast === 'function') showToast('Not connected, thinking NOT changed');
-      return;
-    }
-    const level = pendingThinking || '';
     const modelChanged = !!pendingModel && pendingModel !== currentLiveBase;
-    const resumeModel = modelChanged ? pendingModel
-      : ((SessionModel.resumeModel ? SessionModel.resumeModel(liveSid) : '') || '');
-    if (btn) { btn.disabled = true; btn.textContent = 'Restarting…'; }
-
-    let settled = false;
-    let started = false;
-    const cleanup = () => {
-      settled = true;
-      clearTimeout(timer);
-      socket.off('session_state', onState);
-    };
-    const timer = setTimeout(() => {
-      if (settled) return;
-      cleanup();
-      if (btn) { btn.disabled = false; btn.textContent = 'Apply'; }
-      if (typeof showToast === 'function') {
-        showToast('No confirmation from the server. Check the session before retrying.');
-      }
-    }, 30000);
-
-    function startAtLevel() {
-      if (started) return;
-      started = true;
-      // Explicit restart supersedes the sleep intent marked below.
-      if (typeof clearUserStopped === 'function') clearUserStopped(liveSid);
-      socket.emit('start_session', {
-        session_id: liveSid,
-        cwd: (typeof _currentProjectDir === 'function') ? _currentProjectDir() : '',
-        resume: true,
-        model: resumeModel || undefined,
-        // 'default' = explicit reset to the model default, so the daemon
-        // does not re-pin the level the session was running at.
-        thinking_level: level || 'default',
-      });
-    }
-
-    function onState(d) {
-      if (settled || !d || d.session_id !== liveSid) return;
-      if (!started) {
-        if (d.state === 'stopped') startAtLevel();
-        return;
-      }
-      if (d.state === 'stopped' && d.error) {
-        cleanup();
-        if (btn) { btn.disabled = false; btn.textContent = 'Apply'; }
-        if (typeof showToast === 'function') showToast('Restart FAILED: ' + d.error);
-        return;
-      }
-      if (d.state !== 'idle' && d.state !== 'working') return;
-      cleanup();
-      // Daemon brought the session back.  Record the level on the session so
-      // the next wake from this tab pins it; a daemon that reports `effort`
-      // overwrites this with ground truth through the same write path.
-      SessionModel.setDesired(liveSid, resumeModel, level);
-      if (typeof d.effort === 'string') {
-        SessionModel.ingestConfirmedThinking(liveSid, d.effort);
-      } else {
-        SessionModel.ingestConfirmedThinking(liveSid, level);
-      }
-      _renderSessionThinkingBadge(liveSid);
-      if (modelChanged) _renderSessionModelBadge(liveSid);
-      _closePm();
-      if (typeof showToast === 'function') {
-        showToast('Thinking set to ' + _thinkingLbl(level) +
-          (modelChanged ? ' on ' + _modelLabel(pendingModel) : '') +
-          '. Applies from the next message.');
-      }
-    }
-    socket.on('session_state', onState);
-
-    if (running) {
-      // Explicit stop path: mark intent BEFORE close_session so a pending
-      // ghost-recovery timer can't resurrect the session mid-restart (see the
-      // sleep-must-stick rules in live-panel.js).
-      if (typeof markUserStopped === 'function') markUserStopped(liveSid);
-      socket.emit('close_session', { session_id: liveSid });
-      // If the stopped push is lost, start anyway after a grace period.
-      setTimeout(() => { if (!settled) startAtLevel(); }, 8000);
-    } else {
-      startAtLevel();
-    }
+    _applyThinkingChange(liveSid, {
+      level: pendingThinking || '',
+      model: modelChanged ? pendingModel : '',
+      modelChanged: modelChanged,
+      cwd: (typeof _currentProjectDir === 'function') ? _currentProjectDir() : '',
+      ui: {
+        progress(text) { if (btn) { btn.disabled = true; btn.textContent = text; } },
+        reset() { if (btn) { btn.disabled = false; btn.textContent = 'Apply'; } },
+        close() { _closePicker(); },
+      },
+      // Changed in place, so the session's CLI is untouched and a model change
+      // still needs its own live switch.  One toast reports both.  The local
+      // function, not window._applyLiveSessionModel: every picker or status
+      // panel opened while the reply is out replaces that global with its own.
+      onLive: modelChanged ? (d) => _applyLiveSessionModel(_thinkingToast(d)) : null,
+    });
   }
 
-  window._applyLiveSessionModel = function() {
+  // `donePrefix`: what already happened in the same Apply (a thinking change),
+  // prepended to the success toast so the user gets one message, not two.
+  window._applyLiveSessionModel = _applyLiveSessionModel;
+  function _applyLiveSessionModel(donePrefix) {
     if (!liveMode || !liveSid || !pendingModel) return;
     if (pendingModel === currentLiveBase) {
-      _closePm();
+      _closePicker();
       if (typeof showToast === 'function') showToast('Already running on ' + _modelLabel(pendingModel));
       return;
     }
@@ -670,9 +1009,10 @@ async function _openSessionModelSelector(liveMode, pendingSessionId, preset) {
             clearUserStopped(liveSid);
           }
           _renderSessionModelBadge(liveSid);
-          _closePm();
+          _closePicker();
           if (typeof showToast === 'function') {
-            showToast('Model switched to ' + _modelLabel(data.model) + ' — applies from the next message');
+            showToast((donePrefix ? donePrefix + ' · ' : '') +
+              'Model switched to ' + _modelLabel(data.model) + ' — applies from the next message');
           }
         } else if (!resumeFallbackUsed && /not supported/i.test(String(data.error || ''))) {
           resumeFallbackUsed = true;
@@ -688,7 +1028,8 @@ async function _openSessionModelSelector(liveMode, pendingSessionId, preset) {
         } else {
           if (btn) { btn.disabled = false; btn.textContent = 'Apply'; }
           if (typeof showToast === 'function') {
-            showToast('Model switch FAILED: ' + (data.error || 'unknown error'));
+            showToast((donePrefix ? donePrefix + ', but the model ' : 'Model ') +
+              'switch FAILED: ' + (data.error || 'unknown error'));
           }
         }
       }
@@ -706,6 +1047,25 @@ async function _openSessionModelSelector(liveMode, pendingSessionId, preset) {
     // Sleep the session, wait for the daemon to confirm it stopped, then
     // re-apply the switch (which now takes the resume-with---model path).
     function _sleepThenRetry() {
+      if (!_sessionFreeForRelaunch(liveSid)) {
+        // Sleeping the session now would cut short a running turn (or a
+        // question, wake-up, auto-retry or queued message), so the restart
+        // waits until the session is free instead (the shared relaunch queue
+        // resumes the session with --model, as the retry below would).
+        _queueRelaunch(liveSid, {
+          model: pendingModel, modelChanged: true, thinkingChanged: false,
+          level: SessionModel.resumeThinking ? SessionModel.resumeThinking(liveSid) : '',
+          cwd: (typeof _currentProjectDir === 'function') ? _currentProjectDir() : '',
+          ui: {
+            progress() {},
+            reset() { if (btn) { btn.disabled = false; btn.textContent = 'Apply'; } },
+            close() { _closePicker(); },
+          },
+          toastPrefix: (donePrefix ? donePrefix + '. ' : '') + 'This session’s Claude process predates ' +
+            _modelLabel(pendingModel) + '. ',
+        });
+        return;
+      }
       if (btn) { btn.disabled = true; btn.textContent = 'Restarting session…'; }
       if (typeof showToast === 'function') {
         showToast('Session’s CLI predates ' + _modelLabel(pendingModel) +
@@ -737,7 +1097,7 @@ async function _openSessionModelSelector(liveMode, pendingSessionId, preset) {
     }
 
     attempt();
-  };
+  }
 
   if (preset && liveMode) window._applyLiveSessionChoice();
 }
@@ -1261,10 +1621,16 @@ function _statusPanelHtml() {
   // Apply appears only when something staged differs from what is running,
   // with the consequence next to it.  It is the panel's one accent element.
   if (!c.isNew && (st.dModel || st.dThink)) {
-    h += '<div class="vsp-foot"><span>' + (st.dThink ? 'Restarts the session once idle. History is kept.'
+    h += '<div class="vsp-foot"><span>' + (st.dThink ? 'Never cuts a running turn short.'
       : 'Applies from your next message.') + '</span><span class="vsp-actions">' +
       '<a role="button" tabindex="0" data-act="cancel">Cancel</a>' +
       '<button class="vsp-apply" id="sm-apply-btn" data-act="apply">Apply</button></span></div>';
+  } else if (!c.isNew && sid && _relaunchQueue[sid]) {
+    // A change waiting until the session is free (the relaunch fallback).
+    const q = _relaunchQueue[sid];
+    h += '<div class="vsp-foot"><span>' + escHtml(_changeWords(q, 'queued') + _queuedWhen(q)) +
+      '.</span><span class="vsp-actions">' +
+      '<a role="button" tabindex="0" data-act="unqueue">Cancel</a></span></div>';
   }
   return h;
 }
@@ -1279,6 +1645,11 @@ function _statusPanelClick(e) {
     if (a === 'refresh') _refreshUsageLimits();                       // numbers arrive by push; panel stays open
     else if (a === 'compact') { _closeStatusPanel(); if (typeof liveCompact === 'function') liveCompact(); }
     else if (a === 'cancel') { c.pModel = c.pThink = null; _renderStatusPanel(); }
+    else if (a === 'unqueue') {
+      if (_cancelQueuedRelaunch(_statusState().sid) && typeof showToast === 'function') {
+        showToast('Queued change cancelled');
+      }
+    }
     else if (a === 'apply') {
       const st = _statusState();
       // Same code path as the picker modal's Apply (see `preset` there).

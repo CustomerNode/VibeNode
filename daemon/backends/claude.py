@@ -175,6 +175,56 @@ class ClaudeAgentSDK(AgentSDK):
             raise RuntimeError("Session is not connected")
         await query._send_control_request({"subtype": "set_model", "model": model})
 
+    async def set_effort(self, client: ClaudeSDKClient,
+                         effort: Optional[str]) -> Optional[str]:
+        """Change the session's thinking level (CLI effort) without a restart.
+
+        Sends the CLI control request ``apply_flag_settings`` with
+        ``{"effortLevel": effort}`` (``None`` = back to the model's default),
+        then reads the result back with ``get_settings``.  It works mid-turn:
+        the CLI applies the level to its next API request.  Probed against
+        CLI 2.1.291 on 2026-10-08: answered in ~0.1s while a tool was running,
+        ``get_settings`` reported the new level at once, and an idle change
+        put nothing on the message stream (so, unlike ``set_model``, there is
+        no side-effect ``init`` for the post-turn listeners to misread).
+
+        Returns what ``get_settings`` reports as ``applied.effort``: the level
+        the CLI applies to the session's CURRENT model.  A success can differ
+        from the request:
+
+          * a model clamps a level it lacks (Sonnet 4.6 and Opus 4.6 run
+            ``xhigh`` as ``high``);
+          * a model without thinking levels (Haiku 4.5) reports ``None``, and
+            the CLI holds the level for a later switch to a model that has them;
+          * a reset (``None``) reports the model's own default.
+
+        ``apply_flag_settings`` acknowledges values it ignores (a junk level
+        comes back as success), which is why the read-back is required before
+        anything is recorded.
+
+        Raises:
+            RuntimeError: session not connected, or the CLI did not report an
+                applied level (a CLI too old to confirm the change).
+            Exception: the CLI rejected either request; a CLI that predates
+                them answers "Unsupported control request subtype".
+        """
+        query = getattr(client, "_query", None)
+        if query is None:
+            raise RuntimeError("Session is not connected")
+        await query._send_control_request({
+            "subtype": "apply_flag_settings",
+            "settings": {"effortLevel": effort},
+        })
+        resp = await query._send_control_request({"subtype": "get_settings"})
+        applied = resp.get("applied") if isinstance(resp, dict) else None
+        if not isinstance(applied, dict) or "effort" not in applied:
+            raise RuntimeError(
+                "The Claude CLI did not report its thinking level after the "
+                "change, so it cannot be confirmed"
+            )
+        level = applied.get("effort")
+        return level if isinstance(level, str) else None
+
     async def disconnect(self, client: ClaudeSDKClient) -> None:
         """Disconnect the Claude client.
 

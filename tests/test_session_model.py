@@ -346,3 +346,15 @@ class TestResolverLogic:
             assert.strictEqual(SessionModel.ingestConfirmedThinking('a', undefined), false);
             assert.strictEqual(SessionModel.resumeThinking('ghost'), '');
         """)
+
+    def test_confirmed_default_beats_a_stale_local_choice(self, tmp_path):
+        # The daemon reporting '' (model default) is daemon truth, not
+        # "unknown".  Reset to Default live from another device, then wake from
+        # this tab: the wake must pin '' and not this tab's old 'high'.
+        self._run(tmp_path, """
+            allSessions.push({ id: 'a' });
+            SessionModel.setDesired('a', '', 'high');
+            SessionModel.ingestConfirmedThinking('a', 'high');
+            SessionModel.ingestConfirmedThinking('a', '');
+            assert.strictEqual(SessionModel.resumeThinking('a'), '');
+        """)

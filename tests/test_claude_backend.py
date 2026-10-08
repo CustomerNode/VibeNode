@@ -2091,3 +2091,111 @@ class TestSetModel:
 
         with pytest.raises(NotImplementedError):
             anyio.run(_Minimal().set_model, object(), "claude-sonnet-4-6")
+
+
+# =========================================================================
+# Section 8b: Live thinking-level change (set_effort)
+#
+# The thinking level (CLI effort) used to be launch-only, so changing it
+# restarted the CLI and a busy session refused the change.  set_effort changes
+# it in place through the CLI's apply_flag_settings control request and then
+# confirms it with get_settings, because apply_flag_settings acknowledges
+# values it ignores.  Probed against CLI 2.1.291 on 2026-10-08.
+# =========================================================================
+
+class TestSetEffort:
+
+    @staticmethod
+    def _client(responses):
+        """A connected client whose control requests return `responses` in turn
+        (an Exception instance is raised instead of returned)."""
+        from unittest.mock import AsyncMock, MagicMock
+        client = MagicMock()
+        client._query = MagicMock()
+        replies = list(responses)
+
+        async def _send(req):
+            r = replies.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+        client._query._send_control_request = AsyncMock(side_effect=_send)
+        return client
+
+    def test_applies_then_reads_back(self):
+        import anyio
+        from daemon.backends.claude import ClaudeAgentSDK
+        client = self._client([{}, {"applied": {"model": "claude-opus-5-5", "effort": "high"}}])
+        assert anyio.run(ClaudeAgentSDK().set_effort, client, "high") == "high"
+        calls = [c.args[0] for c in client._query._send_control_request.await_args_list]
+        assert calls == [
+            {"subtype": "apply_flag_settings", "settings": {"effortLevel": "high"}},
+            {"subtype": "get_settings"},
+        ]
+
+    def test_none_resets_to_model_default(self):
+        """None is the CLI's reset; get_settings then reports the model's own
+        default, which is what set_effort returns."""
+        import anyio
+        from daemon.backends.claude import ClaudeAgentSDK
+        client = self._client([{}, {"applied": {"effort": "medium"}}])
+        assert anyio.run(ClaudeAgentSDK().set_effort, client, None) == "medium"
+        first = client._query._send_control_request.await_args_list[0].args[0]
+        assert first["settings"] == {"effortLevel": None}
+
+    def test_clamped_and_unsupported_levels_are_reported_as_applied(self):
+        """A model clamps a level it lacks, and one without thinking levels
+        reports None; both are successes that return what actually runs."""
+        import anyio
+        from daemon.backends.claude import ClaudeAgentSDK
+        clamped = self._client([{}, {"applied": {"effort": "high"}}])
+        assert anyio.run(ClaudeAgentSDK().set_effort, clamped, "xhigh") == "high"
+        haiku = self._client([{}, {"applied": {"effort": None}}])
+        assert anyio.run(ClaudeAgentSDK().set_effort, haiku, "high") is None
+
+    def test_cli_without_read_back_cannot_confirm(self):
+        """No `applied.effort` in get_settings: the change can't be confirmed,
+        so it must raise rather than claim success."""
+        import anyio
+        from daemon.backends.claude import ClaudeAgentSDK
+        client = self._client([{}, {"model": "x"}])
+        with pytest.raises(RuntimeError):
+            anyio.run(ClaudeAgentSDK().set_effort, client, "high")
+
+    def test_cli_that_predates_the_request_raises(self):
+        import anyio
+        from daemon.backends.claude import ClaudeAgentSDK
+        err = Exception("Unsupported control request subtype: apply_flag_settings")
+        client = self._client([err])
+        with pytest.raises(Exception, match="Unsupported control request"):
+            anyio.run(ClaudeAgentSDK().set_effort, client, "high")
+
+    def test_disconnected_client_raises(self):
+        import anyio
+        from unittest.mock import MagicMock
+        from daemon.backends.claude import ClaudeAgentSDK
+        client = MagicMock()
+        client._query = None
+        with pytest.raises(RuntimeError):
+            anyio.run(ClaudeAgentSDK().set_effort, client, "high")
+
+    def test_base_backend_default_is_not_supported(self):
+        import anyio
+        from daemon.backends.base import AgentSDK
+
+        class _Minimal(AgentSDK):
+            async def create_session(self, options): ...
+            async def connect(self, client): ...
+            async def send_query(self, client, prompt): ...
+            async def receive_response(self, client):
+                if False:
+                    yield None
+            async def interrupt(self, client): ...
+            async def disconnect(self, client): ...
+            def extract_process_pid(self, client): return 0
+            def is_transport_alive(self, client): return False
+            def apply_patches(self): ...
+
+        with pytest.raises(NotImplementedError):
+            anyio.run(_Minimal().set_effort, object(), "high")

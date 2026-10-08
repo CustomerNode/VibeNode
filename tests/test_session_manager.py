@@ -1694,6 +1694,164 @@ class TestResumeEffortPinning:
 
 
 # ---------------------------------------------------------------------------
+# Live thinking-level change (set_session_effort, added 2026-10-08)
+#
+# Changing thinking used to restart the CLI, and a busy session refused it:
+# "Session is busy. Change thinking once the current turn finishes."  The CLI's
+# apply_flag_settings control request changes the level in place, mid-turn
+# included.  Same honesty contract as set_session_model: info.effort changes
+# only after the backend confirmed.
+# ---------------------------------------------------------------------------
+
+class TestSetSessionEffort:
+
+    def _make(self, session_manager, sm_module, sid, state=None, effort="medium",
+              client=object()):
+        info = sm_module.SessionInfo(session_id=sid,
+                                     state=state or sm_module.SessionState.WORKING)
+        info.effort = effort
+        info.client = client
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+        return info
+
+    def _pushes(self, session_manager):
+        pushes = []
+        session_manager._push_callback = lambda n, d: pushes.append((n, d))
+        return pushes
+
+    def test_busy_session_switches_in_place(self, session_manager, sm_module):
+        """The reported case: a WORKING session takes the change at once, with
+        no restart and no refusal."""
+        info = self._make(session_manager, sm_module, "ef-live")
+        pushes = self._pushes(session_manager)
+        with patch.object(session_manager._sdk, 'set_effort',
+                          new=AsyncMock(return_value="high")) as mock_set, \
+             patch.object(session_manager, '_emit_state') as mock_emit, \
+             patch.object(session_manager, 'close_session') as mock_close:
+            result = session_manager.set_session_effort("ef-live", "high")
+        assert result == {"ok": True, "effort": "high", "applied": "high"}
+        mock_set.assert_awaited_once()
+        assert mock_set.await_args.args[1] == "high"
+        assert info.effort == "high"                     # re-pinned on every later resume
+        mock_close.assert_not_called()
+        # No _emit_state: on an IDLE session it dispatches the queue.
+        mock_emit.assert_not_called()
+        ev = [d for n, d in pushes if n == "session_effort_changed"]
+        assert ev == [{"session_id": "ef-live", "effort": "high", "applied": "high"}]
+        assert any(e.kind == "system" and e.text == "Thinking set to High"
+                   for e in info.entries)
+
+    def test_default_resets_and_records_no_level(self, session_manager, sm_module):
+        info = self._make(session_manager, sm_module, "ef-def", effort="max")
+        with patch.object(session_manager._sdk, 'set_effort',
+                          new=AsyncMock(return_value="medium")) as mock_set:
+            result = session_manager.set_session_effort("ef-def", "default")
+        assert result["ok"] is True and result["effort"] == ""
+        assert mock_set.await_args.args[1] is None       # the CLI's reset value
+        assert info.effort == ""
+
+    def test_clamped_level_is_recorded_as_chosen_and_noted(self, session_manager,
+                                                           sm_module):
+        """Sonnet 4.6 runs xHigh as High.  The chosen level is what --effort
+        would pin too, so it is recorded; the transcript says what runs."""
+        info = self._make(session_manager, sm_module, "ef-clamp", state=sm_module.SessionState.IDLE)
+        with patch.object(session_manager._sdk, 'set_effort',
+                          new=AsyncMock(return_value="high")):
+            result = session_manager.set_session_effort("ef-clamp", "xhigh")
+        assert result == {"ok": True, "effort": "xhigh", "applied": "high"}
+        assert info.effort == "xhigh"
+        assert any("runs as High" in e.text for e in info.entries)
+
+    def test_unknown_level_rejected_without_touching_the_cli(self, session_manager,
+                                                             sm_module):
+        info = self._make(session_manager, sm_module, "ef-bad")
+        with patch.object(session_manager._sdk, 'set_effort', new=AsyncMock()) as mock_set:
+            result = session_manager.set_session_effort("ef-bad", "auto")
+        assert result["ok"] is False and "auto" in result["error"]
+        mock_set.assert_not_awaited()
+        assert info.effort == "medium"
+
+    @pytest.mark.parametrize("shape", ["missing", "stopped"])
+    def test_asleep_session_asks_caller_to_resume(self, session_manager,
+                                                  sm_module, shape):
+        if shape == "stopped":
+            self._make(session_manager, sm_module, "ef-nl", state=sm_module.SessionState.STOPPED)
+        with patch.object(session_manager._sdk, 'set_effort', new=AsyncMock()) as mock_set:
+            result = session_manager.set_session_effort("ef-nl", "high")
+        assert result["ok"] is False and result["not_live"] is True
+        mock_set.assert_not_awaited()
+
+    def test_connectionless_session_asks_for_a_relaunch_not_a_resume(
+            self, session_manager, sm_module):
+        """In memory, not STOPPED, no client: start_session would refuse a
+        bare resume as "already running", so the caller must close first."""
+        self._make(session_manager, sm_module, "ef-nc", state=sm_module.SessionState.IDLE,
+                   client=None)
+        with patch.object(session_manager._sdk, 'set_effort', new=AsyncMock()) as mock_set:
+            result = session_manager.set_session_effort("ef-nc", "high")
+        assert result["ok"] is False and result["live_unavailable"] is True
+        assert not result.get("not_live")
+        mock_set.assert_not_awaited()
+
+    @pytest.mark.parametrize("client", [object(), None])
+    def test_starting_session_is_not_ready(self, session_manager, sm_module, client):
+        """Starting, with or without its client yet: not dead, just early."""
+        self._make(session_manager, sm_module, "ef-start",
+                   state=sm_module.SessionState.STARTING, client=client)
+        with patch.object(session_manager._sdk, 'set_effort', new=AsyncMock()) as mock_set:
+            result = session_manager.set_session_effort("ef-start", "high")
+        assert result["ok"] is False and result["not_ready"] is True
+        mock_set.assert_not_awaited()
+
+    @pytest.mark.parametrize("exc", [
+        Exception("Unsupported control request subtype: apply_flag_settings"),
+        NotImplementedError("no live effort"),
+        RuntimeError("did not report its thinking level"),
+    ])
+    def test_failure_records_nothing_and_reports_live_unavailable(
+            self, session_manager, sm_module, exc):
+        """An old CLI, a backend without the capability, or an unconfirmed
+        change: nothing recorded, nothing broadcast, and the caller is told to
+        relaunch with --effort instead."""
+        info = self._make(session_manager, sm_module, "ef-fail")
+        pushes = self._pushes(session_manager)
+        with patch.object(session_manager._sdk, 'set_effort',
+                          new=AsyncMock(side_effect=exc)):
+            result = session_manager.set_session_effort("ef-fail", "high")
+        assert result["ok"] is False and result["live_unavailable"] is True
+        assert info.effort == "medium"
+        assert not [d for n, d in pushes if n == "session_effort_changed"]
+        assert not any("Thinking set" in e.text for e in info.entries)
+
+    def test_resolves_pre_remap_id(self, session_manager, sm_module):
+        info = self._make(session_manager, sm_module, "ef-real")
+        session_manager._id_aliases["ef-temp"] = "ef-real"
+        with patch.object(session_manager._sdk, 'set_effort',
+                          new=AsyncMock(return_value="low")):
+            result = session_manager.set_session_effort("ef-temp", "low")
+        assert result["ok"] is True
+        assert info.effort == "low"
+
+    def test_later_wake_repins_the_live_level(self, session_manager, sm_module):
+        """`claude --resume` forgets the effort, so the level set live must be
+        what the next wake (or self-heal reconnect) pins."""
+        info = self._make(session_manager, sm_module, "ef-wake2", effort="low")
+        with patch.object(session_manager._sdk, 'set_effort',
+                          new=AsyncMock(return_value="max")):
+            session_manager.set_session_effort("ef-wake2", "max")
+        info.state = sm_module.SessionState.STOPPED
+        with patch.object(session_manager._reg, 'load_registry',
+                          return_value={"sessions": {}}), \
+             patch.object(session_manager, '_drive_session',
+                          new=AsyncMock(return_value=None)) as mock_drive:
+            assert session_manager.start_session(
+                "ef-wake2", prompt="", cwd=EMPTY_CWD, resume=True)["ok"] is True
+            wait_for(lambda: mock_drive.await_count == 1, timeout=5)
+        assert mock_drive.call_args.kwargs["extra_args"]["effort"] == "max"
+
+
+# ---------------------------------------------------------------------------
 # Pre-remap ids resolve to the real session (fixed 2026-10-01)
 # ---------------------------------------------------------------------------
 

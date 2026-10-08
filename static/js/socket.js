@@ -1220,6 +1220,29 @@ socket.on('session_model_changed', (data) => {
     if (typeof filterSessions === 'function') filterSessions();
 });
 
+// Cross-tab / cross-device thinking-level sync.  Fired by
+// SessionManager.set_session_effort AFTER the CLI confirmed an in-place change.
+// Like set_session_model it deliberately skips _emit_state (that would
+// dispatch a queued message on an idle session), so this broadcast is how
+// every other tab, and this one when a mobile reconnect lost the reply, learns
+// the new level.
+socket.on('session_effort_changed', (data) => {
+    if (!data || !data.session_id || typeof data.effort !== 'string') return;
+    if (_isHiddenSession(data.session_id, data)) return;
+    if (typeof SessionModel !== 'undefined' && SessionModel.ingestConfirmedThinking) {
+        if (SessionModel.ingestConfirmedThinking(data.session_id, data.effort)
+                && data.session_id === liveSessionId
+                && typeof _renderSessionThinkingBadge === 'function') {
+            _renderSessionThinkingBadge(data.session_id);
+        }
+    }
+    // A relaunch queued in this tab for the session's turn end must not undo
+    // the level that just took effect (invoke-workforce.js).
+    if (typeof window._noteLiveEffort === 'function') {
+        window._noteLiveEffort(data.session_id, data.effort);
+    }
+});
+
 // Server confirms it received and accepted our send_message.
 // This is the positive acknowledgment that the message pipeline is working.
 // Reset the watchdog — we know the server got it, so events should follow.

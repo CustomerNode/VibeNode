@@ -697,6 +697,26 @@ class DaemonClient:
             })
         return result
 
+    def set_session_effort(self, session_id, effort=""):
+        """Change a live session's thinking level in place, mid-turn included
+        (see ``SessionManager.set_session_effort`` for the result shapes).
+
+        The Session Engine keeps running across web-server restarts and app
+        updates, so this proxy often talks to a daemon started before the
+        method existed.  That daemon answers "Unknown method"; it is reported
+        as ``live_unavailable`` so the browser relaunches the session's CLI
+        with ``--effort`` once no turn is running, exactly as it did before
+        the live change existed.
+        """
+        result = self._send_request("set_session_effort", {
+            "session_id": session_id, "effort": effort,
+        })
+        if isinstance(result, dict) and not result.get("ok") \
+                and "Unknown method" in str(result.get("error", "")):
+            return {"ok": False, "live_unavailable": True,
+                    "error": "The Session Engine predates live thinking changes"}
+        return result
+
     def cancel_auto_retry(self, session_id):
         """Cancel a pending API-error auto-retry countdown (Cancel button)."""
         return self._send_request("cancel_auto_retry", {

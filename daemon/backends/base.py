@@ -269,6 +269,34 @@ class AgentSDK(ABC):
             "This backend does not support mid-session model switching"
         )
 
+    async def set_effort(self, client: Any,
+                         effort: Optional[str]) -> Optional[str]:
+        """Change a connected session's thinking level (effort) in place.
+
+        Non-abstract for the same reason as ``set_model``: a live change is
+        an optional capability.  The default raises, so the caller falls back
+        to relaunching the session with the level instead of pretending the
+        change happened.
+
+        Args:
+            client: Handle from ``create_session()``.
+            effort: A level the backend accepts, or ``None`` for the model's
+                own default.
+
+        Returns:
+            The level the backend now applies to the session's current model.
+            It may differ from ``effort`` (a model can clamp a level it lacks)
+            or be ``None`` (a model without thinking levels).
+
+        Raises:
+            NotImplementedError: backend cannot change effort live.
+            Exception: the backend rejected the change or could not confirm
+                it (callers MUST NOT record the new level in that case).
+        """
+        raise NotImplementedError(
+            "This backend does not support live thinking-level changes"
+        )
+
     @abstractmethod
     async def disconnect(self, client: Any) -> None:
         """Disconnect and clean up the client.
