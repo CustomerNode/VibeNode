@@ -56,6 +56,14 @@ function _floatEls() {
 function _layoutFloats() {
   let y = _floatLift;
   _floatEls().forEach(e => {
+    // A float whose CSS pins it to the TOP opts out with `--vn-float: top`
+    // (the phone toast, mobile.css: a capsule under the header).  Writing
+    // `bottom` on it as well gave it both edges, and it stretched from the
+    // header down to the composer (2026-10-08).  It takes no slot in the stack.
+    if (getComputedStyle(e).getPropertyValue('--vn-float').trim() === 'top') {
+      e.style.bottom = '';
+      return;
+    }
     e.style.bottom = y + 'px';
     y += e.offsetHeight + _FLOAT_GAP;
   });

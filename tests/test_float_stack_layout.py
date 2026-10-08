@@ -334,3 +334,24 @@ def test_plus_menu_opens_above_the_buttons_it_belongs_to(page):
     )
     assert bad["out"] == [], f"+ menu covering {bad['out']}"
     assert bad["top"] >= 0, "+ menu overflowed the top of the viewport"
+
+
+def test_phone_toast_opts_out_of_the_bottom_stack():
+    """The phone toast is pinned to the TOP (mobile.css) and must not also get
+    a ``bottom`` from _layoutFloats: with both edges set it stretched from the
+    header to the composer, a capsule the height of the screen (2026-10-08).
+    Source-level, so it runs without a browser."""
+    mobile = (STATIC / "css" / "mobile.css").read_text(encoding="utf-8")
+    block = _css_block(mobile, ".toast {")
+    assert "--vn-float: top" in block, "the phone toast lost its --vn-float: top opt-out"
+    assert "top:" in block and "bottom: auto" in block
+
+    utils = (STATIC / "js" / "utils.js").read_text(encoding="utf-8")
+    start = utils.index("function _layoutFloats()")
+    body = utils[start:utils.index("\n}\n", start)]
+    assert "--vn-float" in body and "e.style.bottom = ''" in body, (
+        "_layoutFloats must skip a top-pinned float and clear its inline bottom"
+    )
+    assert body.index("--vn-float") < body.index("e.style.bottom = y"), (
+        "the opt-out check must run before bottom is written"
+    )

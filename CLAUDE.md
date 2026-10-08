@@ -207,6 +207,8 @@ Every bottom-of-screen notice (`#toast`, `#git-sync-mini`, `.vn-undo-toast`, `.c
 
 6. **The float stack re-measures when the on-screen keyboard moves the bar** — `updateKeyboardOffset()` in `static/js/mobile.js` calls `_updateFloatOffset()`. The keyboard changes the bar's `bottom`, not its size, so the `ResizeObserver` behind the stack never fires and the lift would go stale.
 
+7. **A float pinned to the TOP opts out with `--vn-float: top`** (fixed 2026-10-08). On phones the toast is a capsule under the header (`mobile.css .toast`, `top` set, `bottom: auto`). `_layoutFloats()` wrote an inline `bottom` on it anyway, which beat `bottom: auto`; with both edges set the toast stretched from the header to the composer, a capsule the height of the screen. `_layoutFloats()` now skips any float whose computed `--vn-float` is `top`, clears its inline `bottom`, and gives it no slot in the stack. Guard test: `test_phone_toast_opts_out_of_the_bottom_stack`.
+
 ## Publish-gate fix sessions belong to the VibeNode project (fixed 2026-10-05)
 
 `_startFixSession()` in `static/js/git-sync.js` (the "Fix errors" button after a failed pre-publish test run, and "Fix with AI" after a security scan) creates its session in THIS repo's project, resolved from `GET /api/repo-project` (`app/routes/project_api.py`), switching the browser to that project first when it is registered. It used to use the browser's active project, so pressing Update while viewing CustomerNode put a "Fix test failures" session in CustomerNode. The session works on VibeNode's tests and scan, so it lives in VibeNode's project; do not go back to `_currentProjectDir()` for its `cwd`.

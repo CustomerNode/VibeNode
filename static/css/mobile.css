@@ -595,11 +595,17 @@
      Reposition to a centered pill under the header + notch, and give it the frosted
      iOS look (blur, capsule, soft shadow, slide-down). ---- */
   .toast {
+    --vn-float: top;   /* opts out of the bottom float stack: see _layoutFloats() in utils.js */
     top: calc(env(safe-area-inset-top) + 58px);   /* just under the 52px header */
     bottom: auto;
-    left: 50%;
-    right: auto;
-    transform: translateX(-50%) translateY(-12px);
+    /* Centred by auto margins between two 16px edges, so the capsule can use
+       the full width.  `left: 50%` + translateX(-50%) capped it at half the
+       screen and wrapped short messages onto two lines. */
+    left: 16px;
+    right: 16px;
+    width: fit-content;
+    margin: 0 auto;
+    transform: translateY(-12px);
     max-width: calc(100vw - 32px);
     text-align: center;
     padding: 11px 18px;
@@ -614,7 +620,7 @@
     box-shadow: 0 10px 34px rgba(0, 0, 0, 0.4);
     transition: opacity 0.25s ease, transform 0.28s cubic-bezier(.32, .72, 0, 1);
   }
-  .toast.show { transform: translateX(-50%) translateY(0); }
+  .toast.show { transform: translateY(0); }
   /* Error toasts keep a red accent but the same capsule shape + top position. */
   .toast.error {
     background: rgba(58, 20, 22, 0.92);
