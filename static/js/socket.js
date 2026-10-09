@@ -1815,6 +1815,29 @@ socket.on('queue_updated', (data) => {
     }
 });
 
+// A local script posted a line into a session through the message hook
+// (POST /api/hook/message). The daemon gives it to the agent, or queues it, but
+// pushes no bubble for a message that no client typed. So the tab showing that
+// session draws it now; every other tab, and a line that was queued or could
+// not be delivered, gets a toast. A queued line's bubble comes with
+// queue_dispatched below.
+socket.on('hook_message', (data) => {
+    try {
+        const d = data || {};
+        const sid = d.session_id || '';
+        if (!sid || (sid !== liveSessionId && !allSessionIds.has(sid))) return;   // another project's session
+        if (sid === liveSessionId && d.delivered === 'sent' && d.message
+            && typeof _addOptimisticBubble === 'function') {
+            _addOptimisticBubble(sid, d.message);
+            return;
+        }
+        if (d.text && typeof showToast === 'function') {
+            const line = (d.source ? d.source + ': ' : '') + d.text;
+            showToast(line.length > 160 ? line.slice(0, 157) + '\u2026' : line, d.delivered === 'no');
+        }
+    } catch (e) { /* a notice never breaks the other handlers */ }
+});
+
 // Server auto-dispatched a queued message — show toast + optimistic user bubble
 socket.on('queue_dispatched', (data) => {
     const sid = data.session_id;

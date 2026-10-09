@@ -6415,6 +6415,56 @@ paths:
               schema:
                 type: object
 
+  /api/hook/message:
+    post:
+      tags: [App]
+      summary: Post a line from a local script into a session
+      operationId: hookMessage
+      description: |
+        Shows the text in the session's thread under its source, and hands it
+        to the session's agent as its next input: at once when the agent is
+        idle, after the current turn when it is working. The agent receives it
+        marked as posted by a script (a report, not an instruction from the
+        user). Local callers only: requests that arrive through the tailnet
+        proxy or from a browser page are refused with 403. Broadcasts the
+        Socket.IO event hook_message to every connected client.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, text]
+              properties:
+                session_id:
+                  type: string
+                text:
+                  type: string
+                source:
+                  type: string
+                  description: Who is speaking, shown in the thread (default "Script")
+                kind:
+                  type: string
+                  description: A short slug for the event, e.g. release.live
+      responses:
+        "200":
+          description: Accepted; "delivered" is sent, queued, or no
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  delivered:
+                    type: string
+                    enum: [sent, queued, "no"]
+                  error:
+                    type: string
+        "400":
+          description: session_id or text missing, or the body is not a JSON object
+        "403":
+          description: Not a local caller
   /api/notify/approval:
     post:
       tags: [App]

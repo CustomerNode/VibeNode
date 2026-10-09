@@ -429,6 +429,29 @@ function _clearDraft(sessionId) {
   _persistDraftsToStorage(_drafts);
 }
 
+// ── A line a local script posted through the message hook ──────────────────
+// POST /api/hook/message wraps it as
+//   ⟦VN-EVENT source="…" kind="…"⟧ body ⟦VN-EVENT-NOTE⟧note for the agent⟦/VN-EVENT⟧
+// Returns {source, kind, body}, or null for ordinary text. Not anchored to the
+// start: the daemon may put an inbox block in front of a message.
+function _parseVnEvent(text) {
+  if (!text || String(text).indexOf('⟦VN-EVENT') === -1) return null;
+  const m = String(text).match(/⟦VN-EVENT([^⟧]*)⟧\s*([\s\S]*?)\s*(?:⟦VN-EVENT-NOTE⟧[\s\S]*?)?⟦\/VN-EVENT⟧/);
+  if (!m) return null;
+  const attr = function (name) {
+    const a = m[1].match(new RegExp(name + '="([^"]*)"'));
+    return a ? a[1] : '';
+  };
+  return {source: attr('source') || 'Script', kind: attr('kind') || 'event', body: m[2]};
+}
+
+// What a queued message shows as while it waits: a hook line reads
+// "Source: text", never its raw markers.
+function _queueDisplayText(text) {
+  const ev = _parseVnEvent(text);
+  return ev ? ev.source + ': ' + ev.body : text;
+}
+
 // ── Strip "Sent from Q at ..." footer from message text for display ──
 function _stripVnMeta(text) {
   // Remove the server-injected headless-mobile preamble (⟦VN-MOBILE⟧…⟦/VN-MOBILE⟧)
@@ -660,7 +683,7 @@ function _renderQueueBanner() {
     'Remove</button>' +
     '</span>' +
     '</div>' +
-    '<div class="live-queue-banner-text">' + escHtml(text) + '</div>' +
+    '<div class="live-queue-banner-text">' + escHtml(_queueDisplayText(text)) + '</div>' +
     '</div>';
 }
 
@@ -1904,6 +1927,18 @@ function renderLiveEntry(e, opts) {
       text = vnMeta.clean;
       vnSentAt = vnMeta.sentAt;
       vnIsVoice = vnMeta.voice;
+    }
+
+    // A line a local script posted through the message hook: drawn under its
+    // source, not as "me", because the user did not type it.
+    const vnEvent = e.kind === 'user' ? _parseVnEvent(text) : null;
+    if (vnEvent) {
+      div.className = 'msg user vn-event-msg';
+      const evTs = e.timestamp ? _formatMsgTime(e.timestamp) : '';
+      div.innerHTML = '<div class="msg-role">' + escHtml(vnEvent.source) + (evTs ? ' <span class="msg-time">' + evTs + '</span>' : '') + '</div>' +
+        '<div class="msg-body msg-content"></div>';
+      _fillMsgBody(div, 'user', vnEvent.body, false);
+      return div;
     }
 
     // Render [[invoke]] blocks as gradient pills instead of full markdown
@@ -3512,6 +3547,9 @@ function _addOptimisticBubble(sid, text, isVoice) {
   if (sid !== liveSessionId) return;
   const logEl = document.getElementById('live-log');
   if (!logEl) return;
+  // A hook line (see _parseVnEvent) is drawn under its source, without its markers.
+  const _vnEvent = _parseVnEvent(text);
+  if (_vnEvent) text = _vnEvent.body;
 
   // Clear skeleton/placeholder on first message
   const skel = logEl.querySelector('.skel-bar, .skeleton-loader, .skel-row');
@@ -3529,7 +3567,7 @@ function _addOptimisticBubble(sid, text, isVoice) {
   const timestamp = h + ':' + String(now.getMinutes()).padStart(2, '0') + ' ' + (now.getHours() >= 12 ? 'PM' : 'AM');
   const msgId = ++_optimisticMsgId;
   const userMsg = document.createElement('div');
-  userMsg.className = 'msg user msg-entering optimistic-bubble';
+  userMsg.className = 'msg user msg-entering optimistic-bubble' + (_vnEvent ? ' vn-event-msg' : '');
   userMsg.dataset.optimisticId = msgId;
   // Strip [[invoke::name::path=]]...[[/invoke]] tags and render as premium pill.
   // Reuse the same _renderInvokePills() helper the server-rendered path uses so
@@ -3542,14 +3580,14 @@ function _addOptimisticBubble(sid, text, isVoice) {
   } else {
     _bodyHtml = '<pre style="white-space:pre-wrap;margin:0;display:inline;">' + escHtml(text) + '</pre>';
   }
-  userMsg.innerHTML = '<div class="msg-role">me <span class="msg-time">' + timestamp + '</span></div><div class="msg-body msg-content">' + _bodyHtml + '</div>';
+  userMsg.innerHTML = '<div class="msg-role">' + (_vnEvent ? escHtml(_vnEvent.source) : 'me') + ' <span class="msg-time">' + timestamp + '</span></div><div class="msg-body msg-content">' + _bodyHtml + '</div>';
   // Add VN metadata footer
   const vnFooter = document.createElement('div');
   vnFooter.className = 'vn-msg-footer';
   const nowH = now.getHours() % 12 || 12;
   const _timeStr = nowH + ':' + String(now.getMinutes()).padStart(2, '0') + ' ' + (now.getHours() >= 12 ? 'PM' : 'AM');
   vnFooter.innerHTML = _vnMsgFooterHtml(isVoice, _timeStr);
-  userMsg.appendChild(vnFooter);
+  if (!_vnEvent) userMsg.appendChild(vnFooter);   // "sent from" belongs to what the user typed
   userMsg.addEventListener('animationend', () => userMsg.classList.remove('msg-entering'), {once: true});
   logEl.appendChild(userMsg);
   logEl.scrollTop = logEl.scrollHeight;
