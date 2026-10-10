@@ -546,3 +546,42 @@ def test_model_restart_for_an_old_cli_waits_for_the_turn(app):
     app.state("stopped")
     start = app.emits("start_session")[0]
     assert start["model"] == "claude-opus-5-5" and start["thinking_level"] == "medium"
+
+
+# ── 3. The usage-limit banner (added 2026-10-09) ────────────────────────
+# A Fable session that hits its limit switches to the newest Opus by itself
+# (SessionManager._limit_switch_plan); the banner says so during the
+# countdown, and its "Switch to" chips are the newest model of each family.
+
+@pytest.mark.slow
+def test_limit_chips_offer_the_newest_model_of_each_family(app):
+    app.js("""() => { window._statusModels = [
+        {id: 'claude-fable-5-1'}, {id: 'claude-opus-5-5'}, {id: 'claude-opus-6'},
+        {id: 'claude-sonnet-5'}, {id: 'claude-sonnet-5-5'}, {id: 'claude-haiku-4-5-20251001'}]; }""")
+    assert app.js("() => _limitAlternatives('claude-fable-5-1')") == ["claude-opus-6", "claude-sonnet-5-5"]
+    assert app.js("() => _limitAlternatives('claude-opus-6')") == [
+        "claude-sonnet-5-5", "claude-haiku-4-5-20251001"]
+
+
+@pytest.mark.slow
+def test_limit_chips_fall_back_before_the_model_list_loads(app):
+    app.js("() => { window._statusModels = undefined; window._statusModelsLoading = true; }")
+    assert app.js("() => _limitAlternatives('claude-fable-5-1')") == ["claude-opus-5-5", "claude-sonnet-5"]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("switch_to, expected", [
+    ("claude-opus-5-5[1m]", 'switching to <strong style="color:var(--text);">Opus 5.5</strong> in'),
+    # A bare alias: the family, not the legacy alias label ("Opus 4.6").
+    ("opus[1m]", 'switching to <strong style="color:var(--text);">Opus</strong> in'),
+    ("", "continues automatically in"),
+])
+def test_limit_banner_says_what_happens_next(app, switch_to, expected):
+    html = app.js("""([sid, sw]) => {
+        window._sessionRetryState = window._sessionRetryState || {};
+        window._sessionRetryState[sid] = {retry_at: Date.now() / 1000 + 5};
+        return _buildUsageLimitBanner(sid, {limited_model: 'claude-fable-5-1',
+            limit_reset_at: Date.now() / 1000 + 3600, limit_switch_to: sw});
+    }""", [SID, switch_to])
+    assert expected in html
+    assert "[1m]" not in html

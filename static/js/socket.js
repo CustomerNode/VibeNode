@@ -480,6 +480,10 @@ function _ingestLimitState(id, s) {
             // 0 is a legitimate value meaning "reset time unknown" — the banner
             // then renders without a countdown instead of inventing one.
             limit_reset_at: Number(s.limit_reset_at) || 0,
+            // Set while the daemon is about to switch this session to another
+            // model and continue (usage-limit auto-switch): the banner then
+            // says "switching to Opus 5.5 in 5s" instead of waiting for reset.
+            limit_switch_to: s.limit_switch_to || '',
         };
     } else {
         delete window._sessionLimitState[id];

@@ -225,6 +225,37 @@ class ClaudeAgentSDK(AgentSDK):
         level = applied.get("effort")
         return level if isinstance(level, str) else None
 
+    def supported_models(self, client: ClaudeSDKClient) -> list:
+        """The models this session's CLI process can run, from the ``models``
+        list in its ``initialize`` response.
+
+        Entries look like ``{"value": "opus", "resolvedModel":
+        "claude-opus-5-5", "displayName": "Opus 5.5", ...}``.  The family
+        aliases (``opus``, ``fable``, ``sonnet``, ``haiku``) resolve to the
+        CLI's NEWEST model of that family, so this is the one source that
+        knows about a model released after VibeNode was last updated, and it
+        never offers a model the running process would reject.  Probed against
+        CLI 2.1.291 on 2026-10-09.  Read from the SDK's stored response (no
+        request is sent).  Returns [] when the CLI did not report a list (older
+        CLIs) or the client is not connected.  Never raises.
+        """
+        query = getattr(client, "_query", None) if client is not None else None
+        init = getattr(query, "_initialization_result", None) if query is not None else None
+        models = init.get("models") if isinstance(init, dict) else None
+        return [m for m in models if isinstance(m, dict)] if isinstance(models, list) else []
+
+    async def applied_model(self, client: ClaudeSDKClient) -> Optional[str]:
+        """The model the CLI runs now, from ``get_settings`` (``applied.model``):
+        how a switch to a family alias ("opus") learns the concrete id the CLI
+        resolved it to.  None when the CLI cannot say (older CLIs)."""
+        query = getattr(client, "_query", None) if client is not None else None
+        if query is None:
+            return None
+        resp = await query._send_control_request({"subtype": "get_settings"})
+        applied = resp.get("applied") if isinstance(resp, dict) else None
+        model = applied.get("model") if isinstance(applied, dict) else None
+        return model if isinstance(model, str) and model else None
+
     async def disconnect(self, client: ClaudeSDKClient) -> None:
         """Disconnect the Claude client.
 

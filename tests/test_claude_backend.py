@@ -2199,3 +2199,57 @@ class TestSetEffort:
 
         with pytest.raises(NotImplementedError):
             anyio.run(_Minimal().set_effort, object(), "high")
+
+
+# =========================================================================
+# Section 8c: The CLI's own model list (supported_models)
+#
+# The usage-limit auto-switch picks "the newest Opus" from the session's CLI:
+# its initialize response lists every model it can run, with family aliases
+# ("opus") resolved to the newest of each family.  Probed against CLI 2.1.291
+# on 2026-10-09.
+# =========================================================================
+
+class TestSupportedModels:
+
+    def test_reads_the_initialize_response(self):
+        from unittest.mock import MagicMock
+        from daemon.backends.claude import ClaudeAgentSDK
+        client = MagicMock()
+        client._query._initialization_result = {"models": [
+            {"value": "opus", "resolvedModel": "claude-opus-5-5"}, "junk",
+            {"value": "claude-opus-5", "resolvedModel": "claude-opus-5"}]}
+        assert ClaudeAgentSDK().supported_models(client) == [
+            {"value": "opus", "resolvedModel": "claude-opus-5-5"},
+            {"value": "claude-opus-5", "resolvedModel": "claude-opus-5"}]
+
+    @pytest.mark.parametrize("init", [None, {}, {"models": "x"}, {"models": None}])
+    def test_older_cli_or_no_response_reports_nothing(self, init):
+        from unittest.mock import MagicMock
+        from daemon.backends.claude import ClaudeAgentSDK
+        client = MagicMock()
+        client._query._initialization_result = init
+        assert ClaudeAgentSDK().supported_models(client) == []
+
+    def test_disconnected_client_reports_nothing(self):
+        from unittest.mock import MagicMock
+        from daemon.backends.claude import ClaudeAgentSDK
+        client = MagicMock()
+        client._query = None
+        assert ClaudeAgentSDK().supported_models(client) == []
+        assert ClaudeAgentSDK().supported_models(None) == []
+
+    def test_applied_model_reads_get_settings(self):
+        """How a switch to a family alias learns the concrete id."""
+        import anyio
+        from unittest.mock import AsyncMock, MagicMock
+        from daemon.backends.claude import ClaudeAgentSDK
+        client = MagicMock()
+        client._query._send_control_request = AsyncMock(
+            return_value={"applied": {"model": "claude-opus-5-5", "effort": "high"}})
+        assert anyio.run(ClaudeAgentSDK().applied_model, client) == "claude-opus-5-5"
+        client._query._send_control_request.assert_awaited_once_with({"subtype": "get_settings"})
+        client._query._send_control_request = AsyncMock(return_value={})
+        assert anyio.run(ClaudeAgentSDK().applied_model, client) is None
+        client._query = None
+        assert anyio.run(ClaudeAgentSDK().applied_model, client) is None

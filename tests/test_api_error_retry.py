@@ -1348,9 +1348,509 @@ class TestUsageLimitAutoResume:
         assert info._api_retry_needed is True
         assert info._limit_resume_at >= info.limit_reset_at
         assert info.error != "Session ended with error"
+        # A "session limit" binds every model: a Fable session waits for the
+        # reset rather than switching (TestUsageLimitAutoSwitch).
+        assert info.limit_switch_to == ""
 
     def test_exception_channel_schedules_the_continue(self, session_manager, sm_module):
         info = _make_idle_session(sm_module, session_manager, "lim-exc")
         assert session_manager._flag_api_retry_if_transient(info, REAL_LIMIT_TEXT) is True
         assert info.limit_reset_at > 0
         assert info._limit_resume_at > 0
+
+
+# ===========================================================================
+# A Fable limit switches to the newest Opus and keeps going (added 2026-10-09)
+#
+# Asked for: when a Fable session hits its usage limit, switch to Opus and
+# continue instead of waiting days for the reset, for every future Fable and
+# Opus version, defaulting to the most recent Opus.  Keyed by family; the
+# target comes from the session's own CLI (its "opus" alias resolves to the
+# CLI's newest Opus), else from VibeNode's model list.  Only a limit that binds
+# the model ("Fable limit") switches; the 5-hour "session limit" and the
+# "weekly limit" bind every model.  If Opus then hits its own limit, the
+# session continues on whichever model resets first.  The switch rides the
+# auto-retry countdown (visible, cancellable) and falls back to the
+# continue-at-reset plan when it fails.
+# ===========================================================================
+
+# What CLI 2.1.291 reported in its initialize response (probed 2026-10-09).
+CLI_MODELS = [
+    {"value": "default", "resolvedModel": "claude-opus-5-5"},
+    {"value": "opus", "resolvedModel": "claude-opus-5-5"},
+    {"value": "fable", "resolvedModel": "claude-fable-5-1"},
+    {"value": "sonnet", "resolvedModel": "claude-sonnet-5-5"},
+    {"value": "haiku", "resolvedModel": "claude-haiku-4-5-20251001"},
+    {"value": "claude-opus-5", "resolvedModel": "claude-opus-5"},
+    {"value": "claude-fable-5", "resolvedModel": "claude-fable-5"},
+    {"value": "claude-opus-4-8", "resolvedModel": "claude-opus-4-8"},
+]
+FABLE_LIMIT_TEXT = "You've hit your Fable limit · resets Oct 12, 9am (America/New_York)"
+DAY = 24 * 3600
+
+
+def _limited(sm_module, manager, sid, model="claude-fable-5-1", reset_in=3 * DAY,
+             scope="model"):
+    """An idle session just stopped by a usage limit on ``model``."""
+    info = _make_idle_session(sm_module, manager, sid)
+    info.model = model
+    info.limited_model = model
+    info.limit_reset_at = time.time() + reset_in
+    info._limit_scope = scope
+    info.client = object()
+    return info
+
+
+def _run(manager, coro, timeout=10):
+    return asyncio.run_coroutine_threadsafe(coro, manager._loop).result(timeout)
+
+
+class TestUsageLimitAutoSwitch:
+
+    # ── which limits switch ──
+
+    @pytest.mark.parametrize("text, scope", [
+        (FABLE_LIMIT_TEXT, "model"),
+        ("You've hit your Opus limit · resets Oct 14, 9am (America/New_York)", "model"),
+        (REAL_LIMIT_TEXT, "account"),                              # "session limit"
+        ("You've hit your weekly limit · resets Oct 9, 5pm (America/New_York)", "account"),
+        ("You've hit your usage credit limit", "account"),
+        ("You've hit your monthly spend limit.", "account"),
+        ("You've hit your team's shared budget. /model to switch models.", "account"),
+        ("Usage limit reached", ""),
+    ])
+    def test_limit_scope_follows_the_clis_names(self, session_manager, text, scope):
+        assert session_manager._limit_scope(text) == scope
+
+    @pytest.mark.parametrize("text, family, scope", [
+        # Another model's limit says nothing about this one.
+        ("You've hit your Opus limit · resets Oct 14, 9am (America/New_York)", "fable", ""),
+        ("You've hit your Opus limit · resets Oct 14, 9am (America/New_York)", "opus", "model"),
+        # A model name next to "limit" wins over a window word around it.
+        ("Opus weekly limit reached", "opus", "model"),
+        ("You've hit your weekly Fable limit", "fable", "model"),
+        ("Your Max plan's Fable limit is used up", "fable", "model"),
+        ("Credit balance is too low", "fable", "account"),
+    ])
+    def test_limit_scope_for_the_sessions_family(self, session_manager, text, family, scope):
+        assert session_manager._limit_scope(text, family) == scope
+
+    def test_account_wide_limits_never_switch(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-acct", scope="account")
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._limit_switch_plan(info) is None
+
+    def test_unknown_wording_asks_the_usage_tracker(self, session_manager, sm_module):
+        """A limit that names no window: if both account windows still have
+        room, the one that was hit must be the model's own."""
+        info = _limited(sm_module, session_manager, "sw-unknown", scope="")
+        now = time.time()
+        future = now + DAY
+
+        def state(five=0.4, seven=0.7, resets=future, seen=now):
+            return {"windows": {
+                "five_hour": {"utilization": five, "resets_at": resets, "seen_at": seen},
+                "seven_day": {"utilization": seven, "resets_at": resets, "seen_at": seen}}}
+
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            session_manager._usage_state = state()
+            assert session_manager._limit_switch_plan(info)[0] == "claude-opus-5-5"
+            for blocked in (state(five=1.0), {},
+                            state(seen=now - 3600),              # too old to vouch for now
+                            state(resets=now - 60)):             # a window that has ended
+                session_manager._usage_state = blocked
+                assert session_manager._limit_switch_plan(info) is None
+
+    def test_switch_back_needs_a_recognised_model_limit(self, session_manager, sm_module):
+        """On wording that names no window, two models must not trade places
+        every probe interval on a limit neither can pass."""
+        info = _limited(sm_module, session_manager, "sw-no-pingpong", model="claude-opus-5-5",
+                        reset_in=0, scope="")
+        info.limit_reset_at = 0.0                                 # no reset time stated
+        info._limit_origin = "claude-fable-5-1"
+        info._limit_until["fable"] = time.time() - 10            # Fable looks free
+        now = time.time()
+        session_manager._usage_state = {"windows": {
+            k: {"utilization": 0.2, "resets_at": now + DAY, "seen_at": now}
+            for k in ("five_hour", "seven_day")}}
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._limit_switch_plan(info) is None
+            info._limit_scope = "model"
+            assert session_manager._limit_switch_plan(info)[0] == "claude-fable-5-1"
+
+    @pytest.mark.parametrize("limited", ["claude-opus-5-5", "claude-sonnet-5", "claude-haiku-4-5", ""])
+    def test_only_fable_switches(self, session_manager, sm_module, limited):
+        info = _limited(sm_module, session_manager, "sw-other", model=limited)
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._limit_switch_plan(info) is None
+
+    @pytest.mark.parametrize("switch", ["_LIMIT_AUTO_SWITCH", "_LIMIT_AUTO_RESUME"])
+    def test_kill_switches(self, session_manager, sm_module, monkeypatch, switch):
+        monkeypatch.setattr(sm_module.SessionManager, switch, False)
+        info = _limited(sm_module, session_manager, "sw-off")
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._limit_switch_plan(info) is None
+
+    def test_a_reset_that_just_passed_does_not_switch(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-passed", reset_in=-30)
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._limit_switch_plan(info) is None
+
+    # ── choosing the target ──
+
+    def test_target_is_the_clis_own_newest_opus(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-alias")
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._newest_model_of(info, "opus") == "claude-opus-5-5"
+            plan = session_manager._limit_switch_plan(info)
+        assert plan[0] == "claude-opus-5-5"
+        assert plan[1] == pytest.approx(time.time() + session_manager._LIMIT_SWITCH_DELAY, abs=2)
+
+    def test_target_covers_future_versions(self, session_manager, sm_module):
+        """No ids in the code: a future Opus is the target, from the alias and
+        from a plain list without one."""
+        info = _limited(sm_module, session_manager, "sw-future", model="claude-fable-6")
+        future = [{"value": "opus", "resolvedModel": "claude-opus-6-1"}]
+        with patch.object(session_manager._sdk, "supported_models", return_value=future):
+            assert session_manager._limit_switch_plan(info)[0] == "claude-opus-6-1"
+        no_alias = [{"value": m, "resolvedModel": m} for m in
+                    ("claude-opus-5-5", "claude-opus-6", "claude-opus-6-2-20270101",
+                     "claude-opus-6-2", "claude-sonnet-7")]
+        with patch.object(session_manager._sdk, "supported_models", return_value=no_alias):
+            assert session_manager._newest_model_of(info, "opus") == "claude-opus-6-2"
+
+    def test_target_falls_back_to_vibenode_models(self, session_manager, sm_module):
+        """A CLI that does not report its models: VibeNode's own list."""
+        info = _limited(sm_module, session_manager, "sw-list")
+        with patch.object(session_manager._sdk, "supported_models", return_value=[]), \
+             patch.object(session_manager, "_known_models",
+                          return_value=["claude-fable-5-1", "claude-opus-5", "claude-opus-5-5",
+                                        "claude-opus-5-20260601", "claude-sonnet-5-5"]):
+            assert session_manager._newest_model_of(info, "opus") == "claude-opus-5-5"
+
+    def test_an_alias_without_a_resolved_id_is_used_as_is(self, session_manager, sm_module):
+        """The CLI resolves it; _apply_limit_switch reads back what it ran."""
+        info = _limited(sm_module, session_manager, "sw-bare-alias")
+        listed = [{"value": "opus"}, {"value": "claude-opus-5", "resolvedModel": "claude-opus-5"}]
+        with patch.object(session_manager._sdk, "supported_models", return_value=listed):
+            assert session_manager._newest_model_of(info, "opus") == "opus"
+            # A 1M session keeps 1M on the alias too (CLI 2.1.291 accepts
+            # "opus[1m]" and runs claude-opus-5-5[1m]).
+            info.limited_model = "claude-fable-5-1[1m]"
+            assert session_manager._newest_model_of(info, "opus") == "opus[1m]"
+
+    def test_a_1m_session_stays_1m(self, session_manager, sm_module):
+        """Its context may not fit in 200K.  A marker already on the resolved
+        id is not doubled, and is not added to a session that had none."""
+        info = _limited(sm_module, session_manager, "sw-1m", model="claude-fable-5-1[1m]")
+        marked = [{"value": "opus", "resolvedModel": "claude-opus-5-5[1m]"}]
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._newest_model_of(info, "opus") == "claude-opus-5-5[1m]"
+        with patch.object(session_manager._sdk, "supported_models", return_value=marked):
+            assert session_manager._newest_model_of(info, "opus") == "claude-opus-5-5[1m]"
+            info.limited_model = "claude-fable-5-1"
+            assert session_manager._newest_model_of(info, "opus") == "claude-opus-5-5"
+
+    def test_model_helpers(self, sm_module):
+        S = sm_module.SessionManager
+        assert S._model_family("claude-fable-5-1[1m]") == "fable"
+        assert S._model_version("claude-opus-5") == (5, 0)
+        assert S._model_version("claude-haiku-4-5-20251001") == (4, 5)
+        assert S._model_version("claude-opus-4-20250514") == (4, 0)   # not 4.20250514
+        assert S._model_label("claude-opus-4-20250514") == "Opus 4"
+        assert S._model_label("claude-opus-5-5[1m]") == "Opus 5.5"
+        assert S._model_label("opus") == "Opus"
+        assert S._model_label("opus[1m]") == "Opus"
+        assert S._model_family("opus[1m]") == "opus"
+        assert S._model_family("default") == ""
+        assert S._newest_in_family(["claude-opus-5-5", "claude-opus-5-20260601"], "opus") \
+            == "claude-opus-5-5"
+        assert S._newest_in_family(["opus", "claude-opus-5"], "opus") == "claude-opus-5"
+
+    # ── when Opus is limited too: whichever model resets first ──
+
+    def test_opus_limit_goes_back_to_fable_when_fable_resets_first(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-back", model="claude-opus-5-5",
+                        reset_in=4 * DAY)
+        info._limit_origin = "claude-fable-5-1"
+        fable_free = time.time() + 2 * DAY
+        info._limit_until["fable"] = fable_free
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            plan = session_manager._limit_switch_plan(info)
+        assert plan == ("claude-fable-5-1", fable_free)
+
+    def test_opus_limit_waits_when_opus_resets_first(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-stay", model="claude-opus-5-5",
+                        reset_in=1 * DAY)
+        info._limit_origin = "claude-fable-5-1"
+        info._limit_until["fable"] = time.time() + 4 * DAY
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._limit_switch_plan(info) is None
+
+    def test_an_origin_that_has_reset_is_switched_back_to_now(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-back-now", model="claude-opus-5-5")
+        info._limit_origin = "claude-fable-5-1"
+        info._limit_until["fable"] = time.time() - 10
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            plan = session_manager._limit_switch_plan(info)
+        assert plan[0] == "claude-fable-5-1"
+        assert plan[1] == pytest.approx(time.time() + session_manager._LIMIT_SWITCH_DELAY, abs=2)
+
+    def test_a_known_limited_opus_is_only_used_if_it_frees_up_first(self, session_manager, sm_module):
+        opus_free = time.time() + 1 * DAY
+        soon = _limited(sm_module, session_manager, "sw-wait", reset_in=3 * 3600)
+        soon._limit_until["opus"] = opus_free
+        later = _limited(sm_module, session_manager, "sw-later", reset_in=3 * DAY)
+        later._limit_until["opus"] = opus_free
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._limit_switch_plan(soon) is None      # Fable back in 3h
+            assert session_manager._limit_switch_plan(later) == ("claude-opus-5-5", opus_free)
+
+    # ── scheduling and arming ──
+
+    def test_schedule_switches_instead_of_waiting_for_the_reset(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-sched")
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._schedule_limit_resume(info) is True
+        assert info.limit_switch_to == "claude-opus-5-5"
+        assert info._api_retry_needed is True
+        assert info.retry_reason == "Switching to Opus 5.5"
+        assert info._limit_resume_at == pytest.approx(
+            time.time() + session_manager._LIMIT_SWITCH_DELAY, abs=2)
+        assert info.to_state_dict()["limit_switch_to"] == "claude-opus-5-5"
+
+    def test_switch_still_needs_a_turn_and_budget(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-budget")
+        info._api_retry_count = session_manager._API_RETRY_MAX
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._schedule_limit_resume(info) is False
+        assert info.limit_switch_to == ""
+
+    def test_arm_counts_down_to_the_switch_without_the_spread(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-arm")
+        info.limit_switch_to = "claude-opus-5-5"
+        info._api_retry_needed = True
+        info._limit_resume_at = time.time() + 5
+        try:
+            session_manager._arm_api_retry(info.session_id, info)
+            assert info.retry_at == pytest.approx(time.time() + 5, abs=2)   # no 30s spread
+            assert any("Fable 5.1 hit its usage limit. Switching to Opus 5.5 and continuing"
+                       in (e.text or "") for e in info.entries)
+        finally:
+            session_manager._clear_api_retry(info, reset_count=True)
+        assert info.limit_switch_to == ""                     # cleared with the countdown
+
+    def test_arm_says_when_a_switch_back_waits_for_a_reset(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-arm-back", model="claude-opus-5-5")
+        info.limit_switch_to = "claude-fable-5-1"
+        info._api_retry_needed = True
+        info._limit_resume_at = time.time() + 2 * 3600
+        try:
+            session_manager._arm_api_retry(info.session_id, info)
+            assert any("Switching to Fable 5.1 when its limit resets" in (e.text or "")
+                       for e in info.entries)
+        finally:
+            session_manager._clear_api_retry(info, reset_count=True)
+
+    def test_a_skipped_arm_drops_the_plan(self, session_manager, sm_module):
+        """A newer turn supersedes the retry; a later, unrelated error must not
+        inherit its limit wait or its switch."""
+        info = _limited(sm_module, session_manager, "sw-skip")
+        info.state = sm_module.SessionState.WORKING
+        info.limit_switch_to = "claude-opus-5-5"
+        info._limit_resume_at = time.time() + 5
+        session_manager._arm_api_retry(info.session_id, info)
+        assert info.retry_at == 0.0
+        assert info._limit_resume_at == 0.0 and info.limit_switch_to == ""
+
+    # ── the switch itself ──
+
+    def test_switch_confirms_then_resumes_the_turn(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-go")
+        info.limit_switch_to = "claude-opus-5-5"
+        info.retry_at = time.time() + 1
+        pushes, sent = [], []
+        session_manager._push_callback = lambda n, d: pushes.append((n, d))
+
+        def fake_send(sid, text, **kw):
+            sent.append((sid, text, kw))
+            return {"ok": True}
+
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()) as set_model, \
+             patch.object(session_manager, "send_message", side_effect=fake_send):
+            _run(session_manager, session_manager._switch_then_fire(info.session_id, info))
+        set_model.assert_awaited_once()
+        assert set_model.await_args.args[1] == "claude-opus-5-5"
+        assert info.model == "claude-opus-5-5"
+        assert info.limited_model == "" and info.limit_switch_to == "" and info.error == ""
+        assert info._limit_origin == "claude-fable-5-1"         # Opus limit later: back to it
+        assert info._model_switch_in_progress is True            # the resumed turn clears it
+        ev = [d for n, d in pushes if n == "session_model_changed"]
+        assert ev and ev[-1]["model"] == "claude-opus-5-5" and ev[-1]["limited_model"] == ""
+        assert any(e.text == "Switched to Opus 5.5." for e in info.entries)
+        # The interrupted request is re-sent (no tool ran yet), as an auto-retry.
+        assert sent and sent[0][1] == "do the thing" and sent[0][2].get("_auto_retry") is True
+
+    def test_switching_back_clears_the_origin(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-home", model="claude-opus-5-5")
+        info._limit_origin = "claude-fable-5-1"
+        info.limit_switch_to = "claude-fable-5-1"
+        info.retry_at = time.time() + 1
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()), \
+             patch.object(session_manager, "send_message", return_value={"ok": True}):
+            _run(session_manager, session_manager._switch_then_fire(info.session_id, info))
+        assert info.model == "claude-fable-5-1" and info._limit_origin == ""
+
+    def test_an_alias_switch_records_what_the_cli_ran(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-readback")
+        info.limit_switch_to = "opus"
+        info.retry_at = time.time() + 1
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()), \
+             patch.object(session_manager._sdk, "applied_model",
+                          new=AsyncMock(return_value="claude-opus-5-5")), \
+             patch.object(session_manager, "send_message", return_value={"ok": True}):
+            _run(session_manager, session_manager._switch_then_fire(info.session_id, info))
+        assert info.model == "claude-opus-5-5"
+
+    def test_failed_switch_waits_for_the_reset_instead(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-fail")
+        info.limit_switch_to = "claude-opus-5-5"
+        info.retry_at = time.time() + 1
+        sent = []
+        try:
+            with patch.object(session_manager._sdk, "set_model",
+                              new=AsyncMock(side_effect=Exception("model not supported"))), \
+                 patch.object(session_manager, "send_message",
+                              side_effect=lambda *a, **k: sent.append(a) or {"ok": True}):
+                _run(session_manager, session_manager._switch_then_fire(info.session_id, info))
+            assert sent == []
+            assert info.model == "claude-fable-5-1" and info.limited_model == "claude-fable-5-1"
+            assert info.limit_switch_to == ""
+            assert info._model_switch_in_progress is False
+            reset_wait = info.limit_reset_at + session_manager._LIMIT_RESUME_GRACE
+            assert reset_wait <= info.retry_at <= reset_wait + 31
+            assert any("Could not switch to Opus 5.5" in (e.text or "") for e in info.entries)
+        finally:
+            session_manager._clear_api_retry(info, reset_count=True)
+
+    def test_cancel_during_the_switch_does_not_resend(self, session_manager, sm_module):
+        """Cancel (or Stop, or Sleep) lands while the control request is out."""
+        info = _limited(sm_module, session_manager, "sw-cancel-mid")
+        info.limit_switch_to = "claude-opus-5-5"
+        info.retry_at = time.time() + 1
+        sent = []
+
+        async def set_model_then_cancel(client, model):
+            session_manager._clear_api_retry(info, reset_count=True)
+
+        with patch.object(session_manager._sdk, "set_model", new=set_model_then_cancel), \
+             patch.object(session_manager, "send_message",
+                          side_effect=lambda *a, **k: sent.append(a) or {"ok": True}):
+            _run(session_manager, session_manager._switch_then_fire(info.session_id, info))
+        assert sent == []
+        assert info.model == "claude-opus-5-5"                  # the CLI did switch: recorded
+
+    def test_a_manual_switch_supersedes_a_pending_auto_switch(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-manual")
+        info.limit_switch_to = "claude-opus-5-5"
+        info._limit_origin = "claude-fable-5"
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()):
+            assert session_manager.set_session_model(info.session_id, "claude-sonnet-5")["ok"] is True
+        assert info.limit_switch_to == "" and info._limit_origin == ""
+        assert info.model == "claude-sonnet-5"
+
+    def test_a_failed_manual_switch_keeps_the_auto_switch(self, session_manager, sm_module):
+        """The pick did not happen, so the countdown still switches."""
+        info = _limited(sm_module, session_manager, "sw-manual-fail")
+        info.limit_switch_to = "claude-opus-5-5"
+        info.retry_at = time.time() + 5
+        with patch.object(session_manager._sdk, "set_model",
+                          new=AsyncMock(side_effect=Exception("model not supported"))):
+            assert session_manager.set_session_model(info.session_id, "claude-sonnet-5")["ok"] is False
+        assert info.limit_switch_to == "claude-opus-5-5"
+        # ... but not once the countdown is gone (Cancel meanwhile).
+        info.limit_switch_to = "claude-opus-5-5"
+        info.retry_at = 0.0
+        with patch.object(session_manager._sdk, "set_model",
+                          new=AsyncMock(side_effect=Exception("model not supported"))):
+            session_manager.set_session_model(info.session_id, "claude-sonnet-5")
+        assert info.limit_switch_to == ""
+
+    def test_an_earlier_manual_pick_does_not_suppress_a_later_switch(self, session_manager, sm_module):
+        """The user picks Fable again while it is still limited: the next Fable
+        limit must switch to Opus, not resend on Fable."""
+        info = _limited(sm_module, session_manager, "sw-repick")
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()):
+            assert session_manager.set_session_model(info.session_id, "claude-fable-5-1")["ok"] is True
+        info.limited_model = info.model
+        info.limit_reset_at = time.time() + DAY
+        info._limit_scope = "model"
+        info.retry_at = time.time() + 1
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            assert session_manager._schedule_limit_resume(info) is True
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()) as set_model, \
+             patch.object(session_manager, "send_message", return_value={"ok": True}):
+            _run(session_manager, session_manager._switch_then_fire(info.session_id, info))
+        set_model.assert_awaited_once()
+        assert info.model == "claude-opus-5-5"
+
+    def test_timer_switches_then_continues(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-timer")
+        info.limit_switch_to = "claude-opus-5-5"
+        info._api_retry_needed = True
+        info._limit_resume_at = time.time() + 1
+        sent = []
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()), \
+             patch.object(session_manager, "send_message",
+                          side_effect=lambda sid, text, **kw: sent.append(text) or {"ok": True}):
+            session_manager._arm_api_retry(info.session_id, info)
+            wait_for(lambda: sent, timeout=6)
+        assert info.model == "claude-opus-5-5"
+
+    def test_retry_now_switches_first(self, session_manager, sm_module):
+        info = _limited(sm_module, session_manager, "sw-now")
+        info.limit_switch_to = "claude-opus-5-5"
+        info.retry_at = time.time() + 600
+        sent = []
+        with patch.object(session_manager._sdk, "set_model", new=AsyncMock()) as set_model, \
+             patch.object(session_manager, "send_message",
+                          side_effect=lambda sid, text, **kw: sent.append(text) or {"ok": True}):
+            assert session_manager.retry_now(info.session_id)["ok"] is True
+            wait_for(lambda: sent, timeout=5)
+        set_model.assert_awaited_once()
+        assert info.model == "claude-opus-5-5"
+
+    def test_cancel_falls_back_to_waiting_for_the_reset(self, session_manager, sm_module):
+        """Cancel during "switching to Opus in 5s" means "don't switch"."""
+        info = _limited(sm_module, session_manager, "sw-cancel")
+        info.limit_switch_to = "claude-opus-5-5"
+        info.retry_at = time.time() + 5
+        try:
+            assert session_manager.cancel_auto_retry(info.session_id)["ok"] is True
+            assert info.limit_switch_to == ""
+            assert info.limited_model == "claude-fable-5-1"        # the CTA stays
+            reset_wait = info.limit_reset_at + session_manager._LIMIT_RESUME_GRACE
+            assert reset_wait <= info.retry_at <= reset_wait + 31
+            assert any("Not switching models" in (e.text or "") for e in info.entries)
+        finally:
+            session_manager._clear_api_retry(info, reset_count=True)
+
+    # ── end to end through _process_message ──
+
+    def test_fable_limit_result_schedules_the_switch(self, session_manager, sm_module):
+        from daemon.backends.messages import MessageKind, VibeNodeMessage
+        info = sm_module.SessionInfo(session_id="sw-e2e", state=sm_module.SessionState.WORKING)
+        info.model = "claude-fable-5-1"
+        info.client = object()
+        info.entries.append(sm_module.LogEntry(kind="user", text="build it"))
+        with session_manager._lock:
+            session_manager._sessions[info.session_id] = info
+        msg = VibeNodeMessage(kind=MessageKind.RESULT, is_error=True, subtype="success",
+                              data={"result": FABLE_LIMIT_TEXT}, session_id=info.session_id)
+        with patch.object(session_manager._sdk, "supported_models", return_value=CLI_MODELS):
+            _run(session_manager, session_manager._process_message(info.session_id, msg))
+        assert info.limited_model == "claude-fable-5-1"
+        assert info._limit_scope == "model"
+        assert info.limit_switch_to == "claude-opus-5-5"
+        assert info._api_retry_needed is True
+        assert info._limit_resume_at < info.limit_reset_at     # now, not at the reset

@@ -614,6 +614,10 @@ class SessionInfo:
     # render a model-switch CTA instead of a useless "Retry" button.
     limit_reset_at: float = 0.0    # epoch time.time() when the quota resets; 0 == unknown (banner then omits the countdown)
     limited_model: str = ""        # the model id that hit the limit, so the CTA can exclude it from the offered alternatives
+    limit_switch_to: str = ""      # the model this limited session is about to switch to and continue on (SessionManager._limit_switch_plan); "" == waiting for the reset instead.  Serialized so the banner can say "switching to Opus 5.5 in 5s".
+    _limit_scope: str = ""         # what the last limit binds: "model" (e.g. "Fable limit", switching helps), "account" ("session limit", "weekly limit", credits: every model is out) or "" (wording not recognised).  Set by _apply_usage_limit.
+    _limit_until: dict = field(default_factory=dict)  # family -> epoch its own (model-specific) limit resets, as seen in this session.  Lets a later limit on the other side pick whichever model resets first.
+    _limit_origin: str = ""        # the model an auto-switch moved this session away from ("" == none); a later limit on the new model may switch back to it.  Cleared by a manual model switch.
     # ── TTFT wall-clock instrumentation (opt-in) ──
     # Populated only when VIBENODE_TIMING_TTFT=1; otherwise stays at defaults
     # with zero allocations. See _ttft_* helpers near top of module.
@@ -692,6 +696,7 @@ class SessionInfo:
         # renders its own live countdown without a per-second emit.
         d["limit_reset_at"] = self.limit_reset_at
         d["limited_model"] = self.limited_model
+        d["limit_switch_to"] = self.limit_switch_to
         if self.usage:
             d["usage"] = self.usage
         # Include permission details for WAITING sessions so reconnecting
@@ -2061,6 +2066,7 @@ class SessionManager:
             # the recorded limit no longer describes this session.  Clear it
             # BEFORE the resume so the restart doesn't re-emit a stale CTA.
             self._clear_usage_limit(info)
+            info._limit_origin = ""
             info.error = ""
             if resume_turn:
                 prompt = self._resume_turn_prompt(info)
@@ -2164,6 +2170,18 @@ class SessionManager:
         # the next REAL auto-resume signal and leave the session shown IDLE
         # while it is working.
         info._model_switch_at = time.time()
+        # The user's pick beats a usage-limit auto-switch counting down: clear
+        # it BEFORE this blocking request, so the countdown cannot fire its own
+        # set_model behind this one.  Kept aside in case this pick fails.
+        pending_switch = info.limit_switch_to
+        info.limit_switch_to = ""
+
+        def _restore_pending_switch():
+            # The pick did not happen, so the auto-switch still stands, but
+            # only while its countdown does (a Cancel meanwhile ended it).
+            if pending_switch and info.retry_at > 0 and not info.limit_switch_to:
+                info.limit_switch_to = pending_switch
+
         try:
             fut = asyncio.run_coroutine_threadsafe(
                 self._sdk.set_model(info.client, model), self._loop
@@ -2171,18 +2189,23 @@ class SessionManager:
             fut.result(timeout=15)
         except NotImplementedError as e:
             info._model_switch_in_progress = False
+            _restore_pending_switch()
             return {"ok": False, "error": str(e)}
         except Exception as e:
             # The switch did not happen, so no side-effect init is coming —
             # clear the flag now rather than letting it linger and misfile
             # the next genuine auto-resume signal.
             info._model_switch_in_progress = False
+            _restore_pending_switch()
             logger.warning("set_session_model failed for %s -> %s: %s",
                            session_id, model, e)
             return {"ok": False, "error": f"Model switch rejected: {e}"}
 
         # CLI confirmed — now (and only now) record it, via the single sink.
         self._set_confirmed_model(info, model, save_registry=True)
+        # A manual choice ends any usage-limit auto-switch bookkeeping: a later
+        # limit must not "switch back" to a model the user moved away from.
+        info._limit_origin = ""
         # The session is no longer on the model that hit the wall, so retract
         # the usage-limit CTA and its error banner.  (The limit itself is
         # account+model scoped, so switching genuinely resolves it here.)
@@ -2377,6 +2400,10 @@ class SessionManager:
 
         Leaves the session idle with the error visible and the retry budget
         reset, so the user can type a fresh message or click manual Retry.
+        One exception: during a usage-limit auto-switch countdown ("switching
+        to Opus 5.5 in 5s"), Cancel means "don't switch", so the session goes
+        on to wait for its own limit to reset, as a visible countdown with its
+        own Cancel.
         """
         session_id = self._resolve_id(session_id)
         with self._lock:
@@ -2384,7 +2411,21 @@ class SessionManager:
         if not info:
             return {"ok": False, "error": "Session not found"}
         had_pending = info.retry_at > 0
+        had_switch = bool(getattr(info, "limit_switch_to", ""))
         self._clear_api_retry(info, reset_count=True)
+        if had_switch and info.limited_model \
+                and self._schedule_limit_resume(info, allow_switch=False):
+            # Cancel during "switching to Opus in 5s" means "don't switch",
+            # not "stop": wait for this model's own limit to reset instead,
+            # visibly, with its own Cancel.
+            entry = LogEntry(kind="system", text="Not switching models. Continuing on %s "
+                             "when its limit resets." % self._model_label(info.limited_model))
+            with info._lock:
+                info.entries.append(entry)
+                entry_index = len(info.entries) - 1
+            self._emit_entry(session_id, entry, entry_index)
+            self._arm_api_retry(session_id, info)
+            return {"ok": True}
         if had_pending:
             info.error = "Auto-retry cancelled — use Retry or type a new message"
             entry = LogEntry(kind="system", text="Auto-retry cancelled.")
@@ -2429,9 +2470,30 @@ class SessionManager:
             asyncio.run_coroutine_threadsafe(
                 self._do_retry_now_reconnect(session_id), self._loop
             )
+        elif countdown_active and getattr(info, "limit_switch_to", ""):
+            # A usage-limit auto-switch is counting down: "Retry now" means
+            # switch now, then continue.  The switch is a control request, so
+            # it runs on the loop, tracked like the timer so Cancel can stop it.
+            info._api_retry_task = asyncio.run_coroutine_threadsafe(
+                self._retry_now_switch(session_id, info), self._loop
+            )
         else:
             self._fire_api_retry(session_id, info)
         return {"ok": True}
+
+    async def _retry_now_switch(self, session_id: str, info) -> None:
+        """Retry-now during a usage-limit auto-switch countdown: switch, then
+        continue, inside the same exception boundary as the timer
+        (``_api_retry_timer``), so a failure leaves a usable manual Retry
+        instead of a countdown nothing will ever complete."""
+        try:
+            await self._switch_then_fire(session_id, info)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Retry-now switch crashed for %s", session_id)
+            self._fail_retry_open(
+                session_id, "Auto-retry failed unexpectedly — use Retry to resume.")
 
     async def _do_retry_now_reconnect(self, session_id: str) -> None:
         """Reconnect-then-fire path for retry_now when the transport is dead."""
@@ -2450,7 +2512,7 @@ class SessionManager:
             self._emit_state(info)
             return
         info._retry_needs_reconnect = False
-        self._fire_api_retry(session_id, info)
+        await self._switch_then_fire(session_id, info)
 
     def close_session_sync(self, session_id: str, timeout: float = 5.0) -> dict:
         """Close an SDK session and block until the disconnect finishes."""
@@ -6186,11 +6248,12 @@ class SessionManager:
                     _resume = self._schedule_limit_resume(info)
                     logger.info(
                         "Session %s hit a usage limit on %s (resets_at=%s, "
-                        "auto-continue=%s)",
+                        "auto-continue=%s, switch_to=%s)",
                         session_id, info.limited_model or "?",
                         info.limit_reset_at or "unknown",
                         time.strftime("%H:%M:%S", time.localtime(info._limit_resume_at))
                         if _resume else "off",
+                        info.limit_switch_to or "-",
                     )
                     entry = LogEntry(kind="system", text=info.error, is_error=True)
                 else:
@@ -6449,6 +6512,248 @@ class SessionManager:
     # after this short pause instead of waiting a full probe interval.
     _LIMIT_JUST_RESET_DELAY = 120.0
 
+    # ── Usage-limit auto-switch (added 2026-10-09) ──
+    # A session stopped by a MODEL-specific usage limit on a model of a family
+    # on the left switches to the NEWEST model of the family on the right and
+    # carries on with its turn, instead of waiting days for the reset.  Keyed
+    # by family, not id, so every future Fable version triggers it and the
+    # newest Opus is always the target, with no code change when either ships.
+    # Account-wide limits (the 5-hour "session limit", the "weekly limit",
+    # credits) bind every model, so they never switch.  See _limit_switch_plan
+    # and _apply_limit_switch.
+    _LIMIT_SWITCH_FAMILIES = {"fable": "opus"}
+    _LIMIT_AUTO_SWITCH = os.environ.get("VIBENODE_LIMIT_AUTO_SWITCH", "1") != "0"
+    # Pause before switching: long enough to see the banner and press Cancel,
+    # short enough to feel immediate.  Rides the auto-retry countdown, so
+    # Cancel and the queue gate work during it.
+    _LIMIT_SWITCH_DELAY = float(os.environ.get("VIBENODE_LIMIT_SWITCH_DELAY", "5"))
+    # A usage-tracker reading older than this cannot vouch for the account
+    # windows now (see _account_windows_have_room).  Every turn refreshes it.
+    _USAGE_READING_FRESH_S = 900.0
+
+    # What a limit binds, from the name the CLI gives it ("You've hit your
+    # Fable limit · resets …").  The CLI's own table (2.1.291): five_hour
+    # "session limit", seven_day "weekly limit", seven_day_opus "Opus limit",
+    # seven_day_sonnet "Sonnet limit", seven_day_overage_included "Fable
+    # limit", overage "usage credit limit"; plus spend limits, team budgets and
+    # the credit balance.  The CLI itself classes the first two as
+    # "session"/"weekly" and the model names as "model" (its bS() helper).
+    # A model name next to "limit" is checked FIRST, so a variant such as
+    # "weekly Fable limit" still reads as Fable's own.
+    _LIMIT_MODEL_SCOPE_RE = re.compile(
+        r"\b(fable|opus|sonnet|haiku)\b[\w .\-]{0,20}?\blimit\b", re.I)
+    _LIMIT_ACCOUNT_SCOPE_RE = re.compile(
+        r"\b(?:session|weekly|5-hour|five-hour|daily|monthly|spend|credit|plan)"
+        r"\b[\w .'\-]{0,20}?\blimit\b|usage credits?|shared budget|credit balance",
+        re.I,
+    )
+
+    _MODEL_ID_RE = re.compile(r"claude-([a-z]+)-(\d+)(?:-(\d+))?$")
+    _MODEL_FAMILIES = ("fable", "opus", "sonnet", "haiku")
+
+    @staticmethod
+    def _strip_markers(model_id: str) -> str:
+        """'claude-opus-5-5[1m]' -> 'claude-opus-5-5'; 'opus[1m]' -> 'opus'."""
+        return re.sub(r"\[[^\]]*\]", "", str(model_id or "")).strip()
+
+    @classmethod
+    def _model_match(cls, model_id: str):
+        """Match a claude id after dropping marker suffixes ("[1m]") and a
+        date snapshot suffix: 'claude-opus-4-20250514' is Opus 4, not Opus
+        4.20250514."""
+        return cls._MODEL_ID_RE.match(re.sub(r"-\d{8}$", "", cls._strip_markers(model_id)))
+
+    @classmethod
+    def _model_family(cls, model_id: str) -> str:
+        """'claude-fable-5-1[1m]' -> 'fable'; a family alias ('opus',
+        'opus[1m]') -> itself; '' for anything else."""
+        m = cls._model_match(model_id)
+        if m:
+            return m.group(1)
+        bare = cls._strip_markers(model_id).lower()
+        return bare if bare in cls._MODEL_FAMILIES else ""
+
+    @classmethod
+    def _model_version(cls, model_id: str) -> tuple:
+        """(major, minor) of a claude id: 'claude-opus-5-5' -> (5, 5),
+        'claude-opus-5' -> (5, 0), 'claude-haiku-4-5-20251001' -> (4, 5),
+        'claude-opus-4-20250514' -> (4, 0).  () for anything else."""
+        m = cls._model_match(model_id)
+        return (int(m.group(2)), int(m.group(3) or 0)) if m else ()
+
+    @classmethod
+    def _model_label(cls, model_id: str) -> str:
+        """'claude-opus-5-5[1m]' -> 'Opus 5.5', the picker's naming.  A family
+        alias ('opus') reads 'Opus'."""
+        m = cls._model_match(model_id)
+        if not m:
+            return cls._strip_markers(model_id).capitalize() or "the model"
+        return "%s %s%s" % (m.group(1).capitalize(), m.group(2),
+                            "." + m.group(3) if m.group(3) else "")
+
+    @classmethod
+    def _newest_in_family(cls, model_ids, family: str) -> str:
+        """The highest version among the concrete ``model_ids`` of ``family``,
+        or ''.  Marker suffixes ("[1m]") are dropped; a dated snapshot loses a
+        tie to its clean alias; family aliases are skipped."""
+        best, best_key = "", None
+        for raw in model_ids or ():
+            mid = cls._strip_markers(raw)
+            if not mid.startswith("claude-") or cls._model_family(mid) != family:
+                continue
+            key = (cls._model_version(mid), not re.search(r"-\d{8}$", mid))
+            if best_key is None or key > best_key:
+                best, best_key = mid, key
+        return best
+
+    def _known_models(self) -> list:
+        """Model ids VibeNode knows of: every model a session has confirmed
+        plus the ones the picker always offers (app/routes/live_api.py).  The
+        fallback source for _newest_model_of when the session's CLI does not
+        report its own list.  Never raises."""
+        try:
+            from app.routes.live_api import _build_models_quickly
+            return [m.get("id", "") for m in _build_models_quickly() if isinstance(m, dict)]
+        except Exception:
+            return []
+
+    def _newest_model_of(self, info: "SessionInfo", family: str) -> str:
+        """The newest model of ``family`` this session can switch to, or ''.
+
+        From, in order:
+
+          1. the session's own CLI process (``ClaudeAgentSDK.supported_models``):
+             its family alias resolved (``opus`` -> its newest Opus).  This
+             covers models released after VibeNode was updated, and never picks
+             one the running process would reject.  An alias the CLI lists
+             without a resolved id is returned as the alias itself; the CLI
+             resolves it, and _apply_limit_switch reads back what it ran;
+          2. the highest version of the family that CLI lists;
+          3. VibeNode's model list (confirmed + always-offered), for a CLI
+             that does not report its models.
+
+        A 1M-context session (``[1m]`` on the limited id) keeps 1M: its context
+        may not fit in 200K.  That holds for an alias too: CLI 2.1.291 accepts
+        ``opus[1m]`` and runs ``claude-opus-5-5[1m]`` (probed 2026-10-10).
+        """
+        try:
+            listed = self._sdk.supported_models(info.client) if info.client else []
+        except Exception:
+            listed = []
+        if not isinstance(listed, list):
+            listed = []
+        target = ""
+        for m in listed:
+            if isinstance(m, dict) and m.get("value") == family:
+                resolved = str(m.get("resolvedModel") or "")
+                target = resolved if self._model_family(resolved) == family else family
+                break
+        if not target:
+            target = self._newest_in_family(
+                [m.get("resolvedModel") or m.get("value") for m in listed if isinstance(m, dict)],
+                family)
+        if not target:
+            target = self._newest_in_family(self._known_models(), family)
+        if self._model_family(target):
+            target = self._strip_markers(target)
+            if "[1m]" in (info.limited_model or ""):
+                target = self._cli_model_id(target + "[1m]")
+        return target
+
+    def _limit_scope(self, result_text: str, family: str = "") -> str:
+        """What a limit message binds: "model" (only ``family``'s own limit:
+        switching helps), "account" (every model is out: switching cannot
+        help), or "" when the wording does not say.  A message naming ANOTHER
+        model's limit says nothing about this one: "".  With no ``family``,
+        any model's limit counts."""
+        txt = result_text or ""
+        m = self._LIMIT_MODEL_SCOPE_RE.search(txt)
+        if m:
+            return "model" if not family or m.group(1).lower() == family else ""
+        if self._LIMIT_ACCOUNT_SCOPE_RE.search(txt):
+            return "account"
+        return ""
+
+    def _account_windows_have_room(self) -> bool:
+        """For a limit whose wording names no window: True when a FRESH usage
+        tracker reading (daemon/usage_limits.py, refreshed by every turn's
+        rate_limit_event) shows both account-wide windows below 100%, so the
+        limit that was hit must be the model's own.  False when either is full,
+        or when the tracker cannot vouch for now: no reading, a reading older
+        than ``_USAGE_READING_FRESH_S``, or one for a window that has since
+        ended (a file left from a long-gone session must not read as room)."""
+        windows = (getattr(self, "_usage_state", None) or {}).get("windows") or {}
+        now = time.time()
+        for key in ("five_hour", "seven_day"):
+            w = windows.get(key)
+            if not isinstance(w, dict):
+                return False
+            try:
+                resets = float(w.get("resets_at") or 0)
+                seen = float(w.get("seen_at") or 0)
+                if resets <= now or now - seen > self._USAGE_READING_FRESH_S:
+                    return False
+                if float(w.get("utilization", 1.0)) >= 1.0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
+    def _limit_switch_plan(self, info: "SessionInfo"):
+        """Where and when a usage-limited session continues on another model:
+        ``(model, epoch)``, or None to wait for its own limit to reset.
+
+        Only for a limit that binds the model (``_limit_scope``; an account-wide
+        limit stops every model) on a family the session can leave.  The
+        options are the newest model of the mapped family
+        (``_LIMIT_SWITCH_FAMILIES``: any Fable -> the newest Opus) and, after
+        an auto-switch, the model the session left (``_limit_origin``).  Each
+        is free now, or when its own limit, as seen in this session
+        (``_limit_until``), resets.  The soonest wins, and only if it beats
+        waiting here.  So a Fable limit switches to Opus at once, and if Opus
+        then hits its own limit, the session goes back to Fable when Fable's
+        limit resets, if that comes first.
+
+        Off with ``VIBENODE_LIMIT_AUTO_SWITCH=0``, and with
+        ``VIBENODE_LIMIT_AUTO_RESUME=0`` (which turns off every automatic
+        continue after a limit).
+        """
+        if not (self._LIMIT_AUTO_SWITCH and self._LIMIT_AUTO_RESUME):
+            return None
+        family = self._model_family(info.limited_model)
+        if not family:
+            return None
+        scope = getattr(info, "_limit_scope", "")
+        if scope == "account" or (scope != "model" and not self._account_windows_have_room()):
+            return None
+        now = time.time()
+        reset = float(info.limit_reset_at or 0.0)
+        if 0 < reset <= now:
+            return None                     # it just reset: _schedule_limit_resume continues shortly
+        stay_at = reset + self._LIMIT_RESUME_GRACE if reset else now + self._LIMIT_PROBE_INTERVAL
+        info._limit_until[family] = stay_at
+        options = []
+        to_family = self._LIMIT_SWITCH_FAMILIES.get(family)
+        if to_family:
+            newest = self._newest_model_of(info, to_family)
+            if newest:
+                options.append(newest)
+        origin = getattr(info, "_limit_origin", "")
+        # Back to the model an auto-switch left: only for a limit known to be
+        # this model's own.  On unrecognised wording the two models could
+        # trade places every probe interval on a limit neither can pass.
+        if origin and scope == "model" and self._model_family(origin) not in ("", family):
+            options.append(origin)
+        best = None
+        for model in options:
+            free_at = float(info._limit_until.get(self._model_family(model), 0.0))
+            at = now + self._LIMIT_SWITCH_DELAY if free_at <= now else free_at
+            if best is None or at < best[1]:
+                best = (model, at)
+        if best is None or best[1] >= stay_at:
+            return None
+        return best
+
     @staticmethod
     def _api_retry_delay(attempt: int) -> float:
         """Deterministic exponential backoff base delay (seconds) for retry index
@@ -6681,6 +6986,9 @@ class SessionManager:
         # Remember WHICH model ran out so the CTA can exclude it from the
         # alternatives it offers.  info.model is the CLI-confirmed id.
         info.limited_model = info.model or ""
+        # Whether switching models can get past it (_limit_switch_plan).
+        info._limit_scope = self._limit_scope(
+            result_text, self._model_family(info.limited_model))
         info._api_retry_needed = False
         info.retry_at = 0.0
         info.retry_attempt = 0
@@ -6695,33 +7003,49 @@ class SessionManager:
 
     def _clear_usage_limit(self, info: "SessionInfo") -> None:
         """Forget a recorded usage limit (new user message / successful turn /
-        model switch).  Safe to call unconditionally."""
+        model switch).  Safe to call unconditionally.  A pending auto-switch
+        goes with it: a manual switch or a turn that went through supersedes
+        it."""
         info.limit_reset_at = 0.0
         info.limited_model = ""
+        info.limit_switch_to = ""
 
-    def _schedule_limit_resume(self, info: "SessionInfo") -> bool:
-        """Arrange for a usage-limited turn to continue once the limit resets.
+    def _schedule_limit_resume(self, info: "SessionInfo",
+                               allow_switch: bool = True) -> bool:
+        """Arrange for a usage-limited turn to continue.
 
         Call right after ``_apply_usage_limit``.  Flags the retry the same way
         a transient error does (``_api_retry_needed``), so the drive-loop
         ``finally`` arms it through ``_arm_api_retry``.  ``_limit_resume_at``
-        tells that function to wait for the reset instead of backing off:
+        tells that function when to fire instead of backing off:
 
+        * the limit binds the model and another one can run sooner (any Fable
+          version -> the newest Opus, or back to the model an earlier
+          auto-switch left; see ``_limit_switch_plan``): switch then and
+          continue, normally after ``_LIMIT_SWITCH_DELAY``.
+          ``allow_switch=False`` skips this (a failed switch, or Cancel);
         * reset known and ahead: continue ``_LIMIT_RESUME_GRACE`` after it;
         * reset stated but already passed (it just happened): continue after
           ``_LIMIT_JUST_RESET_DELAY``, doubling per consecutive attempt;
         * no reset time in the message: check again after
           ``_LIMIT_PROBE_INTERVAL``.
 
-        Returns True if a resume was flagged.  Not flagged when switched off
-        (``VIBENODE_LIMIT_AUTO_RESUME=0``), when the retry budget is spent, or
-        when there is no turn to resume.
+        Returns True if a resume was flagged.  Not flagged when the retry budget
+        is spent or there is no turn to resume, nor (for the wait-for-reset
+        plans) when switched off with ``VIBENODE_LIMIT_AUTO_RESUME=0``.
         """
-        if not self._LIMIT_AUTO_RESUME:
-            return False
         if info._api_retry_count >= self._API_RETRY_MAX:
             return False
         if not self._has_user_message(info):
+            return False
+        if allow_switch:
+            plan = self._limit_switch_plan(info)
+            if plan:
+                info.limit_switch_to, info._limit_resume_at = plan
+                info._api_retry_needed = True
+                info.retry_reason = "Switching to %s" % self._model_label(plan[0])
+                return True
+        if not self._LIMIT_AUTO_RESUME:
             return False
         now = time.time()
         reset = float(getattr(info, "limit_reset_at", 0.0) or 0.0)
@@ -6982,6 +7306,9 @@ class SessionManager:
         info.retry_attempt = 0
         info.retry_max = 0
         info.retry_reason = ""
+        # A usage-limit auto-switch rides this countdown; cancelling the
+        # countdown (Cancel, a new message, interrupt, close) cancels it too.
+        info.limit_switch_to = ""
         if reset_count:
             info._api_retry_count = 0
 
@@ -7015,6 +7342,11 @@ class SessionManager:
                 else "a newer turn supersedes the retry",
                 info.retry_reason, info._api_retry_count, self._API_RETRY_MAX,
             )
+            # Drop this retry's limit plan with it.  Left set, a later
+            # unrelated error would be scheduled as this limit's wait, or
+            # would even switch models.
+            info._limit_resume_at = 0.0
+            info.limit_switch_to = ""
             return
         attempt = info._api_retry_count  # 0-based index of the attempt to schedule
         # A usage limit waits for its reset (see _schedule_limit_resume)
@@ -7025,7 +7357,22 @@ class SessionManager:
             # Budget already exhausted — _process_message normally handles this,
             # but guard here too so we never schedule a no-op timer.
             return
-        if limit_at > 0:
+        if limit_at > 0 and getattr(info, "limit_switch_to", ""):
+            # Usage-limit auto-switch: no spread (this session moves to another
+            # model rather than racing a window that reopens).  The switch
+            # itself happens when the timer fires (_switch_then_fire).
+            delay = max(1.0, limit_at - time.time())
+            note = "%s hit its usage limit. Switching to %s" % (
+                self._model_label(info.limited_model),
+                self._model_label(info.limit_switch_to))
+            if delay > 60:
+                # Back to a model whose own limit resets first.
+                note += " when its limit resets, at %s (in %s), and continuing." % (
+                    time.strftime("%I:%M %p", time.localtime(time.time() + delay)).lstrip("0"),
+                    self._fmt_duration(delay))
+            else:
+                note += " and continuing…"
+        elif limit_at > 0:
             # Small random spread so every limited session does not hit the
             # API in the same second the window reopens.
             delay = max(5.0, limit_at - time.time()) + random.uniform(0.0, 30.0)
@@ -7235,7 +7582,109 @@ class SessionManager:
             # Reconnected — transport is healthy again; resume normally.
             info._retry_needs_reconnect = False
 
+        await self._switch_then_fire(session_id, info)
+
+    async def _switch_then_fire(self, session_id: str, info: SessionInfo) -> None:
+        """Fire a due retry, switching models first when it is a usage-limit
+        auto-switch (``limit_switch_to``).  If the switch fails, the retry is
+        re-planned to wait for the reset instead and nothing fires now."""
+        if getattr(info, "limit_switch_to", ""):
+            if not await self._apply_limit_switch(session_id, info):
+                return
+            # The switch waited on a control request.  Fire only if the retry
+            # still stands: Cancel, a new message, Stop and close all clear
+            # retry_at, a Sleep stops the session, and another turn may have
+            # taken it meanwhile.
+            if (info.retry_at <= 0 or info.state != SessionState.IDLE
+                    or self._user_stopped(info)):
+                logger.info("Usage-limit retry for %s not fired after the switch: "
+                            "it was cancelled or the session moved on (state=%s)",
+                            session_id[:12], info.state)
+                return
         self._fire_api_retry(session_id, info)
+
+    async def _apply_limit_switch(self, session_id: str, info: SessionInfo) -> bool:
+        """Switch a usage-limited session to ``limit_switch_to``.  Returns True
+        when the caller should resume the turn now: the CLI confirmed, or there
+        was nothing left to switch (a manual model pick cleared it first, see
+        ``set_session_model``).
+
+        Same honesty contract and init guard as ``set_session_model``'s live
+        path: ``info.model`` changes only after the CLI accepted the control
+        request, and ``_model_switch_in_progress`` keeps the post-turn listener
+        from reading the side-effect ``init`` as an auto-resume (the resumed
+        turn's ``send_message`` clears the flag).  The countdown fields stay
+        set until ``_fire_api_retry`` sends, so the queue gate stays closed and
+        no queued message can jump ahead of the resumed turn.
+
+        On failure (an old CLI, a model the process rejects, no connection) the
+        session falls back to what a limit does without the switch: continue
+        when the limit resets, with the model-switch CTA still offered.
+        """
+        target = info.limit_switch_to
+        info.limit_switch_to = ""
+        if not target:
+            return True
+        limited = info.limited_model
+        info._model_switch_in_progress = True
+        info._model_switch_at = time.time()
+        try:
+            if not info.client:
+                raise RuntimeError("the session is not connected")
+            await asyncio.wait_for(self._sdk.set_model(info.client, target), timeout=20)
+        except Exception as e:
+            info._model_switch_in_progress = False
+            err = str(e) or e.__class__.__name__
+            logger.warning("Usage-limit auto-switch %s -> %s failed for %s: %s",
+                           limited, target, session_id[:12], err)
+            entry = LogEntry(kind="system", is_error=True, text=(
+                "Could not switch to %s (%s). Continuing on %s when its limit resets."
+                % (self._model_label(target), err, self._model_label(limited))))
+            with info._lock:
+                info.entries.append(entry)
+                entry_index = len(info.entries) - 1
+            self._emit_entry(session_id, entry, entry_index)
+            # Re-plan from inside the firing timer: drop this task's handle
+            # first so re-arming does not cancel the task that is running.
+            info.retry_at = 0.0
+            info._api_retry_task = None
+            if self._schedule_limit_resume(info, allow_switch=False):
+                self._arm_api_retry(session_id, info)
+            else:
+                self._clear_api_retry(info, reset_count=False)
+                info.error = "Usage limit reached. Switch models to keep working."
+                self._emit_state(info)
+            return False
+        # What the CLI now runs.  A concrete id is recorded as asked (it
+        # carries the session's [1m] choice).  A family alias ("opus") resolves
+        # inside the CLI, so read back what it picked; if that read fails, the
+        # resumed turn's init reports it through the same sink.
+        model = target
+        if not target.startswith("claude-"):
+            try:
+                model = await asyncio.wait_for(
+                    self._sdk.applied_model(info.client), timeout=10) or ""
+            except Exception:
+                model = ""
+        if model:
+            self._set_confirmed_model(info, model, save_registry=True)
+        # A later limit on the new model may go back to the one this left
+        # (_limit_switch_plan); back on it, there is nowhere further to return.
+        info._limit_origin = "" if target == info._limit_origin else limited
+        self._clear_usage_limit(info)
+        info.error = ""
+        # Every tab and device: the badge, and the CTA retracts (the payload
+        # now reports no limit).
+        self._broadcast_model_changed(session_id, info, info.model)
+        entry = LogEntry(kind="system",
+                         text="Switched to %s." % self._model_label(model or target))
+        with info._lock:
+            info.entries.append(entry)
+            entry_index = len(info.entries) - 1
+        self._emit_entry(session_id, entry, entry_index)
+        logger.info("Session %s hit a usage limit on %s; switched to %s (CLI "
+                    "confirmed), resuming the turn", session_id, limited, model or target)
+        return True
 
     def _fire_api_retry(self, session_id: str, info: SessionInfo) -> None:
         """Resume the failed turn.  Consumes one attempt from the budget

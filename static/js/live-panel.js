@@ -865,11 +865,13 @@ function _fmtRetrySecs(s) {
 // clears `_liveRetryTimer` on every rebuild, and a second timer variable would
 // be one more thing to forget to clear.
 
-// Fallback ladder used when the live /api/models list has not loaded yet.
-// Ordered best-alternative-first WITHIN each tier so the two chips we surface
-// are the ones a user would most plausibly want. Kept deliberately short —
-// this is a "get unblocked now" affordance, not a model browser. "More
-// models…" opens the full selector for anything else.
+// Which families to offer for each limited family, best alternative first, so
+// the two chips we surface are the ones a user would most plausibly want.
+// Each chip is the NEWEST model of its family in /api/models, so a new Opus or
+// Sonnet shows up here with no code change; the ids are only the fallback
+// until that list has loaded. Kept deliberately short: this is a "get
+// unblocked now" affordance, not a model browser. "More…" opens the full
+// selector for anything else.
 const _LIMIT_ALT_LADDER = {
   // Limited on a top-tier model → step down to something with its own quota.
   fable:  ['claude-opus-5-5', 'claude-sonnet-5'],
@@ -879,6 +881,31 @@ const _LIMIT_ALT_LADDER = {
   haiku:  ['claude-sonnet-5', 'claude-opus-5-5'],
 };
 const _LIMIT_ALT_DEFAULT = ['claude-sonnet-5', 'claude-haiku-4-5'];
+
+/** [major, minor] of a claude id ('claude-opus-5-5[1m]' -> [5, 5]), or null.
+ *  A date snapshot suffix is ignored. Mirrors SessionManager._model_version. */
+function _modelVersionKey(id) {
+  const base = String(id || '').replace(/\[[^\]]*\]/g, '').replace(/-\d{8}$/, '');
+  const m = /^claude-[a-z]+-(\d+)(?:-(\d+))?$/.exec(base);
+  return m ? [Number(m[1]), Number(m[2] || 0)] : null;
+}
+
+/** The newest model of `family` in the loaded /api/models list, or ''. */
+function _newestModelOfFamily(family) {
+  const models = Array.isArray(window._statusModels) ? window._statusModels : [];
+  let best = '', bestKey = null;
+  for (const mm of models) {
+    const id = String((mm && mm.id) || '');
+    if (id.indexOf('claude-' + family + '-') !== 0) continue;
+    const k = _modelVersionKey(id);
+    if (!k) continue;
+    if (!bestKey || k[0] > bestKey[0] || (k[0] === bestKey[0] && k[1] > bestKey[1])) {
+      best = id;
+      bestKey = k;
+    }
+  }
+  return best;
+}
 
 /**
  * Pick up to two alternative model ids to offer for a limited model.
@@ -891,9 +918,21 @@ function _limitAlternatives(limitedModel) {
   const m = /^claude-([a-z]+)/.exec(limitedModel || '');
   const family = m ? m[1] : '';
   const ladder = _LIMIT_ALT_LADDER[family] || _LIMIT_ALT_DEFAULT;
-  // Defensive: never suggest the same family we just ran out of, even if the
-  // ladder above is later edited into an inconsistent state.
-  return ladder.filter(id => !family || id.indexOf('claude-' + family) !== 0).slice(0, 2);
+  // The model list is shared with the status panel; the next render of the
+  // bar uses it once it has loaded.
+  if (!Array.isArray(window._statusModels) && typeof _loadStatusModels === 'function') {
+    _loadStatusModels();
+  }
+  const out = [];
+  for (const fallback of ladder) {
+    const fam = (/^claude-([a-z]+)/.exec(fallback) || [])[1] || '';
+    // Defensive: never suggest the family we just ran out of, even if the
+    // ladder above is later edited into an inconsistent state.
+    if (!fam || fam === family) continue;
+    const id = _newestModelOfFamily(fam) || fallback;
+    if (out.indexOf(id) < 0) out.push(id);
+  }
+  return out.slice(0, 2);
 }
 
 /**
@@ -919,16 +958,25 @@ function _buildUsageLimitBanner(id, st) {
     _resetStr = ' \u00b7 resets in <strong id="live-limit-countdown" style="color:var(--text);">' +
       _fmtRetrySecs(secs) + '</strong>';
   }
-  // The daemon continues the turn by itself once the limit resets
-  // (_schedule_limit_resume), riding the auto-retry countdown. Say so, and
-  // offer Cancel, so waiting is a visible choice next to switching models.
+  // The daemon continues the turn by itself (_schedule_limit_resume), riding
+  // the auto-retry countdown: right after switching to the newest Opus when a
+  // Fable model ran out (`limit_switch_to`), else once the limit resets. Say
+  // which, and offer Cancel, so it is a visible choice next to the chips.
   const _rs = (window._sessionRetryState && window._sessionRetryState[id]) || null;
   let _autoStr = '';
   let _cancelBtn = '';
   if (_rs && _rs.retry_at > 0) {
     const asecs = Math.max(0, Math.ceil(_rs.retry_at - Date.now() / 1000));
-    _autoStr = ' \u00b7 continues automatically in <strong id="live-retry-countdown" style="color:var(--text);">' +
+    const _countdown = '<strong id="live-retry-countdown" style="color:var(--text);">' +
       _fmtRetrySecs(asecs) + '</strong>';
+    // A bare family alias ("opus": the CLI picks its newest) reads as the
+    // family; _modelLabel maps legacy aliases to old versions ("Opus 4.6").
+    const _sw = String(st.limit_switch_to || '').replace(/\[[^\]]*\]/g, '');
+    const _swLabel = /^claude-/.test(_sw) ? _label(_sw) : _sw.charAt(0).toUpperCase() + _sw.slice(1);
+    _autoStr = _sw
+      ? ' \u00b7 switching to <strong style="color:var(--text);">' + escHtml(_swLabel) +
+        '</strong> in ' + _countdown
+      : ' \u00b7 continues automatically in ' + _countdown;
     _cancelBtn = '<button class="live-mini-btn" onclick="liveCancelRetry()" ' +
       'style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid var(--border-subtle);' +
       'background:transparent;color:var(--text-muted);cursor:pointer;white-space:nowrap;">Cancel</button>';
@@ -1083,7 +1131,11 @@ function liveSwitchModelAndResume(model) {
     // still unfinished, so that one needs an explicit nudge. retry_now is the
     // same mechanism the Retry button uses, and it is safe here because the
     // switch confirmed synchronously and the session is known idle.
-    if (!data.resumed && typeof liveRetryNow === 'function') {
+    // Already working: the daemon's own usage-limit countdown fired and
+    // resumed the turn while this switch was in flight, and a retry_now now
+    // would only be refused with a "not idle" error.
+    const _alreadyWorking = (typeof sessionKinds !== 'undefined') && sessionKinds[sid] === 'working';
+    if (!data.resumed && !_alreadyWorking && typeof liveRetryNow === 'function') {
       if (typeof showToast === 'function') showToast('Switched to ' + _name + ' — resuming');
       liveRetryNow();
     } else {

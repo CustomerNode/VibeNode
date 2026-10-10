@@ -297,6 +297,21 @@ class AgentSDK(ABC):
             "This backend does not support live thinking-level changes"
         )
 
+    def supported_models(self, client: Any) -> list:
+        """Models the connected backend process can run, newest aliases first.
+
+        Each entry is a dict with at least ``value`` (an id or a family alias
+        such as ``"opus"``) and ``resolvedModel`` (the concrete id the value
+        runs).  The default reports nothing; callers then fall back to other
+        sources.  Never raises.
+        """
+        return []
+
+    async def applied_model(self, client: Any) -> Optional[str]:
+        """The concrete model id the connected process runs now, or None when
+        the backend cannot say.  Used after switching to a family alias."""
+        return None
+
     @abstractmethod
     async def disconnect(self, client: Any) -> None:
         """Disconnect and clean up the client.
