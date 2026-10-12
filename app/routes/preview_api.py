@@ -270,7 +270,16 @@ def proxy():
         # submit forms — e.g. an agent-served localhost form the phone fills
         # in.  GET-only here used to 405 any proxied <form method="post">.
         body = request.get_data() if request.method == "POST" else None
-        fwd_headers = {"User-Agent": "VibeNode-Preview"}
+        # Say that this is a proxy. The forwarded request leaves from this
+        # machine with no trace of who asked for it, so VibeNode's own
+        # local-only endpoints (/api/hook/message, /api/notify/approval) took
+        # a phone on the tailnet for a script on this machine: `u` only had to
+        # point back at them. They refuse a request that carries this header.
+        fwd_headers = {
+            "User-Agent": "VibeNode-Preview",
+            "X-Forwarded-For": (request.headers.get("X-Forwarded-For")
+                                or request.remote_addr or "unknown"),
+        }
         if body is not None and request.content_type:
             fwd_headers["Content-Type"] = request.content_type
         req = urllib.request.Request(u, data=body, headers=fwd_headers,

@@ -6468,13 +6468,29 @@ paths:
   /api/notify/approval:
     post:
       tags: [App]
-      summary: Broadcast an "approval needed" alert to every connected browser
+      summary: Ping the user from a local script; watch its approval page
       operationId: notifyApproval
       description: |
-        Re-broadcasts the body as the Socket.IO event approval_needed so an
-        external process (e.g. a release pipeline waiting on a human yes/no)
-        can alert the user on any device. Never returns 4xx for malformed
-        input; missing fields get defaults.
+        Broadcasts the title, message and source once as the Socket.IO event
+        external_notice, so an external process (e.g. a release pipeline) can
+        alert the user on any device: every open tab chimes, and shows a
+        one-off notification if it is in the background. Never returns 4xx for
+        malformed input; missing fields get defaults.
+
+        When the ping names an approval page (url is the front page of a port
+        on this machine, a title is given, and the caller is a process on this
+        machine), VibeNode also starts watching that page. The first fetch
+        must return 200 and show the title. The approval counts as open for as
+        long as every later fetch returns the same page. It is over when the
+        port refuses or the page differs, and also when a page the same source
+        announced after it goes away (a script may leave an earlier page up
+        after the one that mattered was answered). While it is open, the list
+        of open approvals is broadcast as approvals_open every few seconds and
+        background tabs flash their title; they stop when it is over. The only
+        request VibeNode makes is GET / on that port.
+
+        A ping without an approval page (a "release is live" notice) is that
+        one ping and nothing that stays on.
       requestBody:
         content:
           application/json:
@@ -6483,12 +6499,17 @@ paths:
               properties:
                 title:
                   type: string
+                  description: Short label. For an approval page, text the page shows.
                 message:
                   type: string
                 source:
                   type: string
+                  description: Slug of the calling script; groups its approval pages.
                 url:
                   type: string
+                  description: |
+                    The approval page: http://127.0.0.1:PORT/ (no path, no
+                    query). Omit for a notice.
       responses:
         "200":
           description: Broadcast attempted
@@ -6499,6 +6520,87 @@ paths:
                 properties:
                   ok:
                     type: boolean
+                  id:
+                    type: string
+                    description: Names the watched approval page; "" when nothing is watched
+
+  /api/notify/approval/resolve:
+    post:
+      tags: [App]
+      summary: A local script says its approval page has been answered
+      operationId: notifyApprovalResolve
+      description: |
+        Optional. VibeNode notices an answered approval page by itself at its
+        next check of the page (every half second at first, every three seconds
+        once the approval is ten minutes old); a script that calls this ends
+        the title flash at once. Give the id from the reply to
+        POST /api/notify/approval, or the url that was announced. Unknown ids
+        and malformed bodies resolve nothing and are not an error. Local
+        callers only.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id:
+                  type: string
+                url:
+                  type: string
+      responses:
+        "200":
+          description: How many open approvals were ended
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  resolved:
+                    type: integer
+        "403":
+          description: Not a local caller
+
+  /api/notify/approvals:
+    get:
+      tags: [App]
+      summary: The approval pages that are open right now
+      operationId: notifyApprovals
+      description: |
+        The approvals_open Socket.IO event, plus each page's address.
+        Side-effect-free: reads the watch's state and checks nothing.
+      responses:
+        "200":
+          description: Open approvals, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  open:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        title:
+                          type: string
+                        message:
+                          type: string
+                        source:
+                          type: string
+                        url:
+                          type: string
+                        since:
+                          type: number
+                          description: Unix time the page was announced
+                  ttl_ms:
+                    type: integer
+                    description: How long a browser may act on this list without hearing it again
 
   /api/client-log:
     post:

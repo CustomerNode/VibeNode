@@ -478,6 +478,44 @@ Status values: `disconnected`, `connecting`, `restarting`, `connected`
 
 ---
 
+### `external_notice`
+
+**Triggered:** Broadcast once to all clients for every `POST /api/notify/approval` (a local script pinging the user). Clients ping once: a chime, and a one-off notification if the tab is in the background. Nothing starts flashing on this event. `id` is set when the ping named an approval page that the server is now watching, and is `""` otherwise.  
+**Payload:**
+```json
+{
+  "title": "Release 4.2",
+  "message": "Click Approve or Cancel in your browser to continue.",
+  "source": "pipeline",
+  "id": "5f1c9a0be2d4"
+}
+```
+
+---
+
+### `approvals_open`
+
+**Triggered:** Broadcast to all clients when the list of open approval pages changes, and every few seconds while it is not empty. An approval is open while the server can still fetch its unchanged page (`app/approval_watch.py`). `GET /api/notify/approvals` returns the same list, with each page's address added.
+
+A client treats each snapshot as a lease: an approval is open for `ttl_ms` after the last snapshot that listed it, and is over as soon as a snapshot arrives without it. Background tabs flash their title only for open approvals, so a client that stops receiving snapshots stops flashing.  
+**Payload:**
+```json
+{
+  "open": [
+    {
+      "id": "5f1c9a0be2d4",
+      "title": "Release 4.2",
+      "message": "Click Approve or Cancel in your browser to continue.",
+      "source": "pipeline",
+      "since": 1791800000.0
+    }
+  ],
+  "ttl_ms": 10000
+}
+```
+
+---
+
 ### `error`
 
 **Triggered:** On any WebSocket handler error  

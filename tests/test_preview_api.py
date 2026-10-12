@@ -44,9 +44,11 @@ def test_proxy_rewrite_routes_localhost_and_relative_but_not_data():
 @pytest.fixture
 def client():
     from app import create_app
-    app = create_app()
-    app.config["TESTING"] = True
-    return app.test_client()
+    # testing=True, not create_app() with the flag set afterwards: that built a
+    # real app in the test process (a client connected to the live session
+    # daemon, the git fetch, the compose watcher, the voice model loading on a
+    # background thread). See tests/test_app_testing_mode.py.
+    return create_app(testing=True).test_client()
 
 
 def test_render_rejects_non_http_url(client):
@@ -88,6 +90,41 @@ def test_asset_serves_rendered_png(client):
 
 def test_proxy_rejects_non_http(client):
     assert client.get("/api/preview/proxy?u=file:///etc/passwd").status_code == 400
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("incoming,expected", [
+    ({}, "127.0.0.1"),                                          # the test client's own address
+    ({"X-Forwarded-For": "100.64.0.5"}, "100.64.0.5"),          # already through the tailnet proxy
+])
+def test_what_the_proxy_forwards_says_it_was_forwarded(method, incoming, expected, monkeypatch):
+    """The forwarded request leaves from this machine. Without a mark on it,
+    VibeNode's own local-only endpoints took a phone on the tailnet for a local
+    script: ``u`` only had to point back at them (found 2026-10-12)."""
+    from app import create_app
+
+    sent = []
+
+    class Reply:
+        status = 200
+        headers = {"Content-Type": "text/plain"}
+
+        def read(self):
+            return b"ok"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(P.urllib.request, "urlopen", lambda req, timeout=None: sent.append(req) or Reply())
+    client = create_app(testing=True).test_client()
+    resp = client.open("/api/preview/proxy?u=http://127.0.0.1:5050/api/hook/message", method=method,
+                       headers=incoming, json={"x": 1} if method == "POST" else None)
+    assert resp.status_code == 200 and len(sent) == 1
+    assert sent[0].get_header("X-forwarded-for") == expected
+    assert sent[0].get_method() == method
 
 
 # ---- thumbnails -----------------------------------------------------------

@@ -1,19 +1,42 @@
-/* notify.js — General approval-notification capability for VibeNode.
+/* notify.js — the ways VibeNode asks for attention when you are not looking.
  *
  * WHY THIS EXISTS
  * ---------------
- * When Claude asks for tool-use approval inside a session, the daemon emits a
- * `session_permission` Socket.IO event (see daemon/session_manager.py and the
- * matching handler in static/js/socket.js). Historically that event only
- * updated the sidebar row — silently. On mobile especially, the user had no
- * way to notice an approval was pending without proactively looking at the
- * tab. This module turns every such event into a multi-layered ping that
- * degrades gracefully across desktop, Android, and iOS Safari.
+ * Some things need the user while the VibeNode tab is in the background or the
+ * phone is in a pocket: an approval page a release script is waiting on, a
+ * session the watchdog found stalled. This module turns those into a chime,
+ * a vibration, an OS notification, a flashing tab title and a red dot on the
+ * favicon, degrading gracefully across desktop, Android and iOS Safari.
  *
- * This is a *general* capability, not specific to any one project. It fires
- * for every session — including CustomerNode sessions, which are ordinary
- * VibeNode-managed projects and therefore already emit `session_permission`
- * through the same code path without any changes on their side.
+ * It is general: it knows nothing about any one project. CustomerNode's
+ * release pipeline is simply the first script to call the endpoint behind it.
+ *
+ * THE RULE FOR ANYTHING THAT STAYS ON (title flash, favicon dot, OS banner)
+ * ------------------------------------------------------------------------
+ * A chime ends by itself. A flashing title does not, so it is never started
+ * by an event alone: it runs only while a REASON is still true, and every
+ * tick re-checks the reason before it touches the title. The favicon dot
+ * and a reason's OS banner are up only while the title is flashing for it,
+ * so the same tick takes them down.
+ *
+ *   approval   The server knows whether an approval page is still waiting
+ *              (app/approval_watch.py) and says so every few seconds in an
+ *              `approvals_open` snapshot. Each snapshot is a lease: the
+ *              approval counts as open here only until the lease runs out.
+ *              So the flash stops when a snapshot arrives without it (it was
+ *              answered) AND when snapshots stop arriving (socket dead, web
+ *              server restarted). Silence never means "still open".
+ *   attention  A session needs the user (`session_stalled`). Nothing can
+ *              answer that from outside, so it lasts until this tab is
+ *              looked at.
+ *
+ * Before 2026-10-12 an approval ping started the flash and only looking at
+ * that one tab stopped it. It kept flashing after the approval whenever the
+ * user stayed on the approval page, answered on another device or had a
+ * second tab open; a ping that arrived while the tab was on screen was kept
+ * forever and started the flash hours later; and "release is live" pings,
+ * which have nothing to approve, flashed "Approval needed" as well.
+ * Tests: tests/test_notify_flash.py.
  *
  * WHAT WORKS WHERE (iOS Safari being the strict constraint)
  * ---------------------------------------------------------
@@ -58,15 +81,23 @@
  *     automatically. We also attach passive listeners for the first tap
  *     anywhere on the document as a fallback.
  *
- *   window.VNNotify.approvalNeeded({sessionId, sessionName, toolName})
- *     Called by the session_permission Socket.IO handler in socket.js. Fires
- *     the ping layers. Deduplicated per-session for 3s so a rapid
- *     re-emission of the same event doesn't chain into a strobe.
+ *   window.VNNotify.notice({key, title, body, banner})
+ *     One ping: chime, vibration and (unless `banner` is false, and only
+ *     while the tab is hidden) an OS notification. Never flashes anything.
+ *     Called by the `external_notice` handler in socket.js. Deduplicated per
+ *     `key` for 3s so a re-emitted event does not strobe.
+ *
+ *   window.VNNotify.syncApprovals(open, ttlMs)
+ *     The server's current list of open approval pages (`approvals_open` in
+ *     socket.js). Anything listed is open for `ttlMs`; anything not listed
+ *     is over, now.
  *
  *   window.VNNotify.attention({sessionId, sessionName, title, body})
- *     Same ping layers for "a session needs you" events that are not tool
- *     approvals — currently the watchdog's `session_stalled` escalation.
+ *     A session needs the user: the ping layers plus a flash that lasts
+ *     until the tab is looked at. Currently the watchdog's `session_stalled`
+ *     escalation.
  *
+ *   window.VNNotify.state()               what it is flashing about, and why
  *   window.VNNotify.setEnabled(bool)      persist an on/off toggle
  *   window.VNNotify.isEnabled()           read it
  *
@@ -80,18 +111,31 @@
 
   // ── State ─────────────────────────────────────────────────────────────
   var STORAGE_KEY = 'vn_notify_approvals';   // '0' = off, anything else = on
-  var DEDUP_MS = 3000;                        // suppress repeats per session
+  var DEDUP_MS = 3000;                        // suppress repeats per key
   var TITLE_FLASH_INTERVAL_MS = 1000;         // 1s toggle cadence
   var FAVICON_ID = 'favicon-icon-link';       // we tag the <link rel=icon>
+  var DEFAULT_LEASE_MS = 10000;               // a snapshot that names no ttl
+  var MAX_LEASE_MS = 30000;                   // no snapshot is believed for longer
+  var MAX_REMEMBERED = 50;                    // approvals kept, ended ones included, for their flags
 
   var _audioCtx = null;                       // lazily created + unlocked
   var _armed = false;                         // audio unlock attempted
   var _notifPermRequested = false;            // requestPermission called once
-  var _lastFiredAt = {};                      // sessionId -> ms
-  var _originalTitle = null;                  // for title-flash restore
-  var _titleFlashTimer = null;
+  var _lastFiredAt = {};                      // key -> ms
   var _originalFaviconHref = null;            // for favicon-dot restore
   var _badgedFaviconHref = null;              // cached red-dot data URL
+  var _badgeLoading = false;                  // the badge image is being built
+  var _dotWanted = false;                     // the dot should be showing
+
+  // Why this tab may be asking for attention. See THE RULE in the header.
+  //   id  -> {title, body, until, seenAt, acked, notified, note}
+  //   key -> {title, body, notified, note}
+  var _approvals = {};
+  var _attention = {};
+
+  var _flashTimer = null;
+  var _warning = null;                        // the warning in the title right now, or null
+  var _pageTitle = '';                        // the page's own title, put back after a warning
 
   // ── Utilities ─────────────────────────────────────────────────────────
 
@@ -103,6 +147,7 @@
   function setEnabled(on) {
     try { localStorage.setItem(STORAGE_KEY, on ? '1' : '0'); }
     catch (e) {}
+    _reconcile();
   }
 
   function log() {
@@ -132,7 +177,7 @@
     if (!ctx) return;
     // If still suspended (context created before gesture), best-effort resume.
     // On iOS Safari this only succeeds if we're inside a gesture, but the
-    // event handler chain from approvalNeeded may or may not be — the
+    // event handler chain behind a ping may or may not be — the
     // arm() path is what makes this reliable.
     if (ctx.state === 'suspended') {
       try { ctx.resume(); } catch (e) {}
@@ -193,19 +238,20 @@
     } catch (e) {}
   }
 
-  function _showNotification(title, body) {
+  // Returns the Notification, or null when none was shown.
+  function _showNotification(title, body, tag) {
     try {
-      if (typeof Notification === 'undefined') return;
-      if (Notification.permission !== 'granted') return;
+      if (typeof Notification === 'undefined') return null;
+      if (Notification.permission !== 'granted') return null;
       // Only surface OS notifications while the tab is backgrounded — if
       // the user is looking at VibeNode, the in-page chime is enough and
       // an OS banner is noise.
-      if (!document.hidden) return;
+      if (!document.hidden) return null;
       var n = new Notification(title, {
         body: body,
         icon: '/static/vibenode.png',
         badge: '/static/vibenode.png',
-        tag: 'vn-approval',            // coalesce a burst into one banner
+        tag: tag,                      // coalesce a burst into one banner
         renotify: true,
       });
       // Clicking the notification should focus VibeNode.
@@ -213,7 +259,83 @@
         try { window.focus(); } catch (e) {}
         try { n.close(); } catch (e) {}
       };
-    } catch (e) {}
+      return n;
+    } catch (e) { return null; }
+  }
+
+  // ── What may flash, and for how long ──────────────────────────────────
+
+  // A lease has to run out on time whatever happens to the clocks. The wall
+  // clock can be set back, which would stretch it; the monotonic clock can
+  // stand still while the machine sleeps, which would too. So a lease is
+  // held against both, and whichever says it is over ends it.
+  function _mono() {
+    try { return performance.now(); } catch (e) { return Date.now(); }
+  }
+
+  function _lease(ms) {
+    return { wall: Date.now() + ms, mono: _mono() + ms };
+  }
+
+  function _live(a) {
+    return !!a.until && Date.now() < a.until.wall && _mono() < a.until.mono;
+  }
+
+  // THE decision: what this tab's title should be warning about right now,
+  // or null for nothing. Every start and every tick asks it, so no path can
+  // flash for a reason that is over.
+  function _flashLabel() {
+    if (!document.hidden || !isEnabled()) return null;
+    var label = null, id, key;
+    for (key in _attention) label = _attention[key].title;
+    for (id in _approvals) {
+      if (!_approvals[id].acked && _live(_approvals[id])) label = 'Approval needed';
+    }
+    return label;
+  }
+
+  function _closeBanner(reason) {
+    if (!reason.note) return;
+    try { reason.note.close(); } catch (e) {}
+    reason.note = null;
+  }
+
+  // One OS banner per reason: shown once, when the tab is (or becomes)
+  // hidden while the reason holds, and taken down as soon as the title would
+  // no longer flash for it. A banner must never be the thing left behind: a
+  // tab that is not flashing runs no tick, and so would never notice that
+  // the reason behind a banner had ended.
+  function _syncBanners() {
+    var flashing = document.hidden && isEnabled(), id, key, r;
+    for (id in _approvals) {
+      r = _approvals[id];
+      if (!flashing || r.acked || !_live(r)) { _closeBanner(r); continue; }
+      if (r.notified) continue;
+      r.notified = true;
+      r.note = _showNotification('Approval needed', r.body, 'vn-approval-' + id);
+    }
+    for (key in _attention) {
+      r = _attention[key];
+      if (!flashing) { _closeBanner(r); continue; }
+      if (r.notified) continue;
+      r.notified = true;
+      r.note = _showNotification(r.title, r.body, 'vn-' + key);
+    }
+  }
+
+  // Bring the title flash, the favicon dot and the banners in line with the
+  // reasons. Called after anything that can change them. An error in here
+  // turns everything off; it never leaves anything on.
+  function _reconcile() {
+    var label = null;
+    try {
+      _syncBanners();
+      label = _flashLabel();
+    } catch (e) { _everythingOff(); return; }
+    if (label === null) { _stopFlash(); return; }
+    if (_flashTimer) return;
+    _flashTimer = setInterval(_flashTick, TITLE_FLASH_INTERVAL_MS);
+    _startFaviconDot();
   }
 
   // ── Title flash while tab is backgrounded ─────────────────────────────
@@ -221,35 +343,69 @@
   // On mobile this is the ONLY reliable signal a backgrounded tab can leave
   // for the user, because iOS Safari suspends timers aggressively — but
   // the tab title itself is drawn by the OS and remains visible in the
-  // tab switcher. When the user returns to the tab we restore the
-  // original title.
+  // tab switcher.
+  //
+  // The reason is checked again on every tick, in the same turn as the
+  // write. A browser may run this timer once a minute (Chrome does, for a
+  // tab hidden five minutes), so a check made when the flash started says
+  // nothing about now.
 
-  function _startTitleFlash(msg) {
-    if (_titleFlashTimer) return;
-    if (_originalTitle === null) _originalTitle = document.title;
-    var flip = false;
-    _titleFlashTimer = setInterval(function () {
-      flip = !flip;
-      document.title = flip ? ('⚠ ' + msg) : _originalTitle;
-    }, TITLE_FLASH_INTERVAL_MS);
+  function _flashTick() {
+    var label = null;
+    try {
+      _syncBanners();
+      label = _flashLabel();
+    } catch (e) { _everythingOff(); return; }
+    if (label === null) { _stopFlash(); return; }
+    if (_warning === null) _showWarning('⚠ ' + label);
+    else _restoreTitle();
   }
 
-  function _stopTitleFlash() {
-    if (_titleFlashTimer) {
-      clearInterval(_titleFlashTimer);
-      _titleFlashTimer = null;
+  // The only two places that write document.title.
+  function _showWarning(text) {
+    _pageTitle = document.title;      // no warning is up, so this is the page's own
+    document.title = text;
+    // Read it back: the browser trims and collapses whitespace in a title,
+    // and _restoreTitle recognises our warning by comparing against this.
+    _warning = document.title;
+  }
+
+  function _restoreTitle() {
+    if (_warning === null) return;
+    // Put the page's title back only if ours is still there: another module
+    // may have set a new one while the warning was up, and that one stays.
+    try { if (document.title === _warning) document.title = _pageTitle; } catch (e) {}
+    _warning = null;
+  }
+
+  function _stopFlash() {
+    if (_flashTimer) {
+      clearInterval(_flashTimer);
+      _flashTimer = null;
     }
-    if (_originalTitle !== null) {
-      document.title = _originalTitle;
-    }
+    _restoreTitle();
+    _stopFaviconDot();
+  }
+
+  // No warning in the title, no dot, no banner, whatever the reasons say.
+  // For a page that is about to stop running, and for an error.
+  function _everythingOff() {
+    var id, key;
+    for (id in _approvals) _closeBanner(_approvals[id]);
+    for (key in _attention) _closeBanner(_attention[key]);
+    _stopFlash();
   }
 
   // ── Favicon dot while tab is backgrounded ─────────────────────────────
   //
   // We draw the existing favicon into a canvas and overlay a red dot in the
   // top-right corner. This is a subtle but universally visible signal that
-  // survives even when the tab is inactive. Restored when the tab regains
-  // focus (visibilitychange handler below).
+  // survives even when the tab is inactive. It starts and stops with the
+  // title flash.
+  //
+  // The badge is built from an image that loads later. `_dotWanted` is what
+  // that late load consults: without it, a flash that had already stopped
+  // got its red dot painted afterwards, and nothing took it off again.
 
   function _ensureFaviconLink() {
     var link = document.getElementById(FAVICON_ID);
@@ -266,19 +422,28 @@
   }
 
   function _startFaviconDot() {
+    _dotWanted = true;
     var link = _ensureFaviconLink();
     if (_originalFaviconHref === null) _originalFaviconHref = link.href || '';
     if (_badgedFaviconHref) {
       link.href = _badgedFaviconHref;
       return;
     }
+    if (_badgeLoading) return;
+    _badgeLoading = true;
     // Build the badged favicon lazily. Some hosts serve the favicon
     // cross-origin (unlikely here — it's under /static/), which would taint
     // the canvas and block toDataURL. If that happens we swap in a
     // solid-color data URL instead.
+    var done = function (href) {
+      _badgedFaviconHref = href;
+      _badgeLoading = false;
+      if (_dotWanted) _ensureFaviconLink().href = href;
+    };
     var img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = function () {
+      var href;
       try {
         var size = 32;
         var canvas = document.createElement('canvas');
@@ -294,19 +459,15 @@
         ctx.lineWidth = 2;
         ctx.strokeStyle = 'rgba(255,255,255,0.95)';
         ctx.stroke();
-        _badgedFaviconHref = canvas.toDataURL('image/png');
-        link.href = _badgedFaviconHref;
+        href = canvas.toDataURL('image/png');
       } catch (e) {
         // Canvas tainted or drawImage failed — fall back to a plain red
         // dot on transparent so the user still gets a visible signal.
-        _badgedFaviconHref = _plainRedDotDataUrl();
-        link.href = _badgedFaviconHref;
+        href = _plainRedDotDataUrl();
       }
+      done(href);
     };
-    img.onerror = function () {
-      _badgedFaviconHref = _plainRedDotDataUrl();
-      link.href = _badgedFaviconHref;
-    };
+    img.onerror = function () { done(_plainRedDotDataUrl()); };
     img.src = _originalFaviconHref || '/static/images/logo.png';
   }
 
@@ -322,9 +483,10 @@
   }
 
   function _stopFaviconDot() {
+    if (!_dotWanted) return;          // nothing to take off; leave the icon alone
+    _dotWanted = false;
     if (_originalFaviconHref === null) return;
-    var link = _ensureFaviconLink();
-    link.href = _originalFaviconHref;
+    try { _ensureFaviconLink().href = _originalFaviconHref; } catch (e) {}
   }
 
   // ── Arm: unlock audio + request notif permission ──────────────────────
@@ -377,95 +539,137 @@
     });
   }
 
-  // ── Public trigger ────────────────────────────────────────────────────
+  // ── Public triggers ───────────────────────────────────────────────────
 
-  // Shared ping layers for every notification kind (approvals, stalls).
-  function _ping(key, title, body) {
-    if (!isEnabled()) return;
-
-    // Dedup: don't strobe if the same key's event repeats within DEDUP_MS
-    // (some backends can re-emit on reconnect).
+  // The sound layers. False when this key pinged less than DEDUP_MS ago
+  // (some backends can re-emit on reconnect) or pings are switched off.
+  function _chime(key) {
+    if (!isEnabled()) return false;
     var now = Date.now();
     var last = _lastFiredAt[key] || 0;
-    if (key && (now - last) < DEDUP_MS) return;
+    if (key && (now - last) < DEDUP_MS) return false;
     _lastFiredAt[key] = now;
-
     // Audio always attempts to play — if the ctx is locked (no prior
     // gesture on iOS), it will silently no-op and the other layers still
     // fire.
     try { _playChime(); } catch (e) {}
     try { _vibrate(); } catch (e) {}
+    return true;
+  }
 
-    if (document.hidden) {
-      _showNotification(title, body);
-      _startTitleFlash(title);
-      _startFaviconDot();
-    } else {
-      // Foreground: don't spam OS notification. But if the same request
-      // stays unanswered and the user backgrounds the tab, the
-      // visibilitychange handler below promotes it.
-      _pendingWhileForeground = { title: title, body: body };
+  // One ping, nothing that stays on. See the header.
+  function notice(info) {
+    info = info || {};
+    if (!_chime(info.key || '')) return;
+    if (info.banner !== false) {
+      _showNotification(info.title || 'VibeNode', info.body || '', 'vn-notice');
     }
   }
 
-  function approvalNeeded(info) {
-    info = info || {};
-    var sid = info.sessionId || info.session_id || '';
-    var name = info.sessionName || 'Claude session';
-    var tool = info.toolName || info.tool_name || 'a tool';
-    _ping(sid, 'Approval needed', name + ' needs approval for ' + tool);
+  // The server's list of approval pages that are still waiting. Listed: open
+  // for `ttlMs` from now. Not listed: over, now. A record outlives its
+  // approval so one that comes back (the server lost sight of its page for
+  // a moment) keeps what the user already did about it.
+  function syncApprovals(open, ttlMs) {
+    var ttl = (typeof ttlMs === 'number' && ttlMs > 0) ? Math.min(ttlMs, MAX_LEASE_MS) : DEFAULT_LEASE_MS;
+    var now = Date.now(), listed = {}, i, id, item, a;
+    open = Array.isArray(open) ? open : [];
+    for (i = 0; i < open.length; i++) {
+      item = open[i] || {};
+      if (!item.id) continue;
+      id = String(item.id);
+      listed[id] = true;
+      a = _approvals[id];
+      if (!a) a = _approvals[id] = { until: null, acked: false, notified: false, note: null };
+      a.title = String(item.title || 'Approval');
+      a.body = a.title + (item.message ? ' — ' + item.message : '');
+      a.until = _lease(ttl);
+      a.seenAt = now;
+    }
+    for (id in _approvals) {
+      if (!listed[id]) _approvals[id].until = null;        // answered: over, now
+    }
+    // Forget the ones heard about longest ago. Whatever is listed now was
+    // heard about just now, so these are over (or a snapshot far longer than
+    // any the server sends is being cut down to size).
+    var ids = Object.keys(_approvals);
+    if (ids.length > MAX_REMEMBERED) {
+      ids.sort(function (x, y) { return _approvals[x].seenAt - _approvals[y].seenAt; });
+      for (i = 0; i < ids.length - MAX_REMEMBERED; i++) {
+        _closeBanner(_approvals[ids[i]]);
+        delete _approvals[ids[i]];
+      }
+    }
+    _reconcile();
   }
 
-  // A session needs the user for something other than a tool approval —
-  // e.g. the daemon watchdog found it stalled on background work that is
-  // not running, and a nudge did not fix it (`session_stalled` in
+  // A session needs the user for something nothing outside this tab can
+  // answer — e.g. the daemon watchdog found it stalled on background work
+  // that is not running, and a nudge did not fix it (`session_stalled` in
   // socket.js, daemon/health_monitor.py job 5). Keyed separately from
-  // approvals so one never swallows the other inside the dedup window.
+  // notices so one never swallows the other inside the dedup window.
   function attention(info) {
     info = info || {};
     var sid = info.sessionId || info.session_id || '';
     var name = info.sessionName || 'A session';
-    _ping('attention:' + sid, info.title || 'Session needs you',
-          info.body || (name + ' needs you'));
+    var key = 'attention:' + sid;
+    if (!_chime(key)) return;
+    if (_attention[key]) _closeBanner(_attention[key]);   // this event's banner replaces the last one's
+    _attention[key] = {
+      title: info.title || 'Session needs you',
+      body: info.body || (name + ' needs you'),
+      notified: false,
+      note: null,
+    };
+    _reconcile();
   }
 
-  var _pendingWhileForeground = null;
-
-  // If the user backgrounds the tab while an approval is still visibly
-  // pending (chime already played, but they didn't act), start the flash
-  // so returning to the tab they see it. Cleared once they focus back.
-  function _onVisibilityChange() {
-    if (document.hidden) {
-      if (_pendingWhileForeground) {
-        _startTitleFlash(_pendingWhileForeground.title);
-        _startFaviconDot();
-        _showNotification(_pendingWhileForeground.title, _pendingWhileForeground.body);
+  // What it is asking attention for right now. For the console and the tests.
+  function state() {
+    var open = [], id, a;
+    for (id in _approvals) {
+      a = _approvals[id];
+      if (_live(a)) {
+        open.push({ id: id, acked: a.acked, msLeft: Math.min(a.until.wall - Date.now(), a.until.mono - _mono()) });
       }
-    } else {
-      _stopTitleFlash();
-      _stopFaviconDot();
-      _pendingWhileForeground = null;
     }
+    return {
+      flashing: !!_flashTimer, warning: _warning, dot: _dotWanted,
+      approvals: open, attention: Object.keys(_attention),
+      remembered: Object.keys(_approvals).length,
+    };
   }
 
-  // Called by socket.js whenever an approval is resolved (permission
-  // acknowledged) so we don't keep flashing after the user has already
-  // dealt with it in another tab / on another device.
-  function clearPending(sessionId) {
-    if (sessionId) delete _lastFiredAt[sessionId];
-    _pendingWhileForeground = null;
-    _stopTitleFlash();
-    _stopFaviconDot();
+  // ── Page lifecycle ────────────────────────────────────────────────────
+
+  // Looking at the tab is the answer to everything it was flashing about. A
+  // reason that arrives while the tab is on screen is not seen yet: it
+  // starts flashing if the tab is put in the background while it still
+  // holds, and only then.
+  function _onVisibilityChange() {
+    if (!document.hidden) {
+      var id, key;
+      for (id in _approvals) _approvals[id].acked = true;
+      for (key in _attention) _closeBanner(_attention[key]);
+      _attention = {};
+    }
+    _reconcile();
   }
+
 
   // ── Boot ──────────────────────────────────────────────────────────────
 
   function _boot() {
     _installGestureFallback();
     document.addEventListener('visibilitychange', _onVisibilityChange);
-    // Cache the original title now so a later flash restores it correctly
-    // even if some other module has since changed document.title.
-    _originalTitle = document.title;
+    // A page that is frozen by the browser, parked in the back/forward cache
+    // or unloaded stops running. It cannot hear that an approval was
+    // answered, so it leaves nothing on. When it runs again it starts over
+    // from the reasons, and a lease that ran out meanwhile no longer counts.
+    document.addEventListener('freeze', _everythingOff);
+    window.addEventListener('pagehide', _everythingOff);
+    document.addEventListener('resume', _reconcile);
+    window.addEventListener('pageshow', _reconcile);
   }
 
   if (document.readyState === 'loading') {
@@ -477,9 +681,10 @@
   // Export public surface.
   window.VNNotify = {
     arm: arm,
-    approvalNeeded: approvalNeeded,
+    notice: notice,
     attention: attention,
-    clearPending: clearPending,
+    syncApprovals: syncApprovals,
+    state: state,
     setEnabled: setEnabled,
     isEnabled: isEnabled,
   };

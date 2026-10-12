@@ -1760,24 +1760,50 @@ socket.on('session_permission', (data) => {
     if (viewMode === 'sessions' || viewMode === 'workplace' || viewMode === 'homepage') filterSessions();
 });
 
-// External "approval needed" ping — broadcast by POST /api/notify/approval.
-// Emitted by external tools (currently CustomerNode's _confirm_release.py)
-// when a human needs to click Approve/Cancel on a page they may not have
-// noticed. Bridges to the general notify capability so every open VibeNode
-// client — including phones on Tailscale — chimes/flashes. Separate from
-// session_permission, which is Claude tool-approval and stays silent.
-socket.on('approval_needed', (data) => {
+// A local script pinged the user — broadcast by POST /api/notify/approval
+// (currently CustomerNode's release scripts: an approval page is waiting, a
+// test went red, a release is live). Every open VibeNode client, phones on
+// Tailscale included, chimes ONCE. Nothing here may start a title flash: a
+// ping is an event, and only approvals_open below says an approval is still
+// open. Separate from session_permission, which is Claude tool-approval and
+// stays silent.
+function _onExternalNotice(data) {
     try {
-        if (window.VNNotify && typeof window.VNNotify.approvalNeeded === 'function') {
+        if (window.VNNotify && typeof window.VNNotify.notice === 'function') {
             const d = data || {};
-            window.VNNotify.approvalNeeded({
-                sessionId: 'external:' + (d.source || 'unknown'),
-                sessionName: d.title || 'Approval needed',
-                toolName: d.message || (d.source ? d.source : 'action'),
+            window.VNNotify.notice({
+                key: 'external:' + (d.source || 'unknown'),
+                title: d.title || 'VibeNode',
+                body: d.message || '',
+                // A ping with an id is an approval page the server is now
+                // watching. Its banner belongs to approvals_open, which also
+                // takes it down when the page is answered.
+                banner: !d.id,
             });
         }
     } catch (e) { /* notify failures never break other handlers */ }
-});
+}
+socket.on('external_notice', _onExternalNotice);
+// The same ping under its old name, from a web server that has not been
+// restarted since this file changed: static files are live the moment they
+// are pulled, Python only after a restart. It chimes here too, and like any
+// ping it cannot start a flash. A current server never sends it.
+socket.on('approval_needed', _onExternalNotice);
+
+// The approval pages that are still waiting for an answer, as the server sees
+// them right now (app/approval_watch.py). Sent when the list changes and every
+// few seconds while it is not empty. Background tabs flash their title for an
+// approval only while these keep naming it: answered, or no longer heard about,
+// both end the flash (VNNotify.syncApprovals in notify.js).
+function _onApprovalsOpen(data) {
+    try {
+        if (window.VNNotify && typeof window.VNNotify.syncApprovals === 'function') {
+            const d = data || {};
+            window.VNNotify.syncApprovals(d.open, d.ttl_ms);
+        }
+    } catch (e) { /* notify failures never break other handlers */ }
+}
+socket.on('approvals_open', _onApprovalsOpen);
 
 // Watchdog escalation — the daemon found a session idle and "waiting" on
 // background work that is not making progress, and its one nudge did not fix

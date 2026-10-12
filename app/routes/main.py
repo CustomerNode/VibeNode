@@ -3,16 +3,22 @@ Main route -- serves the single-page application.
 """
 
 import json
+import logging
 import os
 import subprocess
 import sys
 
 from flask import Blueprint, Response, jsonify, render_template, request, send_from_directory
 from ..platform_utils import NO_WINDOW as _NO_WINDOW
+from .. import approval_watch
 from .. import mobile_command
 from .. import socketio
+# Same rule as the message hook: only a process on this machine. A phone on the
+# tailnet and a page in a browser both arrive from 127.0.0.1 too.
+from .live_api import _hook_caller_is_local as _caller_is_local
 
 bp = Blueprint('main', __name__)
+log = logging.getLogger(__name__)
 
 
 def _web_port() -> int:
@@ -122,51 +128,114 @@ def usage_limits_refresh():
 
 @bp.route("/api/notify/approval", methods=["POST"])
 def notify_approval():
-    """Broadcast a generic 'approval needed' ping to every connected browser.
+    """A local script tells the user something: every open tab chimes.
 
     Purpose
     -------
     Some external processes (notably CustomerNode's agentic release pipeline,
-    which serves a branded approval page on 127.0.0.1 and opens a browser tab
-    for a human YES/NO click) need to alert the user that human action is
-    required. On desktop, the browser tab opening is obvious; on mobile, or
-    when the user has switched away, it's easy to miss for hours.
-
-    This endpoint accepts a lightweight JSON POST and re-broadcasts it as the
-    Socket.IO event ``approval_needed`` to every connected VibeNode client —
-    including the user's phone connected over Tailscale, which will then
-    chime / flash the title / show a favicon dot via static/js/notify.js.
+    which serves a branded approval page on 127.0.0.1 for a human YES/NO
+    click) need to alert the user. On desktop the page opening is obvious; on
+    mobile, or when the user has switched away, it is easy to miss for hours.
 
     Body (all optional):
         {
-          "title": "Production Release",       // short label for banner
+          "title": "Production Release",       // short label
           "message": "Release v1.2.3 ready",   // longer body text
-          "source": "customernode",            // slug for filtering / grouping
-          "url": "http://127.0.0.1:PORT/"      // where the human should go
+          "source": "customernode",            // slug for grouping
+          "url": "http://127.0.0.1:PORT/"      // the approval page, if any
         }
 
-    Response: ``{"ok": true}`` on success (204-cheap; kept 200 for symmetry
-    with the rest of the API). This endpoint deliberately never returns 4xx
-    for malformed input — a broken alert must not break the release script
-    that emitted it.
+    Two things happen.
+
+    1. Always: the title, message and source are broadcast once as the
+       Socket.IO event ``external_notice``. Each tab pings once
+       (static/js/notify.js): a chime, and a one-off OS notification if the
+       tab is in the background. That is all a ping without an approval page
+       gets ("release is live", "first test red"): there is nothing to
+       answer, so nothing may keep flashing.
+
+    2. When the ping names an approval page (``url`` is the front page of a
+       port on this machine, there is a ``title``, and the caller is a
+       process on this machine), app/approval_watch.py starts watching that
+       page. For as long as the page is verifiably still waiting, background
+       tabs flash their title; they stop when it is answered. See that module
+       for what "still waiting" means. ``id`` in the reply and in the
+       broadcast names the watched page; it is "" when nothing is watched.
+
+    Response: ``{"ok": true, "id": str}``. This endpoint deliberately never
+    returns 4xx for malformed input: a broken alert must not break the release
+    script that emitted it.
     """
     try:
         payload = request.get_json(silent=True) or {}
     except Exception:
         payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
     data = {
         "title": str(payload.get("title") or "Approval needed"),
         "message": str(payload.get("message") or ""),
         "source": str(payload.get("source") or ""),
-        "url": str(payload.get("url") or ""),
+        "id": "",
     }
+    url = str(payload.get("url") or "")
     try:
-        socketio.emit("approval_needed", data)
+        # The script's own title, never the default above: the watch
+        # recognises the page by it. Local callers only, because the watch
+        # fetches the address it is given.
+        if payload.get("title") and url and _caller_is_local():
+            card = approval_watch.watch.register(data["title"], data["message"], data["source"], url)
+            if card:
+                data["id"] = card["id"]
+    except Exception:
+        # The ping still goes out below, as one that names no page.
+        log.exception("notify/approval: could not start watching %r", url[:200])
+    try:
+        socketio.emit("external_notice", data)
     except Exception:
         # Never let a failed broadcast propagate — the caller (a release
         # script) does not care whether the ping actually reached a client.
         pass
-    return jsonify(ok=True)
+    return jsonify(ok=True, id=data["id"])
+
+
+@bp.route("/api/notify/approval/resolve", methods=["POST"])
+def notify_approval_resolve():
+    """A local script says its approval page has been answered.
+
+    Body: ``{"id": str}`` (from the reply to ``POST /api/notify/approval``) or
+    ``{"url": str}`` (the page that was announced).
+
+    Optional: app/approval_watch.py notices an answered page by itself at its
+    next check (every half second while the approval is young, every three
+    seconds after ten minutes). A script that calls this ends the flash at
+    once. Reply: ``{"ok": true, "resolved": int}``; unknown ids and malformed
+    bodies resolve nothing and are not an error. Local callers only (403
+    otherwise).
+    """
+    if not _caller_is_local():
+        return jsonify(ok=False, resolved=0, error="local callers only"), 403
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        payload = {}
+    try:
+        resolved = approval_watch.watch.resolve(payload.get("id"), payload.get("url"))
+    except Exception:
+        log.exception("notify/approval/resolve failed")
+        resolved = 0
+    return jsonify(ok=True, resolved=resolved)
+
+
+@bp.route("/api/notify/approvals")
+def notify_approvals():
+    """The approval pages that are open right now.
+
+    The ``approvals_open`` Socket.IO event, plus each page's address.
+    Side-effect-free: it reads the watch's state and checks nothing. For
+    answering "why is this tab flashing" (or "why is it not").
+    """
+    return jsonify(ok=True, open=approval_watch.watch.open_now(with_urls=True),
+                   ttl_ms=int(approval_watch.CLIENT_TTL_S * 1000))
 
 
 @bp.route("/api/health")

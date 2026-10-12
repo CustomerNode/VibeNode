@@ -129,9 +129,15 @@ def create_app(testing=False) -> Flask:
         # the first client poll. The web-server restart animation takes ~5-10s, so
         # the model is often warm again before the user can even try to use voice.
         # start_install() is idempotent and thread-safe — safe to call at startup.
+        #
+        # Never in a test app: the model is loaded by native code on a daemon
+        # thread, and a process that exits while that load is running dies with
+        # SIGABRT ("terminate called without an active exception", exit 134).
+        # A short pytest run that built an app in its last second ended that
+        # way after every test had passed.
         try:
             from speechnode import engine as _sn_engine
-            if _sn_engine._deps_available():
+            if not testing and _sn_engine._deps_available():
                 _sn_engine.start_install()
                 _logging.getLogger("app").info("SpeechNode: pre-warming model after restart.")
         except Exception:
