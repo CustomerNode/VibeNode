@@ -2926,7 +2926,9 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
    exactly when the user has scrolled up, and releases at the true bottom. */
 .vn-jump-wrap {
   position:sticky; bottom:10px; height:0;
-  display:flex; justify-content:center;
+  /* flex-start, not the default stretch: stretch sized the button to this
+     zero-height wrapper, squashing it to its padding (~12px tall). */
+  display:flex; justify-content:center; align-items:flex-start;
   z-index:5; pointer-events:none;
   opacity:0; visibility:hidden;
   transition:opacity .16s var(--ease-out);
@@ -2957,32 +2959,51 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
 }
 .vn-jump-pill:active { transform:translateY(-100%) scale(.97); }
 .vn-jump-pill svg { flex-shrink:0; opacity:.6; }
-/* Quiet state (content below, nothing new): an arrow-only round button. */
-.vn-jump-pill:not(.has-new) { padding:6px; }
-/* Something new landed below the fold. The thread never scrolls itself any
-   more (thread-scroll.js, D), so this is the ONLY signal: it must be obvious
-   at a glance, hence the solid accent fill and a soft pulse ring. */
-.vn-jump-pill.has-new {
-  background: var(--accent);
-  color: #fff;
-  border-color: var(--accent);
-  opacity:1;
-  font-weight:600;
-  animation: vnJumpPulse 2s var(--ease-out) infinite;
+/* The button carries the session's status (thread-scroll.js _renderPill).
+   The thread never scrolls itself (thread-scroll.js, D), so this is the only
+   signal that something is happening below: each status is a solid colour
+   readable at a glance. Quiet (idle, nothing new) is an arrow-only circle. */
+.vn-jump-pill:not(.is-working):not(.is-waiting):not(.is-done) {
+  padding:7px; opacity:1;
+  color: var(--text-secondary); border-color: var(--border-hover);
 }
-.vn-jump-pill.has-new svg { opacity:1; }
-.vn-jump-pill.has-new:hover,
-.vn-jump-pill.has-new:focus-visible {
-  background: var(--accent-hover); border-color: var(--accent-hover); color:#fff;
+.vn-jump-pill:not(.is-working):not(.is-waiting):not(.is-done) svg { opacity:.9; }
+.vn-jump-pill.is-working,
+.vn-jump-pill.is-waiting,
+.vn-jump-pill.is-done {
+  --vn-jump-c: var(--status-working);
+  background: var(--vn-jump-c);
+  border-color: var(--vn-jump-c);
+  color:#fff; opacity:1; font-weight:600;
 }
+.vn-jump-pill.is-waiting { --vn-jump-c: var(--orange); }
+.vn-jump-pill.is-done    { --vn-jump-c: var(--green);
+  animation: vnJumpPulse 2s var(--ease-out) infinite; }
+.vn-jump-pill.is-working svg,
+.vn-jump-pill.is-waiting svg,
+.vn-jump-pill.is-done svg { opacity:1; }
+.vn-jump-pill.is-working:hover, .vn-jump-pill.is-working:focus-visible,
+.vn-jump-pill.is-waiting:hover, .vn-jump-pill.is-waiting:focus-visible,
+.vn-jump-pill.is-done:hover,    .vn-jump-pill.is-done:focus-visible {
+  color:#fff; border-color: var(--vn-jump-c); filter: brightness(1.12);
+}
+/* "Working" dots: three dots breathing in turn. */
+.vn-jump-dots { display:inline-flex; gap:2px; margin-left:-2px; }
+.vn-jump-dots i {
+  width:3px; height:3px; border-radius:50%; background:currentColor;
+  animation: vnJumpDot 1.2s infinite ease-in-out;
+}
+.vn-jump-dots i:nth-child(2) { animation-delay:.2s; }
+.vn-jump-dots i:nth-child(3) { animation-delay:.4s; }
+@keyframes vnJumpDot { 0%,80%,100% { opacity:.25; } 40% { opacity:1; } }
 @keyframes vnJumpPulse {
-  0%   { box-shadow: var(--elev-2), 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
-  70%  { box-shadow: var(--elev-2), 0 0 0 9px color-mix(in srgb, var(--accent) 0%, transparent); }
-  100% { box-shadow: var(--elev-2), 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
+  0%   { box-shadow: var(--elev-2), 0 0 0 0 color-mix(in srgb, var(--vn-jump-c) 55%, transparent); }
+  70%  { box-shadow: var(--elev-2), 0 0 0 9px color-mix(in srgb, var(--vn-jump-c) 0%, transparent); }
+  100% { box-shadow: var(--elev-2), 0 0 0 0 color-mix(in srgb, var(--vn-jump-c) 0%, transparent); }
 }
 @media (prefers-reduced-motion: reduce) {
   .vn-jump-wrap { transition:none; }
-  .vn-jump-pill.has-new { animation:none; }
+  .vn-jump-pill.is-done, .vn-jump-dots i { animation:none; }
 }
 
 /* Load older messages pagination button */

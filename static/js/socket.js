@@ -1099,7 +1099,10 @@ socket.on('session_state', (data) => {
         updateLiveInputBar();
         // The working bar appearing/disappearing resizes the log. Keep a
         // caught-up reader pinned; never reveal new content (thread-scroll.js, D).
-        if (window.ThreadScroll) setTimeout(() => ThreadScroll.holdBottom(), 100);
+        if (window.ThreadScroll) {
+            ThreadScroll.refresh();   // jump button label: Working / Needs you / Done
+            setTimeout(() => ThreadScroll.holdBottom(), 100);
+        }
 
         // Self-healing: check if frontend is missing entries vs backend.
         // Only re-fetch if the backend genuinely has MORE entries than the

@@ -6928,6 +6928,11 @@ class SessionManager:
                     cand = cand.replace(year=cand.year + 1)
             elif cand.timestamp() < now - SessionManager._LIMIT_CLOCK_RECENT_PAST:
                 cand = cand + timedelta(days=1)
+            elif cand.timestamp() > now + 24 * 3600 - SessionManager._LIMIT_CLOCK_RECENT_PAST:
+                # Midnight edge case: "resets 11:54pm" seen at 00:14am means
+                # YESTERDAY 11:54pm (just reset), not TOMORROW 11:54pm.  The
+                # mirror of the "today-in-past -> tomorrow" branch above.
+                cand = cand - timedelta(days=1)
             return cand.timestamp()
         except (ValueError, KeyError, OverflowError, OSError):
             return 0.0

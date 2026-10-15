@@ -84,13 +84,14 @@
  *    FOLLOW / READING now only govern auto-collapse.  The view moves for exactly
  *    four reasons, all of them the user's own action or a fresh load: opening a
  *    session (the log render positions it), sending a message (`onSend`),
- *    clicking the jump button (`catchUp`), and `holdBottom()` keeping a reader
+ *    clicking the jump button (`catchUp`: to the TOP of the final message, then
+ *    the bottom on a second tap), and `holdBottom()` keeping a reader
  *    who is already caught up pinned when the composer or keyboard resizes the
  *    log (a layout correction that never reveals anything new).
  *
- *    Instead, anything that lands below the fold lights up the jump button
- *    (accent fill, "N new" / "New below"). With nothing new it is a quiet
- *    down-arrow, shown whenever there is content below the viewport.
+ *    Instead the jump button shows whenever anything is below the fold, and
+ *    carries the session's status: "Working", "Needs you", or "Done" (finished
+ *    with output you have not seen). Idle with nothing new: a quiet arrow.
  *
  *    "Unseen" is measured geometrically (`_tailInView`): the sentinel strictly
  *    inside the log's box. The observer's BOTTOM_SLOP is right for the state
@@ -370,37 +371,68 @@
     '<line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>';
   var _pillKey = '';
 
+  /**
+   * What the session is doing right now, from the page's own state map
+   * (`sessionKinds`, written by socket.js on every session_state).
+   *   'working'  a turn is running
+   *   'waiting'  a question or permission prompt needs the user
+   *   'idle'     anything else
+   */
+  function _activity() {
+    try {
+      var sid = (typeof liveSessionId !== 'undefined' && liveSessionId) || _sid;
+      var kind = (typeof sessionKinds !== 'undefined' && sid) ? sessionKinds[sid] : '';
+      if (kind === 'working') return 'working';
+      if (kind === 'question') return 'waiting';
+    } catch (e) { /* globals not loaded yet */ }
+    return 'idle';
+  }
+
+  var _MODES = {
+    //          label        class          aria / title
+    working: ['Working',   'is-working', 'Still working. Jump to the latest'],
+    waiting: ['Needs you', 'is-waiting', 'Waiting on you. Jump to the latest'],
+    done:    ['Done',      'is-done',    'Finished. Jump to the latest'],
+    quiet:   ['',          '',           'Jump to latest'],
+  };
+
   function _renderPill() {
     if (!_pillEl || !_pillWrap) return;
-    // Two looks, one button:
-    //   quiet   content below the fold, nothing new: a muted down-arrow.
-    //   accent  something new landed below: filled with the accent colour and
-    //           labelled, so it is obvious without being read.
+    // The button answers "is it still going?", not "how many entries?" (a
+    // count is noise: one reply can be a dozen tool steps). It shows whenever
+    // there is anything below the fold, and its look is the session's status:
+    //   Working    a turn is running            (blue, animated dots)
+    //   Needs you  a question / permission      (amber)
+    //   Done       finished, and unseen output  (green)
+    //   quiet      idle, nothing new            (muted arrow only)
     var fresh = _hasNew || _newCount > 0;
     var show = fresh || !_atBottom;
     if (!show) {
       _pillWrap.classList.remove('visible');
       _pillWrap.setAttribute('aria-hidden', 'true');
-      _pillEl.classList.remove('has-new');
       _pillKey = '';
       return;
     }
-    var label = !fresh ? '' : (_newCount > 0 ? _newCount + ' new' : 'New below');
-    var key = (fresh ? 'n' : 'q') + label;
-    if (key !== _pillKey) {      // don't churn the DOM on every streamed chunk
-      _pillKey = key;
-      _pillEl.innerHTML = _ARROW_SVG + (label ? '<span>' + label + '</span>' : '');
-      _pillEl.classList.toggle('has-new', fresh);
-      _pillEl.setAttribute('aria-label', fresh
-        ? 'Jump to latest, ' + (_newCount > 0
-            ? _newCount + ' new message' + (_newCount === 1 ? '' : 's')
-            : 'new content below')
-        : 'Jump to latest');
-      _pillEl.title = fresh ? 'New content below. Click to jump to the latest' : 'Jump to latest';
+    var act = _activity();
+    var mode = act === 'working' ? 'working'
+             : act === 'waiting' ? 'waiting'
+             : fresh ? 'done' : 'quiet';
+    if (mode !== _pillKey) {      // don't churn the DOM on every streamed chunk
+      _pillKey = mode;
+      var m = _MODES[mode];
+      _pillEl.innerHTML = _ARROW_SVG +
+        (m[0] ? '<span>' + m[0] + '</span>' : '') +
+        (mode === 'working' ? '<span class="vn-jump-dots"><i></i><i></i><i></i></span>' : '');
+      _pillEl.className = 'vn-jump-pill' + (m[1] ? ' ' + m[1] : '');
+      _pillEl.setAttribute('aria-label', m[2]);
+      _pillEl.title = m[2];
     }
     _pillWrap.classList.add('visible');
     _pillWrap.setAttribute('aria-hidden', 'false');
   }
+
+  /** The session's status changed: repaint the button's label. */
+  function refresh() { _renderPill(); }
 
   // ── Public API ──────────────────────────────────────────────────────────
 
@@ -519,10 +551,44 @@
     scrollToBottom();
   }
 
-  /** Explicit catch-up (jump pill). The strong signal that restores LIVE. */
+  // Gap left above the final message when its top is aligned to the viewport.
+  var FINAL_BOX_TOP_PAD = 8;
+
+  /**
+   * scrollTop that puts the top of the final message box (the last user or
+   * assistant `.msg`) at the top of the viewport, clamped to the real bottom.
+   * Returns null when there is no message to align to.
+   */
+  function _finalBoxScrollTop() {
+    if (!_logEl || !_logEl.querySelectorAll) return null;
+    var boxes = _logEl.querySelectorAll('.msg');
+    if (!boxes.length) return null;
+    var box = boxes[boxes.length - 1];
+    var top = box.getBoundingClientRect().top - _logEl.getBoundingClientRect().top +
+              _logEl.scrollTop - FINAL_BOX_TOP_PAD;
+    var max = Math.max(0, _logEl.scrollHeight - _logEl.clientHeight);
+    return Math.max(0, Math.min(top, max));
+  }
+
+  /**
+   * Explicit catch-up (jump button). The strong signal that restores LIVE.
+   *
+   * Lands on the FIRST line of the final message, not the bottom of it, so a
+   * long reply is read from its start (user request, 2026-10-15). A short one
+   * clamps to the bottom, which is the same view. If the reader is already at
+   * or past that point, a second tap goes all the way to the bottom, so the
+   * button can never get stuck.
+   */
   function catchUp() {
     _setState(LIVE, 'catch-up');
-    scrollToBottom();
+    var target = _finalBoxScrollTop();
+    if (target == null || !_logEl || _logEl.scrollTop >= target - 4) {
+      scrollToBottom();
+      return;
+    }
+    _logEl.scrollTop = target;
+    _clearNew();       // the reader asked to see it: it is no longer "new"
+    _renderPill();
   }
 
   function scrollToBottom() {
@@ -584,6 +650,7 @@
     noteNewContent: noteNewContent,
     holdBottom: holdBottom,
     hasNew: hasNew,
+    refresh: refresh,
     state: state,
     isReading: isReading,
     mayAutoScroll: mayAutoScroll,

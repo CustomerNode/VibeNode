@@ -81,6 +81,11 @@ class FakeEl {
   setAttribute(k, v) { this._attrs[k] = v; }
   getAttribute(k) { return this._attrs[k]; }
   getBoundingClientRect() { return this.rect; }
+  // Enough for '.msg': direct children carrying the class.
+  querySelectorAll(sel) {
+    const cls = sel.replace(/^\./, '');
+    return this.children.filter((c) => c.classList.contains(cls));
+  }
   addEventListener(t, f) { (this._listeners[t] = this._listeners[t] || []).push(f); }
   removeEventListener(t, f) {
     const a = this._listeners[t];
@@ -419,8 +424,8 @@ test('a new message below the fold lights the button and does NOT scroll', () =>
   msg(600, 900);
   assert.strictEqual(log.scrollTop, 123, 'new content must never move the view');
   assert.ok(pillWrap().classList.contains('visible'));
-  assert.ok(pill().classList.contains('has-new'), 'new content must be obvious');
-  assert.ok(/1 new/.test(pill().innerHTML));
+  assert.ok(pill().classList.contains('is-done'), 'idle + unseen output reads "Done"');
+  assert.ok(/Done/.test(pill().innerHTML));
   assert.strictEqual(TS.hasNew(), true);
   assert.strictEqual(TS.atBottom(), false, 'unseen content means not caught up');
 });
@@ -462,13 +467,12 @@ test('streaming growth below the fold lights the button; scrolling to it clears'
   setup();
   tailBelowFold();
   TS.noteNewContent();
-  assert.ok(pill().classList.contains('has-new'));
-  assert.ok(/New below/.test(pill().innerHTML));
+  assert.ok(pill().classList.contains('is-done'));
   tailInView();
   log.dispatch('scroll', {});
   flushRaf();
   assert.strictEqual(TS.hasNew(), false, 'reaching the new content means it was seen');
-  assert.ok(!pill().classList.contains('has-new'));
+  assert.ok(!pillWrap().classList.contains('visible'), 'caught up: nothing to jump to');
 });
 
 test('quiet arrow shows when scrolled up with nothing new', () => {
@@ -476,18 +480,45 @@ test('quiet arrow shows when scrolled up with nothing new', () => {
   log.dispatch('wheel', {});
   fireIO(false);
   assert.ok(pillWrap().classList.contains('visible'));
-  assert.ok(!pill().classList.contains('has-new'));
+  assert.ok(!pill().classList.contains('is-done'));
 });
 
-test('clicking the button jumps to the bottom and clears "new"', () => {
+test('clicking the button jumps to the final message and clears "new"', () => {
   setup();
   tailBelowFold();
   msg(600, 900);
   log.scrollHeight = 3000;
   pill().dispatch('click', { preventDefault() {}, stopPropagation() {} });
-  assert.strictEqual(log.scrollTop, 3000);
+  assert.strictEqual(log.scrollTop, 592, 'top of the final message, minus the 8px pad');
   assert.strictEqual(TS.hasNew(), false);
   assert.strictEqual(TS.state(), 'LIVE');
+});
+
+test('the button lands on the TOP of the final message; a second tap goes to the bottom', () => {
+  setup();
+  log.scrollTop = 0; log.scrollHeight = 3000; log.clientHeight = 500;
+  msg(100, 400);
+  msg(1200, 2900);                    // final message: top 1200px down the log
+  log.dispatch('wheel', {});
+  fireIO(false);
+  TS.catchUp();
+  assert.strictEqual(log.scrollTop, 1192, 'top of final box (minus 8px pad), not the bottom');
+  assert.strictEqual(TS.hasNew(), false);
+  // the fake does not reflow, so shift the rect to match the new scrollTop
+  log.children.filter((c) => c.classList.contains('msg')).pop().rect =
+    { top: 8, bottom: 1708, left: 0, right: 760 };
+  TS.catchUp();
+  assert.strictEqual(log.scrollTop, 3000, 'second tap: all the way down');
+});
+
+test('a short final message clamps to the bottom', () => {
+  setup();
+  log.scrollTop = 0; log.scrollHeight = 1000; log.clientHeight = 500;
+  msg(900, 960);                      // top would need 892, max is 500
+  log.dispatch('wheel', {});
+  fireIO(false);
+  TS.catchUp();
+  assert.strictEqual(log.scrollTop, 500);
 });
 
 test('holdBottom pins a caught-up reader but never reveals new content', () => {
@@ -501,6 +532,32 @@ test('holdBottom pins a caught-up reader but never reveals new content', () => {
   msg(600, 900);
   TS.holdBottom();
   assert.strictEqual(log.scrollTop, 500, 'must not scroll to unseen content');
+});
+
+test('while the session works the button says "Working", even with nothing new', () => {
+  setup();
+  global.liveSessionId = 'sess-1';
+  global.sessionKinds = { 'sess-1': 'working' };
+  try {
+    log.dispatch('wheel', {});
+    fireIO(false);
+    assert.ok(pill().classList.contains('is-working'));
+    assert.ok(/Working/.test(pill().innerHTML));
+    // the turn finishes with output the reader has not seen -> "Done"
+    tailBelowFold();
+    msg(600, 900);
+    global.sessionKinds['sess-1'] = 'idle';
+    TS.refresh();
+    assert.ok(pill().classList.contains('is-done'));
+    // a question below the fold -> "Needs you"
+    global.sessionKinds['sess-1'] = 'question';
+    TS.refresh();
+    assert.ok(pill().classList.contains('is-waiting'));
+    assert.ok(/Needs you/.test(pill().innerHTML));
+  } finally {
+    delete global.liveSessionId;
+    delete global.sessionKinds;
+  }
 });
 
 // ── Report ────────────────────────────────────────────────────────────────
