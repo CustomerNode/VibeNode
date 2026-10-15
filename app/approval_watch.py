@@ -58,6 +58,7 @@ import ipaddress
 import logging
 import re
 import socket
+import sys
 import threading
 import time
 import urllib.parse
@@ -75,9 +76,13 @@ PROBE_SLOW_S = 3.0        # an older page, or one whose last checks could not te
 FAST_FOR_S = 600.0        # how long a page counts as "just told about"
 RETRY_S = 0.3             # after a check that could not tell, look again at once...
 QUICK_RETRIES = 2         # ...this many times, then at the slow pace
-# Above 2s: connecting to a closed port takes about that long to be refused on
-# Windows, and a refusal is the clearest "answered" there is.
 PROBE_TIMEOUT_S = 2.5
+# Windows retries a connect that was refused, so a closed port on this machine
+# takes about 2s to say so; elsewhere the refusal is immediate. A refusal is the
+# clearest "answered" there is, so the connect always waits at least this long,
+# whatever timeout a check is given. A page that is up connects at once, so this
+# never slows a check of a page that is there, silent or not.
+REFUSAL_WAIT_S = 2.5 if sys.platform == "win32" else 0.0
 VERIFY_TTL_S = 8.0        # not seen unchanged for this long: not open
 CONFIRM_WINDOW_S = 30.0   # a new page gets this long to answer its first check
 HEARTBEAT_S = 3.0         # an open approval is said again this often
@@ -136,7 +141,8 @@ def _whole_reply(raw) -> int | None:
 
 
 def fetch_page(url: str, timeout: float = PROBE_TIMEOUT_S):
-    """GET the front page at ``url`` once, in at most ``2 * timeout``.
+    """GET the front page at ``url`` once, in at most ``2 * timeout`` once
+    connected (the connect itself may take ``REFUSAL_WAIT_S``).
 
     ``(PAGE, body)`` for a complete 200.  ``(GONE, b"")`` when that page is not
     being served: nothing listens there, or the answer is anything but a 200 of
@@ -147,13 +153,14 @@ def fetch_page(url: str, timeout: float = PROBE_TIMEOUT_S):
     checked on one thread.  No proxy from the environment, no redirects.
     """
     parts = urllib.parse.urlsplit(url)
-    deadline = time.monotonic() + 2 * timeout
     try:
-        sock = socket.create_connection((parts.hostname, parts.port or 80), timeout=timeout)
+        sock = socket.create_connection((parts.hostname, parts.port or 80),
+                                        timeout=max(timeout, REFUSAL_WAIT_S))
     except ConnectionRefusedError:
         return GONE, b""
     except OSError:
         return UNKNOWN, b""
+    deadline = time.monotonic() + 2 * timeout
     try:
         # "localhost" is a name. Nothing is sent unless the other end really
         # is this machine.

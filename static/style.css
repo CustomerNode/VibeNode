@@ -2932,9 +2932,9 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
   transition:opacity .16s var(--ease-out);
 }
 .vn-jump-wrap.visible { opacity:1; visibility:visible; }
-/* Deliberately understated: this is an ambient hint, not a call to action.
-   Muted text, hairline border, translucent blurred fill so thread content
-   reads through it. It resolves to full contrast only on hover/focus. */
+/* Quiet by default (content below, nothing new): muted text, hairline border,
+   translucent blurred fill so thread content reads through it. `.has-new`
+   below turns it into the loud accent version. */
 .vn-jump-pill {
   position:relative;
   pointer-events:auto; transform:translateY(-100%);
@@ -2957,8 +2957,32 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
 }
 .vn-jump-pill:active { transform:translateY(-100%) scale(.97); }
 .vn-jump-pill svg { flex-shrink:0; opacity:.6; }
+/* Quiet state (content below, nothing new): an arrow-only round button. */
+.vn-jump-pill:not(.has-new) { padding:6px; }
+/* Something new landed below the fold. The thread never scrolls itself any
+   more (thread-scroll.js, D), so this is the ONLY signal: it must be obvious
+   at a glance, hence the solid accent fill and a soft pulse ring. */
+.vn-jump-pill.has-new {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+  opacity:1;
+  font-weight:600;
+  animation: vnJumpPulse 2s var(--ease-out) infinite;
+}
+.vn-jump-pill.has-new svg { opacity:1; }
+.vn-jump-pill.has-new:hover,
+.vn-jump-pill.has-new:focus-visible {
+  background: var(--accent-hover); border-color: var(--accent-hover); color:#fff;
+}
+@keyframes vnJumpPulse {
+  0%   { box-shadow: var(--elev-2), 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
+  70%  { box-shadow: var(--elev-2), 0 0 0 9px color-mix(in srgb, var(--accent) 0%, transparent); }
+  100% { box-shadow: var(--elev-2), 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
+}
 @media (prefers-reduced-motion: reduce) {
   .vn-jump-wrap { transition:none; }
+  .vn-jump-pill.has-new { animation:none; }
 }
 
 /* Load older messages pagination button */

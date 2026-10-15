@@ -33,11 +33,17 @@ class FakeClassList {
   add(...c) { c.forEach((x) => this._s.add(x)); }
   remove(...c) { c.forEach((x) => this._s.delete(x)); }
   contains(c) { return this._s.has(c); }
+  toggle(c, force) {
+    const on = force === undefined ? !this._s.has(c) : !!force;
+    if (on) this._s.add(c); else this._s.delete(c);
+    return on;
+  }
 }
 
 class FakeEl {
   constructor(tag) {
     this.tagName = String(tag || 'div').toUpperCase();
+    this.nodeType = 1;   // ELEMENT_NODE: the module skips anything else
     this.classList = new FakeClassList();
     this.children = [];
     this.parentNode = null;
@@ -395,6 +401,106 @@ test('sentinel stays pinned as the last child after appends', () => {
   const last = log.lastElementChild;
   assert.ok(last.classList.contains('vn-thread-sentinel'),
     'sentinel must remain last or "caught up" detection breaks');
+});
+
+// ── New content never moves the view; the jump button announces it ───────
+// (thread-scroll.js, D — added 2026-10-14)
+
+function tail() { return log.children.find((c) => c.classList.contains('vn-thread-sentinel')); }
+function pillWrap() { return log.children.find((c) => c.classList.contains('vn-jump-wrap')); }
+function pill() { return pillWrap().children[0]; }
+function tailBelowFold() { tail().rect = { top: 900, bottom: 901, left: 0, right: 800 }; }
+function tailInView() { tail().rect = { top: 499, bottom: 500, left: 0, right: 800 }; }
+
+test('a new message below the fold lights the button and does NOT scroll', () => {
+  setup();
+  log.scrollTop = 123;
+  tailBelowFold();
+  msg(600, 900);
+  assert.strictEqual(log.scrollTop, 123, 'new content must never move the view');
+  assert.ok(pillWrap().classList.contains('visible'));
+  assert.ok(pill().classList.contains('has-new'), 'new content must be obvious');
+  assert.ok(/1 new/.test(pill().innerHTML));
+  assert.strictEqual(TS.hasNew(), true);
+  assert.strictEqual(TS.atBottom(), false, 'unseen content means not caught up');
+});
+
+test('a new message the reader can already see is not "new"', () => {
+  setup();
+  tailInView();
+  msg(300, 450);
+  assert.strictEqual(TS.hasNew(), false);
+  assert.ok(!pillWrap().classList.contains('visible'));
+});
+
+test('"Load older" prepends are never counted as new', () => {
+  setup();
+  tailInView();
+  msg(100, 200);                     // an existing message to prepend before
+  tailBelowFold();
+  const older = new FakeEl('div');
+  older.className = 'msg user';
+  _pendingRecords.push({ addedNodes: [older], nextSibling: log.children[0] });
+  flushMutations();
+  assert.strictEqual(TS.hasNew(), false);
+});
+
+test('a fresh render (positioned) is not news', async () => {
+  setup();
+  tailBelowFold();
+  msg(0, 100);                       // queued render batch...
+  // ...but in the browser the MO callback runs after positioned(); emulate that.
+  TS.positioned();
+  const el = new FakeEl('div'); el.className = 'msg assistant';
+  log.appendChild(el);
+  flushMutations();
+  // first batch after positioned() is skipped
+  assert.strictEqual(TS.hasNew(), false);
+});
+
+test('streaming growth below the fold lights the button; scrolling to it clears', () => {
+  setup();
+  tailBelowFold();
+  TS.noteNewContent();
+  assert.ok(pill().classList.contains('has-new'));
+  assert.ok(/New below/.test(pill().innerHTML));
+  tailInView();
+  log.dispatch('scroll', {});
+  flushRaf();
+  assert.strictEqual(TS.hasNew(), false, 'reaching the new content means it was seen');
+  assert.ok(!pill().classList.contains('has-new'));
+});
+
+test('quiet arrow shows when scrolled up with nothing new', () => {
+  setup();
+  log.dispatch('wheel', {});
+  fireIO(false);
+  assert.ok(pillWrap().classList.contains('visible'));
+  assert.ok(!pill().classList.contains('has-new'));
+});
+
+test('clicking the button jumps to the bottom and clears "new"', () => {
+  setup();
+  tailBelowFold();
+  msg(600, 900);
+  log.scrollHeight = 3000;
+  pill().dispatch('click', { preventDefault() {}, stopPropagation() {} });
+  assert.strictEqual(log.scrollTop, 3000);
+  assert.strictEqual(TS.hasNew(), false);
+  assert.strictEqual(TS.state(), 'LIVE');
+});
+
+test('holdBottom pins a caught-up reader but never reveals new content', () => {
+  setup();
+  log.scrollTop = 500; log.scrollHeight = 1200;
+  TS.holdBottom();
+  assert.strictEqual(log.scrollTop, 1200, 'layout correction for a caught-up reader');
+
+  log.scrollTop = 500; log.scrollHeight = 1600;
+  tailBelowFold();
+  msg(600, 900);
+  TS.holdBottom();
+  assert.strictEqual(log.scrollTop, 500, 'must not scroll to unseen content');
 });
 
 // ── Report ────────────────────────────────────────────────────────────────

@@ -1097,14 +1097,9 @@ socket.on('session_state', (data) => {
     if (liveSessionId === session_id) {
         liveBarState = null;  // force re-render
         updateLiveInputBar();
-        // Settle scroll on state change (working bar appears/disappears).
-        // Route through _autoScrollLiveLog so it top-aligns the most-recent
-        // expanded AI message instead of stomping it back to the bottom.
-        const _logEl = document.getElementById('live-log');
-        if (_logEl && liveAutoScroll) setTimeout(() => {
-            if (typeof _autoScrollLiveLog === 'function') _autoScrollLiveLog(_logEl);
-            else _logEl.scrollTop = _logEl.scrollHeight;
-        }, 100);
+        // The working bar appearing/disappearing resizes the log. Keep a
+        // caught-up reader pinned; never reveal new content (thread-scroll.js, D).
+        if (window.ThreadScroll) setTimeout(() => ThreadScroll.holdBottom(), 100);
 
         // Self-healing: check if frontend is missing entries vs backend.
         // Only re-fetch if the backend genuinely has MORE entries than the
@@ -1458,9 +1453,9 @@ socket.on('stream_event', (data) => {
             }
         }
 
-        if (liveAutoScroll) {
-            logEl.scrollTop = logEl.scrollHeight;
-        }
+        // Never follow the stream: new content does not move the reader's view
+        // (thread-scroll.js, D). It lights the jump button instead.
+        if (window.ThreadScroll) ThreadScroll.noteNewContent();
 
         // Reset watchdog — data is flowing
         if (typeof _resetMessageWatchdog === 'function') _resetMessageWatchdog(liveSessionId);
@@ -1681,16 +1676,9 @@ socket.on('session_entry', (data) => {
     if (typeof _tryAddOutputCard === 'function') _tryAddOutputCard(data.entry);
     liveLineCount = (data.index != null) ? data.index + 1 : liveLineCount + 1;
     if (typeof _updateLastMessageTimes === 'function') _updateLastMessageTimes();
-    if (liveAutoScroll) {
-        // For a freshly-arrived AI message, top-align it (when taller than the
-        // viewport) so the user can start reading from its first line; for any
-        // other entry, scroll to bottom as usual.
-        if (typeof _autoScrollLiveLog === 'function') {
-            _autoScrollLiveLog(logEl, _isAsstEntry ? _newEntryEl : null);
-        } else {
-            logEl.scrollTop = logEl.scrollHeight;
-        }
-    }
+    // No auto-scroll for a new entry: the reader's view never moves on its own
+    // (thread-scroll.js, D). ThreadScroll's MutationObserver sees the append and
+    // lights the jump button if it landed below the fold.
     // ── Sub-agent team tracking ──
     if (data.entry.kind === 'tool_use' && data.entry.name === 'Agent') {
         if (!window._subAgents[data.session_id]) window._subAgents[data.session_id] = {};
@@ -1854,7 +1842,7 @@ socket.on('hook_message', (data) => {
         if (!sid || (sid !== liveSessionId && !allSessionIds.has(sid))) return;   // another project's session
         if (sid === liveSessionId && d.delivered === 'sent' && d.message
             && typeof _addOptimisticBubble === 'function') {
-            _addOptimisticBubble(sid, d.message);
+            _addOptimisticBubble(sid, d.message, false, { passive: true });
             return;
         }
         if (d.text && typeof showToast === 'function') {
@@ -1872,7 +1860,7 @@ socket.on('queue_dispatched', (data) => {
     showToast('Sending queued command\u2026' + (remaining ? ' (' + remaining + ' remaining)' : ''));
     // Add optimistic user bubble for the dispatched message
     if (sid === liveSessionId && text && typeof _addOptimisticBubble === 'function') {
-        _addOptimisticBubble(sid, text);
+        _addOptimisticBubble(sid, text, false, { passive: true });
     }
     // Clear local queue when all items dispatched
     if (remaining === 0) {
@@ -2186,6 +2174,8 @@ socket.on('session_log', (data) => {
         if (typeof _autoScrollLiveLog === 'function') _autoScrollLiveLog(logEl, _expandedAsstEl);
         else logEl.scrollTop = logEl.scrollHeight;
     }
+    // A fresh render is the thread itself, not news for the jump button.
+    if (window.ThreadScroll) ThreadScroll.positioned();
 
     // Performance: measure session switch time (from get_session_log emit to render complete)
     if (performance.getEntriesByName('switch-' + data.session_id).length) {

@@ -21,9 +21,11 @@
  * ── The model ─────────────────────────────────────────────────────────────
  * Three states, on a descending ladder of automation:
  *
- *   LIVE     follow the tail + auto-collapse superseded messages
- *   FOLLOW   follow the tail, never auto-collapse
+ *   LIVE     auto-collapse superseded messages (once well off screen)
+ *   FOLLOW   never auto-collapse
  *   READING  touch nothing
+ *
+ * (These rungs used to also tail-follow new content. They no longer do: see D.)
  *
  *                     ┌──────────────────────────────┐
  *     session open ──▶ │            LIVE              │
@@ -76,9 +78,28 @@
  *    not jump — the same anchoring technique already used by the load-older
  *    prepend path in socket.js.
  *
+ * D. NEW CONTENT NEVER MOVES THE VIEW (2026-10-14).  Users asked for this
+ *    outright: "I don't like it when I'm looking at a session and it scrolls by
+ *    itself when new updates come."  So no state tail-follows any more.  LIVE /
+ *    FOLLOW / READING now only govern auto-collapse.  The view moves for exactly
+ *    four reasons, all of them the user's own action or a fresh load: opening a
+ *    session (the log render positions it), sending a message (`onSend`),
+ *    clicking the jump button (`catchUp`), and `holdBottom()` keeping a reader
+ *    who is already caught up pinned when the composer or keyboard resizes the
+ *    log (a layout correction that never reveals anything new).
+ *
+ *    Instead, anything that lands below the fold lights up the jump button
+ *    (accent fill, "N new" / "New below"). With nothing new it is a quiet
+ *    down-arrow, shown whenever there is content below the viewport.
+ *
+ *    "Unseen" is measured geometrically (`_tailInView`): the sentinel strictly
+ *    inside the log's box. The observer's BOTTOM_SLOP is right for the state
+ *    machine but too loose here: a line 60px below the fold is not "seen".
+ *
  * PERF: one IntersectionObserver + one MutationObserver + one passive scroll
  * listener per attached log, all torn down in attach()/detach().  The scroll
- * listener is rAF-coalesced and only does work when a collapse is queued.
+ * listener is rAF-coalesced and only does work when a collapse is queued or
+ * new content is waiting to be seen.
  */
 (function () {
   'use strict';
@@ -130,7 +151,9 @@
   var _settleTimer = null;
   var _rafId = null;
   var _pending = [];      // deferred collapses: [{el, fn}]
-  var _newCount = 0;
+  var _newCount = 0;      // new message entries below the fold
+  var _hasNew = false;    // anything new below the fold (incl. streaming growth)
+  var _skipNextBatch = false;   // set by positioned(): the render batch is not "new"
   var _listeners = [];    // [[target, type, fn, opts]] for teardown
 
   // ── State transitions ───────────────────────────────────────────────────
@@ -146,10 +169,7 @@
     try { liveAutoScroll = (_state !== READING); } catch (e) { /* not loaded yet */ }
     window._threadScrollState = _state;
 
-    if (_state === LIVE) {
-      _newCount = 0;
-      _flushPending();
-    }
+    if (_state === LIVE) _flushPending();
     _renderPill();
 
     if (window._threadScrollDebug) {
@@ -202,12 +222,33 @@
     _logEl.appendChild(_sentinel);
   }
 
+  /** Is the very end of the thread strictly inside the visible box? */
+  function _tailInView() {
+    if (!_logEl || !_sentinel) return true;
+    var s = _sentinel.getBoundingClientRect();
+    var c = _logEl.getBoundingClientRect();
+    return s.top <= c.bottom + 2;   // 2px absorbs sub-pixel rounding
+  }
+
+  function _clearNew() {
+    _newCount = 0;
+    _hasNew = false;
+  }
+
+  /** New content landed. If the reader cannot see it, light up the button. */
+  function _noteArrival(count) {
+    if (_tailInView()) return;
+    _hasNew = true;
+    _newCount += count || 0;
+    _renderPill();
+  }
+
   function _onSentinel(entries) {
     if (!entries || !entries.length) return;
     _atBottom = !!entries[entries.length - 1].isIntersecting;
 
     if (_atBottom) {
-      _newCount = 0;
+      if (_tailInView()) _clearNew();
       _renderPill();
       _maybeSettle();
       return;
@@ -227,22 +268,29 @@
     // the sentinel IS last, so this cannot loop.
     _placeTail();
 
-    if (_atBottom) return;   // nothing to announce; the user can see it
+    // The batch a fresh render produced (session open, reconnect re-fetch) is
+    // the thread itself, not news. positioned() flags it.
+    if (_skipNextBatch) { _skipNextBatch = false; return; }
 
-    var added = 0;
+    var msgs = 0, other = 0;
     for (var i = 0; i < records.length; i++) {
+      // Only APPENDS are news. A prepend ("Load older") inserts before an
+      // existing node; an append lands at the end, or before our own tail.
+      var next = records[i].nextSibling;
+      if (next && next !== _sentinel && next !== _pillWrap) continue;
       var nodes = records[i].addedNodes;
       for (var j = 0; j < nodes.length; j++) {
         var n = nodes[j];
         if (n.nodeType !== 1) continue;
         if (n === _sentinel || n === _pillWrap) continue;
-        if (n.classList && (n.classList.contains('msg') || n.classList.contains('live-entry'))) added++;
+        if (n.classList && (n.classList.contains('msg') || n.classList.contains('live-entry'))) msgs++;
+        else other++;
       }
     }
     // A big batch is a full re-render, not new chat activity.
-    if (!added || added > RERENDER_NODE_THRESHOLD) return;
-    _newCount += added;
-    _renderPill();
+    if (msgs > RERENDER_NODE_THRESHOLD) return;
+    if (!msgs && !other) return;
+    _noteArrival(msgs);
   }
 
   function _onScrollPassive() {
@@ -250,6 +298,8 @@
     _rafId = requestAnimationFrame(function () {
       _rafId = null;
       _flushPending();
+      // The reader scrolled down to the new content: it has been seen.
+      if ((_hasNew || _newCount) && _tailInView()) { _clearNew(); _renderPill(); }
     });
   }
 
@@ -314,24 +364,40 @@
     _pillWrap.appendChild(_pillEl);
   }
 
+  var _ARROW_SVG =
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">' +
+    '<line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>';
+  var _pillKey = '';
+
   function _renderPill() {
     if (!_pillEl || !_pillWrap) return;
-    // The pill means "there is new content you are not seeing". At the bottom
-    // there is nothing to jump to, so it stays hidden regardless of state.
-    var show = !_atBottom && _newCount > 0;
+    // Two looks, one button:
+    //   quiet   content below the fold, nothing new: a muted down-arrow.
+    //   accent  something new landed below: filled with the accent colour and
+    //           labelled, so it is obvious without being read.
+    var fresh = _hasNew || _newCount > 0;
+    var show = fresh || !_atBottom;
     if (!show) {
       _pillWrap.classList.remove('visible');
       _pillWrap.setAttribute('aria-hidden', 'true');
+      _pillEl.classList.remove('has-new');
+      _pillKey = '';
       return;
     }
-    // Compact label on purpose — the pill is an ambient hint, not a banner.
-    _pillEl.innerHTML =
-      '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
-      'stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">' +
-      '<line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>' +
-      '<span>' + _newCount + ' new</span>';
-    _pillEl.setAttribute('aria-label',
-      'Jump to latest — ' + _newCount + ' new message' + (_newCount === 1 ? '' : 's'));
+    var label = !fresh ? '' : (_newCount > 0 ? _newCount + ' new' : 'New below');
+    var key = (fresh ? 'n' : 'q') + label;
+    if (key !== _pillKey) {      // don't churn the DOM on every streamed chunk
+      _pillKey = key;
+      _pillEl.innerHTML = _ARROW_SVG + (label ? '<span>' + label + '</span>' : '');
+      _pillEl.classList.toggle('has-new', fresh);
+      _pillEl.setAttribute('aria-label', fresh
+        ? 'Jump to latest, ' + (_newCount > 0
+            ? _newCount + ' new message' + (_newCount === 1 ? '' : 's')
+            : 'new content below')
+        : 'Jump to latest');
+      _pillEl.title = fresh ? 'New content below. Click to jump to the latest' : 'Jump to latest';
+    }
     _pillWrap.classList.add('visible');
     _pillWrap.setAttribute('aria-hidden', 'false');
   }
@@ -356,7 +422,9 @@
     _state = LIVE;
     _atBottom = true;
     _driving = false;
-    _newCount = 0;
+    _clearNew();
+    _skipNextBatch = false;
+    _pillKey = '';
     _pending = [];
     try { liveAutoScroll = true; } catch (e) { /* not loaded yet */ }
     window._threadScrollState = LIVE;
@@ -447,14 +515,12 @@
    * you scrolled up to copy something and then sent, you want the reply.
    */
   function onSend() {
-    _newCount = 0;
     _setState(LIVE, 'send');
     scrollToBottom();
   }
 
   /** Explicit catch-up (jump pill). The strong signal that restores LIVE. */
   function catchUp() {
-    _newCount = 0;
     _setState(LIVE, 'catch-up');
     scrollToBottom();
   }
@@ -463,14 +529,48 @@
     if (!_logEl) return;
     _logEl.scrollTop = _logEl.scrollHeight;
     _atBottom = true;
+    _clearNew();
     _renderPill();
+  }
+
+  /**
+   * The log was just rendered from scratch and positioned (session open,
+   * reconnect re-fetch). What was rendered is the thread, not news: the
+   * mutation batch it produced must not light up the button.
+   */
+  function positioned() {
+    _clearNew();
+    _skipNextBatch = true;
+    // The render's mutation callback is already queued ahead of this
+    // microtask, so this only drops the flag if the render added nothing.
+    Promise.resolve().then(function () { _skipNextBatch = false; });
+    _renderPill();
+  }
+
+  /**
+   * Content grew in place without adding a node (a streaming bubble getting
+   * more text). Announce it if it is below the fold. Never scrolls.
+   */
+  function noteNewContent() { _noteArrival(0); }
+
+  /**
+   * Keep a caught-up reader at the bottom when the LOG resizes (composer bar
+   * re-render, on-screen keyboard). A layout correction only: it does nothing
+   * when new content is waiting below, so it can never reveal an update the
+   * reader has not chosen to see.
+   */
+  function holdBottom() {
+    if (!_logEl || !_atBottom || _hasNew || _newCount || _driving) return;
+    _logEl.scrollTop = _logEl.scrollHeight;
   }
 
   function state() { return _state; }
   function isReading() { return _state === READING; }
   function mayAutoScroll() { return _state !== READING; }
   function mayAutoCollapse() { return _state === LIVE; }
-  function atBottom() { return _atBottom; }
+  /** Caught up: at the bottom AND nothing new waiting below it. */
+  function atBottom() { return _atBottom && !_hasNew && !_newCount; }
+  function hasNew() { return _hasNew || _newCount > 0; }
 
   window.ThreadScroll = {
     attach: attach,
@@ -480,6 +580,10 @@
     onSend: onSend,
     catchUp: catchUp,
     scrollToBottom: scrollToBottom,
+    positioned: positioned,
+    noteNewContent: noteNewContent,
+    holdBottom: holdBottom,
+    hasNew: hasNew,
     state: state,
     isReading: isReading,
     mayAutoScroll: mayAutoScroll,

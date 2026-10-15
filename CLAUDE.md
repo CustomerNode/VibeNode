@@ -332,6 +332,14 @@ A script may call `POST /api/notify/approval/resolve` to end the flash at once. 
 - Anything `create_app` starts in the background goes inside `if not testing`.
 - Test: `tests/test_app_testing_mode.py`.
 
+## New content never scrolls the thread (changed 2026-10-14)
+
+The user asked for this directly: a session must not scroll by itself when updates arrive. Streamed text, new entries, output cards, conflict cards, queued and hook messages, and state-change settles no longer move `#live-log`. The view moves only when a session opens (the `session_log` full render), when the user sends from this tab (`ThreadScroll.onSend`, the optimistic bubble), or when the user clicks the jump button (`catchUp`). `ThreadScroll.holdBottom()` keeps a caught-up reader pinned when the composer or keyboard resizes the log, and it does nothing while new content is waiting.
+
+- The jump button (`static/js/thread-scroll.js`) is a quiet arrow whenever content sits below the fold. When something new lands there it turns solid accent with a pulse and reads "N new" or "New below". "Seen" is strict geometry (`_tailInView`), not the observer's slop.
+- Do NOT add `scrollTop = scrollHeight` or `_autoScrollLiveLog` back to any incoming-update path. A bubble the user did not type here passes `{ passive: true }` to `_addOptimisticBubble`.
+- Tests: `node tests/test_thread_scroll.js`.
+
 ## Slash commands are intercepted client-side
 Claude CLI slash commands (e.g. `/compact`, `/rewind`, `/clear`) are NOT sent to the SDK. They get silently eaten with no response, leaving the session stuck idle. Instead, `_interceptSlashCommand()` in `live-panel.js` catches them at every submit path and either triggers the GUI equivalent (e.g. `/rewind` clicks the Rewind toolbar button, `/compact` fires `liveCompact()`) or shows a toast explaining the command isn't supported in the GUI. The command map lives in `_slashCommandMap`. Messages with `/` that aren't bare commands (e.g. "fix /etc/config") pass through normally.
 

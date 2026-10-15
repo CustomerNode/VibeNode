@@ -8,6 +8,10 @@ openpyxl
 playwright
 python-pptx
 python-docx
+# IANA time zones for zoneinfo. Windows ships none, so without this a usage
+# limit that "resets 9am (Europe/London)" is read in local time instead
+# (daemon/session_manager.py _parse_reset_clock).
+tzdata
 pytest
 pytest-timeout
 # Parallel test runs for the Publish gate (app/routes/test_api.py uses it when

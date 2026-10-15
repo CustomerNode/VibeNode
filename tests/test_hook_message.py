@@ -302,7 +302,9 @@ def test_every_place_that_draws_a_message_knows_a_hook_line():
 
     sock = SOCKET_JS.read_text(encoding="utf-8")
     handler = sock[sock.index("socket.on('hook_message'"):sock.index("socket.on('queue_dispatched'")]
-    assert "_addOptimisticBubble(sid, d.message)" in handler and "d.delivered === 'sent'" in handler
+    assert "_addOptimisticBubble(sid, d.message" in handler and "d.delivered === 'sent'" in handler
+    # a hook line was not typed here, so it must not move the reader's view
+    assert "{ passive: true }" in handler
     assert "showToast(" in handler and "allSessionIds.has(sid)" in handler
     # the text is escaped wherever it becomes HTML
     assert "innerHTML" not in handler

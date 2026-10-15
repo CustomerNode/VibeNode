@@ -792,8 +792,7 @@ function _addOutputCardForPath(filePath) {
     '<button class="live-output-card-dl" title="Save to..." onclick="event.stopPropagation();_downloadOutputFile(\'' + escHtml(filePath.replace(/\\/g,'\\\\').replace(/'/g,"\\'")) + '\')">' +
     '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
     '</button>';
-  logEl.appendChild(card);
-  if (liveAutoScroll) logEl.scrollTop = logEl.scrollHeight;
+  logEl.appendChild(card);   // no auto-scroll: new content never moves the view
   // Fetch file size asynchronously
   fetch('/api/file-info?path=' + encodeURIComponent(filePath))
     .then(r => r.json())
@@ -1777,19 +1776,19 @@ function _isLastMessageEl(logEl, el) {
 }
 
 /**
- * Auto-scroll the live log after new content is rendered or the view settles.
+ * Position the live log after a FULL render (session open, reconnect re-fetch).
  *
- * Default behavior is scroll-to-bottom (follow the newest content). When the
+ * Since 2026-10-14 this is the only caller path: new content arriving never
+ * moves the view (thread-scroll.js, D), so the per-entry, streaming and
+ * state-change settle-scrolls that used to call this were removed. Do not add
+ * them back; a resize-only correction is ThreadScroll.holdBottom().
+ *
+ * Default behavior is scroll-to-bottom. When the
  * most-recent assistant message is rendered fully expanded AND is taller than
  * the viewport, instead top-align it so the user starts reading from its first
  * line and scrolls down as they read. If the message fits entirely within the
  * viewport (there is extra space), scroll-to-bottom already shows all of it
  * from the top, so we keep the simpler bottom behavior.
- *
- * This is the single source of truth for live-log auto-scroll so that the many
- * settle-scrolls that fire on state transitions (input-bar re-render, session
- * state change) all converge on the same top-aligned result instead of
- * stomping each other back to the bottom.
  *
  * @param {HTMLElement}  logEl  the live-log scroll container
  * @param {HTMLElement?} msgEl  the just-rendered AI message to top-align. When
@@ -1801,8 +1800,6 @@ function _autoScrollLiveLog(logEl, msgEl) {
   if (!logEl) return;
 
   // READING means the user owns the viewport — do not move it for any reason.
-  // (LIVE and FOLLOW both tail-follow; they differ only in whether auto-collapse
-  // is allowed, which is decided in _collapseRecentAsst, not here.)
   if (window.ThreadScroll && !ThreadScroll.mayAutoScroll()) return;
 
   // While a response is actively streaming, always follow the tail — the
@@ -2325,12 +2322,7 @@ function _injectDirectiveConflict(data) {
     };
 
     const el = renderLiveEntry(entry);
-    logEl.appendChild(el);
-
-    // Auto-scroll if enabled
-    if (liveAutoScroll) {
-      logEl.scrollTop = logEl.scrollHeight;
-    }
+    logEl.appendChild(el);   // no auto-scroll: the jump button announces it
   }
 }
 
@@ -2563,8 +2555,7 @@ function updateLiveInputBar() {
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => liveSubmitContinue(id));
     if (_barHadFocus) { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }
     setTimeout(() => {
-      const logEl = document.getElementById('live-log');
-      if (logEl) _autoScrollLiveLog(logEl);
+      if (window.ThreadScroll) ThreadScroll.holdBottom();   // bar resized the log
       const ta = document.getElementById('live-input-ta');
       if (ta) { if (_wantAutofocus && !_barHadFocus) ta.focus(); _initAutoResize(ta); }
     }, 50);
@@ -2625,8 +2616,7 @@ function updateLiveInputBar() {
       if (_barHadFocus) ta.focus();
       _initAutoResize(ta);
       setTimeout(() => {
-        const logEl = document.getElementById('live-log');
-        if (logEl) _autoScrollLiveLog(logEl);
+        if (window.ThreadScroll) ThreadScroll.holdBottom();   // bar resized the log
         if (_wantAutofocus && !_barHadFocus) ta.focus();
       }, 50);
     }
@@ -2732,8 +2722,7 @@ function updateLiveInputBar() {
       }, 1000);
     }
     setTimeout(() => {
-      const logEl = document.getElementById('live-log');
-      if (logEl) _autoScrollLiveLog(logEl);
+      if (window.ThreadScroll) ThreadScroll.holdBottom();   // bar resized the log
       const ta = document.getElementById('live-input-ta');
       if (ta) { if (_wantAutofocus && !_barHadFocus) ta.focus(); _initAutoResize(ta); }
     }, 50);
@@ -3543,7 +3532,10 @@ function _resetMessageWatchdog(sid) {
   _startMessageWatchdog(sid);
 }
 
-function _addOptimisticBubble(sid, text, isVoice) {
+// `opts.passive`: the bubble was not typed in this tab (a queued message the
+// server dispatched, a hook line). It must not move the reader's view; only a
+// send from this tab jumps to the bottom.
+function _addOptimisticBubble(sid, text, isVoice, opts) {
   if (sid !== liveSessionId) return;
   const logEl = document.getElementById('live-log');
   if (!logEl) return;
@@ -3590,7 +3582,7 @@ function _addOptimisticBubble(sid, text, isVoice) {
   if (!_vnEvent) userMsg.appendChild(vnFooter);   // "sent from" belongs to what the user typed
   userMsg.addEventListener('animationend', () => userMsg.classList.remove('msg-entering'), {once: true});
   logEl.appendChild(userMsg);
-  logEl.scrollTop = logEl.scrollHeight;
+  if (!(opts && opts.passive)) logEl.scrollTop = logEl.scrollHeight;
 }
 
 // ── Optimistic bubble lookup — MUST ignore ThreadScroll's tail nodes ────────
