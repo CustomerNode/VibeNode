@@ -140,6 +140,8 @@ global.requestAnimationFrame = (f) => { _rafQueue.push(f); return _rafQueue.leng
 global.cancelAnimationFrame = () => {};
 // live-panel.js normally declares this; thread-scroll.js owns its value.
 global.liveAutoScroll = true;
+const _ls = {};
+global.localStorage = { getItem: (k) => (k in _ls ? _ls[k] : null), setItem: (k, v) => { _ls[k] = String(v); }, removeItem: (k) => { delete _ls[k]; } };
 
 const SRC = path.join(__dirname, '..', 'static', 'js', 'thread-scroll.js');
 // eslint-disable-next-line no-eval
@@ -558,6 +560,56 @@ test('while the session works the button says "Working", even with nothing new',
     delete global.liveSessionId;
     delete global.sessionKinds;
   }
+});
+
+// ── Live scroll preference (2026-10-15) ───────────────────────────────
+
+test('live scroll is OFF by default (static)', () => {
+  setup();
+  assert.strictEqual(TS.isLiveScroll(), false);
+});
+
+test('live scroll ON follows new content and persists the choice', () => {
+  setup();
+  TS.setLiveScroll(true);
+  assert.strictEqual(global.localStorage.getItem('liveScroll'), 'on');
+  log.scrollTop = 0; log.scrollHeight = 2000;
+  tailBelowFold();
+  msg(600, 900);
+  assert.strictEqual(log.scrollTop, 2000, 'live mode follows the new entry');
+  assert.strictEqual(TS.hasNew(), false, 'followed content is not announced');
+  TS.setLiveScroll(false);
+  assert.strictEqual(global.localStorage.getItem('liveScroll'), null);
+});
+
+test('live scroll still never moves a reader who scrolled away', () => {
+  setup();
+  TS.setLiveScroll(true);
+  try {
+    log.dispatch('wheel', {});
+    fireIO(false);
+    assert.strictEqual(TS.state(), 'READING');
+    log.scrollTop = 123; log.scrollHeight = 2000;
+    tailBelowFold();
+    msg(600, 900);
+    assert.strictEqual(log.scrollTop, 123, 'scrolling up pauses live scroll');
+    assert.ok(pill().classList.contains('is-done'), 'and the button announces it');
+  } finally { TS.setLiveScroll(false); }
+});
+
+test('live scroll uses the live panel follow rule when it is loaded', () => {
+  setup();
+  let called = 0;
+  global._autoScrollLiveLog = (el) => { called++; el.scrollTop = 777; };
+  TS.setLiveScroll(true);
+  try {
+    called = 0;
+    log.scrollTop = 0;
+    tailBelowFold();
+    TS.noteNewContent();               // a streamed chunk
+    assert.strictEqual(called, 1);
+    assert.strictEqual(log.scrollTop, 777);
+  } finally { TS.setLiveScroll(false); delete global._autoScrollLiveLog; }
 });
 
 // ── Report ────────────────────────────────────────────────────────────────

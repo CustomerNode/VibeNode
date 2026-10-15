@@ -1778,10 +1778,11 @@ function _isLastMessageEl(logEl, el) {
 /**
  * Position the live log after a FULL render (session open, reconnect re-fetch).
  *
- * Since 2026-10-14 this is the only caller path: new content arriving never
- * moves the view (thread-scroll.js, D), so the per-entry, streaming and
- * state-change settle-scrolls that used to call this were removed. Do not add
- * them back; a resize-only correction is ThreadScroll.holdBottom().
+ * Since 2026-10-14 new content never moves the view by default (thread-scroll.js,
+ * D), so the per-entry, streaming and state-change settle-scrolls that used to
+ * call this were removed. Do not add them back; a resize-only correction is
+ * ThreadScroll.holdBottom(). The one other caller is ThreadScroll's own
+ * `_follow()`, used only when the user turned on the "Live scroll" preference.
  *
  * Default behavior is scroll-to-bottom. When the
  * most-recent assistant message is rendered fully expanded AND is taller than

@@ -2206,6 +2206,9 @@ function openPreferences() {
      hint: 'Local, codebase-aware voice that works in every browser (Firefox & Safari too). Downloads a small model on first enable.'},
     {key: 'send', label: 'Enter to send', on: enterToSend,
      hint: 'Press Enter to send. When off, ' + _MOD + '+Enter sends and Enter adds a new line.'},
+    {key: 'livescroll', label: 'Live scroll',
+     on: !!(window.ThreadScroll && ThreadScroll.isLiveScroll()),
+     hint: 'Follow new output as it arrives. When off, the chat stays where you are and the arrow shows Working, Needs you or Done.'},
     {key: 'sticky', label: 'Sticky chats', on: stickyOn,
      hint: 'Keep your most recent message pinned at the top while scrolling long replies.'},
     {key: 'wsd', label: 'Wrong-session detection', on: wsdOn,
@@ -2247,6 +2250,9 @@ function openPreferences() {
           localStorage.setItem('sendBehavior', sendBehavior);
           if (typeof _refreshSendHints === 'function') _refreshSendHints();
           showToast('Enter to send: ' + (on ? 'On' : 'Off'));
+          break;
+        case 'livescroll':
+          if (typeof toggleLiveScroll === 'function') toggleLiveScroll(on);
           break;
         case 'sticky': {
           if (on) {

@@ -93,6 +93,10 @@
  *    carries the session's status: "Working", "Needs you", or "Done" (finished
  *    with output you have not seen). Idle with nothing new: a quiet arrow.
  *
+ *    This is the default ("static scroll"). A per-device preference, "Live
+ *    scroll" (Preferences, or the session's actions menu), brings back
+ *    follow-along for a reader who has not scrolled away: see setLiveScroll().
+ *
  *    "Unseen" is measured geometrically (`_tailInView`): the sentinel strictly
  *    inside the log's box. The observer's BOTTOM_SLOP is right for the state
  *    machine but too loose here: a line 60px below the fold is not "seen".
@@ -236,9 +240,51 @@
     _hasNew = false;
   }
 
-  /** New content landed. If the reader cannot see it, light up the button. */
+  // ── Live scroll preference (2026-10-15) ────────────────────────────────
+  // Static (default): new content never moves the view; the button announces it.
+  // Live: the old follow-along behaviour, but only while the reader has not
+  // scrolled away (state !== READING). Scrolling up still pauses it, and the
+  // button still announces what lands below. Per device, like the other
+  // display preferences.
+  var LIVE_SCROLL_KEY = 'liveScroll';
+  var _liveScroll = (function () {
+    try { return localStorage.getItem(LIVE_SCROLL_KEY) === 'on'; } catch (e) { return false; }
+  })();
+
+  function isLiveScroll() { return _liveScroll; }
+
+  function setLiveScroll(on) {
+    _liveScroll = !!on;
+    try {
+      if (_liveScroll) localStorage.setItem(LIVE_SCROLL_KEY, 'on');
+      else localStorage.removeItem(LIVE_SCROLL_KEY);
+    } catch (e) { /* private mode: in-memory only */ }
+    // Turning it on while caught up: catch up now, so it starts following.
+    if (_liveScroll && _logEl && _state !== READING) _follow();
+    return _liveScroll;
+  }
+
+  /**
+   * Follow the tail the way the thread always did in live mode: the bottom
+   * while a reply streams, the TOP of a finished reply taller than the
+   * viewport, otherwise the bottom. `_autoScrollLiveLog` (live-panel.js) owns
+   * that rule; fall back to the bottom if it is not loaded.
+   */
+  function _follow() {
+    if (!_logEl) return;
+    if (typeof window._autoScrollLiveLog === 'function') window._autoScrollLiveLog(_logEl);
+    else _logEl.scrollTop = _logEl.scrollHeight;
+    if (_tailInView()) _clearNew();
+    _renderPill();
+  }
+
+  /**
+   * New content landed. If the reader cannot see it: in live mode (and not
+   * reading) follow it; otherwise light up the button.
+   */
   function _noteArrival(count) {
     if (_tailInView()) return;
+    if (_liveScroll && _state !== READING) { _follow(); return; }
     _hasNew = true;
     _newCount += count || 0;
     _renderPill();
@@ -651,6 +697,8 @@
     holdBottom: holdBottom,
     hasNew: hasNew,
     refresh: refresh,
+    isLiveScroll: isLiveScroll,
+    setLiveScroll: setLiveScroll,
     state: state,
     isReading: isReading,
     mayAutoScroll: mayAutoScroll,

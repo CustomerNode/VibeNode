@@ -1025,9 +1025,39 @@ function openActionsPopup() {
   } else {
     statusEl.innerHTML = '';
   }
+  _renderLiveScrollAction();
   const ov = document.getElementById('actions-overlay');
   ov.classList.remove('actions-closing'); // cancel any in-flight slide-down (mobile)
   ov.classList.add('show');
+}
+
+/**
+ * Live scroll on/off (thread-scroll.js setLiveScroll). One switch, two entry
+ * points: Preferences and the session actions menu (the quick one on a phone).
+ * `on` omitted = flip the current value.
+ */
+function toggleLiveScroll(on) {
+  if (!window.ThreadScroll) return;
+  const next = (typeof on === 'boolean') ? on : !ThreadScroll.isLiveScroll();
+  ThreadScroll.setLiveScroll(next);
+  _renderLiveScrollAction();
+  if (typeof showToast === 'function') {
+    showToast(next ? 'Live scroll on: the chat follows new output'
+                   : 'Live scroll off: the chat stays where you are');
+  }
+}
+
+function _renderLiveScrollAction() {
+  const btn = document.getElementById('btn-live-scroll');
+  if (!btn || !window.ThreadScroll) return;
+  const on = ThreadScroll.isLiveScroll();
+  const name = btn.querySelector('.actions-item-name');
+  const desc = btn.querySelector('.actions-item-desc');
+  if (name) name.textContent = 'Live scroll: ' + (on ? 'On' : 'Off');
+  if (desc) desc.textContent = on
+    ? 'Following new output. Tap to keep the chat still instead'
+    : 'Chat stays still. Tap to follow new output as it arrives';
+  btn.setAttribute('aria-pressed', on ? 'true' : 'false');
 }
 
 function closeActionsPopup() {
