@@ -215,6 +215,9 @@ __marimo__/
 
 # Runtime logs
 logs/
+# A Windows path given to Git Bash loses its backslashes, so a test report
+# meant for logs/ lands in the root as e.g. "Users<name>...logslast_test_run.xml".
+/*last_test_run.*
 
 # Isolated Chrome profile (run.py open_browser() — see CLAUDE.md item 18)
 data/chrome-profile/

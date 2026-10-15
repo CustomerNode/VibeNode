@@ -581,6 +581,26 @@ def _no_real_process_scan(request, monkeypatch):
     monkeypatch.setattr(_pd, "_enumerate_claude_processes", lambda: [])
 
 
+# ---------------------------------------------------------------------------
+# No test leaks the UI's active project into the next one.
+#
+# ``app.config._active_project`` is process-global.  Routes set it as a side
+# effect (POST /api/set-project, the socket connect handler, the watchdog
+# deep link), so a route test left it at "test-proj" and every later test in
+# that worker that relies on "no project context" saw the wrong project
+# (test_config_paths::test_empty_project_always_matches failed only in the
+# full run, depending on which files --dist loadfile put on the same worker).
+# Restore it after every test.
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _restore_active_project(monkeypatch):
+    try:
+        import app.config as _cfg
+    except Exception:
+        return
+    monkeypatch.setattr(_cfg, "_active_project", _cfg._active_project)
+
+
 def _make_session_line(msg_type, content="", timestamp=None):
     """Build a single JSONL line for a mock session file."""
     ts = timestamp or datetime.now(timezone.utc).isoformat()
