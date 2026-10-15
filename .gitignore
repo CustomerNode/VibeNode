@@ -229,6 +229,11 @@ data/previews/
 # Composer image attachments — pasted/picked images (app/routes/live_api.py)
 data/uploads/
 
+# Durable Jobs — per-machine registry, launch logs and launchers (daemon/durable_jobs.py)
+data/jobs.json
+data/jobs.json.*
+data/jobs/
+
 # Backups
 backups/
 
