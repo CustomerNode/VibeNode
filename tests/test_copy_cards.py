@@ -180,6 +180,35 @@ def test_an_unreadable_file_disables_the_button_and_says_why(browser):
         pg.close()
 
 
+def test_dollar_patterns_in_a_card_cannot_break_out_or_change_the_path(browser):
+    """$' in a label once pasted the rest of the reply into data-label, which
+    closed the attribute and added an event handler that ran with no click."""
+    markdown = (STATIC / "js" / "markdown.js").read_text(encoding="utf-8")
+    style = (STATIC / "style.css").read_text(encoding="utf-8")
+    attack = ("Your pack:\n```copyfile\n/home/u/.claude/copy-exports/a.md\nPack $'\n```\n"
+              'x" style="animation-name:live;animation-duration:0.1s" '
+              'onanimationstart="window.__pwned=42//')
+    pg = browser.new_page()
+    try:
+        pg.set_content(f"<style>{style}</style><div id=asst></div><script>{markdown}</script>")
+        out = pg.evaluate("""([attack]) => {
+            const el = document.getElementById('asst');
+            el.innerHTML = mdParse(attack);
+            const card = el.querySelector('.vn-copy-export');
+            const paths = ['cost$$.md', "a$&b.md", "q$'r.md", 'p$`s.md'].map(n =>
+              (new DOMParser().parseFromString(mdParse('```copyfile\\n/x/' + n + '\\n```'), 'text/html')
+                .querySelector('.vn-copy-export') || {}).dataset?.path);
+            return { label: card.dataset.label, handler: card.getAttribute('onanimationstart'),
+                     style: card.getAttribute('style'), paths }; }""", [attack])
+        pg.wait_for_timeout(300)
+        assert pg.evaluate("() => window.__pwned") is None
+        assert out["label"] == "Pack $'"
+        assert out["handler"] is None and out["style"] is None
+        assert out["paths"] == ["/x/cost$$.md", "/x/a$&b.md", "/x/q$'r.md", "/x/p$`s.md"]
+    finally:
+        pg.close()
+
+
 def test_outside_vibenode_the_block_reads_as_the_path():
     """No JS hydration: the placeholder still carries the path as plain code."""
     md = (STATIC / "js" / "markdown.js").read_text(encoding="utf-8")

@@ -36,7 +36,7 @@ function highlightCode(code, lang) {
     const _TOKEN = /(\x01[SCNK][^\x02]*\x02)/;
     const _pass = (re, t) => {
         html = html.split(_TOKEN).map((seg, i) =>
-            (i % 2) ? seg : seg.replace(re, _O(t) + '$&' + _C)).join('');
+            (i % 2) ? seg : seg.replace(re, m => _O(t) + m + _C)).join('');
     };
 
     // Strings (double and single quoted) — but avoid breaking HTML entities
@@ -165,7 +165,9 @@ function mdParse(md) {
     }).join('\n');
     // Restore code blocks
     codeBlocks.forEach((block, idx) => {
-      html = html.replace('\x00CODE' + idx + '\x00', block);
+      // A function, not the string: a string replacement reads $' $& $` $$ in
+      // the block as patterns (tests/test_replace_dollar_patterns.py).
+      html = html.replace('\x00CODE' + idx + '\x00', () => block);
     });
     return html;
 }

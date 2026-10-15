@@ -2040,7 +2040,7 @@ socket.on('session_id_remapped', (data) => {
     // Remap kanban task-session link (server-side DB is updated by session_manager,
     // but update client-side kanban state and URL hash too)
     if (window.location.hash.includes(oldId)) {
-        const newHash = window.location.hash.replace(oldId, newId);
+        const newHash = window.location.hash.replace(oldId, () => newId);
         history.replaceState(history.state, '', window.location.pathname + newHash);
     }
     if (history.state && history.state.sessionId === oldId) {
