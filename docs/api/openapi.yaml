@@ -142,6 +142,8 @@ tags:
     description: Mobile Command, private phone access over Tailscale
   - name: Voice
     description: SpeechNode local speech-to-text (optional package)
+  - name: Jobs
+    description: Durable jobs, long commands launched detached and watched until their done test passes
 
 paths:
   # ==========================================================================
@@ -6946,6 +6948,221 @@ paths:
           description: Static asset
         "404":
           description: Not found
+
+  # ==========================================================================
+  # Jobs (jobs_api.py)
+  # ==========================================================================
+  /api/jobs/run:
+    post:
+      tags: [Jobs]
+      summary: Launch a long job detached and register it
+      operationId: jobsRun
+      description: |
+        The same step as `vibenode job run`: launches the command detached on
+        this machine and writes its registry record together. A job with no
+        done test is refused and nothing runs. Because it runs an arbitrary
+        command, only a process on this machine may call it: requests that
+        arrive through the tailnet proxy or from a browser page get 403.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, command, cwd, done_test]
+              properties:
+                name:
+                  type: string
+                command:
+                  type: string
+                cwd:
+                  type: string
+                  description: An existing folder the command runs in
+                done_test:
+                  description: A regex, or {pattern, file, last_line}, that proves the job finished
+                  oneOf:
+                    - type: string
+                    - type: object
+                job_id:
+                  type: string
+                project:
+                  type: string
+                session_id:
+                  type: string
+                env_file:
+                  type: string
+                running_match:
+                  type: string
+                progress:
+                  description: Regex (or {pattern, ...}) that reads progress from the log
+                irreversible_after:
+                  description: Regex (or {pattern, ...}) past which a relaunch is unsafe
+                log_path:
+                  type: string
+                  description: Log file; "{ts}" is replaced at each launch
+                resumable:
+                  type: boolean
+      responses:
+        "200":
+          description: Registered; ok is false when the launch itself failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  job:
+                    type: object
+        "400":
+          description: Not a JSON object, or a required field (such as the done test) is missing or invalid
+        "403":
+          description: Not a local caller
+        "500":
+          description: The jobs registry could not be read or written (registry_error is true)
+  /api/jobs:
+    get:
+      tags: [Jobs]
+      summary: List registered jobs
+      operationId: jobsList
+      responses:
+        "200":
+          description: Every job in the registry
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  jobs:
+                    type: array
+                    items:
+                      type: object
+        "500":
+          description: The jobs registry could not be read (registry_error is true); the file is left untouched
+  /api/jobs/{job_id}:
+    get:
+      tags: [Jobs]
+      summary: Get one job's record
+      operationId: jobsGet
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The job record
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  job:
+                    type: object
+        "404":
+          description: No such job
+        "500":
+          description: The jobs registry could not be read
+  /api/jobs/{job_id}/log:
+    get:
+      tags: [Jobs]
+      summary: Tail of the job's log
+      operationId: jobsLog
+      description: The tail of the log the job's done test reads.
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: bytes
+          in: query
+          required: false
+          description: How much of the tail to return (500 to 200000, default 8000)
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Log path and tail ("" when the job has no log yet)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  path:
+                    type: string
+                  tail:
+                    type: string
+        "404":
+          description: No such job
+        "500":
+          description: The jobs registry could not be read
+  /api/jobs/{job_id}/relaunch:
+    post:
+      tags: [Jobs]
+      summary: Relaunch a registered job (the Relaunch button)
+      operationId: jobsRelaunch
+      description: |
+        Re-runs the command already registered for this job. A person
+        decided, so the no-progress count and the acknowledgement reset.
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Relaunch attempted; ok is false (with error) when the launch failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  job:
+                    type: object
+                  error:
+                    type: string
+        "404":
+          description: No such job
+        "500":
+          description: The jobs registry could not be read or written
+  /api/jobs/{job_id}/leave:
+    post:
+      tags: [Jobs]
+      summary: Stop asking about a job (the Leave it button)
+      operationId: jobsLeave
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The job, now acknowledged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  job:
+                    type: object
+        "404":
+          description: No such job
+        "500":
+          description: The jobs registry could not be read or written
 
 components:
   parameters:
