@@ -85,6 +85,18 @@ function mdParse(md) {
     // the first three backticks and cut such a block off mid-way (2026-10-15).
     html = html.replace(/(`{3,})(\w*)\n?([\s\S]*?)\n?\1`*/g, (_, _fence, lang, code) => {
       const idx = codeBlocks.length;
+      // ```copyfile: a copy card (smart-copy.js) instead of the text. Line 1 is
+      // a file in ~/.claude/copy-exports, optional line 2 a label. Until the
+      // card loads, and outside VibeNode, the reader sees just the path.
+      if (lang === 'copyfile') {
+        const lines = code.split('\n').map(l => l.trim()).filter(Boolean);
+        const attr = s => _escapeHtmlForCode(s || '').replace(/"/g, '&quot;');
+        const path = attr(lines[0]);
+        const label = attr(lines[1]);
+        codeBlocks.push('<div class="vn-copy-export" data-path="' + path + '" data-label="' + label +
+          '"><code>' + path + '</code></div>');
+        return '\x00CODE' + idx + '\x00';
+      }
       const langClass = lang ? ' class="lang-' + _escapeHtmlForCode(lang) + '"' : '';
       // .vn-code: wraps at the box edge instead of scrolling sideways (style.css).
       codeBlocks.push('<pre class="vn-code"><code' + langClass + '>' + highlightCode(code, lang || '') + '</code></pre>');

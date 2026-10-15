@@ -2204,6 +2204,51 @@ paths:
         "403":
           description: Path not within home directory
 
+  /api/copy-export:
+    get:
+      tags: [Live]
+      summary: Text of a file in ~/.claude/copy-exports, for a copy card
+      description: >
+        Serves the text behind a ```copyfile block in a chat message, which the
+        chat shows as a card with a Copy button instead of the text. Reads only
+        files inside ~/.claude/copy-exports (symlinks are resolved first), UTF-8,
+        up to 20 MB.
+      operationId: getCopyExport
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The file's text
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  name:
+                    type: string
+                  bytes:
+                    type: integer
+                  chars:
+                    type: integer
+                  text:
+                    type: string
+        "400":
+          description: No path provided
+        "403":
+          description: Path is not inside ~/.claude/copy-exports
+        "404":
+          description: File does not exist
+        "413":
+          description: File is over 20 MB
+        "415":
+          description: File is not UTF-8 text
+
   /api/open-file:
     post:
       tags: [Live]

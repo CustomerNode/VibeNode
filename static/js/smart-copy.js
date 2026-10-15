@@ -21,7 +21,88 @@ function addSmartCopyButtons(container, rawText) {
 
   // 3. Tables
   _addTableCopyButtons(container);
+
+  // 4. Copy cards (```copyfile blocks)
+  _hydrateCopyExports(container);
 }
+
+// -----------------------------------------------------------------------
+// Copy cards: a long text the agent wrote to ~/.claude/copy-exports, shown as
+// a name, a size and a Copy button, never as the text itself.
+// -----------------------------------------------------------------------
+const _FILE_ICON = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="14" y2="17"/></svg>';
+const _copyExportCache = new Map();   // path -> {at, promise}; re-renders reuse one fetch
+const _COPY_EXPORT_TTL_MS = 5000;
+
+function _fetchCopyExport(path) {
+  const hit = _copyExportCache.get(path);
+  if (hit && Date.now() - hit.at < _COPY_EXPORT_TTL_MS) return hit.promise;
+  const promise = fetch('/api/copy-export?path=' + encodeURIComponent(path))
+    .then(r => r.json().catch(() => ({ ok: false, error: 'Could not read the file (' + r.status + ')' })))
+    .catch(() => ({ ok: false, error: 'Could not reach VibeNode' }));
+  _copyExportCache.set(path, { at: Date.now(), promise });
+  return promise;
+}
+
+function _fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function _hydrateCopyExports(container) {
+  container.querySelectorAll('.vn-copy-export').forEach(card => {
+    if (card.dataset.hydrated) return;
+    card.dataset.hydrated = '1';
+    const path = card.dataset.path || '';
+    const name = card.dataset.label || path.split(/[/\\]/).pop() || 'Export';
+    card.title = path;
+    card.innerHTML =
+      '<span class="vn-copy-export-icon">' + _FILE_ICON + '</span>' +
+      '<span class="vn-copy-export-text"><span class="vn-copy-export-name"></span>' +
+      '<span class="vn-copy-export-meta">Loading…</span></span>' +
+      '<button class="vn-copy-export-btn" type="button" disabled>' + _COPY_ICON + '<span>Copy</span></button>';
+    card.querySelector('.vn-copy-export-name').textContent = name;
+    const meta = card.querySelector('.vn-copy-export-meta');
+    const btn = card.querySelector('.vn-copy-export-btn');
+    const label = btn.querySelector('span');
+    let text = null;
+    // The text is fetched BEFORE the tap: iOS only copies inside the tap's own
+    // call stack, so a fetch started by the tap would lose the gesture.
+    _fetchCopyExport(path).then(d => {
+      if (!d || !d.ok) {
+        card.classList.add('unavailable');
+        meta.textContent = (d && d.error) || 'Not available';
+        return;
+      }
+      text = d.text;
+      meta.textContent = _fmtBytes(d.bytes) + ' · ' + Number(d.chars).toLocaleString() + ' characters';
+      btn.disabled = false;
+    });
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      if (text == null) return;
+      vnCopyText(text).then(() => {
+        label.textContent = 'Copied';
+        btn.classList.add('copied');
+        setTimeout(() => { label.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
+      }).catch(() => { label.textContent = 'Copy failed'; });
+    };
+  });
+}
+
+// The instruction every new session gets, so agents use copy cards instead of
+// pasting a long text into the chat (app.js and kanban.js add it).
+function _buildCopyExportNote() {
+  return 'When the user asks for something to copy that is too long to read in the chat ' +
+    '(a context export, a pack for another AI, a long document), do not paste it. Write it to ' +
+    'a file in ~/.claude/copy-exports/ (create the folder if needed) and put a fenced code block ' +
+    'with the language copyfile in your reply: first line the file\'s absolute path, optional ' +
+    'second line a short label. VibeNode shows it as a card with the size and a Copy button, ' +
+    'without displaying the text.';
+}
+window._buildCopyExportNote = _buildCopyExportNote;
 
 // -----------------------------------------------------------------------
 // Code blocks

@@ -1463,6 +1463,12 @@ async function _newSessionSubmit(sessionId) {
     }
   }
 
+  // Copy cards: long copyable texts go to a file and a ```copyfile block.
+  if (!_isCompose && typeof _buildCopyExportNote === 'function') {
+    const copyNote = _buildCopyExportNote();
+    systemPrompt = systemPrompt ? systemPrompt + '\n\n' + copyNote : copyNote;
+  }
+
   // Inject invoke skill notice into system prompt
   if (_invokeNotice) {
     systemPrompt = systemPrompt

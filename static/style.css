@@ -3790,6 +3790,29 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
 }
 .live-output-shelf:empty { display: none; }
 
+/* Copy card — a ```copyfile block (markdown.js + smart-copy.js): name, size and
+   a Copy button for a long text the chat never displays. */
+.vn-copy-export {
+  display: flex; align-items: center; gap: var(--sp-3);
+  background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--r-md);
+  padding: 10px 12px; margin: 8px 0; max-width: 460px; box-sizing: border-box;
+}
+.vn-copy-export > code { overflow-wrap: anywhere; }
+.vn-copy-export-icon { display: flex; flex-shrink: 0; color: var(--text-secondary); }
+.vn-copy-export-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.vn-copy-export-name { font-size: var(--fs-md); font-weight: 600; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vn-copy-export-meta { font-size: var(--fs-xs); color: var(--text-faint); }
+.vn-copy-export.unavailable .vn-copy-export-meta { color: var(--text-secondary); }
+.vn-copy-export-btn {
+  display: flex; align-items: center; gap: 6px; flex-shrink: 0;
+  background: none; border: 1px solid var(--border-light); border-radius: var(--r-xs);
+  padding: 6px 10px; min-height: 32px; cursor: pointer; color: var(--text-primary);
+  font: inherit; font-size: var(--fs-sm);
+}
+.vn-copy-export-btn:hover:not(:disabled) { background: var(--bg-btn-hover); }
+.vn-copy-export-btn:disabled { opacity: 0.45; cursor: default; }
+.vn-copy-export-btn.copied { color: var(--green); border-color: currentColor; }
+
 /* Inline output card — appears in conversation flow */
 .live-output-card-inline {
   display: flex;

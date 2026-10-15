@@ -3503,6 +3503,12 @@ async function executeTask(taskId, mode, opts) {
     }
   }
 
+  // Copy cards (mirrors _newSessionSubmit)
+  if (typeof _buildCopyExportNote === 'function') {
+    const copyNote = _buildCopyExportNote();
+    systemPrompt = systemPrompt ? systemPrompt + '\n\n' + copyNote : copyNote;
+  }
+
   // 6. Emit start_session via socket (mirrors _newSessionSubmit)
   runningIds.add(newId);
   sessionKinds[newId] = 'working';

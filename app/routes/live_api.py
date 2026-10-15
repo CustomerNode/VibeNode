@@ -1780,6 +1780,41 @@ def api_file_info():
     return jsonify({"name": name, "size": size, "exists": exists})
 
 
+# Copy cards: an agent writes a long text (a context export, a pack for another
+# AI) into this folder and puts a ```copyfile block with the path in its reply.
+# The chat shows a card with a Copy button instead of the text. Only this
+# folder is readable: a phone on the tailnet reaches this route too, so it must
+# never become a way to read any file in home.
+COPY_EXPORTS_DIR = Path.home() / ".claude" / "copy-exports"
+COPY_EXPORT_MAX_BYTES = 20 * 1024 * 1024
+
+
+@bp.route('/api/copy-export')
+def api_copy_export():
+    """Return the text of one file in COPY_EXPORTS_DIR for a copy card."""
+    raw = (request.args.get('path') or '').strip()
+    if not raw:
+        return jsonify({"ok": False, "error": "No path provided"}), 400
+    try:
+        root = COPY_EXPORTS_DIR.resolve()
+        p = Path(raw).expanduser().resolve()
+        p.relative_to(root)
+    except (ValueError, OSError, RuntimeError):
+        return jsonify({"ok": False, "error": "Copy cards only read files in ~/.claude/copy-exports"}), 403
+    if not p.is_file():
+        return jsonify({"ok": False, "error": "File no longer exists"}), 404
+    size = p.stat().st_size
+    if size > COPY_EXPORT_MAX_BYTES:
+        return jsonify({"ok": False, "error": "File is over 20 MB"}), 413
+    try:
+        text = p.read_bytes().decode('utf-8')
+    except UnicodeDecodeError:
+        return jsonify({"ok": False, "error": "File is not UTF-8 text"}), 415
+    resp = jsonify({"ok": True, "name": p.name, "bytes": size, "chars": len(text), "text": text})
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
 @bp.route('/api/open-file', methods=['POST'])
 def api_open_file():
     """Open a file using the system default application (Windows os.startfile)."""
