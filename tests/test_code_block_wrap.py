@@ -198,3 +198,37 @@ def test_tables_and_extract_views_keep_their_own_behaviour():
     assert ".code-block-pre" not in rule and "table" not in rule
     # The extract/diff view keeps its own sideways scroll.
     assert ".code-block-pre { margin:0; padding:var(--sp-5); overflow-x:auto;" in css
+
+
+NESTED = ("Paste this:\n\n````\nFix the renderer so that\n\n```\ninner block\n```\n\n"
+          "stays inside the box.\n````\n\nAfter the box.")
+
+
+def test_a_longer_fence_can_carry_a_shorter_fence_inside(browser):
+    """A ```` fence closes only on ````, so a ``` block inside it is content.
+
+    The first attempt at the wrap-fix prompt put three backticks inside a
+    three-backtick fence and the box ended early.  With a four-backtick outer
+    fence that is one block, inner fence lines included, and nothing after the
+    outer fence is swallowed."""
+    pg = browser.new_page()
+    try:
+        pg.set_content(_page_html())
+        got = pg.evaluate("""(md) => {
+            const d = document.createElement('div');
+            d.innerHTML = mdParse(md);
+            return { pres: d.querySelectorAll('pre').length,
+                     code: d.querySelector('pre code').textContent,
+                     text: d.textContent }; }""", NESTED)
+        assert got["pres"] == 1, got
+        assert got["code"].rstrip("\n") == "Fix the renderer so that\n\n```\ninner block\n```\n\nstays inside the box."
+        assert got["text"].rstrip().endswith("After the box.")
+        assert "````" not in got["text"]
+        # The common case is untouched: a plain ``` fence still closes on ```.
+        plain = pg.evaluate("""(md) => { const d = document.createElement('div');
+            d.innerHTML = mdParse(md);
+            return [d.querySelectorAll('pre').length, d.querySelector('pre code').className,
+                    d.querySelector('pre code').textContent]; }""", "a\n```py\nx = 1\n```\nb")
+        assert plain[0] == 1 and plain[1] == "lang-py" and plain[2].rstrip("\n") == "x = 1", plain
+    finally:
+        pg.close()

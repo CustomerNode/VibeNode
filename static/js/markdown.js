@@ -79,8 +79,11 @@ function mdParse(md) {
     let html = md;
     // Escape HTML in non-code regions (we'll handle code blocks first)
     const codeBlocks = [];
-    // Fenced code blocks — with syntax highlighting
-    html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    // Fenced code blocks — with syntax highlighting.  A fence is three OR MORE
+    // backticks and closes only on a run at least as long (CommonMark), so a
+    // ```` fence can carry a ``` block inside it.  The old /```…```/ closed at
+    // the first three backticks and cut such a block off mid-way (2026-10-15).
+    html = html.replace(/(`{3,})(\w*)\n?([\s\S]*?)\n?\1`*/g, (_, _fence, lang, code) => {
       const idx = codeBlocks.length;
       const langClass = lang ? ' class="lang-' + _escapeHtmlForCode(lang) + '"' : '';
       // .vn-code: wraps at the box edge instead of scrolling sideways (style.css).
