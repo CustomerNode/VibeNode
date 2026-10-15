@@ -83,7 +83,8 @@ function mdParse(md) {
     html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
       const idx = codeBlocks.length;
       const langClass = lang ? ' class="lang-' + _escapeHtmlForCode(lang) + '"' : '';
-      codeBlocks.push('<pre><code' + langClass + '>' + highlightCode(code, lang || '') + '</code></pre>');
+      // .vn-code: wraps at the box edge instead of scrolling sideways (style.css).
+      codeBlocks.push('<pre class="vn-code"><code' + langClass + '>' + highlightCode(code, lang || '') + '</code></pre>');
       return '\x00CODE' + idx + '\x00';
     });
     // Inline code

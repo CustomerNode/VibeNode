@@ -651,8 +651,9 @@
     max-width: 100%;
     overflow-x: hidden;
   }
-  /* Code/pre in messages: scroll inside their own block, never widen the page. */
-  .live-log pre { max-width: 100%; overflow-x: auto; }
+  /* Code/pre in messages: never widen the page.  They wrap inside their own
+     box (style.css, the pre.vn-code rule), so no sideways scroll here either. */
+  .live-log pre { max-width: 100%; }
 
   /* ---- Open-chat toolbar → compact but COMPLETE. Keep the actions (Actions
      popup + Analyze dropdown); just shrink them and let the title truncate so

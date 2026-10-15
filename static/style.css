@@ -1718,8 +1718,28 @@ body.unread-enabled .session-item .unread-dot {
 .msg.assistant .msg-body ul { list-style-type: disc; }
 .msg.assistant .msg-body li { margin:.15em 0; }
 .msg.assistant .msg-body code { background: var(--bg-code); border:1px solid var(--border-light); border-radius:3px; padding:1px 5px; font-size:var(--fs-md); color: var(--text-code); font-family: var(--font-mono); }
-.msg.assistant .msg-body pre { background: var(--bg-code); border:1px solid var(--border-light); border-radius:var(--r-sm); padding:10px 14px; overflow-x:auto; margin:.5em 0; }
+.msg.assistant .msg-body pre { background: var(--bg-code); border:1px solid var(--border-light); border-radius:var(--r-sm); padding:10px 14px; margin:.5em 0; }
 .msg.assistant .msg-body pre code { background:none; border:none; padding:0; color: var(--text-code); }
+/* Code blocks in the chat WRAP; they never scroll sideways (2026-10-15).
+   The one rule for every code block a chat renders: fenced blocks from
+   mdParse (pre.vn-code: assistant messages, queued and compose views,
+   mission-control previews), plain-text user bubbles, the queue banner and
+   the compose file preview.  A long prose prompt in a fence used to be one
+   line per paragraph behind a horizontal scrollbar, unreadable on a phone.
+   pre-wrap keeps indentation and blank lines exactly; overflow-wrap:anywhere
+   breaks long unbroken tokens (paths, URLs) at the box edge.  Height is not
+   capped.  The copy button reads textContent, so it still copies the
+   original unwrapped text.  Do NOT add overflow-x:auto or white-space:pre
+   back on a per-screen pre rule: it re-creates the sideways scroll there.
+   Tables (.smart-copy-table-wrap) and diff/extract views (.code-block-pre)
+   keep their own behaviour. */
+pre.vn-code, .msg-body pre, .live-text pre, .live-queue-banner pre, .compose-preview-file pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: visible;
+  max-width: 100%;
+}
+pre.vn-code code { white-space: inherit; overflow-wrap: inherit; }
 .msg.assistant .msg-body blockquote { border-left:3px solid #4a4a8a; margin:.4em 0; padding:.2em .8em; color: var(--text-muted); }
 .msg.assistant .msg-body table { border-collapse:collapse; margin:.8em 0; font-size:var(--fs-md); width:100%; border-radius:var(--r-sm); overflow:hidden; border:1px solid var(--border); }
 .msg.assistant .msg-body th { background: var(--bg-code); color: var(--accent-md-heading); font-weight:600; padding:8px 14px; text-align:left; border-bottom:2px solid var(--border-light); border-right:1px solid #1e3a2e; font-size:var(--fs-sm); letter-spacing:.04em; text-transform:uppercase; }
@@ -3056,7 +3076,7 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
 .live-entry-asst .live-text p { margin:.3em 0; }
 .live-entry-asst .live-text h1,.live-entry-asst .live-text h2,.live-entry-asst .live-text h3 { color: var(--accent-md-heading); margin:.5em 0 .2em; }
 .live-entry-asst .live-text code { background: var(--bg-code); border:1px solid var(--border-light); border-radius:3px; padding:1px 4px; color: var(--text-code); font-size:var(--fs-sm); }
-.live-entry-asst .live-text pre { background: var(--bg-code); border:1px solid var(--border-light); border-radius:var(--r-sm); padding:8px 12px; overflow-x:auto; margin:.4em 0; }
+.live-entry-asst .live-text pre { background: var(--bg-code); border:1px solid var(--border-light); border-radius:var(--r-sm); padding:8px 12px; margin:.4em 0; }
 .live-entry-asst .live-text pre code { background:none; border:none; padding:0; }
 .live-entry-asst .live-text ul,.live-entry-asst .live-text ol { padding-left:1.3em; margin:.3em 0; }
 .live-entry-asst .live-text ol { list-style-type: decimal; }
@@ -11226,9 +11246,6 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
   background: var(--bg-code, #0d0d1a);
   padding: 8px 10px;
   border-radius: var(--r-sm);
-  overflow-x: auto;
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
 }
 .compose-preview-file table {
   width: 100%;
@@ -12711,7 +12728,7 @@ body.mc-mode #main-panel { width: 100% !important; margin-left: 0 !important; he
 .mc-preview .msg.assistant .msg-role { color: #409cff; opacity: 1; }
 .mc-preview .msg.user .msg-role { color: rgba(235,235,245,0.45); }
 .mc-preview .msg-body, .mc-preview .msg-content { font-size: var(--fs-md); line-height: 1.52; color: rgba(235,235,245,0.82); }
-.mc-preview .msg-body pre { background: rgba(0,0,0,0.25); border-radius: var(--r-sm); padding: 6px 8px; font-size: var(--fs-xs); overflow-x: auto; margin: 4px 0; white-space: pre; }
+.mc-preview .msg-body pre { background: rgba(0,0,0,0.25); border-radius: var(--r-sm); padding: 6px 8px; font-size: var(--fs-xs); margin: 4px 0; }
 .mc-preview .msg-body code { background: rgba(0,0,0,0.2); border-radius: var(--r-xs); padding: 1px 4px; font-size: var(--fs-xs); }
 .mc-preview .msg-body pre code { background: transparent; padding: 0; }
 .mc-preview .msg-body p { margin: 0 0 4px; }
