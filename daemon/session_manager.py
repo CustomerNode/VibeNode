@@ -1006,6 +1006,17 @@ class SessionManager:
         from daemon.health_monitor import HealthMonitor
         self._health_monitor = HealthMonitor(self)
         self._health_monitor.start()
+        # Durable Jobs supervisor: one thread beside the health monitor that
+        # brings registered long jobs back after a restart
+        # (daemon/job_supervisor.py; spec docs/plans/durable-jobs-spec.md).
+        self._job_supervisor = None
+        try:
+            from daemon.job_supervisor import JobSupervisor, ENABLED as _jobs_enabled
+            if _jobs_enabled:
+                self._job_supervisor = JobSupervisor(self)
+                self._job_supervisor.start()
+        except Exception:
+            logger.exception("JobSupervisor failed to start (jobs will not be relaunched)")
 
     def _run_loop(self) -> None:
         """Entry point for the background thread."""
@@ -1030,6 +1041,9 @@ class SessionManager:
         if getattr(self, '_health_monitor', None):
             self._health_monitor.stop()
             self._health_monitor = None
+        if getattr(self, '_job_supervisor', None):
+            self._job_supervisor.stop()
+            self._job_supervisor = None
         # Flush queue to disk
         self._mq.flush()
         # Close all sessions
