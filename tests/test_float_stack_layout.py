@@ -186,6 +186,7 @@ def test_entry_animations_cannot_dip_into_the_composer():
         ".toast": _css_block(css, ".toast {"),
         ".vn-undo-toast": _css_block(css, ".vn-undo-toast {"),
         ".compose-undo-toast": _css_block(css, ".compose-undo-toast {"),
+        ".vn-job-toast": _css_block(css, ".vn-job-toast {"),
     }
     for name, block in blocks.items():
         for travel in re.findall(r"translateY\(\s*(\d+(?:\.\d+)?)px\s*\)", block):
@@ -205,7 +206,7 @@ def test_no_float_transitions_its_own_bottom():
     import re
 
     css = (STATIC / "style.css").read_text(encoding="utf-8")
-    for sel in (".git-sync-mini {", ".toast {", ".vn-undo-toast {", ".compose-undo-toast {"):
+    for sel in (".git-sync-mini {", ".toast {", ".vn-undo-toast {", ".compose-undo-toast {", ".vn-job-toast {"):
         block = _css_block(css, sel)
         for decl in re.findall(r"transition\s*:\s*([^;}]+)", block):
             props = {p.strip().split()[0] for p in decl.split(",") if p.strip()}

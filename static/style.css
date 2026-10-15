@@ -2399,6 +2399,67 @@ pre.vn-code code { white-space: inherit; overflow-wrap: inherit; }
 .vn-undo-toast-btn:hover { background: var(--bg-hover); }
 .vn-undo-toast-btn:active { transform: translateY(1px); }
 
+/* ===== Durable Jobs: the needs-person card (static/js/jobs.js) =====
+   A float in the shared stack (utils.js _floatEls): no hard-coded bottom,
+   10px entry travel (under _FLOAT_CLEARANCE), named transitions only. */
+.vn-job-toast {
+  position: fixed;
+  bottom: var(--vn-float-bottom, 20px); right: 20px;
+  width: min(420px, calc(100vw - 40px));
+  background: var(--bg-toast);
+  border: 1px solid var(--border-toast);
+  color: var(--text-toast);
+  padding: 10px 14px 10px;
+  border-radius: var(--r-md);
+  font-size: var(--fs-md);
+  opacity: 0;
+  transform: translateY(10px);
+  box-shadow: var(--elev-3);
+  transition: opacity var(--dur-slow) var(--ease-out),
+              transform var(--dur-slow) var(--ease-spring);
+  z-index: 9999;
+}
+.vn-job-toast.show { opacity: 1; transform: translateY(0); }
+.vn-job-toast-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.vn-job-toast-title { font-weight: 600; font-size: var(--fs-lg); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vn-job-toast-pct { font-variant-numeric: tabular-nums; font-size: var(--fs-sm); opacity: .8; }
+.vn-job-toast-reason { color: var(--text-toast); opacity: .85; margin-bottom: 8px; overflow-wrap: anywhere; }
+.vn-job-toast-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.vn-job-toast-btn {
+  background: transparent;
+  border: 1px solid var(--border-toast);
+  color: var(--text-toast);
+  padding: 4px 12px;
+  border-radius: var(--r-sm, 4px);
+  font-size: var(--fs-md);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--dur-fast, 120ms) var(--ease-out);
+}
+.vn-job-toast-btn:hover { background: var(--bg-hover); }
+.vn-job-toast-btn:disabled { opacity: var(--disabled-opacity, .5); cursor: default; }
+.vn-job-relaunch { border-color: var(--accent); }
+
+/* System → Durable Jobs list */
+.vn-job-intro, .vn-job-empty { font-size: var(--fs-md); color: var(--text-muted); margin-bottom: 12px; }
+.vn-job-row { border: 1px solid var(--border); border-radius: var(--r-md); padding: 10px 12px; margin-bottom: 10px; }
+.vn-job-row-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.vn-job-state { font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .04em; padding: 1px 7px; border-radius: var(--r-pill); border: 1px solid var(--border-light); color: var(--text-muted); }
+.vn-job-state-needs_person, .vn-job-state-failed { color: var(--orange); border-color: var(--orange); }
+.vn-job-state-finished { color: var(--green); border-color: var(--green); }
+.vn-job-state-running, .vn-job-state-relaunched { color: var(--accent); border-color: var(--accent); }
+.vn-job-name { font-weight: 600; }
+.vn-job-reason { color: var(--orange); font-size: var(--fs-md); margin: 2px 0 6px; }
+.vn-job-bar { height: 6px; background: var(--bg-code); border-radius: 3px; overflow: hidden; margin: 6px 0; }
+.vn-job-bar-fill { height: 100%; background: var(--accent); }
+.vn-job-meta { font-size: var(--fs-sm); color: var(--text-muted); }
+.vn-job-pct { font-weight: 600; color: var(--text-primary); }
+.vn-job-cmd { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-faint); margin-top: 4px; overflow-wrap: anywhere; }
+.vn-job-actions { display: flex; gap: 8px; margin-top: 8px; }
+.vn-job-actions button { font-size: var(--fs-sm); padding: 3px 10px; border-radius: var(--r-sm); border: 1px solid var(--border-light); background: transparent; color: var(--text-secondary); cursor: pointer; }
+.vn-job-actions button:hover { background: var(--bg-hover); }
+.vn-job-log { font-size: var(--fs-xs); max-height: 240px; overflow: auto; background: var(--bg-code); padding: 8px; border-radius: var(--r-sm); margin-top: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+
 /* ===== Spinner ===== */
 .spinner {
   display: inline-block;

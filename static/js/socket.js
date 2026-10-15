@@ -1815,6 +1815,21 @@ socket.on('session_stalled', (data) => {
     } catch (e) { /* notify failures never break other handlers */ }
 });
 
+// Durable Jobs (daemon/job_supervisor.py, static/js/jobs.js). The supervisor
+// relaunches dead jobs by itself and says nothing; only a job that needs a
+// person (irreversible step, three deaths without progress, or a failed
+// launch) reaches the browser, as a card with Relaunch and Leave it.
+socket.on('job_needs_person', (data) => {
+    try {
+        if (window.VNJobs && typeof window.VNJobs.onNeedsPerson === 'function') window.VNJobs.onNeedsPerson(data || {});
+    } catch (e) { /* job card failures never break other handlers */ }
+});
+socket.on('job_registry_error', (data) => {
+    try {
+        if (window.VNJobs && typeof window.VNJobs.onRegistryError === 'function') window.VNJobs.onRegistryError(data || {});
+    } catch (e) { /* ditto */ }
+});
+
 // Server-side queue updates — replaces client-side localStorage queue
 socket.on('queue_updated', (data) => {
     const sid = data.session_id;

@@ -23,6 +23,7 @@ function escHtml(str) {
 //   - #git-sync-mini       "Pulling & pushing..." (clickable)
 //   - .vn-undo-toast       "Session slept · Undo" (clickable)
 //   - .compose-undo-toast  "Deleted · Undo" in Compose (clickable)
+//   - .vn-job-toast        "Job needs you · Relaunch / Leave it" (jobs.js)
 //   - #toast               plain notices
 // They used to sit in three different corners at fixed offsets, and the
 // bottom-right ones covered the composer's Send button; the clickable ones
@@ -47,7 +48,7 @@ function _floatEls() {
   const out = [];
   const mini = document.getElementById('git-sync-mini');
   if (mini && mini.classList.contains('show')) out.push(mini);
-  document.querySelectorAll('.vn-undo-toast, .compose-undo-toast').forEach(e => out.push(e));
+  document.querySelectorAll('.vn-undo-toast, .compose-undo-toast, .vn-job-toast').forEach(e => out.push(e));
   const t = document.getElementById('toast');
   if (t && t.classList.contains('show')) out.push(t);
   return out;
