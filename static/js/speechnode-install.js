@@ -134,6 +134,12 @@
         const act = btn.dataset.vsn;
         if (act === 'close') { _close(); return; }
         if (act === 'retry') { enable(); return; }
+        if (act === 'disable') {
+          try { const sn = SN(); if (sn) sn.setEnabled(false); } catch (e) { /* ignore */ }
+          _refreshBar();
+          _close();
+          return;
+        }
         if (act === 'restart') {
           // Persist intent, then run VibeNode's web-only restart, which shows its
           // own reboot overlay and auto-reloads. On reload, resumeOnLoad() finishes.
@@ -200,6 +206,20 @@
       + '<div class="pm-actions"><button class="pm-btn pm-btn-secondary" data-vsn="close">Close</button></div>'
     );
   }
+  // The engine itself cannot run on this hardware (server-reported). No retry
+  // button: retrying can't change the outcome. Offer to turn the feature off.
+  function _renderUnsupportedMachine(s) {
+    _setBody(
+      '<div class="vsn-err">⚠ ' + _esc(s.error || 'SpeechNode’s engine can’t run on this machine.') + '</div>'
+      + (s.remediation ? '<p class="vsn-sub">' + _esc(s.remediation) + '</p>' : '')
+      + '<div class="pm-actions">'
+      + '<button class="pm-btn pm-btn-secondary" data-vsn="close">Close</button>'
+      + '<button class="pm-btn pm-btn-danger" data-vsn="disable">Turn SpeechNode off</button></div>'
+    );
+  }
+  function _isUnsupportedMachine(s) {
+    return !!s && (s.phase === 'unsupported' || s.supported === false);
+  }
 
   // ---- poll loop -----------------------------------------------------------
   // visible:true  -> update the overlay each tick (interactive enable flow)
@@ -218,9 +238,9 @@
           _onReady(opts);
           return;
         }
-        if (s.phase === 'error') {
+        if (s.phase === 'error' || _isUnsupportedMachine(s)) {
           _polling = false;
-          if (opts.visible) _renderError(s);
+          if (opts.visible) { if (_isUnsupportedMachine(s)) _renderUnsupportedMachine(s); else _renderError(s); }
           else _toast(s.error || 'SpeechNode setup failed.', true);
           return;
         }
@@ -255,7 +275,10 @@
     try { s = (await sn.refreshStatus()) || {}; } catch (e) { s = {}; }
     if (s.phase === 'needs_restart') { _renderNeedsRestart(); return; }
     if (s.ready) { _onReady({ visible: true }); return; }
-    try { await sn.startInstall(); } catch (e) { /* surfaced via poll/status */ }
+    if (_isUnsupportedMachine(s)) { _renderUnsupportedMachine(s); return; }
+    // force: this is a click, so a remembered failed install is retried.
+    try { s = (await sn.startInstall({ force: true })) || {}; } catch (e) { s = {}; }
+    if (_isUnsupportedMachine(s)) { _renderUnsupportedMachine(s); return; }
     _renderProgress(sn.getStatus() || { phase: 'installing', progress: 5 });
     _poll({ visible: true });
   }
@@ -281,6 +304,11 @@
       s = s || {};
       if (s.ready) { _refreshBar(); return; }
       if (s.phase === 'needs_restart') { _renderNeedsRestart(); return; }
+      // Never auto-retry on page load when the machine can't run the engine or the
+      // last install failed: that re-ran pip (and re-failed) on every start. The
+      // server enforces this too (non-forced /install reports, doesn't retry); this
+      // just avoids the pointless call. An explicit click (enable) still retries.
+      if (_isUnsupportedMachine(s) || s.phase === 'error') { _refreshBar(); return; }
       const inProgress = s.phase === 'installing' || s.phase === 'downloading' || s.phase === 'loading';
       if (inProgress || s.deps_available) {
         // Model is loading (or about to load via package _boot()). Run a silent poll
