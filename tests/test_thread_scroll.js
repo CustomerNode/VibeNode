@@ -612,6 +612,55 @@ test('live scroll uses the live panel follow rule when it is loaded', () => {
   } finally { TS.setLiveScroll(false); delete global._autoScrollLiveLog; }
 });
 
+test('the Auto switch on the pill flips live scroll and shows its state', () => {
+  setup();
+  log.dispatch('wheel', {});
+  fireIO(false);
+  const auto = pillWrap().children[1];
+  assert.ok(auto.classList.contains('vn-jump-auto'), 'switch sits beside the pill');
+  assert.strictEqual(auto.getAttribute('aria-checked'), 'false');
+  log.scrollHeight = 2500;
+  auto.dispatch('click', { preventDefault() {}, stopPropagation() {} });
+  try {
+    assert.strictEqual(TS.isLiveScroll(), true);
+    assert.ok(auto.classList.contains('on'));
+    assert.strictEqual(TS.state(), 'LIVE', 'turning it on from the pill starts following now');
+    auto.dispatch('click', { preventDefault() {}, stopPropagation() {} });
+    assert.strictEqual(TS.isLiveScroll(), false);
+    assert.ok(!auto.classList.contains('on'));
+  } finally { TS.setLiveScroll(false); }
+});
+
+test('a change made from a menu repaints the pill switch', () => {
+  setup();
+  log.dispatch('wheel', {});
+  fireIO(false);
+  const auto = pillWrap().children[1];
+  TS.setLiveScroll(true);
+  try { assert.strictEqual(auto.getAttribute('aria-checked'), 'true'); }
+  finally { TS.setLiveScroll(false); }
+  assert.strictEqual(auto.getAttribute('aria-checked'), 'false');
+});
+
+test('with Auto on and the session working, the switch stays reachable at the bottom', () => {
+  setup();                              // caught up, at the bottom
+  global.liveSessionId = 'sess-1';
+  global.sessionKinds = { 'sess-1': 'working' };
+  try {
+    TS.setLiveScroll(true);
+    const wrap = pillWrap(), auto = wrap.children[1];
+    assert.ok(wrap.classList.contains('visible'), 'switch must not vanish while following');
+    assert.strictEqual(pill().style.display, 'none', 'nothing to jump to: pill half hidden');
+    assert.ok(auto.classList.contains('solo'));
+    global.sessionKinds['sess-1'] = 'idle';
+    TS.refresh();
+    assert.ok(!wrap.classList.contains('visible'), 'idle and caught up: nothing shown');
+  } finally {
+    TS.setLiveScroll(false);
+    delete global.liveSessionId; delete global.sessionKinds;
+  }
+});
+
 // ── Report ────────────────────────────────────────────────────────────────
 
 (async () => {

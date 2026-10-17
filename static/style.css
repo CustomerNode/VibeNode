@@ -3040,6 +3040,39 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
 }
 .vn-jump-pill:active { transform:translateY(-100%) scale(.97); }
 .vn-jump-pill svg { flex-shrink:0; opacity:.6; }
+
+/* Pill + "Auto" switch read as ONE control split in two: left half jumps,
+   right half flips live scroll. Same fixed height so the seam lines up. */
+.vn-jump-pill, .vn-jump-auto { box-sizing:border-box; height:26px; padding-top:0; padding-bottom:0; }
+.vn-jump-pill { border-top-right-radius:0; border-bottom-right-radius:0; }
+.vn-jump-auto {
+  position:relative; pointer-events:auto; transform:translateY(-100%);
+  display:inline-flex; align-items:center; gap:6px;
+  margin-left:-1px; padding:0 9px 0 8px;
+  background: var(--bg-dropdown);
+  background: color-mix(in srgb, var(--bg-dropdown) 88%, transparent);
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+  color: var(--text-secondary);
+  border:1px solid var(--border-hover);
+  border-radius:0 999px 999px 0;
+  font: 600 var(--fs-xs) var(--font-sans); letter-spacing:.01em;
+  cursor:pointer; white-space:nowrap; box-shadow: var(--elev-2);
+}
+/* Alone (live scroll following a running session, nothing to jump to): a
+   full round chip instead of the right half of a pill. */
+.vn-jump-auto.solo { border-radius:999px; margin-left:0; padding:0 10px; }
+.vn-jump-auto:hover, .vn-jump-auto:focus-visible { color: var(--text-heading); }
+.vn-jump-auto:active { transform:translateY(-100%) scale(.97); }
+.vn-jump-auto-track {
+  position:relative; width:22px; height:12px; border-radius:999px;
+  background: var(--border-hover); transition: background .15s var(--ease-out);
+}
+.vn-jump-auto-knob {
+  position:absolute; top:2px; left:2px; width:8px; height:8px; border-radius:50%;
+  background:#fff; transition: transform .15s var(--ease-out);
+}
+.vn-jump-auto.on .vn-jump-auto-track { background: var(--green); }
+.vn-jump-auto.on .vn-jump-auto-knob { transform: translateX(10px); }
 /* The button carries the session's status (thread-scroll.js _renderPill).
    The thread never scrolls itself (thread-scroll.js, D), so this is the only
    signal that something is happening below: each status is a solid colour

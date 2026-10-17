@@ -148,6 +148,7 @@
   var _sentinel = null;
   var _pillWrap = null;
   var _pillEl = null;
+  var _autoEl = null;     // the "Auto" (live scroll) switch beside the pill
   var _io = null;
   var _mo = null;
   var _atBottom = true;
@@ -259,6 +260,7 @@
       if (_liveScroll) localStorage.setItem(LIVE_SCROLL_KEY, 'on');
       else localStorage.removeItem(LIVE_SCROLL_KEY);
     } catch (e) { /* private mode: in-memory only */ }
+    _renderPill();   // the pill's switch reflects a change made from a menu too
     // Turning it on while caught up: catch up now, so it starts following.
     if (_liveScroll && _logEl && _state !== READING) _follow();
     return _liveScroll;
@@ -409,6 +411,41 @@
       catchUp();
     });
     _pillWrap.appendChild(_pillEl);
+
+    // The "Auto" switch riding on the right of the pill (2026-10-17): the
+    // live-scroll preference, one tap away while the reader is looking at the
+    // thread. The pill itself still jumps; this half only flips the setting.
+    _autoEl = document.createElement('button');
+    _autoEl.type = 'button';
+    _autoEl.className = 'vn-jump-auto';
+    _autoEl.setAttribute('role', 'switch');
+    _autoEl.innerHTML = '<span class="vn-jump-auto-label">Auto</span>' +
+                        '<span class="vn-jump-auto-track"><span class="vn-jump-auto-knob"></span></span>';
+    _autoEl.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      var next = !_liveScroll;
+      // One code path for every switch, so the actions menu label and the
+      // confirmation toast stay in step (modals.js). Fallback: set it here.
+      if (typeof window.toggleLiveScroll === 'function') window.toggleLiveScroll(next);
+      else setLiveScroll(next);
+      // Turning it ON from here means "follow it now": take the reader to the
+      // latest and leave READING, or nothing would follow until they scrolled
+      // back down by hand.
+      if (next) catchUp();
+      _renderPill();
+    });
+    _pillWrap.appendChild(_autoEl);
+  }
+
+  function _renderAuto() {
+    if (!_autoEl) return;
+    _autoEl.classList.toggle('on', _liveScroll);
+    _autoEl.setAttribute('aria-checked', _liveScroll ? 'true' : 'false');
+    var t = _liveScroll ? 'Auto scroll is on. Tap to keep the chat still'
+                        : 'Auto scroll is off. Tap to follow new output';
+    _autoEl.setAttribute('aria-label', t);
+    _autoEl.title = t;
   }
 
   var _ARROW_SVG =
@@ -452,14 +489,22 @@
     //   Done       finished, and unseen output  (green)
     //   quiet      idle, nothing new            (muted arrow only)
     var fresh = _hasNew || _newCount > 0;
-    var show = fresh || !_atBottom;
-    if (!show) {
+    var act = _activity();
+    var showPill = fresh || !_atBottom;
+    // While live scroll is following a running session the reader sits at the
+    // bottom, where the pill has nothing to jump to. The Auto switch must stay
+    // reachable anyway, or the only way to turn following off would be to
+    // scroll away first. So it shows by itself in that case.
+    var showAuto = showPill || (_liveScroll && act === 'working');
+    _renderAuto();   // keep it truthful even while hidden: it can reappear any time
+    if (!showAuto) {
       _pillWrap.classList.remove('visible');
       _pillWrap.setAttribute('aria-hidden', 'true');
       _pillKey = '';
       return;
     }
-    var act = _activity();
+    _pillEl.style.display = showPill ? '' : 'none';
+    if (_autoEl) _autoEl.classList.toggle('solo', !showPill);
     var mode = act === 'working' ? 'working'
              : act === 'waiting' ? 'waiting'
              : fresh ? 'done' : 'quiet';
@@ -473,6 +518,7 @@
       _pillEl.setAttribute('aria-label', m[2]);
       _pillEl.title = m[2];
     }
+    _renderAuto();
     _pillWrap.classList.add('visible');
     _pillWrap.setAttribute('aria-hidden', 'false');
   }

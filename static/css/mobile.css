@@ -465,13 +465,21 @@
     padding: 6px 13px;
     font-size: 11.5px;
   }
-  .vn-jump-pill::before {
+  .vn-jump-pill::before,
+  .vn-jump-auto::before {
     content: '';
     position: absolute;
     left: -8px; right: -8px;
     top: 50%; transform: translateY(-50%);
     height: 44px;
   }
+  /* The two halves touch, so neither tap overlay may reach into the other:
+     the pill's stops at its own right edge, the switch's at its left. */
+  .vn-jump-pill::before { right: 0; }
+  .vn-jump-auto::before { left: 0; }
+  .vn-jump-auto.solo::before { left: -8px; }
+  .vn-jump-pill, .vn-jump-auto { height: 30px; }
+  .vn-jump-auto { font-size: 11.5px; padding: 0 11px 0 10px; }
 
   /* ---- Composer: don't touch the edges, respect the home indicator, and cap
      the auto-growing textarea so long input can't push the chat out of view ---
