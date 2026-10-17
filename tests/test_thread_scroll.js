@@ -142,6 +142,8 @@ global.cancelAnimationFrame = () => {};
 global.liveAutoScroll = true;
 const _ls = {};
 global.localStorage = { getItem: (k) => (k in _ls ? _ls[k] : null), setItem: (k, v) => { _ls[k] = String(v); }, removeItem: (k) => { delete _ls[k]; } };
+const _ss = {};
+global.sessionStorage = { getItem: (k) => (k in _ss ? _ss[k] : null), setItem: (k, v) => { _ss[k] = String(v); }, removeItem: (k) => { delete _ss[k]; } };
 
 const SRC = path.join(__dirname, '..', 'static', 'js', 'thread-scroll.js');
 // eslint-disable-next-line no-eval
@@ -569,17 +571,48 @@ test('live scroll is OFF by default (static)', () => {
   assert.strictEqual(TS.isLiveScroll(), false);
 });
 
-test('live scroll ON follows new content and persists the choice', () => {
+test('live scroll ON follows new content', () => {
   setup();
   TS.setLiveScroll(true);
-  assert.strictEqual(global.localStorage.getItem('liveScroll'), 'on');
   log.scrollTop = 0; log.scrollHeight = 2000;
   tailBelowFold();
   msg(600, 900);
   assert.strictEqual(log.scrollTop, 2000, 'live mode follows the new entry');
   assert.strictEqual(TS.hasNew(), false, 'followed content is not announced');
   TS.setLiveScroll(false);
+});
+
+test('the DEFAULT (Preferences) persists per device and every session starts with it', () => {
+  setup();
+  TS.setDefaultLiveScroll(true);
+  try {
+    assert.strictEqual(global.localStorage.getItem('liveScroll'), 'on');
+    assert.strictEqual(TS.isLiveScroll(), true, 'applies to the session on screen');
+    TS.attach(log, 'sess-other');
+    assert.strictEqual(TS.isLiveScroll(), true, 'a new session starts with the default');
+  } finally { TS.setDefaultLiveScroll(false); }
   assert.strictEqual(global.localStorage.getItem('liveScroll'), null);
+});
+
+test('the pill switch changes ONLY the session on screen, never the default', () => {
+  setup();                                 // sess-1, default off
+  TS.setLiveScroll(true);
+  assert.strictEqual(TS.getDefaultLiveScroll(), false, 'default untouched');
+  assert.strictEqual(global.localStorage.getItem('liveScroll'), null);
+  TS.attach(log, 'sess-2');
+  assert.strictEqual(TS.isLiveScroll(), false, 'another session keeps the default');
+  TS.attach(log, 'sess-1');
+  assert.strictEqual(TS.isLiveScroll(), true, 'coming back keeps the choice made for this session');
+  TS.setLiveScroll(false);                 // back to the default: override dropped
+  assert.strictEqual(global.sessionStorage.getItem('liveScrollSessions'), '{}');
+});
+
+test('changing the default clears per-session choices', () => {
+  setup();
+  TS.setLiveScroll(true);                  // sess-1 override: on
+  TS.setDefaultLiveScroll(false);          // user says default off
+  TS.attach(log, 'sess-1');
+  assert.strictEqual(TS.isLiveScroll(), false, '"default off" means off everywhere');
 });
 
 test('live scroll still never moves a reader who scrolled away', () => {

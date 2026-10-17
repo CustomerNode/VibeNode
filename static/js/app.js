@@ -2206,9 +2206,9 @@ function openPreferences() {
      hint: 'Local, codebase-aware voice that works in every browser (Firefox & Safari too). Downloads a small model on first enable.'},
     {key: 'send', label: 'Enter to send', on: enterToSend,
      hint: 'Press Enter to send. When off, ' + _MOD + '+Enter sends and Enter adds a new line.'},
-    {key: 'livescroll', label: 'Live scroll',
-     on: !!(window.ThreadScroll && ThreadScroll.isLiveScroll()),
-     hint: 'Follow new output as it arrives. When off, the chat stays where you are and the arrow shows Working, Needs you or Done.'},
+    {key: 'livescroll', label: 'Auto scroll (default)',
+     on: !!(window.ThreadScroll && ThreadScroll.getDefaultLiveScroll()),
+     hint: 'Whether sessions follow new output as it arrives. When off, the chat stays where you are and the arrow shows Working, Needs you or Done. The Auto switch on that arrow changes just the session you are in.'},
     {key: 'sticky', label: 'Sticky chats', on: stickyOn,
      hint: 'Keep your most recent message pinned at the top while scrolling long replies.'},
     {key: 'wsd', label: 'Wrong-session detection', on: wsdOn,
@@ -2252,7 +2252,10 @@ function openPreferences() {
           showToast('Enter to send: ' + (on ? 'On' : 'Off'));
           break;
         case 'livescroll':
-          if (typeof toggleLiveScroll === 'function') toggleLiveScroll(on);
+          // The DEFAULT for every session (resets per-session overrides).
+          if (window.ThreadScroll) ThreadScroll.setDefaultLiveScroll(on);
+          if (typeof _renderLiveScrollAction === 'function') _renderLiveScrollAction();
+          showToast('Auto scroll default: ' + (on ? 'On' : 'Off'));
           break;
         case 'sticky': {
           if (on) {

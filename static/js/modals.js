@@ -1032,9 +1032,10 @@ function openActionsPopup() {
 }
 
 /**
- * Live scroll on/off (thread-scroll.js setLiveScroll). One switch, two entry
- * points: Preferences and the session actions menu (the quick one on a phone).
- * `on` omitted = flip the current value.
+ * Auto scroll on/off for THE SESSION ON SCREEN (thread-scroll.js
+ * setLiveScroll). Used by the Auto switch on the jump pill and the ••• menu.
+ * The default every session starts with is set in System → Preferences
+ * (ThreadScroll.setDefaultLiveScroll). `on` omitted = flip the current value.
  */
 function toggleLiveScroll(on) {
   if (!window.ThreadScroll) return;
@@ -1042,8 +1043,8 @@ function toggleLiveScroll(on) {
   ThreadScroll.setLiveScroll(next);
   _renderLiveScrollAction();
   if (typeof showToast === 'function') {
-    showToast(next ? 'Live scroll on: the chat follows new output'
-                   : 'Live scroll off: the chat stays where you are');
+    showToast(next ? 'Auto scroll on for this session'
+                   : 'Auto scroll off for this session');
   }
 }
 
@@ -1053,10 +1054,11 @@ function _renderLiveScrollAction() {
   const on = ThreadScroll.isLiveScroll();
   const name = btn.querySelector('.actions-item-name');
   const desc = btn.querySelector('.actions-item-desc');
-  if (name) name.textContent = 'Live scroll: ' + (on ? 'On' : 'Off');
-  if (desc) desc.textContent = on
-    ? 'Following new output. Tap to keep the chat still instead'
-    : 'Chat stays still. Tap to follow new output as it arrives';
+  if (name) name.textContent = 'Auto scroll: ' + (on ? 'On' : 'Off');
+  if (desc) desc.textContent = (on
+    ? 'Following new output in this session. Tap to keep it still'
+    : 'This session stays still. Tap to follow new output') +
+    '. Default: System → Preferences';
   btn.setAttribute('aria-pressed', on ? 'true' : 'false');
 }
 

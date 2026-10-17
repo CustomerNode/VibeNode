@@ -241,29 +241,75 @@
     _hasNew = false;
   }
 
-  // ── Live scroll preference (2026-10-15) ────────────────────────────────
-  // Static (default): new content never moves the view; the button announces it.
-  // Live: the old follow-along behaviour, but only while the reader has not
+  // ── Auto scroll ("live scroll") (2026-10-15, split 2026-10-17) ─────────
+  // Off: new content never moves the view; the button announces it.
+  // On: the old follow-along behaviour, but only while the reader has not
   // scrolled away (state !== READING). Scrolling up still pauses it, and the
-  // button still announces what lands below. Per device, like the other
-  // display preferences.
+  // button still announces what lands below.
+  //
+  // Two levels:
+  //   DEFAULT   System → Preferences. Per device (localStorage 'liveScroll').
+  //             Every session starts with it.
+  //   SESSION   the Auto switch on the jump pill and the ••• menu item. Changes
+  //             only the session on screen, for as long as this tab is open
+  //             (sessionStorage, so a reload keeps it).
+  // Changing the default clears the session overrides: "default off" means off.
   var LIVE_SCROLL_KEY = 'liveScroll';
-  var _liveScroll = (function () {
+  var LIVE_SCROLL_SESSIONS_KEY = 'liveScrollSessions';
+
+  function _readDefault() {
     try { return localStorage.getItem(LIVE_SCROLL_KEY) === 'on'; } catch (e) { return false; }
-  })();
+  }
+  function _readOverrides() {
+    try { return JSON.parse(sessionStorage.getItem(LIVE_SCROLL_SESSIONS_KEY) || '{}') || {}; }
+    catch (e) { return {}; }
+  }
+  function _writeOverrides(o) {
+    try { sessionStorage.setItem(LIVE_SCROLL_SESSIONS_KEY, JSON.stringify(o)); } catch (e) { /* in-memory */ }
+  }
+
+  var _liveDefault = _readDefault();
+  var _liveOverrides = _readOverrides();     // { sessionId: true|false }
+  var _liveScroll = _liveDefault;            // effective value for the session on screen
+
+  /** The effective value for a session: its override, else the default. */
+  function _liveFor(sid) {
+    return (sid && Object.prototype.hasOwnProperty.call(_liveOverrides, sid))
+      ? !!_liveOverrides[sid] : _liveDefault;
+  }
 
   function isLiveScroll() { return _liveScroll; }
+  function getDefaultLiveScroll() { return _liveDefault; }
 
-  function setLiveScroll(on) {
+  function _applyLive(on) {
     _liveScroll = !!on;
-    try {
-      if (_liveScroll) localStorage.setItem(LIVE_SCROLL_KEY, 'on');
-      else localStorage.removeItem(LIVE_SCROLL_KEY);
-    } catch (e) { /* private mode: in-memory only */ }
     _renderPill();   // the pill's switch reflects a change made from a menu too
     // Turning it on while caught up: catch up now, so it starts following.
     if (_liveScroll && _logEl && _state !== READING) _follow();
     return _liveScroll;
+  }
+
+  /** This session only (pill switch, ••• menu). */
+  function setLiveScroll(on) {
+    on = !!on;
+    if (_sid) {
+      if (on === _liveDefault) delete _liveOverrides[_sid];   // back to default: no override
+      else _liveOverrides[_sid] = on;
+      _writeOverrides(_liveOverrides);
+    }
+    return _applyLive(on);
+  }
+
+  /** The default for every session (System → Preferences). */
+  function setDefaultLiveScroll(on) {
+    _liveDefault = !!on;
+    try {
+      if (_liveDefault) localStorage.setItem(LIVE_SCROLL_KEY, 'on');
+      else localStorage.removeItem(LIVE_SCROLL_KEY);
+    } catch (e) { /* private mode: in-memory only */ }
+    _liveOverrides = {};
+    _writeOverrides(_liveOverrides);
+    return _applyLive(_liveDefault);
   }
 
   /**
@@ -543,6 +589,7 @@
     if (!logEl) return;
     _logEl = logEl;
     _sid = sessionId || null;
+    _liveScroll = _liveFor(_sid);   // this session's auto scroll: its override, else the default
     _state = LIVE;
     _atBottom = true;
     _driving = false;
@@ -745,6 +792,8 @@
     refresh: refresh,
     isLiveScroll: isLiveScroll,
     setLiveScroll: setLiveScroll,
+    getDefaultLiveScroll: getDefaultLiveScroll,
+    setDefaultLiveScroll: setDefaultLiveScroll,
     state: state,
     isReading: isReading,
     mayAutoScroll: mayAutoScroll,
