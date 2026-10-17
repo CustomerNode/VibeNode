@@ -22,6 +22,10 @@ from pathlib import Path
 
 import pytest
 
+# Every test builds its own page, so a parallel run may split this file
+# across workers (see tests/_xdist_schedule.py).
+XDIST_SPLITTABLE = True
+
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "static"
 

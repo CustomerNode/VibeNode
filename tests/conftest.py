@@ -210,6 +210,44 @@ def _isolate_daemon_home(request, tmp_path_factory, monkeypatch):
     yield
 
 
+# ---------------------------------------------------------------------------
+# Compose tests never touch the real compose-projects/ folder.
+#
+# Compose tests used to create projects in <repo>/compose-projects, where the
+# user's real compositions live, and two cleanup fixtures (test_compose_api,
+# test_compose_deferred) delete EVERY folder that appears there during a test.
+# In a parallel run that deleted other workers' fixture projects mid-test
+# (FileNotFoundError in test_compose_conflicts, 2026-10-17), and a composition
+# the user created while the suite ran would have been deleted the same way.
+#
+# Each worker process gets its own folder, still named "compose-projects"
+# (test_compose_rename_grep_guard checks the name).  The app reads
+# models.COMPOSE_PROJECTS_DIR at call time; test modules that imported their
+# own copy of the path are patched too, so their snapshot cleanups act on the
+# sandbox.  The snapshot cleanups themselves stay (CLAUDE.md, Compose fix 3).
+# ---------------------------------------------------------------------------
+_compose_sandbox = None
+
+
+@pytest.fixture(autouse=True)
+def _isolate_compose_projects(request, tmp_path_factory, monkeypatch):
+    global _compose_sandbox
+    try:
+        import app.compose.models as _compose_models
+    except Exception:
+        yield
+        return
+    if _compose_sandbox is None:
+        _compose_sandbox = tmp_path_factory.mktemp("compose") / "compose-projects"
+        _compose_sandbox.mkdir()
+    real = _compose_models.COMPOSE_PROJECTS_DIR
+    monkeypatch.setattr(_compose_models, "COMPOSE_PROJECTS_DIR", _compose_sandbox)
+    mod = getattr(request, "module", None)
+    if mod is not None and getattr(mod, "COMPOSE_PROJECTS_DIR", None) == real:
+        monkeypatch.setattr(mod, "COMPOSE_PROJECTS_DIR", _compose_sandbox)
+    yield
+
+
 @pytest.fixture(autouse=True)
 def _block_production_paths(request, monkeypatch):
     """Hard-fail any test that tries to read/write the production DB or config.
@@ -528,6 +566,43 @@ def pytest_configure(config):
     sys.stderr.flush()
     os.chdir(str(config.invocation_params.dir))
     os.execvpe(cmd[0], cmd, env)
+
+
+# ---------------------------------------------------------------------------
+# Parallel runs: slowest work first (see tests/_xdist_schedule.py).
+#
+# Runs used to reach ~98% fast and then stall: xdist queued the few-test,
+# slow browser files last, and each then ran alone while the other workers
+# idled.  The controller records how long every test took into pytest's cache
+# (.pytest_cache, gitignored) and the scheduler queues the next run's files
+# slowest first.  Only order and placement change, never which tests run.
+# ---------------------------------------------------------------------------
+_test_durations: dict = {}
+
+
+def pytest_runtest_logreport(report):
+    # setup + call + teardown, so a slow fixture counts as the test's cost.
+    _test_durations[report.nodeid] = _test_durations.get(report.nodeid, 0.0) + report.duration
+
+
+def pytest_sessionfinish(session):
+    config = session.config
+    cache = getattr(config, "cache", None)
+    if cache is None or hasattr(config, "workerinput") or not _test_durations:
+        return
+    from tests._xdist_schedule import DURATIONS_CACHE_NAME
+    # Merge, so running one file does not forget the rest of the suite.
+    merged = dict(cache.get(DURATIONS_CACHE_NAME, {}) or {})
+    merged.update({k: round(v, 3) for k, v in _test_durations.items()})
+    cache.set(DURATIONS_CACHE_NAME, merged)
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_xdist_make_scheduler(config, log):
+    if config.getvalue("dist") != "loadfile":
+        return None
+    from tests._xdist_schedule import DurationOrderedLoadFileScheduling
+    return DurationOrderedLoadFileScheduling(config, log)
 
 
 @pytest.fixture(autouse=True)

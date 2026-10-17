@@ -32,6 +32,10 @@ from pathlib import Path
 
 import pytest
 
+# Every test builds its own page, so a parallel run may split this file
+# across workers (see tests/_xdist_schedule.py).
+XDIST_SPLITTABLE = True
+
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "static"
 TEMPLATES = ROOT / "templates"
@@ -120,6 +124,10 @@ class App:
         self.page = self.ctx.new_page()
         self.page.on("pageerror", lambda e: self.errors.append(str(e)))
         self.page.route("**/*", self._route)
+        # The page's clock is Playwright's: it runs in real time, and wait()
+        # fast-forwards it, firing the same timers in the same order without
+        # sleeping through them (this file used to sleep ~40s per run).
+        self.page.clock.install()
         self.page.goto(ORIGIN + "/", wait_until="domcontentloaded")
         self.page.wait_for_function(
             "document.querySelector('#workforce-grid .wf-card') !== null", timeout=20000)
@@ -184,8 +192,12 @@ class App:
         self.push("session_effort_result", {"ok": True, "session_id": SID, "effort": level,
                                             "applied": applied if applied is not None else level})
 
+    def wait(self, ms):
+        """Advance the page's clock by `ms`, firing every timer due."""
+        self.page.clock.run_for(ms)
+
     def wait_settle(self):
-        self.page.wait_for_timeout(SETTLE_MS)
+        self.wait(SETTLE_MS)
 
     def emits(self, name):
         return [d for ev, d in self.js("window.__emits") if ev == name]
@@ -291,7 +303,7 @@ def test_combined_change_runs_its_own_model_switch(app):
     app.push("session_model_result", {"ok": True, "session_id": SID, "model": "claude-opus-5-5"})
     assert app.toast() == ("Thinking set to High · Model switched to Opus 5.5"
                            " — applies from the next message")
-    app.page.wait_for_timeout(300)                   # past _closePm's 150ms exit
+    app.wait(300)                   # past _closePm's 150ms exit
     assert app.js("document.querySelector('#pm-overlay .pm-card') !== null")
 
 
@@ -305,7 +317,7 @@ def test_a_late_reply_never_closes_an_unrelated_dialog(app):
     assert app.emits("set_session_effort") == [{"session_id": SID, "effort": "high"}]
     app.js("() => { window.__confirm = showConfirm('Something else', 'Unrelated'); }")
     app.ok("high")
-    app.page.wait_for_timeout(300)
+    app.wait(300)
     assert app.js("document.querySelector('#pm-overlay .pm-title').textContent") == "Something else"
 
 
@@ -507,7 +519,7 @@ def test_no_reply_falls_back_without_refusing(app):
     replies; after the reply timeout the change is queued, not refused."""
     app.session("working")
     app.js("(sid) => _applyThinkingChange(sid, {level: 'medium'})", SID)
-    app.page.wait_for_timeout(6600)                  # _EFFORT_LIVE_REPLY_MS + margin
+    app.wait(6600)                  # _EFFORT_LIVE_REPLY_MS + margin
     assert app.emits("close_session") == []
     assert app.toast() == "Thinking switches to Medium when this turn finishes"
 
@@ -518,7 +530,7 @@ def test_no_reply_while_offline_never_relaunches(app):
     reconnect, possibly on a turn started meanwhile from another device."""
     app.session("idle")
     app.js("(sid) => { _applyThinkingChange(sid, {level: 'medium'}); socket.connected = false; }", SID)
-    app.page.wait_for_timeout(6600)
+    app.wait(6600)
     assert app.emits("close_session") == [] and app.queued() is None
     assert app.toast() == "Connection lost: thinking change not confirmed"
 
