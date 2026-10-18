@@ -144,3 +144,168 @@ class TestEndpoint:
         # pythonw has no valid stdin; inheriting it breaks every subprocess a
         # test starts ("[WinError 6] The handle is invalid", 9 failures).
         assert captured["kw"].get("stdin") is ta.subprocess.DEVNULL
+
+
+# ---------------------------------------------------------------------------
+# The run belongs to the server, not to the stream (2026-10-18)
+#
+# A phone that locked its screen 41s into a Publish dropped the stream; the
+# server took that as "client gone", killed the run, and the dialog (no
+# "done" event) showed "running" for 20 minutes.  Now a dropped stream only
+# detaches: the run continues and a stream can reattach from where it was.
+# ---------------------------------------------------------------------------
+import threading as _threading
+
+
+class _GatedProc:
+    """A pytest stand-in whose output arrives only as the test releases it."""
+
+    def __init__(self, junit_path, rc=0):
+        self._q = []
+        self._cv = _threading.Condition()
+        self._closed = False
+        self.returncode = None
+        self._rc = rc
+        self.pid = 4343
+        self.terminated = False
+        self._junit = junit_path
+
+    def emit(self, line):
+        with self._cv:
+            self._q.append(line + "\n")
+            self._cv.notify_all()
+
+    def finish(self):
+        with self._cv:
+            self._junit.write_text(JUNIT_2_FAIL, encoding="utf-8")
+            self._closed = True
+            self._cv.notify_all()
+
+    @property
+    def stdout(self):
+        def gen():
+            while True:
+                with self._cv:
+                    while not self._q and not self._closed:
+                        self._cv.wait(5)
+                    if self._q:
+                        item = self._q.pop(0)
+                    else:
+                        self.returncode = self._rc
+                        return
+                yield item
+        return gen()
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self._rc = 1          # a terminated pytest exits non-zero
+        self.finish()
+
+    def kill(self):
+        self.terminate()
+
+
+@pytest.fixture
+def gated(paths, monkeypatch):
+    procs = []
+    real_popen = ta.subprocess.Popen
+
+    def fake_popen(cmd, *args, **kw):
+        if not (isinstance(cmd, list) and "pytest" in cmd):
+            return real_popen(cmd, *args, **kw)
+        p = _GatedProc(ta.LAST_RUN_JUNIT)
+        procs.append(p)
+        return p
+
+    monkeypatch.setattr(ta.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(ta, "_test_proc", None)
+    monkeypatch.setattr(ta, "_run", None)
+    monkeypatch.setattr(ta, "KEEPALIVE_S", 0.2)
+    app = Flask(__name__)
+    app.register_blueprint(ta.bp)
+    yield app.test_client(), procs
+    for p in procs:
+        p.finish()
+    # Wait for the run's pump thread to write its result BEFORE monkeypatch
+    # restores LAST_RUN_LOG: a late write landed in the real
+    # logs/last_test_run.log (seen 2026-10-18).
+    run = ta._run
+    if run is not None:
+        with ta._run_cond:
+            ta._run_cond.wait_for(lambda: run["done"] is not None, timeout=10)
+        assert run["done"] is not None, "test run pump never finished"
+
+
+def _events(chunks):
+    out = []
+    for chunk in "".join(chunks).split("\n\n"):
+        if chunk.startswith("data: "):
+            out.append(json.loads(chunk[len("data: "):]))
+    return out
+
+
+def _read_until(it, pred, limit=200):
+    got = []
+    for _ in range(limit):
+        got.append(next(it).decode() if isinstance(got, list) else None)
+        if pred(_events(got)):
+            return got
+    raise AssertionError("expected event never arrived")
+
+
+class TestRunSurvivesDisconnect:
+    def test_a_dropped_stream_does_not_stop_the_run_and_a_reattach_gets_the_rest(self, gated):
+        client, procs = gated
+        resp = client.post("/api/run-tests", json={"mode": "full"}, buffered=False)
+        it = resp.response
+        got = _read_until(it, lambda ev: any(e["type"] == "run" for e in ev))
+        run_id = next(e for e in _events(got) if e["type"] == "run")["run_id"]
+        procs[0].emit("..F.")
+        got = _read_until(it, lambda ev: any(e.get("line") == "..F." for e in ev))
+        resp.close()                       # the phone locks its screen
+        assert not procs[0].terminated, "a dropped connection must not stop the run"
+
+        procs[0].emit("FAILED tests/test_x.py::test_y - boom")
+        procs[0].finish()                  # the run ends while nobody watches
+
+        again = client.post("/api/run-tests", json={"mode": "full", "run_id": run_id, "since": 1})
+        ev = _events([again.get_data(as_text=True)])
+        assert ev[0] == {"type": "run", "run_id": run_id, "mode": "full"}
+        assert [e["line"] for e in ev if e["type"] == "line"] == ["FAILED tests/test_x.py::test_y - boom"]
+        done = ev[-1]
+        assert done["type"] == "done" and done["run_id"] == run_id
+        assert (done["passed"], done["failed"]) == (14, 2)
+
+    def test_reattaching_to_an_unknown_run_says_it_is_lost(self, gated):
+        client, _ = gated
+        ev = _events([client.post("/api/run-tests", json={"mode": "full", "run_id": "nope"}).get_data(as_text=True)])
+        assert ev == [{"type": "error", "line": "That test run is no longer available.", "lost": True}]
+
+    def test_a_second_publish_attaches_to_the_run_in_progress(self, gated):
+        client, procs = gated
+        first = client.post("/api/run-tests", json={"mode": "full"}, buffered=False)
+        got = _read_until(first.response, lambda ev: any(e["type"] == "run" for e in ev))
+        run_id = _events(got)[0]["run_id"]
+        second = client.post("/api/run-tests", json={"mode": "full"}, buffered=False)
+        got2 = _read_until(second.response, lambda ev: any(e["type"] == "run" for e in ev))
+        assert _events(got2)[0]["run_id"] == run_id and len(procs) == 1
+        other = client.post("/api/run-tests", json={"mode": "fast"})
+        assert _events([other.get_data(as_text=True)])[0]["type"] == "error"
+        first.close(); second.close()
+
+    def test_cancel_still_stops_the_run_and_says_so(self, gated):
+        client, procs = gated
+        resp = client.post("/api/run-tests", json={"mode": "full"}, buffered=False)
+        got = _read_until(resp.response, lambda ev: any(e["type"] == "run" for e in ev))
+        run_id = _events(got)[0]["run_id"]
+        resp.close()
+        assert client.post("/api/cancel-tests").get_json()["ok"] is True
+        assert procs[0].terminated
+        ev = _events([client.post("/api/run-tests", json={"mode": "full", "run_id": run_id}).get_data(as_text=True)])
+        assert ev[-1]["type"] == "done" and ev[-1]["cancelled"] is True and ev[-1]["ok"] is False

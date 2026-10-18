@@ -274,5 +274,11 @@ class TestSendBehaviorPreference:
         )
         assert match, "Could not find _toggleSendBehavior"
         body = match.group(1)
-        assert "_refreshSendHints" in body, \
+        # The toggle (and the Preferences switch) change the setting through
+        # _setSendBehavior, which is where the refresh lives.
+        assert "_setSendBehavior(" in body, \
+            "_toggleSendBehavior must change the setting through _setSendBehavior"
+        setter = re.search(r"function _setSendBehavior\([^)]*\)\s*\{([\s\S]*?)\n\}", src)
+        assert setter, "Could not find _setSendBehavior"
+        assert "_refreshSendHints" in setter.group(1), \
             "Must call _refreshSendHints after toggle — UI hints go stale otherwise"

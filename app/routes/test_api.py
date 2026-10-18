@@ -4,6 +4,17 @@ Test runner API — runs pytest and streams results via SSE.
 Two modes:
   - fast: unit/mock tests only (ignores tests/e2e/)
   - full: everything including e2e/Selenium tests
+
+The run belongs to the SERVER, not to the request that streams it (changed
+2026-10-18).  It used to live inside the SSE generator, so a dropped
+connection ended it: a phone that locked its screen 41s into a Publish killed
+the run, and the dialog, which never got its "done" event, showed "running"
+for the next 20 minutes.  Now a background thread runs pytest and collects its
+output; a stream attaches to the run and can REATTACH after a dropout with the
+run id and the number of lines it already has, receiving the rest including
+the final result.  Only /api/cancel-tests stops a run.  The browser side is
+_streamTestRun() in static/js/test-runner.js.  Tests:
+tests/test_publish_test_runner.py.
 """
 
 import json
@@ -11,6 +22,7 @@ import logging
 import subprocess
 import sys
 import threading
+import uuid
 from pathlib import Path
 
 from flask import Blueprint, Response, jsonify, request
@@ -24,6 +36,13 @@ from ..platform_utils import NO_WINDOW as _NO_WINDOW
 # Track running test process so we can cancel
 _test_proc = None
 _test_lock = threading.Lock()
+
+# The current or most recent run: {"id", "mode", "cmd", "lines", "done",
+# "cancelled"}.  Only the latest run is kept, so a stream can reattach to it
+# (and fetch its result) until the next run starts.
+_run = None
+_run_cond = threading.Condition()
+KEEPALIVE_S = 15  # an SSE comment this often: dead connections are noticed
 
 
 LAST_RUN_LOG = _REPO_ROOT / "logs" / "last_test_run.log"  # logs/ is gitignored
@@ -111,132 +130,188 @@ def _save_run_log(mode, cmd, lines, exit_code):
         return ""
 
 
-@bp.route("/api/run-tests", methods=["POST"])
-def api_run_tests():
-    """Run tests and stream results via SSE.
+def _sse(obj):
+    return f"data: {json.dumps(obj)}\n\n"
 
-    POST body: {"mode": "fast"|"full"}
-    Returns SSE stream with line-by-line pytest output and a final summary.
-    """
-    mode = (request.get_json() or {}).get("mode", "fast")
-    if mode not in ("fast", "full"):
-        mode = "fast"
 
-    cmd = [_console_python(), "-m", "pytest", "--tb=short", "-q", "--no-header"]
-
-    if mode == "fast":
-        cmd += ["--ignore=tests/e2e", "--timeout=60"]
-    else:
-        cmd += ["--timeout=120"]
-    cmd += _parallel_args()
+def _pump(run, proc):
+    """Read the run's output to the end and record its result.  Runs in its
+    own thread, so nothing a client does can stop it early."""
+    global _test_proc
+    passed = failed = errors = skipped = 0
     try:
-        LAST_RUN_JUNIT.unlink()
-    except OSError:
-        pass
-    cmd += ["--junitxml", str(LAST_RUN_JUNIT)]
-
-    cmd.append("tests/")
-
-    def generate():
-        global _test_proc
-        proc = None
-
-        # Acquire lock to check/start — hold it through Popen to prevent races
-        with _test_lock:
-            if _test_proc and _test_proc.poll() is None:
-                yield f"data: {json.dumps({'type': 'error', 'line': 'Tests already running'})}\n\n"
-                return
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    cwd=str(_REPO_ROOT),
-                    # REQUIRED on Windows: the web server runs under pythonw,
-                    # which has no console and therefore no valid stdin.
-                    # Inherited, that invalid handle reaches every subprocess
-                    # a test starts (git, the security scanner, ...) and
-                    # Windows refuses them with "[WinError 6] The handle is
-                    # invalid".  That made 9 tests fail ONLY via Publish while
-                    # passing from a terminal.  Do not remove.
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    creationflags=_NO_WINDOW,
-                )
-                _test_proc = proc
-            except Exception as e:
-                yield f"data: {json.dumps({'type': 'error', 'line': str(e)})}\n\n"
-                return
-
-        log.info("Test run started: mode=%s, pid=%s", mode, proc.pid)
-
-        passed = 0
-        failed = 0
-        errors = 0
-        skipped = 0
-        all_lines = []  # full output, saved for the "Fix errors" session
-
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip("\n\r")
+            # Count from progress dots (pytest -q output); exact counts come
+            # from the JUnit report below when it exists.
+            for ch in line:
+                if ch == '.':
+                    passed += 1
+                elif ch == 'F':
+                    failed += 1
+                elif ch == 'E':
+                    errors += 1
+                elif ch == 's':
+                    skipped += 1
+            with _run_cond:
+                run["lines"].append(line)
+                _run_cond.notify_all()
         try:
-            for raw_line in proc.stdout:
-                line = raw_line.rstrip("\n\r")
-                all_lines.append(line)
-                # Count from progress dots (pytest -q output)
-                for ch in line:
-                    if ch == '.':
-                        passed += 1
-                    elif ch == 'F':
-                        failed += 1
-                    elif ch == 'E':
-                        errors += 1
-                    elif ch == 's':
-                        skipped += 1
-
-                yield f"data: {json.dumps({'type': 'line', 'line': line})}\n\n"
-
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-
-            exact = _junit_counts()
-            if exact:
-                passed, failed = exact["passed"], exact["failed"]
-                errors, skipped = exact["errors"], exact["skipped"]
-            log_path = _save_run_log(mode, cmd, all_lines, proc.returncode if proc else -1)
-            summary = {
-                "type": "done",
-                "exit_code": proc.returncode if proc else -1,
-                "passed": passed,
-                "failed": failed,
-                "errors": errors,
-                "skipped": skipped,
-                "ok": proc.returncode == 0 if proc else False,
-                "log_path": log_path,
-            }
-            log.info("Test run complete: %s", summary)
-            yield f"data: {json.dumps(summary)}\n\n"
-
-        except GeneratorExit:
-            # Client disconnected — clean up the subprocess
-            log.warning("Test client disconnected, terminating test process")
-        except Exception as e:
-            log.error("Test run error: %s", e)
-            yield f"data: {json.dumps({'type': 'error', 'line': str(e)})}\n\n"
-        finally:
-            # Always clean up the subprocess on any exit path
-            with _test_lock:
-                if proc and proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except Exception:
-                        proc.kill()
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    except Exception as e:
+        log.error("Test run error: %s", e)
+        with _run_cond:
+            run["lines"].append(f"[test runner error: {e}]")
+    finally:
+        rc = proc.poll()
+        exact = _junit_counts()
+        if exact:
+            passed, failed = exact["passed"], exact["failed"]
+            errors, skipped = exact["errors"], exact["skipped"]
+        log_path = _save_run_log(run["mode"], run["cmd"], run["lines"],
+                                 rc if rc is not None else -1)
+        summary = {
+            "type": "done",
+            "run_id": run["id"],
+            "exit_code": rc if rc is not None else -1,
+            "passed": passed,
+            "failed": failed,
+            "errors": errors,
+            "skipped": skipped,
+            # A cancelled run never passes the publish gate, whatever its
+            # exit code says.
+            "ok": rc == 0 and not run.get("cancelled", False),
+            "cancelled": run.get("cancelled", False),
+            "log_path": log_path,
+        }
+        log.info("Test run complete: %s", summary)
+        with _test_lock:
+            if _test_proc is proc:
                 _test_proc = None
+        with _run_cond:
+            run["done"] = summary
+            _run_cond.notify_all()
+
+
+def _stream(run, since):
+    """SSE for one run from line ``since`` on: the run id, each line, then
+    the result.  A client that goes away only ends this stream."""
+    def generate():
+        i = max(0, since)
+        yield _sse({"type": "run", "run_id": run["id"], "mode": run["mode"]})
+        try:
+            while True:
+                with _run_cond:
+                    if i >= len(run["lines"]) and run["done"] is None:
+                        _run_cond.wait(timeout=KEEPALIVE_S)
+                    new = run["lines"][i:]
+                    done = run["done"]
+                for line in new:
+                    yield _sse({"type": "line", "line": line})
+                i += len(new)
+                if done is not None and i >= len(run["lines"]):
+                    yield _sse(done)
+                    return
+                if not new:
+                    yield ": keepalive\n\n"
+        except GeneratorExit:
+            log.info("Test stream for run %s detached at line %d; the run continues",
+                     run["id"], i)
+            raise
 
     return Response(generate(), mimetype='text/event-stream',
                     headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+
+def _error_stream(message, **extra):
+    def generate():
+        yield _sse({"type": "error", "line": message, **extra})
+    return Response(generate(), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+
+@bp.route("/api/run-tests", methods=["POST"])
+def api_run_tests():
+    """Start a test run (or attach to one) and stream it via SSE.
+
+    POST body: {"mode": "fast"|"full"} starts a run, or attaches to the run
+    already in progress when it has the same mode.
+    {"run_id": ..., "since": N} reattaches to that run from line N, e.g.
+    after the connection dropped; the final result is included if the run
+    finished meanwhile.
+    """
+    global _test_proc, _run
+    body = request.get_json(silent=True) or {}
+    mode = body.get("mode", "fast")
+    if mode not in ("fast", "full"):
+        mode = "fast"
+
+    run_id = body.get("run_id")
+    if run_id:
+        try:
+            since = int(body.get("since") or 0)
+        except (TypeError, ValueError):
+            since = 0
+        with _run_cond:
+            run = _run if (_run is not None and _run["id"] == run_id) else None
+        if run is None:
+            return _error_stream("That test run is no longer available.", lost=True)
+        return _stream(run, since)
+
+    with _test_lock:
+        if _test_proc and _test_proc.poll() is None:
+            with _run_cond:
+                active = _run
+            if active is not None and active["done"] is None and active["mode"] == mode:
+                return _stream(active, 0)
+            return _error_stream("Tests already running")
+
+        cmd = [_console_python(), "-m", "pytest", "--tb=short", "-q", "--no-header"]
+        if mode == "fast":
+            cmd += ["--ignore=tests/e2e", "--timeout=60"]
+        else:
+            cmd += ["--timeout=120"]
+        cmd += _parallel_args()
+        try:
+            LAST_RUN_JUNIT.unlink()
+        except OSError:
+            pass
+        cmd += ["--junitxml", str(LAST_RUN_JUNIT)]
+        cmd.append("tests/")
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(_REPO_ROOT),
+                # REQUIRED on Windows: the web server runs under pythonw,
+                # which has no console and therefore no valid stdin.
+                # Inherited, that invalid handle reaches every subprocess
+                # a test starts (git, the security scanner, ...) and
+                # Windows refuses them with "[WinError 6] The handle is
+                # invalid".  That made 9 tests fail ONLY via Publish while
+                # passing from a terminal.  Do not remove.
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                creationflags=_NO_WINDOW,
+            )
+        except Exception as e:
+            return _error_stream(str(e))
+        _test_proc = proc
+        run = {"id": uuid.uuid4().hex[:12], "mode": mode, "cmd": cmd,
+               "lines": [], "done": None, "cancelled": False}
+        with _run_cond:
+            _run = run
+
+    log.info("Test run started: mode=%s, pid=%s, run=%s", mode, proc.pid, run["id"])
+    threading.Thread(target=_pump, args=(run, proc), name="test-run-pump",
+                     daemon=True).start()
+    return _stream(run, 0)
 
 
 @bp.route("/api/cancel-tests", methods=["POST"])
@@ -245,6 +320,9 @@ def api_cancel_tests():
     global _test_proc
     with _test_lock:
         if _test_proc and _test_proc.poll() is None:
+            with _run_cond:
+                if _run is not None and _run["done"] is None:
+                    _run["cancelled"] = True
             _test_proc.terminate()
             try:
                 _test_proc.wait(timeout=5)

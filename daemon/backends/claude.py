@@ -15,6 +15,7 @@ Phase 2 of the OOP abstraction refactor moved the following code here:
 - SDK patch application (L66-69)
 """
 
+import asyncio
 import logging
 import os
 from typing import Any, AsyncIterator, Optional
@@ -115,9 +116,56 @@ class ClaudeAgentSDK(AgentSDK):
 
         PERF-CRITICAL #5: This must remain a thin wrapper -- the caller
         overlaps mtime recording with this call.  Adding blocking work
-        here would break the overlap timing.
+        here would break the overlap timing.  (The owner task below adds no
+        blocking work: one task creation, then the same client.connect().)
+
+        The client runs in its own OWNER task, which connects it and later
+        disconnects it (fixed 2026-10-18).  The SDK enters an anyio task group
+        in connect() and exits it in disconnect(), and anyio only lets the task
+        that entered a cancel scope exit it.  Connected in the session's
+        driving task and disconnected from _close_session's task, the exit
+        raised "Attempted to exit cancel scope in a different task" and the
+        scope was left cancelled but never exited: anyio then re-delivers the
+        cancellation on every pass of the event loop, forever.  Six of those
+        held the Session Engine at ~1 core with every session idle.  With an
+        owner task the scope is always exited by the task that entered it,
+        whichever task calls disconnect().  Tests:
+        tests/test_sdk_client_owner_task.py.
         """
-        await client.connect()
+        loop = asyncio.get_running_loop()
+        connected = loop.create_future()
+        stop = asyncio.Event()
+        state = {"connected": False}
+
+        async def _own() -> None:
+            try:
+                await client.connect()
+            except BaseException as exc:  # incl. cancellation of a pending connect
+                if not connected.done():
+                    if isinstance(exc, asyncio.CancelledError):
+                        connected.cancel()
+                    else:
+                        connected.set_exception(exc)
+                return
+            state["connected"] = True
+            if not connected.done():
+                connected.set_result(None)
+            await stop.wait()
+            await client.disconnect()
+
+        owner = loop.create_task(_own(), name="sdk-client-owner")
+        # Retrieve the result so an error after a cancelled wait is never
+        # reported as "Task exception was never retrieved".
+        owner.add_done_callback(lambda t: t.cancelled() or t.exception())
+        client._vn_owner = (owner, stop)
+        try:
+            await connected
+        except asyncio.CancelledError:
+            # The caller gave up.  A connect still in progress is aborted, as
+            # before; a finished one stays owned until disconnect() is called.
+            if not state["connected"] and not owner.done():
+                owner.cancel()
+            raise
 
     async def send_query(self, client: ClaudeSDKClient, prompt: str) -> None:
         """Send a query to the connected Claude session.
@@ -260,8 +308,24 @@ class ClaudeAgentSDK(AgentSDK):
         """Disconnect the Claude client.
 
         Moved from session_manager.py L2183.
+
+        Runs in the client's owner task (see connect()), so the SDK's task
+        group is exited by the task that entered it, whatever task calls this.
         """
-        await client.disconnect()
+        own = getattr(client, "_vn_owner", None)
+        if own is None:
+            await client.disconnect()   # not connected through connect()
+            return
+        owner, stop = own
+        if owner.done():
+            # The connect never completed (failed or was aborted); there is
+            # no owner left to run it, so fall back to the direct call.
+            await client.disconnect()
+            return
+        stop.set()
+        # shield: if this caller is cancelled the owner still finishes the
+        # disconnect; awaiting it also re-raises any disconnect error.
+        await asyncio.shield(owner)
 
     def extract_process_pid(self, client: Any) -> int:
         """Extract CLI subprocess PID from the Claude client.

@@ -2,6 +2,111 @@
 
 let _testRunning = false;
 
+/**
+ * Stream a test run from /api/run-tests, surviving dropped connections.
+ *
+ * The run lives on the server (app/routes/test_api.py); this stream only
+ * watches it.  When the connection drops (a phone locks its screen, the tab
+ * is backgrounded, the network changes) the stream ends without a "done"
+ * event; this then REATTACHES with the run id and the number of lines
+ * already seen, and gets the rest, including the result if the run finished
+ * meanwhile.  It retries at once when the tab becomes visible again.  Before
+ * 2026-10-18 a dropout ended the run and left the dialog on "running" forever.
+ *
+ * handlers: onLine(lines), onDone(summary, lines), onError(message, {lost, started})
+ */
+function _streamTestRun(mode, handlers) {
+  const lines = [];
+  let runId = null;
+  let finished = false;
+  let failures = 0;
+  let retryTimer = null;
+  let retryOwed = false;           // a retry waiting for the tab to be visible
+  const MAX_FAILURES = 8;          // ~2 minutes of backoff while visible
+
+  function finish(fn) {
+    if (finished) return;
+    finished = true;
+    if (retryTimer) clearTimeout(retryTimer);
+    document.removeEventListener('visibilitychange', onVisible);
+    fn();
+  }
+
+  function onVisible() {
+    if (!finished && document.visibilityState === 'visible' && (retryTimer || retryOwed)) {
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = null;
+      retryOwed = false;
+      connect();
+    }
+  }
+  document.addEventListener('visibilitychange', onVisible);
+
+  function scheduleRetry() {
+    if (finished) return;
+    if (!runId) {
+      // Never got a run id: the run may not exist at all.
+      finish(() => handlers.onError('Could not start tests.', {lost: false, started: false}));
+      return;
+    }
+    if (document.visibilityState === 'hidden') {
+      // Locked phone / background tab: wait for the user to come back
+      // (onVisible) instead of burning retries the browser may not run.
+      retryOwed = true;
+      return;
+    }
+    failures++;
+    if (failures > MAX_FAILURES) {
+      finish(() => handlers.onError('Lost the connection to the test run.', {lost: true, started: true}));
+      return;
+    }
+    const delay = Math.min(15000, 1000 * Math.pow(2, failures - 1));
+    retryTimer = setTimeout(() => { retryTimer = null; connect(); }, delay);
+  }
+
+  function connect() {
+    const body = runId ? {mode, run_id: runId, since: lines.length} : {mode};
+    fetch('/api/run-tests', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    }).then(res => {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      function read() {
+        reader.read().then(({done, value}) => {
+          if (done) { scheduleRetry(); return; }
+          buffer += decoder.decode(value, {stream: true});
+          const parts = buffer.split('\n\n');
+          buffer = parts.pop();
+          for (const part of parts) {
+            if (!part.startsWith('data: ')) continue;   // keepalive comments
+            let d;
+            try { d = JSON.parse(part.slice(6)); } catch (_) { continue; }
+            if (d.type === 'run') {
+              runId = d.run_id;
+              failures = 0;            // reached the server: reset the backoff
+            } else if (d.type === 'line') {
+              lines.push(d.line);
+              handlers.onLine(lines);
+            } else if (d.type === 'done') {
+              finish(() => handlers.onDone(d, lines));
+              return;
+            } else if (d.type === 'error') {
+              finish(() => handlers.onError(d.line, {lost: !!d.lost, started: !!runId}));
+              return;
+            }
+          }
+          read();
+        }).catch(scheduleRetry);
+      }
+      read();
+    }).catch(scheduleRetry);
+  }
+  connect();
+}
+
 function runTests(mode) {
   if (_testRunning) {
     showGitSyncModal('Tests Running', '<p style="color:var(--text-muted)">Tests are already running. Cancel the current run first.</p>', [
@@ -21,49 +126,21 @@ function runTests(mode) {
   // Show the animated modal
   showGitSyncModal(label, _testRunnerHtml(desc), []);
 
-  let lines = [];
-
-  // POST to start the test run
-  fetch('/api/run-tests', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({mode})
-  }).then(res => {
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    function read() {
-      reader.read().then(({done, value}) => {
-        if (done) {
-          _testRunning = false;
-          return;
-        }
-        buffer += decoder.decode(value, {stream: true});
-        const parts = buffer.split('\n\n');
-        buffer = parts.pop(); // keep incomplete chunk
-
-        for (const part of parts) {
-          if (!part.startsWith('data: ')) continue;
-          try {
-            const d = JSON.parse(part.slice(6));
-            if (d.type === 'line') {
-              lines.push(d.line);
-              _updateTestOutput(lines);
-            } else if (d.type === 'done') {
-              _showTestResults(label, d, lines);
-            } else if (d.type === 'error') {
-              _showTestError(label, d.line);
-            }
-          } catch(_) {}
-        }
-        read();
-      }).catch(() => { _testRunning = false; });
-    }
-    read();
-  }).catch(e => {
-    _testRunning = false;
-    _showTestError(label, 'Could not start tests: ' + e.message);
+  _streamTestRun(mode, {
+    onLine: lines => _updateTestOutput(lines),
+    onDone: (summary, lines) => _showTestResults(label, summary, lines),
+    onError: (msg, info) => {
+      if (info && info.lost) {
+        _testRunning = false;
+        showGitSyncModal(label + ' — Interrupted',
+          '<p style="color:var(--text-muted)">' + _escTestHtml(msg)
+          + ' Its result was not received.</p>',
+          [{label: 'Run again', primary: true, onclick: () => { closeGitSyncModal(); runTests(mode); }},
+           {label: 'Close', onclick: closeGitSyncModal}]);
+      } else {
+        _showTestError(label, msg);
+      }
+    },
   });
 }
 

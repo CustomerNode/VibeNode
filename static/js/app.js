@@ -2205,7 +2205,8 @@ function openPreferences() {
     {key: 'speechnode', label: 'SpeechNode voice', on: snOn,
      hint: 'Local, codebase-aware voice that works in every browser (Firefox & Safari too). Downloads a small model on first enable.'},
     {key: 'send', label: 'Enter to send', on: enterToSend,
-     hint: 'Press Enter to send. When off, ' + _MOD + '+Enter sends and Enter adds a new line.'},
+     hint: 'Press Enter to send. When off, ' + _MOD + '+Enter sends and Enter adds a new line.'
+       + (_isTouchKeyboard() ? ' On a touch screen Enter always adds a new line; use the send button.' : '')},
     {key: 'livescroll', label: 'Auto scroll (default)',
      on: !!(window.ThreadScroll && ThreadScroll.getDefaultLiveScroll()),
      hint: 'Whether sessions follow new output as it arrives. When off, the chat stays where you are and the arrow shows Working, Needs you or Done. The Auto switch on that arrow changes just the session you are in.'},
@@ -2246,9 +2247,7 @@ function openPreferences() {
       btn.setAttribute('aria-checked', on ? 'true' : 'false');
       switch (btn.dataset.toggle) {
         case 'send':
-          sendBehavior = on ? 'enter' : 'ctrl-enter';
-          localStorage.setItem('sendBehavior', sendBehavior);
-          if (typeof _refreshSendHints === 'function') _refreshSendHints();
+          _setSendBehavior(on ? 'enter' : 'ctrl-enter');   // also saves it to the server
           showToast('Enter to send: ' + (on ? 'On' : 'Off'));
           break;
         case 'livescroll':

@@ -444,9 +444,10 @@
     pick.appendChild(input);
     menu.appendChild(pick);
 
-    // Enter-to-send preference.  Desktop only: on phones Enter always inserts a
-    // newline and sending is the send button (see _sendHint in utils.js).
-    var mobile = typeof window._isMobileViewport === 'function' && window._isMobileViewport();
+    // Enter-to-send preference.  Keyboard devices only: on touch screens Enter
+    // always inserts a newline and sending is the send button (see _shouldSend
+    // in utils.js).
+    var mobile = typeof window._isTouchKeyboard === 'function' && window._isTouchKeyboard();
     if (!mobile && typeof window._toggleSendBehavior === 'function') {
       var mod = (typeof _MOD !== 'undefined') ? _MOD : 'Ctrl';
       var pref = menuRow('button', ENTER_SVG, 'Enter to send', '');

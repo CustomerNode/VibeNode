@@ -131,6 +131,18 @@ const _MOBILE_MQ = (typeof window !== 'undefined' && window.matchMedia)
   : { matches: false };
 function _isMobileViewport() { return !!_MOBILE_MQ.matches; }
 
+// Touch-first device (phone/tablet with an on-screen keyboard).  This, NOT the
+// viewport width, decides keyboard behaviour: Enter-to-send, the send hint and
+// the iOS keyboard-dismiss send.  Width was used until 2026-10-18 and broke
+// both ways: a desktop window 768px or narrower (half-screen on a scaled
+// laptop) ignored "Enter to send" and could send a half-typed message when
+// focus left the box, and a phone in landscape (wider than 768px) got desktop
+// Enter-sends.  The primary pointer is what tells them apart.
+const _TOUCH_MQ = (typeof window !== 'undefined' && window.matchMedia)
+  ? window.matchMedia('(pointer: coarse)')
+  : { matches: false };
+function _isTouchKeyboard() { return !!_TOUCH_MQ.matches; }
+
 // ---------------------------------------------------------------------------
 // iOS "keyboard-dismiss = send" detection
 // ---------------------------------------------------------------------------
@@ -165,7 +177,7 @@ if (typeof document !== 'undefined') {
  * Call from an inline `onblur=""` on the textarea. Requires nothing else.
  */
 function _wasKeyboardDismissBlur() {
-  if (!_isMobileViewport()) return false;
+  if (!_isTouchKeyboard()) return false;
   // 250ms window: real page taps land well under 50ms before the blur; the
   // buffer absorbs any browser scheduling jitter without opening the door to
   // "user tapped a second ago, then keyboard closed on its own" false-sends.
@@ -175,7 +187,7 @@ function _wasKeyboardDismissBlur() {
 /** Returns true if the keyboard event should trigger a send based on preference */
 function _shouldSend(e) {
   if (e.key !== 'Enter') return false;
-  if (_isMobileViewport()) return false;   // mobile: Enter is always new-line, use the send button
+  if (_isTouchKeyboard()) return false;    // touch: Enter is always new-line, use the send button
   if (sendBehavior === 'enter') return !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey;
   return e.ctrlKey || e.shiftKey || e.altKey || e.metaKey;
 }
@@ -216,7 +228,7 @@ function _sendHint() {
   // On mobile the Enter key always inserts a newline; sending is done via the
   // send button that appears next to the mic. The keyboard-shortcut toggle
   // below is desktop-only, so suppress the hint (and the toggle) on phones.
-  if (_isMobileViewport()) return '';
+  if (_isTouchKeyboard()) return '';
   const full = sendBehavior === 'enter' ? `Enter to send · ${_MOD}+Enter, Shift+Enter, or Alt+Enter for new line` : `${_MOD}+Enter, Shift+Enter, or Alt+Enter to send`;
   // The bar shows the short form; the full list of shortcuts is the tooltip.
   const text = '<span title="' + full + '">' + (sendBehavior === 'enter' ? 'Enter to send' : `${_MOD}+Enter to send`) + '</span>';
@@ -227,16 +239,23 @@ function _sendHint() {
     + '</svg></span>';
 }
 
-/** Toggle send behavior between ctrl-enter and enter */
-function _toggleSendBehavior(e) {
-  if (e) e.stopPropagation();
-  sendBehavior = sendBehavior === 'enter' ? 'ctrl-enter' : 'enter';
+/** Set the send behavior ('enter' | 'ctrl-enter') everywhere it is kept.
+ *  The ONE way to change it: the server copy is restored on every reconnect
+ *  (ui_prefs_loaded in socket.js), so a change saved only to localStorage
+ *  is undone by the next reconnect. */
+function _setSendBehavior(value) {
+  sendBehavior = value === 'enter' ? 'enter' : 'ctrl-enter';
   localStorage.setItem('sendBehavior', sendBehavior);
-  // Persist to server so it survives browser/localStorage resets
   if (typeof socket !== 'undefined' && socket.connected) {
     socket.emit('set_ui_prefs', { sendBehavior: sendBehavior });
   }
   _refreshSendHints();
+}
+
+/** Toggle send behavior between ctrl-enter and enter */
+function _toggleSendBehavior(e) {
+  if (e) e.stopPropagation();
+  _setSendBehavior(sendBehavior === 'enter' ? 'ctrl-enter' : 'enter');
   showToast('Send: ' + (sendBehavior === 'enter' ? 'Enter to send' : _MOD + '+Enter to send'));
 }
 

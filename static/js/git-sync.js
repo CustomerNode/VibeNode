@@ -242,89 +242,75 @@ function _testThenAction(mode, actionType, actionLabel, btnId) {
 
   showGitSyncModal(testLabel + ' Before ' + Verb, typeof _testRunnerHtml === 'function' ? _testRunnerHtml(desc) : '<p>' + desc + '</p>', []);
 
-  fetch('/api/run-tests', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({mode})
-  }).then(res => {
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let lines = [];
-
-    function read() {
-      reader.read().then(({done, value}) => {
-        if (done) {
-          if (typeof _testRunning !== 'undefined') _testRunning = false;
-          return;
+  // The run lives on the server and survives a dropped connection; the
+  // stream reattaches by itself (_streamTestRun in test-runner.js).  Before
+  // 2026-10-18 a phone locking its screen mid-run ended the run and left this
+  // dialog on "running" forever.
+  _streamTestRun(mode, {
+    onLine: lines => { if (typeof _updateTestOutput === 'function') _updateTestOutput(lines); },
+    onDone: (d, lines) => {
+      if (typeof _testRunning !== 'undefined') _testRunning = false;
+      if (d.ok) {
+        showGitSyncModal('Tests Passed \u2713', '<div style="text-align:center;padding:12px 0;">'
+          + '<div style="font-weight:600;color:var(--accent-green,#4ecdc4);">'
+          + d.passed + ' tests passed \u2014 proceeding to ' + verb + '...</div></div>', []);
+        setTimeout(() => {
+          executeGitAction('both', btnId, actionLabel);
+        }, 1200);
+      } else {
+        const report = _testFailureReport(lines, d, mode);
+        const nFail = report.failLines.length;
+        const headline = nFail
+          ? nFail + ' test(s) failed. Fix the failures before ' + verb + 'ing.'
+          : 'The test run did not finish cleanly (exit ' + d.exit_code + '). See the output below.';
+        let body = '<div style="text-align:center;padding:8px 0;">'
+          + '<div style="font-weight:600;color:var(--result-err,#ff4444);font-size:16px;">' + Verb + ' Blocked</div>'
+          + '<div style="font-size:13px;color:var(--text-muted);margin-top:4px;">' + headline + '</div></div>';
+        const shown = nFail ? report.failLines : report.tail;
+        if (shown.length > 0) {
+          body += '<pre id="test-fail-pre" style="text-align:left;font-size:10px;font-family:monospace;'
+            + 'max-height:200px;overflow-y:auto;background:rgba(255,60,60,0.06);'
+            + 'border:1px solid rgba(255,60,60,0.15);border-radius:6px;'
+            + 'padding:8px 10px;margin-top:10px;color:var(--text-secondary);'
+            + 'white-space:pre-wrap;word-break:break-all;user-select:text;">'
+            + shown.map(l => (typeof _escTestHtml === 'function' ? _escTestHtml(l) : l)).join('\n')
+            + '</pre>';
         }
-        buffer += decoder.decode(value, {stream: true});
-        const parts = buffer.split('\n\n');
-        buffer = parts.pop();
-
-        for (const part of parts) {
-          if (!part.startsWith('data: ')) continue;
-          try {
-            const d = JSON.parse(part.slice(6));
-            if (d.type === 'line') {
-              lines.push(d.line);
-              if (typeof _updateTestOutput === 'function') _updateTestOutput(lines);
-            } else if (d.type === 'done') {
-              if (typeof _testRunning !== 'undefined') _testRunning = false;
-              if (d.ok) {
-                showGitSyncModal('Tests Passed \u2713', '<div style="text-align:center;padding:12px 0;">'
-                  + '<div style="font-weight:600;color:var(--accent-green,#4ecdc4);">'
-                  + d.passed + ' tests passed \u2014 proceeding to ' + verb + '...</div></div>', []);
-                setTimeout(() => {
-                  executeGitAction('both', btnId, actionLabel);
-                }, 1200);
-              } else {
-                const report = _testFailureReport(lines, d, mode);
-                const nFail = report.failLines.length;
-                const headline = nFail
-                  ? nFail + ' test(s) failed. Fix the failures before ' + verb + 'ing.'
-                  : 'The test run did not finish cleanly (exit ' + d.exit_code + '). See the output below.';
-                let body = '<div style="text-align:center;padding:8px 0;">'
-                  + '<div style="font-weight:600;color:var(--result-err,#ff4444);font-size:16px;">' + Verb + ' Blocked</div>'
-                  + '<div style="font-size:13px;color:var(--text-muted);margin-top:4px;">' + headline + '</div></div>';
-                const shown = nFail ? report.failLines : report.tail;
-                if (shown.length > 0) {
-                  body += '<pre id="test-fail-pre" style="text-align:left;font-size:10px;font-family:monospace;'
-                    + 'max-height:200px;overflow-y:auto;background:rgba(255,60,60,0.06);'
-                    + 'border:1px solid rgba(255,60,60,0.15);border-radius:6px;'
-                    + 'padding:8px 10px;margin-top:10px;color:var(--text-secondary);'
-                    + 'white-space:pre-wrap;word-break:break-all;user-select:text;">'
-                    + shown.map(l => (typeof _escTestHtml === 'function' ? _escTestHtml(l) : l)).join('\n')
-                    + '</pre>';
-                }
-                if (d.log_path) {
-                  body += '<div style="font-size:11px;color:var(--text-faint);margin-top:6px;text-align:left;">'
-                    + 'Full output saved to ' + (typeof _escTestHtml === 'function' ? _escTestHtml(d.log_path) : d.log_path)
-                    + '</div>';
-                }
-                showGitSyncModal(Verb + ' Blocked \u2014 Tests Failed', body, [
-                  {label: 'Fix errors', primary: true, onclick: () => {
-                    closeGitSyncModal();
-                    _startFixSession('Fix Test Failures', 'Fixing failing tests...', report.prompt);
-                  }},
-                  {label: 'Copy errors', onclick: (e) => _copyTestErrors(report.copyText, e && e.currentTarget)},
-                  {label: Verb + ' Anyway', onclick: () => executeGitAction('both', btnId, actionLabel)},
-                  {label: 'Close', onclick: closeGitSyncModal}
-                ], {sticky: true});
-              }
-            }
-          } catch(_) {}
+        if (d.log_path) {
+          body += '<div style="font-size:11px;color:var(--text-faint);margin-top:6px;text-align:left;">'
+            + 'Full output saved to ' + (typeof _escTestHtml === 'function' ? _escTestHtml(d.log_path) : d.log_path)
+            + '</div>';
         }
-        read();
-      }).catch(() => { if (typeof _testRunning !== 'undefined') _testRunning = false; });
-    }
-    read();
-  }).catch(() => {
-    if (typeof _testRunning !== 'undefined') _testRunning = false;
-    showGitSyncModal('Test Error', '<p style="color:var(--result-err)">Could not run tests. ' + Verb + ' anyway?</p>', [
-      {label: Verb + ' Anyway', onclick: () => executeGitAction('both', btnId, actionLabel)},
-      {label: 'Cancel', onclick: closeGitSyncModal}
-    ]);
+        showGitSyncModal(Verb + ' Blocked \u2014 Tests Failed', body, [
+          {label: 'Fix errors', primary: true, onclick: () => {
+            closeGitSyncModal();
+            _startFixSession('Fix Test Failures', 'Fixing failing tests...', report.prompt);
+          }},
+          {label: 'Copy errors', onclick: (e) => _copyTestErrors(report.copyText, e && e.currentTarget)},
+          {label: Verb + ' Anyway', onclick: () => executeGitAction('both', btnId, actionLabel)},
+          {label: 'Close', onclick: closeGitSyncModal}
+        ], {sticky: true});
+      }
+    },
+    onError: (msg, info) => {
+      if (typeof _testRunning !== 'undefined') _testRunning = false;
+      if (info && info.started) {
+        // The run started but its result never arrived.  Never offer to
+        // publish anyway here: nothing says the tests passed.
+        showGitSyncModal('Test Run Interrupted',
+          '<p style="color:var(--text-muted)">' + (typeof _escTestHtml === 'function' ? _escTestHtml(msg) : msg)
+          + ' Nothing was ' + verb + 'ed.</p>', [
+          {label: 'Run again', primary: true, onclick: () => _testThenAction(mode, actionType, actionLabel, btnId)},
+          {label: 'Close', onclick: closeGitSyncModal}
+        ]);
+        return;
+      }
+      const why = msg ? ' (' + (typeof _escTestHtml === 'function' ? _escTestHtml(msg) : msg) + ')' : '';
+      showGitSyncModal('Test Error', '<p style="color:var(--result-err)">Could not run tests' + why + '. ' + Verb + ' anyway?</p>', [
+        {label: Verb + ' Anyway', onclick: () => executeGitAction('both', btnId, actionLabel)},
+        {label: 'Cancel', onclick: closeGitSyncModal}
+      ]);
+    },
   });
 }
 
