@@ -32,6 +32,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._browser import shared_browser_scope
+
 # Every test builds its own page, so a parallel run may split this file
 # across workers (see tests/_xdist_schedule.py).
 XDIST_SPLITTABLE = True
@@ -103,14 +105,10 @@ def _index_html() -> str:
 
 @pytest.fixture(scope="module")
 def browser():
-    pw = pytest.importorskip("playwright.sync_api", reason="playwright not installed")
-    with pw.sync_playwright() as p:
-        try:
-            b = p.chromium.launch()
-        except Exception as exc:  # browser binary not downloaded on this machine
-            pytest.skip(f"chromium unavailable: {str(exc).splitlines()[0][:80]}")
+    # This worker's shared browser (tests/_browser.py); contexts this file
+    # opens are closed when it is done.
+    with shared_browser_scope() as b:
         yield b
-        b.close()
 
 
 class App:

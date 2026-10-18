@@ -47,6 +47,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._browser import shared_browser_scope
+
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "static"
 TEMPLATES = ROOT / "templates"
@@ -1286,7 +1288,7 @@ window.__icon = () => (document.querySelector('link[rel~="icon"]') || {}).href |
 
 @pytest.fixture(scope="module")
 def page():
-    pw = pytest.importorskip("playwright.sync_api", reason="playwright not installed")
+    pytest.importorskip("playwright.sync_api", reason="playwright not installed")
     from jinja2 import Environment, FileSystemLoader
 
     index = Environment(loader=FileSystemLoader(str(TEMPLATES))).get_template("index.html").render(
@@ -1313,11 +1315,9 @@ def page():
             return route.fulfill(content_type="application/json", body="{}")
         return route.fulfill(status=404, body="")
 
-    with pw.sync_playwright() as p:
-        try:
-            browser = p.chromium.launch()
-        except Exception as exc:  # browser binary not downloaded on this machine
-            pytest.skip(f"chromium unavailable: {str(exc).splitlines()[0][:80]}")
+    # This worker's shared browser (tests/_browser.py); the context is closed
+    # when this file is done.
+    with shared_browser_scope() as browser:
         ctx = browser.new_context(viewport={"width": 1400, "height": 900})
         ctx.add_init_script(_INIT)
         pg = ctx.new_page()
@@ -1326,7 +1326,6 @@ def page():
         pg.wait_for_function("window.VNNotify && typeof socket !== 'undefined' && socket.listeners('approvals_open').length === 1")
         pg.evaluate("window.__watchTitle()")
         yield pg
-        browser.close()
 
 
 CARD = {"id": "c1", "title": "Release 4.2", "source": "pipeline", "since": 1,

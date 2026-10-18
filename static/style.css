@@ -3041,26 +3041,50 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
 .vn-jump-pill:active { transform:translateY(-100%) scale(.97); }
 .vn-jump-pill svg { flex-shrink:0; opacity:.6; }
 
-/* Pill + "Auto" switch read as ONE control split in two: left half jumps,
-   right half flips live scroll. Same fixed height so the seam lines up. */
+/* The bubble opens a selector (thread-scroll.js _openMenu). The standalone
+   "Auto" chip shows only while auto scroll follows at the bottom. */
 .vn-jump-pill, .vn-jump-auto { box-sizing:border-box; height:26px; padding-top:0; padding-bottom:0; }
-.vn-jump-pill { border-top-right-radius:0; border-bottom-right-radius:0; }
 .vn-jump-auto {
   position:relative; pointer-events:auto; transform:translateY(-100%);
   display:inline-flex; align-items:center; gap:6px;
-  margin-left:-1px; padding:0 9px 0 8px;
+  padding:0 10px;
   background: var(--bg-dropdown);
   background: color-mix(in srgb, var(--bg-dropdown) 88%, transparent);
   -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
   color: var(--text-secondary);
   border:1px solid var(--border-hover);
-  border-radius:0 999px 999px 0;
+  border-radius:999px;
   font: 600 var(--fs-xs) var(--font-sans); letter-spacing:.01em;
   cursor:pointer; white-space:nowrap; box-shadow: var(--elev-2);
 }
-/* Alone (live scroll following a running session, nothing to jump to): a
-   full round chip instead of the right half of a pill. */
-.vn-jump-auto.solo { border-radius:999px; margin-left:0; padding:0 10px; }
+
+/* The selector: a small card floating just above the bubble. */
+.vn-jump-menu {
+  position:absolute; left:50%; bottom:34px; transform:translate(-50%, 6px);
+  min-width:200px; padding:4px;
+  background: var(--bg-modal, var(--bg-dropdown));
+  border:1px solid var(--border-modal, var(--border-hover)); border-radius:12px;
+  box-shadow: var(--elev-3, var(--elev-2));
+  pointer-events:none; opacity:0; visibility:hidden;
+  transition: opacity .12s var(--ease-out), transform .12s var(--ease-out);
+  z-index:6;
+}
+.vn-jump-menu.open { pointer-events:auto; opacity:1; visibility:visible; transform:translate(-50%, 0); }
+.vn-jump-menu-item {
+  display:flex; align-items:center; gap:10px; width:100%;
+  padding:9px 10px; border:none; background:none; border-radius:8px;
+  color: var(--text-heading); font: 500 var(--fs-md) var(--font-sans);
+  text-align:left; cursor:pointer;
+}
+.vn-jump-menu-item:hover, .vn-jump-menu-item:focus-visible { background: var(--bg-hover); }
+.vn-jump-menu-item svg { flex-shrink:0; color: var(--accent); }
+.vn-jump-menu-text { flex:1; display:flex; flex-direction:column; line-height:1.25; }
+.vn-jump-menu-text small { font-size: var(--fs-xs); font-weight:400; color: var(--text-faint); }
+.vn-jump-menu-item .vn-jump-auto-track { width:30px; height:16px; flex-shrink:0; }
+.vn-jump-menu-item .vn-jump-auto-knob { width:12px; height:12px; }
+.vn-jump-menu-item.on .vn-jump-auto-track { background: var(--green); }
+.vn-jump-menu-item.on .vn-jump-auto-knob { transform: translateX(14px); }
+@media (prefers-reduced-motion: reduce) { .vn-jump-menu { transition:none; } }
 .vn-jump-auto:hover, .vn-jump-auto:focus-visible { color: var(--text-heading); }
 .vn-jump-auto:active { transform:translateY(-100%) scale(.97); }
 .vn-jump-auto-track {

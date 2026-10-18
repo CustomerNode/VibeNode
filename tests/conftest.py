@@ -586,6 +586,8 @@ def pytest_runtest_logreport(report):
 
 
 def pytest_sessionfinish(session):
+    from tests import _browser
+    _browser.close_shared_browser()
     config = session.config
     cache = getattr(config, "cache", None)
     if cache is None or hasattr(config, "workerinput") or not _test_durations:
@@ -595,6 +597,17 @@ def pytest_sessionfinish(session):
     merged = dict(cache.get(DURATIONS_CACHE_NAME, {}) or {})
     merged.update({k: round(v, 3) for k, v in _test_durations.items()})
     cache.set(DURATIONS_CACHE_NAME, merged)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    # Close this worker's shared browser (tests/_browser.py) as soon as the
+    # next test is not a browser test, so no Playwright event loop is alive
+    # while other tests run.  Runs after the item's own fixture teardown.
+    yield
+    from tests import _browser
+    if nextitem is None or not _browser.uses_shared_browser(getattr(nextitem, "module", None)):
+        _browser.close_shared_browser()
 
 
 @pytest.hookimpl(optionalhook=True)

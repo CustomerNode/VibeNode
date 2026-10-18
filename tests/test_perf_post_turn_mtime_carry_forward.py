@@ -195,3 +195,48 @@ def test_first_turn_with_no_carry_forward_does_walk(sm_module, tmp_path):
         "carry-forward branch is firing even when _post_turn_mtimes "
         "is empty, which would break the bootstrap snapshot."
     )
+
+
+# ---------------------------------------------------------------------------
+# The traversal budget bounds the walk, not the git launch (fixed 2026-10-17)
+#
+# Both scans started their 2s budget BEFORE calling ``git ls-files``.  On a
+# busy machine a slow git launch used the whole budget, so the walk bailed at
+# its first check and the snapshot came back EMPTY: the pre-turn snapshot
+# missed every file and an agent's edits were never detected for rewind.
+# Seen as an intermittent failure of
+# test_fork_rewind::test_filesystem_change_detection_catches_agent_edits in
+# parallel runs.  git has its own 10s timeout; the budget is for the walk.
+# ---------------------------------------------------------------------------
+
+def _slow_git_clock(sm_module, monkeypatch):
+    """A monotonic clock that only moves when git 'runs', by 3 seconds."""
+    now = [1000.0]
+    monkeypatch.setattr(sm_module.time, "monotonic", lambda: now[0])
+
+    def _slow_git(self, cwd_path, info=None):
+        now[0] += 3.0  # longer than the 2s budget
+        return None    # not a repo: fall back to the walk
+    monkeypatch.setattr(sm_module.SessionManager, "_git_ls_files", _slow_git)
+    monkeypatch.setattr(sm_module.SessionManager, "_is_file_tracking_enabled",
+                        staticmethod(lambda: True))
+
+
+def test_a_slow_git_launch_does_not_empty_the_pre_turn_snapshot(sm_module, tmp_path, monkeypatch):
+    src = tmp_path / "config.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    _slow_git_clock(sm_module, monkeypatch)
+    manager = sm_module.SessionManager()
+    info = sm_module.SessionInfo(session_id="slow-git-pre", cwd=str(tmp_path))
+    manager._record_pre_turn_mtimes(info)
+    assert str(src) in info._pre_turn_mtimes
+
+
+def test_a_slow_git_launch_does_not_hide_changed_files(sm_module, tmp_path, monkeypatch):
+    src = tmp_path / "config.py"
+    src.write_text("x = 1\n", encoding="utf-8")
+    _slow_git_clock(sm_module, monkeypatch)
+    manager = sm_module.SessionManager()
+    info = sm_module.SessionInfo(session_id="slow-git-post", cwd=str(tmp_path))
+    info._pre_turn_mtimes = {str(src): src.stat().st_mtime - 10}  # changed since
+    assert str(src) in manager._detect_changed_files(info)

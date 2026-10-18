@@ -148,7 +148,8 @@
   var _sentinel = null;
   var _pillWrap = null;
   var _pillEl = null;
-  var _autoEl = null;     // the "Auto" (live scroll) switch beside the pill
+  var _autoEl = null;     // standalone Auto switch (only while following at the bottom)
+  var _menuEl = null;     // the selector the bubble opens
   var _io = null;
   var _mo = null;
   var _atBottom = true;
@@ -448,50 +449,118 @@
     _pillWrap.className = 'vn-jump-wrap';
     _pillWrap.setAttribute('aria-hidden', 'true');
 
+    // Tapping the bubble opens a small selector (user request, 2026-10-17):
+    //   ↓ Jump to latest
+    //   Auto scroll  [switch]   (this session; default in System → Preferences)
+    // The bubble itself never jumps: the user asked for the selector twice.
     _pillEl = document.createElement('button');
     _pillEl.type = 'button';
     _pillEl.className = 'vn-jump-pill';
+    _pillEl.setAttribute('aria-haspopup', 'menu');
+    _pillEl.setAttribute('aria-expanded', 'false');
     _pillEl.addEventListener('click', function (ev) {
       ev.preventDefault();
       ev.stopPropagation();
-      catchUp();
+      if (_menuOpen) _closeMenu(); else _openMenu();
     });
     _pillWrap.appendChild(_pillEl);
 
-    // The "Auto" switch riding on the right of the pill (2026-10-17): the
-    // live-scroll preference, one tap away while the reader is looking at the
-    // thread. The pill itself still jumps; this half only flips the setting.
+    // A standalone Auto switch, shown ONLY while auto scroll is following a
+    // running session at the bottom, where there is no bubble to tap. Without
+    // it, following could not be turned off without scrolling away first.
     _autoEl = document.createElement('button');
     _autoEl.type = 'button';
-    _autoEl.className = 'vn-jump-auto';
+    _autoEl.className = 'vn-jump-auto solo';
     _autoEl.setAttribute('role', 'switch');
-    _autoEl.innerHTML = '<span class="vn-jump-auto-label">Auto</span>' +
-                        '<span class="vn-jump-auto-track"><span class="vn-jump-auto-knob"></span></span>';
+    _autoEl.innerHTML = '<span class="vn-jump-auto-label">Auto</span>' + _SWITCH_HTML;
     _autoEl.addEventListener('click', function (ev) {
       ev.preventDefault();
       ev.stopPropagation();
-      var next = !_liveScroll;
-      // One code path for every switch, so the actions menu label and the
-      // confirmation toast stay in step (modals.js). Fallback: set it here.
-      if (typeof window.toggleLiveScroll === 'function') window.toggleLiveScroll(next);
-      else setLiveScroll(next);
-      // Turning it ON from here means "follow it now": take the reader to the
-      // latest and leave READING, or nothing would follow until they scrolled
-      // back down by hand.
-      if (next) catchUp();
-      _renderPill();
+      _toggleAuto();
     });
     _pillWrap.appendChild(_autoEl);
+
+    // The selector.
+    _menuEl = document.createElement('div');
+    _menuEl.className = 'vn-jump-menu';
+    _menuEl.setAttribute('role', 'menu');
+    _menuEl.innerHTML =
+      '<button type="button" class="vn-jump-menu-item" data-act="jump" role="menuitem">' +
+        _ARROW_SVG + '<span class="vn-jump-menu-text">Jump to latest</span></button>' +
+      '<button type="button" class="vn-jump-menu-item" data-act="auto" role="menuitemcheckbox">' +
+        '<span class="vn-jump-menu-text">Auto scroll<small>This session</small></span>' +
+        _SWITCH_HTML + '</button>';
+    _menuEl.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      var item = ev.target && ev.target.closest ? ev.target.closest('[data-act]') : null;
+      if (!item) return;
+      var act = item.getAttribute('data-act');
+      _closeMenu();
+      if (act === 'jump') catchUp();
+      else if (act === 'auto') _toggleAuto();
+    });
+    _pillWrap.appendChild(_menuEl);
+  }
+
+  var _SWITCH_HTML =
+    '<span class="vn-jump-auto-track"><span class="vn-jump-auto-knob"></span></span>';
+  var _menuOpen = false;
+
+  function _onOutside(ev) {
+    if (_pillWrap && ev.target && _pillWrap.contains && _pillWrap.contains(ev.target)) return;
+    _closeMenu();
+  }
+  function _onMenuKey(ev) { if (ev.key === 'Escape') _closeMenu(); }
+
+  function _openMenu() {
+    if (!_menuEl) return;
+    _menuOpen = true;
+    _renderAuto();
+    _menuEl.classList.add('open');
+    _pillEl.setAttribute('aria-expanded', 'true');
+    try {
+      document.addEventListener('pointerdown', _onOutside, true);
+      document.addEventListener('keydown', _onMenuKey, true);
+    } catch (e) { /* no document listeners in tests */ }
+  }
+
+  function _closeMenu() {
+    if (!_menuOpen) return;
+    _menuOpen = false;
+    if (_menuEl) _menuEl.classList.remove('open');
+    if (_pillEl) _pillEl.setAttribute('aria-expanded', 'false');
+    try {
+      document.removeEventListener('pointerdown', _onOutside, true);
+      document.removeEventListener('keydown', _onMenuKey, true);
+    } catch (e) { /* ignore */ }
+  }
+
+  /** Flip auto scroll for this session (selector row or standalone switch). */
+  function _toggleAuto() {
+    var next = !_liveScroll;
+    // One code path for every switch, so the ••• menu label and the toast
+    // stay in step (modals.js). Fallback: set it here.
+    if (typeof window.toggleLiveScroll === 'function') window.toggleLiveScroll(next);
+    else setLiveScroll(next);
+    // Turning it ON means "follow it now": take the reader to the latest and
+    // leave READING, or nothing would follow until they scrolled back down.
+    if (next) catchUp();
+    _renderPill();
   }
 
   function _renderAuto() {
-    if (!_autoEl) return;
-    _autoEl.classList.toggle('on', _liveScroll);
-    _autoEl.setAttribute('aria-checked', _liveScroll ? 'true' : 'false');
     var t = _liveScroll ? 'Auto scroll is on. Tap to keep the chat still'
                         : 'Auto scroll is off. Tap to follow new output';
-    _autoEl.setAttribute('aria-label', t);
-    _autoEl.title = t;
+    var els = [_autoEl, _menuEl && _menuEl.querySelector ? _menuEl.querySelector('[data-act="auto"]') : null];
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (!el) continue;
+      el.classList.toggle('on', _liveScroll);
+      el.setAttribute('aria-checked', _liveScroll ? 'true' : 'false');
+      el.setAttribute('aria-label', t);
+      el.title = t;
+    }
   }
 
   var _ARROW_SVG =
@@ -519,10 +588,10 @@
 
   var _MODES = {
     //          label        class          aria / title
-    working: ['Working',   'is-working', 'Still working. Jump to the latest'],
-    waiting: ['Needs you', 'is-waiting', 'Waiting on you. Jump to the latest'],
-    done:    ['Done',      'is-done',    'Finished. Jump to the latest'],
-    quiet:   ['',          '',           'Jump to latest'],
+    working: ['Working',   'is-working', 'Still working. Tap for jump and auto scroll'],
+    waiting: ['Needs you', 'is-waiting', 'Waiting on you. Tap for jump and auto scroll'],
+    done:    ['Done',      'is-done',    'Finished. Tap for jump and auto scroll'],
+    quiet:   ['',          '',           'Tap for jump and auto scroll'],
   };
 
   function _renderPill() {
@@ -544,13 +613,16 @@
     var showAuto = showPill || (_liveScroll && act === 'working');
     _renderAuto();   // keep it truthful even while hidden: it can reappear any time
     if (!showAuto) {
+      _closeMenu();
       _pillWrap.classList.remove('visible');
       _pillWrap.setAttribute('aria-hidden', 'true');
       _pillKey = '';
       return;
     }
+    // Bubble when there is something to jump to; otherwise only the switch.
     _pillEl.style.display = showPill ? '' : 'none';
-    if (_autoEl) _autoEl.classList.toggle('solo', !showPill);
+    if (_autoEl) _autoEl.style.display = showPill ? 'none' : '';
+    if (!showPill) _closeMenu();
     var mode = act === 'working' ? 'working'
              : act === 'waiting' ? 'waiting'
              : fresh ? 'done' : 'quiet';
@@ -642,6 +714,7 @@
   }
 
   function detach() {
+    _closeMenu();
     for (var i = 0; i < _listeners.length; i++) {
       var l = _listeners[i];
       try { l[0].removeEventListener(l[1], l[2], l[3]); } catch (e) { /* ignore */ }

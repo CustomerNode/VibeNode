@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._browser import shared_browser_scope
+
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "static"
 
@@ -116,16 +118,12 @@ function overlaps(floatIds, btnIds) {{
 
 @pytest.fixture(scope="module")
 def page():
-    pw = pytest.importorskip("playwright.sync_api", reason="playwright not installed")
-    with pw.sync_playwright() as p:
-        try:
-            browser = p.chromium.launch()
-        except Exception as exc:  # browser binary not downloaded on this machine
-            pytest.skip(f"chromium unavailable: {str(exc).splitlines()[0][:80]}")
+    # This worker's shared browser (tests/_browser.py); the page's context is
+    # closed when this file is done.
+    with shared_browser_scope() as browser:
         pg = browser.new_page(viewport={"width": 390, "height": 844})
         pg.set_content(_page_html())
         yield pg
-        browser.close()
 
 
 @pytest.mark.slow

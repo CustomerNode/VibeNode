@@ -60,28 +60,53 @@ def test_no_history_falls_back_to_test_count():
     assert _sched().order_units(units) == ["tests/test_big.py", "tests/test_small.py"]
 
 
-def test_browser_work_is_capped_and_a_worker_is_never_left_idle():
-    """8 workers on Chromium at once starved the machine.  Past the cap a
-    worker gets non-browser work; with only browser work left it still gets
-    some, or the run would hang."""
+class _Node:
+    shutting_down = False
+
+
+def test_browser_work_is_capped_and_surplus_workers_wait():
+    """Throughput of the real page peaks at 4 parallel browsers and halves at
+    8.  Past the cap a worker takes non-browser work; with only browser work
+    left it waits instead of joining the pile-up."""
     sources = {f"tests/test_b{i}.py": BROWSER_SRC for i in range(HEAVY_CAP + 1)}
     sources["tests/test_plain.py"] = "def test_x(): pass\n"
     s = _sched(sources=sources)
-    busy = [object() for _ in range(HEAVY_CAP)]
+    busy = [_Node() for _ in range(HEAVY_CAP)]
     for i, n in enumerate(busy):
         s.assigned_work[n] = {f"tests/test_b{i}.py": {f"tests/test_b{i}.py::a": False}}
-    node = object()
+    node = _Node()
     s.assigned_work[node] = {}
     last = f"tests/test_b{HEAVY_CAP}.py"
     s.workqueue[last] = {last + "::a": False}
     s.workqueue["tests/test_plain.py"] = {"tests/test_plain.py::x": False}
     assert s.pick_unit(node) == "tests/test_plain.py"
     del s.workqueue["tests/test_plain.py"]
+    assert s.pick_unit(node) is None
+    # A slot frees up: the browser unit is offered.
+    s.assigned_work[busy[0]][next(iter(s.assigned_work[busy[0]]))]["tests/test_b0.py::a"] = True
     assert s.pick_unit(node) == last
-    # Below the cap, browser work is taken in queue order.
-    s.assigned_work[busy[0]] = {}
-    s.workqueue["tests/test_plain.py"] = {"tests/test_plain.py::x": False}
-    assert s.pick_unit(node) == last
+
+
+def test_a_waiting_worker_is_reoffered_work_when_any_test_finishes():
+    """The wait must never become a hang: every finished test re-offers work
+    to every worker that has none."""
+    sources = {f"tests/test_b{i}.py": BROWSER_SRC for i in range(HEAVY_CAP + 1)}
+    s = _sched(sources=sources)
+    s.registered_collections = {}
+    busy = [_Node() for _ in range(HEAVY_CAP)]
+    for i, n in enumerate(busy):
+        nid = f"tests/test_b{i}.py::a"
+        s.assigned_work[n] = {f"tests/test_b{i}.py": {nid: False}}
+        s.registered_collections[n] = [nid]
+    waiting = _Node()
+    s.assigned_work[waiting] = {}
+    last = f"tests/test_b{HEAVY_CAP}.py"
+    s.workqueue[last] = {last + "::a": False}
+    s._queue_ordered = True
+    offered = []
+    s._reschedule = lambda n: offered.append(n)
+    s.mark_test_complete(busy[0], 0)
+    assert busy[0] in offered and waiting in offered
 
 
 def test_splittable_files_split_into_contiguous_chunks_and_others_stay_whole():

@@ -487,12 +487,24 @@ test('quiet arrow shows when scrolled up with nothing new', () => {
   assert.ok(!pill().classList.contains('is-done'));
 });
 
+// The selector the bubble opens (2026-10-17): third child of the wrap.
+const NOEV = { preventDefault() {}, stopPropagation() {} };
+function menu() { return pillWrap().children[2]; }
+function choose(act) {
+  menu().dispatch('click', Object.assign({ target: { closest: () => ({ getAttribute: () => act }) } }, NOEV));
+}
+
 test('clicking the button jumps to the final message and clears "new"', () => {
   setup();
   tailBelowFold();
   msg(600, 900);
   log.scrollHeight = 3000;
-  pill().dispatch('click', { preventDefault() {}, stopPropagation() {} });
+  const before = log.scrollTop;
+  pill().dispatch('click', NOEV);
+  assert.ok(menu().classList.contains('open'), 'tapping the bubble opens the selector');
+  assert.strictEqual(log.scrollTop, before, 'the tap itself does not scroll');
+  choose('jump');
+  assert.ok(!menu().classList.contains('open'), 'choosing closes it');
   assert.strictEqual(log.scrollTop, 592, 'top of the final message, minus the 8px pad');
   assert.strictEqual(TS.hasNew(), false);
   assert.strictEqual(TS.state(), 'LIVE');
@@ -645,23 +657,35 @@ test('live scroll uses the live panel follow rule when it is loaded', () => {
   } finally { TS.setLiveScroll(false); delete global._autoScrollLiveLog; }
 });
 
-test('the Auto switch on the pill flips live scroll and shows its state', () => {
+test('the selector Auto scroll row flips auto scroll for this session', () => {
   setup();
   log.dispatch('wheel', {});
   fireIO(false);
   const auto = pillWrap().children[1];
-  assert.ok(auto.classList.contains('vn-jump-auto'), 'switch sits beside the pill');
-  assert.strictEqual(auto.getAttribute('aria-checked'), 'false');
+  assert.strictEqual(auto.style.display, 'none', 'standalone switch hidden while the bubble shows');
   log.scrollHeight = 2500;
-  auto.dispatch('click', { preventDefault() {}, stopPropagation() {} });
+  pill().dispatch('click', NOEV);
+  choose('auto');
   try {
     assert.strictEqual(TS.isLiveScroll(), true);
     assert.ok(auto.classList.contains('on'));
-    assert.strictEqual(TS.state(), 'LIVE', 'turning it on from the pill starts following now');
-    auto.dispatch('click', { preventDefault() {}, stopPropagation() {} });
+    assert.strictEqual(TS.state(), 'LIVE', 'turning it on starts following now');
+    assert.ok(!menu().classList.contains('open'));
+    // following at the bottom of a non-working session: nothing shown; flip back via API
+    TS.setLiveScroll(false);
     assert.strictEqual(TS.isLiveScroll(), false);
     assert.ok(!auto.classList.contains('on'));
   } finally { TS.setLiveScroll(false); }
+});
+
+test('tapping the bubble again closes the selector', () => {
+  setup();
+  log.dispatch('wheel', {});
+  fireIO(false);
+  pill().dispatch('click', NOEV);
+  assert.ok(menu().classList.contains('open'));
+  pill().dispatch('click', NOEV);
+  assert.ok(!menu().classList.contains('open'));
 });
 
 test('a change made from a menu repaints the pill switch', () => {

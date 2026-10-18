@@ -8175,11 +8175,15 @@ class SessionManager:
         # ── Full rescan ──
         mtimes = {}
         budget = self._FS_TRAVERSAL_BUDGET_SECONDS
-        deadline = time.monotonic() + budget
         budget_exceeded = False
         try:
             # Fast path: use git ls-files (respects .gitignore)
             git_files = self._git_ls_files(cwd_path, info)
+            # The budget bounds the WALK below, so it starts after git returns
+            # (git has its own timeout).  Started before it, a slow git launch
+            # on a busy machine spent the whole budget and the snapshot came
+            # back empty, hiding every edit from rewind (fixed 2026-10-17).
+            deadline = time.monotonic() + budget
             if git_files is not None:
                 for i, f in enumerate(git_files):
                     # Check budget every 256 files to keep clock-read overhead trivial
@@ -8252,11 +8256,12 @@ class SessionManager:
         changed = set()
         post_mtimes = {}
         budget = self._FS_TRAVERSAL_BUDGET_SECONDS
-        deadline = time.monotonic() + budget
         budget_exceeded = False
         try:
             # Fast path: use git ls-files (cached per-session)
             git_files = self._git_ls_files(cwd_path, info)
+            # Budget starts after git returns; see _record_pre_turn_mtimes.
+            deadline = time.monotonic() + budget
             if git_files is not None:
                 for i, f in enumerate(git_files):
                     if (i & 0xFF) == 0 and time.monotonic() > deadline:
