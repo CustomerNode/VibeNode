@@ -33,7 +33,16 @@ def browser():
         yield b
 
 
-def _open(browser, width, height=900, touch=False, behavior="enter", extra_init=""):
+_IPHONE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 "
+              "(KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1")
+_ANDROID_UA = ("Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36")
+_WINDOWS_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
+
+
+def _open(browser, width, height=900, touch=False, behavior="enter", extra_init="",
+          user_agent=None):
     index = _index_html()
 
     def route(route, request):
@@ -62,8 +71,9 @@ def _open(browser, width, height=900, touch=False, behavior="enter", extra_init=
             return route.fulfill(content_type="application/json", body="{}")
         return route.fulfill(status=404, body="")
 
+    kw = {"user_agent": user_agent} if user_agent else {}
     ctx = browser.new_context(viewport={"width": width, "height": height}, has_touch=touch,
-                              is_mobile=touch)
+                              is_mobile=touch, **kw)
     ctx.add_init_script(extra_init + INIT
                         + "localStorage.setItem('sendBehavior', %s);" % json.dumps(behavior))
     page = ctx.new_page()
@@ -100,20 +110,23 @@ def test_enter_sends_on_a_keyboard_device_at_any_width(browser, width):
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("ua", [_IPHONE_UA, _ANDROID_UA], ids=["iphone", "android"])
 @pytest.mark.parametrize("width,height", [(390, 844), (844, 390)])
-def test_enter_is_a_new_line_on_a_touch_screen_portrait_and_landscape(browser, width, height):
+def test_enter_is_a_new_line_on_a_touch_screen_portrait_and_landscape(browser, width, height, ua):
     """Landscape (844 wide) used to count as a desktop and send on Enter."""
-    page = _open(browser, width, height, touch=True)
+    page = _open(browser, width, height, touch=True, user_agent=ua)
     sent, text = _type_and_press(page, "Enter")
     assert sent == 0 and text == "hello\n"
 
 
-# Chrome on a touchscreen Windows laptop: the primary pointer reports coarse,
-# but the touchpad is a fine pointer.  Reported 2026-10-19: Enter added a new
-# line there despite "Enter to send", and Preferences showed the touch note.
+# Chrome on a Surface Pro: the touchscreen is the primary pointer and, with the
+# Type Cover folded or its touchpad not counted, no fine pointer is reported at
+# all.  Reported twice on 2026-10-19: Enter added a new line despite "Enter to
+# send", and Preferences showed the touch note.
 _TOUCHSCREEN_LAPTOP = """(() => {
   const real = window.matchMedia.bind(window);
-  const fake = { '(pointer: coarse)': true, '(any-pointer: fine)': true };
+  const fake = { '(pointer: coarse)': true, '(any-pointer: fine)': false,
+                 '(any-pointer: coarse)': true, '(hover: hover)': false };
   window.matchMedia = (q) => (q in fake)
     ? { matches: fake[q], media: q, addEventListener() {}, removeEventListener() {},
         addListener() {}, removeListener() {} }
@@ -123,8 +136,9 @@ _TOUCHSCREEN_LAPTOP = """(() => {
 
 
 @pytest.mark.slow
-def test_enter_sends_on_a_touchscreen_laptop(browser):
-    page = _open(browser, 1400, extra_init=_TOUCHSCREEN_LAPTOP)
+def test_enter_sends_on_a_windows_touchscreen_with_no_fine_pointer(browser):
+    page = _open(browser, 1400, touch=True, extra_init=_TOUCHSCREEN_LAPTOP,
+                 user_agent=_WINDOWS_UA)
     assert page.evaluate("_isTouchKeyboard()") is False
     sent, text = _type_and_press(page, "Enter")
     assert sent == 1 and text == "hello"

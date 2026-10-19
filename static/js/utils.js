@@ -137,20 +137,31 @@ function _isMobileViewport() { return !!_MOBILE_MQ.matches; }
 // both ways: a desktop window 768px or narrower (half-screen on a scaled
 // laptop) ignored "Enter to send" and could send a half-typed message when
 // focus left the box, and a phone in landscape (wider than 768px) got desktop
-// Enter-sends.  The pointers are what tell them apart.
+// Enter-sends.
 //
-// A coarse PRIMARY pointer alone is not enough (fixed 2026-10-19): Chrome on a
-// touchscreen Windows laptop reports `pointer: coarse` even though the laptop
-// has a physical keyboard and a touchpad, so "Enter to send" was ignored there.
-// A device counts as touch-only when its primary pointer is coarse AND it has
-// no fine pointer at all (no mouse, touchpad or pen).  A phone or tablet with
-// only its screen matches; a touchscreen laptop, or an iPad with a trackpad
-// keyboard, does not and gets the desktop Enter behaviour.
+// The OPERATING SYSTEM decides, not the pointer (fixed 2026-10-19).  Pointer
+// media queries were tried and failed on a Surface Pro: Chrome on a Windows
+// 2-in-1 reports `pointer: coarse` and, with the Type Cover folded or its
+// touchpad not counted, no fine pointer either, so a machine with a physical
+// keyboard ignored "Enter to send".  So: phone/tablet OSes (iOS, iPadOS,
+// Android) get Enter = new line; every desktop OS (Windows, macOS, Linux)
+// always follows the user's setting.  An iPad with a trackpad keyboard counts
+// as a keyboard device.  Do NOT go back to pointer media queries alone.
 const _mq = (q) => (typeof window !== 'undefined' && window.matchMedia)
   ? window.matchMedia(q) : { matches: false };
-const _TOUCH_MQ = _mq('(pointer: coarse)');
 const _FINE_ANY_MQ = _mq('(any-pointer: fine)');
-function _isTouchKeyboard() { return !!_TOUCH_MQ.matches && !_FINE_ANY_MQ.matches; }
+function _isTouchKeyboard() {
+  if (typeof navigator === 'undefined') return false;
+  const ua = navigator.userAgent || '';
+  if (/Android|iPhone|iPod/i.test(ua)) return true;
+  // A desktop OS always follows the setting, whatever else it reports.
+  if (/Windows|CrOS|X11|Linux/.test(ua)) return false;
+  if (navigator.userAgentData && navigator.userAgentData.mobile === true) return true;
+  // iPadOS reports a Mac user agent; touch points give it away.
+  const iPad = /iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+  if (iPad) return !_FINE_ANY_MQ.matches;
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // iOS "keyboard-dismiss = send" detection
