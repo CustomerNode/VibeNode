@@ -33,7 +33,7 @@ def browser():
         yield b
 
 
-def _open(browser, width, height=900, touch=False, behavior="enter"):
+def _open(browser, width, height=900, touch=False, behavior="enter", extra_init=""):
     index = _index_html()
 
     def route(route, request):
@@ -64,7 +64,8 @@ def _open(browser, width, height=900, touch=False, behavior="enter"):
 
     ctx = browser.new_context(viewport={"width": width, "height": height}, has_touch=touch,
                               is_mobile=touch)
-    ctx.add_init_script(INIT + "localStorage.setItem('sendBehavior', %s);" % json.dumps(behavior))
+    ctx.add_init_script(extra_init + INIT
+                        + "localStorage.setItem('sendBehavior', %s);" % json.dumps(behavior))
     page = ctx.new_page()
     page.route("**/*", route)
     page.goto(ORIGIN + "/", wait_until="domcontentloaded")
@@ -105,6 +106,28 @@ def test_enter_is_a_new_line_on_a_touch_screen_portrait_and_landscape(browser, w
     page = _open(browser, width, height, touch=True)
     sent, text = _type_and_press(page, "Enter")
     assert sent == 0 and text == "hello\n"
+
+
+# Chrome on a touchscreen Windows laptop: the primary pointer reports coarse,
+# but the touchpad is a fine pointer.  Reported 2026-10-19: Enter added a new
+# line there despite "Enter to send", and Preferences showed the touch note.
+_TOUCHSCREEN_LAPTOP = """(() => {
+  const real = window.matchMedia.bind(window);
+  const fake = { '(pointer: coarse)': true, '(any-pointer: fine)': true };
+  window.matchMedia = (q) => (q in fake)
+    ? { matches: fake[q], media: q, addEventListener() {}, removeEventListener() {},
+        addListener() {}, removeListener() {} }
+    : real(q);
+})();
+"""
+
+
+@pytest.mark.slow
+def test_enter_sends_on_a_touchscreen_laptop(browser):
+    page = _open(browser, 1400, extra_init=_TOUCHSCREEN_LAPTOP)
+    assert page.evaluate("_isTouchKeyboard()") is False
+    sent, text = _type_and_press(page, "Enter")
+    assert sent == 1 and text == "hello"
 
 
 @pytest.mark.slow

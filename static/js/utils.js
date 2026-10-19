@@ -137,11 +137,20 @@ function _isMobileViewport() { return !!_MOBILE_MQ.matches; }
 // both ways: a desktop window 768px or narrower (half-screen on a scaled
 // laptop) ignored "Enter to send" and could send a half-typed message when
 // focus left the box, and a phone in landscape (wider than 768px) got desktop
-// Enter-sends.  The primary pointer is what tells them apart.
-const _TOUCH_MQ = (typeof window !== 'undefined' && window.matchMedia)
-  ? window.matchMedia('(pointer: coarse)')
-  : { matches: false };
-function _isTouchKeyboard() { return !!_TOUCH_MQ.matches; }
+// Enter-sends.  The pointers are what tell them apart.
+//
+// A coarse PRIMARY pointer alone is not enough (fixed 2026-10-19): Chrome on a
+// touchscreen Windows laptop reports `pointer: coarse` even though the laptop
+// has a physical keyboard and a touchpad, so "Enter to send" was ignored there.
+// A device counts as touch-only when its primary pointer is coarse AND it has
+// no fine pointer at all (no mouse, touchpad or pen).  A phone or tablet with
+// only its screen matches; a touchscreen laptop, or an iPad with a trackpad
+// keyboard, does not and gets the desktop Enter behaviour.
+const _mq = (q) => (typeof window !== 'undefined' && window.matchMedia)
+  ? window.matchMedia(q) : { matches: false };
+const _TOUCH_MQ = _mq('(pointer: coarse)');
+const _FINE_ANY_MQ = _mq('(any-pointer: fine)');
+function _isTouchKeyboard() { return !!_TOUCH_MQ.matches && !_FINE_ANY_MQ.matches; }
 
 // ---------------------------------------------------------------------------
 // iOS "keyboard-dismiss = send" detection
