@@ -266,6 +266,29 @@ Every stall fix before this (jobs 1 and 4, phantom wake-ups, queue starvation) r
 - Do not gate the wording check on generic "wait": it must stay "waiting on background work" and exclude waiting on the user (see the regex tests). Do not drop the liveness check to "simplify": silence alone false-alarms on quiet test runs.
 - Kill switch: `VIBENODE_SILENT_WAIT_RECOVERY=0`; quiet window: `VIBENODE_SILENT_WAIT_MINUTES`. Tests: `tests/test_silent_wait.py`.
 
+## A fix to the Session Engine is not live until the engine runs it (added 2026-10-20)
+
+The Session Engine keeps the code it started with. Restarting it ends running sessions, so it is rarely restarted. On 2026-10-20 it had been running since Oct 6, and jobs 4, 5 and 6 and Durable Jobs had all been committed after that, so none of them ran. A session sat stranded for 83 minutes in exactly the state job 4 handles (replayed against the files: the current job 4 catches it). Meanwhile the user had been told the problem was "fixed" again and again. Writing a daemon fix is not the same as shipping it. Three pieces:
+
+1. **The watchdog hot-reloads itself** (`HealthMonitor._maybe_hot_reload`, `daemon/health_monitor.py`). When `health_monitor.py`, `orphaned_workers.py`, `silent_wait.py` or `limit_watch.py` change on disk, it:
+   - waits until the files have not changed for 60s;
+   - imports them in a separate interpreter;
+   - reloads them in place;
+   - starts a new monitor that adopts the old one's act-once bookkeeping (`_adopt_state`).
+
+   If the new code does not import cleanly, the running watchdog stays in place, and that version is not retried. Each job runs isolated per session, because new watchdog code can be paired with an older `SessionManager`. **Rule: watchdog code must tolerate an older SessionManager.** Read its attributes with `getattr(..., default)`, and do not make a job depend on a SessionManager method added in the same change. Kill switch: `VIBENODE_WATCHDOG_HOT_RELOAD=0`. Tests: `tests/test_watchdog_hot_reload.py`, which runs a real reload against a copy of the package.
+2. **The engine records what it loaded** (`daemon/engine_code.py` → `data/engine_code.json`, gitignored). `app/engine_freshness.py` compares that record with disk; an engine too old to write the record is judged by its process start time. `GET /api/engine/status` drives the banner in `static/js/engine-freshness.js`: "The Session Engine has been running since … N engine files have changed".
+3. **"Restart when idle"** (`POST /api/engine/restart-when-idle`) waits until nothing is busy, then restarts the engine through the normal `/api/restart` path. Busy means any of:
+   - a session is starting, working or waiting on a prompt;
+   - a background command runs under a CLI;
+   - a footprint write happened in the last 5 minutes.
+
+   The banner lists what it is waiting on. **It is user-initiated only. AI agents must never call it** (see Server restarts).
+
+When you change `daemon/` outside the four hot-reloadable files, tell the user plainly that the fix is NOT live until the Session Engine restarts, and that the banner will offer it. Do not report such a fix as done without saying so.
+
+Same day, job 5: `says_waiting_on_background` now matches a named worker's output ("Still waiting on F2's final report", "waiting on C's final run"). It found 5 more real waits in 2,157 local turn endings, none of them on the user. `task_output_dir` now finds the CLI's per-user temp directory on Linux and macOS (`/tmp/claude-<uid>/…`). Before, it looked only in `/tmp/claude/…`, so background-task writes were never counted as activity.
+
 ## Usage limits continue by themselves at reset (fixed 2026-10-07)
 
 A long autonomous session hit "You've hit your session limit · resets 5pm (America/New_York)" at 4:43pm and was still dead after 5pm, showing "Session ended with error". Four gaps stacked, all in `daemon/session_manager.py`, and each fix is load-bearing:

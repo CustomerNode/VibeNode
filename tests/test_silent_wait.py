@@ -45,6 +45,11 @@ WAITING_ON_BACKGROUND = [
     "The adversarial reviewer is still running. I am waiting on their completion notifications.",
     "Root in progress — the task will notify me when it completes.",
     "Re-armed the monitor; e2e is still running.",
+    # 2026-10-20: the session idled 83 min on this; a named worker's report
+    "That was the morning nine-spec waiter's timeout (its result was already "
+    "read). Still waiting on F2's final report.",
+    "Waiting for W3's results before the merge.",
+    "Still waiting on F2.",
 ]
 
 WAITING_ON_THE_USER_OR_DONE = [
@@ -57,6 +62,8 @@ WAITING_ON_THE_USER_OR_DONE = [
     "Commit + push it all?",
     "I'm waiting for your go-ahead before deploying.",
     "Waiting on your decision about the Jira domains.",
+    "Waiting on Don's approval before I push.",
+    "Waiting for the user's report of what they saw.",
     "",
 ]
 
@@ -94,6 +101,16 @@ def test_task_output_dir_matches_cli_layout(monkeypatch):
     monkeypatch.setattr(sw.tempfile, "gettempdir", lambda: "TMP")
     p = task_output_dir(Path("x") / "C--Users-me-code-Proj" / "abc.jsonl")
     assert p.parts[-5:] == ("TMP", "claude", "C--Users-me-code-Proj", "abc", "tasks")
+
+
+def test_task_output_dir_finds_the_per_user_dir_on_posix(tmp_path, monkeypatch):
+    # Linux/macOS CLIs write to <tmp>/claude-<uid>/... (seen 2026-10-20).
+    # Looking only in <tmp>/claude/ missed every background-task write.
+    monkeypatch.setattr(sw.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(sw.os, "getuid", lambda: 1000, raising=False)
+    real = tmp_path / "claude-1000" / "-home-me-proj" / "abc" / "tasks"
+    real.mkdir(parents=True)
+    assert task_output_dir(Path("x") / "-home-me-proj" / "abc.jsonl") == real
 
 
 def test_footprint_takes_newest_write_anywhere(tmp_path, monkeypatch):

@@ -189,6 +189,74 @@ LIMIT_REATTEMPT_SECONDS = 1800.0
 # loop stalled); the backstop takes over.
 LIMIT_STALE_COUNTDOWN_SECONDS = 600.0
 
+# ── Hot reload (added 2026-10-20) ─────────────────────────────────────────
+# The engine runs for weeks, and Python never re-reads an imported module, so
+# a watchdog fix written to disk did nothing until someone restarted the
+# Session Engine (which ends every running session).  On 2026-10-20 every
+# recovery job had been committed after the engine's Oct 6 start, so none of
+# them ran, and a session sat stranded in the exact state job 4 handles.
+# Now the monitor watches its own source files and swaps new code in while
+# the engine keeps running.  See ``HealthMonitor._maybe_hot_reload``.
+HOT_RELOAD = os.environ.get("VIBENODE_WATCHDOG_HOT_RELOAD", "1") != "0"
+# Reload order: the detectors first, then this module, so the fresh
+# ``from daemon.X import ...`` lines above bind the new functions.
+HOT_RELOAD_MODULES = (
+    "daemon.orphaned_workers",
+    "daemon.silent_wait",
+    "daemon.limit_watch",
+    "daemon.health_monitor",
+)
+# New code is taken only once its files have been unchanged this long, so a
+# file half-way through an editing session is never loaded.
+HOT_RELOAD_SETTLE_SECONDS = 60.0
+# The new code must import cleanly in a separate interpreter first.
+HOT_RELOAD_TRIAL_TIMEOUT = 60.0
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _module_rel_path(name: str) -> str:
+    """``daemon.silent_wait`` -> ``daemon/silent_wait.py``."""
+    return name.replace(".", "/") + ".py"
+
+
+def watchdog_code_mtimes() -> dict:
+    """``{repo-relative path: mtime_ns}`` of the hot-reloadable files."""
+    out = {}
+    for name in HOT_RELOAD_MODULES:
+        rel = _module_rel_path(name)
+        try:
+            out[rel] = os.stat(_REPO_ROOT / rel).st_mtime_ns
+        except OSError:
+            out[rel] = 0
+    return out
+
+
+def _trial_import() -> tuple:
+    """Import the new watchdog code in a fresh interpreter.
+
+    Returns ``(ok, detail)``.  This catches syntax errors, a missing name, or
+    a module that raises on import before anything is swapped into the running
+    engine, where a half-executed reload would leave mixed code behind.
+    """
+    import subprocess
+    code = "import " + ", ".join(HOT_RELOAD_MODULES)
+    extra = {}
+    if sys.platform == "win32":
+        # The engine runs under pythonw: never flash a console window.
+        extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(_REPO_ROOT), capture_output=True, text=True,
+            timeout=HOT_RELOAD_TRIAL_TIMEOUT, **extra,
+        )
+    except Exception as exc:  # timeout, missing interpreter, ...
+        return False, repr(exc)
+    if proc.returncode != 0:
+        return False, (proc.stderr or proc.stdout or "").strip()[-2000:]
+    return True, ""
+
+
 NUDGE_TEXT = (
     "[VibeNode watchdog] Your previous turn produced no output for an "
     "extended period and was automatically interrupted. Continue where "
@@ -256,6 +324,36 @@ class HealthMonitor:
         self._limit_attempts: dict[str, tuple] = {}
         # transcript path -> ((size, mtime_ns), stopped_on_error result)
         self._limit_stop_cache: dict = {}
+        # ── Hot reload bookkeeping ──
+        # The watchdog files' mtimes as of the code this instance runs.
+        self._code_mtimes: dict = watchdog_code_mtimes()
+        # A version that failed to load: not retried until the files change.
+        self._reload_failed_for: dict | None = None
+
+    # Bookkeeping that is NOT carried over to a hot-reloaded monitor: thread
+    # plumbing, its own reload state, and caches holding objects of the old
+    # modules' classes (they are rebuilt cheaply; the act-once sets such as
+    # ``_orphan_nudged`` ARE carried, so nothing is nudged twice).
+    _NOT_ADOPTED = frozenset({
+        "_sm", "_stop_event", "_thread", "_orphan_caches", "_limit_stop_cache",
+        "_code_mtimes", "_reload_failed_for",
+    })
+
+    def _adopt_state(self, old) -> None:
+        """Take over ``old``'s bookkeeping (called on the NEW monitor).
+
+        Generic on purpose: the old instance may be any earlier version of
+        this class.  Only attributes both versions have, with the same type,
+        are copied, so a renamed or retyped field starts fresh instead of
+        crashing the new code.
+        """
+        mine = vars(self)
+        for key, value in vars(old).items():
+            if key in self._NOT_ADOPTED or key not in mine:
+                continue
+            if type(value) is not type(mine[key]):
+                continue
+            mine[key] = value
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -299,6 +397,76 @@ class HealthMonitor:
                 # The monitor must never die to an unexpected error — it
                 # is the safety net, so it logs and keeps ticking.
                 logger.exception("HealthMonitor tick failed")
+            try:
+                if HOT_RELOAD and self._maybe_hot_reload():
+                    return  # the new monitor's thread has taken over
+            except Exception:
+                logger.exception("Watchdog hot reload failed; keeping the running watchdog")
+
+    # ── Hot reload ────────────────────────────────────────────────────
+
+    def _maybe_hot_reload(self) -> bool:
+        """Swap in new watchdog code from disk.  True if a new monitor took over.
+
+        Steps, each of which leaves the running watchdog untouched on failure:
+
+        1. The watchdog files changed since this instance's code was loaded,
+           and have been unchanged for ``HOT_RELOAD_SETTLE_SECONDS``.
+        2. The new code imports cleanly in a separate interpreter.
+        3. The modules are reloaded in place, a new ``HealthMonitor`` (the new
+           class) adopts this one's bookkeeping, and its thread starts.  This
+           thread then exits.
+
+        A version that fails step 2 or 3 is not retried until its files
+        change again.
+        """
+        current = watchdog_code_mtimes()
+        if current == self._code_mtimes or current == self._reload_failed_for:
+            return False
+        newest = max(current.values(), default=0) / 1e9
+        if time.time() - newest < HOT_RELOAD_SETTLE_SECONDS:
+            return False
+        if self._stop_event.is_set():
+            return False
+        changed = sorted(k for k, v in current.items() if self._code_mtimes.get(k) != v)
+        ok, detail = _trial_import()
+        if not ok:
+            self._reload_failed_for = current
+            logger.error(
+                "Watchdog hot reload skipped: the new code (%s) does not import "
+                "cleanly, so the running watchdog stays in place.\n%s",
+                ", ".join(changed), detail,
+            )
+            return False
+        import importlib
+        try:
+            for name in HOT_RELOAD_MODULES:
+                module = sys.modules.get(name)
+                if module is None:
+                    importlib.import_module(name)
+                else:
+                    importlib.reload(module)
+            new_cls = sys.modules["daemon.health_monitor"].HealthMonitor
+            new = new_cls(self._sm)
+            new._adopt_state(self)
+        except Exception:
+            self._reload_failed_for = current
+            logger.exception("Watchdog hot reload of %s failed; keeping the running watchdog",
+                             ", ".join(changed))
+            return False
+        if self._stop_event.is_set():
+            return False  # the engine is shutting down: do not start a thread
+        new._code_mtimes = current
+        self._sm._health_monitor = new
+        new.start()
+        logger.warning("Watchdog hot-reloaded from disk (%s); no engine restart needed.",
+                       ", ".join(changed))
+        try:
+            from daemon.engine_code import note_reloaded
+            note_reloaded(list(current))
+        except Exception:
+            logger.exception("Engine code record update failed after hot reload")
+        return True
 
     # ── One tick (public for tests) ───────────────────────────────────
 
@@ -336,8 +504,15 @@ class HealthMonitor:
                     # One IDLE clock shared by jobs 4 and 5 (set here so it
                     # runs even when either job is switched off).
                     self._idle_since.setdefault(sid, now)
-                    self._check_stranded_workers(info, now)
-                    self._check_silent_wait(info, now)
+                    # Each job is isolated: hot reload can pair new watchdog
+                    # code with an older SessionManager, and one job failing
+                    # on that must not silence the others for every session.
+                    for job in (self._check_stranded_workers, self._check_silent_wait):
+                        try:
+                            job(info, now)
+                        except Exception:
+                            logger.exception("HealthMonitor %s failed for %s",
+                                             job.__name__, sid)
                 else:
                     self._end_idle_episode(sid)
                 continue
@@ -375,7 +550,10 @@ class HealthMonitor:
                 )
                 continue
 
-            self._recover_stalled(info, stalled_for)
+            try:
+                self._recover_stalled(info, stalled_for)
+            except Exception:
+                logger.exception("HealthMonitor stall recovery failed for %s", sid)
 
         # Prune bookkeeping for sessions that were removed entirely.
         for sid in list(self._progress):

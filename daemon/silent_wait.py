@@ -52,9 +52,22 @@ _NOT_BACKGROUND = (
     r"(?:the |a |your )?(?:user|you|your|human|go-ahead|approval|"
     r"confirmation|decision|answer|reply|response|input|call|pick)\b"
 )
+# A worker's output named by its owner: "waiting on F2's final report",
+# "waiting for W3's results".  Missed on 2026-10-20: the session ended "Still
+# waiting on F2's final report" and the whole tree sat idle.  The noun after
+# the possessive must be work output, so "waiting on Don's approval" (a
+# person) does not match.
+_WORK_OUTPUT = (
+    r"(?:final |last |full |next )?(?:report|reports|result|results|review|"
+    r"run|runs|diff|fix|fixes|output|notification|completion|summary)\b"
+)
 _WAIT_BG = re.compile(
     r"\b(?:still )?waiting (?:on|for) (?!" + _NOT_BACKGROUND + r")"
     r"(?:its|their|the|a|my|both|all|each|those|these|that|this|it|them)\b"
+    r"|\b(?:still )?waiting (?:on|for) (?!" + _NOT_BACKGROUND + r")"
+    r"[\w-]+['’]s " + _WORK_OUTPUT +
+    # A short worker label such as F2 / W3 / A10 (people are not named so).
+    r"|\b(?:still )?waiting (?:on|for) [A-Z]{1,3}\d{1,2}\b"
     r"|\bstill (?:running|in progress|executing)\b"
     r"|\bin the background\b"
     r"|\b(?:once|when|after) (?:it|they|both|all|each|those|these|"
@@ -74,12 +87,23 @@ def says_waiting_on_background(text: str) -> bool:
 def task_output_dir(root_transcript) -> Path:
     """Where the CLI writes this session's background-task output files.
 
-    ``<tempdir>/claude/<project dir>/<session id>/tasks``, the directory of
-    every ``<output-file>`` path in the CLI's task notifications.
+    ``<tempdir>/claude/<project dir>/<session id>/tasks`` on Windows, and
+    ``<tempdir>/claude-<uid>/...`` on Linux and macOS (seen 2026-10-20:
+    ``/tmp/claude-1000/-home-.../<sid>/tasks/<id>.output``).  This is the
+    directory of every ``<output-file>`` path in the CLI's task notifications.
+    The per-user name is preferred when it exists.
     """
     root = Path(root_transcript)
-    return (Path(tempfile.gettempdir()) / "claude" / root.parent.name
-            / root.stem / "tasks")
+    tmp = Path(tempfile.gettempdir())
+    names = ["claude"]
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None:
+        names.insert(0, f"claude-{getuid()}")
+    candidates = [tmp / name / root.parent.name / root.stem / "tasks" for name in names]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return candidates[-1]
 
 
 def footprint_last_write(root_transcript) -> float:

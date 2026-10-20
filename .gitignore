@@ -237,6 +237,10 @@ data/jobs.json
 data/jobs.json.*
 data/jobs/
 
+# Session Engine code record — which code the running engine loaded (daemon/engine_code.py)
+data/engine_code.json
+data/.engine_code.*
+
 # Backups
 backups/
 

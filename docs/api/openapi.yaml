@@ -6787,6 +6787,54 @@ paths:
                 type: object
                 additionalProperties: true
 
+  /api/engine/status:
+    get:
+      tags: [Admin]
+      summary: Is the Session Engine running the code on disk
+      operationId: getEngineStatus
+      description: >-
+        Compares the code the running Session Engine loaded (data/engine_code.json,
+        or its start time for an engine too old to write one) with the files on
+        disk. Drives the outdated-engine banner. See app/engine_freshness.py.
+      responses:
+        "200":
+          description: "{ok, running, pid, started_at, has_record, stale, outdated[], restart_armed, waiting_on[]}"
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/engine/restart-when-idle:
+    post:
+      tags: [Admin]
+      summary: Restart the Session Engine once no session is busy
+      operationId: restartEngineWhenIdle
+      description: >-
+        User-initiated only (the outdated-engine banner). Arms or cancels a
+        waiter that restarts the engine once no session is working, asking,
+        writing output, or running a background command. AI agents must never
+        call this.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                arm:
+                  type: boolean
+                  description: true to arm (default), false to cancel
+      responses:
+        "200":
+          description: "{ok, restart_armed}"
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "503":
+          description: Session Engine not connected
+
   /api/admin/claude-update:
     post:
       tags: [Admin]

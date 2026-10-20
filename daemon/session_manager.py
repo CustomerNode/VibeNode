@@ -1017,6 +1017,13 @@ class SessionManager:
                 self._job_supervisor.start()
         except Exception:
             logger.exception("JobSupervisor failed to start (jobs will not be relaunched)")
+        # Record exactly which code this engine loaded, so the web can tell
+        # the user when fixes on disk are not running yet (daemon/engine_code.py).
+        try:
+            from daemon.engine_code import record_loaded_code
+            record_loaded_code()
+        except Exception:
+            logger.exception("Engine code record failed")
 
     def _run_loop(self) -> None:
         """Entry point for the background thread."""

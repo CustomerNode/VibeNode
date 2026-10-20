@@ -343,6 +343,33 @@ def api_scrub_phantoms():
 # — same posture as /api/restart.
 
 
+@bp.route("/api/engine/status", methods=["GET"])
+def api_engine_status():
+    """Is the Session Engine running the code on disk?  See app/engine_freshness.py."""
+    from app import engine_freshness
+    body = engine_freshness.status()
+    if body.get("restart_armed"):
+        body["waiting_on"] = engine_freshness.waiting_on()
+    return jsonify(body)
+
+
+@bp.route("/api/engine/restart-when-idle", methods=["POST"])
+def api_engine_restart_when_idle():
+    """Arm (``{"arm": true}``) or cancel (``{"arm": false}``) a Session Engine
+    restart that fires once no session is busy.  User-initiated only (the
+    outdated-engine banner); AI agents must never call this (CLAUDE.md)."""
+    from app import engine_freshness
+    data = request.get_json(silent=True) or {}
+    if data.get("arm", True):
+        sm = getattr(current_app, "session_manager", None)
+        if sm is None:
+            return jsonify({"ok": False, "error": "Session Engine not connected"}), 503
+        engine_freshness.arm_restart_when_idle(sm)
+    else:
+        engine_freshness.disarm_restart_when_idle()
+    return jsonify({"ok": True, "restart_armed": data.get("arm", True) is not False})
+
+
 @bp.route("/api/admin/claude-status", methods=["GET"])
 def api_claude_status():
     """Return a snapshot of Claude CLI install state.
