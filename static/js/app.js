@@ -2216,6 +2216,9 @@ function openPreferences() {
     {key: 'livescroll', label: 'Auto scroll (default)',
      on: !!(window.ThreadScroll && ThreadScroll.getDefaultLiveScroll()),
      hint: 'Whether sessions follow new output as it arrives. When off, the chat stays where you are and the arrow shows Working, Needs you or Done. The Auto switch on that arrow changes just the session you are in.'},
+    {key: 'classicscroll', label: 'Classic scroll',
+     on: !!(window.ThreadScroll && ThreadScroll.isClassic && ThreadScroll.isClassic()),
+     hint: 'The chat scrolls the way it did before October 14: it follows new output, and a small "N new" pill jumps to the bottom. Replaces the Auto scroll setting while on. Also flipped by the faint double arrow beside the jump button.'},
     {key: 'sticky', label: 'Sticky chats', on: stickyOn,
      hint: 'Keep your most recent message pinned at the top while scrolling long replies.'},
     {key: 'wsd', label: 'Wrong-session detection', on: wsdOn,
@@ -2261,6 +2264,10 @@ function openPreferences() {
           if (window.ThreadScroll) ThreadScroll.setDefaultLiveScroll(on);
           if (typeof _renderLiveScrollAction === 'function') _renderLiveScrollAction();
           showToast('Auto scroll default: ' + (on ? 'On' : 'Off'));
+          break;
+        case 'classicscroll':
+          // thread-scroll-classic.js: the pre-2026-10-14 thread. It shows its own toast.
+          if (window.ThreadScroll && ThreadScroll.setClassic) ThreadScroll.setClassic(on);
           break;
         case 'sticky': {
           if (on) {

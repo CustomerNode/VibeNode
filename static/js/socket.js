@@ -1099,7 +1099,17 @@ socket.on('session_state', (data) => {
         updateLiveInputBar();
         // The working bar appearing/disappearing resizes the log. Keep a
         // caught-up reader pinned; never reveal new content (thread-scroll.js, D).
-        if (window.ThreadScroll) {
+        if (window.vnClassicScroll && vnClassicScroll()) {
+            // [classic] Classic scroll: the pre-2026-10-14 settle (thread-scroll-classic.js).
+            // Settle scroll on state change (working bar appears/disappears).
+            // Route through _autoScrollLiveLog so it top-aligns the most-recent
+            // expanded AI message instead of stomping it back to the bottom.
+            const _logEl = document.getElementById('live-log');
+            if (_logEl && liveAutoScroll) setTimeout(() => {
+                if (typeof _autoScrollLiveLog === 'function') _autoScrollLiveLog(_logEl);
+                else _logEl.scrollTop = _logEl.scrollHeight;
+            }, 100);
+        } else if (window.ThreadScroll) {
             ThreadScroll.refresh();   // jump button label: Working / Needs you / Done
             setTimeout(() => ThreadScroll.holdBottom(), 100);
         }
@@ -1458,7 +1468,12 @@ socket.on('stream_event', (data) => {
 
         // Never follow the stream: new content does not move the reader's view
         // (thread-scroll.js, D). It lights the jump button instead.
-        if (window.ThreadScroll) ThreadScroll.noteNewContent();
+        if (window.vnClassicScroll && vnClassicScroll()) {
+            // [classic] Classic scroll: the pre-2026-10-14 stream follow.
+            if (liveAutoScroll) {
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+        } else if (window.ThreadScroll) ThreadScroll.noteNewContent();
 
         // Reset watchdog — data is flowing
         if (typeof _resetMessageWatchdog === 'function') _resetMessageWatchdog(liveSessionId);
@@ -1682,6 +1697,17 @@ socket.on('session_entry', (data) => {
     // No auto-scroll for a new entry: the reader's view never moves on its own
     // (thread-scroll.js, D). ThreadScroll's MutationObserver sees the append and
     // lights the jump button if it landed below the fold.
+    // [classic] Classic scroll restores the pre-2026-10-14 follow, verbatim.
+    if (window.vnClassicScroll && vnClassicScroll() && liveAutoScroll) {
+        // For a freshly-arrived AI message, top-align it (when taller than the
+        // viewport) so the user can start reading from its first line; for any
+        // other entry, scroll to bottom as usual.
+        if (typeof _autoScrollLiveLog === 'function') {
+            _autoScrollLiveLog(logEl, _isAsstEntry ? _newEntryEl : null);
+        } else {
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+    }
     // ── Sub-agent team tracking ──
     if (data.entry.kind === 'tool_use' && data.entry.name === 'Agent') {
         if (!window._subAgents[data.session_id]) window._subAgents[data.session_id] = {};

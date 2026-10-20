@@ -3144,6 +3144,43 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
   .vn-jump-pill.is-done, .vn-jump-dots i { animation:none; }
 }
 
+/* Classic scroll (thread-scroll-classic.js, 2026-10-20). Its pill is the
+   pre-2026-10-14 "N new" pill: these rules give it back its old look, which the
+   rules above (status colours, fixed 26px height, arrow-only circle) replaced.
+   Scoped to `.vn-classic` so the current design is untouched. The selectors
+   are as specific as the quiet-circle rule above and come after it, so they win. */
+.vn-jump-wrap.vn-classic > .vn-jump-pill.vn-jump-classic {
+  box-sizing:content-box; height:auto; padding:5px 11px; opacity:.82;
+  color: var(--text-faint); border-color: var(--border); font-weight:500;
+}
+.vn-jump-wrap.vn-classic > .vn-jump-pill.vn-jump-classic:hover,
+.vn-jump-wrap.vn-classic > .vn-jump-pill.vn-jump-classic:focus-visible {
+  opacity:1; color: var(--text-secondary); border-color: var(--border-hover);
+}
+.vn-jump-wrap.vn-classic > .vn-jump-pill.vn-jump-classic svg { opacity:.6; }
+/* The old wrapper had the default `align-items` (stretch), which sized the
+   pill to the zero-height wrapper: 12px tall on desktop, 14px on a phone, the
+   text overflowing it. Measured in the pre-10-14 app. That IS the old look,
+   so classic keeps it. */
+.vn-jump-wrap.vn-classic { align-items:normal; }
+.vn-jump-wrap.vn-classic > .vn-scroll-flip { height:12px; }
+.vn-jump-wrap.vn-classic > .vn-scroll-flip::before {
+  content:''; position:absolute; left:-2px; right:-4px; top:-8px; bottom:-8px;
+}
+/* The faint flip control beside either design's button. Deliberately
+   understated: it is for the one person who wants the classic thread. */
+.vn-scroll-flip {
+  position:relative; pointer-events:auto; transform:translateY(-100%);
+  align-self:flex-start; flex-shrink:0;
+  display:inline-flex; align-items:center; justify-content:center;
+  box-sizing:border-box; width:22px; height:26px; margin-left:2px; padding:0;
+  border:none; border-radius:999px; background:transparent;
+  color: var(--text-faint); opacity:.35; cursor:pointer;
+  transition: opacity .15s var(--ease-out), color .15s var(--ease-out);
+}
+.vn-scroll-flip:hover, .vn-scroll-flip:focus-visible { opacity:1; color: var(--text-secondary); }
+.vn-scroll-flip.on { color: var(--accent); }
+
 /* Load older messages pagination button */
 .live-load-more {
   text-align:center; padding:10px 0 14px; position:relative;

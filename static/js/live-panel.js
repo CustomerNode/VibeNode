@@ -793,6 +793,8 @@ function _addOutputCardForPath(filePath) {
     '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>' +
     '</button>';
   logEl.appendChild(card);   // no auto-scroll: new content never moves the view
+  // [classic] Classic scroll restores the pre-2026-10-14 line (thread-scroll-classic.js).
+  if (window.vnClassicScroll && vnClassicScroll()) { if (liveAutoScroll) logEl.scrollTop = logEl.scrollHeight; }
   // Fetch file size asynchronously
   fetch('/api/file-info?path=' + encodeURIComponent(filePath))
     .then(r => r.json())
@@ -2324,6 +2326,13 @@ function _injectDirectiveConflict(data) {
 
     const el = renderLiveEntry(entry);
     logEl.appendChild(el);   // no auto-scroll: the jump button announces it
+    // [classic] Classic scroll restores the pre-2026-10-14 lines (thread-scroll-classic.js).
+    if (window.vnClassicScroll && vnClassicScroll()) {
+      // Auto-scroll if enabled
+      if (liveAutoScroll) {
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+    }
   }
 }
 
@@ -2556,7 +2565,10 @@ function updateLiveInputBar() {
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => liveSubmitContinue(id));
     if (_barHadFocus) { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }
     setTimeout(() => {
-      if (window.ThreadScroll) ThreadScroll.holdBottom();   // bar resized the log
+      if (window.vnClassicScroll && vnClassicScroll()) {   // [classic] the pre-2026-10-14 settle-scroll
+        const logEl = document.getElementById('live-log');
+        if (logEl) _autoScrollLiveLog(logEl);
+      } else if (window.ThreadScroll) ThreadScroll.holdBottom();   // bar resized the log
       const ta = document.getElementById('live-input-ta');
       if (ta) { if (_wantAutofocus && !_barHadFocus) ta.focus(); _initAutoResize(ta); }
     }, 50);
@@ -2617,7 +2629,10 @@ function updateLiveInputBar() {
       if (_barHadFocus) ta.focus();
       _initAutoResize(ta);
       setTimeout(() => {
-        if (window.ThreadScroll) ThreadScroll.holdBottom();   // bar resized the log
+        if (window.vnClassicScroll && vnClassicScroll()) {   // [classic] the pre-2026-10-14 settle-scroll
+          const logEl = document.getElementById('live-log');
+          if (logEl) _autoScrollLiveLog(logEl);
+        } else if (window.ThreadScroll) ThreadScroll.holdBottom();   // bar resized the log
         if (_wantAutofocus && !_barHadFocus) ta.focus();
       }, 50);
     }
@@ -2723,7 +2738,10 @@ function updateLiveInputBar() {
       }, 1000);
     }
     setTimeout(() => {
-      if (window.ThreadScroll) ThreadScroll.holdBottom();   // bar resized the log
+      if (window.vnClassicScroll && vnClassicScroll()) {   // [classic] the pre-2026-10-14 settle-scroll
+        const logEl = document.getElementById('live-log');
+        if (logEl) _autoScrollLiveLog(logEl);
+      } else if (window.ThreadScroll) ThreadScroll.holdBottom();   // bar resized the log
       const ta = document.getElementById('live-input-ta');
       if (ta) { if (_wantAutofocus && !_barHadFocus) ta.focus(); _initAutoResize(ta); }
     }, 50);
@@ -3583,7 +3601,8 @@ function _addOptimisticBubble(sid, text, isVoice, opts) {
   if (!_vnEvent) userMsg.appendChild(vnFooter);   // "sent from" belongs to what the user typed
   userMsg.addEventListener('animationend', () => userMsg.classList.remove('msg-entering'), {once: true});
   logEl.appendChild(userMsg);
-  if (!(opts && opts.passive)) logEl.scrollTop = logEl.scrollHeight;
+  // [classic] Classic scroll: every bubble jumped to the bottom before 2026-10-14.
+  if (!(opts && opts.passive) || (window.vnClassicScroll && vnClassicScroll())) logEl.scrollTop = logEl.scrollHeight;
 }
 
 // ── Optimistic bubble lookup — MUST ignore ThreadScroll's tail nodes ────────

@@ -478,6 +478,18 @@
   /* Selector rows: full 44px touch targets, sitting above the taller bubble. */
   .vn-jump-menu { bottom: 40px; min-width: 220px; }
   .vn-jump-menu-item { min-height: 44px; font-size: 15px; }
+  /* Classic scroll (thread-scroll-classic.js): the old pill's phone size, and
+     the faint flip control with a 44px-tall touch target. */
+  .vn-jump-wrap.vn-classic > .vn-jump-pill.vn-jump-classic { height: auto; padding: 6px 13px; }
+  .vn-scroll-flip { width: 28px; height: 30px; margin-left: 6px; }
+  .vn-jump-wrap.vn-classic > .vn-scroll-flip { height: 14px; }
+  .vn-scroll-flip::before {
+    content: '';
+    position: absolute;
+    left: -2px; right: -6px;
+    top: 50%; transform: translateY(-50%);
+    height: 44px;
+  }
 
   /* ---- Composer: don't touch the edges, respect the home indicator, and cap
      the auto-growing textarea so long input can't push the chat out of view ---
