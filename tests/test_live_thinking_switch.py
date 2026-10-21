@@ -137,11 +137,15 @@ class App:
             "document.querySelector('#workforce-grid .wf-card') !== null", timeout=20000)
         # Freeze the clock here (not before goto): page-load scripts register
         # intervals and non-zero setTimeouts that are harmless but should not
-        # be forced to run during the test's own ``run_for`` windows.  Pause
-        # at the clock's current reading (as an ISO string so Playwright
-        # parses it unambiguously as a wall-clock time) so no stale
-        # page-load timers are flushed by a forward jump.
-        self.page.clock.pause_at(self.page.evaluate("new Date().toISOString()"))
+        # be forced to run during the test's own ``run_for`` windows.
+        # Playwright's ``pause_at`` requires a time at or beyond the clock's
+        # current reading (it refuses "cannot fast-forward to the past"),
+        # and real wall-clock time passes between the ``evaluate`` round-trip
+        # and the ``pause_at`` call, so a plain "now" would race.  Pass a
+        # far-future wall-clock time (year 2100) so Playwright accepts it
+        # unconditionally; after this call the page's clock is frozen and
+        # only ``wait()`` / ``wait_settle()`` moves it forward.
+        self.page.clock.pause_at("2100-01-01T00:00:00Z")
 
     def _route(self, route, request):
         url = request.url
