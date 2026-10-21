@@ -122,13 +122,26 @@ class App:
         self.page = self.ctx.new_page()
         self.page.on("pageerror", lambda e: self.errors.append(str(e)))
         self.page.route("**/*", self._route)
-        # The page's clock is Playwright's: it runs in real time, and wait()
-        # fast-forwards it, firing the same timers in the same order without
-        # sleeping through them (this file used to sleep ~40s per run).
+        # The page's clock is Playwright's.  ``install()`` alone leaves it
+        # ticking in real wall-clock time, so between two Playwright calls
+        # that take >``_TURN_END_SETTLE_MS`` to round-trip (easy under a
+        # parallel pytest run on a loaded machine) the queued-relaunch
+        # settle timer fires BEFORE the test records the user's sleep: a
+        # real race that produced flaky failures of
+        # ``test_sleep_in_the_settle_window_is_never_undone``.  Pause the
+        # clock after page load; only ``wait()`` / ``wait_settle()`` moves
+        # it forward, so timers fire in the order the test schedules them.
         self.page.clock.install()
         self.page.goto(ORIGIN + "/", wait_until="domcontentloaded")
         self.page.wait_for_function(
             "document.querySelector('#workforce-grid .wf-card') !== null", timeout=20000)
+        # Freeze the clock here (not before goto): page-load scripts register
+        # intervals and non-zero setTimeouts that are harmless but should not
+        # be forced to run during the test's own ``run_for`` windows.  Pause
+        # at the clock's current reading (as an ISO string so Playwright
+        # parses it unambiguously as a wall-clock time) so no stale
+        # page-load timers are flushed by a forward jump.
+        self.page.clock.pause_at(self.page.evaluate("new Date().toISOString()"))
 
     def _route(self, route, request):
         url = request.url
