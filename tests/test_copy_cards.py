@@ -55,7 +55,9 @@ def test_route_returns_a_file_in_the_exports_folder(client):
     c, exports, _ = client
     body = "Part 1. Voice rules\n\nNo em-dashes — ever.\n" * 50
     f = exports / "pack.md"
-    f.write_text(body, encoding="utf-8")
+    # newline="" so Windows does not turn \n into \r\n on disk: the route
+    # returns the file byte for byte, and the assertion compares to `body`.
+    f.write_text(body, encoding="utf-8", newline="")
     status, data = _get(c, f)
     assert status == 200
     assert data["ok"] and data["text"] == body and data["name"] == "pack.md"
@@ -66,12 +68,27 @@ def test_route_refuses_anything_outside_the_exports_folder(client):
     c, exports, tmp = client
     secret = tmp / "secret.env"
     secret.write_text("API_KEY=nope\n", encoding="utf-8")
-    link = exports / "innocent.md"
-    os.symlink(secret, link)
-    for path in (secret, f"{exports}/../secret.env", link, "/etc/passwd", "~/.ssh/id_rsa"):
+    for path in (secret, f"{exports}/../secret.env", "/etc/passwd", "~/.ssh/id_rsa"):
         status, data = _get(c, path)
         assert status == 403, (path, status)
         assert not data["ok"] and "text" not in data
+
+
+def test_route_refuses_a_symlink_out_of_the_exports_folder(client):
+    c, exports, tmp = client
+    secret = tmp / "secret.env"
+    secret.write_text("API_KEY=nope\n", encoding="utf-8")
+    link = exports / "innocent.md"
+    try:
+        os.symlink(secret, link)
+    except OSError as e:
+        # Windows without Developer Mode / admin cannot create symlinks
+        # (WinError 1314). The check still runs on Linux, macOS and any
+        # Windows box that allows them.
+        pytest.skip(f"cannot create symlinks here: {e}")
+    status, data = _get(c, link)
+    assert status == 403, (link, status)
+    assert not data["ok"] and "text" not in data
 
 
 def test_route_reports_missing_binary_and_empty(client):

@@ -606,11 +606,13 @@
     var fresh = _hasNew || _newCount > 0;
     var act = _activity();
     var showPill = fresh || !_atBottom;
-    // While live scroll is following a running session the reader sits at the
-    // bottom, where the pill has nothing to jump to. The Auto switch must stay
-    // reachable anyway, or the only way to turn following off would be to
-    // scroll away first. So it shows by itself in that case.
-    var showAuto = showPill || (_liveScroll && act === 'working');
+    // At the bottom the pill has nothing to jump to, so the Auto chip shows by
+    // itself instead. It is PERSISTENT (user request 2026-10-20): it used to
+    // show only while Auto was on and the session working, so turning Auto
+    // off made the chip vanish and left no way to turn it back on. Now it is
+    // there whenever the thread has messages. Only an empty thread shows nothing.
+    var hasThread = !!(_logEl && _logEl.querySelector && _logEl.querySelector('.msg'));
+    var showAuto = showPill || hasThread;
     _renderAuto();   // keep it truthful even while hidden: it can reappear any time
     if (!showAuto) {
       _closeMenu();

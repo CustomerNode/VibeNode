@@ -86,6 +86,7 @@ class FakeEl {
     const cls = sel.replace(/^\./, '');
     return this.children.filter((c) => c.classList.contains(cls));
   }
+  querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
   addEventListener(t, f) { (this._listeners[t] = this._listeners[t] || []).push(f); }
   removeEventListener(t, f) {
     const a = this._listeners[t];
@@ -699,19 +700,32 @@ test('a change made from a menu repaints the pill switch', () => {
   assert.strictEqual(auto.getAttribute('aria-checked'), 'false');
 });
 
-test('with Auto on and the session working, the switch stays reachable at the bottom', () => {
+test('the Auto chip is PERSISTENT at the bottom: turning Auto off never hides it', () => {
   setup();                              // caught up, at the bottom
   global.liveSessionId = 'sess-1';
   global.sessionKinds = { 'sess-1': 'working' };
   try {
-    TS.setLiveScroll(true);
     const wrap = pillWrap(), auto = wrap.children[1];
-    assert.ok(wrap.classList.contains('visible'), 'switch must not vanish while following');
-    assert.strictEqual(pill().style.display, 'none', 'nothing to jump to: pill half hidden');
+    TS.refresh();
+    assert.ok(!wrap.classList.contains('visible'), 'empty thread: nothing to show');
+    tailInView();
+    msg(100, 400);                      // the thread has a message now
+    TS.refresh();
+    assert.ok(wrap.classList.contains('visible'), 'chip shows at the bottom');
+    assert.strictEqual(pill().style.display, 'none', 'nothing to jump to: bubble hidden');
+    assert.strictEqual(auto.style.display, '', 'Auto chip shown instead');
     assert.ok(auto.classList.contains('solo'));
+    TS.setLiveScroll(true);
+    assert.ok(auto.classList.contains('on'));
+    // The reported bug: turning it OFF made the chip vanish for good.
+    auto.dispatch('click', NOEV);
+    assert.strictEqual(TS.isLiveScroll(), false);
+    assert.ok(wrap.classList.contains('visible'), 'still there after turning Auto off');
     global.sessionKinds['sess-1'] = 'idle';
     TS.refresh();
-    assert.ok(!wrap.classList.contains('visible'), 'idle and caught up: nothing shown');
+    assert.ok(wrap.classList.contains('visible'), 'still there when the session is idle');
+    auto.dispatch('click', NOEV);       // and it turns back on from the same chip
+    assert.strictEqual(TS.isLiveScroll(), true);
   } finally {
     TS.setLiveScroll(false);
     delete global.liveSessionId; delete global.sessionKinds;
