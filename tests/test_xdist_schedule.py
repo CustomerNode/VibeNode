@@ -101,12 +101,49 @@ def test_a_waiting_worker_is_reoffered_work_when_any_test_finishes():
     waiting = _Node()
     s.assigned_work[waiting] = {}
     last = f"tests/test_b{HEAVY_CAP}.py"
+    s.registered_collections[waiting] = [last + "::a"]  # waits only after collecting
     s.workqueue[last] = {last + "::a": False}
     s._queue_ordered = True
     offered = []
     s._reschedule = lambda n: offered.append(n)
     s.mark_test_complete(busy[0], 0)
     assert busy[0] in offered and waiting in offered
+
+
+class _Worker(_Node):
+    def __init__(self):
+        self.sent = []
+
+    def send_runtest_some(self, indexes):
+        self.sent.append(list(indexes))
+
+    def shutdown(self):
+        self.shutting_down = True
+
+
+def test_a_replacement_worker_is_not_given_work_before_it_has_collected():
+    """2026-10-23: a worker crashed, xdist started a replacement, and the next
+    finished test re-offered work to it before its collection arrived.  The
+    real xdist path raised KeyError on registered_collections and aborted the
+    whole run with an INTERNALERROR instead of reporting one crashed test."""
+    s = _sched(sources={"tests/test_a.py": "", "tests/test_b.py": "", "tests/test_c.py": ""})
+    s.log = lambda *a: None
+    s.registered_collections = {}
+    busy = _Worker()
+    s.assigned_work[busy] = {"tests/test_a.py": {"tests/test_a.py::x": False}}
+    s.registered_collections[busy] = ["tests/test_a.py::x", "tests/test_b.py::y",
+                                      "tests/test_c.py::z"]
+    replacement = _Worker()
+    s.assigned_work[replacement] = {}  # added, not collected yet
+    s.workqueue["tests/test_b.py"] = {"tests/test_b.py::y": False}
+    s.workqueue["tests/test_c.py"] = {"tests/test_c.py::z": False}
+    s._queue_ordered = True
+    s.mark_test_complete(busy, 0)  # must not raise
+    assert replacement.sent == [] and not replacement.shutting_down
+    # The busy worker, which has collected, still gets the next unit, and the
+    # other stays queued for the replacement.
+    assert busy.sent == [[1]]
+    assert list(s.workqueue) == ["tests/test_c.py"]
 
 
 def test_splittable_files_split_into_contiguous_chunks_and_others_stay_whole():

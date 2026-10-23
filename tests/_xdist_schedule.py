@@ -152,7 +152,21 @@ class DurationOrderedLoadFileScheduling(LoadFileScheduling):
                 return scope
         return None
 
+    def _idle_and_ready(self, node) -> bool:
+        """A worker that has no work left and can be given some.
+
+        A worker xdist starts to replace a crashed one is in ``assigned_work``
+        before its collection is in ``registered_collections``; work sent to
+        it then is a KeyError that aborts the whole run (seen 2026-10-23: one
+        worker's native crash turned into an INTERNALERROR).  It gets its
+        first work from ``schedule()`` once its collection arrives."""
+        return (not node.shutting_down
+                and node in self.registered_collections
+                and self._pending_of(self.assigned_work[node]) == 0)
+
     def _assign_work_unit(self, node) -> None:
+        if node not in self.registered_collections:
+            return  # not collected yet; schedule() offers it work once it is
         # Units are sent as indexes into each worker's own collection, which
         # stays as collected; only the QUEUE is reordered here.
         if not getattr(self, "_queue_ordered", False):
@@ -173,8 +187,7 @@ class DurationOrderedLoadFileScheduling(LoadFileScheduling):
         # queue, which shuts idle workers down): re-offer work to every
         # worker that has none.
         for other in list(self.assigned_work):
-            if (other is not node and not other.shutting_down
-                    and self._pending_of(self.assigned_work[other]) == 0):
+            if other is not node and self._idle_and_ready(other):
                 self._reschedule(other)
 
     def remove_node(self, node):
@@ -182,6 +195,6 @@ class DurationOrderedLoadFileScheduling(LoadFileScheduling):
         # A worker that crashed or finished may have held a browser slot;
         # without this, workers waiting for one would hear nothing more.
         for other in list(self.assigned_work):
-            if not other.shutting_down and self._pending_of(self.assigned_work[other]) == 0:
+            if self._idle_and_ready(other):
                 self._reschedule(other)
         return crashitem
