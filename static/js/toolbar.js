@@ -544,7 +544,7 @@ function _buildHomepageContent() {
         <div class="hp-viz">
           <div class="hp-dots">${dotGridHtml}</div>
         </div>
-        <div class="hp-stat" id="hp-workforce-stat">${_wfc ? `${agentCount} agent${agentCount !== 1 ? 's' : ''} &middot; ${deptCount} department${deptCount !== 1 ? 's' : ''}` : '<span class="skel-shimmer" style="display:inline-block;width:120px;height:13px;border-radius:4px;vertical-align:middle;"></span>'}</div>
+        <div class="hp-stat" id="hp-workforce-stat">${_wfc ? (deptCount ? `${agentCount} agent${agentCount !== 1 ? 's' : ''} &middot; ${deptCount} department${deptCount !== 1 ? 's' : ''}` : 'Not set up in this project') : '<span class="skel-shimmer" style="display:inline-block;width:120px;height:13px;border-radius:4px;vertical-align:middle;"></span>'}</div>
         <div class="hp-cta">Open Workforce <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>
       </div>
 

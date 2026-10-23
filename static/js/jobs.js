@@ -132,7 +132,8 @@
     _needsLoading = true;
     fetch('/api/jobs').then(function (r) { return r.ok ? r.json() : null; }).then(function (j) {
       var jobs = (j && j.ok && Array.isArray(j.jobs)) ? j.jobs : [];
-      _needsCount = jobs.filter(function (x) { return x && (x.state === 'needs_person' || x.state === 'failed'); }).length;
+      // A job the person dismissed (Leave it) no longer needs them.
+      _needsCount = jobs.filter(function (x) { return x && !x.acknowledged && (x.state === 'needs_person' || x.state === 'failed'); }).length;
     }).catch(function () { _needsCount = 0; }).then(function () {
       _needsLoading = false;
       if (typeof viewMode !== 'undefined' && viewMode === 'homepage'
@@ -202,7 +203,8 @@
 
   function renderList(container, jobs) {
     if (Array.isArray(jobs)) {   // the list already read: keep the homepage count in step
-      _needsCount = jobs.filter(function (x) { return x && (x.state === 'needs_person' || x.state === 'failed'); }).length;
+      // A job the person dismissed (Leave it) no longer needs them.
+      _needsCount = jobs.filter(function (x) { return x && !x.acknowledged && (x.state === 'needs_person' || x.state === 'failed'); }).length;
     }
     if (!jobs || !jobs.length) {
       container.innerHTML = '<div class="vn-job-empty">No durable jobs registered on this machine. The run-detached skill registers one for every long job it launches.</div>';
