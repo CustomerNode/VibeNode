@@ -339,11 +339,21 @@ def reset_rate_limit() -> None:
 # ── config ───────────────────────────────────────────────────────────────────
 
 def auth_enabled() -> bool:
-    """``mobile_command_auth`` in kanban_config.json, default on."""
+    """``mobile_command_auth`` in kanban_config.json, default OFF.
+
+    Off by the owner's decision (2026-10-23): every device on the tailnet is
+    the owner's, and pairing each phone was friction with no benefit to them.
+    With it off, any tailnet device reaches the app without a code, exactly
+    as before pairing existed. What stays on regardless: ``@local_only``
+    routes (anything that runs a command or opens a desktop program answers
+    only this machine) and the Socket.IO Origin check (a web page on another
+    site cannot drive sessions). Set ``"mobile_command_auth": true`` to
+    require pairing.
+    """
     try:
-        return bool(get_kanban_config().get(CONFIG_KEY, True))
+        return bool(get_kanban_config().get(CONFIG_KEY, False))
     except Exception:
-        return True
+        return False
 
 
 # ── the gate ─────────────────────────────────────────────────────────────────

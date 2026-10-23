@@ -39,9 +39,10 @@ def _port_from_request() -> int:
 
 
 def _with_pairing(st: dict) -> dict:
-    """Add the pairing code and one-tap link for a LOCAL caller only: the code
+    """Add the pairing code and one-tap link for a LOCAL caller, and only when
+    pairing is switched on (``mobile_command_auth``; off by default): the code
     pairs further devices, so a paired phone does not get to read it."""
-    if mobile_auth.request_is_local():
+    if mobile_auth.auth_enabled() and mobile_auth.request_is_local():
         st.update(mobile_auth.pairing_view(base_url=st.get("url")))
     else:
         st["auth_enabled"] = mobile_auth.auth_enabled()

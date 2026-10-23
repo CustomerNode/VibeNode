@@ -40,7 +40,11 @@ def auth(tmp_path, monkeypatch):
     from app import create_app, mobile_auth
 
     cfg = tmp_path / "kanban_config.json"
-    cfg.write_text(json.dumps({"kanban_backend": "sqlite"}), encoding="utf-8")
+    # Pairing is OFF by default (2026-10-23, the owner's decision); these tests
+    # exercise the gate, so they switch it on. test_pairing_is_off_by_default
+    # covers the default.
+    cfg.write_text(json.dumps({"kanban_backend": "sqlite", "mobile_command_auth": True}),
+                   encoding="utf-8")
     monkeypatch.setattr(config_mod, "_KANBAN_CONFIG_FILE", cfg)
     config_mod._kanban_config_cache = None
     monkeypatch.setattr(mobile_auth, "PAIR_FILE", tmp_path / "data" / "mobile_pair.json")
@@ -567,3 +571,22 @@ def test_auth_login_is_local_only():
     r = c.post("/api/auth-login", environ_base={"REMOTE_ADDR": "100.64.0.7"},
                headers={"X-Forwarded-For": "100.64.0.7", "Tailscale-User-Login": "x@y"})
     assert r.status_code in (401, 403)
+
+
+# ── default: pairing off ─────────────────────────────────────────────────────
+
+def test_pairing_is_off_by_default(auth):
+    """With no ``mobile_command_auth`` in the config, a phone on the tailnet
+    reaches pages and the API with no code, the modal shows no code, and the
+    local-only routes still refuse it."""
+    import app.config as config_mod
+    _app, client, mobile_auth = auth
+    data = json.loads(config_mod._KANBAN_CONFIG_FILE.read_text(encoding="utf-8"))
+    data.pop("mobile_command_auth", None)
+    config_mod._KANBAN_CONFIG_FILE.write_text(json.dumps(data), encoding="utf-8")
+    config_mod._kanban_config_cache = None
+    assert mobile_auth.auth_enabled() is False
+    assert client.get("/api/sessions", headers=PHONE).status_code != 401
+    page = client.get("/", headers=PHONE_PAGE)
+    assert page.status_code == 200
+    assert client.post("/api/open-file", json={"path": "x"}, headers=PHONE).status_code == 403
