@@ -145,8 +145,12 @@ socket.on('permission_policy_loaded', (data) => {
             customPolicies = data.custom_rules;
             localStorage.setItem('customPolicies', JSON.stringify(data.custom_rules));
         }
-        // Refresh permission UI if it exists
-        if (typeof renderPermissionPanel === 'function') renderPermissionPanel();
+        // Redraw the sidebar's policy button. It may already have been drawn
+        // from this browser's localStorage, which can differ from the policy
+        // the server enforces. (This used to call a renderPermissionPanel()
+        // that never existed, so the button kept the stale local value.)
+        const permEl = document.getElementById('sidebar-perm-panel');
+        if (permEl && typeof _buildPermissionPanel === 'function') permEl.innerHTML = _buildPermissionPanel();
     }
 });
 

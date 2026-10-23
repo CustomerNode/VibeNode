@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 from flask import request as flask_request
@@ -150,6 +151,51 @@ def _is_tailnet_turn(data: dict) -> bool:
     except Exception:
         pass
     return False
+
+
+_POLICY_CHANGE_LOG = Path(__file__).resolve().parents[2] / "logs" / "permission_policy.log"
+
+
+def _describe_client() -> str:
+    """Who sent this socket event, as far as the request can tell.
+
+    remote_addr alone is useless for phones (tailscale serve proxies them to
+    127.0.0.1), so the Tailscale identity header and Host come first."""
+    parts = []
+    try:
+        login = flask_request.headers.get("Tailscale-User-Login")
+        if login:
+            parts.append("tailnet=" + login)
+        host = flask_request.host or ""
+        if host:
+            parts.append("host=" + host)
+        parts.append("addr=" + (flask_request.remote_addr or "?"))
+        ua = flask_request.headers.get("User-Agent") or ""
+        if ua:
+            parts.append("ua=" + ua[:160])
+        sid = getattr(flask_request, "sid", None)
+        if sid:
+            parts.append("sid=" + str(sid))
+    except Exception:
+        pass
+    return " ".join(parts) or "unknown"
+
+
+def _record_policy_change(old: str, new: str, source: str) -> None:
+    """Write one line per permission-policy change to logs/permission_policy.log.
+
+    The policy applies to every device, and before this nothing recorded who
+    changed it (a Claude Auto save on 2026-10-14 went untraced for nine days)."""
+    line = "%s  %s -> %s  via=%s  %s" % (
+        time.strftime("%Y-%m-%d %H:%M:%S"), old or "?", new, source or "?",
+        _describe_client())
+    logger.info("Permission policy change: %s", line)
+    try:
+        _POLICY_CHANGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(_POLICY_CHANGE_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        logger.warning("Could not write %s: %s", _POLICY_CHANGE_LOG, e)
 
 
 def _with_mobile_preamble(text: str) -> str:
@@ -1177,8 +1223,14 @@ def register_ws_events(socketio, app):
             return
 
         sm = app.session_manager
+        try:
+            old = (sm.get_permission_policy() or {}).get('policy', '')
+        except Exception:
+            old = ''
         sm.set_permission_policy(policy, custom_rules)
-        logger.debug("Permission policy synced: %s", policy)
+        source = str(data.get('source') or '')[:40]
+        if old != policy or source == 'custom_rules':
+            _record_policy_change(old, policy, source)
 
     @socketio.on('get_ui_prefs')
     def handle_get_ui_prefs():

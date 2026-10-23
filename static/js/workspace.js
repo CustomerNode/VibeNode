@@ -699,9 +699,10 @@ function _buildPermissionPanel() {
     manual: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
     almost_always: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
     auto: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
+    claude_auto: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l1.8 5.4L19 9l-5.2 1.6L12 16l-1.8-5.4L5 9l5.2-1.6z"/></svg>',
     custom: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9"/></svg>',
   };
-  const policyLabels = {auto: 'Auto-Approve', manual: 'Manual', almost_always: 'Auto Approve Most', custom: 'Custom Rules'};
+  const policyLabels = {auto: 'Auto-Approve', manual: 'Manual', almost_always: 'Auto Approve Most', claude_auto: 'Claude Auto', custom: 'Custom Rules'};
 
   let html = '<div class="kanban-sidebar-section">';
   html += '<div class="kanban-sidebar-label">Permissions</div>';
@@ -972,7 +973,7 @@ function setPermissionPolicy(policy) {
 
   // Sync to backend for server-side auto-approve
   if (typeof socket !== 'undefined') {
-    socket.emit('set_permission_policy', { policy: policy, customRules: customPolicies });
+    socket.emit('set_permission_policy', { policy: policy, customRules: customPolicies, source: 'picker' });
   }
 
   // If switching to auto, approve all current queue items
@@ -1033,7 +1034,7 @@ function saveCustomPolicies() {
 
   // Sync to backend for server-side auto-approve
   if (typeof socket !== 'undefined') {
-    socket.emit('set_permission_policy', { policy: permissionPolicy, customRules: customPolicies });
+    socket.emit('set_permission_policy', { policy: permissionPolicy, customRules: customPolicies, source: 'custom_rules' });
   }
 
   _closePm();
