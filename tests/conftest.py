@@ -324,6 +324,38 @@ _atexit.register(_kill_spawned_hosts)
 
 
 @pytest.fixture(autouse=True)
+def _forbid_real_auth_login(request, monkeypatch):
+    """No test may open a real ``claude auth login`` window.
+
+    ``/api/auth-login`` starts the Claude CLI's login in a visible terminal,
+    which opens a browser sign-in page. On 2026-10-23 a test that called the
+    route for real opened four of them on the owner's desktop during suite
+    runs. The route's Popen is replaced with one that fails the test.
+    """
+    try:
+        from app.routes import auth_api
+    except Exception:
+        yield
+        return
+
+    import subprocess as _real_subprocess
+    import types
+
+    def _refuse(*args, **kwargs):
+        raise AssertionError(
+            f"TEST {request.node.nodeid} tried to launch `claude auth login` for real. "
+            "Check the route's guard with a test_request_context instead.")
+
+    # Replace the module auth_api sees, not subprocess itself: every other
+    # caller of subprocess.Popen in the process is untouched.
+    fake = types.SimpleNamespace(**{k: getattr(_real_subprocess, k)
+                                    for k in dir(_real_subprocess) if not k.startswith("__")})
+    fake.Popen = _refuse
+    monkeypatch.setattr(auth_api, "subprocess", fake)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_engine_data_dir(tmp_path_factory, monkeypatch):
     """Point the engine's per-session durable state at a sandbox.
 

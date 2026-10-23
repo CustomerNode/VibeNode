@@ -363,12 +363,49 @@ def request_is_authorized(lenient_xff: bool = False) -> bool:
     return request_is_local(ignore_xff=lenient_xff) or has_valid_cookie()
 
 
+def _via_mobile_command() -> bool:
+    """The request arrived through ``tailscale serve`` (Mobile Command): the
+    tailnet identity header or a ``.ts.net`` host.  The preview proxy marks
+    only ``X-Forwarded-For``, so a request it relays does NOT count, and a
+    page from another site is refused by its Origin."""
+    try:
+        h = request.headers
+        host = (request.host or "").lower()
+        if not (h.get("Tailscale-User-Login") or host.endswith(".ts.net") or ".ts.net:" in host):
+            return False
+        origin = h.get("Origin")
+        if origin:
+            o = (urlsplit(origin).hostname or "").lower()
+            if not (o in _LOOPBACK_HOSTS or o.endswith(".ts.net")):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def request_is_owner() -> bool:
+    """This machine, or one of the owner's devices through Mobile Command.
+
+    The owner wants his phone to do everything the computer can (2026-10-23).
+    So a device on the tailnet counts as the owner's, and when pairing is on
+    (``mobile_command_auth``) it must also carry a valid pairing cookie.
+    """
+    if request_is_local():
+        return True
+    if not _via_mobile_command():
+        return False
+    return (not auth_enabled()) or has_valid_cookie()
+
+
 def local_only(view):
-    """Only this machine may call the route, whatever the config says.
+    """Only the owner may call the route: this machine, or his phone through
+    Mobile Command (``request_is_owner``).
 
     For anything that runs a command or starts a desktop program. Refuses
-    with 403 ``local_only``. The gate skips routes carrying this mark, so a
-    phone gets this answer and not the pairing one.
+    with 403 ``local_only`` everything else: the preview proxy relaying a
+    request, a web page from another site, or (with pairing on) an unpaired
+    device. The gate skips routes carrying this mark, so a refused device gets
+    this answer and not the pairing one.
     """
     @functools.wraps(view)
     def wrapped(*args, **kwargs):
@@ -383,11 +420,11 @@ def local_only(view):
 def require_local():
     """Inline form of ``local_only`` for a handler that is local-only on some
     inputs only (``/api/restart`` with a scope other than ``web``). Returns
-    the 403 response to send, or None when the caller is local."""
-    if request_is_local():
+    the 403 response to send, or None when the caller is the owner."""
+    if request_is_owner():
         return None
     return jsonify(ok=False, error="local_only",
-                   message="This action is only available from the computer running VibeNode."), 403
+                   message="This action is only available from your own devices."), 403
 
 
 def _gate():

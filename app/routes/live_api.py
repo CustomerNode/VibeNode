@@ -1892,10 +1892,10 @@ def api_file_drop():
     target = Path(target_dir).resolve()
     if not _is_within_home(target):
         return jsonify({"error": "Target directory must be within home"}), 403
-    # A paired device (a phone on the tailnet) may only write into the active
-    # project or data/uploads. The folder picker that chooses any folder under
-    # home is a desktop feature, and a local caller keeps it.
-    if not _mobile_auth.request_is_local() and not _is_remote_drop_target(target):
+    # The owner's devices (this machine, or his phone through Mobile Command)
+    # may drop into any folder under home. Anything else may only write into
+    # the active project or data/uploads.
+    if not _mobile_auth.request_is_owner() and not _is_remote_drop_target(target):
         return jsonify({"error": "From a paired device, files can only be dropped into "
                                  "the active project or data/uploads"}), 403
 

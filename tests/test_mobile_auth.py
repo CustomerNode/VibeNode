@@ -234,21 +234,6 @@ def test_the_pair_page_posts_as_a_form_without_javascript(auth):
     assert client.get("/api/sessions", headers=PHONE).status_code == 200
 
 
-def test_only_a_local_caller_rotates_the_code(auth):
-    _app, client, mobile_auth = auth
-    before = mobile_auth.pair_code()
-    _pair(client, mobile_auth)
-    resp = client.post("/api/pair/rotate", headers=PHONE)
-    assert resp.status_code == 403 and resp.get_json()["error"] == "local_only"
-    assert mobile_auth.pair_code() == before
-
-    resp = client.post("/api/pair/rotate")
-    body = resp.get_json()
-    assert resp.status_code == 200 and body["ok"] is True
-    assert body["pair_code"] == mobile_auth.pair_code() != before
-    assert body["pair_code_display"] == mobile_auth.display_code(body["pair_code"])
-
-
 def test_the_modal_sees_the_code_only_from_this_machine(auth, monkeypatch):
     _app, client, mobile_auth = auth
     from app import mobile_command
@@ -268,47 +253,7 @@ def test_the_modal_sees_the_code_only_from_this_machine(auth, monkeypatch):
 
 # ── the emergency switch ────────────────────────────────────────────────────
 
-def test_mobile_command_auth_false_opens_the_gate_but_not_local_only(auth):
-    _app, client, mobile_auth = auth
-    _set_config(None, mobile_command_auth=False)
-    assert mobile_auth.auth_enabled() is False
-    assert client.get("/api/sessions", headers=PHONE).status_code == 200
-    assert client.get("/", headers=PHONE).status_code == 200
-    assert client.get("/pair", headers=PHONE).status_code == 302
-    resp = client.post("/api/open-file", json={"path": "x"}, headers=PHONE)
-    assert resp.status_code == 403 and resp.get_json()["error"] == "local_only"
-    resp = client.post("/api/shutdown", headers=PHONE)
-    assert resp.status_code == 403 and resp.get_json()["error"] == "local_only"
-
-
 # ── local-only routes ───────────────────────────────────────────────────────
-
-def test_install_pack_and_open_file_are_refused_to_a_paired_phone(auth):
-    _app, client, mobile_auth = auth
-    _pair(client, mobile_auth)
-    with patch("app.routes.live_api.subprocess", create=True) as sp:
-        resp = client.post("/api/workforce/install-pack",
-                           json={"pack_id": "x", "git_url": "https://example.com/x.git", "setup_cmd": "calc"},
-                           headers=PHONE_PAGE)
-        assert resp.status_code == 403 and resp.get_json()["error"] == "local_only"
-        assert not sp.Popen.called and not sp.run.called
-    resp = client.post("/api/open-file", json={"path": str(Path.home() / "x.txt")}, headers=PHONE_PAGE)
-    assert resp.status_code == 403 and resp.get_json()["error"] == "local_only"
-
-
-def test_shutdown_and_engine_restart_are_local_only_web_restart_is_not(auth):
-    _app, client, mobile_auth = auth
-    _pair(client, mobile_auth)
-    with patch("app.routes.main.subprocess.Popen") as popen:
-        assert client.post("/api/shutdown", headers=PHONE_PAGE).status_code == 403
-        for scope in ("daemon", "both"):
-            resp = client.post("/api/restart", json={"scope": scope}, headers=PHONE_PAGE)
-            assert resp.status_code == 403 and resp.get_json()["error"] == "local_only", scope
-        assert not popen.called
-        resp = client.post("/api/restart", json={"scope": "web"}, headers=PHONE_PAGE)
-        assert resp.status_code == 200 and resp.get_json()["ok"] is True
-        assert popen.call_count == 1
-
 
 def test_local_callers_still_use_the_local_only_routes(auth):
     _app, client, _ = auth
@@ -318,36 +263,6 @@ def test_local_callers_still_use_the_local_only_routes(auth):
         assert popen.call_count == 2
     resp = client.post("/api/open-file", json={"path": str(Path.home() / "nope.txt")})
     assert resp.status_code == 404, "past the guard: the route's own answer"
-
-
-def test_a_paired_phone_may_drop_files_only_into_the_project_or_uploads(auth, tmp_path, monkeypatch):
-    import io
-    _app, client, mobile_auth = auth
-    _pair(client, mobile_auth)
-    project = Path.home() / "proj"          # projects live under home; the home check still runs first
-    project.mkdir()
-    monkeypatch.setattr("app.routes.live_api._get_project_path", lambda: project)
-    elsewhere = Path.home() / "elsewhere"
-    elsewhere.mkdir()
-
-    def drop(target):
-        return client.post("/api/file-drop", data={"file": (io.BytesIO(b"x"), "a.txt"), "target_dir": str(target)},
-                           content_type="multipart/form-data", headers=PHONE_PAGE)
-
-    resp = drop(elsewhere)
-    assert resp.status_code == 403 and "paired device" in resp.get_json()["error"]
-    assert list(elsewhere.iterdir()) == []
-    resp = drop(project)
-    assert resp.status_code == 200 and (project / "a.txt").read_bytes() == b"x"
-    # data/uploads: checked on the helper (in tests the repo is outside the
-    # sandboxed home, so the route's home check would refuse it first).
-    from app.routes.live_api import _is_remote_drop_target
-    assert _is_remote_drop_target((ROOT / "data" / "uploads" / "sub").resolve()) is True
-    assert _is_remote_drop_target(elsewhere.resolve()) is False
-    # a local caller keeps the folder picker
-    resp = client.post("/api/file-drop", data={"file": (io.BytesIO(b"y"), "b.txt"), "target_dir": str(elsewhere)},
-                       content_type="multipart/form-data")
-    assert resp.status_code == 200
 
 
 def test_the_script_rule_is_unchanged(auth):
@@ -564,15 +479,6 @@ def test_supabase_credentials_reuse_saved_key_only_for_the_saved_url(monkeypatch
     assert creds({"supabase_url": "https://abc.supabase.co", "supabase_secret_key": "new-key"})[1] == "new-key"
 
 
-def test_auth_login_is_local_only():
-    from app import create_app
-    app = create_app(testing=True)
-    c = app.test_client()
-    r = c.post("/api/auth-login", environ_base={"REMOTE_ADDR": "100.64.0.7"},
-               headers={"X-Forwarded-For": "100.64.0.7", "Tailscale-User-Login": "x@y"})
-    assert r.status_code in (401, 403)
-
-
 # ── default: pairing off ─────────────────────────────────────────────────────
 
 def test_pairing_is_off_by_default(auth):
@@ -590,3 +496,82 @@ def test_pairing_is_off_by_default(auth):
     page = client.get("/", headers=PHONE_PAGE)
     assert page.status_code == 200
     assert client.post("/api/open-file", json={"path": "x"}, headers=PHONE).status_code == 403
+
+
+# ── the owner's phone does everything (2026-10-23) ──────────────────────────
+# The owner wants his phone to do everything the computer can. A device that
+# arrives through Mobile Command counts as his (paired too, when pairing is
+# on). Still refused: the preview proxy relaying a request (it marks only
+# X-Forwarded-For), a web page from another site, and an unpaired device
+# while pairing is on.
+
+PROXY_RELAY = {"X-Forwarded-For": "127.0.0.1"}     # what /api/preview/proxy adds
+EVIL_PAGE = dict(PHONE, Origin="https://evil.example")
+
+
+def test_a_paired_phone_runs_install_pack_open_file_and_rotates(auth):
+    _app, client, mobile_auth = auth
+    _pair(client, mobile_auth)
+    with patch("app.routes.live_api.subprocess", create=True) as sp:
+        sp.run.return_value.returncode = 0
+        resp = client.post("/api/workforce/install-pack",
+                           json={"pack_id": "x", "git_url": "https://example.com/x.git"},
+                           headers=PHONE_PAGE)
+        assert resp.get_json().get("error") != "local_only"
+    resp = client.post("/api/open-file", json={"path": str(Path.home() / "nope.txt")}, headers=PHONE_PAGE)
+    assert resp.get_json().get("error") != "local_only"
+    before = mobile_auth.pair_code()
+    resp = client.post("/api/pair/rotate", headers=PHONE)
+    assert resp.status_code == 200 and mobile_auth.pair_code() != before
+
+
+def test_a_paired_phone_passes_the_guard_restart_and_shutdown_use(auth):
+    """/api/restart (any scope) and /api/shutdown call require_local(); check
+    the decision directly so the test never runs a real restart."""
+    app, client, mobile_auth = auth
+    mobile_auth.pair_code()
+    hdrs = dict(PHONE_PAGE, Cookie=f"{mobile_auth.COOKIE_NAME}={mobile_auth.cookie_value()}")
+    with app.test_request_context("/api/restart", method="POST", headers=hdrs):
+        assert mobile_auth.require_local() is None
+    with app.test_request_context("/api/restart", method="POST", headers=PHONE_PAGE):
+        assert mobile_auth.require_local() is not None      # unpaired, pairing on
+    _set_config(None, mobile_command_auth=False)
+    with app.test_request_context("/api/shutdown", method="POST", headers=PHONE_PAGE):
+        assert mobile_auth.require_local() is None
+
+
+def test_with_pairing_off_the_phone_needs_no_code_for_anything(auth):
+    _app, client, mobile_auth = auth
+    _set_config(None, mobile_command_auth=False)
+    assert client.get("/api/sessions", headers=PHONE).status_code == 200
+    resp = client.post("/api/open-file", json={"path": str(Path.home() / "nope.txt")}, headers=PHONE)
+    assert resp.get_json().get("error") != "local_only"
+    # /api/auth-login really opens a Claude login window: never call it from a
+    # test. Check the guard it uses instead (2026-10-23: calling it here opened
+    # four login windows on the owner's desktop).
+    with _app.test_request_context("/api/auth-login", method="POST", headers=PHONE):
+        assert mobile_auth.require_local() is None
+
+
+def test_a_phone_may_drop_files_into_any_folder_under_home(auth):
+    import io
+    _app, client, mobile_auth = auth
+    _pair(client, mobile_auth)
+    elsewhere = Path.home() / "elsewhere"
+    elsewhere.mkdir()
+    resp = client.post("/api/file-drop", data={"file": (io.BytesIO(b"x"), "a.txt"), "target_dir": str(elsewhere)},
+                       content_type="multipart/form-data", headers=PHONE_PAGE)
+    assert resp.status_code == 200 and (elsewhere / "a.txt").read_bytes() == b"x"
+
+
+def test_still_refused_proxy_relay_foreign_page_and_unpaired_device(auth):
+    _app, client, mobile_auth = auth
+    # pairing on (fixture), not paired
+    resp = client.post("/api/open-file", json={"path": "x"}, headers=PHONE_PAGE)
+    assert resp.status_code == 403 and resp.get_json()["error"] == "local_only"
+    _set_config(None, mobile_command_auth=False)
+    for headers in (PROXY_RELAY, EVIL_PAGE):
+        resp = client.post("/api/open-file", json={"path": "x"}, headers=headers)
+        assert resp.status_code == 403 and resp.get_json()["error"] == "local_only", headers
+        resp = client.post("/api/restart", json={"scope": "daemon"}, headers=headers)
+        assert resp.status_code == 403, headers
