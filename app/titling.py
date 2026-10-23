@@ -706,6 +706,86 @@ def _heuristic_title(messages: list) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
+def collect_title_messages(path, session: dict | None = None) -> list:
+    """Return the messages a transcript offers for titling.
+
+    This is the exact source ``POST /api/autonname`` uses when no prompt text
+    is supplied: ``load_session()`` messages that carry content, and, when
+    that yields nothing, a raw scan of the JSONL for the first user text
+    (``queue-operation`` entries or a user entry's text blocks).  Exposed so
+    the background namer (``app/auto_namer.py``) titles from the same input
+    as the route.  *session* is an already-loaded ``load_session()`` result,
+    to spare a second parse.  Returns ``[]`` for an unreadable or empty
+    transcript.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    from .sessions import load_session
+
+    path = _Path(path)
+    messages: list = []
+    try:
+        if session is None:
+            session = load_session(path)
+        messages = [m for m in session.get("messages", []) if m.get("content")]
+    except Exception as e:
+        log.debug("collect_title_messages: load_session failed for %s: %s", path, e)
+        messages = []
+    if messages:
+        return messages
+    try:
+        with open(path, encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if not _line:
+                    continue
+                try:
+                    _entry = _json.loads(_line)
+                except Exception:
+                    continue
+                _t = _entry.get("type", "")
+                # queue-operation entries contain the original user prompt
+                if _t == "queue-operation" and _entry.get("content"):
+                    messages.append({"role": "user", "content": _entry["content"]})
+                    break
+                # user entries may have content in message.content blocks
+                if _entry.get("role") == "user":
+                    mc = _entry.get("message", {}).get("content", [])
+                    if isinstance(mc, list):
+                        for block in mc:
+                            if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                                messages.append({"role": "user", "content": block["text"]})
+                                break
+                    if messages:
+                        break
+    except Exception:
+        pass
+    return messages
+
+
+def cheap_title(messages: list) -> str | None:
+    """The free path: the local heuristic, accepted only when it passes the
+    same validator an LLM title must pass (2-8 words, under 80 chars, shares
+    a word with the source).  Returns ``None`` when the heuristic produces
+    something loose, so the caller falls back to ``smart_title`` (daemon /
+    API / CLI).  Used by the bulk namer, where a thousand LLM calls is the
+    cost being avoided."""
+    texts = _extract_user_texts(messages)
+    if not texts:
+        return None
+    title = _heuristic_title(messages)
+    if not title or title == "Untitled Session":
+        return None
+    # A first clause the heuristic had to cut at its character cap is a
+    # sentence fragment ("You are the drafting agent of a <pipeline>"),
+    # not a title, even when the fragment fits the validator's 8 words.  And
+    # every prompt sharing that opening would get the same fragment.
+    first = _to_title(texts[0])
+    if first and title.startswith(first) and first != _to_title(texts[0], max_chars=10**6):
+        return None
+    return _validate_llm_title(title, texts)
+
+
 def smart_title(messages: list) -> str:
     """Generate a session title.
 

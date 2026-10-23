@@ -860,6 +860,40 @@ header h1 { font-family: 'Space Grotesk', sans-serif; font-size: var(--fs-4xl); 
 .sidebar-search-btn .sidebar-search-icon { position: static; transform: none; flex-shrink: 0; color: inherit; }
 .sidebar-search-btn span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* Session filter bar (2026-10-23): title filter + state/date chips over the
+   session cards and list (app.js "Session filters"). */
+.session-filter-bar { display: flex; flex-direction: column; gap: 6px; padding: 2px 0 4px; }
+.session-filter-bar[hidden] { display: none; }
+.session-typeahead {
+  width: 100%; box-sizing: border-box;
+  background: var(--bg-tertiary); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  padding: 5px 9px; font: inherit; font-size: var(--fs-md);
+}
+.session-typeahead:focus { outline: none; border-color: var(--accent); }
+.session-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.session-chip {
+  background: none; border: 1px solid var(--border); border-radius: 999px;
+  color: var(--text-muted); font: 500 var(--fs-xs) var(--font-sans);
+  padding: 2px 9px; cursor: pointer; white-space: nowrap;
+  transition: color .12s, background .12s, border-color .12s;
+}
+.session-chip:hover { color: var(--text-secondary); border-color: var(--border-hover); }
+.session-chip.active {
+  color: var(--text-heading); border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+.session-name-untitled {
+  align-self: flex-start; background: none; border: 1px dashed var(--border-hover);
+  border-radius: var(--r-sm); color: var(--text-secondary);
+  font: 500 var(--fs-xs) var(--font-sans); padding: 3px 9px; cursor: pointer;
+}
+.session-name-untitled:hover { color: var(--text-heading); border-color: var(--accent); }
+.session-name-untitled[hidden] { display: none; }
+.session-name-untitled:disabled { opacity: .5; cursor: default; }
+/* End of a windowed list/grid: scrolling it into view renders the next rows. */
+.session-window-sentinel { flex-basis: 100%; grid-column: 1 / -1; height: 1px; width: 100%; }
+
 #sidebar-perm-panel {
   flex-shrink: 0;
 }
@@ -3015,6 +3049,18 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
   transition:opacity .16s var(--ease-out);
 }
 .vn-jump-wrap.visible { opacity:1; visibility:visible; }
+/* Reserve room for the pill at the END of the thread (2026-10-23).  The pill
+   is lifted out of its zero-height wrapper with translateY(-100%), so at the
+   true bottom it sat ON the final message: .msg's 24px margin-bottom was 2px
+   short of the 26px pill, and tool/output entries have less.  Padding on the
+   log cannot fix this: the wrapper sits right after the last child, so the
+   pill overlaps the message wherever the padding ends up.  A flow gap before
+   the wrapper does: the pill lands in the gap.  Sticky `bottom` is untouched,
+   so the pill's position while scrolled up is exactly what it was.
+   Scoped away from the classic pill (thread-scroll-classic.js), which keeps
+   its pre-2026-10-14 geometry by design.  Phones override the variable
+   (mobile.css) because their pill is taller. */
+.live-log > .vn-jump-wrap:not(.vn-classic) { margin-top: var(--vn-jump-reserve, 40px); }
 /* Quiet by default (content below, nothing new): muted text, hairline border,
    translucent blurred fill so thread content reads through it. `.has-new`
    below turns it into the loud accent version. */
@@ -6551,7 +6597,11 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
 
 .kanban-column {
   flex: 1;
-  min-width: 160px;
+  /* 240px, not 160px (2026-10-23): five columns at 1280px squeezed to ~230px
+     each and card titles wrapped one word per line.  The wrapper scrolls
+     horizontally (.kanban-columns-wrapper overflow-x:auto), so a narrow
+     window scrolls instead of crushing the columns. */
+  min-width: 240px;
   display: flex;
   flex-direction: column;
   background: none;
@@ -14300,3 +14350,45 @@ header #git-badge-push svg, header #git-badge-pull svg, header #git-badge-sync s
 @keyframes vtf-label { from { opacity: 0; letter-spacing: 12px; filter: blur(4px); } to { opacity: .85; letter-spacing: 4px; filter: blur(0); } }
 @keyframes vtf-hint { from { opacity: 0; letter-spacing: 4px; filter: blur(3px); } to { opacity: .5; letter-spacing: 1px; filter: blur(0); } }
 html.vn-theme-swapping *:not(.vn-theme-flash), html.vn-theme-swapping *::before, html.vn-theme-swapping *::after { transition: none !important; }
+
+/* ── Homepage: what needs you (2026-10-23) ──
+   The Sessions card's "Needs you" / "Running" lists and the status strip under
+   the project name (markup: _buildHomepageContent / _hpStatusStrip in
+   toolbar.js).  Shown on every screen, unlike the desktop-only .hpx-nums. */
+.hpn { display: flex; flex-direction: column; margin: 6px 0 16px; text-align: left; }
+.hpn-hd { margin: 14px 0 4px; font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--text-faint); }
+.hpn-list { display: flex; flex-direction: column; margin: 0 -10px; }
+.hpn-row { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; gap: 11px; align-items: center; min-height: 36px; padding: 0 10px; border-radius: 9px; cursor: pointer; }
+.hpn-row:hover { background: rgba(var(--bt, 128,128,128), .07); }
+.hpn-row .t { font-size: 13.5px; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hpn-row .d { font-size: 11.5px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.hpn-row .hpx-ico { width: 14px; height: 14px; background: currentColor; color: var(--text-faint); -webkit-mask: var(--src) center / contain no-repeat; mask: var(--src) center / contain no-repeat; }
+.hpn-row .hpx-ico.working { --src: url(/static/svg/pickaxe.svg); color: var(--accent); }
+.hpn-row .hpx-ico.question, .hpn-row .hpx-ico.unread { -webkit-mask: none; mask: none; border-radius: 50%; width: 8px; height: 8px; margin: 0 3px; }
+.hpn-row .hpx-ico.question { background: #d97706; }
+.hpn-row .hpx-ico.unread { background: var(--accent); }
+.hpn-empty { margin: 14px 0 4px; font-size: 13.5px; color: var(--text-secondary); }
+.hp-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; margin: -10px 0 18px; font-size: 12px; color: var(--text-muted); }
+@media (min-width: 769px) { .hp-strip { max-width: 1180px; width: 100%; box-sizing: border-box; margin: -12px auto 22px; padding: 0 10px; } }
+.hps-item { display: inline-flex; align-items: center; gap: 7px; font: inherit; color: inherit; background: none; border: 0; padding: 0; }
+.hps-usage:has(.usage-limits-pill[hidden]) { display: none; }
+.hps-lbl { font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--text-faint); }
+button.hps-item { cursor: pointer; text-decoration: underline; text-underline-offset: 3px; text-decoration-color: rgba(var(--bt, 128,128,128), .25); }
+button.hps-item:hover { color: var(--text-heading); }
+.hps-jobs { color: #d97706; }
+.hps-engine { color: #d29922; }
+
+/* ── System → Settings → Recovery & Watchdog (2026-10-23, read-only; markup: openRecoveryWatchdog in modals.js) ── */
+.rw-intro p { margin: 0; }
+.rw-list { margin-top: 10px; }
+.rw-group { margin: 0 0 16px; }
+.rw-group-label { font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--text-faint); margin: 0 0 6px; }
+details.rw-internal > summary { cursor: pointer; }
+.rw-row { padding: 7px 0; border-top: 1px solid var(--border); }
+.rw-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.rw-name { font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px; color: var(--text-primary); }
+.rw-value { font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px; color: var(--text-secondary); margin-left: auto; }
+.rw-unset { color: var(--text-faint); font-style: italic; }
+.rw-set { font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 6px; background: var(--accent); color: #fff; }
+.rw-desc { font-size: 12px; color: var(--text-muted); margin-top: 3px; line-height: 1.45; }
+.rw-empty { padding: 18px; text-align: center; color: var(--text-muted); font-size: 13px; }

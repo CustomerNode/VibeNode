@@ -3,8 +3,12 @@ Mobile Visual Channel — capture + serving backend.
 
 Turns a URL into something a phone on the tailnet can actually see:
 
-  POST /api/preview/render      {url,name,width,height} -> headless-Chrome PNG,
-                                 returns {ok,id,src,name,type:"image"}
+  POST /api/preview/render      {url,name,width,height,wait_ms} -> PNG via
+                                 Playwright device emulation (phone widths lay
+                                 out as a phone), falling back to the Chrome
+                                 CLI (min 500px wide, says so in "note");
+                                 returns {ok,id,src,name,type:"image",renderer,
+                                 viewport[,note]}
   GET  /api/preview/asset/<id>  serve a rendered PNG (opaque id, dir-scoped)
   GET  /api/preview/thumb/<id>  downscaled JPEG of a render, for gallery tiles
                                  (falls back to the full PNG without Pillow)
@@ -109,6 +113,56 @@ def _clamp(v, lo, hi, default):
         return default
 
 
+# Headless Chrome's `--window-size` has a hard floor of 500px wide: a request
+# for 390x844 is laid out at 500px and the PNG is cropped, so every "phone"
+# screenshot was a desktop layout with its right edge cut off (2026-10-23:
+# this produced a false "text is clipped on phones" finding in a UX review).
+# Playwright emulates a device instead (viewport, scale factor, touch, mobile
+# UA), so the page lays out at the requested width. The Chrome CLI path stays
+# as the fallback for machines without Playwright, clamped and labelled.
+_CHROME_MIN_WIDTH = 500
+_MOBILE_MAX_WIDTH = 600   # at or below this, emulate a phone (touch + mobile UA)
+_MOBILE_DEVICE = "iPhone 13"
+
+
+def _render_with_playwright(url: str, out: Path, width: int, height: int, wait_ms: int):
+    """Render with Playwright device emulation. Returns a dict describing the
+    render, or None when Playwright (or its browser) is unavailable so the
+    caller falls back to the Chrome CLI. Exceptions from a page that will not
+    load are re-raised with a short message."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:  # noqa: BLE001 — optional dependency
+        return None
+    mobile = width <= _MOBILE_MAX_WIDTH
+    try:
+        with sync_playwright() as p:
+            try:
+                browser = p.chromium.launch(headless=True)
+            except Exception as e:  # noqa: BLE001 — browser not installed: fall back
+                _log.info("preview: playwright chromium unavailable (%s); using Chrome CLI", e)
+                return None
+            try:
+                ctx_opts = {}
+                if mobile:
+                    ctx_opts.update(p.devices.get(_MOBILE_DEVICE, {}))
+                ctx_opts["viewport"] = {"width": width, "height": height}
+                ctx_opts.setdefault("device_scale_factor", 2 if mobile else 1)
+                ctx = browser.new_context(**ctx_opts)
+                page = ctx.new_page()
+                page.goto(url, wait_until="load", timeout=30000)
+                if wait_ms:
+                    page.wait_for_timeout(wait_ms)
+                page.screenshot(path=str(out), full_page=False)
+                return {"renderer": "playwright", "mobile": mobile,
+                        "viewport": {"width": width, "height": height},
+                        "device_scale_factor": ctx_opts["device_scale_factor"]}
+            finally:
+                browser.close()
+    except Exception as e:  # noqa: BLE001 — surfaced to the caller as a 500
+        raise RuntimeError(str(e).splitlines()[0][:300] if str(e) else "playwright render failed")
+
+
 @bp.route("/api/preview/render", methods=["POST"])
 def render():
     """Headless-render a URL to a PNG the phone can fetch."""
@@ -125,13 +179,32 @@ def render():
     # bug). Caller can raise it for slow/heavy pages. Default 3s; capped at 20s.
     wait_ms = _clamp(data.get("wait_ms"), 0, 20000, 3000)
 
-    chrome = _find_chrome()
-    if not chrome:
-        return jsonify({"ok": False, "error": "Chrome/Chromium not found on this machine"}), 500
-
     _PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
     pid = uuid.uuid4().hex
     out = _PREVIEW_DIR / (pid + ".png")
+
+    try:
+        meta = _render_with_playwright(url, out, width, height, wait_ms)
+    except RuntimeError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    if meta is not None:
+        if not out.exists() or out.stat().st_size == 0:
+            return jsonify({"ok": False, "error": "render produced no image"}), 500
+        resp = {"ok": True, "id": pid, "src": "/api/preview/asset/" + pid,
+                "file": str(out), "bytes": out.stat().st_size,
+                "name": name, "type": "image"}
+        resp.update(meta)
+        return jsonify(resp)
+
+    chrome = _find_chrome()
+    if not chrome:
+        return jsonify({"ok": False, "error": "Chrome/Chromium not found on this machine"}), 500
+    note = ""
+    if width < _CHROME_MIN_WIDTH:
+        note = ("width %d clamped to %d: the Chrome CLI cannot lay out narrower windows; "
+                "install Playwright (pip install playwright && playwright install chromium) "
+                "for real phone-width renders" % (width, _CHROME_MIN_WIDTH))
+        width = _CHROME_MIN_WIDTH
     cmd = [
         chrome, "--headless=new", "--disable-gpu", "--hide-scrollbars",
         "--no-first-run", "--no-default-browser-check",
@@ -155,9 +228,13 @@ def render():
         return jsonify({"ok": False, "error": (r.stderr or "render failed")[:300]}), 500
     # `file` is the absolute path so the agent can OPEN the PNG and visually verify
     # it captured real content before emitting a preview marker (see mobile preamble).
-    return jsonify({"ok": True, "id": pid, "src": "/api/preview/asset/" + pid,
-                    "file": str(out), "bytes": out.stat().st_size,
-                    "name": name, "type": "image"})
+    resp = {"ok": True, "id": pid, "src": "/api/preview/asset/" + pid,
+            "file": str(out), "bytes": out.stat().st_size,
+            "name": name, "type": "image", "renderer": "chrome",
+            "viewport": {"width": width, "height": height}}
+    if note:
+        resp["note"] = note
+    return jsonify(resp)
 
 
 @bp.route("/api/preview/asset/<pid>")

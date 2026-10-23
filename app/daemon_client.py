@@ -46,6 +46,74 @@ _PROFILE_IPC = True
 HEARTBEAT_INTERVAL = 20   # seconds between ping probes
 HEARTBEAT_TIMEOUT = 8     # seconds to wait for a ping response
 
+# ----------------------------------------------------------------------
+# IPC protocol (see PROTOCOL_VERSION in daemon/daemon_server.py)
+# ----------------------------------------------------------------------
+# The engine outlives web restarts and app updates, so this proxy routinely
+# talks to an engine older than itself.  On connect it reads the engine's
+# ``ping`` (protocol version + method list).  A method the engine does not
+# list is answered locally with an "unavailable" result instead of being sent.
+# An engine that predates the handshake (its ping has no version: version 0,
+# methods unknown) is still sent everything, and its "Unknown method" reply is
+# translated into the same result.
+EXPECTED_PROTOCOL_VERSION = 1
+
+# Every RPC this proxy sends.  Kept equal to the ``_send_request("...")``
+# literals in this file by tests/test_daemon_protocol.py, so skew logging
+# compares against what the web really uses.
+CLIENT_RPCS = frozenset({
+    "start_session", "send_message", "resolve_permission", "interrupt_session",
+    "set_session_model", "set_session_effort", "cancel_auto_retry", "retry_now",
+    "close_session", "close_session_sync", "remove_session", "save_registry_now",
+    "get_all_states", "get_entries", "get_entry_count", "get_entry_trim_status",
+    "has_session", "get_session_state", "get_dormant_states",
+    "get_permission_policy", "set_permission_policy", "get_ui_prefs",
+    "set_ui_prefs", "hook_pre_tool", "queue_message",
+    "get_queue", "remove_queue_item", "edit_queue_item", "clear_queue",
+    "get_aliases", "get_subsession_meta", "mark_inbox_dirty",
+    "orphan_children_of", "detect_rewind_orphans", "reanchor_subsession",
+    "detach_subsession", "set_auto_report_on_idle", "ping",
+})
+
+_UNKNOWN_METHOD_PREFIX = "Unknown method"
+
+
+def _unavailable(method, detail=""):
+    """The result for a method the running engine does not have.
+
+    ``error`` keeps the "Unknown method" wording so any caller that matched
+    on it before still matches; ``live_unavailable`` is what callers should
+    test.
+    """
+    return {
+        "ok": False,
+        "live_unavailable": True,
+        "unavailable_method": method,
+        "error": detail or (f"{_UNKNOWN_METHOD_PREFIX}: {method} (the running "
+                            "Session Engine predates it)"),
+    }
+
+
+def _remap_kanban_links(old_id, new_id):
+    """Point kanban task<->session links at a session's adopted CLI id.
+    Idempotent (an UPDATE), so several connected web servers may all run it.
+    Never raises."""
+    try:
+        from .db import create_repository
+        create_repository().remap_session(old_id, new_id)
+    except Exception as e:
+        logger.debug("Kanban link remap %s -> %s failed: %s", old_id, new_id, e)
+
+
+def _as_unavailable(method, result):
+    """Translate an engine's raw "Unknown method" error into ``_unavailable``.
+    Idempotent; any other result passes through unchanged."""
+    if (isinstance(result, dict) and result.get("ok") is False
+            and not result.get("live_unavailable")
+            and str(result.get("error", "")).startswith(_UNKNOWN_METHOD_PREFIX)):
+        return _unavailable(method, str(result.get("error")))
+    return result
+
 
 def _enable_tcp_keepalive(sock):
     """Enable SO_KEEPALIVE with aggressive Linux/macOS timing.
@@ -114,6 +182,10 @@ class DaemonClient:
         # potentially-blocking socketio.emit() call so that IPC response
         # processing is never delayed by WebSocket write latency.
         self._emit_queue = queue.Queue()
+        # What the connected engine speaks, from its ``ping`` (see
+        # protocol_info).  None until the first successful ping.
+        self._protocol = None
+        self._protocol_logged = None
 
     def start(self, socketio, app=None) -> None:
         """Connect to daemon and start the event reader.
@@ -172,6 +244,85 @@ class DaemonClient:
         return self._connected
 
     # ------------------------------------------------------------------
+    # Protocol handshake
+    # ------------------------------------------------------------------
+
+    def protocol_info(self) -> dict:
+        """What the connected engine speaks.
+
+        ``{"known": bool, "protocol_version": int, "methods": [..] | None,
+        "pid": int | None, "engine_started_at": float | None}``.  ``known`` is
+        False before the first ping.  An engine that predates the handshake
+        reports version 0 and ``methods`` None (unknown, not empty).
+        """
+        p = getattr(self, "_protocol", None)
+        if not p:
+            return {"known": False, "protocol_version": 0, "methods": None,
+                    "pid": None, "engine_started_at": None}
+        methods = p.get("methods")
+        return {
+            "known": True,
+            "protocol_version": p.get("protocol_version", 0),
+            "methods": sorted(methods) if methods is not None else None,
+            "pid": p.get("pid"),
+            "engine_started_at": p.get("engine_started_at"),
+        }
+
+    def supports(self, method: str) -> bool:
+        """True unless the engine is known not to have ``method``.
+
+        Optimistic when the method list is unknown (no ping yet, or an engine
+        that predates the handshake): the call is sent, and an "Unknown
+        method" reply is translated by ``_send_request``.
+        """
+        p = getattr(self, "_protocol", None)
+        methods = p.get("methods") if p else None
+        if methods is None:
+            return True
+        return method in methods
+
+    def _note_protocol(self, ping_result) -> None:
+        """Record an engine ``ping`` reply; log one line when it shows skew."""
+        if not (isinstance(ping_result, dict) and ping_result.get("ok") is True):
+            return
+        raw = ping_result.get("methods")
+        methods = frozenset(m for m in raw if isinstance(m, str)) if isinstance(raw, list) else None
+        try:
+            version = int(ping_result.get("protocol_version", 0) or 0)
+        except (TypeError, ValueError):
+            version = 0
+        self._protocol = {
+            "protocol_version": version,
+            "methods": methods,
+            "pid": ping_result.get("pid"),
+            "engine_started_at": ping_result.get("engine_started_at"),
+        }
+        # One line per distinct engine shape, not one per heartbeat.
+        signature = (version, methods, ping_result.get("pid"))
+        if signature == getattr(self, "_protocol_logged", None):
+            return
+        self._protocol_logged = signature
+        missing = sorted(CLIENT_RPCS - methods) if methods is not None else None
+        if version != EXPECTED_PROTOCOL_VERSION or missing:
+            logger.warning(
+                "Session Engine protocol skew: engine v%s (pid %s), web expects v%s; "
+                "methods the web uses that the engine lacks: %s",
+                version, ping_result.get("pid"), EXPECTED_PROTOCOL_VERSION,
+                ", ".join(missing) if missing else
+                ("unknown (engine predates the handshake)" if missing is None else "none"),
+            )
+        else:
+            logger.info("Session Engine protocol v%s (pid %s), %d methods",
+                        version, ping_result.get("pid"), len(methods or ()))
+
+    def _refresh_protocol(self) -> None:
+        """Ping the engine and record what it speaks.  Never raises."""
+        try:
+            self._note_protocol(self._send_request("ping", timeout=HEARTBEAT_TIMEOUT))
+        except Exception as e:
+            logger.debug("Protocol handshake failed: %s", e)
+
+    # ------------------------------------------------------------------
     # Connection management
     # ------------------------------------------------------------------
 
@@ -204,7 +355,11 @@ class DaemonClient:
                 self._sock = sock
                 self._connected = True
                 logger.info("Connected to session daemon on port %d", DAEMON_PORT)
+                # A (re)connect may reach a different engine: forget what the
+                # last one spoke until this one answers a ping.
+                self._protocol = None
                 if resync:
+                    self._refresh_protocol()
                     self._resync_aliases()
                     self._resync_policy()
                 return
@@ -224,6 +379,7 @@ class DaemonClient:
         """
         # Brief pause to let the reader thread enter its recv() loop
         time.sleep(0.05)
+        self._refresh_protocol()
         self._resync_aliases()
         self._resync_policy()
 
@@ -383,6 +539,8 @@ class DaemonClient:
             try:
                 result = self._send_request("ping", timeout=HEARTBEAT_TIMEOUT)
                 ok = isinstance(result, dict) and result.get("ok") is True
+                if ok:
+                    self._note_protocol(result)
             except Exception as e:
                 logger.debug("Heartbeat ping raised: %s", e)
                 ok = False
@@ -428,7 +586,12 @@ class DaemonClient:
         if not self._connected:
             return {"ok": False, "error": "Not connected to session daemon",
                     "disconnected": True}
+        if method != "ping" and not self.supports(method):
+            return _unavailable(method)
+        return _as_unavailable(method, self._send_request_raw(method, params, timeout))
 
+    def _send_request_raw(self, method, params=None, timeout=30):
+        """One request/response round trip, no protocol handling."""
         req_id = uuid.uuid4().hex[:8]
         if _PROFILE_IPC:
             _t0 = time.perf_counter()
@@ -550,6 +713,11 @@ class DaemonClient:
             new_id = data.get("new_id", "")
             if old_id and new_id:
                 self._id_aliases[old_id] = new_id
+                # Kanban task<->session links live in the web's database, so
+                # the web remaps them (the engine used to open the DB itself).
+                # Off the reader thread: a Supabase backend is a network call.
+                threading.Thread(target=_remap_kanban_links, args=(old_id, new_id),
+                                 daemon=True, name="kanban-remap").start()
             if old_id in self._planner_ids:
                 self._planner_ids.add(new_id)
                 _mark_utility(new_id)
@@ -703,18 +871,15 @@ class DaemonClient:
 
         The Session Engine keeps running across web-server restarts and app
         updates, so this proxy often talks to a daemon started before the
-        method existed.  That daemon answers "Unknown method"; it is reported
-        as ``live_unavailable`` so the browser relaunches the session's CLI
-        with ``--effort`` once no turn is running, exactly as it did before
-        the live change existed.
+        method existed.  ``_send_request`` reports any method such an engine
+        lacks as ``live_unavailable`` (generically, for every method), so the
+        browser relaunches the session's CLI with ``--effort`` once no turn
+        is running, exactly as it did before the live change existed.
         """
-        result = self._send_request("set_session_effort", {
-            "session_id": session_id, "effort": effort,
-        })
-        if isinstance(result, dict) and not result.get("ok") \
-                and "Unknown method" in str(result.get("error", "")):
-            return {"ok": False, "live_unavailable": True,
-                    "error": "The Session Engine predates live thinking changes"}
+        result = _as_unavailable("set_session_effort", self._send_request(
+            "set_session_effort", {"session_id": session_id, "effort": effort}))
+        if isinstance(result, dict) and result.get("live_unavailable"):
+            return dict(result, error="The Session Engine predates live thinking changes")
         return result
 
     def cancel_auto_retry(self, session_id):

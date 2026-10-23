@@ -5,6 +5,7 @@ let _currentFolderId = null;  // null = root
 
 // ── In-memory cache + server persistence ──────────────────────────────
 let _folderTreeCache = null;  // in-memory cache; null = not loaded yet
+let _folderTreeLoaded = false; // initFolderTree has answered (a null cache then means "no tree")
 let _saveDebounceTimer = null;
 var _SAVE_DEBOUNCE_MS = 500;
 
@@ -43,6 +44,34 @@ function loadFolderTree() { return _loadFolderTree(); }
 function saveFolderTree(tree) { _saveFolderTree(tree); }
 function getFolderTree() { return _loadFolderTree(); }
 
+/** The Workforce counts, from the one source both the homepage card and the
+ *  Workforce view header read: the installed department tree.
+ *  departments = top-level folders, subDepartments = every folder below them,
+ *  agents = folders that carry an agent/skill definition.  null until the tree
+ *  has loaded, so callers can show "loading" instead of a wrong zero; all zero
+ *  when it loaded and there is none (the view then shows no departments). */
+function workforceCounts(tree) {
+  tree = tree || _loadFolderTree();
+  if (!tree || !tree.folders) return _folderTreeLoaded ? { departments: 0, subDepartments: 0, agents: 0 } : null;
+  const roots = tree.rootChildren || [];
+  let subDepartments = 0;
+  const seen = new Set();
+  const walk = (ids) => {
+    for (const fid of ids || []) {
+      const id = typeof fid === 'string' ? fid : (fid && fid.id);
+      const f = id && tree.folders[id];
+      if (!f || seen.has(id)) continue;
+      seen.add(id);
+      subDepartments += (f.children || []).length;
+      walk(f.children || []);
+    }
+  };
+  walk(roots);
+  let agents = 0;
+  for (const id of seen) if (tree.folders[id].skill) agents++;
+  return { departments: roots.length, subDepartments, agents };
+}
+
 // ── Initialize from server ────────────────────────────────────────────
 
 async function initFolderTree() {
@@ -52,6 +81,7 @@ async function initFolderTree() {
       var data = await resp.json();
       if (data && typeof data === 'object' && (data.version || data.activeTemplate || data.folders)) {
         _folderTreeCache = data;
+        _folderTreeLoaded = true;
         return data;
       }
     }
@@ -60,6 +90,7 @@ async function initFolderTree() {
   }
   // No tree on server — start with empty tree (templates available in Configure mode)
   _folderTreeCache = null;
+  _folderTreeLoaded = true;
   return null;
 }
 

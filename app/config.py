@@ -18,6 +18,9 @@ from pathlib import Path
 
 import os as _os
 
+from common.paths import encode_cwd as _common_encode_cwd  # noqa: E402
+from common.paths import resolve_sessions_dir as _resolve_sessions_dir  # noqa: E402
+
 _CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 _active_project: str = ""   # encoded dir name; empty = auto-detect
 _VIBENODE_DIR = Path(__file__).resolve().parent.parent  # always the VibeNode repo
@@ -134,133 +137,50 @@ def _cleanup_aititle_orphans() -> int:
                 except Exception:
                     pass
     return removed
-# Allow tests to override config path via env var
-_KANBAN_CONFIG_FILE = Path(_os.environ["VIBENODE_CONFIG"]) if _os.environ.get("VIBENODE_CONFIG") else _VIBENODE_DIR / "kanban_config.json"
-
-
-# PERF-CRITICAL: Kanban config cache with 10s TTL + invalidation on save — do NOT remove. See CLAUDE.md #11.
-#
-# LESSON LEARNED (2026-04-12): get_kanban_config() is called on every session
-# start (to check cross_session_awareness preference) and from many API routes.
-# It reads kanban_config.json from disk via read_text() + json.loads() every
-# time.  The cache eliminates redundant disk reads.  save_kanban_config() sets
-# _kanban_config_cache = None so writes are immediately visible.  Returns
-# dict(cached) shallow copies because callers in kanban_api.py mutate the
-# returned dict (e.g., cfg["kanban_backend"] = ...) — without the copy, they'd
-# corrupt the cache.
 # ---------------------------------------------------------------------------
-# Kanban config store
+# Kanban config store: lives in common/config.py (shared with the Session
+# Engine, which must not import this package).  PERF-CRITICAL #11 (the 10s
+# cache + invalidation on save) is implemented THERE; do not re-implement it
+# here.  The module-level state (``_KANBAN_CONFIG_FILE`` and the cache fields)
+# is forwarded, reads and writes, so ``app.config._KANBAN_CONFIG_FILE = x``,
+# ``app.config._kanban_config_cache = None`` and monkeypatching either still
+# act on the one real cache.
 # ---------------------------------------------------------------------------
+from common import config as _common_config  # noqa: E402
+from common.config import (  # noqa: E402, F401
+    get_kanban_config,
+    save_kanban_config,
+    _kanban_config_defaults,
+)
 
-_kanban_config_cache: dict | None = None
-_kanban_config_cache_time: float = 0.0
-_KANBAN_CONFIG_CACHE_TTL = 10.0  # seconds
-
-
-def get_kanban_config() -> dict:
-    """Load kanban configuration from kanban_config.json.
-
-    Missing keys are filled from defaults so callers always see the full set.
-    Results are cached with a 10-second TTL.  The cache is invalidated
-    immediately on save so writes are never stale.
-    """
-    global _kanban_config_cache, _kanban_config_cache_time
-    now = time.monotonic()
-    if _kanban_config_cache is not None and (now - _kanban_config_cache_time) < _KANBAN_CONFIG_CACHE_TTL:
-        return dict(_kanban_config_cache)  # shallow copy — callers may mutate
-    try:
-        stored = json.loads(_KANBAN_CONFIG_FILE.read_text(encoding="utf-8"))
-        merged = _kanban_config_defaults()
-        merged.update(stored)
-        # Migrate old key
-        if "kanban_auto_advance" in stored and "auto_advance_to_validating" not in stored:
-            merged["auto_advance_to_validating"] = bool(stored["kanban_auto_advance"])
-        _kanban_config_cache = merged
-        _kanban_config_cache_time = time.monotonic()
-        return dict(merged)
-    except Exception:
-        result = _kanban_config_defaults()
-        _kanban_config_cache = result
-        _kanban_config_cache_time = time.monotonic()
-        return dict(result)
+_FORWARDED_TO_COMMON_CONFIG = frozenset({
+    "_KANBAN_CONFIG_FILE",
+    "_kanban_config_cache",
+    "_kanban_config_cache_time",
+    "_KANBAN_CONFIG_CACHE_TTL",
+})
 
 
-def _kanban_config_defaults() -> dict:
-    return {
-        "kanban_backend": "sqlite",
-        "supabase_url": "",
-        "supabase_secret_key": "",
-        "supabase_publishable_key": "",
-        "kanban_depth_limit": 5,
-        # ── Browser launch preferences ──
-        # How the VibeNode shortcut opens the app in Chrome:
-        #   "tab" (default) — a normal tab in the user's everyday Chrome profile,
-        #                     so VibeNode lives alongside their other tabs. This
-        #                     is how VibeNode behaved for most of its history.
-        #   "app"           — isolated Chrome app window on its own profile
-        #                     (--app= + --user-data-dir=). See CLAUDE.md item 18
-        #                     for the two bugs it fixes; opt in if you hit them.
-        "browser_launch_mode": "tab",
-        # ── Behavior preferences ──
-        # Session starts → task moves to Working
-        "auto_start_on_session": True,
-        # Child Working → parent moves from Not Started to Working
-        "auto_parent_working": True,
-        # Child Remediating → parent reverts from Complete to Remediating
-        "auto_parent_reopen": True,
-        # All children/sessions done → task moves to Validating
-        "auto_advance_to_validating": False,
-        # ── AI autonomy preferences ──
-        # AI sessions can change task statuses (working, validating, etc.)
-        "ai_can_modify_status": True,
-        # AI planner / sessions can mark tasks as complete
-        "ai_can_mark_complete": True,
-        # ── Cross-session awareness ──
-        # Inject other active sessions' names/status/files into system prompts
-        "cross_session_awareness": True,
-        # Warn before sending a prompt that seems unrelated to the current session
-        "wrong_session_detection": True,
-        # ── Validation URL preferences ──
-        "validation_url_enabled": False,
-        "validation_base_url": "",
-        "validation_url_dismissed": False,
-        # ── Performance preferences ──
-        # File tracking snapshots every source file's mtime each turn for
-        # undo/rewind support.  Disable to speed up sessions on large repos.
-        "file_tracking_enabled": True,
-        # ── Large-session performance ──
-        # Backend-only, no UI.  See docs/plans/large-session-perf.md.  These
-        # govern the lossless stale-media eviction that runs ONLY in the
-        # pre-`--resume` executor pass (never per-turn).  Old inline image
-        # payloads are externalized to ~/.claude/session-env/<sid>/vibenode-media/
-        # (content-addressed by sha256, fully recoverable) and replaced in the
-        # replayed transcript by a short text placeholder, shrinking both the
-        # bytes the CLI reads and the stale vision tokens the model re-attends.
-        #
-        # Master switch for WS1 (inline-image eviction) + WS2 (toolUseResult
-        # de-dup).  Disabling reverts to pure repair behavior with no code change.
-        "large_session_media_eviction": True,
-        # K = number of recent user turns whose images stay inline for the model
-        # (active screenshot→fix→screenshot loops are never degraded).  Older
-        # images are externalized.
-        "large_session_media_keep_recent_turns": 4,
-        # WS2: also externalize the provably-redundant `toolUseResult.file.base64`
-        # duplicate even for images still inside the recent-K window (the model
-        # only ever replays the inline `source.data` copy; toolUseResult is
-        # auxiliary metadata the CLI never feeds back).  Independently switchable.
-        "large_session_dedup_recent_tooluseresult": True,
-    }
+def __getattr__(name):
+    if name in _FORWARDED_TO_COMMON_CONFIG:
+        return getattr(_common_config, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def save_kanban_config(config: dict) -> None:
-    """Save kanban configuration to kanban_config.json."""
-    global _kanban_config_cache, _kanban_config_cache_time
-    _KANBAN_CONFIG_FILE.write_text(
-        json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-    # Invalidate cache so the next read sees the new values immediately
-    _kanban_config_cache = None
-    _kanban_config_cache_time = 0.0
+class _ForwardingConfigModule(type(sys)):
+    def __setattr__(self, name, value):
+        if name in _FORWARDED_TO_COMMON_CONFIG:
+            setattr(_common_config, name, value)
+        else:
+            super().__setattr__(name, value)
+
+    def __delattr__(self, name):
+        if name in _FORWARDED_TO_COMMON_CONFIG:
+            raise AttributeError(f"{name} is forwarded to common.config and cannot be deleted")
+        super().__delattr__(name)
+
+
+sys.modules[__name__].__class__ = _ForwardingConfigModule
 
 
 # ---------------------------------------------------------------------------
@@ -314,86 +234,19 @@ def _sessions_dir(project: str = "") -> Path:
 
     When *project* is provided (encoded dir name), use it directly.
     Otherwise fall back to the global ``_active_project``, then auto-detect.
-
-    Priority (when no explicit project):
-      1. Explicit _active_project (set by UI project picker)
-      2. Match based on server working directory (_VIBENODE_DIR)
-      3. Most recently modified .jsonl across all projects
+    See ``common.paths.resolve_sessions_dir`` for the priority order; this
+    passes THIS module's globals so tests that monkeypatch
+    ``_CLAUDE_PROJECTS`` / ``_active_project`` keep working.
 
     IMPORTANT: This function never mutates ``_active_project``.
     """
-    # --- explicit project parameter ---
-    if project:
-        if not project.startswith("subagents"):
-            p = _CLAUDE_PROJECTS / project
-            if p.is_dir():
-                return p
-
-    # --- global _active_project ---
-    if _active_project:
-        if not _active_project.startswith("subagents"):
-            p = _CLAUDE_PROJECTS / _active_project
-            if p.is_dir():
-                return p
-
-    # Derive from server's own repo path — Claude encodes paths with dashes
-    # e.g. C-drive path -> C--path-segments-joined-with-dashes
-    if not _CLAUDE_PROJECTS.is_dir():
-        _CLAUDE_PROJECTS.mkdir(parents=True, exist_ok=True)
-        return _CLAUDE_PROJECTS
-    repo_path = _encode_cwd(str(_VIBENODE_DIR))
-    for d in _CLAUDE_PROJECTS.iterdir():
-        if not d.is_dir() or d.name.startswith("subagents") or d.name.startswith("_"):
-            continue
-        # Case-insensitive match — Claude's encoding may differ in case
-        if d.name.lower() == repo_path.lower():
-            return d
-
-    # Fallback: most recently modified .jsonl
-    best, best_ts = None, 0.0
-    if not _CLAUDE_PROJECTS.is_dir():
-        return _CLAUDE_PROJECTS
-    for d in _CLAUDE_PROJECTS.iterdir():
-        if not d.is_dir() or d.name.startswith("subagents") or d.name.startswith("_"):
-            continue
-        for f in d.glob("*.jsonl"):
-            if f.stat().st_mtime > best_ts:
-                best_ts = f.stat().st_mtime
-                best = d
-    if best:
-        return best
-    return _CLAUDE_PROJECTS
+    return _resolve_sessions_dir(project, _active_project, _CLAUDE_PROJECTS, _VIBENODE_DIR)
 
 
 
-def _encode_cwd(cwd: str) -> str:
-    """Encode a filesystem path into the Claude project directory name format.
-
-    E.g. ``C:\\Users\\foo\\Bar`` → ``C--Users-foo-Bar``
-
-    IMPORTANT: Underscores AND dots must also be replaced with dashes.  Claude
-    Code's own project directory encoding converts both to dashes (e.g.
-    ``customerNode_root`` → ``customerNode-root``, and ``.claude`` →
-    ``-claude``), but the daemon's CWD preserves the original filesystem
-    characters.  Without matching that exactly, sessions whose CWD contains
-    underscores or dots fail the project filter silently — they appear to not
-    exist even though the daemon has them running.
-
-    The dot-encoding rule matters specifically for the ``_SYSTEM_UTILITY_CWD``
-    filter in ``app/routes/project_api.py::api_projects`` and for
-    ``_cleanup_system_sessions()`` below: the on-disk directory is
-    ``C--Users-<user>--claude--system`` (encoded from ``~/.claude/_system``),
-    and without the ``.`` → ``-`` rule the filter built the wrong string and
-    the system utility project leaked into the user-facing project list AND
-    its old JSONLs never got pruned.  Do NOT remove the ``.replace('.', '-')``.
-    """
-    return (
-        cwd.replace("\\", "-")
-        .replace("/", "-")
-        .replace(":", "-")
-        .replace("_", "-")
-        .replace(".", "-")
-    )
+# The encoding lives in common/paths.py (the Session Engine needs it too and
+# must not import this package).  Do NOT remove its ``.replace('.', '-')``.
+_encode_cwd = _common_encode_cwd
 
 
 def cwd_matches_active_project(cwd: str, project: str = "") -> bool:
@@ -578,6 +431,14 @@ def _save_project_names(names: dict):
 # ---------------------------------------------------------------------------
 
 _summary_cache: dict = {}  # key: (path_str, mtime, size) -> summary dict
+# path_str -> the key currently held in _summary_cache for that path.  Every
+# turn changes a transcript's (mtime, size), so without this index each turn
+# left the previous key behind for the life of the process (only delete /
+# rename evicted).  ``load_session_summary`` pops the indexed key before it
+# stores a new one.  Code that evicts keys directly (delete, move, admin
+# scrub, tests calling ``_summary_cache.clear()``) may leave a dangling index
+# entry; that is harmless because the pop is ``pop(key, None)``.
+_summary_cache_index: dict = {}
 
 
 # ---------------------------------------------------------------------------

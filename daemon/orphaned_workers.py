@@ -63,6 +63,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from daemon.backends.claude_layout import ClaudeTranscriptLayout
+
 # ── Notification parsing ──────────────────────────────────────────────────
 _TASK_ID_RE = re.compile(r"<task-id>([^<]+)</task-id>")
 _STATUS_RE = re.compile(r"<status>([^<]+)</status>")
@@ -237,12 +239,13 @@ def _scan_deliveries(root_path: Path, cache: ScanCache) -> None:
         return
 
 
-def _load_metas(sub_dir: Path, cache: ScanCache) -> dict:
+def _load_metas(sub_dir: Path, cache: ScanCache, layout=None) -> dict:
     """agent_id -> meta dict for every ``agent-<id>.meta.json`` in ``sub_dir``.
 
     Parsed metas are cached by mtime: the CLI rewrites a meta file when the
     agent is resumed, so the mtime is a sufficient invalidation key.
     """
+    layout = layout or ClaudeTranscriptLayout()
     out = {}
     try:
         it = os.scandir(sub_dir)
@@ -251,7 +254,8 @@ def _load_metas(sub_dir: Path, cache: ScanCache) -> dict:
     with it:
         for entry in it:
             name = entry.name
-            if not (name.startswith("agent-") and name.endswith(".meta.json")):
+            agent_id = layout.subagent_meta_id(name)
+            if agent_id is None:
                 continue
             try:
                 mtime_ns = entry.stat().st_mtime_ns
@@ -268,7 +272,7 @@ def _load_metas(sub_dir: Path, cache: ScanCache) -> dict:
                     continue
                 hit = (mtime_ns, meta)
                 cache.metas[name] = hit
-            out[name[len("agent-"):-len(".meta.json")]] = hit[1]
+            out[agent_id] = hit[1]
     return out
 
 
@@ -372,7 +376,7 @@ def _resumed_by_others_since(path: Path, since: float) -> bool:
 
 
 def find_orphaned_workers(root_transcript: Path, cache: ScanCache,
-                          since: float = 0.0) -> list:
+                          since: float = 0.0, layout=None) -> list:
     """Workers stranded on nested agents whose results went to the root.
 
     Args:
@@ -381,15 +385,18 @@ def find_orphaned_workers(root_transcript: Path, cache: ScanCache,
         since: Ignore deliveries before this epoch time.  The watchdog passes
             the moment the daemon took the session on, so history from
             before a daemon restart can never trigger a nudge.
+        layout: The backend's ``TranscriptLayout`` (where agent files live);
+            Claude's when omitted.
 
     Returns:
         ``OrphanedWorker`` list sorted by delivery time.  It is empty when
         nothing is stranded, or when nothing changed since the previous call
         (results are only reported once per change, see ``ScanCache``).
     """
+    layout = layout or ClaudeTranscriptLayout()
     root_transcript = Path(root_transcript)
-    sub_dir = root_transcript.parent / root_transcript.stem / "subagents"
-    if not sub_dir.is_dir():
+    sub_dir = layout.subagents_dir(root_transcript)
+    if sub_dir is None or not sub_dir.is_dir():
         return []
     try:
         size = os.path.getsize(root_transcript)
@@ -397,7 +404,7 @@ def find_orphaned_workers(root_transcript: Path, cache: ScanCache,
         return []
     if size == cache.evaluated_size:
         return []
-    metas = _load_metas(sub_dir, cache)
+    metas = _load_metas(sub_dir, cache, layout)
     nested = {aid: m for aid, m in metas.items() if m.get("parentAgentId")}
     if not nested:
         cache.evaluated_size = size
@@ -411,7 +418,7 @@ def find_orphaned_workers(root_transcript: Path, cache: ScanCache,
         if delivery is None or delivery.delivered_at < since:
             continue
         worker_id = str(nested_meta.get("parentAgentId"))
-        worker_path = sub_dir / f"agent-{worker_id}.jsonl"
+        worker_path = layout.subagent_transcript(sub_dir, worker_id)
         state = _stopped_state(worker_path)
         if state is None:
             continue  # worker is running (or unreadable): leave it alone

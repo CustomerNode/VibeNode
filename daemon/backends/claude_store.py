@@ -12,10 +12,10 @@ Phase 2 of the OOP abstraction refactor moved the following code here:
 - JSONL tail read from ``_write_file_snapshot`` (L3262-3286)
 - JSONL append for file-history-snapshot (L3313-3314)
 
-Methods that delegate to ``app/sessions.py`` for backward compatibility:
-
-- ``load_summary`` -> ``app.sessions.load_session_summary``
-- ``read_entries`` -> ``app.sessions.load_session``
+``load_summary`` and ``read_entries`` are part of the ``ChatStore`` contract
+but the engine never calls them: the session list and timeline are parsed by
+the web (``app/sessions.py``), and the engine must not import the web package
+(``tests/test_layering.py``).  Here they log and return empty.
 """
 
 import base64
@@ -45,6 +45,18 @@ _INTERRUPTION_NOTICE = "\n\n[Session interrupted — resuming from last checkpoi
 #     so a dangling tool_use triggers "tool_use ids were found without
 #     tool_result blocks" on resume.
 _INTERRUPTED_TURN_DROP_TYPES = {"thinking", "redacted_thinking", "tool_use"}
+
+
+def _iso_to_epoch(value) -> float:
+    """A transcript ``timestamp`` (ISO 8601, ``Z`` suffix) as epoch seconds;
+    0.0 when missing or unparsable."""
+    if not value or not isinstance(value, str):
+        return 0.0
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
 
 
 def _is_unreplayable_thinking(block) -> bool:
@@ -198,7 +210,7 @@ class ClaudeJsonlStore(ChatStore):
 
         Moved from session_manager.py L3326-3348 (_find_session_jsonl).
         """
-        from app.config import _encode_cwd
+        from common.paths import encode_cwd as _encode_cwd
         projects_dir = Path.home() / ".claude" / "projects"
 
         # Try the encoded cwd first (fastest path)
@@ -1092,41 +1104,132 @@ class ClaudeJsonlStore(ChatStore):
     # ── Summary / Display Operations ─────────────────────────────────
 
     def load_summary(self, session_id: str, cwd: str = "") -> dict:
-        """Load a lightweight session summary for the session list UI.
+        """Not available in the engine (see the module docstring): the
+        session-list parser is the web's ``app.sessions.load_session_summary``.
+        Returns ``{}``, as the old delegation did on any failure."""
+        logger.warning("load_summary(%s) is not served by the engine; the web "
+                       "parses transcripts (app/sessions.py)", session_id)
+        return {}
 
-        Delegates to app.sessions.load_session_summary for backward
-        compatibility.  The existing function will be consolidated
-        here in Phase 3.
-        """
-        jsonl_path = self.find_session_path(session_id, cwd)
-        if not jsonl_path:
-            return {}
+    # Tail window for read_log_entries: enough for 200 entries of an ordinary
+    # session; a session of huge tool results yields fewer, which is fine (the
+    # web reads the full transcript for display; these only seed memory).
+    _LOG_TAIL_BYTES = 4 * 1024 * 1024
+
+    def read_log_entries(
+        self, session_id: str, cwd: str = "", max_entries: int = 200,
+        until_ts: float = 0.0,
+    ) -> list:
+        """The last ``max_entries`` timeline rows of the transcript, in the
+        same kinds the engine emits live (see ``ChatStore.read_log_entries``).
+        The parse mirrors the web's timeline parser
+        (``app/routes/ws_events._parse_raw_line``), with the engine's system-
+        content labelling.  Tail read only; never raises."""
         try:
-            from app.sessions import load_session_summary
-            return load_session_summary(jsonl_path)
-        except Exception as e:
-            logger.warning("load_summary failed for %s: %s", session_id, e)
-            return {}
+            path = self.find_session_path(session_id, cwd)
+            if path is None:
+                return []
+            size = path.stat().st_size
+            with open(path, "rb") as fh:
+                if size > self._LOG_TAIL_BYTES:
+                    fh.seek(size - self._LOG_TAIL_BYTES)
+                    fh.readline()  # drop the partial first line
+                data = fh.read().decode("utf-8", errors="replace")
+        except Exception:
+            return []
+        from common.transcripts import (
+            is_system_content, system_content_label, CLI_SYSTEM_MARKERS,
+        )
+        rows = []
+        for raw in data.splitlines():
+            if not raw.strip():
+                continue
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            t = obj.get("type", "")
+            if t not in ("user", "assistant"):
+                continue
+            ts = _iso_to_epoch(obj.get("timestamp"))
+            if until_ts and ts and ts > until_ts:
+                continue
+            uid = obj.get("uuid", "") or ""
+            msg = obj.get("message") or {}
+            content = msg.get("content", "") if isinstance(msg, dict) else ""
+
+            def _row(**kw):
+                kw.setdefault("text", "")
+                kw["timestamp"] = ts
+                kw["uuid"] = uid
+                rows.append(kw)
+
+            def _user_text(text):
+                text = text.strip()
+                if is_system_content(text, CLI_SYSTEM_MARKERS):
+                    _row(kind="system", text=system_content_label(text))
+                else:
+                    _row(kind="user", text=text[:20000])
+
+            if t == "user":
+                if isinstance(content, str):
+                    if content.strip():
+                        _user_text(content)
+                elif isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        bt = block.get("type", "")
+                        if bt == "text" and (block.get("text") or "").strip():
+                            _user_text(block["text"])
+                        elif bt == "tool_result":
+                            rc = block.get("content", "")
+                            if isinstance(rc, list):
+                                rt = " ".join(b.get("text", "") for b in rc
+                                              if isinstance(b, dict) and b.get("type") == "text")
+                            else:
+                                rt = str(rc)
+                            _row(kind="tool_result", text=rt[:20000],
+                                 tool_use_id=block.get("tool_use_id", "") or "",
+                                 is_error=bool(block.get("is_error")))
+            else:
+                if isinstance(content, str):
+                    if content.strip():
+                        _row(kind="asst", text=content.strip()[:50000])
+                elif isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        bt = block.get("type", "")
+                        if bt == "text" and (block.get("text") or "").strip():
+                            _row(kind="asst", text=block["text"].strip()[:50000])
+                        elif bt == "tool_use":
+                            inp = block.get("input") or {}
+                            desc = ""
+                            if isinstance(inp, dict) and inp:
+                                if "command" in inp:
+                                    desc = str(inp["command"])[:300]
+                                elif "path" in inp:
+                                    desc = str(inp["path"])
+                                    if "content" in inp:
+                                        desc += f" (write {len(str(inp.get('content', '')))} chars)"
+                                elif "pattern" in inp:
+                                    desc = str(inp["pattern"])[:200]
+                                else:
+                                    k = next(iter(inp))
+                                    desc = f"{k}: {str(inp[k])[:200]}"
+                            _row(kind="tool_use", id=block.get("id", "") or "",
+                                 name=block.get("name", "") or "", desc=desc)
+        return rows[-max_entries:] if max_entries and max_entries > 0 else rows
 
     def read_entries(
         self, session_id: str, since: int = 0, cwd: str = ""
     ) -> list:
-        """Read chat entries for display.
-
-        Delegates to app.sessions.load_session for backward
-        compatibility.  The existing function will be consolidated
-        here in Phase 3.
-        """
-        jsonl_path = self.find_session_path(session_id, cwd)
-        if not jsonl_path:
-            return []
-        try:
-            from app.sessions import load_session
-            result = load_session(jsonl_path)
-            messages = result.get("messages", [])
-            if since > 0:
-                return messages[since:]
-            return messages
-        except Exception as e:
-            logger.warning("read_entries failed for %s: %s", session_id, e)
-            return []
+        """Not available in the engine (see the module docstring): the
+        timeline parser is the web's ``app.sessions.load_session``.  Returns
+        ``[]``, as the old delegation did on any failure."""
+        logger.warning("read_entries(%s) is not served by the engine; the web "
+                       "parses transcripts (app/sessions.py)", session_id)
+        return []

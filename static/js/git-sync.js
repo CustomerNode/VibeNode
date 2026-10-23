@@ -65,7 +65,59 @@ function _armNotifyOnGesture() {
   } catch (e) {}
 }
 
-function openGitPublish() {
+// ── What goes into the commit (2026-10-23) ──
+// 74 of the 100 commits before this were "Update VibeNode <timestamp>".  The
+// commit message is now the user's one-line "What changed" (auto-generated from
+// the staged areas when left empty) plus a "Publish gate" line recording which
+// test mode ran and how it went, or that it was skipped.  Both are read here
+// and sent with the /api/git-sync request (app/git_ops.py build_commit_message).
+let _publishSummary = '';
+let _publishGate = null;       // {mode, passed, skipped, failed, seconds, anyway}
+
+// What each test mode really runs, from /api/test-modes (app/routes/test_api.py
+// MODES).  The fallback matches it; both modes run the same files, and only
+// the per-test timeout differs.  The e2e suite runs in CI, never here.
+const _TEST_MODE_FALLBACK = {
+  fast: {label: 'Fast: unit + browser tests, 60s timeout'},
+  full: {label: 'Full: unit + browser tests, 120s timeout (e2e suite runs in CI only)'},
+};
+let _testModesCache = null;
+async function _testModes() {
+  if (_testModesCache) return _testModesCache;
+  try {
+    const r = await fetch('/api/test-modes');
+    const d = r.ok ? await r.json() : null;
+    if (d && d.modes && d.modes.fast && d.modes.full) _testModesCache = d.modes;
+  } catch (_) {}
+  return _testModesCache || _TEST_MODE_FALLBACK;
+}
+
+function _gateOptionsHtml(modes, verb) {
+  return '<p style="color:var(--text-muted);font-size:12px;margin-top:8px">'
+    + 'Run regression tests before ' + verb + '?</p>'
+    + '<ul style="margin:4px 0 0 16px;color:var(--text-muted);font-size:11px;line-height:1.5">'
+    + '<li>' + escHtml(modes.fast.label) + '</li>'
+    + '<li>' + escHtml(modes.full.label) + '</li>'
+    + '<li>Skip: no tests run; the commit message says so.</li></ul>';
+}
+
+function _summaryFieldHtml() {
+  return '<label for="git-publish-summary" style="display:block;margin-top:10px;font-size:12px;color:var(--text-muted)">'
+    + 'What changed? (one line, optional)</label>'
+    + '<input id="git-publish-summary" type="text" maxlength="120" autocomplete="off" '
+    + 'placeholder="Left empty: areas and file count are filled in for you" '
+    + 'style="width:100%;box-sizing:border-box;margin-top:4px;padding:6px 8px;font-size:13px;'
+    + 'background:var(--bg-input,rgba(255,255,255,0.06));color:var(--text-primary,#eee);'
+    + 'border:1px solid var(--border,rgba(255,255,255,0.15));border-radius:6px">';
+}
+
+/** Read the summary field before the dialog body is replaced. */
+function _readSummaryField() {
+  const el = document.getElementById('git-publish-summary');
+  _publishSummary = el ? String(el.value || '').trim().slice(0, 120) : '';
+}
+
+async function openGitPublish() {
   _armNotifyOnGesture();
   const s = _gitStatus;
   const hasPush = s.ahead > 0 || s.uncommitted;
@@ -85,12 +137,17 @@ function openGitPublish() {
     body += '<p style="color:var(--text-muted);font-size:12px;margin-top:8px">'
       + s.behind + ' remote update(s) will be pulled in first, then your changes pushed.</p>';
   }
-  body += '<p style="color:var(--text-muted);font-size:12px;margin-top:8px">'
-    + 'Run regression tests before publishing?</p>';
+  const modes = await _testModes();
+  body += _summaryFieldHtml() + _gateOptionsHtml(modes, 'publishing');
+  _publishGate = null;
   showGitSyncModal('Publish App Update', body, [
-    {label: 'Fast Tests + Publish', primary: true, onclick: () => _testThenPublish('fast')},
-    {label: 'Full Tests + Publish', onclick: () => _testThenPublish('full')},
-    {label: 'Skip & Publish', onclick: () => executeGitAction('both', 'btn-git-publish', 'Publish App Update')},
+    {label: 'Fast tests + Publish', primary: true, onclick: () => { _readSummaryField(); _testThenPublish('fast'); }},
+    {label: 'Full tests + Publish', onclick: () => { _readSummaryField(); _testThenPublish('full'); }},
+    {label: 'Skip & Publish', onclick: () => {
+      _readSummaryField();
+      _publishGate = {mode: 'skipped'};
+      executeGitAction('both', 'btn-git-publish', 'Publish App Update');
+    }},
     {label: 'Cancel', onclick: closeGitSyncModal}
   ]);
 }
@@ -99,7 +156,7 @@ function _testThenPublish(mode) {
   _testThenAction(mode, 'publish', 'Publish App Update', 'btn-git-publish');
 }
 
-function openGitSyncBoth() {
+async function openGitSyncBoth() {
   _armNotifyOnGesture();
   const s = _gitStatus;
   // Branch guard FIRST — before any sync/test options are shown.
@@ -110,11 +167,16 @@ function openGitSyncBoth() {
   let body = '<p><b style="color:var(--text-heading)">' + s.behind + ' update(s)</b> to pull and '
     + '<b style="color:var(--text-heading)">' + (s.ahead + (s.uncommitted ? 1 : 0)) + ' change(s)</b> to push.</p>'
     + '<p style="color:var(--text-muted);font-size:12px">Remote updates will be pulled first, merge conflicts resolved automatically, then your changes pushed.</p>'
-    + '<p style="color:var(--text-muted);font-size:12px;margin-top:8px">Run regression tests before syncing?</p>';
+    + _summaryFieldHtml() + _gateOptionsHtml(await _testModes(), 'syncing');
+  _publishGate = null;
   showGitSyncModal('Sync App', body, [
-    {label: 'Fast Tests + Sync', primary: true, onclick: () => _testThenSync('fast')},
-    {label: 'Full Tests + Sync', onclick: () => _testThenSync('full')},
-    {label: 'Skip & Sync', onclick: () => executeGitAction('both', 'btn-git-sync', 'Sync App')},
+    {label: 'Fast tests + Sync', primary: true, onclick: () => { _readSummaryField(); _testThenSync('fast'); }},
+    {label: 'Full tests + Sync', onclick: () => { _readSummaryField(); _testThenSync('full'); }},
+    {label: 'Skip & Sync', onclick: () => {
+      _readSummaryField();
+      _publishGate = {mode: 'skipped'};
+      executeGitAction('both', 'btn-git-sync', 'Sync App');
+    }},
     {label: 'Cancel', onclick: closeGitSyncModal}
   ]);
 }
@@ -185,7 +247,7 @@ function _testFailureReport(lines, d, mode) {
   prompt += '4. Check for order-dependence: a test that passes alone but fails in the full run usually means shared state between test files (see the guard notes in tests/conftest.py).\n';
   prompt += '5. Re-run the failing tests, then the full command above, and confirm 0 failures.\n';
   prompt += '6. Report what failed, why, and what you changed. Do not commit or publish; the developer will press Publish again.\n';
-  prompt += '\nFollow CLAUDE.md. This is a public repository, and never restart the session daemon.\n';
+  prompt += '\nFollow CLAUDE.md. This is a public repository, and never restart the Session Engine (the daemon).\n';
 
   const copyText = (failText || tail.join('\n'))
     + (detailText ? '\n\n' + detailText : '')
@@ -242,6 +304,7 @@ function _testThenAction(mode, actionType, actionLabel, btnId) {
 
   showGitSyncModal(testLabel + ' Before ' + Verb, typeof _testRunnerHtml === 'function' ? _testRunnerHtml(desc) : '<p>' + desc + '</p>', []);
 
+  const startedAt = Date.now();
   // The run lives on the server and survives a dropped connection; the
   // stream reattaches by itself (_streamTestRun in test-runner.js).  Before
   // 2026-10-18 a phone locking its screen mid-run ended the run and left this
@@ -250,6 +313,15 @@ function _testThenAction(mode, actionType, actionLabel, btnId) {
     onLine: lines => { if (typeof _updateTestOutput === 'function') _updateTestOutput(lines); },
     onDone: (d, lines) => {
       if (typeof _testRunning !== 'undefined') _testRunning = false;
+      // Recorded in the commit message's "Publish gate" line.
+      _publishGate = {
+        mode: mode,
+        passed: d.passed || 0,
+        skipped: d.skipped || 0,
+        failed: (d.failed || 0) + (d.errors || 0),
+        seconds: (typeof d.seconds === 'number') ? d.seconds : Math.round((Date.now() - startedAt) / 1000),
+        anyway: false,
+      };
       if (d.ok) {
         showGitSyncModal('Tests Passed \u2713', '<div style="text-align:center;padding:12px 0;">'
           + '<div style="font-weight:600;color:var(--accent-green,#4ecdc4);">'
@@ -287,13 +359,19 @@ function _testThenAction(mode, actionType, actionLabel, btnId) {
             _startFixSession('Fix Test Failures', 'Fixing failing tests...', report.prompt);
           }},
           {label: 'Copy errors', onclick: (e) => _copyTestErrors(report.copyText, e && e.currentTarget)},
-          {label: Verb + ' Anyway', onclick: () => executeGitAction('both', btnId, actionLabel)},
+          {label: Verb + ' Anyway', onclick: () => {
+            // Still allowed (a non-technical user must be able to ship), but
+            // the commit message will say "published anyway" with the counts.
+            if (_publishGate) _publishGate.anyway = true;
+            executeGitAction('both', btnId, actionLabel);
+          }},
           {label: 'Close', onclick: closeGitSyncModal}
         ], {sticky: true});
       }
     },
     onError: (msg, info) => {
       if (typeof _testRunning !== 'undefined') _testRunning = false;
+      _publishGate = {mode: 'skipped'};   // nothing ran to completion
       if (info && info.started) {
         // The run started but its result never arrived.  Never offer to
         // publish anyway here: nothing says the tests passed.
@@ -558,12 +636,18 @@ async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
   }, 50);
 
   try {
+    const payload = {action, confirm_branch: !!confirmBranch};
+    if (isPush) {
+      payload.summary = _publishSummary || '';
+      payload.gate = _publishGate || {mode: 'skipped'};
+    }
     const res = await fetch('/api/git-sync', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({action, confirm_branch: !!confirmBranch})
+      body: JSON.stringify(payload)
     });
     clearInterval(_pulseTimer);
     const r = await res.json();
+    if (isPush && !r.needs_branch_confirm) { _publishSummary = ''; _publishGate = null; }
 
     // Server-side branch guard (in case the polled status was stale).
     if (r.needs_branch_confirm) {
@@ -582,6 +666,22 @@ async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
 
     if (r.scan && !r.scan.ok) {
       body += _renderScanFindings(r.scan);
+    }
+
+    // The pull changed requirements.txt and pip ran (app/git_ops.py).
+    if (r.pip_ran) {
+      if (r.pip_ok) {
+        const n = r.pip_installed || 0;
+        if (typeof showToast === 'function') {
+          showToast(n ? 'Installed ' + n + ' new dependenc' + (n === 1 ? 'y' : 'ies') : 'Dependencies already satisfied');
+        }
+      } else {
+        if (typeof showToast === 'function') showToast('Dependency install failed — see the Update dialog');
+        body += '<pre style="text-align:left;font-size:10px;font-family:monospace;max-height:160px;overflow-y:auto;'
+          + 'background:rgba(255,60,60,0.06);border:1px solid rgba(255,60,60,0.15);border-radius:6px;'
+          + 'padding:8px 10px;margin-top:10px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all;user-select:text;">'
+          + escHtml(r.pip_output_tail || '(no pip output)') + '</pre>';
+      }
     }
 
     const btns = [{label:'OK', primary: r.ok, onclick: closeGitSyncModal}];

@@ -25,6 +25,7 @@ from werkzeug.utils import secure_filename
 from .. import socketio as _app_socketio
 
 from ..config import _sessions_dir, get_active_project, _decode_project, _CLAUDE_PROJECTS
+from .. import mobile_auth as _mobile_auth
 
 # System-user message classification — shared with ws_events.py
 from ..platform_utils import is_system_user_content as _is_system_user_content
@@ -135,28 +136,10 @@ _HOOK_SESSION_RE = re.compile(r"[A-Za-z0-9_.:-]{1,100}")
 _HOOK_KIND_JUNK = re.compile(r"[^a-z0-9._-]+")
 
 
-def _hook_caller_is_local() -> bool:
-    """Only a process on this machine may post into an agent's session.
-
-    The web server binds to 127.0.0.1, but that alone does not say "local":
-    a phone, and every other device on the tailnet, arrives through
-    `tailscale serve`, which also connects from 127.0.0.1. The proxy's
-    identity header and the host name tell those apart. A browser page is
-    refused as well: it sends Origin, and a script does not. (A cross-site
-    page cannot send application/json without a preflight either, and this
-    endpoint reads nothing else.)
-    """
-    try:
-        if request.headers.get("Tailscale-User-Login") or request.headers.get("X-Forwarded-For"):
-            return False
-        host = (request.host or "").lower()
-        if host.endswith(".ts.net") or ".ts.net:" in host:
-            return False
-        if request.headers.get("Origin"):
-            return False
-        return (request.remote_addr or "") in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
-    except Exception:
-        return False
+# Only a process on this machine may post into an agent's session. The rule
+# lives in app/mobile_auth.py (caller_is_local_script) next to the rest of
+# the access model; this name is kept for the routes that import it.
+_hook_caller_is_local = _mobile_auth.caller_is_local_script
 
 
 def wrap_hook_message(source, kind, text):
@@ -648,24 +631,13 @@ def put_folder_tree():
 
 _models_cache: dict = {"data": None, "ts": 0}
 
-# Persistent confirmed-models cache: grows as users run sessions with different models.
-# Stored next to kanban_config so it survives restarts.
-_CONFIRMED_MODELS_FILE = Path(__file__).resolve().parents[2] / "confirmed_models.json"
+# The model lists and the confirmed-models file live in common/models.py so the
+# web server and the Session Engine read one copy (they used to keep two that
+# had to be updated in step). These names stay for existing callers.
+from common import models as _common_models
 
-# Fallback model list when no source returns anything (no API key, no CLI installed,
-# no past sessions cached). Ensures the UI always offers a sensible choice.
-# Ordered: Fable (most capable), Opus, Sonnet, Haiku.
-_FALLBACK_KNOWN_MODELS = [
-    {"id": "claude-fable-5-1", "name": "Fable 5.1"},
-    {"id": "claude-fable-5", "name": "Fable 5"},
-    {"id": "claude-opus-5-5", "name": "Opus 5.5"},
-    {"id": "claude-opus-5", "name": "Opus 5"},
-    {"id": "claude-opus-4-8", "name": "Opus 4.8"},
-    {"id": "claude-opus-4-7", "name": "Opus 4.7"},
-    {"id": "claude-sonnet-5-5", "name": "Sonnet 5.5"},
-    {"id": "claude-sonnet-5", "name": "Sonnet 5"},
-    {"id": "claude-haiku-4-5", "name": "Haiku 4.5"},
-]
+_CONFIRMED_MODELS_FILE = _common_models.CONFIRMED_MODELS_FILE
+_FALLBACK_KNOWN_MODELS = _common_models.FALLBACK_KNOWN_MODELS
 # Default-model preference order by family: sonnet first (balanced), then opus, then haiku.
 _DEFAULT_FAMILY_PREFERENCE = ("sonnet", "opus", "haiku")
 
@@ -677,19 +649,9 @@ _models_refresh_lock = None  # Initialised lazily to avoid import-time threading
 # Models change rarely, so 1 hour avoids unnecessary CLI/API round-trips.
 _MODELS_CACHE_TTL = 3600
 
-# Current models that should ALWAYS be offered in the picker, even before the
-# user has run a session with them or set an ANTHROPIC_API_KEY. The family
-# backfill below only adds a model when its whole family is absent, so a newly
-# launched model in an already-present family (e.g. a new Sonnet alongside an
-# existing Sonnet 4.6 in the confirmed cache) would otherwise never appear.
-# Merged in by id (deduped), so it never duplicates an API/CLI/cache entry.
-_ALWAYS_OFFER_MODELS = [
-    {"id": "claude-fable-5-1", "name": "Fable 5.1"},
-    {"id": "claude-opus-5-5", "name": "Opus 5.5"},
-    {"id": "claude-opus-5", "name": "Opus 5"},
-    {"id": "claude-sonnet-5-5", "name": "Sonnet 5.5"},
-    {"id": "claude-sonnet-5", "name": "Sonnet 5"},
-]
+# Always offered in the picker, even before a session has run them (see
+# common/models.py for why the family backfill alone is not enough).
+_ALWAYS_OFFER_MODELS = _common_models.ALWAYS_OFFER_MODELS
 
 
 def _invalidate_models_cache() -> None:
@@ -700,37 +662,16 @@ def _invalidate_models_cache() -> None:
 
 def _load_confirmed_models() -> dict:
     """Load the confirmed-models cache from disk.  Returns {model_id: display_name}."""
-    try:
-        if _CONFIRMED_MODELS_FILE.exists():
-            return json.loads(_CONFIRMED_MODELS_FILE.read_text())
-    except Exception:
-        pass
-    return {}
+    return _common_models.load_confirmed_models()
 
 
 def record_confirmed_model(model_id: str) -> None:
-    """Called by session_manager when a session init message arrives with a model ID.
-    Adds the model to the persistent confirmed list so it always shows in the UI.
-
-    The Claude Code CLI reports its current model with a "[1m]" suffix when 1M
-    context is active (e.g. "claude-opus-4-8[1m]"). That suffix is a CLI display
-    convention — the SDK rejects model IDs with brackets, which surfaces in the
-    UI as "model not available". Strip the suffix and validate before recording
-    so the picker only ever stores SDK-valid IDs.
-    """
-    import re as _re
-    if not model_id:
-        return
-    model_id = _re.sub(r"\[[^\]]*\]", "", model_id).strip()
-    if not _re.fullmatch(r"claude-[A-Za-z0-9-]+", model_id):
-        return
-    confirmed = _load_confirmed_models()
-    if model_id not in confirmed:
-        confirmed[model_id] = _model_id_to_display_name(model_id)
-        try:
-            _CONFIRMED_MODELS_FILE.write_text(json.dumps(confirmed, indent=2))
-        except Exception:
-            pass
+    """Record a CLI-confirmed model id (common/models.py strips ``[1m]`` and
+    other markers and ignores anything that is not ``claude-<name>``), then
+    drop the web's models cache so the picker shows it at once."""
+    before = _common_models.load_confirmed_models()
+    _common_models.record_confirmed_model(model_id)
+    if _common_models.load_confirmed_models() != before:
         _invalidate_models_cache()
 
 
@@ -1532,8 +1473,11 @@ def write_workforce_asset():
 
 
 @bp.route('/api/workforce/install-pack', methods=['POST'])
+@_mobile_auth.local_only
 def install_pack():
-    """Clone a skill pack repo, scan for .md/SKILL.md files, import as workforce assets."""
+    """Clone a skill pack repo, scan for .md/SKILL.md files, import as workforce assets.
+
+    Local-only: ``setup_cmd`` is run through the shell on this machine."""
     import subprocess, shutil
 
     data = request.get_json(silent=True) or {}
@@ -1816,8 +1760,11 @@ def api_copy_export():
 
 
 @bp.route('/api/open-file', methods=['POST'])
+@_mobile_auth.local_only
 def api_open_file():
-    """Open a file using the system default application (Windows os.startfile)."""
+    """Open a file using the system default application (Windows os.startfile).
+
+    Local-only: it starts a desktop program on this machine."""
     data = request.get_json(silent=True) or {}
     raw = data.get('path', '')
     if not raw:
@@ -1945,6 +1892,12 @@ def api_file_drop():
     target = Path(target_dir).resolve()
     if not _is_within_home(target):
         return jsonify({"error": "Target directory must be within home"}), 403
+    # A paired device (a phone on the tailnet) may only write into the active
+    # project or data/uploads. The folder picker that chooses any folder under
+    # home is a desktop feature, and a local caller keeps it.
+    if not _mobile_auth.request_is_local() and not _is_remote_drop_target(target):
+        return jsonify({"error": "From a paired device, files can only be dropped into "
+                                 "the active project or data/uploads"}), 403
 
     if not target.is_dir():
         return jsonify({"error": "Target directory does not exist"}), 400
@@ -1955,6 +1908,23 @@ def api_file_drop():
     f.save(str(dest))
 
     return jsonify({"ok": True, "path": str(dest), "filename": filename})
+
+
+def _is_remote_drop_target(target: Path) -> bool:
+    """True when ``target`` (resolved) is inside the active project directory
+    or VibeNode's own ``data/uploads``."""
+    roots = [Path(__file__).resolve().parents[2] / "data" / "uploads"]
+    try:
+        roots.append(_get_project_path())
+    except Exception:
+        pass
+    for root in roots:
+        try:
+            target.relative_to(root.resolve())
+            return True
+        except (ValueError, OSError):
+            continue
+    return False
 
 
 @bp.route('/api/attach-image', methods=['POST'])

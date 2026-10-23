@@ -272,6 +272,61 @@ These events are sent by the browser to the server.
 
 ---
 
+### `set_session_model`
+
+**Triggered:** When the user picks a model for a session (the model selector). A live session gets a `set_model` control request; a session that is not live is resumed with `--model`.  
+**Payload:**
+```json
+{
+  "session_id": "<uuid>",
+  "model": "claude-opus-5-5"
+}
+```
+**Server response:** Emits `session_model_result` to the requesting socket only. Every other client learns of the change from the `session_model_changed` broadcast, which a client may also treat as its confirmation (the reply can be lost across a mobile reconnect).
+
+---
+
+### `set_session_effort`
+
+**Triggered:** When the user changes a session's thinking level. Applied in place, mid-turn included, through the CLI's `apply_flag_settings` control request and confirmed with a read-back; a relaunch is only the fallback for an older CLI or Session Engine.  
+**Payload:**
+```json
+{
+  "session_id": "<uuid>",
+  "effort": "high"
+}
+```
+`effort` is a CLI level (`low`, `medium`, `high`, `max`, …) or `default` / `""` for the model's own default.  
+**Server response:** Always emits `session_effort_result` to the requesting socket. Other clients learn from `session_effort_changed`.
+
+---
+
+### `cancel_auto_retry`
+
+**Triggered:** The Cancel button on an API-error or usage-limit auto-retry countdown. On a usage-limit switch countdown, cancel means "do not switch; wait for the reset".  
+**Payload:**
+```json
+{
+  "session_id": "<uuid>"
+}
+```
+**Server response:** None on success; `error` with `session_id` on failure.
+
+---
+
+### `retry_now`
+
+**Triggered:** The Retry-now button: fires a pending auto-retry immediately, or a manual retry of the last failed turn.  
+**Payload:**
+```json
+{
+  "session_id": "<uuid>"
+}
+```
+**Server response:** None on success; `error` with `session_id` on failure (for example when the session is not idle).
+
+---
+
 ## Server -> Client Events
 
 These events are pushed from the server to connected browsers.
@@ -529,6 +584,267 @@ A client treats each snapshot as a lease: an approval is open for `ttl_ms` after
 
 ---
 
+### `stream_event`
+
+**Triggered:** For every raw streaming event the CLI produces during a turn (`message_start`, `content_block_delta`, …). Clients render partial text from it and read context usage from `message_start`.  
+**Payload:**
+```json
+{
+  "session_id": "<uuid>",
+  "event": { "type": "content_block_delta", "delta": { "type": "text_delta", "text": "Hel" } }
+}
+```
+
+---
+
+### `session_usage`
+
+**Triggered:** After each API call in a turn, with the session's accumulated usage (input, output, cache read and cache creation tokens). Drives the context readout. A session opened after a page load has no live reading until it replies; `GET /api/session-context/<id>` fills the gap from the transcript.  
+**Payload:**
+```json
+{
+  "session_id": "<uuid>",
+  "usage": { "input_tokens": 1200, "output_tokens": 340, "cache_read_input_tokens": 88000, "cache_creation_input_tokens": 0 }
+}
+```
+
+---
+
+### `system_message`
+
+**Triggered:** For CLI system messages that have no dedicated handling (compaction has: it becomes a `session_entry`). Diagnostic.  
+**Payload:**
+```json
+{
+  "session_id": "<uuid>",
+  "subtype": "status",
+  "data": {}
+}
+```
+
+---
+
+### `session_model_result`
+
+**Triggered:** Reply to `set_session_model`, to the requesting socket only.  
+**Payload:**
+```json
+{
+  "ok": true,
+  "session_id": "<uuid>",
+  "model": "claude-opus-5-5",
+  "resumed": false,
+  "turn_resumed": false
+}
+```
+`resumed` is true when the daemon had to resume a not-live session with `--model` instead of a live switch; `turn_resumed` when that resume also carried the interrupted turn's prompt. On failure `ok` is false and `error` says why.
+
+---
+
+### `session_model_changed`
+
+**Triggered:** Broadcast to all clients whenever a session's model changes: a live switch, a resume with `--model`, the CLI's `init` report refining the model (for example adding `[1m]`), or a usage-limit auto-switch. Clients clear limit state only when the payload reports no limit.  
+**Payload:**
+```json
+{
+  "session_id": "<uuid>",
+  "model": "claude-opus-5-5[1m]",
+  "limit_reset_at": null,
+  "limited_model": null,
+  "error": "",
+  "resumed": false,
+  "turn_resumed": false
+}
+```
+
+---
+
+### `session_effort_result`
+
+**Triggered:** Reply to `set_session_effort`, to the requesting socket only. `ok` is true only after the CLI confirmed the level; otherwise exactly one of `not_live`, `not_ready`, `live_unavailable` tells the client which fallback applies (relaunch when free, wait for the CLI to finish starting, or relaunch because the Session Engine or CLI is too old).  
+**Payload:**
+```json
+{
+  "ok": true,
+  "session_id": "<uuid>",
+  "effort": "high",
+  "applied": "high",
+  "not_live": false,
+  "not_ready": false,
+  "live_unavailable": false
+}
+```
+
+---
+
+### `session_effort_changed`
+
+**Triggered:** Broadcast to all clients after the CLI confirms a thinking-level change.  
+**Payload:**
+```json
+{
+  "session_id": "<uuid>",
+  "effort": "high",
+  "applied": "high"
+}
+```
+
+---
+
+### `session_id_remapped`
+
+**Triggered:** When a session launched under a client temp id adopts the CLI's real id (fired from the CLI's `init` message and again, idempotently, on RESULT). Clients MERGE when a row under `new_id` already exists rather than renaming the old row onto it.  
+**Payload:**
+```json
+{
+  "old_id": "<temp-uuid>",
+  "new_id": "<cli-uuid>"
+}
+```
+
+---
+
+### `session_renamed`
+
+**Triggered:** Broadcast when a session gets a title (auto-naming or a manual rename). Clients remember every title they learn and fill it into nameless rows created later; a title the server returns always wins.  
+**Payload:**
+```json
+{
+  "session_id": "<uuid>",
+  "title": "Fix the kanban column widths",
+  "project": "<encoded-project-id>"
+}
+```
+
+---
+
+### `naming_progress`
+
+**Triggered:** By the bulk naming job (`POST /api/sessions/name-untitled`): once at start (`done: 0`), every 5 sessions, and once at the end with `finished: true`. Each title also fires `session_renamed`.  
+**Payload:**
+```json
+{
+  "project": "<encoded-project-id>",
+  "done": 15,
+  "total": 965,
+  "current_title": "Draft the claims section",
+  "named": 14,
+  "skipped": 1,
+  "failed": 0,
+  "finished": false
+}
+```
+
+---
+
+### `sessions_refresh`
+
+**Triggered:** Broadcast when the session list must be reloaded from the server, for example after an admin scrub removed phantom sessions. Clients clear their remembered titles before reloading so scrubbed names are not painted back.  
+**Payload:**
+```json
+{
+  "reason": "scrub-phantoms"
+}
+```
+
+---
+
+### `session_stalled`
+
+**Triggered:** By the Session Engine's silent-wait watchdog (job 5) the second time a task idles "waiting on background work" that is dead. Clients raise attention (chime, notification, title flash) until the tab is looked at.  
+**Payload:**
+```json
+{
+  "session_id": "<uuid>",
+  "name": "Session Name",
+  "text": "Still waiting on background work that is no longer running…"
+}
+```
+
+---
+
+### `queue_dispatched`
+
+**Triggered:** When a queued message is being sent to a session that just went idle.  
+**Payload:**
+```json
+{
+  "session_id": "<uuid>",
+  "text": "the message being sent",
+  "remaining": 2
+}
+```
+
+---
+
+### `hook_message`
+
+**Triggered:** Broadcast for every `POST /api/hook/message` (a local script posting a line into a session). `delivered` is `"now"`, `"queued"` or `"no"`.  
+**Payload:**
+```json
+{
+  "session_id": "<uuid>",
+  "source": "pipeline",
+  "kind": "info",
+  "text": "Build 412 is green",
+  "message": "[pipeline] Build 412 is green",
+  "delivered": "now"
+}
+```
+
+---
+
+### `inbox_updated`
+
+**Triggered:** When a child subsession reports to its parent (`report-to-parent`), from the web server or the Session Engine.  
+**Payload:**
+```json
+{
+  "parent_session_id": "<uuid>",
+  "undelivered_count": 1,
+  "from_child_session_id": "<uuid>"
+}
+```
+
+---
+
+### `job_needs_person`
+
+**Triggered:** By the Durable Jobs supervisor when a job reaches `needs_person` or `failed`, or a relaunch fails. Clients draw a card in the shared float stack with Relaunch and Leave-it buttons. Pushed once per state change.  
+**Payload:**
+```json
+{
+  "job_id": "job-20261015-1201",
+  "name": "Transcribe interviews",
+  "state": "needs_person",
+  "reason": "dead three times with no progress",
+  "progress": 42,
+  "session_id": "<uuid>",
+  "project": "<encoded-project-id>"
+}
+```
+
+---
+
+### `job_registry_error`
+
+**Triggered:** Once per file version when `data/jobs.json` cannot be parsed. The registry is never rewritten by the supervisor.  
+**Payload:**
+```json
+{
+  "path": "C:/…/data/jobs.json",
+  "error": "Expecting value: line 1 column 1 (char 0)"
+}
+```
+
+---
+
+### `approval_needed` (deprecated)
+
+The pre-2026-10-12 name of `external_notice`. The server no longer emits it; `socket.js` still listens so a web server that has not been restarted since the JS was pulled keeps working. New code must not emit it.
+
+---
+
 ### Kanban Events
 
 These events are emitted by kanban API routes when tasks change.
@@ -550,6 +866,7 @@ These events are emitted by kanban API routes when tasks change.
 | `compose_task_created` | `{project_id, section}` | Section created |
 | `compose_task_updated` | `{project_id, section}` | Section updated |
 | `compose_task_moved` | `{project_id, section_id, old_status, new_status}` | Section status changed |
-| `compose_changing` | `{project_id, section_id, changing}` | Changing flag toggled |
+| `compose_changing` | `{project_id, section_id, changing, change_note?}` | Changing flag toggled (API or the compose watcher) |
+| `compose_context_updated` | `{project_id, context}` | The compose watcher saw a section's context file change |
 | `compose_directive_logged` | `{project_id, directive, conflicts}` | Directive added |
 | `compose_directive_conflict_resolved` | `{project_id, conflict_id, action}` | Conflict resolved |

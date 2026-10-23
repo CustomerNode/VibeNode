@@ -34,8 +34,33 @@ logger = logging.getLogger(__name__)
 
 _SDK_VERSION = getattr(claude_code_sdk, "__version__", "0.0.0")
 
+# The SDK minor series these patches were verified against: [low, high).
+# Every patch below reaches into claude_code_sdk._internal, so a release
+# outside this series may silently change what a patch relies on.
+# requirements.txt carries the matching ceiling (claude-code-sdk<0.1); raise
+# both together after re-running tests/test_sdk_patches.py against the new SDK.
+TESTED_SDK_RANGE: tuple[tuple[int, ...], tuple[int, ...]] = ((0, 0), (0, 1))
+
 # Guard against double-application (e.g. tests + session_manager both import)
 _patches_applied = False
+
+# What the one real apply_patches() run found, for the engine code record
+# (daemon/engine_code.py) and the browser banner (static/js/engine-freshness.js).
+# Before 2026-10-23 a precondition failure was one WARNING line in a log nobody
+# read, and the daemon ran unpatched: a permission prompt that never answered,
+# a 1MB message that killed the stream.
+_patch_failures: list[dict] = []
+_sdk_version_tested: bool = True
+
+# Order matters (Popen patches stack).  Resolved by name at call time so a
+# unit test can replace one patch with a stub without re-running the others.
+_PATCH_TABLE: list[tuple[str, str]] = [
+    ("safe_parse_message", "_apply_patch_safe_parse_message"),
+    ("transport_adapter", "_apply_patch_transport_adapter"),
+    ("suppress_console_windows", "_apply_patch_suppress_console_windows"),
+    ("isolate_posix_subprocesses", "_apply_patch_isolate_posix_subprocesses"),
+    ("raise_json_buffer_limit", "_apply_patch_raise_json_buffer_limit"),
+]
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -52,6 +77,34 @@ def _version_parts(v: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def sdk_version_in_tested_range(version: str = None) -> bool:
+    """Is ``version`` (default: the imported SDK's) inside TESTED_SDK_RANGE?
+
+    Compares on the leading numeric parts; an unparsable version counts as
+    outside the range, because nothing is known about it.
+    """
+    parts = _version_parts(version if version is not None else _SDK_VERSION)
+    if not parts:
+        return False
+    low, high = TESTED_SDK_RANGE
+    return low <= parts < high
+
+
+def patch_report() -> dict:
+    """What happened when the patches were applied, for the engine record.
+
+    ``sdk_patch_failures`` is the list of patch NAMES that did not apply
+    (empty when all is well); ``sdk_patch_failure_details`` carries the
+    precondition each one failed.
+    """
+    return {
+        "sdk_version": _SDK_VERSION,
+        "sdk_version_tested": _sdk_version_tested,
+        "sdk_patch_failures": [f["name"] for f in _patch_failures],
+        "sdk_patch_failure_details": list(_patch_failures),
+    }
+
+
 # ── Public entry point ───────────────────────────────────────────────────
 
 
@@ -60,23 +113,33 @@ def apply_patches() -> list[str]:
 
     Returns a list of patch names that were successfully applied.
     Idempotent — safe to call multiple times.
+
+    A patch whose precondition fails is logged at ERROR with its name and the
+    precondition, and recorded for :func:`patch_report`.  The daemon still
+    starts: an unpatched daemon is degraded, a daemon that refuses to start
+    loses every session.
     """
-    global _patches_applied
+    global _patches_applied, _sdk_version_tested
     if _patches_applied:
         logger.debug("SDK patches already applied, skipping")
         return []
     _patches_applied = True
+    _patch_failures.clear()
 
     logger.info("Applying SDK patches for claude-code-sdk %s", _SDK_VERSION)
+    _sdk_version_tested = sdk_version_in_tested_range()
+    if not _sdk_version_tested:
+        low, high = TESTED_SDK_RANGE
+        logger.error(
+            "claude-code-sdk %s is outside the range these patches were tested "
+            "against (>=%s,<%s). The patches reach into SDK internals; re-check "
+            "daemon/sdk_patches.py and tests/test_sdk_patches.py before trusting them.",
+            _SDK_VERSION, ".".join(map(str, low)), ".".join(map(str, high)),
+        )
 
     applied: list[str] = []
-    for name, fn in [
-        ("safe_parse_message", _apply_patch_safe_parse_message),
-        ("transport_adapter", _apply_patch_transport_adapter),
-        ("suppress_console_windows", _apply_patch_suppress_console_windows),
-        ("isolate_posix_subprocesses", _apply_patch_isolate_posix_subprocesses),
-        ("raise_json_buffer_limit", _apply_patch_raise_json_buffer_limit),
-    ]:
+    for name, attr in _PATCH_TABLE:
+        fn = globals()[attr]
         try:
             if fn():
                 applied.append(name)
@@ -84,9 +147,19 @@ def apply_patches() -> list[str]:
             else:
                 logger.info("Skipped SDK patch: %s (not needed or not applicable)", name)
         except Exception as e:
-            logger.warning("Failed to apply SDK patch %s: %s", name, e)
+            precondition = str(e) or e.__class__.__name__
+            _patch_failures.append({"name": name, "precondition": precondition,
+                                    "error_type": e.__class__.__name__})
+            logger.error(
+                "SDK patch %s did NOT apply (claude-code-sdk %s). Precondition: %s. "
+                "The daemon runs without it.", name, _SDK_VERSION, precondition,
+            )
 
-    logger.info("SDK patches complete. Applied: %s", applied)
+    if _patch_failures:
+        logger.error("SDK patches complete with failures: %s (applied: %s)",
+                     [f["name"] for f in _patch_failures], applied)
+    else:
+        logger.info("SDK patches complete. Applied: %s", applied)
     return applied
 
 

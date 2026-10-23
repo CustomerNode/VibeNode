@@ -276,7 +276,8 @@ class TestRunSurvivesDisconnect:
 
         again = client.post("/api/run-tests", json={"mode": "full", "run_id": run_id, "since": 1})
         ev = _events([again.get_data(as_text=True)])
-        assert ev[0] == {"type": "run", "run_id": run_id, "mode": "full"}
+        assert ev[0] == {"type": "run", "run_id": run_id, "mode": "full",
+                         "mode_label": ta.MODES["full"]["label"]}
         assert [e["line"] for e in ev if e["type"] == "line"] == ["FAILED tests/test_x.py::test_y - boom"]
         done = ev[-1]
         assert done["type"] == "done" and done["run_id"] == run_id

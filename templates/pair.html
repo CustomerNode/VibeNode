@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pair this device · {{ device_name|default('VibeNode', true) }}</title>
+<link rel="icon" href="/static/images/logo.png" type="image/png">
+<meta name="theme-color" content="#0b0d10">
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0b0d10; color: #e6e6f0;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  .pair-wrap { min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 28px 18px; box-sizing: border-box; }
+  .pair-card { width: 100%; max-width: 380px; background: #141418; border: 1px solid rgba(124,124,255,0.14);
+    border-radius: 16px; padding: 28px 24px 24px; box-shadow: 0 18px 50px rgba(0,0,0,0.5); }
+  .pair-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+  .pair-head img { width: 28px; height: auto; }
+  .pair-head h1 { font-size: 1.15rem; margin: 0; font-weight: 700; }
+  .pair-sub { color: #9a9ab0; font-size: 0.86rem; line-height: 1.5; margin: 0 0 20px; }
+  .pair-sub strong { color: #d0d0ff; }
+  label { display: block; font-size: 0.78rem; color: #9a9ab0; margin-bottom: 6px; letter-spacing: .03em; text-transform: uppercase; }
+  input#code { width: 100%; box-sizing: border-box; padding: 14px 12px; font-size: 1.35rem; letter-spacing: .18em;
+    text-align: center; text-transform: uppercase; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #0f0f14; color: #f0f0ff; border: 1px solid #33334a; border-radius: 10px; outline: none; }
+  input#code:focus { border-color: #7c7cff; box-shadow: 0 0 0 3px rgba(124,124,255,0.18); }
+  button#go { width: 100%; margin-top: 14px; padding: 13px 16px; font-size: 0.98rem; font-weight: 600;
+    background: #7c7cff; color: #fff; border: 1px solid #5555cc; border-radius: 10px; cursor: pointer; }
+  button#go:disabled { opacity: .55; cursor: default; }
+  .pair-msg { min-height: 20px; margin-top: 12px; font-size: 0.84rem; text-align: center; }
+  .pair-msg.err { color: #f85149; }
+  .pair-msg.ok { color: #3fb950; }
+  .pair-foot { margin-top: 18px; font-size: 0.76rem; color: #6e7681; line-height: 1.5; text-align: center; }
+</style>
+</head>
+<body>
+<div class="pair-wrap">
+  <form class="pair-card" id="pair-form" method="post" action="/api/pair" autocomplete="off">
+    <div class="pair-head">
+      <img src="/static/images/logo.png" alt="">
+      <h1>Pair this device</h1>
+    </div>
+    <p class="pair-sub">Enter the pairing code shown on <strong>{{ device_name|default('VibeNode', true) }}</strong>
+      under System &rarr; Mobile Command. You only do this once per device.</p>
+    <label for="code">Pairing code</label>
+    <input id="code" name="code" inputmode="latin" autocapitalize="characters" autocorrect="off" spellcheck="false"
+           maxlength="12" placeholder="ABCDE-FGHJK" autofocus required>
+    <button id="go" type="submit">Pair</button>
+    <div class="pair-msg{% if error %} err{% endif %}" id="msg">
+      {%- if error == 'rate_limited' -%}Too many attempts. Wait a minute and try again.
+      {%- elif error -%}That code did not match. Check it on the computer and try again.
+      {%- endif -%}
+    </div>
+    <div class="pair-foot">A local browser on the computer itself never needs to pair.</div>
+  </form>
+</div>
+<script>
+(function () {
+  var form = document.getElementById('pair-form');
+  var input = document.getElementById('code');
+  var btn = document.getElementById('go');
+  var msg = document.getElementById('msg');
+  function say(text, cls) { msg.textContent = text; msg.className = 'pair-msg' + (cls ? ' ' + cls : ''); }
+  form.addEventListener('submit', function (ev) {
+    if (!window.fetch) return;              // no fetch: the plain form post still works
+    ev.preventDefault();
+    var code = (input.value || '').replace(/[^0-9a-z]/gi, '').toUpperCase();
+    if (!code) { say('Enter the code first.', 'err'); return; }
+    btn.disabled = true; say('Checking…');
+    fetch('/api/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                         body: JSON.stringify({ code: code }), credentials: 'same-origin' })
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
+      .then(function (res) {
+        if (res.body && res.body.ok) { say('Paired. Opening VibeNode…', 'ok'); window.location.replace('/'); return; }
+        if (res.status === 429) { say('Too many attempts. Wait a minute and try again.', 'err'); }
+        else { say('That code did not match. Check it on the computer and try again.', 'err'); }
+        btn.disabled = false;
+      })
+      .catch(function () { say('Could not reach VibeNode. Try again.', 'err'); btn.disabled = false; });
+  });
+})();
+</script>
+</body>
+</html>

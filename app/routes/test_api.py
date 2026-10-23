@@ -1,9 +1,15 @@
 """
 Test runner API — runs pytest and streams results via SSE.
 
-Two modes:
-  - fast: unit/mock tests only (ignores tests/e2e/)
-  - full: everything including e2e/Selenium tests
+Two modes, both running the SAME files (pytest.ini's addopts carries
+``--ignore=tests/e2e``, so the Selenium e2e suite never runs here; it runs in
+CI, .github/workflows/e2e-tests.yml).  Unit, API and headless-browser
+(Playwright) tests are all in tests/ and run in both modes.  What differs:
+  - fast: 60s per-test timeout
+  - full: 120s per-test timeout, so a slow browser test is not cut short
+The honest labels are in MODES below and reach the browser in the "run" and
+"done" events (corrected 2026-10-23; the docstring used to claim full mode
+included e2e).
 
 The run belongs to the SERVER, not to the request that streams it (changed
 2026-10-18).  It used to live inside the SSE generator, so a dropped
@@ -22,6 +28,7 @@ import logging
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -47,6 +54,23 @@ KEEPALIVE_S = 15  # an SSE comment this often: dead connections are noticed
 
 LAST_RUN_LOG = _REPO_ROOT / "logs" / "last_test_run.log"  # logs/ is gitignored
 LAST_RUN_JUNIT = _REPO_ROOT / "logs" / "last_test_run.xml"
+
+# What each mode really runs.  Shown in the Publish dialog (static/js/git-sync.js)
+# and recorded in the commit message's "Publish gate" line.
+MODES = {
+    "fast": {
+        "label": "Fast: unit + browser tests, 60s timeout",
+        "pytest_args": ["--ignore=tests/e2e", "--timeout=60"],
+    },
+    "full": {
+        "label": "Full: unit + browser tests, 120s timeout (e2e suite runs in CI only)",
+        "pytest_args": ["--timeout=120"],
+    },
+}
+
+
+def mode_label(mode) -> str:
+    return MODES.get(mode, MODES["fast"])["label"]
 
 
 def _junit_counts():
@@ -176,6 +200,9 @@ def _pump(run, proc):
         summary = {
             "type": "done",
             "run_id": run["id"],
+            "mode": run["mode"],
+            "mode_label": mode_label(run["mode"]),
+            "seconds": int(time.time() - run.get("started_at", time.time())),
             "exit_code": rc if rc is not None else -1,
             "passed": passed,
             "failed": failed,
@@ -201,7 +228,8 @@ def _stream(run, since):
     the result.  A client that goes away only ends this stream."""
     def generate():
         i = max(0, since)
-        yield _sse({"type": "run", "run_id": run["id"], "mode": run["mode"]})
+        yield _sse({"type": "run", "run_id": run["id"], "mode": run["mode"],
+                    "mode_label": mode_label(run["mode"])})
         try:
             while True:
                 with _run_cond:
@@ -270,10 +298,7 @@ def api_run_tests():
             return _error_stream("Tests already running")
 
         cmd = [_console_python(), "-m", "pytest", "--tb=short", "-q", "--no-header"]
-        if mode == "fast":
-            cmd += ["--ignore=tests/e2e", "--timeout=60"]
-        else:
-            cmd += ["--timeout=120"]
+        cmd += MODES[mode]["pytest_args"]
         cmd += _parallel_args()
         try:
             LAST_RUN_JUNIT.unlink()
@@ -304,7 +329,8 @@ def api_run_tests():
             return _error_stream(str(e))
         _test_proc = proc
         run = {"id": uuid.uuid4().hex[:12], "mode": mode, "cmd": cmd,
-               "lines": [], "done": None, "cancelled": False}
+               "lines": [], "done": None, "cancelled": False,
+               "started_at": time.time()}
         with _run_cond:
             _run = run
 
@@ -312,6 +338,13 @@ def api_run_tests():
     threading.Thread(target=_pump, args=(run, proc), name="test-run-pump",
                      daemon=True).start()
     return _stream(run, 0)
+
+
+@bp.route("/api/test-modes", methods=["GET"])
+def api_test_modes():
+    """What each Publish-gate mode really runs (labels for the dialog)."""
+    return jsonify({"modes": {k: {"label": v["label"], "pytest_args": v["pytest_args"]}
+                              for k, v in MODES.items()}})
 
 
 @bp.route("/api/cancel-tests", methods=["POST"])

@@ -111,6 +111,8 @@ import threading
 import time
 from pathlib import Path
 
+# Via claude_layout, not base: see its ImportError fallback (hot reload).
+from daemon.backends.claude_layout import ClaudeTranscriptLayout, TranscriptLayout
 from daemon.limit_watch import due_at as limit_due_at
 from daemon.limit_watch import stopped_on_error
 from daemon.orphaned_workers import ScanCache, build_nudge, find_orphaned_workers
@@ -732,7 +734,8 @@ class HealthMonitor:
         cache = self._orphan_caches.setdefault(sid, ScanCache())
         since = float(getattr(info, "created_ts", 0.0) or 0.0)
         try:
-            stranded = find_orphaned_workers(path, cache, since=since)
+            stranded = find_orphaned_workers(path, cache, since=since,
+                                             layout=self._layout())
         except Exception:
             # The detector is written to be exception-free; this is the
             # belt-and-braces guard that keeps the monitor ticking.
@@ -841,7 +844,8 @@ class HealthMonitor:
 
         idle_since = self._idle_since.get(sid, now)
         path = self._transcript_path(info)
-        last_write = footprint_last_write(path) if path is not None else 0.0
+        last_write = (footprint_last_write(path, layout=self._layout())
+                      if path is not None else 0.0)
         quiet_for = now - max(last_write, bg_at, idle_since)
         live = live_commands(getattr(info, "_cli_pid", 0))
         if live is None:
@@ -991,7 +995,7 @@ class HealthMonitor:
         hit = self._limit_stop_cache.get(path)
         if hit is not None and hit[0] == key:
             return hit[1]
-        stop = stopped_on_error(path, cont)
+        stop = stopped_on_error(path, cont, layout=self._layout())
         self._limit_stop_cache[path] = (key, stop)
         return stop
 
@@ -1033,6 +1037,13 @@ class HealthMonitor:
         if not result.get("ok"):
             logger.error("Limit backstop could not resume %s: %s",
                          sid, result.get("error"))
+
+    def _layout(self):
+        """The backend's on-disk layout, or Claude's when the SessionManager
+        does not provide one.  Read with getattr: hot reload can pair this
+        code with a SessionManager that predates ``backend_layout``."""
+        layout = getattr(self._sm, "backend_layout", None)
+        return layout if isinstance(layout, TranscriptLayout) else ClaudeTranscriptLayout()
 
     def _transcript_path(self, info):
         """The session's root ``.jsonl`` path (cached), or None."""

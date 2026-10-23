@@ -18,7 +18,9 @@ VibeNode is the result: a development platform where the human owns planning, ov
 
 ## What it does
 
-VibeNode is built around three pillars — **Sessions**, **Workflow**, and **Workforce** — each accessible from a homepage that serves as your command center.
+VibeNode is built around three pillars — **Sessions**, **Workflow**, and **Workforce** — plus **Subsessions** for peeling side work off a running session. Each is accessible from a homepage that serves as your command center.
+
+The vocabulary, used the same way in the app, the settings and this document: a **session** is one Claude Code conversation; the **Workflow** is the task board; the **Workforce** is the library of agents and skills, organized into **departments**; **Subsessions** is the view for sessions spawned from other sessions, where a **composition** is a structured group of **sections**, each section being one child session; the **Session Engine** is the background process that owns every running session.
 
 ### Sessions
 
@@ -90,6 +92,14 @@ Agentic coding tools have two similar concepts — skills and agents — that ar
 - **Auto-discovery** — VibeNode scans your `.claude/agents/`, `.claude/skills/` (including installed skill packs), and its own workforce directories on startup. It also scans the active project's tree for any `skills/` or `agents/` folders, so project-scoped assets show up automatically alongside global ones. Everything appears in one unified view with source badges and tier indicators. Install a skill pack or drop a `.md` file into your project's `skills/` folder and it shows up in your departments automatically.
 - **Three complexity tiers** — Simple role prompts (one paragraph persona), structured skills (step-by-step workflows with tool permissions), and full pipelines (multi-phase execution with shell blocks, specialist dispatch, and external dependencies). All three tiers live in the same department tree and use the same invocation paths.
 - **Portable .md format** — Every asset is a markdown file with optional YAML frontmatter. Download them, share them, upload them, edit them in any text editor. The file format is a superset that accommodates everything from Claude Code's native agent format to gstack's SKILL.md pipeline format.
+
+### Subsessions
+
+While a session is answering, you often want to peel off a side investigation without waiting. Subsessions is that: from any session, spawn a child that starts with the parent's conversation up to that moment, runs in parallel, and reports its conclusion back up to the parent when it finishes. The parent keeps working the whole time.
+
+- **Ad-hoc** is the default: one click from a session's menu creates a subsession, no setup. Children sit indented under their parent in the sidebar, and a parent with an unread report shows it in its inbox.
+- **Structured** compositions are for larger pieces of work: a composition holds sections, each section is one child session, and all of them share a context document (facts and directives) that is injected into every section's system prompt and kept in sync when it changes. Conflicts between directives are surfaced with a one-click resolution.
+- Both modes live in the same view (the "Subsessions" card on the homepage) and use the same sessions, so everything in the Sessions section applies to them.
 
 ## SpeechNode — voice input that works in every browser
 
@@ -300,9 +310,11 @@ The API has no authentication — it's a localhost-only development tool. All en
 
 ## Architecture
 
-VibeNode runs as two processes on your machine: a Flask web server (port 5050) serving the UI, and a session daemon (port 5051) that owns all agent sessions. The daemon survives web server restarts so active sessions are never interrupted. Each agent session is an asyncio task on a single shared event loop, with its own CLI subprocess communicating via stdio. The web server proxies all session operations to the daemon over a TCP/JSON-lines IPC channel.
+VibeNode runs as two processes on your machine: a Flask web server (port 5050) serving the UI, and the **Session Engine** (port 5051, `daemon/` in the source) that owns all agent sessions. The Session Engine survives web server restarts so active sessions are never interrupted. Each agent session is an asyncio task on a single shared event loop, with its own CLI subprocess communicating via stdio. The web server proxies all session operations to the Session Engine over a TCP/JSON-lines IPC channel.
 
-This separation means **VibeNode can code itself** — multiple agent sessions can edit VibeNode's own source files simultaneously, restart the web server to pick up changes, and keep working without interrupting each other. The daemon holds all active sessions in memory while the web server restarts around it. Most of VibeNode was built this way: from inside VibeNode.
+This separation means **VibeNode can code itself** — multiple agent sessions can edit VibeNode's own source files simultaneously, restart the web server to pick up changes, and keep working without interrupting each other. The Session Engine holds all active sessions in memory while the web server restarts around it. Most of VibeNode was built this way: from inside VibeNode.
+
+Restarting the Session Engine itself ends every running session, so the app never does it on its own; a banner tells you when the engine is running older code than the files on disk and offers a restart that waits until nothing is busy.
 
 ![VibeNode system architecture diagram](docs/architecture.svg)
 
@@ -311,10 +323,10 @@ This separation means **VibeNode can code itself** — multiple agent sessions c
 **Key design decisions:**
 
 - **One event loop, N sessions.** Agent sessions are I/O-bound (waiting for CLI stdout), so asyncio cooperative scheduling gives us unlimited concurrency on a single thread with no inter-session threading bugs.
-- **Daemon separation.** The daemon is a detached subprocess. Web server restarts (code changes, crashes) don't kill running sessions. Crash recovery restores sessions from a registry file on disk.
+- **Session Engine separation.** The engine is a detached subprocess. Web server restarts (code changes, crashes) don't kill running sessions. Crash recovery restores sessions from a registry file on disk.
 - **Three-thread IPC bridge.** The DaemonClient uses a reader thread (TCP socket), an emitter thread (SocketIO broadcasts), and a queue between them. This prevents slow WebSocket writes from blocking IPC response processing.
 - **Heavy I/O offloaded.** File snapshots, JSONL parsing, and directory scans run in a ThreadPoolExecutor so they don't block the event loop and stall other sessions.
-- **Four SDK monkey-patches.** The Claude Code SDK was designed for single-turn CLI usage. VibeNode patches it at runtime for multi-turn sessions (keep stdin open), permission protocol compatibility (CLI 2.x format), unknown message tolerance, and Windows no-window subprocess spawning.
+- **Five SDK monkey-patches.** The Claude Code SDK was designed for single-turn CLI usage. VibeNode patches it at runtime for unknown-message tolerance, the multi-turn transport adapter (keep stdin open, permission protocol compatibility), Windows no-window subprocess spawning, POSIX process-group isolation so a kill can never reach the daemon itself, and a larger JSON stream buffer. Each patch checks its preconditions against the installed SDK; a patch that cannot apply is reported on the engine status banner rather than silently skipped.
 
 **Performance:**
 
@@ -340,7 +352,7 @@ The backend isn't hardcoded — it's **dependency-injected**. `SessionManager(sd
 
 ### How the abstraction works
 
-The daemon's orchestration logic never imports a vendor SDK — that was fully refactored out. Every point where it would touch one goes through `daemon/backends/`, and all of Claude's specifics (message types, permission classes, transport quirks, the four SDK monkey-patches) are quarantined in `daemon/backends/claude.py`:
+The daemon's orchestration logic never imports a vendor SDK — that was fully refactored out. Every point where it would touch one goes through `daemon/backends/`, and all of Claude's specifics (message types, permission classes, transport quirks, the five SDK monkey-patches) are quarantined in `daemon/backends/claude.py`:
 
 - **`AgentSDK` (abstract base)** — the single interface for every SDK touchpoint: create a session, connect (spawn the agent subprocess), send a query, stream the response, interrupt, disconnect, switch models mid-session, extract the subprocess PID for cleanup, and check transport liveness. `ClaudeAgentSDK` is the one implementation today; a new backend is a new subclass injected at construction.
 - **`VibeNodeMessage` (normalized message type)** — each backend normalizes its own message/content-block types into one backend-agnostic shape inside its `receive_response()`. The orchestrator processes only `VibeNodeMessage` and contains **zero `isinstance` checks against any SDK-specific type**, so a new backend's message formats never leak upward.

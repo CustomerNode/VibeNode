@@ -241,6 +241,17 @@ data/jobs/
 data/engine_code.json
 data/.engine_code.*
 
+# Mobile Command pairing code + cookie salt (app/mobile_auth.py)
+data/mobile_pair.json
+data/mobile_pair.json.tmp
+
+# Background session namer — per-project watermarks (app/auto_namer.py)
+data/auto_namer.json
+data/auto_namer.json.tmp
+
+# sha256 of requirements.txt at the last successful pip install (app/requirements_sync.py)
+data/requirements.stamp
+
 # Backups
 backups/
 
@@ -284,3 +295,9 @@ confirmed_models.json
 
 # Design scratch pages (local mockups, served at /static/scratch/, never shipped)
 static/scratch/
+
+# Session Engine durable state and the per-session hosts (daemon/session_durable.py, session-host spec)
+data/session_durable/
+data/session_aliases.json
+data/session_hosts/
+logs/session_hosts/

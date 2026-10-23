@@ -353,6 +353,15 @@ def api_engine_status():
     return jsonify(body)
 
 
+@bp.route("/api/engine/knobs", methods=["GET"])
+def api_engine_knobs():
+    """Every ``VIBENODE_*`` behaviour switch with its current value and source
+    (read-only; drives System → Settings → Recovery & Watchdog). See
+    app/engine_knobs.py."""
+    from app import engine_knobs
+    return jsonify({"ok": True, "knobs": engine_knobs.snapshot()})
+
+
 @bp.route("/api/engine/restart-when-idle", methods=["POST"])
 def api_engine_restart_when_idle():
     """Arm (``{"arm": true}``) or cancel (``{"arm": false}``) a Session Engine

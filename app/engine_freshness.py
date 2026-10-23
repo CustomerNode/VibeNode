@@ -84,8 +84,8 @@ def engine_process():
     return None
 
 
-def _read_record(pid: int):
-    """The engine's code record, if it was written by THIS engine process."""
+def _read_record_full(pid: int):
+    """The engine's whole code record, if THIS engine process wrote it."""
     try:
         with open(RECORD_PATH, encoding="utf-8") as fh:
             record = json.load(fh)
@@ -93,8 +93,34 @@ def _read_record(pid: int):
         return None
     if not isinstance(record, dict) or record.get("pid") != pid:
         return None
+    return record
+
+
+def _read_record(pid: int):
+    """The engine's ``loaded`` map, if it was written by THIS engine process."""
+    record = _read_record_full(pid)
+    if record is None:
+        return None
     loaded = record.get("loaded")
     return loaded if isinstance(loaded, dict) else None
+
+
+def sdk_status(record) -> dict:
+    """The SDK fields of the record (daemon/engine_code.py ``sdk_fields``).
+
+    ``sdk_patch_failures`` is a list of patch names, empty when every patch
+    applied or when the engine is too old to report (an engine from before
+    2026-10-23 wrote none of these fields; absence is not a failure).
+    """
+    record = record if isinstance(record, dict) else {}
+    failures = record.get("sdk_patch_failures")
+    details = record.get("sdk_patch_failure_details")
+    return {
+        "sdk_version": str(record.get("sdk_version") or ""),
+        "sdk_version_tested": record.get("sdk_version_tested", True) is not False,
+        "sdk_patch_failures": [str(f) for f in failures] if isinstance(failures, list) else [],
+        "sdk_patch_failure_details": details if isinstance(details, list) else [],
+    }
 
 
 def _engine_source_files() -> list:
@@ -150,9 +176,11 @@ def status() -> dict:
     except Exception:
         return {"ok": True, "running": False, "stale": False, "outdated": [],
                 "restart_armed": _waiter.armed()}
-    loaded = _read_record(pid)
+    record = _read_record_full(pid)
+    loaded = record.get("loaded") if isinstance(record, dict) else None
+    loaded = loaded if isinstance(loaded, dict) else None
     outdated = outdated_files(started_at, loaded)
-    return {
+    body = {
         "ok": True,
         "running": True,
         "pid": pid,
@@ -162,6 +190,8 @@ def status() -> dict:
         "outdated": outdated,
         "restart_armed": _waiter.armed(),
     }
+    body.update(sdk_status(record))
+    return body
 
 
 # ── Restart when idle ─────────────────────────────────────────────────────

@@ -3,6 +3,7 @@ Session loading -- summary parser and full session parser.
 """
 
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,7 @@ from .config import (
     _load_names_cached,
     _format_size,
     _summary_cache,
+    _summary_cache_index,
     _get_deleted_ids,
     _get_utility_ids,
     _get_remapped_ids,
@@ -21,7 +23,7 @@ from .config import (
 )
 
 
-def _overlay_access_ts(summary: dict, path: Path) -> dict:
+def _overlay_access_ts(summary: dict, path: Path, access_map: dict | None = None) -> dict:
     """Return *summary* with ``effective_ts`` bumped by the project's
     recorded last-access time for this session if it is newer.
 
@@ -29,10 +31,17 @@ def _overlay_access_ts(summary: dict, path: Path) -> dict:
     UI hooks (session open, send_message, etc).  They are NOT part of the
     file-content cache key, so we must overlay them on every call rather
     than baking them into the cached summary dict.
+
+    *access_map* lets ``all_sessions()`` load the project's map ONCE and
+    reuse it for every row; without it each summary resolved the project
+    directory and stat'ed the access file again (two stats per session,
+    ~170 ms of a 1,009-session listing).
     """
     try:
-        project = path.parent.name
-        access_ts = _load_session_access_cached(project).get(path.stem, 0)
+        if access_map is None:
+            project = path.parent.name
+            access_map = _load_session_access_cached(project)
+        access_ts = access_map.get(path.stem, 0)
     except Exception:
         return summary
     if access_ts <= summary.get("effective_ts", 0):
@@ -40,18 +49,49 @@ def _overlay_access_ts(summary: dict, path: Path) -> dict:
     return {**summary, "effective_ts": access_ts}
 
 
-def load_session_summary(path: Path) -> dict:
-    """Cached summary — reads the whole file, no head/tail tricks."""
+# ai-title-orphan verdicts, one entry per path: str(path) -> (mtime_ns, size,
+# verdict).  ``_is_aititle_only_orphan`` stats AND fully reads every file under
+# 100 KB; doing that on every listing cost ~210 ms for 1,009 transcripts.  A
+# verdict can only change when the file changes, so it is keyed like the
+# summary cache.  One entry per path means the cache cannot leak across turns.
+_orphan_cache: dict = {}
+
+
+def _is_orphan_cached(path: Path, st: os.stat_result) -> bool:
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _orphan_cache.get(str(path))
+    if hit is not None and hit[0] == key[0] and hit[1] == key[1]:
+        return hit[2]
+    # Mirrors the size cap inside _is_aititle_only_orphan: a real session
+    # with even one turn is well past 100 KB, so skip the read entirely.
+    verdict = False if st.st_size > 100_000 else _is_aititle_only_orphan(path)
+    _orphan_cache[str(path)] = (key[0], key[1], verdict)
+    return verdict
+
+
+def _summary_cache_key(path: Path, st: os.stat_result) -> tuple:
+    return (str(path), st.st_mtime, st.st_size)
+
+
+def load_session_summary(path: Path, st: os.stat_result | None = None,
+                         access_map: dict | None = None) -> dict:
+    """Cached summary — reads the whole file, no head/tail tricks.
+
+    *st* is an optional pre-fetched ``stat`` result (``all_sessions`` gets it
+    for free from ``os.scandir`` on Windows); *access_map* is an optional
+    pre-loaded ``_session_access.json`` dict (see ``_overlay_access_ts``).
+    """
     _err = {"id": path.stem, "error": "", "custom_title": None,
             "display_title": path.stem, "date": "", "last_activity": "", "preview": "",
             "last_activity_ts": 0, "effective_ts": 0, "sort_ts": 0,
             "size": "0 B", "file_bytes": 0, "message_count": 0}
-    try:
-        st = path.stat()
-    except Exception:
-        return _err
+    if st is None:
+        try:
+            st = path.stat()
+        except Exception:
+            return _err
 
-    cache_key = (str(path), st.st_mtime, st.st_size)
+    cache_key = _summary_cache_key(path, st)
     cached = _summary_cache.get(cache_key)
     if cached is not None:
         # Even on cache hit, overlay access_ts: access can update without
@@ -66,7 +106,7 @@ def load_session_summary(path: Path) -> dict:
         # process, so a session the user slept came back "idle" on the next
         # list load (project switch / refresh) — the "Sleep won't stick
         # across a project switch" bug.
-        return dict(_overlay_access_ts(cached, path))
+        return dict(_overlay_access_ts(cached, path, access_map))
 
     custom_title = None
     first_user_content = ""
@@ -162,10 +202,17 @@ def load_session_summary(path: Path) -> dict:
         "preview": preview,
         "message_count": message_count,
     }
+    # Drop the key this path held before (previous mtime/size) so a transcript
+    # that grows every turn keeps exactly ONE entry in the cache.
+    path_str = str(path)
+    old_key = _summary_cache_index.get(path_str)
+    if old_key is not None and old_key != cache_key:
+        _summary_cache.pop(old_key, None)
+    _summary_cache_index[path_str] = cache_key
     _summary_cache[cache_key] = result
     # Copy for the same reason as the cache-hit path above: the caller must
     # never be able to mutate the cached summary.
-    return dict(_overlay_access_ts(result, path))
+    return dict(_overlay_access_ts(result, path, access_map))
 
 
 def load_session(path: Path) -> dict:
@@ -528,19 +575,9 @@ def load_session_timeline(path: Path) -> dict:
     }
 
 
-def _is_system_content(text: str) -> bool:
-    t = text.strip()
-    return bool(
-        t.startswith("<") and not t.startswith("<!") or
-        t.startswith("This session is being continued") or
-        t.startswith("This is a continuation") or
-        t.startswith("The user opened") or
-        t.startswith("The user selected") or
-        t.startswith("The user is viewing") or
-        t.startswith("**What we were working on") or
-        t.startswith("**Key context") or
-        t.startswith("**Most recent exchanges")
-    )
+# The timeline's "starts like injected context" test, shared via common/ (the
+# engine's live-stream test is a different question; see common/transcripts.py).
+from common.transcripts import is_timeline_system_content as _is_system_content  # noqa: E402
 
 
 def all_sessions(summary_only: bool = False, project: str = "") -> list:
@@ -554,20 +591,62 @@ def all_sessions(summary_only: bool = False, project: str = "") -> list:
     # in-flight guard for orphans created between sweeps.  The check is a
     # stat() + 1-line read — only fires when the file is <500 bytes, so it
     # adds no cost on real chats.
+    #
+    # Listing cost (measured on a 1,009-transcript project, 2026-10-23): the
+    # directory is read ONCE with os.scandir, whose DirEntry.stat() is free on
+    # Windows (the listing carries the data), and that one stat feeds the
+    # orphan check, the summary-cache key and the summary itself.  Summary
+    # cache hits are served inline; only misses go to the thread pool, so a
+    # fully warm listing spins up no threads at all.
     deleted_ids = _get_deleted_ids(project)
     utility_ids = _get_utility_ids(project)
     remapped_ids = _get_remapped_ids(project)
-    files = [f for f in _sessions_dir(project).glob("*.jsonl")
-             if f.stem not in deleted_ids
-             and f.stem not in utility_ids
-             and f.stem not in remapped_ids
-             and not f.stem.startswith("_")
-             and not _is_aititle_only_orphan(f)]
-    loader = load_session_summary if summary_only else load_session
-    if summary_only and len(files) > 10:
-        with ThreadPoolExecutor(max_workers=min(16, len(files))) as pool:
-            sessions = list(pool.map(loader, files))
-    else:
-        sessions = [loader(f) for f in files]
+    sdir = _sessions_dir(project)
+    hidden = deleted_ids | utility_ids | remapped_ids
+    entries = []  # (Path, stat_result)
+    try:
+        with os.scandir(sdir) as it:
+            for de in it:
+                name = de.name
+                if not name.endswith(".jsonl") or name.startswith("_"):
+                    continue
+                stem = name[:-6]
+                if stem in hidden:
+                    continue
+                try:
+                    if not de.is_file():
+                        continue
+                    st = de.stat()
+                except OSError:
+                    continue
+                p = sdir / name
+                if _is_orphan_cached(p, st):
+                    continue
+                entries.append((p, st))
+    except OSError:
+        entries = []
+
+    if not summary_only:
+        sessions = [load_session(p) for p, _ in entries]
+        sessions.sort(key=lambda x: x["sort_ts"], reverse=True)
+        return sessions
+
+    access_map = _load_session_access_cached(sdir.name)
+    sessions = []
+    misses = []
+    for p, st in entries:
+        cached = _summary_cache.get(_summary_cache_key(p, st))
+        if cached is not None:
+            sessions.append(dict(_overlay_access_ts(cached, p, access_map)))
+        else:
+            misses.append((p, st))
+    if misses:
+        def _load(item):
+            return load_session_summary(item[0], item[1], access_map)
+        if len(misses) > 10:
+            with ThreadPoolExecutor(max_workers=min(16, len(misses))) as pool:
+                sessions.extend(pool.map(_load, misses))
+        else:
+            sessions.extend(_load(m) for m in misses)
     sessions.sort(key=lambda x: x["sort_ts"], reverse=True)
     return sessions

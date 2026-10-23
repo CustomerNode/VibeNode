@@ -273,7 +273,7 @@ def liveness(monkeypatch):
     """Control the two liveness inputs: running commands and footprint writes."""
     state = {"live": [], "last_write": 0.0}
     monkeypatch.setattr(hm, "live_commands", lambda pid: state["live"])
-    monkeypatch.setattr(hm, "footprint_last_write", lambda path: state["last_write"])
+    monkeypatch.setattr(hm, "footprint_last_write", lambda path, layout=None: state["last_write"])
     return state
 
 

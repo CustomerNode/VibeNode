@@ -111,6 +111,14 @@ function markSessionUnread(sessionId) {
   _unreadSessions.add(sessionId);
   _saveUnreadSessions();
   _syncUnreadDom(sessionId);
+  _unreadHomepageRefresh();
+}
+
+/** The homepage's "Needs you" list includes unread finished sessions; an
+ *  unread flag changing is the one input to it that no state event carries. */
+function _unreadHomepageRefresh() {
+  if (typeof viewMode !== 'undefined' && viewMode === 'homepage'
+      && typeof _updateHomepageStats === 'function') _updateHomepageStats();
 }
 
 /**
@@ -122,6 +130,7 @@ function clearSessionUnread(sessionId) {
   _unreadSessions.delete(sessionId);
   _saveUnreadSessions();
   _syncUnreadDom(sessionId);
+  _unreadHomepageRefresh();
 }
 
 /** Wipe every unread flag (used when the preference is switched off). */
@@ -602,15 +611,20 @@ function _findSessionById(sessions, sid) {
   return null;
 }
 
-function _renderSessionRow(s, extraClass) {
-  const status = getSessionStatus(s.id);
+/**
+ * The list row's state icon for a session, as HTML ('' for a plain sleeping
+ * row).  ONE source for both the full render (`_renderSessionRow`) and the
+ * surgical per-event update (`_updateRowState` in socket.js), so a state
+ * event no longer needs a full `filterSessions()` to repaint the compacting
+ * or awaiting-wake-up icon.
+ * @param {string} sid
+ * @param {string} status  getSessionStatus() value: question|working|idle|sleeping
+ */
+function _sessionStateIconHtml(sid, status) {
   const isWaiting = status === 'question';
   const isRunning = status === 'working';
   const isIdle = status === 'idle';
-  const stateClass = isWaiting ? ' waiting' : (isRunning || isIdle ? ' running' : '');
-  const activeClass = s.id === activeId ? ' active' : '';
-  const colClick = `onclick="singleOrDouble('${s.id}',event)" style="cursor:pointer;"`;
-  const _isCompacting = isRunning && window._sessionSubstatus && window._sessionSubstatus[s.id] === 'compacting';
+  const _isCompacting = isRunning && window._sessionSubstatus && window._sessionSubstatus[sid] === 'compacting';
   // Sleeping/awaiting-wake-up = substatus 'auto-resuming' regardless of state.
   // Spans both phases:
   //  * idle + auto-resuming = asleep waiting for wake-up to fire
@@ -621,8 +635,8 @@ function _renderSessionRow(s, extraClass) {
   // pickaxe icon the moment the wake-up fired (state went idle→working)
   // while the live panel still said "Awaiting wake-up…" — that's the
   // state-desync the user reported.
-  const _isSleeping = window._sessionSubstatus && window._sessionSubstatus[s.id] === 'auto-resuming';
-  const icon = isWaiting
+  const _isSleeping = window._sessionSubstatus && window._sessionSubstatus[sid] === 'auto-resuming';
+  return isWaiting
     ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2" stroke-linecap="round" title="Waiting for input"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>'
     : _isCompacting
     ? '<svg class="state-icon compacting-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#aa88ff" stroke-width="2" stroke-linecap="round" title="Compacting context"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>'
@@ -633,6 +647,21 @@ function _renderSessionRow(s, extraClass) {
     : isIdle
     ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#44aa66" stroke-width="2" stroke-linecap="round" title="Idle"><polyline points="20 6 9 17 4 12"/></svg>'
     : '';
+}
+
+/** The row classes that follow the session's state: 'waiting' or 'running'. */
+function _sessionRowStateClass(status) {
+  return status === 'question' ? 'waiting' : (status === 'working' || status === 'idle' ? 'running' : '');
+}
+
+function _renderSessionRow(s, extraClass) {
+  const status = getSessionStatus(s.id);
+  const isIdle = status === 'idle';
+  const _sc = _sessionRowStateClass(status);
+  const stateClass = _sc ? ' ' + _sc : '';
+  const activeClass = s.id === activeId ? ' active' : '';
+  const colClick = `onclick="singleOrDouble('${s.id}',event)" style="cursor:pointer;"`;
+  const icon = _sessionStateIconHtml(s.id, status);
   // multi-select: include .multi-selected class on initial render so the
   // visual stays in sync after sort/filter re-renders without needing an
   // extra _syncMultiSelectionDom() pass.  onmousedown intercepts Ctrl/Cmd+
@@ -1059,7 +1088,7 @@ function _dblclickSleepIfIdle(sessionId, e) {
       })()
     : sessionId.slice(0, 8);
   _showUndoToast(
-    'Session asleep — ' + displayName,
+    'Session sleeping — ' + displayName,
     'Undo',
     function undo() {
       // Clear user-stop intent so the client no longer suppresses ghost
@@ -1964,8 +1993,7 @@ async function _mtpDoMove(encEncoded) {
   // The session left the current project — clean it out of the current view,
   // matching delete's local cleanup (minus the trash/kanban-unlink semantics;
   // the session and its kanban links still exist, just under another project).
-  if (typeof allSessions !== 'undefined') allSessions = allSessions.filter(x => x.id !== sessionId);
-  if (typeof allSessionIds !== 'undefined' && allSessionIds.delete) allSessionIds.delete(sessionId);
+  SessionStore.remove(sessionId);
   if (typeof multiSelectedIds !== 'undefined' && multiSelectedIds.has(sessionId)) {
     multiSelectedIds.delete(sessionId);
     if (typeof _renderMultiSelectionBadge === 'function') _renderMultiSelectionBadge();
@@ -2628,10 +2656,7 @@ async function _bulkDelete() {
       if (!okFlag) throw new Error('delete failed');
 
       // Local cleanup (mirrors deleteSession in toolbar.js).
-      if (typeof allSessions !== 'undefined') {
-        allSessions = allSessions.filter(x => x.id !== id);
-      }
-      if (typeof allSessionIds !== 'undefined') allSessionIds.delete(id);
+      SessionStore.remove(id);
       if (typeof _clearDraft === 'function') _clearDraft(id);
       if (typeof removeSessionFromAllFolders === 'function') removeSessionFromAllFolders(id);
       // Best-effort kanban unlink; do not block on it.

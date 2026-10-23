@@ -461,6 +461,9 @@
      44px tap target comes from a transparent overlay rather than from
      inflating the pill — big enough to hit, small enough to ignore. */
   .vn-jump-wrap { bottom: 14px; }
+  /* The phone pill is 30px tall (below): reserve a little more at the end of
+     the thread so it never sits on the final line (style.css .vn-jump-wrap). */
+  .live-log { --vn-jump-reserve: 44px; }
   .vn-jump-pill {
     padding: 6px 13px;
     font-size: 11.5px;

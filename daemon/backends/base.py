@@ -133,6 +133,116 @@ class SessionOptions:
     # unaltered — this is a notification-only hook.
     pre_compact_callback: Optional[Callable] = None
 
+    # Session Host (daemon/session_host.py).  ``hosted``: run the CLI inside
+    # its own host process so it outlives a Session Engine restart;
+    # ``host_sid``: the id the host's record is filed under; ``attach``: a
+    # host record a previous engine left running, to reattach to instead of
+    # launching anything.  Backends that cannot host ignore all three.
+    hosted: bool = False
+    host_sid: Optional[str] = None
+    attach: Optional[dict] = None
+
+
+class BackendKnowledge:
+    """What the orchestration layer needs to KNOW about a backend's vocabulary,
+    as opposed to what it needs to DO with it (``AgentSDK``).
+
+    Model naming, tool names, stream markers and on-disk paths used to be
+    hardcoded across ``session_manager.py``.  They live behind this object so
+    the manager reads them by meaning ("the compaction marker", "the model
+    family of this id") and never by the Claude CLI's literal spelling
+    (``tests/test_backend_seam.py`` enforces that).  The defaults here are a
+    backend that knows nothing: every lookup misses, nothing switches, nothing
+    is parsed.  ``daemon/backends/claude_layout.py`` is the Claude one.
+
+    Every member is pure and cheap: no I/O, no SDK import.
+    """
+
+    # Tools whose call schedules a deferred auto-resume of the session.
+    wakeup_tool_names: frozenset = frozenset()
+    # System-message subtype that marks a finished context compaction.
+    compaction_marker: Optional[str] = None
+    # Stream-JSON event carrying account usage windows.
+    rate_limit_event_name: Optional[str] = None
+    # Usage-limit auto-switch: model family -> family to continue on.
+    limit_switch_families: dict = {}
+
+    @property
+    def system_markers(self) -> tuple:
+        """Markers of backend-injected content inside user-role messages."""
+        return ()
+
+    # ── Model naming ──
+    def strip_markers(self, model_id: str) -> str:
+        return str(model_id or "").strip()
+
+    def model_family(self, model_id: str) -> str:
+        return ""
+
+    def model_version(self, model_id: str) -> tuple:
+        return ()
+
+    def model_label(self, model_id: str) -> str:
+        return self.strip_markers(model_id) or "the model"
+
+    def newest_in_family(self, model_ids, family: str) -> str:
+        return ""
+
+    def cli_model_id(self, model: Optional[str]) -> str:
+        """A recorded model id made safe to hand back to the backend."""
+        return (model or "").strip()
+
+    def newest_model_of(self, family: str, listed: list, known_ids: Callable,
+                        limited_model: str = "") -> str:
+        """The newest model of ``family`` to continue on, or ''."""
+        return ""
+
+    # ── Stream / disk ──
+    def stream_usage(self, event_data: dict) -> dict:
+        """Read a raw stream event: ``{"type", "payload", "usage_start",
+        "usage"}`` where ``usage`` is the per-call usage dict or None."""
+        return {"type": "", "payload": {}, "usage_start": False, "usage": None}
+
+    def file_history_dir(self, home) -> Optional[Any]:
+        """Where per-session file backups live, under ``home``; None if the
+        backend has no such store."""
+        return None
+
+
+class TranscriptLayout:
+    """Where a backend keeps a session's side files, and how its transcript
+    marks an API-error stop.  Read by the watchdog jobs
+    (``orphaned_workers``, ``silent_wait``, ``limit_watch``).  They obtain it
+    as ``getattr(sm, "backend_layout", None) or ClaudeTranscriptLayout()``:
+    the watchdog hot-reloads, so it must work against a SessionManager that
+    predates this attribute.
+    """
+
+    # Glob (within ``subagents_dir``) of per-agent metadata files.
+    subagent_meta_glob: str = ""
+
+    def subagents_dir(self, root_transcript):
+        """Directory of per-agent transcripts and metadata, or None."""
+        return None
+
+    def subagent_meta_id(self, filename: str) -> Optional[str]:
+        """The agent id a metadata file (matching ``subagent_meta_glob``)
+        belongs to, or None for any other file."""
+        return None
+
+    def subagent_transcript(self, sub_dir, agent_id: str):
+        """Path of agent ``agent_id``'s own transcript inside ``sub_dir``."""
+        return None
+
+    def is_api_error_entry(self, entry) -> Optional[str]:
+        """The error kind (possibly '') if ``entry`` is an API-error stop the
+        backend wrote into the transcript, else None."""
+        return None
+
+    def task_output_dir(self, root_transcript):
+        """Directory of background-task output files, or None."""
+        return None
+
 
 class AgentSDK(ABC):
     """Abstract base for AI agent backends.
@@ -361,6 +471,15 @@ class AgentSDK(ABC):
 
     # ── Non-abstract methods with sensible defaults ──────────────────
 
+    @property
+    def knowledge(self) -> BackendKnowledge:
+        """This backend's vocabulary (see ``BackendKnowledge``)."""
+        return BackendKnowledge()
+
+    def transcript_layout(self) -> TranscriptLayout:
+        """This backend's on-disk session layout (see ``TranscriptLayout``)."""
+        return TranscriptLayout()
+
     def apply_patches(self) -> list[str]:
         """Apply any SDK-specific patches at startup.
 
@@ -375,6 +494,32 @@ class AgentSDK(ABC):
         ``suppress_console_windows`` patches.
         """
         return []
+
+    # ── Session Host (daemon/session_host.py); defaults: no hosting ───
+
+    #: True when ``create_session`` honours ``SessionOptions.hosted``.
+    supports_hosting: bool = False
+
+    def host_record(self, client: Any) -> Optional[dict]:
+        """The host record of a hosted client, or None (not hosted)."""
+        return None
+
+    def host_hello(self, client: Any) -> dict:
+        """What the host reported on attach (``hello_ok``), or {}."""
+        return {}
+
+    def host_release_replay(self, client: Any, skip_ids=()) -> None:
+        """Let a reattached client's replayed messages through, skipping
+        those whose transcript id is in ``skip_ids``."""
+        return None
+
+    async def host_detach(self, client: Any) -> None:
+        """Disconnect WITHOUT ending the CLI (the engine is stopping)."""
+        await self.disconnect(client)
+
+    async def host_rename(self, client: Any, new_id: str) -> None:
+        """The session adopted a new id; the host refiles its record."""
+        return None
 
     def make_permission_result_allow(
         self, tool_input: dict

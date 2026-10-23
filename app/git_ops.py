@@ -10,6 +10,7 @@ import time
 from .config import _VIBENODE_DIR
 
 from .platform_utils import NO_WINDOW as _NO_WINDOW
+from . import requirements_sync as _reqs
 
 # ---------------------------------------------------------------------------
 # Git cache and lock
@@ -134,13 +135,126 @@ def get_git_cache() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Dependencies pulled in by an update
+# ---------------------------------------------------------------------------
+
+def _requirements_blob(proj) -> str:
+    """The blob id of requirements.txt at HEAD, or '' when unknown.
+
+    Compared before and after a pull: a changed blob means the update added,
+    removed or re-pinned a dependency, and pip must run (2026-10-23).
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(proj), "rev-parse", "HEAD:requirements.txt"],
+            capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW)
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _install_pulled_requirements(proj) -> dict:
+    """Run pip for the requirements the pull just landed, with the server's
+    interpreter.  Never raises; the result feeds the sync response."""
+    return _reqs.install_requirements(sys.executable, proj / "requirements.txt")
+
+
+# ---------------------------------------------------------------------------
+# Commit message for a Publish
+# ---------------------------------------------------------------------------
+# 74 of the 100 commits before 2026-10-23 were "Update VibeNode <timestamp>":
+# nothing said what changed or whether the tests ran.  The message is now the
+# user's one-line summary (or an auto summary of the staged areas), then a
+# line recording the publish gate outcome.
+
+_SUMMARY_MAX = 120
+_AREAS_SHOWN = 6
+
+
+def _area_of(path: str) -> str:
+    parts = [p for p in path.replace("\\", "/").split("/") if p]
+    if len(parts) >= 3:
+        return parts[0] + "/" + parts[1]
+    if len(parts) == 2:
+        return parts[0]
+    return parts[0] if parts else ""
+
+
+def summarize_staged(paths) -> str:
+    """'Update app/routes, static/js, tests (14 files)' from staged paths."""
+    paths = [p for p in paths if p and p.strip()]
+    if not paths:
+        return "Update VibeNode"
+    areas = []
+    for p in paths:
+        a = _area_of(p.strip())
+        if a and a not in areas:
+            areas.append(a)
+    shown = ", ".join(areas[:_AREAS_SHOWN]) + (", …" if len(areas) > _AREAS_SHOWN else "")
+    n = len(paths)
+    return "Update %s (%d file%s)" % (shown, n, "" if n == 1 else "s")
+
+
+def _staged_paths(proj) -> list:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(proj), "diff", "--cached", "--name-only"],
+            capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW)
+        if r.returncode == 0:
+            return [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    except Exception:
+        pass
+    return []
+
+
+def format_publish_gate(gate) -> str:
+    """One line recording how the publish gate went.
+
+    ``gate`` is the dict the browser sends: ``{"mode": "fast"|"full"|"skipped",
+    "passed", "skipped", "failed", "seconds", "anyway": bool}``.  Missing or
+    unreadable means the caller did not say, which is recorded as skipped.
+    """
+    gate = gate if isinstance(gate, dict) else {}
+    mode = str(gate.get("mode") or "skipped").lower()
+    if mode not in ("fast", "full"):
+        return "Publish gate: skipped (no tests run)"
+
+    def _n(key):
+        try:
+            return int(gate.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+    line = "Publish gate: %s (%d passed, %d skipped, %d failed, %ds)" % (
+        mode, _n("passed"), _n("skipped"), _n("failed"), _n("seconds"))
+    if gate.get("anyway"):
+        line += ", published anyway"
+    return line
+
+
+def build_commit_message(summary: str, gate, staged_paths) -> str:
+    summary = " ".join(str(summary or "").split())[:_SUMMARY_MAX].strip()
+    if not summary:
+        summary = summarize_staged(staged_paths)
+    return summary + "\n\n" + format_publish_gate(gate) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Git sync logic
 # ---------------------------------------------------------------------------
 
-def do_git_sync(action: str, confirm_branch: bool = False) -> dict:
+def do_git_sync(action: str, confirm_branch: bool = False,
+                summary: str = "", gate=None) -> dict:
     """
     Perform git sync (pull, push, or both).
-    Returns {"ok": bool, "messages": list[str]}.
+    Returns {"ok": bool, "messages": list[str]} plus, after a pull that changed
+    requirements.txt, ``pip_ran`` / ``pip_ok`` / ``pip_installed`` /
+    ``pip_output_tail``.
+
+    ``summary`` is the user's one-line "What changed" for the commit (auto
+    generated from the staged paths when empty); ``gate`` records the publish
+    gate outcome (see ``format_publish_gate``).
 
     If the working copy is not on the repo's default branch, this short-circuits
     and returns {"needs_branch_confirm": True, ...} WITHOUT touching git, so a
@@ -172,8 +286,10 @@ def do_git_sync(action: str, confirm_branch: bool = False) -> dict:
 
     messages = []
     ok = True
+    pip_result = None
 
     if action in ("pull", "both"):
+        reqs_before = _requirements_blob(proj)
         stash = subprocess.run(["git", "-C", str(proj), "stash", "--include-untracked"],
                                capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW)
         stashed = "No local changes" not in stash.stdout
@@ -199,6 +315,19 @@ def do_git_sync(action: str, confirm_branch: bool = False) -> dict:
             messages.append("VibeNode is already up to date.")
         else:
             messages.append("Pulled latest VibeNode updates from remote.")
+        # The update changed requirements.txt: install what it asks for, with
+        # the interpreter that runs this server.  A pip failure is reported
+        # but never undoes the pull.
+        reqs_after = _requirements_blob(proj)
+        if reqs_after and reqs_after != reqs_before:
+            pip_result = _install_pulled_requirements(proj)
+            if pip_result["pip_ok"]:
+                n = pip_result.get("pip_installed", 0)
+                messages.append("Installed %d new or updated dependenc%s." % (n, "y" if n == 1 else "ies")
+                                if n else "Dependencies already satisfied.")
+            else:
+                messages.append("Dependency install failed; the code update landed but some "
+                                "features may not work until it is fixed. See the pip output below.")
 
     if action in ("push", "both") and ok:
         # ── Security scan before push ──
@@ -214,7 +343,6 @@ def do_git_sync(action: str, confirm_branch: bool = False) -> dict:
         dirty = subprocess.run(["git", "-C", str(proj), "status", "--porcelain"],
                                capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW)
         if dirty.stdout.strip():
-            from datetime import datetime as _dt
             subprocess.run(["git", "-C", str(proj), "add", "-A"],
                           capture_output=True, creationflags=_NO_WINDOW)
 
@@ -229,7 +357,7 @@ def do_git_sync(action: str, confirm_branch: bool = False) -> dict:
                     "Secrets or sensitive files were detected. Run Code Scan for details."
                 ], "scan": scan2}
 
-            msg = "Update VibeNode " + _dt.now().strftime("%Y-%m-%d %H:%M")
+            msg = build_commit_message(summary, gate, _staged_paths(proj))
             commit = subprocess.run(["git", "-C", str(proj), "commit", "-m", msg],
                                     capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW)
             if commit.returncode != 0:
@@ -282,4 +410,8 @@ def do_git_sync(action: str, confirm_branch: bool = False) -> dict:
                 pass
         _sync_cooldown_until = time.time() + 10  # suppress bg refresh for 10s
 
-    return {"ok": ok, "messages": messages}
+    result = {"ok": ok, "messages": messages}
+    if pip_result is not None:
+        result.update({k: pip_result[k] for k in
+                       ("pip_ran", "pip_ok", "pip_installed", "pip_output_tail")})
+    return result

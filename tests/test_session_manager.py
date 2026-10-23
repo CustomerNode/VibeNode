@@ -972,7 +972,7 @@ class TestSetSessionModel:
     def test_confirmed_model_sink_updates_and_reports_change(self, session_manager, sm_module):
         info = self._make_session(session_manager, sm_module, "sink-1",
                                   model="claude-fable-5")
-        with patch("app.routes.live_api.record_confirmed_model") as rec:
+        with patch("common.models.record_confirmed_model") as rec:
             changed = session_manager._set_confirmed_model(info, "claude-opus-4-7")
         assert changed is True
         assert info.model == "claude-opus-4-7"

@@ -259,7 +259,7 @@ socket.on('session_renamed', (data) => {
 // Daemon reconnection status — live toasts showing recovery progress
 socket.on('daemon_reconnect', (data) => {
     const status = data.status;
-    const msg = data.message || 'Daemon connection issue';
+    const msg = data.message || 'Session Engine connection issue';
     // Bridge to healthchecks.js so the "engine stopped" overlay clears the
     // instant the daemon reconnects (don't wait for the next /api/health poll).
     try {
@@ -676,8 +676,8 @@ socket.on('state_snapshot', (data) => {
     // Purge stale alias entries — if a session was remapped (old→new), remove
     // the old-ID entry so it doesn't duplicate the new-ID entry.
     if (window._idRemaps) {
-        allSessions = allSessions.filter(s => !window._idRemaps[s.id]);
-        _rebuildSessionIds();  // keep Set in sync after filter
+        SessionStore.replaceAll(allSessions.filter(s => !window._idRemaps[s.id]));
+        _rebuildSessionIds();  // multi-selection prune
     }
 
     // Inject stub entries into allSessions for SDK-managed sessions that
@@ -708,7 +708,7 @@ socket.on('state_snapshot', (data) => {
             // read "New Session" even when this page had already been told
             // the session's title (it arrived before the row did).
             const _stubTitle = (typeof _knownSessionTitle === 'function' && _knownSessionTitle(id)) || s.name || '';
-            allSessions.unshift({
+            SessionStore.set(id, {   // new id: inserted at the front
                 id: id,
                 display_title: _stubTitle || 'New Session',
                 custom_title: _stubTitle,
@@ -725,15 +725,8 @@ socket.on('state_snapshot', (data) => {
         }
     });
 
-    // Final dedup — guarantee no two entries share the same ID
-    {
-        const _seen = new Set();
-        allSessions = allSessions.filter(s => {
-            if (_seen.has(s.id)) return false;
-            _seen.add(s.id);
-            return true;
-        });
-    }
+    // No dedup pass needed: SessionStore.set() never inserts an id twice and
+    // replaceAll() dedups (first copy wins).
     _rebuildSessionIds();
     // The dedup keeps the FIRST copy, which can be the nameless one.
     if (typeof _knownSessionTitles !== 'undefined' && _knownSessionTitles.size) {
@@ -891,6 +884,9 @@ socket.on('session_state', (data) => {
     if (data.cwd && session_id !== liveSessionId && !_sessionBelongsToActiveProject(data.cwd)) return;
     const substatus = data.substatus || '';
     const usage = data.usage || null;
+    // The status BEFORE this event, for the render decision at the end: under
+    // "Active first" a rank change moves the row, anything else is in-place.
+    const _prevStatus = (typeof getSessionStatus === 'function') ? getSessionStatus(session_id) : '';
 
     // Cancel watchdog on definitive state changes (idle/stopped/waiting).
     // For working/starting events, RESET the watchdog so it keeps monitoring
@@ -902,8 +898,7 @@ socket.on('session_state', (data) => {
     }
 
     // Stamp receipt time so heartbeat snapshots don't revert this
-    if (!window._sessionStateTs) window._sessionStateTs = {};
-    window._sessionStateTs[session_id] = Date.now();
+    SessionStore.mapSet('stateTs', session_id, Date.now());
 
     // Track substatus (e.g. "compacting") per session.
     // Rules:
@@ -920,48 +915,45 @@ socket.on('session_state', (data) => {
     //     (compact_boundary is the authoritative confirmation that arrives
     //     shortly after the optimistic set in liveCompact()).
     //   • Any explicit substatus="" from the server always wins (clears it).
-    if (!window._sessionSubstatus) window._sessionSubstatus = {};
     const substatusExplicit = data.hasOwnProperty('substatus');
     if (substatus && state === 'working') {
         // Server says "compacting" (or future substatus) and session is working
-        window._sessionSubstatus[session_id] = substatus;
+        SessionStore.mapSet('substatus', session_id, substatus);
     } else if (substatus === 'auto-resuming' && state === 'idle') {
         // Session is sleeping with a scheduled wake-up pending — keep the
         // substatus visible so the idle indicator can show "Awaiting wake-up…"
         // instead of plain ready.  Cleared by a fresh substatus='' from the
         // server at the wake-up's final RESULT.
-        window._sessionSubstatus[session_id] = substatus;
+        SessionStore.mapSet('substatus', session_id, substatus);
     } else if (state !== 'working') {
         // Non-working state (idle/stopped/waiting) — clear substatus unless
         // the wake-up branch above preserved it.
-        delete window._sessionSubstatus[session_id];
-    } else if (substatusExplicit || window._sessionSubstatus[session_id] !== 'compacting') {
+        SessionStore.mapDelete('substatus', session_id);
+    } else if (substatusExplicit || SessionStore.map('substatus')[session_id] !== 'compacting') {
         // Working state, no substatus: clear unless we're preserving optimistic "compacting"
-        delete window._sessionSubstatus[session_id];
+        SessionStore.mapDelete('substatus', session_id);
     }
 
     // Track API-error auto-retry countdown per session.  The server sends the
     // absolute fire time (retry_at, epoch seconds); the live panel renders a
     // local "Auto-retrying in Ns…" countdown from it.  retry_at == 0 means no
     // retry pending — clear the entry so the banner disappears.
-    if (!window._sessionRetryState) window._sessionRetryState = {};
     if (data.retry_at && Number(data.retry_at) > 0) {
-        window._sessionRetryState[session_id] = {
+        SessionStore.mapSet('retry', session_id, {
             retry_at: Number(data.retry_at),
             retry_attempt: Number(data.retry_attempt) || 0,
             retry_max: Number(data.retry_max) || 0,
             retry_reason: data.retry_reason || '',
-        };
+        });
     } else {
-        delete window._sessionRetryState[session_id];
+        SessionStore.mapDelete('retry', session_id);
     }
     // Track the last error string per session — drives the manual "Retry"
     // button shown on an idle session that ended with a (non-retrying) error.
-    if (!window._sessionError) window._sessionError = {};
     if (error) {
-        window._sessionError[session_id] = error;
+        SessionStore.mapSet('error', session_id, error);
     } else {
-        delete window._sessionError[session_id];
+        SessionStore.mapDelete('error', session_id);
     }
     // Track an exhausted plan quota per session.  When set, the live panel
     // replaces the generic error banner (whose only action, "Retry", re-hits
@@ -969,49 +961,47 @@ socket.on('session_state', (data) => {
     _ingestLimitState(session_id, data);
 
     // Track token usage per session for context window indicator
-    if (!window._sessionUsage) window._sessionUsage = {};
     if (usage) {
-        window._sessionUsage[session_id] = usage;
+        SessionStore.mapSet('usage', session_id, usage);
     }
 
     // Sync server-side working_since for elapsed timer (survives refresh)
-    if (!window._workingSinceMap) window._workingSinceMap = {};
     if (working_since && state === 'working') {
-        window._workingSinceMap[session_id] = working_since * 1000;
+        SessionStore.mapSet('workingSince', session_id, working_since * 1000);
         if (session_id === liveSessionId) _liveWorkingStart = working_since * 1000;
     } else if (state !== 'working') {
-        delete window._workingSinceMap[session_id];
+        SessionStore.mapDelete('workingSince', session_id);
         if (session_id === liveSessionId) _liveWorkingStart = null;
     }
 
     // Map SDK states to existing UI state names
     if (state === 'waiting') {
-        sessionKinds[session_id] = 'question';
+        SessionStore.mapSet('kinds', session_id, 'question');
     } else if (state === 'working' || state === 'starting') {
         // Clear sub-agents from previous turns when starting a new turn
         // (idle/question → working transition means old agents are stale)
         if (sessionKinds[session_id] && sessionKinds[session_id] !== 'working') {
-            delete window._subAgents[session_id];
+            SessionStore.mapDelete('subAgents', session_id);
         }
-        sessionKinds[session_id] = 'working';
+        SessionStore.mapSet('kinds', session_id, 'working');
     } else if (state === 'idle') {
-        sessionKinds[session_id] = 'idle';
+        SessionStore.mapSet('kinds', session_id, 'idle');
         // Clean up any leftover streaming bubble when session goes idle
         if (session_id === liveSessionId) {
             const _sb = document.querySelector('.msg.assistant.streaming-bubble');
             if (_sb) _sb.remove();
         }
         // Clear sub-agent tracking when session finishes
-        delete window._subAgents[session_id];
+        SessionStore.mapDelete('subAgents', session_id);
     } else if (state === 'stopped') {
-        delete sessionKinds[session_id];
-        delete window._subAgents[session_id];
+        SessionStore.mapDelete('kinds', session_id);
+        SessionStore.mapDelete('subAgents', session_id);
     }
 
     if (state === 'stopped') {
-        runningIds.delete(session_id);
+        SessionStore.mapDelete('running', session_id);
     } else {
-        runningIds.add(session_id);
+        SessionStore.mapSet('running', session_id, true);
     }
 
     // Update cost display if this is the active session
@@ -1051,7 +1041,7 @@ socket.on('session_state', (data) => {
     }
 
     if (state !== 'waiting') {
-        delete waitingData[session_id];
+        SessionStore.mapDelete('waiting', session_id);
         // Update workspace permission queue if permission was cleared
         if (workspaceActive && typeof _updatePermissionQueue === 'function') {
             _updatePermissionQueue(waitingData);
@@ -1086,9 +1076,14 @@ socket.on('session_state', (data) => {
       if (_mcPreview) _mcPreview.classList.remove('mc-preview-streaming');
     }
 
-    // Refresh active views — always call filterSessions so sidebar icons
-    // update for substatus changes (e.g. compacting indicator)
-    filterSessions();
+    // Refresh active views.  The row/card was repainted in place above
+    // (_updateRowState covers the state classes, the state icon or avatar
+    // including the compacting / awaiting-wake-up indicators, the status label
+    // and the unread dot).  A full filterSessions() is scheduled ONLY when an
+    // in-place update cannot express the change — see _renderSessionStateChange.
+    // It used to be unconditional: 200 sessions x 200 events = 200 full
+    // sidebar rebuilds (tests/test_session_render_perf.py).
+    _renderSessionStateChange(session_id, _prevStatus);
     // Kanban view: filterSessions doesn't re-render kanban, so use a
     // targeted in-place refresh for any kanban session rows mounted for
     // this session_id.  Without this, kanban indicators desynced from
@@ -1936,7 +1931,7 @@ socket.on('session_started', (data) => {
         const _isSameProject = !data.cwd || _sessionBelongsToActiveProject(data.cwd);
         if (_isSameProject && !allSessionIds.has(data.session_id)) {
             const _stubTitle = (typeof _knownSessionTitle === 'function' && _knownSessionTitle(data.session_id)) || data.name || '';
-            allSessions.unshift({
+            SessionStore.set(data.session_id, {   // new id: inserted at the front
                 id: data.session_id,
                 display_title: _stubTitle || 'New Session',
                 custom_title: _stubTitle,
@@ -1948,7 +1943,6 @@ socket.on('session_started', (data) => {
                 message_count: 0,
                 preview: '',
             });
-            allSessionIds.add(data.session_id);
             filterSessions();
         }
         if (_isSameProject) _updateRowState(data.session_id, sessionKinds[data.session_id] || 'idle');
@@ -1959,6 +1953,12 @@ socket.on('session_started', (data) => {
 if (!window._idRemaps) window._idRemaps = {};  // oldId -> newId
 
 // Session ID remapped — SDK assigned a different ID than the one we generated
+// Bulk "Name N untitled sessions" progress (POST /api/sessions/name-untitled).
+// {project, done, total, current_title, named, skipped, failed, finished}
+socket.on('naming_progress', (data) => {
+    if (typeof _onNamingProgress === 'function') _onNamingProgress(data);
+});
+
 // Account usage windows changed (broadcast by the daemon on a real change).
 socket.on('usage_limits', (data) => {
     if (typeof _ingestUsageLimits === 'function') _ingestUsageLimits(data);
@@ -1980,28 +1980,16 @@ socket.on('session_id_remapped', (data) => {
     // A title learned under the launch id belongs to the new id now.
     if (typeof _remapSessionTitle === 'function') _remapSessionTitle(oldId, newId);
 
-    // Update allSessions array and ID set
-    let s = allSessions.find(x => x.id === oldId);
-    const _sameSessionRow = s ? allSessions.find(x => x.id === newId) : null;
-    if (s && _sameSessionRow) {
-        // The list already has this session under the new id.  A session-list
-        // reload during the first turn returns it twice: the daemon's stub
-        // under the launch id and the CLI transcript under the CLI's id.
-        // Renaming the stub left two cards with the same id, one titled and
-        // one showing the first message.  Keep the transcript row (it has the
-        // real size and dates), carry the title over, and drop the stub.
-        if (s.custom_title && !_sameSessionRow.custom_title) {
-            _sameSessionRow.custom_title = s.custom_title;
-            _sameSessionRow.display_title = s.custom_title;
-        }
-        allSessions = allSessions.filter(x => x !== s);
-        _rebuildSessionIds();
-        s = _sameSessionRow;
-    } else if (s) {
-        s.id = newId;
-        allSessionIds.delete(oldId);
-        allSessionIds.add(newId);
-    }
+    // Update the list and its id index.  If the list already has this
+    // session under the new id, SessionStore.rekey() MERGES: a session-list
+    // reload during the first turn returns it twice (the daemon's stub under
+    // the launch id and the CLI transcript under the CLI's id), and renaming
+    // the stub left two cards with the same id, one titled and one showing
+    // the first message.  It keeps the transcript row (real size and dates),
+    // carries the title over, and drops the stub.  Otherwise it renames the
+    // row in place.  Either way the id Set is in step (PERF-CRITICAL #15).
+    const s = SessionStore.has(oldId) ? SessionStore.rekey(oldId, newId) : null;
+    if (s) _rebuildSessionIds();   // multi-selection prune
     if (s && typeof _applyKnownSessionTitle === 'function') _applyKnownSessionTitle(s);
 
     // Update activeId and URL — use replaceState (not pushState) so the
@@ -2265,19 +2253,138 @@ function _formatPermissionQuestion(toolName, toolInput) {
     return 'Claude wants to use ' + toolName + ':\n\n' + desc;
 }
 
-// Helper: update sidebar row classes
+// Helper: repaint ONE session's sidebar row and/or grid card in place.
+//
+// This is the surgical path a session_state event takes (2026-10-23).  It
+// covers everything the renderers derive from state: the list row's
+// si-*/waiting/running classes and state icon (pickaxe, check, clock, the
+// compacting and awaiting-wake-up icons), the card's wf-* class, avatar,
+// status label and title hint, and the unread dot.  The markup comes from the
+// same helpers the full renderers use (_sessionStateIconHtml in sessions.js,
+// _wfCardStatusParts in workforce.js), so the two paths cannot drift.
+//
+// `state` is the daemon's state as handed to the caller; a few call sites run
+// before sessionKinds catches up (see _syncUnreadDom), so the classes are
+// derived from it rather than from getSessionStatus().
 function _updateRowState(sessionId, state) {
     const row = document.querySelector('.session-item[data-sid="' + sessionId + '"]');
-    if (!row) return;
-    row.classList.remove('si-question', 'si-working', 'si-idle');
-    if (state === 'waiting') row.classList.add('si-question');
-    else if (state === 'working' || state === 'starting') row.classList.add('si-working');
-    else if (state === 'idle') row.classList.add('si-idle');
+    const card = document.querySelector('.wf-card[data-sid="' + sessionId + '"]');
+    if (!row && !card) return;
+    // The renderers' status vocabulary (question|working|idle|sleeping), from
+    // the authoritative `state` when it maps, else from the page's own map.
+    const status = state === 'waiting' ? 'question'
+        : (state === 'working' || state === 'starting') ? 'working'
+        : state === 'idle' ? 'idle'
+        : state === 'stopped' ? 'sleeping'
+        : ((typeof getSessionStatus === 'function') ? getSessionStatus(sessionId) : 'sleeping');
+    if (row) {
+        row.classList.remove('si-question', 'si-working', 'si-idle', 'waiting', 'running');
+        if (state === 'waiting') row.classList.add('si-question');
+        else if (state === 'working' || state === 'starting') row.classList.add('si-working');
+        else if (state === 'idle') row.classList.add('si-idle');
+        const _sc = (typeof _sessionRowStateClass === 'function') ? _sessionRowStateClass(status) : '';
+        if (_sc) row.classList.add(_sc);
+        if (typeof _sessionStateIconHtml === 'function') {
+            const host = row.querySelector('.session-col-name');
+            if (host) {
+                const html = _sessionStateIconHtml(sessionId, status);
+                const old = host.querySelector(':scope > .state-icon');
+                let fresh = null;
+                if (html) {
+                    const tpl = document.createElement('template');
+                    tpl.innerHTML = html;
+                    fresh = tpl.content.firstElementChild;
+                }
+                if (old && fresh) old.replaceWith(fresh);
+                else if (old) old.remove();
+                else if (fresh) {
+                    // Same slot the renderer uses: after caret / glyph / unread dot,
+                    // before the title text.
+                    const anchor = host.querySelector(':scope > .unread-dot')
+                        || host.querySelector(':scope > .subsession-glyph')
+                        || host.querySelector(':scope > .subsession-caret');
+                    if (anchor) anchor.after(fresh); else host.prepend(fresh);
+                }
+            }
+        }
+    }
+    if (card) {
+        card.classList.remove('wf-question', 'wf-working', 'wf-idle', 'wf-sleeping');
+        card.classList.add('wf-' + status);
+        if (typeof _wfCardStatusParts === 'function') {
+            const parts = _wfCardStatusParts(sessionId, status);
+            const avatar = card.querySelector('.wf-avatar');
+            if (avatar && avatar.innerHTML !== parts.emoji) avatar.innerHTML = parts.emoji;
+            const label = card.querySelector('.wf-status-label');
+            if (label && label.textContent !== parts.label) label.textContent = parts.label;
+            const t = card.getAttribute('title') || '';
+            const dash = t.lastIndexOf(' — ');
+            if (dash >= 0) card.setAttribute('title', t.slice(0, dash) + ' — ' + parts.hint);
+        }
+    }
     // The unread dot is idle-only, so it has to be re-evaluated on every state
     // change: the flag is raised while the session is still working and only
     // becomes visible when it settles. This is the surgical path — a full
     // filterSessions() also renders it, but not every state change triggers one.
     if (typeof _syncUnreadDom === 'function') _syncUnreadDom(sessionId, state);
+}
+
+// ── Debounced full sidebar render (2026-10-23) ──────────────────────────
+// A session_state event repaints its own row in place (_updateRowState).  A
+// full filterSessions() is needed only when the change cannot be expressed on
+// one row; those are coalesced here: trailing debounce of 150ms, with a 500ms
+// ceiling so a continuous stream of events still renders twice a second.
+const _FILTER_SESSIONS_DEBOUNCE_MS = 150;
+const _FILTER_SESSIONS_MAX_WAIT_MS = 500;
+let _filterSessionsTimer = null;
+let _filterSessionsFirstAt = 0;
+function _scheduleFilterSessions() {
+    const now = Date.now();
+    if (!_filterSessionsTimer) _filterSessionsFirstAt = now;
+    else clearTimeout(_filterSessionsTimer);
+    const waited = now - _filterSessionsFirstAt;
+    const delay = Math.max(0, Math.min(_FILTER_SESSIONS_DEBOUNCE_MS, _FILTER_SESSIONS_MAX_WAIT_MS - waited));
+    _filterSessionsTimer = setTimeout(() => {
+        _filterSessionsTimer = null;
+        if (typeof filterSessions === 'function') filterSessions();
+    }, delay);
+}
+// "Active first" rank; anything unknown sorts with sleeping, as the sorters do.
+const _STATUS_RANK = {question: 0, working: 1, idle: 2, sleeping: 3};
+/**
+ * Decide whether a session_state event needs a full re-render after its row
+ * was updated in place.  It does when:
+ *   - the view is not the list or card grid (Mission Control, Workforce,
+ *     Subsessions, the homepage stats): those renderers own their DOM;
+ *   - the sort is "Active first" and the session's rank changed, so its
+ *     position in the order changed;
+ *   - the session is in the list but has no row on screen (filtered out, or
+ *     not yet rendered by the windowed list), so there was nothing to patch.
+ * A session that is not in the list at all has nothing to render.
+ */
+function _renderSessionStateChange(sessionId, prevStatus) {
+    const inSessions = (typeof viewMode !== 'undefined') && viewMode === 'sessions';
+    const mode = (typeof sessionDisplayMode !== 'undefined') ? sessionDisplayMode : 'grid';
+    if (!inSessions || (mode !== 'grid' && mode !== 'list')) { _scheduleFilterSessions(); return; }
+    const inList = SessionStore.has(sessionId);
+    if (!inList) return;
+    const statusSort = mode === 'grid'
+        ? ((typeof wfSort !== 'undefined') && wfSort === 'status')
+        : ((typeof sortMode !== 'undefined') && sortMode === 'status');
+    const statusChanged = typeof getSessionStatus === 'function' && prevStatus !== getSessionStatus(sessionId);
+    if (statusSort && statusChanged) {
+        const _r = s => (_STATUS_RANK[s] == null ? 3 : _STATUS_RANK[s]);
+        if (_r(prevStatus) !== _r(getSessionStatus(sessionId))) { _scheduleFilterSessions(); return; }
+    }
+    // A state/unread filter chip is on: the session may enter or leave the list.
+    if (statusChanged && typeof _sessionFiltersDependOnState === 'function'
+            && _sessionFiltersDependOnState()) { _scheduleFilterSessions(); return; }
+    // Outside the rendered window (filtered out, or past the first N rows of a
+    // windowed list): it has no row by design, so there is nothing to render.
+    if (typeof _sessionInRenderWindow === 'function' && !_sessionInRenderWindow(sessionId)) return;
+    const onScreen = document.querySelector(
+        (mode === 'grid' ? '.wf-card' : '.session-item') + '[data-sid="' + sessionId + '"]');
+    if (!onScreen) _scheduleFilterSessions();
 }
 
 // Helper: get the active project's filesystem path

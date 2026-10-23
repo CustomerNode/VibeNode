@@ -309,7 +309,10 @@ test('the restored code is the pre-2026-10-14 file verbatim, except [classic] li
     old = require('child_process').execFileSync('git', ['show', '46817f2~1:static/js/thread-scroll.js'],
       { cwd: path.join(__dirname, '..'), encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
   } catch (e) { console.log('        (skipped: git history not available)'); return; }
-  const now = fs.readFileSync(path.join(JS, 'thread-scroll-classic.js'), 'utf8');
+  // A Windows checkout with core.autocrlf=true has CRLF on disk while
+  // `git show` prints LF, so compare with line endings normalised.
+  old = old.replace(/\r\n/g, '\n');
+  const now = fs.readFileSync(path.join(JS, 'thread-scroll-classic.js'), 'utf8').replace(/\r\n/g, '\n');
   const body = (s, endMark) => {
     const a = s.indexOf('(function () {');
     const b = s.indexOf(endMark);

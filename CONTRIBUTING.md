@@ -8,15 +8,20 @@ Thanks for your interest in contributing! This guide covers everything you need 
 
 - Python 3.10 or later
 - Git
-- Windows (required for process detection features)
+- [Claude Code](https://claude.ai/download) installed and signed in (the only supported backend today)
+- Windows, macOS, or Linux. The test suite runs on all three; a handful of tests are platform-specific and skip elsewhere.
 
 ### Setup
 
 ```bash
 git clone https://github.com/CustomerNode/VibeNode.git
 cd VibeNode
-pip install flask pytest pytest-cov
+pip install -r requirements-test.txt   # includes requirements.txt
+playwright install chromium            # browser-driven tests (skipped without it)
 ```
+
+`requirements.txt` is what the app needs; `requirements-test.txt` adds the test
+tooling. Node 18+ is needed for the two `node tests/*.js` suites.
 
 ### Running the App
 
@@ -24,36 +29,55 @@ pip install flask pytest pytest-cov
 python session_manager.py
 ```
 
-Opens automatically at http://localhost:5050
+Opens automatically at http://localhost:5050. Two processes start: the web
+server (port 5050) and the Session Engine (port 5051), which owns the Claude
+CLI processes. Restarting the web server is cheap; restarting the Session
+Engine ends every running session, so the app only does that when you ask
+(System → Developer Tools → Restart Server → Session Engine). A change under
+`daemon/` is not live until the Session Engine restarts.
 
 ### Running Tests
 
 ```bash
-# All tests
-pytest tests/ -v
+# The suite (fast tests; e2e is excluded by pytest.ini)
+pytest
 
-# With coverage report
-pytest tests/ -v --cov=app --cov-report=term-missing
+# One file
+pytest tests/test_session_manager.py -v
 
-# Single test file
-pytest tests/test_sessions.py -v
+# The JavaScript suites
+node tests/test_thread_scroll.js
+node tests/test_thread_scroll_classic.js
+
+# End-to-end (needs a running server, Selenium and Chrome; also runs nightly in CI)
+pytest tests/e2e -m e2e -v --timeout=300 --reruns 2
 ```
+
+On Linux the suite re-executes itself inside a PID namespace (see
+`tests/conftest.py`) so a bug in the process-kill path can only reach the test
+run. Where `unshare` is unavailable it warns and continues behind two guards.
+Never run tests with a `MagicMock` backend whose `extract_process_pid` returns
+a mock; see the "kill path" section of `CLAUDE.md`.
 
 ## Project Structure
 
-Read [agents.md](agents.md) for the full architecture reference. Key points:
+`CLAUDE.md` (project root) is the architecture reference and the list of
+hard-won rules every change must respect. Read it before touching code. Key
+points:
 
-- **Python backend** lives in `app/` — routes are thin, logic is in helper modules
-- **HTML** lives in `templates/index.html` — no inline JS or CSS
-- **CSS** lives in `static/style.css` — uses CSS custom properties for theming
+- **Web server** lives in `app/` — Flask + Flask-SocketIO; routes in `app/routes/` are thin, logic is in helper modules
+- **Session Engine** lives in `daemon/` — owns Claude CLI processes; talks to the web server over local IPC (`app/daemon_client.py`, `daemon/daemon_server.py`)
+- **HTML** lives in `templates/index.html` — one page; no inline JS or CSS
+- **CSS** lives in `static/style.css` (plus `static/css/mobile.css`) — CSS custom properties for theming
 - **JavaScript** lives in `static/js/` — vanilla JS, no framework, no bundler
-- **Tests** live in `tests/` — pytest, one test file per module
+- **Tests** live in `tests/` — pytest; browser tests drive the real `index.html` in headless Chromium
+- **API docs** live in `docs/api/` — `openapi.yaml` and `socketio-events.md`, both enforced by coverage tests
 
 ## Making Changes
 
 ### Before You Start
 
-1. Read [agents.md](agents.md) for coding standards, UI/UX standards, and testing requirements
+1. Read `CLAUDE.md` for the project rules, performance-critical patterns, and the regressions that must not come back
 2. Check existing issues to avoid duplicate work
 3. For large changes, open an issue first to discuss the approach
 
@@ -92,19 +116,19 @@ Read [agents.md](agents.md) for the full architecture reference. Key points:
 3. **Frontend JS:** Add to the appropriate `static/js/` file (or create a new one if it's a distinct feature)
 4. **CSS:** Add styles to `static/style.css` using CSS variables
 5. **Tests:** Add unit tests for the backend logic and integration tests for the route
-6. **Update agents.md** if you're adding a new architectural component
-7. **Update API docs** if you added or changed a route (see below)
+6. **Update `CLAUDE.md`** if you're adding a new architectural component or a rule future changes must respect
+7. **Update API docs** if you added or changed a route or a SocketIO event (see below)
 
 ### Maintaining API Documentation
 
 VibeNode has a comprehensive API reference at `docs/api/`. When you add or modify routes:
 
 1. **Add the endpoint to `docs/api/openapi.yaml`** — include path, method, summary, parameters, request body, response schema, and tags. Use the existing entries as a template.
-2. **If you added SocketIO events**, update `docs/api/socketio-events.md` with the event name, direction, payload schema, and example.
-3. **Run the coverage test** to verify nothing is missing: `pytest tests/test_api_docs_coverage.py -v`
+2. **If you added SocketIO events**, update `docs/api/socketio-events.md` with the event name, direction, payload schema, and example. Every `@socketio.on(...)` handler and every event name the browser listens for with `socket.on(...)` needs a `### \`event_name\`` section.
+3. **Run the coverage tests** to verify nothing is missing: `pytest tests/test_api_docs_coverage.py tests/test_socketio_docs_coverage.py -v`
 4. **View the docs locally** at http://localhost:5050/api/docs (Redoc renders the spec automatically).
 
-The `test_api_docs_coverage.py` test compares all registered Flask routes against the OpenAPI spec and will fail if any route is undocumented.
+`test_api_docs_coverage.py` compares all registered Flask routes against the OpenAPI spec; `test_socketio_docs_coverage.py` compares the server's handlers and the browser's listeners against the events reference. Either fails when something is undocumented.
 
 ### Adding a New Theme Color
 

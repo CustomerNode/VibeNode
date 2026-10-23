@@ -2057,7 +2057,7 @@ function _showComposePlanResult(rawText) {
         '<div class="planner-result-header"><strong>' + count + ' sections</strong> proposed</div>' +
         _renderComposePlanTree(parsed.sections) +
         '<div class="planner-actions">' +
-          '<button class="planner-accept-btn" id="compose-planner-accept" onclick="_acceptComposePlan()">Add ' + count + ' sections to Board</button>' +
+          '<button class="planner-accept-btn" id="compose-planner-accept" onclick="_acceptComposePlan()">Add ' + count + ' sections</button>' +
         '</div>' +
         '<div class="planner-hint">Want changes? Type below and send.</div>' +
       '</div>';
@@ -2100,6 +2100,7 @@ function _countComposePlanSections(sections) {
 async function _acceptComposePlan() {
   if (!_composePlannerProposal || !_composePlannerProposal.sections || !_composeProject) return;
   const btn = document.getElementById('compose-planner-accept');
+  const btnLabel = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = 'Creating\u2026'; }
 
   try {
@@ -2119,7 +2120,7 @@ async function _acceptComposePlan() {
     initCompose();
   } catch (e) {
     if (typeof showToast === 'function') showToast('Failed: ' + e.message, true);
-    if (btn) { btn.disabled = false; btn.textContent = 'Add to Board'; }
+    if (btn) { btn.disabled = false; btn.textContent = btnLabel || 'Add sections'; }
   }
 }
 
@@ -2891,7 +2892,7 @@ function renderSectionDetail(sectionId) {
 
   const section = _composeSections.find(s => s.id === sectionId);
   if (!section) {
-    board.innerHTML = '<div class="kanban-empty-state"><div style="font-size:15px;font-weight:500;margin-bottom:6px;">Section not found</div><button class="kanban-create-first-btn" onclick="navigateToComposeBoard()">Back to Board</button></div>';
+    board.innerHTML = '<div class="kanban-empty-state"><div style="font-size:15px;font-weight:500;margin-bottom:6px;">Section not found</div><button class="kanban-create-first-btn" onclick="navigateToComposeBoard()">Back to composition</button></div>';
     return;
   }
 

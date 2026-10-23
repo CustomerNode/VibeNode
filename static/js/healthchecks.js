@@ -303,7 +303,7 @@ function _probeServer() {
 registerHealthCheck('server-reachable', {
     label: 'VibeNode Server Unreachable',
     icon: '<svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><line x1="2" y1="9" x2="22" y2="9"/></svg>',
-    message: 'The VibeNode web server is not responding. Your running sessions are likely safe in the session daemon — relaunch VibeNode from your desktop shortcut or launcher to reconnect. If this overlay persists after relaunch, check logs/_server.log.',
+    message: 'The VibeNode web server is not responding. Your running sessions are likely safe in the Session Engine — relaunch VibeNode from your desktop shortcut or launcher to reconnect. If this overlay persists after relaunch, check logs/_server.log.',
     test: function() { return _serverReachable; }
 });
 
@@ -413,9 +413,9 @@ function _decisiveDaemonProbe(isRetry) {
 }
 
 registerHealthCheck('daemon-reachable', {
-    label: 'VibeNode Engine Stopped',
+    label: 'Session Engine stopped',
     icon: '<svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/></svg>',
-    message: 'The VibeNode engine that runs your sessions has stopped. Tap Restart to bring it back — your session history is safe.',
+    message: 'The Session Engine that runs your sessions has stopped. Tap Restart to bring it back — your session history is safe.',
     test: function() { return _daemonReachable; },
     action: {
         text: 'Restart VibeNode',

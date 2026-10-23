@@ -68,4 +68,7 @@ def test_dashboard_is_rebuilt_after_the_old_project_is_cleared():
     """Built before the switch it showed the OLD project's name and counts."""
     body = _function("setProject")
     assert body.index("localStorage.setItem('activeProject', encoded)") < body.index("_buildDashboard()")
-    assert body.index("allSessions = [];") < body.index("_buildDashboard()")
+    # The list is cleared through the session store (static/js/session-store.js)
+    # since 2026-10-23; the bare assignment was its earlier form.
+    clear = "SessionStore.replaceAll([]);" if "SessionStore.replaceAll([]);" in body else "allSessions = [];"
+    assert body.index(clear) < body.index("_buildDashboard()")

@@ -159,6 +159,7 @@ html[data-theme="light"] .vn-splash .vns-track { background: rgba(0,0,0,.08); }
       <button onclick="_showHelpModal();closeHdrSys()">Keyboard Shortcuts</button>
       <div class="sys-separator"></div>
       <button onclick="openTrash();closeHdrSys()" title="View and restore recently deleted sessions">Recently Deleted</button>
+      <button onclick="openRecoveryWatchdog();closeHdrSys()" title="The recovery and watchdog switches, read-only">Recovery &amp; Watchdog</button>
       <button onclick="openDeveloperTools();closeHdrSys()" title="Tests, scans, and server controls">Developer Tools <span class="sys-item-value" id="sys-phantom-badge"></span></button>
     </div>
   </div>
@@ -220,15 +221,12 @@ html[data-theme="light"] .vn-splash .vns-track { background: rgba(0,0,0,.08); }
       </button>
       <!-- Search + Sort + Sleep -->
       <div class="sidebar-search-row">
-        <!-- Opens the deep-search modal (search.js). The modal has its own
-             input — the only place you type. #search stays as a hidden input
-             so the ~100 filterSessions() callers (which read its value) keep
-             working with an empty query = no client-side filtering. -->
+        <!-- Opens the deep-search modal (search.js): full-transcript search.
+             The title filter (#search) lives in the filter bar below. -->
         <button class="sidebar-search-btn" onclick="openDeepSearch()" title="Search all transcripts">
           <svg class="sidebar-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
           <span>Search transcripts&hellip;</span>
         </button>
-        <input type="hidden" id="search">
         <div class="sidebar-menu-wrap">
           <button class="sidebar-menu-btn" id="sidebar-menu-btn" onclick="toggleSidebarMenu()" title="Options">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
@@ -254,6 +252,25 @@ html[data-theme="light"] .vn-splash .vns-track { background: rgba(0,0,0,.08); }
             <button class="sidebar-sort-opt danger" onclick="closeSidebarMenu();deleteAllSessions()">Delete all sessions</button>
           </div>
         </div>
+      </div>
+      <!-- Finding one session among many (2026-10-23): a title filter and
+           state/date chips, all client-side over SessionStore.  Shown only in
+           the Sessions view's cards and list (filterSessions in app.js).
+           #search is read by filterSessions(); chips persist per project in
+           localStorage 'vnSessionFilters'. -->
+      <div class="session-filter-bar" id="session-filter-bar" hidden>
+        <input type="search" id="search" class="session-typeahead" placeholder="Filter sessions&hellip;"
+               autocomplete="off" spellcheck="false" aria-label="Filter sessions by title"
+               oninput="onSessionSearchInput()">
+        <div class="session-chips" role="group" aria-label="Show only">
+          <button type="button" class="session-chip" data-filter="working" aria-pressed="false" onclick="toggleSessionFilter('working')">Working</button>
+          <button type="button" class="session-chip" data-filter="needs" aria-pressed="false" onclick="toggleSessionFilter('needs')">Needs you</button>
+          <button type="button" class="session-chip" data-filter="idle" aria-pressed="false" onclick="toggleSessionFilter('idle')">Idle</button>
+          <button type="button" class="session-chip" data-filter="sleeping" aria-pressed="false" onclick="toggleSessionFilter('sleeping')">Sleeping</button>
+          <button type="button" class="session-chip" data-filter="unread" aria-pressed="false" onclick="toggleSessionFilter('unread')">Unread</button>
+          <button type="button" class="session-chip" data-filter="recent" aria-pressed="false" onclick="toggleSessionFilter('recent')">Last 7 days</button>
+        </div>
+        <button type="button" class="session-name-untitled" id="btn-name-untitled" hidden onclick="nameUntitledSessions()"></button>
       </div>
     </div>
     <!-- Scrollable content -->
@@ -447,8 +464,8 @@ html[data-theme="light"] .vn-splash .vns-track { background: rgba(0,0,0,.08); }
            composition" affordance reveals/creates a Structured comp. -->
       <div id="subsessions-tab-strip" class="subsessions-tab-strip">
         <button id="subsessions-tab-adhoc-btn" class="subsessions-tab subsessions-tab-active" onclick="setSubsessionsTab('adhoc')">Ad-hoc</button>
-        <button id="subsessions-tab-structured-btn" class="subsessions-tab" onclick="setSubsessionsTab('structured')" style="display:none;">Structured</button>
-        <button id="subsessions-tab-new-structured-btn" class="subsessions-tab subsessions-tab-affordance" onclick="composeCreateProject()" title="Create a Structured composition">+ New structured composition</button>
+        <button id="subsessions-tab-structured-btn" class="subsessions-tab" onclick="setSubsessionsTab('structured')" style="display:none;">Compositions</button>
+        <button id="subsessions-tab-new-structured-btn" class="subsessions-tab subsessions-tab-affordance" onclick="composeCreateProject()" title="Create a composition">+ New composition</button>
       </div>
       <!-- Ad-hoc tab body (default). v1 placeholder — Build Team will
            populate with the parent-child subsessions tree per spec §4.4. -->
@@ -777,6 +794,10 @@ html[data-theme="light"] .vn-splash .vns-track { background: rgba(0,0,0,.08); }
 <!-- JavaScript files — load order matters -->
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <script src="{{ versioned_static('js/utils.js') }}"></script>
+<!-- SessionStore: owns the session list and every per-session table, and
+     defines the allSessions / sessionKinds / ... globals as accessors.  Must
+     load before any script that touches those names. -->
+<script src="{{ versioned_static('js/session-store.js') }}"></script>
 <!-- Startup banner: warns when the Claude CLI is stale so new models don't
      fail with claude_code_version_too_old at the moment of use. Depends on
      showConfirm/showToast from utils.js — load right after it. -->
@@ -793,7 +814,7 @@ html[data-theme="light"] .vn-splash .vns-track { background: rgba(0,0,0,.08); }
 <script src="{{ versioned_static('js/workspace.js') }}"></script>
 <script src="{{ versioned_static('js/time-utils.js') }}"></script>
 <script src="{{ versioned_static('js/kanban.js') }}"></script>
-<script src="{{ versioned_static('js/kanban-report.js') }}"></script>
+<script type="module" src="{{ versioned_static('js/kanban-report.js') }}"></script>
 <script src="{{ versioned_static('js/compose.js') }}"></script>
 <script src="{{ versioned_static('js/sessions.js') }}"></script>
 <script src="{{ versioned_static('js/toolbar.js') }}"></script>
@@ -815,8 +836,8 @@ html[data-theme="light"] .vn-splash .vns-track { background: rgba(0,0,0,.08); }
 <script src="{{ versioned_static('js/image-attach.js') }}"></script>   <!-- composer image paste/pick (after live-panel: observes its bar rows) -->
 <script src="{{ versioned_static('js/find.js') }}"></script>
 <script src="{{ versioned_static('js/search.js') }}"></script>
-<script src="{{ versioned_static('js/extract.js') }}"></script>
-<script src="{{ versioned_static('js/compare.js') }}"></script>
+<script type="module" src="{{ versioned_static('js/extract.js') }}"></script>
+<script type="module" src="{{ versioned_static('js/compare.js') }}"></script>
 <script src="/speechnode/speechnode.js"></script>   <!-- SpeechNode package asset -->
 <script src="{{ versioned_static('js/speechnode-install.js') }}"></script>   <!-- VibeNode-owned install/enable UX (must load after the package) -->
 <script src="{{ versioned_static('js/voice.js') }}"></script>

@@ -194,12 +194,16 @@ def test_a_local_script_may_post(addr, hook):
     assert resp.status_code == 200 and app.session_manager.send_message.call_count == 1
 
 
-def test_the_preview_proxy_does_not_make_a_phone_a_local_script(hook):
+def test_the_preview_proxy_does_not_make_a_phone_a_local_script(hook, tmp_path, monkeypatch):
     """``/api/preview/proxy`` fetches a URL for a phone on the tailnet. Pointed
     back at this endpoint, the request arrived from this machine with nothing
     to say who had asked for it, and the phone's text went to the agent as a
     local script's (found 2026-10-12). The proxy now marks what it forwards.
-    Run for real: a live server, so the proxy really calls back into it."""
+    Run for real: a live server, so the proxy really calls back into it.
+
+    Since the pairing gate (app/mobile_auth.py) an unpaired phone is refused
+    at the proxy itself; a PAIRED phone gets through the proxy and must still
+    be refused by the hook, which is the hole this test guards."""
     import threading
     import urllib.error
     import urllib.parse
@@ -207,20 +211,35 @@ def test_the_preview_proxy_does_not_make_a_phone_a_local_script(hook):
 
     from werkzeug.serving import make_server
 
+    from app import mobile_auth
+
+    monkeypatch.setattr(mobile_auth, "PAIR_FILE", tmp_path / "data" / "mobile_pair.json")
+    mobile_auth._state_cache.update(mtime=None, state={})
+    monkeypatch.setattr(mobile_auth, "auth_enabled", lambda: True)
+    phone = {"Content-Type": "application/json", "Tailscale-User-Login": "phone@example.com"}
+    paired = dict(phone, Cookie=f"{mobile_auth.COOKIE_NAME}={mobile_auth.cookie_value()}")
+
     app, _client, emitted = hook
     server = make_server("127.0.0.1", 0, app, threaded=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_port}"
-    request = urllib.request.Request(
-        f"{base}/api/preview/proxy?u=" + urllib.parse.quote(f"{base}/api/hook/message", safe=""),
-        data=json.dumps(BODY).encode(), method="POST",
-        headers={"Content-Type": "application/json", "Tailscale-User-Login": "phone@example.com"})
-    try:
+
+    def post(headers):
+        request = urllib.request.Request(
+            f"{base}/api/preview/proxy?u=" + urllib.parse.quote(f"{base}/api/hook/message", safe=""),
+            data=json.dumps(BODY).encode(), method="POST", headers=headers)
         with pytest.raises(urllib.error.HTTPError) as refused:
             urllib.request.urlopen(request, timeout=10)
+        return refused
+
+    try:
+        unpaired = post(phone)
+        refused = post(paired)
     finally:
         server.shutdown()
         server.server_close()
+    assert unpaired.value.code == 401
+    assert json.loads(unpaired.value.read())["error"] == "pairing_required"
     assert refused.value.code == 403
     assert json.loads(refused.value.read())["error"] == "local callers only"
     assert not app.session_manager.send_message.called and emitted == []

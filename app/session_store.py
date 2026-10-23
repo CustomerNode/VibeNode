@@ -12,21 +12,23 @@ import time
 from pathlib import Path
 
 from .config import _sessions_dir
+# The name and remap files have ONE owner, shared with the Session Engine,
+# which writes them when it adopts a CLI session id.  The wrappers below only
+# resolve the project directory (through _sessions_dir, so tests can redirect
+# it); the file names, format and prune rule live in common/session_names.py.
+from common import session_names as _session_names
 
 # ---------------------------------------------------------------------------
 # User-set name store -- survives Claude Code's own auto-naming
 # ---------------------------------------------------------------------------
 
 def _names_file(project: str = "") -> Path:
-    return _sessions_dir(project) / "_session_names.json"
+    return _session_names.names_path(_sessions_dir(project))
 
 
 def _load_names(project: str = "") -> dict:
     """Return {session_id: name} for all user-manually-set names."""
-    try:
-        return json.loads(_names_file(project).read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return _session_names.load_names_at(_names_file(project))
 
 
 def _save_name(session_id: str, name: str, project: str = "") -> None:
@@ -41,7 +43,7 @@ def _save_name(session_id: str, name: str, project: str = "") -> None:
     except Exception:
         names = {}
     names[session_id] = name
-    nf.write_text(json.dumps(names, indent=2, ensure_ascii=False), encoding="utf-8")
+    _session_names.write_names_at(nf, names)
 
 
 def _delete_name(session_id: str, project: str = "") -> None:
@@ -49,17 +51,12 @@ def _delete_name(session_id: str, project: str = "") -> None:
     names = _load_names(project)
     if session_id in names:
         names.pop(session_id)
-        _names_file(project).write_text(json.dumps(names, indent=2, ensure_ascii=False), encoding="utf-8")
+        _session_names.write_names_at(_names_file(project), names)
 
 
 def _remap_name(old_id: str, new_id: str, project: str = ""):
     """Move a user-set name from old_id to new_id. Returns the title or None."""
-    names = _load_names(project)
-    title = names.pop(old_id, None)
-    if title:
-        names[new_id] = title
-        _names_file(project).write_text(json.dumps(names, indent=2, ensure_ascii=False), encoding="utf-8")
-    return title
+    return _session_names.remap_name_at(_names_file(project), old_id, new_id)
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +64,37 @@ def _remap_name(old_id: str, new_id: str, project: str = ""):
 # ---------------------------------------------------------------------------
 
 _names_cache: dict = {}  # key: project -> {"data": {}, "mtime": float}
+
+
+# ---------------------------------------------------------------------------
+# Generic mtime/size-keyed read-through cache for the per-project JSON side
+# files (tombstones, utility ids, remaps).  ``all_sessions()`` reads all three
+# on EVERY ``GET /api/sessions``; re-parsing them per request cost three
+# reads + three json.loads per listing (plus two more from the route itself).
+# A stat is an order of magnitude cheaper than read+parse.  Keyed on
+# ``(st_mtime_ns, st_size)`` so a rewrite within the same mtime tick that
+# changes the length still invalidates.  Writers keep using the uncached
+# loaders under their locks; only read paths go through here.
+# ---------------------------------------------------------------------------
+
+_json_file_cache: dict = {}  # key: str(path) -> {"key": (mtime_ns, size), "data": dict}
+
+
+def _load_json_cached(path: Path, loader) -> dict:
+    """Return ``loader()`` for *path*, re-running it only when the file's
+    ``(mtime_ns, size)`` changed since the last call.  A missing file yields
+    ``{}`` and drops any stale entry."""
+    try:
+        st = path.stat()
+    except Exception:
+        _json_file_cache.pop(str(path), None)
+        return {}
+    key = (st.st_mtime_ns, st.st_size)
+    entry = _json_file_cache.get(str(path))
+    if entry is None or entry["key"] != key:
+        entry = {"key": key, "data": loader()}
+        _json_file_cache[str(path)] = entry
+    return entry["data"]
 
 
 def _load_names_cached(project: str = "") -> dict:
@@ -168,8 +196,12 @@ def _get_deleted_ids(project: str = "") -> set:
     Pruning (removing expired entries) happens lazily inside _mark_deleted()
     whenever a new tombstone is recorded.  Keeping _get_deleted_ids() write-free
     avoids any possibility of a save here clobbering a concurrent _mark_deleted().
+
+    The file is parsed through the mtime/size read-through cache; pruning
+    runs on every call (it depends on the clock) but is a pure dict pass.
     """
-    tombstones = _load_tombstones(project)
+    tombstones = _load_json_cached(_tombstone_file(project),
+                                   lambda: _load_tombstones(project))
     pruned = _prune_tombstones(tombstones, project)
     return set(pruned.keys())
 
@@ -670,7 +702,7 @@ def _mark_utility(session_id: str, project: str = "") -> None:
 
 def _get_utility_ids(project: str = "") -> set:
     """Return the set of session IDs marked as utility sessions."""
-    data = _load_utility(project)
+    data = _load_json_cached(_utility_file(project), lambda: _load_utility(project))
     now = time.time()
     return {sid for sid, ts in data.items() if now - ts < _UTILITY_MAX_AGE}
 
@@ -683,51 +715,49 @@ def _get_utility_ids(project: str = "") -> set:
 # so all_sessions() filters it out, preventing a stale "sleeping" duplicate
 # from appearing on page refresh — even if in-memory aliases haven't synced.
 
-_REMAP_MAX_AGE = 86400  # 24 hours — old temp IDs are pruned after this
-_remap_lock = threading.Lock()
+_REMAP_MAX_AGE = _session_names.REMAP_MAX_AGE  # 24 hours — old temp IDs are pruned after this
+_remap_lock = _session_names.REMAP_LOCK
 
 
 def _remap_file(project: str = "") -> Path:
-    return _sessions_dir(project) / "_remapped_sessions.json"
+    return _session_names.remaps_path(_sessions_dir(project))
 
 
 def _load_remaps(project: str = "") -> dict:
     """Return {old_session_id: {"new_id": str, "ts": float}} of remapped sessions."""
-    rf = _remap_file(project)
-    try:
-        data = json.loads(rf.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    return {}
+    return _session_names.load_remaps_at(_remap_file(project))
 
 
 def _save_remaps(data: dict, project: str = "") -> None:
-    _remap_file(project).write_text(
-        json.dumps(data, ensure_ascii=False), encoding="utf-8"
-    )
+    _session_names.save_remaps_at(_remap_file(project), data)
 
 
 def _mark_remapped(old_session_id: str, new_session_id: str = "", project: str = "") -> None:
-    """Record an old (pre-remap) session ID so its JSONL is hidden."""
-    with _remap_lock:
-        data = _load_remaps(project)
-        data[old_session_id] = {"new_id": new_session_id, "ts": time.time()}
-        # Lazy prune — drop entries older than 24 h whose .jsonl is gone
-        now = time.time()
-        sd = _sessions_dir(project)
-        data = {
-            sid: entry for sid, entry in data.items()
-            if now - entry.get("ts", 0) < _REMAP_MAX_AGE
-            or (sd / f"{sid}.jsonl").exists()
-        }
-        _save_remaps(data, project)
+    """Record an old (pre-remap) session ID so its JSONL is hidden (lazy
+    prune of entries older than 24 h whose .jsonl is gone)."""
+    _session_names.mark_remapped_in(_sessions_dir(project), old_session_id, new_session_id)
+
+
+def _load_remaps_cached(project: str = "") -> dict:
+    """Read-only, mtime/size-cached form of ``_load_remaps`` for listing paths.
+    Callers must not mutate the returned dict.
+
+    The engine's alias index (``data/session_aliases.json``, written on every
+    id adoption and kept across engine restarts) is read through underneath:
+    the per-project file wins where both know an id."""
+    own = _load_json_cached(_remap_file(project), lambda: _load_remaps(project))
+    engine = _load_json_cached(Path(_session_names.ENGINE_ALIASES_PATH),
+                               _session_names.load_engine_aliases)
+    if not engine:
+        return own
+    merged = dict(engine)
+    merged.update(own)
+    return merged
 
 
 def _get_remapped_ids(project: str = "") -> set:
     """Return the set of old session IDs that were remapped (should be hidden)."""
-    data = _load_remaps(project)
+    data = _load_remaps_cached(project)
     now = time.time()
     return {sid for sid, entry in data.items()
             if now - entry.get("ts", 0) < _REMAP_MAX_AGE}
@@ -735,7 +765,7 @@ def _get_remapped_ids(project: str = "") -> set:
 
 def _resolve_remapped_id(old_session_id: str, project: str = "") -> str | None:
     """Look up the new (canonical) ID for a remapped session, or None."""
-    data = _load_remaps(project)
+    data = _load_remaps_cached(project)
     entry = data.get(old_session_id)
     if entry and entry.get("new_id"):
         return entry["new_id"]

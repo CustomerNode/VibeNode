@@ -2,7 +2,7 @@
 
 let extractBlocks = [];
 
-async function openExtract() {
+export async function openExtract() {
   if (!activeId) return;
   const body = document.getElementById('extract-body');
   body.innerHTML = '<p style="padding:20px;color:var(--text-faint);font-size:12px;">Loading\u2026</p>';
@@ -18,7 +18,7 @@ async function openExtract() {
   }
 }
 
-function closeExtract() {
+export function closeExtract() {
   document.getElementById('extract-drawer').classList.remove('open');
 }
 
@@ -49,7 +49,7 @@ function renderExtractBlocks(blocks) {
   }).join('');
 }
 
-function copyBlock(i) {
+export function copyBlock(i) {
   const b = extractBlocks[i];
   if (!b) return;
   navigator.clipboard.writeText(b.content).then(() => {
@@ -58,7 +58,7 @@ function copyBlock(i) {
   });
 }
 
-function triggerExport() {
+export function triggerExport() {
   if (!activeId) return;
   const a = document.createElement('a');
   const _p = localStorage.getItem('activeProject') || '';
@@ -78,3 +78,10 @@ document.getElementById('extract-copy-all').addEventListener('click', () => {
 document.getElementById('extract-export-btn').addEventListener('click', () => {
   if (activeId) triggerExport();
 });
+
+// ES module (2026-10-23): deferred, strict, its own scope.  Inline onclick
+// handlers and classic scripts reach these through window.
+window.openExtract = openExtract;
+window.closeExtract = closeExtract;
+window.copyBlock = copyBlock;
+window.triggerExport = triggerExport;

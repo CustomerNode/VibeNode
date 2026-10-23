@@ -1433,17 +1433,50 @@ def planner_accept():
         return jsonify({"error": str(e)}), 500
 
 
+_SECRET_MASK_PREFIX = "••••"   # ••••
+
+
+def _mask_secret(value) -> str:
+    """``""`` when unset, else ``••••`` + the last 4 characters. The service-role
+    key never leaves the server in full: this endpoint is reachable from every
+    paired device, and the settings form only needs to show that a key is set."""
+    value = str(value or "")
+    if not value:
+        return ""
+    return _SECRET_MASK_PREFIX + (value[-4:] if len(value) > 8 else "")
+
+
+def _supabase_credentials(data):
+    """(url, key) from a request body. The settings form never holds the saved
+    key (the GET masks it), so an empty key for the SAME url as the saved one
+    means "use the key already stored". A different url never inherits the
+    saved key, so a key is never sent to a server it was not saved for."""
+    url = str(data.get("supabase_url", "") or "").strip()
+    key = str(data.get("supabase_secret_key", "") or "").strip()
+    if key.startswith(_SECRET_MASK_PREFIX):
+        key = ""
+    if url and not key:
+        from ..config import get_kanban_config as _get_cfg
+        cfg = _get_cfg()
+        if url.rstrip("/") == str(cfg.get("supabase_url", "") or "").strip().rstrip("/"):
+            key = cfg.get("supabase_secret_key", "") or ""
+    return url, key
+
+
 @bp.route("/api/kanban/config")
 def get_kanban_config():
-    """Get current kanban configuration."""
+    """Get current kanban configuration. ``supabase_secret_key`` is masked;
+    ``supabase_secret_key_set`` says whether one is stored."""
     from ..config import get_kanban_config as _get_cfg
     cfg = _get_cfg()
+    secret = cfg.get("supabase_secret_key", "")
     return jsonify({
         "backend": cfg.get("kanban_backend", "sqlite"),
         "kanban_backend": cfg.get("kanban_backend", "sqlite"),
         "supabase_url": cfg.get("supabase_url", ""),
         "supabase_publishable_key": cfg.get("supabase_publishable_key", ""),
-        "supabase_secret_key": cfg.get("supabase_secret_key", ""),
+        "supabase_secret_key": _mask_secret(secret),
+        "supabase_secret_key_set": bool(secret),
         "supabase_connected": bool(cfg.get("supabase_url")),
         "depth_limit": cfg.get("kanban_depth_limit", 5),
         "auto_advance": cfg.get("kanban_auto_advance", False),
@@ -1470,7 +1503,13 @@ def update_kanban_config():
     if "supabase_url" in data:
         cfg["supabase_url"] = data["supabase_url"]
     if "supabase_secret_key" in data:
-        cfg["supabase_secret_key"] = data["supabase_secret_key"]
+        incoming = data["supabase_secret_key"]
+        current = cfg.get("supabase_secret_key", "")
+        # The settings form round-trips the GET's mask; a mask is never a key.
+        is_mask = isinstance(incoming, str) and (
+            incoming == _mask_secret(current) or incoming.startswith(_SECRET_MASK_PREFIX))
+        if not (current and is_mask):
+            cfg["supabase_secret_key"] = incoming
     if "supabase_publishable_key" in data:
         cfg["supabase_publishable_key"] = data["supabase_publishable_key"]
     if "depth_limit" in data:
@@ -1816,8 +1855,7 @@ def migrate_backend():
         key = ""
         if target_backend == "supabase":
             # Validate before importing the client (see migrate_preflight).
-            url = data.get("supabase_url", "")
-            key = data.get("supabase_secret_key", "")
+            url, key = _supabase_credentials(data)
             if not url or not key:
                 return jsonify({"error": "supabase_url and supabase_secret_key required"}), 400
             from ..db.supabase_backend import SupabaseRepository
@@ -1905,8 +1943,7 @@ def migrate_preflight():
             # Validate input BEFORE importing the Supabase client: where that
             # library (or one of its deps) is missing, importing first turned
             # an empty-credentials request into a 500 instead of this 400.
-            url = data.get("supabase_url", "")
-            key = data.get("supabase_secret_key", "")
+            url, key = _supabase_credentials(data)
             if not url or not key:
                 return jsonify({"error": "supabase_url and supabase_secret_key required"}), 400
             from ..db.supabase_backend import SupabaseRepository, SchemaNotReady
@@ -1949,8 +1986,7 @@ def migrate_test():
         data = request.get_json(silent=True) or {}
         target = data.get("target", "").strip()
         if target == "supabase":
-            url = data.get("supabase_url", "")
-            key = data.get("supabase_secret_key", "")
+            url, key = _supabase_credentials(data)
             if not url or not key:
                 return jsonify({"ok": False, "error": "URL and key required"}), 400
             from ..db.supabase_backend import SupabaseRepository, SchemaNotReady

@@ -399,6 +399,14 @@ def register_ws_events(socketio, app):
         without any delay.
         """
         from flask import request as flask_request
+        # Same two-tier rule as the HTTP routes (app/mobile_auth.py): the
+        # Origin must be loopback or the Mobile Command host, and the caller
+        # must be local or paired. False refuses the connection.
+        from .. import mobile_auth
+        allowed, why = mobile_auth.socket_connection_allowed(app)
+        if not allowed:
+            logger.warning("WebSocket connect refused (%s): %s", why, _describe_client())
+            return False
         project = ""
         try:
             project = (flask_request.args.get("project") or "").strip()

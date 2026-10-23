@@ -31,6 +31,8 @@ import json
 import os
 from typing import Optional
 
+from daemon.backends.claude_layout import ClaudeTranscriptLayout
+
 # Error kinds the CLI tags on a synthetic stop entry that are worth resuming
 # after a wait.  Both observed in local history.
 RESUMABLE_ERRORS = frozenset({"rate_limit", "server_error"})
@@ -109,21 +111,23 @@ def _tail_entries(path) -> list:
     return out
 
 
-def stopped_on_error(path, continue_prompt: str = "") -> Optional[dict]:
+def stopped_on_error(path, continue_prompt: str = "", layout=None) -> Optional[dict]:
     """The resumable API-error stop a transcript ends on, or None.
 
     Returns ``{"ts", "error", "text", "failures"}``.  ``failures`` counts the
     consecutive stops of the same kind at the end of the transcript, looking
     past our own ``continue_prompt`` resends, so a repeatedly failing probe
-    backs off.
+    backs off.  ``layout`` (the backend's ``TranscriptLayout``) says how a
+    stop entry is marked; Claude's when omitted.
     """
+    layout = layout or ClaudeTranscriptLayout()
     entries = _tail_entries(path)
     if not entries:
         return None
     last = entries[-1]
-    if last.get("type") != "assistant" or not last.get("isApiErrorMessage"):
+    err = layout.is_api_error_entry(last)
+    if err is None:
         return None
-    err = last.get("error") or ""
     if err not in RESUMABLE_ERRORS:
         return None
     ts = _parse_ts(last.get("timestamp"))
@@ -132,7 +136,7 @@ def stopped_on_error(path, continue_prompt: str = "") -> Optional[dict]:
     failures = 0
     for entry in reversed(entries):
         if entry.get("type") == "assistant":
-            if entry.get("isApiErrorMessage") and (entry.get("error") or "") == err:
+            if layout.is_api_error_entry(entry) == err:
                 failures += 1
                 continue
             break  # a real reply: the streak ends

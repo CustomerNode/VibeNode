@@ -87,6 +87,106 @@ def _enable_tcp_keepalive(sock):
 MAX_IPC_CLIENTS = 8
 
 
+# ---------------------------------------------------------------------------
+# IPC protocol.  The web server and the engine are restarted independently
+# (the engine rarely: restarting it ends every session), so the web routinely
+# talks to an engine older or newer than itself.  ``ping`` advertises what this
+# engine speaks; ``app/daemon_client.py`` reads it on connect and answers a
+# method the engine does not list with a typed "unavailable" result instead of
+# a raw "Unknown method" string.  Bump PROTOCOL_VERSION when a method's
+# parameters or result shape change incompatibly; adding a method needs no
+# bump (it shows up in METHODS).
+# ---------------------------------------------------------------------------
+PROTOCOL_VERSION = 1
+ENGINE_STARTED_AT = time.time()
+
+# Answered by _dispatch_blocking, not the handler table.
+_BLOCKING_METHODS = ("hook_pre_tool",)
+
+
+def ping_payload() -> dict:
+    """``ping``'s reply: liveness (``ok``, read by the web heartbeat) plus the
+    protocol the engine speaks."""
+    return {
+        "ok": True,
+        "pid": os.getpid(),
+        "protocol_version": PROTOCOL_VERSION,
+        "methods": list(METHODS),
+        "engine_started_at": ENGINE_STARTED_AT,
+    }
+
+
+def build_handlers(sm):
+    """The IPC method table: method name -> callable(**params).
+
+    The single source of the protocol's method list (``METHODS``).  Built per
+    dispatch, exactly as before, so a test that patches a SessionManager
+    method after the daemon was constructed is still honoured.
+    """
+    handlers = {
+        "start_session": sm.start_session,
+        "send_message": sm.send_message,
+        "resolve_permission": sm.resolve_permission_unified,
+        "interrupt_session": sm.interrupt_session,
+        "set_session_model": sm.set_session_model,
+        "set_session_effort": sm.set_session_effort,
+        "cancel_auto_retry": sm.cancel_auto_retry,
+        "retry_now": sm.retry_now,
+        "close_session": sm.close_session,
+        "close_session_sync": sm.close_session_sync,
+        "remove_session": lambda **kw: sm.remove_session(**kw) or {"ok": True},
+        "save_registry_now": lambda **kw: sm._save_registry_now() or {"ok": True},
+        "get_all_states": lambda **kw: sm.get_all_states(),
+        "get_entries": sm.get_entries,
+        "get_entry_count": lambda **kw: sm.get_entry_count(kw["session_id"]),
+        # Companion to get_entry_count that also reports the sticky
+        # ``_entries_trimmed`` flag.  Consumed by ws_events fast path so
+        # it can refuse to trust daemon count as an authoritative total
+        # once in-memory entries have been trimmed (JSONL is never trimmed).
+        # See docs/plans/runs/2026-09-11-1546-load-older-fix.
+        "get_entry_trim_status": lambda **kw: sm.get_entry_trim_status(kw["session_id"]),
+        "has_session": sm.has_session,
+        "get_session_state": sm.get_session_state,
+        "get_dormant_states": lambda **kw: sm.get_dormant_states(),
+        "get_permission_policy": lambda **kw: sm.get_permission_policy(),
+        "set_permission_policy": sm.set_permission_policy,
+        "get_ui_prefs": lambda **kw: sm.get_ui_prefs(),
+        "set_ui_prefs": lambda **kw: sm.set_ui_prefs(kw.get("prefs", {})),
+        "resolve_hook_permission": sm.resolve_hook_permission,
+        "queue_message": sm.queue_message,
+        "get_queue": lambda **kw: sm.get_queue(**kw),
+        "remove_queue_item": sm.remove_queue_item,
+        "edit_queue_item": sm.edit_queue_item,
+        "clear_queue": sm.clear_queue,
+        "get_aliases": lambda **kw: dict(sm._id_aliases),
+        # ── Subsessions (spec §4.2/§4.3/§6) ──
+        # get_subsession_meta normalizes None → {} so the falsy result
+        # survives IPC: the reader stores msg["result"], and _send_request
+        # treats a None result as a timeout.  {} is both non-None (IPC-safe)
+        # and correctly falsy for the route's "not daemon-managed" check.
+        "get_subsession_meta": lambda **kw: sm.get_subsession_meta(kw["session_id"]) or {},
+        "mark_inbox_dirty": lambda **kw: sm.mark_inbox_dirty(kw["session_id"]),
+        "orphan_children_of": lambda **kw: sm.orphan_children_of(kw["parent_sid"]),
+        "detect_rewind_orphans": lambda **kw: sm.detect_rewind_orphans(kw["parent_sid"], kw["new_line_count"]),
+        "reanchor_subsession": lambda **kw: sm.reanchor_subsession(kw["child_sid"], kw["new_origin_turn"]),
+        "detach_subsession": lambda **kw: sm.detach_subsession(kw["child_sid"]),
+        "set_auto_report_on_idle": lambda **kw: sm.set_auto_report_on_idle(kw["session_id"], kw["on"]),
+        "ping": lambda **kw: ping_payload(),
+    }
+    return handlers
+
+
+class _MethodNamesOnly:
+    """Stand-in SessionManager: lets METHODS be read off the real table
+    without constructing one (attribute reads return a placeholder)."""
+
+    def __getattr__(self, name):
+        return None
+
+
+METHODS = tuple(sorted(set(build_handlers(_MethodNamesOnly())) | set(_BLOCKING_METHODS)))
+
+
 class SessionDaemon:
     """Long-lived process that manages Claude Code SDK sessions via TCP IPC."""
 
@@ -366,56 +466,7 @@ class SessionDaemon:
 
     def _dispatch_sync(self, sock, req_id, method, params):
         """Synchronous dispatch — returns response immediately."""
-        handlers = {
-            "start_session": self.session_manager.start_session,
-            "send_message": self.session_manager.send_message,
-            "resolve_permission": self.session_manager.resolve_permission_unified,
-            "interrupt_session": self.session_manager.interrupt_session,
-            "set_session_model": self.session_manager.set_session_model,
-            "set_session_effort": self.session_manager.set_session_effort,
-            "cancel_auto_retry": self.session_manager.cancel_auto_retry,
-            "retry_now": self.session_manager.retry_now,
-            "close_session": self.session_manager.close_session,
-            "close_session_sync": self.session_manager.close_session_sync,
-            "remove_session": lambda **kw: self.session_manager.remove_session(**kw) or {"ok": True},
-            "save_registry_now": lambda **kw: self.session_manager._save_registry_now() or {"ok": True},
-            "get_all_states": lambda **kw: self.session_manager.get_all_states(),
-            "get_entries": self.session_manager.get_entries,
-            "get_entry_count": lambda **kw: self.session_manager.get_entry_count(kw["session_id"]),
-            # Companion to get_entry_count that also reports the sticky
-            # ``_entries_trimmed`` flag.  Consumed by ws_events fast path so
-            # it can refuse to trust daemon count as an authoritative total
-            # once in-memory entries have been trimmed (JSONL is never trimmed).
-            # See docs/plans/runs/2026-09-11-1546-load-older-fix.
-            "get_entry_trim_status": lambda **kw: self.session_manager.get_entry_trim_status(kw["session_id"]),
-            "has_session": self.session_manager.has_session,
-            "get_session_state": self.session_manager.get_session_state,
-            "get_dormant_states": lambda **kw: self.session_manager.get_dormant_states(),
-            "get_permission_policy": lambda **kw: self.session_manager.get_permission_policy(),
-            "set_permission_policy": self.session_manager.set_permission_policy,
-            "get_ui_prefs": lambda **kw: self.session_manager.get_ui_prefs(),
-            "set_ui_prefs": lambda **kw: self.session_manager.set_ui_prefs(kw.get("prefs", {})),
-            "resolve_hook_permission": self.session_manager.resolve_hook_permission,
-            "queue_message": self.session_manager.queue_message,
-            "get_queue": lambda **kw: self.session_manager.get_queue(**kw),
-            "remove_queue_item": self.session_manager.remove_queue_item,
-            "edit_queue_item": self.session_manager.edit_queue_item,
-            "clear_queue": self.session_manager.clear_queue,
-            "get_aliases": lambda **kw: dict(self.session_manager._id_aliases),
-            # ── Subsessions (spec §4.2/§4.3/§6) ──
-            # get_subsession_meta normalizes None → {} so the falsy result
-            # survives IPC: the reader stores msg["result"], and _send_request
-            # treats a None result as a timeout.  {} is both non-None (IPC-safe)
-            # and correctly falsy for the route's "not daemon-managed" check.
-            "get_subsession_meta": lambda **kw: self.session_manager.get_subsession_meta(kw["session_id"]) or {},
-            "mark_inbox_dirty": lambda **kw: self.session_manager.mark_inbox_dirty(kw["session_id"]),
-            "orphan_children_of": lambda **kw: self.session_manager.orphan_children_of(kw["parent_sid"]),
-            "detect_rewind_orphans": lambda **kw: self.session_manager.detect_rewind_orphans(kw["parent_sid"], kw["new_line_count"]),
-            "reanchor_subsession": lambda **kw: self.session_manager.reanchor_subsession(kw["child_sid"], kw["new_origin_turn"]),
-            "detach_subsession": lambda **kw: self.session_manager.detach_subsession(kw["child_sid"]),
-            "set_auto_report_on_idle": lambda **kw: self.session_manager.set_auto_report_on_idle(kw["session_id"], kw["on"]),
-            "ping": lambda **kw: {"ok": True, "pid": os.getpid()},
-        }
+        handlers = build_handlers(self.session_manager)
 
         handler = handlers.get(method)
         if not handler:
@@ -631,7 +682,7 @@ def main():
         pass
 
     # Singleton gate: only one daemon allowed system-wide
-    from app.singleton import acquire_daemon_singleton
+    from common.singleton import acquire_daemon_singleton
     if not acquire_daemon_singleton():
         # Double-check: is the port actually in use? If not, mutex is stale.
         try:

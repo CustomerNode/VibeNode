@@ -259,6 +259,22 @@ class ChatStore(ABC):
         """
         ...
 
+    def read_log_entries(
+        self, session_id: str, cwd: str = "", max_entries: int = 200,
+        until_ts: float = 0.0,
+    ) -> list:
+        """The session's last ``max_entries`` timeline entries, for the engine
+        to put back in memory after a restart (``LogEntry.from_transcript``).
+
+        Each row is a dict with ``kind`` (user / asst / tool_use / tool_result
+        / system), ``text``, ``name``, ``desc``, ``id``, ``tool_use_id``,
+        ``is_error``, ``timestamp`` (epoch) and ``uuid`` (the transcript
+        line's id, "" if none).  ``until_ts`` > 0 drops rows written after it.
+        Reads only the tail of the transcript.  The default knows no format and
+        returns ``[]``; a backend overrides it.  Never raises.
+        """
+        return []
+
     @abstractmethod
     def read_entries(
         self, session_id: str, since: int = 0, cwd: str = ""

@@ -94,16 +94,39 @@ def _in_tests() -> bool:
     return "pytest" in sys.modules
 
 
+def sdk_fields() -> dict:
+    """The SDK version and the patches that did not apply (daemon/sdk_patches.py).
+
+    Read from the module's report when the SDK is importable; otherwise the
+    SDK itself is missing, which is recorded as its own failure.  The web
+    server passes these through ``/api/engine/status`` so the browser can show
+    "SDK patches did not apply" (2026-10-23).
+    """
+    try:
+        from daemon import sdk_patches
+        report = sdk_patches.patch_report()
+    except Exception as exc:  # SDK not installed, or import broke
+        return {"sdk_version": "", "sdk_version_tested": False,
+                "sdk_patch_failures": ["sdk_import"],
+                "sdk_patch_failure_details": [{"name": "sdk_import",
+                                               "precondition": str(exc)}]}
+    return {k: report.get(k) for k in
+            ("sdk_version", "sdk_version_tested", "sdk_patch_failures",
+             "sdk_patch_failure_details")}
+
+
 def record_loaded_code() -> None:
     """Write the full record.  Called once the engine has finished starting."""
     if _in_tests():
         return
     try:
-        _write({
+        record = {
             "pid": os.getpid(),
             "recorded_at": time.time(),
             "loaded": loaded_source_files(),
-        })
+        }
+        record.update(sdk_fields())
+        _write(record)
     except Exception:
         logger.exception("Could not write the engine code record")
 
@@ -124,6 +147,7 @@ def note_reloaded(rel_paths) -> None:
             record = {}
         if record.get("pid") != os.getpid():
             record = {"pid": os.getpid(), "recorded_at": time.time(), "loaded": {}}
+            record.update(sdk_fields())
         loaded = record.setdefault("loaded", {})
         for rel, mtime in loaded_source_files().items():
             loaded.setdefault(rel, mtime)

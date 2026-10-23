@@ -40,6 +40,8 @@ class TestDoGitSync:
         # On the default branch → branch guard is a no-op.
         monkeypatch.setattr(git_ops, "_current_branch", lambda *a: "main")
         monkeypatch.setattr(git_ops, "_default_branch", lambda *a: "main")
+        # requirements.txt unchanged by this pull (see TestPullInstallsRequirements).
+        monkeypatch.setattr(git_ops, "_requirements_blob", lambda *a: "abc")
 
         mock_run = MagicMock()
         # stash returns "No local changes"

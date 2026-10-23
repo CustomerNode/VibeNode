@@ -45,8 +45,16 @@ def create_app(testing=False) -> Flask:
     if testing:
         app.config["TESTING"] = True
 
-    # Initialize SocketIO with threading mode (Flask's default)
-    socketio.init_app(app, async_mode='threading', cors_allowed_origins='*')
+    # Initialize SocketIO with threading mode (Flask's default).
+    # Origins: the same predicate handle_connect applies (app/mobile_auth.py):
+    # loopback on any port, or the Mobile Command host. Was '*'.
+    from . import mobile_auth
+    socketio.init_app(app, async_mode='threading',
+                      cors_allowed_origins=mobile_auth.origin_allowed)
+    # Paired-tier gate for every page and /api/* route (local callers and the
+    # pairing cookie pass; see app/mobile_auth.py). Installed in test mode too,
+    # so the tests drive the real gate.
+    mobile_auth.install(app)
 
     if not testing:
         # Connect to the session daemon (runs in a separate process)
@@ -176,6 +184,7 @@ def create_app(testing=False) -> Flask:
         # Start compose-context.json file watcher for real-time board pushes
         from .compose.watcher import start_compose_watcher
         start_compose_watcher(socketio, app)
+        from .auto_namer import start_auto_namer; start_auto_namer(app)  # names untitled sessions (app/auto_namer.py); never in a test app
 
         # Mobile Command: if the user left phone access ON, re-establish the private
         # tailnet bridge (tailscale serve) now so it persists across restarts —

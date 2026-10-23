@@ -130,6 +130,7 @@ var _SX_ICONS = {
   'Bulk Operations': '<rect x="3" y="4" width="18" height="5" rx="1.5"/><rect x="3" y="15" width="18" height="5" rx="1.5"/><path d="M7 9v6M17 9v6"/>',
   'Keyboard Shortcuts': '<rect x="2.5" y="6" width="19" height="12" rx="2.5"/><path d="M6.5 10h.01M10 10h.01M13.5 10h.01M17 10h.01M7 14h10"/>',
   'Recently Deleted': '<path d="M4 7h16M10 3h4M6 7l1 13h10l1-13M10 11v6M14 11v6"/>',
+  'Recovery & Watchdog': '<path d="M3 12h4l2-5 4 10 2-5h6"/>',
   'Developer Tools': '<path d="M8 8l-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/>'
 };
 var _SX_GROUPS = ['Defaults', 'Access', 'Tools', 'Maintenance'];
@@ -246,6 +247,69 @@ function openSettings(key) {
   overlay.classList.add('sx');
   _sxShow(want);
 }
+// --- Recovery & Watchdog (read-only) ---
+// Every VIBENODE_* behaviour switch the web server and the Session Engine
+// read, from GET /api/engine/knobs (app/engine_knobs.py), grouped as the
+// server groups them.  Nothing here edits: the values are environment
+// variables read at start, so the honest UI is a reference card.
+function _rwEsc(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function _rwRowHtml(k) {
+  var val = (k.value === '' || k.value == null) ? '<span class="rw-unset">unset</span>' : _rwEsc(k.value);
+  return '<div class="rw-row" data-knob="' + _rwEsc(k.name) + '">'
+    + '<div class="rw-head"><code class="rw-name">' + _rwEsc(k.name) + '</code>'
+    + '<span class="rw-value">' + val + '</span>'
+    + (k.source === 'env' ? '<span class="rw-set" title="Set in the environment">set</span>' : '')
+    + '</div>'
+    + (k.description ? '<div class="rw-desc">' + _rwEsc(k.description) + '</div>' : '')
+    + '</div>';
+}
+function _rwBodyHtml(knobs) {
+  var order = [], groups = {}, internal = [];
+  (knobs || []).forEach(function(k) {
+    if (!k || !k.name) return;
+    if (k.internal) { internal.push(k); return; }
+    var g = k.group || 'Other';
+    if (!groups[g]) { groups[g] = []; order.push(g); }
+    groups[g].push(k);
+  });
+  var html = '';
+  order.forEach(function(g) {
+    html += '<div class="rw-group"><div class="rw-group-label">' + _rwEsc(g) + '</div>'
+      + groups[g].map(_rwRowHtml).join('') + '</div>';
+  });
+  if (internal.length) {
+    html += '<details class="rw-group rw-internal"><summary class="rw-group-label">Internal (' + internal.length + ')</summary>'
+      + internal.map(_rwRowHtml).join('') + '</details>';
+  }
+  return html || '<div class="rw-empty">No settings reported.</div>';
+}
+function openRecoveryWatchdog() {
+  var overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+  overlay.innerHTML = '<div class="pm-card pm-enter rw-card" style="width:620px;max-height:76vh;display:flex;flex-direction:column;">'
+    + '<h2 class="pm-title">Recovery &amp; Watchdog</h2>'
+    + '<div class="pm-body rw-intro"><p>These are set with environment variables before VibeNode starts. '
+    + 'Changing one needs a restart of the part that reads it.</p></div>'
+    + '<div id="rw-list" class="rw-list" style="overflow:auto;flex:1;min-height:60px">'
+    + '<div class="rw-empty">Loading…</div></div>'
+    + '<div class="pm-actions"><button type="button" class="pm-btn pm-btn-secondary" onclick="_closePm()">Close</button></div>'
+    + '</div>';
+  overlay.classList.add('show');
+  requestAnimationFrame(function() { var c = overlay.querySelector('.pm-card'); if (c) c.classList.remove('pm-enter'); });
+  overlay.onclick = function(e) { if (e.target === overlay) _closePm(); };
+  var list = overlay.querySelector('#rw-list');
+  fetch('/api/engine/knobs').then(function(r) { return r.ok ? r.json() : null; }).then(function(d) {
+    if (!list.isConnected) return;
+    if (!d || !d.ok || !Array.isArray(d.knobs)) { list.innerHTML = '<div class="rw-empty">Could not read the settings.</div>'; return; }
+    list.innerHTML = _rwBodyHtml(d.knobs);
+  }).catch(function() {
+    if (list.isConnected) list.innerHTML = '<div class="rw-empty">Could not read the settings.</div>';
+  });
+}
+
 function closeHdrSys() {
   // On mobile the menu lives in #mobile-sheet, not the dropdown — close both
   // so callers (each dropdown button's inline `closeHdrSys()`) work in both
@@ -493,7 +557,7 @@ function restartServer() {
           <strong>Application</strong><br><span style="font-size:12px;color:var(--text-muted)">Quick refresh. Your running sessions stay alive.</span>
         </button>
         <button class="restart-opt" data-scope="daemon" style="padding:10px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-primary);cursor:pointer;text-align:left">
-          <strong>Session Engine</strong><br><span style="font-size:12px;color:var(--text-muted)">Restarts the AI session engine. All running sessions will stop.</span>
+          <strong>Session Engine</strong><br><span style="font-size:12px;color:var(--text-muted)">Restarts the Session Engine. All running sessions will stop.</span>
         </button>
         <button class="restart-opt" data-scope="both" style="padding:10px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-primary);cursor:pointer;text-align:left">
           <strong>Everything</strong><br><span style="font-size:12px;color:var(--text-muted)">Full restart. All running sessions will stop.</span>
@@ -617,7 +681,7 @@ function shutdownServer() {
   overlay.innerHTML = `
     <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:10px;padding:24px 28px;min-width:340px;max-width:420px;color:var(--text-primary);font-family:inherit">
       <h3 style="margin:0 0 14px;font-size:16px;color:var(--text-heading)">Turn Off Server</h3>
-      <p style="margin:0 0 18px;font-size:13px;color:var(--text-muted)">This will kill both the web server (5050) and session daemon (5051). All running sessions and agents will be terminated. You will need to manually restart VibeNode to use it again.</p>
+      <p style="margin:0 0 18px;font-size:13px;color:var(--text-muted)">This will kill both the web server (5050) and Session Engine (5051). All running sessions and agents will be terminated. You will need to manually restart VibeNode to use it again.</p>
       <div style="display:flex;justify-content:flex-end;gap:8px">
         <button id="shutdown-cancel" style="padding:8px 18px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-primary);cursor:pointer">Cancel</button>
         <button id="shutdown-confirm" style="padding:8px 18px;border-radius:6px;border:1px solid transparent;background:var(--danger,#e55);color:#fff;cursor:pointer;font-weight:600">Turn Off</button>
@@ -755,7 +819,7 @@ async function openPersistentStorage() {
     <h2 class="pm-title">Persistent Storage</h2>
     <div class="pm-body">
       <div style="font-size:12px;color:var(--text-muted);margin-bottom:16px;">
-        Controls where your <strong>kanban tasks</strong> are stored. This applies to all projects &mdash; not sessions.
+        Controls where your <strong>Workflow tasks</strong> are stored. This applies to all projects &mdash; not sessions.
         Sessions always stay local. Switching copies all existing tasks to the new backend.
       </div>
       <div style="display:flex;gap:12px;margin-bottom:16px;">
@@ -774,7 +838,10 @@ async function openPersistentStorage() {
       <div id="kb-supabase-config" style="${isSupa ? '' : 'display:none;'}padding:16px;border:1px solid var(--border);border-radius:8px;">
         <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:var(--text-muted);">Supabase Connection</div>
         <div class="kanban-settings-field"><label>Project URL</label><input type="text" id="kb-supa-url" value="${typeof escHtml === 'function' ? escHtml(config.supabase_url || '') : (config.supabase_url || '')}" placeholder="https://your-project.supabase.co"></div>
-        <div class="kanban-settings-field"><label>Secret Key <span style="font-size:10px;color:var(--orange);">(service_role)</span></label><input type="password" id="kb-supa-key" value="${typeof escHtml === 'function' ? escHtml(config.supabase_secret_key || '') : (config.supabase_secret_key || '')}" placeholder="eyJhbGciOi…"></div>
+        <!-- The server never returns the stored key, only a mask (••••last4) and supabase_secret_key_set.
+             The field starts EMPTY with the mask as its placeholder; saveAllKanbanSettings (kanban.js) only
+             sends supabase_secret_key when the user typed one, so the stored key is never clobbered. -->
+        <div class="kanban-settings-field"><label>Secret Key <span style="font-size:10px;color:var(--orange);">(service_role)</span>${config.supabase_secret_key_set ? ' <span style="font-size:10px;color:var(--text-muted);">saved; type a new one to replace it</span>' : ''}</label><input type="password" id="kb-supa-key" value="" data-key-set="${config.supabase_secret_key_set ? '1' : ''}" placeholder="${config.supabase_secret_key_set ? (typeof escHtml === 'function' ? escHtml(config.supabase_secret_key || '••••') : '••••') : 'eyJhbGciOi…'}"></div>
         <div style="display:flex;gap:8px;margin-top:10px;align-items:center;">
           <button class="kanban-settings-btn-accent" id="kb-test-btn" onclick="testConnection()" style="padding:8px 18px;font-size:13px;">Step 1: Test Connection</button>
           <span id="kb-conn-status" style="font-size:12px;margin-left:4px;"></span>

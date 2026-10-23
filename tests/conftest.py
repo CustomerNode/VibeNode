@@ -248,6 +248,138 @@ def _isolate_compose_projects(request, tmp_path_factory, monkeypatch):
     yield
 
 
+# Session Hosts (daemon/session_host.py) are separate processes that inherit
+# this environment: none of them may ever launch the real Claude CLI, only a
+# fake one passed as cli_path.  And the host paths point at a scratch folder
+# for the WHOLE process, so a SessionManager timer that outlives its test (and
+# its per-test sandbox below) can never read the real data/session_hosts.
+os.environ["VIBENODE_HOST_FORBID_REAL_CLI"] = "1"
+# Hosting is ON by default in production; the suite runs in-process unless a
+# test turns it on (per test, below).  Set process-wide too, so an engine a
+# test starts in a subprocess, or before the per-test fixture runs, also
+# defaults to in-process.
+os.environ["VIBENODE_SESSION_HOST"] = "0"
+try:
+    import tempfile as _tempfile
+    from daemon import session_host_protocol as _shp_mod
+    _shp_scratch = Path(_tempfile.mkdtemp(prefix="vn-test-hosts-"))
+    _shp_mod.HOSTS_DIR = _shp_scratch / "session_hosts"
+    _shp_mod.LOGS_DIR = _shp_scratch / "session_host_logs"
+except Exception:
+    pass
+
+# No Session Host outlives the test that started it, however that test ends.
+# A host is built to survive its parent (on Windows it even breaks away from
+# the parent's job), so three backstops, each covering what the one before
+# misses (2026-10-23: a stopped run left 9 host and fake-CLI processes):
+#
+# 1. ``_isolate_engine_data_dir`` shuts down every host with a record in the
+#    test's sandbox (the polite path: the host kills its own CLI tree).
+# 2. Every ``spawn_host`` call is tracked here by (pid, create time); the same
+#    finalizer tree-kills any the test started that are still alive, record or
+#    not, and ``atexit`` kills whatever a leaked engine timer started later.
+# 3. ``VIBENODE_HOST_TEST_OWNER`` names this pytest process; each host exits
+#    by itself once it is gone (``Host._test_owner_watch``), which is the only
+#    thing that still works when pytest itself is killed.
+_SPAWNED_HOSTS: list = []        # [(pid, create_time)] in spawn order
+try:
+    from daemon import session_host_protocol as _shp_own
+    os.environ["VIBENODE_HOST_TEST_OWNER"] = (
+        f"{os.getpid()}:{_shp_own.process_create_time(os.getpid()) or 0.0}")
+except Exception:
+    pass
+try:
+    from daemon import session_host_transport as _sht_mod
+    _real_spawn_host = _sht_mod.spawn_host
+
+    def _tracked_spawn_host(*args, **kwargs):
+        proc = _real_spawn_host(*args, **kwargs)
+        from daemon import session_host_protocol as _p
+        _SPAWNED_HOSTS.append((proc.pid, _p.process_create_time(proc.pid)))
+        return proc
+
+    _sht_mod.spawn_host = _tracked_spawn_host
+except Exception:
+    pass
+
+
+def _kill_spawned_hosts(since: int = 0) -> None:
+    """Tree-kill every tracked host spawned at index ``since`` or later that
+    is provably still that process (pid + create time; never a bare pid)."""
+    try:
+        from daemon import session_host_protocol as _p
+        from daemon.session_manager import SessionManager as _SM
+    except Exception:
+        return
+    for pid, ct in list(_SPAWNED_HOSTS[since:]):
+        if ct and _p.same_process(pid, ct):
+            try:
+                _SM._kill_process_tree(pid)
+            except Exception:
+                pass
+
+
+import atexit as _atexit  # noqa: E402
+_atexit.register(_kill_spawned_hosts)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_engine_data_dir(tmp_path_factory, monkeypatch):
+    """Point the engine's per-session durable state at a sandbox.
+
+    ``daemon/session_durable.py`` (``DURABLE_DIR``) and the engine alias index
+    (``common/session_names.ENGINE_ALIASES_PATH``) live under ``<repo>/data``,
+    not under home, so ``_isolate_daemon_home`` does not cover them.  Without
+    this, 2026-10-23, the suite left 261 test records in ``data/session_durable``
+    and wrote ``temp-x -> real-x`` into the real alias file, which a later
+    ``SessionManager.start()`` restored into ``_id_aliases``, so the init-time
+    remap test found its remap "already done" and failed.  Sandboxed here,
+    the real files are never read or written by a test.
+    """
+    box = tmp_path_factory.mktemp("engine-data")
+    try:
+        from daemon import session_durable as _sd
+        monkeypatch.setattr(_sd, "DURABLE_DIR", box / "session_durable")
+    except Exception:
+        pass
+    try:
+        from common import session_names as _sn
+        monkeypatch.setattr(_sn, "ENGINE_ALIASES_PATH", box / "session_aliases.json")
+    except Exception:
+        pass
+    # Session Host records, spill files and logs (daemon/session_host_protocol.py).
+    # A test that wants hosted sessions turns VIBENODE_SESSION_HOST on itself;
+    # everything else runs in-process exactly as before.
+    _shp = None
+    try:
+        from daemon import session_host_protocol as _shp
+        monkeypatch.setattr(_shp, "HOSTS_DIR", box / "session_hosts")
+        monkeypatch.setattr(_shp, "LOGS_DIR", box / "session_host_logs")
+    except Exception:
+        pass
+    monkeypatch.setenv("VIBENODE_SESSION_HOST", "0")
+    spawned_before = len(_SPAWNED_HOSTS)
+    yield
+    # No host process outlives its test (each one runs a fake CLI): first the
+    # polite shutdown of every recorded host, then a tree kill of any host
+    # this test spawned that is still alive (see _SPAWNED_HOSTS above).
+    if _shp is not None and (box / "session_hosts").is_dir():
+        try:
+            from tests._session_host_helpers import reap_hosts
+            reap_hosts(box / "session_hosts")
+        except Exception:
+            pass
+    if len(_SPAWNED_HOSTS) > spawned_before:
+        _kill_spawned_hosts(spawned_before)
+    # A debounced write (session_durable.save(immediate=False)) that fires
+    # after monkeypatch restores DURABLE_DIR would land in the real data dir.
+    try:
+        from daemon import session_durable as _sd
+        _sd.cancel_all()
+    except Exception:
+        pass
+
+
 @pytest.fixture(autouse=True)
 def _block_production_paths(request, monkeypatch):
     """Hard-fail any test that tries to read/write the production DB or config.

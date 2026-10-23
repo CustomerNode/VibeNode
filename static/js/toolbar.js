@@ -369,11 +369,12 @@ function _buildHomepageContent() {
     wfStatLine = 'No tasks yet';
   }
 
-  // Workforce stats
-  const agentCount = (typeof FOLDER_SUPERSET === 'object' && FOLDER_SUPERSET)
-    ? Object.keys(FOLDER_SUPERSET).filter(k => FOLDER_SUPERSET[k].skill).length : 0;
-  const deptCount = (typeof FOLDER_SUPERSET === 'object' && FOLDER_SUPERSET)
-    ? Object.keys(FOLDER_SUPERSET).filter(k => !FOLDER_SUPERSET[k].parentId).length : 0;
+  // Workforce stats: the same source as the Workforce view's header
+  // (workforceCounts in folders.js, the installed department tree), so the two
+  // can never disagree.  null until the tree has loaded.
+  const _wfc = (typeof workforceCounts === 'function') ? workforceCounts() : null;
+  const agentCount = _wfc ? _wfc.agents : 0;
+  const deptCount = _wfc ? _wfc.departments : 0;
 
   // Session segmented bar
   const barParts = [];
@@ -442,7 +443,7 @@ function _buildHomepageContent() {
     const parts = composeColCounts.filter(c => c.count > 0).map(c => `${c.count} ${c.name.toLowerCase()}`);
     composeStatLine = `${composeTotal} section${composeTotal !== 1 ? 's' : ''} &middot; ${parts.join(', ')}`;
   } else {
-    composeStatLine = 'No sections yet';
+    composeStatLine = 'No subsessions yet';
   }
 
   // Workforce dot grid — colored by department
@@ -464,19 +465,32 @@ function _buildHomepageContent() {
     }
   }
 
-  // Featured Sessions card: four status counts and the five most recent
-  // sessions (click one to open it).  Shown on desktop; see ".hpx-*" in style.css.
+  // Featured Sessions card: four status counts, then what needs the user
+  // ("Needs you") and what is running ("Running").  Numbers are desktop-only
+  // (".hpx-*" in style.css); the two lists show on every screen (".hpn-*").
   const _hpNum = (n, label, cls) => `<div class="hpx-num ${n ? cls : 'zero'}"><b>${n}</b><span>${label}</span></div>`;
   const hpNumsHtml = _hpNum(working, 'Working', 'work') + _hpNum(question, 'Waiting on you', '')
     + _hpNum(idle, 'Idle', '') + _hpNum(sleeping, 'Sleeping', '');
-  const _hpKey = s => s.effective_ts || s.last_activity_ts || s.sort_ts || 0;
-  const hpRecentHtml = allSessions.slice().sort((a, b) => _hpKey(b) - _hpKey(a)).slice(0, 5).map(s => {
-    const st = (polled && typeof getSessionStatus === 'function') ? (getSessionStatus(s.id) || 'sleeping') : 'sleeping';
+  const hpLists = _hpAttentionLists(polled);
+  const _hpRow = (s, ico) => {
     const sid = String(s.id).replace(/[^A-Za-z0-9_-]/g, '');
-    return `<div class="hpx-row" onclick="event.stopPropagation();_hpOpenSession('${sid}')" title="${escHtml(s.display_title || '')}">`
-      + `<span class="hpx-ico ${st}"></span><span class="t">${escHtml(s.display_title || s.id)}</span>`
+    return `<div class="hpx-row hpn-row" data-sid="${sid}" onclick="event.stopPropagation();_hpOpenSession('${sid}')" title="${escHtml(s.display_title || '')}">`
+      + `<span class="hpx-ico ${ico}"></span><span class="t">${escHtml(s.display_title || s.id)}</span>`
       + `<span class="d">${escHtml(typeof _shortDate === 'function' ? _shortDate(s.last_activity) : '')}</span></div>`;
-  }).join('');
+  };
+  let hpAttentionHtml = '';
+  if (hpLists.needs.length) {
+    hpAttentionHtml += `<div class="hpn-hd">Needs you</div><div class="hpn-list" id="hp-needs-list">`
+      + hpLists.needs.map(x => _hpRow(x.s, x.why === 'question' ? 'question' : 'unread')).join('') + `</div>`;
+  }
+  if (hpLists.running.length) {
+    hpAttentionHtml += `<div class="hpn-hd">Running</div><div class="hpn-list" id="hp-running-list">`
+      + hpLists.running.map(s => _hpRow(s, 'working')).join('') + `</div>`;
+  }
+  if (!hpAttentionHtml && polled && total > 0) {
+    hpAttentionHtml = `<div class="hpn-empty" id="hp-attention-empty">Nothing needs you. ${sleeping} sleeping.</div>`;
+  }
+  const hpStripHtml = _hpStatusStrip();
 
   // Project selector for homepage
   const _hpProject = _allProjects ? _allProjects.find(p => p.encoded === localStorage.getItem('activeProject')) : null;
@@ -490,6 +504,7 @@ function _buildHomepageContent() {
       <span class="hp-project-name">${escHtml(_hpProjectName)}</span>
       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="opacity:0.35;"><polyline points="6 9 12 15 18 9"/></svg>
     </div>
+    ${hpStripHtml}
     <div class="homepage-cards">
 
       <div class="homepage-card hp-sessions hpx" onclick="setViewMode('sessions')">
@@ -503,7 +518,7 @@ function _buildHomepageContent() {
           <div class="hp-bar">${sessionBar}</div>
         </div>
         <div class="hp-stat">${sessionStat}</div>
-        ${hpRecentHtml ? `<div class="hpx-hd">Recent</div><div class="hpx-list">${hpRecentHtml}</div>` : ''}
+        ${hpAttentionHtml ? `<div class="hpn" id="hp-attention">${hpAttentionHtml}</div>` : ''}
         <div class="hp-cta">Open Sessions <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>
       </div>
 
@@ -529,7 +544,7 @@ function _buildHomepageContent() {
         <div class="hp-viz">
           <div class="hp-dots">${dotGridHtml}</div>
         </div>
-        <div class="hp-stat">${agentCount} agent${agentCount !== 1 ? 's' : ''} &middot; ${deptCount} department${deptCount !== 1 ? 's' : ''}</div>
+        <div class="hp-stat" id="hp-workforce-stat">${_wfc ? `${agentCount} agent${agentCount !== 1 ? 's' : ''} &middot; ${deptCount} department${deptCount !== 1 ? 's' : ''}` : '<span class="skel-shimmer" style="display:inline-block;width:120px;height:13px;border-radius:4px;vertical-align:middle;"></span>'}</div>
         <div class="hp-cta">Open Workforce <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>
       </div>
 
@@ -554,6 +569,71 @@ function _buildHomepageContent() {
 function _hpOpenSession(id) {
   if (typeof setViewMode === 'function') setViewMode('sessions');
   setTimeout(() => { if (typeof openInGUI === 'function') openInGUI(id); }, 300);
+}
+
+/** The homepage's two lists, from SessionStore and the live state maps (no
+ *  fetch of its own; it re-renders on the same events as the counts).
+ *  needs:   waiting on a question or permission (newest first), then finished
+ *           sessions with unread output; at most 5 in all.
+ *  running: working sessions, most recently started first; at most 5. */
+const _HP_LIST_MAX = 5;
+function _hpAttentionLists(polled) {
+  if (!polled) return { needs: [], running: [] };
+  const key = s => s.effective_ts || s.last_activity_ts || s.sort_ts || 0;
+  const status = id => (typeof getSessionStatus === 'function') ? getSessionStatus(id) : 'sleeping';
+  const unread = id => (typeof hasUnread === 'function') && hasUnread(id);
+  const questions = [], finished = [], running = [];
+  for (const s of allSessions) {
+    const st = status(s.id);
+    if (st === 'question') questions.push(s);
+    else if (st === 'working') running.push(s);
+    else if (unread(s.id)) finished.push(s);
+  }
+  questions.sort((a, b) => key(b) - key(a));
+  finished.sort((a, b) => key(b) - key(a));
+  const since = window._workingSinceMap || {};
+  running.sort((a, b) => ((since[b.id] || 0) - (since[a.id] || 0)) || (key(b) - key(a)));
+  const needs = questions.map(s => ({ s, why: 'question' }))
+    .concat(finished.map(s => ({ s, why: 'unread' }))).slice(0, _HP_LIST_MAX);
+  return { needs, running: running.slice(0, _HP_LIST_MAX) };
+}
+
+/** The strip under the project name: usage-limit gauge, Durable Jobs that
+ *  need a person, an older-code Session Engine, and "Name N untitled
+ *  sessions".  Every piece reads data another module already keeps:
+ *  _usageLimitsPillHtml (invoke-workforce.js, repainted by
+ *  _renderUsageLimits), VNJobs.needsPersonCount (jobs.js),
+ *  EngineFreshness.last (engine-freshness.js) and window._untitledInfo
+ *  (app.js _refreshUntitledButton).  A piece with nothing to say is left out. */
+function _hpStatusStrip() {
+  const parts = [];
+  // Always present when the gauge exists: _renderUsageLimits() repaints every
+  // .usage-limits-pill (and un-hides it) when a reading arrives, and CSS hides
+  // the whole item while the pill is hidden.
+  if (typeof _usageLimitsPillHtml === 'function') {
+    parts.push('<span class="hps-item hps-usage" title="Usage limits"><span class="hps-lbl">Usage</span>'
+      + _usageLimitsPillHtml() + '</span>');
+  }
+  const jobs = (window.VNJobs && typeof VNJobs.needsPersonCount === 'function') ? VNJobs.needsPersonCount() : 0;
+  if (jobs > 0) {
+    parts.push('<button type="button" class="hps-item hps-jobs" id="hp-jobs-link" '
+      + 'onclick="event.stopPropagation();if(typeof openDurableJobs===\'function\')openDurableJobs()">'
+      + jobs + ' durable job' + (jobs === 1 ? ' needs' : 's need') + ' you</button>');
+  }
+  const eng = (window.EngineFreshness && EngineFreshness.last) || null;
+  if (eng && eng.running && eng.stale) {
+    const n = (eng.outdated || []).length;
+    parts.push('<span class="hps-item hps-engine" id="hp-engine-stale" title="' + escHtml((eng.outdated || []).join('\n')) + '">'
+      + 'Session Engine running older code: ' + n + ' file' + (n === 1 ? '' : 's') + ' changed</span>');
+  }
+  const ut = window._untitledInfo;
+  if (ut && ut.project === (localStorage.getItem('activeProject') || '')
+      && ut.untitled >= _NAME_UNTITLED_MIN && ut.nameable > 0) {
+    parts.push('<button type="button" class="hps-item hps-name" id="hp-name-untitled" '
+      + 'onclick="event.stopPropagation();nameUntitledSessions()">Name ' + ut.nameable
+      + ' untitled session' + (ut.nameable === 1 ? '' : 's') + '</button>');
+  }
+  return parts.length ? '<div class="hp-strip" id="hp-strip">' + parts.join('') + '</div>' : '';
 }
 
 function _updateHomepageStats() {
@@ -917,8 +997,7 @@ async function deleteSession(id) {
   }
 
   if (deleteOk) {
-    allSessions = allSessions.filter(x => x.id !== id);
-    allSessionIds.delete(id);
+    SessionStore.remove(id);
     // Drop from sidebar multi-selection so the badge count stays honest
     // when a session is deleted via single-target Delete while it was
     // also part of a Ctrl+click selection.
@@ -960,8 +1039,8 @@ async function deleteEmptySessions() {
   const data = await resp.json();
 
   if (data.ok) {
-    allSessions = allSessions.filter(s => s.message_count > 0);
-    _rebuildSessionIds();
+    SessionStore.replaceAll(allSessions.filter(s => s.message_count > 0));
+    _rebuildSessionIds();   // multi-selection prune
     if (empty.find(s => s.id === activeId)) {
       if (workspaceActive) {
         _wsExpandedId = null;

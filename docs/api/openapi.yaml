@@ -256,15 +256,68 @@ paths:
       tags: [Sessions]
       summary: List all sessions for a project
       operationId: listSessions
+      description: |
+        Without the optional filters the response is the full, unfiltered list
+        (unchanged contract). With any of `state`, `q`, `since`, `limit` or
+        `offset` the body is still a bare array, and the `X-Total-Count`
+        response header carries the number of rows that matched BEFORE
+        `offset`/`limit` were applied. Filters are applied in the order
+        state, q, since, then paging. An invalid value is a 400.
       parameters:
         - name: project
           in: query
           schema:
             type: string
           description: Encoded project identifier. Defaults to active project.
+        - name: state
+          in: query
+          schema:
+            type: string
+          description: |
+            Comma-separated list of `working`, `waiting`, `idle`, `sleeping`.
+            `working` includes the daemon's `starting`; `sleeping` is any
+            session without a live daemon record (or `stopped`).
+          example: working,waiting
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Case-insensitive substring matched against `display_title`, `custom_title` and `preview` (the first user message).
+        - name: since
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+          description: Keep sessions active within the last N days (latest of effective_ts, last_activity_ts, sort_ts).
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+          description: Return at most this many rows (after `offset`).
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+          description: Skip this many rows of the filtered list.
       responses:
+        "400":
+          description: Invalid filter value (unknown state, non-integer since/limit/offset)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
         "200":
           description: Array of session summaries
+          headers:
+            X-Total-Count:
+              description: Present only when a filter or paging parameter was given; the matched row count before paging.
+              schema:
+                type: integer
           content:
             application/json:
               schema:
@@ -296,6 +349,130 @@ paths:
                   file_bytes: 0
                   message_count: 0
                   preview: ""
+
+  /api/sessions/untitled-count:
+    get:
+      tags: [Sessions]
+      summary: Count sessions without a title in a project
+      operationId: sessionsUntitledCount
+      description: |
+        `GET /api/sessions` returns a bare list, so the count lives here.
+        `untitled` is every session with no `custom_title`; `nameable` is the
+        subset with at least one message, which is what the bulk namer
+        (`POST /api/sessions/name-untitled`) will process.
+      parameters:
+        - name: project
+          in: query
+          schema:
+            type: string
+          description: Encoded project identifier. Defaults to active project.
+      responses:
+        "200":
+          description: Counts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  project:
+                    type: string
+                  total:
+                    type: integer
+                  untitled:
+                    type: integer
+                  nameable:
+                    type: integer
+              example:
+                project: "C--Users-me-Documents-myproj"
+                total: 1009
+                untitled: 1009
+                nameable: 988
+
+  /api/sessions/name-untitled:
+    post:
+      tags: [Sessions]
+      summary: Name every untitled session in a project (background job)
+      operationId: sessionsNameUntitled
+      description: |
+        Starts a background job that titles every nameable untitled session of
+        the project, oldest first. The free heuristic is tried first and the
+        LLM path (`POST /api/autonname`'s chain) only when the heuristic does
+        not produce a tight title. Each title is persisted exactly like
+        `/api/autonname` (a `custom-title` line, `_session_names.json`, and a
+        `session_renamed` Socket.IO broadcast).
+
+        Progress is pushed over Socket.IO as `naming_progress`:
+        `{project, done, total, current_title, named, skipped, failed, finished}`,
+        once at start (`done: 0`), every 5 sessions, and once at the end with
+        `finished: true`. Only one run per project at a time: a second POST
+        while a run is in progress is a 409 carrying that run's status.
+      parameters:
+        - name: project
+          in: query
+          schema:
+            type: string
+          description: Encoded project identifier (may also be given in the body). Defaults to active project.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                project:
+                  type: string
+                limit:
+                  type: integer
+                  minimum: 1
+                  description: Name at most this many sessions (oldest first).
+      responses:
+        "202":
+          description: Job started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  started:
+                    type: boolean
+                  status:
+                    $ref: "#/components/schemas/NamingJobStatus"
+        "400":
+          description: Invalid limit
+        "409":
+          description: A run for this project is already in progress
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  error:
+                    type: string
+                  status:
+                    $ref: "#/components/schemas/NamingJobStatus"
+
+  /api/sessions/name-untitled/status:
+    get:
+      tags: [Sessions]
+      summary: Status of the bulk naming job for a project
+      operationId: sessionsNameUntitledStatus
+      parameters:
+        - name: project
+          in: query
+          schema:
+            type: string
+          description: Encoded project identifier. Defaults to active project.
+      responses:
+        "200":
+          description: "Current or last run; `running: false` with zero counts when none has run in this web-server process."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamingJobStatus"
 
   /api/resolve-session/{session_id}:
     get:
@@ -5619,6 +5796,28 @@ paths:
                   type: string
                   enum: [pull, push, both]
                   default: both
+                confirm_branch:
+                  type: boolean
+                summary:
+                  type: string
+                  description: One-line "What changed" for the commit; auto-generated from staged paths when empty.
+                gate:
+                  type: object
+                  description: Publish gate outcome recorded in the commit message.
+                  properties:
+                    mode:
+                      type: string
+                      enum: [fast, full, skipped]
+                    passed:
+                      type: integer
+                    skipped:
+                      type: integer
+                    failed:
+                      type: integer
+                    seconds:
+                      type: integer
+                    anyway:
+                      type: boolean
       responses:
         "200":
           description: Sync result
@@ -5631,6 +5830,15 @@ paths:
                     type: boolean
                   git_status:
                     type: object
+                  pip_ran:
+                    type: boolean
+                    description: Present when the pull changed requirements.txt and pip ran.
+                  pip_ok:
+                    type: boolean
+                  pip_installed:
+                    type: integer
+                  pip_output_tail:
+                    type: string
 
   /api/git-scan:
     get:
@@ -5756,6 +5964,35 @@ paths:
             text/event-stream:
               schema:
                 type: string
+
+  /api/test-modes:
+    get:
+      tags: [Tests]
+      summary: What each Publish-gate test mode really runs
+      operationId: getTestModes
+      description: |
+        Labels and pytest arguments for the `fast` and `full` modes (app/routes/test_api.py
+        MODES). Both modes run the same files (pytest.ini ignores tests/e2e); only the
+        per-test timeout differs. The Publish dialog shows these labels.
+      responses:
+        "200":
+          description: Mode descriptions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  modes:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        label:
+                          type: string
+                        pytest_args:
+                          type: array
+                          items:
+                            type: string
 
   /api/cancel-tests:
     post:
@@ -6805,6 +7042,27 @@ paths:
                 type: object
                 additionalProperties: true
 
+  /api/engine/knobs:
+    get:
+      tags: [Admin]
+      summary: Every VIBENODE_* behaviour switch with its current value
+      operationId: getEngineKnobs
+      description: >-
+        Read-only list of the environment variables the Session Engine and the
+        web server read (kill switches and thresholds for the stall watchdog,
+        stranded-worker and silent-wait recovery, usage-limit auto-resume and
+        auto-switch, API retry, the runaway reaper, Durable Jobs, ports and
+        paths). Drives System → Settings → Recovery & Watchdog. Values are read
+        from the web server's environment. See app/engine_knobs.py.
+      responses:
+        "200":
+          description: "{ok, knobs: [{name, group, description, default, value, source: env|default, internal}]}"
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
   /api/engine/restart-when-idle:
     post:
       tags: [Admin]
@@ -6925,6 +7183,87 @@ paths:
                 properties:
                   device_name:
                     type: string
+
+  /pair:
+    get:
+      tags: [Mobile]
+      summary: Pairing page for a phone, or one-tap pairing with ?code=
+      operationId: pairPage
+      description: |
+        Every page and /api/* route requires the paired tier (a local caller, or
+        the vn_pair cookie; see app/mobile_auth.py). An unpaired page load is
+        redirected here. With `?code=<pairing code>` the request pairs the
+        browser (sets the cookie) and redirects to `/`; a wrong code redirects
+        back here with `?error=1`. A caller that is already in is sent to `/`.
+        Rate-limited to 5 code attempts a minute per address.
+      parameters:
+        - name: code
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The pairing page (HTML)
+        "302":
+          description: Redirect to `/` (paired or already in) or `/pair?error=1` (wrong code)
+        "429":
+          description: Too many code attempts
+
+  /api/pair:
+    post:
+      tags: [Mobile]
+      summary: Check the pairing code and set the vn_pair cookie
+      operationId: pair
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  description: The 10-character code shown under System → Mobile Command (case and dashes ignored)
+      responses:
+        "200":
+          description: Paired; the vn_pair cookie is set (HttpOnly, SameSite=Lax, one year)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+        "403":
+          description: Wrong code
+        "429":
+          description: Too many attempts (5 a minute per address)
+
+  /api/pair/rotate:
+    post:
+      tags: [Mobile]
+      summary: Issue a new pairing code (local callers only)
+      operationId: pairRotate
+      description: Every cookie set under the old code stops working at once.
+      responses:
+        "200":
+          description: The new code and one-tap link
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  pair_code:
+                    type: string
+                  pair_code_display:
+                    type: string
+                  pair_url:
+                    type: string
+                    nullable: true
+                  auth_enabled:
+                    type: boolean
+        "403":
+          description: Not a local caller
 
   /api/speechnode/status:
     get:
@@ -7332,6 +7671,44 @@ components:
         ok:
           type: boolean
           example: false
+
+    NamingJobStatus:
+      type: object
+      description: State of a project's bulk naming run (POST /api/sessions/name-untitled).
+      properties:
+        project:
+          type: string
+        running:
+          type: boolean
+        limit:
+          type: integer
+          nullable: true
+        total:
+          type: integer
+          description: Sessions the run will process (after `limit`).
+        done:
+          type: integer
+        named:
+          type: integer
+        skipped:
+          type: integer
+          description: Already titled, user-named, no user text, or no usable title.
+        failed:
+          type: integer
+        cheap:
+          type: integer
+          description: How many of `named` came from the free heuristic rather than the LLM.
+        current_title:
+          type: string
+          description: The most recent title written.
+        started_at:
+          type: number
+          nullable: true
+        finished_at:
+          type: number
+          nullable: true
+        error:
+          type: string
 
     SessionSummary:
       type: object

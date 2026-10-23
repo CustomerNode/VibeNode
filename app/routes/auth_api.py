@@ -14,6 +14,7 @@ bp = Blueprint('auth_api', __name__)
 _claude_bin = shutil.which("claude") or "claude"
 
 from ..platform_utils import NO_WINDOW as _NO_WINDOW
+from ..mobile_auth import local_only  # opens a terminal on the desktop: this machine only
 
 
 @bp.route("/api/auth-status")
@@ -32,6 +33,7 @@ def api_auth_status():
 
 
 @bp.route("/api/auth-login", methods=["POST"])
+@local_only
 def api_auth_login():
     """Kick off `claude auth login` in a visible terminal so the user can complete OAuth."""
     try:

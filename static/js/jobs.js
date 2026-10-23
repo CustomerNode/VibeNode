@@ -42,6 +42,7 @@
     var el = _cards[jobId];
     if (!el) return;
     delete _cards[jobId];
+    if (_needsCount !== null) _loadNeedsCount();   // an answered card changes the homepage count
     el.classList.remove('show');
     setTimeout(function () {
       try { el.remove(); } catch (e) {}
@@ -119,10 +120,35 @@
     return el;
   }
 
+  // How many jobs need a person (needs_person or failed), for the homepage
+  // strip (toolbar.js _hpStatusStrip).  Read from /api/jobs on first ask, and
+  // after that re-read when a job_needs_person push arrives or a card is
+  // answered.  Never fetched until something asks (no cost off the homepage).
+  // null = not read yet.
+  var _needsCount = null;
+  var _needsLoading = false;
+  function _loadNeedsCount() {
+    if (_needsLoading) return;
+    _needsLoading = true;
+    fetch('/api/jobs').then(function (r) { return r.ok ? r.json() : null; }).then(function (j) {
+      var jobs = (j && j.ok && Array.isArray(j.jobs)) ? j.jobs : [];
+      _needsCount = jobs.filter(function (x) { return x && (x.state === 'needs_person' || x.state === 'failed'); }).length;
+    }).catch(function () { _needsCount = 0; }).then(function () {
+      _needsLoading = false;
+      if (typeof viewMode !== 'undefined' && viewMode === 'homepage'
+          && typeof _updateHomepageStats === 'function') _updateHomepageStats();
+    });
+  }
+  function needsPersonCount() {
+    if (_needsCount === null) _loadNeedsCount();
+    return _needsCount || 0;
+  }
+
   // Socket handlers (wired from socket.js).
   function onNeedsPerson(data) {
     data = data || {};
     showCard(data);
+    if (_needsCount !== null) _loadNeedsCount();   // only once something has asked for it
     try {
       if (window.VNNotify && typeof window.VNNotify.attention === 'function') {
         window.VNNotify.attention({
@@ -175,6 +201,9 @@
   }
 
   function renderList(container, jobs) {
+    if (Array.isArray(jobs)) {   // the list already read: keep the homepage count in step
+      _needsCount = jobs.filter(function (x) { return x && (x.state === 'needs_person' || x.state === 'failed'); }).length;
+    }
     if (!jobs || !jobs.length) {
       container.innerHTML = '<div class="vn-job-empty">No durable jobs registered on this machine. The run-detached skill registers one for every long job it launches.</div>';
       return;
@@ -227,6 +256,7 @@
   }
 
   window.VNJobs = { showCard: showCard, onNeedsPerson: onNeedsPerson, onRegistryError: onRegistryError,
-                    renderList: renderList, jobRowHtml: jobRowHtml, dismiss: _dismiss };
+                    renderList: renderList, jobRowHtml: jobRowHtml, dismiss: _dismiss,
+                    needsPersonCount: needsPersonCount, refreshNeedsCount: _loadNeedsCount };
   window.openDurableJobs = openDurableJobs;
 })();

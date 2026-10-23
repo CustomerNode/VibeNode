@@ -195,7 +195,9 @@ async function _mcRender(prefetched) {
 
   // Post-render: draw any QR codes the step declared, then auto-advance next tick.
   if (overlay.querySelector('#mc-qr-app')) _mcRenderQR('mc-qr-app', _MC_APPSTORE_URL);
-  if (st && st.url && overlay.querySelector('#mc-qr-open')) _mcRenderQR('mc-qr-open', st.url);
+  // The "Open VibeNode" QR carries the one-tap pair link when the server gave us one
+  // (local caller, pairing on), so one scan pairs the phone AND opens the app.
+  if (st && st.url && overlay.querySelector('#mc-qr-open')) _mcRenderQR('mc-qr-open', st.pair_url || st.url);
   if (st && st.install_url && overlay.querySelector('#mc-qr-install')) _mcRenderQR('mc-qr-install', st.install_url);
 
   // Bridge step needs an active nudge: status() can't start the serve — POST /enable does.
@@ -364,12 +366,13 @@ function _mcStepPhone(st) {
         <div class="mc-cta-row">
           <button class="pm-btn pm-btn-secondary mc-copy" onclick="_mcCopy('${url.replace(/'/g, "\\'")}', this)">📋 Copy link</button>
         </div>
-        <div class="mc-col-note">Scan to open, then <strong>Share → Add to Home Screen</strong>. The icon is named <strong>${dev}</strong>.</div>
+        <div class="mc-col-note">Scan to ${st.pair_url ? 'pair and open' : 'open'}, then <strong>Share → Add to Home Screen</strong>. The icon is named <strong>${dev}</strong>.${st.pair_url ? ' The Home-Screen app keeps its own cookies, so it asks for the code once more the first time.' : ''}</div>
       </div>
     </div>
 
     ${acctCta}
     ${phoneLine}
+    ${_mcPairingBox(st)}
 
     <div class="mc-name-row">
       <div class="mc-name-label">Name this computer (so multiple machines are easy to tell apart on your phone):</div>
@@ -381,6 +384,58 @@ function _mcStepPhone(st) {
     </div>
 
     <div class="mc-url">${url}</div>`;
+}
+
+/* Pairing (app/mobile_auth.py). A phone needs the paired tier to reach any page or
+ * API route: it enters this code once on /pair, or opens the one-tap link / scans the
+ * QR, which pairs and opens the app in one go. The server only includes pair_code /
+ * pair_url for a LOCAL caller, so a paired phone opening this modal sees no code. */
+function _mcPairingBox(st) {
+  if (!st || st.auth_enabled === false) {
+    return `<div class="mc-acct-box" style="border-color:rgba(210,153,34,0.35);background:rgba(210,153,34,0.08);">
+      <div class="mc-acct-label">Pairing is <strong>off</strong> (<code>mobile_command_auth: false</code> in kanban_config.json):
+        every device on your tailnet can use VibeNode without a code.</div></div>`;
+  }
+  if (!st.pair_code) return '';
+  const code = _mcEsc(st.pair_code_display || st.pair_code);
+  const pairUrl = _mcEsc(st.pair_url || '');
+  const linkRow = pairUrl
+    ? `<div class="mc-acct-row" style="margin-top:8px;">
+         <code class="mc-acct-code" style="font-size:11px;font-weight:500;">${pairUrl}</code>
+         <button class="pm-btn pm-btn-secondary mc-copy" onclick="_mcCopy('${pairUrl.replace(/'/g, "\\'")}', this)">📋 Copy link</button>
+       </div>`
+    : '';
+  return `<div class="mc-acct-box" id="mc-pair-box">
+      <div class="mc-acct-label">③ <strong>Pairing code</strong> — the phone asks for it once. The QR above and the link below
+        carry it, so scanning or tapping pairs the phone by itself.</div>
+      <div class="mc-acct-row">
+        <code class="mc-acct-code" style="letter-spacing:.12em;">${code}</code>
+        <button class="pm-btn pm-btn-secondary mc-copy" onclick="_mcCopy('${_mcEsc(st.pair_code)}', this)">📋 Copy</button>
+        <button class="pm-btn pm-btn-secondary mc-copy" onclick="_mcRotateCode(this)" title="New code; every paired phone must pair again">↻ Rotate</button>
+      </div>
+      ${linkRow}
+    </div>`;
+}
+
+let _mcRotateInFlight = false;
+async function _mcRotateCode(btn) {
+  if (_mcRotateInFlight) return;
+  if (!confirm('Issue a new pairing code? Every phone paired with the current code will have to pair again.')) return;
+  _mcRotateInFlight = true;
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch('/api/pair/rotate', { method: 'POST' });
+    if (!r.ok) {
+      if (typeof showToast === 'function') showToast('Could not rotate the pairing code', true);
+      return;
+    }
+    await _mcRender();
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Could not rotate the pairing code', true);
+  } finally {
+    _mcRotateInFlight = false;
+    if (btn) btn.disabled = false;
+  }
 }
 
 /* Save this computer's Home-Screen label. */

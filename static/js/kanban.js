@@ -528,9 +528,9 @@ function renderKanbanBoard(data) {
     board.innerHTML =
       '<div class="kanban-empty-state">' +
       '<div style="margin-bottom:12px;color:var(--text-muted);">' + KI.clipboard + '</div>' +
-      '<div style="font-size:16px;font-weight:500;color:var(--text);margin-bottom:6px;">Welcome to your Kanban board</div>' +
+      '<div style="font-size:16px;font-weight:500;color:var(--text);margin-bottom:6px;">Welcome to your Workflow</div>' +
       '<div style="font-size:13px;color:var(--text-muted);margin-bottom:16px;">This project doesn\'t have any tasks yet.</div>' +
-      '<button class="kanban-create-first-btn" onclick="createTask(\'not_started\')">+ Create your first task</button>' +
+      '<button class="kanban-create-first-btn" onclick="createTask(\'not_started\')">Create your first task</button>' +
       '<div style="margin-top:14px;">' +
       '<button class="kanban-create-first-btn" id="kb-find-cloud-btn" onclick="discoverCloudProjects()" ' +
       'style="background:transparent;color:var(--text-muted);border:1px solid var(--border);font-weight:500;">' +
@@ -853,7 +853,7 @@ function createTask(status, parentId) {
 
   overlay.innerHTML = `<div class="pm-card pm-enter" style="max-width:480px;">
     <h2 class="pm-title" style="display:flex;align-items:center;justify-content:space-between;">
-      <span>Add to Board</span>
+      <span>New task</span>
       <div class="kanban-create-position-row" style="margin:0;">
         <span style="font-size:11px;color:var(--text-dim);">Insert</span>
         <button class="kanban-create-pos-btn active" id="kb-pos-top" onclick="_setInsertPos('top')">Top</button>
@@ -1002,7 +1002,7 @@ let _plannerAccumText = '';
 let _plannerHistory = [];  // [{role, content}] for multi-turn refine via the chat endpoint
 
 const _PLANNER_SYSTEM = [
-  'You are a task planning assistant for a Kanban board.',
+  'You are a task planning assistant for a Workflow task board (Kanban-style columns).',
   'You MUST respond with ONLY valid JSON. No explanation, no prose, no apologies, no refusals.',
   'Even for trivial, nonsensical, or test inputs, you MUST produce a valid task tree.',
   'NEVER refuse. NEVER explain. NEVER ask questions. NEVER ask for clarification.',
@@ -1364,7 +1364,7 @@ function _showPlanResult(rawText) {
         '<div class="planner-result-header">' + KI.check + ' <strong>' + count + ' tasks</strong> proposed</div>' +
         _renderPlanTree(parsed.tasks) +
         '<div class="planner-actions">' +
-          '<button class="planner-accept-btn" id="planner-accept-btn" onclick="_acceptPlan()">Add ' + count + ' tasks to Board</button>' +
+          '<button class="planner-accept-btn" id="planner-accept-btn" onclick="_acceptPlan()">Add ' + count + ' tasks to Workflow</button>' +
         '</div>' +
         '<div class="planner-hint">Want changes? Type below and send.</div>' +
       '</div>';
@@ -1430,6 +1430,7 @@ function _countTasks(tasks) {
 async function _acceptPlan() {
   if (!_plannerProposal || !_plannerProposal.tasks) return;
   const btn = document.getElementById('planner-accept-btn');
+  const btnLabel = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = 'Creating\u2026'; }
 
   try {
@@ -1466,7 +1467,7 @@ async function _acceptPlan() {
     }, 350);
   } catch (e) {
     if (typeof showToast === 'function') showToast('Failed: ' + e.message, true);
-    if (btn) { btn.disabled = false; btn.textContent = 'Add to Board'; }
+    if (btn) { btn.disabled = false; btn.textContent = btnLabel || 'Add tasks to Workflow'; }
   }
 }
 
@@ -1679,7 +1680,7 @@ function _resumePlan() {
       '<div class="planner-result-header">' + KI.check + ' <strong>' + count + ' tasks</strong> proposed</div>' +
       _renderPlanTree(_plannerProposal.tasks) +
       '<div class="planner-actions">' +
-        '<button class="planner-accept-btn" id="planner-accept-btn" onclick="_acceptPlan()">Add ' + count + ' tasks to Board</button>' +
+        '<button class="planner-accept-btn" id="planner-accept-btn" onclick="_acceptPlan()">Add ' + count + ' tasks to Workflow</button>' +
       '</div>' +
       '<div class="planner-hint">Want changes? Type below and send.</div>' +
     '</div>';
@@ -2142,7 +2143,7 @@ async function renderTaskDetail(taskId, opts) {
     let html = '<div class="kanban-drill-titlebar">';
     html += '<div class="kanban-drill-breadcrumb">';
     html += _kanbanHistoryIcon();
-    html += '<span class="kanban-drill-crumb kanban-board-crumb" onclick="navigateToBoard()" onmouseenter="_showKanbanHistory(this)" onmouseleave="_hideKanbanHistory()">' + KI.menu + ' Board</span>';
+    html += '<span class="kanban-drill-crumb kanban-board-crumb" onclick="navigateToBoard()" onmouseenter="_showKanbanHistory(this)" onmouseleave="_hideKanbanHistory()">' + KI.menu + ' Workflow</span>';
     for (const a of ancestors) {
       html += '<span class="kanban-drill-sep">' + KI.chevronR + '</span>';
       html += `<span class="kanban-drill-crumb" onclick="navigateToTask('${a.id}')">${escHtml(a.title)}</span>`;
@@ -2490,7 +2491,7 @@ async function renderTaskDetail(taskId, opts) {
       kanbanDetailTaskId = null;
       const _proj = localStorage.getItem('activeProject') || '';
       if (_proj) localStorage.removeItem('pvs_' + _proj + '_kanban');
-      if (typeof showToast === 'function') showToast('Task no longer exists — returned to board');
+      if (typeof showToast === 'function') showToast('Task no longer exists — returned to Workflow');
       navigateToBoard();
       return;
     }
@@ -2509,7 +2510,7 @@ async function renderTaskDetail(taskId, opts) {
       '<div style="font-size:12px;color:var(--text-faint);margin-bottom:14px;">' + escHtml(e.message) + '</div>' +
       '<div style="display:flex;gap:8px;justify-content:center;">' +
       '<button class="kanban-create-first-btn" onclick="renderTaskDetail._retries=0;renderTaskDetail(\'' + escHtml(taskId) + '\')">Retry</button>' +
-      '<button class="kanban-create-first-btn" style="background:var(--bg-btn);color:var(--text-secondary);border:1px solid var(--border);" onclick="navigateToBoard()">Back to Board</button>' +
+      '<button class="kanban-create-first-btn" style="background:var(--bg-btn);color:var(--text-secondary);border:1px solid var(--border);" onclick="navigateToBoard()">Back to Workflow</button>' +
       '</div></div>';
   }
 }
@@ -3282,11 +3283,10 @@ async function openSessionSpawner(taskId) {
   const newId = crypto.randomUUID();
 
   // Register session
-  allSessions.unshift({
+  SessionStore.set(newId, {   // new id: inserted at the front, list + id Set
     id: newId, display_title: 'New Session', custom_title: '',
     last_activity: '', size: '', message_count: 0, preview: '',
   });
-  allSessionIds.add(newId);
   if (typeof guiOpenAdd === 'function') guiOpenAdd(newId);
 
   // ── Build crumb bar (same as _openSessionInKanban) ──
@@ -3306,7 +3306,7 @@ async function openSessionSpawner(taskId) {
     }
     crumbInnerHtml = clone.innerHTML;
   } else {
-    crumbInnerHtml = '<span class="kanban-drill-crumb kanban-board-crumb" onclick="_kanbanSessionClose(\'board\')" onmouseenter="_showKanbanHistory(this)" onmouseleave="_hideKanbanHistory()">' + KI.menu + ' Board</span>';
+    crumbInnerHtml = '<span class="kanban-drill-crumb kanban-board-crumb" onclick="_kanbanSessionClose(\'board\')" onmouseenter="_showKanbanHistory(this)" onmouseleave="_hideKanbanHistory()">' + KI.menu + ' Workflow</span>';
     if (taskId) {
       const taskTitle = window._kanbanDetailTaskTitle || '';
       if (taskTitle) {
@@ -3459,10 +3459,10 @@ async function executeTask(taskId, mode, opts) {
     }
   } catch (e) { /* proceed anyway */ }
 
-  // 3. Generate session ID + register in allSessions + allSessionIds
-  // PERF-CRITICAL #15: must add to BOTH allSessions array AND allSessionIds Set
+  // 3. Generate session ID + register in the session store
+  // PERF-CRITICAL #15: SessionStore.set() adds to the list AND the id Set
   const newId = crypto.randomUUID();
-  allSessions.unshift({
+  SessionStore.set(newId, {
     id: newId,
     display_title: taskTitle || 'Executing task...',
     custom_title: '',
@@ -3471,7 +3471,6 @@ async function executeTask(taskId, mode, opts) {
     message_count: 0,
     preview: '',
   });
-  allSessionIds.add(newId);
   if (typeof guiOpenAdd === 'function') guiOpenAdd(newId);
 
   // 4. Build prompt text based on mode
@@ -3585,7 +3584,7 @@ async function executeTask(taskId, mode, opts) {
       }
       crumbInnerHtml = clone.innerHTML;
     } else {
-      crumbInnerHtml = '<span class="kanban-drill-crumb kanban-board-crumb" onclick="_kanbanSessionClose(\'board\')" onmouseenter="_showKanbanHistory(this)" onmouseleave="_hideKanbanHistory()">' + KI.menu + ' Board</span>';
+      crumbInnerHtml = '<span class="kanban-drill-crumb kanban-board-crumb" onclick="_kanbanSessionClose(\'board\')" onmouseenter="_showKanbanHistory(this)" onmouseleave="_hideKanbanHistory()">' + KI.menu + ' Workflow</span>';
       if (taskTitle) {
         crumbInnerHtml += '<span class="kanban-drill-sep">' + KI.chevronR + '</span>';
         crumbInnerHtml += '<span class="kanban-drill-crumb" onclick="_kanbanSessionClose(\'' + escHtml(taskId) + '\')">' + escHtml(taskTitle) + '</span>';
@@ -3849,7 +3848,7 @@ function _openPlannerDrillDown(taskId, sessionId, taskTitle, prefill) {
     }
     crumbInnerHtml = clone.innerHTML;
   } else {
-    crumbInnerHtml = '<span class="kanban-drill-crumb kanban-board-crumb" onclick="_kanbanPlannerClose(\'board\')" onmouseenter="_showKanbanHistory(this)" onmouseleave="_hideKanbanHistory()">' + KI.menu + ' Board</span>';
+    crumbInnerHtml = '<span class="kanban-drill-crumb kanban-board-crumb" onclick="_kanbanPlannerClose(\'board\')" onmouseenter="_showKanbanHistory(this)" onmouseleave="_hideKanbanHistory()">' + KI.menu + ' Workflow</span>';
     if (taskId && taskTitle) {
       crumbInnerHtml += '<span class="kanban-drill-sep">' + KI.chevronR + '</span>';
       crumbInnerHtml += '<span class="kanban-drill-crumb" onclick="_kanbanPlannerClose(\'' + escHtml(taskId) + '\')">' + escHtml(taskTitle) + '</span>';
@@ -4277,7 +4276,7 @@ function _openSessionInKanban(sessionId) {
     crumbInnerHtml = clone.innerHTML;
   } else {
     // Fallback: build minimal breadcrumb
-    crumbInnerHtml = '<span class="kanban-drill-crumb kanban-board-crumb" onclick="_kanbanSessionClose(\'board\')" onmouseenter="_showKanbanHistory(this)" onmouseleave="_hideKanbanHistory()">' + KI.menu + ' Board</span>';
+    crumbInnerHtml = '<span class="kanban-drill-crumb kanban-board-crumb" onclick="_kanbanSessionClose(\'board\')" onmouseenter="_showKanbanHistory(this)" onmouseleave="_hideKanbanHistory()">' + KI.menu + ' Workflow</span>';
     if (taskId) {
       const taskTitle = window._kanbanDetailTaskTitle || '';
       if (taskTitle) {
@@ -5188,12 +5187,16 @@ function _closeKanbanSettings() {
 async function testConnection() {
   const url = document.getElementById('kb-supa-url')?.value?.trim();
   const key = document.getElementById('kb-supa-key')?.value?.trim();
+  // The saved key is never sent to the browser (the config GET masks it), so
+  // an empty field with a key on file means "use the saved key": the server
+  // fills it in when the URL matches the saved one (_supabase_credentials).
+  const keySaved = document.getElementById('kb-supa-key')?.dataset?.keySet === '1';
   const status = document.getElementById('kb-conn-status');
   const btn = document.getElementById('kb-test-btn');
   const schemaPanel = document.getElementById('kb-schema-setup');
   const actionArea = document.getElementById('kb-action-area');
 
-  if (!url || !key) {
+  if (!url || (!key && !keySaved)) {
     if (status) { status.style.color = 'var(--orange)'; status.textContent = 'Enter URL and key first'; }
     return;
   }
@@ -5519,8 +5522,9 @@ async function replaceCloudWithLocal() {
 async function switchToSupabase() {
   const url = document.getElementById('kb-supa-url')?.value?.trim();
   const key = document.getElementById('kb-supa-key')?.value?.trim();
-  if (!url || !key) return;
-  await runMigrationPreflight(url, key);
+  const keySaved = document.getElementById('kb-supa-key')?.dataset?.keySet === '1';
+  if (!url || (!key && !keySaved)) return;
+  await runMigrationPreflight(url, key || '');
 }
 
 
@@ -5709,8 +5713,8 @@ function renderKanbanSidebar() {
 
   // ── Actions ──
   html += '<div class="kanban-sidebar-section">';
-  html += '<div class="kanban-sidebar-label">Kanban</div>';
-  html += '<button class="kanban-sidebar-btn" onclick="createTask(\'not_started\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> New Task</button>';
+  html += '<div class="kanban-sidebar-label">Workflow</div>';
+  html += '<button class="kanban-sidebar-btn" onclick="createTask(\'not_started\')"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> New task</button>';
   html += '<button class="kanban-sidebar-btn" onclick="openReportsPanel()">' + KI.chart + ' Report</button>';
   html += '<button class="kanban-sidebar-btn" onclick="openKanbanSettings(\'columns\')">' + KI.gear + ' Settings</button>';
 

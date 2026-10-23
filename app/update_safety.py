@@ -257,8 +257,14 @@ def upgrade_sdk_safely(
     env: Optional[Mapping[str, str]] = None,
     timeout: int = 120,
     pkg: str = "claude-code-sdk",
+    requirement: Optional[str] = None,
 ) -> dict:
     """Upgrade ``pkg`` (default ``claude-code-sdk``) safely, or refuse.
+
+    ``requirement`` is the full requirement line to hand pip (e.g.
+    ``claude-code-sdk>=0.0.25,<0.1`` from requirements.txt, 2026-10-23); it
+    keeps the daily upgrade inside the range the SDK patches were written
+    against.  Defaults to the bare ``pkg`` (unbounded, the old behaviour).
 
     Never raises. Every failure mode maps to a structured dict:
 
@@ -281,6 +287,7 @@ def upgrade_sdk_safely(
     runner = runner if runner is not None else _default_runner
     interpreter = interpreter or sys.executable
     sdk_canonical = _canonical(pkg)
+    target = (requirement or "").strip() or pkg
 
     result: dict = {
         "status": STATUS_FAILED,
@@ -331,7 +338,7 @@ def upgrade_sdk_safely(
     dry_cmd = [
         interpreter, "-m", "pip", "install", "--dry-run",
         "--disable-pip-version-check", "--only-binary=:all:",
-        "--upgrade", pkg,
+        "--upgrade", target,
     ]
     dry_rc, dry_out = runner(dry_cmd, timeout)
     result["dry_run_returncode"] = dry_rc
@@ -374,7 +381,7 @@ def upgrade_sdk_safely(
         cmd = [
             interpreter, "-m", "pip", "install",
             "--disable-pip-version-check", "--only-binary=:all:",
-            "--upgrade", pkg,
+            "--upgrade", target,
         ]
     else:
         # Shared env: dry-run proved only the SDK moves; --no-deps is
@@ -382,7 +389,7 @@ def upgrade_sdk_safely(
         cmd = [
             interpreter, "-m", "pip", "install",
             "--disable-pip-version-check", "--only-binary=:all:",
-            "--upgrade", "--no-deps", pkg,
+            "--upgrade", "--no-deps", target,
         ]
     result["pip_command"] = list(cmd)
 

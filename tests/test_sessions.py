@@ -70,8 +70,13 @@ class TestLoadSessionSummary:
         with open(sample_session_file, "a", encoding="utf-8") as f:
             f.write(json.dumps({"type": "user", "message": {"content": "new"},
                                 "timestamp": "2026-03-01T11:00:00Z"}) + "\n")
+        old_keys = set(_summary_cache)
         r2 = load_session_summary(sample_session_file)
-        assert len(_summary_cache) == n1 + 1  # new cache entry, cache busted
+        # Cache busted: a new key replaced the old one.  The old key is dropped
+        # (one entry per path) so a transcript that grows every turn no longer
+        # leaks one stale entry per turn (A4, 2026-10-23).
+        assert len(_summary_cache) == n1
+        assert set(_summary_cache).isdisjoint(old_keys)
         assert r2["message_count"] == r1["message_count"] + 1
 
     def test_large_file_uses_head_tail(self, large_session_file):

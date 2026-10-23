@@ -2387,7 +2387,7 @@ const _ST_ICONS = {
   waking: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',
   asleep: '<span class="vn-st-mask vn-st-sleep"></span>',
 };
-const _ST_LABELS = {working: 'Working', compacting: 'Compacting', waking: 'Awaiting wake-up', asleep: 'Asleep'};
+const _ST_LABELS = {working: 'Working', compacting: 'Compacting', waking: 'Awaiting wake-up', asleep: 'Sleeping'};
 /** Session substatus -> header state for a WORKING session. */
 function _stKindFor(sub) { return sub === 'compacting' ? 'compacting' : (sub === 'auto-resuming' ? 'waking' : 'working'); }
 /** The motion that goes with a busy state (nothing while a session merely

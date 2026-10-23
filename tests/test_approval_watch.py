@@ -1126,13 +1126,25 @@ def test_the_resolve_route(api, cards):
     assert client.get("/api/notify/approvals").get_json()["open"] == []
 
 
-def test_the_preview_proxy_does_not_make_a_phone_a_local_script(api, cards):
+def test_the_preview_proxy_does_not_make_a_phone_a_local_script(api, cards, tmp_path, monkeypatch):
     """``/api/preview/proxy`` fetches a URL for a phone on the tailnet. Pointed
     back at VibeNode it used to arrive as a request from this machine with
     nothing to say who asked, and so passed for a local script: the phone
     could have any local address fetched and watched, and could resolve
-    approvals. Run for real: a live server, so the proxy really calls back."""
+    approvals. Run for real: a live server, so the proxy really calls back.
+
+    Since the pairing gate (app/mobile_auth.py) an unpaired phone is refused
+    at the proxy itself; the phone here is PAIRED, so it gets through the
+    proxy and the notify routes' own local-script rule is what is tested."""
     from werkzeug.serving import make_server
+
+    from app import mobile_auth
+
+    monkeypatch.setattr(mobile_auth, "PAIR_FILE", tmp_path / "data" / "mobile_pair.json")
+    mobile_auth._state_cache.update(mtime=None, state={})
+    monkeypatch.setattr(mobile_auth, "auth_enabled", lambda: True)
+    phone = {"Content-Type": "application/json", "Tailscale-User-Login": "phone@example.com"}
+    paired = dict(phone, Cookie=f"{mobile_auth.COOKIE_NAME}={mobile_auth.cookie_value()}")
 
     client, emitted, w = api
     card = cards()
@@ -1140,11 +1152,11 @@ def test_the_preview_proxy_does_not_make_a_phone_a_local_script(api, cards):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_port}"
 
-    def through_the_proxy(path, body):
+    def through_the_proxy(path, body, headers=paired):
         target = urllib.request.quote(f"{base}{path}", safe="")
         request = urllib.request.Request(
             f"{base}/api/preview/proxy?u={target}", data=json.dumps(body).encode(), method="POST",
-            headers={"Content-Type": "application/json", "Tailscale-User-Login": "phone@example.com"})
+            headers=headers)
         try:
             with urllib.request.urlopen(request, timeout=10) as resp:
                 return resp.status, json.loads(resp.read())
@@ -1155,6 +1167,9 @@ def test_the_preview_proxy_does_not_make_a_phone_a_local_script(api, cards):
         mine = client.post("/api/notify/approval", json={"title": TITLE, "url": card.url}).get_json()["id"]
         w.step()
         asked = len(card.requests)
+
+        status, reply = through_the_proxy("/api/notify/approval", {"title": TITLE, "url": card.url}, phone)
+        assert (status, reply["error"]) == (401, "pairing_required"), "an unpaired phone stops at the proxy"
 
         status, reply = through_the_proxy("/api/notify/approval", {"title": TITLE, "url": card.url})
         assert (status, reply) == (200, {"ok": True, "id": ""}), "pinged, but nothing is watched for it"

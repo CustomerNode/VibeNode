@@ -20,7 +20,7 @@
 // REPORT DASHBOARD
 // ═══════════════════════════════════════════════════════════════
 
-async function openReportsPanel() {
+export async function openReportsPanel() {
   const board = document.getElementById('kanban-board');
   if (!board) return;
 
@@ -48,7 +48,7 @@ async function openReportsPanel() {
     // Breadcrumb
     let html = '<div class="kanban-drill-titlebar">';
     html += '<div class="kanban-drill-breadcrumb">';
-    html += '<span class="kanban-drill-crumb" onclick="navigateToBoard()">' + KI.menu + ' Board</span>';
+    html += '<span class="kanban-drill-crumb" onclick="navigateToBoard()">' + KI.menu + ' Workflow</span>';
     html += '<span class="kanban-drill-sep">' + KI.chevronR + '</span>';
     html += '<span class="kanban-drill-crumb current">' + KI.chart + ' Reports</span>';
     html += '</div></div>';
@@ -370,7 +370,7 @@ function _renderActivityLogCard(data) {
 // ACTIVITY LOG PAGINATION
 // ═══════════════════════════════════════════════════════════════
 
-async function _loadMoreActivityLog(cursor) {
+export async function _loadMoreActivityLog(cursor) {
   try {
     const res = await fetch('/api/kanban/report/activity-log?cursor=' + encodeURIComponent(cursor));
     if (!res.ok) throw new Error('Failed to load');
@@ -379,3 +379,8 @@ async function _loadMoreActivityLog(cursor) {
     if (typeof showToast === 'function') showToast('Failed to load more: ' + e.message, true);
   }
 }
+
+// ES module (2026-10-23): deferred, strict, its own scope.  Inline onclick
+// handlers and classic scripts reach these through window.
+window.openReportsPanel = openReportsPanel;
+window._loadMoreActivityLog = _loadMoreActivityLog;

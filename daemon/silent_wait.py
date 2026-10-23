@@ -41,6 +41,8 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from daemon.backends.claude_layout import ClaudeTranscriptLayout
+
 # ── Wording ───────────────────────────────────────────────────────────────
 # "Waiting on background work", deliberately NOT a bare "wait": the history
 # scan showed most waiting is on the user.  Three shapes:
@@ -84,29 +86,15 @@ def says_waiting_on_background(text: str) -> bool:
 
 # ── Footprint ─────────────────────────────────────────────────────────────
 
-def task_output_dir(root_transcript) -> Path:
-    """Where the CLI writes this session's background-task output files.
-
-    ``<tempdir>/claude/<project dir>/<session id>/tasks`` on Windows, and
-    ``<tempdir>/claude-<uid>/...`` on Linux and macOS (seen 2026-10-20:
-    ``/tmp/claude-1000/-home-.../<sid>/tasks/<id>.output``).  This is the
-    directory of every ``<output-file>`` path in the CLI's task notifications.
-    The per-user name is preferred when it exists.
-    """
-    root = Path(root_transcript)
-    tmp = Path(tempfile.gettempdir())
-    names = ["claude"]
-    getuid = getattr(os, "getuid", None)
-    if getuid is not None:
-        names.insert(0, f"claude-{getuid()}")
-    candidates = [tmp / name / root.parent.name / root.stem / "tasks" for name in names]
-    for candidate in candidates:
-        if candidate.is_dir():
-            return candidate
-    return candidates[-1]
+def task_output_dir(root_transcript, layout=None) -> Path:
+    """Where the CLI writes this session's background-task output files: the
+    directory of every ``<output-file>`` path in its task notifications.
+    Backend knowledge (``TranscriptLayout.task_output_dir``); Claude's
+    layout when ``layout`` is omitted."""
+    return (layout or ClaudeTranscriptLayout()).task_output_dir(root_transcript)
 
 
-def footprint_last_write(root_transcript) -> float:
+def footprint_last_write(root_transcript, layout=None) -> float:
     """Newest mtime across everything the session's background work writes.
 
     That is the root transcript, every agent transcript and meta file under
@@ -114,13 +102,16 @@ def footprint_last_write(root_transcript) -> float:
     agent appends to its transcript on every step, and a background command
     appends to its output file as it prints.  Returns 0.0 if nothing exists.
     """
+    layout = layout or ClaudeTranscriptLayout()
     root = Path(root_transcript)
     newest = 0.0
     try:
         newest = os.stat(root).st_mtime
     except OSError:
         pass
-    for directory in (root.parent / root.stem / "subagents", task_output_dir(root)):
+    for directory in (layout.subagents_dir(root), layout.task_output_dir(root)):
+        if directory is None:
+            continue
         try:
             with os.scandir(directory) as it:
                 for entry in it:

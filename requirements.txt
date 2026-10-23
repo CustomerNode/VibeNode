@@ -1,6 +1,13 @@
-flask
-flask-socketio
-claude-code-sdk>=0.0.25
+# Floors are the versions VibeNode runs on (verified 2026-10-23: Flask 3.1.3,
+# Flask-SocketIO 5.6.1, python-socketio 5.16.1).
+flask>=3.1
+flask-socketio>=5.5
+python-socketio>=5.13
+# daemon/sdk_patches.py patches this SDK's INTERNALS, and TESTED_SDK_RANGE there
+# names the series the patches were verified against.  The ceiling keeps the
+# daily auto-upgrade (run.py → app/update_safety.py) inside that series; raise
+# both together after re-checking the patches' preconditions.
+claude-code-sdk>=0.0.25,<0.1
 anthropic
 supabase
 pg8000

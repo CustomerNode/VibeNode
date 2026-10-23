@@ -1,6 +1,6 @@
 /* compare.js — session comparison modal */
 
-function openCompare() {
+export function openCompare() {
   const sel = document.getElementById('compare-select');
   sel.innerHTML = allSessions
     .filter(s => s.id !== activeId)
@@ -10,7 +10,7 @@ function openCompare() {
   document.getElementById('compare-overlay').classList.add('open');
 }
 
-function closeCompare() {
+export function closeCompare() {
   document.getElementById('compare-overlay').classList.remove('open');
 }
 
@@ -18,7 +18,7 @@ document.getElementById('compare-overlay').addEventListener('click', function(e)
   if (e.target === this) closeCompare();
 });
 
-async function runCompare() {
+export async function runCompare() {
   const id2 = document.getElementById('compare-select').value;
   if (!id2 || !activeId) return;
   const body = document.getElementById('compare-body');
@@ -77,3 +77,9 @@ function renderCompare(d) {
 
   body.innerHTML = meta + statsBar + `<div class="sum-label" style="margin-bottom:8px;">Code Comparison</div>` + diffRows;
 }
+
+// ES module (2026-10-23): deferred, strict, its own scope.  Inline onclick
+// handlers and classic scripts reach these through window.
+window.openCompare = openCompare;
+window.closeCompare = closeCompare;
+window.runCompare = runCompare;

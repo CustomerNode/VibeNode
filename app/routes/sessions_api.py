@@ -16,6 +16,7 @@ from ..config import (
     _CLAUDE_PROJECTS,
     _sessions_dir,
     _load_names,
+    _load_names_cached,
     _names_file,
     _save_name,
     _delete_name,
@@ -34,11 +35,13 @@ from ..config import (
     purge_from_trash,
     _get_utility_ids,
     _resolve_remapped_id,
-    _load_remaps,
     _record_session_access,
 )
+from ..session_store import _load_remaps_cached
+from ..session_awareness import _get_all_states_cached
 from ..sessions import load_session, load_session_timeline, all_sessions
-from ..titling import smart_title
+from ..titling import smart_title, collect_title_messages
+from .. import auto_namer as _auto_namer
 
 bp = Blueprint('sessions_api', __name__)
 log = logging.getLogger(__name__)
@@ -213,6 +216,111 @@ def _append_custom_title_if_changed(path: Path, title: str, session_id: str) -> 
     return True
 
 
+# ---------------------------------------------------------------------------
+# GET /api/sessions query parameters (added 2026-10-23, sessions at scale).
+# No parameter -> the response is the same bare list it has always been.
+# ---------------------------------------------------------------------------
+
+_LISTING_STATES = ("working", "waiting", "idle", "sleeping")
+
+
+def _state_bucket(live_state: str | None) -> str:
+    """Collapse a daemon state onto the four buckets the ``state`` filter
+    accepts.  No live record (or ``stopped``) is ``sleeping``; ``starting``
+    counts as ``working`` because the user sees the same spinner."""
+    s = (live_state or "").lower()
+    if s in ("working", "starting"):
+        return "working"
+    if s.startswith("waiting"):
+        return "waiting"
+    if s == "idle":
+        return "idle"
+    return "sleeping"
+
+
+def _parse_listing_filters(args):
+    """Validate the optional listing parameters.  Returns ``(filters, error)``
+    where *filters* is ``None`` when no parameter was given (fast path) and
+    *error* is a message for a 400."""
+    raw_state = (args.get("state") or "").strip().lower()
+    q = (args.get("q") or "").strip().lower()
+    raw_since = (args.get("since") or "").strip()
+    raw_limit = (args.get("limit") or "").strip()
+    raw_offset = (args.get("offset") or "").strip()
+    if not (raw_state or q or raw_since or raw_limit or raw_offset):
+        return None, None
+    states = None
+    if raw_state:
+        states = {s.strip() for s in raw_state.split(",") if s.strip()}
+        bad = sorted(states - set(_LISTING_STATES))
+        if bad:
+            return None, f"unknown state(s) {', '.join(bad)}; expected {', '.join(_LISTING_STATES)}"
+
+    def _int(raw, name, minimum):
+        if not raw:
+            return None, None
+        try:
+            v = int(raw)
+        except ValueError:
+            return None, f"{name} must be an integer"
+        if v < minimum:
+            return None, f"{name} must be >= {minimum}"
+        return v, None
+
+    since, err = _int(raw_since, "since", 0)
+    if err:
+        return None, err
+    limit, err = _int(raw_limit, "limit", 0)
+    if err:
+        return None, err
+    offset, err = _int(raw_offset, "offset", 0)
+    if err:
+        return None, err
+    return {"states": states, "q": q, "since": since,
+            "limit": limit, "offset": offset}, None
+
+
+def _apply_listing_filters(sessions: list, filters: dict, state_by_sid: dict):
+    """Filter, then page.  Returns ``(rows, total_after_filters)``."""
+    states, q, since = filters["states"], filters["q"], filters["since"]
+    out = sessions
+    if states is not None:
+        out = [s for s in out
+               if _state_bucket((state_by_sid.get(s["id"]) or {}).get("state")) in states]
+    if q:
+        def _match(s):
+            for field in ("display_title", "custom_title", "preview"):
+                v = s.get(field)
+                if v and q in str(v).lower():
+                    return True
+            return False
+        out = [s for s in out if _match(s)]
+    if since is not None:
+        cutoff = _time.time() - since * 86400
+        out = [s for s in out
+               if max(s.get("effective_ts") or 0, s.get("last_activity_ts") or 0,
+                      s.get("sort_ts") or 0) >= cutoff]
+    total = len(out)
+    offset = filters["offset"] or 0
+    if offset:
+        out = out[offset:]
+    if filters["limit"] is not None:
+        out = out[:filters["limit"]]
+    return out, total
+
+
+def _listing_states(sm) -> list:
+    """Daemon states for the listing, through the 2 s cache the awareness
+    module keeps (PERF-CRITICAL #10).  ``GET /api/sessions`` is hit by every
+    sidebar refresh and project switch, and each uncached call is a blocking
+    IPC round-trip that serialises every live session.  In a test app the
+    cache is bypassed: the module-level cache would otherwise hand one test's
+    MagicMock states to the next test built within 2 s."""
+    if current_app.testing:
+        return sm.get_all_states()
+    return _get_all_states_cached(sm)
+
+
 @bp.route("/api/sessions")
 def api_sessions():
     # ── Extract project from client request ──
@@ -221,6 +329,10 @@ def api_sessions():
     project = request.args.get("project", "").strip()
     if project and not (_CLAUDE_PROJECTS / project).is_dir():
         project = get_active_project()
+
+    filters, err = _parse_listing_filters(request.args)
+    if err:
+        return jsonify({"error": err}), 400
 
     sessions = all_sessions(summary_only=True, project=project)
 
@@ -235,7 +347,7 @@ def api_sessions():
     # Merge in-memory aliases with disk-persisted remaps so resolution
     # still works after a web restart (when _id_aliases is empty).
     aliases = dict(sm._id_aliases) if hasattr(sm, '_id_aliases') else {}
-    for old_id, entry in _load_remaps(project).items():
+    for old_id, entry in _load_remaps_cached(project).items():
         if old_id not in aliases and entry.get("new_id"):
             aliases[old_id] = entry["new_id"]
 
@@ -260,13 +372,13 @@ def api_sessions():
     sessions = [s for s in sessions if s["id"] not in utility_ids]
 
     existing_ids = {s["id"] for s in sessions}
-    names = _load_names(project)  # check _session_names.json for auto-named titles
+    names = _load_names_cached(project)  # _session_names.json, mtime-cached (auto-named titles)
     # Subsessions (spec §4.4): build a sid -> daemon-state lookup so the
     # disk-sourced session list can be decorated with the parent pointer
     # + inbox-dirty flag.  Without this the sidebar can't render the
     # tree variant for closed-but-still-managed parents.
     _state_by_sid = {}
-    for state in sm.get_all_states():
+    for state in _listing_states(sm):
         sid = state.get("session_id", "")
         if state.get("session_type") in ("planner", "title"):
             continue
@@ -345,7 +457,7 @@ def api_sessions():
     # status (delivered via WebSocket) always overrides this on the client.
     # Wrapped defensively: a slow/absent daemon must never break the list.
     try:
-        dormant = sm.get_dormant_states() if hasattr(sm, "get_dormant_states") else {}
+        dormant = sm.get_dormant_states() if sm.supports("get_dormant_states") else {}
     except Exception:
         dormant = {}
     if dormant:
@@ -362,7 +474,58 @@ def api_sessions():
             if info.get("model") and not s.get("model"):
                 s["model"] = info["model"]
 
-    return jsonify(sessions)
+    if filters is None:
+        return jsonify(sessions)
+    rows, total = _apply_listing_filters(sessions, filters, _state_by_sid)
+    resp = jsonify(rows)
+    # The body stays a bare list for every caller; the post-filter total the
+    # pager needs travels in a header.
+    resp.headers["X-Total-Count"] = str(total)
+    return resp
+
+
+def _listing_project(raw: str) -> str:
+    project = (raw or "").strip()
+    if project and not (_CLAUDE_PROJECTS / project).is_dir():
+        project = get_active_project()
+    return project or get_active_project()
+
+
+@bp.route("/api/sessions/untitled-count")
+def api_sessions_untitled_count():
+    """How many sessions in a project have no title.  ``GET /api/sessions``
+    returns a bare list, so the count lives here instead of in response
+    metadata.  ``nameable`` is the subset the bulk namer can act on (it has
+    at least one message)."""
+    project = _listing_project(request.args.get("project", ""))
+    counts = _auto_namer.count_untitled(project)
+    return jsonify({"project": project, **counts})
+
+
+@bp.route("/api/sessions/name-untitled", methods=["POST"])
+def api_sessions_name_untitled():
+    """Start the bulk namer for one project: every untitled session, oldest
+    first, cheap heuristic before the LLM.  Progress is pushed as
+    ``naming_progress`` over Socket.IO every 5 sessions and at the end.
+    Body (optional JSON): ``{"limit": N}``.  409 if a run for this project is
+    already in progress."""
+    data = request.get_json(silent=True) or {}
+    project = _listing_project(request.args.get("project", "") or data.get("project", ""))
+    limit = data.get("limit")
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            return jsonify({"ok": False, "error": "limit must be a positive integer"}), 400
+    app = current_app._get_current_object()
+    status, started = _auto_namer.start_bulk(app, project, limit=limit)
+    if not started:
+        return jsonify({"ok": False, "error": "already running", "status": status}), 409
+    return jsonify({"ok": True, "started": True, "status": status}), 202
+
+
+@bp.route("/api/sessions/name-untitled/status")
+def api_sessions_name_untitled_status():
+    project = _listing_project(request.args.get("project", ""))
+    return jsonify(_auto_namer.bulk_status(project))
 
 
 @bp.route("/api/resolve-session/<session_id>")
@@ -527,36 +690,10 @@ def api_autoname(session_id):
             return jsonify({"error": "Not found"}), 404
 
         session = load_session(path)
-        messages = [m for m in session["messages"] if m.get("content")]
-
-    # Fallback: if load_session found no messages with content, scan the raw
-    # JSONL for user text (queue-operation entries, user role with message.content)
-    if not messages:
-        import json as json_mod
-        try:
-            with open(path, encoding="utf-8") as _f:
-                for _line in _f:
-                    _line = _line.strip()
-                    if not _line:
-                        continue
-                    _entry = json_mod.loads(_line)
-                    _t = _entry.get("type", "")
-                    # queue-operation entries contain the original user prompt
-                    if _t == "queue-operation" and _entry.get("content"):
-                        messages.append({"role": "user", "content": _entry["content"]})
-                        break
-                    # user entries may have content in message.content blocks
-                    if _entry.get("role") == "user":
-                        mc = _entry.get("message", {}).get("content", [])
-                        if isinstance(mc, list):
-                            for block in mc:
-                                if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
-                                    messages.append({"role": "user", "content": block["text"]})
-                                    break
-                        if messages:
-                            break
-        except Exception:
-            pass
+        # load_session messages with content, with the raw-JSONL fallback
+        # (queue-operation / user text blocks) when that yields nothing.
+        # Shared with the background namer so both title from the same input.
+        messages = collect_title_messages(path, session)
 
     # Check if this is a re-evaluate request (session already has an auto-title)
     session = session if 'session' in dir() else {}

@@ -23,6 +23,11 @@ REGISTRY_PATH = Path.home() / ".claude" / "gui_active_sessions.json"
 # Maximum age (seconds) for a session to be eligible for recovery
 MAX_RECOVERY_AGE = 3600  # 1 hour
 
+# A session with an armed auto-retry or usage-limit continue
+# (daemon/session_durable.py) is recovered for longer: a weekly limit can
+# reset many hours after the session last did anything.
+ARMED_RECOVERY_AGE = 7 * 86400
+
 # States that mean a session was in active use before the last shutdown.
 # These are the states we "remember" across a restart so the UI can mark the
 # session as previously-active instead of collapsing it to a generic
@@ -214,6 +219,8 @@ class SessionRegistry:
         store,
         max_age: int = None,
         mark_inbox_dirty_fn: Optional[Callable[[str], bool]] = None,
+        skip_sids: Optional[set] = None,
+        armed_sids: Optional[set] = None,
     ) -> None:
         """Recover sessions that were active before a crash.
 
@@ -230,9 +237,19 @@ class SessionRegistry:
             in-memory inbox_dirty flag back on so the next send_message turn
             drains them.  Without this, daemon restart strands undelivered
             reports (phase 6.5 P0-3).
+        skip_sids: sessions already re-attached to their live Session Host
+            (``daemon/session_host_registry.reconcile``).  Their CLI never
+            died, so a ``--resume`` would start a SECOND CLI on the same
+            transcript.  Never relaunched here.
+        armed_sids: sessions whose SessionDurable record carries an armed
+            auto-retry or usage-limit continue (``session_durable.
+            armed_session_ids``).  Relaunched even when they were idle at the
+            restart (within ``ARMED_RECOVERY_AGE``), so the timer fires.
         """
         if max_age is None:
             max_age = MAX_RECOVERY_AGE
+        skip_sids = set(skip_sids or ())
+        armed_sids = set(armed_sids or ())
         try:
             registry = self.load_registry()
             sessions = registry.get("sessions", {})
@@ -302,7 +319,12 @@ class SessionRegistry:
                 logger.warning("Could not read queue file for recovery: %s", _qerr)
 
             for sid, meta in sessions.items():
+                if sid in skip_sids:
+                    logger.info("Not recovering %s: re-attached to its live "
+                                "Session Host", sid)
+                    continue
                 state = meta.get("state", "stopped")
+                armed = sid in armed_sids
                 # Recover sessions that were mid-task (working/waiting/
                 # starting) OR sessions that have queued messages waiting to
                 # be delivered.  Pure-idle sessions with no queue are skipped
@@ -310,7 +332,7 @@ class SessionRegistry:
                 # send a new message (which auto-resumes them via the
                 # send_message fallback path).
                 if state not in ("working", "waiting", "starting") \
-                        and sid not in queued_sids:
+                        and sid not in queued_sids and not armed:
                     continue
 
                 # Never recover planner sessions
@@ -319,7 +341,7 @@ class SessionRegistry:
 
                 last_activity = meta.get("last_activity", 0)
                 age = now - last_activity
-                if age > max_age:
+                if age > (max(max_age, ARMED_RECOVERY_AGE) if armed else max_age):
                     logger.info(
                         "Skipping stale session %s (%.0f min old)", sid, age / 60
                     )

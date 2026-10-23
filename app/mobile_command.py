@@ -620,6 +620,14 @@ def status(port: Optional[int] = None) -> dict:
     serving = bool(installed and logged_in and _serve_targets_port(port))
     url = tailnet_url(st) if logged_in else None
     enabled = is_flag_enabled()
+    if url:
+        # The Socket.IO Origin check accepts this name (app/mobile_auth.py);
+        # telling it here saves it a `tailscale status` of its own.
+        try:
+            from . import mobile_auth
+            mobile_auth.set_known_mobile_host(_dns_from_status(st))
+        except Exception:  # noqa: BLE001
+            pass
 
     needs = None
     if not installed:

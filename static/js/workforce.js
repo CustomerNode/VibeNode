@@ -851,13 +851,6 @@ function renderWorkforce(sessions) {
     grid.innerHTML = '<div style="padding:20px;color:var(--text-muted);font-size:12px;">No sessions found</div>';
     return;
   }
-  const statusSvg = {
-    question: '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r=".5" fill="#ff9500"/></svg>',
-    working: '<img src="/static/svg/pickaxe.svg" width="28" height="28" style="filter:brightness(0) saturate(100%) invert(55%) sepia(78%) saturate(1000%) hue-rotate(215deg);">',
-    idle: '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#44aa66" stroke-width="1.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>',
-    sleeping: '<img src="/static/svg/sleeping.svg" width="28" height="28" class="sleeping-icon">',
-  };
-  const statusLabel = {question:'Question', working:'Working', idle:'Idle', sleeping:'Sleeping'};
   // Keep subsessions glued to their parent regardless of the active sort,
   // and tag each card with its family role so parent/child get distinct
   // text colors (see .wf-parent / .wf-child in style.css).  Falls back to
@@ -870,19 +863,7 @@ function renderWorkforce(sessions) {
   }
   grid.innerHTML = sessions.map(s => {
     const st = getSessionStatus(s.id);
-    const _isCompacting = st === 'working' && window._sessionSubstatus && window._sessionSubstatus[s.id] === 'compacting';
-    // Sleeping = substatus 'auto-resuming' regardless of state.  Covers
-    // both phases: idle+auto-resuming (waiting for wake-up) and
-    // working+auto-resuming (wake-up firing).  Keeps the workforce card
-    // visually consistent with the live panel's "Awaiting wake-up…"
-    // throughout the cycle.
-    const _isSleepingCard = window._sessionSubstatus && window._sessionSubstatus[s.id] === 'auto-resuming';
-    const emoji = _isCompacting
-      ? '<svg class="compacting-icon" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#aa88ff" stroke-width="1.5" stroke-linecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>'
-      : _isSleepingCard
-      ? statusSvg.sleeping
-      : (statusSvg[st] || statusSvg.sleeping);
-    const label = _isCompacting ? 'Compacting' : (_isSleepingCard ? 'Awaiting wake-up' : (statusLabel[st] || 'Sleeping'));
+    const { emoji, label, hint: _dblTitle } = _wfCardStatusParts(s.id, st);
     const selClass = s.id === activeId ? ' wf-selected' : '';
     // Multi-select: include .multi-selected class on initial render so the
     // visual stays in sync after re-renders without an extra DOM pass.
@@ -913,17 +894,6 @@ function renderWorkforce(sessions) {
     const unreadDot = _isUnread
       ? '<span class="unread-dot" aria-label="Unread" title="Unread \u2014 new response you haven\u2019t opened"></span>'
       : '';
-    // Double-click on a card TOGGLES sleep: idle \u2192 sleep, sleeping \u2192 wake.
-    // See `_dblclickSleepIfIdle()` in sessions.js.  Working/waiting cards ignore
-    // the gesture (with a toast explaining why).  Single click still opens the
-    // session; the two-click prefix runs first and the panel briefly opens
-    // before the sleep/wake completes, which doubles as visual confirmation
-    // that the right card was targeted.
-    const _dblTitle = (st === 'sleeping')
-      ? 'click to open, double-click to wake'
-      : (st === 'idle')
-        ? 'click to open, double-click to sleep'
-        : 'click to open';
     return `<div class="wf-card wf-${st}${selClass}${msClass}${familyClass}${unreadClass}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" onclick="singleOrDouble('${s.id}',event)" ondblclick="_dblclickSleepIfIdle('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')" title="${escHtml(s.display_title)} \u2014 ${_dblTitle}">
       ${unreadDot}
       <div class="wf-avatar">${emoji}</div>
@@ -932,6 +902,51 @@ function renderWorkforce(sessions) {
       <div class="wf-meta">${escHtml(date)}</div>
     </div>`;
   }).join('');
+}
+
+const _WF_STATUS_SVG = {
+  question: '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r=".5" fill="#ff9500"/></svg>',
+  working: '<img src="/static/svg/pickaxe.svg" width="28" height="28" style="filter:brightness(0) saturate(100%) invert(55%) sepia(78%) saturate(1000%) hue-rotate(215deg);">',
+  idle: '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#44aa66" stroke-width="1.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>',
+  sleeping: '<img src="/static/svg/sleeping.svg" width="28" height="28" class="sleeping-icon">',
+};
+const _WF_STATUS_LABEL = {question:'Question', working:'Working', idle:'Idle', sleeping:'Sleeping'};
+
+/**
+ * A card's state-dependent parts: the avatar markup, the status label and
+ * the title hint.  ONE source for the full render above and the surgical
+ * per-event update (`_updateRowState` in socket.js), so a session_state
+ * event repaints its own card instead of rebuilding the grid.
+ * @param {string} sid
+ * @param {string} st  getSessionStatus() value
+ * @returns {{emoji: string, label: string, hint: string}}
+ */
+function _wfCardStatusParts(sid, st) {
+  const _isCompacting = st === 'working' && window._sessionSubstatus && window._sessionSubstatus[sid] === 'compacting';
+  // Sleeping = substatus 'auto-resuming' regardless of state.  Covers
+  // both phases: idle+auto-resuming (waiting for wake-up) and
+  // working+auto-resuming (wake-up firing).  Keeps the workforce card
+  // visually consistent with the live panel's "Awaiting wake-up\u2026"
+  // throughout the cycle.
+  const _isSleepingCard = window._sessionSubstatus && window._sessionSubstatus[sid] === 'auto-resuming';
+  const emoji = _isCompacting
+    ? '<svg class="compacting-icon" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#aa88ff" stroke-width="1.5" stroke-linecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>'
+    : _isSleepingCard
+    ? _WF_STATUS_SVG.sleeping
+    : (_WF_STATUS_SVG[st] || _WF_STATUS_SVG.sleeping);
+  const label = _isCompacting ? 'Compacting' : (_isSleepingCard ? 'Awaiting wake-up' : (_WF_STATUS_LABEL[st] || 'Sleeping'));
+  // Double-click on a card TOGGLES sleep: idle \u2192 sleep, sleeping \u2192 wake.
+  // See `_dblclickSleepIfIdle()` in sessions.js.  Working/waiting cards ignore
+  // the gesture (with a toast explaining why).  Single click still opens the
+  // session; the two-click prefix runs first and the panel briefly opens
+  // before the sleep/wake completes, which doubles as visual confirmation
+  // that the right card was targeted.
+  const hint = (st === 'sleeping')
+    ? 'click to open, double-click to wake'
+    : (st === 'idle')
+      ? 'click to open, double-click to sleep'
+      : 'click to open';
+  return { emoji, label, hint };
 }
 
 function wfCardClick(id) {

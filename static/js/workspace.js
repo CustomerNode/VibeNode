@@ -185,7 +185,8 @@ function _renderHierarchicalWorkspace(mainBody, sessions, tree) {
       else if (st === 'idle') idle++;
       else sleeping++;
     }
-    const totalDepts = (tree.rootChildren || []).length;
+    const _wfc = workforceCounts(tree) || { departments: 0, subDepartments: 0, agents: 0 };
+    const totalDepts = _wfc.departments;
     html += '<div class="wf-command-center">';
 
     // Header with Work/Configure toggle
@@ -193,13 +194,11 @@ function _renderHierarchicalWorkspace(mainBody, sessions, tree) {
     html += '<div style="display:flex;align-items:center;justify-content:space-between;">';
     html += '<div class="wf-cc-title">Workforce</div>';
     html += '<div class="wf-mode-toggle">';
-    html += '<button class="wf-mode-btn' + (_wsConfigMode ? '' : ' active') + '" onclick="_setWsConfigMode(false)">Work</button>';
+    html += '<button class="wf-mode-btn' + (_wsConfigMode ? '' : ' active') + '" onclick="_setWsConfigMode(false)">Workspace</button>';
     html += '<button class="wf-mode-btn' + (_wsConfigMode ? ' active' : '') + '" onclick="_setWsConfigMode(true)">Configure</button>';
     html += '</div>';
     html += '</div>';
-    let totalSubDepts = 0;
-    const _countSubs = (fids) => { for (const fid of fids) { const f = tree.folders[typeof fid === 'string' ? fid : fid.id]; if (f) { totalSubDepts += (f.children || []).length; _countSubs(f.children || []); } } };
-    _countSubs(tree.rootChildren || []);
+    const totalSubDepts = _wfc.subDepartments;
     html += '<div class="wf-cc-subtitle">' + totalDepts + ' department' + (totalDepts !== 1 ? 's' : '') + (totalSubDepts ? ' &middot; ' + totalSubDepts + ' sub-department' + (totalSubDepts !== 1 ? 's' : '') : '') + ' &middot; ' + totalSessions + ' session' + (totalSessions !== 1 ? 's' : '') + '</div>';
     html += '<div class="wf-cc-opinionated">'
       + '<span class="wf-cc-opinionated-icon" title="VibeNode is opinionated about how knowledge assets are organized.">&#9432;</span> '
@@ -1592,7 +1591,7 @@ function _renderConfigMode(tree) {
   h += '<div style="display:flex;align-items:center;justify-content:space-between;">';
   h += '<div class="wf-cc-title">Configure Departments</div>';
   h += '<div class="wf-mode-toggle">';
-  h += '<button class="wf-mode-btn" onclick="_setWsConfigMode(false)">Work</button>';
+  h += '<button class="wf-mode-btn" onclick="_setWsConfigMode(false)">Workspace</button>';
   h += '<button class="wf-mode-btn active" onclick="_setWsConfigMode(true)">Configure</button>';
   h += '</div>';
   h += '</div>';

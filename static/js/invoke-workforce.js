@@ -1584,7 +1584,7 @@ function _statusPanelHtml() {
     h += '</div>';
     // No level reported (a sleeping session the engine has not loaded): say so
     // instead of leaving an unexplained strip with nothing selected.
-    if (st.pThink === null) h += '<div class="vsp-hint">Level not reported while this session is asleep. Pick one to set it.</div>';
+    if (st.pThink === null) h += '<div class="vsp-hint">Level not reported while this session is sleeping. Pick one to set it.</div>';
   }
 
   const at = window._usageLimits && window._usageLimits.updated_at;

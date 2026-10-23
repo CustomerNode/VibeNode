@@ -25,6 +25,10 @@ from daemon import health_monitor as hm
 REPO = Path(__file__).resolve().parents[1]
 WATCHDOG_FILES = ("__init__.py", "health_monitor.py", "orphaned_workers.py",
                   "silent_wait.py", "limit_watch.py", "engine_code.py")
+# The watchdog reads the backend's disk layout (claude_layout.py, SDK-free).
+# Importing it runs daemon/backends/__init__.py, which imports these.
+WATCHDOG_BACKEND_FILES = ("__init__.py", "base.py", "messages.py", "chat_store.py",
+                          "claude_layout.py")
 
 
 class _FakeSM:
@@ -182,6 +186,9 @@ def _run_driver(tmp_path, mode):
     pkg.mkdir()
     for name in WATCHDOG_FILES:
         shutil.copy2(REPO / "daemon" / name, pkg / name)
+    (pkg / "backends").mkdir()
+    for name in WATCHDOG_BACKEND_FILES:
+        shutil.copy2(REPO / "daemon" / "backends" / name, pkg / "backends" / name)
     driver = tmp_path / "driver.py"
     driver.write_text(_DRIVER, encoding="utf-8")
     proc = subprocess.run([sys.executable, str(driver), mode], cwd=str(tmp_path),
@@ -205,3 +212,38 @@ def test_broken_code_on_disk_leaves_the_running_watchdog_in_place(tmp_path):
     assert out["took_over"] == "False"
     assert out["swapped"] == "False"
     assert out["mark"] == "None"
+
+
+# ── New watchdog code inside an engine started before the backend seam ────
+
+_OLD_BASE_DRIVER = textwrap.dedent(r'''
+    import os, sys, types, threading
+    sys.path.insert(0, os.getcwd())
+    # The running engine imported daemon.backends.base before BackendKnowledge
+    # and TranscriptLayout existed.  Python never re-reads it, so the reloaded
+    # watchdog modules see THIS module.
+    old = types.ModuleType("daemon.backends.base")
+    for name in ("AgentSDK", "SessionOptions", "PermissionAction", "PermissionResult"):
+        setattr(old, name, type(name, (), {}))
+    sys.modules["daemon.backends.base"] = old
+    import daemon.orphaned_workers, daemon.silent_wait, daemon.limit_watch
+    from daemon import health_monitor as hm
+
+    class SM:   # an older SessionManager: no backend_layout
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._sessions = {}
+            self._health_monitor = None
+
+    mon = hm.HealthMonitor(SM())
+    print("layout", type(mon._layout()).__name__)
+''')
+
+
+def test_watchdog_code_imports_in_an_engine_older_than_the_backend_seam(tmp_path):
+    driver = tmp_path / "old_base_driver.py"
+    driver.write_text(_OLD_BASE_DRIVER, encoding="utf-8")
+    proc = subprocess.run([sys.executable, str(driver)], cwd=str(REPO),
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert "layout ClaudeTranscriptLayout" in proc.stdout

@@ -33,7 +33,12 @@ from daemon.backends.base import (
     SessionOptions,
     PermissionResult,
     PermissionAction,
+    TranscriptLayout,
 )
+# The default backend's vocabulary and disk layout (SDK-free).  Everything the
+# manager knows about Claude's spelling of things comes from these, never from
+# literals here (tests/test_backend_seam.py).
+from daemon.backends.claude_layout import CLAUDE_KNOWLEDGE, ClaudeTranscriptLayout
 from daemon.backends.messages import VibeNodeMessage, MessageKind, BlockKind
 from daemon.backends.chat_store import ChatStore
 from daemon.message_queue import MessageQueue
@@ -515,6 +520,29 @@ class LogEntry:
     tool_use_id: str = ""  # for tool_result, references the tool_use
     is_error: bool = False
     timestamp: float = field(default_factory=time.time)
+    # True for an entry rebuilt from the transcript after an engine restart
+    # (``from_transcript``), not seen live.  Never serialized.  The self-heal
+    # resend paths skip these: they must re-send only a message the user sent
+    # to THIS engine, never an old one from history.
+    restored: bool = False
+
+    @classmethod
+    def from_transcript(cls, rows) -> list:
+        """LogEntries from the store's transcript rows
+        (``ChatStore.read_log_entries``), flagged ``restored``."""
+        out = []
+        for r in rows or ():
+            if not isinstance(r, dict) or not r.get("kind"):
+                continue
+            out.append(cls(
+                kind=r["kind"], text=r.get("text", "") or "",
+                name=r.get("name", "") or "", desc=r.get("desc", "") or "",
+                id=r.get("id", "") or "", tool_use_id=r.get("tool_use_id", "") or "",
+                is_error=bool(r.get("is_error")),
+                timestamp=float(r.get("timestamp") or 0.0) or time.time(),
+                restored=True,
+            ))
+        return out
 
     def to_dict(self) -> dict:
         d = {"kind": self.kind}
@@ -730,46 +758,12 @@ class SessionInfo:
 # These include continuation summaries, local-command output, and
 # system-reminder tags that should NOT render as user chat bubbles.
 # ---------------------------------------------------------------------------
-_SYSTEM_CONTENT_MARKERS = (
-    "This session is being continued from a previous conversation",
-    "<system-reminder>",
-    "<local-command-stdout>",
-    "<local-command-caveat>",
-    "<command-name>",
-    "<command-message>",
-    "<command-args>",
-    "[Request interrupted by user]",
+# Implemented once in common/transcripts.py.  The marker tuple is the CLI's:
+# the call site passes the backend's ``system_markers``.
+from common.transcripts import (  # noqa: E402
+    is_system_content as _is_system_content,
+    system_content_label as _system_content_label,
 )
-
-def _is_system_content(text: str) -> bool:
-    """Return True if text looks like SDK/CLI system content, not human input."""
-    for marker in _SYSTEM_CONTENT_MARKERS:
-        if marker in text:
-            return True
-    return False
-
-def _system_content_label(text: str) -> str:
-    """Extract a short human-readable label for system content."""
-    if "[Request interrupted by user]" in text:
-        return "Session interrupted by user"
-    if "This session is being continued from a previous conversation" in text:
-        return "Session continued from previous conversation"
-    if "<command-name>" in text:
-        # Extract command name: <command-name>/compact</command-name>
-        import re
-        m = re.search(r'<command-name>(/?\w+)</command-name>', text)
-        cmd = m.group(1) if m else "command"
-        # Extract stdout if present
-        m2 = re.search(r'<local-command-stdout>(.*?)</local-command-stdout>', text, re.DOTALL)
-        stdout = m2.group(1).strip() if m2 else ""
-        if stdout:
-            return f"{cmd}: {stdout[:100]}"
-        return f"Local command: {cmd}"
-    if "<local-command-stdout>" in text:
-        import re
-        m = re.search(r'<local-command-stdout>(.*?)</local-command-stdout>', text, re.DOTALL)
-        return f"Command output: {(m.group(1).strip()[:100]) if m else '...'}"
-    return "System message"
 
 
 # The genuine Anthropic 400 always points at the offending block with a
@@ -888,6 +882,15 @@ class SessionManager:
             store = ClaudeJsonlStore()
         self._sdk: AgentSDK = sdk
         self._store: ChatStore = store
+        # The backend's on-disk session layout, read by the watchdog jobs as
+        # ``getattr(sm, "backend_layout", None)``.  A backend that does not
+        # provide one (or a test double) gets Claude's, the default backend.
+        try:
+            layout = sdk.transcript_layout()
+        except Exception:
+            layout = None
+        self.backend_layout: TranscriptLayout = (
+            layout if isinstance(layout, TranscriptLayout) else ClaudeTranscriptLayout())
 
         # Apply SDK-specific patches (moved from module-level L66-69)
         try:
@@ -970,6 +973,41 @@ class SessionManager:
             logger.exception("Failed to capture restart-memory snapshot")
             self._last_known_states = {}
 
+        # SessionDurable (daemon/session_durable.py): the temp-id aliases the
+        # previous engine adopted, so a tab still holding a launch id keeps
+        # reaching its session after the restart.
+        try:
+            from daemon import session_durable as _sd
+            if _sd.enabled():
+                from common.session_names import load_engine_aliases
+                restored = {old: v.get("new_id") for old, v in load_engine_aliases().items()
+                            if isinstance(v, dict) and v.get("new_id")}
+                if restored:
+                    with self._lock:
+                        for old, new in restored.items():
+                            self._id_aliases.setdefault(old, new)
+                    logger.info("Restored %d session id alias(es) from the alias index",
+                                len(restored))
+        except Exception:
+            logger.exception("Failed to restore session id aliases")
+
+        # Session Host (daemon/session_host_registry.py): reattach every live
+        # host a previous engine left running, BEFORE recovery and before the
+        # daemon binds its IPC port, so the web never sees those sessions as
+        # gone.  The ids attached here are skipped by recover_sessions below.
+        self._host_attached: set = set()
+        try:
+            from daemon import session_host_registry as _shr
+        except ImportError:
+            _shr = None   # the Session Host is not built yet (spec steps 3-6)
+        if _shr is not None:
+            try:
+                self._host_attached = _shr.reconcile(self)
+            except Exception:
+                logger.exception("Session Host reconcile failed (hosted sessions "
+                                 "fall back to resume recovery)")
+                self._host_attached = set()
+
         # Recover sessions from a previous crash (non-blocking background task)
         #
         # Phase 6.5 P0-3: also pass ``mark_inbox_dirty`` so recover_sessions
@@ -979,11 +1017,18 @@ class SessionManager:
         # session_manager.py:595 skips the disk read forever — any
         # ``delivered: false`` entries written before the daemon restart
         # are stranded.
+        try:
+            from daemon import session_durable as _sd
+            _armed = _sd.armed_session_ids()
+        except Exception:
+            _armed = set()
         threading.Thread(
             target=lambda: self._reg.recover_sessions(
                 self.start_session,
                 self._store,
                 mark_inbox_dirty_fn=self.mark_inbox_dirty,
+                skip_sids=set(self._host_attached),
+                armed_sids=_armed,
             ),
             daemon=True,
             name="session-recovery"
@@ -1053,16 +1098,54 @@ class SessionManager:
             self._job_supervisor = None
         # Flush queue to disk
         self._mq.flush()
-        # Close all sessions
+        # SessionDurable: every session's state as it is NOW (before the
+        # closes below flip them to STOPPED), so recovery puts it back.
         with self._lock:
             session_ids = list(self._sessions.keys())
-        for sid in session_ids:
+            infos = list(self._sessions.values())
+        for info in infos:
+            self._durable_save(info)
+        try:
+            from daemon import session_durable as _sd
+            _sd.flush_all()
+        except Exception:
+            pass
+        # Hosted sessions (daemon/session_host.py) are DETACHED, not closed:
+        # their CLI keeps running in its host and the next engine reattaches.
+        # The registry snapshot keeps their pre-detach state (hosted: true)
+        # instead of STOPPED.  In-process sessions close as before.
+        hosted_snapshot = {}
+        detach = getattr(self._sdk, "host_detach", None)
+        for info in infos:
+            if detach is None or not self._is_hosted(info):
+                continue
             try:
-                self._run_sync(self._close_session(sid))
+                hosted_snapshot[info.session_id] = self._reg_entry(info)
+                hosted_snapshot[info.session_id]["hosted"] = True
+                # From here the host owns the CLI: no self-heal, retry or
+                # reconnect in this engine may act on the session, and its
+                # driving task must not read the closing stream.
+                info._host_detached = True
+                info._listener_superseded = True
+                task = info.task
+                if task is not None and not task.done():
+                    self._loop.call_soon_threadsafe(task.cancel)
+                self._run_sync(detach(info.client), timeout=10)
+                info.client = None
+                with self._lock:
+                    self._sessions.pop(info.session_id, None)
+            except Exception:
+                logger.exception("Detaching hosted session %s failed", info.session_id)
+        for sid in session_ids:
+            if sid in hosted_snapshot:
+                continue
+            try:
+                self._run_sync(self._close_session(sid, forget=False))
             except Exception:
                 pass
         # Clear the registry since all sessions are intentionally stopped
-        self._save_registry_now()
+        # (hosted ones keep their entry: they are still running).
+        self._save_registry_now(extra=hosted_snapshot)
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread:
@@ -1133,28 +1216,62 @@ class SessionManager:
         # Remap queue to the new id
         self._mq.remap_session_id(old_id, new_id)
 
-        # Remap user-set name to the new id (server-side, no race)
+        # SessionDurable + Session Host: both are keyed by session id.  The
+        # alias goes into the session's own record and the engine-wide alias
+        # index (so a restarted engine still resolves the launch id), the
+        # durable record moves to the new id, and a hosted session's host
+        # record is renamed by its host.
         try:
-            from app.config import _remap_name
-            _remap_name(old_id, new_id)
+            from daemon import session_durable as _sd
+            if _sd.enabled():
+                if not isinstance(getattr(info, "_durable_aliases", None), set):
+                    info._durable_aliases = set()
+                info._durable_aliases.add(old_id)
+                _sd.rename(old_id, new_id)
+                from common.session_names import record_engine_alias
+                record_engine_alias(old_id, new_id)
+                self._durable_save(info)
+        except Exception:
+            logger.exception("SessionDurable remap failed for %s -> %s", old_id, new_id)
+        try:
+            rename_host = getattr(self._sdk, "host_rename", None)
+            if rename_host is not None and self._loop is not None:
+                coro = rename_host(info.client, new_id)
+                if asyncio.iscoroutine(coro):
+                    try:
+                        running = asyncio.get_running_loop()
+                    except RuntimeError:
+                        running = None
+                    if running is self._loop:
+                        running.create_task(coro)
+                    elif self._loop.is_running():
+                        asyncio.run_coroutine_threadsafe(coro, self._loop)
+                    else:
+                        coro.close()
+        except Exception:
+            logger.exception("Session Host rename failed for %s -> %s", old_id, new_id)
+
+        # Remap user-set name to the new id (server-side, no race).  The name
+        # and remap files are owned by common/session_names.py (the web reads
+        # them through the same module).
+        try:
+            from common.session_names import remap_name
+            remap_name(old_id, new_id)
         except Exception:
             pass
 
         # Persist the old temp id so all_sessions() filters it out even if
         # in-memory aliases haven't synced yet on refresh.
         try:
-            from app.config import _mark_remapped
-            _mark_remapped(old_id, new_id)
+            from common.session_names import mark_remapped
+            mark_remapped(old_id, new_id)
         except Exception:
             pass
 
-        # Remap kanban task↔session links so they point to the new id
-        try:
-            from app.db import create_repository
-            repo = create_repository()
-            repo.remap_session(old_id, new_id)
-        except Exception:
-            pass
+        # Kanban task<->session links are the web's database: the web remaps
+        # them when it receives the session_id_remapped push below
+        # (DaemonClient._emit_socketio).  The engine no longer opens the
+        # kanban DB itself.
 
         # Notify frontend to update its references (URL, activeId, etc.)
         if self._push_callback:
@@ -1301,6 +1418,25 @@ class SessionManager:
             parent_deleted_at=parent_deleted_at,
             auto_report_on_idle=auto_report_on_idle,
         )
+        # SessionDurable: a record that exists at resume time was left by an
+        # engine restart or crash (Sleep/Delete forget theirs), so put its
+        # state back.  Timers are re-armed once the session is IDLE
+        # (_durable_restore_timers, from _drive_session).
+        if resume:
+            try:
+                from daemon import session_durable as _sd
+                _rec = _sd.load(session_id)
+                if _rec:
+                    info._durable_restore = _sd.apply_static(info, _rec, attached=False)
+                    for _old in getattr(info, "_durable_aliases", ()) or ():
+                        with self._lock:
+                            self._id_aliases.setdefault(_old, session_id)
+                    logger.info("SessionDurable: restored %s (retry_at=%s, "
+                                "lost permission=%r)", session_id,
+                                info._durable_restore.get("retry_at"),
+                                info._durable_restore.get("lost_permission"))
+            except Exception:
+                logger.exception("SessionDurable restore failed for %s", session_id)
         with self._lock:
             self._sessions[session_id] = info
 
@@ -1838,7 +1974,7 @@ class SessionManager:
         if not path:
             return ""
         try:
-            from app.config import _encode_cwd
+            from common.paths import encode_cwd as _encode_cwd
         except Exception:
             return ""
         home = path.parent.name
@@ -1857,26 +1993,16 @@ class SessionManager:
             return ""
         return ""
 
-    @staticmethod
-    def _cli_model_id(model: Optional[str]) -> str:
+    @classmethod
+    def _cli_model_id(cls, model: Optional[str]) -> str:
         """Turn a recorded/confirmed model id into one safe to hand the CLI.
 
-        The CLI reports ``claude-opus-5[1m]`` when 1M context is active, and
-        that id flows into ``info.model`` and the registry.  ``[1m]`` IS a
-        valid ``--model`` / ``set_model`` value for Opus and Sonnet (verified
-        2026-10-05 against every model: launch and live switch both come up
-        in 1M mode), so it is KEPT — stripping it silently dropped a 1M
-        session back to 200K on every wake.  Two exceptions are stripped:
-        any other bracketed marker, and ``[1m]`` on Haiku, which the API
-        rejects with a 400 ("long context beta is not yet available").
-        Mirrors ``SessionModel._cleanId`` on the client.
+        Backend knowledge (``ClaudeKnowledge.cli_model_id``): the 1M-context
+        marker is KEPT (stripping it silently woke 1M sessions on 200K),
+        any other bracketed marker is stripped, and so is 1M on a model the
+        API rejects it for.  Mirrors ``SessionModel._cleanId`` on the client.
         """
-        import re as _re
-        m = (model or "").strip()
-        m = _re.sub(r"\[(?!1m\])[^\]]*\]", "", m)
-        if "haiku" in m:
-            m = m.replace("[1m]", "")
-        return m
+        return cls._BACKEND.cli_model_id(model)
 
     # Values ``claude --effort`` accepts (verified against ``claude --help``,
     # CLI 2.1.283).  The CLI only warns on anything else and silently runs at
@@ -2016,7 +2142,7 @@ class SessionManager:
         if changed:
             info.model = model
         try:
-            from app.routes.live_api import record_confirmed_model
+            from common.models import record_confirmed_model
             record_confirmed_model(model)
         except Exception:
             pass
@@ -2111,7 +2237,7 @@ class SessionManager:
                     "error": start_result.get("error",
                                               "Failed to resume session")}
         try:
-            from app.routes.live_api import record_confirmed_model
+            from common.models import record_confirmed_model
             record_confirmed_model(model)
         except Exception:
             pass
@@ -3179,7 +3305,7 @@ class SessionManager:
         ``repair_incomplete_turn`` so a broken eviction can never block resume.
         """
         try:
-            from app.config import get_kanban_config
+            from common.config import get_kanban_config
             cfg = get_kanban_config()
             evict = bool(cfg.get("large_session_media_eviction", True))
             keep = int(cfg.get("large_session_media_keep_recent_turns", 4))
@@ -3204,6 +3330,54 @@ class SessionManager:
                     "%s: %s", resolved_id, _rep_err,
                 )
 
+    # In-memory entries put back after a restart: the same number the IDLE
+    # trim keeps (_emit_state), so a restored session looks like one that ran.
+    _RESTORED_ENTRY_COUNT = 200
+
+    def _restore_entries_from_transcript(self, info, resolved_id: str,
+                                         cwd: str, until_ts: float = 0.0) -> int:
+        """Seed ``info.entries`` with the session's last turns from the
+        transcript (Session Host spec, step 2).  Runs in an executor.
+
+        Only into an EMPTY log (a live session's entries are newer than the
+        file).  The entries are flagged ``restored`` (the self-heal resend
+        paths skip them) and the log is marked ``_entries_trimmed``: the
+        web's timeline then keeps reading the full transcript, and
+        ``_has_user_message`` stays honest for a retry after the restart.  The
+        subsession report counters start at the restored length so history is
+        never reported to a parent as new.  Returns the count restored.
+        Gated by ``VIBENODE_SESSION_DURABLE``.
+        """
+        try:
+            from daemon import session_durable as _sd
+            if not _sd.enabled():
+                return 0
+            reader = getattr(self._store, "read_log_entries", None)
+            if reader is None:
+                return 0
+            rows = reader(resolved_id, cwd=cwd or "",
+                          max_entries=self._RESTORED_ENTRY_COUNT, until_ts=until_ts)
+            if not isinstance(rows, list):
+                return 0
+            restored = LogEntry.from_transcript(rows)
+            if not restored:
+                return 0
+            with info._lock:
+                if info.entries:
+                    return 0
+                info.entries = restored
+                info._entries_trimmed = True
+                info._last_auto_report_entry_count = len(restored)
+                info._last_marker_report_entry_count = len(restored)
+            info._restored_uuids = {r.get("uuid") for r in rows
+                                    if isinstance(r, dict) and r.get("uuid")}
+            logger.info("Restored %d timeline entries for %s from its transcript",
+                        len(restored), resolved_id)
+            return len(restored)
+        except Exception:
+            logger.exception("Restoring entries for %s failed", resolved_id)
+            return 0
+
     @staticmethod
     def _user_stopped(info) -> bool:
         """True if the user explicitly stopped/slept/closed the session.
@@ -3216,9 +3390,12 @@ class SessionManager:
         session the user just put to sleep, re-sending the last message and
         flipping it back to WORKING.  That is the "Sleep won't stick" bug.
         """
+        # A session detached from its Session Host by an engine stop() is
+        # owned by the host now: nothing in this engine may reconnect it.
         return info is not None and (
             info.state == SessionState.STOPPED
             or getattr(info, '_interrupted', False)
+            or getattr(info, '_host_detached', False) is True
         )
 
     async def _reconnect_client(self, session_id: str, info) -> bool:
@@ -3295,10 +3472,13 @@ class SessionManager:
                         extra_args=({"effort": info.effort}
                                     if getattr(info, "effort", "") in self.VALID_EFFORTS
                                     else {}),
+                        hosted=self._host_wanted(info.session_type),
+                        host_sid=resolved,
                     )
                     client = await self._sdk.create_session(options)
                     await self._sdk.connect(client)
                     info.client = client
+                    self._mark_hosted(info, client)
                     # Update tracked PID so orphan sweep doesn't kill the new process
                     info._cli_pid = self._sdk.extract_process_pid(info.client)
                     logger.info("Reconnected SDK client for %s (new PID %d)",
@@ -3319,8 +3499,16 @@ class SessionManager:
         max_turns: Optional[int] = None, allowed_tools: Optional[list] = None,
         permission_mode: Optional[str] = None,
         extra_args: Optional[dict] = None,
+        attach: Optional[dict] = None,
     ) -> None:
-        """Main driver coroutine for one SDK session."""
+        """Main driver coroutine for one SDK session.
+
+        ``attach``: the session's CLI survived an engine restart inside its
+        Session Host and ``info.client`` is already connected to it
+        (``_attach_hosted``); this is the host's ``hello_ok``.  Then nothing
+        is launched or sent: the timeline is reloaded from the transcript up
+        to the moment the previous engine left, the host's replay is let
+        through, and the turn in flight (if any) is read to its RESULT."""
         with self._lock:
             info = self._sessions.get(session_id)
         if not info:
@@ -3401,10 +3589,15 @@ class SessionManager:
                 permission_mode=_effective_mode,
                 include_partial_messages=True,
                 extra_args=extra_args or {},
+                hosted=self._host_wanted(info.session_type),
+                host_sid=session_id,
             )
             _profile_log("options_built")
-            client = await self._sdk.create_session(options)
-            info.client = client
+            if attach is None:
+                client = await self._sdk.create_session(options)
+                info.client = client
+            else:
+                client = info.client
 
             # Connect with no prompt. The SDK auto-sets permission_prompt_tool_name="stdio"
             # when can_use_tool is set. Prompt=None becomes _empty_stream() which is an
@@ -3420,14 +3613,44 @@ class SessionManager:
             # client_connected timestamp (0ms additional wait).
             loop = asyncio.get_event_loop()
             mtime_task = loop.run_in_executor(None, self._record_pre_turn_mtimes, info)
+            # Step 2 of the Session Host spec: a resumed session gets its
+            # recent timeline back in memory from the transcript (tail read,
+            # overlapped with connect like the mtime scan above).
+            _entries_task = None
+            if resume:
+                _entries_task = loop.run_in_executor(
+                    None, self._restore_entries_from_transcript, info,
+                    self._resolve_id(session_id), cwd or "", 0.0)
 
-            await self._sdk.connect(client)
-            _profile_log("client_connected")
+            if attach is None:
+                await self._sdk.connect(client)
+                _profile_log("client_connected")
+            else:
+                # Reattached: the timeline up to the moment the previous
+                # engine left comes from the transcript; the host's replay
+                # carries the rest (lines already in the transcript are
+                # skipped by uuid).  0 = the previous engine was replaced
+                # while attached: load all and let the uuid check dedupe.
+                _entries_task = loop.run_in_executor(
+                    None, self._restore_entries_from_transcript, info,
+                    self._resolve_id(session_id), cwd or "",
+                    float(attach.get("detached_at") or 0.0))
+            if _entries_task is not None:
+                try:
+                    await _entries_task
+                except Exception as _ent_err:
+                    logger.warning("Restoring entries for %s failed: %s",
+                                   session_id, _ent_err)
+            if attach is not None:
+                self._sdk.host_release_replay(
+                    client, getattr(info, "_restored_uuids", None) or ())
 
             # Capture the CLI subprocess PID for orphan cleanup.
             # If _drive_session exits (crash, cancel, normal end) without
             # going through _close_session, the finally block uses this to
             # kill the process tree so child node.exe workers don't linger.
+            # (A hosted CLI is its host's child; the host cleans it up.)
+            self._mark_hosted(info, client)
             info._cli_pid = self._sdk.extract_process_pid(info.client)
 
             info.state = SessionState.WORKING
@@ -3447,16 +3670,24 @@ class SessionManager:
             # Fresh session start — clear any wake-up tracking from a
             # prior incarnation of this session_id (e.g. crash recovery
             # restoring a SessionInfo).  See _send_query's matching
-            # reset for full reasoning.
-            info._wakeup_pending = False
+            # reset for full reasoning.  A reattached CLI is NOT fresh: its
+            # wake-up timer is still real (restored by SessionDurable).
+            if attach is None:
+                info._wakeup_pending = False
+                info._wakeup_deadline = 0.0
+                info._wakeup_is_scheduled = False
             info._force_queue_dispatch = False
             info._wakeup_queue_blocked_since = 0.0
-            info._wakeup_deadline = 0.0
             info._wakeup_max_delay = 0.0
-            info._wakeup_is_scheduled = False
             info._post_compact_init_seen = False
             await mtime_task
             _profile_log("pre_turn_mtimes_done")
+
+            # A wake with a message supersedes a countdown restored from
+            # before a restart: the user's new turn is the continuation.
+            if prompt and getattr(info, "_durable_restore", None):
+                info._durable_restore = None
+                self._clear_api_retry(info, reset_count=True)
 
             # Add user's message to the log and send
             if prompt:
@@ -3477,7 +3708,16 @@ class SessionManager:
             # ClaudeAgentSDK.receive_response() for details.
             info._stream_evt_logged = False
             _first_msg_logged = False
-            if prompt:
+            # Reattached mid-turn (or the turn ended while no engine was
+            # attached): read the replay and the live stream to the RESULT.
+            _attach_turn = attach is not None and bool(
+                attach.get("turn_in_flight") or attach.get("replay_has_result"))
+            if _attach_turn and getattr(info, "_durable_restore", None):
+                # The turn that ran on is the continuation; a countdown saved
+                # before it started is stale.
+                info._durable_restore = None
+                self._clear_api_retry(info, reset_count=False)
+            if prompt or _attach_turn:
                 _watchdog = asyncio.create_task(
                     self._cli_watchdog(session_id, info)
                 )
@@ -3541,7 +3781,9 @@ class SessionManager:
                                 return  # startup init consumed — done
                             if msg.kind == MessageKind.RESULT:
                                 return  # unexpected early result — stop
-                    await asyncio.wait_for(_drain_startup_init(), timeout=3.0)
+                    # A reattached CLI started long ago: no startup init comes.
+                    if attach is None:
+                        await asyncio.wait_for(_drain_startup_init(), timeout=3.0)
                 except asyncio.TimeoutError:
                     pass   # no startup init — safe to continue
                 except asyncio.CancelledError:
@@ -3553,6 +3795,9 @@ class SessionManager:
                     )
                 info.state = SessionState.IDLE
                 self._emit_state(info)
+                # SessionDurable: re-arm a countdown from before the restart.
+                if getattr(info, "_durable_restore", None):
+                    self._durable_restore_timers(session_id, info)
 
             # Post-turn compact drain — also installs the extended listener
             # that consumes auto-resume / late ``task_notification`` content.
@@ -3773,7 +4018,7 @@ class SessionManager:
                             last_user_text = None
                             with info._lock:
                                 for e in reversed(info.entries):
-                                    if e.kind == "user":
+                                    if e.kind == "user" and not getattr(e, "restored", False):
                                         last_user_text = e.text
                                         break
                             if last_user_text:
@@ -3884,8 +4129,9 @@ class SessionManager:
             # Orphan cleanup: if the CLI process died (crash, OOM, etc.),
             # kill its child process tree.  On Windows, child node.exe
             # workers survive when the parent dies — they become orphans
-            # eating CPU/RAM until the machine is rebooted.
-            if info and info._cli_pid:
+            # eating CPU/RAM until the machine is rebooted.  A hosted CLI is
+            # not our child: its host kills its own tree.
+            if info and info._cli_pid and not self._is_hosted(info):
                 try:
                     # Check if the CLI process is actually dead.  Windows-safe:
                     # a bare os.kill(pid, 0) would TERMINATE a still-alive CLI
@@ -4517,7 +4763,7 @@ class SessionManager:
                             last_user_text = None
                             with info._lock:
                                 for e in reversed(info.entries):
-                                    if e.kind == "user":
+                                    if e.kind == "user" and not getattr(e, "restored", False):
                                         last_user_text = e.text
                                         break
                             if last_user_text:
@@ -4777,6 +5023,15 @@ class SessionManager:
                     "_kill_process_tree(pid=%r): refusing to act — not a "
                     "valid process id.", pid)
                 return
+            # Never our own tree, on either platform: ``taskkill /T`` on the
+            # engine would also take every Session Host it spawned (they are
+            # detached, but still its children by parent pid), ending the
+            # sessions a restart is meant to keep.
+            if pid == os.getpid():
+                logger.error(
+                    "_kill_process_tree(pid=%r): refusing to act — that is "
+                    "this process.", pid)
+                return
             if os.name == "nt":
                 # Try taskkill /T first (works when parent is alive)
                 result = _subprocess.run(
@@ -4965,7 +5220,9 @@ class SessionManager:
             cleaned = 0
             for info in sessions:
                 pid = info._cli_pid
-                if not pid:
+                if not pid or self._is_hosted(info):
+                    # A hosted CLI is its host's child; the host reaps it,
+                    # and session_host_registry.sweep reaps hosts.
                     continue
                 # Skip sessions that are actively working — their CLI
                 # process may have been replaced by a reconnect and
@@ -4998,6 +5255,13 @@ class SessionManager:
                 cleaned += 1
             if cleaned:
                 logger.info("Orphan sweep cleaned up %d dead session(s)", cleaned)
+            # Session Hosts: hosts of slept sessions, retiring hosts, dead
+            # records (only for sessions this engine knows).
+            try:
+                from daemon import session_host_registry as _shr
+                _shr.sweep(self)
+            except Exception as _sh_err:
+                logger.debug("Session Host sweep error: %s", _sh_err)
         except Exception as e:
             logger.debug("Orphan sweep error: %s", e)
         finally:
@@ -5161,8 +5425,19 @@ class SessionManager:
             if getattr(self, '_started', False):
                 self._schedule_wakeup_queue_watchdog()
 
-    async def _close_session(self, session_id: str) -> None:
+    async def _close_session(self, session_id: str, forget: bool = True) -> None:
         """Disconnect and clean up a session.
+
+        ``forget`` (default): an explicit close (Sleep/Delete/close_session),
+        so the session's SessionDurable record is deleted ("Sleep must
+        stick").  ``stop()`` passes False: an engine shutdown keeps the record
+        for the next engine's recovery.
+
+        A hosted session (``daemon/session_host.py``) is shut down through its
+        host (the ``shutdown`` frame: the host closes the CLI's stdin and kills
+        ITS OWN child tree).  The daemon never signals a pid it read from a
+        host record unless the host is unreachable and the pid's create time
+        still matches (``session_host_registry.guarded_kill``).
 
         Exception-safety contract: this coroutine MUST NEVER let an
         exception escape.  It runs on the daemon's asyncio loop via
@@ -5211,22 +5486,46 @@ class SessionManager:
 
         # Step 3: Grab the CLI subprocess PID before the SDK's
         # disconnect() cleans it up.
+        hosted = self._is_hosted(info)
+        host_record = getattr(info, "_host_record", None) if hosted else None
         cli_pid = 0
-        try:
-            cli_pid = self._sdk.extract_process_pid(info.client) or info._cli_pid
-        except Exception:
-            logger.exception("close_session: extract_process_pid failed for %s",
-                             session_id)
-            cli_pid = info._cli_pid or 0
+        if not hosted:
+            try:
+                cli_pid = self._sdk.extract_process_pid(info.client) or info._cli_pid
+            except Exception:
+                logger.exception("close_session: extract_process_pid failed for %s",
+                                 session_id)
+                cli_pid = info._cli_pid or 0
 
         # Step 4: Disconnect the SDK client (closes pipes, calls the
-        # SDK's process.terminate() — per-PID, safe).
+        # SDK's process.terminate() — per-PID, safe).  A hosted client's
+        # disconnect sends its host the ``shutdown`` frame.
         if info.client:
             try:
                 await self._sdk.disconnect(info.client)
             except Exception:
                 logger.exception("close_session: SDK disconnect failed for %s",
                                  session_id)
+
+        # Step 4b (hosted): the host normally confirms and exits.  If it did
+        # not, the guarded fallback kills only a pid whose create time still
+        # matches the record.
+        if hosted and isinstance(host_record, dict):
+            # Remembered so the sweep still shuts this host down if it
+            # outlives the close AND the session is then deleted (forgotten
+            # from _sessions): session_host_registry.sweep acts only on
+            # sessions this engine knows or closed.
+            closed = getattr(self, "_host_closed", None)
+            if not isinstance(closed, set):
+                closed = self._host_closed = set()
+            closed.update(s for s in (session_id, info.session_id,
+                                      host_record.get("sid")) if isinstance(s, str) and s)
+            try:
+                from daemon import session_host_registry as _shr
+                await asyncio.get_running_loop().run_in_executor(
+                    None, _shr.ensure_host_gone, host_record)
+            except Exception:
+                logger.exception("close_session: host cleanup failed for %s", session_id)
 
         # Step 5: Kill the full process tree so descendants don't leak.
         # Defended at the kill_process_tree level against killpg-on-self.
@@ -5257,6 +5556,12 @@ class SessionManager:
         except Exception:
             logger.exception("close_session: _schedule_registry_save failed for %s",
                              session_id)
+        if forget:
+            try:
+                from daemon import session_durable as _sd
+                _sd.delete(session_id)
+            except Exception:
+                logger.exception("close_session: durable delete failed for %s", session_id)
 
     # ------------------------------------------------------------------
     # Permission callback
@@ -5500,10 +5805,14 @@ class SessionManager:
             info.pending_permission = (perm_event, perm_result_holder)
             info.pending_tool_name = tool_name
             info.pending_tool_input = tool_input if isinstance(tool_input, dict) else {}
+            info._pending_since = time.time()
 
             # Set state to WAITING
             prev_state = info.state
             info.state = SessionState.WAITING
+            # Write-through (SessionDurable): a restart must know a prompt
+            # was open.
+            manager._durable_save(info)
 
             # Emit permission via push_callback.
             # Use resolved_id so the frontend matches the current session key.
@@ -5567,6 +5876,9 @@ class SessionManager:
                 info.pending_permission = None
                 info.pending_tool_name = ""
                 info.pending_tool_input = {}
+                # Write-through (SessionDurable): the answered prompt and any
+                # new "Always" grant.
+                manager._durable_save(info)
 
                 # Back to working — but NOT if this was an interrupt.
                 # The interrupt handler already set state to IDLE; emitting
@@ -5699,7 +6011,7 @@ class SessionManager:
                         last_user_text = None
                         with info._lock:
                             for e in reversed(info.entries):
-                                if e.kind == "user":
+                                if e.kind == "user" and not getattr(e, "restored", False):
                                     last_user_text = e.text
                                     break
 
@@ -5942,7 +6254,7 @@ class SessionManager:
                     # Detect SDK-injected system content (continuation
                     # summaries, local-command output, system-reminders).
                     # Render as collapsed system entry, not user bubble.
-                    if _is_system_content(stripped):
+                    if _is_system_content(stripped, self._BACKEND.system_markers):
                         logger.debug("Rendering SDK system content as system entry (len=%d)", len(stripped))
                         # Extract a short human-readable label
                         label = _system_content_label(stripped)
@@ -5991,7 +6303,7 @@ class SessionManager:
                 info._bg_work_at = time.time()
 
             # Detect compaction events — CLI sends "compact_boundary" subtype
-            if subtype == 'compact_boundary':
+            if subtype == self._BACKEND.compaction_marker:
                 # Guard against stale SDK-buffered compact_boundary messages.
                 # The SDK delivers compact_boundary AFTER ResultMessage, so it
                 # stays in the internal MemoryObjectStream buffer and gets
@@ -6001,7 +6313,7 @@ class SessionManager:
                 #   (b) at the start of a /compact turn (substatus already set).
                 # If neither is true, this is a stale leftover — discard it.
                 if not info._turn_content_started and info.substatus != 'compacting':
-                    logger.info("Discarding stale compact_boundary for %s (buffered from prior turn)", session_id)
+                    logger.info("Discarding stale compaction marker for %s (buffered from prior turn)", session_id)
                     return
                 compact_meta = data.get('compactMetadata', {})
                 pre_tokens = compact_meta.get('preTokens', 0)
@@ -6353,26 +6665,15 @@ class SessionManager:
             # Forward raw streaming events for partial message display
             event_data = message.data or {}
 
-            # Extract per-call context usage from message_start events.
-            # This is the AUTHORITATIVE context window size — unlike
-            # ResultMessage.usage which is cumulative across the session.
-            # NOTE: event is a STRING like "message_start", while
-            # data is the dict payload with the actual content.
-            evt_type = event_data.get('event', '')
-            evt_data = event_data.get('data') or {}
-            # Current SDK shape (seen 2026-10-05): ``event`` IS the payload
-            # dict ({'type': 'message_start', 'message': {...}}) and ``data``
-            # is empty.  The string-compare below never matched it, so per-call
-            # usage was silently never extracted: no session_usage push, no
-            # context reading anywhere in the UI.  Normalize to the payload.
-            if isinstance(evt_type, dict):
-                if not (isinstance(evt_data, dict) and evt_data):
-                    evt_data = evt_type
-                evt_type = evt_type.get('type', '')
-            is_message_start = (
-                evt_type == 'message_start'
-                or (isinstance(evt_data, dict) and evt_data.get('type') == 'message_start')
-            )
+            # Extract per-call context usage.  This is the AUTHORITATIVE
+            # context window size, unlike ResultMessage.usage which is
+            # cumulative across the session.  Which event carries it, and
+            # the two payload shapes the SDK has used for it, are backend
+            # knowledge (ClaudeKnowledge.stream_usage).  Before both shapes
+            # were normalized (2026-10-05), per-call usage was silently never
+            # extracted: no session_usage push, no context reading in the UI.
+            parsed = self._BACKEND.stream_usage(event_data)
+            evt_type, evt_data = parsed["type"], parsed["payload"]
             # Log first StreamEvent per session for diagnostics (shape of event/data)
             if not getattr(info, '_stream_evt_logged', False):
                 logger.info("StreamEvent for %s: event_type=%r data_type=%s data_keys=%s",
@@ -6380,39 +6681,40 @@ class SessionManager:
                             type(evt_data).__name__,
                             list(evt_data.keys())[:8] if isinstance(evt_data, dict) else '(not dict)')
                 info._stream_evt_logged = True
-            if is_message_start:
-                logger.info("message_start detected for %s — evt_data keys: %s",
-                            session_id, list(evt_data.keys()) if isinstance(evt_data, dict) else '(not dict)')
-            if is_message_start and isinstance(evt_data, dict):
-                msg = evt_data.get('message', {})
-                logger.info("message_start msg keys: %s, has usage: %s",
-                            list(msg.keys()) if isinstance(msg, dict) else '(not dict)',
-                            'usage' in msg if isinstance(msg, dict) else False)
-                if isinstance(msg, dict) and 'usage' in msg:
-                    call_usage = msg['usage']
-                    if isinstance(call_usage, dict):
-                        # Preserve pre_compact_tokens if set
-                        prev_pct = info.usage.get('pre_compact_tokens')
-                        info.usage = dict(call_usage)
-                        info.usage['_per_call'] = True
-                        if prev_pct:
-                            info.usage['pre_compact_tokens'] = prev_pct
-                        logger.info("Per-call usage for %s: input=%s cache_read=%s cache_create=%s",
-                                    session_id, call_usage.get('input_tokens'),
-                                    call_usage.get('cache_read_input_tokens'),
-                                    call_usage.get('cache_creation_input_tokens'))
-                        # Push lightweight usage update to frontend
-                        if self._push_callback:
-                            self._push_callback('session_usage', {
-                                'session_id': session_id,
-                                'usage': info.usage,
-                            })
+            if parsed["usage_start"]:
+                logger.info("Usage-start event for %s: payload keys %s, has usage: %s",
+                            session_id,
+                            list(evt_data.keys()) if isinstance(evt_data, dict) else '(not dict)',
+                            parsed["usage"] is not None)
+            call_usage = parsed["usage"]
+            if isinstance(call_usage, dict):
+                # Preserve pre_compact_tokens if set
+                prev_pct = info.usage.get('pre_compact_tokens')
+                info.usage = dict(call_usage)
+                info.usage['_per_call'] = True
+                if prev_pct:
+                    info.usage['pre_compact_tokens'] = prev_pct
+                logger.info("Per-call usage for %s: input=%s cache_read=%s cache_create=%s",
+                            session_id, call_usage.get('input_tokens'),
+                            call_usage.get('cache_read_input_tokens'),
+                            call_usage.get('cache_creation_input_tokens'))
+                # Push lightweight usage update to frontend
+                if self._push_callback:
+                    self._push_callback('session_usage', {
+                        'session_id': session_id,
+                        'usage': info.usage,
+                    })
 
             if self._push_callback:
                 self._push_callback('stream_event', {
                     'session_id': session_id,
                     'event': event_data,
                 })
+
+    # The backend's vocabulary (base.BackendKnowledge).  Bound at class level
+    # because the model-naming helpers are classmethods the tests call on the
+    # class; it is the default backend's, like ``ClaudeAgentSDK`` in __init__.
+    _BACKEND = CLAUDE_KNOWLEDGE
 
     # Tools that schedule a deferred SDK auto-resume cycle.  Used in
     # _process_message to flag the session so the post-turn listener
@@ -6424,7 +6726,7 @@ class SessionManager:
     # case-insensitively via substring so renames / vendor variants
     # (e.g. ``schedule_wakeup``, ``WakeUp``, ``BackgroundTask``) are
     # still caught without code changes.
-    _WAKEUP_TOOL_NAMES = frozenset({"ScheduleWakeup"})
+    _WAKEUP_TOOL_NAMES = _BACKEND.wakeup_tool_names
     _WAKEUP_TOOL_SUBSTRINGS = ("schedulewake", "wakeup", "backgroundtask")
 
     # CLI background-task lifecycle events (SystemMessage subtypes, observed
@@ -6542,7 +6844,7 @@ class SessionManager:
     # Account-wide limits (the 5-hour "session limit", the "weekly limit",
     # credits) bind every model, so they never switch.  See _limit_switch_plan
     # and _apply_limit_switch.
-    _LIMIT_SWITCH_FAMILIES = {"fable": "opus"}
+    _LIMIT_SWITCH_FAMILIES = _BACKEND.limit_switch_families
     _LIMIT_AUTO_SWITCH = os.environ.get("VIBENODE_LIMIT_AUTO_SWITCH", "1") != "0"
     # Pause before switching: long enough to see the banner and press Cancel,
     # short enough to feel immediate.  Rides the auto-retry countdown, so
@@ -6569,72 +6871,36 @@ class SessionManager:
         re.I,
     )
 
-    _MODEL_ID_RE = re.compile(r"claude-([a-z]+)-(\d+)(?:-(\d+))?$")
-    _MODEL_FAMILIES = ("fable", "opus", "sonnet", "haiku")
-
-    @staticmethod
-    def _strip_markers(model_id: str) -> str:
-        """'claude-opus-5-5[1m]' -> 'claude-opus-5-5'; 'opus[1m]' -> 'opus'."""
-        return re.sub(r"\[[^\]]*\]", "", str(model_id or "")).strip()
-
+    # Model naming is backend knowledge (claude_layout.ClaudeKnowledge).
+    # These wrappers keep the manager's (and its tests') names.
     @classmethod
-    def _model_match(cls, model_id: str):
-        """Match a claude id after dropping marker suffixes ("[1m]") and a
-        date snapshot suffix: 'claude-opus-4-20250514' is Opus 4, not Opus
-        4.20250514."""
-        return cls._MODEL_ID_RE.match(re.sub(r"-\d{8}$", "", cls._strip_markers(model_id)))
+    def _strip_markers(cls, model_id: str) -> str:
+        return cls._BACKEND.strip_markers(model_id)
 
     @classmethod
     def _model_family(cls, model_id: str) -> str:
-        """'claude-fable-5-1[1m]' -> 'fable'; a family alias ('opus',
-        'opus[1m]') -> itself; '' for anything else."""
-        m = cls._model_match(model_id)
-        if m:
-            return m.group(1)
-        bare = cls._strip_markers(model_id).lower()
-        return bare if bare in cls._MODEL_FAMILIES else ""
+        return cls._BACKEND.model_family(model_id)
 
     @classmethod
     def _model_version(cls, model_id: str) -> tuple:
-        """(major, minor) of a claude id: 'claude-opus-5-5' -> (5, 5),
-        'claude-opus-5' -> (5, 0), 'claude-haiku-4-5-20251001' -> (4, 5),
-        'claude-opus-4-20250514' -> (4, 0).  () for anything else."""
-        m = cls._model_match(model_id)
-        return (int(m.group(2)), int(m.group(3) or 0)) if m else ()
+        return cls._BACKEND.model_version(model_id)
 
     @classmethod
     def _model_label(cls, model_id: str) -> str:
-        """'claude-opus-5-5[1m]' -> 'Opus 5.5', the picker's naming.  A family
-        alias ('opus') reads 'Opus'."""
-        m = cls._model_match(model_id)
-        if not m:
-            return cls._strip_markers(model_id).capitalize() or "the model"
-        return "%s %s%s" % (m.group(1).capitalize(), m.group(2),
-                            "." + m.group(3) if m.group(3) else "")
+        return cls._BACKEND.model_label(model_id)
 
     @classmethod
     def _newest_in_family(cls, model_ids, family: str) -> str:
-        """The highest version among the concrete ``model_ids`` of ``family``,
-        or ''.  Marker suffixes ("[1m]") are dropped; a dated snapshot loses a
-        tie to its clean alias; family aliases are skipped."""
-        best, best_key = "", None
-        for raw in model_ids or ():
-            mid = cls._strip_markers(raw)
-            if not mid.startswith("claude-") or cls._model_family(mid) != family:
-                continue
-            key = (cls._model_version(mid), not re.search(r"-\d{8}$", mid))
-            if best_key is None or key > best_key:
-                best, best_key = mid, key
-        return best
+        return cls._BACKEND.newest_in_family(model_ids, family)
 
     def _known_models(self) -> list:
         """Model ids VibeNode knows of: every model a session has confirmed
-        plus the ones the picker always offers (app/routes/live_api.py).  The
+        plus the ones the picker always offers (common/models.py).  The
         fallback source for _newest_model_of when the session's CLI does not
         report its own list.  Never raises."""
         try:
-            from app.routes.live_api import _build_models_quickly
-            return [m.get("id", "") for m in _build_models_quickly() if isinstance(m, dict)]
+            from common.models import known_model_ids
+            return known_model_ids()
         except Exception:
             return []
 
@@ -6661,25 +6927,8 @@ class SessionManager:
             listed = self._sdk.supported_models(info.client) if info.client else []
         except Exception:
             listed = []
-        if not isinstance(listed, list):
-            listed = []
-        target = ""
-        for m in listed:
-            if isinstance(m, dict) and m.get("value") == family:
-                resolved = str(m.get("resolvedModel") or "")
-                target = resolved if self._model_family(resolved) == family else family
-                break
-        if not target:
-            target = self._newest_in_family(
-                [m.get("resolvedModel") or m.get("value") for m in listed if isinstance(m, dict)],
-                family)
-        if not target:
-            target = self._newest_in_family(self._known_models(), family)
-        if self._model_family(target):
-            target = self._strip_markers(target)
-            if "[1m]" in (info.limited_model or ""):
-                target = self._cli_model_id(target + "[1m]")
-        return target
+        return self._BACKEND.newest_model_of(family, listed, self._known_models,
+                                             info.limited_model or "")
 
     def _limit_scope(self, result_text: str, family: str = "") -> str:
         """What a limit message binds: "model" (only ``family``'s own limit:
@@ -7325,6 +7574,7 @@ class SessionManager:
         reset_count=False preserves the counter so attempts keep accumulating
         toward _API_RETRY_MAX across an auto-retry chain.
         """
+        _was_armed = bool(getattr(info, "retry_at", 0.0) or getattr(info, "limit_switch_to", ""))
         self._cancel_api_retry_task(info)
         info._api_retry_needed = False
         info._retry_needs_reconnect = False
@@ -7337,6 +7587,11 @@ class SessionManager:
         info.limit_switch_to = ""
         if reset_count:
             info._api_retry_count = 0
+        # Write-through: a disarmed countdown must not come back after a
+        # restart (SessionDurable).  Only when one was armed: this runs on
+        # every genuine send, which must not pay for a disk write.
+        if _was_armed:
+            self._durable_save(info)
 
     def _arm_api_retry(self, session_id: str, info: SessionInfo) -> None:
         """Schedule an automatic retry after an exponential-backoff delay.
@@ -7451,6 +7706,9 @@ class SessionManager:
                     coro, self._loop)
             else:
                 raise RuntimeError("no running manager event loop")
+            # Write-through: the armed instant survives a restart
+            # (SessionDurable; re-armed by _durable_restore_timers).
+            self._durable_save(info)
         except Exception as sched_err:
             # Nothing can run the timer (daemon shutting down / loop gone).  Do
             # NOT fire inline here: a failing send re-arms, so an inline fire is
@@ -8541,7 +8799,7 @@ class SessionManager:
 
         try:
             sid = info.session_id
-            history_dir = Path.home() / ".claude" / "file-history" / sid
+            history_dir = self._BACKEND.file_history_dir(Path.home()) / sid
             history_dir.mkdir(parents=True, exist_ok=True)
 
             tracked_backups = {}
@@ -8735,36 +8993,197 @@ class SessionManager:
     # Registry methods — thin wrappers delegating to SessionRegistry
     # ------------------------------------------------------------------
 
-    def _save_registry_now(self) -> None:
-        """Prepare a snapshot of active sessions and save via SessionRegistry."""
-        sessions_data = {}
+    @staticmethod
+    def _is_hosted(info) -> bool:
+        """True when this session's CLI runs in a Session Host
+        (``daemon/session_host.py``).  A plain flag set where the hosted client
+        is created, never inferred from the SDK object (a test double answers
+        every attribute)."""
+        return getattr(info, "_hosted", False) is True
+
+    def _host_wanted(self, session_type: str) -> bool:
+        """Should a NEW CLI for this session start inside a Session Host?
+        ``VIBENODE_SESSION_HOST`` on, a backend that can host, and a session
+        that is ever recovered (planner and title sessions are not)."""
+        if session_type in ("planner", "title"):
+            return False
+        if getattr(self._sdk, "supports_hosting", False) is not True:
+            return False
+        try:
+            from daemon import session_host_protocol as _shp
+            return _shp.enabled()
+        except Exception:
+            return False
+
+    async def _attach_hosted(self, record: dict, timeout: float = 5.0) -> Optional[str]:
+        """Reattach a session whose CLI survived the previous engine inside
+        its Session Host.  Builds the SessionInfo from the registry (name,
+        cwd, model, effort) and SessionDurable (allow-lists, timers, aliases),
+        connects to the host (``initialize`` is answered from the host's
+        cache), then hands the client to ``_drive_session(attach=...)``.
+        Returns the session id, or None when the host could not be reached
+        (the caller falls back to ``--resume``)."""
+        sid = str(record.get("sid") or "")
+        if not sid:
+            return None
+        resolved = self._resolve_id(sid)
         with self._lock:
-            live = set(self._sessions.keys())
+            existing = self._sessions.get(resolved)
+            if existing is not None and existing.state != SessionState.STOPPED:
+                return None
+        try:
+            sessions = self._reg.load_registry().get("sessions", {}) or {}
+        except Exception:
+            sessions = {}
+        reg = sessions.get(resolved) or sessions.get(sid) or {}
+        cwd = record.get("cwd") or reg.get("cwd") or ""
+        if cwd:
+            cwd = os.path.normpath(cwd)
+        info = SessionInfo(
+            session_id=resolved,
+            name=reg.get("name", "") or "",
+            cwd=cwd,
+            model=reg.get("model", "") or "",
+            effort=reg.get("effort", "") or "",
+            state=SessionState.STARTING,
+            session_type=reg.get("session_type", "") or "",
+            parent_session_id=reg.get("parent_session_id"),
+            subsession_origin_turn=int(reg.get("subsession_origin_turn") or 0),
+            parent_deleted_at=reg.get("parent_deleted_at"),
+            auto_report_on_idle=bool(reg.get("auto_report_on_idle", False)),
+        )
+        try:
+            from daemon import session_durable as _sd
+            rec = _sd.load(resolved)
+            if rec:
+                restore = _sd.apply_static(info, rec, attached=True)
+                # A permission request still open is replayed by the host and
+                # asked again; it is not lost.
+                restore["lost_permission"] = ""
+                info._durable_restore = restore
+                for old in getattr(info, "_durable_aliases", ()) or ():
+                    with self._lock:
+                        self._id_aliases.setdefault(old, resolved)
+        except Exception:
+            logger.exception("SessionDurable restore failed for hosted %s", resolved)
+        options = SessionOptions(
+            cwd=cwd or None,
+            permission_callback=self._make_permission_callback(resolved),
+            pre_compact_callback=self._make_pre_compact_callback(resolved),
+            include_partial_messages=True,
+            hosted=True,
+            host_sid=sid,
+            attach=record,
+        )
+        try:
+            client = await self._sdk.create_session(options)
+        except Exception:
+            logger.exception("Session Host attach: client for %s failed", resolved)
+            return None
+        info.client = client
+        with self._lock:
+            self._sessions[resolved] = info
+        try:
+            await asyncio.wait_for(self._sdk.connect(client), timeout)
+        except BaseException as exc:
+            logger.warning("Session Host attach for %s failed: %s", resolved, exc)
+            with self._lock:
+                if self._sessions.get(resolved) is info:
+                    del self._sessions[resolved]
+            info.client = None
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return None
+        self._mark_hosted(info, client)
+        hello = self._sdk.host_hello(client) or {}
+        info._cli_pid = self._sdk.extract_process_pid(client)
+        logger.info("Session Host: reattached %s (cli pid %s, turn in flight %s, "
+                    "%s replayed line(s))", resolved, info._cli_pid,
+                    hello.get("turn_in_flight"), hello.get("replay_count"))
+        self._loop.create_task(self._tracked_coro(info, self._drive_session(
+            resolved, "", cwd, False, attach=hello)))
+        return resolved
+
+    def attach_hosted_sessions(self, records: list, each_timeout: float = 5.0,
+                               total_timeout: float = 15.0) -> dict:
+        """Reattach ``records`` in parallel (``session_host_registry.reconcile``
+        calls this from ``start()`` before the engine binds its IPC port).
+        Returns ``{record sid: attached session id or None}``."""
+        out = {}
+        if not records or not self._loop or not self._loop.is_running():
+            return out
+        futs = {}
+        for rec in records:
+            futs[rec.get("sid")] = asyncio.run_coroutine_threadsafe(
+                self._attach_hosted(rec, each_timeout), self._loop)
+        deadline = time.monotonic() + total_timeout
+        for sid, fut in futs.items():
+            try:
+                out[sid] = fut.result(timeout=max(0.1, deadline - time.monotonic()))
+            except Exception as exc:
+                logger.warning("Session Host attach for %s did not finish: %s", sid, exc)
+                fut.cancel()
+                out[sid] = None
+        return out
+
+    def _mark_hosted(self, info, client) -> None:
+        """Record on ``info`` whether ``client`` runs in a Session Host."""
+        try:
+            rec = self._sdk.host_record(client) if client is not None else None
+        except Exception:
+            rec = None
+        if isinstance(rec, dict):
+            info._hosted = True
+            info._host_record = rec
+            closed = getattr(self, "_host_closed", None)
+            if isinstance(closed, set):       # woken again: a live host, not a closed one
+                closed.discard(info.session_id)
+                closed.discard(rec.get("sid"))
+        else:
+            info._hosted = False
+            info._host_record = None
+
+    def _reg_entry(self, info) -> dict:
+        """One session's registry snapshot entry (see ``_save_registry_now``)."""
+        entry = {
+            "name": info.name,
+            "cwd": info.cwd,
+            "model": info.model,
+            "effort": info.effort,
+            "session_type": info.session_type,
+            "state": info.state.value,
+            "started_at": (
+                info.entries[0].timestamp if info.entries else time.time()
+            ),
+            "last_activity": time.time(),
+            # Subsessions (spec §4.1) — backward-compatible additions.
+            # Older registry readers ignore unknown keys; newer
+            # readers use .get() with defaults so an older snapshot
+            # without these keys still loads cleanly.
+            "parent_session_id": info.parent_session_id,
+            "subsession_origin_turn": info.subsession_origin_turn,
+            "parent_deleted_at": info.parent_deleted_at,
+            # Phase 6.5 P1-4: persist the auto-report toggle so a
+            # daemon restart preserves the user's preference.
+            "auto_report_on_idle": info.auto_report_on_idle,
+        }
+        if self._is_hosted(info):
+            # Its CLI lives in a Session Host and outlives this engine.
+            entry["hosted"] = True
+        return entry
+
+    def _save_registry_now(self, extra: Optional[dict] = None) -> None:
+        """Prepare a snapshot of active sessions and save via SessionRegistry.
+
+        ``extra``: entries to write as-is (``stop()`` passes the hosted
+        sessions it detached, with their pre-detach state)."""
+        sessions_data = dict(extra or {})
+        with self._lock:
+            live = set(self._sessions.keys()) | set(sessions_data)
             for sid, info in self._sessions.items():
                 if info.state == SessionState.STOPPED:
                     continue
-                sessions_data[sid] = {
-                    "name": info.name,
-                    "cwd": info.cwd,
-                    "model": info.model,
-                    "effort": info.effort,
-                    "session_type": info.session_type,
-                    "state": info.state.value,
-                    "started_at": (
-                        info.entries[0].timestamp if info.entries else time.time()
-                    ),
-                    "last_activity": time.time(),
-                    # Subsessions (spec §4.1) — backward-compatible additions.
-                    # Older registry readers ignore unknown keys; newer
-                    # readers use .get() with defaults so an older snapshot
-                    # without these keys still loads cleanly.
-                    "parent_session_id": info.parent_session_id,
-                    "subsession_origin_turn": info.subsession_origin_turn,
-                    "parent_deleted_at": info.parent_deleted_at,
-                    # Phase 6.5 P1-4: persist the auto-report toggle so a
-                    # daemon restart preserves the user's preference.
-                    "auto_report_on_idle": info.auto_report_on_idle,
-                }
+                sessions_data[sid] = self._reg_entry(info)
 
         # Carry forward dormant restart-memory so idle-session display state
         # survives MORE THAN ONE restart.  recover_sessions() deliberately does
@@ -8907,7 +9326,7 @@ class SessionManager:
                         return
                     if msg.kind == MessageKind.SYSTEM:
                         sub = msg.subtype or ''
-                        if sub == 'compact_boundary':
+                        if sub == self._BACKEND.compaction_marker:
                             compact_seen = True
                             return
                         if sub == 'init':
@@ -9363,6 +9782,97 @@ class SessionManager:
         info._wakeup_is_scheduled = False
         self._emit_state(info)
 
+    # ------------------------------------------------------------------
+    # SessionDurable (daemon/session_durable.py)
+    # ------------------------------------------------------------------
+
+    def _durable_save(self, info, immediate: bool = True) -> None:
+        """Record ``info``'s restart-proof state.  Skips STOPPED sessions: an
+        explicit Sleep/Delete forgets the record (``_close_session``), and a
+        late write must not bring it back ("Sleep must stick").  Planner and
+        title sessions are never recovered, so they keep no record.
+        Never raises."""
+        try:
+            if info is None or getattr(info, "state", None) == SessionState.STOPPED:
+                return
+            if getattr(info, "session_type", "") in ("planner", "title"):
+                return
+            from daemon import session_durable as _sd
+            _sd.save(info, immediate=immediate)
+        except Exception:
+            logger.debug("durable save failed", exc_info=True)
+
+    def _durable_restore_timers(self, session_id: str, info) -> None:
+        """After a recovered or re-attached session reaches IDLE: re-arm the
+        auto-retry / usage-limit continue its SessionDurable record carried,
+        and report a permission request a ``--resume`` could not keep.
+
+        Consumes ``info._durable_restore`` (set by ``start_session`` or the
+        host attach).  The arm uses the record's ABSOLUTE instant: the
+        remaining delay, or now if it already passed."""
+        restore = getattr(info, "_durable_restore", None)
+        info._durable_restore = None
+        if not restore:
+            return
+        try:
+            lost = restore.get("lost_permission") or ""
+            if lost:
+                entry = LogEntry(
+                    kind="system", is_error=True,
+                    text=("A permission request for %s was lost in the Session "
+                          "Engine restart. Send a message to continue." % lost))
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(session_id, entry, entry_index)
+            at = float(restore.get("retry_at") or 0.0)
+            if at > 0 and info.state == SessionState.IDLE \
+                    and not self._user_stopped(info):
+                self._arm_api_retry_at(session_id, info, at)
+            else:
+                self._durable_save(info)
+        except Exception:
+            logger.exception("Restoring durable timers failed for %s", session_id)
+
+    def _arm_api_retry_at(self, session_id: str, info, at: float) -> None:
+        """Re-arm an auto-retry countdown for the absolute instant ``at``
+        (a SessionDurable record from before a restart).  The countdown
+        fields (attempt, max, reason, ``limit_switch_to``) were already put
+        back by ``session_durable.apply_static``; a passed instant fires on
+        the next loop tick."""
+        delay = max(0.0, float(at) - time.time())
+        self._cancel_api_retry_task(info)
+        info.retry_at = time.time() + delay
+        if not info.retry_max:
+            info.retry_max = self._API_RETRY_MAX
+        if not info.retry_attempt:
+            info.retry_attempt = info._api_retry_count + 1
+        info.error = ""
+        entry = LogEntry(
+            kind="system",
+            text="Continuing the countdown from before the Session Engine "
+                 "restart: retrying in %s." % self._fmt_duration(delay))
+        with info._lock:
+            info.entries.append(entry)
+            entry_index = len(info.entries) - 1
+        self._emit_entry(session_id, entry, entry_index)
+        self._emit_state(info)
+        coro = self._api_retry_timer(session_id, delay)
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not None:
+            info._api_retry_task = running.create_task(coro)
+        elif self._loop is not None and self._loop.is_running():
+            info._api_retry_task = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        else:
+            coro.close()
+            self._fail_retry_open(
+                session_id, "Auto-retry could not be scheduled — use Retry to resume.")
+            return
+        self._durable_save(info)
+
     def _emit_state(self, info: SessionInfo) -> None:
         """Push session state change to all connected WebSocket clients.
 
@@ -9411,6 +9921,9 @@ class SessionManager:
                              info.session_id, info.state, cb_err)
         # Keep the persistent registry up to date
         self._schedule_registry_save()
+        # SessionDurable: debounced (1 s) write of the session's restart-proof
+        # state.  The write-through sites call _durable_save(info) directly.
+        self._durable_save(info, immediate=False)
 
         # ── Phase 6.5 P1-4: auto-report on IDLE for opted-in subsessions ──
         # When a subsession with auto_report_on_idle == True transitions

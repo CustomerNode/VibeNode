@@ -1,20 +1,26 @@
 /* app.js — global state, project loading, session loading */
 
-let allSessions = [];
-// PERF-CRITICAL: O(1) Set lookup — must stay in sync with allSessions. Do NOT replace .has() with .find(). See CLAUDE.md #15.
+// `allSessions` and `allSessionIds` are owned by SessionStore
+// (static/js/session-store.js, loaded before this file).  Both names are
+// window accessors onto the store: reading `allSessions` returns the store's
+// array, assigning it calls SessionStore.replaceAll(), and `allSessionIds` is
+// the store's id Set.  Do NOT declare them here again: a top-level `let` of
+// the same name throws at load.
 //
+// PERF-CRITICAL: O(1) Set lookup. Do NOT replace .has() with .find(). See CLAUDE.md #15.
 // LESSON LEARNED (2026-04-12): The session_entry handler ran
 // allSessions.find(x => x.id === data.session_id) on EVERY streaming token
 // to filter cross-project events.  With 50 sessions and 100 entries per turn,
-// that was 5,000 linear scans per response.  This Set is maintained at all 12
-// mutation sites across app.js, socket.js, toolbar.js, kanban.js, and
-// git-sync.js.  _rebuildSessionIds() handles bulk mutations (filter,
-// reassignment); individual add()/delete() handle single-item changes.
-/** O(1) lookup set kept in sync with allSessions. */
-let allSessionIds = new Set();
-/** Rebuild allSessionIds from allSessions. Call after any reassignment of allSessions. */
+// that was 5,000 linear scans per response.  SessionStore.has() / the
+// allSessionIds Set is the O(1) answer, and the store keeps it in step with
+// the list at every mutation, so call sites no longer maintain it by hand.
+/**
+ * Kept for callers that predate the store.  The store re-derives its index on
+ * every bulk change, so this only repairs drift from a legacy raw array
+ * mutation, then prunes the sidebar multi-selection.
+ */
 function _rebuildSessionIds() {
-  allSessionIds = new Set(allSessions.map(s => s.id));
+  SessionStore.reindexIfDrifted();
   // Sidebar multi-selection may hold IDs that were filtered out by this
   // bulk reassignment (e.g. deleteEmptySessions, loadSessions purge,
   // session-type filter).  Prune so the badge count and DOM don't lie.
@@ -42,7 +48,7 @@ function _rebuildSessionIds() {
 // loadSessions(), the state_snapshot / session_started stubs and the
 // session_id_remapped handler (socket.js).  Tests:
 // tests/test_session_title_memory.py.
-const _knownSessionTitles = new Map();   // session_id -> title
+const _knownSessionTitles = SessionStore.titles;   // session_id -> title (owned by the store)
 const _KNOWN_SESSION_TITLES_MAX = 500;
 
 /** Remember a confirmed session title (rename / auto-name). */
@@ -90,6 +96,26 @@ if (!localStorage.getItem('viewMode')) viewMode = 'homepage';
 // Hash-based routing: URL hash overrides stored viewMode for direct-link support
 if (window.location.hash.startsWith('#kanban')) viewMode = 'kanban';
 if (window.location.hash.startsWith('#compose')) viewMode = 'compose';
+// A fresh tab opened on /#kanban or /#compose while the STORED mode was
+// 'homepage' (fixed 2026-10-23): the boot script in index.html hid the sidebar
+// for the homepage before this file ran, and loadSessions() then calls
+// setViewMode(viewMode) with prevMode === viewMode, so the "leaving homepage:
+// restore sidebar" branch in workforce.js never runs.  The board rendered with
+// no sidebar and no project switcher.  Undo the boot hide here, where the hash
+// override happens.  Tests: tests/test_visible_fixes.py.
+(function _restoreSidebarAfterHashRoute() {
+  if (viewMode === 'homepage') return;
+  const sb = document.querySelector('.sidebar');
+  if (!sb || sb.style.display !== 'none') return;   // only the boot script's inline hide
+  sb.style.display = '';
+  const rh = document.querySelector('.resize-handle');
+  if (rh) rh.style.display = '';
+  const eb = document.getElementById('btn-sidebar-expand');
+  if (eb) {
+    eb.style.display = '';
+    eb.classList.toggle('visible', sb.classList.contains('collapsed'));
+  }
+})();
 // Session display sub-mode (grid vs list vs control within sessions view)
 let sessionDisplayMode = localStorage.getItem('sessionDisplayMode') || 'grid';
 if (!['grid', 'list', 'control'].includes(sessionDisplayMode)) sessionDisplayMode = 'grid';
@@ -102,11 +128,11 @@ if (!['grid', 'list', 'control'].includes(sessionDisplayMode)) sessionDisplayMod
 // 2026-10-05 it was migrated away to 'recent'.  It is now a visible, selectable
 // option, so a stored 'status' is a real choice and is honoured.
 let wfSort = localStorage.getItem('wfSort') || 'recent';
-let runningIds = new Set();
-let waitingData = {};   // { session_id: {question, options, kind} }
-let sessionKinds = {};   // session_id -> 'question' | 'working' | 'idle'
+// runningIds (Set), waitingData ({id: {question, options, kind}}), sessionKinds
+// ({id: 'question'|'working'|'idle'}) and guiOpenSessions (Set, seeded from
+// localStorage) are per-session tables owned by SessionStore and exposed as
+// window accessors (session-store.js).  Assigning one replaces the table.
 let liveSessionId = null;
-let guiOpenSessions = new Set(JSON.parse(localStorage.getItem('guiOpenSessions') || '[]'));
 let _activeGrpPopup = null;
 let respondTarget = null;
 let _allProjects = [];  // cached project list for overlay
@@ -310,8 +336,7 @@ async function setProject(encoded, reload = true) {
   waitingData = {};
   // Clear allSessions so old-project sessions don't remain visible in the
   // sidebar/grid during the gap between project switch and loadSessions().
-  allSessions = [];
-  allSessionIds.clear();
+  SessionStore.replaceAll([]);
   // Reset main body to the dashboard so the old chat isn't visible while the
   // new project loads.  Built here, AFTER activeProject and the session data
   // are switched: built earlier it showed the OLD project's name and counts.
@@ -1243,8 +1268,7 @@ async function addNewAgent() {
     message_count: 0,
     preview: '',
   };
-  allSessions.unshift(optimistic);
-  allSessionIds.add(optimistic.id);
+  SessionStore.set(newId, optimistic);   // new id: inserted at the front, list + id Set
   filterSessions();
 
   // Mark as GUI-opened but DON'T add to runningIds or sessionKinds yet.
@@ -1792,28 +1816,19 @@ async function loadSessions() {
   const _preserved = allSessions.filter(s =>
       !_freshIds.has(s.id) && s.id === liveSessionId
   );
-  allSessions = _preserved.concat(_freshSessions);
-  // Deduplicate by ID — race between remap events and session list fetch
-  // can produce two entries with the same ID
-  {
-    const _seen = new Set();
-    allSessions = allSessions.filter(s => {
-      if (_seen.has(s.id)) return false;
-      _seen.add(s.id);
-      return true;
-    });
-  }
-  // Filter out hidden utility sessions (planner, auto-title, etc.)
-  // Convention: any session ID starting with "_" is a system/utility session.
-  allSessions = allSessions.filter(s =>
+  // One bulk replace.  SessionStore.replaceAll() also dedups by id (first copy
+  // wins): the race between remap events and the session list fetch can
+  // produce two entries with the same ID.
+  const _remaps = window._idRemaps || {};
+  SessionStore.replaceAll(_preserved.concat(_freshSessions).filter(s =>
+    // Hidden utility sessions (planner, auto-title, etc.): any session ID
+    // starting with "_" is a system/utility session.
     !s.id.startsWith('_') &&
-    !(s.session_type && (s.session_type === 'planner' || s.session_type === 'title'))
-  );
-  // Purge stale alias entries (old pre-remap IDs still on disk or in daemon)
-  if (window._idRemaps) {
-    allSessions = allSessions.filter(s => !window._idRemaps[s.id]);
-  }
-  _rebuildSessionIds();
+    !(s.session_type && (s.session_type === 'planner' || s.session_type === 'title')) &&
+    // Stale alias entries (old pre-remap IDs still on disk or in daemon).
+    !_remaps[s.id]
+  ));
+  _rebuildSessionIds();   // multi-selection prune
   // A reload computed before a title was saved must not wipe a title this
   // page already received (see _knownSessionTitles).  Fills nameless rows only.
   if (_knownSessionTitles.size) {
@@ -1836,6 +1851,7 @@ async function loadSessions() {
     }
   }
   document.getElementById('search').placeholder = 'Search ' + allSessions.length + ' sessions\u2026';
+  _refreshUntitledButton();   // fire-and-forget; hides itself on any failure
   setViewMode(viewMode);
   // Template selector is handled by initFolderTree() — no duplicate call here
 
@@ -1931,36 +1947,270 @@ async function loadSessions() {
 }
 
 function filterSessions() {
-  // Re-renders the session list. #search is now a hidden input (the visible
-  // control is the deep-search button that opens the modal), so `q` is
-  // normally empty and no client-side filter is applied; the deep-search
-  // modal (search.js) handles searching. Kept resilient in case #search is
-  // ever restored to a visible field.
-  const searchEl = document.getElementById('search');
-  const q = searchEl ? searchEl.value.toLowerCase() : '';
-  const filtered = q
-    ? allSessions.filter(s =>
-        (s.display_title||'').toLowerCase().includes(q) ||
-        (s.preview||'').toLowerCase().includes(q)
-      )
-    : allSessions;
+  // Re-renders the session view.  In the Sessions view's cards and list the
+  // filter bar applies (title filter #search + state/date chips, see "Session
+  // filters" below) and the result is windowed (first 150, more on scroll).
+  // Other views get the full list: the bar is hidden there, so a value left
+  // in #search must not silently narrow them.
+  const inSessionList = viewMode === 'sessions'
+    && (sessionDisplayMode === 'grid' || sessionDisplayMode === 'list');
+  _syncSessionFilterBar(inSessionList);
   if (viewMode === 'homepage') {
     if (typeof _updateHomepageStats === 'function') _updateHomepageStats();
     return;
   }
   if (viewMode === 'workplace') {
-    renderWorkspace(wfSortedSessions(filtered));
+    renderWorkspace(wfSortedSessions(allSessions));
   } else if (viewMode === 'sessions' && sessionDisplayMode === 'control') {
     if (typeof renderMissionControl === 'function') renderMissionControl();
   } else if (viewMode === 'sessions' && sessionDisplayMode === 'grid') {
-    renderWorkforce(wfSortedSessions(filtered));
+    renderWorkforce(_windowSessions(wfSortedSessions(_applySessionFilters(allSessions))));
+    _mountWindowSentinel(document.getElementById('workforce-grid'));
   } else if (viewMode === 'sessions') {
-    renderList(sortedSessions(filtered));
+    renderList(_windowSessions(sortedSessions(_applySessionFilters(allSessions))));
+    _mountWindowSentinel(document.getElementById('session-list'));
   } else if (viewMode === 'compose') {
     // Keep the Subsessions "Ad-hoc" family tree live as session state
     // changes stream in.  No-op when the Structured tab is active or the
     // renderer isn't loaded yet.
     if (typeof _renderAdhocSubsessions === 'function') _renderAdhocSubsessions();
+  }
+}
+
+// ── Session filters: finding one session among 1,009 (2026-10-23) ────────
+// All client-side over SessionStore.  Chips:
+//   working / needs / idle / sleeping   the session's status (OR'd together)
+//   unread                              has an unread reply   (AND)
+//   recent                              active in the last 7 days (AND)
+// Chips persist per project in ONE localStorage key, 'vnSessionFilters'
+// ({project: [chip, ...]}).  The title filter (#search) is not persisted.
+// Tests: tests/test_session_filters.py.
+const _SESSION_FILTERS_KEY = 'vnSessionFilters';
+const _STATE_CHIPS = {working: 'working', needs: 'question', idle: 'idle', sleeping: 'sleeping'};
+const _SESSION_CHIPS = ['working', 'needs', 'idle', 'sleeping', 'unread', 'recent'];
+const _SEARCH_DEBOUNCE_MS = 100;
+let _sessionSearchTimer = null;
+
+function _readAllSessionFilters() {
+  try { return JSON.parse(localStorage.getItem(_SESSION_FILTERS_KEY) || '{}') || {}; }
+  catch (e) { return {}; }
+}
+
+/** The active chips for the current project, as a Set. */
+function _activeSessionFilters() {
+  const proj = localStorage.getItem('activeProject') || '';
+  const list = _readAllSessionFilters()[proj];
+  return new Set(Array.isArray(list) ? list.filter(c => _SESSION_CHIPS.includes(c)) : []);
+}
+
+function toggleSessionFilter(chip) {
+  if (!_SESSION_CHIPS.includes(chip)) return;
+  const proj = localStorage.getItem('activeProject') || '';
+  const all = _readAllSessionFilters();
+  const cur = _activeSessionFilters();
+  if (cur.has(chip)) cur.delete(chip); else cur.add(chip);
+  if (cur.size) all[proj] = Array.from(cur); else delete all[proj];
+  try { localStorage.setItem(_SESSION_FILTERS_KEY, JSON.stringify(all)); } catch (e) { /* private mode */ }
+  _resetSessionWindow();
+  filterSessions();
+}
+
+/** True when a status change can move a session in or out of the filtered list. */
+function _sessionFiltersDependOnState() {
+  const cur = _activeSessionFilters();
+  for (const c of cur) if (_STATE_CHIPS[c]) return true;
+  return cur.has('unread');
+}
+
+function onSessionSearchInput() {
+  if (_sessionSearchTimer) clearTimeout(_sessionSearchTimer);
+  _sessionSearchTimer = setTimeout(() => {
+    _sessionSearchTimer = null;
+    _resetSessionWindow();
+    filterSessions();
+  }, _SEARCH_DEBOUNCE_MS);
+}
+
+function _applySessionFilters(list) {
+  const searchEl = document.getElementById('search');
+  const q = searchEl ? searchEl.value.trim().toLowerCase() : '';
+  const chips = _activeSessionFilters();
+  if (!q && !chips.size) return list;
+  const states = new Set();
+  for (const c of chips) if (_STATE_CHIPS[c]) states.add(_STATE_CHIPS[c]);
+  const wantUnread = chips.has('unread');
+  const since = chips.has('recent') ? Date.now() / 1000 - 7 * 86400 : 0;
+  return list.filter(s => {
+    if (q) {
+      // Title, custom title and the first message (`preview`).
+      const hay = ((s.display_title || '') + '\n' + (s.custom_title || '') + '\n' + (s.preview || '')).toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    if (states.size && !states.has(getSessionStatus(s.id))) return false;
+    if (wantUnread && !(typeof hasUnread === 'function' && hasUnread(s.id))) return false;
+    if (since && (s.effective_ts || s.last_activity_ts || s.sort_ts || 0) < since) return false;
+    return true;
+  });
+}
+
+function _syncSessionFilterBar(show) {
+  const bar = document.getElementById('session-filter-bar');
+  if (!bar) return;
+  bar.hidden = !show;
+  if (!show) return;
+  const cur = _activeSessionFilters();
+  bar.querySelectorAll('.session-chip[data-filter]').forEach(b => {
+    const on = cur.has(b.dataset.filter);
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+}
+
+// ── Windowed rendering ──
+// The cards and list render the first 150 sessions; a sentinel at the end of
+// the container, watched by an IntersectionObserver, adds 150 more as it
+// scrolls into view.  1,009 cards no longer all mount on every render.
+const _SESSION_WINDOW_STEP = 150;
+let _sessionWindowLimit = _SESSION_WINDOW_STEP;
+let _sessionWindowProject = null;
+let _sessionWindowTotal = 0;
+let _sessionWindowIds = new Set();
+let _sessionWindowIO = null;
+
+function _resetSessionWindow() { _sessionWindowLimit = _SESSION_WINDOW_STEP; }
+
+function _windowSessions(sorted) {
+  const proj = localStorage.getItem('activeProject') || '';
+  if (proj !== _sessionWindowProject) { _sessionWindowProject = proj; _resetSessionWindow(); }
+  _sessionWindowTotal = sorted.length;
+  const out = sorted.length > _sessionWindowLimit ? sorted.slice(0, _sessionWindowLimit) : sorted;
+  _sessionWindowIds = new Set(out.map(s => s.id));
+  return out;
+}
+
+/** Is this session inside the rendered window (so it should have a row)? */
+function _sessionInRenderWindow(id) { return _sessionWindowIds.has(id); }
+
+function _mountWindowSentinel(container) {
+  if (_sessionWindowIO) { _sessionWindowIO.disconnect(); _sessionWindowIO = null; }
+  if (!container || _sessionWindowTotal <= _sessionWindowLimit) return;
+  const s = document.createElement('div');
+  s.className = 'session-window-sentinel';
+  s.setAttribute('aria-hidden', 'true');
+  container.appendChild(s);
+  if (typeof IntersectionObserver !== 'function') return;
+  _sessionWindowIO = new IntersectionObserver((entries) => {
+    if (!entries.some(e => e.isIntersecting)) return;
+    _sessionWindowIO.disconnect();
+    _sessionWindowIO = null;
+    _sessionWindowLimit += _SESSION_WINDOW_STEP;
+    filterSessions();
+  }, { root: container, rootMargin: '0px 0px 400px 0px' });
+  _sessionWindowIO.observe(s);
+}
+
+// ── "Name N untitled sessions" ──
+// Appears in the sidebar when the project has >= 10 untitled sessions.  The
+// count comes from GET /api/sessions/untitled-count ({project, total,
+// untitled, nameable}); the run is POST /api/sessions/name-untitled, and its
+// progress arrives as the `naming_progress` socket event ({project, done,
+// total, current_title, named, skipped, failed, finished}), shown in a notice
+// that sits in the shared float stack (a .vn-undo-toast, so _floatEls() and
+// _layoutFloats() place it; see CLAUDE.md "Floating notices share ONE stack").
+// Any failure of the count (404 on a server without the endpoint) hides it.
+const _NAME_UNTITLED_MIN = 10;
+
+async function _refreshUntitledButton() {
+  const btn = document.getElementById('btn-name-untitled');
+  if (!btn) return;
+  const proj = localStorage.getItem('activeProject') || '';
+  try {
+    const r = await fetch('/api/sessions/untitled-count?project=' + encodeURIComponent(proj), { cache: 'no-store' });
+    if (!r.ok) { btn.hidden = true; window._untitledInfo = null; return; }
+    const d = await r.json();
+    if ((localStorage.getItem('activeProject') || '') !== proj) return;   // project switched meanwhile
+    const untitled = Number(d && d.untitled) || 0;
+    const nameable = Number(d && d.nameable != null ? d.nameable : untitled) || 0;
+    // The homepage strip shows the same action (toolbar.js _hpStatusStrip).
+    window._untitledInfo = { project: proj, untitled, nameable };
+    if (viewMode === 'homepage' && typeof _updateHomepageStats === 'function') _updateHomepageStats();
+    if (untitled >= _NAME_UNTITLED_MIN && nameable > 0) {
+      btn.textContent = 'Name ' + nameable + ' untitled session' + (nameable === 1 ? '' : 's');
+      btn.hidden = false;
+    } else {
+      btn.hidden = true;
+    }
+  } catch (e) {
+    btn.hidden = true;
+    window._untitledInfo = null;
+  }
+}
+
+async function nameUntitledSessions() {
+  const btn = document.getElementById('btn-name-untitled');
+  const proj = localStorage.getItem('activeProject') || '';
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch('/api/sessions/name-untitled?project=' + encodeURIComponent(proj), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    if (r.status === 409) { showToast('Naming is already running for this project'); return; }
+    if (!r.ok) { showToast('Could not start naming', true); if (btn) btn.disabled = false; return; }
+    if (btn) btn.hidden = true;
+    window._untitledInfo = null;   // the homepage strip's copy of the button goes too
+    if (viewMode === 'homepage' && typeof _updateHomepageStats === 'function') _updateHomepageStats();
+    _showNamingProgress({ project: proj, done: 0, total: 0, current_title: '' });
+  } catch (e) {
+    showToast('Could not start naming: network error', true);
+    if (btn) btn.disabled = false;
+  }
+}
+
+let _namingHideTimer = null;
+function _showNamingProgress(d) {
+  let el = document.getElementById('vn-naming-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'vn-naming-toast';
+    el.className = 'vn-undo-toast vn-naming-toast';
+    el.setAttribute('role', 'status');
+    el.innerHTML = '<span class="vn-undo-toast-msg"></span>';
+    document.body.appendChild(el);
+    requestAnimationFrame(() => { el.classList.add('show'); _updateFloatOffset(); });
+  }
+  if (_namingHideTimer) { clearTimeout(_namingHideTimer); _namingHideTimer = null; }
+  const msg = el.querySelector('.vn-undo-toast-msg');
+  let text;
+  if (d.finished) {
+    const n = Number(d.named) || 0;
+    text = 'Named ' + n + ' session' + (n === 1 ? '' : 's')
+      + (d.failed ? ' · ' + d.failed + ' failed' : '');
+  } else if (d.total) {
+    text = 'Naming sessions ' + (d.done || 0) + '/' + d.total
+      + (d.current_title ? ' · ' + d.current_title : '');
+  } else {
+    text = 'Naming untitled sessions…';
+  }
+  msg.textContent = text;
+  el.title = text;
+  _updateFloatOffset();
+  if (d.finished) {
+    _namingHideTimer = setTimeout(() => {
+      el.classList.remove('show');
+      setTimeout(() => { el.remove(); _updateFloatOffset(); }, 300);
+    }, 4000);
+  }
+}
+
+/** Socket `naming_progress` (socket.js). */
+function _onNamingProgress(d) {
+  if (!d) return;
+  if (d.project && d.project !== (localStorage.getItem('activeProject') || '')) return;
+  _showNamingProgress(d);
+  if (d.finished) {
+    const btn = document.getElementById('btn-name-untitled');
+    if (btn) btn.disabled = false;
+    _refreshUntitledButton();
   }
 }
 

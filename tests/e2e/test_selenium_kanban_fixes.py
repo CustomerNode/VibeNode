@@ -121,7 +121,7 @@ class TestSidebarLayout:
         btns = driver.execute_script('''
             return Array.from(document.querySelectorAll(".kanban-sidebar-btn")).map(b => b.textContent.trim());
         ''')
-        assert any("New Task" in b for b in btns)
+        assert any("New task" in b for b in btns)
 
     def test_sidebar_no_plan_with_ai_button(self, driver):
         """Plan with AI was merged into the New Task popup."""

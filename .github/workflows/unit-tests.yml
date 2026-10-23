@@ -1,0 +1,76 @@
+name: Unit Tests
+
+# The Publish gate runs this suite on the developer's machine, and can be
+# skipped ("Skip & Publish", "Publish Anyway").  Nothing ran it anywhere else
+# until 2026-10-23.  This runs it on every push to main and every PR so a
+# skipped gate still shows up red here.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: unit-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Python dependencies
+        # requirements-test.txt includes requirements.txt, whose SpeechNode line
+        # is a git dependency with native wheels (webrtcvad) that is slow to
+        # build and irrelevant to the unit suite (voice reports "unavailable"
+        # and the tests do not need it).  Install the two files with that line
+        # dropped.
+        run: |
+          python -m pip install --upgrade pip
+          grep -v -i 'speechnode' requirements.txt > /tmp/requirements-ci.txt
+          grep -v '^-r ' requirements-test.txt > /tmp/requirements-test-ci.txt
+          pip install -r /tmp/requirements-ci.txt -r /tmp/requirements-test-ci.txt
+
+      - name: Install Playwright Chromium
+        # The headless-browser tests (tests/_browser.py) use Python Playwright.
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run the unit suite
+        # tests/conftest.py re-execs the run inside a PID namespace (unshare)
+        # on Linux and falls back with a warning where that is unavailable;
+        # nothing is set here on purpose.  pytest.ini already ignores tests/e2e.
+        run: |
+          python -m pytest -q -p no:cacheprovider --timeout=120 \
+            --junitxml=junit-py${{ matrix.python-version }}.xml
+
+      - name: Run the thread-scroll JS tests
+        if: always()
+        run: |
+          node tests/test_thread_scroll.js
+          node tests/test_thread_scroll_classic.js
+
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-py${{ matrix.python-version }}
+          path: junit-py${{ matrix.python-version }}.xml
+          if-no-files-found: warn

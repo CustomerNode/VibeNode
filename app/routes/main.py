@@ -13,6 +13,7 @@ from ..platform_utils import NO_WINDOW as _NO_WINDOW
 from .. import approval_watch
 from .. import mobile_command
 from .. import socketio
+from .. import mobile_auth as _mobile_auth
 # Same rule as the message hook: only a process on this machine. A phone on the
 # tailnet and a page in a browser both arrive from 127.0.0.1 too.
 from .live_api import _hook_caller_is_local as _caller_is_local
@@ -289,10 +290,17 @@ def restart_server():
     "web"    — kills only port 5050, leaves daemon alive
     "daemon" — kills only port 5051, leaves web alive
     "both"   — kills both 5050 and 5051
+
+    A paired device may restart the web server. Anything that takes the
+    Session Engine down ("daemon", "both") is local-only.
     """
     try:
         data = request.get_json(silent=True) or {}
         scope = data.get("scope", "web")
+        if scope != "web":
+            denied = _mobile_auth.require_local()
+            if denied is not None:
+                return denied
 
         # Resolve ports from env so test/side-by-side instances don't
         # accidentally murder the user's production 5050/5051.  Previously
@@ -504,8 +512,11 @@ def restart_server():
 
 
 @bp.route("/api/shutdown", methods=["POST"])
+@_mobile_auth.local_only
 def shutdown_server():
     """Shut down both the web server and daemon without restarting.
+
+    Local-only: it ends every session on this machine.
 
     Sends the response first, then kills ports 5050 and 5051 after a
     short delay so the client receives the acknowledgement.

@@ -104,3 +104,64 @@ def test_later_hides_it(page):
 def test_the_page_loads_the_banner():
     html = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
     assert "js/engine-freshness.js" in html
+
+
+# ── SDK patches did not apply (2026-10-23) ───────────────────────────────
+
+SDK_BAD = {"ok": True, "running": True, "stale": False, "outdated": [], "restart_armed": False,
+           "sdk_version": "0.0.31", "sdk_version_tested": True,
+           "sdk_patch_failures": ["transport_adapter", "raise_json_buffer_limit"],
+           "sdk_patch_failure_details": [
+               {"name": "transport_adapter", "precondition": "Query.__init__ missing 'transport' param"}]}
+
+
+def test_failed_sdk_patches_show_a_red_banner_naming_them(page):
+    page.evaluate("(s) => { window.__status = s; }", SDK_BAD)
+    page.evaluate("() => EngineFreshness.check()")
+    page.wait_for_selector("#sdk-patch-banner")
+    bar = page.locator("#sdk-patch-banner")
+    text = bar.text_content()
+    assert "SDK patches did not apply: transport_adapter, raise_json_buffer_limit (SDK 0.0.31)" in text
+    assert bar.get_attribute("role") == "alert"
+    assert "missing 'transport' param" in bar.get_attribute("title")
+    # Red, and separate from the amber "outdated code" banner.
+    bg = page.evaluate("() => getComputedStyle(document.getElementById('sdk-patch-banner')).backgroundColor")
+    assert bg == "rgb(90, 17, 17)"
+    assert page.locator("#engine-freshness-banner").count() == 0
+
+
+def test_both_banners_stack_when_the_engine_is_also_outdated(page):
+    both = dict(STALE, **{k: SDK_BAD[k] for k in ("sdk_version", "sdk_patch_failures")})
+    page.evaluate("(s) => { window.__status = s; }", both)
+    page.evaluate("() => EngineFreshness.check()")
+    page.wait_for_selector("#engine-freshness-banner")
+    page.wait_for_selector("#sdk-patch-banner")
+    sdk_box = page.locator("#sdk-patch-banner").bounding_box()
+    stale_box = page.locator("#engine-freshness-banner").bounding_box()
+    assert stale_box["y"] >= sdk_box["y"] + sdk_box["height"] - 1, (sdk_box, stale_box)
+
+
+def test_untested_sdk_version_is_mentioned(page):
+    page.evaluate("(s) => { window.__status = Object.assign({}, s, {sdk_version_tested: false}); }", SDK_BAD)
+    page.evaluate("() => EngineFreshness.check()")
+    page.wait_for_selector("#sdk-patch-banner")
+    assert "outside the range" in page.locator("#sdk-patch-banner").text_content()
+
+
+def test_dismiss_hides_it_for_this_page_only(page):
+    page.evaluate("(s) => { window.__status = s; }", SDK_BAD)
+    page.evaluate("() => EngineFreshness.check()")
+    page.wait_for_selector("#sdk-patch-banner")
+    page.click("#sdk-patch-banner [data-act=sdk-dismiss]")
+    assert page.locator("#sdk-patch-banner").count() == 0
+    page.evaluate("() => EngineFreshness.check()")
+    page.wait_for_timeout(200)
+    assert page.locator("#sdk-patch-banner").count() == 0
+
+
+def test_an_engine_with_all_patches_applied_shows_no_sdk_banner(page):
+    page.evaluate("() => { window.__status = {ok: true, running: true, stale: false, outdated: [],"
+                  " sdk_version: '0.0.25', sdk_patch_failures: []}; }")
+    page.evaluate("() => EngineFreshness.check()")
+    page.wait_for_timeout(200)
+    assert page.locator("#sdk-patch-banner").count() == 0

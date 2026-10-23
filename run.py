@@ -570,6 +570,43 @@ def _check_dependencies():
 _update_boot_status("STEP:deps")
 _check_dependencies()
 
+
+# ---------------------------------------------------------------------------
+# requirements.txt changed since the last launch → install it (2026-10-23)
+#
+# _check_dependencies() above knows four packages.  Every other dependency a
+# commit adds (tzdata, pytest-xdist, a re-pinned SpeechNode) reached one-click
+# users only if they ran pip by hand.  The Update button now runs pip when the
+# pull changes requirements.txt (app/git_ops.py); this covers a pull made
+# outside the UI and the very first launch after this change.  The file's
+# sha256 is kept in data/requirements.stamp (gitignored), written only after
+# a successful install so a failure is retried next launch.  Logic in
+# app/requirements_sync.py.  Skipped on a VIBENODE_TEST_PORT instance and
+# when VIBENODE_NO_PIP_UPDATE is set.
+# ---------------------------------------------------------------------------
+def _install_requirements_if_changed():
+    if _TEST_PORT or os.environ.get("VIBENODE_NO_PIP_UPDATE"):
+        return
+    try:
+        from app.requirements_sync import install_if_changed
+        res = install_if_changed(python=sys.executable)
+    except Exception as e:  # never block boot
+        print("  WARNING: requirements check failed: %s" % e, flush=True)
+        return
+    if not res.get("pip_ran"):
+        return
+    if res.get("pip_ok"):
+        print("  requirements.txt changed: pip installed %d package(s)."
+              % res.get("pip_installed", 0), flush=True)
+    else:
+        print("  WARNING: requirements.txt changed but pip install failed; "
+              "retrying next launch.", flush=True)
+        for line in (res.get("pip_output_tail") or "").splitlines()[-15:]:
+            print("    " + line, flush=True)
+
+
+_install_requirements_if_changed()
+
 # ---------------------------------------------------------------------------
 # Claude auto-update — keep the claude CLI + Python SDK current so newly
 # released models are picked up without manual intervention.
@@ -733,7 +770,11 @@ def _check_claude_updates():
             print("  WARNING: claude CLI update check failed: %s" % e, flush=True)
 
     # 2. Python SDK — the daemon's interface to the CLI.  requirements.txt
-    #    only pins a floor (>=). The upgrade is delegated to
+    #    pins a floor AND a ceiling (e.g. ``>=0.0.25,<0.1``, 2026-10-23):
+    #    daemon/sdk_patches.py is written against the SDK's internals, so an
+    #    unbounded daily ``--upgrade`` could pull a release whose internals
+    #    the patches do not fit.  The requirement line is passed to pip as
+    #    is.  The upgrade is delegated to
     #    ``app.update_safety.upgrade_sdk_safely``, which:
     #      * uses ``pip install --upgrade --no-deps`` when the current
     #        interpreter is a SHARED global Python (today's x64 setup), so
@@ -749,10 +790,12 @@ def _check_claude_updates():
     sdk_result = None
     try:
         from app.update_safety import upgrade_sdk_safely
+        from app.requirements_sync import sdk_requirement
         sdk_result = upgrade_sdk_safely(
             interpreter=sys.executable,
             runner=_run_captured,
             timeout=120,
+            requirement=sdk_requirement(),
         )
         # Print a single line the operator can grep. Full pip output is
         # captured on the state file below.

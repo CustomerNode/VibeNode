@@ -107,7 +107,61 @@ class ClaudeAgentSDK(AgentSDK):
             extra_args=options.extra_args,
             hooks=hooks_config,
         )
+        if options.hosted or options.attach:
+            # The CLI runs in a Session Host (daemon/session_host.py) and
+            # outlives a Session Engine restart.  Only connect() differs.
+            from daemon.backends.claude_host import HostedSDKClient
+            return HostedSDKClient(
+                options=claude_options,
+                host_sid=(options.attach or {}).get("sid") or options.host_sid or "",
+                attach_record=options.attach,
+                cli_path=self.host_cli_path,
+            )
         return ClaudeSDKClient(options=claude_options)
+
+    # ── Session Host ─────────────────────────────────────────────────
+
+    supports_hosting = True
+
+    #: The CLI a host launches; None = the SDK finds the real ``claude``.
+    #: Tests point it at tests/fake_cli.py's launcher.
+    host_cli_path: Optional[str] = None
+
+    @staticmethod
+    def _host_transport(client: Any):
+        """The client's ``HostTransport``, or None.  A real isinstance check,
+        never duck typing: a test double answers every attribute, and a mock
+        pid must never reach a kill path."""
+        try:
+            from daemon.backends.claude_host import HostTransport
+        except Exception:      # a test's stand-in SDK lacks the transport ABC
+            return None
+        transport = getattr(client, "_transport", None) if client is not None else None
+        return transport if isinstance(transport, HostTransport) else None
+
+    def host_record(self, client: Any) -> Optional[dict]:
+        t = self._host_transport(client)
+        return t.host_record if t is not None else None
+
+    def host_hello(self, client: Any) -> dict:
+        t = self._host_transport(client)
+        return dict(t.hello) if t is not None else {}
+
+    def host_release_replay(self, client: Any, skip_ids=()) -> None:
+        t = self._host_transport(client)
+        if t is not None:
+            t.release_replay(skip_ids)
+
+    async def host_detach(self, client: Any) -> None:
+        t = self._host_transport(client)
+        if t is not None:
+            t.set_detach()
+        await self.disconnect(client)
+
+    async def host_rename(self, client: Any, new_id: str) -> None:
+        t = self._host_transport(client)
+        if t is not None:
+            await t.rename(new_id)
 
     async def connect(self, client: ClaudeSDKClient) -> None:
         """Connect the Claude client (spawns CLI subprocess).
@@ -273,6 +327,17 @@ class ClaudeAgentSDK(AgentSDK):
         level = applied.get("effort")
         return level if isinstance(level, str) else None
 
+    @property
+    def knowledge(self):
+        """The Claude CLI's vocabulary (``claude_layout.ClaudeKnowledge``)."""
+        from daemon.backends.claude_layout import CLAUDE_KNOWLEDGE
+        return CLAUDE_KNOWLEDGE
+
+    def transcript_layout(self):
+        """The Claude CLI's on-disk session layout."""
+        from daemon.backends.claude_layout import ClaudeTranscriptLayout
+        return ClaudeTranscriptLayout()
+
     def supported_models(self, client: ClaudeSDKClient) -> list:
         """The models this session's CLI process can run, from the ``models``
         list in its ``initialize`` response.
@@ -335,6 +400,11 @@ class ClaudeAgentSDK(AgentSDK):
         """
         if not client:
             return 0
+        hosted = self._host_transport(client)
+        if hosted is not None:
+            # Hosted: the CLI is the host's child.  0 once the host reported
+            # the CLI's exit or the connection to the host was lost.
+            return hosted.cli_pid
         transport = getattr(client, '_transport', None)
         if transport is None:
             query = getattr(client, '_query', None)
