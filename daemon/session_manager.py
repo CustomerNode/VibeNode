@@ -8298,6 +8298,16 @@ class SessionManager:
     # for one turn.  Acceptable; multi-second blocking is not.
     _FS_TRAVERSAL_BUDGET_SECONDS = 2.0
 
+    # A turn whose filesystem scan finds more changed files than this is a
+    # bulk operation (git worktree add, checkout, npm install, codegen), not
+    # edits.  Its files are NOT copied into the snapshot store; files the
+    # session edited directly (tracked_files) still are.  Without this, a
+    # session whose folder holds git worktrees copied 11,154 files per turn
+    # (median) and up to 72,216, which grew ~/.claude/file-history by
+    # ~220 MB a day (measured 2026-10-23).  Rewind cannot undo such a bulk
+    # change; git can.
+    _FS_BULK_CHANGE_LIMIT = 500
+
     @staticmethod
     def _is_file_tracking_enabled() -> bool:
         """Check kanban_config.json for the file_tracking_enabled preference.
@@ -8715,7 +8725,11 @@ class SessionManager:
         fs_snapshot_extras = set()
         if is_post_turn and not info._turn_had_direct_edit:
             fs_changed = self._detect_changed_files(info)
-            if fs_changed:
+            if fs_changed and len(fs_changed) > self._FS_BULK_CHANGE_LIMIT:
+                logger.info("_write_file_snapshot(%s): bulk filesystem change of %d files "
+                            "(limit %d) not snapshotted; direct edits still are",
+                            session_id, len(fs_changed), self._FS_BULK_CHANGE_LIMIT)
+            elif fs_changed:
                 fs_snapshot_extras = fs_changed
                 logger.info("_write_file_snapshot(%s): filesystem fallback detected %d changed files (snapshot-only)",
                             session_id, len(fs_changed))

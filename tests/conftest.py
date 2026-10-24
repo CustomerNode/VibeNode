@@ -40,6 +40,7 @@ past its own mock, the guard raises loudly with the test's node ID. Silent
 regression is impossible.
 """
 
+import importlib
 import json
 import os
 import shlex
@@ -74,6 +75,37 @@ _REAL_DAEMON_STATE_FILES = {
     (Path.home() / ".claude" / "gui_ui_prefs.json").resolve(),
 }
 _REAL_FILE_HISTORY_ROOT = (Path.home() / ".claude" / "file-history").resolve()
+# Every folder under here is a project in the user's sidebar.
+_REAL_CLAUDE_PROJECTS = (Path.home() / ".claude" / "projects").resolve()
+
+
+def _find_claude_projects_holders():
+    """Modules that hold their own copy of ``app.config._CLAUDE_PROJECTS``.
+
+    Read from source so a route that starts importing it is sandboxed
+    without anyone remembering to add it here.
+    """
+    names = {"app.config"}
+    for pkg in ("app", "common", "daemon"):
+        root = _REPO_ROOT / pkg
+        if not root.is_dir():
+            continue
+        for py in root.rglob("*.py"):
+            try:
+                src = py.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if "_CLAUDE_PROJECTS" not in src:
+                continue
+            rel = py.relative_to(_REPO_ROOT).with_suffix("")
+            parts = list(rel.parts)
+            if parts[-1] == "__init__":
+                parts.pop()
+            names.add(".".join(parts))
+    return sorted(names)
+
+
+_CLAUDE_PROJECTS_HOLDERS = _find_claude_projects_holders()
 
 
 def _is_production_path(p) -> bool:
@@ -184,21 +216,21 @@ def _isolate_daemon_home(request, tmp_path_factory, monkeypatch):
             )
     except ImportError:
         pass
-    try:
-        import app.config as _cfg
-        monkeypatch.setattr(_cfg, "_CLAUDE_PROJECTS",
-                            fake_home / ".claude" / "projects")
-    except ImportError:
-        pass
-    # ``app.routes.sessions_api`` does ``from ..config import _CLAUDE_PROJECTS``,
-    # which binds the value at import time and doesn't follow ``app.config``
-    # reassignment. Patch the route's local binding directly.
-    try:
-        import app.routes.sessions_api as _sa
-        monkeypatch.setattr(_sa, "_CLAUDE_PROJECTS",
-                            fake_home / ".claude" / "projects")
-    except ImportError:
-        pass
+    # ``app.config._CLAUDE_PROJECTS`` is bound by value into every module
+    # that does ``from ..config import _CLAUDE_PROJECTS``, so patching
+    # app.config alone leaves those copies pointing at the REAL folder.
+    # Patching only sessions_api let ``POST /api/add-project``
+    # (project_api) create empty project folders in the user's real
+    # ~/.claude/projects on every suite run, which showed up in the sidebar
+    # as projects nobody made. Patch every module that holds a copy.
+    for _mod_name in _CLAUDE_PROJECTS_HOLDERS:
+        try:
+            _mod = importlib.import_module(_mod_name)
+        except ImportError:
+            continue
+        if hasattr(_mod, "_CLAUDE_PROJECTS"):
+            monkeypatch.setattr(_mod, "_CLAUDE_PROJECTS",
+                                fake_home / ".claude" / "projects")
 
     # daemon.session_manager appends Path.home()-derived paths to
     # os.environ["PATH"] at import time. Tests that reload that module
@@ -458,6 +490,27 @@ def _block_production_paths(request, monkeypatch):
         return real_write_text(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "write_text", _guarded_write_text)
+
+    real_mkdir = Path.mkdir
+
+    def _guarded_mkdir(self, *args, **kwargs):
+        try:
+            target = Path(str(self)).resolve(strict=False)
+            inside = target != _REAL_CLAUDE_PROJECTS and \
+                target.is_relative_to(_REAL_CLAUDE_PROJECTS)
+        except (OSError, ValueError):
+            inside = False
+        if inside:
+            raise RuntimeError(
+                f"\n\nTEST {request.node.nodeid} tried to create a folder in "
+                f"the REAL Claude projects directory:\n    {self}\n\n"
+                f"Every folder there shows up as a project in the user's "
+                f"sidebar. A module bound ``_CLAUDE_PROJECTS`` by value and "
+                f"was not sandboxed; see _CLAUDE_PROJECTS_HOLDERS.\n"
+            )
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", _guarded_mkdir)
     yield
 
 

@@ -40,7 +40,7 @@ TOKENS = (
     "ScheduleWakeup", "compact_boundary", "isApiErrorMessage",
     "--model", "--resume", "--effort", "message_start", "rate_limit_event",
 )
-EXACT_TOKENS = (".claude",)
+EXACT_LITERALS = (".claude",)
 
 # (file, token, literal) -> allowed count, with the reason.
 EXEMPT = {
@@ -78,7 +78,7 @@ def hits(rel: str):
         for token in TOKENS:
             if token in value:
                 out.append((rel, token, value, line))
-        for token in EXACT_TOKENS:
+        for token in EXACT_LITERALS:
             if value == token:
                 out.append((rel, token, value, line))
     return out

@@ -464,7 +464,9 @@ class DaemonClient:
             return
         logger.info("Daemon appears dead — restarting it")
         try:
-            log_file = daemon_script.parent.parent / "logs" / "daemon_debug.log"
+            # Console output only; the engine writes its own capped
+            # daemon_debug.log (common/logfiles.py, same rule as run.py).
+            log_file = daemon_script.parent.parent / "logs" / "daemon_console.log"
             log_file.parent.mkdir(exist_ok=True)
             fh = open(log_file, "a")
             popen_kwargs = {

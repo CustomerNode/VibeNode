@@ -98,7 +98,12 @@ def _redirect_stdio_for_pythonw() -> None:
     """
     if sys.stdout is None or sys.stderr is None:
         (_HERE / "logs").mkdir(exist_ok=True)
-        _log = open(_HERE / "logs" / "_server.log", "a", encoding="utf-8")
+        try:
+            # Size-capped: this process is the file's long-lived writer.
+            from common.logfiles import open_capped
+            _log = open_capped(_HERE / "logs" / "_server.log")
+        except Exception:
+            _log = open(_HERE / "logs" / "_server.log", "a", encoding="utf-8")
         if sys.stdout is None:
             sys.stdout = _log
         if sys.stderr is None:

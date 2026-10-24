@@ -665,11 +665,38 @@ def _install_signal_forensics_watcher(daemon):
     return True
 
 
+def _open_engine_log():
+    """Open logs/daemon_debug.log as a size-capped stream this process owns.
+
+    The engine used to log to the stdout/stderr handle its spawner passed
+    down.  Nothing capped it, and on Windows an outside trim made it grow
+    back padded with NULs (see common/logfiles.py).  Prints and tracebacks
+    are routed here too.  The inherited handle (logs/daemon_console.log)
+    now only receives output from before this point and native crash dumps.
+    Returns None when the file cannot be opened, so the engine still starts.
+    """
+    try:
+        from common.logfiles import open_capped
+        stream = open_capped(
+            Path(__file__).resolve().parent.parent / "logs" / "daemon_debug.log")
+    except Exception as exc:
+        print("engine log: could not open capped log (%s); using stderr" % exc,
+              flush=True)
+        return None
+    if not (getattr(sys.stdout, "isatty", None) and sys.stdout.isatty()):
+        sys.stdout = stream
+    if not (getattr(sys.stderr, "isatty", None) and sys.stderr.isatty()):
+        sys.stderr = stream
+    return stream
+
+
 def main():
+    _engine_log = _open_engine_log()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [daemon] %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
+        stream=_engine_log if _engine_log is not None else sys.stderr,
     )
 
     # Label this process so a resource-hunting human or AI sees a "do not kill"

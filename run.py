@@ -169,7 +169,12 @@ def ensure_daemon():
         print("  WARNING: daemon_server.py not found at %s" % daemon_script, flush=True)
         return
 
-    daemon_log = Path(__file__).parent / "logs" / "daemon_debug.log"
+    # The engine writes its own capped log (logs/daemon_debug.log, see
+    # common/logfiles.py).  This handle only catches output from before its
+    # logging starts and native crash dumps.  Do NOT point it back at
+    # daemon_debug.log: on Windows the child does not inherit append mode,
+    # so two writers on that file leave NUL gaps.
+    daemon_log = Path(__file__).parent / "logs" / "daemon_console.log"
     print("  Spawning daemon for port %d (log: %s)" % (DAEMON_PORT, daemon_log),
           flush=True)
     proc = None
@@ -1340,7 +1345,12 @@ if __name__ == "__main__":
     # (console output is lost when launch.bat runs minimized)
     _web_log_path = Path(__file__).resolve().parent / "logs" / "web_server.log"
     _web_log_path.parent.mkdir(exist_ok=True)
-    _web_log_fh = open(_web_log_path, "a", encoding="utf-8")
+    try:
+        # Size-capped and owned by this process (see common/logfiles.py).
+        from common.logfiles import open_capped
+        _web_log_fh = open_capped(_web_log_path)
+    except Exception:
+        _web_log_fh = open(_web_log_path, "a", encoding="utf-8")
     import datetime as _dt
     _web_log_fh.write("\n--- Web server starting at %s ---\n" % _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     _web_log_fh.flush()
@@ -1368,7 +1378,14 @@ if __name__ == "__main__":
     # Format mirrors the daemon's "HH:MM:SS [web] LEVEL message" style.
     _root = logging.getLogger()
     _root.setLevel(logging.INFO)
-    _sh = logging.StreamHandler(sys.stdout)  # stdout is already tee'd
+    # In a terminal, log through the tee so the console shows it too.
+    # Detached (pythonw, nohup) the original stdout is logs/_server.log, and
+    # the tee stored every PROFILE line there a second time: the bulk of
+    # both files.  Detached, log to web_server.log only.
+    _orig_out = getattr(sys.stdout, "_orig", None)
+    _interactive = bool(_orig_out is not None and getattr(_orig_out, "isatty", None)
+                        and _orig_out.isatty())
+    _sh = logging.StreamHandler(sys.stdout if _interactive else _web_log_fh)
     _sh.setLevel(logging.INFO)
     _sh.setFormatter(logging.Formatter("%(asctime)s [web] %(levelname)s %(message)s",
                                        datefmt="%H:%M:%S"))

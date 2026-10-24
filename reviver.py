@@ -113,6 +113,11 @@ def _log(msg: str) -> None:
     """Best-effort line to logs/reviver.log (gitignored). Never raises."""
     try:
         _LOG_PATH.parent.mkdir(exist_ok=True)
+        try:
+            from common.logfiles import rotate_if_over
+            rotate_if_over(_LOG_PATH, 5 * 1024 * 1024)
+        except Exception:
+            pass
         with open(_LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
     except Exception:
