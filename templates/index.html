@@ -221,12 +221,41 @@ html[data-theme="light"] .vn-splash .vns-track { background: rgba(0,0,0,.08); }
       </button>
       <!-- Search + Sort + Sleep -->
       <div class="sidebar-search-row">
-        <!-- Opens the deep-search modal (search.js): full-transcript search.
-             The title filter (#search) lives in the filter bar below. -->
+        <!-- Opens the deep-search modal (search.js). The modal has its own
+             input — the ONLY place you type; it matches titles and message
+             content. Do NOT add a second search/filter box to the sidebar
+             (removed 2026-07-13, re-added 2026-10-23, removed again
+             2026-10-26). #search stays as a hidden input so the
+             filterSessions() callers that read its value keep working. -->
         <button class="sidebar-search-btn" onclick="openDeepSearch()" title="Search all transcripts">
           <svg class="sidebar-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-          <span>Search transcripts&hellip;</span>
+          <span>Search&hellip;</span>
         </button>
+        <!-- Filter (funnel): the status/date filters, and nothing else (app.js
+             "Session filters"). Shown only in the Sessions view's cards and
+             list, where the filters apply. A click toggles one and leaves the
+             menu open, so several can be ticked. The funnel lights up with a
+             dot while any is on. Its own class, NOT .sidebar-menu-wrap:
+             several callers querySelector('.sidebar-menu-wrap') for the •••
+             menu. -->
+        <div class="sidebar-filter-wrap" id="sidebar-filter-wrap" hidden>
+          <button class="sidebar-menu-btn sidebar-filter-btn" id="sidebar-filter-btn" onclick="toggleFilterMenu()" title="Filter" aria-haspopup="true">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"><path d="M3 5h18l-7 8.5V19l-4 2v-7.5z"/></svg>
+          </button>
+          <div class="sidebar-menu-dropdown" id="sidebar-filter-dropdown">
+            <div class="sidebar-menu-section-label">Show only</div>
+            <button type="button" class="sidebar-sort-opt sidebar-filter-opt" data-filter="working" aria-pressed="false" onclick="toggleSessionFilter('working')">Working</button>
+            <button type="button" class="sidebar-sort-opt sidebar-filter-opt" data-filter="needs" aria-pressed="false" onclick="toggleSessionFilter('needs')">Needs you</button>
+            <button type="button" class="sidebar-sort-opt sidebar-filter-opt" data-filter="idle" aria-pressed="false" onclick="toggleSessionFilter('idle')">Idle</button>
+            <button type="button" class="sidebar-sort-opt sidebar-filter-opt" data-filter="sleeping" aria-pressed="false" onclick="toggleSessionFilter('sleeping')">Sleeping</button>
+            <button type="button" class="sidebar-sort-opt sidebar-filter-opt" data-filter="unread" aria-pressed="false" onclick="toggleSessionFilter('unread')">Unread</button>
+            <button type="button" class="sidebar-sort-opt sidebar-filter-opt" data-filter="recent" aria-pressed="false" onclick="toggleSessionFilter('recent')">Last 7 days</button>
+            <div id="sidebar-filter-clear" hidden>
+              <div class="sort-divider"></div>
+              <button type="button" class="sidebar-sort-opt" onclick="clearSessionFilters()">Show all sessions</button>
+            </div>
+          </div>
+        </div>
         <div class="sidebar-menu-wrap">
           <button class="sidebar-menu-btn" id="sidebar-menu-btn" onclick="toggleSidebarMenu()" title="Options">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
@@ -247,31 +276,15 @@ html[data-theme="light"] .vn-splash .vns-track { background: rgba(0,0,0,.08); }
             <button class="sidebar-sort-opt" data-display="control" onclick="closeSidebarMenu();setSessionDisplayMode('control')">Mission Control</button>
             <div class="sort-divider"></div>
             <div class="sidebar-menu-section-label">Actions</div>
+            <!-- Shown at >= 10 untitled sessions (app.js _refreshUntitledButton). -->
+            <button type="button" class="sidebar-sort-opt" id="btn-name-untitled" hidden onclick="closeSidebarMenu();nameUntitledSessions()"></button>
             <button class="sidebar-sort-opt danger" onclick="closeSidebarMenu();sleepAllSessions()">Sleep all sessions</button>
             <button class="sidebar-sort-opt danger" onclick="closeSidebarMenu();deleteEmptySessions()">Delete empty sessions</button>
             <button class="sidebar-sort-opt danger" onclick="closeSidebarMenu();deleteAllSessions()">Delete all sessions</button>
           </div>
         </div>
       </div>
-      <!-- Finding one session among many (2026-10-23): a title filter and
-           state/date chips, all client-side over SessionStore.  Shown only in
-           the Sessions view's cards and list (filterSessions in app.js).
-           #search is read by filterSessions(); chips persist per project in
-           localStorage 'vnSessionFilters'. -->
-      <div class="session-filter-bar" id="session-filter-bar" hidden>
-        <input type="search" id="search" class="session-typeahead" placeholder="Filter sessions&hellip;"
-               autocomplete="off" spellcheck="false" aria-label="Filter sessions by title"
-               oninput="onSessionSearchInput()">
-        <div class="session-chips" role="group" aria-label="Show only">
-          <button type="button" class="session-chip" data-filter="working" aria-pressed="false" onclick="toggleSessionFilter('working')">Working</button>
-          <button type="button" class="session-chip" data-filter="needs" aria-pressed="false" onclick="toggleSessionFilter('needs')">Needs you</button>
-          <button type="button" class="session-chip" data-filter="idle" aria-pressed="false" onclick="toggleSessionFilter('idle')">Idle</button>
-          <button type="button" class="session-chip" data-filter="sleeping" aria-pressed="false" onclick="toggleSessionFilter('sleeping')">Sleeping</button>
-          <button type="button" class="session-chip" data-filter="unread" aria-pressed="false" onclick="toggleSessionFilter('unread')">Unread</button>
-          <button type="button" class="session-chip" data-filter="recent" aria-pressed="false" onclick="toggleSessionFilter('recent')">Last 7 days</button>
-        </div>
-        <button type="button" class="session-name-untitled" id="btn-name-untitled" hidden onclick="nameUntitledSessions()"></button>
-      </div>
+      <input type="hidden" id="search">
     </div>
     <!-- Scrollable content -->
     <div class="session-list" id="session-list">

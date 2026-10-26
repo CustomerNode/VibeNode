@@ -1,11 +1,17 @@
-"""Finding one session among many: chips, title filter, windowing, naming.
+"""Finding one session among many: the funnel filters, windowing, naming.
 
 Added 2026-10-23.  Against the real page (``tests/_fake_app.py``) with 300
 fake sessions:
-  * the title filter (#search) narrows the cards after its 100ms debounce,
-    matching title, custom title and first message;
-  * state chips (OR'd) and Unread / Last 7 days (AND'd) narrow them, and the
-    chips persist per project in localStorage 'vnSessionFilters';
+  * the sidebar has ONE search control, the "Search…" button: no second
+    title-filter box under it (removed 2026-07-13, re-added 2026-10-23,
+    removed again 2026-10-26 at the owner's request);
+  * the status/date filters live behind the funnel button beside the •••
+    menu (the owner's pick, 2026-10-26): state filters (OR'd) and Unread /
+    Last 7 days (AND'd) narrow the cards, a click leaves the funnel menu open,
+    the funnel lights up with a dot while any is on, "Show all sessions"
+    clears them, the ••• menu no longer holds them, the funnel shows only
+    where the filters apply, and they persist per project in localStorage
+    'vnSessionFilters';
   * the grid and list mount the first 150 rows, and scrolling the sentinel
     into view mounts the next 150;
   * "Name N untitled sessions" appears at >= 10 untitled, POSTs the run,
@@ -72,19 +78,42 @@ def test_windowing_mounts_150_then_more_on_scroll(browser):
         app.close()
 
 
+def _opt(name):
+    return f".sidebar-filter-opt[data-filter='{name}']"
+
+
+HAS_DOT = "() => document.getElementById('sidebar-filter-btn').classList.contains('has-filter')"
+FILTER_OPEN = "() => document.getElementById('sidebar-filter-dropdown').classList.contains('open')"
+MENU_OPEN = "() => document.getElementById('sidebar-menu-dropdown').classList.contains('open')"
+FUNNEL_SHOWN = "() => !document.getElementById('sidebar-filter-wrap').hidden"
+
+
 @pytest.mark.slow
-def test_title_filter_and_chips(browser):
+def test_one_search_control_in_the_sidebar(browser):
+    """The sidebar's only search is the 'Search…' button.  A second box under
+    it was added twice and removed twice; this keeps it out."""
     app = FakeApp(browser, _sessions())
     try:
-        assert app.eval("() => !document.getElementById('session-filter-bar').hidden")
-        assert app.eval("() => document.getElementById('search').type") == "search"
-        # Title filter (debounced): custom title, and first message.
-        app.page.fill("#search", "quarterly")
-        app.page.wait_for_function(f"({CARDS})() === 1", timeout=3000)
-        app.page.fill("#search", "zebra")
-        app.page.wait_for_function(f"({CARDS})() === 6", timeout=3000)
-        app.page.fill("#search", "")
-        app.page.wait_for_function(f"({CARDS})() === 150", timeout=3000)
+        assert app.eval("() => document.querySelector('.sidebar-search-btn span').textContent") == "Search…"
+        assert app.eval("() => document.getElementById('search').type") == "hidden"
+        assert app.eval("() => !document.getElementById('session-filter-bar')")
+        typable = app.eval("""() => [...document.querySelectorAll(
+            '.sidebar input:not([type=hidden]):not([type=checkbox]):not([type=radio])')]
+            .filter(el => el.getClientRects().length).map(el => el.id || el.className)""")
+        assert typable == [], typable
+        assert not app.errors, app.errors
+    finally:
+        app.close()
+
+
+@pytest.mark.slow
+def test_filters_live_behind_the_funnel(browser):
+    app = FakeApp(browser, _sessions())
+    try:
+        assert app.eval(FUNNEL_SHOWN)
+        assert not app.eval(HAS_DOT)
+        # The ••• menu no longer holds them.
+        assert app.eval("() => document.querySelectorAll('#sidebar-menu-dropdown .sidebar-filter-opt').length") == 0
 
         # State: 10 working, 5 waiting; everything else sleeping.
         sessions = app.sessions
@@ -92,21 +121,45 @@ def test_title_filter_and_chips(browser):
                       [{"session_id": s["id"], "state": "working", "cwd": CWD} for s in sessions[:10]]
                       + [{"session_id": s["id"], "state": "waiting", "cwd": CWD} for s in sessions[10:15]])
         app.page.wait_for_timeout(300)
-        _click(app, ".session-chip[data-filter='working']")
+        _click(app, "#sidebar-filter-btn")
+        assert app.eval(FILTER_OPEN)
+        assert app.eval("() => document.getElementById('sidebar-filter-clear').hidden")
+        _click(app, _opt("working"))
         assert app.eval(CARDS) == 10
-        assert app.eval("() => document.querySelector(\".session-chip[data-filter='working']\").getAttribute('aria-pressed')") == "true"
-        _click(app, ".session-chip[data-filter='needs']")          # OR
+        assert app.eval(FILTER_OPEN), "ticking a filter must leave the menu open"
+        assert app.eval(HAS_DOT)
+        assert not app.eval("() => document.getElementById('sidebar-menu-btn').classList.contains('has-filter')")
+        assert "Working" in app.eval("() => document.getElementById('sidebar-filter-btn').title")
+        assert app.eval(f"() => document.querySelector(\"{_opt('working')}\").getAttribute('aria-pressed')") == "true"
+        _click(app, _opt("needs"))          # OR
         assert app.eval(CARDS) == 15
         # A working session going idle leaves the filtered list (debounced rebuild).
         app.push("session_state", {"session_id": sessions[0]["id"], "state": "idle", "cwd": CWD})
         app.page.wait_for_function(f"({CARDS})() === 14", timeout=3000)
-        _click(app, ".session-chip[data-filter='working']")
-        _click(app, ".session-chip[data-filter='needs']")
+        # "Show all sessions" clears every filter and closes the menu.
+        assert not app.eval("() => document.getElementById('sidebar-filter-clear').hidden")
+        _click(app, "#sidebar-filter-clear button")
         assert app.eval(CARDS) == 150
+        assert not app.eval(HAS_DOT)
+        assert not app.eval(FILTER_OPEN)
+        assert app.eval("() => document.querySelectorAll('.sidebar-filter-opt.active').length") == 0
+
+        # One menu open at a time.
+        _click(app, "#sidebar-filter-btn")
+        _click(app, "#sidebar-menu-btn")
+        assert app.eval(MENU_OPEN) and not app.eval(FILTER_OPEN)
+        _click(app, "#sidebar-filter-btn")
+        assert app.eval(FILTER_OPEN) and not app.eval(MENU_OPEN)
+
+        # A sort pick re-ticks the active filters (pickSort clears .active on every option).
+        _click(app, _opt("sleeping"))
+        _click(app, ".sidebar-sort-opt[data-sort='name'][data-asc='true']")
+        assert app.eval(f"() => document.querySelector(\"{_opt('sleeping')}\").classList.contains('active')")
+        _click(app, _opt("sleeping"))
 
         # Last 7 days (AND with nothing else): 250 recent -> windowed to 150; with Sleeping too.
-        _click(app, ".session-chip[data-filter='recent']")
-        _click(app, ".session-chip[data-filter='sleeping']")
+        _click(app, _opt("recent"))
+        _click(app, _opt("sleeping"))
         stored = json.loads(app.eval("() => localStorage.getItem('vnSessionFilters')"))
         assert sorted(stored[PROJECT]) == ["recent", "sleeping"]
         app.eval("() => { const g = document.getElementById('workforce-grid'); g.scrollTop = g.scrollHeight; }")
@@ -117,7 +170,22 @@ def test_title_filter_and_chips(browser):
         # Persisted per project: a reload restores the chips.
         app.page.reload(wait_until="domcontentloaded")
         app.page.wait_for_function(f"({CARDS})() > 0", timeout=20000)
-        assert app.eval("() => [...document.querySelectorAll('.session-chip.active')].map(b => b.dataset.filter).sort()") == ["recent", "sleeping"]
+        assert app.eval("() => [...document.querySelectorAll('.sidebar-filter-opt.active')].map(b => b.dataset.filter).sort()") == ["recent", "sleeping"]
+        assert app.eval(HAS_DOT)
+        assert not app.errors, app.errors
+    finally:
+        app.close()
+
+
+@pytest.mark.slow
+def test_funnel_shows_only_where_filters_apply(browser):
+    app = FakeApp(browser, _sessions())
+    try:
+        assert app.eval(FUNNEL_SHOWN)
+        _click(app, "#sidebar-filter-btn")
+        app.eval("() => setViewMode('workplace')")       # the Workforce view: no filters there
+        app.page.wait_for_function("document.getElementById('sidebar-filter-wrap').hidden", timeout=5000)
+        assert not app.eval(FILTER_OPEN), "a hidden funnel must not leave its menu open"
         assert not app.errors, app.errors
     finally:
         app.close()
@@ -128,8 +196,11 @@ def test_list_mode_filters_too(browser):
     app = FakeApp(browser, _sessions(), init=init_script("sessions", "list"))
     try:
         assert app.eval(ROWS) == 150
-        app.page.fill("#search", "quarterly")
-        app.page.wait_for_function(f"({ROWS})() === 1", timeout=3000)
+        app.push_many("session_state",
+                      [{"session_id": s["id"], "state": "working", "cwd": CWD} for s in app.sessions[:3]])
+        app.page.wait_for_timeout(300)
+        _click(app, _opt("working"))
+        app.page.wait_for_function(f"({ROWS})() === 3", timeout=3000)
         assert not app.errors, app.errors
     finally:
         app.close()

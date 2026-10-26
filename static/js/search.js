@@ -1,6 +1,6 @@
 /* search.js — deep search across ALL session transcripts (FTS5-backed).
  *
- * Entry point: the "Search transcripts" button in the sidebar (which
+ * Entry point: the "Search…" button in the sidebar (which
  * replaced the old sidebar title-filter input) calls openDeepSearch().
  * This opens a modal with its own search input — the ONE place you type —
  * and searches the full message content of every session in the active

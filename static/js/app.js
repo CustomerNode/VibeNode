@@ -990,10 +990,22 @@ _updateViewModeButton(viewMode);
 // --- Sidebar menu (three dots) ---
 function toggleSidebarMenu() {
   _syncSortMenu();
+  closeFilterMenu();   // one open menu at a time
   document.getElementById('sidebar-menu-dropdown').classList.toggle('open');
 }
 function closeSidebarMenu() {
   document.getElementById('sidebar-menu-dropdown').classList.remove('open');
+}
+
+// --- Filter menu (funnel), see "Session filters" ---
+function toggleFilterMenu() {
+  closeSidebarMenu();
+  const dd = document.getElementById('sidebar-filter-dropdown');
+  if (dd) dd.classList.toggle('open');
+}
+function closeFilterMenu() {
+  const dd = document.getElementById('sidebar-filter-dropdown');
+  if (dd) dd.classList.remove('open');
 }
 
 function pickSort(mode, asc) {
@@ -1031,10 +1043,12 @@ function _syncSortMenu() {
   });
 }
 
-// Close sidebar menu on outside click
+// Close the sidebar menus on outside click
 document.addEventListener('click', function(e) {
   const wrap = document.querySelector('.sidebar-menu-wrap');
   if (wrap && !wrap.contains(e.target)) closeSidebarMenu();
+  const fwrap = document.getElementById('sidebar-filter-wrap');
+  if (fwrap && !fwrap.contains(e.target)) closeFilterMenu();
 });
 
 // --- Sleep All ---
@@ -1948,13 +1962,12 @@ async function loadSessions() {
 
 function filterSessions() {
   // Re-renders the session view.  In the Sessions view's cards and list the
-  // filter bar applies (title filter #search + state/date chips, see "Session
-  // filters" below) and the result is windowed (first 150, more on scroll).
-  // Other views get the full list: the bar is hidden there, so a value left
-  // in #search must not silently narrow them.
+  // "Show only" filters from the ••• menu apply (see "Session filters" below)
+  // and the result is windowed (first 150, more on scroll).  Other views get
+  // the full list: the filters are hidden there, so they must not narrow them.
   const inSessionList = viewMode === 'sessions'
     && (sessionDisplayMode === 'grid' || sessionDisplayMode === 'list');
-  _syncSessionFilterBar(inSessionList);
+  _syncSessionFilterMenu(inSessionList);
   if (viewMode === 'homepage') {
     if (typeof _updateHomepageStats === 'function') _updateHomepageStats();
     return;
@@ -1978,18 +1991,23 @@ function filterSessions() {
 }
 
 // ── Session filters: finding one session among 1,009 (2026-10-23) ────────
-// All client-side over SessionStore.  Chips:
+// All client-side over SessionStore.  They live behind the funnel button
+// (#sidebar-filter-btn) beside the ••• menu, which the owner picked on
+// 2026-10-26 from the scratch variants; they were briefly a chip bar under the
+// search button.  There is NO sidebar title filter: the "Search…" window is
+// the one place you type, and it matches titles too.
+// Filters:
 //   working / needs / idle / sleeping   the session's status (OR'd together)
 //   unread                              has an unread reply   (AND)
 //   recent                              active in the last 7 days (AND)
-// Chips persist per project in ONE localStorage key, 'vnSessionFilters'
-// ({project: [chip, ...]}).  The title filter (#search) is not persisted.
+// They persist per project in ONE localStorage key, 'vnSessionFilters'
+// ({project: [chip, ...]}), so the funnel lights up with a dot while any is on.
 // Tests: tests/test_session_filters.py.
 const _SESSION_FILTERS_KEY = 'vnSessionFilters';
 const _STATE_CHIPS = {working: 'working', needs: 'question', idle: 'idle', sleeping: 'sleeping'};
 const _SESSION_CHIPS = ['working', 'needs', 'idle', 'sleeping', 'unread', 'recent'];
-const _SEARCH_DEBOUNCE_MS = 100;
-let _sessionSearchTimer = null;
+const _SESSION_CHIP_LABELS = {working: 'Working', needs: 'Needs you', idle: 'Idle',
+  sleeping: 'Sleeping', unread: 'Unread', recent: 'Last 7 days'};
 
 function _readAllSessionFilters() {
   try { return JSON.parse(localStorage.getItem(_SESSION_FILTERS_KEY) || '{}') || {}; }
@@ -2015,6 +2033,17 @@ function toggleSessionFilter(chip) {
   filterSessions();
 }
 
+/** "Show all sessions" in the funnel menu: drop every filter for this project. */
+function clearSessionFilters() {
+  const proj = localStorage.getItem('activeProject') || '';
+  const all = _readAllSessionFilters();
+  delete all[proj];
+  try { localStorage.setItem(_SESSION_FILTERS_KEY, JSON.stringify(all)); } catch (e) { /* private mode */ }
+  closeFilterMenu();
+  _resetSessionWindow();
+  filterSessions();
+}
+
 /** True when a status change can move a session in or out of the filtered list. */
 function _sessionFiltersDependOnState() {
   const cur = _activeSessionFilters();
@@ -2022,30 +2051,14 @@ function _sessionFiltersDependOnState() {
   return cur.has('unread');
 }
 
-function onSessionSearchInput() {
-  if (_sessionSearchTimer) clearTimeout(_sessionSearchTimer);
-  _sessionSearchTimer = setTimeout(() => {
-    _sessionSearchTimer = null;
-    _resetSessionWindow();
-    filterSessions();
-  }, _SEARCH_DEBOUNCE_MS);
-}
-
 function _applySessionFilters(list) {
-  const searchEl = document.getElementById('search');
-  const q = searchEl ? searchEl.value.trim().toLowerCase() : '';
   const chips = _activeSessionFilters();
-  if (!q && !chips.size) return list;
+  if (!chips.size) return list;
   const states = new Set();
   for (const c of chips) if (_STATE_CHIPS[c]) states.add(_STATE_CHIPS[c]);
   const wantUnread = chips.has('unread');
   const since = chips.has('recent') ? Date.now() / 1000 - 7 * 86400 : 0;
   return list.filter(s => {
-    if (q) {
-      // Title, custom title and the first message (`preview`).
-      const hay = ((s.display_title || '') + '\n' + (s.custom_title || '') + '\n' + (s.preview || '')).toLowerCase();
-      if (!hay.includes(q)) return false;
-    }
     if (states.size && !states.has(getSessionStatus(s.id))) return false;
     if (wantUnread && !(typeof hasUnread === 'function' && hasUnread(s.id))) return false;
     if (since && (s.effective_ts || s.last_activity_ts || s.sort_ts || 0) < since) return false;
@@ -2053,17 +2066,29 @@ function _applySessionFilters(list) {
   });
 }
 
-function _syncSessionFilterBar(show) {
-  const bar = document.getElementById('session-filter-bar');
-  if (!bar) return;
-  bar.hidden = !show;
-  if (!show) return;
-  const cur = _activeSessionFilters();
-  bar.querySelectorAll('.session-chip[data-filter]').forEach(b => {
+/** Show the funnel where the filters apply, tick the active ones, and light
+ *  the funnel with a dot while any is on (they persist, and a list narrowed
+ *  by a filter nobody can see would look like missing sessions). */
+function _syncSessionFilterMenu(show) {
+  const wrap = document.getElementById('sidebar-filter-wrap');
+  const btn = document.getElementById('sidebar-filter-btn');
+  const clear = document.getElementById('sidebar-filter-clear');
+  const cur = show ? _activeSessionFilters() : new Set();
+  if (!wrap) return;
+  wrap.hidden = !show;
+  if (!show) closeFilterMenu();
+  wrap.querySelectorAll('.sidebar-filter-opt[data-filter]').forEach(b => {
     const on = cur.has(b.dataset.filter);
     b.classList.toggle('active', on);
     b.setAttribute('aria-pressed', on ? 'true' : 'false');
   });
+  if (clear) clear.hidden = cur.size === 0;
+  if (btn) {
+    btn.classList.toggle('has-filter', cur.size > 0);
+    btn.title = cur.size
+      ? 'Filter · showing only: ' + _SESSION_CHIPS.filter(c => cur.has(c)).map(c => _SESSION_CHIP_LABELS[c]).join(', ')
+      : 'Filter';
+  }
 }
 
 // ── Windowed rendering ──
