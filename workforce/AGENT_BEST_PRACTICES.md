@@ -201,6 +201,23 @@ This is enforced at the top of Execute Pipeline's TEAM UNIQUE VALUE block. When 
 
 ---
 
+## Rule 11: Pipelines share one spine, and the grade is computed
+
+A pipeline is an agent that takes a request through plan, build and independent checks to a graded result. `code-pipeline.md` is the first built on this spine; a Writing, Deck or Workbook pipeline follows the same spine with its own teams and its own kind of evidence. The spine, which every pipeline keeps:
+
+1. **The request is on disk verbatim** (`00-request.md`), created by `python -m pipeline.start`, before any team runs.
+2. **Acceptance criteria are written before building**, as a fenced `verification` block the programs read, naming what proves each criterion for this project.
+3. **Checkers are fresh subagents, one at a time.** Review, Test and Audit run as Agent-tool subagents whose brief holds only the request, the run directory, the spec path and the diff, and they run in sequence: Review's fixes land before Test runs, Test's evidence is on the tree Audit reads. A checker stage the root session wrote is self-grading, a plan a checker edited is self-graded criteria, and the harness says so in both cases.
+4. **One artifact per stage** in `docs/plans/runs/<run>/` (Rule 6), and the next stage reads the previous file in full.
+5. **Evidence is what the Session Engine recorded**, never what an agent typed: `pipeline.run_check` executes each criterion and the harness matches its evidence file against the transcript that shows it being produced, on the tree being graded.
+6. **The grade is computed** by `python -m pipeline.harness`, reported verbatim, and bound to the final tree. HIGH, MEDIUM, LOW are grades of evidence strength; BLOCKED is an execution status.
+7. **The audit answers the fourth question**: if every check passed, what could still be wrong that no check would catch? A material answer changes the grade, adds a check, or goes to the user.
+8. **The ledger remembers; tests converge.** Every run appends one row to `LEDGER.md` and every defect a checker found becomes a regression test in the project.
+
+A new pipeline that drops any of these is not a pipeline. What it may change is the team roster, the routes, and what counts as evidence for its kind of deliverable. The programs live in `pipeline/` and import nothing from `app` or `daemon`, so they work in any repository. Tests: `tests/test_code_pipeline.py`, which starts from one valid run and breaks one thing at a time.
+
+---
+
 ## When you edit an existing agent
 
 1. Read this file first.

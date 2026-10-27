@@ -672,7 +672,17 @@ def test_the_number_watched_is_bounded(cards, watch, clock):
     for n, card in enumerate(made):
         clock.tick(1)
         watch.register(f"Release 9.{n}", MESSAGE, "", card.url)
-    watch.step()
+    # ``step()`` deliberately stops at the first UNKNOWN so one hung page cannot
+    # hold the rest (see the comment in ``ApprovalWatch.step``), and the suite's
+    # ``_short_timeout`` cuts PROBE_TIMEOUT_S to 0.3s. On an 8-worker parallel
+    # run the local HTTP fetch of a tracked page can genuinely miss that budget,
+    # so one ``step()`` is not guaranteed to confirm every page; the watcher is
+    # built to pick them up on the next pass. Loop the way the real thread does.
+    for _ in range(4 * aw.MAX_TRACKED):
+        watch.step()
+        if len(watch.open_now()) == aw.MAX_TRACKED:
+            break
+        clock.tick(aw.RETRY_S + 0.1)
     titles = [c["title"] for c in watch.open_now()]
     assert titles == [f"Release 9.{n}" for n in range(3, aw.MAX_TRACKED + 3)], "the oldest give way"
 

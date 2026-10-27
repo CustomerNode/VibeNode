@@ -3,7 +3,7 @@ id: final-audit
 name: Final Audit
 department: compose
 source: vibenode
-version: 1.2.0
+version: 1.2.1
 depends_on: []
 type: prompt-template
 ---
@@ -21,7 +21,7 @@ Last-pass skeptical audit of completed work. Use this after implementation, revi
 The caller MUST include in the kickoff prompt:
 - the **original user request verbatim** — not paraphrased. Final Audit's whole purpose is comparing reality to original intent.
 - the list of files created or modified (or a git range like `HEAD~N..HEAD`),
-- pointers to prior pipeline artifacts if this is part of Execute Pipeline (e.g. `docs/plans/runs/<run-id>/`),
+- pointers to prior pipeline artifacts if this is part of Execute Pipeline or Code Pipeline (e.g. `docs/plans/runs/<run-id>/`; under Code Pipeline the audit reads prior teams' confidence and escalations from those artifacts, not from the brief),
 - the spec the work was supposed to satisfy (if one exists),
 - any prior team's confidence levels and escalations so the audit can probe what was deferred.
 

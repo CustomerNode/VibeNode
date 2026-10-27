@@ -1,0 +1,18 @@
+# Files whose change forces Code Pipeline to full depth in this repository
+# (one glob per line; the defaults in pipeline/depth.py already cover
+# daemon/, common/, auth, billing, schemas, IPC and PERF-CRITICAL markers).
+app/mobile_auth.py
+app/routes/ws_events.py
+app/routes/preview_api.py
+app/daemon_client.py
+run.py
+launch.bat
+launch.sh
+static/js/socket.js
+static/js/live-panel.js
+static/js/session-store.js
+static/js/thread-scroll*.js
+static/js/notify.js
+static/js/utils.js
+templates/index.html
+workforce/AGENT_BEST_PRACTICES.md

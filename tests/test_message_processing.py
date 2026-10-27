@@ -543,6 +543,12 @@ class TestEventLoopReliability:
 
     def test_rapid_start_stop_10_cycles(self, session_manager, sm_module):
         """Rapid session start/stop cycles (10x) all clean up properly."""
+        # The point of this test is "every cycle cleans up", not a performance
+        # budget. Under the pre-publish 8-worker parallel run, each worker's
+        # daemon event-loop thread competes with 7 others for CPU, and a state
+        # transition that normally lands in ~50ms can slip past a tight 5s cap.
+        # pytest's own ``--timeout=120`` still catches a real deadlock.
+        wait_s = 20.0
         for i in range(10):
             sid = f"cycle-{i}"
             client = MockClaudeSDKClient()
@@ -555,13 +561,13 @@ class TestEventLoopReliability:
                 session_manager.start_session(sid, prompt="go", cwd=EMPTY_CWD)
                 wait_for(
                     lambda s=sid: session_manager.get_session_state(s) == "idle",
-                    timeout=5,
+                    timeout=wait_s,
                 )
 
             session_manager.close_session(sid)
             wait_for(
                 lambda s=sid: session_manager.get_session_state(s) == "stopped",
-                timeout=5,
+                timeout=wait_s,
             )
 
         # All sessions should be stopped
