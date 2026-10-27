@@ -3,7 +3,7 @@ id: execute-pipeline
 name: Execute Pipeline
 department: compose
 source: vibenode
-version: 1.2.0
+version: 1.3.0
 depends_on: [plan-team, build-team, review-team, test-team, final-audit, debug-team, hotfix-team, refactor-team]
 type: prompt-template
 ---
@@ -80,6 +80,19 @@ Skip stage files that don't apply to the selected route. Numbering stays consist
 
 Each subsequent stage MUST read the prior stage's full artifact before starting, not just the in-context summary. The final pipeline report references these artifacts by path so the user can dig into any stage without re-running.
 
+INDEPENDENT CHECKS — THE BUILDER NEVER GRADES ITS OWN WORK:
+
+Review Team, Test Team and Final Audit are checkers. Each one runs as a FRESH subagent (Agent tool, foreground), never as a role played inside the conversation that wrote the code. A checker that remembers why the builder made each choice tends to agree with it; that is the failure this rule removes.
+- The checker's kickoff prompt contains only: the original request verbatim, the run directory path, the spec path (if any), and the changed files or git range. Do NOT pass the builder's reasoning, its own assessment, or any hint about the expected verdict.
+- The checker judges from the code, the diff, the artifacts and what it runs itself. It writes its own stage artifact.
+- If a fresh subagent cannot be launched in this environment, run the stage in-context, say so in the stage artifact and the final report, and the final confidence cannot be HIGH.
+
+EVIDENCE REQUIRED FOR HIGH CONFIDENCE — all three, recorded in the run directory:
+1. **Full suite, zero failures.** `04-test.md` contains the verbatim final summary line of the full publish-gate command: `python -m pytest --tb=short -q --no-header --timeout=120 -n 8 --dist loadfile tests/`. Running only the new or nearby tests does not count.
+2. **The screen was tested if the screen changed.** If any file under `static/` or `templates/` changed, or anything the user sees changed, the changed behavior was driven in headless Chromium against the real page: the faked-network harness `tests/_fake_app.py` (real `index.html` and real scripts, no server), or a dedicated browser test in the style of `tests/test_code_block_wrap.py`. These need no running server and no restart, so "the server cannot be restarted" is NOT a reason to skip them.
+3. **Independent checkers.** Review, Test and Final Audit each ran as a fresh subagent per the rule above.
+If any one is missing, the final confidence is MEDIUM at most, and the report says which one and why.
+
 TEAM WORKFLOW:
 
 1. **Routing Decision** (BEFORE any team is invoked)
@@ -89,7 +102,7 @@ Classify the request and select the route. Do not default to the new-feature rou
 Routes:
 - **(a) New feature or major change** → Plan Team → Build Team → Review Team → Test Team → Final Audit
 - **(b) Bug with unknown cause** → Debug Team → Build Team → Review Team → Test Team → Final Audit
-- **(c) Production issue where speed matters** → Hotfix Team → Review Team → targeted test validation → Final Audit
+- **(c) Production issue where speed matters** → Hotfix Team → Review Team → Test Team (targeted validation plus the full suite) → Final Audit
 - **(d) Internal cleanup with no intended behavior change** → Refactor Team → Review Team → Test Team → Final Audit
 
 Classification rules:
@@ -126,7 +139,7 @@ If Review Team finds issues, fix them and re-submit for review. Do not proceed t
 
 4. **Review Team**
 
-Read `02-build.md` in full before starting.
+Launch as a fresh subagent (see INDEPENDENT CHECKS). It reads `02-build.md` in full before starting.
 Review the result for code quality, security, compliance, documentation, maintainability, and adherence to project rules.
 Do not rubber-stamp.
 If something is weak, fix it or send it back to Build Team for correction.
@@ -138,7 +151,9 @@ If issues are fundamental enough to require spec changes, loop back to Plan Team
 
 5. **Test Team**
 
-Read `02-build.md` and `03-review.md` in full before starting.
+Launch as a fresh subagent (see INDEPENDENT CHECKS). It reads `02-build.md` and `03-review.md` in full before starting.
+Run the full suite with the publish-gate command (see EVIDENCE REQUIRED) and record its final summary line verbatim in `04-test.md`. This is mandatory on every route, including (c) Hotfix.
+If the screen changed, drive the changed behavior in headless Chromium (see EVIDENCE REQUIRED) and record the test file and result.
 Run broad validation beyond implementation tests.
 Validate integrated behavior, real workflows, edge cases, stale state, concurrency risks, error handling, browser and platform behavior, and performance-sensitive paths where relevant.
 Do not stop at unit tests.
@@ -150,7 +165,7 @@ If testing reveals a design-level problem, loop back to Plan Team or Build Team 
 
 6. **Final Audit**
 
-This is not a re-review. Review and Test already did their jobs. This is a whole-system skeptical audit that asks whether the finished result actually does what was intended, works end to end, and did not create new problems.
+Launch as a fresh subagent (see INDEPENDENT CHECKS). This is not a re-review. Review and Test already did their jobs. This is a whole-system skeptical audit that asks whether the finished result actually does what was intended, works end to end, and did not create new problems.
 
 Read `00-request.md` (for the original goal) and ALL prior stage artifacts in full before starting.
 
@@ -212,7 +227,7 @@ Return the final pipeline report in this numbered structure:
 9. **What was not validated or could not be fully verified** — Blind spots across the whole pipeline.
 10. **Obstacles encountered** — Setup issues, workarounds, commands needing special flags, dependency or env quirks discovered at any stage. Aggregated so the next pipeline run benefits.
 11. **Final confidence level** — HIGH, MEDIUM, or LOW:
-    - HIGH: Solution is sound, holds together end to end, no meaningful risk. Ship it. Do not assign HIGH unless there is no meaningful unresolved risk.
+    - HIGH: Solution is sound, holds together end to end, no meaningful risk. Ship it. Do not assign HIGH unless there is no meaningful unresolved risk AND all three items under EVIDENCE REQUIRED are present in the run directory. State each of the three with where it is recorded.
     - MEDIUM: Mostly works but has identifiable weak spots that should be addressed. Usable but not fully trusted.
     - LOW: Material problems found. Does not reliably achieve intent, has significant risk, or broke something. Do not ship.
 

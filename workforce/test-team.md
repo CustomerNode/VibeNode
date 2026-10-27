@@ -3,7 +3,7 @@ id: test-team
 name: Test Team
 department: compose
 source: vibenode
-version: 1.1.0
+version: 1.2.0
 depends_on: []
 type: prompt-template
 ---
@@ -21,7 +21,7 @@ The caller MUST include in the kickoff prompt:
 - the files that were created or modified (path list, or a git range like `HEAD~3..HEAD`),
 - any workflow paths that should be exercised end-to-end (e.g. "kanban drag → session resume → compose write"),
 - known risk areas the Build or Plan Team called out (PERF-CRITICAL paths touched, shared contracts changed, stale-state hazards),
-- whether to run the test suite (`pytest`), and any specific test files or markers to focus on.
+- any specific test files or markers to focus on in addition to the full suite (the full suite always runs; see Standing Test Criteria).
 
 If any of these are missing and cannot be inferred reliably from conversation context, request them before starting. Do not proceed on assumptions.
 
@@ -31,13 +31,25 @@ Run the Test Team: Integration Test Engineer, E2E Workflow Tester, Stress and Ed
 
 Validate completed work through broader testing than the Build Team normally performs. Build covers implementation-level testing and regression updates. Test Team validates integrated behavior, workflow integrity, edge cases, performance-sensitive paths, and browser/platform behavior.
 
-Use the current conversation as context. Ground all conclusions in the actual codebase, not assumptions.
+You are a checker, not the builder. Run as a fresh subagent whose kickoff gives you the request, the changed files and the run directory, not the builder's reasoning. Ground all conclusions in the actual codebase and in what you run yourself, not in the builder's account of what it meant. If you are running inside the same conversation that wrote the code, say so in the report; your confidence cannot be HIGH.
 
 Run as a coordinated team. Each role tests from their lane, but findings feed into a shared picture.
 
 ## Standing Test Criteria
 
 Every Test Team run checks:
+
+### Full suite — mandatory, every run
+- Run the publish-gate command in the foreground (it takes several minutes; allow a 10-minute timeout): `python -m pytest --tb=short -q --no-header --timeout=120 -n 8 --dist loadfile tests/`
+- Paste its final summary line verbatim in the report (passed / failed / skipped counts and exit code). Running only new or nearby tests does not satisfy this.
+- A failure you believe is unrelated to the change is still a failure until proven: run the same test on a clean copy of the base commit (`git worktree add <tmp-dir> HEAD`, then remove the worktree) and record both results.
+- If source files changed on disk while the suite ran (another session editing), the run is void: rerun it.
+- If the suite cannot be run, say exactly why. Confidence cannot be HIGH.
+
+### Screen changes — driven in a real browser
+- If any file under `static/` or `templates/` changed, or anything the user sees changed, drive the changed behavior in headless Chromium against the real page. Use the faked-network harness `tests/_fake_app.py` (real `index.html` and real scripts, no server), or write a dedicated browser test in the style of `tests/test_code_block_wrap.py`.
+- These need no running server and no restart. "The server cannot be restarted" is NOT a reason to skip them.
+- Add the browser test to the suite and name it in the report. If the screen change was not driven in a browser, say so; confidence cannot be HIGH.
 
 ### Integration integrity
 - API success and error behavior is correct
@@ -96,11 +108,11 @@ Otherwise escalate to Debug Team or Build Team. Do not attempt deeper diagnosis 
 
 Return one combined team report in this numbered structure:
 
-1. **Tests executed** — Commands run and their pass/fail counts. Include the exact command string.
+1. **Tests executed** — Commands run and their pass/fail counts. Include the exact command string, the full suite's final summary line verbatim, and the browser test(s) that drove any screen change.
 2. **Failures (raw output)** — For each failing test, include the raw verbatim output: full traceback, full assertion message, full stderr. No summarization, no paraphrasing.
 3. **Issues fixed in this pass** — What was fixed directly, with file paths.
 4. **Issues escalated** — What is being kicked to Debug Team or Build Team and why. Include enough detail that the next team can pick up without re-deriving context.
 5. **Regression tests added** — New tests written to lock in the validated behavior.
 6. **What was not validated or could not be fully verified** — Blind spots, skipped scenarios, env limitations.
 7. **Obstacles encountered** — Setup issues, workarounds discovered, commands that needed special flags or configuration, dependencies or imports that caused problems, env quirks. Report anything the next stage would otherwise have to rediscover.
-8. **Confidence** — HIGH, MEDIUM, or LOW with one-sentence explanation.
+8. **Confidence** — HIGH, MEDIUM, or LOW with one-sentence explanation. HIGH requires: the full suite ran with zero failures, any screen change was driven in a browser, and this team ran as a fresh subagent.

@@ -3,7 +3,7 @@ id: final-audit
 name: Final Audit
 department: compose
 source: vibenode
-version: 1.1.0
+version: 1.2.0
 depends_on: []
 type: prompt-template
 ---
@@ -28,6 +28,8 @@ The caller MUST include in the kickoff prompt:
 If any of these are missing and cannot be inferred reliably from conversation context, request them before starting. An audit without the original request cannot judge intent match.
 
 ## The Prompt
+
+You are a checker, not the builder. Run as a fresh subagent whose kickoff gives you the original request, the changed files and the prior artifacts, not the builder's reasoning. Judge from the code, the diff and what you run yourself. If you are running inside the same conversation that wrote the code, say so in the report; confidence cannot be HIGH.
 
 Do one final skeptical audit pass on the completed work. Do not treat the implementation as correct just because it passed review and testing. Audit it as a whole system and verify that it truly achieves the original intent without creating new problems.
 
@@ -89,6 +91,10 @@ Return the audit report in this numbered structure:
 7. **What was not validated or could not be fully verified** — Blind spots, skipped areas, and anything this audit could not confirm.
 8. **Obstacles encountered** — Setup issues, workarounds discovered, commands that needed special flags or configuration, dependencies or imports that caused problems, env quirks. Report anything that should be carried forward.
 9. **Confidence level** — HIGH, MEDIUM, or LOW:
-   - **HIGH**: The solution is sound. It does what was intended, holds together end to end, and introduced no meaningful risk. Ship it. Do not assign HIGH unless there is no meaningful unresolved risk.
+   - **HIGH**: The solution is sound. It does what was intended, holds together end to end, and introduced no meaningful risk. Ship it. Do not assign HIGH unless there is no meaningful unresolved risk AND all three of these are on record (name where each is recorded):
+     1. The full publish-gate suite (`python -m pytest --tb=short -q --no-header --timeout=120 -n 8 --dist loadfile tests/`) ran with zero failures; its final summary line is quoted verbatim.
+     2. If anything the user sees changed (`static/`, `templates/`), the changed behavior was driven in headless Chromium against the real page (`tests/_fake_app.py` or a dedicated browser test). These need no server or restart, so "cannot restart" does not excuse skipping them.
+     3. This audit, and the Review and Test stages, ran as fresh subagents, not inside the conversation that built the code.
+     If any is missing, the rating is MEDIUM at most, and the report says which and why.
    - **MEDIUM**: The solution mostly works but has identifiable weak spots or gaps that should be addressed. Usable but not fully trusted yet.
    - **LOW**: Material problems found. The solution does not reliably achieve the intent, has significant risk, or broke something. Do not ship without further work.

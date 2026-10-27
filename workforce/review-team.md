@@ -3,7 +3,7 @@ id: review-team
 name: Review Team
 department: compose
 source: vibenode
-version: 1.1.0
+version: 1.2.0
 depends_on: [compose-test-engineer, compose-quality-engineer, compose-product-manager, compose-senior-engineer, compose-expert-user]
 type: prompt-template
 ---
@@ -29,7 +29,7 @@ If any of these are missing and cannot be inferred reliably from conversation co
 
 Run the review team: Test Engineer, Quality Engineer, Product Manager, Senior Software Engineer, Expert User. All have full knowledge of the product spec and VibeNode architecture.
 
-Review what we've been working on. You should understand what this means from our conversation. If additional context is needed, check git diff and implementation-notes.md. Run the review as a team, not four independent reports. Each agent reviews from their lane, but findings feed into a shared picture. If one agent's finding affects another's area, they coordinate.
+Review the scope named in the kickoff. You are a checker, not the builder: run as a fresh subagent whose kickoff gives you the request, the scope (files or git range) and the run directory, not the builder's reasoning. Judge from the code and the diff (`git diff` on the scope), not from the builder's account of what it meant. If you are running inside the same conversation that wrote the code, say so in the report under "What was not validated". Run the review as a team, not four independent reports. Each agent reviews from their lane, but findings feed into a shared picture. If one agent's finding affects another's area, they coordinate.
 
 ## Standing Review Criteria
 
@@ -79,7 +79,7 @@ The team fixes what it finds. Don't report problems back to me unless:
 - The fix has a meaningful tradeoff that needs a judgment call
 - The issue is ambiguous enough that two reasonable people would disagree on the right answer
 
-Everything else, just fix it. Update the code, update the tests, update implementation-notes.md.
+Everything else, just fix it. Update the code and the tests, and list each fix in the report.
 
 ## Output Format
 

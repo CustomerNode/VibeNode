@@ -138,7 +138,11 @@ function mdParse(md) {
     });
     html = html.replace(/((?:^\d+\.\s+.+\n?)+)/gm, (block) => {
       const items = block.trim().split('\n').map(l => '<li>' + l.replace(/^\d+\.\s+/, '') + '</li>').join('');
-      return '<ol>' + items + '</ol>\n';
+      // Keep the author's numbering: a list that resumes at 6 after a
+      // heading must not restart at 1.
+      const first = parseInt(block.trim(), 10);
+      const start = first > 1 ? ' start="' + first + '"' : '';
+      return '<ol' + start + '>' + items + '</ol>\n';
     });
     // Tables — | col | col | rows with a separator row of |---|---|
     html = html.replace(/((?:^\|.+\|\n?)+)/gm, (block) => {
