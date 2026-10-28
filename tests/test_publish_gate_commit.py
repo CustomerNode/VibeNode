@@ -112,6 +112,8 @@ class TestPullInstallsRequirements:
         monkeypatch.setattr(git_ops, "_default_branch", lambda *a: "main")
         it = iter(blobs)
         monkeypatch.setattr(git_ops, "_requirements_blob", lambda proj: next(it))
+        # The stash-pop clash check is its own git call; no clash here.
+        monkeypatch.setattr(git_ops, "_unmerged_paths", lambda *a: [])
         monkeypatch.setattr(subprocess, "run",
                             lambda cmd, **kw: MagicMock(stdout="Updating abc..def", returncode=0, stderr=""))
 

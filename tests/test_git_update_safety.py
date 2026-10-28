@@ -55,6 +55,9 @@ def test_pull_stashes_before_pulling_and_pops_after(tmp_path, monkeypatch):
     # The requirements blob check (2026-10-23) is its own git call; keep it
     # out of the scripted sequence so this test stays about stash/pull/pop.
     monkeypatch.setattr(git_ops, "_requirements_blob", lambda *a: "")
+    # The stash-pop clash check is its own git call; no clash in these tests
+    # (a real clash is covered in tests/test_git_scanner_gaps.py).
+    monkeypatch.setattr(git_ops, "_unmerged_paths", lambda *a: [])
 
     # Model a WORKING TREE WITH LOCAL EDITS: stash reports it did save
     # something. pull runs cleanly. stash pop restores.
@@ -108,6 +111,9 @@ def test_pull_still_pops_stash_after_upstream_landed(tmp_path, monkeypatch):
     monkeypatch.setattr(git_ops, "_current_branch", lambda *a: "main")
     monkeypatch.setattr(git_ops, "_default_branch", lambda *a: "main")
     monkeypatch.setattr(git_ops, "_requirements_blob", lambda *a: "")
+    # The stash-pop clash check is its own git call; no clash in these tests
+    # (a real clash is covered in tests/test_git_scanner_gaps.py).
+    monkeypatch.setattr(git_ops, "_unmerged_paths", lambda *a: [])
 
     calls = []
     scripted = [

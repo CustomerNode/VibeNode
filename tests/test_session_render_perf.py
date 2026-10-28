@@ -94,8 +94,10 @@ def test_grid_state_burst_updates_cards_in_place(browser):
         idle = app.eval("() => document.querySelectorAll('#workforce-grid .wf-card.wf-idle').length")
         assert idle == WINDOW
         # A stopped, awake session waits for your verdict: Review, never "Idle"
-        # (session-verb.js, 2026-10-27).
-        assert app.eval(f"() => document.querySelector('{card3} .wf-status-label').textContent") == "Review"
+        # (session-verb.js, 2026-10-27), drawn as "Needs you" (status-merge B,
+        # 2026-10-28).
+        assert app.eval(f"() => SessionVerb.display('{sessions[3]['id']}')") == "review"
+        assert app.eval(f"() => document.querySelector('{card3} .wf-status-label').textContent") == "Needs you"
         assert not app.errors, app.errors
     finally:
         app.close()

@@ -69,6 +69,8 @@ class TestDoGitSync:
         # Mock the security scanner to pass (imported inside function)
         monkeypatch.setattr("app.git_scanner.scan_staged_files",
                             lambda *a, **kw: {"ok": True, "summary": "clean", "files_scanned": 1})
+        # No leftover merge clash (do_git_sync checks before pushing).
+        monkeypatch.setattr(git_ops, "_unmerged_paths", lambda *a: [])
 
         mock_run = MagicMock()
         # status --porcelain (no dirty files)
@@ -127,6 +129,8 @@ class TestBranchGuard:
         monkeypatch.setattr(git_ops, "_default_branch", lambda *a: "main")
         monkeypatch.setattr("app.git_scanner.scan_staged_files",
                             lambda *a, **kw: {"ok": True, "summary": "clean", "files_scanned": 1})
+        # No leftover merge clash (do_git_sync checks before pushing).
+        monkeypatch.setattr(git_ops, "_unmerged_paths", lambda *a: [])
         status_result = MagicMock(stdout="", returncode=0)   # no dirty files
         push_result = MagicMock(stdout="", returncode=0, stderr="")
         monkeypatch.setattr(subprocess, "run",
@@ -156,6 +160,8 @@ class TestBranchGuard:
         monkeypatch.setattr(git_ops, "_default_branch", lambda *a: "")  # unknown
         monkeypatch.setattr("app.git_scanner.scan_staged_files",
                             lambda *a, **kw: {"ok": True, "summary": "clean", "files_scanned": 1})
+        # No leftover merge clash (do_git_sync checks before pushing).
+        monkeypatch.setattr(git_ops, "_unmerged_paths", lambda *a: [])
         status_result = MagicMock(stdout="", returncode=0)
         push_result = MagicMock(stdout="", returncode=0, stderr="")
         monkeypatch.setattr(subprocess, "run",

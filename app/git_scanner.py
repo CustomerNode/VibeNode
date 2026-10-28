@@ -75,7 +75,15 @@ _SECRET_PATTERNS = [
     # snake_case identifier (e.g. _CONFIG_KEY = "mobile_command_enabled"). Those
     # are config-dict key constants, not secrets — real credentials always carry
     # digits, mixed case, or special chars, so this never suppresses a true secret.
-    ("Env Variable Secret", re.compile(r'(?i)^[A-Z_]*(SECRET|TOKEN|KEY|PASSWORD|CREDENTIAL|AUTH)[A-Z_]*\s*=\s*(?!["\'][a-z]+(?:_[a-z]+)*["\']\s*$)[^\s]{8,}', re.MULTILINE), "Environment variable with secret value"),
+    # The second and third lookaheads exclude values that are Python code, not
+    # a literal: a container opened on the line ( ( [ { ) or a call such as
+    # frozenset(...), re.compile(...), os.environ.get(...). Constants like
+    # ZOOM_KEYS = ((...)) and KNOWN_KEYS = frozenset({...}) used to need a
+    # per-file suppression, which also blinded those files to a REAL generic
+    # secret (SERVICE_TOKEN = "Zq81LmPx4Rt" went unreported). Known secret
+    # shapes (sk-, ghp_, AKIA...) are caught by their own patterns either way.
+    # Do NOT go back to per-file "Env Variable Secret" suppressions.
+    ("Env Variable Secret", re.compile(r'(?i)^[A-Z_]*(SECRET|TOKEN|KEY|PASSWORD|CREDENTIAL|AUTH)[A-Z_]*\s*=\s*(?!["\'][a-z]+(?:_[a-z]+)*["\']\s*$)(?![(\[{])(?![A-Za-z_][\w.]*\()[^\s]{8,}', re.MULTILINE), "Environment variable with secret value"),
 
     # ── PII / personal data ──
     ("Hardcoded User Path", re.compile(r'(?i)["\'][A-Z]:\\\\Users\\\\[a-zA-Z][a-zA-Z0-9._\-]{2,}\\\\|["\']/(?:Users|home)/[a-zA-Z][a-zA-Z0-9._\-]{2,}/'), "Hardcoded personal filesystem path"),
@@ -86,7 +94,10 @@ _SECRET_PATTERNS = [
     # paths like "C--Users-15512-Documents-..." which are system-generated.
     ("Owner ID (15512)", re.compile(r'(?<!-)(?<!\w)15512(?!-\d)(?!\w)'), "Owner user ID found in file"),
     ("Owner Name (donca)", re.compile(r'(?i)\bdonca\b'), "Owner name found in file"),
-    ("Owner Name (canto)", re.compile(r'(?i)\bcanto(?:w)?\b'), "Owner family name found in file"),
+    # One optional leading letter: usernames and email addresses put an initial
+    # straight before the surname, and \bcanto never matched those because the
+    # initial is a word character (no word boundary before "canto").
+    ("Owner Name (canto)", re.compile(r'(?i)(?<![a-z0-9_])[a-z]?canto(?:w)?\b'), "Owner family name found in file"),
 
     # ── Internal network ──
     ("Internal IP URL", re.compile(r'https?://(?:192\.168\.|10\.|172\.(?:1[6-9]|2[0-9]|3[01])\.)\d+'), "Internal/private network URL"),
@@ -180,22 +191,10 @@ _FINDING_SUPPRESSIONS = [
     # Workforce agent docs use classification terms as templates
     (re.compile(r'workforce/'), "Confidential Marker"),
     (re.compile(r'docs/'), "Confidential Marker"),
-    # session_store.py defines Python constants whose NAMES end in _KEY
-    # (e.g. _RETENTION_PREFS_KEY = "session_retention_days"). The
-    # "Env Variable Secret" pattern matches the variable name, not a
-    # credential — the value is a plain dict-key string. Suppress only this
-    # finding type for this file; all other secret patterns still run.
-    (re.compile(r'app/session_store\.py$'), "Env Variable Secret"),
-    # pipeline/plan.py defines KNOWN_KEYS = frozenset({...}), the set of field
-    # names a plan criterion may carry. The name ends in _KEYS, the value is a
-    # Python literal, not a credential. Same narrow suppression as above.
-    (re.compile(r'pipeline/plan\.py$'), "Env Variable Secret"),
-    # Smart-termination card rules: constants named _SKIP_KEYS (a frozenset
-    # of card field names), _JS_OPTION_KEY (a regex) and ZOOM_KEYS (a tuple
-    # of zoom-line labels). Names contain KEY; values are not credentials.
-    # Only this finding type is suppressed; every other pattern still runs.
-    (re.compile(r'daemon/handoff_rules\.py$'), "Env Variable Secret"),
-    (re.compile(r'daemon/smart_termination\.py$'), "Env Variable Secret"),
+    # NOTE: session_store.py, pipeline/plan.py, daemon/handoff_rules.py and
+    # daemon/smart_termination.py used to suppress "Env Variable Secret"
+    # because of constants named *_KEY(S). The pattern now ignores values
+    # that are code (see its comment), so those files are fully scanned again.
     # NOTE: prelogin_unlock.py previously needed a "Password Assignment"
     # suppression here. It no longer does — the root cause was the pattern's
     # value class matching newlines (see _SECRET_PATTERNS above). The

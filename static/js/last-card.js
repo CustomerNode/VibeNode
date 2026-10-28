@@ -101,6 +101,7 @@
     back: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>',
     close: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
     fwd: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>',
+    dl: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 10l5 5 5-5"/><path d="M5 20h14"/></svg>',
     pen: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L19 9l-4-4L4 16z"/></svg>',
   };
 
@@ -227,6 +228,19 @@
     if (d.meta && (typeof d.meta !== 'object' || Array.isArray(d.meta))) d = Object.assign({}, d, { meta: null });
     const mailto = d.kind === 'email' && d.meta ? 'mailto:' + encodeURIComponent(d.meta.To || '') + '?subject=' + encodeURIComponent(d.meta.Subject || '') + '&body=' + encodeURIComponent(d.body || '') : '';
     const fmt = dvFormat(d);
+    // Files to download: one Download button per file, a real link with the
+    // download attribute (2026-10-28: a presentation's zip handed over as a
+    // Validate row framed the archive full screen and showed nothing).
+    const files = (Array.isArray(d.files) ? d.files : []).filter(f => f && typeof f === 'object' && /^(\/(?!\/)|https?:\/\/)/.test(String(f.url || '').trim()));
+    const fileRows = files.map(f => {
+      const u = String(f.url).trim(), name = decodeURIComponent((u.split(/[?#]/)[0].split('/').pop()) || 'file');
+      const sub = [name, f.size, f.note].filter(x => x != null && String(x).trim()).map(x => esc(String(x))).join(' · ');
+      return '<a class="lm-row lm-dlfile" href="' + esc(u) + '" download="' + esc(name) + '">' +
+        '<span class="tile">' + I.dl + '</span><span class="tx"><span class="tt">' + inl(f.label || name) + '</span>' +
+        '<span class="ts mono">' + sub + '</span></span><span class="vb">' + I.dl + ' Download</span></a>';
+    }).join('');
+    const filesHtml = fileRows ? '<div class="lm-rows lm-dlfiles">' + fileRows + '</div>' : '';
+    if (!String(d.body || '').trim()) return filesHtml + metaHtml;
     // The first copy row holds the body; the full-screen view reads it there.
     const acts = [copyRow({ title: fmt === 'html' ? 'Copy the HTML' : 'Copy the text', sub: fmt === 'html' ? 'The page’s source, ready to paste' : 'The body only, ready to paste', text: d.body || '' })];
     if (d.meta && d.meta.Subject) acts.push(copyRow({ title: 'Copy with the subject line', sub: 'Subject first, then the body', text: 'Subject: ' + d.meta.Subject + '\n\n' + (d.body || '') }));
@@ -245,7 +259,7 @@
       ' data-dv="' + fmt + '" data-title="' + esc(ttl) + '">' +
       '<div class="dv-top"><span class="k">' + _DV_LABEL[fmt] + '</span><span class="n">' + inl(d.title || '') + '</span><span class="fx">' + I.expand + '</span></div>' +
       '<div class="dv-pvbox">' + inner + '</div></div>';
-    return open + metaHtml + '<div class="lm-rows">' + acts.join('') + '</div>';
+    return filesHtml + open + metaHtml + '<div class="lm-rows">' + acts.join('') + '</div>';
   }
   /** A deliverable's body drawn as its format, for the full-screen view.
    *  HTML is not drawn here: it goes in a sandboxed frame. */
@@ -271,6 +285,7 @@
     const core = window.SessionVerbCore;
     if (core && typeof core.verbFromCard === 'function') return core.verbFromCard(m) || '';
     if (m.type === 'explain') return 'read';
+    if (m.type === 'deliverable' && Array.isArray((m.deliverable || {}).files) && m.deliverable.files.length) return 'read';
     if (m.type === 'deliverable') return /report|doc|summary|notes|analysis|audit|findings|plan|research/i.test(String((m.deliverable || {}).kind || '')) ? 'read' : 'send';
     return '';
   }

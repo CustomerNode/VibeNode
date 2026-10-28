@@ -67,6 +67,9 @@ def verb_from_card(card: dict) -> Optional[str]:
         return "waiting"
     if t == "deliverable":
         d = card.get("deliverable") if isinstance(card.get("deliverable"), dict) else {}
+        # Files to download are taken, not sent: Got it (2026-10-28).
+        if isinstance(d.get("files"), list) and d.get("files"):
+            return "read"
         return "read" if _READ_KINDS.search(str(d.get("kind") or "")) else "send"
     if t == "explain":
         return "read"

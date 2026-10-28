@@ -60,6 +60,24 @@ except Exception:
     _REAL_USER_BASE = ""
 
 
+def _real_playwright_browsers() -> str:
+    """Where Playwright keeps its browsers, from the REAL home.  On Windows it
+    is under LOCALAPPDATA, which ``isolate_home`` leaves alone; on Linux and
+    macOS it is under HOME, so a moved HOME made Playwright launched inside a
+    test (the preview renderer) find no browser and fall back to the Chrome
+    CLI, which timed out."""
+    if os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or os.name == "nt":
+        return ""
+    if sys.platform == "darwin":
+        p = Path.home() / "Library" / "Caches" / "ms-playwright"
+    else:
+        p = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "ms-playwright"
+    return str(p) if p.is_dir() else ""
+
+
+_REAL_PLAYWRIGHT_BROWSERS = _real_playwright_browsers()
+
+
 # Resolve the production paths once at module load. We compare against
 # these in the guard below; any test that hits these exact paths fails
 # the whole test, before the destructive call lands.
@@ -202,6 +220,8 @@ def _isolate_daemon_home(request, tmp_path_factory, monkeypatch):
     # 'anyio'").  Pin the real user base; it only says where to read packages.
     if _REAL_USER_BASE and not os.environ.get("PYTHONUSERBASE"):
         monkeypatch.setenv("PYTHONUSERBASE", _REAL_USER_BASE)
+    if _REAL_PLAYWRIGHT_BROWSERS:
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", _REAL_PLAYWRIGHT_BROWSERS)
 
     # Several daemon modules capture ``Path.home()``-derived paths at IMPORT
     # time (module-level constants), so by the time this per-test fixture

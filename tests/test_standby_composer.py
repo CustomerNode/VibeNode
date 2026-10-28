@@ -19,6 +19,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+# At module level: conftest keeps the shared browser open only for files that
+# import this name (``uses_shared_browser``); imported inside the fixture, the
+# browser was closed after the first test and the second one failed.
+from tests._browser import shared_browser_scope
+
 
 def _line(kind, text, ts, sid):
     return json.dumps({"type": kind, "message": {"role": kind, "content": text}, "timestamp": ts, "sessionId": sid})
@@ -65,7 +70,6 @@ def test_the_list_says_when_a_session_was_set_aside(proj):
 
 @pytest.fixture(scope="module")
 def browser():
-    from tests._browser import shared_browser_scope
     with shared_browser_scope() as b:
         yield b
 

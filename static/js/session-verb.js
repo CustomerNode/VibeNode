@@ -108,6 +108,8 @@
     if (t === 'working') return 'waiting';
     if (t === 'deliverable') {
       const d = (card.deliverable && typeof card.deliverable === 'object') ? card.deliverable : {};
+      // Files to download are taken, not sent: Got it (2026-10-28).
+      if (Array.isArray(d.files) && d.files.length) return 'read';
       return READ_KINDS.test(String(d.kind || '')) ? 'read' : 'send';
     }
     if (t === 'explain') return 'read';

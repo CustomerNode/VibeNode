@@ -473,6 +473,62 @@ def variants_pick_problem(card: dict) -> Optional[str]:
 # A validate.url the card can open: a page on this app, or a web address.
 _VALIDATE_URL = re.compile(r"^(?:/(?!/)|https?://\S)", re.I)
 
+# A file to download, not a page to look at.  2026-10-28: a presentation was
+# handed over as a "done" card whose Validate row pointed at a .zip, so "Try
+# it" framed the archive full screen and showed nothing (the owner: "the
+# download here is fucked ... that should be a deliverable type, and what it
+# did needs to get rejected").  Files go in deliverable.files, drawn as
+# Download buttons.
+_DOWNLOAD_FILE = re.compile(
+    r"\.(?:zip|tar|tgz|gz|bz2|xz|7z|rar|pdf|pptx?|key|odp|docx?|odt|rtf|xlsx?|ods|csv|tsv"
+    r"|epub|dmg|pkg|exe|msi|apk|deb|rpm|appimage|whl|iso|mp4|mov|m4v|webm|mkv|avi|mp3|m4a|wav|flac)"
+    r"(?:[?#].*)?$", re.I)
+# Where the browser can fetch a file from: this app's static files or API,
+# or a web address.  A path on disk ("/home/…", "~/…") is not one.
+_SERVED_URL = re.compile(r"^(?:/(?:static|api)/\S|https?://\S)", re.I)
+
+
+def is_download(url) -> bool:
+    return bool(_DOWNLOAD_FILE.search(_s(url).strip()))
+
+
+def download_problems(card: dict) -> list[str]:
+    """A file to download handed over as a page to try or a link to open,
+    and a deliverable file the browser cannot fetch."""
+    out = []
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    v = card.get("validate") if isinstance(card.get("validate"), dict) else {}
+    misplaced = []
+    if is_download(v.get("url")):
+        misplaced.append(("validate.url", _s(v.get("url"))))
+    for where, items in (("links", card.get("links")), ("needs.look", needs.get("look"))):
+        for x in _items(items):
+            if isinstance(x, dict) and x.get("kind") != "image" and is_download(x.get("url")):
+                misplaced.append((where, _s(x.get("url"))))
+    if misplaced:
+        where, url = misplaced[0]
+        out.append(f"{where} is a file to download ({url}), not a page to try: \"Try it\" and \"Open\" "
+                   "show nothing for it. Hand files over as type \"deliverable\" with \"deliverable\": "
+                   "{\"kind\": \"download\", \"title\": \"…\", \"files\": [{\"label\": \"what it is\", "
+                   "\"url\": \"/static/scratch/<name>\", \"size\": \"3.4 MB\"}]}: the card draws a "
+                   "Download button per file. No validate row and no file links for them.")
+    d = card.get("deliverable") if isinstance(card.get("deliverable"), dict) else {}
+    files = d.get("files")
+    if files is not None:
+        if not isinstance(files, list) or not files:
+            out.append("\"deliverable.files\" is a list of {\"label\", \"url\", \"size\"}.")
+        else:
+            for i, f in enumerate(files):
+                f = f if isinstance(f, dict) else {}
+                if not _s(f.get("label")):
+                    out.append(f"deliverable.files[{i}] needs \"label\": what the file is, in plain words.")
+                if not _SERVED_URL.match(_s(f.get("url")).strip()):
+                    out.append(f"deliverable.files[{i}].url ({_s(f.get('url')) or 'empty'}) must be an "
+                               "address the browser can download from: put the file in static/scratch/ "
+                               "(not published) and give \"/static/scratch/<name>\", or a web address. "
+                               "A path on disk downloads nothing, on the phone least of all.")
+    return out
+
 
 # ── Layer 1: the format ───────────────────────────────────────────────────
 
@@ -557,8 +613,9 @@ def format_problems(card: dict) -> list[str]:
                        + ". Fix it, whoever caused it, or use \"blocked\".")
     if t == "deliverable":
         d = card.get("deliverable")
-        if not isinstance(d, dict) or not _s(d.get("body")):
-            out.append("A \"deliverable\" card needs \"deliverable.body\": the text itself.")
+        if not isinstance(d, dict) or not (_s(d.get("body")) or _items(d.get("files"))):
+            out.append("A \"deliverable\" card needs \"deliverable.body\" (the text itself) or "
+                       "\"deliverable.files\" (the files to download).")
         elif _s(d.get("format")) and _s(d.get("format")).lower() not in DELIVERABLE_FORMATS:
             out.append("\"deliverable.format\" is \"markdown\", \"html\" or \"text\".")
     if t == "explain" and not (_s(card.get("answer")) or isinstance(card.get("compare"), dict)):
@@ -846,6 +903,8 @@ when it is long). Never a Decide card, even if you have something to offer, \
 with one exception: mockups of something he asked for are on screen. Then \
 it is a decision with a reply per variant, and the answer goes in "answer".
 - He asked for a text (an email, notes, a plan) → "deliverable".
+- He asked for a file (a download, a zip, a PDF, a deck) → "deliverable" \
+with "files".
 - He gave an order, and it is finished and checked → "done".
 - He gave an order, and a choice that only he can make blocks it → \
 "needs_you" with needs.kind "decision", tied to that order in "asks" (state \
@@ -886,13 +945,18 @@ preview; such a card is sent back.
 - working: idle on purpose while YOUR background work runs. needs.eta is required.
 - blocked: something outside your control stops you. Add "tried": [...] and \
 say in needs.why exactly what blocks you.
-- deliverable: the point was a piece of text. Put it in "deliverable": \
+- deliverable: the point was a piece of text, or files to download. Put \
+it in "deliverable": \
 {"kind": "email|notes|report|…", "title": "…", "body": "the text, in \
 markdown (## headings, - lists, **bold**)"}. Optional "meta" is an object \
 of labelled lines, e.g. {"To": "…", "Subject": "…"}; leave it out otherwise. \
 Optional "format": "markdown" (the default), "html" (a whole page, drawn \
 as a web page; no scripts run) or "text" (plain text, shown as written); \
-the user opens it full screen with a Copy button.
+the user opens it full screen with a Copy button. Files to download (a zip, \
+a PDF, a deck) go in "files": [{"label": "what it is", "url": \
+"/static/scratch/<name>", "size": "3.4 MB"}], drawn as Download buttons; \
+"body" is then optional. Never hand a file over as a Validate row or a \
+link: such a card is sent back.
 - explain: an answer to a question, in "answer" (or a "compare" block).
 When earlier work in this session is still unfinished and this card is \
 about something else, add "back_to": {"label": "that work, in a few words", \
@@ -980,7 +1044,8 @@ def review(message: str, facts=None) -> Optional[str]:
     if err:
         return ("Smart termination: " + err + " End every turn with one ```" + FENCE_LANG
                 + " card as the last thing in your message.\n\n" + INSTRUCTIONS)
-    problems = format_problems(card) + length_problems(card) + machinery_problems(card)
+    problems = (format_problems(card) + download_problems(card) + length_problems(card)
+                + machinery_problems(card))
     hits = _checks(card, prose)
     labels = label_problems(card, prose)
     from daemon import handoff_evidence

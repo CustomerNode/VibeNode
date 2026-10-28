@@ -244,6 +244,16 @@ def build_commit_message(summary: str, gate, staged_paths) -> str:
 # Git sync logic
 # ---------------------------------------------------------------------------
 
+def _unmerged_paths(proj) -> list:
+    """Files git still marks as conflicted (unmerged), e.g. after a stash pop clash."""
+    try:
+        r = subprocess.run(["git", "-C", str(proj), "diff", "--name-only", "--diff-filter=U"],
+                           capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW)
+    except Exception:
+        return []
+    return [p for p in r.stdout.splitlines() if p.strip()] if r.returncode == 0 else []
+
+
 def do_git_sync(action: str, confirm_branch: bool = False,
                 summary: str = "", gate=None) -> dict:
     """
@@ -309,8 +319,20 @@ def do_git_sync(action: str, confirm_branch: bool = False,
         else:
             out = pull.stdout.strip()
         if stashed:
-            subprocess.run(["git", "-C", str(proj), "stash", "pop"],
-                          capture_output=True, creationflags=_NO_WINDOW)
+            pop = subprocess.run(["git", "-C", str(proj), "stash", "pop"],
+                                 capture_output=True, text=True, creationflags=_NO_WINDOW)
+            # A pop that clashes with the pulled code leaves conflict markers in
+            # the working tree and the stash in place. Carrying on would let the
+            # push step `git add -A` and publish the markers (2026-10-28: it left
+            # app/git_scanner.py with <<<<<<< lines; only a scan finding stopped
+            # the push). Stop here; nothing is lost, the stash is still there.
+            clashed = _unmerged_paths(proj)
+            if pop.returncode != 0 or clashed:
+                where = ", ".join(clashed) if clashed else (pop.stderr or pop.stdout or "").strip()
+                return {"ok": False, "messages": messages + [
+                    "Pulled the update, but your local changes clashed with it in: " + where + ".",
+                    "Nothing was published. Your changes are kept (git stash); resolve the clash, then Update again.",
+                ], "conflicts": clashed}
         if "Already up to date" in out:
             messages.append("VibeNode is already up to date.")
         else:
@@ -330,6 +352,15 @@ def do_git_sync(action: str, confirm_branch: bool = False,
                                 "features may not work until it is fixed. See the pip output below.")
 
     if action in ("push", "both") and ok:
+        # A clash left over from an earlier run is never committed: `git add -A`
+        # would mark it resolved and publish the conflict markers.
+        clashed = _unmerged_paths(proj)
+        if clashed:
+            return {"ok": False, "messages": messages + [
+                "⛔ Not published: unresolved clash in " + ", ".join(clashed) + ".",
+                "Resolve it, then Update again.",
+            ], "conflicts": clashed}
+
         # ── Security scan before push ──
         from .git_scanner import scan_staged_files
         scan = scan_staged_files(proj)

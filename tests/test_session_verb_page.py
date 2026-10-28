@@ -8,6 +8,13 @@ from ``/api/sessions`` with ``next_step`` (the last message's handoff card,
 "Active first" order, live changes repainting one card, the funnel's "Needs
 you" filter, the list-mode icons, and the terminating workflow: a stopped
 session is never Idle, Accept sleeps it and it shows Done.
+
+Drawn statuses are the three groups (owner's pick B, 2026-10-28,
+static/scratch/status-merge.html): Needs you / Working / Done (plus Standby).
+The fine verb (Decide, Review, ...) is kept in ``SessionVerb.display()``, the
+"Active first" rank and the hover title.  Sidebar cards carry no answer
+buttons (owner, 2026-10-27) and the "Is this right?" strip under the reply is
+never mounted (owner, 2026-10-27: "NO SECOND PANEL").
 """
 
 from __future__ import annotations
@@ -24,6 +31,9 @@ XDIST_SPLITTABLE = True
 LABELS = """() => Object.fromEntries([...document.querySelectorAll('#workforce-grid .wf-card')]
   .map(c => [c.dataset.sid, c.querySelector('.wf-status-label').textContent]))"""
 ORDER = "() => [...document.querySelectorAll('#workforce-grid .wf-card')].map(c => c.dataset.sid)"
+VERBS = "(ids) => Object.fromEntries(ids.map(i => [i, SessionVerb.display(i)]))"
+# The hold a verdict saves (app/session_holds.py); the page checks the reply.
+HOLD_OK = {"/api/session-hold/": lambda r: (200, {"ok": True})}
 
 
 @pytest.fixture(scope="module")
@@ -47,7 +57,8 @@ def _app(browser, mode, sort_js):
     ids = [x["id"] for x in s]
     unread = json.dumps([ids[2], ids[3], ids[5]])
     a = FakeApp(browser, s, init=init_script("sessions", mode,
-                f"localStorage.setItem('vn_unread_sessions', '{unread}'); {sort_js}"))
+                f"localStorage.setItem('vn_unread_sessions', '{unread}'); {sort_js}"),
+                extra_routes=HOLD_OK)
     a.push_many("session_state", [{"session_id": i, "state": "idle", "cwd": CWD} for i in ids[:6]])
     a.page.wait_for_timeout(600)
     return a, ids
@@ -61,18 +72,20 @@ def _card(sid):
 def test_cards_say_what_you_have_to_do(browser):
     app, ids = _app(browser, "grid", "localStorage.setItem('wfSort', 'status');")
     try:
-        # A stopped session is never "Idle": no card means Review.  Opening it
+        # Every move that is yours is drawn as one status, "Needs you".  A
+        # stopped session is never "Idle": no card means Review.  Opening it
         # (the unread flag) changes nothing.  Asleep with a decision: Decide.
-        assert app.eval(LABELS) == {
-            ids[0]: "Decide", ids[1]: "Unblock", ids[2]: "Review", ids[3]: "Send",
-            ids[4]: "Review", ids[5]: "Review", ids[6]: "Decide"}
-        assert app.eval(f"() => document.querySelector('{_card(ids[1])}').classList.contains('vs-unblock')")
-        assert app.eval(f"() => !!document.querySelector('{_card(ids[0])} .wf-avatar svg.vs-ic.vs-decide')")
+        assert app.eval(LABELS) == {i: "Needs you" for i in ids}
+        assert app.eval(VERBS, ids) == {
+            ids[0]: "decide", ids[1]: "unblock", ids[2]: "review", ids[3]: "send",
+            ids[4]: "review", ids[5]: "review", ids[6]: "decide"}
+        assert app.eval(f"() => document.querySelector('{_card(ids[1])}').classList.contains('vs-needs')")
+        assert app.eval(f"() => !!document.querySelector('{_card(ids[0])} .wf-avatar svg.vs-ic.vs-needs')")
         # Active first: can't-go-on, then your verdict, newest first within.
         assert app.eval(ORDER) == [ids[0], ids[1], ids[6], ids[2], ids[3], ids[4], ids[5]]
-        # Review / Send cards carry the verdict in place of the date; Decide does not.
-        assert app.eval(f"() => document.querySelector('{_card(ids[3])} .vs-verdict .vs-ok').textContent") == "✓ Sent it"
-        assert app.eval(f"() => !document.querySelector('{_card(ids[0])} .vs-verdict')")
+        # No answer buttons on a sidebar card; every card keeps its date line.
+        assert app.eval("() => document.querySelectorAll('#workforce-grid .vs-verdict').length") == 0
+        assert app.eval(f"() => !!document.querySelector('{_card(ids[3])} .wf-meta')")
 
         # You answered session 0: it works again.
         app.push("session_entry", {"session_id": ids[0], "index": 9, "entry": {"kind": "user", "text": "go with C"}})
@@ -88,15 +101,14 @@ def test_cards_say_what_you_have_to_do(browser):
         app.eval(f"() => clearSessionUnread('{ids[2]}')")
         app.page.wait_for_timeout(600)
         got = app.eval(LABELS)
-        assert got[ids[0]] == "Working"
-        assert got[ids[4]] == "Unblock"
-        assert got[ids[3]] == "Waiting"
-        assert got[ids[2]] == "Review"
-        # Session 3's buttons went with its Review: the date line is back.
-        assert app.eval(f"() => !document.querySelector('{_card(ids[3])} .vs-verdict') && !!document.querySelector('{_card(ids[3])} .wf-meta')")
+        verbs = app.eval(VERBS, ids)
+        assert (got[ids[0]], verbs[ids[0]]) == ("Working", "working")
+        assert (got[ids[4]], verbs[ids[4]]) == ("Needs you", "unblock")
+        assert (got[ids[3]], verbs[ids[3]]) == ("Working", "waiting")    # its move: it continues by itself
+        assert (got[ids[2]], verbs[ids[2]]) == ("Needs you", "review")
 
-        # Accept on session 5's card: it sleeps (close_session) and shows Done.
-        app.eval(f"() => document.querySelector('{_card(ids[5])} .vs-verdict .vs-ok').click()")
+        # Accept on session 5: it sleeps (close_session) and shows Done.
+        app.eval(f"() => SessionVerdict.accept('{ids[5]}')")
         app.page.wait_for_timeout(400)
         assert app.eval(LABELS)[ids[5]] == "Done"
         assert ["close_session", {"session_id": ids[5]}] in app.eval("() => window.__emits")
@@ -121,13 +133,13 @@ def test_list_rows_carry_the_icon_and_no_unread_dot(browser):
     app, ids = _app(browser, "list", "")
     try:
         row = lambda sid: f"#session-list .session-item[data-sid=\"{sid}\"]"
-        assert app.eval(f"() => !!document.querySelector('{row(ids[0])} svg.vs-ic.vs-decide')")
-        assert app.eval(f"() => !!document.querySelector('{row(ids[5])} svg.vs-ic.vs-review')")
+        assert app.eval(f"() => !!document.querySelector('{row(ids[0])} svg.vs-ic.vs-needs')")
+        assert app.eval(f"() => !!document.querySelector('{row(ids[5])} svg.vs-ic.vs-needs')")
         assert app.eval(f"() => document.querySelector('{row(ids[0])}').classList.contains('vs-row-yours')")
         assert app.eval("() => document.querySelectorAll('#session-list .vs-row-idle').length") == 0
         # The ask is the icon's tooltip.
         assert app.eval(f"() => document.querySelector('{row(ids[1])} svg.vs-ic title').textContent") == \
-            "Unblock: Log the GitHub CLI in"
+            "Needs you: Log the GitHub CLI in"
         # Review / Read / Send say "unread" themselves: the dot is not drawn beside them.
         dots = app.eval("""() => [...document.querySelectorAll('#session-list .unread-dot')]
             .filter(d => getComputedStyle(d).display !== 'none').length""")
@@ -142,41 +154,28 @@ def test_list_rows_carry_the_icon_and_no_unread_dot(browser):
 
 @pytest.mark.slow
 def test_open_session_asks_is_this_right(browser):
-    """The verdict at the end of the open thread: Send back points the composer
-    at what's wrong, the strip leaves while it works, Accept sleeps it."""
+    """No second panel under the reply (owner, 2026-10-27): the "Is this
+    right?" strip is never mounted.  Accept (the end-of-turn card's Done)
+    still sleeps the open session."""
     s = fake_sessions(2)
     ids = [x["id"] for x in s]
-    app = FakeApp(browser, s, init=init_script("sessions", "grid"),
-                  extra_routes={"/api/session/": lambda r: (200, {"id": ids[0], "display_title": "T", "messages": []})})
+    routes = {"/api/session/": lambda r: (200, {"id": ids[0], "display_title": "T", "messages": []}), **HOLD_OK}
+    app = FakeApp(browser, s, init=init_script("sessions", "grid"), extra_routes=routes)
     try:
         app.push_many("session_state", [{"session_id": i, "state": "idle", "cwd": CWD} for i in ids])
         app.eval(f"() => openInGUI('{ids[0]}')")
         app.page.wait_for_function(f"typeof liveSessionId !== 'undefined' && liveSessionId === '{ids[0]}'", timeout=10000)
         app.push("session_log", {"session_id": ids[0], "total": 2, "offset": 0, "has_more": False, "entries": [
             {"kind": "user", "text": "build it"}, {"kind": "asst", "text": "Built it. Tests pass."}]})
-        app.page.wait_for_function("!!document.querySelector('#live-log > .vs-verdict-strip')", timeout=5000)
-        # After the last message, before the thread's own jump button / sentinel; and it stays put.
-        assert app.eval("""() => { const s = document.querySelector('#live-log > .vs-verdict-strip');
-            const p = s.previousElementSibling; return !!p && p.classList.contains('msg'); }""")
-        app.eval("() => { window.__muts = 0; new MutationObserver(m => window.__muts += m.length).observe(document.getElementById('live-log'), {childList: true}); }")
+        app.page.wait_for_function("!!document.querySelector('#live-log .msg')", timeout=5000)
         app.page.wait_for_timeout(600)
-        assert app.eval("() => window.__muts") == 0
+        assert app.eval(f"() => SessionVerb.display('{ids[0]}')") == "review"
+        assert app.eval("() => !document.querySelector('#live-log .vs-verdict-strip')")
 
-        app.eval("() => document.querySelector('#live-log > .vs-verdict-strip .vs-back').click()")
-        app.page.wait_for_timeout(300)
-        assert app.eval("() => { const t = document.getElementById('live-input-ta'); return [t.placeholder, document.activeElement === t]; }") == \
-            ["What’s wrong, and what do you want fixed?", True]
-
-        app.push("session_state", {"session_id": ids[0], "state": "working", "cwd": CWD})
-        app.page.wait_for_timeout(300)
-        assert app.eval("() => !document.querySelector('#live-log > .vs-verdict-strip')")
-
-        app.push("session_state", {"session_id": ids[0], "state": "idle", "cwd": CWD})
-        app.page.wait_for_function("!!document.querySelector('#live-log > .vs-verdict-strip')", timeout=5000)
-        app.eval("() => document.querySelector('#live-log > .vs-verdict-strip .vs-accept').click()")
+        app.eval(f"() => SessionVerdict.accept('{ids[0]}')")
         app.page.wait_for_timeout(400)
         assert ["close_session", {"session_id": ids[0]}] in app.eval("() => window.__emits")
-        assert app.eval("() => !document.querySelector('#live-log > .vs-verdict-strip')")
+        assert app.eval("() => !document.querySelector('#live-log .vs-verdict-strip')")
         assert not app.errors, app.errors
     finally:
         app.close()
@@ -184,8 +183,8 @@ def test_open_session_asks_is_this_right(browser):
 
 @pytest.mark.slow
 def test_new_session_has_no_verdict_and_done_is_grey(browser):
-    """A new session has nothing to judge: no "Is this right?" strip and no
-    Accept on its card until it replies.  Done looks like Sleeping always did:
+    """A new session has nothing to judge (its verb is ``idle``, drawn as
+    Needs you): no "Is this right?" strip and no Accept until it replies.  Done looks like Sleeping always did:
     grey label, greyed-out picture, the card not faded as a whole."""
     s = fake_sessions(2)
     ids = [x["id"] for x in s]
@@ -198,7 +197,7 @@ def test_new_session_has_no_verdict_and_done_is_grey(browser):
         assert app.eval(f"() => SessionVerb.display('{new_id}')") == "idle"
         assert app.eval("() => !document.querySelector('#live-log > .vs-verdict-strip')")
         card = _card(new_id)
-        assert app.eval(f"() => document.querySelector('{card} .wf-status-label').textContent") == "New"
+        assert app.eval(f"() => document.querySelector('{card} .wf-status-label').textContent") == "Needs you"
         assert app.eval(f"() => !document.querySelector('{card} .vs-verdict')")
 
         # Its first reply makes it Review, Accept and all.
