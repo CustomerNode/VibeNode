@@ -45,6 +45,7 @@ class TurnFacts:
     requests: list = field(default_factory=list)   # the user's messages in this task, oldest first
     complete: bool = True   # False when older entries were trimmed: "no evidence" can't be concluded
     prev_big: str = ""      # the "Big picture" line of the session's last card that ended a turn
+    prev_path: str = ""     # the first "path" step of that same card
     last_user: str = ""     # the user's latest message, whatever it is ("ok" included)
     history: list = field(default_factory=list)    # every request still in memory, oldest first
 
@@ -128,12 +129,12 @@ def facts_from_entries(entries: Iterable, *, trimmed: bool = False, max_requests
         if t and not t.startswith(_NOT_ASKED + ("Stop hook feedback",)):
             facts.last_user = t
             break
-    facts.prev_big = _prev_big(entries)
+    facts.prev_big, facts.prev_path = _prev_big(entries, with_path=True)
     facts.history = [clean_request(entries[i].text) for i in human][-60:]
     return facts
 
 
-def _prev_big(entries: list) -> str:
+def _prev_big(entries: list, with_path: bool = False):
     """The big-picture line of the last card that ended a turn.
 
     A card counts once the user's next message follows it; a card that was
@@ -141,6 +142,7 @@ def _prev_big(entries: list) -> str:
     (nothing follows yet) do not."""
     from daemon import handoff_rules  # local: handoff_rules imports this module
     found = ""
+    path0 = ""
     for i, e in enumerate(entries):
         if getattr(e, "kind", "") != "asst" or "```handoff" not in (getattr(e, "text", "") or ""):
             continue
@@ -152,7 +154,10 @@ def _prev_big(entries: list) -> str:
         z = card.get("zoom") if not err and isinstance(card, dict) else None
         if isinstance(z, dict) and isinstance(z.get("big"), str) and z["big"].strip():
             found = z["big"].strip()
-    return found
+        p = card.get("path") if not err and isinstance(card, dict) else None
+        if isinstance(p, list) and p and isinstance(p[0], str) and p[0].strip():
+            path0 = p[0].strip()
+    return (found, path0) if with_path else found
 
 
 # ── 1. Claims against actions ─────────────────────────────────────────────
@@ -637,15 +642,28 @@ def reviewer_problems(card: dict, facts: TurnFacts) -> list:
                        "state \"needs_you\", in his words. An idea or improvement you would like to "
                        "offer is not a decision; name it in needs.next.")
 
+    # The path's first step is where the thing lives; like the big picture it
+    # stays put unless his own words moved to a new topic (owner, 2026-10-28,
+    # static/scratch/card-title-crumb.html).
+    path = card.get("path") if isinstance(card.get("path"), list) else []
+    first = path[0].strip() if path and isinstance(path[0], str) else ""
+    prev_first = getattr(facts, "prev_path", "") or ""
+    if prev_first and first and first.lower() != prev_first.lower():
+        old_w, new_w = _stem(_words(prev_first)), _stem(_words(first))
+        if not new_w <= old_w and not (new_w - old_w) & _stem(_words(asked)):
+            out.append(f"\"path\" starts with \"{first}\" but this session's last summary started it with "
+                       f"\"{prev_first}\". The path's first step stays the same all session unless the user "
+                       "started a new topic; keep it, or add steps after it.")
+
     # When he asked something, the title names his question in words he
     # would recognise, not the fix.  Only then: a terse order ("add the
     # guard") leaves too few words to judge a title by.
     title = card.get("title") if isinstance(card.get("title"), str) else ""
     mine = _stem(_words(facts.last_user))
     if title.strip() and is_question(facts.last_user) and len(mine) >= 3 and \
-            not _stem(_words(title)) & (mine | _stem(_words(facts.prev_big))):
-        out.append(f"\"title\" (\"{title.strip()}\") shares no word with what the user asked or this "
-                   "session's big picture. Name his problem or question in his words, not the name of your fix.")
+            not (_stem(_words(title)) | _stem(_words(" ".join(x for x in path if isinstance(x, str))))) & (mine | _stem(_words(facts.prev_big))):
+        out.append(f"\"title\" (\"{title.strip()}\") and \"path\" share no word with what the user asked or "
+                   "this session's big picture. Name the thing his question is about, in his words.")
     return out
 
 

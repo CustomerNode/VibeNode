@@ -261,7 +261,7 @@ def _files_card(**d):
           "files": [{"label": "Offline presentation", "url": ZIP, "size": "3.4 MB"},
                     {"label": "PDF with speaker notes", "url": "/static/scratch/deck%20notes.pdf", "size": "4.6 MB"}]}
     dv.update(d)
-    return {"type": "deliverable", "title": "Presentation to download", "headline": "h", "context": "x",
+    return {"type": "deliverable", "title": "Presentation files", "path": ["Smart termination deck"], "headline": "h", "context": "x",
             "deliverable": dv, "needs": {"kind": "none", "why": "w", "next": "n"}}
 
 

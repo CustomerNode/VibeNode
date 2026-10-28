@@ -19,7 +19,7 @@ EXPLAINED = ("## What this is about\nOn a phone, the bar at the top of a chat sa
 
 
 def _card(**over):
-    c = {"type": "done", "title": "Phone header fixed", "headline": "The phone header no longer covers the chat",
+    c = {"type": "done", "title": "Phone header", "path": ["Chat view"], "headline": "The phone header no longer covers the chat",
          "context": "the header overlapping the chat on phones.",
          "status": {"done": ["Header fixed on desktop and phone"]},
          "verified": [{"check": "Phone-size screenshot", "result": "Header clears the chat", "ok": True}],

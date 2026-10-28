@@ -46,7 +46,7 @@ def facts(*parts, trimmed=False):
 
 DONE = {
     "type": "done",
-    "title": "Sort fix shipped",
+    "title": "Status sort", "path": ["Journey picker"],
     "headline": "CustomerNode's sort fix is in and the tests pass",
     "context": "the journey picker sorted by status in a strange order.",
     "did": [{"what": "Sorted status by the shown name", "why": "It sorted by the raw code before."}],

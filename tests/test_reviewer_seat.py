@@ -96,7 +96,7 @@ def test_the_bad_card_is_sent_back_for_all_four_reasons():
     out = " ".join(ev.reviewer_problems(BAD, _facts()))
     assert '"zoom.big" changed from' in out
     assert "The user asked a question" in out
-    assert '"title" ("Card rules load live") shares no word' in out
+    assert '"title" ("Card rules load live") and "path" share no word' in out
     reason = rules.review(_msg(BAD), _facts())
     assert reason and "implementer's seat" in reason and '"zoom.big" changed' in reason
 
@@ -319,3 +319,78 @@ def test_a_demo_pages_sample_data_is_not_variants(scratch):
     assert _hr._variant_keys("/static/scratch/card-back-to.html") == ["A", "B", "C"]
     c = {"type": "needs_you", "links": [{"label": "Demo", "url": "/static/scratch/standby-demo.html"}], "needs": {"kind": "approve"}}
     assert _hr.shows_variants(c) == [] and _hr.variants_pick_problem(c) is None
+
+
+# ── A choice named by its key (owner, 2026-10-28) ─────────────────────────
+# "got a dogshit title talking by variant name, should be illegal", on a done
+# card titled "Header A, more frustrated" with zoom.now "Header A drawn in full".
+
+def test_a_variant_named_by_its_key_is_sent_back():
+    card = {"type": "done", "title": "Header A, more frustrated",
+            "headline": "The article header now shows a bigger, overwhelmed person",
+            "zoom": {"big": "LinkedIn series", "task": "Draft the next article", "now": "Header A drawn in full"}}
+    out = " ".join(rules.variant_name_problems(card))
+    assert '"Header A" (title)' in out and '"Header A" (zoom.now)' in out
+    assert "Names a choice by its letter or number" in rules.review(_msg(card))
+
+
+def test_every_shape_of_a_key_where_he_skims():
+    for line in ["Layout 4 in the sidebar", "Built your pick B", "So A and B look different",
+                 "D without the big picture", "Locked in E", "Went with design A",
+                 "option 2 is live", "B or C for the header"]:
+        assert rules.variant_name_problems({"title": line}), line
+    # an explanation after the key does not excuse it in these lines
+    assert rules.variant_name_problems({"headline": "You picked option C (the darker header)"})
+
+
+def test_plain_words_and_idioms_pass():
+    for line in ["A clearer, more frustrated header", "A Bigger Person At The Desk",
+                 "Plan B for the release", "Vitamin C reminder", "Type A pages load", "Series A deck",
+                 "Fix the A/B test page", "C++ build fixed", "E-mail draft ready", "Opus 5.5 on every session",
+                 "Draft 16 is ready", "Step 3 of the release", "Python 3 only", "Header: a more frustrated person"]:
+        assert rules.variant_name_problems({"title": line, "headline": line}) == [], line
+
+
+def test_reply_labels_and_context_may_still_use_keys():
+    card = {"type": "needs_you", "title": "Pick the article's header",
+            "headline": "Pick a header for the LinkedIn article", "context": "Three sketches, A to C.",
+            "needs": {"kind": "decision", "ask": "Pick the header for the LinkedIn article",
+                      "replies": [{"key": "A", "label": "A: overwhelmed person"}]}}
+    assert rules.variant_name_problems(card) == []
+
+
+# ── The title names the thing; the path is the way to it (owner, 2026-10-28) ──
+# static/scratch/card-title-crumb.html: "the subtitle is the sentence ... the
+# title becomes the last crumb".
+
+def test_a_title_is_a_name_not_a_sentence():
+    for bad in ["Header A, more frustrated", "Decide popup: all on top", "Pick the article's header",
+                "Why Done still woke up", "Make the person in the image more frustrated"]:
+        assert rules.title_path_problems({"title": bad, "path": ["Article series"]}), bad
+    for good in ["Header image", "Session right-click menu", "Top bar", "Release 2.4", "Gen vs Validation Leverage"]:
+        assert rules.title_path_problems({"title": good, "path": ["Article series"]}) == [], good
+
+
+def test_every_card_needs_a_short_path_that_leads_to_the_title():
+    out = " ".join(rules.title_path_problems({"title": "Header image"}))
+    assert '"path" is missing' in out
+    assert rules.title_path_problems({"title": "Header image", "path": ["Article series", "Gen vs Validation Leverage"]}) == []
+    assert rules.title_path_problems({"title": "Top bar", "path": ["a", "b", "c", "d"]})          # too many steps
+    assert rules.title_path_problems({"title": "Top bar", "path": ["The popup that opens when you press Decide"]})
+    assert rules.title_path_problems({"title": "Top bar", "path": ["Decide popup", "Top bar"]})   # ends on the title
+    assert rules.variant_name_problems({"title": "Top bar", "path": ["Layout 4"]})
+
+
+def test_the_path_keeps_its_first_step_unless_he_moves_on():
+    earlier = dict(EARLIER, path=["Decide popup"], title="Motion")
+    entries = [E("user", "Make the decide popup transitions premium"), E("asst", _msg(earlier)),
+               E("user", "now the top bar")]
+    facts = ev.facts_from_entries(entries)
+    assert facts.prev_path == "Decide popup"
+    moved = dict(EARLIER, path=["Summary cards"], title="Top bar")
+    assert any('"path" starts with "Summary cards"' in p for p in ev.reviewer_problems(moved, facts))
+    kept = dict(EARLIER, path=["Decide popup"], title="Top bar")
+    assert not any('"path" starts with' in p for p in ev.reviewer_problems(kept, facts))
+    # his own words bring the new topic
+    entries[-1] = E("user", "switch to the summary cards now")
+    assert not any('"path" starts with' in p for p in ev.reviewer_problems(moved, ev.facts_from_entries(entries)))

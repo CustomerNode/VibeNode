@@ -592,11 +592,12 @@ def format_problems(card: dict) -> list[str]:
     # 2026-10-28: "a char limited title length with a subtitle").
     title = _s(card.get("title"))
     if not title:
-        out.append(f"\"title\" is empty: a few words, at most {MAX_TITLE_CHARS} characters, "
-                   "drawn big at the top of the card (\"Verdict buttons in Next\").")
+        out.append(f"\"title\" is empty: the thing itself, a short name, at most {MAX_TITLE_CHARS} "
+                   "characters, drawn big at the top of the card (\"Header image\").")
     elif len(title) > MAX_TITLE_CHARS:
         out.append(f"\"title\" is {len(title)} characters; the limit is {MAX_TITLE_CHARS}. "
-                   "Cut it to the few words that name the thing.")
+                   "Cut it to the name of the thing.")
+    out += title_path_problems(card)
     # A bare "cards" in the title: the app has sidebar cards, Workflow cards,
     # copy cards and these end-of-turn summaries.  "Cards say the problem
     # first" left the owner unsure which (2026-10-28).
@@ -606,7 +607,7 @@ def format_problems(card: dict) -> list[str]:
         if bare:
             out.append(f"\"title\" says \"{bare[0]}\" without saying which: VibeNode has sidebar cards, "
                        "Workflow cards and end-of-turn summaries. Name the one he sees, or what he "
-                       "gets: \"Cards say the problem first\" becomes \"Summaries now in your words\".")
+                       "gets: \"Cards\" becomes \"Summary card titles\".")
     if not _s(card.get("context")):
         out.append("\"context\" is empty: what we are working on, for someone who read nothing else.")
 
@@ -668,6 +669,12 @@ def format_problems(card: dict) -> list[str]:
             out.append("\"deliverable.format\" is \"markdown\", \"html\" or \"text\".")
     if t == "explain" and not (_s(card.get("answer")) or isinstance(card.get("compare"), dict)):
         out.append("An \"explain\" card needs \"answer\" (or a \"compare\" block).")
+    if "full_answer" in card:
+        if not _s(card.get("full_answer")):
+            out.append("\"full_answer\" is the detailed answer in markdown; leave it out rather than "
+                       "sending it empty.")
+        elif not _s(card.get("answer")):
+            out.append("\"full_answer\" is drawn under \"In short\": it needs \"answer\" (the short one) too.")
     if t == "working":
         if kind != "none":
             out.append("A \"working\" card has needs.kind \"none\". If the user must act, use \"needs_you\".")
@@ -771,6 +778,63 @@ _CARD_WORD = re.compile(r"\bcards?\b", re.I)
 _CARD_QUALIFIERS = {"sidebar", "session", "summary", "end-of-turn", "workflow", "task", "copy",
                     "compose", "section", "job", "decide", "credit", "gift", "business", "index"}
 MAX_LINE_WORDS = 25
+
+# The title names the thing and the path is the way to it; the headline says
+# what happened (owner, 2026-10-28, static/scratch/card-title-crumb.html:
+# "the subtitle is the sentence ... the title becomes the last crumb").  A
+# name cannot be a fragment, an order or a session nickname in disguise, and
+# all of it is checked by counting.
+MAX_TITLE_WORDS = 5
+MAX_PATH_STEPS = 3
+MAX_STEP_CHARS = 28
+MAX_STEP_WORDS = 4
+MAX_PATH_CHARS = 48
+_NAME_PUNCT = re.compile(r"[:;,!?]|(?<!\d)\.|\.(?!\d)")
+_NOT_A_NAME = re.compile(
+    r"^(?:pick|choose|make|fix|add|build|move|remove|catch|stop|use|ban|try|restart|reload|approve|confirm|"
+    r"give|send|write|tell|rename|draft|decide|check|why|how|what|which|when|where|who|should|can|could|"
+    r"does|do|did|is|are|was|were|will|would)\b", re.I)
+
+
+def title_path_problems(card: dict) -> list[str]:
+    out = []
+    title = _s(card.get("title"))
+    if title:
+        why = []
+        if len(title.split()) > MAX_TITLE_WORDS:
+            why.append(f"{len(title.split())} words (at most {MAX_TITLE_WORDS})")
+        if _NAME_PUNCT.search(title):
+            why.append(f"it has \"{_NAME_PUNCT.search(title).group(0)}\"")
+        m = _NOT_A_NAME.match(title)
+        if m:
+            why.append(f"it starts with \"{m.group(0)}\", so it reads as an order or a question")
+        if why:
+            out.append(f"\"title\" (\"{title}\") is not the name of a thing: " + "; ".join(why) + ". The "
+                       "title only names the thing (\"Header image\", \"Session right-click menu\"); the "
+                       "headline under it says what happened to it.")
+    path = card.get("path")
+    steps = [x.strip() for x in path if isinstance(x, str) and x.strip()] if isinstance(path, list) else []
+    if not steps:
+        out.append("\"path\" is missing: one to three short names leading to the thing the title names, "
+                   "broad to specific, drawn small above it. [\"Article series\", \"Gen vs Validation "
+                   "Leverage\"] above \"Header image\"; [\"Sidebar\"] above \"Session right-click menu\". "
+                   "Not the project: the app already shows it.")
+        return out
+    if len(steps) > MAX_PATH_STEPS:
+        out.append(f"\"path\" has {len(steps)} steps; at most {MAX_PATH_STEPS}. Keep the ones he needs to "
+                   "find the thing.")
+    bad = [x for x in steps if len(x) > MAX_STEP_CHARS or len(x.split()) > MAX_STEP_WORDS or _NAME_PUNCT.search(x)]
+    if bad:
+        out.append("\"path\" steps are short names (at most " + str(MAX_STEP_WORDS) + " words and "
+                   + str(MAX_STEP_CHARS) + " characters, no punctuation): " + ", ".join(f"\"{x}\"" for x in bad) + ".")
+    joined = " › ".join(steps)
+    if len(joined) > MAX_PATH_CHARS:
+        out.append(f"\"path\" runs {len(joined)} characters; at most {MAX_PATH_CHARS} so it fits one line "
+                   "on a phone. Shorten the steps.")
+    if title and steps[-1].lower() == title.lower():
+        out.append("\"path\" ends with the title itself; the path is the way TO it, the title is the last step.")
+    return out
+
 MAX_ANSWER_WORDS = 60
 MAX_LIST_ITEMS = 4
 # Lists that may run longer: the user's own requests, and link rows.
@@ -805,8 +869,10 @@ def length_problems(card: dict) -> list[str]:
     long_lines = []
     for where, text in _strings(card):
         # zoom: smart_termination.zoom_problems; explained: the "Explain more"
-        # text, long on purpose (smart_termination.explained_problems).
-        if where.startswith(("deliverable", "asks", "zoom", "explained")):
+        # text, long on purpose (smart_termination.explained_problems);
+        # full_answer: the "Full answer" under "In short", folded away and long
+        # on purpose (owner's pick A, 2026-10-28, static/scratch/answer-detail.html).
+        if where.startswith(("deliverable", "asks", "zoom", "explained", "full_answer")):
             continue
         n = _words(text)
         if _POPUP_ONLY.match(where):
@@ -851,14 +917,20 @@ _MACHINERY = re.compile(
     # the card's own field names: on screen they read Big picture / This
     # task / Just now (the owner, 2026-10-28, confused by "zoom lines capped")
     r"zoom(?:\s+lines?)?)\b", re.I)
-MACHINERY_FIELDS = ("title", "headline", "zoom.big", "zoom.task", "zoom.now", "needs.ask")
+MACHINERY_FIELDS = ("path", "title", "headline", "zoom.big", "zoom.task", "zoom.now", "needs.ask")
+
+
+def _path_text(card: dict) -> str:
+    p = card.get("path")
+    return " › ".join(x for x in p if isinstance(x, str)) if isinstance(p, list) else ""
 
 
 def machinery_problems(card: dict) -> list[str]:
     needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
     zoom = card.get("zoom") if isinstance(card.get("zoom"), dict) else {}
-    fields = {"title": card.get("title"), "headline": card.get("headline"), "zoom.big": zoom.get("big"),
-              "zoom.task": zoom.get("task"), "zoom.now": zoom.get("now"), "needs.ask": needs.get("ask")}
+    fields = {"path": _path_text(card), "title": card.get("title"), "headline": card.get("headline"),
+              "zoom.big": zoom.get("big"), "zoom.task": zoom.get("task"), "zoom.now": zoom.get("now"),
+              "needs.ask": needs.get("ask")}
     hits = []
     for where in MACHINERY_FIELDS:
         text = fields.get(where)
@@ -875,6 +947,60 @@ def machinery_problems(card: dict) -> list[str]:
             "headline, zoom lines and ask say what the user sees, asked or gets, in his words; the "
             "machinery goes in context or links. \"Card rules load live\" becomes \"Why my card "
             "skipped the title rule\"."]
+
+
+# A choice named by its key where the user skims (owner, 2026-10-28, on a done
+# card titled "Header A, more frustrated": "got a dogshit title talking by
+# variant name, should be illegal").  The key ("A", "Layout 4") meant
+# something on a mockup page hours ago; read between ten other sessions it
+# names nothing.  Unlike _LABEL, an explanation after it does not excuse it:
+# these lines have no room for one, so they name the thing itself.
+# Two forms:
+#  - any word followed by a lone capital A-H ("Header A", "your pick B",
+#    "B or C"), minus idioms ("Plan B", "Vitamin C", "Type A", "Series A").
+#    "A" is also the article: in a Title Case title the next word is
+#    capitalised ("A Bigger Person"), so "A" only counts when the next word is
+#    lowercase, punctuation or the end ("Header A drawn", "Header A,").
+#  - a variant noun followed by a number ("Layout 4", "option 2").
+_VARIANT_NOUNS = (r"option|options|variant|variants|choice|design|layout|mockup|mock-up|sketch|"
+                  r"pick|idea|approach|concept|proposal|alternative|candidate|style|direction|"
+                  r"treatment|take")
+_VARIANT_IDIOMS = {"plan", "vitamin", "type", "series", "class", "grade", "hepatitis", "section",
+                   "schedule", "form", "exhibit", "appendix", "annex", "model", "drive", "size"}
+_VARIANT_KEY = re.compile(
+    r"(?<![\w/+#.-])(?:(?P<word>[A-Za-z][\w'-]*)\s+)"
+    r"(?P<key>A(?=\s*$|\s*[,.;:!?)—–]|\s+[a-z])|[B-H](?![\w/+#'-]))"
+    # a line that opens on the key ("D without the big picture"); a leading
+    # "A" is the article ("A clearer header") and is left alone
+    r"|^\s*[B-H](?![\w/+#'.-])"
+    r"|\b(?i:" + _VARIANT_NOUNS + r")\s+#?\d{1,2}\b(?!\.\d)"
+)
+VARIANT_FIELDS = MACHINERY_FIELDS
+
+
+def variant_name_problems(card: dict) -> list[str]:
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    zoom = card.get("zoom") if isinstance(card.get("zoom"), dict) else {}
+    fields = {"path": _path_text(card), "title": card.get("title"), "headline": card.get("headline"),
+              "zoom.big": zoom.get("big"), "zoom.task": zoom.get("task"), "zoom.now": zoom.get("now"),
+              "needs.ask": needs.get("ask")}
+    hits = []
+    for where in VARIANT_FIELDS:
+        text = fields.get(where)
+        if not isinstance(text, str):
+            continue
+        for m in _VARIANT_KEY.finditer(_norm(text)):
+            word = (m.group("word") or "").lower()
+            if word in _VARIANT_IDIOMS:
+                continue
+            hits.append(f"\"{m.group(0).strip()}\" ({where})")
+    if not hits:
+        return []
+    return ["Names a choice by its letter or number: " + ", ".join(dict.fromkeys(hits)) + ". The "
+            "path, title, headline, zoom lines and ask never call a variant by its key, even with an "
+            "explanation after it: the user no longer has the options in front of him. Name what "
+            "it is: \"Header A, more frustrated\" becomes the title \"Header image\" with the headline "
+            "\"The person in the header image is now more frustrated\"."]
 
 
 # ── Layer 2: banned phrases by type ───────────────────────────────────────
@@ -935,8 +1061,9 @@ has read nothing else in this session.
 
 ```handoff
 {"type": "done | needs_you | working | blocked | deliverable | explain",
- "title": "a few words, at most 32 characters, drawn big",
- "headline": "one sentence under the title: what happened",
+ "path": ["the way to the thing, broad to specific", "..."],
+ "title": "the thing itself, a short name, drawn big",
+ "headline": "one sentence under the title: what happened to it",
  "context": "what we are working on, in plain words",
  "status": {"done": ["..."], "remaining": ["..."], "broken": ["..."]},
  "verified": [{"check": "...", "result": "...", "ok": true}],
@@ -1013,16 +1140,38 @@ a PDF, a deck) go in "files": [{"label": "what it is", "url": \
 "/static/scratch/<name>", "size": "3.4 MB"}], drawn as Download buttons; \
 "body" is then optional. Never hand a file over as a Validate row or a \
 link: such a card is sent back.
-- explain: an answer to a question, in "answer" (or a "compare" block).
+- explain: an answer to a question, in "answer" (or a "compare" block). \
+When there is reasoning, evidence or examples behind it (most answers), add \
+"full_answer": the detailed answer in markdown (## headings, - lists, \
+tables), no length limit, drawn folded under "In short" as "Full answer". \
+"answer" stays the short version; "explained" stays the whole card for \
+someone lost.
 When earlier work in this session is still unfinished and this card is \
 about something else, add "back_to": {"label": "that work, in a few words", \
 "status": "where it stands", "reply": "the message to send to resume it"}. \
 The card draws it as a "Left waiting" strip with a Back to it button; do \
 not also put it in needs.next.
 
-The title is the card's name, drawn big at the top: a few words, at most \
-32 characters ("Verdict buttons in Next", "Pick a release day"). It may \
-leave out the project; the headline under it may not.
+Name the thing, then say what happened to it. Picture him switching in \
+with no memory of this session: "path" and "title" tell him WHERE, the \
+headline tells him WHAT. The app already shows the project, so neither \
+names it.
+- "title" is the thing itself, a short name drawn big: at most 5 words and at most \
+32 characters, no verb needed, no ":" "," ";" "." "?" "!" ("Header image", \
+"Session right-click menu", "Top bar"). Never a sentence, an order, a \
+question or a fragment ("A more frustrated person", "Pick a header", "Why \
+Done woke up").
+- "path" is the way to it, one to three short names from broad to specific, \
+drawn small above the title: ["Article series", "Gen vs Validation \
+Leverage"] above "Header image"; ["Sidebar"] above "Session right-click \
+menu". Use names he would recognise: his own words, an area of the app, a \
+document's title. Never the project, a choice letter or a name you made up. \
+Keep its first step the same all session unless his message starts a new \
+topic.
+- The headline is the sentence: what happened to the thing, or what he \
+must do about it.
+Never name a choice by its letter or number in the path, title, headline, \
+zoom lines or ask ("Header A", "Layout 4", "your pick B"): say what it is.
 
 The headline and needs.ask are shown ON THEIR OWN (sidebar, Needs you list, \
 notifications) to a user working across many sessions. Each must make sense \
@@ -1048,8 +1197,8 @@ three lines on the phone; now one or two". The title is his report, not \
 yours: what he gets, named so he knows which thing without reading on \
 ("Summaries now in your words", not "Cards say the problem first").
 
-Keep it SHORT. The whole card is at most 120 words (the deliverable and \
-"asks" don't count): headline at most 20 words, any other line at most 25, \
+Keep it SHORT. The whole card is at most 120 words (the deliverable, \
+"full_answer" and "asks" don't count): headline at most 20 words, any other line at most 25, \
 an explain answer at most 60, and at most 4 items in any list. Say what \
 happened, where it stands and what the user must do; leave out background \
 and explanation. A longer card is sent back. Long text the user asked for \
@@ -1101,7 +1250,7 @@ def review(message: str, facts=None) -> Optional[str]:
         return ("Smart termination: " + err + " End every turn with one ```" + FENCE_LANG
                 + " card as the last thing in your message.\n\n" + INSTRUCTIONS)
     problems = (format_problems(card) + download_problems(card) + length_problems(card)
-                + machinery_problems(card))
+                + machinery_problems(card) + variant_name_problems(card))
     hits = _checks(card, prose)
     labels = label_problems(card, prose)
     from daemon import handoff_evidence

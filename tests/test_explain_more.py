@@ -53,11 +53,12 @@ def out():
     return json.loads(r.stdout)
 
 
-def test_explain_more_sits_under_the_zoom_lines(out):
+def test_explain_more_sits_under_the_sentence_and_history_at_the_bottom(out):
+    # The This task / Just now lines moved into a Session history section at
+    # the bottom of the card (owner, 2026-10-28, card-title-crumb.html);
+    # Explain more stays at the top, right under the sentence.
     h = out["zoomed"]
-    zoom = h[h.index('<div class="lm-zoom">'):]
-    # inside the zoom block, after "Just now"
-    assert zoom.index("Just now") < zoom.index('class="lm-xpl-tg"')
+    assert h.index('class="lm-subtitle"') < h.index('class="lm-xpl-tg"') < h.index(">History<") < h.index("Just now")
     assert ">Explain more <span class=\"tg\">" in h
     # the long text is markdown, closed until tapped
     assert "<h4>What this is about</h4>" in h and "<b>deliverable</b>" in h

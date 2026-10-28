@@ -897,3 +897,52 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
 .lm.skim .lm-xpl .lm-xpl-in > h3:first-child, .lm.skim .lm-xpl .lm-xpl-in > h4:first-child, .lm.skim .lm-xpl .lm-xpl-in > h5:first-child { margin-top: 0; }
 .lm-xpl-in p { margin: 0 0 6px; }
 @media (prefers-reduced-motion: reduce) { .lm-xpl-body, .lm-xpl-tg .tg { transition: none; } }
+/* "Full answer" folded under "In short" (owner's pick A, 2026-10-28) */
+.lm-xpl.lm-fullans { margin-top: 10px; }
+.lm-xpl-in ul, .lm-xpl-in ol { padding-left: 1.3em; }
+
+/* ── The title is the last step of a path; This task / Just now move to a
+   Session history section at the bottom (owner, 2026-10-28,
+   static/scratch/card-title-crumb.html). ── */
+.lm.skim .lm-path { display: flex; align-items: baseline; gap: 6px; min-width: 0; margin: 2px 0 1px; font-size: 12.5px; line-height: 1.45; color: var(--text-secondary); white-space: nowrap; }
+.lm.skim .lm-path .s { overflow: hidden; text-overflow: ellipsis; min-width: 1.5em; flex: 0 1 auto; }
+.lm.skim .lm-path .sep { flex: none; color: var(--text-faint); }
+.lm.skim .lm-hist .lm-zoom { padding: 0; border-bottom: 0; }
+.lm.skim .lm-hist .lm-zoom .r:first-child { padding-top: 0; }
+@media (max-width: 640px) { .lm.skim .lm-hist .lm-zoom { padding: 0; } }
+
+/* Validate: Try it OR See it, two tiles side by side (owner's pick B,
+   2026-10-28, static/scratch/validate-or.html).  Stacks on a phone. */
+.lm .lm-vpair { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 8px; align-items: stretch; }
+.lm .lm-vpair .vt { all: unset; box-sizing: border-box; cursor: pointer; display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 12px;
+  border-radius: 8px; border: 1px solid rgba(var(--bt), .14); background: var(--bg-body); transition: border-color .1s, background .1s; }
+[data-theme="light"] .lm .lm-vpair .vt { background: #fff; }
+.lm .lm-vpair div.vt { cursor: default; }
+.lm .lm-vpair .vt:hover { border-color: rgba(var(--bt), .32); background: rgba(var(--bt), .035); }
+.lm .lm-vpair div.vt:hover { border-color: rgba(var(--bt), .14); background: var(--bg-body); }
+.lm .lm-vpair .vt:focus-visible { outline: 2px solid rgba(var(--tone), .8); outline-offset: 1px; }
+.lm .lm-vpair .vt-h { display: flex; align-items: center; gap: 7px; font-size: 13.5px; font-weight: 700; color: var(--text-heading); }
+.lm .lm-vpair .vt-d { font-size: 12.5px; line-height: 1.45; color: var(--text-muted); }
+.lm .lm-vpair .vt-pic { all: unset; box-sizing: border-box; cursor: pointer; display: block; height: 74px; border-radius: 5px; overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(var(--bt), .18); }
+.lm .lm-vpair .vt-pic img, .lm .lm-vpair .vt-thumb img { width: 100%; height: 100%; object-fit: cover; object-position: top; display: block; }
+.lm .lm-vpair .vt-more { display: flex; gap: 6px; flex-wrap: wrap; }
+.lm .lm-vpair .vt-thumb { all: unset; box-sizing: border-box; cursor: pointer; width: 46px; height: 30px; border-radius: 4px; overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(var(--bt), .2); }
+.lm .lm-vpair .vt-pic:hover, .lm .lm-vpair .vt-thumb:hover { box-shadow: inset 0 0 0 1px rgba(var(--bt), .45); }
+.lm .lm-vpair .vt-act { margin-top: auto; display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; letter-spacing: .07em;
+  text-transform: uppercase; color: var(--accent, #6aa9ff); }
+.lm .lm-vpair .vt-or { display: flex; align-items: center; justify-content: center; }
+.lm .lm-vpair .vt-or span { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; font-size: 10.5px; font-weight: 800;
+  letter-spacing: .04em; color: var(--text-muted); border: 1px solid rgba(var(--bt), .16); }
+@media (max-width: 520px) {
+  .lm .lm-vpair { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .lm .lm-vpair .vt-or span { width: auto; height: auto; border: 0; padding: 0; }
+}
+
+/* The big bold title's first letter carries ~2px of side space at 24px, so its
+   ink started right of the path and the sentence (owner, 2026-10-28: "i hate
+   how the left of the title subtitle and crumbs dont align").  Pull it back. */
+.lm.skim .lm-head h3.lm-title.lm-headline.stem { margin-left: -.095em; }   /* only titles opening on a straight stem: H R D B E… (T, W, A have no gap) */
+/* Explain more sits inside the top block, under the sentence, no rule above. */
+.lm.skim .lm-head .lm-xpl { margin-top: 10px; }

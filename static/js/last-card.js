@@ -403,15 +403,6 @@
     if (ti) h += '<div class="lm-stick" aria-hidden="true"><div class="in"><b>' + inl(ti) + '</b>' + (jl ? '<button type="button" class="jump" tabindex="-1">' + esc(jl) +
       ' <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"><path d="M12 5v14M6 13l6 6 6-6"/></svg></button>'
       : '<span class="st">' + t.icon + esc(m.pill || t.label) + '</span>') + '</div></div>';
-    h += '<div class="lm-head"><div class="lm-pillrow"><span class="lm-pill">' + t.icon + esc(m.pill || t.label) + '</span>' + (opts.when ? '<span class="lm-when">' + esc(opts.when) + '</span>' : '') + '</div>' +
-      (ti ? '<h3 class="lm-headline lm-title">' + inl(ti) + '</h3><p class="lm-subtitle">' + inl(m.headline) + '</p>'
-          : '<h3 class="lm-headline">' + inl(m.headline) + '</h3>' + (m.context ? '<p class="lm-context"><b>Working on</b> ' + inl(m.context) + '</p>' : '')) + '</div>';
-    // Big picture / this task / just now: three lines under the title (the
-    // owner's pick, 2026-10-28, static/scratch/card-zoom.html option A), drawn
-    // as a nested dial ladder with the label on the same line
-    // (static/scratch/zoom-icons.html option J).  The dial's filled part says
-    // how far zoomed in the line is: outer ring, inner ring, centre dot.
-    const zm = (m.zoom && typeof m.zoom === 'object') ? m.zoom : null;
     // "Explain more": the same card written out in plain words with no length
     // limit, for when the short card is not enough (owner's pick B of
     // static/scratch/card-lost.html, 2026-10-28): under the This task / Just
@@ -419,12 +410,34 @@
     const ex = typeof m.explained === 'string' && m.explained.trim() ? m.explained.trim() : '';
     const exH = ex ? '<div class="lm-xpl"><button type="button" class="lm-xpl-tg" aria-expanded="false">Explain more <span class="tg">▾</span></button>' +
       '<div class="lm-xpl-body"><div><div class="lm-xpl-in">' + dvBodyHtml('markdown', ex) + '</div></div></div></div>' : '';
+    // The way to the thing the title names (owner, 2026-10-28,
+    // static/scratch/card-title-crumb.html): the title is the last step of
+    // the path, so the small line above it holds the steps before it.
+    const pth = Array.isArray(m.path) ? m.path.filter(x => typeof x === 'string' && x.trim()).map(x => x.trim()) : [];
+    const pathH = pth.length ? '<div class="lm-path">' + pth.map(x => '<span class="s">' + inl(x) + '</span><span class="sep">›</span>').join('') + '</div>' : '';
+    h += '<div class="lm-head"><div class="lm-pillrow"><span class="lm-pill">' + t.icon + esc(m.pill || t.label) + '</span>' + (opts.when ? '<span class="lm-when">' + esc(opts.when) + '</span>' : '') + '</div>' +
+      (ti ? pathH + '<h3 class="lm-headline lm-title' + (/^[BDEFHIKLMNPRbhiklmnpr]/.test(ti) ? ' stem' : '') + '">' + inl(ti) + '</h3><p class="lm-subtitle">' + inl(m.headline) + '</p>'
+          : '<h3 class="lm-headline">' + inl(m.headline) + '</h3>' + (m.context ? '<p class="lm-context"><b>Working on</b> ' + inl(m.context) + '</p>' : '')) +
+      // Explain more belongs to the top block, with no rule above it (owner,
+      // 2026-10-28: "should be integrated into the crumbs title subtitle block").
+      exH + '</div>';
+    // Big picture / this task / just now: three lines under the title (the
+    // owner's pick, 2026-10-28, static/scratch/card-zoom.html option A), drawn
+    // as a nested dial ladder with the label on the same line
+    // (static/scratch/zoom-icons.html option J).  The dial's filled part says
+    // how far zoomed in the line is: outer ring, inner ring, centre dot.
+    const zm = (m.zoom && typeof m.zoom === 'object') ? m.zoom : null;
+    let histH = '';
     if (zm && (zm.big || zm.task || zm.now)) {
       const dial = lvl => '<svg class="zd" width="13" height="13" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"' + (lvl === 0 ? ' class="on"' : '') +
         '/><circle cx="12" cy="12" r="5.5"' + (lvl === 1 ? ' class="on"' : '') + '/><circle class="dot' + (lvl === 2 ? ' on' : '') + '" cx="12" cy="12" r="2.2"/></svg>';
       const zr = (k, label, lvl) => zm[k] ? '<div class="r z' + lvl + '"><div class="nst">' + dial(lvl) + '<span class="lbl">' + label + '</span><span class="t">' + inl(zm[k]) + '</span></div></div>' : '';
-      h += '<div class="lm-zoom">' + zr('big', 'Big picture', 0) + zr('task', 'This task', 1) + zr('now', 'Just now', 2) + exH + '</div>';
-    } else if (exH) h += '<div class="lm-xpl-wrap">' + exH + '</div>';
+      // This task / Just now (with the earlier tasks and the queued-messages
+      // line that attach to them) are drawn at the bottom of the card in a
+      // Session history section (owner, 2026-10-28, card-title-crumb.html);
+      // Explain more stays at the top, under the sentence.
+      histH = band('History', '<div class="lm-zoom">' + zr('big', 'Big picture', 0) + zr('task', 'This task', 1) + zr('now', 'Just now', 2) + '</div>', 'lm-hist');
+    }
 
     if (m.late) {
       h += band('Late', '<p class="lm-apol">' + inl(m.late.apology) + '</p><dl class="lm-kv">' +
@@ -481,9 +494,44 @@
       // static/scratch/validate-later.html).
       const later = typeof vl.later === 'string' && vl.later.trim()
         ? '<div class="lm-vlater"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span>' + inl(vl.later) + '</span></div>' : '';
+      // A page to try AND a screenshot: two tiles side by side with OR between,
+      // so it reads as a choice, not two steps (owner's pick B, 2026-10-28,
+      // static/scratch/validate-or.html: "its not obvious to me that that is a
+      // or ... i need that clearer").  Stacks on a phone.
+      const tryOpens = !_isDownload(vu) && (vs || /^https?:\/\//.test(vu));
+      if (shots.length && tryOpens) {
+        const play = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l13-7.5z"/></svg>';
+        const pic = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m21 16-5-5L5 20"/></svg>';
+        const shotAttrs = l => { const src = _imgSrc(l.url), t = l.label || 'Screenshot';
+          return ' data-view="' + esc(src) + '" data-img="1" data-title="' + esc(t) + '"'; };
+        const tryTile = '<button type="button" class="lm-row lm-validate vt vt-try"' +
+          (vs ? ' data-view="' + esc(vs) + '" data-href="' + esc(vu) + '" data-title="' + esc(vl.how) + '"' : ' data-href="' + esc(vu) + '"') + '>' +
+          '<span class="vt-h">' + play + ' Try it</span><span class="vt-d">' + inl(vl.how) + '</span>' +
+          '<span class="vt-act">' + (vs ? 'Open the demo' : 'Open it') + ' ' + I.arrow + '</span></button>';
+        const s0 = shots[0], more = shots.slice(1);
+        // One screenshot: the whole tile opens it.  Several: each picture does.
+        const seeTile = !more.length
+          ? '<button type="button" class="lm-row shot vt vt-see"' + shotAttrs(s0) + '><span class="vt-h">' + pic + ' See it</span>' +
+            '<span class="vt-pic"><img src="' + esc(_imgSrc(s0.url)) + '" alt="" loading="lazy"></span>' +
+            '<span class="vt-act">View the screenshot</span></button>'
+          : '<div class="vt vt-see"><span class="vt-h">' + pic + ' See it</span>' +
+          '<button type="button" class="lm-row shot vt-pic"' + shotAttrs(s0) + ' aria-label="' + esc('View ' + (s0.label || 'screenshot')) + '">' +
+            '<img src="' + esc(_imgSrc(s0.url)) + '" alt="" loading="lazy"></button>' +
+          (more.length ? '<span class="vt-more">' + more.map(l => '<button type="button" class="lm-row shot vt-thumb"' + shotAttrs(l) + ' title="' + esc(l.label || 'Screenshot') + '">' +
+            '<img src="' + esc(_imgSrc(l.url)) + '" alt="" loading="lazy"></button>').join('') + '</span>' : '') +
+          '<span class="vt-act">Tap a screenshot</span></div>';
+        h += band('Validate', '<div class="lm-vpair">' + tryTile + '<div class="vt-or"><span>OR</span></div>' + seeTile + '</div>' + later, 'lm-sec');
+      } else
       h += band('Validate', '<div class="lm-rows">' + vr + shots.map(linkRow).join('') + '</div>' + later, 'lm-sec');
     }
-    if (m.answer) h += band('In short', paras(m.answer), 'lm-sec');
+    // "Full answer": the detailed answer in markdown, folded under the short
+    // one (owner's pick A, 2026-10-28, static/scratch/answer-detail.html:
+    // "shouldn't there be a more detailed answer too, perhaps like expandable
+    // markdown").  The same toggle as Explain more, which stays up top for
+    // when the card itself is confusing.
+    const fa = typeof m.full_answer === 'string' && m.full_answer.trim() ? m.full_answer.trim() : '';
+    if (m.answer) h += band('In short', paras(m.answer) + (fa ? '<div class="lm-xpl lm-fullans"><button type="button" class="lm-xpl-tg" aria-expanded="false">Full answer <span class="tg">▾</span></button>' +
+      '<div class="lm-xpl-body"><div><div class="lm-xpl-in">' + dvBodyHtml('markdown', fa) + '</div></div></div></div>' : ''), 'lm-sec');
     if (m.compare) h += band(esc(m.compare.label || 'Change'), compareBlock(m.compare), 'lm-sec');
     if (m.deliverable) h += band('Deliverable', deliverableBlock(m.deliverable), 'lm-sec');
     if (shots.length && !shotsInValidate) h += band('Screens', '<div class="lm-rows">' + shots.map(linkRow).join('') + '</div>', 'lm-sec');
@@ -558,7 +606,7 @@
     if (links.length) { bits.push(links.length + (links.length > 1 ? ' links' : ' link')); more += '<div class="lm-sub">Look at</div><div class="lm-rows">' + links.map(linkRow).join('') + '</div>'; }
     if (m.details && m.details.length) { bits.push('technical details'); more += '<div class="lm-sub">Technical details</div>' + list(m.details, 'dot'); }
     if (more) h += band('More', '<button type="button" class="lm-more">' + I.chev + ' ' + bits.map(b => b.charAt(0).toUpperCase() + b.slice(1)).join(' · ') + '</button><div class="lm-fold">' + more + '</div>', 'lm-morebar');
-    return h + '</div>';
+    return h + histH + '</div>';
   }
 
   // ── The verdict bar: only on the open session's newest card, only while
@@ -731,11 +779,13 @@
     wrap._items = items;
     let zoom = last.querySelector('.lm-zoom');
     if (!zoom) {
-      zoom = document.createElement('div');
-      zoom.className = 'lm-zoom';
-      const head = last.querySelector('.lm-head');
-      if (!head) return;
-      head.insertAdjacentElement('afterend', zoom);
+      // A card without This task / Just now still gets a Session history
+      // section for the line, at the bottom like everywhere else.
+      const sec = document.createElement('div');
+      sec.className = 'lm-dl lm-hist';
+      sec.innerHTML = '<div class="dt">History</div><div class="dd"><div class="lm-zoom"></div></div>';
+      last.appendChild(sec);
+      zoom = sec.querySelector('.lm-zoom');
     }
     zoom.appendChild(wrap);
   }

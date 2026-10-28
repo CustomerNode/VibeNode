@@ -20,7 +20,7 @@ def msg(card, prose=""):
 
 DONE = {
     "type": "done",
-    "title": "Smart termination built",
+    "title": "Smart termination built", "path": ["Preferences"],
     "headline": "Smart termination is built: sessions end with a summary you can act on",
     "context": "stopping sessions from ending on messages you can't follow without reading the thread.",
     "did": [{"what": "Added a Smart termination switch to Preferences, on by default",
@@ -37,7 +37,7 @@ DONE = {
 
 DECISION = {
     "type": "needs_you",
-    "title": "Pick a preview indicator",
+    "title": "Preview indicator", "path": ["Session list"],
     "headline": "Pick how the preview shows it is open or closed",
     "context": "the Trial page's preview panel: it should be obvious whether the preview is expanded.",
     "status": {"done": ["Built both designs on the review page"],
@@ -58,7 +58,7 @@ DECISION = {
 
 APPROVE = {
     "type": "needs_you",
-    "title": "Push guard messages less",
+    "title": "Push guard messages", "path": ["Publishing"],
     "headline": "The push guard no longer messages sessions. Approve and it messages only the session that broke the build",
     "context": "the automatic test check that runs after each push.",
     "compare": {"title": "How the push guard works", "rows": [
@@ -74,7 +74,7 @@ APPROVE = {
 
 ACTION = {
     "type": "needs_you",
-    "title": "GitHub login needed",
+    "title": "GitHub login", "path": ["Smart termination", "Pull request"],
     "headline": "I need a GitHub login before I can open the pull request",
     "context": "publishing the Smart termination change as a pull request so CI runs on it.",
     "status": {"done": ["Branch pushed: smart-termination"], "remaining": ["Open the pull request"]},
@@ -87,7 +87,7 @@ ACTION = {
 
 WORKING = {
     "type": "working",
-    "title": "Full test suite running",
+    "title": "Full test suite", "path": ["Smart termination"],
     "headline": "The full test suite is running; the result comes here when it finishes",
     "context": "confirming the Smart termination change broke nothing else.",
     "status": {"done": ["New tests: 22 of 22 pass"], "remaining": ["Full suite (about 2,100 tests)"]},
@@ -97,7 +97,7 @@ WORKING = {
 
 BLOCKED = {
     "type": "blocked",
-    "title": "Release blocked at registry",
+    "title": "Release 2.4", "path": ["Releases"],
     "headline": "The CustomerNode release can't run: the image registry refuses our login",
     "context": "shipping the nightly-drill fix to production.",
     "tried": ["Logged in again with the stored token", "Checked the registry status page: it is up"],
@@ -111,7 +111,7 @@ BLOCKED = {
 
 DELIVERABLE = {
     "type": "deliverable",
-    "title": "Reply to Dana ready",
+    "title": "Reply to Dana", "path": ["Email"],
     "headline": "The reply to Dana about the delayed release is ready to send",
     "context": "Dana asked why 2.4 slipped a week and whether Friday still holds.",
     "deliverable": {"kind": "email", "title": "Re: 2.4 release date",
@@ -124,7 +124,7 @@ DELIVERABLE = {
 
 EXPLAIN = {
     "type": "explain",
-    "title": "Gate red from search work",
+    "title": "Publish gate", "path": ["Releases"],
     "headline": "CustomerNode's gate went red because of a commit from the search work, not this branch",
     "context": "why this morning's gate failed.",
     "answer": "The failing test is in search, from another session's commit at 9:12. It passes on this branch alone.",

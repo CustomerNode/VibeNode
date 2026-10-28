@@ -64,6 +64,13 @@ def out():
                       "validate": {"how": "Tap each preview", "url": "/static/scratch/x.html"},
                       "links": [{"label": "Desktop shot", "kind": "image", "url": "/static/scratch/d.png"},
                                 {"label": "The page", "kind": "link", "url": "/static/scratch/x.html"}]},
+        "val_shots2": {"type": "done", "headline": "S", "context": "x", "needs": {"kind": "none", "why": "y"},
+                       "validate": {"how": "Tap each preview", "url": "/static/scratch/x.html"},
+                       "links": [{"label": "Desktop shot", "kind": "image", "url": "/static/scratch/d.png"},
+                                 {"label": "Phone shot", "kind": "image", "url": "/static/scratch/p.png"}]},
+        "val_shots_noaddr": {"type": "done", "headline": "S", "context": "x", "needs": {"kind": "none", "why": "y"},
+                             "validate": {"how": "Send a message in any session"},
+                             "links": [{"label": "Desktop shot", "kind": "image", "url": "/static/scratch/d.png"}]},
         "shots_only": {"type": "explain", "headline": "S", "context": "x", "answer": "a",
                        "needs": {"kind": "none", "why": "y"},
                        "links": [{"label": "Desktop shot", "kind": "image", "url": "/static/scratch/d.png"}]},
@@ -187,3 +194,35 @@ def test_screenshots_sit_inside_validate_never_beside_it(out):
     assert 'data-view="/static/scratch/d.png"' in band and "Desktop shot" in band
     # a card with no Validate row keeps its Screens band
     assert '<div class="dt">Screens</div>' in out["shots_only"]
+
+
+def _validate_band(h):
+    return h.split('<div class="dt">Validate</div>', 1)[1].split('<div class="lm-dl', 1)[0]
+
+
+def test_try_it_or_see_it_reads_as_a_choice(out):
+    """Owner's pick B, 2026-10-28 (static/scratch/validate-or.html): "its not
+    obvious to me that that is a or ... i need that clearer".  A page to try
+    and a screenshot are two tiles with OR between, not one list."""
+    band = _validate_band(out["val_shots"])
+    assert 'class="lm-vpair"' in band and '<span>OR</span>' in band
+    assert band.index('vt-try') < band.index('vt-or') < band.index('vt-see')
+    assert 'Try it' in band and 'See it' in band and 'class="lm-rows"' not in band
+    # the try tile opens the page; the whole see tile opens the one screenshot
+    try_tile = band.split('vt-try"', 1)[1].split('</button>', 1)[0]
+    assert 'data-view="/static/scratch/x.html"' in try_tile
+    see_tile = band.split('vt-see"', 1)[1].split('</button>', 1)[0]
+    assert 'data-view="/static/scratch/d.png"' in see_tile and 'data-img="1"' in see_tile
+
+
+def test_several_screenshots_each_open_from_the_see_tile(out):
+    band = _validate_band(out["val_shots2"])
+    assert '<span>OR</span>' in band
+    assert 'data-view="/static/scratch/d.png"' in band and 'data-view="/static/scratch/p.png"' in band
+    assert band.count('class="lm-row shot vt-') == 2
+
+
+def test_nothing_to_open_keeps_the_plain_rows(out):
+    """With no page to try there is no choice to draw: the screenshots stay rows."""
+    band = _validate_band(out["val_shots_noaddr"])
+    assert 'lm-vpair' not in band and 'class="lm-row lm-validate static"' in band and 'lm-row shot' in band
