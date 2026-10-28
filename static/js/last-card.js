@@ -106,8 +106,18 @@
   };
 
   /** The URL to show a review page in a frame, or '' when it can't be framed
-   *  here: same-origin paths as they are; this machine's other ports through
-   *  the preview proxy (a phone cannot reach them directly). */
+   *  here: same-origin paths as they are; this machine's other ports as
+   *  themselves when this page is open on this machine, else (the phone, which
+   *  cannot reach them) through the preview proxy.
+   *
+   *  Framed as itself, another app on this machine keeps the person's sign-in
+   *  and runs its own scripts. Through the proxy it can do neither: the proxy
+   *  sends no cookies, and the page's script requests go to VibeNode. So a
+   *  signed-in app (CustomerNode's live design trials, 2026-10-28: "live pages
+   *  plug into the vibenode stuff") showed only its login.  The address takes
+   *  this page's host name: 127.0.0.1 and localhost are different sites to the
+   *  browser, and only the same site sends that app's sign-in into a frame. */
+  const _LOOPBACK = /^(localhost|127\.0\.0\.1|\[::1\])$/;
   function _reviewSrc(url) {
     url = String(url || '').trim();
     if (/^\/(?!\/)/.test(url)) return url;
@@ -115,7 +125,13 @@
     try { u = new URL(url); } catch (_e) { return ''; }
     if (!/^https?:$/.test(u.protocol)) return '';
     if (typeof location !== 'undefined' && u.host === location.host) return u.pathname + u.search + u.hash;
-    if (/^(localhost|127\.0\.0\.1|\[::1\])$/.test(u.hostname)) return '/api/preview/proxy?u=' + encodeURIComponent(url);
+    if (_LOOPBACK.test(u.hostname)) {
+      if (typeof location !== 'undefined' && _LOOPBACK.test(location.hostname || '')) {
+        u.hostname = location.hostname;
+        return u.href;
+      }
+      return '/api/preview/proxy?u=' + encodeURIComponent(url);
+    }
     return '';
   }
 
@@ -187,7 +203,19 @@
     url = String(url || '').trim();
     if (/^\/(api|static)\//.test(url)) return url;
     if (/^(\/(?!\/)|~\/|file:\/\/\/|[A-Za-z]:[\\/])/.test(url)) return '/api/card-image?path=' + encodeURIComponent(url);
-    return _reviewSrc(url) || url;
+    return _loopbackPic(url) || _reviewSrc(url) || url;
+  }
+  // A picture on another port of this machine comes through the proxy, on this
+  // computer too (a page is framed as itself, see _reviewSrc): a picture needs
+  // no sign-in, and a server that keeps its files to its own site
+  // (Cross-Origin-Resource-Policy: same-origin, as CustomerNode's dev server
+  // sends) refuses an <img> from VibeNode's port.
+  function _loopbackPic(url) {
+    let u;
+    try { u = new URL(String(url || '').trim()); } catch (_e) { return ''; }
+    if (!/^https?:$/.test(u.protocol) || !_LOOPBACK.test(u.hostname)) return '';
+    if (typeof location !== 'undefined' && u.host === location.host) return '';
+    return '/api/preview/proxy?u=' + encodeURIComponent(String(url).trim());
   }
   // Replies are real buttons in the card's colour, inside the "Your move"
   // band (design A, picked by the owner 2026-10-28 from
@@ -896,8 +924,11 @@
   // became "#v-a?theme=dark", the anchor matched nothing, and every screen
   // of a decision showed the top of the same page (owner, 2026-10-28:
   // "these are all showing as the same ... its a systemic failure").
+  // Another app on this machine, framed as itself (_reviewSrc), gets ?theme=
+  // too: it is another origin, so data-theme cannot be set inside it, and the
+  // address is the only way to tell it (CustomerNode's trial pages read it).
   function _themedSrc(src) {
-    if (!/^\/static\//.test(src)) return src;
+    if (!/^(\/static\/|https?:\/\/)/.test(src)) return src;
     const h = src.indexOf('#'), path = h === -1 ? src : src.slice(0, h), frag = h === -1 ? '' : src.slice(h);
     if (/[?&]theme=/.test(path)) return src;
     return path + (path.indexOf('?') === -1 ? '?' : '&') + 'theme=' + encodeURIComponent(_appTheme()) + frag;
@@ -926,9 +957,34 @@
     _SWOT.forEach(q => { const a = strs(r[q[0]]); if (a.length) o[q[0]] = a; });
     ['effort', 'undo', 'risk', 'fit'].forEach(k => { const v = typeof r[k] === 'string' ? r[k].trim().slice(0, k === 'fit' ? 300 : 40) : ''; if (v) o[k] = v; });
     const sc = (Array.isArray(r.screens) ? r.screens : []).filter(s => s && typeof s.url === 'string' && _reviewSrc(s.url)).slice(0, 8)
-      .map(s => ({ label: String(s.label || ''), url: s.url, device: s.device === 'phone' || s.device === 'both' ? s.device : 'web' }));
+      .map(s => {
+        const o = { label: String(s.label || ''), url: s.url, device: s.device === 'phone' || s.device === 'both' ? s.device : 'web' };
+        const im = _screenImage(s.image);
+        if (im) o.image = im;
+        return o;
+      });
     if (sc.length) o.screens = sc;
     return o;
+  }
+  // A screen's "image": its picture, drawn where its page cannot be shown live
+  // (the phone, for another app on this machine: _tplStage).  A picture, or one
+  // per device {"web", "phone"}, each a picture or one per theme {"light", "dark"}.
+  function _screenImage(v) {
+    const pic = x => (typeof x === 'string' && _isPic(x.trim()) ? x.trim() : '');
+    const keep = (x, keys, inner) => {
+      if (!x || typeof x !== 'object') return '';
+      const o = {};
+      keys.forEach(k => { const y = inner(x[k]); if (y) o[k] = y; });
+      return Object.keys(o).length ? o : '';
+    };
+    const themed = x => pic(x) || keep(x, ['light', 'dark'], pic);
+    return pic(v) || keep(v, ['web', 'phone'], themed);
+  }
+  function _screenPic(s, dev) {
+    let v = s && s.image;
+    if (v && typeof v === 'object') v = v[dev === 'phone' ? 'phone' : 'web'] || v.web || v.phone;
+    if (v && typeof v === 'object') v = v[_appTheme()] || v.light || v.dark;
+    return typeof v === 'string' ? v : '';
   }
   function _hasTpl(r) { return !!(r && !r.other && (r.screens || r.fit || r.effort || r.undo || r.risk || _SWOT.some(q => r[q[0]]))); }
   function _cap1(s) { s = String(s || ''); return s.charAt(0).toUpperCase() + s.slice(1); }
@@ -949,9 +1005,15 @@
   const _isPic = u => /\.(?:png|jpe?g|webp|gif)(?:[?#]|$)/i.test(String(u || ''));
   function _tplStage(r, dev, shot) {
     const s = r.screens[Math.min(shot, r.screens.length - 1)];
-    if (_isPic(s.url)) return '<div class="fr pic"><img alt="' + esc(s.label || 'Screen') + '" src="' + esc(_reviewSrc(s.url)) + '"></div>';
-    const d = dev || s.device;
-    return (d === 'both' ? ['web', 'phone'] : [d]).map(k => {
+    if (_isPic(s.url)) return '<div class="fr pic"><img alt="' + esc(s.label || 'Screen') + '" src="' + esc(_loopbackPic(s.url) || _reviewSrc(s.url)) + '"></div>';
+    const d = dev || s.device, devs = d === 'both' ? ['web', 'phone'] : [d];
+    // Its page would reach this browser only through the preview proxy (the
+    // phone, for another app on this machine), which cannot sign in to it or
+    // run it: its picture for that device instead.
+    if (s.image && /^\/api\/preview\/proxy\?/.test(_reviewSrc(s.url))) {
+      return devs.map(k => '<div class="fr pic"><img alt="' + esc(s.label || 'Screen') + '" src="' + esc(_imgSrc(_screenPic(s, k))) + '"></div>').join('');
+    }
+    return devs.map(k => {
       const wh = _DEV[k], ifr = '<iframe title="' + esc(s.label || 'Screen') + '" data-src="' + esc(_reviewSrc(s.url)) + '"></iframe>';
       return k === 'web'
         ? '<div class="fr web" data-w="' + wh[0] + '" data-h="' + wh[1] + '"><div class="chrome"><i></i><i></i><i></i><span>' + esc(s.label || s.url) + '</span></div><div class="scr">' + ifr + '</div></div>'
@@ -1782,6 +1844,6 @@
     xm.setAttribute('aria-expanded', String(o));
   });
   const _api = { render, renderIn, openReview: _openReview, closeReview: _closeReview, reviewSrc: _reviewSrc,
-    openDecide: _openDecide, closeDecide: _closeDecide, syncDone: _syncDone, syncAnswered: _syncAnswered, markAnswered: _markAnswered, themedSrc: _themedSrc, screenOption: _screenOption, deliverableBody: dvBodyHtml };
+    openDecide: _openDecide, closeDecide: _closeDecide, syncDone: _syncDone, syncAnswered: _syncAnswered, markAnswered: _markAnswered, themedSrc: _themedSrc, screenOption: _screenOption, tplStage: _tplStage, deliverableBody: dvBodyHtml };
   window.VNLastCard = _api;
 })();

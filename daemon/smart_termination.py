@@ -86,7 +86,13 @@ INSTRUCTIONS = _rules.INSTRUCTIONS + (
     "\"device\": \"web|phone|both\"}], pages this app can show; the user flips "
     "Web, Phone or Both. Use them whenever the choice is a design, UI or "
     "presentation call (slides, a deck, a page): build the scratch page first, "
-    "one mockup per option tagged data-option=\"<key>\", so he picks by looking.\n")
+    "one mockup per option tagged data-option=\"<key>\", so he picks by looking.\n"
+    "A project whose own instructions show design options in its real app "
+    "(CustomerNode's design trials) does that instead of a scratch page here: each "
+    "screen's \"url\" is that app's live page on this machine "
+    "(\"http://127.0.0.1:<port>/...\", shown signed in on this computer) and its "
+    "\"image\" is its picture for the phone, which cannot reach it: "
+    "{\"web\": {\"light\": \"<png>\", \"dark\": \"<png>\"}, \"phone\": {...}}.\n")
 
 # The owner, 2026-10-27: "I never want to see a wall of text outside one of my
 # approved formats again."  Text above the card is sent back.

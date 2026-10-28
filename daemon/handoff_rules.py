@@ -323,7 +323,50 @@ def visual_choice_problem(card: dict) -> Optional[str]:
             "app as it is today tagged data-option=\"now\", when there is one). Put the page "
             "in needs.look and give each reply \"screens\": [{\"label\": \"...\", \"url\": "
             "\"/static/scratch/<topic>.html#<key>\", \"device\": \"web|phone|both\"}]. "
-            "A screenshot per option (a \"kind\": \"image\" link) also works.")
+            "A screenshot per option (a \"kind\": \"image\" link) also works. In a project "
+            "whose instructions show options in its real app (CustomerNode's design "
+            "trials), follow them instead: each reply's \"screens\" are that app's live "
+            "pages on this machine, with their pictures in \"image\".")
+
+
+# A screen that is another app's live page on this machine (CustomerNode's
+# design trials, 2026-10-28: "live pages plug into the vibenode stuff") is
+# framed signed in on this computer, but the phone cannot reach it and the
+# preview proxy cannot sign in to it, so the phone shows the screen's picture
+# ("image", drawn by _tplStage in static/js/last-card.js).  Without one, the
+# phone would show that app's login.
+_LOOPBACK_PAGE = re.compile(r"^https?://(?:localhost|127\.0\.0\.1|\[::1\]):(\d+)(?:[/?#]|$)", re.I)
+_PIC = re.compile(r"\.(?:png|jpe?g|webp|gif)(?:[?#].*)?$", re.I)
+
+
+def _own_port() -> str:
+    import os
+    return os.environ.get("VIBENODE_WEB_PORT") or "5050"
+
+
+def _screen_image_ok(v) -> bool:
+    """The same shapes the popup draws: a picture, or one per device
+    {"web", "phone"}, each a picture or one per theme {"light", "dark"}."""
+    pic = lambda x: isinstance(x, str) and bool(_PIC.search(x.strip()))  # noqa: E731
+    themed = lambda x: pic(x) or (isinstance(x, dict) and any(pic(x.get(t)) for t in ("light", "dark")))  # noqa: E731
+    return pic(v) or (isinstance(v, dict) and any(themed(v.get(d)) for d in ("web", "phone")))
+
+
+def live_screen_picture_problem(card: dict) -> Optional[str]:
+    """Why a reply's screen on another port of this machine has no picture, or None."""
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    for r in _items(needs.get("replies")):
+        for s in _items(r.get("screens") if isinstance(r, dict) else None):
+            if not isinstance(s, dict):
+                continue
+            m = _LOOPBACK_PAGE.match(_s(s.get("url")))
+            if m and m.group(1) != _own_port() and not _screen_image_ok(s.get("image")):
+                return (f"The screen \"{_s(s.get('label')) or _s(s.get('url'))}\" is a live page of another "
+                        f"app on this machine ({_s(s.get('url'))}). It shows on this computer, but the phone "
+                        "cannot reach it: give every such screen its picture in \"image\": "
+                        "{\"web\": {\"light\": \"<png>\", \"dark\": \"<png>\"}, \"phone\": {...}} "
+                        "(a file path on this machine works).")
+    return None
 
 
 # A mockup page (the scratch folder) linked from a card that is not a Decide
@@ -645,6 +688,9 @@ def format_problems(card: dict) -> list[str]:
     pick = variants_pick_problem(card)
     if pick:
         out.append(pick)
+    live = live_screen_picture_problem(card)
+    if live:
+        out.append(live)
 
     # The needs block itself.
     if kind == "none":
@@ -679,8 +725,13 @@ def format_problems(card: dict) -> list[str]:
             if bare:
                 out.append("Every choice must be spelled out in its \"label\" (three words or more), "
                            "not a bare letter or name.")
-            if not _items(needs.get("look")) and not isinstance(card.get("compare"), dict):
-                out.append("A decision needs something to look at: a link in needs.look or a \"compare\" block.")
+            # Choices that carry their own screens are something to look at
+            # (CustomerNode's trials, 2026-10-28: today's look is choice A, so a
+            # page in needs.look would add a "Now" tab showing it twice).
+            if (not _items(needs.get("look")) and not isinstance(card.get("compare"), dict)
+                    and not any(_items(r.get("screens")) for r in replies)):
+                out.append("A decision needs something to look at: a link in needs.look, a \"compare\" "
+                           "block, or \"screens\" on its replies.")
             seen = visual_choice_problem(card)
             if seen:
                 out.append(seen)

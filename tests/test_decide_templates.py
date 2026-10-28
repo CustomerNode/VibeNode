@@ -134,7 +134,9 @@ def test_the_theme_goes_before_the_fragment(screens):
                               "/static/scratch/p.html?x=1&theme=dark#b",
                               "/static/scratch/p.html?theme=dark",
                               "/static/scratch/p.html?theme=light#a",
-                              "http://localhost:3000/#a"]
+                              # another app on this machine, framed as itself,
+                              # hears the theme on its address too
+                              "http://localhost:3000/?theme=dark#a"]
 
 
 def test_each_screen_finds_its_own_option(screens):
