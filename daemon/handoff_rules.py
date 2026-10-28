@@ -335,8 +335,12 @@ def visual_choice_problem(card: dict) -> Optional[str]:
 # preview proxy cannot sign in to it, so the phone shows the screen's picture
 # ("image", drawn by _tplStage in static/js/last-card.js).  Without one, the
 # phone would show that app's login.
-_LOOPBACK_PAGE = re.compile(r"^https?://(?:localhost|127\.0\.0\.1|\[::1\]):(\d+)(?:[/?#]|$)", re.I)
+# The host as the browser reads it: after any user-info, with or without a port.
+_LOOPBACK_PAGE = re.compile(r"^(https?)://(?:[^/?#@]*@)?(?:localhost|127\.0\.0\.1|\[::1\])(?::(\d+))?(?:[/?#]|$)", re.I)
 _PIC = re.compile(r"\.(?:png|jpe?g|webp|gif)(?:[?#].*)?$", re.I)
+# An address the card can load (isImg in last-card.js): not a relative path,
+# not a file:// with two slashes.
+_LOADABLE = re.compile(r"^(?:/(?!/)|https?://|~/|file:///|[A-Za-z]:[\\/])", re.I)
 
 
 def _own_port() -> str:
@@ -345,9 +349,9 @@ def _own_port() -> str:
 
 
 def _screen_image_ok(v) -> bool:
-    """The same shapes the popup draws: a picture, or one per device
-    {"web", "phone"}, each a picture or one per theme {"light", "dark"}."""
-    pic = lambda x: isinstance(x, str) and bool(_PIC.search(x.strip()))  # noqa: E731
+    """The same shapes the popup draws (_screenImage): a picture, or one per
+    device {"web", "phone"}, each a picture or one per theme {"light", "dark"}."""
+    pic = lambda x: isinstance(x, str) and bool(_PIC.search(x.strip())) and bool(_LOADABLE.match(x.strip()))  # noqa: E731
     themed = lambda x: pic(x) or (isinstance(x, dict) and any(pic(x.get(t)) for t in ("light", "dark")))  # noqa: E731
     return pic(v) or (isinstance(v, dict) and any(themed(v.get(d)) for d in ("web", "phone")))
 
@@ -360,7 +364,8 @@ def live_screen_picture_problem(card: dict) -> Optional[str]:
             if not isinstance(s, dict):
                 continue
             m = _LOOPBACK_PAGE.match(_s(s.get("url")))
-            if m and m.group(1) != _own_port() and not _screen_image_ok(s.get("image")):
+            port = m and (m.group(2) or ("443" if m.group(1).lower() == "https" else "80"))
+            if m and port != _own_port() and not _screen_image_ok(s.get("image")):
                 return (f"The screen \"{_s(s.get('label')) or _s(s.get('url'))}\" is a live page of another "
                         f"app on this machine ({_s(s.get('url'))}). It shows on this computer, but the phone "
                         "cannot reach it: give every such screen its picture in \"image\": "

@@ -114,9 +114,13 @@
    *  and runs its own scripts. Through the proxy it can do neither: the proxy
    *  sends no cookies, and the page's script requests go to VibeNode. So a
    *  signed-in app (CustomerNode's live design trials, 2026-10-28: "live pages
-   *  plug into the vibenode stuff") showed only its login.  The address takes
-   *  this page's host name: 127.0.0.1 and localhost are different sites to the
-   *  browser, and only the same site sends that app's sign-in into a frame. */
+   *  plug into the vibenode stuff") showed only its login.  The address is
+   *  framed as given, never renamed: a server listening only on ::1 (Vite
+   *  under "localhost") refuses 127.0.0.1, and a sign-in belongs to the host
+   *  name it was made at.  127.0.0.1 and localhost are different sites to the
+   *  browser, so a signed-in app is named the way VibeNode is opened
+   *  (127.0.0.1: CustomerNode's trials). VibeNode itself under its other
+   *  name is this page's own path. */
   const _LOOPBACK = /^(localhost|127\.0\.0\.1|\[::1\])$/;
   function _reviewSrc(url) {
     url = String(url || '').trim();
@@ -127,8 +131,7 @@
     if (typeof location !== 'undefined' && u.host === location.host) return u.pathname + u.search + u.hash;
     if (_LOOPBACK.test(u.hostname)) {
       if (typeof location !== 'undefined' && _LOOPBACK.test(location.hostname || '')) {
-        u.hostname = location.hostname;
-        return u.href;
+        return u.port === location.port ? u.pathname + u.search + u.hash : url;
       }
       return '/api/preview/proxy?u=' + encodeURIComponent(url);
     }
@@ -969,8 +972,11 @@
   // A screen's "image": its picture, drawn where its page cannot be shown live
   // (the phone, for another app on this machine: _tplStage).  A picture, or one
   // per device {"web", "phone"}, each a picture or one per theme {"light", "dark"}.
+  // Only an address the card can load counts (as isImg): a relative path or a
+  // file:// with two slashes drew a broken picture.  daemon/handoff_rules.py
+  // _screen_image_ok holds the same shapes.
   function _screenImage(v) {
-    const pic = x => (typeof x === 'string' && _isPic(x.trim()) ? x.trim() : '');
+    const pic = x => (typeof x === 'string' && _isPic(x.trim()) && /^(\/(?!\/)|https?:\/\/|~\/|file:\/\/\/|[A-Za-z]:[\\/])/.test(x.trim()) ? x.trim() : '');
     const keep = (x, keys, inner) => {
       if (!x || typeof x !== 'object') return '';
       const o = {};

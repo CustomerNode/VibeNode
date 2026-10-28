@@ -25,7 +25,7 @@ LAST_CARD = Path(__file__).resolve().parents[1] / "static" / "js" / "last-card.j
 SCRIPT = r"""
 const [file, host, input] = process.argv.slice(1);
 global.window = global;
-global.location = { host, hostname: host.replace(/:\d+$/, '') };
+global.location = { host, hostname: host.replace(/:\d+$/, ''), port: (host.match(/:(\d+)$/) || [])[1] || '' };
 global.document = { addEventListener() {}, querySelectorAll() { return []; },
                     documentElement: { getAttribute: () => 'dark' } };
 eval(require('fs').readFileSync(file, 'utf8'));
@@ -47,7 +47,9 @@ def _card():
     replies = [{"key": "A", "label": "Today", "reply": "a", "screens": [dict(SCREEN, url=LIVE.replace("=b", "=a"))]},
                {"key": "B", "label": "Opens as shown", "reply": "b", "screens": [SCREEN]},
                {"key": "C", "label": "Two ways in", "reply": "c",
-                "screens": [{"label": "Bad picture", "url": LIVE, "image": "notes.md"}]}]
+                "screens": [{"label": "Bad picture", "url": LIVE, "image": "notes.md"},
+                            {"label": "Relative", "url": LIVE, "image": ".design_review/x/0.png"},
+                            {"label": "Two slashes", "url": LIVE, "image": "file://C:/x.png"}]}]
     return {"type": "needs_you", "headline": "Pick how a preview opens", "context": "x",
             "links": [{"label": "A picture from the app", "kind": "image", "url": "http://127.0.0.1:8000/x.png"}],
             "needs": {"kind": "decision", "ask": "Which?", "why": "y", "replies": replies}}
@@ -58,7 +60,7 @@ def _run(host):
         pytest.skip("node not installed")
     reply = {"screens": [SCREEN]}
     t = {"src": [LIVE, "http://localhost:8000/app/x#top", "http://127.0.0.1:5050/static/scratch/x.html",
-                 "https://example.com/page"],
+                 "https://example.com/page", "http://[::1]:3001/", "http://localhost:5050/static/scratch/x.html#b"],
          "themed": [LIVE + "#v-b", "http://127.0.0.1:8000/app/x?theme=light"],
          "card": _card(),
          "stage": [[reply, "web"], [reply, "phone"], [reply, "both"]]}
@@ -80,9 +82,13 @@ def phone():
 def test_on_this_computer_another_app_is_framed_as_itself(desk):
     # live, signed in: never the proxy, which shows its login
     assert desk["src"][0] == LIVE
-    # under this page's host name, so the browser sends that app's sign-in
-    assert desk["src"][1] == "http://127.0.0.1:8000/app/x#top"
+    # as given, never renamed: a server on ::1 only (Vite under "localhost")
+    # refuses 127.0.0.1, and a sign-in belongs to the name it was made at
+    assert desk["src"][1] == "http://localhost:8000/app/x#top"
+    assert desk["src"][4] == "http://[::1]:3001/"
     assert desk["src"][2] == "/static/scratch/x.html"
+    # VibeNode itself under its other name: this page's own path
+    assert desk["src"][5] == "/static/scratch/x.html#b"
     assert desk["src"][3] == ""
 
 
@@ -101,7 +107,7 @@ def test_the_screen_picture_rides_on_the_decide_button(desk):
     a, b, c = data["replies"]
     assert b["screens"] == [SCREEN]
     # not a picture: dropped, the screen stays
-    assert c["screens"] == [{"label": "Bad picture", "url": LIVE, "device": "web"}]
+    assert c["screens"] == [{"label": n, "url": LIVE, "device": "web"} for n in ("Bad picture", "Relative", "Two slashes")]
 
 
 def test_on_this_computer_the_popup_shows_the_live_page(desk):
@@ -154,6 +160,16 @@ def test_a_live_screen_with_its_picture_passes():
 def test_a_picture_that_is_not_one_does_not_count():
     assert hr.live_screen_picture_problem(_decision(dict(SCREEN, image="notes.md")))
     assert hr.live_screen_picture_problem(_decision(dict(SCREEN, image={"web": "x.txt"})))
+    # the popup cannot load these either (_screenImage drops them)
+    assert hr.live_screen_picture_problem(_decision(dict(SCREEN, image=".design_review/x/0_phone_b_dark.png")))
+    assert hr.live_screen_picture_problem(_decision(dict(SCREEN, image="file://C:/x.png")))
+    assert hr.live_screen_picture_problem(_decision(dict(SCREEN, image="file:///C:/x.png"))) is None
+
+
+def test_every_way_of_naming_this_machine_needs_its_picture():
+    # what the browser reads as another port of this machine, as the popup does
+    for url in ("http://localhost/app/x", "http://me@127.0.0.1:8000/app/x", "http://[::1]:3001/", "https://localhost/x"):
+        assert hr.live_screen_picture_problem(_decision({"label": "x", "url": url})), url
 
 
 def test_vibenodes_own_pages_and_the_web_need_no_picture():
