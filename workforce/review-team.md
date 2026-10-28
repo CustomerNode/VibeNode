@@ -3,7 +3,7 @@ id: review-team
 name: Review Team
 department: compose
 source: vibenode
-version: 1.2.0
+version: 1.4.0
 depends_on: [compose-test-engineer, compose-quality-engineer, compose-product-manager, compose-senior-engineer, compose-expert-user]
 type: prompt-template
 ---
@@ -20,7 +20,7 @@ The caller MUST include in the kickoff prompt:
 - the specific scope to review: file list, git range (e.g. `git diff HEAD~3..HEAD`), or PR description,
 - the spec, intent, or user request the code was supposed to satisfy,
 - any areas explicitly out of scope (e.g. "do not review the migration in app/legacy/"),
-- whether to auto-fix issues per the Fix Policy or only report them,
+- whether to auto-fix issues per the Fix Policy or only report them (under Code Pipeline, follow `code-pipeline.md`),
 - any PERF-CRITICAL paths or strategic-intent constraints in the touched code.
 
 If any of these are missing and cannot be inferred reliably from conversation context, request them before starting. A review without scope drifts and produces low-signal noise.
@@ -29,7 +29,7 @@ If any of these are missing and cannot be inferred reliably from conversation co
 
 Run the review team: Test Engineer, Quality Engineer, Product Manager, Senior Software Engineer, Expert User. All have full knowledge of the product spec and VibeNode architecture.
 
-Review the scope named in the kickoff. You are a checker, not the builder: run as a fresh subagent whose kickoff gives you the request, the scope (files or git range) and the run directory, not the builder's reasoning. Judge from the code and the diff (`git diff` on the scope), not from the builder's account of what it meant. If you are running inside the same conversation that wrote the code, say so in the report under "What was not validated". Run the review as a team, not four independent reports. Each agent reviews from their lane, but findings feed into a shared picture. If one agent's finding affects another's area, they coordinate.
+Review the scope named in the kickoff. You are a checker, not the builder: run as a fresh subagent whose kickoff gives you the request, the scope (files or git range) and the run directory, not the builder's reasoning. Judge from the code and the diff (`git diff` on the scope), not from the builder's account of what it meant. Write your own findings down BEFORE you read any builder or earlier stage report; then read those reports to follow up on what they raise. If you are running inside the same conversation that wrote the code, say so in the report under "What was not validated". Run the review as a team, not four independent reports. Each agent reviews from their lane, but findings feed into a shared picture. If one agent's finding affects another's area, they coordinate.
 
 ## Standing Review Criteria
 
@@ -74,7 +74,9 @@ Regardless of who calls this review or what context is provided, the team always
 
 ## Fix Policy
 
-The team fixes what it finds. Don't report problems back to me unless:
+**Under Code Pipeline (and Execute Pipeline, its alias):** follow `code-pipeline.md`. Review's fixes land before Test runs, and Test and Audit, both fresh, check the result on the final tree; the harness grades only evidence produced on that tree. Record each material defect on its own line as `BLOCKING: <short-id> <what is wrong>`; only a later checker stage can clear it with `RESOLVED: <short-id> <what proves it>`.
+
+**Invoked on its own, with the caller asking for auto-fix:** the team fixes what it finds. Don't report problems back to me unless:
 - The fix would change the spec or user-facing behavior
 - The fix has a meaningful tradeoff that needs a judgment call
 - The issue is ambiguous enough that two reasonable people would disagree on the right answer

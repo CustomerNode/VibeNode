@@ -3,7 +3,7 @@ id: code-pipeline
 name: Code Pipeline
 department: compose
 source: vibenode
-version: 1.0.0
+version: 1.3.2
 depends_on: [plan-team, build-team, review-team, test-team, final-audit, debug-team, hotfix-team, refactor-team]
 type: prompt-template
 ---
@@ -14,9 +14,17 @@ Reusable prompt template. Invoke by typing: **code pipeline**
 
 **Unique value**: Takes a code request, in any repository, from idea to a delivered result whose confidence grade is computed by a program from what the Session Engine recorded, so no agent can award a grade it did not earn. No other agent produces a grade with evidence behind it.
 
-Execute Pipeline is the older, prose-enforced version and is left as it is. This one is a standalone engine: the programs under `pipeline/` (`start`, `depth`, `run_check`, `harness`, `ledger`) do the bookkeeping, and the teams do the thinking.
+This is the one programming workflow. Typing **execute pipeline** runs it too: Execute Pipeline, the older version whose rules lived only in prose, became an alias for Code Pipeline once Code Pipeline passed its qualification run (a planted defect caught at LOW, the fix graded HIGH, a late edit voiding HIGH). The programs under `pipeline/` (`start`, `depth`, `run_check`, `attest`, `escalate`, `harness`, `deliver`, `ledger`) do the bookkeeping, and the teams do the thinking.
 
-**Why this agent diverges** from AGENT_BEST_PRACTICES "When you create a new agent" step 4: it is not added to Execute Pipeline's TEAM UNIQUE VALUE list or routing rules, because it is a second orchestrator beside Execute Pipeline, not a team Execute Pipeline routes to, and Execute Pipeline is deliberately left untouched (Rule 11).
+**The teams, and the failure each one removes** (AGENT_BEST_PRACTICES Rule 10; a new team must add a line here):
+- Plan Team: spec gaps, ambiguity, and architectural risk before any code is written.
+- Build Team: implementation errors, step-by-step correctness, and spec-to-code drift during construction.
+- Review Team: code quality, security, documentation, and project rule violations in completed code.
+- Test Team: integration failures, workflow breakage, concurrency issues, and performance regressions, with evidence the program records.
+- Debug Team: unknown-cause failures, through root cause analysis.
+- Refactor Team: structural decay, duplication, and maintainability drag without changing behavior.
+- Hotfix Team: production-blocking failures, contained with the minimum safe change under time pressure.
+- Final Audit: intent mismatch, whole-system incoherence, blast radius damage, and gaps between the checks and the request.
 
 ## Invocation Contract
 
@@ -41,16 +49,19 @@ The rules of this pipeline are enforced by programs, not by this text. Where the
 
     python -m pipeline.start --repo <repo> --slug <short-slug> --route <a|b|c|d> --request-file <file>
 
-Routes: (a) new feature or major change; (b) bug with unknown cause; (c) production issue where speed matters; (d) internal cleanup with no behavior change. If the request is ambiguous between routes, ask; the wrong route costs more than the question. The command prints `PIPELINE-RUN nonce=…`; that line is how the harness later finds this session's transcript. Never run it outside the session doing the work.
+Routes: (a) new feature or major change; (b) bug with unknown cause; (c) production issue where speed matters; (d) internal cleanup with no behavior change. If the request is ambiguous between routes, ask; the wrong route costs more than the question. The command prints `PIPELINE-RUN nonce=… route=… request=… pinned=… protected=… dir=…`. That line is the run's fixed point: the harness finds this session's transcript by the nonce, and takes the route, the hash of the verbatim request, and the hashes of the repository's `.pipeline-verify` and `.pipeline-protected` from the line the engine recorded, never from `run.json` or any file an agent can edit. Changing any of them afterwards is tampering, graded LOW. Never run it outside the session doing the work, and never append anything to `00-request.md`.
 
 The `pipeline` package lives in the VibeNode checkout, so every `python -m pipeline.<cmd>` runs from there (or with it on `PYTHONPATH`); `--repo` points at the repository being worked on. When the session's working directory is not that repository, pass `--project-cwd <session cwd>` as well: the harness looks for this session's transcript under the project of the working directory, not of the repository.
 
 **Step 2: plan, at the depth the diff demands.** For route (a), run the Plan Team and write the hardened spec to `docs/plans/` and the Plan Team report to `01-plan.md`. For (b), (c), (d) the entry team writes `05-debug.md`, `06-hotfix.md` or `07-refactor.md` instead. Whatever the route, the planning file ends with the verification plan, a fenced block the programs read:
 
     ```verification
-    - id: suite
-      cmd: <the repository's own full test command>
+    - id: sub-works
+      cmd: {python} -m pytest tests/test_sub.py
       expect: \d+ passed
+      detects_change: true
+      baseline_files: tests/test_sub.py
+      fails_with: has no attribute 'sub'
     - id: ui
       cmd: <a headless-browser or UI-driving test for the changed screen>
       expect: \d+ passed
@@ -59,19 +70,38 @@ The `pipeline` package lives in the VibeNode checkout, so every `python -m pipel
       reason: <why it cannot run on this machine>
     ```
 
+`{python}` is the interpreter running the check; never write one machine's virtualenv path into a plan.
+
+**The project's full suite is pinned, not planned.** A repository declares its mandatory checks in `.pipeline-verify` at its root (the same list syntax, no fence; VibeNode's holds the publish-gate suite). `pipeline.start` copies it into the run as `pinned-verify.txt` and records its hash in the start line, and those checks are added to every plan as required criteria. A plan cannot redefine them, and a run that edits `.pipeline-verify` is graded on the pinned copy, forced to full depth, and held below HIGH until a person reviews the change. A repository with no declaration yet (a new project) marks its suite in the plan with `suite: true`; without one the grade is MEDIUM at most. Add the declaration so later runs cannot change it.
+
+**The tests must detect the change.** On routes (a), (b) and (c), at least one required criterion is a regression demonstration: `detects_change: true`, with `baseline_files` (the test files, comma-separated globs) and `fails_with` (a regex the failure must print, naming the missing behavior). The Test Team runs it twice: normally, where it must pass, and with `python -m pipeline.run_check <run-dir> <id> --baseline`, which checks the code as it was when the run started out into a temporary git worktree (your working directory is never touched), copies the test files in, and must FAIL there for the reason `fails_with` names. A test that passes without the change does not test the change; a failure for some other reason (a missing helper file, an import error) does not count. Where no behavior can be demonstrated (configuration, documentation), the plan says so with a non-executable item marked `waiver: true` and a reason; the audit must name it in its coverage section and still judge the request covered. Route (d), a cleanup with no behavior change, needs none.
+
 One criterion per thing that must be true for the request to be met. Choose what proves it for THIS project: its own test command (read its CLAUDE.md or equivalent), a browser test when a web screen changed, build-and-run for a desktop app, schema and rollback checks for a database change, evaluation data for an AI feature. A new project with no test framework gets one as part of the plan. Anything that cannot run here is listed as `executable: false` with the reason; the harness caps the grade at MEDIUM for it and the report names it. Do not invent a criterion to make the list longer; do not leave out the one that matters to make it pass.
 
-Depth is not your call. After the plan (and again after the build), run `python -m pipeline.depth <run-dir>`. It prints `full` or `light` from the diff: protected files (`daemon/`, `common/`, auth, billing, schemas, IPC, anything near a PERF-CRITICAL marker, the repository's `.pipeline-protected`) or more than 5 files / 200 lines mean full. Light depth skips the Plan Team and the Review Team. It never skips the independent test on the final tree, the audit, or the fourth question. At light depth on route (a) there is no `01-plan.md`, so the verification block goes at the end of `00-request.md`, below the verbatim request, which stays untouched.
+Depth is not your call. After the plan (and again after the build), run `python -m pipeline.depth <run-dir>`. It prints `full` or `light` from the diff: protected files (`daemon/`, `common/`, auth, billing, schemas, IPC, anything near a PERF-CRITICAL marker, the repository's `.pipeline-protected` as pinned at the start, so deleting or editing that file during the run removes no protection and is itself a full-depth change), a risk signal in an added or removed line (a shell call, a swallowed exception, a skipped test, a removed assertion or access check, disabled TLS, raw HTML), more than 5 files / 200 lines (pure renames not counted), no commit to bound the change against, or a checker's escalation all mean full. Light depth skips the Plan Team and the Review Team. It never skips the independent test on the final tree, the audit, or the fourth question. At light depth on route (a) there is no `01-plan.md`, so the verification block goes in `00-plan.md`; `00-request.md` is never touched after the start.
 
-Write the `expect` regex against what the command really prints here. Read the repository's pytest configuration before adding `-q`: VibeNode's `pytest.ini` already passes `-q`, a second one makes `-qq`, and the `N passed` summary line disappears (the ledger's first obstacle). Run the command once by hand and match a line you saw.
+Any checker may demand full depth with `python -m pipeline.escalate <run-dir> "<why>"` when the change is larger than its diff looks. A checker can demand more review, never less: the escalation is recorded in the checker's transcript and cannot be undone, and the run then needs every full-depth stage.
+
+The block's keys are fixed (`id`, `cmd`, `expect`, `required`, `executable`, `reason`, `cwd`, `timeout`, `suite`, `detects_change`, `fails_with`, `baseline_files`, `waiver`); an unknown or repeated key is an error, so a typo cannot silently drop an assertion. A check pinned in `.pipeline-verify` must be executable and can never be a waiver: `pipeline.start` refuses such a declaration. A baseline demonstration counts only if it exited non-zero, did not time out, and printed `fails_with`. The repository a run checks is the one its run directory lives in, never what `run.json` says, and each piece of evidence names the `pipeline` implementation that produced it, so run the programs from the VibeNode checkout. Run directories carry a short random suffix, so two runs can start together.
+
+Write the `expect` and `fails_with` regexes against what the command really prints here. Read the repository's pytest configuration before adding `-q`: VibeNode's `pytest.ini` already passes `-q`, a second one makes `-qq`, and the `N passed` summary line disappears (the ledger's first obstacle). Run the command once by hand and match a line you saw.
 
 **Step 3: build.** The Build Team implements the plan end to end, writes `02-build.md`, and adds or updates tests as it goes. Every defect a later stage finds becomes a regression test that failed before the fix and passes after. That is how the pipeline converges; the ledger only remembers.
 
-**Step 4: the checkers.** Review Team (full depth), Test Team and Final Audit each run as a FRESH subagent launched with the Agent tool, one at a time, in this order: Review finishes and its fixes land, then Test runs on that tree, then Audit reads both. Never two checkers on a moving tree (the first run of this pipeline did exactly that: Review changed six files while Test was running the suite, and every piece of Test's evidence went stale). Foreground, or background only if you wait for it before starting anything else. The brief for a checker contains only: the original request verbatim, the run directory path, the spec path if any, and the changed files or git range. It does not contain the builder's report, the builder's reasoning, or any hint of the expected verdict. The harness reads each checker's kickoff prompt and flags a pasted builder report; it flags a checker stage the root session wrote as self-graded. Each checker writes its own stage file (`03-review.md`, `04-test.md`, `08-audit.md`) with the Write tool from inside its own session.
+**Step 4: the checkers.** Review Team (full depth), Test Team and Final Audit each run as a FRESH subagent launched with the Agent tool, one at a time, in this order: Review finishes and its fixes land, then Test runs on that tree, then Audit reads both. Never two checkers on a moving tree (the first run of this pipeline did exactly that: Review changed six files while Test was running the suite, and every piece of Test's evidence went stale). Foreground, or background only if you wait for it before starting anything else. The brief for a checker contains only: the original request verbatim, the run directory path, the spec path if any, and the changed files or git range. It does not contain the builder's report, the builder's reasoning, or any hint of the expected verdict. The harness reads each checker's kickoff prompt and flags a pasted builder report; it flags a checker stage the root session wrote as self-graded. Each checker writes its own stage file (`03-review.md`, `04-test.md`, `08-audit.md`) with the Write tool from inside its own session. Each stage is a DIFFERENT subagent: one that writes two checker stages has checked its own judgment, and the harness flags it. The audit is written after the last code change; an audit older than the code is stale.
+
+**Every checker signs its report.** After writing its stage file, and again after any change to it, the checker runs, from inside its own session, as a single command with nothing chained after it:
+
+    python -m pipeline.attest <run-dir> <stage-file>      # e.g. 08-audit.md
+
+That records the sha of the report and the fingerprint of the tree the checker examined, and prints a `PIPELINE-ATTEST` line the engine keeps. The harness requires it for every checker stage: the sha must be the file's sha at grading time (a report changed after the checker signed it is not the checker's report), and the fingerprint must be the tree at grading time (a reviewer whose tree is not the final tree has not reviewed the final code). So after ANY code change, the Review Team looks again at full depth and attests again, not only the Test Team. Put the attest instruction in every checker's brief.
+
+A material defect a checker finds is recorded on its own line as `BLOCKING: <short-id> <what is wrong>`. It stops HIGH until a LATER checker stage, written by a different subagent after the fix, records `RESOLVED: <short-id> <what proves it>`. The stage that raised a finding cannot clear it, the builder's report does not count, and rewriting the report does not make the finding go away: the attest records keep every BLOCKING id a signed version carried. The audit is the last stage, so a BLOCKING the audit raises is cleared by a FRESH auditor (a different subagent) that rewrites `08-audit.md` after the fix and records the RESOLVED line; the auditor that raised it cannot. Put the same lines in the briefs' instructions so every checker uses them.
 
 The Test Team runs every executable criterion through the program, never by hand:
 
     python -m pipeline.run_check <run-dir> <criterion-id>
+    python -m pipeline.run_check <run-dir> <criterion-id> --baseline    # each detects_change criterion
 
 That records the command, exit status, output, the plan it read and the tree it ran against in `<run-dir>/evidence/<id>.json`, and prints a `PIPELINE-EVIDENCE` line the engine keeps. A passing summary typed into `04-test.md` is worth nothing; the harness only counts evidence a transcript shows being produced. Failures go into `04-test.md` verbatim (full traceback, full assertion) per Test Team's raw-output rule.
 
@@ -79,18 +109,28 @@ If a check fails, the Test Team hands the specifics back to the Build Team. Afte
 
 **Step 5: the audit.** Final Audit is a fresh subagent that reads `00-request.md`, every stage file and the evidence, and asks whether the result does what the user wanted, end to end, without new problems (intent, blast radius, regressions, project rules, operational risk, as in `final-audit.md`). It fixes only what is clear, low-risk and unambiguous. `08-audit.md` ends with a heading containing the words "what could still be wrong" and a real answer to: *if every check passed, what could still be wrong that no check would catch?* A material answer does one of three things: triggers another criterion and another run, stays as a named reason the grade is MEDIUM, or goes to the user for a decision. It is never recorded and waved through. A non-material answer is a candidate check for later.
 
+`08-audit.md` must also have a heading containing the words "checks prove the request", answered criterion by criterion: for each required criterion (named by its id), does it prove part of what the user asked for, and is any part of the request left with no check? The section ends with a line `Verdict: covered` or `Verdict: not covered`. Passing checks can all be trivial on an unfinished feature, so the harness caps the grade at MEDIUM when the section is missing, skips a required criterion, has no verdict line, or says `not covered`. A `not covered` answer is fixed the same way as a material fourth-question answer: add the missing criterion and run again, or report the gap.
+
 Two rules for every checker. A checker may challenge the criteria against the original request, in its report; it does not edit the plan file, and the harness flags a plan edited by a checker, because a checker that rewrites `expect` has graded its own criteria. And a checker reads evidence with `cat`, `Get-Content` or `jq`; an inline interpreter (`python -c`) naming the evidence folder reads as a write and grades as a forgery.
 
-**Step 6: the grade.** Run `python -m pipeline.harness <run-dir>`. It prints `PIPELINE-VERDICT HIGH|MEDIUM|LOW|BLOCKED` and its findings. You report that grade. You do not round it up, and you do not argue it down. If a finding is wrong about the facts, fix the fact (run the check again, launch the checker properly) and grade again.
+**Step 6: the grade.** Run `python -m pipeline.harness <run-dir>`. It prints `PIPELINE-VERDICT HIGH|MEDIUM|LOW|BLOCKED` and its findings, and exits 0 whatever the grade, so a MEDIUM or LOW run still gives the user a full report of what is missing. You report that grade. You do not round it up, and you do not argue it down. If a finding is wrong about the facts, fix the fact (run the check again, launch the checker properly) and grade again.
 
-**Step 7: deliver and record.** State separately what was built, verified, committed, merged, packaged and deployed. Commit and push only if the user's rules allow it; anything irreversible (production data, auth, payments, secrets, destructive git, anything leaving the machine) waits for the user. Then:
+**The completion gate is `python -m pipeline.deliver <run-dir>`.** It recomputes the grade on the tree as it is now (it never reads `verdict.json`), writes `delivered.json`, prints `PIPELINE-DELIVERED grade=… accepted=…`, and exits 0 only for HIGH. Run it immediately before calling the work verified or complete, and before any delivery action (commit, merge, push, package, deploy). Exit 1 means the work is not verified: quote the line in the first line of the report, do not deliver it as done, and name what is missing. The user may still choose to deliver a MEDIUM result; then the user says so, and the command is run again with `--accept MEDIUM`. That is the user's call, stated in the report, never yours.
+
+**Step 7: deliver and record.** State separately what was built, verified, committed, merged, packaged and deployed, quoting the `PIPELINE-DELIVERED` line. Commit and push only if the user's rules allow it and the gate passed; anything irreversible (production data, auth, payments, secrets, destructive git, anything leaving the machine) waits for the user. A commit of the verified code does not change the grade: the fingerprint is the tree's content, not its commit id. Then:
 
     python -m pipeline.ledger <run-dir> --delivered "<files or commit>" --obstacles "<one line the next run needs>"
 
+The ledger recomputes the grade as well, so its row says what the evidence says at that moment.
+
+**What `run_check` runs.** Each criterion's command runs through the platform shell on this machine with this session's permissions; VibeNode's own permission check sees `pipeline.run_check`, not the inner command. That is by design: the command is the verification, written by the planner, pinned in the plan a checker cannot edit, and readable by a person before it runs. Do not put anything in a `cmd` you would not run by hand here: no network calls to production, no credentials, no destructive steps. A baseline worktree isolates the source files, not the machine.
+
 ## Standing Criteria
 
-- No stage file is evidence. The transcript that shows a command running, or a subagent writing, is.
-- The grade applies to the tree at grading time. A change after a check invalidates that check.
+- No stage file is evidence. The transcript that shows a command running, or a subagent writing and attesting, is.
+- The route, the request and the pinned declarations are what the start line recorded. `run.json`, `00-request.md` and the pinned copies are read, and a difference is tampering.
+- The grade applies to the tree at grading time, by content. A change after a check invalidates that check and every checker's attestation; a commit of unchanged code invalidates nothing. The ledger and the delivery gate recompute the grade; neither trusts `verdict.json`.
+- The project's pinned checks always run; the tests always show they detect the change (or a waiver the audit accepts); every checker is a different subagent.
 - Less work is allowed at light depth. Less evidence never is.
 - The repository's own rules (its CLAUDE.md, its publish-gate command, its protected paths) are read, not assumed from VibeNode's.
 - No secrets, personal paths or user data in anything committed; run directories are not committed to a public repository.
@@ -115,7 +155,7 @@ Return the final pipeline report in this numbered structure. The first three ite
 5. **Run directory** — path to `docs/plans/runs/<…>/` with the stage artifacts and the evidence folder.
 6. **Implementation summary** — brief; detail in `02-build.md`.
 7. **Checker findings and fixes** — brief; detail in `03-review.md`, `04-test.md`, `08-audit.md`. Raw failure traces live in the artifacts.
-8. **The fourth question** — the audit's answer, and what was done about it.
+8. **Coverage and the fourth question** — the audit's coverage verdict and its answer to the fourth question, and what was done about each.
 9. **Risks, tradeoffs and follow-ups** — anything material that was deferred or remains uncertain.
 10. **What was not validated or could not be fully verified** — the unexecuted criteria and every other blind spot.
 11. **Obstacles encountered** — setup issues, workarounds, flags, environment quirks, aggregated across stages, and the one line that went into the ledger.

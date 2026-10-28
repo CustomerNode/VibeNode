@@ -1,0 +1,12 @@
+# VibeNode's pinned verification for Code Pipeline (see workforce/code-pipeline.md).
+# pipeline.start copies this file into every run, and the harness requires each
+# entry to pass on the final code. A run cannot drop or weaken it; changing it
+# forces full depth and caps that run below HIGH until a person reviews it.
+#
+# The full suite is the command the Publish button runs. pytest.ini already
+# passes -q, so the "N passed" line is hidden; the progress line's [100%] and
+# exit status 0 are the evidence. {python} is the interpreter running the check.
+- id: suite
+  cmd: {python} -m pytest --tb=short -q --no-header --timeout=120 -n 8 --dist loadfile tests/
+  expect: \[100%\]
+  timeout: 1800

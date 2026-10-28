@@ -290,6 +290,53 @@ _SHELL_WRITE_RE = re.compile(
 )
 
 
+# The delimiter must be a whole word (optionally quoted as a whole) ending at
+# a shell boundary: ``<<E"O"F`` has delimiter ``EOF`` in bash, and reading it
+# as ``E`` let a body run on past bash's real terminator (Review, loop 6).
+_HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)(\w+)\1(?=$|[\s;&|<>)])")
+# A heredoc fed to one of these is text being written somewhere, not code.
+_DATA_SINKS = re.compile(r"^\s*(?:cat|tee)\b")
+# Where one command of a header line ends and the next begins.
+_SEGMENT_SPLIT_RE = re.compile(r"\|\|?|;|&&?|\$\(|\(|`")
+
+
+def strip_data_heredocs(command: str) -> str:
+    """The command with the bodies of heredocs that only carry text removed.
+
+    ``cat >> 03-review.md <<'EOF' … EOF`` appends a report; the report may
+    NAME an evidence or output file, and the command also has a ``>``, so a
+    check that saw both read a forgery where there was none (found on the
+    evidence-gaps run).  Only heredocs fed to ``cat`` or ``tee`` are stripped:
+    one fed to ``python``, ``node`` or a shell is code and stays.
+
+    Fail-safe rules (Review, loop 6): the command that owns the heredoc (the
+    segment the ``<<`` is in) must be ``cat`` or ``tee``, and every later
+    segment of the header line too, so ``python - <<EOF | cat`` and
+    ``cat <<EOF | sh`` keep their bodies; a body is stripped only when its
+    terminator line is found, so an unterminated or misread heredoc hides
+    nothing."""
+    lines = command.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        m = _HEREDOC_RE.search(line)
+        data = False
+        if m:
+            owner = _SEGMENT_SPLIT_RE.split(line[:m.start()])[-1]
+            later = [s for s in _SEGMENT_SPLIT_RE.split(line[m.end():])[1:] if s.strip()]
+            data = bool(_DATA_SINKS.match(owner)) and all(_DATA_SINKS.match(s) for s in later)
+        if data:
+            delim = m.group(2)
+            end = next((j for j in range(i + 1, len(lines)) if lines[j].strip() == delim), None)
+            if end is not None:
+                out.append(lines[end])
+                i = end
+        i += 1
+    return "\n".join(out)
+
+
 def shell_writes_under(transcripts: Iterable[Transcript], directory: str | Path) -> list[tuple[Transcript, ToolCall]]:
     """Bash/PowerShell calls whose command text names *directory*.
 
@@ -301,32 +348,79 @@ def shell_writes_under(transcripts: Iterable[Transcript], directory: str | Path)
     hits = []
     for t in transcripts:
         for c in t.calls_named("Bash", "PowerShell"):
-            cmd = c.command.replace("\\", "/")
+            cmd = strip_data_heredocs(c.command).replace("\\", "/")
             if not (f"/{tail}/" in cmd or cmd.rstrip().endswith(f"/{tail}")):
                 continue
-            if "pipeline.run_check" in cmd or "pipeline/run_check" in cmd:
+            if is_evidence_writer_call(cmd):
                 continue
             if _SHELL_WRITE_RE.search(cmd):
                 hits.append((t, c))
     return hits
 
 
-def is_run_check_call(command: str) -> bool:
-    """True when a shell command invokes ``pipeline.run_check``.
+# The programs that are allowed to write into the evidence folder, and whose
+# printed lines the harness accepts as produced (not quoted).
+EVIDENCE_WRITERS = ("run_check", "attest", "escalate")
 
-    The harness accepts a ``PIPELINE-EVIDENCE`` line only from such a call.
-    Any command can print that line (``echo`` it after hashing a hand-written
-    file); a line from a command that never ran ``run_check`` is not evidence.
+
+def is_pipeline_call(command: str, module: str) -> bool:
+    """True when a shell command invokes ``pipeline.<module>`` and nothing
+    runs after it.
+
+    The harness accepts a program's printed line (``PIPELINE-EVIDENCE``,
+    ``PIPELINE-ATTEST``, ``PIPELINE-ESCALATE``) only from such a call.  Any
+    command can print such a line (``echo`` it after hashing a hand-written
+    file); a line from a command that never ran the program is not evidence.
+    And nothing may run AFTER the program in the same command: a compound
+    ``run_check …; python forge.py`` invokes run_check and then rewrites the
+    evidence and prints a matching line, all under one recorded command.  A
+    prefix (``cd repo &&``) is allowed; a suffix operator is not.
     """
     cmd = command.replace("\\", "/")
-    idx = max(cmd.find("pipeline.run_check"), cmd.find("pipeline/run_check"))
+    idx = max(cmd.find(f"pipeline.{module}"), cmd.find(f"pipeline/{module}"))
     if idx < 0:
         return False
-    # Nothing may run AFTER run_check in the same command.  A compound
-    # ``run_check …; python forge.py`` invokes run_check and then rewrites the
-    # evidence and prints a matching line, all under one recorded command.  A
-    # prefix (``cd repo &&``) is allowed; a suffix operator is not.
-    return not _SHELL_CHAIN_RE.search(cmd[idx:])
+    if _SHELL_CHAIN_RE.search(cmd[idx:]):
+        return False
+    # The prefix may only be a directory change and the interpreter.  An
+    # environment assignment before the program (``PYTEST_ADDOPTS='-k one'
+    # python -m pipeline.run_check …``, ``env X=1 …``, ``$env:X='…'; …``)
+    # changes what the verified command does while the program records a
+    # genuine passing run.  Found by the Test Team of the evidence-chain run.
+    return _ALLOWED_PREFIX_RE.fullmatch(cmd[:idx]) is not None
 
 
-_SHELL_CHAIN_RE = re.compile(r";|&&|\|\||\||\n|`|\$\(|\brun_check\b.*\b(python|sh|bash|pwsh|node)\b")
+def is_run_check_call(command: str) -> bool:
+    """``is_pipeline_call(command, "run_check")``."""
+    return is_pipeline_call(command, "run_check")
+
+
+def is_evidence_writer_call(command: str) -> bool:
+    """True when the command invokes one of the programs allowed to write
+    under ``evidence/`` (chained or not; the chain rule is applied where the
+    line is consumed)."""
+    cmd = command.replace("\\", "/")
+    return any(f"pipeline.{m}" in cmd or f"pipeline/{m}" in cmd for m in EVIDENCE_WRITERS)
+
+
+# A bare ``&`` is a chain too: a sequential separator in cmd.exe, and in bash
+# it backgrounds the program and runs the rest at once (``run_check … & perl
+# -e 'sleep 30; forge'`` rewrites the evidence after run_check wrote it, under
+# one recorded command).  ``2>&1`` and ``&>`` are redirects, not chains.
+# Before ``pipeline.<module>``: optionally ``cd <dir> &&`` (or ``;``, or
+# PowerShell's ``Set-Location``), then the interpreter (bare, quoted, or after
+# PowerShell's ``&`` call operator), then ``-m``.  Nothing else.  Neither the
+# directory nor the interpreter may contain a separator or an expansion:
+# ``cd foo;$env:PYTEST_ADDOPTS='-k one';python -m …`` read as a directory
+# named ``foo;$env:…`` followed by ``;``, and PowerShell evaluates
+# ``"$($env:X='y';'.')"`` in the caller's scope, so a ``$(`` inside the quotes
+# sets the variable too (found by the Review Team, loop 1).
+_ALLOWED_PREFIX_RE = re.compile(
+    r"""\s*(?:(?:cd|Set-Location)\s+(?:"[^"$`(]*"|'[^'$`(]*'|[^\s;&|$`"'()]+)\s*(?:&&|;)\s*)?"""
+    r"""(?:&\s*)?(?:"[^"$`(]*python[^"$`(]*"|'[^'$`(]*python[^'$`(]*'|[^\s"';&|=$`()]*python[^\s"';&|=$`()]*)"""
+    r"""\s+-m\s+""",
+    re.IGNORECASE,
+)
+
+_SHELL_CHAIN_RE = re.compile(
+    r";|&&|(?<![>&])&(?![&>])|\|\||\||\n|`|\$\(|\b(run_check|attest|escalate)\b.*\b(python|sh|bash|pwsh|node)\b")

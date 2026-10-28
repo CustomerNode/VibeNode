@@ -24,17 +24,23 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from common.paths import claude_projects_dir, encode_cwd
+from pipeline import attest as attest_mod
+from pipeline import deliver as deliver_mod
 from pipeline import depth as depth_mod
+from pipeline import escalate as escalate_mod
+from pipeline import evidence as evidence_mod
 from pipeline import harness, ledger, plan, run_check, start
-from pipeline.evidence import evidence_line, evidence_sha, run_criterion, tree_fingerprint
+from pipeline.evidence import evidence_line, evidence_sha, run_baseline, run_criterion, tree_fingerprint
 
 PY = sys.executable.replace("\\", "/")
 
@@ -42,7 +48,9 @@ PY = sys.executable.replace("\\", "/")
 # ── a real repository ────────────────────────────────────────────────────────
 
 def _git(repo: Path, *args: str) -> str:
-    r = subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True, check=True)
+    r = subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} in {repo} failed ({r.returncode}): {r.stderr.strip()}")
     return r.stdout
 
 
@@ -91,6 +99,7 @@ class FakeSession:
              is_error: bool = False, result: str | None = None) -> str:
         tid = self._id()
         self._append(path, {"type": "assistant", "sessionId": self.sid, "uuid": str(uuid.uuid4()),
+                            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                             "message": {"role": "assistant", "content": [
                                 {"type": "tool_use", "id": tid, "name": name, "input": inp}]}})
         entry = {"type": "user", "sessionId": self.sid, "uuid": str(uuid.uuid4()),
@@ -135,12 +144,21 @@ class FakeAgent:
 
 # ── one valid run ────────────────────────────────────────────────────────────
 
-PLAN_BLOCK = f"""```verification
+# The request is sub(); the test calls sub().  An earlier version of this
+# fixture checked add() and still graded HIGH: the false HIGH the baseline
+# demonstration now rules out (test_a_test_that_misses_the_change_is_not_high).
+SUB_TEST = "import thing\nassert thing.sub(5, 3) == 2\nassert thing.sub(0, 4) == -4\nprint('2 passed')\n"
+
+PLAN_BLOCK = """```verification
 - id: unit
-  cmd: {PY} -c "import thing; assert thing.add(2, 2) == 4; print('3 passed')"
+  cmd: {python} test_sub.py
   expect: \\d+ passed
+  suite: true
+  detects_change: true
+  baseline_files: test_sub.py
+  fails_with: has no attribute 'sub'
 - id: lint
-  cmd: {PY} -c "print('clean')"
+  cmd: {python} -c "print('clean')"
   expect: clean
   required: false
 ```"""
@@ -149,6 +167,13 @@ AUDIT_TEXT = """# 08 Audit
 
 Intent matched. Blast radius: thing.py only.
 
+## Do the checks prove the request?
+
+The request is a sub() helper beside add(). unit calls sub() with a positive and a negative result,
+and its baseline run shows it fails without sub(); lint is optional hygiene and proves nothing about the request.
+
+Verdict: covered
+
 ## What could still be wrong that no check would catch?
 
 Overflow on very large integers is not exercised; Python ints make it moot, but a port to a typed
@@ -156,16 +181,41 @@ language would need a bound. Nothing else outstanding.
 """
 
 
-def make_valid_run(repo: Path, *, route: str = "a", change: bool = True):
+def _attest(checker, run_dir: Path, stage: str) -> dict:
+    """The checker signs its report the way a real one does: it runs
+    ``pipeline.attest`` and the engine records the printed line."""
+    rec, _path = attest_mod.attest_stage(run_dir, stage)
+    checker.bash(f"{PY} -m pipeline.attest {run_dir} {stage}", stdout=attest_mod.attest_line(rec) + "\n")
+    return rec
+
+
+def _write_stage(sess, run_dir: Path, stage: str, text: str, *, attest: bool = True, brief: str = "brief"):
+    """A fresh checker writes *stage* and (by default) attests it."""
+    checker = sess.agent(brief)
+    (run_dir / stage).write_text(text, encoding="utf-8")
+    checker.write(run_dir / stage, text)
+    if attest:
+        _attest(checker, run_dir, stage)
+    return checker
+
+
+def make_valid_run(repo: Path, *, route: str = "a", change: bool = True, full: bool = False):
     """A run with a real change, a real run_check execution, and transcripts
-    showing every checker as a linked subagent.  Returns (run_dir, session)."""
+    showing every checker as a linked subagent that attested its report.
+    Returns (run_dir, session).  The run starts first and the build changes
+    the code after it, as in a real run, so the baseline snapshot is the code
+    without sub().  ``full=True`` also touches a protected file, so the diff
+    requires full depth and the Review stage is a required checker."""
+    run_dir, run = start.create_run(repo, "add-sub", route, "Add a sub() helper beside add().")
     if change:
         (repo / "thing.py").write_text("def add(a, b):\n    return a + b\n\n\ndef sub(a, b):\n    return a - b\n",
                                        encoding="utf-8")
-    run_dir, run = start.create_run(repo, "add-sub", route, "Add a sub() helper beside add().")
+        (repo / "test_sub.py").write_text(SUB_TEST, encoding="utf-8")
+    if full:
+        (repo / "daemon" / "core.py").write_text("X = 2\n", encoding="utf-8")
     sess = FakeSession(repo)
     sess.bash_root(f"{PY} -m pipeline.start --repo . --slug add-sub --route {route} --request-file req.txt",
-                   stdout=f"PIPELINE-RUN nonce={run['nonce']} dir={run_dir}\n")
+                   stdout=start.start_line(run, run_dir) + "\n")
     (run_dir / "01-plan.md").write_text("# 01 Plan\n\nAdd sub().\n\n" + PLAN_BLOCK + "\n", encoding="utf-8")
     sess.write_root(run_dir / "01-plan.md", "plan")
     build_text = ("# 02 Build\n\n" + "Implemented sub(a, b) returning a - b in thing.py, with a one-line docstring, "
@@ -177,20 +227,36 @@ def make_valid_run(repo: Path, *, route: str = "a", change: bool = True):
     reviewer = sess.agent(brief)
     (run_dir / "03-review.md").write_text("# 03 Review\n\nNo findings.\n", encoding="utf-8")
     reviewer.write(run_dir / "03-review.md", "review")
+    _attest(reviewer, run_dir, "03-review.md")
 
     tester = sess.agent(brief)
     for cid in ("unit", "lint"):
         rec, path = run_criterion(run_dir, cid)
         assert rec["passed"], rec
         tester.bash(f"{PY} -m pipeline.run_check {run_dir} {cid}",
-                    stdout=rec["stdout_tail"] + evidence_line(cid, evidence_sha(path), True, rec["fingerprint"]) + "\n")
+                    stdout=rec["stdout_tail"]
+                    + evidence_line(cid, evidence_sha(path), True, rec["fingerprint"], rec.get("impl")) + "\n")
+    if change:
+        record_baseline(tester, run_dir, "unit")
     (run_dir / "04-test.md").write_text("# 04 Test\n\nunit: passed (see evidence/unit.json).\n", encoding="utf-8")
     tester.write(run_dir / "04-test.md", "test")
+    _attest(tester, run_dir, "04-test.md")
 
     auditor = sess.agent(brief)
     (run_dir / "08-audit.md").write_text(AUDIT_TEXT, encoding="utf-8")
     auditor.write(run_dir / "08-audit.md", "audit")
+    _attest(auditor, run_dir, "08-audit.md")
     return run_dir, sess
+
+
+def record_baseline(checker, run_dir: Path, cid: str) -> dict:
+    """Run the regression demonstration for *cid* and record it as *checker*'s
+    run_check --baseline call."""
+    rec, path = run_baseline(run_dir, cid)
+    checker.bash(f"{PY} -m pipeline.run_check {run_dir} {cid} --baseline",
+                 stdout=evidence_line(f"{cid}@baseline", evidence_sha(path), rec["passed"], rec["snapshot"],
+                                      rec.get("impl")) + "\n")
+    return rec
 
 
 def codes(v: harness.Verdict) -> set[str]:
@@ -314,7 +380,7 @@ def test_a_check_that_failed_is_low(repo):
     assert not rec["passed"]
     tester = sess.agent("brief")
     tester.bash(f"{PY} -m pipeline.run_check {run_dir} unit", is_error=True,
-                stdout=evidence_line("unit", evidence_sha(path), False, rec["fingerprint"]))
+                stdout=evidence_line("unit", evidence_sha(path), False, rec["fingerprint"], rec.get("impl")))
     v = harness.grade_run(run_dir)
     assert v.grade == "LOW"
     assert "check-failed" in codes(v)
@@ -362,15 +428,20 @@ def test_an_unexecutable_criterion_caps_the_grade_at_medium(repo):
     is the only finding, and it caps the grade at MEDIUM, not lower."""
     run_dir, sess = make_valid_run(repo)
     p = run_dir / "01-plan.md"
-    p.write_text("# plan\n\n```verification\n- id: unit\n  cmd: " + PY + " -c \"print('3 passed')\"\n"
-                 "  expect: passed\n- id: native-ui\n  executable: false\n  reason: no desktop here\n```\n",
-                 encoding="utf-8")
+    unit = PLAN_BLOCK.split("- id: lint")[0].replace("```verification\n", "")
+    p.write_text("# plan\n\n```verification\n" + unit +
+                 "- id: native-ui\n  executable: false\n  reason: no desktop here\n```\n", encoding="utf-8")
     rec, path = run_criterion(run_dir, "unit")
     tester = sess.agent("brief")
     tester.bash(f"{PY} -m pipeline.run_check {run_dir} unit",
-                stdout=evidence_line("unit", evidence_sha(path), True, rec["fingerprint"]))
+                stdout=evidence_line("unit", evidence_sha(path), True, rec["fingerprint"], rec.get("impl")))
+    record_baseline(tester, run_dir, "unit")
+    # The audit accounts for both criteria, the one that cannot run included.
+    _audit(run_dir, "## Do the checks prove the request?\n\nunit exercises sub(); native-ui would prove the "
+                    "desktop screen but cannot run here.\n\nVerdict: covered\n\n", sess)
     v = harness.grade_run(run_dir)
-    assert codes(v) == {"unexecuted"}, harness.format_verdict(v)
+    # Informational notes (the fixture repository pins no suite) do not grade.
+    assert {f.code for f in v.findings if f.severity != "info"} == {"unexecuted"}, harness.format_verdict(v)
     assert v.grade == "MEDIUM"
     assert {c["id"]: c["status"] for c in v.criteria} == {"unit": "passed", "native-ui": "unexecuted"}
 
@@ -384,7 +455,7 @@ def test_an_echoed_evidence_line_is_not_a_producer(repo):
     rec["stdout_tail"] = "forged"
     p.write_text(json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
     tester = sess.agent("brief")
-    line = evidence_line("unit", evidence_sha(p), True, rec["fingerprint"])
+    line = evidence_line("unit", evidence_sha(p), True, rec["fingerprint"], rec.get("impl"))
     tester.bash(f"echo '{line}'", stdout=line + "\n")
     v = harness.grade_run(run_dir)
     assert v.grade == "LOW"
@@ -397,6 +468,68 @@ def test_an_audit_without_the_fourth_question_is_medium(repo):
     v = harness.grade_run(run_dir)
     assert v.grade == "MEDIUM"
     assert "fourth-question" in codes(v)
+
+
+FOURTH_ONLY = ("## What could still be wrong that no check would catch?\n\n"
+               "Nothing material: the helper is pure and both branches are exercised by the unit criterion.\n")
+
+
+def _audit(run_dir: Path, coverage: str, sess=None) -> None:
+    """Rewrite the audit.  With *sess*, a fresh auditor writes and attests it
+    (what a real re-audit does); without, the file is simply replaced, which
+    the harness must notice."""
+    text = "# 08 Audit\n\nIntent matched.\n\n" + coverage + FOURTH_ONLY
+    if sess is None:
+        (run_dir / "08-audit.md").write_text(text, encoding="utf-8")
+    else:
+        _write_stage(sess, run_dir, "08-audit.md", text)
+
+
+COVERAGE_OK = "## Do the checks prove the request?\n\nunit exercises sub() directly.\n\nVerdict: covered\n\n"
+
+
+def test_an_audit_that_does_not_judge_coverage_is_medium(repo):
+    """Every check can pass on an unfinished feature: passing tests are not
+    proof the request was met unless an independent checker says they cover it."""
+    run_dir, _ = make_valid_run(repo)
+    _audit(run_dir, "")
+    v = harness.grade_run(run_dir)
+    assert v.grade == "MEDIUM"
+    assert "coverage" in codes(v)
+
+
+def test_an_audit_that_judges_the_checks_insufficient_is_medium(repo):
+    run_dir, _ = make_valid_run(repo)
+    _audit(run_dir, "## Do the checks prove the request?\n\n"
+                    "unit only checks add(); nothing calls sub(), so the request is untested.\n\n"
+                    "Verdict: not covered\n\n")
+    v = harness.grade_run(run_dir)
+    assert v.grade == "MEDIUM"
+    assert any(f.code == "coverage" and "do not prove" in f.message for f in v.findings)
+
+
+def test_the_coverage_section_must_name_every_required_criterion(repo):
+    run_dir, _ = make_valid_run(repo)
+    _audit(run_dir, "## Do the checks prove the request?\n\nLooks thorough to me.\n\nVerdict: covered\n\n")
+    v = harness.grade_run(run_dir)
+    assert v.grade == "MEDIUM"
+    assert any(f.code == "coverage" and "unit" in f.message for f in v.findings)
+    # The optional criterion need not be named; the required one must.
+    _audit(run_dir, "## Do the checks prove the request?\n\nunit exercises sub() directly.\n\nVerdict: covered\n\n")
+    v = harness.grade_run(run_dir)
+    assert "coverage" not in codes(v)
+
+
+def test_the_coverage_verdict_must_be_explicit_and_under_the_heading(repo):
+    run_dir, _ = make_valid_run(repo)
+    # A verdict in prose, or under another heading, does not count.
+    _audit(run_dir, "We think the checks prove the request; unit covers it. Verdict: covered\n\n")
+    v = harness.grade_run(run_dir)
+    assert "coverage" in codes(v)
+    _audit(run_dir, "## Do the checks prove the request?\n\nunit exercises sub().\n\n"
+                    "## Notes\n\nVerdict: covered\n\n")
+    v = harness.grade_run(run_dir)
+    assert any(f.code == "coverage" and "no 'Verdict" in f.message for f in v.findings)
 
 
 def test_a_run_with_no_engine_record_is_blocked(repo):
@@ -615,7 +748,7 @@ def test_start_writes_the_request_verbatim_and_prints_the_nonce(repo, tmp_path, 
     out = capsys.readouterr().out
     assert out.startswith("PIPELINE-RUN nonce=")
     run_dir = Path(out.split("dir=")[1].strip())
-    assert run_dir.name.endswith("-fix-thing")
+    assert re.search(r"-fix-thing-[0-9a-f]{4}$", run_dir.name), run_dir.name
     run = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
     assert run["route"] == "b" and run["nonce"] in out and run["base_rev"] == _git(repo, "rev-parse", "HEAD").strip()
     assert "Fix the   thing.\n\nExactly   like this." in (run_dir / "00-request.md").read_text(encoding="utf-8")
@@ -638,6 +771,15 @@ def test_ledger_appends_one_row_per_run_and_replaces_a_repeat(repo):
     ledger.append_row(run_dir, delivered="thing.py (committed)", obstacles="none")
     text = p.read_text(encoding="utf-8")
     assert text.count(run_dir.name) == 1 and "(committed)" in text
+    # Code changed after grading: the row is RECOMPUTED, so it no longer reads
+    # as a verified HIGH, whatever verdict.json says.
+    (repo / "thing.py").write_text("changed\n", encoding="utf-8")
+    forged = json.loads((run_dir / "verdict.json").read_text(encoding="utf-8"))
+    forged["grade"] = "HIGH"
+    (run_dir / "verdict.json").write_text(json.dumps(forged), encoding="utf-8")
+    text = ledger.append_row(run_dir, delivered="thing.py", obstacles="none").read_text(encoding="utf-8")
+    assert "| MEDIUM |" in text and "| HIGH |" not in text
+    assert json.loads((run_dir / "verdict.json").read_text(encoding="utf-8"))["grade"] == "MEDIUM"
 
 
 # ── review findings from the first real run, each closed with a check ────────
@@ -722,7 +864,7 @@ def test_a_compound_command_after_run_check_cannot_manufacture_evidence(repo):
     p.write_text(json.dumps(rec, indent=2, sort_keys=True), encoding="utf-8")
     forger = sess.agent("brief")
     forger.bash(f"{PY} -m pipeline.run_check {run_dir} unit; python forge.py",
-                stdout=evidence_line("unit", evidence_sha(p), True, rec["fingerprint"]) + "\n")
+                stdout=evidence_line("unit", evidence_sha(p), True, rec["fingerprint"], rec.get("impl")) + "\n")
     v = harness.grade_run(run_dir)
     assert v.grade == "LOW"
     assert "evidence-unrecorded" in codes(v)
@@ -744,3 +886,596 @@ def test_the_package_imports_nothing_from_app_or_daemon():
         text = py.read_text(encoding="utf-8")
         for bad in ("from app", "import app", "from daemon", "import daemon"):
             assert not any(line.strip().startswith(bad) for line in text.splitlines()), (py.name, bad)
+
+
+# ── the change is detected: the regression demonstration ─────────────────────
+
+def _replan(run_dir: Path, sess, block: str):
+    """Replace the plan with *block* and re-run every executable criterion as a
+    fresh tester, so only the plan's content differs from the valid run."""
+    (run_dir / "01-plan.md").write_text("# 01 Plan\n\n" + block + "\n", encoding="utf-8")
+    tester = sess.agent("brief")
+    for c in plan.load_plan(run_dir)[0]:
+        if c.executable:
+            rec, path = run_criterion(run_dir, c.id)
+            tester.bash(f"{PY} -m pipeline.run_check {run_dir} {c.id}",
+                        stdout=evidence_line(c.id, evidence_sha(path), rec["passed"], rec["fingerprint"], rec.get("impl")) + "\n")
+    return tester
+
+
+ADD_ONLY = """```verification
+- id: unit
+  cmd: {python} -c "import thing; assert thing.add(2, 2) == 4; print('3 passed')"
+  expect: \\d+ passed
+  suite: true
+  detects_change: true
+  baseline_files: test_sub.py
+  fails_with: has no attribute 'sub'
+```"""
+
+NO_DEMO = PLAN_BLOCK.replace("  detects_change: true\n  baseline_files: test_sub.py\n"
+                             "  fails_with: has no attribute 'sub'\n", "")
+
+
+def test_a_test_that_misses_the_change_is_not_high(repo):
+    """The false HIGH a reviewer found in this file's own fixture: the request
+    is sub(), the test calls add(), every check passes, and the audit says
+    covered.  On the code before the change the test passes too, so it does
+    not test the change, and the grade cannot be HIGH."""
+    run_dir, sess = make_valid_run(repo)
+    tester = _replan(run_dir, sess, ADD_ONLY)
+    rec = record_baseline(tester, run_dir, "unit")
+    assert rec["failed"] is False and rec["passed"] is False
+    v = harness.grade_run(run_dir)
+    assert v.grade == "MEDIUM", harness.format_verdict(v)
+    assert "baseline-passed" in codes(v)
+
+
+def test_an_unrelated_baseline_failure_does_not_count(repo):
+    """A test that fails on the baseline for some other reason (a helper file
+    the baseline does not have) is not evidence that it detects the change."""
+    run_dir, sess = make_valid_run(repo)
+    (repo / "helper.py").write_text("X = 1\n", encoding="utf-8")
+    (repo / "test_sub.py").write_text("import helper\n" + SUB_TEST, encoding="utf-8")
+    tester = _replan(run_dir, sess, PLAN_BLOCK)
+    rec = record_baseline(tester, run_dir, "unit")
+    assert rec["failed"] and not rec["fails_with_matched"]
+    v = harness.grade_run(run_dir)
+    assert "baseline-unrelated" in codes(v) and v.grade == "MEDIUM"
+
+
+def test_a_feature_run_without_a_regression_demonstration_is_medium(repo):
+    run_dir, sess = make_valid_run(repo)
+    _replan(run_dir, sess, NO_DEMO)
+    v = harness.grade_run(run_dir)
+    assert "no-change-detection" in codes(v) and v.grade == "MEDIUM"
+
+
+def test_a_cleanup_run_needs_no_regression_demonstration(repo):
+    """Route d intends no behavior change, so there is nothing to detect."""
+    run_dir, sess = make_valid_run(repo, route="d")
+    (run_dir / "01-plan.md").unlink()
+    (run_dir / "07-refactor.md").write_text("# 07 Refactor\n\n" + NO_DEMO + "\n", encoding="utf-8")
+    _run_all(run_dir, sess.agent("brief"))
+    v = harness.grade_run(run_dir)
+    assert "no-change-detection" not in codes(v), harness.format_verdict(v)
+    assert "baseline-missing" not in codes(v)
+
+
+def test_a_waiver_holds_only_when_the_independent_audit_names_it(repo):
+    run_dir, sess = make_valid_run(repo)
+    block = NO_DEMO.replace("\n```", "\n- id: no-baseline\n  executable: false\n  waiver: true\n"
+                                      "  reason: documentation-only change\n```")
+    _replan(run_dir, sess, block)
+    _audit(run_dir, COVERAGE_OK, sess)
+    v = harness.grade_run(run_dir)
+    assert "no-change-detection" not in codes(v)
+    assert any(f.code == "coverage" and "no-baseline" in f.message for f in v.findings)
+    _audit(run_dir, "## Do the checks prove the request?\n\nunit exercises sub(); no-baseline: agreed, nothing "
+                    "observable changes.\n\nVerdict: covered\n\n", sess)
+    v = harness.grade_run(run_dir)
+    assert {f.code for f in v.findings if f.severity != "info"} == set(), harness.format_verdict(v)
+    assert v.grade == "HIGH"
+
+
+def test_the_baseline_never_touches_the_working_tree(repo):
+    run_dir, sess = make_valid_run(repo)
+    before = tree_fingerprint(repo)
+    worktrees = _git(repo, "worktree", "list")
+    rec, _ = run_baseline(run_dir, "unit")
+    assert rec["demonstrated"]
+    assert tree_fingerprint(repo) == before
+    assert _git(repo, "worktree", "list") == worktrees
+    assert (repo / "thing.py").read_text(encoding="utf-8").count("def sub") == 1
+
+
+def test_a_dirty_start_is_the_baseline_and_is_kept(repo):
+    """Uncommitted work present when the run starts is part of the baseline,
+    captured without touching the working tree or the index."""
+    (repo / "thing.py").write_text("def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n",
+                                   encoding="utf-8")
+    status = _git(repo, "status", "--porcelain")
+    run_dir, run = start.create_run(repo, "dirty", "a", "Add sub().")
+    assert _git(repo, "status", "--porcelain") == status
+    assert run["base_snapshot"] != run["base_rev"]
+    assert _git(repo, "rev-parse", f"refs/pipeline/{run['run_id']}").strip() == run["base_snapshot"]
+    shown = _git(repo, "show", f"{run['base_snapshot']}:thing.py")
+    assert "def mul" in shown and "def sub" not in shown
+
+
+def test_baseline_evidence_edited_by_hand_is_forged(repo):
+    run_dir, sess = make_valid_run(repo)
+    p = run_dir / "evidence" / "unit.baseline.json"
+    rec = json.loads(p.read_text(encoding="utf-8"))
+    rec["stdout_tail"] += " "
+    p.write_text(json.dumps(rec), encoding="utf-8")
+    v = harness.grade_run(run_dir)
+    assert "evidence-unrecorded" in codes(v) and v.grade == "LOW"
+
+
+def test_a_baseline_goes_stale_when_its_tests_change(repo):
+    run_dir, sess = make_valid_run(repo)
+    (repo / "test_sub.py").write_text(SUB_TEST + "assert thing.sub(1, 1) == 0\n", encoding="utf-8")
+    _run_all(run_dir, sess.agent("brief"))
+    v = harness.grade_run(run_dir)
+    assert "baseline-stale" in codes(v)
+
+
+def test_run_check_baseline_cli_exits_by_the_demonstration(repo, capsys):
+    run_dir, _ = make_valid_run(repo)
+    assert run_check.main([str(run_dir), "unit", "--baseline"]) == 0
+    assert "PIPELINE-EVIDENCE id=unit@baseline" in capsys.readouterr().out
+    (run_dir / "01-plan.md").write_text("# plan\n\n" + ADD_ONLY + "\n", encoding="utf-8")
+    assert run_check.main([str(run_dir), "unit", "--baseline"]) == 1
+    assert "does not detect it" in capsys.readouterr().err
+
+
+def test_a_detects_change_criterion_must_say_what_it_detects():
+    with pytest.raises(plan.PlanError, match="fails_with and baseline_files"):
+        plan.parse_criteria("- id: t\n  cmd: x\n  detects_change: true\n")
+
+
+# ── the project's suite is pinned for the run ────────────────────────────────
+
+SUITE_DECL = "- id: suite\n  cmd: {python} -c \"print('9 passed')\"\n  expect: \\d+ passed\n"
+
+
+def _pinned_repo(repo: Path) -> Path:
+    (repo / ".pipeline-verify").write_text(SUITE_DECL, encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "declare suite")
+    return repo
+
+
+def _run_all(run_dir: Path, checker) -> None:
+    for c in plan.load_plan(run_dir)[0]:
+        if c.executable:
+            rec, path = run_criterion(run_dir, c.id)
+            checker.bash(f"{PY} -m pipeline.run_check {run_dir} {c.id}",
+                         stdout=evidence_line(c.id, evidence_sha(path), rec["passed"], rec["fingerprint"], rec.get("impl")) + "\n")
+
+
+def test_the_pinned_suite_is_required_even_when_the_plan_leaves_it_out(repo):
+    run_dir, sess = make_valid_run(_pinned_repo(repo))
+    assert (run_dir / "pinned-verify.txt").read_text(encoding="utf-8") == SUITE_DECL
+    assert [c.id for c in plan.load_plan(run_dir)[0]][0] == "suite"
+    v = harness.grade_run(run_dir)
+    assert any(f.code == "never-ran" and "suite" in f.message for f in v.findings) and v.grade == "LOW"
+    _run_all(run_dir, sess.agent("brief"))
+    record_baseline(sess.agent("brief"), run_dir, "unit")
+    # New evidence means a fresh audit of it.
+    _audit(run_dir, "## Do the checks prove the request?\n\nsuite is the project's own suite; unit exercises "
+                    "sub().\n\nVerdict: covered\n\n", sess)
+    v = harness.grade_run(run_dir)
+    assert v.grade == "HIGH", harness.format_verdict(v)
+    assert "suite-unpinned" not in codes(v)
+
+
+def test_weakening_the_declaration_during_the_run_is_not_enforced_and_not_high(repo):
+    run_dir, sess = make_valid_run(_pinned_repo(repo))
+    (repo / ".pipeline-verify").write_text("- id: suite\n  cmd: {python} -c \"print('ok')\"\n", encoding="utf-8")
+    rec, _ = run_criterion(run_dir, "suite")
+    assert "9 passed" in rec["stdout_tail"]  # the pinned command ran, not the weakened one
+    v = harness.grade_run(run_dir)
+    assert "verify-declaration-changed" in codes(v) and v.grade != "HIGH"
+
+
+def test_editing_the_pinned_copy_is_tampering(repo):
+    run_dir, _ = make_valid_run(_pinned_repo(repo))
+    (run_dir / "pinned-verify.txt").write_text("- id: suite\n  cmd: echo 1 passed\n", encoding="utf-8")
+    v = harness.grade_run(run_dir)
+    assert "pinned-tampered" in codes(v) and v.grade == "LOW"
+
+
+def test_a_plan_cannot_redefine_a_pinned_criterion(repo):
+    run_dir, _ = make_valid_run(_pinned_repo(repo))
+    (run_dir / "01-plan.md").write_text("# plan\n\n```verification\n- id: suite\n  cmd: echo 1 passed\n```\n",
+                                        encoding="utf-8")
+    with pytest.raises(plan.PlanError, match="redefines pinned criterion suite"):
+        plan.load_plan(run_dir)
+
+
+def test_no_declaration_and_no_suite_in_the_plan_is_medium(repo):
+    run_dir, sess = make_valid_run(repo)
+    tester = _replan(run_dir, sess, PLAN_BLOCK.replace("  suite: true\n", ""))
+    record_baseline(tester, run_dir, "unit")
+    v = harness.grade_run(run_dir)
+    assert "no-suite" in codes(v) and v.grade == "MEDIUM"
+
+
+def test_a_new_project_may_supply_its_suite_in_the_plan(repo):
+    """No declaration yet: the plan's suite: true criterion counts, with a note."""
+    run_dir, _ = make_valid_run(repo)
+    v = harness.grade_run(run_dir)
+    assert v.grade == "HIGH" and "suite-unpinned" in codes(v)
+
+
+def test_the_declaration_is_a_protected_file():
+    assert depth_mod._matches(".pipeline-verify", depth_mod.DEFAULT_PROTECTED)
+
+
+def test_a_plan_command_names_no_machine_interpreter(repo):
+    run_dir, _ = make_valid_run(repo)
+    rec, _ = run_criterion(run_dir, "lint")
+    assert rec["cmd"].startswith("{python}") and rec["passed"]
+
+
+# ── distinct, current checkers ───────────────────────────────────────────────
+
+def test_one_checker_writing_two_stages_is_medium(repo):
+    run_dir, sess = make_valid_run(repo)
+    reviewer = harness.writers_of(harness.subagents_of(sess.root), run_dir / "03-review.md")[0][0]
+    again = FakeAgent.__new__(FakeAgent)
+    again.session, again.agent_id, again.path = sess, reviewer.agent_id, reviewer.path
+    again.write(run_dir / "08-audit.md", "audit")
+    v = harness.grade_run(run_dir)
+    assert "checker-reused" in codes(v) and v.grade == "MEDIUM"
+
+
+def test_an_audit_older_than_the_evidence_it_relies_on_is_stale(repo, monkeypatch):
+    """The code changed after the audit and the tests ran again on it, so the
+    evidence is current but the audit judged the earlier version."""
+    monkeypatch.setattr(harness, "STALE_TOLERANCE_S", 0.0)
+    run_dir, sess = make_valid_run(repo)
+    (repo / "thing.py").write_text("def add(a, b):\n    return a + b\n\n\ndef sub(a, b):\n    return -(b - a)\n",
+                                   encoding="utf-8")
+    _run_all(run_dir, sess.agent("brief"))
+    record_baseline(sess.agent("brief"), run_dir, "unit")
+    v = harness.grade_run(run_dir)
+    assert "stale-tree" not in codes(v)
+    assert "checker-stale" in codes(v) and v.grade == "MEDIUM"
+
+
+def test_touching_a_file_without_changing_it_does_not_stale_the_audit(repo):
+    """Found by the qualification run: an mtime-based check kept MEDIUM after
+    the code was restored byte for byte.  Freshness is judged by content."""
+    run_dir, _ = make_valid_run(repo)
+    future = datetime.now(timezone.utc).timestamp() + 30
+    os.utime(repo / "thing.py", (future, future))
+    v = harness.grade_run(run_dir)
+    assert v.grade == "HIGH", harness.format_verdict(v)
+
+
+def test_checkers_run_in_order(repo):
+    run_dir, sess = make_valid_run(repo)
+    sess.agent("brief").write(run_dir / "04-test.md", "test again")
+    v = harness.grade_run(run_dir)
+    assert "stage-order" in codes(v)
+
+
+def test_a_blocking_finding_needs_a_resolution_from_a_later_checker(repo):
+    run_dir, sess = make_valid_run(repo)
+    (run_dir / "03-review.md").write_text("# 03 Review\n\nBLOCKING: neg-input sub() ignores negatives\n",
+                                          encoding="utf-8")
+    v = harness.grade_run(run_dir)
+    assert any(f.code == "finding-unresolved" and "neg-input" in f.message for f in v.findings)
+    assert v.grade == "MEDIUM"
+    # The stage that raised it cannot clear it itself.
+    (run_dir / "03-review.md").write_text("# 03 Review\n\nBLOCKING: neg-input\nRESOLVED: neg-input\n",
+                                          encoding="utf-8")
+    assert "finding-unresolved" in codes(harness.grade_run(run_dir))
+    # A later checker stage can: a fresh tester records the resolution and a
+    # fresh auditor follows, in order.
+    (run_dir / "03-review.md").write_text("# 03 Review\n\nBLOCKING: neg-input\n", encoding="utf-8")
+    _write_stage(sess, run_dir, "04-test.md", "# 04 Test\n\nRESOLVED: neg-input (test_sub covers 0 - 4)\n")
+    _audit(run_dir, COVERAGE_OK, sess)
+    v = harness.grade_run(run_dir)
+    assert "finding-unresolved" not in codes(v) and v.grade == "HIGH", harness.format_verdict(v)
+
+
+# ── the gate ─────────────────────────────────────────────────────────────────
+
+def test_expect_high_is_the_completion_gate_and_lower_grades_still_report(repo, capsys):
+    run_dir, sess = make_valid_run(repo)
+    assert harness.main([str(run_dir), "--expect", "HIGH"]) == 0
+    capsys.readouterr()
+    _replan(run_dir, sess, ADD_ONLY)
+    # The plain report succeeds and says what is wrong; the gate refuses.
+    assert harness.main([str(run_dir)]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("PIPELINE-VERDICT MEDIUM") and "baseline" in out
+    assert harness.main([str(run_dir), "--expect", "HIGH"]) == 1
+
+
+# ── found by the qualification run ───────────────────────────────────────────
+
+def test_non_ascii_output_is_recorded_and_echoed_without_crashing(repo, capsys):
+    """The first real qualification run: pytest printed an ellipsis, the
+    evidence recorded U+FFFD, and echoing it to a cp1252 console crashed
+    run_check after the evidence was written."""
+    run_dir, _ = make_valid_run(repo)
+    (run_dir / "01-plan.md").write_text(
+        "# plan\n\n```verification\n- id: dots\n"
+        "  cmd: {python} -c \"print(chr(8230) + ' 1 passed')\"\n"
+        "  expect: passed\n```\n", encoding="utf-8")
+    rec, _ = run_criterion(run_dir, "dots")
+    assert "…" in rec["stdout_tail"] and "�" not in rec["stdout_tail"], rec["stdout_tail"]
+    assert run_check.main([str(run_dir), "dots"]) == 0
+    assert "PIPELINE-EVIDENCE id=dots" in capsys.readouterr().out
+
+
+# ── review of the evidence-gaps run (2026-10-28) ─────────────────────────────
+
+def test_evidence_that_names_no_pipeline_implementation_is_flagged(repo):
+    """A stand-in (or an older copy) that prints no impl= is not this pipeline."""
+    run_dir, sess = make_valid_run(repo)
+    tester = sess.agent("brief")
+    for cid in ("unit", "lint"):
+        rec, path = run_criterion(run_dir, cid)
+        line = (f"PIPELINE-EVIDENCE id={cid} sha={evidence_sha(path)} passed=true "
+                f"fingerprint={rec['fingerprint'][:12]}")
+        tester.bash(f"{PY} -m pipeline.run_check {run_dir} {cid}", stdout=line + "\n")
+    v = harness.grade_run(run_dir)
+    assert "pipeline-impl-unknown" in codes(v), harness.format_verdict(v)
+
+
+def test_baseline_evidence_from_another_pipeline_implementation_is_flagged(repo):
+    run_dir, sess = make_valid_run(repo, change=True)
+    rec, path = evidence_mod.run_baseline(run_dir, "unit")
+    line = (f"PIPELINE-EVIDENCE id=unit@baseline sha={evidence_sha(path)} passed=true "
+            f"fingerprint={rec['snapshot'][:12]} impl=000000000000")
+    sess.agent("brief").bash(f"{PY} -m pipeline.run_check {run_dir} unit --baseline", stdout=line + "\n")
+    v = harness.grade_run(run_dir)
+    assert "pipeline-impl-mismatch" in codes(v), harness.format_verdict(v)
+
+
+def test_a_run_directory_outside_a_runs_tree_is_a_plan_error(tmp_path):
+    with pytest.raises(plan.PlanError):
+        evidence_mod.run_repo(Path(tmp_path.anchor) / "shallow")
+
+
+def test_a_baseline_that_exits_zero_is_not_recorded_as_demonstrated(repo, monkeypatch):
+    """run_check and the harness agree: only a non-zero exit demonstrates."""
+    run_dir, _ = make_valid_run(repo)
+    real = evidence_mod._execute
+
+    def exits_zero(*a, **k):
+        r = list(real(*a, **k))
+        r[0] = 0
+        return tuple(r)
+
+    monkeypatch.setattr(evidence_mod, "_execute", exits_zero)
+    rec, _ = evidence_mod.run_baseline(run_dir, "unit")
+    monkeypatch.setattr(evidence_mod, "_execute", real)
+    assert rec["fails_with_matched"] and not rec["passed"], rec
+
+
+def test_a_key_with_no_value_is_an_error():
+    """``expect:`` with nothing after it dropped the assertion silently
+    (Review Team, evidence-gaps run)."""
+    with pytest.raises(plan.PlanError, match="has no value"):
+        plan.parse_criteria("- id: a\n  cmd: x\n  expect:\n")
+
+
+def test_an_earlier_run_in_the_same_session_does_not_leak_into_this_one(repo):
+    """Final Audit, evidence-gaps run: one session held two runs, and the
+    earlier run's signed BLOCKING findings capped the later run at MEDIUM
+    because the harness read every attest line in the session.  Attestations
+    and escalations count only when the command names this run."""
+    from pipeline import attest as attest_mod2
+    first, sess = make_valid_run(repo)
+    reviewer = sess.agent("brief")
+    (first / "03-review.md").write_text("# 03 Review\n\nBLOCKING: old-issue in the first run\n", encoding="utf-8")
+    reviewer.write(first / "03-review.md", "review")
+    rec, _ = attest_mod2.attest_stage(first, "03-review.md")
+    reviewer.bash(f"{PY} -m pipeline.attest {first} 03-review.md", stdout=attest_mod2.attest_line(rec) + "\n")
+    # A second run in the SAME session: start, build, checkers, all clean.
+    second, run = start.create_run(repo, "second", "a", "Add a sub() helper beside add().")
+    sess.bash_root(f"{PY} -m pipeline.start --repo . --slug second --route a --request-file r.txt",
+                   stdout=start.start_line(run, second) + "\n")
+    (second / "01-plan.md").write_text("# 01 Plan\n\n" + PLAN_BLOCK + "\n", encoding="utf-8")
+    (second / "02-build.md").write_text("# 02 Build\n\nNothing new.\n", encoding="utf-8")
+    tester = sess.agent("brief")
+    for cid in ("unit", "lint"):
+        r, path = run_criterion(second, cid)
+        tester.bash(f"{PY} -m pipeline.run_check {second} {cid}",
+                    stdout=evidence_line(cid, evidence_sha(path), r["passed"], r["fingerprint"]) + "\n")
+    record_baseline(tester, second, "unit")
+    for stage, text in (("04-test.md", "# 04 Test\n\nall passed\n"), ("08-audit.md", AUDIT_TEXT)):
+        checker = tester if stage == "04-test.md" else sess.agent("brief")
+        (second / stage).write_text(text, encoding="utf-8")
+        checker.write(second / stage, text)
+        r, _ = attest_mod2.attest_stage(second, stage)
+        checker.bash(f"{PY} -m pipeline.attest {second} {stage}", stdout=attest_mod2.attest_line(r) + "\n")
+    v = harness.grade_run(second)
+    assert not ({"finding-dropped", "finding-unresolved"} & codes(v)), harness.format_verdict(v)
+
+
+def test_a_run_is_named_by_whole_path_segment_in_any_spelling():
+    """Loop 3 review: the filter must not find ``...-gaps`` inside ``...-gaps-2``."""
+    run = Path("/r/docs/plans/runs/2026-10-28-0006-gaps")
+    for cmd in ("py -m pipeline.attest docs/plans/runs/2026-10-28-0006-gaps 03-review.md",
+                r'py -m pipeline.attest "C:\R\DOCS\PLANS\RUNS\2026-10-28-0006-GAPS\" 03-review.md',
+                "py -m pipeline.attest './2026-10-28-0006-gaps' 03-review.md",
+                "py -m pipeline.attest 2026-10-28-0006-gaps/ 03-review.md"):
+        assert harness._names_run(cmd, run), cmd
+    other = "py -m pipeline.attest docs/plans/runs/2026-10-28-0006-gaps-2 03-review.md"
+    assert not harness._names_run(other, run)
+    assert harness._names_other_run(other, run)
+
+
+def test_an_escalation_whose_target_is_not_spelled_out_still_counts(repo):
+    """Loop 3 review: ``escalate . "why"`` (after a cd) must not lower the depth;
+    only an escalation that names another run is left out."""
+    run_dir, sess = make_valid_run(repo)
+    rec, _ = escalate_mod.escalate(run_dir, "sub() is called from the billing path")
+    sess.agent("brief").bash(f'{PY} -m pipeline.escalate . "sub() is called from the billing path"',
+                             stdout=escalate_mod.escalate_line(rec) + "\n")
+    assert harness.grade_run(run_dir).facts["depth"] == "full"
+
+
+def test_an_escalation_of_another_run_does_not_count(repo):
+    run_dir, sess = make_valid_run(repo)
+    rec, _ = escalate_mod.escalate(run_dir, "about the other run")
+    sess.agent("brief").bash(f'{PY} -m pipeline.escalate docs/plans/runs/2026-01-01-0000-other "about the other run"',
+                             stdout=escalate_mod.escalate_line(rec) + "\n")
+    assert harness.grade_run(run_dir).facts["depth"] == "light"
+
+
+def test_a_signed_finding_cannot_be_dropped_by_spelling_the_run_differently(repo):
+    """Test Team, evidence-gaps loop 3: a reviewer signed a report carrying a
+    BLOCKING with ``attest $RUN 03-review.md`` (the path hidden in a shell
+    variable), then rewrote it
+    without the finding and signed with the full path; the history read only
+    commands naming the run, so the finding vanished.  Findings are read
+    leniently: only a command that names ANOTHER run is left out."""
+    from pipeline import attest as attest_mod2
+    run_dir, sess = make_valid_run(repo, full=True)
+    reviewer = sess.agent("brief")
+    (run_dir / "03-review.md").write_text("# 03 Review\n\nBLOCKING: hidden-issue\n", encoding="utf-8")
+    reviewer.write(run_dir / "03-review.md", "review")
+    rec, _ = attest_mod2.attest_stage(run_dir, "03-review.md")
+    reviewer.bash(f"{PY} -m pipeline.attest $RUN 03-review.md", stdout=attest_mod2.attest_line(rec) + "\n")
+    (run_dir / "03-review.md").write_text("# 03 Review\n\nNo findings.\n", encoding="utf-8")
+    reviewer.write(run_dir / "03-review.md", "review")
+    rec, _ = attest_mod2.attest_stage(run_dir, "03-review.md")
+    reviewer.bash(f"{PY} -m pipeline.attest {run_dir} 03-review.md", stdout=attest_mod2.attest_line(rec) + "\n")
+    v = harness.grade_run(run_dir)
+    assert any(f.code == "finding-dropped" and "hidden-issue" in f.message for f in v.findings), harness.format_verdict(v)
+
+
+def test_an_earlier_runs_unspelled_sign_off_does_not_leak_into_this_one(repo):
+    """Review, loop 4: the lenient history must not take in another run's
+    finding signed with ``$RUN``; that signature lives in the other run's
+    attest file, not this one's."""
+    first, sess = make_valid_run(repo)
+    reviewer = sess.agent("brief")
+    (first / "03-review.md").write_text("# 03 Review\n\nBLOCKING: old-issue in the first run\n", encoding="utf-8")
+    reviewer.write(first / "03-review.md", "review")
+    rec, _ = attest_mod.attest_stage(first, "03-review.md")
+    reviewer.bash(f"{PY} -m pipeline.attest $RUN 03-review.md", stdout=attest_mod.attest_line(rec) + "\n")
+    second, run = start.create_run(repo, "second", "a", "Add a sub() helper beside add().")
+    sess.bash_root(f"{PY} -m pipeline.start --repo . --slug second --route a --request-file r.txt",
+                   stdout=start.start_line(run, second) + "\n")
+    (second / "03-review.md").write_text("# 03 Review\n\nNo findings.\n", encoding="utf-8")
+    checker = sess.agent("brief")
+    checker.write(second / "03-review.md", "review")
+    r, _ = attest_mod.attest_stage(second, "03-review.md")
+    checker.bash(f"{PY} -m pipeline.attest {second} 03-review.md", stdout=attest_mod.attest_line(r) + "\n")
+    v = harness.grade_run(second)
+    assert not any("old-issue" in f.message for f in v.findings), harness.format_verdict(v)
+
+
+def _background_run_check(sess, checker, run_dir, cid, tmp_path, *, tamper=False):
+    """Run a criterion and record it the way the shell tool does when the
+    command outruns its foreground limit: the result names an output file the
+    engine writes, and the evidence line is in that file."""
+    rec, path = run_criterion(run_dir, cid)
+    out = tmp_path / "tasks" / f"bg{cid}.output"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(evidence_line(cid, evidence_sha(path), rec["passed"], rec["fingerprint"], rec.get("impl"))
+                   + "\n...\n", encoding="utf-8")
+    msg = (f"Command did not complete within its 600s timeout and was moved to the background (ID: bg{cid}). "
+           f"Output is being written to: {out}. You will be notified when it completes.")
+    sess.tool(checker.path, "Bash", {"command": f"{PY} -m pipeline.run_check {run_dir} {cid}"}, result=msg)
+    if tamper:
+        checker.write(out, "forged")
+    return rec
+
+
+def test_a_run_check_that_outran_the_shell_limit_still_counts(repo, tmp_path):
+    """Test Team, evidence-gaps loop 4: the full suite outran the shell tool's
+    10-minute foreground limit twice, finished in the background, and its
+    evidence was unrecorded.  The engine names the output file it writes; the
+    evidence line in it counts."""
+    run_dir, sess = make_valid_run(repo)
+    tester = sess.agent("brief")
+    for cid in ("unit", "lint"):
+        _background_run_check(sess, tester, run_dir, cid, tmp_path)
+    (run_dir / "04-test.md").write_text("# 04 Test\n\nran in the background\n", encoding="utf-8")
+    tester.write(run_dir / "04-test.md", "test")
+    _attest(tester, run_dir, "04-test.md")
+    _audit(run_dir, COVERAGE_OK, sess)
+    v = harness.grade_run(run_dir)
+    assert {c["id"]: c["status"] for c in v.criteria}["unit"] == "passed", harness.format_verdict(v)
+    assert "evidence-unrecorded" not in codes(v) and v.grade == "HIGH", harness.format_verdict(v)
+
+
+def test_a_background_output_file_written_by_a_tool_call_is_forged(repo, tmp_path):
+    run_dir, sess = make_valid_run(repo)
+    tester = sess.agent("brief")
+    _background_run_check(sess, tester, run_dir, "unit", tmp_path, tamper=True)
+    v = harness.grade_run(run_dir)
+    assert "evidence-forged" in codes(v) and v.grade == "LOW"
+
+
+def test_a_criterion_that_prints_the_background_sentence_cannot_attach_a_file(repo, tmp_path):
+    """Review, loop 5: the background sentence counts only as the tool's own
+    result.  A foreground run_check whose checked command prints it, naming a
+    file the command wrote with another criterion's evidence line, must not
+    make that evidence recorded."""
+    run_dir, sess = make_valid_run(repo)
+    checker = sess.agent("brief")
+    lint, lint_path = run_criterion(run_dir, "lint")  # new content, no recorded producer yet
+    planted = tmp_path / "tasks" / "bx.output"
+    planted.parent.mkdir(parents=True, exist_ok=True)
+    planted.write_text(evidence_line("lint", evidence_sha(lint_path), True, lint["fingerprint"], lint.get("impl"))
+                       + "\n", encoding="utf-8")
+    unit, unit_path = run_criterion(run_dir, "unit")
+    result = (evidence_line("unit", evidence_sha(unit_path), True, unit["fingerprint"], unit.get("impl")) + "\n"
+              + "Command did not complete within its 600s timeout and was moved to the background (ID: bx). "
+              + f"Output is being written to: {planted}. You will be notified when it completes.\n")
+    sess.tool(checker.path, "Bash", {"command": f"{PY} -m pipeline.run_check {run_dir} unit"}, result=result)
+    v = harness.grade_run(run_dir)
+    assert {c["id"]: c["status"] for c in v.criteria}["lint"] == "unrecorded", harness.format_verdict(v)
+
+
+def test_a_report_that_names_an_evidence_file_is_not_a_forgery(repo, tmp_path):
+    """Found on the evidence-gaps run: a reviewer appended its report with
+    ``cat >> 03-review.md <<'EOF'``, the report named a background output
+    file, and the write check read a forgery.  Text fed to cat or tee is data;
+    the same text fed to an interpreter is code and still counts."""
+    from pipeline.transcripts import strip_data_heredocs
+    run_dir, sess = make_valid_run(repo)
+    tester = sess.agent("brief")
+    _background_run_check(sess, tester, run_dir, "unit", tmp_path)
+    reviewer = sess.agent("brief")
+    reviewer.bash(f"cat >> {run_dir}/03-review.md <<'EOF'\nThe output went to {tmp_path}/tasks/bgunit.output\n"
+                  f"and evidence lives in {run_dir}/evidence/unit.json\nEOF")
+    v = harness.grade_run(run_dir)
+    assert "evidence-forged" not in codes(v), harness.format_verdict(v)
+    # The same text fed to python is code: a write to the evidence folder.
+    code = f"python - <<'EOF'\nopen(r'{run_dir}/evidence/unit.json', 'w').write('x')\nEOF"
+    assert "evidence/unit.json" in strip_data_heredocs(code)
+    sess.agent("brief").bash(code + " > /dev/null")
+    assert "evidence-forged" in codes(harness.grade_run(run_dir))
+
+
+def test_a_heredoc_that_is_code_or_misread_hides_nothing():
+    """Review, loop 6: only a terminated heredoc owned by cat/tee, on a header
+    line where nothing but cat/tee follows, is stripped.  A heredoc piped from
+    an interpreter, a delimiter bash reads differently, and an unterminated
+    heredoc all keep every line visible to the write checks."""
+    from pipeline.transcripts import strip_data_heredocs
+    ev_path = "docs/plans/runs/R/evidence/unit.json"
+    visible = [
+        "python - <<'EOF' | cat\nopen('%s', 'w').write('x')\nEOF" % ev_path,
+        "cat <<'EOF' | sh\necho x > %s\nEOF" % ev_path,
+        'cat <<E"O"F >/dev/null\nx\nEOF\ncp f.json %s\nE' % ev_path,
+        "cat <<'EOF' >/dev/null\nx\ncp f.json %s" % ev_path,
+        "cat <<'EOF' > %s\n{}\nEOF" % ev_path,
+    ]
+    for cmd in visible:
+        assert "evidence/" in strip_data_heredocs(cmd), cmd
+    report = "cat >> 03-review.md <<'EOF'\nnames evidence/unit.json > x\nEOF"
+    assert "evidence/" not in strip_data_heredocs(report)

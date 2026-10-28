@@ -3,22 +3,25 @@
     python -m pipeline.ledger <run-dir> [--delivered "..."] [--obstacles "..."]
 
 One row per run.  Step 0 of every run reads the ledger; the last step appends
-to it.  The three measures the spec asks for come from these rows: escaped
-defects after HIGH (a later row's ``obstacles`` or a repair run naming an
-earlier run), verification completeness (``criteria``), and time to verified
-delivery (``duration``).  The ledger remembers; the regression tests a run
-leaves in the repository are what converge.
+to it.  The row's grade is RECOMPUTED by the harness on the tree as it is now,
+never read from ``verdict.json`` (an editable file), so a row can only ever
+say what the evidence says at the moment it is written.  The three measures
+the spec asks for come from these rows: escaped defects after HIGH (a later
+row's ``obstacles`` or a repair run naming an earlier run), verification
+completeness (``criteria``), and time to verified delivery (``duration``).
+The ledger remembers; the regression tests a run leaves in the repository are
+what converge.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pipeline.evidence import RUNS_SUBDIR, load_run
+from pipeline.evidence import RUNS_SUBDIR, load_run, run_repo
+from pipeline.harness import grade_run, write_verdict
 
 HEADER = (
     "# Code Pipeline ledger\n\n"
@@ -52,24 +55,24 @@ def ledger_path(repo: Path) -> Path:
 
 
 def append_row(run_dir: Path, *, delivered: str = "", obstacles: str = "") -> Path:
-    """Append the run's row (from ``run.json`` and ``verdict.json``) to the
-    ledger, replacing an earlier row for the same run id.  Returns the path."""
+    """Recompute the run's grade, refresh ``verdict.json``, and append the
+    row to the ledger, replacing an earlier row for the same run id.  Returns
+    the ledger path."""
     run_dir = run_dir.resolve()
     run = load_run(run_dir)
-    repo = Path(run["repo"])
-    verdict_path = run_dir / "verdict.json"
-    verdict = json.loads(verdict_path.read_text(encoding="utf-8")) if verdict_path.is_file() else {}
-    facts = verdict.get("facts", {})
-    crit = verdict.get("criteria", [])
-    passed = sum(1 for c in crit if c.get("status") == "passed")
+    repo = run_repo(run_dir)
+    v = grade_run(run_dir)
+    write_verdict(run_dir, v)
+    facts = v.facts
+    passed = sum(1 for c in v.criteria if c.get("status") == "passed")
     row = "| " + " | ".join([
         _cell(run.get("run_id")),
         _cell(str(run.get("created_at", ""))[:10]),
-        _cell(run.get("route")),
+        _cell(facts.get("route") or run.get("route")),
         _cell(facts.get("depth") or run.get("depth")),
         _duration(str(run.get("created_at", "")), str(facts.get("graded_at", ""))),
-        _cell(verdict.get("grade", "UNGRADED")),
-        f"{passed}/{len(crit)}" if crit else "-",
+        _cell(v.grade),
+        f"{passed}/{len(v.criteria)}" if v.criteria else "-",
         _cell(delivered),
         _cell(obstacles),
     ]) + " |\n"

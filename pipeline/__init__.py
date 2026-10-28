@@ -6,11 +6,15 @@ the run's confidence grade from that evidence; an agent never awards the grade.
 
 Commands (all ``python -m pipeline.<name>``):
 
-* ``start``      create a run directory and its ``run.json``;
+* ``start``      create a run directory and its ``run.json``; print the start
+                 line that fixes the route, the request and the pinned declarations;
 * ``depth``      the depth the current diff requires (full or light), by rule;
 * ``run_check``  execute one verification criterion and record the evidence;
+* ``attest``     a checker signs its report: this content, on this tree;
+* ``escalate``   a checker demands full depth, for good;
 * ``harness``    compute the grade for a run from the engine's own records;
-* ``ledger``     append the finished run to ``LEDGER.md``.
+* ``deliver``    the delivery gate: recompute the grade, refuse below HIGH;
+* ``ledger``     append the finished run to ``LEDGER.md`` with a recomputed grade.
 
 Nothing here imports ``app`` or ``daemon``; the package is usable from any
 repository.

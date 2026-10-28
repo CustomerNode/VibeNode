@@ -3,7 +3,7 @@ id: final-audit
 name: Final Audit
 department: compose
 source: vibenode
-version: 1.2.1
+version: 1.4.1
 depends_on: []
 type: prompt-template
 ---
@@ -21,15 +21,16 @@ Last-pass skeptical audit of completed work. Use this after implementation, revi
 The caller MUST include in the kickoff prompt:
 - the **original user request verbatim** — not paraphrased. Final Audit's whole purpose is comparing reality to original intent.
 - the list of files created or modified (or a git range like `HEAD~N..HEAD`),
-- pointers to prior pipeline artifacts if this is part of Execute Pipeline or Code Pipeline (e.g. `docs/plans/runs/<run-id>/`; under Code Pipeline the audit reads prior teams' confidence and escalations from those artifacts, not from the brief),
-- the spec the work was supposed to satisfy (if one exists),
-- any prior team's confidence levels and escalations so the audit can probe what was deferred.
+- pointers to prior pipeline artifacts if this is part of Code Pipeline or Execute Pipeline, its alias (e.g. `docs/plans/runs/<run-id>/`; under Code Pipeline the audit reads prior teams' confidence and escalations from those artifacts, not from the brief),
+- the spec the work was supposed to satisfy (if one exists).
+
+The brief carries nothing from the builder's or the other checkers' reasoning, and no prior team's confidence level: the audit forms its own judgment first, then reads the prior stages from the artifacts to follow up on what they raised and what they deferred.
 
 If any of these are missing and cannot be inferred reliably from conversation context, request them before starting. An audit without the original request cannot judge intent match.
 
 ## The Prompt
 
-You are a checker, not the builder. Run as a fresh subagent whose kickoff gives you the original request, the changed files and the prior artifacts, not the builder's reasoning. Judge from the code, the diff and what you run yourself. If you are running inside the same conversation that wrote the code, say so in the report; confidence cannot be HIGH.
+You are a checker, not the builder. Run as a fresh subagent whose kickoff gives you the original request, the changed files and the prior artifacts, not the builder's reasoning. Judge from the code, the diff and what you run yourself. Audit against the original request and its acceptance criteria first and write your findings down BEFORE you read the earlier stage reports; then read them in full to follow up on what they raised. If you are running inside the same conversation that wrote the code, say so in the report; confidence cannot be HIGH.
 
 Do one final skeptical audit pass on the completed work. Do not treat the implementation as correct just because it passed review and testing. Audit it as a whole system and verify that it truly achieves the original intent without creating new problems.
 
@@ -74,7 +75,8 @@ INSTRUCTIONS:
 - Be skeptical. Do not rubber-stamp.
 - Trace the result from the user's actual goal through implementation to real behavior.
 - Review both the changed area and the blast radius around it.
-- Fix problems that are clear, low-risk, and unambiguous (typos, missing imports, obvious logic errors, dead code). Do not expand scope — only fix issues directly related to the completed work.
+- Under Code Pipeline (and Execute Pipeline, its alias): follow `code-pipeline.md`. Record each material defect as `BLOCKING: <short-id> <what is wrong>`; a defect stops HIGH until a later checker stage records `RESOLVED: <short-id>`. Any change you make moves the tree, so every required criterion must run again through `pipeline.run_check` before grading; the harness flags evidence from the earlier tree as stale. The grade is the harness's, not yours.
+- Invoked on its own: you may fix problems that are clear, low-risk, and unambiguous (typos, missing imports, obvious logic errors, dead code), directly related to the completed work. Any code you change voids earlier test runs: run the project's full test command again, and your own fixes are not independently checked, so list them; with code fixes applied, confidence cannot be HIGH.
 - For anything that requires a judgment call, changes user-facing behavior, or has broader risk — do not fix it. Explain it clearly and recommend the next action.
 - Only conclude success if the solution is genuinely sound as a whole.
 
@@ -91,10 +93,12 @@ Return the audit report in this numbered structure:
 7. **What was not validated or could not be fully verified** — Blind spots, skipped areas, and anything this audit could not confirm.
 8. **Obstacles encountered** — Setup issues, workarounds discovered, commands that needed special flags or configuration, dependencies or imports that caused problems, env quirks. Report anything that should be carried forward.
 9. **Confidence level** — HIGH, MEDIUM, or LOW:
-   - **HIGH**: The solution is sound. It does what was intended, holds together end to end, and introduced no meaningful risk. Ship it. Do not assign HIGH unless there is no meaningful unresolved risk AND all three of these are on record (name where each is recorded):
-     1. The full publish-gate suite (`python -m pytest --tb=short -q --no-header --timeout=120 -n 8 --dist loadfile tests/`) ran with zero failures; its final summary line is quoted verbatim.
-     2. If anything the user sees changed (`static/`, `templates/`), the changed behavior was driven in headless Chromium against the real page (`tests/_fake_app.py` or a dedicated browser test). These need no server or restart, so "cannot restart" does not excuse skipping them.
-     3. This audit, and the Review and Test stages, ran as fresh subagents, not inside the conversation that built the code.
+   - **HIGH**: The solution is sound. It does what was intended, holds together end to end, and introduced no meaningful risk. Ship it. Do not assign HIGH unless there is no meaningful unresolved risk AND all of these are on record (name where each is recorded):
+     1. The project's own full test command (the one its publish, CI or release step runs; for VibeNode `python -m pytest --tb=short -q --no-header --timeout=120 -n 8 --dist loadfile tests/`) ran with zero failures AFTER the last code change; its final summary line is quoted verbatim. A run made before a later fix does not count.
+     2. If anything the user sees or touches changed, the changed behavior was driven through the project's real interface (for VibeNode: headless Chromium against the real page via `tests/_fake_app.py` or a dedicated browser test; these need no server or restart, so "cannot restart" does not excuse skipping them).
+     3. Every acceptance criterion has evidence: a named test or a recorded check with its result. Passing tests that do not cover the criteria do not count.
+     4. This audit, and the Review and Test stages, ran as fresh subagents, not inside the conversation that built the code, and each judged the final code.
+     5. No material finding from any stage is left unresolved.
      If any is missing, the rating is MEDIUM at most, and the report says which and why.
    - **MEDIUM**: The solution mostly works but has identifiable weak spots or gaps that should be addressed. Usable but not fully trusted yet.
    - **LOW**: Material problems found. The solution does not reliably achieve the intent, has significant risk, or broke something. Do not ship without further work.

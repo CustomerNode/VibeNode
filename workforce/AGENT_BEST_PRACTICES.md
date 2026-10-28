@@ -144,14 +144,14 @@ Agents with multiple internal roles ("Run the Plan Team: Spec Analyst, Product S
 
 Multi-stage pipelines where each stage depends on the previous stage's discoveries lose information at every handoff — the summary returned to the parent strips out detail the next stage needs.
 
-**Mitigation pattern** (used in Execute Pipeline):
+**Mitigation pattern** (used in Code Pipeline):
 - Each stage writes its full findings to a numbered file in `docs/plans/runs/<run-id>/`.
 - The next stage reads the prior artifact in full, not just the in-context summary.
 
 If you build a new pipeline-style agent, you MUST adopt this pattern. The artifact directory should be:
 
 ```
-docs/plans/runs/<YYYY-MM-DD-HHMM>-<short-slug>/
+docs/plans/runs/<YYYY-MM-DD-HHMM>-<short-slug>-<4 hex>/
   00-request.md
   01-<stage>.md
   02-<stage>.md
@@ -181,7 +181,7 @@ Every agent file has a YAML `version:` field. Bump it when you make a substantiv
 - Minor (1.0.0 → 1.1.0): added section, added rule, expanded scope.
 - Major (1.0.0 → 2.0.0): changed output format, removed required behavior, breaking change for callers that depend on the prior structure.
 
-The `depends_on` field lists other agent IDs this agent invokes or builds on. Keep it accurate — Execute Pipeline reads this to construct its workflow.
+The `depends_on` field lists other agent IDs this agent invokes or builds on. Keep it accurate — Code Pipeline reads this to construct its workflow.
 
 ---
 
@@ -197,7 +197,7 @@ Standing criteria should be **non-negotiable**. If a check is optional, it belon
 
 Every agent must remove a **distinct class of failure** the other agents cannot remove. If two agents repeatedly catch the same issues, one of them is redundant — merge, narrow, or delete the weaker one.
 
-This is enforced at the top of Execute Pipeline's TEAM UNIQUE VALUE block. When you add a new agent to `workforce/`, you must be able to add it to that list with a one-sentence "catches X failures that nothing else catches" statement.
+This is enforced by Code Pipeline's list of teams and the failure each one removes. When you add a new agent to `workforce/`, you must be able to add it to that list with a one-sentence "catches X failures that nothing else catches" statement.
 
 ---
 
@@ -205,13 +205,13 @@ This is enforced at the top of Execute Pipeline's TEAM UNIQUE VALUE block. When 
 
 A pipeline is an agent that takes a request through plan, build and independent checks to a graded result. `code-pipeline.md` is the first built on this spine; a Writing, Deck or Workbook pipeline follows the same spine with its own teams and its own kind of evidence. The spine, which every pipeline keeps:
 
-1. **The request is on disk verbatim** (`00-request.md`), created by `python -m pipeline.start`, before any team runs.
+1. **The request is on disk verbatim** (`00-request.md`), created by `python -m pipeline.start`, before any team runs, and **the start line is the run's fixed point**: the engine records the route, the hash of the request, and the hashes of the repository's pinned checks and pinned protection. A route, a request or a declaration that later differs from that line is tampering, graded LOW. Nothing is ever appended to `00-request.md`; a light run's plan goes in `00-plan.md`.
 2. **Acceptance criteria are written before building**, as a fenced `verification` block the programs read, naming what proves each criterion for this project.
-3. **Checkers are fresh subagents, one at a time.** Review, Test and Audit run as Agent-tool subagents whose brief holds only the request, the run directory, the spec path and the diff, and they run in sequence: Review's fixes land before Test runs, Test's evidence is on the tree Audit reads. A checker stage the root session wrote is self-grading, a plan a checker edited is self-graded criteria, and the harness says so in both cases.
+3. **Checkers are fresh subagents, one at a time, and they sign what they judged.** Review, Test and Audit run as Agent-tool subagents whose brief holds only the request, the run directory, the spec path and the diff, and they run in sequence: Review's fixes land before Test runs, Test's evidence is on the tree Audit reads. Each checker ends by running `python -m pipeline.attest <run-dir> <its stage file>`: the recorded line binds the report's content and the tree it examined to that checker, so a report changed after signing is not the checker's report, and a reviewer whose tree is not the final tree must look again. A checker stage the root session wrote or attested is self-grading, a plan a checker edited is self-graded criteria, and the harness says so in each case. A checker may demand full depth with `python -m pipeline.escalate`; that cannot be undone.
 4. **One artifact per stage** in `docs/plans/runs/<run>/` (Rule 6), and the next stage reads the previous file in full.
 5. **Evidence is what the Session Engine recorded**, never what an agent typed: `pipeline.run_check` executes each criterion and the harness matches its evidence file against the transcript that shows it being produced, on the tree being graded.
-6. **The grade is computed** by `python -m pipeline.harness`, reported verbatim, and bound to the final tree. HIGH, MEDIUM, LOW are grades of evidence strength; BLOCKED is an execution status.
-7. **The audit answers the fourth question**: if every check passed, what could still be wrong that no check would catch? A material answer changes the grade, adds a check, or goes to the user.
+6. **The grade is computed** by `python -m pipeline.harness`, reported verbatim, and bound to the final tree by content (a commit of unchanged code changes nothing). HIGH, MEDIUM, LOW are grades of evidence strength; BLOCKED is an execution status. **Delivery goes through `python -m pipeline.deliver`**, which recomputes the grade and exits non-zero below HIGH unless the user explicitly accepted the lower grade; the ledger recomputes too and never trusts `verdict.json`.
+7. **The audit answers the fourth question**: if every check passed, what could still be wrong that no check would catch? A material answer changes the grade, adds a check, or goes to the user. **And it judges coverage**: criterion by criterion, do the checks prove the request was met? Anything short of an explicit `Verdict: covered` caps the grade at MEDIUM, because passing checks can all be trivial. Where the program can check coverage, it does: the project's pinned checks (`.pipeline-verify`) always run, and on behavior-changing routes at least one test must FAIL on the code as it was before the change, for the reason the plan named (`run_check --baseline`, in an isolated worktree).
 8. **The ledger remembers; tests converge.** Every run appends one row to `LEDGER.md` and every defect a checker found becomes a regression test in the project.
 
 A new pipeline that drops any of these is not a pipeline. What it may change is the team roster, the routes, and what counts as evidence for its kind of deliverable. The programs live in `pipeline/` and import nothing from `app` or `daemon`, so they work in any repository. Tests: `tests/test_code_pipeline.py`, which starts from one valid run and breaks one thing at a time.
@@ -232,7 +232,7 @@ A new pipeline that drops any of these is not a pipeline. What it may change is 
 1. Read this file first.
 2. State the unique value in one sentence (Rule 1). If you can't, stop — the agent doesn't earn a slot.
 3. Use the template in "Required sections" above. Every section is required unless you have a documented reason to diverge.
-4. Add the new agent to Execute Pipeline's TEAM UNIQUE VALUE list and routing rules if applicable.
+4. Add the new agent to Code Pipeline's list of teams and its routes if applicable (Execute Pipeline is an alias for Code Pipeline).
 5. Test the agent by invoking it on a real task and reading the output. If the output is shapeless or runs too long, the format is wrong.
 
 ---
