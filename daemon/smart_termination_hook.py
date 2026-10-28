@@ -65,9 +65,11 @@ def _ours(data: dict) -> bool:
     """A VibeNode session that talks to a person (engine-run or not)."""
     if os.environ.get("CLAUDE_CODE_ENTRYPOINT", "") != "sdk-py":
         return False
-    cwd = str(data.get("cwd") or "")
-    system_dir = str(Path.home() / ".claude" / "_system")
-    if cwd == system_dir or cwd.startswith(system_dir + os.sep):
+    # normcase + normpath: on Windows a folder can arrive with either slash.
+    raw = str(data.get("cwd") or "")
+    cwd = os.path.normcase(os.path.normpath(raw)) if raw else ""
+    system_dir = os.path.normcase(os.path.normpath(str(Path.home() / ".claude" / "_system")))
+    if cwd and (cwd == system_dir or cwd.startswith(system_dir + os.sep)):
         return False
     if _registry_type(str(data.get("session_id") or "")) in ("planner", "title"):
         return False
@@ -263,7 +265,15 @@ def handle(data: dict):
 # ── Install / uninstall into ~/.claude/settings.json ─────────────────────
 
 def _command() -> str:
-    return "%s -P %s" % (sys.executable or "python3", Path(__file__).resolve())
+    """The hook command, written so every shell the CLI may use runs it.
+
+    Forward slashes and double quotes (fixed 2026-10-28): the CLI runs hook
+    commands through bash on Windows (Git Bash), where an unquoted
+    ``C:\\Users\\...\\python.exe`` loses its backslashes and fails with "command
+    not found", so the installed copy silently never ran.  ``C:/Users/...``
+    in double quotes works in bash, cmd and PowerShell, and survives spaces."""
+    exe = Path(sys.executable).as_posix() if sys.executable else "python3"
+    return '"%s" -P "%s"' % (exe, Path(__file__).resolve().as_posix())
 
 
 def install(settings_path: Path, remove: bool = False) -> None:

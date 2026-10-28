@@ -454,6 +454,25 @@ def test_hook_install_keeps_other_settings_and_uninstalls_cleanly(tmp_path):
     assert cfg["hooks"] == {"Stop": [{"hooks": [other]}]}
 
 
+def test_installed_hook_command_runs_under_bash(tmp_path):
+    """The CLI runs hook commands through bash, Git Bash on Windows.  An
+    unquoted backslash path lost its backslashes there ("command not found",
+    exit 127), so the installed copy never ran (2026-10-28)."""
+    import os
+    import shutil
+    import subprocess
+    cmd = hook._command()
+    assert "\\" not in cmd, cmd
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("no bash on this machine")
+    env = dict(os.environ, CLAUDE_CODE_ENTRYPOINT="sdk-py")
+    env.pop("VIBENODE_SMART_TERMINATION_ENGINE", None)
+    r = subprocess.run([bash, "-c", cmd], input=json.dumps({"hook_event_name": "Notification"}),
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 0, (r.returncode, r.stderr)
+
+
 def test_engine_tells_the_settings_hook_it_handles_the_rules():
     from daemon.backends.claude import ClaudeAgentSDK
     from daemon.backends.base import SessionOptions
