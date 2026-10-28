@@ -27,6 +27,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -257,6 +258,24 @@ def record_baseline(checker, run_dir: Path, cid: str) -> dict:
                  stdout=evidence_line(f"{cid}@baseline", evidence_sha(path), rec["passed"], rec["snapshot"],
                                       rec.get("impl")) + "\n")
     return rec
+
+
+def rerun_fresh(fn, run_dir: Path, cid: str):
+    """Run a criterion again (``run_criterion`` or ``run_baseline``) and make
+    sure the evidence it writes is NEW content.  The record keeps its start to
+    the second and its run time to the millisecond, so a rerun right after
+    make_valid_run's can be byte-identical to the evidence that run_check
+    already printed (measured: 11 in 36 under a loaded parallel run), and that
+    recorded line then rightly counts.  A test that records the rerun some
+    other way (no impl=, another impl, a planted file) needs it to differ."""
+    edir = run_dir / evidence_mod.EVIDENCE_DIR
+    before = {p.name: evidence_sha(p) for p in edir.glob("*.json")} if edir.is_dir() else {}
+    for _ in range(30):
+        rec, path = fn(run_dir, cid)
+        if before.get(path.name) != evidence_sha(path):
+            return rec, path
+        time.sleep(0.1)
+    raise AssertionError(f"rerunning {cid} kept writing the same evidence")
 
 
 def codes(v: harness.Verdict) -> set[str]:
@@ -1221,7 +1240,7 @@ def test_evidence_that_names_no_pipeline_implementation_is_flagged(repo):
     run_dir, sess = make_valid_run(repo)
     tester = sess.agent("brief")
     for cid in ("unit", "lint"):
-        rec, path = run_criterion(run_dir, cid)
+        rec, path = rerun_fresh(run_criterion, run_dir, cid)
         line = (f"PIPELINE-EVIDENCE id={cid} sha={evidence_sha(path)} passed=true "
                 f"fingerprint={rec['fingerprint'][:12]}")
         tester.bash(f"{PY} -m pipeline.run_check {run_dir} {cid}", stdout=line + "\n")
@@ -1231,7 +1250,7 @@ def test_evidence_that_names_no_pipeline_implementation_is_flagged(repo):
 
 def test_baseline_evidence_from_another_pipeline_implementation_is_flagged(repo):
     run_dir, sess = make_valid_run(repo, change=True)
-    rec, path = evidence_mod.run_baseline(run_dir, "unit")
+    rec, path = rerun_fresh(evidence_mod.run_baseline, run_dir, "unit")
     line = (f"PIPELINE-EVIDENCE id=unit@baseline sha={evidence_sha(path)} passed=true "
             f"fingerprint={rec['snapshot'][:12]} impl=000000000000")
     sess.agent("brief").bash(f"{PY} -m pipeline.run_check {run_dir} unit --baseline", stdout=line + "\n")
@@ -1426,7 +1445,7 @@ def test_a_criterion_that_prints_the_background_sentence_cannot_attach_a_file(re
     make that evidence recorded."""
     run_dir, sess = make_valid_run(repo)
     checker = sess.agent("brief")
-    lint, lint_path = run_criterion(run_dir, "lint")  # new content, no recorded producer yet
+    lint, lint_path = rerun_fresh(run_criterion, run_dir, "lint")  # new content, no recorded producer yet
     planted = tmp_path / "tasks" / "bx.output"
     planted.parent.mkdir(parents=True, exist_ok=True)
     planted.write_text(evidence_line("lint", evidence_sha(lint_path), True, lint["fingerprint"], lint.get("impl"))

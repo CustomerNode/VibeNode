@@ -237,3 +237,93 @@ def test_the_rules_check_back_to_and_tell_sessions():
     assert not [p for p in handoff_rules.format_problems(_done(back_to={"label": "Standby"})) if "back_to" in p]
     assert [p for p in handoff_rules.format_problems(_done(back_to="Standby")) if "back_to" in p]
     assert '"back_to"' in handoff_rules.INSTRUCTIONS and "Left waiting" in handoff_rules.INSTRUCTIONS
+
+
+# ── Files to download (2026-10-28: a presentation's zip was handed over as a
+#    "done" card's Validate row; "Try it" framed the archive and showed
+#    nothing.  The owner: "that should be a deliverable type, and what it did
+#    needs to get rejected"). ──
+
+ZIP = "/static/scratch/smart-termination-presentation.zip"
+
+
+def _the_card_that_was_sent():
+    return {"type": "done", "title": "Presentation ready to download",
+            "headline": "The smart termination presentation is ready to download.",
+            "context": "x", "status": {"done": ["Zip: offline presentation", "PDF: 24 pages"]},
+            "verified": [{"check": "unzipped", "result": "opens", "ok": True}],
+            "validate": {"how": "Download the zip, unzip it, and open the page inside in Chrome", "url": ZIP},
+            "needs": {"kind": "none", "why": "w", "next": "n"}}
+
+
+def _files_card(**d):
+    dv = {"kind": "presentation", "title": "Smart termination",
+          "files": [{"label": "Offline presentation", "url": ZIP, "size": "3.4 MB"},
+                    {"label": "PDF with speaker notes", "url": "/static/scratch/deck%20notes.pdf", "size": "4.6 MB"}]}
+    dv.update(d)
+    return {"type": "deliverable", "title": "Presentation to download", "headline": "h", "context": "x",
+            "deliverable": dv, "needs": {"kind": "none", "why": "w", "next": "n"}}
+
+
+def test_a_download_behind_try_it_is_sent_back():
+    msg = "Done.\n\n```handoff\n" + json.dumps(_the_card_that_was_sent()) + "\n```"
+    reason = handoff_rules.review(msg)
+    assert reason and "file to download" in reason and '"files"' in reason
+    # a download in links or needs.look is sent back too; a screenshot is not
+    c = _the_card_that_was_sent()
+    c["validate"]["url"] = "/static/scratch/demo.html"
+    c["links"] = [{"label": "PDF", "kind": "file", "url": "/static/scratch/x.pdf?v=2"}]
+    assert handoff_rules.download_problems(c)
+    c["links"] = [{"label": "shot", "kind": "image", "url": "/static/scratch/x.png"},
+                  {"label": "code", "kind": "file", "url": "app/x.py"}]
+    assert handoff_rules.download_problems(c) == []
+
+
+def test_a_files_deliverable_passes_and_a_disk_path_does_not():
+    assert handoff_rules.format_problems(_files_card()) == []
+    assert handoff_rules.download_problems(_files_card()) == []
+    bad = _files_card(files=[{"label": "Zip", "url": "/home/me/deck.zip"}, {"url": "~/x.pdf"}])
+    probs = handoff_rules.download_problems(bad)
+    assert any("files[0].url" in p for p in probs) and any("files[1] needs \"label\"" in p for p in probs)
+    assert handoff_rules.format_problems(_files_card(files=None)) != []
+    assert '"files": [{"label"' in handoff_rules.INSTRUCTIONS and "Download buttons" in handoff_rules.INSTRUCTIONS
+
+
+@pytest.fixture(scope="module")
+def files_out():
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    cards = {"files": _files_card(), "both": _files_card(body="## Notes\nRead me first.")}
+    r = subprocess.run(["node", "-e", BACK_SCRIPT, str(LAST_CARD), json.dumps(cards)],
+                       capture_output=True, text=True, timeout=30, check=True)
+    return json.loads(r.stdout)
+
+
+def test_files_are_download_links_not_viewers(files_out):
+    h = files_out["files"]
+    assert h.count('class="lm-row lm-dlfile"') == 2
+    assert '<a class="lm-row lm-dlfile" href="' + ZIP + '" download="smart-termination-presentation.zip">' in h
+    assert 'download="deck notes.pdf"' in h
+    assert "3.4 MB · smart-termination-presentation.zip" in h and " Download</span></a>" in h
+    # no viewer, no preview, no copy rows for a files-only deliverable
+    assert "data-view" not in h.split('lm-dlfiles"', 1)[1].split("</div>", 1)[0]
+    assert "lm-dvopen" not in h and "data-copy" not in h
+
+
+def test_files_and_a_body_show_both(files_out):
+    h = files_out["both"]
+    assert h.count("lm-dlfile\"") == 2 and h.count("lm-dvopen") == 1 and "Copy the text" in h
+
+
+def test_an_older_card_pointing_at_a_download_downloads_it():
+    """Cards already in a thread are not rewritten: their zip downloads."""
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    old = _the_card_that_was_sent()
+    old["links"] = [{"label": "PDF", "kind": "file", "url": "/static/scratch/x.pdf"}]
+    r = subprocess.run(["node", "-e", BACK_SCRIPT, str(LAST_CARD), json.dumps({"old": old})],
+                       capture_output=True, text=True, timeout=30, check=True)
+    h = json.loads(r.stdout)["old"]
+    assert '<a class="lm-row lm-dlfile lm-validate" href="' + ZIP + '" download=' in h
+    assert 'href="/static/scratch/x.pdf" download="x.pdf"' in h
+    assert 'data-view="' + ZIP not in h and 'data-view="/static/scratch/x.pdf' not in h

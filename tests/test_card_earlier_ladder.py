@@ -41,7 +41,11 @@ def dom(tmp_path_factory):
         + json.dumps(v).replace("'", "&#39;") + "'></div></div></div>" for k, v in SEQ)
     page = tmp_path_factory.mktemp("ladder") / "page.html"
     page.write_text(f"""<!doctype html><html><head><meta charset="utf-8"></head><body><div id="live-log">{msgs}</div>
-<script>var liveSessionId='s1',sessionKinds={{s1:'idle'}};window.fetch=()=>Promise.reject(new Error('offline'));</script>
+<script>var liveSessionId='s1',sessionKinds={{s1:'idle'}};window.fetch=()=>Promise.reject(new Error('offline'));
+// renderIn draws the ladder on the next animation frame.  --dump-dom does not
+// always produce a frame before it dumps (the ladder was missing in about one
+// dump in three), but it always runs timers inside the virtual-time budget.
+window.requestAnimationFrame=cb=>setTimeout(()=>cb(performance.now()),0);</script>
 <script src="{(ROOT / 'static/js/last-card.js').as_uri()}"></script>
 <script>VNLastCard.renderIn(document.getElementById('live-log'));</script></body></html>""", "utf-8")
     r = subprocess.run([CHROME, "--headless=new", "--no-sandbox", "--disable-gpu", "--allow-file-access-from-files",

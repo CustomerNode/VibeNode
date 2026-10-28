@@ -29,6 +29,7 @@ from pipeline import evidence as ev
 from pipeline import harness, plan, start
 from pipeline.evidence import evidence_sha, run_criterion, tree_fingerprint
 from tests.test_code_pipeline import (COVERAGE_OK, PY, _audit, _git, codes, make_valid_run, record_baseline,
+                                      rerun_fresh,
                                       repo)  # noqa: F401  (repo is the fixture)
 
 
@@ -128,7 +129,7 @@ def test_evidence_from_another_pipeline_implementation_is_flagged(repo):
     run_dir, sess = make_valid_run(repo)
     tester = sess.agent("brief")
     for cid in ("unit", "lint"):
-        rec, path = run_criterion(run_dir, cid)
+        rec, path = rerun_fresh(run_criterion, run_dir, cid)
         line = (f"PIPELINE-EVIDENCE id={cid} sha={evidence_sha(path)} passed=true "
                 f"fingerprint={rec['fingerprint'][:12]} impl=000000000000")
         tester.bash(f"{PY} -m pipeline.run_check {run_dir} {cid}", stdout=line + "\n")

@@ -50,6 +50,7 @@ CASES = [
     ({"type": "deliverable", "deliverable": {"kind": "Report"}}, "read"),
     ({"type": "deliverable", "deliverable": {"kind": "audit findings"}}, "read"),
     ({"type": "deliverable"}, "send"),
+    ({"type": "deliverable", "deliverable": {"kind": "presentation", "files": [{"label": "Zip", "url": "/static/scratch/a.zip"}]}}, "read"),
     ({"type": "explain"}, "read"),
     ({"type": "done", "needs": {"kind": "none"}}, "review"),
     ({"type": "done", "needs": {"kind": "decision"}}, "decide"),

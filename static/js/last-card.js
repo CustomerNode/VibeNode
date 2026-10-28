@@ -145,9 +145,22 @@
   // phone too (a localhost page goes through the preview proxy): owner,
   // 2026-10-28, "what we really need is a click to fullscreen type thing".
   // A screenshot is the same row with its picture as the tile.
+  // A file to download (same list as handoff_rules._DOWNLOAD_FILE): framing
+  // it full screen showed nothing (2026-10-28, a presentation's .zip behind
+  // "Try it"), so an older card that still points at one gets a Download link.
+  const _DL_FILE = /\.(?:zip|tar|tgz|gz|bz2|xz|7z|rar|pdf|pptx?|key|odp|docx?|odt|rtf|xlsx?|ods|csv|tsv|epub|dmg|pkg|exe|msi|apk|deb|rpm|appimage|whl|iso|mp4|mov|m4v|webm|mkv|avi|mp3|m4a|wav|flac)(?:[?#].*)?$/i;
+  const _isDownload = u => /^(\/(?!\/)|https?:\/\/)/.test(String(u || '').trim()) && _DL_FILE.test(String(u || '').trim());
+  function dlRow(u, label, sub, cls) {
+    u = String(u).trim();
+    const name = decodeURIComponent((u.split(/[?#]/)[0].split('/').pop()) || 'file');
+    return '<a class="lm-row lm-dlfile' + (cls ? ' ' + cls : '') + '" href="' + esc(u) + '" download="' + esc(name) + '">' +
+      '<span class="tile">' + I.dl + '</span><span class="tx"><span class="tt">' + inl(label || name) + '</span>' +
+      '<span class="ts mono">' + (sub == null ? esc(name) : sub) + '</span></span><span class="vb">' + I.dl + ' Download</span></a>';
+  }
   function linkRow(l) {
     l = l || {};
     const title = l.label || l.url || '';
+    if (!isImg(l) && _isDownload(l.url)) return dlRow(l.url, title);
     if (isImg(l)) {
       const src = _imgSrc(l.url);
       return row({ cls: 'shot', tile: '<img class="thumb" src="' + esc(src) + '" alt="" loading="lazy">', title: inl(title || 'Screenshot'),
@@ -234,10 +247,7 @@
     const files = (Array.isArray(d.files) ? d.files : []).filter(f => f && typeof f === 'object' && /^(\/(?!\/)|https?:\/\/)/.test(String(f.url || '').trim()));
     const fileRows = files.map(f => {
       const u = String(f.url).trim(), name = decodeURIComponent((u.split(/[?#]/)[0].split('/').pop()) || 'file');
-      const sub = [name, f.size, f.note].filter(x => x != null && String(x).trim()).map(x => esc(String(x))).join(' · ');
-      return '<a class="lm-row lm-dlfile" href="' + esc(u) + '" download="' + esc(name) + '">' +
-        '<span class="tile">' + I.dl + '</span><span class="tx"><span class="tt">' + inl(f.label || name) + '</span>' +
-        '<span class="ts mono">' + sub + '</span></span><span class="vb">' + I.dl + ' Download</span></a>';
+      return dlRow(u, f.label || name, [f.size, name, f.note].filter(x => x != null && String(x).trim()).map(x => esc(String(x))).join(' · '));
     }).join('');
     const filesHtml = fileRows ? '<div class="lm-rows lm-dlfiles">' + fileRows + '</div>' : '';
     if (!String(d.body || '').trim()) return filesHtml + metaHtml;
@@ -431,7 +441,7 @@
     const shotsInValidate = !!(vl && vl.how);
     if (vl && vl.how) {
       const vu = String(vl.url || '').trim(), vs = vu ? _reviewSrc(vu) : '';
-      const vr = vs ? row({ cls: 'lm-validate', tile: I.eye, title: inl(vl.how), sub: esc(vu), mono: true, verb: 'Try it',
+      const vr = _isDownload(vu) ? dlRow(vu, inl(vl.how), null, 'lm-validate') : vs ? row({ cls: 'lm-validate', tile: I.eye, title: inl(vl.how), sub: esc(vu), mono: true, verb: 'Try it',
                             attrs: ' data-view="' + esc(vs) + '" data-href="' + esc(vu) + '" data-title="' + esc(vl.how) + '"' })
         : /^https?:\/\//.test(vu) ? row({ cls: 'lm-validate', tile: I.eye, title: inl(vl.how), sub: esc(vu), mono: true, verb: 'Open ' + I.arrow, attrs: ' data-href="' + esc(vu) + '"' })
         : row({ cls: 'lm-validate static', tile: I.eye, title: inl(vl.how), sub: vu ? esc(vu) : '', mono: !!vu });
