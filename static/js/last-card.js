@@ -331,7 +331,8 @@
     return '';
   }
   function verdictRows(offer) {
-    const r = (act, ic, t, s, attrs) => '<button type="button" class="v-' + act + '" data-verdict="' + act + '"' + (attrs || '') + '><span class="ic">' + ic + '</span>' +
+    // title: the meaning line, for the Your verdict chips that hide it.
+    const r = (act, ic, t, s, attrs) => '<button type="button" class="v-' + act + '" data-verdict="' + act + '"' + (attrs || '') + ' title="' + esc(String(s).replace(/<[^>]*>/g, '')) + '"><span class="ic">' + ic + '</span>' +
       '<span><span class="tt">' + t + '</span><span class="ts">' + s + '</span></span><span class="go">' + I.chev + '</span></button>';
     // An answer (Read) and a text to send (Send) get their own rows, not the
     // finished-fix ones (owner's pick A, 2026-10-28,
@@ -494,10 +495,13 @@
       // static/scratch/validate-later.html).
       const later = typeof vl.later === 'string' && vl.later.trim()
         ? '<div class="lm-vlater"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span>' + inl(vl.later) + '</span></div>' : '';
-      // A page to try AND a screenshot: two tiles side by side with OR between,
-      // so it reads as a choice, not two steps (owner's pick B, 2026-10-28,
+      // A page to try AND a screenshot: two tiles side by side, so it reads as
+      // a choice, not two steps (owner's pick B, 2026-10-28,
       // static/scratch/validate-or.html: "its not obvious to me that that is a
-      // or ... i need that clearer").  Stacks on a phone.
+      // or ... i need that clearer").  The OR is in the tile names, "Try it
+      // yourself" / "OR just look", with no mark between them (owner's pick B,
+      // static/scratch/validate-or-word.html: "more pronounced without a
+      // circle").  Stacks on a phone.
       const tryOpens = !_isDownload(vu) && (vs || /^https?:\/\//.test(vu));
       if (shots.length && tryOpens) {
         const play = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l13-7.5z"/></svg>';
@@ -506,21 +510,21 @@
           return ' data-view="' + esc(src) + '" data-img="1" data-title="' + esc(t) + '"'; };
         const tryTile = '<button type="button" class="lm-row lm-validate vt vt-try"' +
           (vs ? ' data-view="' + esc(vs) + '" data-href="' + esc(vu) + '" data-title="' + esc(vl.how) + '"' : ' data-href="' + esc(vu) + '"') + '>' +
-          '<span class="vt-h">' + play + ' Try it</span><span class="vt-d">' + inl(vl.how) + '</span>' +
+          '<span class="vt-h">' + play + ' Try it yourself</span><span class="vt-d">' + inl(vl.how) + '</span>' +
           '<span class="vt-act">' + (vs ? 'Open the demo' : 'Open it') + ' ' + I.arrow + '</span></button>';
-        const s0 = shots[0], more = shots.slice(1);
+        const s0 = shots[0], more = shots.slice(1), seeName = ' <span class="vt-orw">OR</span> just look';
         // One screenshot: the whole tile opens it.  Several: each picture does.
         const seeTile = !more.length
-          ? '<button type="button" class="lm-row shot vt vt-see"' + shotAttrs(s0) + '><span class="vt-h">' + pic + ' See it</span>' +
+          ? '<button type="button" class="lm-row shot vt vt-see"' + shotAttrs(s0) + '><span class="vt-h">' + pic + seeName + '</span>' +
             '<span class="vt-pic"><img src="' + esc(_imgSrc(s0.url)) + '" alt="" loading="lazy"></span>' +
             '<span class="vt-act">View the screenshot</span></button>'
-          : '<div class="vt vt-see"><span class="vt-h">' + pic + ' See it</span>' +
+          : '<div class="vt vt-see"><span class="vt-h">' + pic + seeName + '</span>' +
           '<button type="button" class="lm-row shot vt-pic"' + shotAttrs(s0) + ' aria-label="' + esc('View ' + (s0.label || 'screenshot')) + '">' +
             '<img src="' + esc(_imgSrc(s0.url)) + '" alt="" loading="lazy"></button>' +
           (more.length ? '<span class="vt-more">' + more.map(l => '<button type="button" class="lm-row shot vt-thumb"' + shotAttrs(l) + ' title="' + esc(l.label || 'Screenshot') + '">' +
             '<img src="' + esc(_imgSrc(l.url)) + '" alt="" loading="lazy"></button>').join('') + '</span>' : '') +
           '<span class="vt-act">Tap a screenshot</span></div>';
-        h += band('Validate', '<div class="lm-vpair">' + tryTile + '<div class="vt-or"><span>OR</span></div>' + seeTile + '</div>' + later, 'lm-sec');
+        h += band('Validate', '<div class="lm-vpair">' + tryTile + seeTile + '</div>' + later, 'lm-sec');
       } else
       h += band('Validate', '<div class="lm-rows">' + vr + shots.map(linkRow).join('') + '</div>' + later, 'lm-sec');
     }
@@ -541,6 +545,10 @@
       h += band('Tried', '<ul class="lm-tried">' + n.tried.map(x => '<li><span class="ic">' + I.x + '</span><span><span class="w">' + inl(x.what) + '</span><span class="y">' + inl(x.result) + '</span></span></li>').join('') + '</ul>' +
         (n.only_you ? '<p class="lm-onlyyou"><b>Why only you:</b> ' + inl(n.only_you) + '</p>' : ''), 'lm-sec');
     }
+    // History sits above the action band (Next, Decide, To do, Read it…),
+    // which sits above More (owner, 2026-10-28: "history should go before
+    // next which goes before more").
+    h += histH;
     // An answer or a text to send: the band is named for what he does and
     // holds only its own buttons, no "Nothing needed" (owner's pick A,
     // 2026-10-28, static/scratch/card-next-cta.html).  A finished fix keeps
@@ -552,9 +560,23 @@
       // Still running: "Nothing needed until 11:40" when the time is a clock time.
       const clock = m.type === 'working' && typeof n.eta === 'string' && !n.eta_minutes &&
         /^~?\s*(\d{1,2}:\d{2}(\s*[ap]\.?m\.?)?|\d{1,2}\s*[ap]\.?m\.?)\s*$/i.test(n.eta.trim()) ? n.eta.trim().replace(/^~\s*/, '') : '';
-      h += band('Next', (clock ? '<b>Nothing needed until ' + esc(clock) + '.</b> ' : '<b>Nothing needed.</b> ') + inl(n.next || n.why || '') +
+      // Next says only what the session does next; the verdict chips get their
+      // own "Your verdict" band under it, with no line above them (owner's
+      // picks B and A, 2026-10-28, static/scratch/next-verdict-words.html and
+      // next-verdict-line.html: "connecting the done nothing needs me to the
+      // actions ... its like it does need me").  "Nothing needed." stays only
+      // while the chips are not shown (an older card, a working one); CSS
+      // hides it and the empty band otherwise.
+      h += band('Next', (clock ? '<b>Nothing needed until ' + esc(clock) + '.</b> ' : '<b class="lm-nn">Nothing needed.</b> ') +
+        '<span class="lm-nx">' + inl(n.next || n.why || '') + '</span>' +
         (n.eta && !n.eta_minutes && !clock ? '<span class="lm-eta">' + esc(n.eta) + '</span>' : '') +
-        backToStrip(m.back_to) + (m.type !== 'working' && !m.late ? verdictRows() : ''), 'lm-quiet');
+        // The verdict chips sit right under the Next line, in the same band
+        // (owner's pick A, 2026-10-28, static/scratch/card-verdict-in-next.html:
+        // "verdict should just fall under next").  The wrapper keeps the
+        // .lm-yv chip styles and hides itself while the chips are hidden.
+        // A "Left waiting" strip stays above the verdict (owner's pick C).
+        backToStrip(m.back_to) +
+        (m.type !== 'working' && !m.late ? '<div class="lm-yv lm-yv-in">' + verdictRows() + '</div>' : ''), 'lm-quiet');
     } else {
       let x = '<p class="lm-ask">' + inl(n.ask) + '</p>';
       let look = (n.look || []).filter(l => !isImg(l));
@@ -606,7 +628,7 @@
     if (links.length) { bits.push(links.length + (links.length > 1 ? ' links' : ' link')); more += '<div class="lm-sub">Look at</div><div class="lm-rows">' + links.map(linkRow).join('') + '</div>'; }
     if (m.details && m.details.length) { bits.push('technical details'); more += '<div class="lm-sub">Technical details</div>' + list(m.details, 'dot'); }
     if (more) h += band('More', '<button type="button" class="lm-more">' + I.chev + ' ' + bits.map(b => b.charAt(0).toUpperCase() + b.slice(1)).join(' · ') + '</button><div class="lm-fold">' + more + '</div>', 'lm-morebar');
-    return h + histH + '</div>';
+    return h + '</div>';
   }
 
   // ── The verdict bar: only on the open session's newest card, only while
@@ -779,12 +801,13 @@
     wrap._items = items;
     let zoom = last.querySelector('.lm-zoom');
     if (!zoom) {
-      // A card without This task / Just now still gets a Session history
-      // section for the line, at the bottom like everywhere else.
+      // A card without This task / Just now still gets a History section
+      // for the line, above Next and More like everywhere else.
       const sec = document.createElement('div');
       sec.className = 'lm-dl lm-hist';
       sec.innerHTML = '<div class="dt">History</div><div class="dd"><div class="lm-zoom"></div></div>';
-      last.appendChild(sec);
+      const after = last.querySelector(':scope > .lm-dl.lm-quiet, :scope > .lm-dl.lm-needs, :scope > .lm-dl.lm-morebar');
+      if (after) last.insertBefore(sec, after); else last.appendChild(sec);
       zoom = sec.querySelector('.lm-zoom');
     }
     zoom.appendChild(wrap);

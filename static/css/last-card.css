@@ -911,9 +911,11 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
 .lm.skim .lm-hist .lm-zoom .r:first-child { padding-top: 0; }
 @media (max-width: 640px) { .lm.skim .lm-hist .lm-zoom { padding: 0; } }
 
-/* Validate: Try it OR See it, two tiles side by side (owner's pick B,
-   2026-10-28, static/scratch/validate-or.html).  Stacks on a phone. */
-.lm .lm-vpair { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 8px; align-items: stretch; }
+/* Validate: "Try it yourself" / "OR just look", two tiles side by side
+   (owner's picks, 2026-10-28, static/scratch/validate-or.html and
+   validate-or-word.html: the OR is in the second tile's name, no circle).
+   Stacks on a phone. */
+.lm .lm-vpair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; align-items: stretch; }
 .lm .lm-vpair .vt { all: unset; box-sizing: border-box; cursor: pointer; display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 12px;
   border-radius: 8px; border: 1px solid rgba(var(--bt), .14); background: var(--bg-body); transition: border-color .1s, background .1s; }
 [data-theme="light"] .lm .lm-vpair .vt { background: #fff; }
@@ -921,7 +923,8 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
 .lm .lm-vpair .vt:hover { border-color: rgba(var(--bt), .32); background: rgba(var(--bt), .035); }
 .lm .lm-vpair div.vt:hover { border-color: rgba(var(--bt), .14); background: var(--bg-body); }
 .lm .lm-vpair .vt:focus-visible { outline: 2px solid rgba(var(--tone), .8); outline-offset: 1px; }
-.lm .lm-vpair .vt-h { display: flex; align-items: center; gap: 7px; font-size: 13.5px; font-weight: 700; color: var(--text-heading); }
+.lm .lm-vpair .vt-h { display: flex; align-items: center; gap: 7px; font-size: 15px; font-weight: 700; color: var(--text-heading); }
+.lm .lm-vpair .vt-orw { color: var(--accent, #6aa9ff); font-size: 13px; font-weight: 800; letter-spacing: .05em; }
 .lm .lm-vpair .vt-d { font-size: 12.5px; line-height: 1.45; color: var(--text-muted); }
 .lm .lm-vpair .vt-pic { all: unset; box-sizing: border-box; cursor: pointer; display: block; height: 74px; border-radius: 5px; overflow: hidden;
   box-shadow: inset 0 0 0 1px rgba(var(--bt), .18); }
@@ -931,14 +934,12 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
   box-shadow: inset 0 0 0 1px rgba(var(--bt), .2); }
 .lm .lm-vpair .vt-pic:hover, .lm .lm-vpair .vt-thumb:hover { box-shadow: inset 0 0 0 1px rgba(var(--bt), .45); }
 .lm .lm-vpair .vt-act { margin-top: auto; display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; letter-spacing: .07em;
-  text-transform: uppercase; color: var(--accent, #6aa9ff); }
-.lm .lm-vpair .vt-or { display: flex; align-items: center; justify-content: center; }
-.lm .lm-vpair .vt-or span { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; font-size: 10.5px; font-weight: 800;
-  letter-spacing: .04em; color: var(--text-muted); border: 1px solid rgba(var(--bt), .16); }
-@media (max-width: 520px) {
-  .lm .lm-vpair { grid-template-columns: minmax(0, 1fr); gap: 6px; }
-  .lm .lm-vpair .vt-or span { width: auto; height: auto; border: 0; padding: 0; }
-}
+  text-transform: uppercase; color: var(--text-secondary); }
+/* The link lines are in the text colour, so the OR is the only accent
+   (owner's pick A, 2026-10-28, static/scratch/card-validate-links.html:
+   "maybe the purple footers are the problem not the or"). */
+.lm .lm-vpair .vt:hover .vt-act { color: var(--text-heading); }
+@media (max-width: 520px) { .lm .lm-vpair { grid-template-columns: minmax(0, 1fr); gap: 8px; } }
 
 /* The big bold title's first letter carries ~2px of side space at 24px, so its
    ink started right of the path and the sentence (owner, 2026-10-28: "i hate
@@ -946,3 +947,46 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
 .lm.skim .lm-head h3.lm-title.lm-headline.stem { margin-left: -.095em; }   /* only titles opening on a straight stem: H R D B E… (T, W, A have no gap) */
 /* Explain more sits inside the top block, under the sentence, no rule above. */
 .lm.skim .lm-head .lm-xpl { margin-top: 10px; }
+
+/* Spacing of the top block: "even breathing" (owner's pick C, 2026-10-28,
+   static/scratch/card-top-spacing2.html), after "generous" felt slightly
+   off: 22 above, 16 under the status line, 6 from path to title, 10 to the
+   sentence, 14 to Explain more, 22 below.  Line heights of the path and
+   title are trimmed so the gaps are the ones set here; the path has no
+   trailing ›. */
+.lm.skim.lm-titled .lm-head { padding-top: 22px; padding-bottom: 22px; }
+.lm.skim.lm-titled .lm-pillrow { margin-bottom: 20px; }   /* 16 → 20: "a bit more padding above the crumbs under the status" (owner, 2026-10-28) */
+.lm.skim.lm-titled .lm-path { margin: 0 0 6px; line-height: 1.25; }
+.lm.skim.lm-titled .lm-path .sep:last-child { display: none; }
+.lm.skim.lm-titled .lm-head h3.lm-title.lm-headline { margin-top: 0; margin-bottom: 0; line-height: 1.1; }
+.lm.skim.lm-titled .lm-subtitle { margin: 10px 0 0; line-height: 1.55; }
+.lm.skim.lm-titled .lm-head .lm-xpl { margin-top: 14px; }
+/* The path in the title's voice, smaller (owner, 2026-10-28,
+   static/scratch/card-top-type.html: "the typography is solid"): the title's
+   colour and a semibold weight, dimmed. */
+.lm.skim.lm-titled .lm-path { font-size: 13px; font-weight: 600; color: var(--text-heading); opacity: .55; letter-spacing: -.005em; }
+.lm.skim.lm-titled .lm-path .sep { color: inherit; opacity: .7; }
+
+/* "Your verdict": the finished card's Done / Something else / Problem /
+   Standby as quiet chips in their own band under Next, with no line above
+   them (owner's picks, 2026-10-28, static/scratch/next-verdict-words.html B
+   and next-verdict-line.html A).  The band shows only while its chips do;
+   while they show, Next drops "Nothing needed." (it does need him). */
+.lm .lm-yv:not(:has(.lm-finish:not([hidden]))) { display: none; }
+.lm:has(.lm-yv .lm-finish:not([hidden])) .lm-nn { display: none; }
+.lm.skim .lm-quiet:has(.lm-nn) .dd .lm-nx { color: var(--text-muted); }
+.lm.skim:has(.lm-yv .lm-finish:not([hidden])) .lm-quiet .dd .lm-nx { color: var(--text-secondary); }
+.lm .lm-yv .lm-finish { margin-top: 0; }
+.lm .lm-yv .lm-verdict { flex-direction: row; flex-wrap: wrap; gap: 6px; border: 0; border-radius: 0; overflow: visible; }
+.lm .lm-yv .lm-verdict button { display: inline-flex; grid-template-columns: none; gap: 6px; padding: 4px 10px 4px 8px; border-radius: 999px;
+  border: 1px solid rgba(var(--bt), .14) !important; }
+.lm .lm-yv .lm-verdict button:hover { border-color: rgba(var(--bt), .32) !important; }
+.lm .lm-yv .lm-verdict .ic { width: auto; height: auto; background: none; }
+.lm .lm-yv .lm-verdict .ic svg { width: 12px; height: 12px; }
+.lm .lm-yv .lm-verdict .tt { font: 600 12.5px var(--font-sans); color: var(--text-secondary); }
+.lm .lm-yv .lm-verdict .ts, .lm .lm-yv .lm-verdict .go { display: none; }
+.lm .lm-yv .lm-fq { display: none !important; }
+.lm .lm-yv .lm-finish[data-state="standby"] .v-unpark { display: inline-flex !important; }
+/* The chips under the Next line, in the Next band (owner's pick A,
+   2026-10-28, static/scratch/card-verdict-in-next.html). */
+.lm .lm-yv-in .lm-finish { margin-top: 10px; }

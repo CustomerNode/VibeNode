@@ -71,6 +71,12 @@ def out():
         "val_shots_noaddr": {"type": "done", "headline": "S", "context": "x", "needs": {"kind": "none", "why": "y"},
                              "validate": {"how": "Send a message in any session"},
                              "links": [{"label": "Desktop shot", "kind": "image", "url": "/static/scratch/d.png"}]},
+        "ordered": {"type": "done", "title": "T", "headline": "S", "context": "x", "status": {"done": ["a"]},
+                    "verified": [{"check": "c", "result": "r", "ok": True}],
+                    "zoom": {"big": "b", "task": "t", "now": "n"}, "needs": {"kind": "none", "why": "y", "next": "z"}},
+        "ordered_ask": {"type": "needs_you", "title": "T", "headline": "S", "context": "x",
+                        "zoom": {"big": "b", "task": "t", "now": "n"},
+                        "needs": {"kind": "action", "ask": "Log in", "why": "y", "steps": [{"text": "do it"}]}},
         "shots_only": {"type": "explain", "headline": "S", "context": "x", "answer": "a",
                        "needs": {"kind": "none", "why": "y"},
                        "links": [{"label": "Desktop shot", "kind": "image", "url": "/static/scratch/d.png"}]},
@@ -156,9 +162,10 @@ def test_a_review_card_ends_with_the_verdict_bar(out):
         assert 'data-verdict="' + act + '"' in h
         assert '<span class="tt">' + label + '</span><span class="ts">' + meaning + '</span>' in h
     assert 'data-verdict="undo"' in h
-    # inside the Next band (pick B of static/scratch/card-verdict-next.html)
-    nxt = h.split('<div class="dt">Next</div>', 1)[1].split('<div class="lm-dl', 1)[0]
-    assert 'class="lm-finish"' in nxt
+    # right under the Next line, in the Next band (owner's pick A, 2026-10-28,
+    # static/scratch/card-verdict-in-next.html)
+    nx = h.split('<div class="dt">Next</div>', 1)[1].split('<div class="lm-dl', 1)[0]
+    assert 'class="lm-finish"' in nx and '<div class="dt">Your verdict</div>' not in h
     # A question or a blocker carries the same block, for "Not answering
     # now?" Standby / Done (Standby, owner 2026-10-28); _syncDone shows only
     # the rows that fit the session's status.
@@ -205,9 +212,11 @@ def test_try_it_or_see_it_reads_as_a_choice(out):
     obvious to me that that is a or ... i need that clearer".  A page to try
     and a screenshot are two tiles with OR between, not one list."""
     band = _validate_band(out["val_shots"])
-    assert 'class="lm-vpair"' in band and '<span>OR</span>' in band
-    assert band.index('vt-try') < band.index('vt-or') < band.index('vt-see')
-    assert 'Try it' in band and 'See it' in band and 'class="lm-rows"' not in band
+    assert 'class="lm-vpair"' in band and 'class="lm-rows"' not in band
+    # the OR is in the tile names, no mark between them (owner's pick B,
+    # static/scratch/validate-or-word.html: "more pronounced without a circle")
+    assert 'vt-or"' not in band
+    assert band.index('Try it yourself') < band.index('<span class="vt-orw">OR</span> just look')
     # the try tile opens the page; the whole see tile opens the one screenshot
     try_tile = band.split('vt-try"', 1)[1].split('</button>', 1)[0]
     assert 'data-view="/static/scratch/x.html"' in try_tile
@@ -217,7 +226,7 @@ def test_try_it_or_see_it_reads_as_a_choice(out):
 
 def test_several_screenshots_each_open_from_the_see_tile(out):
     band = _validate_band(out["val_shots2"])
-    assert '<span>OR</span>' in band
+    assert '<span class="vt-orw">OR</span> just look' in band
     assert 'data-view="/static/scratch/d.png"' in band and 'data-view="/static/scratch/p.png"' in band
     assert band.count('class="lm-row shot vt-') == 2
 
@@ -226,3 +235,12 @@ def test_nothing_to_open_keeps_the_plain_rows(out):
     """With no page to try there is no choice to draw: the screenshots stay rows."""
     band = _validate_band(out["val_shots_noaddr"])
     assert 'lm-vpair' not in band and 'class="lm-row lm-validate static"' in band and 'lm-row shot' in band
+
+
+
+def test_history_sits_above_next_which_sits_above_more(out):
+    """Owner, 2026-10-28: "history should go before next which goes before more"."""
+    h = out["ordered"]
+    assert h.index('<div class="dt">History</div>') < h.index('<div class="dt">Next</div>') < h.index('<div class="dt">More</div>')
+    h = out["ordered_ask"]
+    assert h.index('<div class="dt">History</div>') < h.index('<div class="dt">To do</div>') < h.index('<div class="dt">More</div>')

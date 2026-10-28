@@ -401,7 +401,7 @@ def mockup_picture_problem(card: dict) -> Optional[str]:
         # choices, confused the fuck out of me").
         return (f"This Decide card links a mockup page ({pages[0]}) but its choices show nothing "
                 "of it. Give each reply its own picture in \"screens\": [{\"label\": \"...\", "
-                "\"url\": \"/static/scratch/<topic>.html#<key>\" or a PNG in static/scratch/}]. "
+                "\"url\": \"/static/scratch/<topic>.html#<key>\"}], its own section of the page, shown like Now. "
                 "They are shown inside the Decide popup, one per choice. Do not add them as "
                 "\"links\" too: the card would show the same choices twice.")
     return (f"This card links a mockup page ({pages[0]}) but shows nothing of it: the user sees "
@@ -443,8 +443,60 @@ def duplicate_choice_problem(card: dict) -> Optional[str]:
         return None
     return ("This Decide card shows its choices twice: as pictures in \"links\" (" + ", ".join(hits[:4]) +
             ") and again behind Decide. Move each picture into its reply's \"screens\" "
-            "[{\"label\": \"...\", \"url\": \"/static/scratch/<name>.png\"}] and take it out of "
+            "[{\"label\": \"...\", \"url\": \"/static/scratch/<page>.html#<key>\"}] and take it out of "
             "\"links\": the Decide popup shows it with that choice.")
+
+
+# Every choice is shown the way "Now" is (owner, 2026-10-28: "idk why im
+# getting these shitty zoomed in dark theme variants when the now is the way
+# you should be presenting that ... i also need a check on variants that
+# forces consistency").  The Decide popup's Now tab is the page's live
+# data-option="now" section, in his theme and at real size; a reply whose
+# screen was a PNG came out zoomed (shot at 2x) and in the theme it was shot
+# in, so the choices could not be compared with Now or with each other.
+# When the card has a mockup page, every reply's screen is its own section of
+# that same page.  Live pages of another app (CustomerNode's design trials)
+# are live too and pass.
+def screens_like_now_problem(card: dict) -> Optional[str]:
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    replies = [r for r in _items(needs.get("replies")) if isinstance(r, dict)]
+    if _s(needs.get("kind")) != "decision" or not replies:
+        return None
+    base = lambda u: re.sub(r"[?#].*$", "", u or "")  # noqa: E731
+    pages = [_s(it.get("url")) for it in _items(needs.get("look")) + _items(card.get("links"))
+             if isinstance(it, dict) and _s(it.get("kind")) != "image" and _MOCKUP_PAGE.match(_s(it.get("url")))]
+    pages += [_s(s.get("url")) for r in replies for s in _items(r.get("screens"))
+              if isinstance(s, dict) and _MOCKUP_PAGE.match(_s(s.get("url")))]
+    if not pages:
+        return None
+    page = base(pages[0])
+    bad = []
+    for r in replies:
+        key = _s(r.get("key")) or _s(r.get("label"))[:20]
+        scr = [s for s in _items(r.get("screens")) if isinstance(s, dict)]
+        if not scr:
+            bad.append(f"{key} has no screen")
+        for s in scr:
+            u = _s(s.get("url"))
+            if _PIC.search(u):
+                bad.append(f"{key} is a screenshot")
+            elif _MOCKUP_PAGE.match(u) and base(u) != page:
+                bad.append(f"{key} is on another page")
+    try:
+        name = page.rsplit("/", 1)[-1]
+        f = (_SCRATCH_DIR / name).resolve()
+        if f.parent == _SCRATCH_DIR.resolve() and f.is_file() and \
+                not re.search(r"""data-option\s*=\s*["']now["']""", f.read_text(encoding="utf-8", errors="replace"), re.I):
+            bad.append("the page has no Now section (data-option=\"now\")")
+    except OSError:
+        pass
+    if not bad:
+        return None
+    return ("Show every choice the way the Now tab shows today's app: as its own section of the same "
+            f"live page ({page}), never a screenshot. Found: " + "; ".join(dict.fromkeys(bad)) + ". Give "
+            "each reply \"screens\": [{\"label\": \"...\", \"url\": \"" + page + "#<section id>\", \"device\": "
+            "\"web\"}] and tag the page's sections data-option=\"now\", \"A\", \"B\"… A screenshot comes out "
+            "at another size, zoom and theme than Now, so the choices can't be compared.")
 
 
 # Variants on screen always come with a way to pick one (owner, 2026-10-28:
@@ -697,6 +749,9 @@ def format_problems(card: dict) -> list[str]:
     dup = duplicate_choice_problem(card)
     if dup:
         out.append(dup)
+    like_now = screens_like_now_problem(card)
+    if like_now:
+        out.append(like_now)
     pick = variants_pick_problem(card)
     if pick:
         out.append(pick)
@@ -1123,8 +1178,9 @@ spelled out, plus a link to look at), an approval, or an action such as a \
 login (steps plus an "I did it" button). A choice about how something looks \
 or is presented (a design, layout, style, slides, a deck) must SHOW every \
 option before you ask: a scratch page of clickable mockups in needs.look and \
-each reply's "screens", or a screenshot per option. A file to read is not a \
-preview; such a card is sent back.
+each reply's "screens" pointing at its own section of that page \
+("<page>.html#<id>"), shown live like the Now tab, never a screenshot. A file \
+to read is not a preview; such a card is sent back.
 - working: idle on purpose while YOUR background work runs. needs.eta is required.
 - blocked: something outside your control stops you. Add "tried": [...] and \
 say in needs.why exactly what blocks you.

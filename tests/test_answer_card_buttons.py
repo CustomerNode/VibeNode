@@ -88,17 +88,28 @@ def test_a_text_to_send_ends_in_send_it_and_a_report_in_read_it(out):
 
 
 def test_a_finished_fix_keeps_its_next_band(out):
+    # Next says what the session does, and the verdict chips sit right under
+    # that line in the same band (owner's pick A, 2026-10-28,
+    # static/scratch/card-verdict-in-next.html: "verdict should just fall
+    # under next"); there is no separate "Your verdict" band.
     b = _band(out["done"], "Next")
-    assert "<b>Nothing needed.</b>" in b
+    assert '<b class="lm-nn">Nothing needed.</b>' in b
+    assert b.index('class="lm-nx"') < b.index('class="lm-yv lm-yv-in"')
     for act in ("done", "next", "bad", "standby"):
         assert 'data-verdict="' + act + '"' in b
+    assert '<div class="dt">Your verdict</div>' not in out["done"]
+    css = (ROOT / "static/css/last-card.css").read_text("utf-8")
+    # the chips hide with their wrapper; "Nothing needed." goes while they show
+    assert ".lm .lm-yv:not(:has(.lm-finish:not([hidden]))) { display: none; }" in css
+    assert ".lm:has(.lm-yv .lm-finish:not([hidden])) .lm-nn { display: none; }" in css
 
 
 def test_a_running_card_says_until_when(out):
     assert "<b>Nothing needed until 11:40.</b>" in out["working_clock"]
     assert "lm-eta" not in _band(out["working_clock"], "Next")
     span = _band(out["working_span"], "Next")
-    assert "<b>Nothing needed.</b>" in span and "12 min" in span
+    assert '<b class="lm-nn">Nothing needed.</b>' in span and "12 min" in span
+    assert "lm-yv-in" not in out["working_span"]
 
 
 def test_a_late_answer_has_no_buttons_and_its_band_hides(out):

@@ -66,7 +66,11 @@ def test_explain_more_sits_under_the_sentence_and_history_at_the_bottom(out):
 
 
 def test_a_card_without_zoom_lines_still_gets_it(out):
-    assert '<div class="lm-xpl-wrap"><div class="lm-xpl">' in out["bare"]
+    # Explain more sits in the top block, under the sentence, whether or not
+    # the card has zoom lines (owner, 2026-10-28: "integrated into the crumbs
+    # title subtitle block").
+    h = out["bare"]
+    assert 'class="lm-xpl-tg"' in h and h.index('class="lm-xpl-tg"') < h.index('class="lm-dl')
 
 
 def test_no_explained_text_no_button(out):

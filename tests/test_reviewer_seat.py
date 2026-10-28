@@ -394,3 +394,41 @@ def test_the_path_keeps_its_first_step_unless_he_moves_on():
     # his own words bring the new topic
     entries[-1] = E("user", "switch to the summary cards now")
     assert not any('"path" starts with' in p for p in ev.reviewer_problems(moved, ev.facts_from_entries(entries)))
+
+
+# ── Choices are shown the way Now is (owner, 2026-10-28) ──────────────────
+# "idk why im getting these shitty zoomed in dark theme variants when the now
+# is the way you should be presenting that ... i also need a check on variants
+# that forces consistency".
+
+def _decide(screens_by_key, page="/static/scratch/card-top-type.html"):
+    return {"type": "needs_you", "needs": {"kind": "decision", "look": [{"label": "p", "kind": "link", "url": page}],
+            "replies": [{"key": k, "label": "choice " + k, "reply": k, "screens": s} for k, s in screens_by_key.items()]}}
+
+
+def test_a_screenshot_choice_beside_a_live_page_is_sent_back(tmp_path, monkeypatch):
+    monkeypatch.setattr(rules, "_SCRATCH_DIR", tmp_path)
+    (tmp_path / "p.html").write_text('<div data-option="now"></div><div id="a" data-option="A"></div><div id="b" data-option="B"></div>')
+    page = "/static/scratch/p.html"
+    bad = _decide({"A": [{"label": "a", "url": "/static/scratch/p-A.png"}], "B": [{"label": "b", "url": page + "#b"}]}, page)
+    assert "A is a screenshot" in rules.screens_like_now_problem(bad)
+    good = _decide({"A": [{"label": "a", "url": page + "#a"}], "B": [{"label": "b", "url": page + "#b"}]}, page)
+    assert rules.screens_like_now_problem(good) is None
+    other = _decide({"A": [{"label": "a", "url": page + "#a"}], "B": [{"label": "b", "url": "/static/scratch/q.html#b"}]}, page)
+    assert "B is on another page" in rules.screens_like_now_problem(other)
+    missing = _decide({"A": [{"label": "a", "url": page + "#a"}], "B": []}, page)
+    assert "B has no screen" in rules.screens_like_now_problem(missing)
+
+
+def test_a_page_without_a_now_section_is_sent_back(tmp_path, monkeypatch):
+    monkeypatch.setattr(rules, "_SCRATCH_DIR", tmp_path)
+    (tmp_path / "p.html").write_text('<div id="a" data-option="A"></div><div id="b" data-option="B"></div>')
+    page = "/static/scratch/p.html"
+    card = _decide({"A": [{"label": "a", "url": page + "#a"}], "B": [{"label": "b", "url": page + "#b"}]}, page)
+    assert "no Now section" in rules.screens_like_now_problem(card)
+
+
+def test_live_pages_of_another_app_still_pass():
+    card = {"type": "needs_you", "needs": {"kind": "decision", "replies": [
+        {"key": "A", "label": "one two three", "reply": "a", "screens": [{"label": "x", "url": "http://127.0.0.1:3000/trial/a"}]}]}}
+    assert rules.screens_like_now_problem(card) is None
