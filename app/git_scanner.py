@@ -186,6 +186,10 @@ _FINDING_SUPPRESSIONS = [
     # credential — the value is a plain dict-key string. Suppress only this
     # finding type for this file; all other secret patterns still run.
     (re.compile(r'app/session_store\.py$'), "Env Variable Secret"),
+    # pipeline/plan.py defines KNOWN_KEYS = frozenset({...}), the set of field
+    # names a plan criterion may carry. The name ends in _KEYS, the value is a
+    # Python literal, not a credential. Same narrow suppression as above.
+    (re.compile(r'pipeline/plan\.py$'), "Env Variable Secret"),
     # NOTE: prelogin_unlock.py previously needed a "Password Assignment"
     # suppression here. It no longer does — the root cause was the pattern's
     # value class matching newlines (see _SECRET_PATTERNS above). The
