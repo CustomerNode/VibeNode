@@ -732,6 +732,50 @@ test('the Auto chip is PERSISTENT at the bottom: turning Auto off never hides it
   }
 });
 
+// ── Follow the work after a card decision (2026-10-28) ────────────────
+
+test('followWork follows new content with Auto scroll OFF, without changing the setting', () => {
+  setup();                                 // sess-1, Auto off
+  log.dispatch('wheel', {});
+  fireIO(false);
+  assert.strictEqual(TS.state(), 'READING');
+  TS.followWork();                         // the owner answered a card
+  assert.strictEqual(TS.state(), 'LIVE', 'a decision restores following from anywhere');
+  assert.strictEqual(TS.isLiveScroll(), false, 'the Auto scroll setting is untouched');
+  log.scrollTop = 0; log.scrollHeight = 2000;
+  tailBelowFold();
+  msg(600, 900);
+  assert.strictEqual(log.scrollTop, 2000, 'the work trail is followed');
+  assert.strictEqual(TS.hasNew(), false);
+});
+
+test('followWork stops at the first scroll away and does not re-arm', () => {
+  setup();
+  TS.followWork();
+  log.dispatch('wheel', {});
+  fireIO(false);
+  assert.strictEqual(TS.state(), 'READING');
+  log.scrollTop = 123; log.scrollHeight = 2000;
+  tailBelowFold();
+  msg(600, 900);
+  assert.strictEqual(log.scrollTop, 123, 'scrolling away ends the follow');
+  TS.catchUp();                            // back to the bottom by the button
+  log.scrollTop = 0; log.scrollHeight = 3000;
+  tailBelowFold();
+  msg(900, 1200);
+  assert.strictEqual(log.scrollTop, 0, 'with Auto off, coming back does not re-arm it');
+});
+
+test('followWork belongs to the session it was armed in', () => {
+  setup();
+  TS.followWork();
+  TS.attach(log, 'sess-2');
+  log.scrollTop = 0; log.scrollHeight = 2000;
+  tailBelowFold();
+  msg(600, 900);
+  assert.strictEqual(log.scrollTop, 0, 'another session is not followed');
+});
+
 // ── Report ────────────────────────────────────────────────────────────────
 
 (async () => {

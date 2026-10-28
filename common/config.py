@@ -102,6 +102,12 @@ def _kanban_config_defaults() -> dict:
         "cross_session_awareness": True,
         # Warn before sending a prompt that seems unrelated to the current session
         "wrong_session_detection": True,
+        # Smart termination (daemon/smart_termination.py): every turn ends
+        # with a "what we're working on / where it stands / what's needed
+        # from you" handoff, and a session stopping with work it could still
+        # do is sent back once to think again.  Opt-in (off by default) by the
+        # owner's decision, 2026-10-27.
+        "smart_termination": False,
         # ── Validation URL preferences ──
         "validation_url_enabled": False,
         "validation_base_url": "",

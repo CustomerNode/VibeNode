@@ -2004,10 +2004,11 @@ function filterSessions() {
 // ({project: [chip, ...]}), so the funnel lights up with a dot while any is on.
 // Tests: tests/test_session_filters.py.
 const _SESSION_FILTERS_KEY = 'vnSessionFilters';
-const _STATE_CHIPS = {working: 'working', needs: 'question', idle: 'idle', sleeping: 'sleeping'};
-const _SESSION_CHIPS = ['working', 'needs', 'idle', 'sleeping', 'unread', 'recent'];
-const _SESSION_CHIP_LABELS = {working: 'Working', needs: 'Needs you', idle: 'Idle',
-  sleeping: 'Sleeping', unread: 'Unread', recent: 'Last 7 days'};
+// No 'idle' filter: a stopped session waits on you or is Done (session-verb.js, 2026-10-27).
+const _STATE_CHIPS = {working: 'working', needs: 'question', standby: 'standby', sleeping: 'sleeping'};
+const _SESSION_CHIPS = ['working', 'needs', 'standby', 'sleeping', 'unread', 'recent'];
+const _SESSION_CHIP_LABELS = {working: 'Working', needs: 'Needs you', standby: 'Standby', idle: 'Idle',
+  sleeping: 'Done', unread: 'Unread', recent: 'Last 7 days'};   // a sleeping session shows as Done (session-verb.js)
 
 function _readAllSessionFilters() {
   try { return JSON.parse(localStorage.getItem(_SESSION_FILTERS_KEY) || '{}') || {}; }
@@ -2059,7 +2060,8 @@ function _applySessionFilters(list) {
   const wantUnread = chips.has('unread');
   const since = chips.has('recent') ? Date.now() / 1000 - 7 * 86400 : 0;
   return list.filter(s => {
-    if (states.size && !states.has(getSessionStatus(s.id))) return false;
+    // "Needs you" = any of the person's moves (session-verb.js), not only a permission prompt.
+    if (states.size && !states.has(window.SessionVerb ? window.SessionVerb.filterBucket(s.id) : getSessionStatus(s.id))) return false;
     if (wantUnread && !(typeof hasUnread === 'function' && hasUnread(s.id))) return false;
     if (since && (s.effective_ts || s.last_activity_ts || s.sort_ts || 0) < since) return false;
     return true;
@@ -2477,6 +2479,7 @@ function openPreferences() {
   const enterToSend = sendBehavior === 'enter';
   const stickyOn = localStorage.getItem('stickyUserMsgs') !== 'off';
   const wsdOn = window._wrongSessionDetectionEnabled !== false;
+  const stOn = window._smartTerminationEnabled === true;  // opt-in
   const unreadOn = typeof unreadDotsEnabled === 'function' ? unreadDotsEnabled() : true;
 
   const snOn = !!(window.SpeechNode && window.SpeechNode.isEnabled());
@@ -2498,6 +2501,8 @@ function openPreferences() {
      hint: 'Keep your most recent message pinned at the top while scrolling long replies.'},
     {key: 'wsd', label: 'Wrong-session detection', on: wsdOn,
      hint: 'Warn before sending a prompt that looks meant for a different active session.'},
+    {key: 'smartterm', label: 'Smart termination', on: stOn,
+     hint: 'Every session ends its turn with what it is working on, where it stands and what it needs from you, and thinks again before stopping with work it could still do.'},
     {key: 'unread', label: 'Unread indicators', on: unreadOn,
      hint: 'Show a small dot on idle chats that replied while you were looking elsewhere.'},
   ];
@@ -2522,6 +2527,28 @@ function openPreferences() {
   requestAnimationFrame(() => overlay.querySelector('.pm-card').classList.remove('pm-enter'));
   document.getElementById('pm-pref-close').onclick = () => _closePm();
   overlay.onclick = e => { if (e.target === overlay) _closePm(); };
+
+  // Server-saved switches can be flipped from another tab or the phone; the
+  // values above came from this page's load.  Re-read them so the switch shows
+  // what the sessions are actually running with, no reload needed.
+  fetch('/api/kanban/config').then(r => r.ok ? r.json() : null).then(cfg => {
+    if (!cfg) return;
+    const sync = (key, on) => {
+      const b = overlay.querySelector('.pref-toggle[data-toggle="' + key + '"]');
+      const shown = rows.find(r => r.key === key);
+      // Skip a switch the user already flipped while this was loading.
+      if (!b || !shown || b.classList.contains('on') !== shown.on) return;
+      if (key === 'smartterm') {
+        if (typeof window.applySmartTerminationView === 'function') window.applySmartTerminationView(on);
+        else window._smartTerminationEnabled = on;
+      }
+      if (key === 'wsd') window._wrongSessionDetectionEnabled = on;
+      b.classList.toggle('on', on);
+      b.setAttribute('aria-checked', on ? 'true' : 'false');
+    };
+    sync('smartterm', cfg.smart_termination === true);
+    sync('wsd', cfg.wrong_session_detection !== false);
+  }).catch(() => {});
 
   // Toggle handlers. The modal stays open so several settings can be flipped at once.
   overlay.querySelectorAll('.pref-toggle').forEach(btn => {
@@ -2567,6 +2594,18 @@ function openPreferences() {
             body: JSON.stringify({wrong_session_detection: on})
           }).catch(() => { /* fail-open: in-memory flag is already set */ });
           showToast('Wrong-session detection: ' + (on ? 'On' : 'Off'));
+          break;
+        case 'smartterm':
+          // Read by the Session Engine at every turn end (daemon/smart_termination.py).
+          // The sidebar statuses follow it at once (session-verb.js).
+          if (typeof window.applySmartTerminationView === 'function') window.applySmartTerminationView(on);
+          else window._smartTerminationEnabled = on;
+          fetch('/api/kanban/config', {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({smart_termination: on})
+          }).catch(() => showToast('Smart termination: could not save', true));
+          showToast('Smart termination: ' + (on ? 'On' : 'Off'));
           break;
         case 'unread':
           // localStorage-only, like 'sticky' — this is a per-device display

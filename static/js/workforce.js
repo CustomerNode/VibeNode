@@ -825,8 +825,9 @@ function wfSortedSessions(sessions) {
   const dateKey = s => s.effective_ts || s.last_activity_ts || s.sort_ts || 0;
   if (wfSort === 'status') {
     copy.sort((a, b) => {
-      const sa = statusOrder[getSessionStatus(a.id)] ?? 3;
-      const sb = statusOrder[getSessionStatus(b.id)] ?? 3;
+      // Person-oriented order when session-verb.js is loaded (see sessions.js sortedSessions).
+      const sa = window.SessionVerb ? window.SessionVerb.rank(a.id) : (statusOrder[getSessionStatus(a.id)] ?? 3);
+      const sb = window.SessionVerb ? window.SessionVerb.rank(b.id) : (statusOrder[getSessionStatus(b.id)] ?? 3);
       if (sa !== sb) return sa - sb;
       return dateKey(b) - dateKey(a);
     });
@@ -863,7 +864,7 @@ function renderWorkforce(sessions) {
   }
   grid.innerHTML = sessions.map(s => {
     const st = getSessionStatus(s.id);
-    const { emoji, label, hint: _dblTitle } = _wfCardStatusParts(s.id, st);
+    const { emoji, label, hint: _dblTitle, cls: _vsCls, foot: _vsFoot } = _wfCardStatusParts(s.id, st);
     const selClass = s.id === activeId ? ' wf-selected' : '';
     // Multi-select: include .multi-selected class on initial render so the
     // visual stays in sync after re-renders without an extra DOM pass.
@@ -894,12 +895,12 @@ function renderWorkforce(sessions) {
     const unreadDot = _isUnread
       ? '<span class="unread-dot" aria-label="Unread" title="Unread \u2014 new response you haven\u2019t opened"></span>'
       : '';
-    return `<div class="wf-card wf-${st}${selClass}${msClass}${familyClass}${unreadClass}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" onclick="singleOrDouble('${s.id}',event)" ondblclick="_dblclickSleepIfIdle('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')" title="${escHtml(s.display_title)} \u2014 ${_dblTitle}">
+    return `<div class="wf-card wf-${st}${_vsCls ? ' ' + _vsCls : ''}${selClass}${msClass}${familyClass}${unreadClass}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" onclick="singleOrDouble('${s.id}',event)" ondblclick="_dblclickSleepIfIdle('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')" title="${escHtml(s.display_title)} \u2014 ${_dblTitle}">
       ${unreadDot}
       <div class="wf-avatar">${emoji}</div>
       <div class="wf-status-label">${label}</div>
       <div class="wf-name">${childGlyph}${name}</div>
-      <div class="wf-meta">${escHtml(date)}</div>
+      ${_vsFoot || `<div class="wf-meta">${escHtml(date)}</div>`}
     </div>`;
   }).join('');
 }
@@ -946,7 +947,13 @@ function _wfCardStatusParts(sid, st) {
     : (st === 'idle')
       ? 'click to open, double-click to sleep'
       : 'click to open';
-  return { emoji, label, hint };
+  // Person-oriented status (session-verb.js, 2026-10-27).  `hint` stays tied
+  // to the process state: double-click sleep/wake still follows it.
+  if (window.SessionVerb && !_isCompacting) {
+    const p = window.SessionVerb.cardParts(sid, st);
+    return { emoji: p.emoji, label: p.label, hint, cls: p.cls, title: p.title, foot: p.foot };
+  }
+  return { emoji, label, hint, cls: '' };
 }
 
 function wfCardClick(id) {

@@ -3328,6 +3328,67 @@ mark.search-hit { background:#7c7cff44; color:inherit; border-radius:2px; paddin
 }
 .live-interrupted-pill svg { opacity:.85; flex-shrink:0; }
 
+/* Smart termination "invalid termination response" (live-panel.js
+   _renderSentBackCard).  Design A "Quiet", picked 2026-10-28 from
+   static/scratch/sent-back-premium.html: a neutral raised surface, amber only in
+   the icon tile and the reason label.  It takes the place of the message the
+   session tried to stop on; the header opens that message and what it was told. */
+.vn-sent-back { margin: 12px 0 14px; font-family: var(--font-sans); --bt: 255,255,255; --sb-am: 240,170,60; --sb-ok: 63,185,112; }
+[data-theme="light"] .vn-sent-back { --bt: 0,0,0; --sb-am: 196,118,8; --sb-ok: 30,140,80; }
+.vn-sb-card {
+  border-radius: 14px; border: 1px solid rgba(var(--bt), .09); overflow: hidden;
+  background: linear-gradient(180deg, rgba(var(--bt), .035), rgba(var(--bt), .015));
+  box-shadow: 0 1px 0 rgba(var(--bt), .05) inset, 0 6px 20px -12px rgba(0,0,0,.5);
+  font-size: var(--fs-md); line-height: 1.5;
+}
+[data-theme="light"] .vn-sb-card { background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.05), 0 8px 24px -14px rgba(0,0,0,.18); }
+.vn-sb-head {
+  all: unset; box-sizing: border-box; width: 100%; cursor: pointer;
+  display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center; padding: 12px 14px;
+}
+.vn-sb-head:focus-visible { outline: 2px solid rgba(var(--sb-am), .7); outline-offset: -2px; border-radius: 14px; }
+.vn-sb-icon {
+  width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; color: rgb(var(--sb-am));
+  background: rgba(var(--sb-am), .12); box-shadow: inset 0 0 0 1px rgba(var(--sb-am), .25);
+}
+.vn-sb-main { min-width: 0; display: block; }
+.vn-sb-line { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.vn-sb-title { font-size: 13.5px; font-weight: 600; color: var(--text-heading); letter-spacing: -.005em; }
+.vn-sb-chip { font-size: 10px; font-weight: 650; letter-spacing: .07em; text-transform: uppercase; color: rgb(var(--sb-am)); }
+.vn-sb-sum { display: block; font-size: 12.5px; color: var(--text-muted); margin-top: 2px; line-height: 1.45; }
+.vn-sb-more {
+  display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; font-weight: 600;
+  color: var(--text-faint); padding: 5px 8px; border-radius: 8px; transition: color .15s, background .15s;
+}
+.vn-sb-head:hover .vn-sb-more { color: var(--text-primary); background: rgba(var(--bt), .06); }
+.vn-sb-chev { transition: transform .28s cubic-bezier(.2,.7,.2,1); }
+.vn-sent-back.open .vn-sb-chev { transform: rotate(180deg); }
+.vn-sb-clip { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .32s cubic-bezier(.2,.7,.2,1); }
+.vn-sent-back.open .vn-sb-clip { grid-template-rows: 1fr; }
+.vn-sb-clip > div { overflow: hidden; min-height: 0; }
+.vn-sb-body { padding: 2px 14px 14px 56px; }
+.vn-sb-h { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--text-faint); margin: 0 0 5px; }
+.vn-sb-tried { color: var(--text-muted); margin: 0 0 12px; }
+.vn-sb-told {
+  white-space: pre-wrap; margin: 0; font-family: var(--font-mono); font-size: 11.5px; line-height: 1.6; color: var(--text-muted);
+}
+/* The moved message reads as a quote, not a bubble.  Four classes so it beats
+   the later `[data-theme="light"] .conversation .msg-body` bubble rule. */
+.conversation .vn-sent-back .vn-sb-tried > .msg-body {
+  padding: 0; background: none; border: 0; border-radius: 0; box-shadow: none;
+  -webkit-backdrop-filter: none; backdrop-filter: none;
+  font-size: 13px; line-height: 1.6; color: var(--text-muted);
+}
+.vn-sb-tried .msg-body p { margin: .35em 0; }
+.vn-sb-tried .msg-body p:first-child { margin-top: 0; }
+.vn-sb-tried .msg-body p:last-child { margin-bottom: 0; }
+.vn-sb-link {
+  display: flex; align-items: center; gap: 7px; padding: 9px 14px 10px 56px;
+  border-top: 1px solid rgba(var(--bt), .06); font-size: 11.5px; color: var(--text-faint);
+}
+.vn-sb-link svg { color: rgb(var(--sb-ok)); flex: none; }
+@media (prefers-reduced-motion: reduce) { .vn-sb-clip, .vn-sb-chev { transition: none; } }
+
 /* ===== Directive conflict resolution card ===== */
 .live-directive-conflict {
   margin:12px 0; padding:0; border-radius:var(--r-md);
@@ -13641,19 +13702,22 @@ body.mc-mode #main-panel { width: 100% !important; margin-left: 0 !important; he
 @media (min-width: 769px) {
   .main-toolbar { --bt: 255,255,255; flex-wrap: nowrap; gap: 2px;
     /* the thread's column is centred in the log MINUS its 6px scrollbar, hence 766 and the extra 6px on the right */
-    padding: 14px max(20px, calc((100% - 766px) / 2 + 6px)) 6px max(14px, calc((100% - 766px) / 2)); }
+    padding: 3px max(20px, calc((100% - 766px) / 2 + 6px)) 1px max(14px, calc((100% - 766px) / 2)); }
   [data-theme="light"] .main-toolbar { --bt: 0,0,0; }
   /* The session name is the page's heading, so it uses the app's heading face (the one the VibeNode wordmark
      uses), not the body font at a heavy weight. */
-  .main-toolbar .session-name, .main-toolbar #main-title { font-family: 'Space Grotesk', var(--font-sans); font-size: 18px; font-weight: 500; letter-spacing: -.018em; line-height: 1.25; }
+  /* Thin title strip (owner's pick B, 2026-10-28, scratch/session-toolbar-height.html): the name is a small muted
+     caption so the row takes ~27px instead of ~61px. */
+  .main-toolbar .session-name, .main-toolbar #main-title { font-family: var(--font-sans); font-size: 12.5px; font-weight: 500; line-height: 1.25; color: var(--text-muted); }
+  .main-toolbar #main-title[data-editable="true"]:hover { color: var(--text-primary); }
   .main-toolbar .btn-group-label { height: 26px; padding: 0 9px; border-radius: 8px; background: none; border-color: transparent;
     font-size: 12px; font-weight: 550; color: var(--text-muted); }
   .main-toolbar .btn-group-label:hover { background: rgba(var(--bt), .07); border-color: transparent; color: var(--text-primary); }
   .main-toolbar .btn-group-label.grp-open { background: rgba(var(--bt), .10); border-color: transparent; color: var(--text-primary); }
   /* Actions + Analyze are one "•••" menu (modals.js); the standalone Actions label is not shown. */
   .main-toolbar > .btn-group-label { display: none; }
-  .main-toolbar .btn-group-label.toolbar-dots { width: 26px; padding: 0; justify-content: center; }
-  .main-toolbar .toolbar-close { width: 26px; height: 26px; padding: 0; margin-left: 0; margin-right: -6px; justify-content: center; align-items: center;
+  .main-toolbar .btn-group-label.toolbar-dots { width: 24px; height: 22px; padding: 0; justify-content: center; }
+  .main-toolbar .toolbar-close { width: 24px; height: 22px; padding: 0; margin-left: 0; margin-right: -6px; justify-content: center; align-items: center;
     background: none; border: 0; border-radius: 8px; color: var(--text-muted); }
   .main-toolbar .toolbar-close:hover { background: rgba(var(--bt), .07); color: var(--text-primary); }
 }
@@ -13924,7 +13988,9 @@ header #git-badge-push svg, header #git-badge-pull svg, header #git-badge-sync s
 /* ── Left panel: chosen tweaks (desktop) ── */
 @media (min-width: 769px) {
   /* Quiet sleeping pill: plain small caps; WORKING and IDLE keep their coloured pills */
-  .sidebar .wf-sleeping .wf-status-label { background: none; padding-left: 0; padding-right: 0; }
+  /* Only where no status colour applies: session-status.css gives sleeping Needs you / Standby / Done labels a
+     background back, and with zero side padding they drew as pills with the text touching both edges (2026-10-28). */
+  .sidebar .wf-sleeping:not([class*=" vs-"]) .wf-status-label { background: none; padding-left: 0; padding-right: 0; }
   /* Dim sleeping cards: they step back so active and selected sessions stand out */
   .sidebar .wf-card.wf-sleeping:not(.wf-selected) { background: transparent; box-shadow: none; }
   .sidebar .wf-card.wf-sleeping:not(.wf-selected) .wf-name { color: var(--text-muted); }
@@ -13989,11 +14055,12 @@ header #git-badge-push svg, header #git-badge-pull svg, header #git-badge-sync s
   .homepage-card:not(.hp-sessions) .hp-cta { grid-area: cta; justify-self: end; font-size: 0; gap: 0; }
   .homepage-card:not(.hp-sessions) .hp-cta svg { width: 14px; height: 14px; }
   /* Featured card content added by the preview script: big status numbers and a list of recent sessions */
-  .hpx-nums { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 4px 0 18px; }
+  .hpx-nums { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 4px 0 18px; }
   .hpx-num b { display: block; font-family: 'Space Grotesk', var(--font-sans); font-size: 40px; font-weight: 500; line-height: 1; letter-spacing: -.03em; color: var(--text-heading); font-variant-numeric: tabular-nums; }
   .hpx-num span { display: block; margin-top: 6px; font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--text-faint); }
   .hpx-num.zero b { color: var(--text-faint); }
   .hpx-num.work b { color: var(--accent-text, var(--accent)); }
+  .hpx-num.wait b { color: #d97706; }
   .hpx-hd { margin: 22px 0 6px; font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--text-faint); }
   .hpx-list { display: flex; flex-direction: column; margin: 0 -10px 18px; flex: 1; }
   .hpx-row { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; gap: 11px; align-items: center; height: 36px; padding: 0 10px; border-radius: 9px; cursor: pointer; }
@@ -14221,7 +14288,7 @@ header #git-badge-push svg, header #git-badge-pull svg, header #git-badge-sync s
 .dx-project-name { font: 600 34px/1.2 'Space Grotesk', var(--font-sans); letter-spacing: -.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dx-project svg { flex: none; margin-top: 4px; color: var(--text-faint); }
 .dx-project:hover svg { color: var(--text-secondary); }
-.dx-nums { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; padding: 22px 0; border-top: 1px solid rgba(var(--bt), .08); border-bottom: 1px solid rgba(var(--bt), .08); }
+.dx-nums { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 22px 0; border-top: 1px solid rgba(var(--bt), .08); border-bottom: 1px solid rgba(var(--bt), .08); }
 .dx-num b { display: block; font-family: 'Space Grotesk', var(--font-sans); font-size: 40px; font-weight: 500; line-height: 1; letter-spacing: -.03em; color: var(--text-heading); font-variant-numeric: tabular-nums; }
 .dx-num span { display: block; margin-top: 8px; font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--text-faint); }
 .dx-num.zero b { color: var(--text-faint); }

@@ -430,6 +430,16 @@ class TestKanbanConfig:
                                  json={"kanban_depth_limit": 3})
         assert resp.status_code == 200
 
+    def test_preference_switches_round_trip(self, kanban_client):
+        # The Preferences switches load from this GET; without the keys the
+        # Smart termination switch always showed off (fixed 2026-10-28).
+        for on in (True, False, True):
+            kanban_client.put('/api/kanban/config',
+                              json={"smart_termination": on, "wrong_session_detection": not on})
+            body = kanban_client.get('/api/kanban/config').get_json()
+            assert body["smart_termination"] is on
+            assert body["wrong_session_detection"] is (not on)
+
 
 # ---------------------------------------------------------------------------
 # Board Filtering

@@ -29,6 +29,7 @@ from .. import mobile_auth as _mobile_auth
 
 # System-user message classification — shared with ws_events.py
 from ..platform_utils import is_system_user_content as _is_system_user_content
+from common.transcripts import sent_back_entry as _sent_back_entry
 from ..platform_utils import system_user_label as _system_user_label
 
 bp = Blueprint('live_api', __name__)
@@ -206,6 +207,15 @@ def hook_message():
     return jsonify(body)
 
 
+@bp.route("/api/queue-history/<session_id>")
+def api_queue_history(session_id):
+    """Queued messages this session handled since the user last sent one
+    himself, for the "Also handled" line on its newest card
+    (app/queue_history.py).  Read-only."""
+    from app import queue_history
+    return jsonify(queue_history.since_review(session_id))
+
+
 @bp.route("/api/live/state/<session_id>")
 def api_live_state(session_id):
     """Lightweight endpoint returning just the session state + entry count.
@@ -378,7 +388,9 @@ def api_session_log(session_id):
             content = msg.get("content", "")
             if isinstance(content, str) and content.strip():
                 text = _cap_user_text(content.strip())
-                if _is_system_user_content(text):
+                if _sent_back_entry(text):
+                    entries.append(_sent_back_entry(text))
+                elif _is_system_user_content(text):
                     entries.append({"kind": "system", "text": _system_user_label(text)})
                 else:
                     entries.append({"kind": "user", "text": text})
@@ -387,7 +399,9 @@ def api_session_log(session_id):
                     bt = block.get("type", "")
                     if bt == "text" and block.get("text", "").strip():
                         text = _cap_user_text(block["text"].strip())
-                        if _is_system_user_content(text):
+                        if _sent_back_entry(text):
+                            entries.append(_sent_back_entry(text))
+                        elif _is_system_user_content(text):
                             entries.append({"kind": "system", "text": _system_user_label(text)})
                         else:
                             entries.append({"kind": "user", "text": text})
@@ -1755,6 +1769,63 @@ def api_copy_export():
     except UnicodeDecodeError:
         return jsonify({"ok": False, "error": "File is not UTF-8 text"}), 415
     resp = jsonify({"ok": True, "name": p.name, "bytes": size, "chars": len(text), "text": text})
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
+# ── Card screenshots on disk (2026-10-28) ──
+# Sessions put screenshots in their handoff card as a file path
+# ("/tmp/shot.png"), which the browser asked this server for as a page path
+# and drew as a broken image, on every device.  The card now asks this route
+# instead.  It serves ONLY a real image (checked by its first bytes, not its
+# name), under home or the temp folder, to the owner (local_only).
+CARD_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+_CARD_IMAGE_TYPES = (
+    (b'\x89PNG\r\n\x1a\n', 'image/png'),
+    (b'\xff\xd8\xff', 'image/jpeg'),
+    (b'GIF87a', 'image/gif'),
+    (b'GIF89a', 'image/gif'),
+)
+
+
+def _card_image_type(head: bytes):
+    for magic, mime in _CARD_IMAGE_TYPES:
+        if head.startswith(magic):
+            return mime
+    if head[:4] == b'RIFF' and head[8:12] == b'WEBP':
+        return 'image/webp'
+    return None
+
+
+@bp.route('/api/card-image')
+@_mobile_auth.local_only
+def api_card_image():
+    """Serve one screenshot named by a handoff card's absolute file path."""
+    from flask import send_file
+    raw = (request.args.get('path') or '').strip()
+    if raw.startswith('file://'):
+        raw = raw[7:]
+    if not raw:
+        return jsonify({"ok": False, "error": "No path provided"}), 400
+    try:
+        p = Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return jsonify({"ok": False, "error": "Bad path"}), 400
+    roots = [Path.home().resolve(), Path(tempfile.gettempdir()).resolve()]
+    if not any(p == r or r in p.parents for r in roots):
+        return jsonify({"ok": False, "error": "Only images under home or the temp folder"}), 403
+    if not p.is_file():
+        return jsonify({"ok": False, "error": "File no longer exists"}), 404
+    if p.stat().st_size > CARD_IMAGE_MAX_BYTES:
+        return jsonify({"ok": False, "error": "Image is over 20 MB"}), 413
+    try:
+        with open(p, 'rb') as f:
+            mime = _card_image_type(f.read(16))
+    except OSError:
+        return jsonify({"ok": False, "error": "Can't read the file"}), 404
+    if not mime:
+        return jsonify({"ok": False, "error": "Not an image"}), 415
+    resp = send_file(str(p), mimetype=mime, max_age=0)
     resp.headers['Cache-Control'] = 'no-store'
     return resp
 

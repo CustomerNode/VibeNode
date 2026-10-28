@@ -57,6 +57,7 @@ _setup_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ws-setup
 
 # System-user message classification — shared with live_api.py
 from ..platform_utils import is_system_user_content as _is_system_user_content
+from common.transcripts import sent_back_entry as _sent_back_entry
 from ..platform_utils import system_user_label as _system_user_label
 
 # Sidebar sort uses max(last_msg_ts, file_mtime, access_ts).  We bump
@@ -198,11 +199,26 @@ def _record_policy_change(old: str, new: str, source: str) -> None:
         logger.warning("Could not write %s: %s", _POLICY_CHANGE_LOG, e)
 
 
+_CARD_SHOTS_NOTE = (
+    "SMART TERMINATION IS ON: your turn ends with the ```handoff card alone. In the "
+    "final message, put each screenshot INSIDE the card as a \"links\" entry "
+    "{\"label\": \"<short name>\", \"kind\": \"image\", \"url\": \"/api/preview/asset/<id>\"}, "
+    "never as a marker outside it.\n"
+)
+
+
 def _with_mobile_preamble(text: str) -> str:
     """Prepend the headless-mobile preamble to an outgoing user message."""
     if not text:
         return text
-    return _MOBILE_PREAMBLE + "\n\n" + text
+    pre = _MOBILE_PREAMBLE
+    try:
+        from common.config import get_kanban_config
+        if get_kanban_config().get("smart_termination") is True:
+            pre = pre.replace("⟦/VN-MOBILE⟧", _CARD_SHOTS_NOTE + "⟦/VN-MOBILE⟧")
+    except Exception:
+        pass
+    return pre + "\n\n" + text
 
 
 def _cap_user_text(text: str, limit: int = _USER_TEXT_CAP) -> str:
@@ -232,7 +248,9 @@ def _parse_raw_line(raw: str) -> list:
         content = msg.get("content", "")
         if isinstance(content, str) and content.strip():
             text = _cap_user_text(content.strip())
-            if _is_system_user_content(text):
+            if _sent_back_entry(text):
+                entries.append(_sent_back_entry(text))
+            elif _is_system_user_content(text):
                 entries.append({"kind": "system", "text": _system_user_label(text)})
             else:
                 entries.append({"kind": "user", "text": text})
@@ -241,7 +259,9 @@ def _parse_raw_line(raw: str) -> list:
                 bt = block.get("type", "")
                 if bt == "text" and block.get("text", "").strip():
                     text = _cap_user_text(block["text"].strip())
-                    if _is_system_user_content(text):
+                    if _sent_back_entry(text):
+                        entries.append(_sent_back_entry(text))
+                    elif _is_system_user_content(text):
                         entries.append({"kind": "system", "text": _system_user_label(text)})
                     else:
                         entries.append({"kind": "user", "text": text})
@@ -726,6 +746,11 @@ def register_ws_events(socketio, app):
         if result.get('ok'):
             # Acknowledge receipt so the client knows the message was accepted.
             emit('message_ack', {'session_id': session_id})
+            try:   # he sent something himself: the card's queue line starts over
+                from app import queue_history
+                queue_history.note_direct(session_id)
+            except Exception:
+                pass
         elif result.get('queued'):
             # Daemon auto-queued because session wasn't idle
             emit('message_ack', {'session_id': session_id, 'queued': True})
@@ -1279,6 +1304,12 @@ def register_ws_events(socketio, app):
         result = sm.queue_message(session_id, text)
         if not result.get('ok'):
             emit('error', {'message': result.get('error', 'Failed to queue'), 'session_id': session_id})
+        else:
+            try:   # for the card's "Also handled" line (app/queue_history.py)
+                from app import queue_history
+                queue_history.note_queued(session_id, text)
+            except Exception:
+                pass
 
     @socketio.on('remove_queue_item')
     def handle_remove_queue_item(data):

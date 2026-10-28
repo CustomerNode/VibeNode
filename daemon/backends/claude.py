@@ -94,18 +94,48 @@ class ClaudeAgentSDK(AgentSDK):
                 "PreCompact": [HookMatcher(matcher=None, hooks=[_pre_compact_wrap])],
             }
 
+        # Smart termination (daemon/smart_termination.py): the CLI's Stop hook
+        # hands us the final message; a returned reason sends the agent back.
+        # Registered AFTER PreCompact so the SDK's callback ids (hook_0,
+        # hook_1, ...) keep PreCompact at hook_0 for a reattached Session Host.
+        # Any failure lets the turn end: this hook must never trap a session.
+        if options.turn_end_callback:
+            tcb = options.turn_end_callback
+            async def _stop_wrap(input_data, tool_use_id, context):
+                try:
+                    data = input_data if isinstance(input_data, dict) else {}
+                    reason = await tcb(
+                        message=data.get("last_assistant_message"),
+                        continued=bool(data.get("stop_hook_active")),
+                        background_in_flight=bool(data.get("background_tasks")),
+                    )
+                except Exception as e:
+                    logger.warning("turn_end_callback raised: %s", e)
+                    return {}
+                if isinstance(reason, str) and reason:
+                    return {"decision": "block", "reason": reason}
+                return {}
+            hooks_config = dict(hooks_config or {})
+            hooks_config["Stop"] = [HookMatcher(matcher=None, hooks=[_stop_wrap])]
+        # Tells daemon/smart_termination_hook.py (the settings-file copy of
+        # these rules, for CLIs an older engine starts) that this engine runs
+        # them itself, so a session is never checked twice.
+        st_env = {"VIBENODE_SMART_TERMINATION_ENGINE": "1"} if options.turn_end_callback else {}
+
         claude_options = ClaudeCodeOptions(
             cwd=os.path.normpath(options.cwd) if options.cwd else None,
             resume=options.resume,
             can_use_tool=can_use_tool,
             model=options.model,
             system_prompt=options.system_prompt,
+            append_system_prompt=options.append_system_prompt,
             max_turns=options.max_turns,
             allowed_tools=options.allowed_tools,
             permission_mode=options.permission_mode,
             include_partial_messages=options.include_partial_messages,
             extra_args=options.extra_args,
             hooks=hooks_config,
+            env=st_env,
         )
         if options.hosted or options.attach:
             # The CLI runs in a Session Host (daemon/session_host.py) and

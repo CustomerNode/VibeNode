@@ -36,6 +36,9 @@ SYSTEM_USER_MARKERS = (
     "<command-name>",
     "<command-message>",
     "<command-args>",
+    # Smart termination send-back; drawn as a card via
+    # common.transcripts.sent_back_entry before this check runs.
+    "Stop hook feedback:",
 )
 
 

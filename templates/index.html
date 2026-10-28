@@ -32,6 +32,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="{{ versioned_static('style.css') }}">
 <link rel="stylesheet" href="{{ versioned_static('css/mobile.css') }}">   <!-- mobile responsive layer (<=768px only) -->
+<link rel="stylesheet" href="{{ versioned_static('css/session-status.css') }}">   <!-- sidebar status oriented to the person (session-verb.js) -->
 <link rel="stylesheet" href="{{ versioned_static('css/mobile-preview.css') }}">   <!-- mobile visual channel: preview cards + sheet -->
 <link rel="stylesheet" href="/speechnode/speechnode.css">   <!-- SpeechNode package assets -->
 <link rel="stylesheet" href="{{ versioned_static('css/embed.css') }}">   <!-- embed mode: hides project/view chrome, only active with ?embed=1 -->
@@ -246,8 +247,8 @@ html[data-theme="light"] .vn-splash .vns-track { background: rgba(0,0,0,.08); }
             <div class="sidebar-menu-section-label">Show only</div>
             <button type="button" class="sidebar-sort-opt sidebar-filter-opt" data-filter="working" aria-pressed="false" onclick="toggleSessionFilter('working')">Working</button>
             <button type="button" class="sidebar-sort-opt sidebar-filter-opt" data-filter="needs" aria-pressed="false" onclick="toggleSessionFilter('needs')">Needs you</button>
-            <button type="button" class="sidebar-sort-opt sidebar-filter-opt" data-filter="idle" aria-pressed="false" onclick="toggleSessionFilter('idle')">Idle</button>
-            <button type="button" class="sidebar-sort-opt sidebar-filter-opt" data-filter="sleeping" aria-pressed="false" onclick="toggleSessionFilter('sleeping')">Sleeping</button>
+            <button type="button" class="sidebar-sort-opt sidebar-filter-opt" data-filter="standby" aria-pressed="false" onclick="toggleSessionFilter('standby')">Standby</button>
+            <button type="button" class="sidebar-sort-opt sidebar-filter-opt" data-filter="sleeping" aria-pressed="false" onclick="toggleSessionFilter('sleeping')">Done</button>
             <button type="button" class="sidebar-sort-opt sidebar-filter-opt" data-filter="unread" aria-pressed="false" onclick="toggleSessionFilter('unread')">Unread</button>
             <button type="button" class="sidebar-sort-opt sidebar-filter-opt" data-filter="recent" aria-pressed="false" onclick="toggleSessionFilter('recent')">Last 7 days</button>
             <div id="sidebar-filter-clear" hidden>
@@ -811,6 +812,8 @@ html[data-theme="light"] .vn-splash .vns-track { background: rgba(0,0,0,.08); }
      defines the allSessions / sessionKinds / ... globals as accessors.  Must
      load before any script that touches those names. -->
 <script src="{{ versioned_static('js/session-store.js') }}"></script>
+<script src="{{ versioned_static('js/session-verb.js') }}"></script>
+<script src="{{ versioned_static('js/session-verdict.js') }}"></script>
 <!-- Startup banner: warns when the Claude CLI is stale so new models don't
      fail with claude_code_version_too_old at the moment of use. Depends on
      showConfirm/showToast from utils.js — load right after it. -->
@@ -818,6 +821,9 @@ html[data-theme="light"] .vn-splash .vns-track { background: rgba(0,0,0,.08); }
 <script src="{{ versioned_static('js/engine-freshness.js') }}"></script>
 <script src="{{ versioned_static('js/markdown.js') }}"></script>
 <script src="{{ versioned_static('js/smart-copy.js') }}"></script>
+<script src="{{ versioned_static('js/last-card.js') }}"></script>   <!-- the approved last-message card (```handoff) -->
+<link rel="stylesheet" href="{{ versioned_static('css/last-card.css') }}">
+<script src="{{ versioned_static('js/live-assets.js') }}"></script>   <!-- open tabs pick up a changed card without a reload -->
 <script src="{{ versioned_static('js/chat-component.js') }}"></script>
 <script src="{{ versioned_static('js/app.js') }}"></script>
 <script src="{{ versioned_static('js/session-model.js') }}"></script>

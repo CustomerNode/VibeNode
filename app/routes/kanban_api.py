@@ -1486,6 +1486,10 @@ def get_kanban_config():
         "validation_base_url": cfg.get("validation_base_url", ""),
         "validation_url_dismissed": cfg.get("validation_url_dismissed", False),
         "file_tracking_enabled": cfg.get("file_tracking_enabled", True),
+        # Read by the Preferences switches (socket.js startup, openPreferences).
+        # Missing until 2026-10-28, so Smart termination always loaded as off.
+        "wrong_session_detection": cfg.get("wrong_session_detection", True) is not False,
+        "smart_termination": cfg.get("smart_termination", False) is True,
     })
 
 
@@ -1520,6 +1524,7 @@ def update_kanban_config():
                      "ai_can_modify_status", "ai_can_mark_complete",
                      "cross_session_awareness",
                      "wrong_session_detection",
+                     "smart_termination",
                      "validation_url_enabled", "validation_url_dismissed",
                      "file_tracking_enabled"):
         if pref_key in data:

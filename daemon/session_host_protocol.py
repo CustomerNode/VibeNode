@@ -258,7 +258,28 @@ def process_alive(pid) -> bool:
         return True
     except OSError:
         return False
-    return True
+    return not _is_zombie(pid)
+
+
+def _is_zombie(pid: int) -> bool:
+    """A POSIX process that has exited but is not yet reaped still answers
+    ``kill(pid, 0)``.  A host is spawned by the engine (or a test) that keeps
+    no handle to wait on it, so after shutdown it sits as a zombie until its
+    parent next reaps, and "is the host gone?" never came back yes.  An
+    exited process is gone for every purpose here: it runs nothing and owns
+    no CLI."""
+    if sys.platform.startswith("linux"):
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                state = fh.read().rsplit(")", 1)[1].split()[0]
+            return state in ("Z", "X", "x")
+        except Exception:
+            return False
+    try:
+        import psutil  # optional
+        return psutil.Process(pid).status() in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD)
+    except Exception:
+        return False
 
 
 def process_create_time(pid) -> Optional[float]:

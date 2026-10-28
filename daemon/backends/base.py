@@ -133,6 +133,17 @@ class SessionOptions:
     # unaltered — this is a notification-only hook.
     pre_compact_callback: Optional[Callable] = None
 
+    # Smart termination (daemon/smart_termination.py) -- set by SessionManager.
+    # ``append_system_prompt`` is added AFTER the session's system prompt
+    # (whatever it is) on every launch, resumes included.
+    # ``turn_end_callback`` runs when the agent tries to end a turn::
+    #     async (message: str | None, continued: bool,
+    #            background_in_flight: bool) -> str | None
+    # A returned string sends the agent back with that text as the reason;
+    # None lets the turn end.  Backends without a turn-end hook ignore it.
+    append_system_prompt: Optional[str] = None
+    turn_end_callback: Optional[Callable] = None
+
     # Session Host (daemon/session_host.py).  ``hosted``: run the CLI inside
     # its own host process so it outlives a Session Engine restart;
     # ``host_sid``: the id the host's record is filed under; ``attach``: a

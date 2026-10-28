@@ -692,6 +692,7 @@
     noteNewContent: _modernOnly('noteNewContent'),
     holdBottom: _modernOnly('holdBottom'),
     refresh: _modernOnly('refresh'),
+    followWork: _modernOnly('followWork'),   // classic already follows unless scrolled up
     hasNew: _modernOnly('hasNew', false),
     isLiveScroll: _modernSetting('isLiveScroll'),
     setLiveScroll: _modernSetting('setLiveScroll'),

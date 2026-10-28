@@ -133,8 +133,10 @@ def test_filters_live_behind_the_funnel(browser):
         assert app.eval(f"() => document.querySelector(\"{_opt('working')}\").getAttribute('aria-pressed')") == "true"
         _click(app, _opt("needs"))          # OR
         assert app.eval(CARDS) == 15
-        # A working session going idle leaves the filtered list (debounced rebuild).
-        app.push("session_state", {"session_id": sessions[0]["id"], "state": "idle", "cwd": CWD})
+        # A working session going to sleep (Done) leaves the filtered list (debounced
+        # rebuild).  Going idle would not: a stopped session is Review, which is
+        # "Needs you" (session-verb.js, 2026-10-27).
+        app.push("session_state", {"session_id": sessions[0]["id"], "state": "stopped", "cwd": CWD})
         app.page.wait_for_function(f"({CARDS})() === 14", timeout=3000)
         # "Show all sessions" clears every filter and closes the menu.
         assert not app.eval("() => document.getElementById('sidebar-filter-clear').hidden")
@@ -164,8 +166,8 @@ def test_filters_live_behind_the_funnel(browser):
         assert sorted(stored[PROJECT]) == ["recent", "sleeping"]
         app.eval("() => { const g = document.getElementById('workforce-grid'); g.scrollTop = g.scrollHeight; }")
         app.page.wait_for_timeout(300)
-        # 250 recent, minus 14 working/waiting/idle (sessions 0..14, 0 now idle) = 235.
-        assert app.eval(CARDS) == 235
+        # 250 recent, minus 14 working/waiting (sessions 1..14; 0 is asleep now) = 236.
+        assert app.eval(CARDS) == 236
 
         # Persisted per project: a reload restores the chips.
         app.page.reload(wait_until="domcontentloaded")

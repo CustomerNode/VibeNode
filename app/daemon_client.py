@@ -94,6 +94,17 @@ def _unavailable(method, detail=""):
     }
 
 
+def _note_queue_event(event_name, data):
+    try:
+        from app import queue_history
+        if event_name == "queue_dispatched":
+            queue_history.note_dispatched(data.get("session_id", ""), data.get("text", ""))
+        else:
+            queue_history.note_remap(data.get("old_id", ""), data.get("new_id", ""))
+    except Exception as e:
+        logger.debug("queue history: %s", e)
+
+
 def _remap_kanban_links(old_id, new_id):
     """Point kanban task<->session links at a session's adopted CLI id.
     Idempotent (an UPDATE), so several connected web servers may all run it.
@@ -731,6 +742,12 @@ class DaemonClient:
             state = data.get("state", "")
             if state in ("idle", "stopped") and sid in self._planner_ids:
                 self._cleanup_utility_jsonl(sid)
+        # A queued message the engine sent: remembered for the card's "Also
+        # handled" line (app/queue_history.py).  Off the reader thread: it
+        # writes a file.
+        if isinstance(data, dict) and event_name in ("queue_dispatched", "session_id_remapped"):
+            threading.Thread(target=_note_queue_event, args=(event_name, dict(data)),
+                             daemon=True, name="queue-history").start()
         # Utility session events (planner, title) are allowed through to the
         # browser — the frontend's _isHiddenSession() prevents them from
         # affecting the main UI, but the planner's dedicated listeners need

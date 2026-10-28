@@ -51,6 +51,14 @@ import pytest
 from pathlib import Path
 from datetime import datetime, timezone
 
+# The user package folder as it is BEFORE any fixture moves HOME (see
+# ``isolate_home``): computed once at import, from the real home.
+try:
+    import site as _site
+    _REAL_USER_BASE = _site.getuserbase() if _site.ENABLE_USER_SITE else ""
+except Exception:
+    _REAL_USER_BASE = ""
+
 
 # Resolve the production paths once at module load. We compare against
 # these in the guard below; any test that hits these exact paths fails
@@ -187,6 +195,13 @@ def _isolate_daemon_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.setenv("APPDATA", str(fake_appdata))
     monkeypatch.setenv("USERPROFILE", str(fake_home))
     monkeypatch.setenv("HOME", str(fake_home))
+    # A Python a test spawns (the Session Host, a stand-in engine) finds its
+    # user-installed packages under HOME (``~/.local``).  With HOME moved it
+    # lost them, so on a machine whose packages are user-installed the host
+    # could not import the SDK and its tree kill failed ("No module named
+    # 'anyio'").  Pin the real user base; it only says where to read packages.
+    if _REAL_USER_BASE and not os.environ.get("PYTHONUSERBASE"):
+        monkeypatch.setenv("PYTHONUSERBASE", _REAL_USER_BASE)
 
     # Several daemon modules capture ``Path.home()``-derived paths at IMPORT
     # time (module-level constants), so by the time this per-test fixture

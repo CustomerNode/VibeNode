@@ -1913,9 +1913,149 @@ function _trimLiveLogIfOversized(logEl) {
   return removed;
 }
 
+// ── Smart termination: the "sent back" card ─────────────────────────────
+// Entry: {kind:'sent_back', name:<reason chip>, desc:<one plain sentence>,
+// text:<what the session was told>} (common/transcripts.py sent_back_entry).
+// Every caller appends the returned element synchronously, so by the
+// microtask the message it tried to stop on is its previous sibling; its body
+// moves into the card and the empty bubble is removed, so the thread shows
+// the card instead of the message.
+// Browser copy of common/transcripts.sent_back_entry, for entries an older
+// engine or web server still sends as kind 'user'.  Keep the chips and
+// sentences in step with the Python one.
+const _SENT_BACK_PREFIX = 'Stop hook feedback:';
+function _sentBackFromText(raw) {
+  let reason = String(raw || '').trim().slice(_SENT_BACK_PREFIX.length).trim();
+  let body = reason;
+  if (/^smart termination:/i.test(body)) {
+    body = body.replace(/^smart termination:\s*/i, '');
+    let told = body;
+    ['\n\n# Ending a turn', '\n\nEnd your final message with this block'].forEach(cut => {
+      const i = told.indexOf(cut); if (i !== -1) told = told.slice(0, i);
+    });
+    if (told.toLowerCase().startsWith('your handoff card was sent back.')) told = told.slice('your handoff card was sent back.'.length);
+    told = told.trim();
+    reason = told.charAt(0).toUpperCase() + told.slice(1);
+  }
+  const low = body.toLowerCase();
+  const firstPara = body.split('\n\n')[0];
+  const quotedIn = (txt, re) => { const out = []; let m; re.lastIndex = 0;
+    while ((m = re.exec(txt)) !== null) { if (out.indexOf(m[1]) === -1 && out.length < 4) out.push(m[1]); } return out; };
+  const andList = arr => {
+    const q = arr.map(w => '"' + w + '"');
+    return q.length === 1 ? q[0] : q.slice(0, -1).join(', ') + ' and ' + q[q.length - 1];
+  };
+  const group = /not allowed in a "(\w+)" card, ([^:]+):([^\n]*)/i.exec(body);
+  let name, desc;
+  if (low.indexOf('text outside the') !== -1 && low.indexOf('handoff') !== -1) {
+    name = 'Text outside the response'; desc = 'It wrote text around its termination response. Everything goes inside it.';
+  } else if (low.indexOf('end every turn with one') !== -1) {
+    name = 'No response'; desc = 'It ended without a termination response.';
+  } else if (group) {
+    const g = group[2].trim();
+    name = g.charAt(0).toUpperCase() + g.slice(1);
+    const words = quotedIn(group[3], /"([^"\n]{1,60})" \(/g);
+    desc = words.length ? 'It wrote ' + andList(words) + ' in a "' + group[1].split('_').join(' ') + '" response.'
+                        : 'Its response broke a rule: ' + g + '.';
+  } else if (low.indexOf('labels the user may not know') !== -1) {
+    const words = quotedIn(body, /"([^"\n]{1,60})" \(/g);
+    name = 'Unexplained labels';
+    desc = words.length ? 'It used ' + andList(words) + ' without saying what they are.'
+                        : 'It used labels from earlier in the session without saying what they are.';
+  } else if (low.indexOf('against what actually happened') !== -1) {
+    name = 'Claim not backed'; desc = 'Its response claimed something this session did not actually do.';
+  } else if (low.indexOf('format:') !== -1) {
+    name = 'Incomplete response'; desc = 'Its response was missing required parts.';
+  } else if (low.indexOf('think again') !== -1 || low.indexOf('unfinished work') !== -1) {
+    const words = quotedIn(firstPara, /"([^"\n]{1,60})"/g);
+    name = 'Unfinished work';
+    desc = words.length ? 'It said ' + andList(words) + '. That is work it can do itself, so it was sent back to finish it.'
+                        : 'It tried to stop with work left that it can do itself, so it was sent back to finish it.';
+  } else if (low.indexOf('labels') !== -1) {
+    const words = quotedIn(firstPara, /"([^"\n]{1,60})"/g);
+    name = 'Unexplained labels';
+    desc = words.length ? 'It used ' + andList(words) + ' without saying what they are.'
+                        : 'It used labels from earlier in the session without saying what they are.';
+  } else if (low.indexOf('nothing is needed') !== -1 || low.indexOf('says nothing') !== -1) {
+    name = 'Missing handoff';
+    desc = 'It said nothing was needed from you, without saying why, what happens next, or when you will hear back.';
+  } else if (low.indexOf('handoff') !== -1) {
+    name = 'Missing handoff';
+    desc = 'Its last message did not say what it is working on, where it stands, and what it needs from you.';
+  } else {
+    name = 'Sent back';
+    desc = firstPara.split('\n')[0].slice(0, 200);
+  }
+  return { kind: 'sent_back', name: name, desc: desc, text: reason.slice(0, 4000) };
+}
+
+// Names an engine or web server older than the 2026-10-28 rename still sends.
+const _SENT_BACK_OLD_NAMES = {
+  'Incomplete card': ['Incomplete response', 'Its response was missing required parts.'],
+  'No card': ['No response', 'It ended without a termination response.'],
+  'Text outside the card': ['Text outside the response', 'It wrote text around its termination response. Everything goes inside it.'],
+};
+function _renderSentBackCard(div, e) {
+  const old = _SENT_BACK_OLD_NAMES[e.name];
+  if (old) e = Object.assign({}, e, { name: old[0], desc: old[1] });
+  else if (e.desc) e = Object.assign({}, e, { desc: e.desc.replace(/\bIts card\b/, 'Its response').replace(/" card\.$/, '" response.') });
+  const chip = e.name || 'Sent back';
+  // Design A "Quiet" (2026-10-28, static/scratch/sent-back-premium.html).
+  const backSvg = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-3"/></svg>';
+  const chevSvg = '<svg class="vn-sb-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>';
+  const okSvg = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+  div.className = 'live-entry vn-sent-back';
+  div.innerHTML =
+    '<div class="vn-sb-card">' +
+      '<button type="button" class="vn-sb-head vn-sb-toggle" aria-expanded="false">' +
+        '<span class="vn-sb-icon">' + backSvg + '</span>' +
+        '<span class="vn-sb-main">' +
+          '<span class="vn-sb-line"><span class="vn-sb-title">Invalid termination response</span>' +
+          '<span class="vn-sb-chip">' + escHtml(chip) + '</span></span>' +
+          (e.desc ? '<span class="vn-sb-sum">' + escHtml(e.desc) + '</span>' : '') +
+        '</span>' +
+        '<span class="vn-sb-more"><span class="vn-sb-more-l">Details</span>' + chevSvg + '</span>' +
+      '</button>' +
+      '<div class="vn-sb-clip"><div><div class="vn-sb-body">' +
+        '<div class="vn-sb-h vn-sb-tried-h" hidden>It tried to end on</div>' +
+        '<div class="vn-sb-tried" hidden></div>' +
+        '<div class="vn-sb-h">It was told</div>' +
+        '<div class="vn-sb-told"></div>' +
+      '</div></div></div>' +
+      '<div class="vn-sb-link">' + okSvg + (chip === 'Unfinished work' ? 'It kept working' : 'It rewrote its last message') + '</div>' +
+    '</div>';
+  div.querySelector('.vn-sb-told').textContent = e.text || '';
+  const toggle = div.querySelector('.vn-sb-toggle');
+  toggle.onclick = () => {
+    const open = div.classList.toggle('open');
+    toggle.querySelector('.vn-sb-more-l').textContent = open ? 'Hide' : 'Details';
+    toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (typeof _noteDetailToggle === 'function') _noteDetailToggle();
+  };
+  queueMicrotask(() => {
+    const prev = div.previousElementSibling;
+    if (!prev || !prev.classList.contains('msg') || !prev.classList.contains('assistant')) return;
+    const body = prev.querySelector('.msg-body');
+    if (!body) return;
+    const slot = div.querySelector('.vn-sb-tried');
+    slot.appendChild(body);
+    slot.hidden = false;
+    div.querySelector('.vn-sb-tried-h').hidden = false;
+    prev.remove();
+  });
+}
+
 function renderLiveEntry(e, opts) {
   const div = document.createElement('div');
   if (!e) return div;
+
+  // A send-back delivered as a plain user entry, by a Session Engine or web
+  // server older than the 'sent_back' kind: still a card, never "me".
+  if (e.kind === 'user' && typeof e.text === 'string'
+      && e.text.trim().startsWith(_SENT_BACK_PREFIX)) {
+    _renderSentBackCard(div, _sentBackFromText(e.text));
+    return div;
+  }
 
   if (e.kind === 'user' || e.kind === 'asst') {
     const role = e.kind === 'user' ? 'user' : 'assistant';
@@ -1969,6 +2109,8 @@ function renderLiveEntry(e, opts) {
     }
 
     div.className = 'msg ' + role;
+    // The last-message card's live timing counts from when this was written.
+    if (e.timestamp) div.dataset.ts = String(e.timestamp);
     const roleLabel = e.kind === 'user' ? 'me' : 'claude';
     const ts = e.timestamp ? _formatMsgTime(e.timestamp) : '';
     // Scaffold: role line + an empty body that _fillMsgBody() populates below.
@@ -2030,6 +2172,13 @@ function renderLiveEntry(e, opts) {
     line.onclick = () => { _noteDetailToggle(); detail.classList.toggle('open'); };
     div.appendChild(line);
     div.appendChild(detail);
+
+  } else if (e.kind === 'sent_back') {
+    // Smart termination sent the session back when it tried to stop (design B,
+    // picked 2026-10-27 from static/scratch/smart-termination.html). The card
+    // takes the place of the message it tried to stop on: that message is
+    // moved into the card's "Show" section once both are on the page.
+    _renderSentBackCard(div, e);
 
   } else if (e.kind === 'system') {
     const text = e.text || e.message || '';
@@ -2386,8 +2535,34 @@ const _ST_ICONS = {
   compacting: '<svg class="vn-st-squeeze" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>',
   waking: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>',
   asleep: '<span class="vn-st-mask vn-st-sleep"></span>',
+  // Standby: the sidebar's pause icon (session-verb.js), owner's pick A of
+  // static/scratch/standby-bar.html, 2026-10-28.
+  standby: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9.5"/><path d="M10 9v6"/><path d="M14 9v6"/></svg>',
 };
-const _ST_LABELS = {working: 'Working', compacting: 'Compacting', waking: 'Awaiting wake-up', asleep: 'Sleeping'};
+const _ST_LABELS = {working: 'Working', compacting: 'Compacting', waking: 'Awaiting wake-up', asleep: 'Sleeping', standby: 'Standby'};
+/** "Set aside 12 min ago" for a Standby session's text box (epoch seconds). */
+function _setAsideText(since) {
+  const s = Math.max(0, Date.now() / 1000 - (+since || 0));
+  if (!(+since > 0)) return '';
+  if (s < 60) return 'Set aside just now';
+  const m = Math.floor(s / 60);
+  if (m < 60) return 'Set aside ' + m + ' min ago';
+  const h = Math.floor(m / 60);
+  if (h < 24) return 'Set aside ' + h + ' hr ago';
+  const d = Math.floor(h / 24);
+  return d === 1 ? 'Set aside yesterday' : 'Set aside ' + d + ' days ago';
+}
+// Keeps "Set aside N min ago" true while the box stays open.  One interval
+// for the page; it only touches the bar when that line is on screen.
+let _setAsideTicker = null;
+function _tickSetAside() {
+  if (_setAsideTicker) return;
+  _setAsideTicker = setInterval(() => {
+    const el = document.querySelector('#live-input-bar .vn-st-since');
+    if (!el) { clearInterval(_setAsideTicker); _setAsideTicker = null; return; }
+    el.textContent = _setAsideText(el.dataset.since);
+  }, 30000);
+}
 /** Session substatus -> header state for a WORKING session. */
 function _stKindFor(sub) { return sub === 'compacting' ? 'compacting' : (sub === 'auto-resuming' ? 'waking' : 'working'); }
 /** The motion that goes with a busy state (nothing while a session merely
@@ -2479,7 +2654,11 @@ function updateLiveInputBar() {
   // renders the limit CTA but not the generic error banner, so keying off the
   // error would force a repaint that changes nothing visible while destroying
   // any text the user had typed into the resume box.
-  if (!isRunning) stateKey = 'ended' + _limitKey;
+  // A sleeping session on Standby says so (owner's pick A, standby-bar.html).
+  const _SV = window.SessionVerb;
+  const _standby = !isRunning && !!(_SV && _SV.holdOf && _SV.holdOf(id) === 'standby');
+  const _standbySince = _standby && _SV.holdSince ? _SV.holdSince(id) : 0;
+  if (!isRunning) stateKey = 'ended' + _limitKey + (_standby ? ':standby:' + _standbySince : '');
   else if (kind === 'question') stateKey = 'question:' + (wd ? wd.question || '' : '');
   else if (kind === 'idle') stateKey = 'idle:' + _idleSub
     + (_retrySt ? ':retry:' + _retrySt.retry_at + ':' + _retrySt.retry_attempt : '')
@@ -2546,10 +2725,13 @@ function updateLiveInputBar() {
     bar.innerHTML =
       (_limitBanner || '') +
       // No limit banner: the "asleep" header is attached to the text box.
-      (_limitBanner ? '' : '<div class="vn-card">' +
+      (_limitBanner ? '' : _standby
+        ? '<div class="vn-card" data-st="standby">' + _stHeader('standby', _standbySince
+            ? '<span class="vn-st-hint vn-st-since" data-since="' + _standbySince + '">' + _setAsideText(_standbySince) + '</span>' : '')
+        : '<div class="vn-card">' +
         _stHeader('asleep', '<span class="vn-st-hint">Wakes when you send a message</span>')) +
       '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="' +
-      (_limitBanner ? 'Type a message to continue\u2026' : 'Type a message to wake it') + '"' +
+      (_limitBanner ? 'Type a message to continue\u2026' : _standby ? 'Type to pick it back up' : 'Type a message to wake it') + '"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitContinue(\'' + id + '\')}"' +
       ' onblur="if(_wasKeyboardDismissBlur()){liveSubmitContinue(\'' + id + '\')}"></textarea>' +
       (_limitBanner ? '' : '</div>') +
@@ -2560,6 +2742,7 @@ function updateLiveInputBar() {
       '</div>';
     const btnClose = document.getElementById('btn-close');
     if (btnClose) btnClose.disabled = true;
+    if (_standbySince && !_limitBanner) _tickSetAside();
     // Tick the "resets in …" text if the CTA is showing with a known reset.
     if (_limitBanner && _limitSt && (_limitSt.limit_reset_at > 0 || _retrySt)) _startLimitCountdown();
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => liveSubmitContinue(id));

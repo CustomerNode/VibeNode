@@ -248,6 +248,24 @@ function cancelListInlineRename() {
   // Alias for compatibility — escape is handled in startListInlineRename
 }
 
+// The three statuses the sidebar draws (owner's pick B, 2026-10-28):
+// Needs you, Working, Done.  Counted from session-verb.js so the homepage and
+// the empty Sessions view say exactly what the cards say.
+function _hpThree(polled) {
+  if (!polled) return { needs: '-', working: '-', standby: '-', done: '-' };
+  const c = { needs: 0, working: 0, standby: 0, done: 0 };
+  allSessions.forEach(s => {
+    let g;
+    if (window.SessionVerb && window.SessionVerb.shown) g = window.SessionVerb.shown(window.SessionVerb.display(s.id));
+    else {
+      const k = runningIds.has(s.id) ? sessionKinds[s.id] : 'sleeping';
+      g = k === 'working' ? 'working' : (k === 'question' || k === 'idle') ? 'needs' : 'done';
+    }
+    c[g] = (c[g] || 0) + 1;
+  });
+  return c;
+}
+
 function _buildDashboard() {
   const project = _allProjects.find(p => p.encoded === localStorage.getItem('activeProject'));
   const projectName = project ? _projectShortName(project) : 'No project';
@@ -262,7 +280,12 @@ function _buildDashboard() {
   // counts, the sessions waiting on the user (if any), and one primary action.
   // No boxes; same pieces and type as the homepage's Sessions card (".dx-*").
   const _n = (n, label, cls) => `<div class="dx-num ${n && n !== '-' ? cls : 'zero'}"><b>${n}</b><span>${label}</span></div>`;
-  const nums = _n(working, 'Working', 'work') + _n(question, 'Waiting on you', 'wait') + _n(idle, 'Idle', '') + _n(sleeping, 'Sleeping', '');
+  const _c3 = _hpThree(polled);
+  // Smart termination off: the process counts it showed before (session-verb.js gate).
+  const nums = window.SessionVerb
+    ? _n(_c3.needs, 'Needs you', 'wait') + _n(_c3.working, 'Working', 'work')
+      + (_c3.standby && _c3.standby !== '-' ? _n(_c3.standby, 'Standby', '') : '') + _n(_c3.done, 'Done', '')
+    : _n(working, 'Working', 'work') + _n(question, 'Waiting on you', 'wait') + _n(idle, 'Idle', '') + _n(sleeping, 'Sleeping', '');
   const _key = s => s.effective_ts || s.last_activity_ts || s.sort_ts || 0;
   const waiting = polled ? allSessions.filter(s => runningIds.has(s.id) && sessionKinds[s.id] === 'question')
     .sort((a, b) => _key(b) - _key(a)).slice(0, 4) : [];
@@ -469,8 +492,13 @@ function _buildHomepageContent() {
   // ("Needs you") and what is running ("Running").  Numbers are desktop-only
   // (".hpx-*" in style.css); the two lists show on every screen (".hpn-*").
   const _hpNum = (n, label, cls) => `<div class="hpx-num ${n ? cls : 'zero'}"><b>${n}</b><span>${label}</span></div>`;
-  const hpNumsHtml = _hpNum(working, 'Working', 'work') + _hpNum(question, 'Waiting on you', '')
-    + _hpNum(idle, 'Idle', '') + _hpNum(sleeping, 'Sleeping', '');
+  const _h3 = _hpThree(polled);
+  const hpNumsHtml = window.SessionVerb
+    ? _hpNum(_h3.needs === '-' ? 0 : _h3.needs, 'Needs you', 'wait') + _hpNum(_h3.working === '-' ? 0 : _h3.working, 'Working', 'work')
+      + (_h3.standby && _h3.standby !== '-' ? _hpNum(_h3.standby, 'Standby', '') : '')
+      + _hpNum(_h3.done === '-' ? 0 : _h3.done, 'Done', '')
+    : _hpNum(working, 'Working', 'work') + _hpNum(question, 'Waiting on you', '')   // Smart termination off
+      + _hpNum(idle, 'Idle', '') + _hpNum(sleeping, 'Sleeping', '');
   const hpLists = _hpAttentionLists(polled);
   const _hpRow = (s, ico) => {
     const sid = String(s.id).replace(/[^A-Za-z0-9_-]/g, '');
@@ -585,6 +613,15 @@ function _hpAttentionLists(polled) {
   const questions = [], finished = [], running = [];
   for (const s of allSessions) {
     const st = status(s.id);
+    if (window.SessionVerb) {
+      // Person-oriented (session-verb.js): Decide / Unblock / Approve lead,
+      // then Review / Read / Send; Working is "Running".
+      const r = window.SessionVerb.rank(s.id, st);
+      if (r === 0) questions.push(s);
+      else if (r === 1) finished.push(s);
+      else if (st === 'working') running.push(s);
+      continue;
+    }
     if (st === 'question') questions.push(s);
     else if (st === 'working') running.push(s);
     else if (unread(s.id)) finished.push(s);

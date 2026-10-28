@@ -205,6 +205,12 @@ socket.on('sessions_refresh', (data) => {
 //
 // Deliberately patches a single row rather than reloading the whole list
 // (autoname fires often, so a full reload per name change would be a storm).
+// Standby / marked Done set on another device or tab (app/session_holds.py).
+socket.on('session_hold', (data) => {
+  if (!data || !data.session_id || !window.SessionVerbCore || !window.SessionVerbCore.applyHold) return;
+  window.SessionVerbCore.applyHold(data.session_id, data.state || null, data.since || 0);
+});
+
 socket.on('session_renamed', (data) => {
     try {
         const id = data && data.session_id;
@@ -1545,6 +1551,11 @@ socket.on('session_entry', (data) => {
     // the live-session sid-match bail-out below so background sessions get
     // the same freshness treatment as the live one.
     _bumpSessionActivity(data.session_id);
+    // The newest message's handoff card decides the sidebar status (session-verb.js).
+    // Core, not SessionVerb: cards seen while Smart termination is off still
+    // count the moment it is turned on.
+    const _sv = window.SessionVerbCore || window.SessionVerb;
+    if (_sv) _sv.noteEntry(data.session_id, data.entry);
 
     // NOTE: Watchdog reset moved AFTER session_id match check below.
     // Previously it was here, so entries for a mismatched session_id (e.g.
@@ -2284,6 +2295,11 @@ function _updateRowState(sessionId, state) {
         else if (state === 'idle') row.classList.add('si-idle');
         const _sc = (typeof _sessionRowStateClass === 'function') ? _sessionRowStateClass(status) : '';
         if (_sc) row.classList.add(_sc);
+        // Person-oriented status classes (session-verb.js; sessions.js _sessionVerbRowClass).
+        if (typeof _sessionVerbRowClass === 'function') {
+            row.classList.forEach(c => { if (c.startsWith('vs-row-')) row.classList.remove(c); });
+            _sessionVerbRowClass(sessionId, status).split(' ').forEach(c => { if (c) row.classList.add(c); });
+        }
         if (typeof _sessionStateIconHtml === 'function') {
             const host = row.querySelector('.session-col-name');
             if (host) {
@@ -2313,10 +2329,32 @@ function _updateRowState(sessionId, state) {
         card.classList.add('wf-' + status);
         if (typeof _wfCardStatusParts === 'function') {
             const parts = _wfCardStatusParts(sessionId, status);
+            // Person-oriented colour class (session-verb.js): vs-decide, vs-read, ...
+            card.classList.forEach(c => { if (c.startsWith('vs-')) card.classList.remove(c); });
+            if (parts.cls) card.classList.add(parts.cls);
             const avatar = card.querySelector('.wf-avatar');
             if (avatar && avatar.innerHTML !== parts.emoji) avatar.innerHTML = parts.emoji;
             const label = card.querySelector('.wf-status-label');
             if (label && label.textContent !== parts.label) label.textContent = parts.label;
+            // The verdict buttons (Accept / Back) take the date line's place
+            // while the session waits for your verdict (session-verdict.js).
+            const foot = card.querySelector(':scope > .vs-verdict');
+            if (parts.foot && !foot) {
+                const meta = card.querySelector(':scope > .wf-meta');
+                const tpl = document.createElement('template');
+                tpl.innerHTML = parts.foot;
+                if (meta) meta.replaceWith(tpl.content.firstElementChild); else card.appendChild(tpl.content.firstElementChild);
+            } else if (foot && parts.foot && foot.dataset.k !== parts.status) {
+                const tpl = document.createElement('template');
+                tpl.innerHTML = parts.foot;
+                foot.replaceWith(tpl.content.firstElementChild);
+            } else if (foot && !parts.foot) {
+                const row = (typeof SessionStore !== 'undefined' && SessionStore.get) ? SessionStore.get(sessionId) : null;
+                const meta = document.createElement('div');
+                meta.className = 'wf-meta';
+                meta.textContent = (row && typeof _shortDate === 'function') ? _shortDate(row.last_activity) : '';
+                foot.replaceWith(meta);
+            }
             const t = card.getAttribute('title') || '';
             const dash = t.lastIndexOf(' — ');
             if (dash >= 0) card.setAttribute('title', t.slice(0, dash) + ' — ' + parts.hint);
@@ -2327,6 +2365,8 @@ function _updateRowState(sessionId, state) {
     // becomes visible when it settles. This is the surgical path — a full
     // filterSessions() also renders it, but not every state change triggers one.
     if (typeof _syncUnreadDom === 'function') _syncUnreadDom(sessionId, state);
+    // The open session's "Is this right?" strip follows its status too.
+    if (window.SessionVerdict && typeof liveSessionId !== 'undefined' && liveSessionId === sessionId) window.SessionVerdict.sync();
 }
 
 // ── Debounced full sidebar render (2026-10-23) ──────────────────────────
@@ -2374,7 +2414,10 @@ function _renderSessionStateChange(sessionId, prevStatus) {
     const statusChanged = typeof getSessionStatus === 'function' && prevStatus !== getSessionStatus(sessionId);
     if (statusSort && statusChanged) {
         const _r = s => (_STATUS_RANK[s] == null ? 3 : _STATUS_RANK[s]);
-        if (_r(prevStatus) !== _r(getSessionStatus(sessionId))) { _scheduleFilterSessions(); return; }
+        const _moved = window.SessionVerb
+            ? window.SessionVerb.rank(sessionId, prevStatus) !== window.SessionVerb.rank(sessionId)
+            : _r(prevStatus) !== _r(getSessionStatus(sessionId));
+        if (_moved) { _scheduleFilterSessions(); return; }
     }
     // A state/unread filter chip is on: the session may enter or leave the list.
     if (statusChanged && typeof _sessionFiltersDependOnState === 'function'
@@ -2553,6 +2596,10 @@ loadProjects().then(() => { window._initialLoadDone = true; }).catch(() => { win
 // Fail-open: defaults to true on error.
 fetch('/api/kanban/config').then(r => r.ok ? r.json() : {}).then(cfg => {
   window._wrongSessionDetectionEnabled = cfg.wrong_session_detection !== false;
+  // opt-in; redraws the sidebar statuses if it differs from the cached value
+  if (typeof cfg.smart_termination !== 'boolean') { /* unknown: keep the cached value */ }
+  else if (typeof window.applySmartTerminationView === 'function') window.applySmartTerminationView(cfg.smart_termination);
+  else window._smartTerminationEnabled = cfg.smart_termination;
 }).catch(() => { /* fail-open: keep default true */ });
 // Git status polling — initial check + 60s interval
 if (typeof pollGitStatus === 'function') {

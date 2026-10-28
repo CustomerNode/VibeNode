@@ -1139,6 +1139,7 @@ class ClaudeJsonlStore(ChatStore):
             return []
         from common.transcripts import (
             is_system_content, system_content_label, CLI_SYSTEM_MARKERS,
+            sent_back_entry,
         )
         rows = []
         for raw in data.splitlines():
@@ -1168,7 +1169,10 @@ class ClaudeJsonlStore(ChatStore):
 
             def _user_text(text):
                 text = text.strip()
-                if is_system_content(text, CLI_SYSTEM_MARKERS):
+                sb = sent_back_entry(text)
+                if sb:
+                    _row(**sb)
+                elif is_system_content(text, CLI_SYSTEM_MARKERS):
                     _row(kind="system", text=system_content_label(text))
                 else:
                     _row(kind="user", text=text[:20000])

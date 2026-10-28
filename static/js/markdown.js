@@ -83,7 +83,11 @@ function mdParse(md) {
     // backticks and closes only on a run at least as long (CommonMark), so a
     // ```` fence can carry a ``` block inside it.  The old /```…```/ closed at
     // the first three backticks and cut such a block off mid-way (2026-10-15).
-    html = html.replace(/(`{3,})(\w*)\n?([\s\S]*?)\n?\1`*/g, (_, _fence, lang, code) => {
+    // Both fences must start a line (2026-10-28): a ``` inside a line, such as
+    // a handoff card's text mentioning "``` code blocks", closed the card
+    // there and the rest of its JSON showed raw.  Same rule as the checker
+    // (_FENCE in daemon/handoff_rules.py) and CommonMark.
+    html = html.replace(/^[ \t]*(`{3,}|~{3,})(\w*)[ \t]*\n([\s\S]*?)\n?^[ \t]*\1[`~]*[ \t]*$/gm, (_, _fence, lang, code) => {
       const idx = codeBlocks.length;
       // ```copyfile: a copy card (smart-copy.js) instead of the text. Line 1 is
       // a file in ~/.claude/copy-exports, optional line 2 a label. Until the
@@ -95,6 +99,15 @@ function mdParse(md) {
         const label = attr(lines[1]);
         codeBlocks.push('<div class="vn-copy-export" data-path="' + path + '" data-label="' + label +
           '"><code>' + path + '</code></div>');
+        return '\x00CODE' + idx + '\x00';
+      }
+      // ```handoff: the session's last-message card (last-card.js renders it,
+      // docs/plans/last-message-cards-spec.md).  Until then, or if the JSON is
+      // invalid, the reader sees the block as code, never nothing.
+      if (lang === 'handoff') {
+        const attr = _escapeHtmlForCode(code).replace(/"/g, '&quot;');
+        codeBlocks.push('<div class="vn-card-ph" data-card="' + attr + '"><pre class="vn-code"><code>' +
+          _escapeHtmlForCode(code) + '</code></pre></div>');
         return '\x00CODE' + idx + '\x00';
       }
       const langClass = lang ? ' class="lang-' + _escapeHtmlForCode(lang) + '"' : '';

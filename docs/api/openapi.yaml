@@ -939,6 +939,45 @@ paths:
                     nullable: true
                     type: object
 
+  /api/session-hold/{session_id}:
+    post:
+      tags: [Sessions]
+      summary: Put a session on Standby, mark it Done, or clear that
+      description: >
+        The hold lasts until the session's next message. Every open sidebar
+        learns it from the session_hold Socket.IO broadcast.
+      operationId: setSessionHold
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                state:
+                  type: string
+                  nullable: true
+                  enum: [standby, done, null]
+                project:
+                  type: string
+      responses:
+        "200":
+          description: Hold saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  state:
+                    type: string
+                    nullable: true
+        "400":
+          description: Bad state or session id
+
   /api/session-timeline/{session_id}:
     get:
       tags: [Sessions]
@@ -2425,6 +2464,74 @@ paths:
           description: File is over 20 MB
         "415":
           description: File is not UTF-8 text
+
+  /api/card-image:
+    get:
+      tags: [Live]
+      summary: A screenshot named by a handoff card's file path
+      description: >
+        Serves an image an end-of-turn card links by absolute path (or file://
+        URL), so the card can draw it. Owner-only. Reads only files under the
+        home or temp folder, up to 20 MB, whose first bytes are a PNG, JPEG,
+        GIF or WebP image. Not cached.
+      operationId: getCardImage
+      parameters:
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The image
+          content:
+            image/png: {}
+            image/jpeg: {}
+            image/gif: {}
+            image/webp: {}
+        "400":
+          description: No path, or a path that cannot be resolved
+        "403":
+          description: Not under home or the temp folder, or the caller is not the owner
+        "404":
+          description: File does not exist or cannot be read
+        "413":
+          description: Image is over 20 MB
+        "415":
+          description: Not an image
+
+  /api/queue-history/{session_id}:
+    get:
+      tags: [Live]
+      summary: Queued messages a session handled since the user last sent one
+      description: >
+        Feeds the "Also handled" line on the session's newest card. Lists the
+        messages the user queued that were sent after he last sent something
+        himself. Read-only.
+      operationId: getQueueHistory
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      responses:
+        "200":
+          description: Queued messages sent since the last review
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reviewed_at:
+                    type: number
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        text:
+                          type: string
+                        queued_at:
+                          type: number
+                        sent_at:
+                          type: number
 
   /api/open-file:
     post:

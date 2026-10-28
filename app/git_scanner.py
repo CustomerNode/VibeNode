@@ -190,6 +190,12 @@ _FINDING_SUPPRESSIONS = [
     # names a plan criterion may carry. The name ends in _KEYS, the value is a
     # Python literal, not a credential. Same narrow suppression as above.
     (re.compile(r'pipeline/plan\.py$'), "Env Variable Secret"),
+    # Smart-termination card rules: constants named _SKIP_KEYS (a frozenset
+    # of card field names), _JS_OPTION_KEY (a regex) and ZOOM_KEYS (a tuple
+    # of zoom-line labels). Names contain KEY; values are not credentials.
+    # Only this finding type is suppressed; every other pattern still runs.
+    (re.compile(r'daemon/handoff_rules\.py$'), "Env Variable Secret"),
+    (re.compile(r'daemon/smart_termination\.py$'), "Env Variable Secret"),
     # NOTE: prelogin_unlock.py previously needed a "Password Assignment"
     # suppression here. It no longer does — the root cause was the pattern's
     # value class matching newlines (see _SECRET_PATTERNS above). The

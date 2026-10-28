@@ -169,6 +169,8 @@
     if (next === _state) return;
     var prev = _state;
     _state = next;
+    // Scrolling away ends a follow armed by a decision (followWork).
+    if (_state === READING) _followWorkSid = null;
 
     // Keep the legacy global in sync. Many call sites across live-panel.js and
     // socket.js still do `if (liveAutoScroll) logEl.scrollTop = ...`; mapping
@@ -331,9 +333,26 @@
    * New content landed. If the reader cannot see it: in live mode (and not
    * reading) follow it; otherwise light up the button.
    */
+  // ── Follow the work after a decision (2026-10-28) ──────────────────────
+  // The owner: when he answers a card ("Decide … Sent: B"), the thread must
+  // follow the work that answer starts, at least until he scrolls, whatever
+  // the Auto scroll setting says. followWork() arms a follow for the session
+  // on screen; the first scroll away ends it (scrolling back does not re-arm).
+  // It is not the Auto scroll setting: the switch and the default are untouched.
+  var _followWorkSid = null;
+
+  function _followingWork() { return !!_sid && _followWorkSid === _sid; }
+
+  function followWork() {
+    if (!_sid) return;
+    _followWorkSid = _sid;
+    _setState(LIVE, 'follow-work');
+    scrollToBottom();
+  }
+
   function _noteArrival(count) {
     if (_tailInView()) return;
-    if (_liveScroll && _state !== READING) { _follow(); return; }
+    if ((_liveScroll || _followingWork()) && _state !== READING) { _follow(); return; }
     _hasNew = true;
     _newCount += count || 0;
     _renderPill();
@@ -858,6 +877,7 @@
     requestCollapse: requestCollapse,
     noteUserExpand: noteUserExpand,
     onSend: onSend,
+    followWork: followWork,
     catchUp: catchUp,
     scrollToBottom: scrollToBottom,
     positioned: positioned,

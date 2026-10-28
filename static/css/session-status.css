@@ -1,0 +1,103 @@
+/* Sidebar status oriented to the person (2026-10-27).  See static/js/session-verb.js.
+   Colours are RGB triplets in --vs so the card border, label and icon share one source. */
+
+.vs-decide  { --vs: 255, 149, 0; }
+.vs-unblock { --vs: 242, 100, 100; }
+.vs-approve { --vs: 214, 178, 84; }
+.vs-review  { --vs: 68, 170, 102; }
+.vs-read    { --vs: 80, 185, 215; }
+.vs-send    { --vs: 160, 130, 255; }
+.vs-waiting { --vs: 138, 169, 255; }
+.vs-idle    { --vs: 140, 145, 160; }
+[data-theme="light"] .vs-decide  { --vs: 210, 120, 0; }
+[data-theme="light"] .vs-unblock { --vs: 205, 60, 60; }
+[data-theme="light"] .vs-approve { --vs: 160, 120, 20; }
+[data-theme="light"] .vs-review  { --vs: 42, 138, 68; }
+[data-theme="light"] .vs-read    { --vs: 20, 135, 170; }
+[data-theme="light"] .vs-send    { --vs: 115, 85, 220; }
+[data-theme="light"] .vs-waiting { --vs: 70, 105, 210; }
+[data-theme="light"] .vs-idle    { --vs: 130, 135, 150; }
+
+/* The icon itself (list row and card avatar). */
+svg.vs-ic { color: rgb(var(--vs)); }
+
+/* List rows: a person's move warms the title; Idle stays quiet. */
+.session-item.vs-row-yours .session-col-name { color: var(--text-heading); }
+
+/* Cards.  You decide, "can't go on": a solid border in its colour.  "When you
+   can": a softer one.  Waiting: faint.  Idle: the existing quiet card. */
+.wf-card.vs-decide, .wf-card.vs-unblock { border-color: rgba(var(--vs), .75); }
+.wf-card.vs-review, .wf-card.vs-read, .wf-card.vs-send { border-color: rgba(var(--vs), .45); }
+.wf-card.vs-waiting { border-color: rgba(var(--vs), .35); }
+.wf-card.vs-decide .wf-status-label, .wf-card.vs-unblock .wf-status-label, .wf-card.vs-approve .wf-status-label,
+.wf-card.vs-review .wf-status-label, .wf-card.vs-read .wf-status-label, .wf-card.vs-send .wf-status-label,
+.wf-card.vs-waiting .wf-status-label { background: rgba(var(--vs), .15); color: rgb(var(--vs)); }
+.wf-card.vs-idle .wf-status-label { background: var(--bg-hover); color: var(--text-faint); }
+.wf-card.vs-idle .wf-avatar { opacity: .6; }
+/* A sleeping session that still needs you keeps its colour, not the grey-out. */
+.wf-card.wf-sleeping.vs-decide .wf-avatar, .wf-card.wf-sleeping.vs-unblock .wf-avatar { filter: none; }
+
+/* Review / Read / Send say "unread" themselves; no dot beside them. */
+.session-item.has-unread[class*="vs-row-"] .unread-dot,
+.wf-card.has-unread[class*="vs-"] .unread-dot { display: none; }
+
+/* ── The workflow terminates (2026-10-27, scratch: status-workflow.html) ──
+   Done is a sleeping session, and looks the way Sleeping always did: grey
+   (the owner, 2026-10-27).  The card keeps the wf-sleeping grey-out
+   (style.css: grayscale avatar, quiet border and label). */
+.vs-done { --vs: 140, 145, 160; }
+[data-theme="light"] .vs-done { --vs: 130, 135, 150; }
+svg.vs-ic.vs-done { color: var(--text-faint); }
+.wf-card.vs-done .wf-status-label { background: var(--bg-hover); color: var(--text-faint); }
+.session-item.vs-row-done .session-col-name { color: var(--text-muted); }
+
+/* Accept / Back on a Review, Read or Send card, in place of the date line. */
+.vs-verdict { display: flex; gap: 4px; margin-top: 2px; }
+.vs-vbtn { all: unset; box-sizing: border-box; cursor: pointer; white-space: nowrap; font: 650 10px/1.5 var(--font-sans);
+  padding: 1px 6px; border-radius: 7px; border: 1px solid var(--border-light); color: var(--text-muted); }
+.vs-vbtn:hover { color: var(--text-heading); border-color: var(--text-faint); }
+.vs-vbtn.vs-ok:hover { color: rgb(68, 170, 102); border-color: rgba(68, 170, 102, .6); }
+.vs-vbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* "Is this right?" at the end of the open session's thread (session-verdict.js). */
+.vs-verdict-strip { margin: 6px 0 14px; padding: 12px 14px 13px; border-radius: 12px; font-family: var(--font-sans); letter-spacing: normal;
+  border: 1px solid rgba(var(--vs), .3); background: rgba(var(--vs), .05); }
+.vs-verdict-strip .vs-vq { font-size: 10.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: rgb(var(--vs)); margin-bottom: 9px; }
+.vs-verdict-strip .vs-vrow { display: flex; gap: 10px; flex-wrap: wrap; }
+.vs-big { all: unset; box-sizing: border-box; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; padding: 8px 13px; border-radius: 10px;
+  font: 600 13.5px/1.3 var(--font-sans); border: 1px solid var(--border-light); color: var(--text-primary); background: var(--bg-card); }
+.vs-big small { font-weight: 500; font-size: 12px; color: var(--text-muted); }
+.vs-big.vs-accept { border-color: rgba(68, 170, 102, .55); color: rgb(68, 170, 102); background: rgba(68, 170, 102, .09); }
+.vs-big.vs-back { border-color: rgba(240, 166, 40, .5); color: rgb(240, 166, 40); background: rgba(240, 166, 40, .07); }
+.vs-big.vs-back.on { box-shadow: 0 0 0 2px rgba(240, 166, 40, .35); }
+.vs-big.vs-cont { border-color: rgba(96, 158, 255, .5); color: rgb(96, 158, 255); background: rgba(96, 158, 255, .07); }
+.vs-big.vs-cont.on { box-shadow: 0 0 0 2px rgba(96, 158, 255, .35); }
+.vs-big:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* The composer while it is asking what's wrong. */
+.live-textarea.vs-sendback { box-shadow: inset 0 0 0 1px rgba(240, 166, 40, .55); }
+.live-textarea.vs-continue { box-shadow: inset 0 0 0 1px rgba(96, 158, 255, .55); }
+
+/* Three drawn statuses (owner's pick B, 2026-10-28): Needs you, Working, Done.
+   Needs you is one colour and one picture whatever the session wants. */
+.vs-needs { --vs: 255, 149, 0; }
+[data-theme="light"] .vs-needs { --vs: 210, 120, 0; }
+.wf-card.vs-needs { border-color: rgba(var(--vs), .6); }
+.wf-card.vs-needs .wf-status-label { background: rgba(var(--vs), .15); color: rgb(var(--vs)); }
+.wf-card.wf-sleeping.vs-needs .wf-avatar { filter: none; }
+
+/* Standby (owner, 2026-10-28, static/scratch/standby-status.html option A):
+   seen, not now, still on the list.  Teal (owner's pick A, 2026-10-28,
+   static/scratch/standby-vs-done.html: slate blue blended with Done's grey), a dashed border, no
+   grey-out (it is not finished). */
+.vs-standby { --vs: 40, 190, 175; }
+[data-theme="light"] .vs-standby { --vs: 10, 135, 125; }
+.wf-card.vs-standby { border-color: rgba(var(--vs), .45); border-style: dashed; }
+.wf-card.vs-standby .wf-status-label { background: rgba(var(--vs), .13); color: rgb(var(--vs)); }
+.wf-card.wf-sleeping.vs-standby .wf-avatar { filter: none; }
+.session-item.vs-row-standby .session-col-name { color: var(--text-secondary); }
+/* The open session's text box on Standby (owner's pick A, 2026-10-28,
+   static/scratch/standby-bar.html): "Standby · Set aside 12 min ago" in the
+   same teal, instead of "Sleeping · Wakes when you send a message". */
+.vn-card[data-st="standby"] { --vs: 40, 190, 175; }
+[data-theme="light"] .vn-card[data-st="standby"] { --vs: 10, 135, 125; }
+.vn-card[data-st="standby"] .vn-st-ico, .vn-card[data-st="standby"] .vn-st-lbl { color: rgb(var(--vs)); }

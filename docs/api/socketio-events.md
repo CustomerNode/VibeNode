@@ -718,6 +718,21 @@ A client treats each snapshot as a lease: an approval is open for `ttl_ms` after
 
 ---
 
+### `session_hold`
+
+**Triggered:** Broadcast by `POST /api/session-hold/<session_id>` when a session is put on Standby, marked Done, or has that cleared. The hold lasts until the session's next message; every open sidebar redraws the row. `since` is when the hold was set (null when cleared).  
+**Payload:**
+```json
+{
+  "session_id": "<uuid>",
+  "state": "standby",
+  "project": "<encoded-project-id>",
+  "since": 1793203200.5
+}
+```
+
+---
+
 ### `naming_progress`
 
 **Triggered:** By the bulk naming job (`POST /api/sessions/name-untitled`): once at start (`done: 0`), every 5 sessions, and once at the end with `finished: true`. Each title also fires `session_renamed`.  

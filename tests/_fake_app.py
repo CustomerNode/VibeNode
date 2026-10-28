@@ -57,6 +57,10 @@ def init_script(view_mode: str = "sessions", display_mode: str = "grid", extra: 
 localStorage.setItem('activeProject', '%s');
 localStorage.setItem('viewMode', '%s');
 localStorage.setItem('sessionDisplayMode', '%s');
+// The sidebar's person statuses follow Smart termination (session-verb.js);
+// the fake config is {} so this cached value decides.  A test that wants the
+// process statuses sets it to 'off' in `extra`.
+localStorage.setItem('vnSmartTermination', 'on');
 window.__emits = [];
 window.__push = (ev, d) => { for (const fn of socket.listeners(ev)) fn(d); };
 %s

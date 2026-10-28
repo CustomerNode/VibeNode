@@ -3461,6 +3461,8 @@ class SessionManager:
                         resume=resolved,
                         permission_callback=self._make_permission_callback(session_id),
                         pre_compact_callback=self._make_pre_compact_callback(session_id),
+                        turn_end_callback=self._make_turn_end_callback(session_id),
+                        append_system_prompt=self._smart_termination_prompt(info.session_type),
                         # Marker-stripped: info.model can carry the CLI's
                         # "[1m]" display suffix, which is an API 400 as --model.
                         model=self._cli_model_id(info.model) or None,
@@ -3582,8 +3584,10 @@ class SessionManager:
                 resume=session_id if resume else None,
                 permission_callback=self._make_permission_callback(session_id),
                 pre_compact_callback=self._make_pre_compact_callback(session_id),
+                turn_end_callback=self._make_turn_end_callback(session_id),
                 model=model or None,
                 system_prompt=system_prompt or None,
+                append_system_prompt=self._smart_termination_prompt(info.session_type),
                 max_turns=max_turns or None,
                 allowed_tools=allowed_tools or [],
                 permission_mode=_effective_mode,
@@ -5567,6 +5571,89 @@ class SessionManager:
     # Permission callback
     # ------------------------------------------------------------------
 
+    # ── Smart termination (daemon/smart_termination.py) ──────────────────
+
+    @staticmethod
+    def _smart_termination_on() -> bool:
+        """The ``smart_termination`` preference (System → Preferences), opt-in:
+        on only when set to true.  Read through the cached config (CLAUDE.md
+        PERF-CRITICAL #11)."""
+        try:
+            from common.config import get_kanban_config
+            return get_kanban_config().get("smart_termination", False) is True
+        except Exception:
+            return False
+
+    def _smart_termination_prompt(self, session_type: str) -> Optional[str]:
+        """The handoff instruction appended to a launch's system prompt, or
+        None for sessions that never talk to a person (planner, title)."""
+        if session_type in ("planner", "title") or not self._smart_termination_on():
+            return None
+        try:
+            # The rules as they are on disk now, not as they were when the
+            # engine started (daemon/smart_termination_live.py).
+            from daemon.smart_termination_live import module as _st_live
+            return _st_live().INSTRUCTIONS
+        except Exception:
+            return None
+
+    def _make_turn_end_callback(self, session_id: str):
+        """The backend's turn-end hook for one session: returns the reason to
+        send the agent back (no handoff block, unexplained labels, or stopping
+        with work it could still do), or None to let the turn end.
+
+        Never sends back a session the user stopped (``_interrupted``), a
+        planner/title session, or any session while the preference is off.
+        Each stop cycle is sent back at most ``MAX_SENDBACKS`` times."""
+        captured_sid = session_id
+
+        async def turn_end_hook(message=None, continued=False,
+                                background_in_flight=False):
+            if not self._smart_termination_on():
+                return None
+            sid = self._resolve_id(captured_sid)
+            with self._lock:
+                info = self._sessions.get(sid)
+            if info is None or getattr(info, "_interrupted", False):
+                return None
+            if getattr(info, "session_type", "") in ("planner", "title"):
+                return None
+            # A queued message goes out now; the next turn's card covers it
+            # (the owner, 2026-10-27: "if i queued it, i want that to occur").
+            try:
+                if self._mq.get_queue(sid):
+                    return None
+            except Exception:
+                pass
+            if not continued:
+                info._st_sendbacks = 0
+            sendbacks = getattr(info, "_st_sendbacks", 0) or 0
+            from daemon.smart_termination_live import module as _st_live
+            # Off the event loop: after a rule edit it runs an import check.
+            _st = await asyncio.get_running_loop().run_in_executor(None, _st_live)
+            # What the session did and what the user said in this task: the
+            # card is checked against it (claims, every ask covered, the big
+            # picture kept, his question answered; daemon/handoff_evidence.py).
+            facts = None
+            try:
+                from daemon import handoff_evidence as _ev
+                with self._lock:
+                    entries = list(info.entries)
+                facts = _ev.facts_from_entries(entries, trimmed=bool(getattr(info, "_entries_trimmed", False)))
+            except Exception as e:   # never trap a turn on a facts failure
+                logger.debug("Smart termination: no facts for %s: %s", sid[:12], e)
+                facts = None
+            reason = _st.review(message, continued=continued, sendbacks=sendbacks,
+                                background_in_flight=background_in_flight, facts=facts)
+            if reason:
+                info._st_sendbacks = sendbacks + 1
+                logger.info("Smart termination: sent %s back (%d/%d): %s",
+                            sid[:12], sendbacks + 1, _st.MAX_SENDBACKS,
+                            reason.split("\n", 1)[0][:160])
+            return reason
+
+        return turn_end_hook
+
     def _make_pre_compact_callback(self, session_id: str):
         """Create a PreCompact hook callback for a specific session.
 
@@ -6249,6 +6336,21 @@ class SessionManager:
                     stripped = user_text.strip()
                     if stripped.startswith('/') and ' ' not in stripped:
                         logger.debug("Skipping CLI slash command echo: %s", stripped[:50])
+                        continue
+
+                    # Smart termination send-back: drawn as a card in the chat
+                    # (live-panel.js), never as a bubble the user seems to
+                    # have typed.  Checked before the generic system markers,
+                    # which also list it.
+                    from common.transcripts import sent_back_entry as _sent_back
+                    _sb = _sent_back(stripped)
+                    if _sb:
+                        entry = LogEntry(kind=_sb["kind"], text=_sb["text"],
+                                         name=_sb["name"], desc=_sb["desc"])
+                        with info._lock:
+                            info.entries.append(entry)
+                            entry_index = len(info.entries) - 1
+                        self._emit_entry(session_id, entry, entry_index)
                         continue
 
                     # Detect SDK-injected system content (continuation
@@ -9084,6 +9186,7 @@ class SessionManager:
             cwd=cwd or None,
             permission_callback=self._make_permission_callback(resolved),
             pre_compact_callback=self._make_pre_compact_callback(resolved),
+            turn_end_callback=self._make_turn_end_callback(resolved),
             include_partial_messages=True,
             hosted=True,
             host_sid=sid,

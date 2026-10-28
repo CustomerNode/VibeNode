@@ -317,7 +317,7 @@ class Host:
             return 3
         self.cli_pid = self.cli.pid
         self.cli_create_time = shp.process_create_time(self.cli_pid) or time.time()
-        self.cli_name = shp.process_name(self.cli_pid)
+        self.cli_name = await self._settled_cli_name()
         self.server = await asyncio.start_server(self._on_conn, "127.0.0.1", 0,
                                                  limit=shp.FRAME_LIMIT)
         self.port = self.server.sockets[0].getsockname()[1]
@@ -339,10 +339,46 @@ class Host:
         return 0
 
     # ── CLI -> engine ────────────────────────────────────────────────────
+    async def _settled_cli_name(self) -> str:
+        """The CLI's process name once its launcher has handed over.
+
+        On POSIX the CLI path is often a script (``#!/usr/bin/env node``, or
+        a ``sh`` wrapper that ``exec``s the real program), so the name read
+        right after spawn is the launcher's and changes a few milliseconds
+        later.  A record holding that first name made ``same_process`` call
+        the live CLI a stranger, so it could never be verified or stopped.
+        Wait until three reads 25 ms apart agree (at most 1.5 s).  Windows has
+        no exec, so its first read is final."""
+        name = shp.process_name(self.cli_pid)
+        if os.name == "nt":
+            return name
+        same, end = 0, time.monotonic() + 1.5
+        while same < 2 and time.monotonic() < end:
+            await asyncio.sleep(0.025)
+            now = shp.process_name(self.cli_pid)
+            same = same + 1 if now == name else 0
+            name = now
+        return name
+
+    def _refresh_cli_name(self) -> None:
+        """Backstop for a launcher slower than the settle window: by the
+        time the CLI writes its first line it is the real program."""
+        if os.name == "nt" or self.cli_exited:
+            return
+        now = shp.process_name(self.cli_pid)
+        if now and now != self.cli_name:
+            logger.info("CLI name settled late: %s -> %s", self.cli_name, now)
+            self.cli_name = now
+            self.save_record()
+
     async def _pump_cli(self) -> None:
         from daemon.backends import claude_wire as wire
+        first = True
         try:
             async for msg in self.cli.read_messages():
+                if first:
+                    first = False
+                    self._refresh_cli_name()
                 self._on_cli_message(msg, wire)
         except asyncio.CancelledError:
             raise

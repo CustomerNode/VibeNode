@@ -108,10 +108,13 @@ function hasUnread(sessionId) {
 function markSessionUnread(sessionId) {
   if (!sessionId || !unreadDotsEnabled()) return;
   if (_unreadSessions.has(sessionId)) return;
+  const _vsBefore = window.SessionVerb ? window.SessionVerb.display(sessionId) : null;
   _unreadSessions.add(sessionId);
   _saveUnreadSessions();
   _syncUnreadDom(sessionId);
   _unreadHomepageRefresh();
+  // Unread turns Idle into Review / Read / Send (session-verb.js).
+  if (window.SessionVerb && window.SessionVerb.display(sessionId) !== _vsBefore) window.SessionVerb.repaint(sessionId, _vsBefore);
 }
 
 /** The homepage's "Needs you" list includes unread finished sessions; an
@@ -127,10 +130,13 @@ function _unreadHomepageRefresh() {
  */
 function clearSessionUnread(sessionId) {
   if (!sessionId || !_unreadSessions.has(sessionId)) return;
+  const _vsBefore = window.SessionVerb ? window.SessionVerb.display(sessionId) : null;
   _unreadSessions.delete(sessionId);
   _saveUnreadSessions();
   _syncUnreadDom(sessionId);
   _unreadHomepageRefresh();
+  // Opened: Review / Read / Send become Idle (session-verb.js).
+  if (window.SessionVerb && window.SessionVerb.display(sessionId) !== _vsBefore) window.SessionVerb.repaint(sessionId, _vsBefore);
 }
 
 /** Wipe every unread flag (used when the preference is switched off). */
@@ -511,7 +517,10 @@ function sortedSessions(sessions) {
     // "Active first": by state, newest first within each state (same as the cards).
     const order = {question: 0, working: 1, idle: 2, sleeping: 3};
     const key = s => s.effective_ts || s.last_activity_ts || s.sort_ts || 0;
-    const rank = s => { const r = order[(typeof getSessionStatus === 'function') ? getSessionStatus(s.id) : 'sleeping']; return r == null ? 3 : r; };
+    // With session-verb.js: you decide (can't go on), you check (when you can),
+    // Working, Waiting, Idle, Sleeping.
+    const rank = window.SessionVerb ? (s => window.SessionVerb.rank(s.id))
+      : (s => { const r = order[(typeof getSessionStatus === 'function') ? getSessionStatus(s.id) : 'sleeping']; return r == null ? 3 : r; });
     copy.sort((a, b) => (rank(a) - rank(b)) || (key(b) - key(a)));
   } else if (sortMode === 'size') {
     copy.sort((a, b) => dir * ((a.file_bytes || 0) - (b.file_bytes || 0)));
@@ -636,6 +645,10 @@ function _sessionStateIconHtml(sid, status) {
   // while the live panel still said "Awaiting wake-up…" — that's the
   // state-desync the user reported.
   const _isSleeping = window._sessionSubstatus && window._sessionSubstatus[sid] === 'auto-resuming';
+  // Person-oriented status (session-verb.js, 2026-10-27): Decide / Unblock /
+  // Approve / Review / Read / Send / Working / Waiting / Idle / Sleeping.
+  // "Awaiting wake-up" is Waiting there.  Compacting keeps its own icon.
+  if (window.SessionVerb && !_isCompacting) return window.SessionVerb.listIconHtml(sid, status);
   return isWaiting
     ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2" stroke-linecap="round" title="Waiting for input"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>'
     : _isCompacting
@@ -647,6 +660,14 @@ function _sessionStateIconHtml(sid, status) {
     : isIdle
     ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#44aa66" stroke-width="2" stroke-linecap="round" title="Idle"><polyline points="20 6 9 17 4 12"/></svg>'
     : '';
+}
+
+/** ' vs-row-<status>' (+ ' vs-row-yours' when it's the person's move) for a
+ *  list row; '' without session-verb.js.  socket.js _updateRowState mirrors it. */
+function _sessionVerbRowClass(sid, status) {
+  if (!window.SessionVerb) return '';
+  const d = window.SessionVerb.display(sid, status);
+  return ' vs-row-' + d + (window.SessionVerb.rank(sid, status) <= 1 ? ' vs-row-yours' : '');
 }
 
 /** The row classes that follow the session's state: 'waiting' or 'running'. */
@@ -725,9 +746,10 @@ function _renderSessionRow(s, extraClass) {
   const unreadDot = isUnread
     ? '<span class="unread-dot" aria-label="Unread" title="Unread — new response you haven’t opened"></span>'
     : '';
+  const vsClass = _sessionVerbRowClass(s.id, status);
 
   return `
-  <div class="session-item${activeClass}${stateClass}${msClass}${subsessionClass}${unreadClass}${extraClass || ''}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" ondblclick="_dblclickSleepIfIdle('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')">
+  <div class="session-item${activeClass}${stateClass}${msClass}${subsessionClass}${unreadClass}${vsClass}${extraClass || ''}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" ondblclick="_dblclickSleepIfIdle('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')">
     <div class="session-col-name" onclick="handleNameClick('${s.id}')" style="cursor:text;" title="Click to rename">
       ${caretSpan}${subsessionGlyph}${unreadDot}${icon}${escHtml(s.display_title)}${_autoNamingInFlight.has(s.id) ? '<span class="naming-badge"><span class="naming-dot"></span>Naming\u2026</span>' : ''}${inboxBadge}
       ${subsessionFromLine}
@@ -993,10 +1015,10 @@ function singleOrDouble(id, e) {
  * Double-click gesture on a session row (list-table view) or card (grid view)
  * TOGGLES a session between IDLE and SLEEPING:
  *
- *   • IDLE       → sleep it (safe: no work in flight, resumable with full context)
  *   • SLEEPING   → wake it to idle (start_session with resume=true, no prompt)
- *   • WORKING    → ignored with an explanatory toast (interrupt via menu Stop)
- *   • QUESTION   → ignored with an explanatory toast (answer, or menu Stop)
+ *   • anything else (idle, working, waiting on a question) → sleep it.  The
+ *     user is in charge: a working session is not a reason to refuse.  Undo
+ *     on a session slept mid-turn wakes it rather than restoring "working".
  *
  * The idle→sleep and sleeping→wake paths are exact inverses of each other so
  * the same double-click gesture flips between the two states repeatedly.  Both
@@ -1028,7 +1050,48 @@ function singleOrDouble(id, e) {
  * the row reflects the wake immediately.  The daemon's session_state stream
  * (starting → idle) takes over from there.
  */
-function _dblclickSleepIfIdle(sessionId, e) {
+function _dblclickSleepIfIdle(sessionId, e, toastLabel) {
+  if (e && typeof e.preventDefault === 'function') e.preventDefault();
+  if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+  if (!sessionId) return;
+  // Standby (owner, 2026-10-28, static/scratch/standby-status.html option A):
+  // a double-click steps a session down one level, Needs you → Standby →
+  // Done, sleeping it on the way (Undo puts both back).  A Done session goes
+  // back to Standby without waking (owner, 2026-10-28: "when i click a done
+  // session i think it should go right to standby"); chatting with it wakes
+  // it.  Only while the person-oriented statuses are on (SessionVerb); an
+  // explicit caller (toastLabel, e.g. Accept) keeps the plain sleep.
+  const SV = window.SessionVerb;
+  if (SV && SV.setHold && !toastLabel) {
+    const g = SV.shown(SV.display(sessionId));
+    const st = (typeof getSessionStatus === 'function') ? getSessionStatus(sessionId) : null;
+    const prev = SV.holdOf(sessionId);
+    if (g === 'needs' || g === 'standby') {
+      const to = g === 'needs' ? 'standby' : 'done', label = to === 'standby' ? 'Standby' : 'Done';
+      SV.setHold(sessionId, to);
+      const undoHold = () => SV.setHold(sessionId, prev);
+      if (st === 'sleeping') { _holdUndoToast(sessionId, label, undoHold); return; }
+      return _sleepOrWake(sessionId, null, label, undoHold);
+    }
+    if (g === 'done') {
+      SV.setHold(sessionId, 'standby');
+      _holdUndoToast(sessionId, 'Standby', () => SV.setHold(sessionId, prev));
+      return;
+    }
+  }
+  return _sleepOrWake(sessionId, null, toastLabel);
+}
+
+/** A hold changed on a session that was already asleep: just the Undo toast. */
+function _holdUndoToast(sessionId, label, undo) {
+  const s = (typeof allSessions !== 'undefined' && allSessions.find) ? allSessions.find(x => x.id === sessionId) : null;
+  const name = (s && s.display_title) || sessionId.slice(0, 8);
+  if (typeof _showUndoToast === 'function') _showUndoToast(label + ' — ' + name, 'Undo', undo, 6000);
+}
+
+/** Sleep an awake session (or wake a sleeping one), with Undo.  extraUndo
+ *  runs first when Undo is pressed (the hold a double-click set). */
+function _sleepOrWake(sessionId, e, toastLabel, extraUndo) {
   if (e && typeof e.preventDefault === 'function') e.preventDefault();
   if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
   if (!sessionId) return;
@@ -1038,15 +1101,13 @@ function _dblclickSleepIfIdle(sessionId, e) {
     _dblclickWakeSleeping(sessionId);
     return;
   }
-  if (status !== 'idle') {
-    // Give the user feedback so the gesture doesn't feel broken on
-    // working/waiting rows.  A silent no-op reads as a bug.
-    if (typeof showToast === 'function') {
-      if (status === 'working') showToast('Session is working — use Stop from the menu to interrupt');
-      else if (status === 'question') showToast('Session is waiting for input — answer or use Stop from the menu');
-    }
-    return;
-  }
+  // The user is in charge (owner, 2026-10-27: "if i sleep a session, i am in
+  // charge").  A working session, or one waiting on a question, sleeps too:
+  // it used to refuse with "use Stop from the menu", which read as the
+  // session not letting him sleep it.  close_session ends the turn and the
+  // CLI; the conversation resumes with full context on wake.  Do NOT bring
+  // back a refusal for any state.
+  const wasBusy = status !== 'idle';
 
   // ── Snapshot the pre-sleep state so Undo can restore it exactly ──
   // Idle can mean any of three flavors (see workforce.js getSessionStatus):
@@ -1088,9 +1149,13 @@ function _dblclickSleepIfIdle(sessionId, e) {
       })()
     : sessionId.slice(0, 8);
   _showUndoToast(
-    'Session sleeping — ' + displayName,
+    (toastLabel || 'Session sleeping') + ' — ' + displayName,   // 'Done' from Accept (session-verdict.js)
     'Undo',
     function undo() {
+      if (typeof extraUndo === 'function') { try { extraUndo(); } catch (_e) { /* the sleep undo still runs */ } }
+      // A session slept mid-turn has no idle state to restore: its turn and
+      // CLI are gone.  Undo wakes it instead (resume, no prompt).
+      if (wasBusy) { _dblclickWakeSleeping(sessionId); return; }
       // Clear user-stop intent so the client no longer suppresses ghost
       // recovery / send-message auto-resume for this session.
       if (typeof clearUserStopped === 'function') clearUserStopped(sessionId);
@@ -1121,6 +1186,7 @@ function _dblclickSleepIfIdle(sessionId, e) {
 }
 // Expose for cross-script use (workforce.js's grid card ondblclick).
 if (typeof window !== 'undefined') window._dblclickSleepIfIdle = _dblclickSleepIfIdle;
+if (typeof window !== 'undefined') window._sleepOrWake = _sleepOrWake;
 
 /**
  * Inverse of the sleep leg above: wake a SLEEPING session back to idle.
@@ -1400,6 +1466,8 @@ function _openSessionSheet(items, onAction) {
 
 // ---- Icon strings, factored out so both mobile and desktop paths share ----
 var _ICONS = {
+  pause:    '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9.5"/><path d="M10 9v6"/><path d="M14 9v6"/></svg>',
+  checkc:   '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5"/><polyline points="16.5 9 10.5 15 7.5 12"/></svg>',
   open:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>',
   autoname: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
   rename:   '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>',
@@ -1484,6 +1552,15 @@ function sessionContextMenu(e, sessionId) {
   if (!isActive) items.push({ label: 'Open',        icon: _ICONS.open,     action: 'open' });
   items.push({ label: 'Auto-name',                  icon: _ICONS.autoname, action: 'autoname' });
   items.push({ label: 'Rename',                     icon: _ICONS.rename,   action: 'rename' });
+  // Standby / Mark done (owner, 2026-10-28, standby-status.html option A),
+  // while the person-oriented statuses are on.
+  if (window.SessionVerb && window.SessionVerb.setHold) {
+    const _g = window.SessionVerb.shown(window.SessionVerb.display(sessionId));
+    items.push({ divider: true });
+    if (_g === 'standby') items.push({ label: 'Back to Needs you', icon: _ICONS.cont, action: 'unpark' });
+    else items.push({ label: 'Standby', icon: _ICONS.pause, action: 'standby' });
+    if (_g !== 'done') items.push({ label: 'Mark done', icon: _ICONS.checkc, action: 'mark-done' });
+  }
   items.push({ divider: true });
   items.push({ label: 'Link to Workflow Task',      icon: _ICONS.link,     action: 'link-workflow' });
   items.push({ label: 'Add to Structured composition', icon: _ICONS.compose, action: 'add-compose' });
@@ -1556,6 +1633,15 @@ function _sessCtx(action, sessionId) {
   _closeSessionSheet();
 
   switch (action) {
+    case 'standby':
+      if (window.SessionVerdict) window.SessionVerdict.standby(sessionId);
+      break;
+    case 'mark-done':
+      if (window.SessionVerdict) window.SessionVerdict.accept(sessionId);
+      break;
+    case 'unpark':
+      if (window.SessionVerdict) window.SessionVerdict.unpark(sessionId);
+      break;
     case 'open':
       openInGUI(sessionId);
       break;

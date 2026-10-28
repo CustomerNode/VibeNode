@@ -31,7 +31,106 @@ CLI_SYSTEM_MARKERS = (
     "<command-message>",
     "<command-args>",
     "[Request interrupted by user]",
+    # Text a Stop hook sent back (Smart termination).  Checked with
+    # ``sent_back_entry`` FIRST, which draws it as a card; listed here too so
+    # every other reader treats it as injected, never as the user's words.
+    "Stop hook feedback:",
 )
+
+
+# ── Smart termination send-backs (added 2026-10-27) ─────────────────────────
+# When a Stop hook blocks the end of a turn, the CLI injects its reason as a
+# user-role message starting with this prefix.  Every timeline parser turns it
+# into a ``sent_back`` entry, which the chat draws as a card (live-panel.js),
+# instead of a chat bubble that looks like the user typed it.
+
+STOP_HOOK_FEEDBACK_PREFIX = "Stop hook feedback:"
+
+
+def _quoted(text: str, limit: int = 4) -> list:
+    import re
+    out = []
+    for q in re.findall(r'"([^"\n]{1,60})"', text):
+        if q not in out:
+            out.append(q)
+    return out[:limit]
+
+
+def _and_list(items: list) -> str:
+    q = ['"%s"' % i for i in items]
+    return q[0] if len(q) == 1 else ", ".join(q[:-1]) + " and " + q[-1]
+
+
+def sent_back_entry(text: str):
+    """The timeline entry for a Stop hook send-back, or None if *text* is not
+    one: ``{"kind": "sent_back", "name": <reason chip>, "desc": <one plain
+    sentence>, "text": <what the session was told>}``."""
+    t = (text or "").strip()
+    if not t.startswith(STOP_HOOK_FEEDBACK_PREFIX):
+        return None
+    import re
+    reason = t[len(STOP_HOOK_FEEDBACK_PREFIX):].strip()
+    body = reason
+    if body.lower().startswith("smart termination:"):
+        body = body[len("smart termination:"):].strip()
+        # What the session was told, without the instruction text every
+        # send-back carries after it.
+        told = body
+        for cut in ("\n\n# Ending a turn", "\n\nEnd your final message with this block"):
+            if cut in told:
+                told = told.split(cut, 1)[0]
+        if told.lower().startswith("your handoff card was sent back."):
+            told = told[len("your handoff card was sent back."):]
+        told = told.strip()
+        reason = told[:1].upper() + told[1:]
+    low = body.lower()
+    first_para = body.split("\n\n", 1)[0]
+    group = re.search(r'not allowed in a "(\w+)" card, ([^:]+):([^\n]*)', body, re.I)
+    if "text outside the" in low and "handoff" in low:
+        chip = "Text outside the response"
+        desc = "It wrote text around its termination response. Everything goes inside it."
+    elif "end every turn with one" in low:
+        chip = "No response"
+        desc = "It ended without a termination response."
+    elif group:
+        chip = group.group(2).strip()[:1].upper() + group.group(2).strip()[1:]
+        words = re.findall(r'"([^"\n]{1,60})" \(', group.group(3))[:4]
+        desc = ("It wrote " + _and_list(words) + ' in a "' + group.group(1).replace("_", " ")
+                + '" response.') if words else "Its response broke a rule: " + group.group(2).strip() + "."
+    elif "labels the user may not know" in low:
+        words = re.findall(r'"([^"\n]{1,60})" \(', body)[:4]
+        chip = "Unexplained labels"
+        desc = ("It used " + _and_list(words) + " without saying what they are.") if words else \
+               "It used labels from earlier in the session without saying what they are."
+    elif "against what actually happened" in low:
+        chip = "Claim not backed"
+        desc = "Its response claimed something this session did not actually do."
+    elif "format:" in low:
+        chip = "Incomplete response"
+        desc = "Its response was missing required parts."
+    elif "think again" in low or "unfinished work" in low:
+        words = _quoted(first_para)
+        chip = "Unfinished work"
+        desc = ("It said " + _and_list(words) + ". That is work it can do itself, "
+                "so it was sent back to finish it.") if words else \
+               "It tried to stop with work left that it can do itself, so it was sent back to finish it."
+    elif "labels" in low:
+        words = _quoted(first_para)
+        chip = "Unexplained labels"
+        desc = ("It used " + _and_list(words) + " without saying what they are.") if words else \
+               "It used labels from earlier in the session without saying what they are."
+    elif "nothing is needed" in low or "says nothing" in low:
+        chip = "Missing handoff"
+        desc = ("It said nothing was needed from you, without saying why, what "
+                "happens next, or when you will hear back.")
+    elif "handoff" in low:
+        chip = "Missing handoff"
+        desc = ("Its last message did not say what it is working on, where it "
+                "stands, and what it needs from you.")
+    else:
+        chip = "Sent back"
+        desc = first_para.split("\n", 1)[0][:200]
+    return {"kind": "sent_back", "name": chip, "desc": desc, "text": reason[:4000]}
 
 
 def is_system_content(text: str, markers=CLI_SYSTEM_MARKERS) -> bool:
@@ -70,6 +169,7 @@ def is_timeline_system_content(text: str) -> bool:
     t = text.strip()
     return bool(
         t.startswith("<") and not t.startswith("<!") or
+        t.startswith(STOP_HOOK_FEEDBACK_PREFIX) or
         t.startswith("This session is being continued") or
         t.startswith("This is a continuation") or
         t.startswith("The user opened") or

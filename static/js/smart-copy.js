@@ -13,6 +13,10 @@ const _CHECK_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none"
 function addSmartCopyButtons(container, rawText) {
   if (!container) return;
 
+  // 0. The session's last-message card (last-card.js) replaces its ```handoff
+  // code block first, so no copy button is put on the raw JSON.
+  if (window.VNLastCard) window.VNLastCard.renderIn(container);
+
   // 1. Code blocks
   _addCodeCopyButtons(container);
 

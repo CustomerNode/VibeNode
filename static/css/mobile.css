@@ -682,12 +682,13 @@
      (see toggleGrpDropdown), so they're never clipped by the toolbar. ---- */
   .main-toolbar {
     overflow: hidden; flex-wrap: nowrap;
-    padding: 4px 8px 4px 15px;   /* left 15px aligns the ✕ with the content below */
-    gap: 2px; min-height: 44px;
+    /* Thin title strip (owner's pick B, 2026-10-28, scratch/session-toolbar-height.html): ~23px tall. */
+    padding: 0 4px 0 14px;
+    gap: 2px; min-height: 0;
   }
   #main-title {
     flex: 1 1 auto; min-width: 0; margin: 0;
-    font-size: 14px; font-weight: 600; color: var(--text-primary);
+    font-size: 12px; font-weight: 500; color: var(--text-muted);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   /* Collapse the desktop action labels — every action moves into the ••• sheet. */
@@ -706,6 +707,8 @@
     color: var(--text-secondary) !important;
   }
   .toolbar-close svg, .toolbar-more svg { width: 19px; height: 19px; }
+  .main-toolbar .toolbar-more { width: 28px; height: 22px; }
+  .main-toolbar .toolbar-more svg { width: 15px; height: 15px; }
   .toolbar-close:active, .toolbar-more:active { background: var(--bg-hover); }
   /* Hide the session-close X on mobile — you leave a session via the burger/
      drawer, so the tiny X next to ••• is redundant here. */

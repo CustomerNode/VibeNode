@@ -32,6 +32,9 @@ BANNED = {
     "'Asleep' label": re.compile(r"""['"`>]Asleep['"`<]"""),
     "Add to Board": re.compile(r"Add to Board", re.I),
     "Kanban label": re.compile(r">\s*Kanban\s*<"),
+    # The owner, 2026-10-28: "I FUCKING HATE THE YOUR MOVE SHIT".  The card
+    # band is named for what it asks: Decide, Approve, To do, or Next.
+    "your move": re.compile(r"\b(?:your|its|my)\s+move\b", re.I),
 }
 
 # (file name, substring of the line, reason).  Keep this short.
@@ -88,6 +91,7 @@ def test_the_scan_catches_a_planted_form(tmp_path):
         "const _ST_LABELS = {asleep: 'Asleep'};",
         "<span>Add to Board</span>",
         "'<div class=\"kanban-sidebar-label\">Kanban</div>'",
+        "h += band('Your move', x, 'lm-sec lm-needs');",
     ]
     for line in old:
         assert any(rx.search(line) for rx in BANNED.values()), line

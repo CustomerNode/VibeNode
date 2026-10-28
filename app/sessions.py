@@ -69,6 +69,19 @@ def _is_orphan_cached(path: Path, st: os.stat_result) -> bool:
     return verdict
 
 
+def _next_step_of(content) -> dict | None:
+    """``{"verb", "line"}`` from the final assistant message's handoff card."""
+    if content is None:
+        return None
+    if isinstance(content, list):
+        content = "\n".join(b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") == "text")
+    if "handoff" not in content:
+        return None
+    from common.handoff_status import next_step
+    return next_step(content)
+
+
 def _summary_cache_key(path: Path, st: os.stat_result) -> tuple:
     return (str(path), st.st_mtime, st.st_size)
 
@@ -113,6 +126,7 @@ def load_session_summary(path: Path, st: os.stat_result | None = None,
     first_ts = None
     last_ts = None
     message_count = 0
+    last_asst_content = None
 
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
@@ -133,6 +147,16 @@ def load_session_summary(path: Path, st: os.stat_result | None = None,
 
                 elif t in ("user", "assistant"):
                     message_count += 1
+                    # The final message's handoff card (sidebar status, see
+                    # common/handoff_status.py).  Kept by reference; parsed once
+                    # below.  Any user text after it means a newer turn began.
+                    if not obj.get("isSidechain"):
+                        _c = (obj.get("message") or {}).get("content", "")
+                        _has_text = isinstance(_c, str) and bool(_c.strip()) or (
+                            isinstance(_c, list) and any(
+                                isinstance(b, dict) and b.get("type") == "text" for b in _c))
+                        if _has_text:
+                            last_asst_content = _c if t == "assistant" else None
                     ts_str = obj.get("timestamp", "")
                     if ts_str:
                         try:
@@ -201,6 +225,7 @@ def load_session_summary(path: Path, st: os.stat_result | None = None,
         "size": _format_size(st.st_size),
         "preview": preview,
         "message_count": message_count,
+        "next_step": _next_step_of(last_asst_content),
     }
     # Drop the key this path held before (previous mtime/size) so a transcript
     # that grows every turn keeps exactly ONE entry in the cache.
@@ -648,5 +673,9 @@ def all_sessions(summary_only: bool = False, project: str = "") -> list:
                 sessions.extend(pool.map(_load, misses))
         else:
             sessions.extend(_load(m) for m in misses)
+    # Standby / marked Done (app/session_holds.py): only rows that have one
+    # get a "hold" key, so a project without holds lists exactly as before.
+    from .session_holds import overlay as _hold_overlay
+    _hold_overlay(sessions, sdir)
     sessions.sort(key=lambda x: x["sort_ts"], reverse=True)
     return sessions

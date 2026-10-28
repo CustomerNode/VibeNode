@@ -633,6 +633,39 @@ def api_rename(session_id):
     return jsonify({"ok": True, "title": new_title})
 
 
+@bp.route("/api/session-hold/<session_id>", methods=["POST"])
+def api_session_hold(session_id):
+    """Put a session on Standby, mark it Done, or clear that (owner,
+    2026-10-28).  Body: {"state": "standby" | "done" | null, "project"}.
+    The hold lasts until the session's next message (app/session_holds.py).
+    Every open sidebar learns it from the ``session_hold`` broadcast."""
+    from ..sessions import load_session_summary
+    from .. import session_holds
+    data = request.get_json(silent=True) or {}
+    state = data.get("state")
+    if state not in (None, "standby", "done"):
+        return jsonify({"error": "state must be standby, done or null"}), 400
+    if not session_id or any(c in session_id for c in "/\\") or ".." in session_id:
+        return jsonify({"error": "bad session id"}), 400
+    project = (data.get("project") or request.args.get("project", "")).strip()
+    sdir = _sessions_dir(project)
+    path = sdir / f"{session_id}.jsonl"
+    at = 0.0
+    if path.exists():
+        try:
+            at = float(load_session_summary(path).get("last_activity_ts") or 0)
+        except Exception:
+            at = 0.0
+    session_holds.set_hold(sdir, session_id, state, at or _time.time())
+    try:
+        from .. import socketio
+        socketio.emit("session_hold", {"session_id": session_id, "state": state, "project": project,
+                                       "since": _time.time() if state else None})
+    except Exception as e:  # SocketIO not wired (unit tests): non-fatal
+        log.debug("session_hold emit failed: %s", e)
+    return jsonify({"ok": True, "state": state})
+
+
 @bp.route("/api/remap-name", methods=["POST"])
 def api_remap_name():
     """Re-persist a user-set name under a new session ID after SDK remaps."""
