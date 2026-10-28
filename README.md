@@ -1,46 +1,104 @@
 # VibeNode
 
-A development platform for agentic programming. VibeNode runs as a persistent session daemon and a web control plane that together orchestrate parallel coding agents: sessions that are aware of each other and avoid conflicts automatically, a hierarchical task board where your roadmap terminates in working agent sessions, a unified knowledge asset library that brings skills and agents together, plus private mobile access and local voice input. The orchestration layer is backend-agnostic by design; [Claude Code](https://claude.ai/download) is the currently supported backend (see [Supported backends](#supported-backends)). Built by [CustomerNode](https://customernode.com).
+**Agents made writing code cheap. Checking it is the new bottleneck. VibeNode is built for both halves.**
 
-![VibeNode homepage showing Sessions, Workflow, and Workforce cards](docs/screenshots/homepage.png)
+VibeNode is a development platform for agentic programming. A persistent Session Engine and a web control plane run a fleet of parallel coding agents: sessions that are aware of each other and avoid conflicts automatically, a hierarchical task board where your roadmap ends in working agent sessions, and one library for skills and agents. On top of that, **Smart termination** makes every session end its turn the same way: a short card that says what happened, how it was checked and exactly what it needs from you. A session that can't say that clearly is sent back until it can. Private mobile access and local voice input come with it. The orchestration layer is backend-agnostic by design; [Claude Code](https://claude.ai/download) is the currently supported backend (see [Supported backends](#supported-backends)). Built by [CustomerNode](https://customernode.com).
 
-## Why we built this
+![VibeNode homepage: sessions counted by what they need from you (Needs you, Working, Standby, Done), next to Workflow, Workforce and Subsessions](docs/screenshots/homepage.png)
 
-VibeNode is a full platform for agentic programming — a persistent session daemon, a planning engine, a shared knowledge library, private mobile access, and local voice — built on a backend-agnostic core rather than tied to any one vendor's tool. It solves three problems that anyone running coding agents at scale hits:
+## Why we built this: generation leverage and validation leverage
 
-1. **Session sprawl.** Running 8+ coding-agent sessions across terminal windows gets unwieldy fast — especially permission management. Even a three-monitor setup runs out of space. VibeNode runs a *fleet* of agents graphically, not as a wall of terminals.
+Every coding-agent tool so far sells **generation leverage**: more code, more sessions, more output per hour. That part works. Run eight agents and you get eight streams of finished work.
 
-2. **Velocity without direction.** Coding agents are powerful, but raw throughput doesn't move a roadmap — sessions drift, work gets duplicated, and there's no connection between what an agent is doing and what you need delivered. VibeNode couples every session to a task plan so every agent is working toward a specific deliverable.
+What doesn't scale is the person on the other end. Every one of those streams ends in a reply someone has to read, judge and act on, and those replies aren't built for it:
 
-3. **Scattered, invisible knowledge assets.** Agentic coding tools have landed on two nearly identical concepts — skills and agents — that are really the same thing: a markdown file with instructions, differing only in how they're invoked. The distinction is confusing, and the files scatter across hidden config directories with no discoverability. There's no way to browse what's available, see how it's organized, or invoke it without memorizing names. VibeNode gives you a visual library that treats them as one thing, organizes them into departments, and lets you build, browse, import, and invoke them without caring whether they run inline or as a subprocess.
+- **They have no fixed shape.** Every reply has a different length and layout, so nothing can be skimmed. The one thing you need to do is somewhere in paragraph four.
+- **They're written from the implementer's seat.** "Idle". "Want me to wire it in?" "Go with option C?" File names, function names, labels from an hour ago. The agent talks as if you'd been coding next to it all along, not switching in from five other sessions.
+- **They hand unfinished work back.** "Mostly working, I haven't run the full suite yet" ends the turn, and the job lands on you.
 
-VibeNode is the result: a development platform where the human owns planning, oversight, and validating outputs, while coding agents handle execution — scoped to tasks, not left to wander. The session manager makes pure vibe coding better on its own, but the workflow board is where it becomes vibe *engineering* — structured planning and validation with a human in the loop. And because the execution layer is pluggable, none of this is bet on a single agent staying the best one.
+So the more you generate, the more of your day goes to sifting. **Validation leverage** is the other half: multiplying how much one person can check, decide and accept in a minute. VibeNode does both.
+
+It solves four problems that anyone running coding agents at scale runs into:
+
+1. **Validation is the bottleneck.** Generation scales with compute. Your attention doesn't. VibeNode's **Smart termination** turns every session's last message into the same short, checkable card, written from your side, and sends back any session that ends in a wall of text, an unexplained "option C" or work it could have finished itself. The sidebar stops describing the agent ("Idle") and starts describing you: **Needs you**, **Working**, **Standby**, **Done**.
+
+2. **Session sprawl.** Running 8+ coding-agent sessions across terminal windows gets unwieldy fast, permission prompts especially. Even a three-monitor setup runs out of space. VibeNode runs a *fleet* of agents graphically, not as a wall of terminals.
+
+3. **Velocity without direction.** Coding agents are powerful, but raw throughput doesn't move a roadmap. Sessions drift, work gets duplicated, and nothing connects what an agent is doing with what you need delivered. VibeNode couples every session to a task plan so every agent is working toward a specific deliverable.
+
+4. **Scattered, invisible knowledge assets.** Agentic coding tools have landed on two nearly identical concepts, skills and agents, that are really the same thing: a markdown file with instructions, differing only in how it's invoked. The files scatter across hidden config directories with no way to browse them. VibeNode gives you a visual library that treats them as one thing, organizes them into departments, and lets you build, browse, import and invoke them without caring whether they run inline or as a subprocess.
+
+The result is a development platform where the human owns planning, oversight and validation while coding agents handle execution, scoped to tasks instead of left to wander. And VibeNode now does the heavy lifting on the human side as well: what used to be reading becomes glancing, and what used to be judging becomes one tap. Because the execution layer is pluggable, none of this depends on a single agent staying the best one.
 
 ## What it does
 
-VibeNode is built around three pillars — **Sessions**, **Workflow**, and **Workforce** — plus **Subsessions** for peeling side work off a running session. Each is accessible from a homepage that serves as your command center.
+VibeNode is built around three pillars, **Sessions**, **Workflow** and **Workforce**, plus **Subsessions** for peeling side work off a running session. **Smart termination** runs through all of them: it decides how every session ends its turn and how that ending reaches you. The homepage is the command center for all of it.
 
-The vocabulary, used the same way in the app, the settings and this document: a **session** is one Claude Code conversation; the **Workflow** is the task board; the **Workforce** is the library of agents and skills, organized into **departments**; **Subsessions** is the view for sessions spawned from other sessions, where a **composition** is a structured group of **sections**, each section being one child session; the **Session Engine** is the background process that owns every running session.
+The vocabulary, used the same way in the app, the settings and this document: a **session** is one Claude Code conversation; a session's status says what it needs from **you** (**Needs you**, **Working**, **Standby** or **Done**); the **handoff card** is how a session ends its turn; the **Workflow** is the task board; the **Workforce** is the library of agents and skills, organized into **departments**; **Subsessions** is the view for sessions spawned from other sessions, where a **composition** is a structured group of **sections**, each section being one child session; the **Session Engine** is the background process that owns every running session.
+
+### Smart termination: every session ends in something you can act on in seconds
+
+Turn it on under **System → Preferences → Smart termination** (it is off by default).
+
+Every turn of every session ends in a **handoff card** with the same shape, whatever the session did:
+
+- **A short title and one line on what happened**, in your words, not the code's: "Rate limits on every API route", not "Refactored `RateLimitMiddleware`".
+- **This task / Just now.** Two lines that tell you where you are, so you can switch in from another session without scrolling back.
+- **What changed and how it was checked.** The list of what was done, and the checks that ran, with their results.
+- **Validate: Try it.** A row that opens the page, preview or demo where you can see it working yourself, right now.
+- **Buttons that fit the ending.** Finished work gets **Done · Something else · Problem · Standby**. An answer gets **Got it**. A draft email or post gets **Sent it · Change it**. A decision shows each choice spelled out, and picking one sends it.
+- **Explain more.** The card is short by force; the longer, plain-language version sits one tap away for when you've lost the thread.
+
+![A finished session's handoff card: title, what changed, a Try it row, and Done / Something else / Problem / Standby](docs/screenshots/smart-termination-done.png)
+
+**The gate.** The Session Engine checks every ending before the turn is allowed to finish. A session is **sent back**, with the reason, when it:
+
+- ends with work it could do itself ("haven't run the full suite yet", "want me to keep going?");
+- writes a wall of text (a card has a hard word limit, and lists stop at four items);
+- refers to labels you can't know ("option C", "point 5") without saying what they are;
+- claims something it didn't do ("tests pass" with no test run in the session);
+- asks you to choose between designs without showing them;
+- says "nothing needed from you" while quietly waiting on your yes.
+
+You see the send-back as a small card in the thread, not as a message from you, and the session fixes its ending by itself:
+
+![A session sent back for leaving unfinished work, then finishing it and ending on a Done card](docs/screenshots/smart-termination-sent-back.png)
+
+**Statuses read from your side.** The sidebar, the homepage and the filters show what each session needs from *you*:
+
+| Status | Meaning |
+|---|---|
+| **Needs you** | A decision, an approval, something only you can unblock, or finished work waiting for your verdict |
+| **Working** | It's busy, or waiting on its own tests or a scheduled wake-up |
+| **Standby** | You've seen it and set it aside for later; any new message brings it back |
+| **Done** | You accepted it, and it's asleep |
+
+There is no "Idle". A session that stopped is waiting for your verdict until you give one. Double-click a session to step it from Needs you to Standby to Done.
+
+**Decisions you can see.** When a session needs you to pick something, the choices are spelled out on the card, each with its own button. If the choice is about how something looks, the session has to build each option as a real page. The Decide view shows each one full window, on Web or Phone, and you flip between them before you choose.
+
+![A session waiting on a decision: what's done, what's left, and the question with its choices](docs/screenshots/smart-termination-decide.png)
+
+**Pick up where you left off.** The newest card shows the tasks you worked on before this one in the same session, each marked done or still waiting. Messages you queued while it was busy show up as "also handled", and a finished card can point you **Back to it** for earlier work that's still open.
+
+**Does it hold up?** In its first two days on our own machine, sessions wrote 322 cards and the gate sent 150 endings back before they reached a person, 107 of them for being too long. Every one of those would otherwise have been read, and sifted, by a person.
 
 ### Sessions
 
-Run and interact with your agent sessions (Claude Code today — see [Supported backends](#supported-backends)). This is the full interactive terminal experience — not just a list of sessions, but where you actually work.
+Run and interact with your agent sessions (Claude Code today; see [Supported backends](#supported-backends)). This is the full interactive experience, not just a list of sessions: it's where you actually work.
 
-- Lists all sessions with live state (Working / Idle / Question / Sleeping)
-- Live terminal panel — watch the agent work in real time
+- Lists every session by what it needs from you: **Needs you / Working / Standby / Done** (see Smart termination above)
+- Live panel: watch the agent work in real time
 - Answer the agent's questions directly from the browser (with clickable option buttons)
-- Send commands to running sessions
+- Send commands to running sessions, or queue them while it works
 - Session tools: auto-name, duplicate, fork, rewind, delete, summarize, extract code, compare sessions
-- Display as visual grid cards or compact list — switch anytime from the sidebar menu
-- **Cross-session awareness** — Every session in a project knows what the other sessions are doing. At session start, each session's system prompt is injected with a live snapshot of all other active sessions in the same project: their auto-generated names, current status, how long they've been running, and the last few files they've edited. When sessions are touching the same files, the overlap is flagged explicitly — the AI sees the conflict, re-reads the file before editing, and if the file is unstable mid-refactor, backs off and surfaces the incomplete work to the user instead of creating merge conflicts. No inter-session messaging, no coordination protocol — just awareness and smart avoidance. Toggle it on or off in System Preferences.
+- Filter by status or date, and search titles and message content
+- Display as visual grid cards or a compact list; switch anytime from the sidebar menu
+- **Cross-session awareness.** Every session in a project knows what the other sessions are doing. At session start, each session's system prompt is injected with a live snapshot of all other active sessions in the same project: their auto-generated names, current status, how long they've been running, and the last few files they've edited. When sessions are touching the same files, the overlap is flagged explicitly. The AI sees the conflict, re-reads the file before editing, and if the file is unstable mid-refactor, backs off and surfaces the incomplete work to the user instead of creating merge conflicts. No inter-session messaging, no coordination protocol: just awareness and smart avoidance. Toggle it on or off in System Preferences.
 
-Sessions can be displayed as visual grid cards or a compact list — switch anytime from the sidebar menu.
+Sessions can be displayed as visual grid cards (as in the screenshots above) or as a compact list:
 
-![Session grid with live conversation panel](docs/screenshots/session-grid.png)
-
-Or switch to a compact list view:
-
-![Session list view](docs/screenshots/session-list.png)
+![Session list view with a finished draft of release notes, ready to copy, and Sent it / Change it / Standby](docs/screenshots/session-list.png)
 
 ### Workflow
 
@@ -133,6 +191,15 @@ It's a persistent toggle under **System → Mobile Command** (it works like Pers
 Mobile Command is off by default. It requires [Tailscale](https://tailscale.com/download) installed and signed in on both your computer and your phone (same account).
 
 **Surviving unattended reboots.** Out of the box, the phone link comes back when you log in to the computer. If the machine reboots while nobody is around (power blip, auto-update) and you want your phone to bring VibeNode back *before anyone logs in*, run the one-time setup for your OS in [`scripts/boot_access/`](scripts/boot_access/README.md) — including an "Unlock & start" page for Linux machines with encrypted home directories.
+
+## Runs unattended
+
+Validation leverage only pays off if the work keeps moving while you're not looking. The Session Engine is built so that a session you walked away from is still going, or tells you why not, when you come back:
+
+- **Sessions survive a Session Engine restart.** Each session's CLI runs inside a small host process that keeps it alive while the engine restarts, and the engine reattaches to it. A turn in progress, an open permission prompt and every countdown carry over.
+- **Usage limits continue by themselves.** A session stopped by a usage limit continues at the reset time. When only one model's limit was hit (a Fable limit, say), it switches to the newest Opus after a short countdown you can cancel.
+- **Long jobs survive a reboot.** Jobs launched through `python vibenode.py job run` are registered on disk, watched, and relaunched after a crash or restart unless they've passed a step that can't be repeated. Only a job that needs a person reaches your screen.
+- **A watchdog for silent stalls.** If a session says it's waiting on background work that has already finished, or that died, the watchdog nudges it once and tells you if it's still stuck.
 
 ## Requirements
 
@@ -306,15 +373,15 @@ Full API reference for all 146 REST endpoints, 33 SocketIO events, and 27 daemon
 - **SocketIO events:** `docs/api/socketio-events.md`
 - **Daemon IPC (internal):** `docs/api/daemon-ipc.md`
 
-The API has no authentication — it's a localhost-only development tool. All endpoints are available without credentials.
+The server listens on localhost only. Requests from this machine, and from your own phone through Mobile Command, need no credentials. Anything that runs a command or opens a desktop program is restricted to you, and an optional pairing code can be required for every other device (`mobile_command_auth`).
 
 ## Architecture
 
-VibeNode runs as two processes on your machine: a Flask web server (port 5050) serving the UI, and the **Session Engine** (port 5051, `daemon/` in the source) that owns all agent sessions. The Session Engine survives web server restarts so active sessions are never interrupted. Each agent session is an asyncio task on a single shared event loop, with its own CLI subprocess communicating via stdio. The web server proxies all session operations to the Session Engine over a TCP/JSON-lines IPC channel.
+VibeNode runs as two processes on your machine: a Flask web server (port 5050) serving the UI, and the **Session Engine** (port 5051, `daemon/` in the source) that owns all agent sessions. The Session Engine survives web server restarts so active sessions are never interrupted. Each agent session is an asyncio task on a single shared event loop, talking over stdio to its own CLI subprocess, which runs inside a small Session Host process so it can outlive an engine restart. The web server proxies all session operations to the Session Engine over a TCP/JSON-lines IPC channel.
 
 This separation means **VibeNode can code itself** — multiple agent sessions can edit VibeNode's own source files simultaneously, restart the web server to pick up changes, and keep working without interrupting each other. The Session Engine holds all active sessions in memory while the web server restarts around it. Most of VibeNode was built this way: from inside VibeNode.
 
-Restarting the Session Engine itself ends every running session, so the app never does it on its own; a banner tells you when the engine is running older code than the files on disk and offers a restart that waits until nothing is busy.
+Restarting the Session Engine no longer ends running sessions: each session's CLI lives in its own Session Host, which keeps it running and buffers its output until the restarted engine reattaches. The app still never restarts the engine on its own; a banner tells you when the engine is running older code than the files on disk and offers a restart that waits until nothing is busy.
 
 ![VibeNode system architecture diagram](docs/architecture.svg)
 
