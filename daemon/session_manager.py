@@ -5690,9 +5690,27 @@ class SessionManager:
             if reason:
                 info._st_sendbacks = sendbacks + 1
                 logger.info("Smart termination: sent %s back (%d/%d): %s",
-                            sid[:12], sendbacks + 1, _st.MAX_SENDBACKS,
+                            sid[:12], sendbacks + 1, getattr(_st, "HARD_CEILING", _st.MAX_SENDBACKS),
                             reason.split("\n", 1)[0][:160])
-            return reason
+                return reason
+            # Let through at the ceiling still unusable: say so on screen, so
+            # a summary with nothing to tap never looks like a working one
+            # (the owner, 2026-10-29: "The idea was this could not happen").
+            try:
+                released = getattr(_st, "released_faults", None)
+                faults = released(message, sendbacks) if released else []
+            except Exception:
+                faults = []
+            if faults:
+                entry = LogEntry(kind="system", is_error=True,
+                                 text="This summary was let through after "
+                                      f"{sendbacks} send-backs and still cannot be used: "
+                                      + "; ".join(faults) + " Reply in the box below.")
+                with info._lock:
+                    info.entries.append(entry)
+                    entry_index = len(info.entries) - 1
+                self._emit_entry(sid, entry, entry_index)
+            return None
 
         return turn_end_hook
 

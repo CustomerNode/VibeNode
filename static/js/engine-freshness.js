@@ -147,16 +147,31 @@
     bar.style.cssText = [
       'position:fixed', 'top:' + top + 'px', 'left:0', 'right:0', 'z-index:9998',
       'background:#4b2a00', 'color:#ffd9a0', 'padding:8px 12px',
-      'display:flex', 'align-items:center', 'gap:10px', 'font-size:13px',
+      'display:flex', 'align-items:center', 'gap:6px 10px', 'flex-wrap:wrap', 'font-size:13px',
       'box-shadow:0 2px 6px rgba(0,0,0,.3)',
     ].join(';');
-    bar.title = (data.outdated || []).join('\n');
-    bar.innerHTML = '<span style="flex:1">' + _esc(msg) + '</span>'
+    bar.title = armed ? msg : (data.outdated || []).join('\n');
+    // At most two lines (2026-10-29): on a phone the waiting list wrapped to
+    // eight and the bar covered the chat.  The full text is in the tooltip.
+    bar.innerHTML = '<span style="flex:1 1 240px;min-width:0;overflow:hidden;display:-webkit-box;'
+      + '-webkit-box-orient:vertical;-webkit-line-clamp:' + (armed ? 1 : 2) + '">' + _esc(msg) + '</span>'
+      // One button row in both states (owner, 2026-10-29: "Now, When
+      // sessions done, Cancel, Hide").  "When sessions done" shows as pressed
+      // while the restart is queued; Cancel exists only then.  Hide keeps a
+      // queued restart queued: the server still restarts once nothing is busy.
+      + '<span style="display:flex;gap:6px;flex-shrink:0;margin-left:auto">'
+      + '<button data-act="now" class="pm-btn pm-btn-secondary" style="padding:4px 10px" '
+      +   'title="Restart the Session Engine now">Now</button>'
       + (armed
-          ? '<button data-act="now" class="pm-btn pm-btn-secondary" style="padding:4px 12px">Restart now</button>'
-            + '<button data-act="cancel" class="pm-btn pm-btn-secondary" style="padding:4px 12px">Cancel</button>'
-          : '<button data-act="arm" class="pm-btn pm-btn-primary" style="padding:4px 12px">Restart when idle</button>'
-            + '<button data-act="later" class="pm-btn pm-btn-secondary" style="padding:4px 12px">Later</button>');
+          ? '<button data-act="armed" class="pm-btn pm-btn-primary" aria-pressed="true" '
+            + 'style="padding:4px 10px;cursor:default" title="Queued: restarts once no session is busy">'
+            + 'When sessions done</button>'
+            + '<button data-act="cancel" class="pm-btn pm-btn-secondary" style="padding:4px 10px">Cancel</button>'
+          : '<button data-act="arm" class="pm-btn pm-btn-primary" style="padding:4px 10px" '
+            + 'title="Restart once no session is busy">When sessions done</button>')
+      + '<button data-act="later" class="pm-btn pm-btn-secondary" style="padding:4px 10px" '
+      +   'title="' + (armed ? 'The restart still happens once no session is busy' : 'Hide for 4 hours') + '">Hide</button>'
+      + '</span>';
     document.body.appendChild(bar);
     bar.addEventListener('click', function (e) {
       var act = e.target && e.target.getAttribute && e.target.getAttribute('data-act');
@@ -212,7 +227,9 @@
           _schedule(RECHECK_MS);
           return;
         }
-        if (!data.restart_armed && Date.now() < _snoozedUntil()) {
+        // A snooze hides the waiting bar too; the queued restart is server
+        // side and still fires (app/engine_freshness.py).
+        if (Date.now() < _snoozedUntil()) {
           _remove();
           _schedule(RECHECK_MS);
           return;

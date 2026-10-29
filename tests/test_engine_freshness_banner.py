@@ -69,7 +69,7 @@ def test_outdated_engine_shows_the_banner_with_a_restart_when_idle_button(page):
     assert "2 engine files have changed" in text
     assert "not running until it restarts" in text
     buttons = [b.strip() for b in page.locator("#engine-freshness-banner button").all_text_contents()]
-    assert buttons == ["Restart when idle", "Later"]
+    assert buttons == ["Now", "When sessions done", "Hide"]
 
 
 def test_restart_when_idle_arms_the_server_and_shows_what_it_waits_on(page):
@@ -99,6 +99,41 @@ def test_later_hides_it(page):
     page.evaluate("() => EngineFreshness.check()")
     page.wait_for_timeout(200)
     assert page.locator("#engine-freshness-banner").count() == 0
+
+
+def test_the_waiting_bar_can_be_hidden_and_the_restart_stays_queued(page):
+    """2026-10-29, the owner on a phone: "You can't have this always on top I
+    can't do anything".  The waiting bar re-drew every 15 s with only Restart
+    now and Cancel; Hide removes it without cancelling the queued restart."""
+    page.evaluate("() => EngineFreshness.check()")
+    page.click("#engine-freshness-banner [data-act=arm]")
+    page.wait_for_selector("#engine-freshness-banner [data-act=now]")
+    buttons = [b.strip() for b in page.locator("#engine-freshness-banner button").all_text_contents()]
+    assert buttons == ["Now", "When sessions done", "Cancel", "Hide"]
+    assert page.get_attribute("#engine-freshness-banner [data-act=armed]", "aria-pressed") == "true"
+    page.click("#engine-freshness-banner [data-act=later]")
+    assert page.locator("#engine-freshness-banner").count() == 0
+    page.evaluate("() => EngineFreshness.check()")
+    page.wait_for_timeout(200)
+    assert page.locator("#engine-freshness-banner").count() == 0
+    # Hiding never sent a cancel: the only post is the arm.
+    assert page.evaluate("() => window.__posts") == [["/api/engine/restart-when-idle", {"arm": True}]]
+
+
+def test_the_waiting_bar_is_at_most_two_lines_on_a_phone(browser):
+    pg = browser.new_page(viewport={"width": 390, "height": 844})
+    try:
+        pg.set_content(_page_html())
+        pg.evaluate("() => { window.__status = Object.assign({}, window.__status, {restart_armed: true,"
+                    " waiting_on: ['057f5033 is working', '71bd161d wrote output 214s ago',"
+                    " 'Fix Test Failures wrote output 94s ago', 'a0e9e819 wrote output 190s ago',"
+                    " 'x', 'y']}); }")
+        pg.evaluate("() => EngineFreshness.check()")
+        pg.wait_for_selector("#engine-freshness-banner")
+        h = pg.evaluate("() => document.getElementById('engine-freshness-banner').offsetHeight")
+        assert h <= 80, h
+    finally:
+        pg.close()
 
 
 def test_the_page_loads_the_banner():

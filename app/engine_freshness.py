@@ -51,7 +51,11 @@ HOT_RELOAD_FILES = frozenset({
 HOT_RELOAD_GRACE_SECONDS = 300.0
 
 # Restart-when-idle: how long everything must be quiet, and how often to look.
-QUIET_SECONDS = 300.0
+# 90 s (was 300, the owner's call 2026-10-29: "why not as soon as quiet").
+# The write check only has to catch helpers that write without their session
+# showing as working; active helpers write far more often than this, and a
+# long silent command is caught by the live-command check below.
+QUIET_SECONDS = 90.0
 POLL_SECONDS = 15.0
 # Second look before restarting: a session can start a turn between polls.
 RECHECK_PAUSE_SECONDS = 3.0

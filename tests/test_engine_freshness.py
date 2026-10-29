@@ -134,6 +134,21 @@ def test_quiet_engine_is_safe_to_restart(monkeypatch, tmp_path):
                                 {"session_id": "z", "state": "stopped"}])) == []
 
 
+def test_the_quiet_window_is_ninety_seconds(monkeypatch, tmp_path):
+    """2026-10-29, the owner: "why wait five minutes, why not as soon as
+    quiet".  Output 60 s old still holds the restart; 120 s old does not."""
+    assert ef.QUIET_SECONDS == 90.0
+    monkeypatch.setattr(ef, "engine_process", lambda: None)
+    recent = tmp_path / "recent.jsonl"
+    older = tmp_path / "older.jsonl"
+    _touch(recent, time.time() - 60)
+    _touch(older, time.time() - 120)
+    monkeypatch.setattr(ef, "_transcript_for", lambda sid: str(recent))
+    assert ef.busy_reasons(_SM([{"session_id": "r", "state": "idle"}]))
+    monkeypatch.setattr(ef, "_transcript_for", lambda sid: str(older))
+    assert ef.busy_reasons(_SM([{"session_id": "o", "state": "idle"}])) == []
+
+
 def test_unreadable_states_count_as_busy():
     class Broken:
         def get_all_states(self):

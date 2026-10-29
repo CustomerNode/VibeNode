@@ -803,6 +803,14 @@
     return Math.max(0, Math.min(top, max));
   }
 
+  /** Is the final message box an end-of-turn summary card (last-card.js)? */
+  function _finalIsCard() {
+    if (!_logEl || !_logEl.querySelectorAll) return false;
+    var boxes = _logEl.querySelectorAll('.msg');
+    var box = boxes.length ? boxes[boxes.length - 1] : null;
+    return !!(box && box.querySelector && box.querySelector('.lm'));
+  }
+
   /**
    * Explicit catch-up (jump button). The strong signal that restores LIVE.
    *
@@ -815,7 +823,15 @@
   function catchUp() {
     _setState(LIVE, 'catch-up');
     var target = _finalBoxScrollTop();
-    if (target == null || !_logEl || _logEl.scrollTop >= target - 4) {
+    // An end-of-turn summary card is read from its top: from anywhere inside
+    // it, the jump goes back UP to its title, never down to its last line
+    // (2026-10-29, the owner on a phone: "instead of scrolling to bottom of
+    // card it should scroll to top of card"). Only when already at its top
+    // does a tap go on to the bottom, so the button still never gets stuck.
+    var atCardTop = _finalIsCard() && target != null && _logEl &&
+                    Math.abs(_logEl.scrollTop - target) <= 4;
+    var pastTop = !_finalIsCard() && target != null && _logEl && _logEl.scrollTop >= target - 4;
+    if (target == null || !_logEl || atCardTop || pastTop) {
       scrollToBottom();
       return;
     }

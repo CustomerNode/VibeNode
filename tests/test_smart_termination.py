@@ -71,8 +71,51 @@ def test_card_rules_apply_unfinished_work_in_a_done_card():
     assert reason and "unfinished work" in reason
 
 
-def test_never_more_than_max_sendbacks():
-    assert _review("no card at all", continued=True, sendbacks=st.MAX_SENDBACKS) is None
+def test_never_more_than_max_sendbacks_for_a_usable_card():
+    # A card with rough edges (here: unfinished work in a done card) is let
+    # through after MAX_SENDBACKS; only an unusable one keeps going back.
+    rough = _card(watch_for=["one caveat: still untested on the phone"])
+    assert _review(rough, sendbacks=0)
+    assert _review(rough, continued=True, sendbacks=st.MAX_SENDBACKS) is None
+
+
+def test_never_more_than_the_hard_ceiling():
+    assert _review("no card at all", continued=True, sendbacks=st.HARD_CEILING) is None
+
+
+# The owner, 2026-10-29, on an Approve section with nothing to tap that
+# reached him on the third try: "The idea was this could not happen."
+BUTTONLESS = _card(type="needs_you", title="Grading rules", headline="Keep the two grading rules?",
+                   needs={"kind": "approve", "why": "It changes how the grade is computed."},
+                   replies=[{"label": "Keep", "reply": "Keep"}, {"label": "Undo", "reply": "Undo"}])
+
+
+def test_a_summary_with_no_buttons_goes_back_past_the_soft_cap():
+    reason = _review(BUTTONLESS, continued=True, sendbacks=st.MAX_SENDBACKS)
+    assert reason and "needs.replies" in reason and "needs.ask" in reason
+    assert f"try {st.MAX_SENDBACKS + 1} of {st.HARD_CEILING}" in reason
+    assert _review(BUTTONLESS, continued=True, sendbacks=st.HARD_CEILING - 1)
+    assert _review(BUTTONLESS, continued=True, sendbacks=st.HARD_CEILING) is None
+
+
+def test_no_card_at_all_goes_back_past_the_soft_cap():
+    assert _review("Done, pushed it.", continued=True, sendbacks=st.MAX_SENDBACKS)
+
+
+def test_the_first_pass_reports_every_fault_not_only_the_first():
+    # The card that got through had a missing type, and the type check
+    # returned early, hiding its missing ask and buttons for two rounds.
+    reason = _review("Here it is.\n\n" + _card(type=None, title="Grading rules",
+                     needs={"kind": "approve", "why": "x"}))
+    assert reason and "outside" in reason
+    assert '"type" must be one of' in reason
+    assert "needs.ask is empty" in reason and "needs.replies" in reason
+
+
+def test_released_faults_name_what_is_still_wrong_at_the_ceiling():
+    assert st.released_faults(BUTTONLESS, st.HARD_CEILING)
+    assert st.released_faults(BUTTONLESS, st.HARD_CEILING - 1) == []
+    assert st.released_faults(GOOD, st.HARD_CEILING) == []
 
 
 @pytest.mark.parametrize("msg", [
@@ -142,11 +185,25 @@ def _fire(m, **kw):
 
 def test_manager_sends_back_and_counts(sm):
     m, info = sm
-    assert _fire(m, message="done", continued=False)
+    rough = _card(watch_for=["one caveat: still untested on the phone"])
+    assert _fire(m, message=rough, continued=False)
     assert info._st_sendbacks == 1
-    assert _fire(m, message="done", continued=True)
-    assert _fire(m, message="done", continued=True) is None   # capped
-    assert _fire(m, message="done", continued=False)          # new stop resets
+    assert _fire(m, message=rough, continued=True)
+    assert _fire(m, message=rough, continued=True) is None   # capped: usable, just rough
+    assert _fire(m, message=rough, continued=False)          # new stop resets
+
+
+def test_manager_flags_an_unusable_summary_let_through_at_the_ceiling(sm):
+    m, info = sm
+    emitted = []
+    m._emit_entry = lambda sid, entry, idx: emitted.append(entry)
+    assert _fire(m, message="done", continued=False)          # no card: back
+    for _ in range(st.HARD_CEILING - 1):
+        assert _fire(m, message="done", continued=True)       # still no card: back again
+    assert info._st_sendbacks == st.HARD_CEILING
+    assert _fire(m, message="done", continued=True) is None   # ceiling: let through...
+    assert len(emitted) == 1 and emitted[0].is_error          # ...and said so on screen
+    assert "cannot be used" in emitted[0].text and "Reply in the box below" in emitted[0].text
 
 
 def test_manager_lets_a_queued_message_go_out_at_once(sm):
@@ -338,10 +395,17 @@ def test_hook_sends_back_and_lets_good_handoffs_through(hook_env):
 
 
 def test_hook_caps_send_backs_per_stop(hook_env):
+    # No card at all is unusable: it goes back until the hard ceiling.
     assert _stop("x")
-    assert _stop("x", continued=True)
+    for _ in range(st.HARD_CEILING - 1):
+        assert _stop("x", continued=True)
     assert _stop("x", continued=True) is None
     assert _stop("x")                       # a new stop starts over
+    # A usable but rough card stops at the soft cap.
+    rough = _card(watch_for=["one caveat: still untested on the phone"])
+    assert _stop(rough)
+    assert _stop(rough, continued=True)
+    assert _stop(rough, continued=True) is None
 
 
 def test_hook_session_start_adds_the_instructions(hook_env):
