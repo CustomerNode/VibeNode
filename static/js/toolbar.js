@@ -333,7 +333,11 @@ function _buildHomepageContent() {
   // Kick off async fetch if board data hasn't been loaded yet
   if (typeof kanbanTasks !== 'undefined' && kanbanTasks.length === 0 && typeof kanbanColumns !== 'undefined' && kanbanColumns.length === 0 && !_hpBoardFetching) {
     _hpBoardFetching = true;
-    fetch('/api/kanban/board').then(r => r.ok ? r.json() : null).then(data => {
+    // Name the project: the server's active project is shared by every open
+    // tab, so without it this tile showed whichever project another tab had
+    // switched to (kanban_api._requested_project).
+    const _hpBoardProj = localStorage.getItem('activeProject') || '';
+    fetch('/api/kanban/board' + (_hpBoardProj ? '?project=' + encodeURIComponent(_hpBoardProj) : '')).then(r => r.ok ? r.json() : null).then(data => {
       _hpBoardFetching = false;
       _hpBoardLoaded = true;
       if (data) {

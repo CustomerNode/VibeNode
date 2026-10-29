@@ -1062,3 +1062,30 @@ class TestProjectsAlias:
         assert "Remote Task" in titles, \
             "After adopting an alias, /board should query the aliased " \
             "project_id. Got titles: %r" % titles
+
+
+# ── the board request names its project (2026-10-28) ────────────────────────
+# The server keeps one active project for every tab, so the homepage Workflow
+# tile showed another project's tasks when two tabs disagreed. A request that
+# names a valid project reads that project; anything else falls back.
+
+def test_board_project_param_overrides_the_shared_active_project(monkeypatch):
+    from app import create_app
+    from app.routes import kanban_api
+    import app.config as cfg
+    monkeypatch.setattr(kanban_api, "get_active_project", lambda: "C--shared-active")
+    monkeypatch.setattr(cfg, "resolve_project_alias", lambda p: p)
+    app = create_app(testing=True)
+    with app.test_request_context("/api/kanban/board?project=C--this-tab"):
+        assert kanban_api._get_project_id() == "C--this-tab"
+    with app.test_request_context("/api/kanban/board"):
+        assert kanban_api._get_project_id() == "C--shared-active"
+    for bad in ("../etc", "a/b", "a\\b", "x" * 300):
+        with app.test_request_context("/api/kanban/board", query_string={"project": bad}):
+            assert kanban_api._get_project_id() == "C--shared-active", bad
+
+
+def test_homepage_board_fetch_names_the_project():
+    from pathlib import Path
+    js = (Path(__file__).resolve().parents[1] / "static" / "js" / "toolbar.js").read_text(encoding="utf-8")
+    assert "'/api/kanban/board' + (_hpBoardProj ? '?project=' + encodeURIComponent(_hpBoardProj)" in js

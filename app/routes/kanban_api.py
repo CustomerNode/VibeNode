@@ -138,7 +138,27 @@ def _get_project_id():
     sessions / git / file APIs still use the real local-derived id.
     """
     from ..config import resolve_project_alias
-    return resolve_project_alias(get_active_project())
+    return resolve_project_alias(_requested_project() or get_active_project())
+
+
+def _requested_project() -> str:
+    """The ``?project=`` a request names, when it is a plausible encoded
+    project name, else "".
+
+    The server keeps ONE active project for every open tab, so a tab on
+    project A and another on project B kept switching it, and a board request
+    that named no project read whichever tab spoke last: the homepage
+    Workflow tile showed another project's tasks (2026-10-28). A caller that
+    knows its project passes it; anything else keeps the old behaviour.
+    Encoded names never contain path separators or ``..``.
+    """
+    try:
+        p = (request.args.get("project") or "").strip()
+    except RuntimeError:          # no request context
+        return ""
+    if not p or "/" in p or "\\" in p or ".." in p or len(p) > 255:
+        return ""
+    return p
 
 
 def _emit(event, data):
