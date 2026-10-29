@@ -25,6 +25,9 @@ tzdata
 psutil>=5.9
 pytest
 pytest-timeout
+# tests/test_api_docs_coverage.py reads docs/api/openapi.yaml.  Missing on CI,
+# so every GitHub run stopped at collection and emailed whoever pushed.
+pyyaml
 # Parallel test runs for the Publish gate (app/routes/test_api.py uses it when
 # installed and falls back to a serial run when it is not).
 pytest-xdist>=3.5

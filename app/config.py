@@ -161,24 +161,29 @@ _FORWARDED_TO_COMMON_CONFIG = frozenset({
 })
 
 
-def __getattr__(name):
-    if name in _FORWARDED_TO_COMMON_CONFIG:
+def _forwarded(name):
+    def _get(self):
         return getattr(_common_config, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    def _set(self, value):
+        setattr(_common_config, name, value)
+
+    def _del(self):
+        raise AttributeError(f"{name} is forwarded to common.config and cannot be deleted")
+
+    return property(_get, _set, _del)
 
 
-class _ForwardingConfigModule(type(sys)):
-    def __setattr__(self, name, value):
-        if name in _FORWARDED_TO_COMMON_CONFIG:
-            setattr(_common_config, name, value)
-        else:
-            super().__setattr__(name, value)
-
-    def __delattr__(self, name):
-        if name in _FORWARDED_TO_COMMON_CONFIG:
-            raise AttributeError(f"{name} is forwarded to common.config and cannot be deleted")
-        super().__delattr__(name)
-
+# Each forwarded name is a data descriptor (a property) on the module's class,
+# not a module-level __getattr__.  pytest 9.2's monkeypatch reads the old value
+# from the module __dict__ unless a data descriptor sits in the way; with only
+# __getattr__ it found nothing, "restored" by deleting, and every test that
+# monkeypatched _KANBAN_CONFIG_FILE errored at teardown (180 tests on CI).
+_ForwardingConfigModule = type(
+    "_ForwardingConfigModule",
+    (type(sys),),
+    {name: _forwarded(name) for name in _FORWARDED_TO_COMMON_CONFIG},
+)
 
 sys.modules[__name__].__class__ = _ForwardingConfigModule
 

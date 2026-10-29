@@ -136,15 +136,21 @@ class TestRestartShellSyntax:
         way on Linux.  If this test ever passes (i.e. nohup starts accepting
         env-prefix syntax), the source guards above can be relaxed."""
         log = tmp_path / "broken_probe.log"
+        # nohup's exit status is recorded too: GNU nohup prints "No such file
+        # or directory", but the uutils nohup of Ubuntu 26.04 (GitHub's
+        # ubuntu-latest from 2026-10-19) prints nothing and only exits 127.
         cmd = (
             "bash -c '"
             f"nohup VIBENODE_PRESERVE_DAEMON=1 /bin/sh -c \"echo CHILD_SAW=$VIBENODE_PRESERVE_DAEMON\" "
-            f"</dev/null >>\"{log}\" 2>&1; true'"
+            f"</dev/null >>\"{log}\" 2>&1; echo NOHUP_EXIT=$? >>\"{log}\"'"
         )
         subprocess.run(cmd, shell=True, capture_output=True,
                        text=True, timeout=5)
         text = log.read_text(encoding="utf-8") if log.exists() else ""
-        assert "No such file or directory" in text or "command not found" in text, (
+        rejected = ("No such file or directory" in text
+                    or "command not found" in text
+                    or "NOHUP_EXIT=127" in text)
+        assert rejected and "CHILD_SAW" not in text, (
             f"Expected nohup to reject `VIBENODE_PRESERVE_DAEMON=1` as a "
             f"command, but it didn't.  If this regression-canary test starts "
             f"passing the wrong way (child inherits the var), the underlying "

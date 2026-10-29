@@ -392,20 +392,24 @@ class TestListenerPreDetectAutoResume:
                     states.append((data.get('state'), data.get('substatus', '')))
             sm._push_callback = _push
 
+            async def listen():
+                # The listener checks info.task is current_task — bind it
+                # HERE, inside the coroutine wait_for runs.  On Python 3.11
+                # wait_for runs its coroutine in a new task (3.12+ awaits it
+                # in place), so binding in run() made the listener see itself
+                # as superseded and bail before doing anything.  The app
+                # awaits the listener in its own task, without wait_for.
+                info.task = asyncio.current_task()
+                await sm._extended_post_turn_listener(info.session_id, info)
+
             async def run():
-                # The listener checks info.task is current_task — bind it.
-                task = asyncio.current_task()
-                info.task = task
                 try:
                     # Run with a timeout — the listener never returns
                     # normally: once the batches are drained the fake SDK
                     # blocks forever, so the timeout is always waited out.
                     # The batches are processed in memory within
                     # milliseconds; 0.5s is margin, not a wait.
-                    await asyncio.wait_for(
-                        sm._extended_post_turn_listener(info.session_id, info),
-                        timeout=0.5,
-                    )
+                    await asyncio.wait_for(listen(), timeout=0.5)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     pass
 
