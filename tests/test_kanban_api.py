@@ -440,6 +440,12 @@ class TestKanbanConfig:
             assert body["smart_termination"] is on
             assert body["wrong_session_detection"] is (not on)
 
+    def test_chrome_control_round_trips_and_is_off_by_default(self, kanban_client):
+        assert kanban_client.get('/api/kanban/config').get_json()["chrome_control"] is False
+        for on in (True, False):
+            kanban_client.put('/api/kanban/config', json={"chrome_control": on})
+            assert kanban_client.get('/api/kanban/config').get_json()["chrome_control"] is on
+
 
 # ---------------------------------------------------------------------------
 # Board Filtering

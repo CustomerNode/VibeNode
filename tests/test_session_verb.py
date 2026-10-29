@@ -109,8 +109,11 @@ const r = {};
 st.a = 'question'; rows.a = { next_step: { verb: 'decide' } }; r.permission_beats_card = d('a');
 st.b = 'working';  rows.b = { next_step: { verb: 'decide' } }; r.running_turn_is_working = d('b');
 st.c = 'sleeping'; rows.c = { next_step: { verb: 'decide' } }; r.decide_survives_sleep = d('c');
-st.c2 = 'sleeping'; rows.c2 = { next_step: { verb: 'review' } }; unread.add('c2'); r.accepted_review_is_done = d('c2');
-st.z = 'sleeping'; r.sleeping_is_done = d('z');
+st.c2 = 'sleeping'; rows.c2 = { next_step: { verb: 'review' }, hold: 'done' }; unread.add('c2'); r.accepted_review_is_done = d('c2');
+// Done is the person's verdict, never sleep alone (owner, 2026-10-28):
+// a session slept by anything else still waits for him.
+st.y = 'sleeping'; rows.y = { next_step: { verb: 'review' } }; r.slept_without_verdict_is_review = d('y');
+st.z = 'sleeping'; rows.z = { hold: 'done' }; r.marked_done_is_done = d('z');
 st.e = 'idle'; rows.e = { next_step: { verb: 'review' } }; unread.add('e'); r.unread_review = d('e');
 unread.delete('e'); r.opened_review_stays_review = d('e');
 st.f = 'idle'; unread.add('f'); r.stopped_no_card_is_review = d('f');
@@ -154,7 +157,8 @@ def test_browser_copy_matches_and_display_rules(tmp_path):
         "running_turn_is_working": "working",
         "decide_survives_sleep": "decide",
         "accepted_review_is_done": "done",
-        "sleeping_is_done": "done",
+        "slept_without_verdict_is_review": "review",
+        "marked_done_is_done": "done",
         "unread_review": "review",
         "opened_review_stays_review": "review",
         "stopped_no_card_is_review": "review",
@@ -271,7 +275,8 @@ ctx.SessionStore = { get: id => rows[id] || null };
 ctx._sessionSubstatus = {}; ctx._sessionRetryState = {};
 const set = (id, s, verb) => { st[id] = s; rows[id] = { message_count: 3, next_step: verb ? { verb } : null }; };
 set('dec', 'idle', 'decide'); set('rev', 'idle', 'review'); set('snd', 'idle', 'send'); set('q', 'question');
-set('w', 'working'); set('wt', 'idle', 'waiting'); set('dn', 'sleeping');
+set('w', 'working'); set('wt', 'idle', 'waiting'); set('dn', 'sleeping'); rows.dn.hold = 'done';
+set('sl', 'sleeping', 'review');
 const out = {};
 for (const id of Object.keys(st)) { const p = SV.cardParts(id); out[id] = [p.label, p.cls, SV.filterBucket(id)]; }
 process.stdout.write(JSON.stringify(out));
@@ -282,4 +287,5 @@ process.stdout.write(JSON.stringify(out));
     needs = ["Needs you", "vs-needs", "question"]
     assert out["dec"] == needs and out["rev"] == needs and out["snd"] == needs and out["q"] == needs
     assert out["w"][:2] == ["Working", "vs-working"] and out["wt"][:2] == ["Working", "vs-working"]
-    assert out["dn"] == ["Done", "vs-done", "sleeping"]
+    assert out["dn"] == ["Done", "vs-done", "sleeping"]       # marked Done by the person
+    assert out["sl"] == needs                                   # slept, no verdict: still his

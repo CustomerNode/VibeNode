@@ -25,7 +25,7 @@ from daemon import session_host_protocol as shp
 from daemon import session_host_transport as sht
 from daemon.backends.claude import ClaudeAgentSDK
 from daemon.session_manager import SessionManager
-from tests._session_host_helpers import make_fake_cli, read_log, wait_until
+from tests._session_host_helpers import make_fake_cli, pin_preferences, read_log, wait_until
 
 
 class Pushes:
@@ -50,6 +50,7 @@ def fake(tmp_path, monkeypatch):
     log = tmp_path / "cli.log"
     sdk = ClaudeAgentSDK()
     sdk.host_cli_path = make_fake_cli(tmp_path / "bin", FAKE_CLI_LOG=str(log))
+    pin_preferences(monkeypatch)
     engines = []
 
     def engine():

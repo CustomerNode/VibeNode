@@ -56,9 +56,11 @@ from pathlib import Path
 from pipeline import depth as depth_mod
 from pipeline.attest import ATTEST_PREFIX, load_attestations
 from pipeline.escalate import ESCALATE_PREFIX
-from pipeline.evidence import (EVIDENCE_DIR, EVIDENCE_PREFIX, RUNS_SUBDIR, _file_sha, baseline_label, evidence_sha,
+from pipeline.evidence import (_is_git_repo, git, EVIDENCE_DIR, EVIDENCE_PREFIX, RUNS_SUBDIR, _file_sha, baseline_label, evidence_sha,
                                impl_identity, interpreter_site_dirs, load_run, local_excludes, run_repo,
                                site_fingerprint, tree_fingerprint)
+from pipeline.decisions import (DECISION_PREFIX, DECISIONS_DIR, DecisionError, answer as decision_answer,
+                                load as load_decision)
 from pipeline.plan import (PINNED_FILE, PINNED_PROTECTED_FILE, PROTECTED_FILE, VERIFY_FILE, PlanError, block_sha,
                            load_plan, request_sha, request_text_of)
 from pipeline.transcripts import (_SHELL_WRITE_RE, Transcript, find_root_transcript, is_pipeline_call,
@@ -347,6 +349,16 @@ def grade_run(run_dir: Path) -> Verdict:
     for t, c in shell_writes_under(everything, edir):
         v.add("evidence-forged", "low",
               f"a shell command touched the evidence folder outside the pipeline programs: {c.command[:120]!r}")
+    # Decisions (who allowed a check to run) are written only by the pipeline
+    # programs, like evidence.
+    ddir = run_dir / DECISIONS_DIR
+    for t, c in writes_under(everything, ddir):
+        v.add("decision-forged", "low",
+              f"{c.file_path} was written with the {c.name} tool by {'subagent ' + t.agent_id if t.is_subagent else 'the root session'}; "
+              f"decisions are written only by the pipeline programs")
+    for t, c in shell_writes_under(everything, ddir):
+        v.add("decision-forged", "low",
+              f"a shell command touched the decisions folder outside the pipeline programs: {c.command[:120]!r}")
     # When each piece of evidence the grade relies on was produced.
     evidence_times: list[datetime] = []
     for crit in criteria:
@@ -400,6 +412,7 @@ def grade_run(run_dir: Path) -> Verdict:
             v.add("tree-unstable", "medium", f"criterion {crit.id} changed the working tree while it ran")
         _check_site(v, crit.id, rec, site_pinned, site_now)
         _check_impl(v, crit.id, producers)
+        _check_decision(v, run_dir, run, crit.id, rec, sha, shell_calls)
         if rec.get("passed"):
             entry["status"] = "passed"
         else:
@@ -412,6 +425,15 @@ def grade_run(run_dir: Path) -> Verdict:
 
     _check_suite(v, run, criteria)
     _check_baseline(v, run_dir, run, repo, route, criteria, plan_sha, shell_calls, evidence_times)
+    for c in criteria:
+        bp = edir / f"{c.id}.baseline.json"
+        if c.detects_change and bp.is_file():
+            try:
+                brec = json.loads(bp.read_text(encoding="utf-8"))
+            except ValueError:
+                continue
+            _check_decision(v, run_dir, run, c.id, brec, evidence_sha(bp), shell_calls, baseline=True)
+    _check_commits(v, run_dir, run, repo)
     # The audit is the last judgment, so it must postdate the evidence it
     # judged.  Together with the fingerprint check (the tree has not changed
     # since that evidence) this binds the audit to the final code by content:
@@ -825,6 +847,80 @@ def _check_coverage(v: Verdict, audit_text: str, criteria) -> None:
     elif not re.fullmatch(r"covered", verdict.group(1), re.IGNORECASE):
         v.add("coverage", "medium",
               "the audit judged that the checks do not prove the request was met")
+
+
+def _check_decision(v: Verdict, run_dir: Path, run: dict, cid: str, rec: dict, sha: str, shell_calls,
+                    baseline: bool = False) -> None:
+    """Evidence counts only when a decision allowed exactly this execution:
+    the decision exists, was issued by a recorded ``run_check authorize`` in
+    this run's sessions, binds this criterion (and whether it is the baseline
+    run), the plan and the fingerprint the evidence records, is allowed (by
+    the policy, or by the user's answer on the card), and was used for this
+    evidence file.  Anything less is ``unauthorized``: a check that ran
+    without an approval is graded LOW, however it went."""
+    label = f"{cid}@baseline" if baseline else cid
+    nonce = str(rec.get("decision") or "")
+    if not nonce:
+        v.add("unauthorized", "low", f"criterion {label} ran without a decision (the old one-step run_check)")
+        return
+    try:
+        d = load_decision(run_dir, nonce)
+    except DecisionError as e:
+        v.add("unauthorized", "low", f"criterion {label}: {e}")
+        return
+    # Only the authorize step issues a decision; execute prints the line too,
+    # but a decision an agent wrote by hand and then executed is not issued.
+    issued = f"{DECISION_PREFIX} id={nonce} "
+    if not any(issued in c.output and is_pipeline_call(c.command, "run_check")
+               and re.search(r"run_check\s+authorize\b", c.command) for _t, c in shell_calls):
+        v.add("unauthorized", "low", f"criterion {label}: no recorded run_check authorize issued decision {nonce}")
+        return
+    op = d.get("operation") or {}
+    if d.get("kind") != "check" or op.get("criterion") != cid or bool(op.get("baseline")) != baseline:
+        v.add("unauthorized", "low", f"criterion {label}: decision {nonce} is for a different operation")
+        return
+    if op.get("plan_sha") != rec.get("plan_sha"):
+        v.add("unauthorized", "low", f"criterion {label}: decision {nonce} approved a different plan")
+        return
+    fp = rec.get("snapshot") if baseline else rec.get("fingerprint")
+    if op.get("fingerprint") != fp:
+        v.add("unauthorized", "low", f"criterion {label}: decision {nonce} approved a different tree")
+        return
+    if d.get("verdict") != "allow":
+        ans, detail = decision_answer(run_dir, d, run=run)
+        if ans != "allow":
+            v.add("unauthorized", "low", f"criterion {label}: decision {nonce} was not allowed ({detail})")
+            return
+    if not d.get("used") or d.get("evidence_sha") != sha:
+        v.add("unauthorized", "low", f"criterion {label}: decision {nonce} was not used for this evidence")
+
+
+def _check_commits(v: Verdict, run_dir: Path, run: dict, repo: Path) -> None:
+    """A commit made in the run's repository before a passed delivery is
+    reported, not prevented: Code Pipeline does not sit in VibeNode's
+    permission path.  The ledger carries the same flag."""
+    base = str(run.get("base_rev") or "")
+    if base in ("", "no-git", "no-commits") or not _is_git_repo(repo):
+        return
+    out = [t for t in (_parse_ts(x) for x in git(repo, "log", "--format=%cI", f"{base}..HEAD", check=False).split())
+           if t is not None]
+    if not out:
+        return
+    first_commit = min(out)
+    dp = run_dir / "delivered.json"
+    delivered_at = None
+    if dp.is_file():
+        try:
+            drec = json.loads(dp.read_text(encoding="utf-8"))
+            if drec.get("delivered"):
+                delivered_at = _parse_ts(str(drec.get("at") or ""))
+        except ValueError:
+            pass
+    if delivered_at is None or first_commit < delivered_at:
+        v.add("committed-before-delivery", "medium",
+              f"{len(out)} commit(s) were made in this repository since the run started, the first at "
+              f"{first_commit.isoformat(timespec='seconds')}, before any passed delivery; the delivery gate runs "
+              f"before a commit")
 
 
 def _parse_ts(ts: str) -> datetime | None:

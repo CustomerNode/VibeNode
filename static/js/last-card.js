@@ -341,10 +341,15 @@
     // / Do what it suggested (only with the card's "offer") / Ask more /
     // Standby.  Send: Sent it / Change it / Standby.
     offer = typeof offer === 'string' ? offer.trim() : '';
-    const own = r('gotit', I.check, 'Got it', 'Answered. Put the session to sleep') +
-      (offer ? r('offer', I.fwd, 'Do what it suggested', inl(offer), ' data-offer="' + esc(offer) + '"') : '') +
+    // One rule for every set (owner, 2026-10-28): the answer the card expects
+    // first, other ways to keep going next, Standby last.  An offer is the
+    // expected answer, so: Do what it suggested · Ask more · Got it · Standby.
+    // Without one, Got it leads.  Got it is drawn exactly once.
+    const gotit = r('gotit', I.check, 'Got it', 'Answered. Put the session to sleep');
+    const own = (offer ? r('offer', I.fwd, 'Do what it suggested', inl(offer), ' data-offer="' + esc(offer) + '"') : gotit) +
       r('sent', I.check, 'Sent it', 'Put the session to sleep') +
       r('ask', I.chat, 'Ask more', 'A follow-up question in the chat box') +
+      (offer ? gotit : '') +
       r('change', I.pen, 'Change it', 'Tell it what to change');
     // Which rows show depends on the session's status (_syncDone sets
     // data-state): "verdict" (Review / Read / Send), "question" (Decide /
@@ -647,7 +652,17 @@
     const all = log.querySelectorAll('.lm-finish');
     if (!all.length) return;
     const sid = (typeof liveSessionId !== 'undefined') ? liveSessionId : null;
-    const d = sid && window.SessionVerb ? window.SessionVerb.display(sid) : '';
+    let d = sid && window.SessionVerb ? window.SessionVerb.display(sid) : '';
+    // Which verdict buttons fit is the newest card's own kind, not the
+    // sidebar's guess: an answer showed Done · Something else · Problem
+    // (2026-10-28) when the sidebar had no card for the session and fell back
+    // to Review.  Review / Read / Send only; Decide, Standby and Done keep
+    // the status's own rows.
+    if ((d === 'review' || d === 'read' || d === 'send') && last) {
+      let own = '';
+      try { own = _cardVerb(JSON.parse(last.getAttribute('data-card') || '{}') || {}); } catch (_e) { own = ''; }
+      if (own === 'read' || own === 'send') d = own;
+    }
     const state = { review: 'verdict', read: 'read', send: 'send', decide: 'question', unblock: 'question', standby: 'standby', done: 'done' }[d] || '';
     all.forEach(f => {
       const mine = !!(last && f.closest('.lm') === last && state);

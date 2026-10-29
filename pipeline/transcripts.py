@@ -173,6 +173,38 @@ def read_transcript(path: Path, *, is_subagent: bool) -> Transcript:
     return t
 
 
+def _entry_ts(entry: dict) -> str:
+    return str(entry.get("timestamp") or "")
+
+
+def user_texts(path: Path) -> list[tuple[str, str]]:
+    """``(timestamp, text)`` of every user entry that is a MESSAGE (text the
+    person or the app sent), oldest first.  Tool results are not messages."""
+    out = []
+    for entry in _iter_entries(path):
+        if entry.get("type") != "user":
+            continue
+        if any(b.get("type") == "tool_result" for b in _content_blocks(entry)):
+            continue
+        text = _content_text(entry)
+        if text:
+            out.append((_entry_ts(entry), text))
+    return out
+
+
+def assistant_texts(path: Path) -> list[tuple[str, str]]:
+    """``(timestamp, text)`` of every assistant entry's text blocks, oldest
+    first (tool calls carry no text and are left out)."""
+    out = []
+    for entry in _iter_entries(path):
+        if entry.get("type") != "assistant":
+            continue
+        text = _content_text(entry)
+        if text:
+            out.append((_entry_ts(entry), text))
+    return out
+
+
 def project_transcripts_dir(project_cwd: str) -> Path:
     """Where the CLI keeps the root transcripts of sessions started in *project_cwd*."""
     return claude_projects_dir() / encode_cwd(project_cwd)
@@ -360,7 +392,7 @@ def shell_writes_under(transcripts: Iterable[Transcript], directory: str | Path)
 
 # The programs that are allowed to write into the evidence folder, and whose
 # printed lines the harness accepts as produced (not quoted).
-EVIDENCE_WRITERS = ("run_check", "attest", "escalate")
+EVIDENCE_WRITERS = ("run_check", "attest", "escalate", "deliver")
 
 
 def is_pipeline_call(command: str, module: str) -> bool:
@@ -423,4 +455,4 @@ _ALLOWED_PREFIX_RE = re.compile(
 )
 
 _SHELL_CHAIN_RE = re.compile(
-    r";|&&|(?<![>&])&(?![&>])|\|\||\||\n|`|\$\(|\b(run_check|attest|escalate)\b.*\b(python|sh|bash|pwsh|node)\b")
+    r";|&&|(?<![>&])&(?![&>])|\|\||\||\n|`|\$\(|\b(run_check|attest|escalate|deliver)\b.*\b(python|sh|bash|pwsh|node)\b")

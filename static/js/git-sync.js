@@ -76,10 +76,11 @@ let _publishGate = null;       // {mode, passed, skipped, failed, seconds, anywa
 
 // What each test mode really runs, from /api/test-modes (app/routes/test_api.py
 // MODES).  The fallback matches it; both modes run the same files, and only
-// the per-test timeout differs.  The e2e suite runs in CI, never here.
+// the per-test timeout differs.  The e2e suite and the Code Pipeline tests run
+// in CI, never here.
 const _TEST_MODE_FALLBACK = {
-  fast: {label: 'Fast: unit + browser tests, 60s timeout'},
-  full: {label: 'Full: unit + browser tests, 120s timeout (e2e suite runs in CI only)'},
+  fast: {label: 'Fast: unit + browser tests, 60s timeout (Code Pipeline tests run in CI)'},
+  full: {label: 'Full: unit + browser tests, 120s timeout (e2e and Code Pipeline tests run in CI)'},
 };
 let _testModesCache = null;
 async function _testModes() {
@@ -225,7 +226,8 @@ function _testFailureReport(lines, d, mode) {
   // Same command the Publish gate runs (app/routes/test_api.py), including the
   // parallel workers, so "passes for the fix session" means "passes Publish".
   const cmd = 'python -m pytest --tb=short -q --no-header'
-    + (mode === 'fast' ? ' --ignore=tests/e2e --timeout=60' : ' --timeout=120')
+    + (mode === 'fast' ? ' --ignore=tests/e2e --ignore-glob=tests/test_code_pipeline*.py --timeout=60'
+                       : ' --ignore-glob=tests/test_code_pipeline*.py --timeout=120')
     + ' -n 8 --dist loadfile tests/';
 
   let prompt = 'TEST FAILURES ARE BLOCKING PUBLISH\n\n';
@@ -295,8 +297,10 @@ function _testThenAction(mode, actionType, actionLabel, btnId) {
   const Verb = verb.charAt(0).toUpperCase() + verb.slice(1);
 
   if (typeof _testRunning !== 'undefined' && _testRunning) {
-    showGitSyncModal('Tests Running', '<p style="color:var(--text-muted)">Tests are already running.</p>',
-      [{label: 'OK', onclick: closeGitSyncModal}]);
+    showGitSyncModal('Tests Running', '<p style="color:var(--text-muted)">Tests are already running in this tab. '
+      + 'The earlier run carries on and reports when it finishes.</p>',
+      [{label: 'Cancel Tests', onclick: () => { if (typeof cancelTests === 'function') cancelTests(); }},
+       {label: 'OK', primary: true, onclick: closeGitSyncModal}]);
     return;
   }
 
@@ -315,7 +319,7 @@ function _testThenAction(mode, actionType, actionLabel, btnId) {
       if (typeof _testRunning !== 'undefined') _testRunning = false;
       // Recorded in the commit message's "Publish gate" line.
       _publishGate = {
-        mode: mode,
+        mode: d.mode || mode,   // the run joined may be a full one
         passed: d.passed || 0,
         skipped: d.skipped || 0,
         failed: (d.failed || 0) + (d.errors || 0),
@@ -372,6 +376,16 @@ function _testThenAction(mode, actionType, actionLabel, btnId) {
     onError: (msg, info) => {
       if (typeof _testRunning !== 'undefined') _testRunning = false;
       _publishGate = {mode: 'skipped'};   // nothing ran to completion
+      if (info && info.busy) {
+        // Another run (started elsewhere) is in progress.  Never offer to
+        // sync anyway here: say so, and give a way to cancel it.
+        showGitSyncModal('Tests Running',
+          '<p style="color:var(--text-muted)">' + (typeof _escTestHtml === 'function' ? _escTestHtml(msg) : msg) + '</p>', [
+          {label: 'Cancel that run', onclick: () => { if (typeof cancelTests === 'function') cancelTests(); }},
+          {label: 'OK', primary: true, onclick: closeGitSyncModal}
+        ]);
+        return;
+      }
       if (info && info.started) {
         // The run started but its result never arrived.  Never offer to
         // publish anyway here: nothing says the tests passed.

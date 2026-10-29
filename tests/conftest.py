@@ -870,6 +870,50 @@ def pytest_xdist_make_scheduler(config, log):
     return DurationOrderedLoadFileScheduling(config, log)
 
 
+# ---------------------------------------------------------------------------
+# Transient worker crash: retry the crashed test ONCE on another worker.
+#
+# A worker can crash with a native Windows access violation inside
+# ``subprocess._wait`` on Python 3.14 ARM64 under heavy concurrent subprocess
+# load (seen 2026-10-28 in test_code_pipeline_review.py::test_attest_cli: the
+# test spawns ~140 git subprocess calls, four workers run splittable pipeline
+# chunks in parallel, and once in a while one of them hits the native crash).
+# The test is correct and passes on a less-parallel run; the crash is the
+# interpreter's problem, not the test's.
+#
+# ``LoadScopeScheduling.remove_node`` already re-queues the whole workload
+# (including the crashed item) when a worker dies, so another worker will
+# pick the test up and run it again.  But ``DSession.handle_crashitem`` logs
+# a ``TestReport(outcome="failed", when="???")`` right after, which the junit
+# XML writer records as an error and bumps the exit code to 1 before the
+# retry has a chance to run.  This hook marks a FIRST crash of a given test
+# as ``outcome="rerun"`` so pytest does not count it as a failure; the actual
+# retry's report (passed or failed) is what stands.  A SECOND crash of the
+# same test is left as a real failure, so a genuinely-broken test still
+# surfaces.
+#
+# Kill switch: ``VIBENODE_NO_CRASH_RETRY=1``.
+# ---------------------------------------------------------------------------
+_crash_retry_count: dict[str, int] = {}
+
+
+@pytest.hookimpl(tryfirst=True, optionalhook=True)
+def pytest_handlecrashitem(crashitem, report, sched):
+    if os.environ.get("VIBENODE_NO_CRASH_RETRY"):
+        return
+    count = _crash_retry_count.get(crashitem, 0) + 1
+    _crash_retry_count[crashitem] = count
+    if count > 1:
+        # Already retried once and crashed again: let the failure stand.
+        return
+    # Mark as a non-counted outcome so pytest's testsfailed stays at 0 for
+    # this spurious failed report.  The LoadScopeScheduling base re-queued
+    # the workload (including this nodeid) in ``remove_node`` seconds ago,
+    # so another worker will run the test again and its report decides the
+    # outcome.
+    report.outcome = "rerun"
+
+
 @pytest.fixture(autouse=True)
 def _forbid_real_claude_cli(request, monkeypatch):
     if _real_cli_transport is None or request.node.get_closest_marker("allow_real_claude_cli"):

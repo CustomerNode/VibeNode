@@ -772,3 +772,89 @@ def test_an_open_offer_is_not_a_wait():
 def test_nothing_waiting_on_you_is_not_a_wait():
     card = dict(DONE, needs={"kind": "none", "why": "Nothing is waiting on you.", "next": "Nothing planned."})
     assert not any("waits on the user" in p for p in hr.format_problems(card))
+
+
+# ── Handing over work the session could do (2026-10-28) ───────────────────
+# The owner, on a ChatGPT cleanup session that found no browser tools and
+# told him to open a terminal and run `claude --chrome`: "fix smart
+# termination so this type of error does not occur again, not just the
+# specific case".  The card shapes below are the ones that session wrote.
+GAVE_UP = {
+    "type": "needs_you",
+    "title": "Browser access for ChatGPT", "path": ["ChatGPT", "Chat cleanup"],
+    "headline": "To manage your ChatGPT chats I need a new Claude session that starts connected to your Chrome.",
+    "context": "Deleting old ChatGPT chats and sorting the rest into Projects. This session can't reach Chrome.",
+    "needs": {"kind": "action",
+              "ask": "Open a new Claude session with Chrome connected",
+              "why": "This session started without the Chrome connection.",
+              "steps": [{"text": "Keep Chrome open, signed in at chatgpt.com"},
+                        {"text": "Open a terminal and start Claude with Chrome on", "command": "claude --chrome"},
+                        {"text": "Type: organize my ChatGPT chats into projects"}],
+              "replies": [{"key": "✓", "label": "I started the Chrome session", "reply": "started it"}],
+              "next": "I list your chats and delete nothing until you OK it."},
+}
+
+
+def _handover(card):
+    return hr.handover_problems(card)
+
+
+def test_a_command_step_is_sent_back():
+    found = _handover(GAVE_UP)
+    assert any("claude --chrome" in p and "You have a shell" in p for p in found)
+    assert hr.review(msg(GAVE_UP)) is not None
+
+
+def test_giving_up_on_a_missing_tool_needs_two_other_ways_tried():
+    found = _handover(GAVE_UP)
+    assert any("This session can't" in p and "needs.tried" in p for p in found)
+
+
+@pytest.mark.parametrize("text", [
+    "Open a terminal and paste the command",
+    "Start a new Claude session and ask again",
+    "Run this in PowerShell",
+    "Launch claude in a separate session",
+])
+def test_steps_that_send_him_to_a_terminal_or_new_session_are_sent_back(text):
+    card = copy.deepcopy(ACTION)
+    card["needs"]["steps"] = [{"text": text}]
+    assert _handover(card), text
+
+
+@pytest.mark.parametrize("step", [
+    {"text": "Run in a terminal, then follow the prompts", "command": "gh auth login --web"},
+    {"text": "Sign in at chatgpt.com in Chrome"},
+    {"text": "Enter the 2FA code from your phone"},
+    {"text": "Restart the Session Engine from System, Developer Tools"},
+    {"text": "Open the registry's token page and create a new token"},
+])
+def test_steps_only_a_person_can_do_pass(step):
+    card = copy.deepcopy(ACTION)
+    card["needs"]["steps"] = [step]
+    assert _handover(card) == [], step
+
+
+def test_i_cant_passes_once_two_other_ways_were_tried_and_only_you_is_said():
+    card = copy.deepcopy(GAVE_UP)
+    card["needs"]["steps"] = [{"text": "Sign in at chatgpt.com in the window I opened"}]
+    card["needs"]["tried"] = [
+        {"what": "Playwright with your Chrome profile", "result": "ChatGPT's bot check blocked it"},
+        {"what": "ChatGPT's own conversation API", "result": "Needs a signed-in session"}]
+    assert any("only_you" in p for p in _handover(card))
+    card["needs"]["only_you"] = "Signing in needs your OpenAI password."
+    assert _handover(card) == []
+
+
+def test_blocked_card_with_its_tries_passes():
+    card = copy.deepcopy(BLOCKED)
+    card["headline"] = "I can't push the CustomerNode release: the registry refuses our login"
+    assert _handover(card) == []
+    card["tried"] = card["tried"][:1]
+    assert _handover(card)
+
+
+def test_an_answer_that_says_i_cant_is_not_a_handover():
+    card = copy.deepcopy(EXPLAIN)
+    card["answer"] = "No: I can't see your screen, only what you send."
+    assert _handover(card) == []

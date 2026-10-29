@@ -1490,6 +1490,7 @@ def get_kanban_config():
         # Missing until 2026-10-28, so Smart termination always loaded as off.
         "wrong_session_detection": cfg.get("wrong_session_detection", True) is not False,
         "smart_termination": cfg.get("smart_termination", False) is True,
+        "chrome_control": cfg.get("chrome_control", False) is True,
     })
 
 
@@ -1525,6 +1526,7 @@ def update_kanban_config():
                      "cross_session_awareness",
                      "wrong_session_detection",
                      "smart_termination",
+                     "chrome_control",
                      "validation_url_enabled", "validation_url_dismissed",
                      "file_tracking_enabled"):
         if pref_key in data:

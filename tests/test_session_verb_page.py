@@ -187,6 +187,7 @@ def test_new_session_has_no_verdict_and_done_is_grey(browser):
     Needs you): no "Is this right?" strip and no Accept until it replies.  Done looks like Sleeping always did:
     grey label, greyed-out picture, the card not faded as a whole."""
     s = fake_sessions(2)
+    s[1]["hold"] = "done"         # Done is the person's verdict, not sleep (2026-10-28)
     ids = [x["id"] for x in s]
     app = FakeApp(browser, s, init=init_script("sessions", "grid"))
     try:

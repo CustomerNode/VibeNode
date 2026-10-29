@@ -90,6 +90,64 @@ def overlay(sessions: list, sessions_dir: Path) -> list:
     return sessions
 
 
+# ── One-time backfill of the backlog (owner-approved, 2026-10-28) ──
+# Done used to be drawn for any sleeping session.  Sleep has causes the
+# person never sees (watchdogs, limits, restarts), so Done now means only his
+# verdict: a 'done' hold.  Sessions whose newest message is older than this
+# instant (7 days before the change shipped) are marked Done once, so the
+# backlog does not all turn Needs you.  Decide / Unblock cards are left alone:
+# those still wait on him.  A fixed instant, so nothing turns Done later just
+# because time passed.  Undo per session: double-click, or any new message.
+BACKFILL_CUTOFF_TS = 1792540800.0        # 2026-10-21 00:00:00 UTC
+BACKFILL_MARKER = "_session_holds_backfill.json"
+_KEEP_WAITING = ("decide", "unblock")
+
+
+def backfill_reviewed(sessions: list, sessions_dir: Path) -> int:
+    """Mark the project's old, unmarked sessions Done, once.  Returns how
+    many were marked.  Runs at most once per project (a marker file)."""
+    sd = Path(sessions_dir)
+    marker = sd / BACKFILL_MARKER
+    if marker.exists():
+        return 0
+    p = holds_path(sd)
+    marked = 0
+    with _lock:
+        if marker.exists():
+            return 0
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        now = time.time()
+        for s in sessions:
+            sid = s.get("id")
+            try:
+                last = float(s.get("last_activity_ts") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not sid or sid in data or not (0 < last < BACKFILL_CUTOFF_TS):
+                continue
+            step = s.get("next_step") if isinstance(s.get("next_step"), dict) else {}
+            if step.get("verb") in _KEEP_WAITING:
+                continue
+            data[sid] = {"state": "done", "at": last, "set": now, "backfill": True}
+            marked += 1
+        try:
+            if marked:
+                tmp = p.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp, p)
+                _cache.pop(str(p), None)
+            marker.write_text(json.dumps({"at": now, "marked": marked,
+                                          "cutoff": BACKFILL_CUTOFF_TS}), encoding="utf-8")
+        except OSError:
+            return 0
+    return marked
+
+
 def set_hold(sessions_dir: Path, session_id: str, state: str | None, at: float) -> None:
     """Record (or with ``state=None`` clear) the person's choice."""
     if state is not None and state not in STATES:

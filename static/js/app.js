@@ -455,9 +455,11 @@ function openProjectOverlay() {
   // just the header and "+ Add Project" with no way to reach their projects
   // short of a full page refresh. Refetching here recovers automatically the
   // next time they tap "Select project" instead of leaving them stuck.
-  if (!_allProjects || _allProjects.length === 0) {
-    _refreshProjectsAndRerender();
-  }
+  // Refetch on EVERY open, not only when empty: the list cached at page load
+  // went stale when projects were removed on disk (97 leaked test projects
+  // were cleared on 2026-10-28 and an open tab kept listing all of them).
+  // The cached rows render first, so the tap still feels instant.
+  _refreshProjectsAndRerender();
 }
 
 /** Display form of a project path: the home directory becomes "~" (the full
@@ -524,6 +526,8 @@ async function _refreshProjectsAndRerender() {
     if (!res.ok) throw new Error('HTTP ' + res.status);
     _allProjects = await res.json();
   } catch (e) {
+    // A failed background refresh keeps the rows already on screen.
+    if (_allProjects && _allProjects.length) return;
     const list = document.getElementById('project-list');
     if (list) {
       list.innerHTML = '<div class="empty-state" style="padding:24px;text-align:center;color:var(--text-muted);font-size:13px;">Couldn\'t load projects. Check your connection and tap "Select project" again.</div>';
@@ -2503,6 +2507,8 @@ function openPreferences() {
      hint: 'Warn before sending a prompt that looks meant for a different active session.'},
     {key: 'smartterm', label: 'Smart termination', on: stOn,
      hint: 'Every session ends its turn with what it is working on, where it stands and what it needs from you, and thinks again before stopping with work it could still do.'},
+    {key: 'chrome', label: 'Chrome control', on: window._chromeControlEnabled === true,
+     hint: 'Sessions can use your Chrome through the Claude in Chrome extension, to read pages and act on sites you are signed in to. Applies to sessions started or woken after you turn it on.'},
     {key: 'unread', label: 'Unread indicators', on: unreadOn,
      hint: 'Show a small dot on idle chats that replied while you were looking elsewhere.'},
   ];
@@ -2543,11 +2549,13 @@ function openPreferences() {
         else window._smartTerminationEnabled = on;
       }
       if (key === 'wsd') window._wrongSessionDetectionEnabled = on;
+      if (key === 'chrome') window._chromeControlEnabled = on;
       b.classList.toggle('on', on);
       b.setAttribute('aria-checked', on ? 'true' : 'false');
     };
     sync('smartterm', cfg.smart_termination === true);
     sync('wsd', cfg.wrong_session_detection !== false);
+    sync('chrome', cfg.chrome_control === true);
   }).catch(() => {});
 
   // Toggle handlers. The modal stays open so several settings can be flipped at once.
@@ -2606,6 +2614,18 @@ function openPreferences() {
             body: JSON.stringify({smart_termination: on})
           }).catch(() => showToast('Smart termination: could not save', true));
           showToast('Smart termination: ' + (on ? 'On' : 'Off'));
+          break;
+        case 'chrome':
+          window._chromeControlEnabled = on;
+          // Read by the Session Engine at each launch and wake: adds --chrome
+          // (SessionManager._with_chrome).
+          fetch('/api/kanban/config', {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({chrome_control: on})
+          }).then(r => { if (!r.ok) throw new Error(); })
+            .catch(() => showToast('Chrome control: could not save', true));
+          showToast('Chrome control: ' + (on ? 'On for new and woken sessions' : 'Off'));
           break;
         case 'unread':
           // localStorage-only, like 'sticky' — this is a per-device display

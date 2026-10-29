@@ -256,6 +256,9 @@ data/auto_namer.json.tmp
 # sha256 of requirements.txt at the last successful pip install (app/requirements_sync.py)
 data/requirements.stamp
 
+# Backups of per-project Standby/Done marks taken before a one-off migration (session ids)
+data/holds_backup_*/
+
 # Backups
 backups/
 

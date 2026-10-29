@@ -296,9 +296,23 @@ class TestRunSurvivesDisconnect:
         second = client.post("/api/run-tests", json={"mode": "full"}, buffered=False)
         got2 = _read_until(second.response, lambda ev: any(e["type"] == "run" for e in ev))
         assert _events(got2)[0]["run_id"] == run_id and len(procs) == 1
-        other = client.post("/api/run-tests", json={"mode": "fast"})
-        assert _events([other.get_data(as_text=True)])[0]["type"] == "error"
-        first.close(); second.close()
+        # A Sync asking for fast tests joins the full run (full covers fast)
+        # instead of being refused with nothing on screen (2026-10-28).
+        third = client.post("/api/run-tests", json={"mode": "fast"}, buffered=False)
+        got3 = _read_until(third.response, lambda ev: any(e["type"] == "run" for e in ev))
+        ev3 = _events(got3)[0]
+        assert ev3["run_id"] == run_id and ev3["mode"] == "full" and len(procs) == 1
+        first.close(); second.close(); third.close()
+
+    def test_a_full_request_during_a_fast_run_is_refused_as_busy(self, gated):
+        client, procs = gated
+        first = client.post("/api/run-tests", json={"mode": "fast"}, buffered=False)
+        _read_until(first.response, lambda ev: any(e["type"] == "run" for e in ev))
+        other = client.post("/api/run-tests", json={"mode": "full"})
+        ev = _events([other.get_data(as_text=True)])[0]
+        assert ev["type"] == "error" and ev["busy"] is True and "fast" in ev["line"]
+        assert len(procs) == 1
+        first.close()
 
     def test_cancel_still_stops_the_run_and_says_so(self, gated):
         client, procs = gated

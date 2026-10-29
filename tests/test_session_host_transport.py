@@ -20,7 +20,7 @@ from daemon.backends.base import PermissionAction, PermissionResult, SessionOpti
 from daemon.backends.claude import ClaudeAgentSDK
 from daemon.backends.claude_host import HostedSDKClient, HostTransport
 from daemon.backends.messages import MessageKind
-from tests._session_host_helpers import make_fake_cli, read_log, wait_until
+from tests._session_host_helpers import make_fake_cli, pin_preferences, read_log, wait_until
 
 
 @pytest.fixture
@@ -31,6 +31,7 @@ def fake(tmp_path, monkeypatch):
     sdk = ClaudeAgentSDK()
     sdk.apply_patches()
     sdk.host_cli_path = make_fake_cli(tmp_path / "bin", FAKE_CLI_LOG=str(log))
+    pin_preferences(monkeypatch)
     return {"sdk": sdk, "cwd": cwd, "log": log}
 
 

@@ -461,9 +461,21 @@ def test_installed_hook_command_runs_under_bash(tmp_path):
     import os
     import shutil
     import subprocess
+    import sys
+    from pathlib import Path
     cmd = hook._command()
     assert "\\" not in cmd, cmd
     bash = shutil.which("bash")
+    if sys.platform == "win32":
+        # The CLI runs hooks through Git Bash (CLAUDE_CODE_GIT_BASH_PATH, else
+        # the bash beside git).  A bare "bash" on PATH can be the WSL stub in
+        # WindowsApps, which is not the shell the hook ever runs under.
+        git = shutil.which("git")
+        cands = [os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")]
+        if git:
+            root = Path(git).resolve().parent.parent
+            cands += [root / "bin" / "bash.exe", root / "usr" / "bin" / "bash.exe"]
+        bash = next((str(c) for c in cands if c and Path(c).is_file()), None)
     if not bash:
         pytest.skip("no bash on this machine")
     env = dict(os.environ, CLAUDE_CODE_ENTRYPOINT="sdk-py")

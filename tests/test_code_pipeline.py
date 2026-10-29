@@ -40,10 +40,17 @@ from pipeline import deliver as deliver_mod
 from pipeline import depth as depth_mod
 from pipeline import escalate as escalate_mod
 from pipeline import evidence as evidence_mod
+from pipeline import decisions as decisions_mod
 from pipeline import harness, ledger, plan, run_check, start
 from pipeline.evidence import evidence_line, evidence_sha, run_baseline, run_criterion, tree_fingerprint
 
 PY = sys.executable.replace("\\", "/")
+
+# Every test builds its own repository and session records, so a parallel run
+# may split this file across workers (tests/_xdist_schedule.py).  Whole, it was
+# one worker grinding for ~12 minutes at the end of the publish run (each test
+# makes ~140 git and shell calls, which slow down under 8 workers).
+XDIST_SPLITTABLE = True
 
 
 # ── a real repository ────────────────────────────────────────────────────────
@@ -74,12 +81,25 @@ def repo(tmp_path: Path) -> Path:
 
 # ── transcripts in the CLI's shape ───────────────────────────────────────────
 
+# The real projects folder, read at import: conftest moves ``Path.home()`` only
+# inside its per-test fixture, so this is the user's.  Every folder there is a
+# project in their sidebar; on 2026-10-27 one run of this file left 97 of them
+# (``…pytest-of-…-proj``).  conftest's guards were in place, so that run did
+# not go through them; this check lives here so it holds even then.
+_REAL_PROJECTS = (Path.home() / ".claude" / "projects").resolve()
+
+
 class FakeSession:
     """Writes a root transcript and subagent transcripts the way the CLI does."""
 
     def __init__(self, project_cwd: Path):
         self.sid = str(uuid.uuid4())
-        self.dir = claude_projects_dir() / encode_cwd(str(project_cwd))
+        projects = claude_projects_dir().resolve()
+        if projects == _REAL_PROJECTS:
+            raise RuntimeError(
+                f"FakeSession would write into the REAL Claude projects folder ({projects}). "
+                "Path.home() is not sandboxed: run this file through pytest with tests/conftest.py.")
+        self.dir = projects / encode_cwd(str(project_cwd))
         self.dir.mkdir(parents=True, exist_ok=True)
         self.root = self.dir / f"{self.sid}.jsonl"
         self.root.write_text("", encoding="utf-8")
@@ -114,6 +134,18 @@ class FakeSession:
 
     def bash_root(self, command: str, stdout: str = "", **kw) -> str:
         return self.tool(self.root, "Bash", {"command": command}, stdout=stdout, **kw)
+
+    def assistant_text(self, text: str, path: Path | None = None) -> None:
+        """The agent's own words (its final message with a card, say)."""
+        self._append(path or self.root, {"type": "assistant", "sessionId": self.sid, "uuid": str(uuid.uuid4()),
+                                         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                                         "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
+
+    def user_text(self, text: str, path: Path | None = None) -> None:
+        """A message the user sent (a card button sends its reply this way)."""
+        self._append(path or self.root, {"type": "user", "sessionId": self.sid, "uuid": str(uuid.uuid4()),
+                                         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                                         "message": {"role": "user", "content": text}})
 
     def write_root(self, file_path: Path, content: str) -> str:
         return self.tool(self.root, "Write", {"file_path": str(file_path), "content": content}, result="ok")
@@ -182,6 +214,33 @@ language would need a bound. Nothing else outstanding.
 """
 
 
+def run_authorized(run_dir: Path, cid: str, *, baseline: bool = False, repo: Path | None = None,
+                   checker=None, policy: str = "auto"):
+    """Authorize (under *policy*, "auto" unless told otherwise) and execute one
+    criterion, the way the two run_check steps do.  With *checker*, the
+    authorize step is recorded in its transcript (the execute step is the
+    test's to record: that is where tests vary).  Returns (record, path)."""
+    dec = run_check.authorize(run_dir, cid, baseline=baseline, repo=repo, policy=policy)
+    if checker is not None:
+        flag = " --baseline" if baseline else ""
+        checker.bash(f"{PY} -m pipeline.run_check authorize {run_dir} {cid}{flag}",
+                     stdout=decisions_mod.decision_line(dec) + "\n")
+    rec, path, _dec = run_check.execute(run_dir, cid, dec["nonce"], baseline=baseline, repo=repo)
+    return rec, path
+
+
+def record_check(checker, run_dir: Path, cid: str, *, baseline: bool = False, repo: Path | None = None) -> dict:
+    """Authorize and execute *cid* as *checker*, recording both steps."""
+    rec, path = run_authorized(run_dir, cid, baseline=baseline, repo=repo, checker=checker)
+    flag = " --baseline" if baseline else ""
+    label = f"{cid}@baseline" if baseline else cid
+    fp = rec["snapshot"] if baseline else rec["fingerprint"]
+    line = evidence_line(label, evidence_sha(path), rec["passed"], str(fp), rec.get("impl"))
+    checker.bash(f"{PY} -m pipeline.run_check execute {run_dir} {cid}{flag} --decision {rec['decision']}",
+                 stdout=(rec.get("stdout_tail") or "") + line + "\n")
+    return rec
+
+
 def _attest(checker, run_dir: Path, stage: str) -> dict:
     """The checker signs its report the way a real one does: it runs
     ``pipeline.attest`` and the engine records the printed line."""
@@ -232,11 +291,8 @@ def make_valid_run(repo: Path, *, route: str = "a", change: bool = True, full: b
 
     tester = sess.agent(brief)
     for cid in ("unit", "lint"):
-        rec, path = run_criterion(run_dir, cid)
+        rec = record_check(tester, run_dir, cid)
         assert rec["passed"], rec
-        tester.bash(f"{PY} -m pipeline.run_check {run_dir} {cid}",
-                    stdout=rec["stdout_tail"]
-                    + evidence_line(cid, evidence_sha(path), True, rec["fingerprint"], rec.get("impl")) + "\n")
     if change:
         record_baseline(tester, run_dir, "unit")
     (run_dir / "04-test.md").write_text("# 04 Test\n\nunit: passed (see evidence/unit.json).\n", encoding="utf-8")
@@ -252,26 +308,20 @@ def make_valid_run(repo: Path, *, route: str = "a", change: bool = True, full: b
 
 def record_baseline(checker, run_dir: Path, cid: str) -> dict:
     """Run the regression demonstration for *cid* and record it as *checker*'s
-    run_check --baseline call."""
-    rec, path = run_baseline(run_dir, cid)
-    checker.bash(f"{PY} -m pipeline.run_check {run_dir} {cid} --baseline",
-                 stdout=evidence_line(f"{cid}@baseline", evidence_sha(path), rec["passed"], rec["snapshot"],
-                                      rec.get("impl")) + "\n")
-    return rec
+    authorized run_check --baseline execution."""
+    return record_check(checker, run_dir, cid, baseline=True)
 
 
-def rerun_fresh(fn, run_dir: Path, cid: str):
-    """Run a criterion again (``run_criterion`` or ``run_baseline``) and make
-    sure the evidence it writes is NEW content.  The record keeps its start to
-    the second and its run time to the millisecond, so a rerun right after
-    make_valid_run's can be byte-identical to the evidence that run_check
-    already printed (measured: 11 in 36 under a loaded parallel run), and that
-    recorded line then rightly counts.  A test that records the rerun some
-    other way (no impl=, another impl, a planted file) needs it to differ."""
+def rerun_fresh(fn, run_dir: Path, cid: str, *, checker=None):
+    """Run a criterion again under a NEW decision (``run_criterion`` or
+    ``run_baseline`` says which) and make sure the evidence it writes is new
+    content.  Every execution carries its own decision id, so the evidence
+    always differs from the one already recorded; the loop stays as a guard."""
+    baseline = fn is run_baseline or fn is evidence_mod.run_baseline
     edir = run_dir / evidence_mod.EVIDENCE_DIR
     before = {p.name: evidence_sha(p) for p in edir.glob("*.json")} if edir.is_dir() else {}
     for _ in range(30):
-        rec, path = fn(run_dir, cid)
+        rec, path = run_authorized(run_dir, cid, baseline=baseline, checker=checker)
         if before.get(path.name) != evidence_sha(path):
             return rec, path
         time.sleep(0.1)
@@ -280,6 +330,28 @@ def rerun_fresh(fn, run_dir: Path, cid: str):
 
 def codes(v: harness.Verdict) -> set[str]:
     return {f.code for f in v.findings}
+
+
+@pytest.fixture
+def auto_policy(tmp_path: Path, monkeypatch):
+    """The CLI reads the machine's permission policy; a test pins its own."""
+    pol = tmp_path / "policy.json"
+    pol.write_text(json.dumps({"policy": "auto"}), encoding="utf-8")
+    monkeypatch.setattr(decisions_mod, "POLICY_PATH", pol)
+    return pol
+
+
+def cli_run(run_dir: Path, cid: str, capsys, *, baseline: bool = False) -> int:
+    """The two run_check steps through the CLI, as an agent runs them.
+    Returns execute's exit code (or authorize's when it fails); capsys holds
+    execute's output afterwards."""
+    flag = ["--baseline"] if baseline else []
+    code = run_check.main(["authorize", str(run_dir), cid, *flag])
+    out = capsys.readouterr().out
+    if code != 0:
+        return code
+    nonce = out.split("PIPELINE-DECISION id=")[1].split()[0]
+    return run_check.main(["execute", str(run_dir), cid, *flag, "--decision", nonce])
 
 
 # ── the valid run ────────────────────────────────────────────────────────────
@@ -450,10 +522,8 @@ def test_an_unexecutable_criterion_caps_the_grade_at_medium(repo):
     unit = PLAN_BLOCK.split("- id: lint")[0].replace("```verification\n", "")
     p.write_text("# plan\n\n```verification\n" + unit +
                  "- id: native-ui\n  executable: false\n  reason: no desktop here\n```\n", encoding="utf-8")
-    rec, path = run_criterion(run_dir, "unit")
     tester = sess.agent("brief")
-    tester.bash(f"{PY} -m pipeline.run_check {run_dir} unit",
-                stdout=evidence_line("unit", evidence_sha(path), True, rec["fingerprint"], rec.get("impl")))
+    record_check(tester, run_dir, "unit")
     record_baseline(tester, run_dir, "unit")
     # The audit accounts for both criteria, the one that cannot run included.
     _audit(run_dir, "## Do the checks prove the request?\n\nunit exercises sub(); native-ui would prove the "
@@ -675,22 +745,22 @@ def test_plan_block_sha_ignores_line_endings_and_trailing_space():
 
 # ── run_check ────────────────────────────────────────────────────────────────
 
-def test_run_check_cli_prints_the_evidence_line_last_and_exits_by_result(repo, capsys):
+def test_run_check_cli_prints_the_evidence_line_last_and_exits_by_result(repo, capsys, auto_policy):
     run_dir, _ = start.create_run(repo, "rc", "a", "x")
     (run_dir / "01-plan.md").write_text("```verification\n- id: ok\n  cmd: " + PY + " -c \"print('fine')\"\n"
                                         "- id: bad\n  cmd: " + PY + " -c \"import sys; sys.exit(3)\"\n```\n",
                                         encoding="utf-8")
-    assert run_check.main([str(run_dir), "ok"]) == 0
+    assert cli_run(run_dir, "ok", capsys) == 0
     out = capsys.readouterr().out.rstrip("\n").splitlines()
     assert out[1] == "fine"
     assert out[-1].startswith("PIPELINE-EVIDENCE id=ok sha=")
     sha = out[-1].split("sha=")[1].split()[0]
     assert sha == evidence_sha(run_dir / "evidence" / "ok.json")
-    assert run_check.main([str(run_dir), "bad"]) == 1
-    assert run_check.main([str(run_dir), "missing"]) == 2
+    assert cli_run(run_dir, "bad", capsys) == 1
+    assert cli_run(run_dir, "missing", capsys) == 2
 
 
-def test_run_check_prints_the_evidence_line_before_the_echo_as_well(repo, capsys):
+def test_run_check_prints_the_evidence_line_before_the_echo_as_well(repo, capsys, auto_policy):
     """The Session Engine keeps only a ~2 KB preview of a tool result over
     ~30 KB (measured 2026-10-27: both the Bash and the PowerShell tool persist
     the rest to a side file).  A 20 KB stdout tail plus a 20 KB stderr tail
@@ -700,7 +770,7 @@ def test_run_check_prints_the_evidence_line_before_the_echo_as_well(repo, capsys
     run_dir, _ = start.create_run(repo, "rc", "a", "x")
     (run_dir / "01-plan.md").write_text("```verification\n- id: loud\n  cmd: " + PY +
                                         " -c \"print('y' * 30000)\"\n```\n", encoding="utf-8")
-    assert run_check.main([str(run_dir), "loud"]) == 0
+    assert cli_run(run_dir, "loud", capsys) == 0
     out = capsys.readouterr().out
     first, last = out.split("\n", 1)[0], out.rstrip("\n").rsplit("\n", 1)[-1]
     assert first == last and first.startswith("PIPELINE-EVIDENCE id=loud sha=")
@@ -916,9 +986,7 @@ def _replan(run_dir: Path, sess, block: str):
     tester = sess.agent("brief")
     for c in plan.load_plan(run_dir)[0]:
         if c.executable:
-            rec, path = run_criterion(run_dir, c.id)
-            tester.bash(f"{PY} -m pipeline.run_check {run_dir} {c.id}",
-                        stdout=evidence_line(c.id, evidence_sha(path), rec["passed"], rec["fingerprint"], rec.get("impl")) + "\n")
+            record_check(tester, run_dir, c.id)
     return tester
 
 
@@ -1040,12 +1108,12 @@ def test_a_baseline_goes_stale_when_its_tests_change(repo):
     assert "baseline-stale" in codes(v)
 
 
-def test_run_check_baseline_cli_exits_by_the_demonstration(repo, capsys):
+def test_run_check_baseline_cli_exits_by_the_demonstration(repo, capsys, auto_policy):
     run_dir, _ = make_valid_run(repo)
-    assert run_check.main([str(run_dir), "unit", "--baseline"]) == 0
+    assert cli_run(run_dir, "unit", capsys, baseline=True) == 0
     assert "PIPELINE-EVIDENCE id=unit@baseline" in capsys.readouterr().out
     (run_dir / "01-plan.md").write_text("# plan\n\n" + ADD_ONLY + "\n", encoding="utf-8")
-    assert run_check.main([str(run_dir), "unit", "--baseline"]) == 1
+    assert cli_run(run_dir, "unit", capsys, baseline=True) == 1
     assert "does not detect it" in capsys.readouterr().err
 
 
@@ -1069,9 +1137,7 @@ def _pinned_repo(repo: Path) -> Path:
 def _run_all(run_dir: Path, checker) -> None:
     for c in plan.load_plan(run_dir)[0]:
         if c.executable:
-            rec, path = run_criterion(run_dir, c.id)
-            checker.bash(f"{PY} -m pipeline.run_check {run_dir} {c.id}",
-                         stdout=evidence_line(c.id, evidence_sha(path), rec["passed"], rec["fingerprint"], rec.get("impl")) + "\n")
+            record_check(checker, run_dir, c.id)
 
 
 def test_the_pinned_suite_is_required_even_when_the_plan_leaves_it_out(repo):
@@ -1218,7 +1284,7 @@ def test_expect_high_is_the_completion_gate_and_lower_grades_still_report(repo, 
 
 # ── found by the qualification run ───────────────────────────────────────────
 
-def test_non_ascii_output_is_recorded_and_echoed_without_crashing(repo, capsys):
+def test_non_ascii_output_is_recorded_and_echoed_without_crashing(repo, capsys, auto_policy):
     """The first real qualification run: pytest printed an ellipsis, the
     evidence recorded U+FFFD, and echoing it to a cp1252 console crashed
     run_check after the evidence was written."""
@@ -1229,7 +1295,7 @@ def test_non_ascii_output_is_recorded_and_echoed_without_crashing(repo, capsys):
         "  expect: passed\n```\n", encoding="utf-8")
     rec, _ = run_criterion(run_dir, "dots")
     assert "…" in rec["stdout_tail"] and "�" not in rec["stdout_tail"], rec["stdout_tail"]
-    assert run_check.main([str(run_dir), "dots"]) == 0
+    assert cli_run(run_dir, "dots", capsys) == 0
     assert "PIPELINE-EVIDENCE id=dots" in capsys.readouterr().out
 
 
@@ -1399,14 +1465,15 @@ def _background_run_check(sess, checker, run_dir, cid, tmp_path, *, tamper=False
     """Run a criterion and record it the way the shell tool does when the
     command outruns its foreground limit: the result names an output file the
     engine writes, and the evidence line is in that file."""
-    rec, path = run_criterion(run_dir, cid)
+    rec, path = run_authorized(run_dir, cid, checker=checker)
     out = tmp_path / "tasks" / f"bg{cid}.output"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(evidence_line(cid, evidence_sha(path), rec["passed"], rec["fingerprint"], rec.get("impl"))
                    + "\n...\n", encoding="utf-8")
     msg = (f"Command did not complete within its 600s timeout and was moved to the background (ID: bg{cid}). "
            f"Output is being written to: {out}. You will be notified when it completes.")
-    sess.tool(checker.path, "Bash", {"command": f"{PY} -m pipeline.run_check {run_dir} {cid}"}, result=msg)
+    sess.tool(checker.path, "Bash",
+              {"command": f"{PY} -m pipeline.run_check execute {run_dir} {cid} --decision {rec['decision']}"}, result=msg)
     if tamper:
         checker.write(out, "forged")
     return rec

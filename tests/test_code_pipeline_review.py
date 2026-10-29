@@ -37,6 +37,10 @@ from tests.test_code_pipeline import (ADD_ONLY, AUDIT_TEXT, COVERAGE_OK, PLAN_BL
                                       _git, _replan, _run_all, _write_stage, codes, make_valid_run, record_baseline,
                                       repo)  # noqa: F401  (repo is the fixture)
 
+# Every test builds its own repository and session records, so a parallel run
+# may split this file across workers (tests/_xdist_schedule.py).
+XDIST_SPLITTABLE = True
+
 
 def _as(sess, agent):
     """A handle that writes and runs as an existing subagent."""
@@ -157,6 +161,10 @@ def test_rewriting_the_base_revision_or_snapshot_in_run_json_is_tampering(repo):
 def test_a_commit_of_unchanged_code_does_not_stale_the_verification(repo):
     run_dir, _ = make_valid_run(repo)
     before = tree_fingerprint(repo)
+    # The sanctioned order: the delivery gate passes, then the commit.  A
+    # commit before it is graded MEDIUM (committed-before-delivery).
+    _rec, delivered = deliver_mod.deliver(run_dir)
+    assert delivered
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "ship")
     assert tree_fingerprint(repo) == before
@@ -352,11 +360,10 @@ def test_the_delivery_gate_recomputes_and_refuses_below_high(repo, capsys):
     assert deliver_mod.main([str(run_dir)]) == 1
     captured = capsys.readouterr()
     assert "grade=MEDIUM" in captured.out and "accepted=false" in captured.out and "Not delivered" in captured.err
-    assert deliver_mod.main([str(run_dir), "--accept", "MEDIUM"]) == 0
-    assert deliver_mod.main([str(run_dir), "--accept", "LOW"]) == 1
-    # BLOCKED is an execution status, not a grade: there is nothing to accept.
+    # There is no flag an agent can type to accept a lower grade: the user
+    # answers a card (tests/test_code_pipeline_cards.py).
     with pytest.raises(SystemExit):
-        deliver_mod.main([str(run_dir), "--accept", "BLOCKED"])
+        deliver_mod.main([str(run_dir), "--accept", "MEDIUM"])
 
 
 # ── found by the Review Team of the evidence-chain run (2026-10-27) ───────────
@@ -497,7 +504,7 @@ def test_run_check_strips_test_steering_variables_and_records_it(repo, monkeypat
     monkeypatch.setenv("PYTEST_ADDOPTS", "-k test_a")
     rec, _ = run_criterion(run_dir, "two")
     assert rec["passed"], rec["stdout_tail"] + rec["stderr_tail"]
-    assert "2 passed" in rec["stdout_tail"] and rec["env_stripped"] == ["PYTEST_ADDOPTS"]
+    assert "2 passed" in rec["stdout_tail"] and "PYTEST_ADDOPTS" in rec["env_stripped"]
 
 
 def test_a_file_hidden_by_git_info_exclude_still_counts(repo):

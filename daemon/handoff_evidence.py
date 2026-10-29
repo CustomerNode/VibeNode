@@ -48,6 +48,10 @@ class TurnFacts:
     prev_path: str = ""     # the first "path" step of that same card
     last_user: str = ""     # the user's latest message, whatever it is ("ok" included)
     history: list = field(default_factory=list)    # every request still in memory, oldest first
+    # Other sessions in this project that are working right now, as the
+    # Session Engine sees them at the stop (names or short ids).  None when
+    # the caller cannot tell (the settings-file copy, an older engine).
+    others_working: Optional[list] = None
 
 
 # A user message that carries no request of its own.
@@ -669,10 +673,98 @@ def reviewer_problems(card: dict, facts: TurnFacts) -> list:
 
 # ── Entry point ───────────────────────────────────────────────────────────
 
+# ── 5. Work left to another session, and Next lines that only hope ───────
+# The owner, 2026-10-28, on a "Blocked" card that left 3 failing tests to
+# "another session's in-progress edit" (that session had not touched the
+# files for 11 minutes) and whose Next line read "That session's own test run
+# should catch these 3": "how do we fix the code in smart termination so this
+# does not happen again".  Two causes.  The rule against blaming another
+# session was only words in the instructions; and VibeNode's note on other
+# active sessions (app/session_awareness.py), written once when a session
+# starts, said to back off and report.  So:
+#   1. a card that leaves work undone because of another session is sent
+#      back when no other session in the project is working now (the engine
+#      knows: ``TurnFacts.others_working``), and, when that is unknown,
+#      unless its "tried" shows the session was seen still working, and when;
+#   2. a Next line that hopes someone else will act ("should catch",
+#      "hopefully") is sent back on any card: say who does what, and when.
+_OTHER_SESSION = re.compile(
+    r"\b(?:another|other|a\s+different|a\s+parallel|the\s+other|someone\s+else'?s?)\s+(?:active\s+|running\s+)?"
+    r"(?:sessions?|agents?)(?:'s|')?\b", re.I)
+_STILL_WORKING = re.compile(r"\b(?:still|is|was|it'?s)\s+(?:working|running|editing|writing|mid-?(?:turn|change|edit))\b", re.I)
+_WHEN_SEEN = re.compile(r"\b\d{1,2}:\d{2}\b|\b\d+\s*(?:s|sec|secs|seconds?|min|mins|minutes?)\b", re.I)
+_HOPE = re.compile(
+    r"\b(?:hopefully|presumably|probably|ought\s+to|is\s+likely\s+to|"
+    r"should\s+(?:catch|notice|fix|handle|take\s+care\s+of|sort\s+(?:it|this|them)\s+out|resolve|cover|"
+    r"pick\s+(?:it|this|them|these|that)\s+up))\b", re.I)
+# Where a card says what is left undone.  Not why/context/answer: those
+# mention other sessions for other reasons ("renewing it needs your account,
+# which another session's run also uses").
+_BLAME_FIELDS = ("headline", "needs.next", "status.remaining", "status.broken", "tried")
+
+
+def _field_texts(card: dict, names) -> list:
+    out = []
+    for name in names:
+        node = card
+        for part in name.split("."):
+            node = node.get(part) if isinstance(node, dict) else None
+        for v in (node if isinstance(node, list) else [node]):
+            if isinstance(v, str) and v.strip():
+                out.append((name, " ".join(v.replace("’", "'").split())))
+    return out
+
+
+def _leaves_work(card: dict) -> bool:
+    status = card.get("status") if isinstance(card.get("status"), dict) else {}
+    return (card.get("type") in ("blocked", "needs_you")
+            or any(isinstance(status.get(k), list) and status.get(k) for k in ("remaining", "broken")))
+
+
+def blame_problems(card: dict, others_working: Optional[list]) -> list:
+    """Work left undone because of another session that may have stopped."""
+    if not _leaves_work(card):
+        return []
+    hit = next(((w, m.group(0)) for w, t in _field_texts(card, _BLAME_FIELDS)
+                for m in [_OTHER_SESSION.search(t)] if m), None)
+    if not hit:
+        return []
+    where, phrase = hit
+    if others_working:                       # someone really is working there now
+        return []
+    if others_working is not None:           # the engine says nobody is
+        return [f"The card leaves work undone because of another session (\"{phrase}\", {where}), but no "
+                "other session in this project is working right now. Nothing stands in your way: "
+                "finish the work yourself, check it, and end on the card for the finished work."]
+    seen = [t for _, t in _field_texts(card, ("tried",)) if _STILL_WORKING.search(t) and _WHEN_SEEN.search(t)]
+    if seen:
+        return []
+    return [f"The card leaves work undone because of another session (\"{phrase}\", {where}). First "
+            "check that session is still working: the session list, or when the files it touched last "
+            "changed (nothing in 5 minutes means it has stopped). If it has stopped, the work is yours: "
+            "finish it and check it. If it is still working, add a \"tried\" line saying what you saw "
+            "and when, e.g. \"Checked 8:11 PM: still working, last edit 8:10\"."]
+
+
+def hope_problems(card: dict) -> list:
+    """A Next line that only hopes someone else will act."""
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    nxt = needs.get("next")
+    if not isinstance(nxt, str):
+        return []
+    m = _HOPE.search(nxt.replace("’", "'"))
+    if not m:
+        return []
+    return [f"needs.next only hopes (\"{m.group(0)}\"): it should say who does what next, and when. "
+            "If the thing left is yours to do, do it now. If nothing will happen on its own, say so "
+            "plainly. If only the user can do it, end on \"needs_you\" with the step."]
+
+
 def problems(card: dict, facts: Optional[TurnFacts]) -> list:
     if not isinstance(card, dict):
         return []
-    out = standalone_problems(card)
+    out = (standalone_problems(card) + hope_problems(card)
+           + blame_problems(card, getattr(facts, "others_working", None) if facts is not None else None))
     if facts is None:
         return out
     return out + claim_problems(card, facts) + request_problems(card, facts) + reviewer_problems(card, facts)

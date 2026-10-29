@@ -50,6 +50,9 @@ def _sessions():
             s["effective_ts"] = s["last_activity_ts"] = s["sort_ts"] = now - 30 * 86400
         if i % 50 == 7:
             s["preview"] = "please fix the zebra stripes"
+        # Marked Done by the person: Done is his verdict, not sleep
+        # (2026-10-28).  Live work still beats it.
+        s["hold"] = "done"
     rows[42]["display_title"] = rows[42]["custom_title"] = "Quarterly Report Draft"
     return rows
 

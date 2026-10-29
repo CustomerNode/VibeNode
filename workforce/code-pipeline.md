@@ -3,7 +3,7 @@ id: code-pipeline
 name: Code Pipeline
 department: compose
 source: vibenode
-version: 1.3.2
+version: 1.4.0
 depends_on: [plan-team, build-team, review-team, test-team, final-audit, debug-team, hotfix-team, refactor-team]
 type: prompt-template
 ---
@@ -98,12 +98,14 @@ That records the sha of the report and the fingerprint of the tree the checker e
 
 A material defect a checker finds is recorded on its own line as `BLOCKING: <short-id> <what is wrong>`. It stops HIGH until a LATER checker stage, written by a different subagent after the fix, records `RESOLVED: <short-id> <what proves it>`. The stage that raised a finding cannot clear it, the builder's report does not count, and rewriting the report does not make the finding go away: the attest records keep every BLOCKING id a signed version carried. The audit is the last stage, so a BLOCKING the audit raises is cleared by a FRESH auditor (a different subagent) that rewrites `08-audit.md` after the fix and records the RESOLVED line; the auditor that raised it cannot. Put the same lines in the briefs' instructions so every checker uses them.
 
-The Test Team runs every executable criterion through the program, never by hand:
+The Test Team runs every executable criterion through the program, never by hand, in two steps:
 
-    python -m pipeline.run_check <run-dir> <criterion-id>
-    python -m pipeline.run_check <run-dir> <criterion-id> --baseline    # each detects_change criterion
+    python -m pipeline.run_check authorize <run-dir> <criterion-id> [--baseline]
+    python -m pipeline.run_check execute   <run-dir> <criterion-id> [--baseline] --decision <id>
 
-That records the command, exit status, output, the plan it read and the tree it ran against in `<run-dir>/evidence/<id>.json`, and prints a `PIPELINE-EVIDENCE` line the engine keeps. A passing summary typed into `04-test.md` is worth nothing; the harness only counts evidence a transcript shows being produced. Failures go into `04-test.md` verbatim (full traceback, full assertion) per Test Team's raw-output rule.
+`authorize` binds the exact operation (the expanded command, the folder, the repository, the plan, the source fingerprint, the environment names it passes) to a decision and prints `PIPELINE-DECISION id=<id> … verdict=allow|pending`. Under the user's **auto** permission policy the decision is allowed at once: run `execute` next, with that id. Under any other policy it is **pending** and the command prints a card: **end your turn with that card, alone, exactly as printed.** The user's tap sends the card's reply ("Run the tests (id)" or "Don't run them (id)") as his own message; on your next turn run `execute` with the id. `execute` rebuilds the operation from the state now and refuses when anything changed since the approval (then authorize again), refuses an unanswered or refused card, uses each decision once, strips secret-shaped variables from the command's environment, and runs the criterion (`--baseline`: the regression demonstration against the starting snapshot, in an isolated worktree). It records the command, exit status, output, the plan, the tree and the decision in `<run-dir>/evidence/<id>.json` and prints the `PIPELINE-EVIDENCE` line first and last. A criterion whose timeout is over nine minutes is executed as a background shell command.
+
+A passing summary typed into `04-test.md` is worth nothing; the harness counts only evidence a transcript shows being produced, under a decision the same session's `authorize` issued, allowed by the policy or by the user's own answer. Evidence with no decision grades LOW (`unauthorized`). Failures go into `04-test.md` verbatim (full traceback, full assertion) per Test Team's raw-output rule.
 
 If a check fails, the Test Team hands the specifics back to the Build Team. After ANY change to the code, every required criterion runs again: the harness grades the tree as it is now, and evidence from an earlier tree is stale. Two fix-and-recheck loops per checker stage; on the third disagreement, stop and bring it to the user with both positions stated. Route (c) has 15 minutes before it escalates.
 
@@ -115,7 +117,9 @@ Two rules for every checker. A checker may challenge the criteria against the or
 
 **Step 6: the grade.** Run `python -m pipeline.harness <run-dir>`. It prints `PIPELINE-VERDICT HIGH|MEDIUM|LOW|BLOCKED` and its findings, and exits 0 whatever the grade, so a MEDIUM or LOW run still gives the user a full report of what is missing. You report that grade. You do not round it up, and you do not argue it down. If a finding is wrong about the facts, fix the fact (run the check again, launch the checker properly) and grade again.
 
-**The completion gate is `python -m pipeline.deliver <run-dir>`.** It recomputes the grade on the tree as it is now (it never reads `verdict.json`), writes `delivered.json`, prints `PIPELINE-DELIVERED grade=… accepted=…`, and exits 0 only for HIGH. Run it immediately before calling the work verified or complete, and before any delivery action (commit, merge, push, package, deploy). Exit 1 means the work is not verified: quote the line in the first line of the report, do not deliver it as done, and name what is missing. The user may still choose to deliver a MEDIUM result; then the user says so, and the command is run again with `--accept MEDIUM`. That is the user's call, stated in the report, never yours.
+**The completion gate is `python -m pipeline.deliver <run-dir>`.** It recomputes the grade on the tree as it is now (it never reads `verdict.json`), writes `delivered.json`, prints `PIPELINE-DELIVERED grade=… accepted=…`, and exits 0 only for HIGH. Run it immediately before calling the work verified or complete, and before any delivery action (commit, merge, push, package, deploy). Exit 1 means the work is not verified: quote the line in the first line of the report, do not deliver it as done, and name what is missing.
+
+**Below HIGH, only the user can accept, on a card.** There is no flag you can type for it. Run `python -m pipeline.deliver <run-dir> --request-acceptance <commit|merge|push|package|deploy>`: it issues a decision bound to this run, this grade, this code and these findings, and prints a card that says in plain words what happened, what it means and what the user decides, with two buttons, **Fix it first** (recommended) and **Commit it anyway**. End your turn with that card, alone, exactly as printed. A "Fix it first" tap is your next instruction: close the gap and ask again. A "Commit it anyway" tap sends `Commit it anyway (<id>)`; on your next turn run `python -m pipeline.deliver <run-dir> --decision <id>`, which passes only if the user's answer is in the transcript, the card was shown unchanged, and nothing (code, grade, findings) changed since. A card you edit answers nothing. Not answering leaves the work undelivered; nothing happens on its own.
 
 **Step 7: deliver and record.** State separately what was built, verified, committed, merged, packaged and deployed, quoting the `PIPELINE-DELIVERED` line. Commit and push only if the user's rules allow it and the gate passed; anything irreversible (production data, auth, payments, secrets, destructive git, anything leaving the machine) waits for the user. A commit of the verified code does not change the grade: the fingerprint is the tree's content, not its commit id. Then:
 
@@ -123,7 +127,7 @@ Two rules for every checker. A checker may challenge the criteria against the or
 
 The ledger recomputes the grade as well, so its row says what the evidence says at that moment.
 
-**What `run_check` runs.** Each criterion's command runs through the platform shell on this machine with this session's permissions; VibeNode's own permission check sees `pipeline.run_check`, not the inner command. That is by design: the command is the verification, written by the planner, pinned in the plan a checker cannot edit, and readable by a person before it runs. Do not put anything in a `cmd` you would not run by hand here: no network calls to production, no credentials, no destructive steps. A baseline worktree isolates the source files, not the machine.
+**What `run_check` runs, and what approving it means.** Each criterion's command runs through the platform shell on this machine; VibeNode's own permission check sees `pipeline.run_check`, not the inner command, so the pipeline asks for the inner command itself: it reads the user's permission policy and, when that policy is not automatic, puts the exact command on a card for the user. Approving a command says nothing about the code it runs: a permitted `pytest` still executes the project's tests, and the command still has the filesystem and the network; secret-shaped variables are kept out of its environment, which is not a sandbox. Do not put anything in a `cmd` you would not run by hand here: no network calls to production, no credentials, no destructive steps. A baseline worktree isolates the source files, not the machine. A commit made in the run's repository before a passed delivery is reported (`committed-before-delivery`) and flagged in the ledger, not prevented: Code Pipeline does not sit in VibeNode's permission path.
 
 ## Standing Criteria
 

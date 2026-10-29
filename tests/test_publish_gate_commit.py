@@ -175,8 +175,19 @@ class TestModeLabels:
         assert "e2e" not in ta.MODES["fast"]["label"].lower().replace("e2e suite runs in ci", "")
         assert "CI" in ta.MODES["full"]["label"]
         assert "60s" in ta.MODES["fast"]["label"] and "120s" in ta.MODES["full"]["label"]
-        assert ta.MODES["fast"]["pytest_args"] == ["--ignore=tests/e2e", "--timeout=60"]
-        assert ta.MODES["full"]["pytest_args"] == ["--timeout=120"]
+        cp = "--ignore-glob=tests/test_code_pipeline*.py"
+        assert ta.MODES["fast"]["pytest_args"] == ["--ignore=tests/e2e", cp, "--timeout=60"]
+        assert ta.MODES["full"]["pytest_args"] == [cp, "--timeout=120"]
+
+    def test_code_pipeline_tests_never_gate_a_publish_but_ci_runs_them(self):
+        """Code Pipeline is a separate tool; its tests do not gate a VibeNode
+        Update (owner, 2026-10-28).  CI keeps running the whole suite."""
+        import app.routes.test_api as ta
+        for mode in ta.MODES.values():
+            assert ta.CODE_PIPELINE_TESTS in mode["pytest_args"]
+            assert "Code Pipeline tests run in CI" in mode["label"]
+        ci = (ta._REPO_ROOT / ".github" / "workflows" / "unit-tests.yml").read_text(encoding="utf-8")
+        assert "test_code_pipeline" not in ci, "CI must keep running the Code Pipeline tests"
 
     def test_the_docstring_no_longer_claims_full_includes_e2e(self):
         import app.routes.test_api as ta
@@ -189,7 +200,7 @@ class TestModeLabels:
         app.register_blueprint(ta.bp)
         body = app.test_client().get("/api/test-modes").get_json()
         assert body["modes"]["full"]["label"] == ta.MODES["full"]["label"]
-        assert body["modes"]["fast"]["pytest_args"] == ["--ignore=tests/e2e", "--timeout=60"]
+        assert body["modes"]["fast"]["pytest_args"] == ta.MODES["fast"]["pytest_args"]
 
     def test_the_dialog_fallback_matches_the_server(self):
         import re

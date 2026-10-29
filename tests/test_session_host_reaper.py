@@ -35,7 +35,7 @@ from daemon import session_host_transport as sht
 from daemon.backends.claude import ClaudeAgentSDK
 from daemon.session_manager import SessionManager, SessionState
 from tests._session_host_helpers import (
-    RawClient, is_type, kill_if_same, launch_host, make_fake_cli, wait_until,
+    RawClient, is_type, kill_if_same, launch_host, make_fake_cli, pin_preferences, wait_until,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -118,6 +118,7 @@ def fake(tmp_path, monkeypatch):
     cwd.mkdir()
     sdk = ClaudeAgentSDK()
     sdk.host_cli_path = make_fake_cli(tmp_path / "bin", FAKE_CLI_LOG=str(tmp_path / "cli.log"))
+    pin_preferences(monkeypatch)
     engines = []
 
     def engine():

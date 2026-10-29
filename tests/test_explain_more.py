@@ -49,7 +49,7 @@ def out():
                              "replies": [{"key": "D", "label": "I did it now", "reply": "done"}]}),
     }
     r = subprocess.run(["node", "-e", SCRIPT, str(LAST_CARD), json.dumps(cards)],
-                       capture_output=True, text=True, timeout=30, check=True)
+                       capture_output=True, text=True, encoding="utf-8", timeout=30, check=True)
     return json.loads(r.stdout)
 
 
@@ -78,17 +78,17 @@ def test_no_explained_text_no_button(out):
 
 
 def test_no_icon_and_no_status_colour():
-    css = CSS.read_text()
+    css = CSS.read_text(encoding="utf-8")
     block = css[css.index('/* "Explain more"'):]
     rules = [r for r in re.findall(r"[^{}]*\{[^}]*\}", block) if "lm-xpl" in r]
     assert rules
     assert not any("--tone" in r for r in rules), "Explain more must not take the card's status colour"
-    js = LAST_CARD.read_text()
+    js = LAST_CARD.read_text(encoding="utf-8")
     tg = js[js.index('class="lm-xpl-tg"'):js.index('class="lm-xpl-tg"') + 200]
     assert "<svg" not in tg.split("</button>")[0]
 
 
 def test_it_does_not_reuse_the_more_bands_class():
     """The card's MORE band already uses .lm-more (and a click handler on it)."""
-    js = LAST_CARD.read_text()
+    js = LAST_CARD.read_text(encoding="utf-8")
     assert 'class="lm-more"><button type="button" class="lm-xpl-tg"' not in js

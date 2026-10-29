@@ -96,6 +96,40 @@ def test_state_for_pins_the_hold_to_the_newest_message():
     assert state_for(None, 1.0) is None
 
 
+# ── The one-time backfill: the backlog is marked Done once (2026-10-28) ──
+
+def _row(sid, ts, verb=None):
+    return {"id": sid, "last_activity_ts": ts, "next_step": {"verb": verb} if verb else None}
+
+
+def test_backfill_marks_old_sessions_done_once(tmp_path):
+    from app import session_holds as sh
+    old = sh.BACKFILL_CUTOFF_TS - 86400
+    rows = [_row("old_review", old, "review"), _row("old_plain", old),
+            _row("old_decide", old, "decide"), _row("old_unblock", old, "unblock"),
+            _row("recent", sh.BACKFILL_CUTOFF_TS + 60, "review"), _row("never", 0)]
+    (tmp_path / sh.FILENAME).write_text(json.dumps({"old_plain": {"state": "standby", "at": old, "set": 1}}), encoding="utf-8")
+    assert sh.backfill_reviewed(rows, tmp_path) == 1
+    holds = json.loads((tmp_path / sh.FILENAME).read_text(encoding="utf-8"))
+    assert holds["old_review"]["state"] == "done" and holds["old_review"]["at"] == old
+    assert holds["old_plain"]["state"] == "standby"           # his own choice is kept
+    for sid in ("old_decide", "old_unblock", "recent", "never"):   # still his, or too new
+        assert sid not in holds
+    # Once per project: a later run marks nothing, even a session that aged.
+    assert (tmp_path / sh.BACKFILL_MARKER).exists()
+    assert sh.backfill_reviewed([_row("late", old, "review")], tmp_path) == 0
+    assert "late" not in json.loads((tmp_path / sh.FILENAME).read_text(encoding="utf-8"))
+
+
+def test_a_backfilled_done_ends_on_the_next_message(tmp_path):
+    from app import session_holds as sh
+    old = sh.BACKFILL_CUTOFF_TS - 86400
+    sh.backfill_reviewed([_row("s", old, "review")], tmp_path)
+    entry = sh.load(tmp_path)["s"]
+    assert sh.state_for(entry, old) == "done"
+    assert sh.state_for(entry, old + 60) is None
+
+
 # ── What the sidebar draws ──
 
 HARNESS = r"""
@@ -133,7 +167,9 @@ def test_the_sidebar_draws_standby_between_needs_you_and_done(tmp_path):
     assert out["rev"][:3] == ["Done", "vs-done", "sleeping"]          # a marked Done question or review
     assert out["w"][:2] == ["Working", "vs-working"]                   # live work beats the hold
     assert out["q"][:3] == ["Needs you", "vs-needs", "question"]       # a question still needs you, asleep
-    assert out["after_msg"][:2] == ["Done", "vs-done"]                # asleep, no card: plain Done, not Standby
+    # A new message ends Standby; asleep with no verdict it waits for him
+    # again (Done is his verdict, never sleep alone: owner, 2026-10-28).
+    assert out["after_msg"][:2] == ["Needs you", "vs-needs"]
     assert out["applied"][:2] == ["Standby", "vs-standby"] and out["cleared"][:2] == ["Needs you", "vs-needs"]
     # "Active first": Needs you, Working, Standby, Done
     assert out["plain"][3] < out["w"][3] < out["dec"][3] < out["rev"][3]

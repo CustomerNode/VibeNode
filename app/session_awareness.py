@@ -69,41 +69,42 @@ def _get_all_states_cached(daemon_client) -> list:
 
 _CROSS_SESSION_TEMPLATE = """## Other Active Sessions in This Project
 
-The following sessions are currently active in the same project as you:
+The following sessions were active in the same project when your session
+started.  This list is a snapshot and does not update: a session shown as
+working may have stopped since.
 
 {session_lines}
 
 ### Multi-Session Conflict Guidance
 
-Multiple sessions are working in this project simultaneously.  Follow
-these rules:
+Multiple sessions may be working in this project.  Follow these rules:
 
 1. **Before editing a file that another session has recently touched**
    (listed above), re-read it first so you are working from the latest
    version on disk.
 
-2. **If you hit unexpected errors** — import failures, missing functions,
-   changed signatures — and you can see above that another session is
-   actively editing related files, **do not fight it.**  The other session
-   is likely mid-refactor.  Back off from that file and move on to other
-   parts of your task.
+2. **If you hit unexpected errors** (import failures, missing functions,
+   changed signatures) in files another session is editing right now,
+   **do not fight it.**  Work on other parts of your task first, then come
+   back to it.
 
-3. **If you cannot complete part of your task** because it conflicts with
-   another active session's work, that is OK.  Complete everything else,
-   then clearly surface the incomplete part to the user in your final
-   response:
-
-   **\u26a0 Not completed \u2014 potential conflict with another active session:**
-   Describe what you could not do and which file(s) were affected so the
-   user can retry after the other session finishes.
+3. **Another session is never a reason to leave your task unfinished.**
+   Before you hold back, check that the other session is still working:
+   when did the files it touched last change?  Nothing in the last 5
+   minutes means it has stopped, and the work is yours: finish it, matching
+   the direction of its changes (read its diff), and check it.  Only while
+   it is still editing those files do you wait or work elsewhere; if you
+   end your turn then, say in "tried" what you saw and when.  Smart
+   termination sends back a card that leaves work to a session that has
+   stopped.
 
 4. **Keep edits surgical** on any file another session may also be
    touching.  Small, targeted changes are far less likely to collide than
    large rewrites.
 
 5. **Do not attempt to coordinate with or send messages to other sessions.**
-   Just be aware of them, work around conflicts when needed, and tell the
-   user what you skipped."""
+   Just be aware of them, check whether they are still working before you
+   defer to them, and tell the user how you handled any overlap."""
 
 
 # ---------------------------------------------------------------------------

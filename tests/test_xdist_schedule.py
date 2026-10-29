@@ -166,3 +166,94 @@ def test_the_real_flags_and_browser_detection():
     assert s._splittable("tests/test_session_manager.py") is False
     assert s._heavy("tests/test_notify_flash.py") is True
     assert s._heavy("tests/test_session_manager.py") is False
+
+
+def test_a_first_worker_crash_of_a_test_is_marked_rerun_not_failed():
+    """2026-10-28: test_code_pipeline_review.py::test_attest_cli crashed with a
+    native Windows access violation inside subprocess._wait on Python 3.14
+    ARM64, under 8-worker loadfile parallelism.  LoadScopeScheduling.remove_node
+    already re-queues the workload (including the crashed test), so the test
+    runs again on another worker; the hook changes the first crash's spurious
+    ``failed`` report to ``rerun`` so pytest does not count it as a failure.
+    The retry's own report is what stands."""
+    from tests import conftest
+
+    class _Report:
+        outcome = "failed"
+        when = "???"
+        failed = True
+
+    # First crash: outcome is flipped to "rerun", so report.failed goes False.
+    conftest._crash_retry_count.clear()
+    r1 = _Report()
+    conftest.pytest_handlecrashitem("tests/test_x.py::t_one", r1, None)
+    assert r1.outcome == "rerun"
+    assert conftest._crash_retry_count["tests/test_x.py::t_one"] == 1
+    # Second crash of the SAME test: leave it as a real failure (no infinite retry).
+    r2 = _Report()
+    conftest.pytest_handlecrashitem("tests/test_x.py::t_one", r2, None)
+    assert r2.outcome == "failed"
+    assert conftest._crash_retry_count["tests/test_x.py::t_one"] == 2
+    # A DIFFERENT test's first crash is still a rerun.
+    r3 = _Report()
+    conftest.pytest_handlecrashitem("tests/test_x.py::t_two", r3, None)
+    assert r3.outcome == "rerun"
+
+
+def test_the_crash_retry_can_be_turned_off(monkeypatch):
+    """Kill switch for the retry (``VIBENODE_NO_CRASH_RETRY=1``): the hook
+    leaves the report as failed so a developer debugging a genuinely-crashing
+    test sees it fail on the first run."""
+    from tests import conftest
+
+    monkeypatch.setenv("VIBENODE_NO_CRASH_RETRY", "1")
+
+    class _Report:
+        outcome = "failed"
+        when = "???"
+        failed = True
+
+    conftest._crash_retry_count.clear()
+    r = _Report()
+    conftest.pytest_handlecrashitem("tests/test_x.py::t_off", r, None)
+    assert r.outcome == "failed"
+    assert "tests/test_x.py::t_off" not in conftest._crash_retry_count
+
+
+def test_an_xdist_worker_crash_is_actually_retried_end_to_end(tmp_path):
+    """Drive the real xdist controller + a worker that crashes on its first
+    run of a specific test, and confirm the retry runs on another worker and
+    the overall exit code is 0.
+
+    The crashing test uses a file flag so the first run of it hits
+    ``os._exit(134)`` (SIGABRT-equivalent on Windows) and the retry finds the
+    flag and passes.  Without the ``pytest_handlecrashitem`` hook in
+    conftest.py the controller would record the first run's crash report as a
+    failure and exit 1 even though the retry passes."""
+    import subprocess
+    import sys
+
+    (tmp_path / "conftest.py").write_text(
+        "import sys\n"
+        "sys.path.insert(0, r'" + str(ROOT) + "')\n"
+        "from tests.conftest import pytest_handlecrashitem  # noqa: F401\n",
+        encoding="utf-8")
+    (tmp_path / "test_sub.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "FLAG = Path(__file__).parent / 'crashed_once.flag'\n"
+        "def test_passes():\n"
+        "    assert True\n"
+        "def test_crashes_once_then_passes():\n"
+        "    if not FLAG.exists():\n"
+        "        FLAG.write_text('x')\n"
+        "        os._exit(134)  # SIGABRT-equivalent: worker crash, no traceback\n"
+        "    assert True\n",
+        encoding="utf-8")
+    r = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "xdist", "--dist", "loadfile",
+         "-n", "2", "-q", "--no-header", str(tmp_path)],
+        cwd=str(tmp_path), capture_output=True, text=True, timeout=120)
+    # The retry must have run and the suite must exit clean (0): without the
+    # hook, the first crash report would set testsfailed and exit 1.
+    assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"

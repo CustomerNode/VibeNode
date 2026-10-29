@@ -9,7 +9,7 @@
  *   You decide, it can't go on  decide · unblock · approve
  *   You check, when you can     review · read · send   (Accept or Send back)
  *   It is busy                  working · waiting
- *   Finished                    done (a sleeping session)
+ *   Finished                    done (your verdict: a 'done' hold)
  *
  * Inputs, strongest first:
  *   - live state: a running turn is Working, an open permission is Approve,
@@ -70,7 +70,7 @@
   // says it, and behaviour reads it); everything drawn goes through shown().
   //   Needs you  decide · unblock · approve · review · read · send · new
   //   Working    working · waiting
-  //   Done       done (a sleeping session)
+  //   Done       done (the person's verdict, not sleep)
   const GROUP = { decide: 'needs', unblock: 'needs', approve: 'needs', review: 'needs', read: 'needs', send: 'needs', idle: 'needs',
     working: 'working', waiting: 'working', standby: 'standby', done: 'done' };
   // Standby (owner, 2026-10-28, static/scratch/standby-status.html option A):
@@ -248,15 +248,21 @@
     const step = _cardStep(sid);
     const v = step && step.verb;
     if (v === 'decide' || v === 'unblock') return v;                // still yours, awake or not
-    // The workflow terminates (2026-10-27): a sleeping session is Done, and
-    // an awake one that stopped is never "Idle": it waits for your verdict,
-    // as Review unless its card says Read or Send.  Opening it does not
-    // clear that; Accept (sleep) or Send back does.
+    // The workflow terminates (2026-10-27): a stopped session, awake or
+    // asleep, is never "Idle": it waits for your verdict, as Review unless
+    // its card says Read or Send.  Opening it does not clear that; Accept
+    // or Send back does.
     // A session that has not replied yet (a new one, nothing sent) has
     // nothing to judge and nothing done: no "Is this right?", no Accept on
     // its card, and not Done (its card is drawn before it is marked open).
     if (!v && _neverReplied(sid)) return 'idle';
-    if (st === 'sleeping') return 'done';
+    // Done is the person's verdict, never an inference from sleep (owner,
+    // 2026-10-28: "we are using sleep to determine status but is sleep
+    // deterministic?").  Sleep has many causes he never sees (watchdogs,
+    // limits, restarts), so a session slept without a verdict stays Needs
+    // you.  A verdict is a 'done' hold (above): Accept / Got it / Sent it or
+    // the double-click.  The backlog was marked once on the server
+    // (app/session_holds.py backfill_reviewed).
     if (v === 'waiting') return 'waiting';
     if (v === 'read' || v === 'send') return v;
     return 'review';

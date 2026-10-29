@@ -55,16 +55,23 @@ KEEPALIVE_S = 15  # an SSE comment this often: dead connections are noticed
 LAST_RUN_LOG = _REPO_ROOT / "logs" / "last_test_run.log"  # logs/ is gitignored
 LAST_RUN_JUNIT = _REPO_ROOT / "logs" / "last_test_run.xml"
 
+# Code Pipeline is a separate tool that lives in this repository; it is not
+# part of what an Update publishes, so its tests do not gate one (the owner,
+# 2026-10-28: "Code pipeline should have nothing to do with pushing vibenode
+# updates").  They were 61% of a local run's time.  CI still runs them on
+# every push (.github/workflows/unit-tests.yml runs the whole suite).
+CODE_PIPELINE_TESTS = "--ignore-glob=tests/test_code_pipeline*.py"
+
 # What each mode really runs.  Shown in the Publish dialog (static/js/git-sync.js)
 # and recorded in the commit message's "Publish gate" line.
 MODES = {
     "fast": {
-        "label": "Fast: unit + browser tests, 60s timeout",
-        "pytest_args": ["--ignore=tests/e2e", "--timeout=60"],
+        "label": "Fast: unit + browser tests, 60s timeout (Code Pipeline tests run in CI)",
+        "pytest_args": ["--ignore=tests/e2e", CODE_PIPELINE_TESTS, "--timeout=60"],
     },
     "full": {
-        "label": "Full: unit + browser tests, 120s timeout (e2e suite runs in CI only)",
-        "pytest_args": ["--timeout=120"],
+        "label": "Full: unit + browser tests, 120s timeout (e2e and Code Pipeline tests run in CI)",
+        "pytest_args": [CODE_PIPELINE_TESTS, "--timeout=120"],
     },
 }
 
@@ -293,9 +300,17 @@ def api_run_tests():
         if _test_proc and _test_proc.poll() is None:
             with _run_cond:
                 active = _run
-            if active is not None and active["done"] is None and active["mode"] == mode:
+            # Join the run in progress when it covers what was asked for: a
+            # full run is a fast run with a longer timeout, so a Sync asking
+            # for fast tests waits on it instead of being refused.  Refusing
+            # left "Tests already running" with nothing on screen to watch or
+            # cancel when the run was started from another tab or device.
+            if (active is not None and active["done"] is None
+                    and (active["mode"] == mode or active["mode"] == "full")):
                 return _stream(active, 0)
-            return _error_stream("Tests already running")
+            running = active["mode"] if active is not None else "a"
+            return _error_stream(f"A {running} test run is already in progress. "
+                                 "Wait for it to finish, or cancel it.", busy=True)
 
         cmd = [_console_python(), "-m", "pytest", "--tb=short", "-q", "--no-header"]
         cmd += MODES[mode]["pytest_args"]

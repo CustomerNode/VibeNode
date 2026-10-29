@@ -59,7 +59,7 @@ def out():
              "answer": {"type": "explain", "headline": "Q", "context": "x", "answer": "- a\n- b",
                         "needs": {"kind": "none", "why": "y", "next": "z"}}}
     r = subprocess.run(["node", "-e", SCRIPT, str(LAST_CARD), json.dumps(cards), json.dumps({"md": BODY, "text": TEXT})],
-                       capture_output=True, text=True, timeout=30, check=True)
+                       capture_output=True, text=True, encoding="utf-8", timeout=30, check=True)
     return json.loads(r.stdout)
 
 
@@ -212,7 +212,7 @@ def back():
                                     "reply": "Back to <Standby> now"}),
              "noreply": _done(back_to={"label": "Standby"}), "without": _done(), "bad": _done(back_to="Standby")}
     r = subprocess.run(["node", "-e", BACK_SCRIPT, str(LAST_CARD), json.dumps(cards)],
-                       capture_output=True, text=True, timeout=30, check=True)
+                       capture_output=True, text=True, encoding="utf-8", timeout=30, check=True)
     return json.loads(r.stdout)
 
 
@@ -295,7 +295,7 @@ def files_out():
         pytest.skip("node not installed")
     cards = {"files": _files_card(), "both": _files_card(body="## Notes\nRead me first.")}
     r = subprocess.run(["node", "-e", BACK_SCRIPT, str(LAST_CARD), json.dumps(cards)],
-                       capture_output=True, text=True, timeout=30, check=True)
+                       capture_output=True, text=True, encoding="utf-8", timeout=30, check=True)
     return json.loads(r.stdout)
 
 
@@ -322,7 +322,7 @@ def test_an_older_card_pointing_at_a_download_downloads_it():
     old = _the_card_that_was_sent()
     old["links"] = [{"label": "PDF", "kind": "file", "url": "/static/scratch/x.pdf"}]
     r = subprocess.run(["node", "-e", BACK_SCRIPT, str(LAST_CARD), json.dumps({"old": old})],
-                       capture_output=True, text=True, timeout=30, check=True)
+                       capture_output=True, text=True, encoding="utf-8", timeout=30, check=True)
     h = json.loads(r.stdout)["old"]
     assert '<a class="lm-row lm-dlfile lm-validate" href="' + ZIP + '" download=' in h
     assert 'href="/static/scratch/x.pdf" download="x.pdf"' in h

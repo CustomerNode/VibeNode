@@ -818,6 +818,96 @@ def format_problems(card: dict) -> list[str]:
     return out
 
 
+# ── Layer 1a: handing over work the session could do ─────────────────────
+# The owner, 2026-10-28, on a ChatGPT cleanup session that found no browser
+# tools and ended on "open a terminal, run claude --chrome, type: organize my
+# ChatGPT chats": "this looks like a session that should be taking action ...
+# fix smart termination so this type of error does not occur again, not just
+# the specific case".  The class: a session that hits a missing tool (or a
+# command it could run) and hands the job to him instead of finding another
+# way.  Two checks, on the card alone so the settings-file copy runs them too:
+#   1. a step that gives him a command to run, a terminal to open, or a new
+#      session to start is work with a shell behind it: the session runs it;
+#   2. a "needs_you" or "blocked" card that gives up on a missing ability
+#      ("I can't reach", "this session has no browser") must show at least
+#      two other ways it tried and why only he can do it.
+# Steps only a person can do (a login, a password or code, an approval on
+# his phone, restarting the Session Engine, hands-on work) pass.
+_RUNNABLE_STEP = re.compile(
+    r"\b(?:open|start|launch)\s+(?:up\s+)?(?:a\s+|your\s+|the\s+)?(?:new\s+)?(?:terminal|command\s+prompt|cmd|"
+    r"powershell|shell|console|bash)\b"
+    r"|\bin\s+(?:(?:a|your|the)\s+)?(?:new\s+)?(?:terminal|command\s+prompt|powershell|shell|console)\b"
+    r"|\b(?:start|open|launch|run)\s+(?:a\s+|another\s+)?(?:new\s+|separate\s+|second\s+)?(?:claude|claude\s+code)"
+    r"(?:\s+(?:code\s+)?session)?\b"
+    r"|\b(?:start|open|launch)\s+(?:a\s+|another\s+)?(?:new\s+|separate\s+|second\s+)session\b", re.I)
+_HUMAN_ONLY = re.compile(
+    r"\b(?:log\s*in|login|log\s+into|sign(?:ed)?\s*in|password|passcode|passphrase|2fa|mfa|two-factor|"
+    r"verification\s+code|one-time\s+code|captcha|sudo|administrator|admin\s+rights|uac|"
+    r"auth(?:enticate|orize)?|credentials?|session\s+engine|unplug|plug\s+in|on\s+your\s+phone)\b", re.I)
+_CANT_DO = re.compile(
+    r"\bI\s+(?:can'?t|cannot|am\s+unable\s+to|have\s+no\s+way\s+to|don'?t\s+have\s+(?:a\s+way|access|"
+    r"the\s+tools?|tools?|any\s+(?:way|tools?)))\b"
+    r"|\b(?:this|the|my)\s+session\s+(?:can'?t|cannot|has\s+no|doesn'?t\s+have|lacks|still\s+can'?t)\b"
+    r"|\bno\s+(?:browser|tools?|access)\s+(?:control\s+)?(?:here|to|for|in\s+this|available)\b"
+    r"|\bnot\s+available\s+to\s+me\b|\b(?:outside|beyond)\s+(?:my|this\s+session'?s)\s+reach\b"
+    r"|\bcan'?t\s+(?:reach|open|control|access|get\s+(?:to|into))\b", re.I)
+_CANT_FIELDS = ("headline", "context", "needs.ask", "needs.why")
+MIN_TRIED = 2
+
+
+def _tried(card: dict) -> list:
+    """What the card says it already tried, wherever it put it."""
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    out = []
+    for it in _items(needs.get("tried")) + _items(card.get("tried")) + _items(card.get("did")):
+        txt = _s(it.get("what")) if isinstance(it, dict) else _s(it)
+        if txt:
+            out.append(txt)
+    return list(dict.fromkeys(out))
+
+
+def handover_problems(card: dict) -> list[str]:
+    """Work handed to the user that the session could do, or find a way to do."""
+    out: list[str] = []
+    t = card.get("type")
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    runnable = []
+    for st in _items(needs.get("steps")):
+        text = _s(st.get("text")) if isinstance(st, dict) else _s(st)
+        cmd = _s(st.get("command")) if isinstance(st, dict) else ""
+        both = _norm(text + " " + cmd)
+        if (cmd or _RUNNABLE_STEP.search(both)) and not _HUMAN_ONLY.search(both):
+            runnable.append(cmd or text)
+    if runnable:
+        shown = ", ".join(f"\"{r[:60]}\"" for r in runnable[:3])
+        out.append(f"needs.steps hands the user work you can run yourself ({shown}). You have a shell: "
+                   "run the command, write the script, or call the tool. Never send him to a terminal or "
+                   "to start another session. If a step truly needs him (a login, a password or code, "
+                   "an approval only he can give), say that in the step.")
+    if t in ("needs_you", "blocked"):
+        fields = {"headline": card.get("headline"), "context": card.get("context"),
+                  "needs.ask": needs.get("ask"), "needs.why": needs.get("why")}
+        gap = None
+        for where in _CANT_FIELDS:
+            m = _CANT_DO.search(_norm(_s(fields.get(where))))
+            if m:
+                gap = (where, m.group(0).strip())
+                break
+        if gap and len(_tried(card)) < MIN_TRIED:
+            out.append(f"The card gives up on something you lack (\"{gap[1]}\" in {gap[0]}) without "
+                       f"showing other ways you tried. A missing tool is a reason to find another way, "
+                       "not to hand the job over: write a script, use a library (Playwright, requests), "
+                       "call the service's API or the app's own routes, or use a different tool. Try at "
+                       f"least {MIN_TRIED}, then list them in needs.tried as {{\"what\": ..., \"result\": "
+                       "...}} and say in needs.only_you why only he can do the rest. If one works, do the "
+                       "work instead.")
+        if gap and t == "needs_you" and needs.get("kind") == "action" and not _s(needs.get("only_you")):
+            if len(_tried(card)) >= MIN_TRIED:
+                out.append("needs.only_you is empty: say why only the user can do this step, now that "
+                           "the other ways failed.")
+    return out
+
+
 # ── Layer 1b: length ──────────────────────────────────────────────────────
 # The owner, 2026-10-27, on a 600-word needs_you card: "this response is way
 # too fucking long, fix the system to not allow this".  The card is read at a
@@ -1149,6 +1239,15 @@ with "files".
 "needs_you"). One decision, the one that blocks the work.
 - Only he can do the next step (log in, restart, approve) → "needs_you" with \
 "action" or "approve".
+A missing tool or ability is never a reason to hand him the job. Find \
+another way first: write a script, use a library (Playwright, requests), \
+call the service's API or the app's own routes, or use a different tool. A \
+step that sends him to a terminal, gives him a command to run, or has him \
+start another session is sent back: you have a shell, so run it. If at \
+least two other ways truly failed, an action card lists them in \
+needs.tried ([{"what": "...", "result": "..."}]) and says in \
+needs.only_you why only he can do the rest; a card that says "I can't" \
+without them is sent back.
 - Your own background work is still running → "working". Something outside \
 your control stops you → "blocked".
 - Work he asked for waits only on his yes (he asked a question about it, or \
@@ -1305,8 +1404,8 @@ def review(message: str, facts=None) -> Optional[str]:
     if err:
         return ("Smart termination: " + err + " End every turn with one ```" + FENCE_LANG
                 + " card as the last thing in your message.\n\n" + INSTRUCTIONS)
-    problems = (format_problems(card) + download_problems(card) + length_problems(card)
-                + machinery_problems(card) + variant_name_problems(card))
+    problems = (format_problems(card) + download_problems(card) + handover_problems(card)
+                + length_problems(card) + machinery_problems(card) + variant_name_problems(card))
     hits = _checks(card, prose)
     labels = label_problems(card, prose)
     from daemon import handoff_evidence

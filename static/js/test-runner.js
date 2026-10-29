@@ -94,7 +94,7 @@ function _streamTestRun(mode, handlers) {
               finish(() => handlers.onDone(d, lines));
               return;
             } else if (d.type === 'error') {
-              finish(() => handlers.onError(d.line, {lost: !!d.lost, started: !!runId}));
+              finish(() => handlers.onError(d.line, {lost: !!d.lost, started: !!runId, busy: !!d.busy}));
               return;
             }
           }

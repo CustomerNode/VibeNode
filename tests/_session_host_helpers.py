@@ -36,6 +36,20 @@ def make_fake_cli(folder: Path, **env) -> str:
     return str(p)
 
 
+def pin_preferences(monkeypatch) -> None:
+    """Engine tests run with Smart termination off, whatever the owner's
+    kanban_config says.  With it on, the engine appends its ~14k-character
+    card instructions to the CLI's argv, and on Windows the fake CLI is a
+    ``.bat`` that cmd.exe refuses past 8,191 characters: the CLI exits 1
+    before Python starts (seen 2026-10-28, every hosted SessionManager test
+    failed on the owner's machine and passed on CI).  ``common.config`` is
+    patched, not SessionManager, so a test that reloaded session_manager is
+    covered too."""
+    from common import config as _cfg
+    real = _cfg.get_kanban_config
+    monkeypatch.setattr(_cfg, "get_kanban_config", lambda *a, **k: {**real(*a, **k), "smart_termination": False})
+
+
 def read_log(path) -> list:
     try:
         return [json.loads(l) for l in Path(path).read_text(encoding="utf-8").splitlines() if l.strip()]

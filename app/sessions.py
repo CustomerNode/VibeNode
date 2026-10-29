@@ -675,7 +675,19 @@ def all_sessions(summary_only: bool = False, project: str = "") -> list:
             sessions.extend(_load(m) for m in misses)
     # Standby / marked Done (app/session_holds.py): only rows that have one
     # get a "hold" key, so a project without holds lists exactly as before.
-    from .session_holds import overlay as _hold_overlay
+    from .session_holds import overlay as _hold_overlay, backfill_reviewed as _backfill
+    # Done is the person's verdict, not sleep: the backlog is marked once per
+    # project (session_holds.backfill_reviewed).  Never under pytest's app.
+    try:
+        from flask import current_app
+        _testing = bool(current_app.testing)
+    except Exception:
+        _testing = False
+    if not _testing:
+        try:
+            _backfill(sessions, sdir)
+        except Exception:
+            pass
     _hold_overlay(sessions, sdir)
     sessions.sort(key=lambda x: x["sort_ts"], reverse=True)
     return sessions

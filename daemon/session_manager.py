@@ -3471,9 +3471,10 @@ class SessionManager:
                         # Re-pin the session's effort.  Without this every
                         # self-heal reconnect silently dropped the session to
                         # the CLI default level (seen live 2026-10-01).
-                        extra_args=({"effort": info.effort}
-                                    if getattr(info, "effort", "") in self.VALID_EFFORTS
-                                    else {}),
+                        extra_args=self._with_chrome(
+                            {"effort": info.effort}
+                            if getattr(info, "effort", "") in self.VALID_EFFORTS
+                            else {}, info.session_type),
                         hosted=self._host_wanted(info.session_type),
                         host_sid=resolved,
                     )
@@ -3592,7 +3593,7 @@ class SessionManager:
                 allowed_tools=allowed_tools or [],
                 permission_mode=_effective_mode,
                 include_partial_messages=True,
-                extra_args=extra_args or {},
+                extra_args=self._with_chrome(extra_args, info.session_type),
                 hosted=self._host_wanted(info.session_type),
                 host_sid=session_id,
             )
@@ -5571,6 +5572,31 @@ class SessionManager:
     # Permission callback
     # ------------------------------------------------------------------
 
+    # ── Chrome control (System → Preferences) ────────────────────────────
+    # The owner, 2026-10-28: a ChatGPT cleanup session had no browser tools
+    # because the engine never passed the CLI's ``--chrome``, so it told him
+    # to run ``claude --chrome`` in a terminal.  The global
+    # ``claudeInChromeDefaultEnabled`` setting does not reach SDK sessions
+    # (probed: tools appear only with the flag).  Opt-in: every launch and
+    # resume carries ``--chrome`` while ``chrome_control`` is true.  A caller
+    # that chose ``chrome`` / ``no-chrome`` itself wins.
+
+    @staticmethod
+    def _chrome_control_on() -> bool:
+        try:
+            from common.config import get_kanban_config
+            return get_kanban_config().get("chrome_control", False) is True
+        except Exception:
+            return False
+
+    def _with_chrome(self, extra_args: Optional[dict], session_type: str) -> dict:
+        """``extra_args`` plus ``--chrome`` when Chrome control is on."""
+        args = dict(extra_args or {})
+        if (session_type not in ("planner", "title") and "chrome" not in args
+                and "no-chrome" not in args and self._chrome_control_on()):
+            args["chrome"] = None
+        return args
+
     # ── Smart termination (daemon/smart_termination.py) ──────────────────
 
     @staticmethod
@@ -5596,6 +5622,18 @@ class SessionManager:
             return _st_live().INSTRUCTIONS
         except Exception:
             return None
+
+    def _others_working(self, sid: str, cwd: str) -> list:
+        """Short ids of the other sessions in the same folder that are
+        WORKING right now (Smart termination's blame check)."""
+        def norm(p):
+            return os.path.normcase(os.path.normpath(p)) if p else ""
+        mine = norm(cwd)
+        if not mine:
+            return []
+        with self._lock:
+            return [k[:8] for k, s in self._sessions.items()
+                    if k != sid and s.state == SessionState.WORKING and norm(getattr(s, "cwd", "")) == mine]
 
     def _make_turn_end_callback(self, session_id: str):
         """The backend's turn-end hook for one session: returns the reason to
@@ -5640,6 +5678,10 @@ class SessionManager:
                 with self._lock:
                     entries = list(info.entries)
                 facts = _ev.facts_from_entries(entries, trimmed=bool(getattr(info, "_entries_trimmed", False)))
+                # Who else in this project is working now: a card that
+                # leaves work to "another session" is sent back when nobody
+                # is (handoff_evidence.blame_problems).
+                facts.others_working = self._others_working(sid, getattr(info, "cwd", "") or "")
             except Exception as e:   # never trap a turn on a facts failure
                 logger.debug("Smart termination: no facts for %s: %s", sid[:12], e)
                 facts = None

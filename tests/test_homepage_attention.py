@@ -43,13 +43,21 @@ def _titles(app, list_id):
                     list_id)
 
 
-def _sessions(n=12):
-    return fake_sessions(n, base_ts=int(time.time()))
+def _sessions(n=12, live=()):
+    """Sleeping sessions the person already marked Done (a 'done' hold): Done
+    is his verdict, not sleep (owner, 2026-10-28), so a sleeping session with
+    no verdict would sit in Needs you.  Rows at the indexes in *live* get no
+    hold: the test drives them with state pushes."""
+    rows = fake_sessions(n, base_ts=int(time.time()))
+    for i, r in enumerate(rows):
+        if i not in live:
+            r["hold"] = "done"
+    return rows
 
 
 @pytest.mark.slow
 def test_needs_you_and_running_lists(browser):
-    rows = _sessions()
+    rows = _sessions(live=(0, 1, 2, 3, 5))
     # Session 0003 has unread output from an earlier turn.
     extra = "localStorage.setItem('vn_unread_sessions', JSON.stringify(['%s']));" % rows[3]["id"]
     app = _home(browser, rows, extra=extra)

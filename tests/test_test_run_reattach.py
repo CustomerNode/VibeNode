@@ -104,7 +104,16 @@ def test_a_run_the_server_no_longer_has_is_reported_lost_not_passed(page):
     _wait(page, "__streams.length === 2")
     page.evaluate("""() => __send(1, {type: 'error', line: 'That test run is no longer available.', lost: true})""")
     _wait(page, "__result !== null")
-    assert page.evaluate("__result.info") == {"lost": True, "started": True}
+    assert page.evaluate("__result.info") == {"lost": True, "started": True, "busy": False}
+
+
+def test_a_run_already_in_progress_elsewhere_is_reported_busy(page):
+    page.evaluate("__start()")
+    _wait(page, "__streams.length === 1")
+    page.evaluate("""() => __send(0, {type: 'error', busy: true,
+        line: 'A fast test run is already in progress. Wait for it to finish, or cancel it.'})""")
+    _wait(page, "__result !== null")
+    assert page.evaluate("__result.info") == {"lost": False, "started": False, "busy": True}
 
 
 @pytest.mark.slow

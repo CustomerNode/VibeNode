@@ -60,7 +60,7 @@ ctx._sessionSubstatus = {}; ctx._sessionRetryState = {};
 
 def _run(answers, state="standby", newer=""):
     res = subprocess.run([NODE, "-e", HARNESS, str(VERB_JS), json.dumps(answers), state, newer],
-                         capture_output=True, text=True, timeout=30)
+                         capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert res.returncode == 0, res.stderr
     return json.loads(res.stdout)
 
@@ -87,7 +87,7 @@ def test_a_standby_the_server_never_kept_is_not_shown(fail):
     r = _run([fail, fail])
     assert r["shownAtOnce"] == "standby"          # drawn at once, as before
     assert r["ok"] is False and r["after"] is None
-    assert r["display"] == "done"                 # what a reload shows, shown now
+    assert r["display"] == "review"               # what a reload shows, shown now (no verdict: Needs you)
     assert r["toasts"] == ["Couldn’t save Standby. Try again."]
 
 

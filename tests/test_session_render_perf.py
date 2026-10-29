@@ -53,8 +53,14 @@ def _events(sessions, state, **extra):
     return [{"session_id": s["id"], "state": state, "cwd": CWD, **extra} for s in sessions]
 
 
-def _app(browser, display_mode, sort_extra=""):
+def _app(browser, display_mode, sort_extra="", marked_done=False):
     sessions = fake_sessions(N)
+    if marked_done:
+        # Done is the person's verdict, not sleep (owner, 2026-10-28): a
+        # sleeping session with no verdict is Needs you, which "Active first"
+        # ranks above Working.  These stand for sessions he already accepted.
+        for s in sessions:
+            s["hold"] = "done"
     a = FakeApp(browser, sessions, init=init_script("sessions", display_mode, sort_extra))
     a.eval(COUNT_RENDERS)
     return a, sessions
@@ -133,7 +139,7 @@ def test_active_first_sort_rebuilds_once_per_burst(browser):
     The burst must coalesce into a handful of debounced rebuilds, never one per
     event, and the final order must put the working cards first.
     """
-    app, sessions = _app(browser, "grid", "localStorage.setItem('wfSort', 'status');")
+    app, sessions = _app(browser, "grid", "localStorage.setItem('wfSort', 'status');", marked_done=True)
     try:
         # Only the second half starts working: their cards must move to the front.
         app.push_many("session_state", _events(sessions[N // 2:], "working"))

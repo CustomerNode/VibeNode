@@ -453,13 +453,24 @@ def _shell_command(cmd: str, cwd: Path) -> str:
 # evidence records which ones were set.
 ENV_STRIPPED = ("PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "PYTHONSTARTUP",
                 "NODE_OPTIONS", "JEST_OPTIONS")
+# Secret-shaped variables never reach a verification command (Phase 1, F).
+# A test the project needs a secret for is not a pipeline check yet; there is
+# no exception key.  Stripping variables is not a sandbox: the command still
+# has the filesystem, the network and every credential store on the machine.
+ENV_SECRET_RE = re.compile(
+    r"TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|_KEY$|^ANTHROPIC_|^AWS_|^AZURE_|^GH_|^SUPABASE_|^CLAUDE_CODE_MESSAGING_",
+    re.IGNORECASE)
+
+
+def is_secret_name(name: str) -> bool:
+    return ENV_SECRET_RE.search(name) is not None
 
 
 def child_env() -> tuple[dict, list[str]]:
     """The environment a verification command runs in, and the names of the
-    variables stripped from it."""
+    variables stripped from it (names only; values are never recorded)."""
     env = dict(os.environ)
-    stripped = [k for k in ENV_STRIPPED if k in env]
+    stripped = sorted(k for k in env if k in ENV_STRIPPED or is_secret_name(k))
     for k in stripped:
         env.pop(k, None)
     return env, stripped
@@ -506,7 +517,8 @@ def overlay_files(repo: Path, globs: list[str]) -> list[str]:
     return sorted(out)
 
 
-def run_baseline(run_dir: Path, cid: str, *, repo: Path | None = None) -> tuple[dict, Path]:
+def run_baseline(run_dir: Path, cid: str, *, repo: Path | None = None,
+                 extra: dict | None = None) -> tuple[dict, Path]:
     """The regression demonstration for one ``detects_change`` criterion.
 
     Checks out the run's starting snapshot into a temporary git worktree (the
@@ -587,6 +599,7 @@ def run_baseline(run_dir: Path, cid: str, *, repo: Path | None = None) -> tuple[
         "impl_path": impl_identity()[1],
         "recorder": "pipeline.run_check --baseline",
     }
+    record.update(extra or {})
     edir = run_dir / EVIDENCE_DIR
     edir.mkdir(parents=True, exist_ok=True)
     path = edir / f"{c.id}.baseline.json"
@@ -594,7 +607,8 @@ def run_baseline(run_dir: Path, cid: str, *, repo: Path | None = None) -> tuple[
     return record, path
 
 
-def run_criterion(run_dir: Path, cid: str, *, repo: Path | None = None) -> tuple[dict, Path]:
+def run_criterion(run_dir: Path, cid: str, *, repo: Path | None = None,
+                  extra: dict | None = None) -> tuple[dict, Path]:
     """Execute one criterion and record the evidence.  Returns (record, path).
 
     The record's ``passed`` is true only when the command exited 0, ``expect``
@@ -649,6 +663,7 @@ def run_criterion(run_dir: Path, cid: str, *, repo: Path | None = None) -> tuple
         "python": sys.version.split()[0],
         "platform": sys.platform,
     }
+    record.update(extra or {})
     edir = run_dir / EVIDENCE_DIR
     edir.mkdir(parents=True, exist_ok=True)
     path = edir / f"{c.id}.json"
