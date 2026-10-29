@@ -1289,6 +1289,49 @@
     if (v && typeof v === 'object') v = v[_appTheme()] || v.light || v.dark;
     return typeof v === 'string' ? v : '';
   }
+  // A choice whose body is only its screens (no read-out): its frames can be
+  // kept when the next choice shows the same pages.
+  function _onlyScreens(r) { return !!(r && !r.other && r.screens && !(r.fit || r.effort || r.undo || r.risk || _SWOT.some(q => r[q[0]]))); }
+  // Switch the live pages of another app to the next choice WITHOUT loading
+  // them again (owner, 2026-10-29: "if i click between them i keep seeing the
+  // splash over and fucking over again ... certainly not more than once").
+  // Only when every frame would load the same page (origin and path) with
+  // another query: the page is asked to rewrite its own address
+  // ({type: 'vn:set-address', url}; CustomerNode's TrialMount does) and
+  // answers 'vn:set-address:ok'; a page that does not answer within
+  // _SET_ADDRESS_MS is loaded at the new address as before.
+  const _SET_ADDRESS_MS = 1500;
+  function _switchInPlace(stage, r, dev, shot) {
+    const s = r.screens[Math.min(shot, r.screens.length - 1)];
+    const next = _reviewSrc(s.url);
+    if (!/^https?:\/\//.test(next) || _isPic(s.url)) return false;
+    const frames = [...stage.querySelectorAll('iframe')];
+    const want = (dev || s.device) === 'both' ? 2 : 1;
+    if (frames.length !== want) return false;
+    let to;
+    try { to = new URL(_themedSrc(next)); } catch (_e) { return false; }
+    for (const f of frames) {
+      let at;
+      try { at = new URL(f._vnUrl || ''); } catch (_e) { return false; }
+      if (at.origin !== to.origin || at.pathname !== to.pathname) return false;
+    }
+    frames.forEach(f => {
+      if (f._vnUrl === to.href) return;
+      f._vnUrl = to.href;
+      if (f._vnWait) f._vnWait();
+      let timer = 0;
+      const onMsg = e => {
+        if (e.source !== f.contentWindow || !e.data || e.data.type !== 'vn:set-address:ok') return;
+        f._vnWait();
+      };
+      f._vnWait = () => { clearTimeout(timer); window.removeEventListener('message', onMsg); f._vnWait = null; };
+      window.addEventListener('message', onMsg);
+      timer = setTimeout(() => { if (f._vnWait) { f._vnWait(); f.src = to.href; } }, _SET_ADDRESS_MS);
+      try { f.contentWindow.postMessage({ type: 'vn:set-address', url: to.pathname + to.search + to.hash }, to.origin); } catch (_e) { /* answered by the timer */ }
+    });
+    stage.querySelectorAll('.chrome span').forEach(sp => { sp.textContent = s.label || s.url; });
+    return true;
+  }
   function _hasTpl(r) { return !!(r && !r.other && (r.screens || r.fit || r.effort || r.undo || r.risk || _SWOT.some(q => r[q[0]]))); }
   function _cap1(s) { s = String(s || ''); return s.charAt(0).toUpperCase() + s.slice(1); }
   // Pictures in links / needs.look that belong to one of a Decide card's
@@ -1404,6 +1447,7 @@
         setTimeout(() => top(d), 400);
       });
       f.src = _themedSrc(own ? src.slice(0, h) : src);
+      f._vnUrl = f.src;
       f.removeAttribute('data-src');
     });
     _fitFrames(scope);
@@ -1610,6 +1654,12 @@
       go.disabled = r.other ? !typed.trim() : false;
       go.textContent = r.other ? 'Send' : r.now ? 'Keep it as it is' : 'Choose ' + r.key;
       const old = body.querySelector('.pane:not(.leaving)');
+      // The same live pages with another choice on: switched in place, no reload.
+      const oldStage = old && old._vnOnlyScreens && old.querySelector('.tp-stage');
+      if (!opening && oldStage && _onlyScreens(r) && _switchInPlace(oldStage, r, dev, shot)) {
+        old._vnKey = r.key;
+        return;
+      }
       if (old) {
         if (opening) old.remove();
         else {
@@ -1630,6 +1680,7 @@
       const pane = document.createElement('div');
       pane.className = 'pane';
       pane.innerHTML = paneHTML(r);
+      pane._vnOnlyScreens = _onlyScreens(r);
       body.appendChild(pane);
       body.scrollTop = 0;
       wirePane(pane, r);
@@ -2165,6 +2216,6 @@
     xm.setAttribute('aria-expanded', String(o));
   });
   const _api = { render, renderIn, openReview: _openReview, closeReview: _closeReview, reviewSrc: _reviewSrc,
-    openDecide: _openDecide, closeDecide: _closeDecide, syncDone: _syncDone, syncAnswered: _syncAnswered, markAnswered: _markAnswered, themedSrc: _themedSrc, screenOption: _screenOption, tplStage: _tplStage, deliverableBody: dvBodyHtml };
+    openDecide: _openDecide, closeDecide: _closeDecide, syncDone: _syncDone, syncAnswered: _syncAnswered, markAnswered: _markAnswered, themedSrc: _themedSrc, screenOption: _screenOption, tplStage: _tplStage, switchInPlace: _switchInPlace, deliverableBody: dvBodyHtml };
   window.VNLastCard = _api;
 })();

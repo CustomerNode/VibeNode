@@ -186,3 +186,42 @@ def test_choices_with_their_own_screens_need_no_look_page():
     for r in card["needs"]["replies"]:
         del r["screens"]
     assert [p for p in hr.format_problems(card) if "something to look at" in p]
+
+
+# ── Switching choices keeps the live page (owner, 2026-10-29: "if i click
+#    between them i keep seeing the splash over and fucking over again") ──
+
+SWITCH = r"""
+global.window = global;
+global.location = { host: '127.0.0.1:5050', hostname: '127.0.0.1', port: '5050' };
+global.document = { addEventListener() {}, querySelectorAll() { return []; },
+                    documentElement: { getAttribute: () => 'dark' } };
+const posted = [];
+global.addEventListener = () => {}; global.removeEventListener = () => {};
+eval(require('fs').readFileSync(process.argv[1], 'utf8'));
+const frame = (url) => ({ _vnUrl: url, contentWindow: { postMessage: (m, o) => posted.push([m, o]) }, set src(v) { posted.push(['reload', v]); } });
+const stage = (frames) => ({ querySelectorAll: sel => sel === 'iframe' ? frames : [] });
+const at = 'http://127.0.0.1:8000/app/journeys/j1?stage=5&spaceOpens=a&theme=dark';
+const r = (url) => ({ screens: [{ label: 's', url, device: 'web' }] });
+const out = {
+  same: VNLastCard.switchInPlace(stage([frame(at)]), r('http://127.0.0.1:8000/app/journeys/j1?stage=5&spaceOpens=b'), 'web', 0),
+  other: VNLastCard.switchInPlace(stage([frame(at)]), r('http://127.0.0.1:8000/app/journeys/j1/stages/5?spaceOpens=b'), 'web', 0),
+  own: VNLastCard.switchInPlace(stage([frame('http://127.0.0.1:5050/static/scratch/x.html')]), r('/static/scratch/x.html#b'), 'web', 0),
+};
+out.posted = posted;
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+def test_another_choice_on_the_same_page_is_switched_in_place():
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    r = subprocess.run(["node", "-e", SWITCH, str(LAST_CARD)], capture_output=True, text=True, timeout=30, check=True)
+    out = json.loads(r.stdout)
+    # same page, another choice: asked to rewrite its address, not reloaded
+    assert out["same"] is True
+    assert out["posted"][0] == [{"type": "vn:set-address", "url": "/app/journeys/j1?stage=5&spaceOpens=b&theme=dark"},
+                                "http://127.0.0.1:8000"]
+    assert not [p for p in out["posted"] if p[0] == "reload"]
+    # another page, or VibeNode's own page: built as before
+    assert out["other"] is False and out["own"] is False
