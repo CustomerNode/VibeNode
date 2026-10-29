@@ -368,6 +368,14 @@ def _over(page, sel, steps=14):
 SETTLED = "() => !document.querySelector('.vn-pin-lifted, .vn-pin-settling') && !document.body.classList.contains('vn-pin-dragging')"
 
 
+def _wait_posts(app, posts, n, timeout=3.0):
+    """The save goes out as the card settles; give the request time to land."""
+    end = time.time() + timeout
+    while len(posts) < n and time.time() < end:
+        app.page.wait_for_timeout(50)
+    return posts
+
+
 @pytest.mark.slow
 def test_pinned_sessions_follow_their_saved_order(browser):
     rows = _ranked({1: 1, 4: 0})
@@ -405,7 +413,7 @@ def test_pinned_cards_reorder_live_while_dragging_and_save_on_release(browser):
         assert not app.eval("() => !!document.querySelector('.session-ctx-menu')")   # no press-and-hold menu
         app.page.mouse.up()
         app.page.wait_for_function(SETTLED, timeout=3000)
-        assert posts == [{"order": [ids[5], ids[1], ids[3]], "project": PROJECT}]
+        assert _wait_posts(app, posts, 1) == [{"order": [ids[5], ids[1], ids[3]], "project": PROJECT}]
         assert app.eval(CARD_ORDER)[:4] == [ids[5], ids[1], ids[3], ids[0]]
         time.sleep(0.4)
         assert app.eval("() => typeof activeId === 'undefined' ? null : activeId") in (None, "")   # not opened
@@ -415,7 +423,7 @@ def test_pinned_cards_reorder_live_while_dragging_and_save_on_release(browser):
         assert app.eval(CARD_ORDER)[:3] == [ids[1], ids[3], ids[5]]
         app.page.mouse.up()
         app.page.wait_for_function(SETTLED, timeout=3000)
-        assert posts[-1]["order"] == [ids[1], ids[3], ids[5]]
+        assert _wait_posts(app, posts, 2)[-1]["order"] == [ids[1], ids[3], ids[5]]
         assert not app.errors, app.errors
     finally:
         app.close()
@@ -471,7 +479,7 @@ def test_pinned_rows_reorder_live_in_the_list(browser):
         assert app.eval(ROW_ORDER)[:3] == [ids[2], ids[4], ids[0]]
         app.page.mouse.up()
         app.page.wait_for_function(SETTLED, timeout=3000)
-        assert posts == [{"order": [ids[2], ids[4], ids[0]], "project": PROJECT}]
+        assert _wait_posts(app, posts, 1) == [{"order": [ids[2], ids[4], ids[0]], "project": PROJECT}]
         assert not app.errors, app.errors
     finally:
         app.close()
