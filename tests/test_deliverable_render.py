@@ -315,6 +315,25 @@ def test_files_and_a_body_show_both(files_out):
     assert h.count("lm-dlfile\"") == 2 and h.count("lm-dvopen") == 1 and "Copy the text" in h
 
 
+def test_a_text_file_marked_copy_is_a_copy_button():
+    """Owner, 2026-10-29: "I want it in my copy buffer when I select the
+    button".  A text file with "copy": true is a Copy row that loads its text
+    on render; anything else, or a file outside static/scratch, still downloads."""
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    cards = {"copy": _files_card(files=[{"label": "Code", "url": "/static/scratch/code.txt", "size": "175 KB", "copy": True},
+                                        {"label": "Zip", "url": ZIP, "copy": True},
+                                        {"label": "Elsewhere", "url": "/api/x.txt", "copy": True}])}
+    assert handoff_rules.format_problems(cards["copy"]) == []
+    r = subprocess.run(["node", "-e", BACK_SCRIPT, str(LAST_CARD), json.dumps(cards)],
+                       capture_output=True, text=True, encoding="utf-8", timeout=30, check=True)
+    h = json.loads(r.stdout)["copy"]
+    assert h.count("data-copy-src=") == 1 and 'data-copy-src="/static/scratch/code.txt" aria-disabled="true"' in h
+    assert " Save .txt</span></button>" in h and h.count('class="lm-row lm-dlfile"') == 2
+    assert "data-copy=" not in h   # filled only once the text has arrived
+    assert '"copy": true' in handoff_rules.INSTRUCTIONS
+
+
 def test_an_older_card_pointing_at_a_download_downloads_it():
     """Cards already in a thread are not rewritten: their zip downloads."""
     if shutil.which("node") is None:

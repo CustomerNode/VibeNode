@@ -693,6 +693,7 @@
     holdBottom: _modernOnly('holdBottom'),
     refresh: _modernOnly('refresh'),
     followWork: _modernOnly('followWork'),   // classic already follows unless scrolled up
+    landCard: _modernOnly('landCard'),       // classic top-aligns a long reply by itself
     hasNew: _modernOnly('hasNew', false),
     isLiveScroll: _modernSetting('isLiveScroll'),
     setLiveScroll: _modernSetting('setLiveScroll'),

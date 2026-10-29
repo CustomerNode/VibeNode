@@ -188,6 +188,7 @@
 
   function _markDriving() {
     _driving = true;
+    _lastDriveAt = Date.now();
     if (_driveTimer) clearTimeout(_driveTimer);
     _driveTimer = setTimeout(function () {
       _driving = false;
@@ -405,7 +406,74 @@
     // A big batch is a full re-render, not new chat activity.
     if (msgs > RERENDER_NODE_THRESHOLD) return;
     if (!msgs && !other) return;
+    var card = msgs ? _cardJustLanded(records) : null;
+    if (card) { _showCardTop(card); return; }
     _noteArrival(msgs);
+  }
+
+  // ── An end-of-turn card lands at the top of the screen (2026-10-29) ────
+  // The owner, on a phone: "When the answer card comes the scroll should be so
+  // the top of the card is at the top of the screen." The one exception to D:
+  // a newly arrived summary card scrolls its title to the top, ALWAYS: whatever
+  // the Auto scroll setting and wherever the reader is. Two earlier versions
+  // held back for a reader "away from the end" (READING, then "more than half
+  // a screen above the card"); both broke on his phone ("it doesn't work"),
+  // because with Auto scroll off the thread never follows the work, so by
+  // the time the card lands he is always screens behind it. The only wait is
+  // a finger on the glass: the jump happens the moment the swipe ends.
+  function _cardJustLanded(records) {
+    for (var i = 0; i < records.length; i++) {
+      var nodes = records[i].addedNodes;
+      for (var j = 0; j < nodes.length; j++) {
+        var n = nodes[j];
+        if (n.nodeType === 1 && n.classList && n.classList.contains('msg') &&
+            n.querySelector && n.querySelector('.lm')) return n;
+      }
+    }
+    return null;
+  }
+
+  var _lastDriveAt = 0;
+
+  // The card being landed. last-card.js asks for the same card a frame after
+  // the observer here saw it (its ask is what reaches a tab running older
+  // thread code): one landing, not two.
+  var _landing = null;
+
+  function _showCardTop(el) {
+    if (!el || _landing === el) return;
+    _landing = el;
+    var waited = 0;
+    (function start() {
+      if (_driving && waited++ < 30) { setTimeout(start, 100); return; }
+      _settleCardTop(el);
+    })();
+  }
+
+  /** Public: land this `.msg` (holding a card) with its top at the top. */
+  function landCard(el) {
+    if (!_logEl || !el || !_logEl.contains(el)) return;
+    _showCardTop(el);
+  }
+
+  function _settleCardTop(el) {
+    var landed = Date.now();
+    var go = function () {
+      // A scroll of his own after the card landed wins over the settle passes.
+      if (!_logEl || !el.isConnected || _driving || _lastDriveAt > landed || !_finalIsCard()) return;
+      var t = _finalBoxScrollTop();
+      if (t == null) return;
+      _logEl.scrollTop = t;
+      // No longer at the bottom: holdBottom() (composer redraw on the turn's
+      // end) must not pull the view back down before the observer says so.
+      if (!_tailInView()) _atBottom = false;
+      _clearNew();
+      _renderPill();
+    };
+    go();
+    // The card can still grow a frame later (fonts, pictures): settle again.
+    try { requestAnimationFrame(go); } catch (e) { /* no rAF */ }
+    setTimeout(go, 250);
   }
 
   function _onScrollPassive() {
@@ -799,6 +867,11 @@
     var box = boxes[boxes.length - 1];
     var top = box.getBoundingClientRect().top - _logEl.getBoundingClientRect().top +
               _logEl.scrollTop - FINAL_BOX_TOP_PAD;
+    // A summary card stops below the pinned "you asked" pill
+    // (--vn-stick-top, last-card.css), so its Done line is not hidden.
+    if (box.querySelector && box.querySelector('.lm') && typeof getComputedStyle === 'function') {
+      try { top -= parseFloat(getComputedStyle(_logEl).getPropertyValue('--vn-stick-top')) || 0; } catch (e) { /* no styles (tests) */ }
+    }
     var max = Math.max(0, _logEl.scrollHeight - _logEl.clientHeight);
     return Math.max(0, Math.min(top, max));
   }
@@ -894,6 +967,7 @@
     noteUserExpand: noteUserExpand,
     onSend: onSend,
     followWork: followWork,
+    landCard: landCard,
     catchUp: catchUp,
     scrollToBottom: scrollToBottom,
     positioned: positioned,

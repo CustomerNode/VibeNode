@@ -48,7 +48,7 @@ def test_first_launch_installs_and_writes_the_stamp(tmp_path):
     assert res["pip_ran"] is True and res["pip_ok"] is True
     assert res["pip_installed"] == 2
     assert run.calls == [["py.exe", "-m", "pip", "install", "--disable-pip-version-check",
-                          "-r", str(req)]]
+                          "--only-binary=:all:", "-r", str(req)]]
     assert stamp.read_text().strip() == rs.requirements_sha256(req)
 
 

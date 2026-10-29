@@ -278,6 +278,10 @@
     const files = (Array.isArray(d.files) ? d.files : []).filter(f => f && typeof f === 'object' && /^(\/(?!\/)|https?:\/\/)/.test(String(f.url || '').trim()));
     const fileRows = files.map(f => {
       const u = String(f.url).trim(), name = decodeURIComponent((u.split(/[?#]/)[0].split('/').pop()) || 'file');
+      if (f.copy === true && /^\/static\/scratch\/[^?#]+\.(?:txt|md|json|py|js|css|html?|csv|log)$/i.test(u)) {
+        return row({ cls: 'loading', tile: I.copy, title: inl(f.label || name), sub: [f.size, name].filter(x => x != null && String(x).trim()).map(x => esc(String(x))).join(' · '),
+          verb: (_shareFiles() ? I.copy + ' Copy .txt' : I.dl + ' Save .txt'), attrs: ' data-copy-src="' + esc(u) + '" aria-disabled="true"' });
+      }
       return dlRow(u, f.label || name, [f.size, name, f.note].filter(x => x != null && String(x).trim()).map(x => esc(String(x))).join(' · '));
     }).join('');
     const filesHtml = fileRows ? '<div class="lm-rows lm-dlfiles">' + fileRows + '</div>' : '';
@@ -378,6 +382,29 @@
     return '<div class="lm-backto"><span class="ic">' + I.back + '</span><span class="tx"><span class="tt">Left waiting: ' + inl(b.label) + '</span>' +
       (b.status ? '<span class="ts">' + inl(b.status) + '</span>' : '') + '</span>' +
       '<button type="button" class="go" data-back="' + esc(reply) + '">Back to it</button></div>';
+  }
+
+  // "Also found": something the session noticed outside the user's ask that
+  // it may not, or should not, act on alone (a permission rule it would have
+  // to change, a risk in code it was not asked to touch).  Neither unfinished
+  // work nor a decision, so it never has to be dressed up as either to pass
+  // the end-of-turn check (2026-10-29: a side finding about Windows delete
+  // commands became an Approve card in jargon because the rules had no other
+  // place for it).  Card field: "finding": {"what", "risk", "recommend",
+  // "reply"}.  One quiet band after Next, one button, "Deal with it", that
+  // sends finding.reply (or a default naming the finding) as the user's
+  // message.  The button acts only on the newest card (_syncDone), like the
+  // verdict chips; the text stays on older cards.
+  function findingBand(f) {
+    if (!f || typeof f !== 'object' || typeof f.what !== 'string' || !f.what.trim()) return '';
+    const what = f.what.trim();
+    const reply = (typeof f.reply === 'string' && f.reply.trim()) ? f.reply.trim() : 'Deal with what you found: ' + what;
+    // Same shape as render()'s band(): a .lm-dl with its dt and dd.
+    return '<div class="lm-dl lm-quiet lm-findband"><div class="dt">Also found</div><div class="dd">' +
+      '<div class="lm-find"><span class="ic">' + I.info + '</span><span class="tx"><span class="tt">' + inl(what) + '</span>' +
+      (typeof f.risk === 'string' && f.risk.trim() ? '<span class="ts"><b>Risk:</b> ' + inl(f.risk.trim()) + '</span>' : '') +
+      (typeof f.recommend === 'string' && f.recommend.trim() ? '<span class="ts"><b>Recommends:</b> ' + inl(f.recommend.trim()) + '</span>' : '') +
+      '</span><button type="button" class="go" data-find="' + esc(reply) + '">Deal with it</button></div></div></div>';
   }
 
   /** The approved Report card.  opts.clock: epoch ms the card was written. */
@@ -598,6 +625,12 @@
           const pics = [...optImg].filter(([, key]) => key === k).map(([l]) => ({ label: l.label || '', url: l.url }));
           const rr = pics.length ? Object.assign({}, r, { screens: [].concat(r.screens || [], pics) }) : r;
           return Object.assign({ key: k, label: r.label || '', detail: r.detail || '', reply: r.reply || r.label || '', recommended: !!r.recommended }, _tplFields(rr)); }) };
+        // The choices are named on the band, the recommended one tagged, so
+        // "which do you recommend" is answered without opening anything (owner,
+        // 2026-10-29: 'it should have said "A, my recommendation, and B"').
+        if (n.replies.length > 1 && n.replies.some(r => r && r.recommended))
+          x += '<ul class="lm-dlist">' + data.replies.map(r => '<li><b>' + esc(r.key) + '</b> ' + inl(r.label) +
+            (r.recommended ? '<span class="rec">Recommended</span>' : '') + '</li>').join('') + '</ul>';
         x += '<button type="button" class="lm-decide" data-decide="' + esc(JSON.stringify(data)) + '">' +
           // The band above already reads "Decide", so the button names what it
           // opens, in the band's tone, not an inverted fill (owner, 2026-10-28).
@@ -624,6 +657,8 @@
       if ((n.kind === 'decision' || n.kind === 'action') && !m.late) x += verdictRows();
       h += band(({ decision: 'Decide', approve: 'Approve', action: 'To do' })[n.kind] || 'Needed from you', x, 'lm-sec lm-needs');
     }
+    // After the action band, before More: a side finding and its one button.
+    h += findingBand(m.finding);
 
     let more = '', bits = [];
     if (n.why && n.kind && n.kind !== 'none') { bits.push('why I’m asking'); more += '<div class="lm-sub">Why I’m asking</div><div style="font-size:13px;color:var(--text-muted)">' + inl(n.why) + '</div>'; }
@@ -634,6 +669,52 @@
     if (m.details && m.details.length) { bits.push('technical details'); more += '<div class="lm-sub">Technical details</div>' + list(m.details, 'dot'); }
     if (more) h += band('More', '<button type="button" class="lm-more">' + I.chev + ' ' + bits.map(b => b.charAt(0).toUpperCase() + b.slice(1)).join(' · ') + '</button><div class="lm-fold">' + more + '</div>', 'lm-morebar');
     return h + '</div>';
+  }
+
+  // A deliverable file marked "copy": true is a Copy row (owner, 2026-10-29:
+  // "I want it in my copy buffer when I select the button").  The text is
+  // fetched when the card renders, never on the tap: iOS copies only inside
+  // the tap's own call stack (same rule as the copy cards in smart-copy.js).
+  // Only this app's own static files, so a card cannot make the page fetch
+  // anything else.
+  // The owner then wanted it as a .txt FILE, not pasted text (2026-10-29: "I
+  // need the copy to be a txt file").  A web page cannot put a file on the
+  // clipboard, so on a phone the tap opens the share sheet with the .txt
+  // (its Copy puts the file on the clipboard; ChatGPT, Files, Mail take it
+  // directly).  Elsewhere the tap saves the .txt.  The text is already
+  // loaded, so the share runs inside the tap as iOS requires.
+  function _shareFiles() {
+    try {
+      return typeof navigator !== 'undefined' && typeof navigator.canShare === 'function' && typeof File === 'function' &&
+        !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+    } catch (_e) { return false; }
+  }
+  function _copyAsFile(r) {
+    const text = r.dataset.copy;
+    if (text == null) return;
+    const name = decodeURIComponent(r.dataset.copySrc.split('/').pop() || 'text.txt').replace(/\.[^.]+$/, '') + '.txt';
+    const vb = r.querySelector('.vb'), old = vb.innerHTML;
+    const done = label => { r.classList.add('copied'); vb.innerHTML = I.check + ' ' + label; setTimeout(() => { r.classList.remove('copied'); vb.innerHTML = old; }, 1600); };
+    const file = new File([text], name, { type: 'text/plain' });
+    if (_shareFiles() && navigator.canShare({ files: [file] })) {
+      navigator.share({ files: [file], title: name }).then(() => done('Shared')).catch(() => {});
+      return;
+    }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(file); a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    done('Saved');
+  }
+  function _syncCopySrc(root) {
+    root.querySelectorAll('.lm-row[data-copy-src]:not([data-copy])').forEach(r => {
+      if (r.dataset.copyLoading) return;
+      r.dataset.copyLoading = '1';
+      fetch(r.dataset.copySrc, { credentials: 'same-origin' })
+        .then(res => res.ok ? res.text() : Promise.reject(res.status))
+        .then(t => { r.dataset.copy = t; r.removeAttribute('aria-disabled'); r.classList.remove('loading'); })
+        .catch(() => { const vb = r.querySelector('.vb'); if (vb) vb.textContent = 'Could not load'; });
+    });
   }
 
   // ── The verdict bar: only on the open session's newest card, only while
@@ -649,6 +730,10 @@
     // A "Left waiting" strip only on the newest card: an older one's way
     // back is out of date.
     log.querySelectorAll('.lm-backto').forEach(b => { b.hidden = !last || b.closest('.lm') !== last; });
+    // "Deal with it" acts only from the newest card; the finding's text stays.
+    log.querySelectorAll('.lm-find .go').forEach(b => { b.hidden = !last || b.closest('.lm') !== last; });
+    _syncDelete(log, last);
+    _syncCopySrc(log);
     const all = log.querySelectorAll('.lm-finish');
     if (!all.length) return;
     const sid = (typeof liveSessionId !== 'undefined') ? liveSessionId : null;
@@ -669,6 +754,57 @@
       f.hidden = !mine;
       if (mine) { f.classList.toggle('done', d === 'done'); f.dataset.state = state; }
     });
+  }
+  // ── Delete the session from its newest summary (owner, 2026-10-29: "on
+  //    every card should we have delete session button perhaps offset to
+  //    bottom right"; picked "confirm on the button" from
+  //    static/scratch/summary-delete-confirm.html). A quiet trash at the
+  //    bottom right of the NEWEST summary only (every summary in a thread is
+  //    the same session). Tapping it turns that spot into "Delete session?"
+  //    Delete · Cancel, with Cancel where the trash was so a double-tap can
+  //    never delete; left alone it goes back after 6 s.
+  const _TRASH = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
+  function _syncDelete(log, last) {
+    const sid = (typeof liveSessionId !== 'undefined') ? liveSessionId : null;
+    const can = !!(last && sid && typeof window.deleteSession === 'function');
+    log.querySelectorAll('.lm.lm-hasdel').forEach(c => {
+      if (c === last && can) return;
+      c.classList.remove('lm-hasdel');
+      c.querySelectorAll(':scope > .lm-del, :scope > .lm-delask').forEach(e => e.remove());
+    });
+    if (!can || last.querySelector(':scope > .lm-del')) return;
+    last.classList.add('lm-hasdel');
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'lm-del';
+    b.title = 'Delete session';
+    b.setAttribute('aria-label', 'Delete session');
+    b.innerHTML = _TRASH;
+    b.addEventListener('click', ev => { ev.preventDefault(); ev.stopPropagation(); _askDelete(last, b, sid); });
+    last.appendChild(b);
+  }
+  function _askDelete(card, b, sid) {
+    if (card.querySelector(':scope > .lm-delask')) return;
+    b.hidden = true;
+    const ask = document.createElement('div');
+    ask.className = 'lm-delask';
+    ask.setAttribute('role', 'group');
+    ask.setAttribute('aria-label', 'Delete session?');
+    ask.innerHTML = '<span class="q">Delete session?</span>' +
+      '<button type="button" class="yes">Delete</button><button type="button" class="no">Cancel</button>';
+    card.appendChild(ask);
+    const t = setTimeout(close, 6000);
+    function close() { clearTimeout(t); ask.remove(); b.hidden = false; }
+    ask.addEventListener('click', ev => ev.stopPropagation());
+    ask.querySelector('.no').addEventListener('click', close);
+    ask.querySelector('.yes').addEventListener('click', () => {
+      clearTimeout(t);
+      ask.remove();
+      b.hidden = false;
+      try { window.deleteSession(sid, { confirmed: true }); } catch (_e) { /* the toast reports a failure */ }
+    });
+    // preventScroll: a plain focus() scrolled the thread under the tap.
+    try { ask.querySelector('.no').focus({ preventScroll: true }); } catch (_e) { /* no focus */ }
   }
   // Something else / Problem / Change it: the chat box opens with a starter
   // line; Ask more opens it empty.
@@ -748,8 +884,49 @@
     if (!ms) return '';
     try { return new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); } catch (_e) { return ''; }
   }
+  // ── A new card lands with its top at the top of the screen (2026-10-29,
+  //    the owner on his phone: "When the answer card comes the scroll should
+  //    be so the top of the card is at the top of the screen"). The scrolling
+  //    is ThreadScroll.landCard (thread-scroll.js). The TRIGGER is here as
+  //    well, because this file reaches an open tab without a reload
+  //    (live-assets.js) and the thread code does not: his phone tab, open all
+  //    evening, ran the thread code from before the fix twice over ("it
+  //    doesn't work", "still not working"). A card drawn for a message that is
+  //    not yet in the page is a live arrival (renderLiveEntry builds the
+  //    message, then appends it); a redraw works on a connected one. One such
+  //    draw in a frame is an arrival; several are a full render of the thread.
+  let _fresh = 0, _freshEl = null, _freshRaf = 0;
+  function _noteFresh(el) {
+    _fresh++; _freshEl = el;
+    if (_freshRaf) return;
+    _freshRaf = requestAnimationFrame(() => {
+      _freshRaf = 0;
+      const n = _fresh, el = _freshEl;
+      _fresh = 0; _freshEl = null;
+      if (window.VNLastCard !== _api || n !== 1 || !el) return;
+      const log = document.getElementById('live-log');
+      const msg = el.closest && el.closest('.msg');
+      if (!log || !msg || !log.contains(msg)) return;
+      const msgs = log.querySelectorAll('.msg');
+      if (msgs[msgs.length - 1] !== msg) return;
+      _landCard(msg, log);
+    });
+  }
+  function _landCard(msg, log) {
+    if (window.ThreadScroll && typeof ThreadScroll.landCard === 'function') { ThreadScroll.landCard(msg); return; }
+    // Thread code from before 2026-10-29 on this tab: land it here.
+    const go = () => {
+      if (!msg.isConnected) return;
+      const top = msg.getBoundingClientRect().top - log.getBoundingClientRect().top + log.scrollTop - 8 - _stickOffset(log);
+      log.scrollTop = Math.max(0, Math.min(top, log.scrollHeight - log.clientHeight));
+    };
+    go(); requestAnimationFrame(go); setTimeout(go, 250);
+  }
+
   function renderIn(container) {
     if (!container || !container.querySelectorAll) return;
+    const fresh = !container.isConnected;
+    if (fresh) _fresh++;   // counted even when nothing in it is a card: a full render is many draws
     container.querySelectorAll('.vn-card-ph').forEach(ph => {
       let card = null;
       try { card = JSON.parse(ph.getAttribute('data-card') || ''); } catch (_e) { card = null; }
@@ -761,8 +938,9 @@
       const el = wrap.firstElementChild;
       // Keep the card's JSON on it so live-assets.js can redraw it when
       // this file changes on disk (no page reload, 2026-10-28).
-      if (el) { el.setAttribute('data-card', ph.getAttribute('data-card') || ''); ph.replaceWith(el); }
+      if (el) { el.setAttribute('data-card', ph.getAttribute('data-card') || ''); ph.replaceWith(el); if (fresh) _noteFresh(el); }
     });
+    _syncCopySrc(container);
     _tick();
     _hookSocket();
     requestAnimationFrame(() => { _syncDone(); _syncAnswered(); _queueSoon(); _syncEarlier(); });
@@ -1538,7 +1716,7 @@
    *  session's text, so it must never reach the app or its API. */
   function _openDeliverable(btn) {
     const dd = btn.closest('.dd') || btn.closest('.lm');
-    const src = dd && dd.querySelector('.lm-row[data-copy]');
+    const src = dd && dd.querySelector('.lm-row[data-copy]:not([data-copy-src])');
     if (!src) return;
     _closeAll();
     const body = src.dataset.copy || '', fmt = btn.dataset.dv || 'markdown', title = btn.dataset.title || 'Deliverable';
@@ -1875,6 +2053,14 @@
       else if (typeof showToast === 'function') showToast('Couldn’t send that. Type it in the box below.', true);
       return;
     }
+    // Also found → Deal with it: sends the finding's reply as the user's message.
+    const fd = e.target.closest('.lm-find .go');
+    if (fd) {
+      if (fd.disabled) return;
+      if (_send(fd.dataset.find)) { fd.disabled = true; fd.textContent = 'Sent'; fd.closest('.lm-find').classList.add('sent'); }
+      else if (typeof showToast === 'function') showToast('Couldn’t send that. Type it in the box below.', true);
+      return;
+    }
     const dvo =e.target.closest('.lm-dvopen');
     if (dvo) { _openDeliverable(dvo); return; }
     const vw = e.target.closest('.lm-row[data-view]');
@@ -1887,6 +2073,8 @@
       else if (u && await _copy(u) && typeof showToast === 'function') showToast('Path copied: ' + u);
       return;
     }
+    const cf = e.target.closest('.lm-row[data-copy-src]');
+    if (cf) { _copyAsFile(cf); return; }
     const cp = e.target.closest('.lm-row[data-copy]');
     if (cp) {
       if (!(await _copy(cp.dataset.copy))) return;

@@ -747,6 +747,8 @@ def format_problems(card: dict) -> list[str]:
     if bt is not None and not (isinstance(bt, dict) and _s(bt.get("label"))):
         out.append("\"back_to\" is {\"label\": \"the earlier work, in a few words\", \"status\": "
                    "\"where it stands\", \"reply\": \"the message its Back to it button sends\"}.")
+    out += finding_problems(card)
+    out += plain_choice_problems(card)
     mock = mockup_picture_problem(card)
     if mock:
         out.append(mock)
@@ -819,6 +821,106 @@ def format_problems(card: dict) -> list[str]:
                 out.append("An action needs needs.steps: exactly what the user does.")
             if not replies:
                 out.append("An action needs a reply button the user taps when it is done.")
+    return out
+
+
+# ── A home for findings, and a yes-or-no the user can picture ────────────
+# The owner, 2026-10-28, on an Approve card that asked "Should Claude Auto in
+# VibeNode refuse the Windows delete-everything commands (del /s /q, rmdir
+# /s /q, Remove-Item -Recurse -Force) like rm -rf?": "I don't know what you
+# are talking about."  He had asked for a test cleanup; the test found a
+# permission gap the session may not fix alone.  The rules gave that finding
+# no home: a done card may not mention it (UNFINISHED), so the only way
+# through was a Decide/Approve, and that question came out in code names and
+# raw command syntax, with no recommendation, about a thing he never raised.
+# Three checks:
+#   1. "finding": a sanctioned place for something noticed outside his ask
+#      (what, risk, recommend), drawn as a quiet "Also found" band with one
+#      button.  It is neither unfinished work nor a decision.
+#   2. plain_choice_problems: a Decide/Approve question and its buttons carry
+#      no command syntax, flags or code names, and one reply is marked
+#      "recommended" (a pick between mockups is his taste: exempt).
+#   3. handoff_evidence.reviewer_problems: an Approve, like a Decide, must be
+#      tied to something he asked for, in his words.
+FINDING_KEYS = ("what", "risk", "recommend")
+
+
+def finding_problems(card: dict) -> list[str]:
+    f = card.get("finding")
+    if f is None:
+        return []
+    shape = ("\"finding\" is {\"what\": \"what you noticed, one line\", \"risk\": \"what it risks "
+             "for the user\", \"recommend\": \"what you recommend\", \"reply\": \"optional: the "
+             "message its Deal with it button sends\"}: something outside his ask that you may "
+             "not act on alone. It is not unfinished work and not a decision.")
+    if not isinstance(f, dict):
+        return [shape]
+    missing = [k for k in FINDING_KEYS if not _s(f.get(k))]
+    if missing:
+        return [shape + " Missing: " + ", ".join(missing) + "."]
+    return []
+
+
+# Command syntax and code names where the user must answer a question.
+_CODE_TOKEN = re.compile(
+    r"`[^`\n]+`"                                              # `anything`
+    r"|(?<![\w-])--?[A-Za-z][\w-]*(?=[\s,.;:)]|$)"              # -rf, --force, -Recurse
+    r"|(?<=\s)/[A-Za-z]{1,2}\b"                                 # /s /q /F
+    # a command with its first argument: a flag or switch ("rm -rf", "del /s",
+    # "Remove-Item -Recurse"), or a known subcommand ("git push", "pip
+    # install").  "git" alone is English in "git calls" (seen in the replay).
+    r"|\b(?:rm|del|rmdir|rd|taskkill|killall|curl|wget|chmod|chown|Remove-Item|Stop-Process|"
+    r"Get-ChildItem|Set-Item)\s+(?:-{1,2}|/)[\w./-]+"
+    r"|\bgit\s+(?:push|pull|reset|clean|checkout|rebase|branch|commit|stash|merge|fetch|rm|add)\b"
+    r"|\b(?:pip\s+install|npm\s+(?:run|install|publish)|npx\s+\w+|sudo\s+\w+)\b"
+    r"|\b[a-z][a-z0-9]*_[a-z0-9_]+\b"                            # snake_case names
+    r"|\b\w+(?:\.\w+)*\([^)\n]*\)"                               # foo.bar(), run()
+    r"|\$\{?[A-Za-z_]\w*",                                       # $VAR
+)
+# Where a Decide/Approve question is read: the question, its reason, what
+# follows, and the buttons.  A reply's "detail" is the fine print and may
+# name the exact thing; the title, headline and zoom lines often repeat the
+# user's own task name (Code Pipeline's cards quote it), so they are left to
+# machinery_problems.
+PLAIN_CHOICE_FIELDS = ("needs.ask", "needs.why", "needs.next")
+# A quoted span is a name the card repeats (the user's task title, a button
+# label), not the session's own words: left out of the scan.
+_QUOTED = re.compile(r"“[^”\n]*”|\"[^\"\n]*\"")
+
+
+def plain_choice_problems(card: dict) -> list[str]:
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    kind = needs.get("kind")
+    if kind not in ("decision", "approve"):
+        return []
+    fields = {"needs.ask": needs.get("ask"), "needs.why": needs.get("why"), "needs.next": needs.get("next")}
+    replies = [r for r in _items(needs.get("replies")) if isinstance(r, dict)]
+    for i, r in enumerate(replies):
+        fields[f"needs.replies[{i}].label"] = r.get("label")
+    hits = []
+    for where, text in fields.items():
+        if not isinstance(text, str):
+            continue
+        for m in _CODE_TOKEN.finditer(_QUOTED.sub(" ", _norm(text))):
+            hits.append(f"\"{m.group(0).strip()}\" ({where})")
+    out = []
+    if hits:
+        out.append("The question and its buttons read like code: " + ", ".join(dict.fromkeys(hits)) + ". "
+                   "A yes-or-no the user can picture names the outcome, not the syntax: not \"refuse del "
+                   "/s /q and Remove-Item -Recurse -Force like rm -rf\" but \"stop a session from wiping "
+                   "a folder on Windows the way it is already stopped on Mac\". The exact command or "
+                   "name may go in a reply's \"detail\", in context, or in links.")
+    # A pick between mockups is his taste; every other choice comes with the
+    # session's recommendation, so a yes-or-no is never handed over bare.
+    picks = shows_variants(card) or any(_items(r.get("screens")) for r in replies)
+    if replies and not picks:
+        rec = [r for r in replies if r.get("recommended") is True]
+        if not rec:
+            out.append("Mark the reply you recommend with \"recommended\": true (exactly one). The user "
+                       "reads the question between many sessions; the card says which way you would go "
+                       "and why (in needs.why), so he can agree in one tap or disagree knowingly.")
+        elif len(rec) > 1:
+            out.append("More than one reply is marked \"recommended\"; mark exactly one.")
     return out
 
 
@@ -1021,7 +1123,14 @@ def length_problems(card: dict) -> list[str]:
         # text, long on purpose (smart_termination.explained_problems);
         # full_answer: the "Full answer" under "In short", folded away and long
         # on purpose (owner's pick A, 2026-10-28, static/scratch/answer-detail.html).
+        # finding: the "Also found" band, three capped lines outside the 120
+        # (finding_problems); the per-line cap below still applies.
         if where.startswith(("deliverable", "asks", "zoom", "explained", "full_answer")):
+            continue
+        if where.startswith("finding"):
+            if n_f := _words(text):
+                if n_f > MAX_LINE_WORDS:
+                    long_lines.append(f"{where} is {n_f} words (limit {MAX_LINE_WORDS})")
             continue
         n = _words(text)
         if _POPUP_ONLY.match(where):
@@ -1171,8 +1280,13 @@ def _checks(card: dict, prose: str) -> list[tuple[str, str, str, str]]:
         quoted = where.startswith(("deliverable", "compare"))
         if where.startswith("asks"):
             continue   # the user's own words ("fix the open issues you left")
+        # A finding is, by definition, something noticed and not acted on
+        # (finding_problems); its words for that are not unfinished work.
+        finding = where.startswith("finding")
         for name, advice, rx in groups:
             if quoted and rx is not AI_TELL[2]:
+                continue
+            if finding and rx in (UNFINISHED[2], BLAME[2]):
                 continue
             if t == "needs_you" and rx is HAND_BACK[2] and where == "needs.ask":
                 continue
@@ -1225,7 +1339,10 @@ has read nothing else in this session.
            "ask": "...", "why": "...", "next": "...", "eta": "...",
            "look": [{"label": "...", "kind": "link", "url": "..."}],
            "steps": [{"text": "...", "command": "..."}],
-           "replies": [{"key": "A", "label": "the choice spelled out", "detail": "...", "reply": "..."}]}}
+           "replies": [{"key": "A", "label": "the choice spelled out", "detail": "...", "reply": "...",
+                        "recommended": true}]},
+ "finding": {"what": "something you noticed outside his ask", "risk": "what it risks for him",
+             "recommend": "what you recommend", "reply": "optional: what its button sends"}}
 ```
 
 Which card to end on: go by what the user's last message was, then by what \
@@ -1265,6 +1382,20 @@ would do ("Give answer cards their own buttons"): it is drawn as a "Do what \
 it suggested" button that sends "Yes, do that". A "none" card's next \
 never waits on him ("once you confirm", "when you say go"): such a card is \
 sent back.
+Something you NOTICED outside his ask and may not act on alone (a permission \
+rule, a security gap, a cost) goes in "finding": {"what", "risk", \
+"recommend"}, drawn as a quiet "Also found" band with one button. It is \
+neither unfinished work nor a decision, so a done card may carry it, and it \
+is never turned into a Decide/Approve: a decision or approval must be tied to \
+something HE asked for, in his words, in "asks" (state "needs_you"); one that \
+is not is sent back.
+A Decide or Approve question is a yes-or-no he can picture. Its ask, why, \
+next and button labels name the outcome in plain words ("stop a session from \
+wiping a folder on Windows, as it is already stopped on Mac"), never command \
+syntax, flags or code names ("del /s /q", "--force", "chrome_control"): those \
+go in a reply's "detail", in context or in links. Mark the reply you \
+recommend with "recommended": true (exactly one), and say why in needs.why; \
+a pick between mockups is his taste and needs no recommendation.
 
 Types:
 - done: everything asked for is finished and checked. Nothing in remaining or \
@@ -1297,7 +1428,8 @@ as a web page; no scripts run) or "text" (plain text, shown as written); \
 the user opens it full screen with a Copy button. Files to download (a zip, \
 a PDF, a deck) go in "files": [{"label": "what it is", "url": \
 "/static/scratch/<name>", "size": "3.4 MB"}], drawn as Download buttons; \
-"body" is then optional. Never hand a file over as a Validate row or a \
+a text file there with "copy": true is drawn as a Copy button instead (a long \
+text to paste). "body" is then optional. Never hand a file over as a Validate row or a \
 link: such a card is sent back.
 - explain: an answer to a question, in "answer" (or a "compare" block). \
 When there is reasoning, evidence or examples behind it (most answers), add \

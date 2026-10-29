@@ -262,6 +262,18 @@ def test_a_pick_between_variants_may_answer_a_question(scratch):
     assert not any("answers it with a Decide card" in p for p in _he.reviewer_problems(c, _vfacts()))
 
 
+def test_a_pick_answering_a_question_must_mark_its_recommendation(scratch):
+    # "Which do you prefer and why" got an answer, but the choices still read
+    # as an unmarked A or B (2026-10-29).
+    c = _variant_card("decision")
+    probs = _he.reviewer_problems(c, _vfacts())
+    assert any("wants your pick" in p for p in probs)
+    c["needs"]["replies"][1]["recommended"] = True
+    assert not any("wants your pick" in p for p in _he.reviewer_problems(c, _vfacts()))
+    c["needs"]["replies"][2]["recommended"] = True
+    assert any("wants your pick" in p for p in _he.reviewer_problems(c, _vfacts()))
+
+
 def test_other_decisions_after_a_question_are_still_sent_back(scratch):
     c = _variant_card("decision")
     c["needs"]["look"] = [{"label": "x", "kind": "link", "url": "/static/js/app.js"}]

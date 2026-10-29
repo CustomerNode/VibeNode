@@ -83,8 +83,14 @@ def install_requirements(python: str | None = None, requirements: Path = REQUIRE
     "pip_output_tail": str}``.  Never raises.
     """
     python = python or sys.executable
+    # --only-binary=:all: — never source-build (same rule as update_safety.py).
+    # On Windows ARM64, supabase -> pyjwt[crypto] -> cryptography has no wheel,
+    # so pip bootstrapped Rust (rustup, cargo, maturin) on every launch, flashed
+    # a burst of terminal windows, failed, left the stamp unwritten, and retried
+    # at the next launch.  Wheels-only turns that into a quick, silent resolver
+    # failure; it is still reported and still retried, just never compiled.
     cmd = [python, "-m", "pip", "install", "--disable-pip-version-check",
-           "-r", str(requirements)]
+           "--only-binary=:all:", "-r", str(requirements)]
     run = runner or subprocess.run
     try:
         r = run(cmd, capture_output=True, text=True, timeout=timeout,

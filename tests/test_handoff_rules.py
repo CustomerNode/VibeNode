@@ -49,7 +49,8 @@ DECISION = {
         "look": [{"label": "Review page: both designs side by side", "kind": "link",
                   "url": "http://127.0.0.1:8000/app/scratch/review?trial=spaceOpens"}],
         "replies": [
-            {"key": "B", "label": "A chevron button on the preview's right edge", "reply": "Go with the chevron"},
+            {"key": "B", "label": "A chevron button on the preview's right edge", "reply": "Go with the chevron",
+             "recommended": True},
             {"key": "C", "label": "Expanded and Collapsed text links in the header", "reply": "Go with the links"},
         ],
         "next": "I build the one you pick and remove the other. About 10 minutes.",
@@ -67,7 +68,7 @@ APPROVE = {
          "after": "Only the session whose commit caused it is told"}]},
     "needs": {"kind": "approve", "ask": "Commit CustomerNode's push-guard change and build the targeted version?",
               "why": "It changes what every session hears after a push.",
-              "replies": [{"key": "✓", "label": "Go", "reply": "go"},
+              "replies": [{"key": "✓", "label": "Go", "reply": "go", "recommended": True},
                           {"key": "–", "label": "Not yet", "reply": "not yet"}],
               "next": "Until you answer, sessions hear nothing about the check."},
 }

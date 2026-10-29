@@ -127,7 +127,9 @@
   watch('js/last-card.js', 'js', redrawCards);
   watch('css/last-card.css', 'css', null);
   // Can't be loaded twice: reload the tab when it is out of view.
-  ['js/sessions.js', 'js/session-verb.js', 'js/session-verdict.js', 'js/socket.js', 'js/live-panel.js', 'js/app.js']
+  ['js/sessions.js', 'js/session-verb.js', 'js/session-verdict.js', 'js/socket.js', 'js/live-panel.js', 'js/app.js', 'js/toolbar.js',
+   // The thread's scroll rules (the classic facade wraps it, so never twice).
+   'js/thread-scroll.js', 'js/thread-scroll-classic.js']
     .forEach(p => watch(p, 'reload', null));
 
   document.addEventListener('visibilitychange', () => {

@@ -631,20 +631,37 @@ def reviewer_problems(card: dict, facts: TurnFacts) -> list:
                        "Do not attach a new choice to an answer; anything you would offer goes in needs.next "
                        "as what happens next. If work he asked for waits on his yes, use needs.kind "
                        "\"approve\" with the answer in \"answer\" and that request in \"asks\" (state \"needs_you\").")
+        # A question asked while choices are up wants the session's pick, and
+        # the buttons must say which one it is (2026-10-29, the owner on "Which
+        # do you prefer and why": the answer leaned one way but the choices
+        # still read as an unmarked A or B).
+        replies = needs.get("replies") if isinstance(needs.get("replies"), list) else []
+        if picks and len(replies) > 1 and \
+                sum(1 for r in replies if isinstance(r, dict) and r.get("recommended") is True) != 1:
+            out.append("The user asked a question about the choices on screen, so he wants your pick. Mark "
+                       "exactly one reply \"recommended\": true (the one your answer favours), so the choices "
+                       "read as \"<that one>, recommended\" and the other, and say why in needs.why.")
 
     # A Decide card is for a choice that blocks something he asked for, not
     # an idea the session would like to offer ("why did you think that was
     # the right choice?", 2026-10-28: an answer arrived as a Decide card about
     # adding a check nobody had asked for).
+    # The same for an Approve (2026-10-28: an approval about a permission gap
+    # a test had found, which he had never raised, passed because its "asks"
+    # entry was text the card wrote for itself).  The match is against his
+    # actual messages; something noticed outside his ask goes in "finding".
     needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
-    if needs.get("kind") == "decision" and facts.history and facts.complete:
+    if needs.get("kind") in ("decision", "approve") and facts.history and facts.complete:
         waiting = [a.get("ask", "") for a in (card.get("asks") or []) if isinstance(a, dict)
                    and a.get("state") == "needs_you" and isinstance(a.get("ask"), str)]
         if not any(_covers(w, r) or _covers(r, w) for w in waiting for r in facts.history):
-            out.append("This Decide card is not tied to anything the user asked for. A decision is only "
-                       "for a choice that blocks work he asked for: list that request in \"asks\" with "
-                       "state \"needs_you\", in his words. An idea or improvement you would like to "
-                       "offer is not a decision; name it in needs.next.")
+            what = "Decide" if needs.get("kind") == "decision" else "Approve"
+            out.append(f"This {what} card is not tied to anything the user asked for. A decision or an "
+                       "approval is only for a choice that blocks work he asked for: list that request "
+                       "in \"asks\" with state \"needs_you\", in his words. An idea or improvement you "
+                       "would like to offer is not a decision; name it in needs.next. Something you "
+                       "noticed outside his ask that you may not act on alone goes in \"finding\" "
+                       "(what, risk, recommend), drawn as an \"Also found\" band with its own button.")
 
     # The path's first step is where the thing lives; like the big picture it
     # stays put unless his own words moved to a new topic (owner, 2026-10-28,
