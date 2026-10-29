@@ -2,22 +2,29 @@ name: Unit Tests
 
 # The Publish gate runs this suite on the developer's machine, and can be
 # skipped ("Skip & Publish", "Publish Anyway").  Nothing ran it anywhere else
-# until 2026-10-23.  This runs it on every push to main and every PR so a
-# skipped gate still shows up red here.
+# until 2026-10-23.  This runs it on every push to main and every PR.
+#
+# THIS RUN NEVER EMAILS ANYONE (owner, 2026-10-29: "I DO NOT WANT TO GET THE
+# EMAILS ANYMORE").  GitHub emails whoever pushed when a run ends failed or
+# cancelled, so a run must end neither way:
+#   - the job and its test steps are continue-on-error, so a red test, a
+#     timeout or a failed install never fails the run;
+#   - there is no concurrency group with cancel-in-progress, so a newer push
+#     never cancels a run.
+# Results are on the run's page: the "Test results" summary lists every
+# failing test.  Do NOT remove continue-on-error or add cancel-in-progress.
+# Guard: test_the_ci_run_never_fails_or_cancels (tests/test_publish_gate_commit.py).
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
 
-concurrency:
-  group: unit-tests-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   unit:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -57,18 +64,44 @@ jobs:
         # tests/conftest.py re-execs the run inside a PID namespace (unshare)
         # on Linux and falls back with a warning where that is unavailable;
         # nothing is set here on purpose.
+        continue-on-error: true
+        timeout-minutes: 40
         run: |
           python -m pytest -q -p no:cacheprovider --timeout=120 \
             --junitxml=junit-py${{ matrix.python-version }}.xml
 
       - name: Run the thread-scroll JS tests
         if: always()
+        continue-on-error: true
         run: |
           node tests/test_thread_scroll.js
           node tests/test_thread_scroll_classic.js
 
+      - name: Test results
+        if: always()
+        continue-on-error: true
+        run: |
+          python - junit-py${{ matrix.python-version }}.xml >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          try:
+              root = ET.parse(sys.argv[1]).getroot()
+          except Exception as e:
+              print(f"### No test report ({e})")
+              raise SystemExit(0)
+          s = root if root.tag == "testsuite" else root.find("testsuite")
+          n, f, e, k = (int(s.get(a, 0)) for a in ("tests", "failures", "errors", "skipped"))
+          print(f"### {n - f - e - k} passed, {f + e} failed, {k} skipped")
+          for tc in s.iter("testcase"):
+              for bad in ("failure", "error"):
+                  x = tc.find(bad)
+                  if x is not None:
+                      msg = (x.get("message") or "").splitlines()[0][:160] if x.get("message") else ""
+                      print(f"- `{tc.get('classname')}::{tc.get('name')}` {msg}")
+          PY
+
       - name: Upload JUnit report
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: junit-py${{ matrix.python-version }}

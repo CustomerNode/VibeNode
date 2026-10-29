@@ -229,3 +229,20 @@ def test_the_unit_suite_has_a_ci_workflow():
     assert "node tests/test_thread_scroll_classic.js" in text
     assert "playwright install --with-deps chromium" in text
     assert "upload-artifact" in text and "junit" in text
+
+
+def test_the_ci_run_never_fails_or_cancels():
+    """GitHub emails whoever pushed when a run ends failed or cancelled, and
+    the owner wants none of those emails (2026-10-29).  So nothing may fail
+    the run (job and test steps continue-on-error) and no push may cancel
+    one (no cancel-in-progress)."""
+    import yaml
+    import app.routes.test_api as ta
+    wf = yaml.safe_load((ta._REPO_ROOT / ".github" / "workflows" / "unit-tests.yml").read_text(encoding="utf-8"))
+    assert "concurrency" not in wf, "a concurrency group cancels runs, and a cancelled run emails"
+    for name, job in wf["jobs"].items():
+        assert job.get("continue-on-error") is True, f"job {name} can fail the run"
+        assert "concurrency" not in job, f"job {name} can be cancelled by a newer push"
+        for step in job["steps"]:
+            if "run" in step and ("pytest" in step["run"] or "node tests/" in step["run"]):
+                assert step.get("continue-on-error") is True, f"step {step.get('name')} can fail the job"
