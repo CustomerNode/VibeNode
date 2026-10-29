@@ -148,6 +148,124 @@ def backfill_reviewed(sessions: list, sessions_dir: Path) -> int:
     return marked
 
 
+# ── Second backfill: what the person SAW as Done stays Done (2026-10-29) ──
+# The first backfill only covered sessions older than a week.  Until the rule
+# above shipped, every sleeping session was drawn Done, and putting a session
+# to sleep was how the person marked it Done.  The owner restarted VibeNode
+# and every session he had marked that way turned Needs you ("every fucking
+# session i marked done is now showing needs you").  So each session that was
+# asleep when this shipped, and whose newest message is older than this
+# instant, keeps the Done it was drawn with: a 'done' hold, same rules as
+# any other (a new message ends it).  Decide / Unblock survived sleep in the
+# old drawing too, and a session that never replied was never Done.
+SLEPT_CUTOFF_TS = 1793281500.0           # 2026-10-29 13:45:00 UTC
+SLEPT_MARKER = "_session_holds_backfill_slept.json"
+
+
+def backfill_slept(sessions: list, sessions_dir: Path, live_ids) -> int:
+    """Mark Done, once per project, every session not in *live_ids* (the
+    Session Engine's awake sessions) whose newest message predates
+    ``SLEPT_CUTOFF_TS``.  Returns how many were marked.  *live_ids* must be
+    the engine's real list: an empty set would mark awake sessions too, so
+    the caller passes None when it could not read it, and nothing is done."""
+    if live_ids is None:
+        return 0
+    live = set(live_ids)
+    sd = Path(sessions_dir)
+    marker = sd / SLEPT_MARKER
+    if marker.exists():
+        return 0
+    p = holds_path(sd)
+    marked = 0
+    with _lock:
+        if marker.exists():
+            return 0
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:
+            data = {}
+        now = time.time()
+        for s in sessions:
+            sid = s.get("id")
+            try:
+                last = float(s.get("last_activity_ts") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not sid or sid in data or sid in live or not (0 < last < SLEPT_CUTOFF_TS):
+                continue
+            step = s.get("next_step") if isinstance(s.get("next_step"), dict) else {}
+            if step.get("verb") in _KEEP_WAITING:
+                continue
+            if not step and not s.get("message_count"):
+                continue                     # never replied: nothing was Done
+            data[sid] = {"state": "done", "at": last, "set": now, "backfill": "slept"}
+            marked += 1
+        try:
+            if marked:
+                tmp = p.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp, p)
+                _cache.pop(str(p), None)
+            marker.write_text(json.dumps({"at": now, "marked": marked,
+                                          "cutoff": SLEPT_CUTOFF_TS}), encoding="utf-8")
+        except OSError:
+            return 0
+    return marked
+
+
+def awake_ids_from_registry(path: Path | None = None):
+    """The Session Engine's awake sessions, from its restart memory
+    (``~/.claude/gui_active_sessions.json``).  A slept or deleted session is
+    removed from it, so what is listed is awake.  None when unreadable, so a
+    caller never mistakes "could not read" for "nothing is awake"."""
+    p = Path(path) if path else Path.home() / ".claude" / "gui_active_sessions.json"
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        sessions = data.get("sessions") if isinstance(data, dict) else None
+        if not isinstance(sessions, dict):
+            return None
+        return {sid for sid, v in sessions.items()
+                if not (isinstance(v, dict) and v.get("state") == "stopped")}
+    except Exception:
+        return None
+
+
+def migrate_all(projects_root: Path | None = None, live_ids=None) -> dict:
+    """Run every hold migration over every project, with THIS code.
+
+    Called by ``app/post_update.py`` in a fresh interpreter right after an
+    Update pulls new code (2026-10-29).  The running web server keeps the code
+    it started with while the browser gets the new screen code at once, so a
+    migration that only ran inside the server waited for some later restart:
+    on 2026-10-29 the new "Done is your verdict" screen code was live for
+    hours before the server ever ran the carry-over, and every session the
+    owner had marked Done showed Needs you.  Returns {project: marked}."""
+    from .sessions import load_session_summary
+    root = Path(projects_root) if projects_root else Path.home() / ".claude" / "projects"
+    if live_ids is None:
+        live_ids = awake_ids_from_registry()
+    out = {}
+    try:
+        dirs = sorted(d for d in root.iterdir() if d.is_dir() and not d.name.startswith("_")
+                      and not d.name.endswith("-_system"))
+    except OSError:
+        return out
+    for d in dirs:
+        files = [f for f in d.glob("*.jsonl") if not f.name.startswith("_")]
+        if not files:
+            continue
+        try:
+            rows = [load_session_summary(f) for f in files]
+            n = backfill_reviewed(rows, d) + backfill_slept(rows, d, live_ids)
+        except Exception:
+            continue
+        if n:
+            out[d.name] = n
+    return out
+
+
 def set_hold(sessions_dir: Path, session_id: str, state: str | None, at: float) -> None:
     """Record (or with ``state=None`` clear) the person's choice."""
     if state is not None and state not in STATES:

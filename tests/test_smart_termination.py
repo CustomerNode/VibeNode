@@ -26,7 +26,7 @@ def _card(**over):
          "links": [{"label": "Phone screenshot of the header", "kind": "file", "url": "/tmp/phone-header.png"}],
          "needs": {"kind": "none", "why": "It is finished.", "next": "It ships with your next Update."},
          "links": [{"label": "The fixed header on a phone", "kind": "image", "url": "/api/preview/asset/abc"}],
-         "validate": {"how": "Open any chat on your phone and scroll up", "url": "/"},
+         "validate": {"how": "Open any chat on your phone and scroll up", "url": "/static/scratch/phone-header-demo.html"},
          "zoom": {"big": "Make the VibeNode chat usable on phones.",
                   "task": "Stop the header covering the chat.",
                   "now": "Fixed the header, checked on a phone."},

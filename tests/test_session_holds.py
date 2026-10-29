@@ -130,6 +130,41 @@ def test_a_backfilled_done_ends_on_the_next_message(tmp_path):
     assert sh.state_for(entry, old + 60) is None
 
 
+# ── Second backfill: a session drawn Done because it slept stays Done ──
+# (2026-10-29: after a restart every session the owner had marked Done by
+# sleeping it turned Needs you.)
+
+def test_sessions_asleep_before_the_change_stay_done(tmp_path):
+    from app import session_holds as sh
+    t = sh.SLEPT_CUTOFF_TS - 3600
+    rows = [dict(_row("slept", t, "review"), message_count=4),
+            dict(_row("slept_plain", t), message_count=4),
+            dict(_row("awake", t, "review"), message_count=4),
+            dict(_row("slept_decide", t, "decide"), message_count=4),
+            dict(_row("never_replied", t), message_count=0),
+            dict(_row("after", sh.SLEPT_CUTOFF_TS + 60, "review"), message_count=4),
+            dict(_row("mine", t, "review"), message_count=4)]
+    (tmp_path / sh.FILENAME).write_text(json.dumps({"mine": {"state": "standby", "at": t, "set": 1}}), encoding="utf-8")
+    assert sh.backfill_slept(rows, tmp_path, {"awake"}) == 2
+    holds = sh.load(tmp_path)
+    assert holds["slept"]["state"] == "done" and holds["slept"]["at"] == t
+    assert holds["slept_plain"]["state"] == "done"
+    assert holds["mine"]["state"] == "standby"                 # his own choice is kept
+    for sid in ("awake", "slept_decide", "never_replied", "after"):
+        assert sid not in holds
+    assert sh.state_for(holds["slept"], t + 60) is None        # a new message ends it
+    # Once per project.
+    assert sh.backfill_slept([dict(_row("late", t), message_count=2)], tmp_path, set()) == 0
+
+
+def test_slept_backfill_waits_when_the_awake_list_is_unknown(tmp_path):
+    from app import session_holds as sh
+    t = sh.SLEPT_CUTOFF_TS - 3600
+    assert sh.backfill_slept([dict(_row("s", t, "review"), message_count=2)], tmp_path, None) == 0
+    assert not (tmp_path / sh.SLEPT_MARKER).exists()
+    assert sh.backfill_slept([dict(_row("s", t, "review"), message_count=2)], tmp_path, set()) == 1
+
+
 # ── What the sidebar draws ──
 
 HARNESS = r"""
@@ -227,3 +262,60 @@ def test_double_click_still_steps_needs_you_to_standby_to_done():
     assert r["after"][0] == "hold:standby" and "emit:close_session" in r["after"]
     r = _dbl("sleeping", "standby", "standby")
     assert r["after"][0] == "hold:done" and not any(e.startswith("emit:") for e in r["after"])
+
+
+# ── Done never lost again (2026-10-29): the three ways it was lost ──
+
+def test_an_update_runs_the_migrations_with_the_pulled_code(tmp_path):
+    """The screen code changes the moment an Update pulls; the server keeps its
+    old code.  app/post_update.py runs the migrations in a FRESH interpreter,
+    so a carry-over that ships with an update never waits for a restart."""
+    from app import session_holds as sh
+    root = tmp_path / "projects"
+    d = root / "C--proj"
+    d.mkdir(parents=True)
+    old = "2026-10-25T12:00:00+00:00"
+    for sid in ("slept", "awake"):
+        (d / f"{sid}.jsonl").write_text(_line("user", "hi", old, sid) + "\n" + _line("assistant", "Done it.", old, sid) + "\n", encoding="utf-8")
+    assert sh.migrate_all(root, {"awake"}) == {"C--proj": 1}
+    assert sh.load(d)["slept"]["state"] == "done" and "awake" not in sh.load(d)
+    assert sh.migrate_all(root, {"awake"}) == {}                       # once
+
+
+def test_migrate_all_does_nothing_when_the_awake_list_is_unreadable(tmp_path):
+    from app import session_holds as sh
+    assert sh.awake_ids_from_registry(tmp_path / "missing.json") is None
+    reg = tmp_path / "reg.json"
+    reg.write_text(json.dumps({"sessions": {"a": {"state": "idle"}, "b": {"state": "stopped"}}}), encoding="utf-8")
+    assert sh.awake_ids_from_registry(reg) == {"a"}
+
+
+def test_the_update_calls_post_update_in_a_fresh_interpreter(monkeypatch):
+    import app.git_ops as g
+    calls = []
+    class R:
+        returncode = 0; stdout = "{}"; stderr = ""
+    monkeypatch.setattr(g.subprocess, "run", lambda cmd, **kw: (calls.append((cmd, kw)), R())[1])
+    assert g._run_post_update(ROOT) is True
+    cmd, kw = calls[0]
+    assert cmd[1:] == ["-m", "app.post_update"] and kw["cwd"] == str(ROOT)
+    src = (ROOT / "app" / "git_ops.py").read_text(encoding="utf-8")
+    assert "_run_post_update(proj)" in src
+
+
+def test_post_update_runs_as_a_script():
+    r = subprocess.run([__import__("sys").executable, "-c",
+                        "import app.post_update as p, app.session_holds as h; h.migrate_all = lambda: {'x': 1}; print(p.run())"],
+                       cwd=str(ROOT), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and "'x': 1" in r.stdout, r.stderr
+
+
+def test_a_hold_on_a_renamed_id_survives_a_reload(client, proj, monkeypatch):
+    """The row shows the session's new id while its transcript keeps the old
+    file name; marking it Done must still show Done after a reload."""
+    import app.routes.sessions_api as sa
+    monkeypatch.setattr(sa, "_load_remaps_cached", lambda project="": {"deck": {"new_id": "deck-new"}})
+    assert "deck-new" in _list(client, proj)
+    r = client.post("/api/session-hold/deck-new", json={"state": "done", "project": proj.name})
+    assert r.status_code == 200
+    assert _list(client, proj)["deck-new"].get("hold") == "done"

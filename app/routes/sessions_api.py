@@ -366,6 +366,14 @@ def api_sessions():
             _seen.add(s["id"])
             deduped.append(s)
     sessions = deduped
+    # A hold is saved under the id the browser shows; a row listed under a
+    # renamed id (above) must still find it (app/session_holds.py).
+    if aliases:
+        try:
+            from .. import session_holds as _holds_alias
+            _holds_alias.overlay(sessions, _sessions_dir(project))
+        except Exception:
+            pass
 
     # Final pass: filter out any sessions whose resolved ID is a utility session
     utility_ids = _get_utility_ids(project)
@@ -378,7 +386,22 @@ def api_sessions():
     # + inbox-dirty flag.  Without this the sidebar can't render the
     # tree variant for closed-but-still-managed parents.
     _state_by_sid = {}
-    for state in _listing_states(sm):
+    _states = _listing_states(sm)
+    # Sessions that were drawn Done because they slept keep that Done
+    # (app/session_holds.py backfill_slept, once per project).  It needs the
+    # engine's awake list; an empty or unreadable one waits for a later call.
+    if not current_app.testing:
+        try:
+            from .. import session_holds as _holds
+            _live = {st.get("session_id") for st in _states
+                     if st.get("state") != "stopped"} if _states else None
+            if _live is not None and getattr(sm, "_connected", True) is False:
+                _live = None
+            if _holds.backfill_slept(sessions, _sessions_dir(project), _live):
+                _holds.overlay(sessions, _sessions_dir(project))
+        except Exception:
+            pass
+    for state in _states:
         sid = state.get("session_id", "")
         if state.get("session_type") in ("planner", "title"):
             continue
@@ -650,6 +673,16 @@ def api_session_hold(session_id):
     project = (data.get("project") or request.args.get("project", "")).strip()
     sdir = _sessions_dir(project)
     path = sdir / f"{session_id}.jsonl"
+    if not path.exists():
+        # The row may show a renamed id while its transcript keeps the old
+        # file name: pin the hold to that file's newest message.
+        try:
+            for old_id, entry in _load_remaps_cached(project).items():
+                if entry.get("new_id") == session_id and (sdir / f"{old_id}.jsonl").exists():
+                    path = sdir / f"{old_id}.jsonl"
+                    break
+        except Exception:
+            pass
     at = 0.0
     if path.exists():
         try:

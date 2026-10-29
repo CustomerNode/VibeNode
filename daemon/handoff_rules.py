@@ -573,6 +573,24 @@ def variants_pick_problem(card: dict) -> Optional[str]:
 # A validate.url the card can open: a page on this app, or a web address.
 _VALIDATE_URL = re.compile(r"^(?:/(?!/)|https?://\S)", re.I)
 
+
+def is_app_home(url) -> bool:
+    """True when ``url`` is VibeNode's own front page and nothing more: "/",
+    or this app's port on this machine or the tailnet, with no path, query or
+    fragment.  2026-10-29: a done card's Validate row for an Update fix linked
+    "http://localhost:5050/", the app the owner was already in ("telling me to
+    validate via a link to the interface i am already in was manic").  A deep
+    link ("/?session=…", "#kanban") points at something and passes."""
+    u = _s(url).strip()
+    if u in ("/", ""):
+        return u == "/"
+    m = re.match(r"^https?://(?:[^@/?#]*@)?(\[[^\]]*\]|[^:/?#]+)(?::(\d+))?(/?)$", u, re.I)
+    if not m:
+        return False
+    host, port = m.group(1).lower(), m.group(2)
+    local = host in ("localhost", "127.0.0.1", "[::1]", "0.0.0.0") or host.endswith(".ts.net")
+    return local and (port == _own_port() or (port is None and host.endswith(".ts.net")))
+
 # A file to download, not a page to look at.  2026-10-28: a presentation was
 # handed over as a "done" card whose Validate row pointed at a .zip, so "Try
 # it" framed the archive full screen and showed nothing (the owner: "the
@@ -712,6 +730,12 @@ def format_problems(card: dict) -> list[str]:
                        "not a file path or nothing. If the real check only happens later (the next "
                        "time X occurs), build a demo page that shows it happening, put it in "
                        "validate.url, and say when the real moment is in validate.later.")
+        elif is_app_home(v.get("url")):
+            out.append(f"validate.url ({_s(v.get('url'))}) is VibeNode's front page, the app he is "
+                       "already in: it opens nothing he can check. Link the exact place the change "
+                       "shows (a deep link, a preview, a screenshot), or, when the real check only "
+                       "happens later, build a demo page that shows it happening and say when the "
+                       "real moment is in validate.later.")
         if failed_checks:
             out.append("A \"done\" card cannot carry a failed check: "
                        + "; ".join(_s(v.get("check")) or "(unnamed)" for v in failed_checks)
@@ -1408,7 +1432,8 @@ have "validate": one line on how the user checks it works himself, and in \
 "url" the page, preview or screen he opens to try it NOW. When the real check \
 only happens later (the next time something occurs), build a demo page that \
 shows it happening, link it in "url", and put the real moment in "later". A \
-Validate row with nothing to open is sent back.
+Validate row with nothing to open, or one that only opens VibeNode's front \
+page (the app he is already in), is sent back.
 - needs_you: only the user can do it: a decision that is theirs (each choice \
 spelled out, plus a link to look at), an approval, or an action such as a \
 login (steps plus an "I did it" button). A choice about how something looks \

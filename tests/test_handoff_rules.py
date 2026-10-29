@@ -625,6 +625,25 @@ def test_a_page_or_demo_satisfies_validate(url):
     assert not any("validate.url" in p for p in hr.format_problems(card))
 
 
+# 2026-10-29: an Update fix's Validate row linked the app the owner was
+# already in ("telling me to validate via a link to the interface i am already
+# in was manic").  The front page alone opens nothing to check.
+@pytest.mark.parametrize("url", ["/", "http://localhost:5050/", "http://127.0.0.1:5050",
+                                 "http://[::1]:5050/", "https://box.tail1234.ts.net/"])
+def test_the_app_front_page_is_not_a_validate_link(url):
+    card = dict(DONE, validate={"how": "Press Update", "url": url,
+                                "later": "The next Update that pulls a package"})
+    problems = hr.format_problems(card)
+    assert any("front page" in p and "validate.later" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("url", ["/?session=abc", "/#kanban", "http://localhost:5050/static/x.html",
+                                 "http://localhost:8000/", "https://example.com/"])
+def test_a_deep_link_or_another_app_still_passes(url):
+    card = dict(DONE, validate={"how": "Look", "url": url})
+    assert not any("front page" in p for p in hr.format_problems(card))
+
+
 def test_a_validate_page_counts_as_something_to_review():
     card = dict(DONE, validate={"how": "Open it and press Back", "url": "/static/x.html"})
     card.pop("links")

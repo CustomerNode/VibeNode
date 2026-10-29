@@ -11,6 +11,9 @@ from .config import _VIBENODE_DIR
 
 from .platform_utils import NO_WINDOW as _NO_WINDOW
 from . import requirements_sync as _reqs
+import logging as _logging
+
+_log = _logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Git cache and lock
@@ -254,6 +257,21 @@ def _unmerged_paths(proj) -> list:
     return [p for p in r.stdout.splitlines() if p.strip()] if r.returncode == 0 else []
 
 
+def _run_post_update(proj) -> bool:
+    """Run ``app/post_update.py`` in a fresh interpreter from the pulled tree.
+    The running server's own modules are the OLD code, so importing them
+    here would run the old migrations.  Never fails the update."""
+    try:
+        r = subprocess.run([sys.executable, "-m", "app.post_update"], cwd=str(proj),
+                           capture_output=True, text=True, timeout=120,
+                           creationflags=_NO_WINDOW)
+        _log.info("post_update rc=%s %s", r.returncode, (r.stdout or r.stderr or "").strip()[-500:])
+        return r.returncode == 0
+    except Exception as e:
+        _log.warning("post_update failed: %s", e)
+        return False
+
+
 def do_git_sync(action: str, confirm_branch: bool = False,
                 summary: str = "", gate=None) -> dict:
     """
@@ -363,6 +381,10 @@ def do_git_sync(action: str, confirm_branch: bool = False,
             else:
                 messages.append("Dependency install failed; the code update landed but some "
                                 "features may not work until it is fixed. See the pip output below.")
+        # Data migrations that ship with the update run NOW, with the pulled
+        # code, not at the web server's next restart (app/post_update.py).
+        if "Already up to date" not in out:
+            _run_post_update(proj)
 
     if action in ("push", "both") and ok:
         # A clash left over from an earlier run is never committed: `git add -A`
