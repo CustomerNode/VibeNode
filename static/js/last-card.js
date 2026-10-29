@@ -1990,12 +1990,14 @@
     if (!_ownEntry(st, key)) { _dropPanelParam(); return; }   // not opened here by him: open nothing
     const open = _findPanel(key);
     if (open) {
+      // After a refresh, app.js rewrote this entry's state; mark it ours again
+      // BEFORE opening, so _panelOpened sees its own entry and pushes no
+      // second one (marked after, a refresh left two ?panel entries and Back
+      // had to be pressed twice to close a Decide).
+      if (!_ownEntry(history.state, key))
+        history.replaceState(Object.assign({}, history.state || {}, { vnPanel: key, vnChat: _chatOf() }), '', location.href);
       open();
       _lastBase = _panelUrl(null).href;
-      // After a refresh, app.js rewrote this entry's state; mark it ours again
-      // so closing steps back to the entry it was opened from.
-      if (_bootState && _bootState.vnPanel === key && !(history.state && history.state.vnPanel))
-        history.replaceState(Object.assign({}, history.state || {}, { vnPanel: key }), '', location.href);
       return;
     }
     if ((tries || 0) < 60) { setTimeout(() => _restorePanel(key, (tries || 0) + 1, st), 300); return; }

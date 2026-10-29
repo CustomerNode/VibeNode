@@ -92,7 +92,7 @@ async def _drive(url):
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         port_file = Path(prof) / "DevToolsActivePort"
-        for _ in range(100):
+        for _ in range(600):   # 60 s: a cold Chrome on a GitHub runner took over 10
             if port_file.exists() and port_file.read_text().strip():
                 break
             time.sleep(0.1)
