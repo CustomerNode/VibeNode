@@ -226,10 +226,14 @@ def review(message: str, *, continued: bool, sendbacks: int,
     if not text or _ERROR_STOP.search(text[:400]):
         return None
     card, prose, err = _rules.extract(text)
+    if facts is not None and background_in_flight:
+        facts.background_live = True   # the CLI itself says work is out
     if sendbacks >= MAX_SENDBACKS:
         # The polish rules have had their two tries; only a summary he cannot
         # use at all goes back again.
-        bad = unusable_problems(card, err)
+        # A success claim with nothing behind it ("tests pass", "pushed")
+        # keeps going back too: let through, it reads as verified (2026-10-29).
+        bad = unusable_problems(card, err) + unproven_claims(card, facts)
         if not bad:
             return None
         return ("Smart termination: this summary cannot be used as it stands, so it was sent back "
@@ -283,16 +287,29 @@ def unusable_problems(card, err=None) -> list:
     return out
 
 
-def released_faults(message: str, sendbacks: int) -> list:
-    """When the summary is let through at HARD_CEILING still unusable, the
-    faults it carries, so the engine can say so on screen; [] otherwise."""
+def unproven_claims(card, facts) -> list:
+    """The card's success claims (tests pass, checked in the app, pushed)
+    that the session's own tool calls do not back up; [] without facts."""
+    if facts is None or not isinstance(card, dict):
+        return []
+    try:
+        from daemon import handoff_evidence as _ev
+        return ["Not proven: " + p for p in _ev.claim_problems(card, facts)]
+    except Exception:
+        return []
+
+
+def released_faults(message: str, sendbacks: int, facts=None) -> list:
+    """When the summary is let through at HARD_CEILING still unusable or
+    still claiming what it did not prove, the faults it carries, so the
+    engine can say so on screen; [] otherwise."""
     if message is None or sendbacks < HARD_CEILING:
         return []
     text = _norm(message).strip()
     if not text or _ERROR_STOP.search(text[:400]):
         return []
     card, _prose, err = _rules.extract(text)
-    return unusable_problems(card, err)
+    return unusable_problems(card, err) + unproven_claims(card, facts)
 
 
 # Big picture / this task / just now (the owner picked "three lines under

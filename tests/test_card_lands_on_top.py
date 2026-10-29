@@ -180,6 +180,58 @@ def test_a_card_lands_on_top_even_when_he_was_left_screens_behind(browser):
 
 
 @pytest.mark.slow
+def test_a_card_lands_on_top_in_a_tab_running_older_thread_code(browser):
+    """The owner's phone tab, open all evening, kept the thread code from
+    before the fix (a tab reloads only out of view) and said "still not
+    working". The card's own file reaches open tabs live (live-assets.js), so
+    the trigger lives there too: with no thread code at all, a new card still
+    lands with its top at the top."""
+    app, sid, _cwd = _open_with_reply(browser)
+    try:
+        app.eval("() => { ThreadScroll.detach(); ThreadScroll.landCard = undefined; }")
+        app.eval("() => { document.getElementById('live-log').scrollTop = 0; }")
+        app.page.wait_for_timeout(200)
+        app.push("session_entry", {"session_id": sid, "index": 9,
+                                   "entry": {"kind": "asst", "text": _tall_card()}})
+        app.page.wait_for_function("!!document.querySelector('#live-log .lm')", timeout=5000)
+        app.page.wait_for_timeout(400)
+        top = app.eval(CARD_TOP)
+        assert 0 <= top <= 60, f"card top sits {top}px from the top of the thread"
+        assert not app.errors, app.errors
+    finally:
+        app.close()
+
+
+@pytest.mark.slow
+def test_opening_a_session_does_not_count_as_a_card_arriving(browser):
+    """A full render draws many messages in one frame: the card's trigger
+    must leave the thread's own positioning alone, and never fire twice."""
+    from tests._fake_app import CWD, FakeApp, fake_sessions, init_script
+    s = fake_sessions(1)
+    sid = s[0]["id"]
+    app = FakeApp(browser, s, init=init_script("sessions", "grid"),
+                  viewport={"width": 390, "height": 760},
+                  extra_routes={"/api/session/": lambda r: (200, {"id": sid, "display_title": "T", "messages": []})})
+    try:
+        app.push("session_state", {"session_id": sid, "state": "idle", "cwd": CWD})
+        app.eval(f"() => openInGUI('{sid}')")
+        app.page.wait_for_function(f"typeof liveSessionId !== 'undefined' && liveSessionId === '{sid}'", timeout=10000)
+        app.page.wait_for_timeout(400)
+        app.eval("() => { window.__lands = 0; const o = ThreadScroll.landCard; ThreadScroll.landCard = (el) => { window.__lands++; return o(el); }; }")
+        # A short card at the end: the thread's own positioning shows it whole.
+        app.push("session_log", {"session_id": sid, "total": 3, "offset": 0, "has_more": False, "entries": [
+            {"kind": "user", "text": "build all three fixes"},
+            {"kind": "asst", "text": "Earlier reply. " * 40},
+            {"kind": "asst", "text": _tall_card()}]})
+        app.page.wait_for_function("!!document.querySelector('#live-log .lm')", timeout=5000)
+        app.page.wait_for_timeout(500)
+        assert app.eval("() => window.__lands") == 0
+        assert not app.errors, app.errors
+    finally:
+        app.close()
+
+
+@pytest.mark.slow
 def test_a_card_waits_for_a_swipe_in_progress_then_lands_on_top(browser):
     app, sid, _cwd = _open_with_reply(browser)
     try:

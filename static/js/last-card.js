@@ -859,6 +859,23 @@
     }
     return null;
   }
+  // Does his message answer this card?  A reply's own words, its label, or
+  // its key alone ("B", "go with B"); for an action, "done" / "I did it".
+  // A question back or a change of topic leaves the card waiting on him
+  // (2026-10-29).  The card and the earlier-tasks rows both use this.
+  const _norm = t => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  function _answers(c, text) {
+    const n = (c && c.needs) || {};
+    const said = _norm(text);
+    if (!said) return false;
+    const rs = (Array.isArray(n.replies) ? n.replies : []).map(r => r || {});
+    if (rs.some(r => [r.reply, r.label].some(x => { const v = _norm(x); return v.length >= 3 && said.indexOf(v.slice(0, 40)) !== -1; }))) return true;
+    const keys = rs.map((r, i) => String(r.key || String.fromCharCode(65 + i)).toLowerCase());
+    const m = said.match(/^(?:(?:go with|pick|choose|option|i pick|i choose|let's do|lets do)\s+)?(?:option\s+)?([a-z0-9])[.!,]?(?:\s+(?:please|thanks))?[.!]?$/);
+    if (m && keys.indexOf(m[1]) !== -1) return true;
+    if (n.kind === 'action' && /^(?:done|did it|i did it|i've done it|logged in|i logged in|finished)\b/.test(said) && !/\?\s*$/.test(said)) return true;
+    return false;
+  }
   function _syncAnswered() {
     if (window.VNLastCard !== _api) return;
     const log = document.getElementById('live-log');
@@ -867,6 +884,9 @@
       const u = _replyAfter(card);
       if (!u) return;
       const body = u.querySelector('.msg-body') || u;
+      let c = null;
+      try { c = JSON.parse(card.getAttribute('data-card') || 'null'); } catch (_e) { c = null; }
+      if (!_answers(c, body.textContent || '')) return;
       _markAnswered(card, body.textContent || '');
     });
   }
@@ -896,8 +916,9 @@
   //    message, then appends it); a redraw works on a connected one. One such
   //    draw in a frame is an arrival; several are a full render of the thread.
   let _fresh = 0, _freshEl = null, _freshRaf = 0;
+  /** null: one more fresh draw this frame (card or not); an element: the card it drew. */
   function _noteFresh(el) {
-    _fresh++; _freshEl = el;
+    if (el) _freshEl = el; else _fresh++;
     if (_freshRaf) return;
     _freshRaf = requestAnimationFrame(() => {
       _freshRaf = 0;
@@ -926,7 +947,7 @@
   function renderIn(container) {
     if (!container || !container.querySelectorAll) return;
     const fresh = !container.isConnected;
-    if (fresh) _fresh++;   // counted even when nothing in it is a card: a full render is many draws
+    if (fresh) _noteFresh(null);   // counted even when nothing in it is a card: a full render is many draws
     container.querySelectorAll('.vn-card-ph').forEach(ph => {
       let card = null;
       try { card = JSON.parse(ph.getAttribute('data-card') || ''); } catch (_e) { card = null; }
@@ -1025,16 +1046,14 @@
   }
   function _earlierTasks(log, last) {
     const cards = [...log.querySelectorAll('.lm.skim[data-card]')];
-    const users = [...log.querySelectorAll('.msg.user')];
     // Answered: his next message is one of the card's replies (a Decide pick,
     // an "I did it").  Moving on to something else leaves it waiting on him.
-    const norm = t => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    // Same rule as the card itself (_answers): his first message after it.
     const repliedAfter = (el, c) => {
-      const next = users.find(u => el.compareDocumentPosition(u) & Node.DOCUMENT_POSITION_FOLLOWING);
+      if (el.classList && el.classList.contains('lm-answered')) return true;
+      const next = _replyAfter(el);
       if (!next) return false;
-      const said = norm(next.textContent);
-      const rs = (c && c.needs && Array.isArray(c.needs.replies)) ? c.needs.replies : [];
-      return rs.some(r => r && [r.reply, r.label].some(x => { const n = norm(x); return n.length >= 3 && said.indexOf(n.slice(0, 40)) !== -1; }));
+      return _answers(c, (next.querySelector('.msg-body') || next).textContent || '');
     };
     let cur = '';
     try { cur = _cardTask(JSON.parse(last.getAttribute('data-card') || '{}')).toLowerCase(); } catch (_e) { cur = ''; }

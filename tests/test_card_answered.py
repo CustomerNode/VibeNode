@@ -47,6 +47,12 @@ PAGE = f"""<!doctype html><meta charset=utf-8>
 <div class="msg assistant" id="m2"><div class="msg-body"><div class="vn-card-ph" data-card='{_card("Answered from the card", kind="approve", replies=[{"key": "A", "label": "Yes", "reply": "yes"}, {"key": "B", "label": "No", "reply": "no"}], ask="Ok?")}'></div></div></div>
 <div class="msg user vn-event-msg"><div class="msg-body">watchdog nudge, not his answer</div></div>
 <div class="msg assistant" id="m3"><div class="msg-body"><div class="vn-card-ph" data-card='{_card("Not answered yet")}'></div></div></div>
+<div class="msg assistant" id="m4"><div class="msg-body"><div class="vn-card-ph" data-card='{_card("Asked back")}'></div></div></div>
+<div class="msg user"><div class="msg-body">wait, what does a demo mean here?</div></div>
+<div class="msg assistant" id="m5"><div class="msg-body"><div class="vn-card-ph" data-card='{_card("Moved on")}'></div></div></div>
+<div class="msg user"><div class="msg-body">different thing: the sidebar is slow today</div></div>
+<div class="msg assistant" id="m6"><div class="msg-body"><div class="vn-card-ph" data-card='{_card("Answered by its key")}'></div></div></div>
+<div class="msg user"><div class="msg-body">B</div></div>
 </div>
 <script>window.liveSessionId = 's1'; window.sessionKinds = {{}}; window.__sent = [];
 window._liveSubmitDirect = (sid, t) => window.__sent.push(t);</script>
@@ -112,7 +118,7 @@ async def _drive(url):
 
             await call("Page.navigate", url=url)
             for _ in range(50):
-                if await ev("document.querySelectorAll('.lm').length === 3"):
+                if await ev("document.querySelectorAll('.lm').length === 6"):
                     break
                 await asyncio.sleep(0.1)
             await asyncio.sleep(0.2)   # the rAF that marks answered cards
@@ -134,7 +140,7 @@ GREEN, AMBER = "52, 199, 120", "240, 166, 40"
 
 def test_a_card_answered_in_the_chat_turns_green_and_the_rest_stay_amber(site):
     r = asyncio.run(_drive(site))
-    m1, m2, m3 = r["loaded"]
+    m1, m2, m3, *_ = r["loaded"]
     assert (m1["answered"], m1["tone"], m1["pill"]) == (True, GREEN, "Decided")
     assert m1["decide"] == "Sent: “Validate fix B: always a demo”"
     assert m1["stick"] == "Decided"
@@ -143,9 +149,21 @@ def test_a_card_answered_in_the_chat_turns_green_and_the_rest_stay_amber(site):
     assert (m3["answered"], m3["tone"], m3["pill"], m3["stick"]) == (False, AMBER, "Needs you", "jump")
 
     # answering from the card's own buttons turns it green at once
-    c1, c2, c3 = r["clicked"]
+    c1, c2, c3, *_ = r["clicked"]
     assert r["sent"] == ["no"]
     assert (c2["answered"], c2["tone"], c2["pill"]) == (True, GREEN, "Answered")
     assert c3["answered"] is False
     # a later sync does not touch the unanswered card
     assert r["resynced"][2]["answered"] is False
+
+
+def test_a_question_back_or_a_new_topic_leaves_the_card_waiting(site):
+    # 2026-10-29: any later message of his used to turn a Needs-you card
+    # green.  A question back, or a change of subject, is not an answer.
+    r = asyncio.run(_drive(site))
+    m4, m5, m6 = r["loaded"][3:]
+    assert (m4["answered"], m4["pill"]) == (False, "Needs you")
+    assert (m5["answered"], m5["pill"]) == (False, "Needs you")
+    # the choice's key typed alone in the chat box still counts
+    assert (m6["answered"], m6["pill"]) == (True, "Decided")
+    assert r["resynced"][3]["answered"] is False and r["resynced"][4]["answered"] is False

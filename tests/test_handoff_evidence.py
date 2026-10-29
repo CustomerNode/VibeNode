@@ -414,3 +414,84 @@ def test_an_ask_a_later_message_replaced_counts_as_settled():
     # first asked, and a done card may say so (2026-10-27).
     from daemon import handoff_evidence as he
     assert "replaced" in he.ASK_STATES and "replaced" in he.ASK_DONE_STATES
+
+
+# ── A call with no result proves nothing (2026-10-29) ────────────────────
+# A tool call that never got its result back (cut off, still hanging, the
+# turn ended mid-call) used to count as a success: the action defaulted to
+# ok.  It must not prove tests passed, a push went through, or a browser
+# check ran.
+
+def _no_result(name, desc):
+    return E(kind="tool_use", name=name, desc=desc, id=f"t{next(_n)}")
+
+
+def test_a_test_command_with_no_result_does_not_prove_tests_pass():
+    p = ev.problems(DONE, facts(user("fix the status sort"), _no_result("Bash", "python3 -m pytest tests/ -q")))
+    assert p and "test" in p[0]
+
+
+def test_a_push_with_no_result_does_not_prove_it_was_pushed():
+    card = dict(DONE, headline="CustomerNode's sort fix is pushed to develop",
+                verified=[{"check": "Read the code", "result": "ok", "ok": True}])
+    p = ev.problems(card, facts(user("fix the status sort"), _no_result("Bash", "git push origin develop")))
+    assert p and "push" in p[0]
+
+
+def test_a_browser_step_with_no_result_does_not_prove_an_app_check():
+    card = dict(DONE, verified=[{"check": "Checked it in the real app on a phone width", "result": "Sorted.", "ok": True}],
+                headline="CustomerNode's sort fix is in")
+    for step in (_no_result("mcp__playwright__browser_navigate", "url: http://127.0.0.1:5050"),
+                 _no_result("Bash", "curl -s -X POST http://127.0.0.1:5050/api/preview/screenshot")):
+        p = ev.problems(card, facts(user("fix the status sort"), step))
+        assert p and "browser" in p[0]
+
+
+def test_a_sub_agent_with_no_result_does_not_prove_a_push():
+    card = dict(DONE, headline="CustomerNode's sort fix is pushed to develop",
+                verified=[{"check": "Read the code", "result": "ok", "ok": True}])
+    p = ev.problems(card, facts(user("fix the status sort"), _no_result("Agent", "Push the branch to develop")))
+    assert p and "push" in p[0]
+
+
+# ── A Working card needs work that is actually running (2026-10-29) ──────
+# The only check on a "working" card was an ETA.  Now the session's own
+# calls must show background work it launched that has not reported back.
+
+WORKING = {"type": "working", "title": "Status sort", "path": ["Journey picker"],
+           "headline": "CustomerNode's full test suite is running in the background",
+           "context": "the journey picker sort fix.",
+           "needs": {"kind": "none", "why": "The suite takes a while.", "next": "I read the result when it ends.",
+                     "eta": "about 10 minutes"}}
+
+BG_LAUNCH = tool("Bash", "python3 -m pytest tests/ -q", "Command running in background with ID: b12")
+AGENT_LAUNCH = tool("Agent", "Review the diff", "Async agent launched successfully. agentId: a1")
+NOTIFIED = user("<task-notification><task-id>b12</task-id><status>completed</status></task-notification>")
+
+
+def _working_faults(*parts, trimmed=False):
+    return [p for p in ev.problems(WORKING, facts(user("fix the status sort"), *parts, trimmed=trimmed))
+            if "working" in p.lower()]
+
+
+def test_a_working_card_with_nothing_launched_is_sent_back():
+    assert _working_faults(tool("Edit", "app/sort.py"))
+
+
+def test_a_working_card_after_the_work_reported_back_is_sent_back():
+    assert _working_faults(BG_LAUNCH, NOTIFIED)
+
+
+def test_a_working_card_with_live_background_work_passes():
+    assert _working_faults(BG_LAUNCH) == []
+    assert _working_faults(AGENT_LAUNCH) == []
+    assert _working_faults(BG_LAUNCH, AGENT_LAUNCH, NOTIFIED) == []   # one of two still out
+    assert _working_faults(tool("ScheduleWakeup", "delaySeconds: 600", "scheduled")) == []
+
+
+def test_a_working_card_is_not_judged_when_history_was_trimmed():
+    assert _working_faults(tool("Edit", "app/sort.py"), trimmed=True) == []
+
+
+def test_a_working_card_is_not_judged_without_facts():
+    assert [p for p in ev.problems(WORKING, None) if "working" in p.lower()] == []

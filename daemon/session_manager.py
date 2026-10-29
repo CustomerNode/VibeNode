@@ -5698,13 +5698,18 @@ class SessionManager:
             # (the owner, 2026-10-29: "The idea was this could not happen").
             try:
                 released = getattr(_st, "released_faults", None)
-                faults = released(message, sendbacks) if released else []
+                try:
+                    faults = released(message, sendbacks, facts=facts) if released else []
+                except TypeError:   # rules from before the facts argument
+                    faults = released(message, sendbacks) if released else []
             except Exception:
                 faults = []
             if faults:
+                # A claim it never proved is labelled "Not proven", so it
+                # never reads as verified (2026-10-29).
                 entry = LogEntry(kind="system", is_error=True,
                                  text="This summary was let through after "
-                                      f"{sendbacks} send-backs and still cannot be used: "
+                                      f"{sendbacks} send-backs and still cannot be used as it stands: "
                                       + "; ".join(faults) + " Reply in the box below.")
                 with info._lock:
                     info.entries.append(entry)

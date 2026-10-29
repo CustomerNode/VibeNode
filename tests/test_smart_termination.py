@@ -635,3 +635,57 @@ def test_the_long_version_is_not_counted_in_the_card_length():
 
 def test_the_instructions_ask_for_the_long_version():
     assert '"explained"' in st.INSTRUCTIONS and "Explain more" in st.INSTRUCTIONS
+
+
+# ── A false success claim is never let through silently (2026-10-29) ────
+# After MAX_SENDBACKS only an unusable card kept going back, so a card that
+# said "tests pass" with no test run behind it went through on the third
+# stop with nothing on screen.  An unproven claim now keeps going back up to
+# HARD_CEILING, and if it is still there it is shown as not proven.
+
+from types import SimpleNamespace as _E
+from daemon import handoff_evidence as _ev
+
+CLAIMS_TESTS = _card(headline="The phone header fix is in and the tests pass")
+
+
+def _no_run_facts():
+    return _ev.facts_from_entries([_E(kind="user", text="fix the phone header please"),
+                                   _E(kind="tool_use", name="Edit", desc="static/css/mobile.css", id="u1"),
+                                   _E(kind="tool_result", tool_use_id="u1", text="ok", is_error=False)])
+
+
+def test_an_unproven_claim_goes_back_past_the_soft_cap():
+    f = _no_run_facts()
+    reason = _review(CLAIMS_TESTS, continued=True, sendbacks=st.MAX_SENDBACKS, facts=f)
+    assert reason and "no test run" in reason
+    assert _review(CLAIMS_TESTS, continued=True, sendbacks=st.HARD_CEILING, facts=f) is None
+
+
+def test_a_proven_claim_is_still_let_through_at_the_soft_cap():
+    f = _ev.facts_from_entries([_E(kind="user", text="fix the phone header please"),
+                                _E(kind="tool_use", name="Bash", desc="python -m pytest tests -q", id="u2"),
+                                _E(kind="tool_result", tool_use_id="u2", text="12 passed in 1.0s", is_error=False)])
+    assert _review(CLAIMS_TESTS, continued=True, sendbacks=st.MAX_SENDBACKS, facts=f) is None
+
+
+def test_released_faults_name_an_unproven_claim_at_the_ceiling():
+    faults = st.released_faults(CLAIMS_TESTS, st.HARD_CEILING, facts=_no_run_facts())
+    assert faults and any("no test run" in x for x in faults)
+    assert st.released_faults(GOOD, st.HARD_CEILING, facts=_no_run_facts()) == []
+
+
+def test_manager_marks_an_unproven_claim_let_through_at_the_ceiling(sm):
+    from daemon.session_manager import LogEntry
+    m, info = sm
+    info.entries.extend([LogEntry(kind="user", text="fix the phone header please"),
+                         LogEntry(kind="tool_use", name="Edit", desc="static/css/mobile.css", id="u1"),
+                         LogEntry(kind="tool_result", tool_use_id="u1", text="ok")])
+    emitted = []
+    m._emit_entry = lambda sid, entry, idx: emitted.append(entry)
+    assert _fire(m, message=CLAIMS_TESTS, continued=False)
+    for _ in range(st.HARD_CEILING - 1):
+        assert _fire(m, message=CLAIMS_TESTS, continued=True)
+    assert _fire(m, message=CLAIMS_TESTS, continued=True) is None
+    assert len(emitted) == 1 and emitted[0].is_error
+    assert "Not proven" in emitted[0].text and "no test run" in emitted[0].text

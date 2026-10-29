@@ -35,8 +35,9 @@ from typing import Iterable, Optional
 class Action:
     tool: str
     detail: str          # command line, file path or short description
-    ok: bool             # the tool result was not an error
+    ok: bool             # the tool result came back and was not an error
     output: str = ""
+    returned: bool = True   # False while the call has no result: it proves nothing
 
 
 @dataclass
@@ -52,6 +53,10 @@ class TurnFacts:
     # Session Engine sees them at the stop (names or short ids).  None when
     # the caller cannot tell (the settings-file copy, an older engine).
     others_working: Optional[list] = None
+    # Background work this session launched that has not reported back
+    # (a background shell or agent, a scheduled wake-up).  None when it
+    # cannot be told (history trimmed).
+    background_live: Optional[bool] = None
 
 
 # A user message that carries no request of its own.
@@ -83,6 +88,36 @@ def _is_request(text: str) -> bool:
     return len(text.split()) >= 3
 
 
+_BG_LAUNCHED = re.compile(r"running in (?:the )?background with ID|Async agent launched", re.I)
+_WAKE_TOOLS = ("ScheduleWakeup", "Monitor", "CronCreate")
+
+
+def _background_live(entries: list, last_human: int) -> bool:
+    """Something this session launched is still out: more background
+    launches than completion notices, or a wake-up scheduled since his
+    latest message."""
+    launched = notified = 0
+    for i, e in enumerate(entries):
+        kind = getattr(e, "kind", "")
+        if kind == "tool_result" and _BG_LAUNCHED.search((getattr(e, "text", "") or "")[:400]):
+            launched += 1
+        elif kind == "user" and (getattr(e, "text", "") or "").lstrip().startswith("<task-notification>"):
+            notified += 1
+        elif kind == "tool_use" and i > last_human and (getattr(e, "name", "") or "") in _WAKE_TOOLS:
+            return True
+    return launched > notified
+
+
+def working_problems(card: dict, facts: TurnFacts) -> list:
+    """A "working" card says background work is running; the session's own
+    calls must show some (2026-10-29: the only check was an ETA)."""
+    if card.get("type") != "working" or facts.background_live is not False:
+        return []
+    return ["This is a \"working\" card, but nothing this session launched is still running: no "
+            "background command, agent or scheduled wake-up is out. Finish the work now, or use the "
+            "card type that says where it really stands."]
+
+
 def _closes_task(text: str) -> bool:
     """An assistant message whose handoff card closed a task."""
     if "```" not in (text or ""):
@@ -105,7 +140,10 @@ def facts_from_entries(entries: Iterable, *, trimmed: bool = False, max_requests
     for e in entries:
         kind = getattr(e, "kind", "")
         if kind == "tool_use":
-            a = Action(tool=getattr(e, "name", "") or "", detail=getattr(e, "desc", "") or "", ok=True)
+            # Not a success until its result comes back (2026-10-29): a call
+            # cut off or still hanging must not prove tests, a push or a check.
+            a = Action(tool=getattr(e, "name", "") or "", detail=getattr(e, "desc", "") or "",
+                       ok=False, returned=False)
             facts.actions.append(a)
             if getattr(e, "id", ""):
                 pending[e.id] = a
@@ -114,11 +152,14 @@ def facts_from_entries(entries: Iterable, *, trimmed: bool = False, max_requests
             if a is None:   # a result with no call in memory still counts as output
                 a = Action(tool="", detail="", ok=True)
                 facts.actions.append(a)
+            a.returned = True
             a.ok = not bool(getattr(e, "is_error", False))
             a.output = getattr(e, "text", "") or ""
 
     human = [i for i, e in enumerate(entries)
              if getattr(e, "kind", "") == "user" and _is_request(clean_request(getattr(e, "text", "")))]
+    if not trimmed:
+        facts.background_live = _background_live(entries, human[-1] if human else -1)
     if human:
         last_human = human[-1]
         start = -1
@@ -323,6 +364,8 @@ def test_runs(facts: TurnFacts) -> list:
     a test command, or any tool output carrying a runner's summary."""
     runs = []
     for a in facts.actions:
+        if not a.returned:
+            continue   # no result yet: neither a pass nor a failure
         is_cmd = bool(_TEST_CMD.search(a.detail))
         # A summary counts from a test command or a log/output file, never
         # from reading source or notes (a doc can quote any summary).
@@ -784,4 +827,5 @@ def problems(card: dict, facts: Optional[TurnFacts]) -> list:
            + blame_problems(card, getattr(facts, "others_working", None) if facts is not None else None))
     if facts is None:
         return out
-    return out + claim_problems(card, facts) + request_problems(card, facts) + reviewer_problems(card, facts)
+    return (out + claim_problems(card, facts) + request_problems(card, facts) + reviewer_problems(card, facts)
+            + working_problems(card, facts))
