@@ -82,6 +82,15 @@ def test_invalid_policy_is_rejected_and_not_recorded(ws):
     assert _lines(log_path) == []
 
 
+def test_the_suite_never_writes_the_real_log():
+    """conftest redirects the log for every test; a test that sends a policy
+    change without its own redirect must not reach logs/permission_policy.log."""
+    from pathlib import Path
+    import app.routes.ws_events as ws_events
+    real = Path(ws_events.__file__).resolve().parents[2] / "logs" / "permission_policy.log"
+    assert ws_events._POLICY_CHANGE_LOG.resolve() != real
+
+
 def test_unwritable_log_never_blocks_the_change(ws, monkeypatch, tmp_path):
     import app.routes.ws_events as ws_events
     client, sm, _ = ws

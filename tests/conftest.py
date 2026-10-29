@@ -423,6 +423,24 @@ def _forbid_real_auth_login(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_permission_policy_log(tmp_path_factory, monkeypatch):
+    """No test writes the real ``logs/permission_policy.log``.
+
+    It is the owner's record of who changed the permission policy. From
+    2026-10-23 to 10-28 every suite run appended a line to it (a ws_events
+    test sends a policy change through a mock engine), burying any real
+    change under 75 test lines.
+    """
+    try:
+        import app.routes.ws_events as _ws
+        monkeypatch.setattr(_ws, "_POLICY_CHANGE_LOG",
+                            tmp_path_factory.mktemp("policy-log") / "permission_policy.log")
+    except Exception:
+        pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_engine_data_dir(tmp_path_factory, monkeypatch):
     """Point the engine's per-session durable state at a sandbox.
 

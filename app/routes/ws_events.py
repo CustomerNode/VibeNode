@@ -1260,6 +1260,8 @@ def register_ws_events(socketio, app):
             old = (sm.get_permission_policy() or {}).get('policy', '')
         except Exception:
             old = ''
+        if not isinstance(old, str):
+            old = ''
         sm.set_permission_policy(policy, custom_rules)
         source = str(data.get('source') or '')[:40]
         if old != policy or source == 'custom_rules':
