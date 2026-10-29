@@ -212,6 +212,8 @@
   // Show / hide
   // ---------------------------------------------------------------------------
   function show(el) {
+    // Not over a pinned session being dragged into place (sessions.js).
+    if (document.body && document.body.classList.contains('vn-pin-dragging')) return;
     var text = el.getAttribute('title');
     if (!text || !text.trim()) return;
 

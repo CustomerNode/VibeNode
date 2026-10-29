@@ -211,6 +211,22 @@ socket.on('session_hold', (data) => {
   window.SessionVerbCore.applyHold(data.session_id, data.state || null, data.since || 0);
 });
 
+// A session pinned or unpinned on another device or tab (app/session_pins.py).
+socket.on('session_pin', (data) => {
+  if (!data || !data.session_id || typeof _applyPin !== 'function') return;
+  const rank = typeof data.rank === 'number' ? data.rank : undefined;
+  if (typeof isSessionPinned === 'function' && isSessionPinned(data.session_id) === !!data.pinned
+      && (!data.pinned || rank === undefined || (typeof pinRankOf === 'function' && pinRankOf(data.session_id) === rank))) return;
+  _applyPin(data.session_id, !!data.pinned, rank);
+});
+
+// Pinned sessions dragged into a new order on another device or tab.
+socket.on('session_pin_order', (data) => {
+  if (!data || !Array.isArray(data.order) || typeof _applyPinOrder !== 'function') return;
+  if (typeof pinRankOf === 'function' && data.order.every((sid, i) => pinRankOf(sid) === i)) return;
+  _applyPinOrder(data.order);
+});
+
 socket.on('session_renamed', (data) => {
     try {
         const id = data && data.session_id;
@@ -1992,6 +2008,8 @@ socket.on('session_id_remapped', (data) => {
 
     // A title learned under the launch id belongs to the new id now.
     if (typeof _remapSessionTitle === 'function') _remapSessionTitle(oldId, newId);
+    // So does a pin (sessions.js _pinRekey).
+    if (typeof _pinRekey === 'function') _pinRekey(oldId, newId);
 
     // Update the list and its id index.  If the list already has this
     // session under the new id, SessionStore.rekey() MERGES: a session-list

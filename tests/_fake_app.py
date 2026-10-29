@@ -96,13 +96,15 @@ class FakeApp:
 
     def __init__(self, browser, sessions: list[dict], *, init: str | None = None,
                  path: str = "/", viewport=None, wait_for: str | None = None,
-                 extra_routes: dict | None = None):
+                 extra_routes: dict | None = None, context: dict | None = None):
         self.sessions = sessions
         self.errors: list[str] = []
         self.requests: list[str] = []
         self.extra_routes = extra_routes or {}
         self._index = index_html()
-        self.ctx = browser.new_context(viewport=viewport or {"width": 1400, "height": 900})
+        # `context`: more browser-context options, e.g. a touch phone
+        # (is_mobile=True, has_touch=True).
+        self.ctx = browser.new_context(viewport=viewport or {"width": 1400, "height": 900}, **(context or {}))
         self.ctx.add_init_script(init if init is not None else init_script())
         self.page = self.ctx.new_page()
         self.page.on("pageerror", lambda e: self.errors.append(str(e)))

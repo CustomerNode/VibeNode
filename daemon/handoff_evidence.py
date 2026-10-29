@@ -833,6 +833,30 @@ def hope_problems(card: dict) -> list:
             "plainly. If only the user can do it, end on \"needs_you\" with the step."]
 
 
+def redo_kind_problems(card: dict, facts: Optional[TurnFacts]) -> list:
+    """His latest message is the "Redo as…" button on the newest card
+    (last-card.js): the reply must end on the kind he picked.  Two honest
+    exceptions: work he asked to have done that is still running in the
+    background (a Working card), and a Done or Deliverable that something
+    outside the session's control stops (a Blocked card)."""
+    if facts is None or not isinstance(card, dict):
+        return []
+    from daemon import handoff_rules  # local: handoff_rules imports this module
+    want = handoff_rules.redo_wanted(facts.last_user)
+    if not want or handoff_rules.card_is_kind(card, want):
+        return []
+    t = card.get("type")
+    if t == "working" and want in ("done", "deliverable") and facts.background_live is not False:
+        return []
+    if t == "blocked" and want in ("done", "deliverable", "working"):
+        return []
+    row = next(r for r in handoff_rules.CARD_KINDS if r[0] == want)
+    shape = f"type \"{row[1]}\"" + (f" with needs.kind \"{row[2]}\"" if row[2] else "")
+    return [f"The user tapped \"Redo as {row[3]}\" on your last card ({row[4].lower()}), and this "
+            f"reply ends on a \"{t}\" card. End it on {shape}, doing whatever work that kind needs "
+            "first: a Done means doing the work, a Decide means showing the options."]
+
+
 def problems(card: dict, facts: Optional[TurnFacts]) -> list:
     if not isinstance(card, dict):
         return []
@@ -841,4 +865,4 @@ def problems(card: dict, facts: Optional[TurnFacts]) -> list:
     if facts is None:
         return out
     return (out + claim_problems(card, facts) + request_problems(card, facts) + reviewer_problems(card, facts)
-            + working_problems(card, facts))
+            + working_problems(card, facts) + redo_kind_problems(card, facts))

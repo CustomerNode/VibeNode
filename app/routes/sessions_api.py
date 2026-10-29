@@ -497,6 +497,14 @@ def api_sessions():
             if info.get("model") and not s.get("model"):
                 s["model"] = info["model"]
 
+    # Pinned sessions (app/session_pins.py): only pinned rows get the key.
+    # Applied last, so it covers renamed ids and live stubs alike.
+    try:
+        from .. import session_pins as _pins
+        _pins.overlay(sessions, _sessions_dir(project), aliases)
+    except Exception:
+        pass
+
     if filters is None:
         return jsonify(sessions)
     rows, total = _apply_listing_filters(sessions, filters, _state_by_sid)
@@ -697,6 +705,77 @@ def api_session_hold(session_id):
     except Exception as e:  # SocketIO not wired (unit tests): non-fatal
         log.debug("session_hold emit failed: %s", e)
     return jsonify({"ok": True, "state": state})
+
+
+@bp.route("/api/session-pin/<session_id>", methods=["POST"])
+def api_session_pin(session_id):
+    """Pin a session to the top of the sidebar, or unpin it (owner,
+    2026-10-29).  Body: {"pinned": true | false, "project"}.  The pin stays
+    until it is unpinned (app/session_pins.py).  Every open sidebar learns it
+    from the ``session_pin`` broadcast."""
+    from .. import session_pins
+    data = request.get_json(silent=True) or {}
+    pinned = data.get("pinned")
+    if not isinstance(pinned, bool):
+        return jsonify({"error": "pinned must be true or false"}), 400
+    if not session_id or any(c in session_id for c in "/\\") or ".." in session_id:
+        return jsonify({"error": "bad session id"}), 400
+    project = (data.get("project") or request.args.get("project", "")).strip()
+    if any(c in project for c in "/\\") or ".." in project:
+        return jsonify({"error": "bad project"}), 400
+    # Unpinning also drops a pin saved under the session's launch id, which
+    # the listing would otherwise still find through the alias.
+    old_ids = []
+    if not pinned:
+        old_ids = [o for o, n in _pin_aliases(project).items() if n == session_id]
+    rank = session_pins.set_pin(_sessions_dir(project), session_id, pinned, old_ids)
+    try:
+        from .. import socketio
+        socketio.emit("session_pin", {"session_id": session_id, "pinned": pinned, "rank": rank,
+                                      "project": project})
+    except Exception as e:  # SocketIO not wired (unit tests): non-fatal
+        log.debug("session_pin emit failed: %s", e)
+    return jsonify({"ok": True, "pinned": pinned, "rank": rank})
+
+
+def _pin_aliases(project: str) -> dict:
+    """Launch id -> the id the sidebar shows, from the engine and from disk
+    (the same merge ``api_sessions`` does)."""
+    try:
+        aliases = dict(getattr(current_app.session_manager, "_id_aliases", None) or {})
+    except Exception:
+        aliases = {}
+    try:
+        for old_id, entry in _load_remaps_cached(project).items():
+            if entry.get("new_id"):
+                aliases.setdefault(old_id, entry["new_id"])
+    except Exception:
+        pass
+    return aliases
+
+
+@bp.route("/api/session-pin-order", methods=["POST"])
+def api_session_pin_order():
+    """Put the pinned sessions in the order he dragged them to (owner,
+    2026-10-29).  Body: {"order": [session ids, top first], "project"}.
+    Every open sidebar learns it from the ``session_pin_order`` broadcast."""
+    from .. import session_pins
+    data = request.get_json(silent=True) or {}
+    order = data.get("order")
+    if (not isinstance(order, list) or not order or len(order) > 500
+            or not all(isinstance(s, str) and s and not any(c in s for c in "/\\") and ".." not in s
+                       for s in order)):
+        return jsonify({"error": "order must be a list of session ids"}), 400
+    project = (data.get("project") or request.args.get("project", "")).strip()
+    if any(c in project for c in "/\\") or ".." in project:
+        return jsonify({"error": "bad project"}), 400
+    placed = session_pins.set_order(_sessions_dir(project), order, _pin_aliases(project))
+    try:
+        from .. import socketio
+        socketio.emit("session_pin_order", {"order": placed, "project": project})
+    except Exception as e:  # SocketIO not wired (unit tests): non-fatal
+        log.debug("session_pin_order emit failed: %s", e)
+    return jsonify({"ok": True, "order": placed})
 
 
 @bp.route("/api/remap-name", methods=["POST"])

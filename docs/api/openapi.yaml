@@ -978,6 +978,89 @@ paths:
         "400":
           description: Bad state or session id
 
+  /api/session-pin/{session_id}:
+    post:
+      tags: [Sessions]
+      summary: Pin a session to the top of the sidebar, or unpin it
+      description: >
+        A pinned session stays first in the sidebar whatever the sort, until
+        it is unpinned. Saved per project. Every open sidebar learns it from
+        the session_pin Socket.IO broadcast.
+      operationId: setSessionPin
+      parameters:
+        - $ref: "#/components/parameters/sessionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pinned]
+              properties:
+                pinned:
+                  type: boolean
+                project:
+                  type: string
+      responses:
+        "200":
+          description: Pin saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  pinned:
+                    type: boolean
+                  rank:
+                    type: number
+                    nullable: true
+                    description: The pin's place among pinned sessions (a new pin goes to the top); null when unpinned
+        "400":
+          description: Bad pinned value, session id or project
+
+  /api/session-pin-order:
+    post:
+      tags: [Sessions]
+      summary: Put the pinned sessions in a new order (drag to reorder)
+      description: >
+        Ids that are not pinned are skipped; pinned sessions left out keep
+        their place after the listed ones. Every open sidebar learns it from
+        the session_pin_order Socket.IO broadcast.
+      operationId: setSessionPinOrder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order]
+              properties:
+                order:
+                  type: array
+                  items:
+                    type: string
+                  description: Session ids, top first
+                project:
+                  type: string
+      responses:
+        "200":
+          description: Order saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  order:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          description: Bad order or project
+
   /api/session-timeline/{session_id}:
     get:
       tags: [Sessions]
@@ -1840,6 +1923,103 @@ paths:
                   action:
                     type: string
                     enum: [allow, deny]
+
+  /api/card-feedback:
+    get:
+      tags: [Live]
+      summary: List every "Redo as…" send-back from the end-of-turn card
+      description: >
+        Each record is the person's message, the card he got, the kind he
+        wanted, his note, and the card the session redid it as (when it came).
+        Data for tuning the card rules; nothing reads it at run time.
+      operationId: listCardFeedback
+      responses:
+        "200":
+          description: Send-backs, oldest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+    post:
+      tags: [Live]
+      summary: Record one "Redo as…" send-back
+      operationId: recordCardFeedback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                session:
+                  type: string
+                project:
+                  type: string
+                your_message:
+                  type: string
+                card_kind:
+                  type: string
+                wanted:
+                  type: string
+                note:
+                  type: string
+                message:
+                  type: string
+                card:
+                  type: object
+      responses:
+        "200":
+          description: Recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  id:
+                    type: string
+        "400":
+          description: A body it cannot keep
+
+  /api/card-feedback/{rid}/redo:
+    post:
+      tags: [Live]
+      summary: Record the card a session answered a send-back with
+      operationId: recordCardFeedbackRedo
+      parameters:
+        - name: rid
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                redo_card:
+                  type: object
+                redo_kind:
+                  type: string
+      responses:
+        "200":
+          description: Recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  id:
+                    type: string
+        "400":
+          description: Bad id or body
 
   /api/live/state/{session_id}:
     get:

@@ -216,6 +216,30 @@ def api_queue_history(session_id):
     return jsonify(queue_history.since_review(session_id))
 
 
+@bp.route("/api/card-feedback", methods=["GET", "POST"])
+def api_card_feedback():
+    """POST: one "Redo as…" send-back from the end-of-turn card
+    (app/card_feedback.py).  GET: every send-back, merged with the card the
+    session redid it as, for tuning the card rules."""
+    from app import card_feedback
+    if request.method == "GET":
+        return jsonify(card_feedback.records())
+    try:
+        return jsonify(card_feedback.record_sent(request.get_json(silent=True)))
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@bp.route("/api/card-feedback/<rid>/redo", methods=["POST"])
+def api_card_feedback_redo(rid):
+    """The card a session answered a "Redo as…" send-back with."""
+    from app import card_feedback
+    try:
+        return jsonify(card_feedback.record_redo(rid, request.get_json(silent=True)))
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
 @bp.route("/api/live/state/<session_id>")
 def api_live_state(session_id):
     """Lightweight endpoint returning just the session state + entry count.

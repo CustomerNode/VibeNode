@@ -1523,6 +1523,49 @@ body.unread-enabled .session-item .unread-dot {
 }
 .wf-card.has-unread .wf-name { color: var(--text-heading); }
 
+/* ---- Pinned sessions (owner's pick B, 2026-10-29, static/scratch/session-pin.html) ----
+   A pinned session stays first whatever the sort (sessions.js _pinnedFirst).
+   Hover shows a faint, tilted grey pin: a card's top-right corner, the end of
+   the name in the list.  Pinned, it stands upright, filled, purple on a soft
+   purple dot, and stays.  Markup: sessions.js _pinButtonHtml. */
+.vn-pin { all: unset; box-sizing: border-box; cursor: pointer; display: grid; place-items: center;
+  width: 22px; height: 22px; border-radius: 6px; color: var(--text-faint); opacity: 0;
+  transition: opacity .12s, color .12s, background .12s; }
+.vn-pin svg { width: 13px; height: 13px; transform: rotate(45deg); transition: transform .15s; }
+.vn-pin:focus-visible { opacity: 1; outline: 2px solid var(--accent); outline-offset: 1px; }
+@media (hover: hover) {
+  .wf-card:hover .vn-pin:not(.on), .session-item:hover .vn-pin:not(.on) { opacity: .6; }
+  .vn-pin:hover { opacity: 1 !important; color: var(--text-secondary); background: var(--bg-hover); }
+}
+/* A touch screen has no hover: an unpinned pin is not there to be tapped by
+   mistake (press and hold opens the menu with Pin to top). */
+@media (hover: none) { .vn-pin:not(.on) { display: none; } }
+.vn-pin.on { opacity: 1; color: var(--accent); border-radius: 50%;
+  background: color-mix(in srgb, var(--accent) 18%, transparent); }
+.vn-pin.on svg { transform: none; }
+.vn-pin.on svg path { fill: currentColor; }
+@media (hover: hover) {
+  .vn-pin.on:hover { color: var(--accent); background: color-mix(in srgb, var(--accent) 28%, transparent); }
+}
+.wf-card .vn-pin { position: absolute; top: 6px; right: 6px; z-index: 1; }
+/* In the list the title stops short of the pin's slot: on every row where a
+   pointer can hover, only on pinned rows on a touch screen. */
+@media (hover: hover) { .session-item > .session-col-name { position: relative; padding-right: 26px; } }
+.session-item.is-pinned > .session-col-name { position: relative; padding-right: 26px; }
+.session-item .vn-pin { position: absolute; right: 3px; top: 13px; transform: translateY(-50%); width: 20px; height: 20px; }
+.session-item .vn-pin svg { width: 12px; height: 12px; }
+/* Drag to reorder pinned sessions, live (owner, 2026-10-29: "literally reorder
+   as you move it like ios"; sessions.js _pinDragMove).  The card or row lifts
+   and follows the mouse (its transform is set inline, so nothing may
+   transition it); the others slide out of its way; letting go settles it. */
+body.vn-pin-dragging, body.vn-pin-dragging * { user-select: none !important; cursor: grabbing !important; }
+.vn-pin-lifted { position: relative; z-index: 30; transition: box-shadow .15s !important;
+  box-shadow: 0 16px 32px -10px rgba(0,0,0,.55), 0 4px 10px rgba(0,0,0,.25) !important; }
+/* Solid while lifted: the card's own background is see-through. */
+.sidebar .wf-card.vn-pin-lifted, .session-item.vn-pin-lifted { background: var(--bg-card); }
+.vn-pin-settling { position: relative; z-index: 30;
+  transition: transform .18s cubic-bezier(.2,.8,.2,1), box-shadow .18s !important; }
+
 /* Reduced-motion users get the identical treatment (nothing here animates),
    but forced-colors mode needs an explicit non-accent fill or the dot vanishes. */
 @media (forced-colors: active) {

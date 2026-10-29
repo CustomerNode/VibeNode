@@ -843,7 +843,8 @@ function wfSortedSessions(sessions) {
     const _asc = (typeof sortAsc !== 'undefined') && sortAsc;
     copy.sort((a, b) => _asc ? dateKey(a) - dateKey(b) : dateKey(b) - dateKey(a));
   }
-  return copy;
+  // Pinned sessions stay first whatever the sort (sessions.js _pinnedFirst).
+  return (typeof _pinnedFirst === 'function') ? _pinnedFirst(copy) : copy;
 }
 
 function renderWorkforce(sessions) {
@@ -895,8 +896,11 @@ function renderWorkforce(sessions) {
     const unreadDot = _isUnread
       ? '<span class="unread-dot" aria-label="Unread" title="Unread \u2014 new response you haven\u2019t opened"></span>'
       : '';
-    return `<div class="wf-card wf-${st}${_vsCls ? ' ' + _vsCls : ''}${selClass}${msClass}${familyClass}${unreadClass}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" onclick="singleOrDouble('${s.id}',event)" ondblclick="_dblclickSleepIfIdle('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')" title="${escHtml(s.display_title)} \u2014 ${_dblTitle}">
-      ${unreadDot}
+    // Pinned sessions (sessions.js _pinButtonHtml): faint pin on hover, purple once pinned.
+    const _pinned = typeof isSessionPinned === 'function' && isSessionPinned(s.id);
+    const pinBtn = typeof _pinButtonHtml === 'function' ? _pinButtonHtml(s.id) : '';
+    return `<div class="wf-card wf-${st}${_vsCls ? ' ' + _vsCls : ''}${selClass}${msClass}${familyClass}${unreadClass}${_pinned ? ' is-pinned' : ''}" data-sid="${s.id}"${typeof _pinDragAttrs === 'function' ? _pinDragAttrs(s.id) : ''} onmousedown="_sessionRowMouseDown(event,'${s.id}')" onclick="singleOrDouble('${s.id}',event)" ondblclick="_dblclickSleepIfIdle('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')" title="${escHtml(s.display_title)} \u2014 ${_dblTitle}">
+      ${unreadDot}${pinBtn}
       <div class="wf-avatar">${emoji}</div>
       <div class="wf-status-label">${label}</div>
       <div class="wf-name">${childGlyph}${name}</div>

@@ -1050,3 +1050,82 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
 .lm-dlist b { display: inline-block; min-width: 1.4em; color: var(--text-muted); font-weight: 700; }
 .lm-dlist .rec { display: inline-block; vertical-align: 1px; margin-left: 8px; font-size: 9.5px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase;
   padding: 1px 6px; border-radius: 4px; color: rgb(var(--tone)); border: 1px solid rgba(var(--tone), .7); }
+
+/* "Redo as…" (owner's pick C, 2026-10-29, static/scratch/card-wrong-kind-b.html):
+   a thin outlined button in the card's top corner, where the time was, on the
+   open session's newest card only (_syncRedo in last-card.js).  The negative
+   margin keeps the status line's height, so the top block's picked spacing
+   does not move.  Its popup shows a drawing of every kind of card. */
+.lm .lm-pillrow .lm-redo { all: unset; box-sizing: border-box; cursor: pointer; margin: -5px 0 -5px auto; display: inline-flex; align-items: center; gap: 6px;
+  font: 600 12px/1.2 var(--font-sans); letter-spacing: 0; text-transform: none; white-space: nowrap; color: var(--text-secondary);
+  padding: 4px 10px 4px 8px; border-radius: 999px; border: 1px solid rgba(var(--bt), .16); transition: border-color .12s, background .12s, color .12s; }
+.lm .lm-pillrow .lm-redo[hidden] { display: none; }
+.lm .lm-pillrow .lm-redo svg { color: rgb(160, 130, 255); flex: none; }
+.lm .lm-pillrow .lm-redo:hover { color: var(--text-heading); border-color: rgba(160, 130, 255, .6); background: rgba(160, 130, 255, .08); }
+.lm .lm-pillrow .lm-redo:focus-visible { outline: 2px solid var(--text-heading); outline-offset: 2px; }
+[data-theme="light"] .lm .lm-pillrow .lm-redo svg { color: rgb(110, 80, 220); }
+.lm .lm-pillrow .lm-redone { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  font: 600 12px/1.2 var(--font-sans); color: var(--text-muted); }
+.lm .lm-pillrow .lm-redone svg { color: rgb(160, 130, 255); flex: none; }
+
+.lm-rd-scrim { position: fixed; inset: 0; z-index: 100000; background: rgba(0,0,0,.5); opacity: 0; transition: opacity .16s; }
+[data-theme="light"] .lm-rd-scrim { background: rgba(20,20,30,.25); }
+.lm-rd-scrim.on { opacity: 1; }
+.lm-rd { --bt: 255,255,255; position: fixed; z-index: 100001; left: 50%; top: 50%; width: 600px; max-width: calc(100vw - 24px); max-height: calc(100vh - 40px); max-height: calc(100dvh - 40px);
+  overflow: auto; box-sizing: border-box; padding: 18px 16px 14px; border-radius: 16px; font-family: var(--font-sans); color: var(--text-primary);
+  background: var(--bg-modal, #1a1a1a); border: 1px solid rgba(var(--bt), .14); box-shadow: 0 24px 70px rgba(0,0,0,.5);
+  opacity: 0; transform: translate(-50%, -46%) scale(.98); transition: opacity .16s, transform .16s; }
+[data-theme="light"] .lm-rd { --bt: 0,0,0; background: #fff; box-shadow: 0 24px 70px rgba(20,20,40,.2); }
+.lm-rd.on { opacity: 1; transform: translate(-50%, -50%); }
+.lm-rd h3 { margin: 0 4px 3px; font: 700 17px/1.3 var(--font-sans); color: var(--text-heading); }
+.lm-rd .sub { margin: 0 4px 12px; font-size: 13px; line-height: 1.5; color: var(--text-muted); }
+.lm-rd .sub b { color: var(--text-secondary); }
+.lm-rd-kinds { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
+.lm-rd .rk { all: unset; box-sizing: border-box; cursor: pointer; position: relative; display: flex; flex-direction: column; gap: 6px; padding: 8px;
+  border-radius: 10px; border: 1px solid rgba(var(--bt), .1); --tone: 140, 150, 175; }
+.lm-rd .rk:hover { background: rgba(var(--bt), .05); }
+.lm-rd .rk:focus-visible { outline: 2px solid var(--text-heading); outline-offset: -2px; }
+.lm-rd .rk[aria-pressed="true"] { background: rgba(var(--tone), .12); border-color: rgba(var(--tone), .55); }
+.lm-rd .rk[aria-disabled="true"] { cursor: default; opacity: .5; }
+.lm-rd .rk[aria-disabled="true"]:hover { background: none; }
+.lm-rd .rk[data-type="done"] { --tone: 52, 199, 120; }
+.lm-rd .rk[data-type="needs_you"] { --tone: 240, 166, 40; }
+.lm-rd .rk[data-type="working"] { --tone: 96, 158, 255; }
+.lm-rd .rk[data-type="blocked"] { --tone: 242, 100, 100; }
+.lm-rd .rk[data-type="deliverable"] { --tone: 160, 130, 255; }
+[data-theme="light"] .lm-rd .rk[data-type="done"] { --tone: 22, 150, 80; }
+[data-theme="light"] .lm-rd .rk[data-type="needs_you"] { --tone: 205, 128, 0; }
+.lm-rd .rk .sk { position: relative; height: 54px; border-radius: 7px; overflow: hidden; color: rgb(var(--tone));
+  border: 1px solid rgba(var(--bt), .12); background: rgba(var(--bt), .03); }
+.lm-rd .rk .sk::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: rgb(var(--tone)); }
+.lm-rd .rk .sk svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.lm-rd .rk .tag { position: absolute; top: 12px; right: 12px; padding: 1px 5px; border-radius: 4px; font-size: 9.5px; font-weight: 700; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--text-faint); background: var(--bg-modal, #1a1a1a); }
+[data-theme="light"] .lm-rd .rk .tag { background: #fff; }
+.lm-rd .rk .nm { display: block; font: 650 13.5px/1.3 var(--font-sans); color: var(--text-heading); }
+.lm-rd .rk .ds { display: block; font-size: 11.5px; line-height: 1.35; color: var(--text-muted); }
+.lm-rd label.nl { display: block; margin: 0 4px 5px; font-size: 12px; font-weight: 600; color: var(--text-secondary); }
+.lm-rd label.nl span { color: var(--text-faint); font-weight: 500; }
+.lm-rd .lm-rd-note { box-sizing: border-box; width: 100%; resize: vertical; min-height: 44px; border-radius: 9px; border: 1px solid rgba(var(--bt), .14);
+  background: rgba(var(--bt), .03); color: var(--text-heading); font: 13.5px/1.45 var(--font-sans); padding: 8px 10px; }
+.lm-rd .lm-rd-note:focus { outline: none; border-color: rgba(var(--bt), .35); }
+.lm-rd .lm-rd-note::placeholder { color: var(--text-faint); }
+/* Cancel / Redo stay in reach while the kinds scroll (a phone shows them in four rows). */
+.lm-rd .act { position: sticky; bottom: -14px; display: flex; justify-content: flex-end; gap: 8px; margin: 2px -4px -14px; padding: 10px 4px 14px;
+  background: var(--bg-modal, #1a1a1a); }
+[data-theme="light"] .lm-rd .act { background: #fff; }
+.lm-rd .act button { all: unset; box-sizing: border-box; cursor: pointer; font: 650 13.5px var(--font-sans); padding: 8px 14px; border-radius: 10px; }
+.lm-rd .act .cx { color: var(--text-secondary); border: 1px solid rgba(var(--bt), .16); }
+.lm-rd .act .cx:hover { color: var(--text-heading); border-color: rgba(var(--bt), .3); }
+.lm-rd .act .go { background: rgb(160, 130, 255); color: #120d22; }
+[data-theme="light"] .lm-rd .act .go { background: rgb(110, 80, 220); color: #fff; }
+.lm-rd .act .go:hover { filter: brightness(1.07); }
+.lm-rd .act .go[disabled] { background: rgba(var(--bt), .1); color: var(--text-faint); cursor: default; filter: none; }
+@media (max-width: 600px) {
+  .lm-rd { left: 0; right: 0; top: auto; bottom: 0; width: auto; max-width: none; max-height: 86vh; max-height: 86dvh; border-radius: 16px 16px 0 0;
+    transform: translateY(18px); padding: 18px 14px calc(14px + env(safe-area-inset-bottom)); }
+  .lm-rd.on { transform: none; }
+  .lm-rd-kinds { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lm-rd .act { bottom: calc(-14px - env(safe-area-inset-bottom)); margin-bottom: calc(-14px - env(safe-area-inset-bottom)); padding-bottom: calc(14px + env(safe-area-inset-bottom)); }
+}
+@media (prefers-reduced-motion: reduce) { .lm-rd, .lm-rd-scrim { transition: none; } }

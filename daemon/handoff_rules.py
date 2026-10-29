@@ -39,6 +39,50 @@ TYPES = ("done", "needs_you", "working", "blocked", "deliverable", "explain")
 DELIVERABLE_FORMATS = ("markdown", "html", "text", "plain", "plaintext")
 NEEDS_KINDS = ("none", "decision", "approve", "action")
 
+# Every kind of card a session can end on, named the way the user sees it.
+# The "Redo as…" button on the newest card (static/js/last-card.js,
+# REDO_KINDS) lists exactly these, word for word; tests/test_card_redo.py
+# fails when a type or a needs.kind above has no entry here, or when the two
+# lists differ (owner, 2026-10-29: "you are missing card types, lets make sure
+# thats impossible").  (key, type, needs.kind or None for any, name, what he gets)
+CARD_KINDS = (
+    ("explain", "explain", None, "Answer", "Just answer my question"),
+    ("done", "done", None, "Done", "Do the work, then show me what changed"),
+    ("decision", "needs_you", "decision", "Decide", "Show me the options first, I pick"),
+    ("approve", "needs_you", "approve", "Approve", "Ask me yes or no before you go on"),
+    ("action", "needs_you", "action", "To do", "Tell me the one step only I can do"),
+    ("deliverable", "deliverable", None, "Deliverable", "Give me the text or file itself"),
+    ("working", "working", None, "Working", "Keep going and tell me when it will be done"),
+    ("blocked", "blocked", None, "Blocked", "Tell me what is stopping you and what you tried"),
+)
+
+# The message the "Redo as…" button sends as the user (last-card.js
+# _redoMessage): "Wrong kind of card: you ended on a Done card. I wanted a
+# Decide card: show me the options first, I pick. Redo your last reply that way."
+REDO_PREFIX = "Wrong kind of card:"
+_REDO_WANT = re.compile(r"\bI wanted (?:an?\s+)?(.+?) card\b", re.I)
+
+
+def redo_wanted(text) -> Optional[str]:
+    """The CARD_KINDS key a "Redo as…" message asks for, or None."""
+    t = (text or "").strip() if isinstance(text, str) else ""
+    if not t.startswith(REDO_PREFIX):
+        return None
+    m = _REDO_WANT.search(t.split("\n", 1)[0])
+    if not m:
+        return None
+    name = m.group(1).strip().lower()
+    return next((k for k, _t, _n, nm, _d in CARD_KINDS if nm.lower() == name), None)
+
+
+def card_is_kind(card, key: str) -> bool:
+    """Is ``card`` the CARD_KINDS kind ``key``?"""
+    row = next((r for r in CARD_KINDS if r[0] == key), None)
+    if row is None or not isinstance(card, dict):
+        return False
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    return card.get("type") == row[1] and (row[2] is None or needs.get("kind") == row[2])
+
 # Fields that are not prose the user reads as the session's words: links,
 # commands, button keys, enum values, and the reply text a button sends AS
 # the user.
@@ -1397,6 +1441,10 @@ needs.only_you why only he can do the rest; a card that says "I can't" \
 without them is sent back.
 - Your own background work is still running → "working". Something outside \
 your control stops you → "blocked".
+- His message starts "Wrong kind of card:" → he tapped "Redo as…" on your \
+last card. End this reply on the kind he names, doing whatever work that kind \
+needs (a Done means doing the work, a Decide means showing the options). \
+Another kind is sent back.
 - Work he asked for waits only on his yes (he asked a question about it, or \
 must OK a step) → "needs_you" with needs.kind "approve" and a button per \
 answer; on a question the answer goes in "answer" on that card. If he \

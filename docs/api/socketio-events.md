@@ -733,6 +733,34 @@ A client treats each snapshot as a lease: an approval is open for `ttl_ms` after
 
 ---
 
+### `session_pin`
+
+**Triggered:** Broadcast by `POST /api/session-pin/<session_id>` when a session is pinned to the top of the sidebar or unpinned. Every open sidebar re-sorts with pinned sessions first. `rank` is the pin's place among pinned sessions (null when unpinned).  
+**Payload:**
+```json
+{
+  "session_id": "<uuid>",
+  "pinned": true,
+  "rank": -1,
+  "project": "<encoded-project-id>"
+}
+```
+
+---
+
+### `session_pin_order`
+
+**Triggered:** Broadcast by `POST /api/session-pin-order` when pinned sessions are dragged into a new order. `order` is the pinned session ids, top first.  
+**Payload:**
+```json
+{
+  "order": ["<uuid>", "<uuid>"],
+  "project": "<encoded-project-id>"
+}
+```
+
+---
+
 ### `naming_progress`
 
 **Triggered:** By the bulk naming job (`POST /api/sessions/name-untitled`): once at start (`done: 0`), every 5 sessions, and once at the end with `finished: true`. Each title also fires `session_renamed`.  

@@ -103,6 +103,7 @@
     fwd: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>',
     dl: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 10l5 5 5-5"/><path d="M5 20h14"/></svg>',
     pen: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L19 9l-4-4L4 16z"/></svg>',
+    redo: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>',
   };
 
   /** The URL to show a review page in a frame, or '' when it can't be framed
@@ -146,6 +147,66 @@
     deliverable: { cls: 't-deliverable', label: 'Deliverable', icon: I.doc },
     explain:     { cls: 't-explain',     label: 'Answer',      icon: I.info },
   };
+
+  // ── "Redo as…": every kind of card a session can end on, named the way he
+  //    sees them (owner's pick C, 2026-10-29, static/scratch/card-wrong-kind-b.html).
+  //    Word for word the list CARD_KINDS in daemon/handoff_rules.py, which the
+  //    end-of-turn check uses to hold the redone card to the kind he picked;
+  //    tests/test_card_redo.py fails when either list misses a type or a
+  //    needs.kind, or when they differ (owner: "you are missing card types,
+  //    lets make sure thats impossible").  And at run time a type in TYPES
+  //    with no entry here still gets a plain tile (_redoKinds).
+  const REDO_KINDS = [
+    { k: 'explain',     type: 'explain',     needs: null,       name: 'Answer',      ds: 'Just answer my question' },
+    { k: 'done',        type: 'done',        needs: null,       name: 'Done',        ds: 'Do the work, then show me what changed' },
+    { k: 'decision',    type: 'needs_you',   needs: 'decision', name: 'Decide',      ds: 'Show me the options first, I pick' },
+    { k: 'approve',     type: 'needs_you',   needs: 'approve',  name: 'Approve',     ds: 'Ask me yes or no before you go on' },
+    { k: 'action',      type: 'needs_you',   needs: 'action',   name: 'To do',       ds: 'Tell me the one step only I can do' },
+    { k: 'deliverable', type: 'deliverable', needs: null,       name: 'Deliverable', ds: 'Give me the text or file itself' },
+    { k: 'working',     type: 'working',     needs: null,       name: 'Working',     ds: 'Keep going and tell me when it will be done' },
+    { k: 'blocked',     type: 'blocked',     needs: null,       name: 'Blocked',     ds: 'Tell me what is stopping you and what you tried' },
+  ];
+  // A small drawing of each kind, in the kind's colour (the tile's --tone).
+  const _SKF = '<svg viewBox="0 0 100 58" preserveAspectRatio="none" aria-hidden="true"';
+  const REDO_SKETCH = {
+    explain: _SKF + '><g fill="currentColor" opacity=".55"><rect x="10" y="12" width="70" height="5" rx="2.5"/><rect x="10" y="23" width="80" height="5" rx="2.5"/><rect x="10" y="34" width="62" height="5" rx="2.5"/><rect x="10" y="45" width="40" height="5" rx="2.5"/></g></svg>',
+    done: _SKF + ' fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M10 17l4 4 7-8"/><path d="M10 37l4 4 7-8"/><g stroke-width="5" opacity=".5"><path d="M30 17h52"/><path d="M30 37h40"/></g></svg>',
+    decision: _SKF + '><g fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="17" width="24" height="24" rx="5"/><rect x="38" y="17" width="24" height="24" rx="5" fill="currentColor" fill-opacity=".25"/><rect x="67" y="17" width="24" height="24" rx="5"/></g><g fill="currentColor" font-family="Inter,sans-serif" font-weight="700" font-size="12" text-anchor="middle"><text x="21" y="33">A</text><text x="50" y="33">B</text><text x="79" y="33">C</text></g></svg>',
+    approve: _SKF + '><rect x="12" y="19" width="36" height="20" rx="10" fill="currentColor" fill-opacity=".85"/><rect x="54" y="19" width="34" height="20" rx="10" fill="none" stroke="currentColor" stroke-width="2"/><g font-family="Inter,sans-serif" font-weight="700" font-size="10" text-anchor="middle"><text x="30" y="32.5" fill="#15120c">Yes</text><text x="71" y="32.5" fill="currentColor">No</text></g></svg>',
+    action: _SKF + '><circle cx="20" cy="29" r="10" fill="currentColor" fill-opacity=".85"/><text x="20" y="33" fill="#15120c" font-family="Inter,sans-serif" font-weight="700" font-size="11" text-anchor="middle">1</text><rect x="36" y="26" width="50" height="6" rx="3" fill="currentColor" opacity=".55"/></svg>',
+    deliverable: _SKF + ' fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M36 8h20l10 10v32H36z"/><path d="M56 8v10h10"/><g stroke-width="3" stroke-linecap="round" opacity=".55"><path d="M42 27h18"/><path d="M42 34h18"/><path d="M42 41h12"/></g></svg>',
+    working: _SKF + '><path d="M24 29a10 10 0 1 1-6.2-9.2" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/><rect x="42" y="26" width="46" height="6" rx="3" fill="currentColor" opacity=".22"/><rect x="42" y="26" width="28" height="6" rx="3" fill="currentColor" opacity=".8"/></svg>',
+    blocked: _SKF + ' fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><circle cx="21" cy="29" r="11"/><path d="M13.2 21.2l15.6 15.6"/><g stroke-width="5" opacity=".5"><path d="M42 22h44"/><path d="M42 36h30"/></g></svg>',
+  };
+  const _SK_PLAIN = _SKF + '><g fill="currentColor" opacity=".45"><rect x="10" y="18" width="80" height="6" rx="3"/><rect x="10" y="32" width="55" height="6" rx="3"/></g></svg>';
+  /** REDO_KINDS, plus a plain tile for any card type it lacks. */
+  function _redoKinds() {
+    const out = REDO_KINDS.slice();
+    Object.keys(TYPES).forEach(t => { if (!out.some(x => x.type === t)) out.push({ k: t, type: t, needs: null, name: TYPES[t].label, ds: '' }); });
+    return out;
+  }
+  /** The REDO_KINDS entry a card is, or a stand-in named from its type. */
+  function _redoKindOf(card) {
+    const t = (card && card.type) || '', n = ((card && card.needs) || {}).kind || '';
+    return _redoKinds().find(x => x.type === t && (!x.needs || x.needs === n)) ||
+      { k: t, type: t, needs: null, name: (TYPES[t] || TYPES.explain).label, ds: '' };
+  }
+  const _an = w => (/^[AEIOU]/i.test(w) ? 'an ' : 'a ') + w;
+  // The message the button sends as him.  daemon/handoff_rules.py
+  // redo_wanted() reads the kind back out of it: keep the two in step.
+  const REDO_PREFIX = 'Wrong kind of card:';
+  function _redoMessage(card, want, note) {
+    const was = _redoKindOf(card).name, ds = want.ds ? ': ' + want.ds.charAt(0).toLowerCase() + want.ds.slice(1) : '';
+    return REDO_PREFIX + ' you ended on ' + _an(was) + ' card. I wanted ' + _an(want.name) + ' card' + ds + '. Redo your last reply that way.' +
+      (note ? '\nWhat was off: ' + note : '');
+  }
+  /** The kind name a redo message asks for, or ''. */
+  function _redoWantedName(text) {
+    const t = String(text || '').trim();
+    if (t.indexOf(REDO_PREFIX) !== 0) return '';
+    const m = /\bI wanted (?:an?\s+)?(.+?) card\b/i.exec(t.split('\n')[0]);
+    return m ? m[1].trim() : '';
+  }
 
   function fmtDur(ms) {
     ms = Math.max(0, Math.round(ms / 1000));
@@ -455,7 +516,11 @@
     // the path, so the small line above it holds the steps before it.
     const pth = Array.isArray(m.path) ? m.path.filter(x => typeof x === 'string' && x.trim()).map(x => x.trim()) : [];
     const pathH = pth.length ? '<div class="lm-path">' + pth.map(x => '<span class="s">' + inl(x) + '</span><span class="sep">›</span>').join('') + '</div>' : '';
-    h += '<div class="lm-head"><div class="lm-pillrow"><span class="lm-pill">' + t.icon + esc(m.pill || t.label) + '</span>' + (opts.when ? '<span class="lm-when">' + esc(opts.when) + '</span>' : '') + '</div>' +
+    // The time is gone from the corner; "Redo as…" sits there instead, shown
+    // only on the open session's newest card (_syncRedo) (owner, 2026-10-29:
+    // "remove the time", then pick C of static/scratch/card-wrong-kind-b.html).
+    h += '<div class="lm-head"><div class="lm-pillrow"><span class="lm-pill">' + t.icon + esc(m.pill || t.label) + '</span>' +
+      '<button type="button" class="lm-redo" hidden title="Wrong kind of card? Pick the one you wanted and it redoes its reply" aria-haspopup="dialog">' + I.redo + 'Redo as…</button></div>' +
       (ti ? pathH + '<h3 class="lm-headline lm-title' + (/^[BDEFHIKLMNPRbhiklmnpr]/.test(ti) ? ' stem' : '') + '">' + inl(ti) + '</h3><p class="lm-subtitle">' + inl(m.headline) + '</p>'
           : '<h3 class="lm-headline">' + inl(m.headline) + '</h3>' + (m.context ? '<p class="lm-context"><b>Working on</b> ' + inl(m.context) + '</p>' : '')) +
       // Explain more belongs to the top block, with no rule above it (owner,
@@ -747,6 +812,7 @@
     log.querySelectorAll('.lm-backto').forEach(b => { b.hidden = !last || b.closest('.lm') !== last; });
     // "Deal with it" acts only from the newest card; the finding's text stays.
     log.querySelectorAll('.lm-find .go').forEach(b => { b.hidden = !last || b.closest('.lm') !== last; });
+    _syncRedo(log, last);
     _syncDelete(log, last);
     _syncCopySrc(log);
     const all = log.querySelectorAll('.lm-finish');
@@ -821,6 +887,181 @@
     // preventScroll: a plain focus() scrolled the thread under the tap.
     try { ask.querySelector('.no').focus({ preventScroll: true }); } catch (_e) { /* no focus */ }
   }
+  // ── "Redo as…" (owner's pick C, 2026-10-29, static/scratch/card-wrong-kind-b.html):
+  //    on the open session's newest card only, while nothing of his follows
+  //    it.  It opens a popup with a drawing of every kind of card; the pick
+  //    (and an optional note) goes to the session as his message, and the
+  //    send-back is saved (app/card_feedback.py) with his message before the
+  //    card, the card, the kind he wanted, and later the redone card, so the
+  //    rules can be tuned on real use.  Once he has sent it, the corner says
+  //    "Redoing as …" instead, read back from his message so a reload keeps it.
+  function _syncRedo(log, last) {
+    const sid = (typeof liveSessionId !== 'undefined') ? liveSessionId : null;
+    log.querySelectorAll('.lm-redo').forEach(b => {
+      const card = b.closest('.lm');
+      const after = card === last ? _replyAfter(card) : null;
+      const said = after ? ((after.querySelector('.msg-body') || after).textContent || '') : '';
+      const want = _redoWantedName(said);
+      let note = card.querySelector('.lm-pillrow .lm-redone');
+      if (card === last && want) {
+        if (!note) { note = document.createElement('span'); note.className = 'lm-redone'; b.after(note); }
+        note.innerHTML = I.redo + 'Redoing as ' + esc(want);
+      } else if (note) note.remove();
+      b.hidden = !(sid && card === last && !after);
+    });
+    _redoCapture(log, last, sid);
+    _redoFlush();
+  }
+
+  let _rd = null;   // the open popup: { scrim, box, card, btn, picked }
+  function _closeRedo() {
+    if (!_rd) return;
+    const r = _rd; _rd = null;
+    r.scrim.classList.remove('on'); r.box.classList.remove('on');
+    document.removeEventListener('keydown', r.onKey, true);
+    setTimeout(() => { r.scrim.remove(); r.box.remove(); }, 180);
+    try { r.btn.focus({ preventScroll: true }); } catch (_e) { /* gone */ }
+  }
+  function _openRedo(card, btn) {
+    _closeRedo();
+    let c = {};
+    try { c = JSON.parse(card.getAttribute('data-card') || '{}') || {}; } catch (_e) { c = {}; }
+    const cur = _redoKindOf(c), kinds = _redoKinds();
+    const scrim = document.createElement('div');
+    scrim.className = 'lm-rd-scrim';
+    const box = document.createElement('div');
+    box.className = 'lm-rd';
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-modal', 'true');
+    box.setAttribute('aria-labelledby', 'lm-rd-h');
+    box.innerHTML = '<h3 id="lm-rd-h">What kind of card did you want?</h3>' +
+      '<p class="sub">This one is ' + (/^[AEIOU]/i.test(cur.name) ? 'an ' : 'a ') + '<b>' + esc(cur.name) + '</b>. Pick the one you wanted and the session redoes its reply that way.</p>' +
+      '<div class="lm-rd-kinds" role="group" aria-label="Kind of card">' + kinds.map(x => {
+        const mine = x.k === cur.k;
+        return '<button type="button" class="rk" data-kind="' + esc(x.k) + '" data-type="' + esc(x.type) + '" aria-pressed="false"' + (mine ? ' aria-disabled="true" tabindex="-1"' : '') + '>' +
+          '<span class="sk">' + (REDO_SKETCH[x.k] || _SK_PLAIN) + '</span>' + (mine ? '<span class="tag">This one</span>' : '') +
+          '<span class="nm">' + esc(x.name) + '</span>' + (x.ds ? '<span class="ds">' + esc(x.ds) + '</span>' : '') + '</button>';
+      }).join('') + '</div>' +
+      '<label class="nl" for="lm-rd-note">What was off? <span>(optional)</span></label>' +
+      '<textarea id="lm-rd-note" class="lm-rd-note" rows="2" placeholder="e.g. I asked you to fix it, not explain it"></textarea>' +
+      '<div class="act"><button type="button" class="cx">Cancel</button><button type="button" class="go" disabled>Pick a kind</button></div>';
+    document.body.appendChild(scrim);
+    document.body.appendChild(box);
+    const r = _rd = { scrim, box, card, btn, picked: null, cur, c };
+    const go = box.querySelector('.go');
+    r.onKey = ev => { if (ev.key === 'Escape') { ev.stopPropagation(); ev.preventDefault(); _closeRedo(); } };
+    document.addEventListener('keydown', r.onKey, true);
+    scrim.addEventListener('click', _closeRedo);
+    box.addEventListener('click', ev => {
+      ev.stopPropagation();
+      const k = ev.target.closest('.rk');
+      if (k) {
+        if (k.getAttribute('aria-disabled') === 'true') return;
+        r.picked = kinds.find(x => x.k === k.dataset.kind) || null;
+        box.querySelectorAll('.rk').forEach(x => x.setAttribute('aria-pressed', String(x === k)));
+        go.disabled = !r.picked;
+        go.textContent = r.picked ? 'Redo as ' + r.picked.name : 'Pick a kind';
+        return;
+      }
+      if (ev.target.closest('.cx')) { _closeRedo(); return; }
+      if (ev.target.closest('.go') && r.picked) _redoSend(r, box.querySelector('.lm-rd-note').value.trim());
+    });
+    requestAnimationFrame(() => { scrim.classList.add('on'); box.classList.add('on'); });
+    const first = box.querySelector('.rk:not([aria-disabled="true"])');
+    try { first && first.focus({ preventScroll: true }); } catch (_e) { /* ok */ }
+  }
+  function _redoSend(r, note) {
+    const msg = _redoMessage(r.c, r.picked, note);
+    if (!_send(msg)) {
+      if (typeof showToast === 'function') showToast('Couldn’t send that. Type it in the box below.', true);
+      return;
+    }
+    const sid = (typeof liveSessionId !== 'undefined') ? liveSessionId : '';
+    const id = 'rd-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+    _redoQueue('/api/card-feedback', {
+      id, session: sid, project: (function () { try { return localStorage.getItem('activeProject') || ''; } catch (_e) { return ''; } })(),
+      your_message: _yourMessageBefore(r.card), card: r.c, card_kind: r.cur.k, wanted: r.picked.k, note, message: msg,
+    });
+    try { localStorage.setItem('vnRedoPending:' + sid, JSON.stringify({ id, from: _cardKey(r.card) })); } catch (_e) { /* private mode */ }
+    r.btn.hidden = true;
+    let tag = r.card.querySelector('.lm-pillrow .lm-redone');
+    if (!tag) { tag = document.createElement('span'); tag.className = 'lm-redone'; r.btn.after(tag); }
+    tag.innerHTML = I.redo + 'Redoing as ' + esc(r.picked.name);
+    _closeRedo();
+  }
+  /** His message the card answered: the nearest one of his above it. */
+  function _yourMessageBefore(card) {
+    for (let n = card.closest('.msg'); n && (n = n.previousElementSibling);) {
+      if (n.classList.contains('msg') && n.classList.contains('user') && !n.classList.contains('vn-event-msg')) {
+        return String((n.querySelector('.msg-body') || n).textContent || '').trim().slice(0, 20000);
+      }
+    }
+    return '';
+  }
+  function _cardKey(card) {
+    const s = card.getAttribute('data-card') || '';
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+    return s.length + ':' + h;
+  }
+  // The redone card joins the same record once it has landed: the newest
+  // card, after his "Wrong kind of card" message, with the session no longer
+  // working (a card sent back by the end-of-turn check is not the answer).
+  function _redoCapture(log, last, sid) {
+    if (!sid || !last) return;
+    let p = null;
+    try { p = JSON.parse(localStorage.getItem('vnRedoPending:' + sid) || 'null'); } catch (_e) { p = null; }
+    if (!p || !p.id || _cardKey(last) === p.from) return;
+    if (typeof sessionKinds !== 'undefined' && sessionKinds && sessionKinds[sid] === 'working') return;
+    let asked = false;
+    for (let n = last.closest('.msg'); n && (n = n.previousElementSibling);) {
+      if (n.classList.contains('msg') && n.classList.contains('user') && !n.classList.contains('vn-event-msg')) {
+        asked = !!_redoWantedName((n.querySelector('.msg-body') || n).textContent || '');
+        break;
+      }
+    }
+    if (!asked) return;
+    let c = null;
+    try { c = JSON.parse(last.getAttribute('data-card') || 'null'); } catch (_e) { c = null; }
+    if (!c) return;
+    try { localStorage.removeItem('vnRedoPending:' + sid); } catch (_e) { /* ok */ }
+    _redoQueue('/api/card-feedback/' + encodeURIComponent(p.id) + '/redo', { redo_card: c, redo_kind: _redoKindOf(c).k });
+  }
+  // Records wait in this browser until the web server takes them (a server
+  // not yet restarted onto the route answers 404), so none is lost.
+  const _RD_OUTBOX = 'vnCardFeedbackOutbox';
+  function _redoQueue(url, body) {
+    let box = [];
+    try { box = JSON.parse(localStorage.getItem(_RD_OUTBOX) || '[]') || []; } catch (_e) { box = []; }
+    box.push({ url, body });
+    try { localStorage.setItem(_RD_OUTBOX, JSON.stringify(box.slice(-50))); } catch (_e) { /* full: send it now anyway */ }
+    _redoFlush(true);
+  }
+  let _rdFlushAt = 0, _rdFlushing = false;
+  function _redoFlush(now) {
+    if (_rdFlushing || typeof fetch !== 'function') return;
+    if (!now && Date.now() - _rdFlushAt < 60000) return;
+    let box = [];
+    try { box = JSON.parse(localStorage.getItem(_RD_OUTBOX) || '[]') || []; } catch (_e) { box = []; }
+    if (!box.length) return;
+    _rdFlushing = true; _rdFlushAt = Date.now();
+    const item = box[0];
+    fetch(item.url, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(item.body) })
+      .then(res => {
+        _rdFlushing = false;
+        // 400 / 413: a record the server will never take; drop it so it
+        // cannot hold up the ones behind it.  Anything else waits.
+        if (!res.ok && res.status !== 400 && res.status !== 413) return;
+        let cur = [];
+        try { cur = JSON.parse(localStorage.getItem(_RD_OUTBOX) || '[]') || []; } catch (_e) { cur = []; }
+        const i = cur.findIndex(x => x.url === item.url && JSON.stringify(x.body) === JSON.stringify(item.body));
+        if (i !== -1) cur.splice(i, 1);
+        try { localStorage.setItem(_RD_OUTBOX, JSON.stringify(cur)); } catch (_e) { /* ok */ }
+        if (cur.length) _redoFlush(true);
+      })
+      .catch(() => { _rdFlushing = false; });
+  }
+
   // Something else / Problem / Change it: the chat box opens with a starter
   // line; Ask more opens it empty.
   const _VERDICT_PREFIX = { next: 'That’s done. Next: ', bad: 'Problem: ', change: 'Change: ', other: 'Not that. Instead: ', ask: '' };
@@ -2131,6 +2372,8 @@
     if (!root) return;
     const sk = e.target.closest('.lm-stick .in');
     if (sk) { _stickJump(root, !!e.target.closest('.jump')); return; }
+    const rdb = e.target.closest('.lm-redo');
+    if (rdb) { if (!rdb.hidden) _openRedo(root, rdb); return; }
     const em = e.target.closest('.lm-emore');
     if (em) {
       const w = em.closest('.lm-earlier'), open = !w.classList.contains('open');
@@ -2287,6 +2530,7 @@
     xm.setAttribute('aria-expanded', String(o));
   });
   const _api = { render, renderIn, shapeCard: _shapeCard, openReview: _openReview, closeReview: _closeReview, reviewSrc: _reviewSrc,
-    openDecide: _openDecide, closeDecide: _closeDecide, syncDone: _syncDone, syncAnswered: _syncAnswered, markAnswered: _markAnswered, themedSrc: _themedSrc, screenOption: _screenOption, tplStage: _tplStage, switchInPlace: _switchInPlace, deliverableBody: dvBodyHtml };
+    openDecide: _openDecide, closeDecide: _closeDecide, syncDone: _syncDone, syncAnswered: _syncAnswered, markAnswered: _markAnswered, themedSrc: _themedSrc, screenOption: _screenOption, tplStage: _tplStage, switchInPlace: _switchInPlace, deliverableBody: dvBodyHtml,
+    redoKinds: _redoKinds, redoMessage: (card, key, note) => _redoMessage(card || {}, _redoKinds().find(x => x.k === key), note || ''), redoWantedName: _redoWantedName, openRedo: _openRedo, closeRedo: _closeRedo };
   window.VNLastCard = _api;
 })();

@@ -243,6 +243,8 @@ data/engine_code.json
 # Queued messages a session handled since the user last looked (app/queue_history.py): his own words
 data/queue_history.json
 data/queue_history.json.*
+# "Redo as…" send-backs from the end-of-turn card (app/card_feedback.py): his own words and cards
+data/card_feedback.jsonl
 data/.engine_code.*
 
 # Mobile Command pairing code + cookie salt (app/mobile_auth.py)

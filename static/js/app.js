@@ -2019,6 +2019,9 @@ async function loadSessions() {
 }
 
 function filterSessions() {
+  // A pinned card is being dragged (sessions.js _pinDragMove): a redraw would
+  // replace it under the mouse.  The drag redraws when it ends.
+  if (window._pinDragActive) return;
   // Re-renders the session view.  In the Sessions view's cards and list the
   // "Show only" filters from the ••• menu apply (see "Session filters" below)
   // and the result is windowed (first 150, more on scroll).  Other views get

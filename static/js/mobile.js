@@ -490,6 +490,13 @@
     // triggers HTML5 drag, and even a still hold can suppress our
     // pointerup. Cancel any pending drag once our timer has fired so the
     // menu behaves like a menu, not a drag preview.
+    // A pinned session dragged to reorder it (sessions.js _pinDragStart,
+    // mouse only) becomes a drag 5px in, well inside LP_SLOP: it tells us,
+    // and the pending menu is dropped so it cannot open mid-drag.
+    document.addEventListener("vn:press-cancel", function () {
+      cancelTimer(); clearActive(); _armedFor = null;
+    });
+
     document.addEventListener("dragstart", function (e) {
       // If a long-press is armed (timer running or menu just opened),
       // suppress the drag entirely — user is trying to open the menu, not

@@ -534,7 +534,358 @@ function sortedSessions(sessions) {
     const key = s => s.effective_ts || s.last_activity_ts || s.sort_ts || 0;
     copy.sort((a, b) => dir * (key(a) - key(b)));
   }
-  return copy;
+  return _pinnedFirst(copy);
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Pinned sessions (owner, 2026-10-29: pick B of static/scratch/session-pin.html)
+// ───────────────────────────────────────────────────────────────────────
+// A pinned session stays first whatever the sort.  Pin it from the right-click
+// menu ("Pin to top") or the pin on its card or row: faint grey on hover,
+// purple on a soft purple dot once pinned (style.css .vn-pin).  Saved per
+// project on the server (app/session_pins.py, POST /api/session-pin/<id>) and
+// broadcast as `session_pin`, so the phone and the computer show one order.
+const _PIN_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>';
+// sid -> bool / rank: this page's newest word on a pin and its place (its own
+// taps and drags, and the broadcasts).  They beat the `pinned` / `pin_rank`
+// fields of a list load that was computed before the save landed, as
+// SessionVerb's holds do.
+const _pinLocal = new Map();
+const _pinRankLocal = new Map();
+const _pinSeq = new Map();   // sid -> number of the newest toggle
+let _pinOrderSeq = 0;        // number of the newest drag
+const _PIN_RETRY_MS = 1500;
+
+function _pinRow(sid) {
+  return (typeof SessionStore !== 'undefined' && SessionStore.get) ? SessionStore.get(sid) : null;
+}
+
+function isSessionPinned(sid) {
+  if (_pinLocal.has(sid)) return _pinLocal.get(sid);
+  const row = _pinRow(sid);
+  return !!(row && row.pinned);
+}
+
+/** A pinned session's place among the pinned ones, smallest first. */
+function pinRankOf(sid) {
+  if (_pinRankLocal.has(sid)) return _pinRankLocal.get(sid);
+  const row = _pinRow(sid);
+  return (row && typeof row.pin_rank === 'number') ? row.pin_rank : 0;
+}
+
+/** Pinned sessions first, in his order (drag to reorder); equal places and
+ *  everything unpinned keep the order the sort gave them. */
+function _pinnedFirst(list) {
+  const pinned = [], rest = [];
+  for (const s of list) (isSessionPinned(s.id) ? pinned : rest).push(s);
+  if (!pinned.length) return list;
+  const at = new Map(pinned.map((s, i) => [s.id, i]));
+  pinned.sort((a, b) => (pinRankOf(a.id) - pinRankOf(b.id)) || (at.get(a.id) - at.get(b.id)));
+  return pinned.concat(rest);
+}
+
+/** The place a new pin takes: the top of the pinned group. */
+function _topPinRank() {
+  let min = 1;
+  for (const s of (typeof allSessions !== 'undefined' ? allSessions : [])) {
+    if (isSessionPinned(s.id)) min = Math.min(min, pinRankOf(s.id));
+  }
+  return min - 1;
+}
+
+/** Show a pin (from this page or another device) and re-sort.  No save. */
+function _applyPin(sid, on, rank) {
+  if (!sid) return;
+  _pinLocal.set(sid, !!on);
+  const row = _pinRow(sid);
+  if (on && typeof rank === 'number') _pinRankLocal.set(sid, rank);
+  if (row) {
+    if (on) { row.pinned = true; if (typeof rank === 'number') row.pin_rank = rank; }
+    else { delete row.pinned; delete row.pin_rank; }
+  }
+  if (!on) _pinRankLocal.delete(sid);
+  if (typeof filterSessions === 'function') filterSessions();
+}
+
+/** Show an order of pinned sessions (top first) and re-sort.  No save.
+ *  `render` false records the places without redrawing. */
+function _applyPinOrder(order, render) {
+  if (!Array.isArray(order)) return;
+  order.forEach((sid, i) => {
+    _pinRankLocal.set(sid, i);
+    const row = _pinRow(sid);
+    if (row) row.pin_rank = i;
+  });
+  if (render !== false && typeof filterSessions === 'function') filterSessions();
+}
+
+/** A session that adopted the CLI's id keeps its pin (socket.js remap). */
+function _pinRekey(oldId, newId) {
+  if (!oldId || !newId) return;
+  if (_pinLocal.has(oldId)) { _pinLocal.set(newId, _pinLocal.get(oldId)); _pinLocal.delete(oldId); }
+  if (_pinRankLocal.has(oldId)) { _pinRankLocal.set(newId, _pinRankLocal.get(oldId)); _pinRankLocal.delete(oldId); }
+}
+
+function _postJson(url, body) {
+  return fetch(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }).then(r => r.ok).catch(() => false);
+}
+
+/** Save once, and once more after a pause if that failed. */
+function _saveWithRetry(url, body) {
+  return _postJson(url, body)
+    .then(ok => ok ? true : new Promise(res => setTimeout(res, _PIN_RETRY_MS)).then(() => _postJson(url, body)));
+}
+
+/** Pin or unpin.  The screen changes at once; a failed save is retried once,
+ *  then the screen goes back to what is saved and says so (the rule
+ *  SessionVerb.setHold follows: never show a choice the server did not keep). */
+function toggleSessionPin(sid) {
+  if (!sid) return Promise.resolve(false);
+  const on = !isSessionPinned(sid);
+  const prevRank = pinRankOf(sid);
+  _applyPin(sid, on, on ? _topPinRank() : undefined);
+  const project = localStorage.getItem('activeProject') || '';
+  const seq = (_pinSeq.get(sid) || 0) + 1;
+  _pinSeq.set(sid, seq);
+  return _saveWithRetry('/api/session-pin/' + encodeURIComponent(sid), { pinned: on, project: project })
+    .then(ok => {
+      // A newer tap on this session owns the screen now; leave it be.
+      if (ok || _pinSeq.get(sid) !== seq) return ok;
+      _applyPin(sid, !on, on ? undefined : prevRank);
+      if (typeof showToast === 'function') showToast(on ? 'Couldn’t pin it. Try again.' : 'Couldn’t unpin it. Try again.', true);
+      return false;
+    });
+}
+
+/** The pinned sessions, top first, as the sidebar shows them now. */
+function _pinnedOrder() {
+  const list = typeof allSessions !== 'undefined' ? allSessions : [];
+  const sorter = (typeof sessionDisplayMode !== 'undefined' && sessionDisplayMode === 'list') || typeof wfSortedSessions !== 'function'
+    ? sortedSessions : wfSortedSessions;
+  return sorter(list).filter(s => isSessionPinned(s.id)).map(s => s.id);
+}
+
+/** Drop a pinned session before or after another pinned one, and save the
+ *  new order (owner, 2026-10-29: "enable drag and drop reorder of the pinned
+ *  sessions").  The order covers every pinned session, including any a
+ *  filter hides, so a drag never loses one's place.  Same save rule as a pin. */
+function movePinnedSession(sid, targetSid, after) {
+  const order = _pinnedOrder();
+  if (sid === targetSid || order.indexOf(sid) < 0 || order.indexOf(targetSid) < 0) return Promise.resolve(false);
+  order.splice(order.indexOf(sid), 1);
+  order.splice(order.indexOf(targetSid) + (after ? 1 : 0), 0, sid);
+  return _savePinOrder(order, true);
+}
+
+/** Show and save a whole pinned order (top first).  `render` false: the
+ *  screen already shows it (a drag moved the cards), so only the places are
+ *  recorded.  A failed save puts the old order back and says so. */
+function _savePinOrder(order, render) {
+  const before = new Map(_pinnedOrder().map(id => [id, pinRankOf(id)]));
+  _applyPinOrder(order, render);
+  const project = localStorage.getItem('activeProject') || '';
+  const seq = ++_pinOrderSeq;
+  return _saveWithRetry('/api/session-pin-order', { order: order, project: project })
+    .then(ok => {
+      if (ok || seq !== _pinOrderSeq) return ok;
+      before.forEach((r, id) => { _pinRankLocal.set(id, r); const row = _pinRow(id); if (row) row.pin_rank = r; });
+      if (typeof filterSessions === 'function') filterSessions();
+      if (typeof showToast === 'function') showToast('Couldn’t save the new order. Try again.', true);
+      return false;
+    });
+}
+
+/** The pin on a card or list row.  Its own mousedown / click / double-click
+ *  stop at the button, so tapping it never opens, renames or sleeps the session. */
+function _pinButtonHtml(sid) {
+  const on = isSessionPinned(sid);
+  const label = on ? 'Unpin' : 'Pin to top';
+  return '<button type="button" class="vn-pin' + (on ? ' on' : '') + '" aria-pressed="' + on + '" aria-label="' + label + '" title="' + label + '"'
+    + ' onmousedown="event.stopPropagation()" ondblclick="event.stopPropagation()"'
+    + ' onclick="event.stopPropagation();toggleSessionPin(\'' + sid + '\')">' + _PIN_SVG + '</button>';
+}
+
+// ── Drag to reorder pinned sessions, live (desktop) ──
+// The owner, 2026-10-29: "i dont like the drag ux, lets just have them
+// literally reorder as you move it like ios".  So the card (or row) itself
+// lifts and follows the mouse, and the other pinned ones slide out of its way
+// the moment it passes over them; letting go settles it into its slot and
+// saves the order.  No browser drag ghost, no drop marker.
+//
+// Mouse only: on a touch screen press-and-hold opens the session menu
+// (mobile.js), so nothing there carries data-pin-drag.  A drag starts after
+// _PIN_DRAG_START px of movement, so a plain click still opens the session;
+// the click that ends a drag is swallowed.  While a drag runs, full sidebar
+// redraws wait (filterSessions checks window._pinDragActive), because a
+// redraw would replace the card under the mouse.  Escape puts it back.
+const _PIN_DRAG_OK = !!(typeof window !== 'undefined' && window.matchMedia
+  && window.matchMedia('(hover: hover) and (pointer: fine)').matches);
+const _PIN_DRAG_START = 5;      // px of movement before a press becomes a drag
+const _PIN_SLIDE_MS = 180;      // how long the others take to slide out of the way
+
+/** Marks a pinned card or row as draggable ('' otherwise). */
+function _pinDragAttrs(sid) {
+  return (_PIN_DRAG_OK && isSessionPinned(sid)) ? ' data-pin-drag="1"' : '';
+}
+
+let _pinDrag = null;   // the drag in progress, see _pinDragDown
+
+/** What moves for a pinned element: a list row with subsessions moves with
+ *  its family box. */
+function _pinUnit(el) {
+  const fam = el.classList.contains('family-parent') ? el.closest('.subsession-family') : null;
+  return fam || el;
+}
+
+/** The movable pinned units in a container, in screen order. */
+function _pinUnits(container) {
+  return [...container.children].filter(u => u.matches('[data-pin-drag][data-sid]')
+    || (u.classList.contains('subsession-family') && u.querySelector(':scope > [data-pin-drag].family-parent')));
+}
+
+function _pinUnitSid(u) {
+  return u.dataset.sid || (u.querySelector(':scope > [data-pin-drag].family-parent') || {}).dataset.sid;
+}
+
+/** Slide every unit but the lifted one from where it was to where it is now. */
+function _pinSlide(units, before) {
+  units.forEach(u => {
+    if (u === (_pinDrag && _pinDrag.unit)) return;
+    const a = before.get(u);
+    if (!a) return;
+    // Where it is now without any slide still running (a is where it showed).
+    u.style.transition = 'none';
+    u.style.transform = '';
+    const b = u.getBoundingClientRect();
+    const dx = a.left - b.left, dy = a.top - b.top;
+    if (!dx && !dy) { u.style.transition = ''; return; }
+    u.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
+    void u.offsetWidth;   // apply the start position before animating from it
+    u.style.transition = 'transform ' + _PIN_SLIDE_MS + 'ms cubic-bezier(.2,.8,.2,1)';
+    u.style.transform = '';
+    clearTimeout(u._pinSlideT);
+    u._pinSlideT = setTimeout(() => { u.style.transition = ''; }, _PIN_SLIDE_MS + 20);
+  });
+}
+
+/** Keep the lifted unit under the mouse, wherever its slot now is. */
+function _pinFollow(x, y) {
+  const d = _pinDrag, u = d.unit;
+  u.style.transform = 'none';
+  const r = u.getBoundingClientRect();
+  u.style.transform = 'translate(' + (x - d.gx - r.left) + 'px,' + (y - d.gy - r.top) + 'px) scale(1.04)';
+}
+
+function _pinDragDown(e) {
+  if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.pointerType !== 'mouse') return;
+  const el = e.target && e.target.closest ? e.target.closest('[data-pin-drag][data-sid]') : null;
+  if (!el || e.target.closest('.vn-pin') || el.classList.contains('family-child') || el.classList.contains('wf-child')) return;
+  _pinDrag = { el: el, unit: _pinUnit(el), container: _pinUnit(el).parentElement, id: e.pointerId,
+               x0: e.clientX, y0: e.clientY, live: false };
+}
+
+function _pinDragStart(e) {
+  const d = _pinDrag;
+  d.live = true;
+  window._pinDragActive = true;
+  // The press-and-hold menu (mobile.js) must not open in the middle of a drag.
+  document.dispatchEvent(new CustomEvent('vn:press-cancel'));
+  const tip = document.getElementById('session-tooltip');
+  if (tip) tip.classList.remove('visible');
+  try { window.getSelection().removeAllRanges(); } catch (_e) { /* nothing selected */ }
+  try { d.el.setPointerCapture(d.id); } catch (_e) { /* still follows document moves */ }
+  const r = d.unit.getBoundingClientRect();
+  d.gx = d.x0 - r.left; d.gy = d.y0 - r.top;
+  d.startOrder = _pinUnits(d.container).map(_pinUnitSid);
+  d.lockUntil = 0; d.lockOn = null;
+  document.body.classList.add('vn-pin-dragging');
+  d.unit.classList.add('vn-pin-lifted');
+}
+
+function _pinDragMove(e) {
+  const d = _pinDrag;
+  if (!d || (d.id != null && e.pointerId !== d.id)) return;
+  if (!d.live) {
+    if (Math.abs(e.clientX - d.x0) < _PIN_DRAG_START && Math.abs(e.clientY - d.y0) < _PIN_DRAG_START) return;
+    if (!d.unit.isConnected) { _pinDrag = null; return; }
+    _pinDragStart(e);
+  }
+  e.preventDefault();
+  if (!d.unit.isConnected) { _pinDragEnd(false); return; }
+  _pinFollow(e.clientX, e.clientY);
+  // Over another pinned one?  Take its slot at once; the others slide.
+  const units = _pinUnits(d.container);
+  const from = units.indexOf(d.unit);
+  const now = performance.now();
+  for (let i = 0; i < units.length; i++) {
+    const u = units[i];
+    if (u === d.unit) continue;
+    const r = u.getBoundingClientRect();
+    if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) continue;
+    // A unit sliding away can pass under the mouse again; wait for it to land.
+    if (u === d.lockOn && now < d.lockUntil) break;
+    const before = new Map(units.map(x => [x, x.getBoundingClientRect()]));
+    if (i > from) u.after(d.unit); else u.before(d.unit);
+    _pinSlide(units, before);
+    d.lockOn = u; d.lockUntil = now + _PIN_SLIDE_MS + 40;
+    _pinFollow(e.clientX, e.clientY);
+    break;
+  }
+}
+
+/** Let go (keep = true) or give up (Escape, a lost pointer). */
+function _pinDragEnd(keep) {
+  const d = _pinDrag;
+  _pinDrag = null;
+  if (!d || !d.live) return;
+  window._pinDragActive = false;
+  document.body.classList.remove('vn-pin-dragging');
+  // The click that ends a drag is not a click on the session.  After Escape
+  // the button is still down: swallow the click its release brings.
+  window._pinDragClickUntil = keep ? Date.now() + 400 : Infinity;
+  const u = d.unit;
+  const order = d.unit.isConnected ? _pinUnits(d.container).map(_pinUnitSid) : d.startOrder;
+  const moved = keep && order.join('\n') !== d.startOrder.join('\n');
+  // Settle into the slot, then draw the list from the data again.
+  u.classList.remove('vn-pin-lifted');
+  u.classList.add('vn-pin-settling');
+  u.style.transition = '';
+  u.style.transform = '';
+  setTimeout(() => {
+    u.classList.remove('vn-pin-settling');
+    if (moved) {
+      // Pinned sessions this view does not show (a filter) keep their place
+      // among the others.
+      const shown = new Set(order);
+      const full = _pinnedOrder();
+      let k = 0;
+      _savePinOrder(full.map(id => shown.has(id) ? order[k++] : id), true);
+    } else if (typeof filterSessions === 'function') filterSessions();
+  }, _PIN_SLIDE_MS);
+}
+
+if (typeof document !== 'undefined' && !window._pinDragBound) {
+  window._pinDragBound = true;
+  document.addEventListener('pointerdown', _pinDragDown);
+  document.addEventListener('pointermove', _pinDragMove, { passive: false });
+  document.addEventListener('pointerup', e => {
+    if (window._pinDragClickUntil === Infinity) window._pinDragClickUntil = Date.now() + 400;
+    if (_pinDrag && (_pinDrag.id == null || e.pointerId === _pinDrag.id)) _pinDragEnd(true);
+  });
+  document.addEventListener('pointercancel', () => _pinDragEnd(false));
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && _pinDrag && _pinDrag.live) _pinDragEnd(false); });
+  // The card's icon is an image the browser would drag on its own.
+  document.addEventListener('dragstart', e => {
+    if (e.target && e.target.closest && e.target.closest('[data-pin-drag]')) e.preventDefault();
+  });
+  document.addEventListener('click', e => {
+    if (window._pinDragClickUntil && Date.now() < window._pinDragClickUntil) {
+      window._pinDragClickUntil = 0;
+      e.stopPropagation(); e.preventDefault();
+    }
+  }, true);
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -748,11 +1099,12 @@ function _renderSessionRow(s, extraClass) {
     ? '<span class="unread-dot" aria-label="Unread" title="Unread — new response you haven’t opened"></span>'
     : '';
   const vsClass = _sessionVerbRowClass(s.id, status);
+  const pinClass = isSessionPinned(s.id) ? ' is-pinned' : '';
 
   return `
-  <div class="session-item${activeClass}${stateClass}${msClass}${subsessionClass}${unreadClass}${vsClass}${extraClass || ''}" data-sid="${s.id}" onmousedown="_sessionRowMouseDown(event,'${s.id}')" ondblclick="_dblclickSleepIfIdle('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')">
+  <div class="session-item${activeClass}${stateClass}${msClass}${subsessionClass}${unreadClass}${vsClass}${pinClass}${extraClass || ''}" data-sid="${s.id}"${_pinDragAttrs(s.id)} onmousedown="_sessionRowMouseDown(event,'${s.id}')" ondblclick="_dblclickSleepIfIdle('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')">
     <div class="session-col-name" onclick="handleNameClick('${s.id}')" style="cursor:text;" title="Click to rename">
-      ${caretSpan}${subsessionGlyph}${unreadDot}${icon}${escHtml(s.display_title)}${_autoNamingInFlight.has(s.id) ? '<span class="naming-badge"><span class="naming-dot"></span>Naming\u2026</span>' : ''}${inboxBadge}
+      ${caretSpan}${subsessionGlyph}${unreadDot}${icon}${escHtml(s.display_title)}${_autoNamingInFlight.has(s.id) ? '<span class="naming-badge"><span class="naming-dot"></span>Naming\u2026</span>' : ''}${inboxBadge}${_pinButtonHtml(s.id)}
       ${subsessionFromLine}
     </div>
     <div class="session-col-date" ${colClick} title="${escHtml(s.last_activity)}" data-short-date="${escHtml(s.last_activity)}">${escHtml(_shortDate(s.last_activity))}</div>
@@ -1468,6 +1820,7 @@ function _openSessionSheet(items, onAction) {
 // ---- Icon strings, factored out so both mobile and desktop paths share ----
 var _ICONS = {
   pause:    '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9.5"/><path d="M10 9v6"/><path d="M14 9v6"/></svg>',
+  pin:      _PIN_SVG.replace('<svg ', '<svg width="18" height="18" '),
   checkc:   '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5"/><polyline points="16.5 9 10.5 15 7.5 12"/></svg>',
   open:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>',
   autoname: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
@@ -1553,6 +1906,10 @@ function sessionContextMenu(e, sessionId) {
   if (!isActive) items.push({ label: 'Open',        icon: _ICONS.open,     action: 'open' });
   items.push({ label: 'Auto-name',                  icon: _ICONS.autoname, action: 'autoname' });
   items.push({ label: 'Rename',                     icon: _ICONS.rename,   action: 'rename' });
+  // Pinned sessions stay first whatever the sort (owner, 2026-10-29).
+  items.push(isSessionPinned(sessionId)
+    ? { label: 'Unpin',      icon: _ICONS.pin, action: 'unpin' }
+    : { label: 'Pin to top', icon: _ICONS.pin, action: 'pin' });
   // Standby / Mark done (owner, 2026-10-28, standby-status.html option A),
   // while the person-oriented statuses are on.
   if (window.SessionVerb && window.SessionVerb.setHold) {
@@ -1634,6 +1991,10 @@ function _sessCtx(action, sessionId) {
   _closeSessionSheet();
 
   switch (action) {
+    case 'pin':
+    case 'unpin':
+      if (isSessionPinned(sessionId) !== (action === 'pin')) toggleSessionPin(sessionId);
+      break;
     case 'standby':
       if (window.SessionVerdict) window.SessionVerdict.standby(sessionId);
       break;
