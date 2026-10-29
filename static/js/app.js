@@ -1269,6 +1269,23 @@ function _revealComposerAboveKeyboard(el) {
   setTimeout(finish, 350);
 }
 
+/** Scroll the sidebar so this session's card or row is visible (no-op when
+ *  it is already, or not drawn).  Only the sidebar scrolls, never the page. */
+function _scrollSessionCardIntoView(sid) {
+  const el = document.querySelector('#workforce-grid .wf-card[data-sid="' + sid + '"], #session-list .session-item[data-sid="' + sid + '"]');
+  if (!el) return;
+  try { el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (_e) { /* old browser: harmless */ }
+}
+
+/** A new session made in this tab whose first message has not been sent:
+ *  it exists only in this page, so nothing the server reports about running
+ *  sessions applies to it (2026-10-29: clicking away and back showed
+ *  "Session not found" because a state refresh had forgotten it). */
+function _isUnsentNewSession(sid) {
+  const row = (typeof SessionStore !== 'undefined' && SessionStore.get) ? SessionStore.get(sid) : null;
+  return !!(row && row.unsent);
+}
+
 // --- New Agent ---
 async function addNewAgent() {
   // If on homepage, switch to sessions mode first
@@ -1276,18 +1293,31 @@ async function addNewAgent() {
 
   const newId = crypto.randomUUID();
 
-  // Optimistic UI: add placeholder to sidebar
+  // Leaving the open session: keep what was typed there (same as openInGUI).
+  if (liveSessionId && liveSessionId !== newId) { _savePendingInputAsDraft(); stopLivePanel(); }
+
+  // Optimistic UI: add placeholder to sidebar.  It is stamped "now" (as the
+  // session_started stub is) so it sorts first by date: with no time it sank
+  // to the bottom of the list and only rose once the server reloaded it
+  // (owner, 2026-10-29: "super delayed before the left card gets focused").
+  const _nowS = Date.now() / 1000;
   const optimistic = {
     id: newId,
     display_title: 'New Session',
     custom_title: '',
     last_activity: '',
+    last_activity_ts: _nowS,
+    sort_ts: _nowS,
+    effective_ts: _nowS,
     size: '',
     message_count: 0,
     preview: '',
+    // Made in this tab, nothing sent yet: the server has no record of it, so
+    // the "not running any more" clean-ups and list reloads must keep it.
+    // Cleared by _newSessionSubmit.  See _isUnsentNewSession.
+    unsent: true,
   };
   SessionStore.set(newId, optimistic);   // new id: inserted at the front, list + id Set
-  filterSessions();
 
   // Mark as GUI-opened but DON'T add to runningIds or sessionKinds yet.
   // The session doesn't exist on the server until _newSessionSubmit sends it.
@@ -1309,6 +1339,13 @@ async function addNewAgent() {
     localStorage.setItem('activeSessionId', newId);
     setToolbarSession(newId, 'New Session', true, '');
   }
+
+  // Draw the sidebar only now that the new session is the open one, so its
+  // card is highlighted in the same frame it appears (it used to be drawn
+  // first and stay unhighlighted until some later redraw), and bring it
+  // into view.
+  filterSessions();
+  _scrollSessionCardIntoView(newId);
 
   // Update URL/history so back/forward and reload work the same as clicking a session
   _pushChatUrl(newId);
@@ -1476,6 +1513,12 @@ async function _newSessionSubmit(sessionId) {
   // NOW seed as running (session will exist on server after this emit)
   runningIds.add(sessionId);
   sessionKinds[sessionId] = 'working';
+  // Which session is on screen as this starts.  The awaits below can take a
+  // moment; if the person opens another session meanwhile, the session still
+  // starts, but this must not pull the screen back to it (2026-10-29).
+  const _liveAtSubmit = liveSessionId;
+  const _sentRow = SessionStore.get(sessionId);
+  if (_sentRow) delete _sentRow.unsent;   // the server knows it from here on
 
   // Get skill from current folder (if in workplace mode with folder tree)
   let systemPrompt = null;
@@ -1548,13 +1591,14 @@ async function _newSessionSubmit(sessionId) {
   }
 
   socket.emit('start_session', startOpts);
+  const _stillHere = liveSessionId === _liveAtSubmit;
 
   // Use the user's first message as a placeholder title until auto-name kicks in,
   // BUT respect any name the user already set — don't overwrite it.
   const s = allSessions.find(x => x.id === sessionId);
   if (s && s.custom_title && _userNamedSessions.has(sessionId)) {
     // User already named this session — keep their title
-    setToolbarSession(sessionId, s.custom_title, false, s.custom_title);
+    if (_stillHere) setToolbarSession(sessionId, s.custom_title, false, s.custom_title);
   } else {
     let _placeholder;
     if (/\[\[invoke\]\]/.test(text)) {
@@ -1563,7 +1607,7 @@ async function _newSessionSubmit(sessionId) {
       _placeholder = text.split('\n')[0].slice(0, 65) + (text.length > 65 ? '\u2026' : '');
     }
     if (s) { s.display_title = _placeholder; }
-    setToolbarSession(sessionId, _placeholder, true, '');
+    if (_stillHere) setToolbarSession(sessionId, _placeholder, true, '');
   }
   filterSessions();
 
@@ -1575,13 +1619,17 @@ async function _newSessionSubmit(sessionId) {
   // Switch to live panel mode — skip log fetch since this is a brand-new session
   // Clear dedup set right before panel creation so stale entries from
   // any prior session during the async await cannot block the bubble.
-  _optimisticMsgId = 0;
-  startLivePanel(sessionId, {skipLog: true});
+  // Not when the person has moved to another session meanwhile: opening this
+  // one again fetches its log, first message included.
+  if (_stillHere) {
+    _optimisticMsgId = 0;
+    startLivePanel(sessionId, {skipLog: true});
 
-  // Add optimistic user bubble into the fresh log (after startLivePanel creates it)
-  _liveSending = true;
-  _addOptimisticBubble(sessionId, text);
-  setTimeout(() => { _liveSending = false; }, 500);
+    // Add optimistic user bubble into the fresh log (after startLivePanel creates it)
+    _liveSending = true;
+    _addOptimisticBubble(sessionId, text);
+    setTimeout(() => { _liveSending = false; }, 500);
+  }
 
   // Auto-name immediately using the prompt text (no need to wait for JSONL)
   if (!_userNamedSessions.has(sessionId)) autoName(sessionId, true, false, text);
@@ -1831,8 +1879,13 @@ async function loadSessions() {
   // Without this, a concurrent loadSessions() from setProject() wipes the
   // optimistic entry and destroys the live panel.
   const _freshIds = new Set(_freshSessions.map(s => s.id));
+  // Also keep a new session made in this tab that the server has no file
+  // for yet, even when another session is open: a reload (a reconnect, a
+  // duplicate) used to drop its card, so clicking away from a new session
+  // could leave nothing to click back to (2026-10-29).
   const _preserved = allSessions.filter(s =>
-      !_freshIds.has(s.id) && s.id === liveSessionId
+      !_freshIds.has(s.id) && (s.id === liveSessionId
+        || s.unsent)
   );
   // One bulk replace.  SessionStore.replaceAll() also dedups by id (first copy
   // wins): the race between remap events and the session list fetch can

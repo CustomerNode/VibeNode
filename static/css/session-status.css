@@ -34,6 +34,11 @@ svg.vs-ic { color: rgb(var(--vs)); }
 .wf-card.vs-waiting .wf-status-label { background: rgba(var(--vs), .15); color: rgb(var(--vs)); }
 .wf-card.vs-idle .wf-status-label { background: var(--bg-hover); color: var(--text-faint); }
 .wf-card.vs-idle .wf-avatar { opacity: .6; }
+/* New (2026-10-29): a session with nothing sent yet keeps set A's quiet idle look. */
+.vs-new { --vs: 140, 145, 160; }
+[data-theme="light"] .vs-new { --vs: 130, 135, 150; }
+.wf-card.vs-new .wf-status-label { background: var(--bg-hover); color: var(--text-faint); }
+.wf-card.vs-new .wf-avatar { opacity: .6; }
 /* A sleeping session that still needs you keeps its colour, not the grey-out. */
 .wf-card.wf-sleeping.vs-decide .wf-avatar, .wf-card.wf-sleeping.vs-unblock .wf-avatar { filter: none; }
 

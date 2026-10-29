@@ -782,9 +782,11 @@ socket.on('state_snapshot', (data) => {
 
     // Clean up guiOpenSessions: if a session the user previously opened in GUI
     // is no longer reported as running by the server, stop treating it as idle.
-    // Exception: keep the live panel session.
+    // Exception: keep the live panel session, and a new session this tab has
+    // not sent yet (the server cannot report it; _isUnsentNewSession).
     guiOpenSessions.forEach(id => {
-        if (!newRunning.has(id) && id !== liveSessionId) {
+        if (!newRunning.has(id) && id !== liveSessionId
+                && !(typeof _isUnsentNewSession === 'function' && _isUnsentNewSession(id))) {
             guiOpenDelete(id);
         }
     });
@@ -2076,11 +2078,17 @@ socket.on('session_id_remapped', (data) => {
         history.replaceState(Object.assign({}, history.state, { sessionId: newId }), '', window.location.href);
     }
 
-    // Update toolbar data attribute
-    setToolbarSession(newId,
-        s ? (s.custom_title || s.display_title) : 'New Session',
-        s ? !s.custom_title : true,
-        s ? (s.custom_title || '') : '');
+    // Update toolbar data attribute — only when this session is the one on
+    // screen.  A new session is remapped seconds into its first turn; if the
+    // person has opened another session by then, writing this title over the
+    // toolbar put the wrong name (and the wrong target for Rename, Delete...)
+    // above the session they were reading (2026-10-29).
+    if (activeId === newId || liveSessionId === newId) {
+        setToolbarSession(newId,
+            s ? (s.custom_title || s.display_title) : 'New Session',
+            s ? !s.custom_title : true,
+            s ? (s.custom_title || '') : '');
+    }
 
     // Track remapped planner session ID so state/entry listeners match both IDs.
     // Don't overwrite _plannerSessionId — entry events still use the original ID.

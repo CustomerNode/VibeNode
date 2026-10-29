@@ -136,6 +136,57 @@ def test_update_stops_when_local_changes_clash_with_the_pull(tmp_path, monkeypat
     assert _git(b, "stash", "list").stdout.strip(), "local changes were not kept"
 
 
+def test_a_second_update_after_a_clash_says_so_and_touches_nothing(tmp_path, monkeypatch):
+    """2026-10-29: Update clashed on its stash pop; the next press ran `git
+    stash` (refused: "needs merge"), counted that as a stash, and showed git's
+    raw "Pulling is not possible because you have unmerged files"."""
+    from app import git_ops
+    remote, b = _clone_pair(tmp_path)
+    monkeypatch.setattr(git_ops, "_VIBENODE_DIR", b)
+    monkeypatch.setattr(git_ops, "_requirements_blob", lambda *a: "same")
+    monkeypatch.setattr("app.git_scanner.scan_staged_files",
+                        lambda *a, **k: {"ok": True, "findings": [], "blocked_files": [], "summary": ""})
+    first = git_ops.do_git_sync("both")
+    assert first.get("conflicts") == ["f.txt"], first
+    stashes = _git(b, "stash", "list").stdout
+    clash_text = (b / "f.txt").read_text()
+    head_before = _git(remote, "rev-parse", "main").stdout
+
+    second = git_ops.do_git_sync("both")
+
+    assert second["ok"] is False, second
+    assert second.get("conflicts") == ["f.txt"], second
+    assert any("earlier Update left a clash" in m for m in second["messages"]), second["messages"]
+    assert not any("Could not pull" in m for m in second["messages"]), second["messages"]
+    assert _git(b, "stash", "list").stdout == stashes, "a stash was added or popped"
+    assert (b / "f.txt").read_text() == clash_text
+    assert _git(remote, "rev-parse", "main").stdout == head_before
+
+
+def test_a_failed_stash_never_pops_an_older_one(tmp_path, monkeypatch):
+    """If `git stash` itself fails, the pop after the pull must not run: it
+    would apply someone's older, unrelated stash."""
+    from unittest.mock import MagicMock
+    from app import git_ops
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(git_ops, "_VIBENODE_DIR", tmp_path)
+    monkeypatch.setattr(git_ops, "_current_branch", lambda *a: "main")
+    monkeypatch.setattr(git_ops, "_default_branch", lambda *a: "main")
+    monkeypatch.setattr(git_ops, "_requirements_blob", lambda *a: "same")
+    monkeypatch.setattr(git_ops, "_unmerged_paths", lambda *a: [])
+    calls = []
+
+    def _run(cmd, *a, **kw):
+        calls.append(list(cmd))
+        if "stash" in cmd and "pop" not in cmd:
+            return MagicMock(stdout="", stderr="error: could not write index", returncode=1)
+        return MagicMock(stdout="Already up to date.", stderr="", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    git_ops.do_git_sync("pull")
+    assert not any("stash" in c and "pop" in c for c in calls), calls
+
+
 def test_update_refuses_to_publish_a_leftover_clash(tmp_path, monkeypatch):
     from app import git_ops
     remote, b = _clone_pair(tmp_path)

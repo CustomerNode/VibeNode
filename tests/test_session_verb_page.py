@@ -184,7 +184,7 @@ def test_open_session_asks_is_this_right(browser):
 @pytest.mark.slow
 def test_new_session_has_no_verdict_and_done_is_grey(browser):
     """A new session has nothing to judge (its verb is ``idle``, drawn as
-    Needs you): no "Is this right?" strip and no Accept until it replies.  Done looks like Sleeping always did:
+    New since 2026-10-29): no "Is this right?" strip and no Accept until it replies.  Done looks like Sleeping always did:
     grey label, greyed-out picture, the card not faded as a whole."""
     s = fake_sessions(2)
     s[1]["hold"] = "done"         # Done is the person's verdict, not sleep (2026-10-28)
@@ -198,7 +198,7 @@ def test_new_session_has_no_verdict_and_done_is_grey(browser):
         assert app.eval(f"() => SessionVerb.display('{new_id}')") == "idle"
         assert app.eval("() => !document.querySelector('#live-log > .vs-verdict-strip')")
         card = _card(new_id)
-        assert app.eval(f"() => document.querySelector('{card} .wf-status-label').textContent") == "Needs you"
+        assert app.eval(f"() => document.querySelector('{card} .wf-status-label').textContent") == "New"
         assert app.eval(f"() => !document.querySelector('{card} .vs-verdict')")
 
         # Its first reply makes it Review, Accept and all.

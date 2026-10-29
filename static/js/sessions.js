@@ -667,7 +667,8 @@ function _sessionStateIconHtml(sid, status) {
 function _sessionVerbRowClass(sid, status) {
   if (!window.SessionVerb) return '';
   const d = window.SessionVerb.display(sid, status);
-  return ' vs-row-' + d + (window.SessionVerb.rank(sid, status) <= 1 ? ' vs-row-yours' : '');
+  const r = window.SessionVerb.rank(sid, status);   // New ranks -1: first, but not a move to warm
+  return ' vs-row-' + d + (r >= 0 && r <= 1 ? ' vs-row-yours' : '');
 }
 
 /** The row classes that follow the session's state: 'waiting' or 'running'. */

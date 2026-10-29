@@ -897,8 +897,19 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
 .lm.skim .lm-xpl .lm-xpl-in > h3:first-child, .lm.skim .lm-xpl .lm-xpl-in > h4:first-child, .lm.skim .lm-xpl .lm-xpl-in > h5:first-child { margin-top: 0; }
 .lm-xpl-in p { margin: 0 0 6px; }
 @media (prefers-reduced-motion: reduce) { .lm-xpl-body, .lm-xpl-tg .tg { transition: none; } }
-/* "Full answer" folded under "In short" (owner's pick A, 2026-10-28) */
-.lm-xpl.lm-fullans { margin-top: 10px; }
+/* The Answer band's Short / Full / Plain words switch (owner's pick C,
+   2026-10-28, static/scratch/answer-depth.html): one version at a time. */
+.lm-depth { display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 3px; margin: 0 0 10px; border-radius: 9px;
+  background: rgba(var(--bt), .06); border: 1px solid rgba(var(--bt), .08); }
+.lm-depth-b { all: unset; cursor: pointer; font-size: 12.5px; font-weight: 600; line-height: 1.5; color: var(--text-muted); padding: 4px 11px; border-radius: 7px; }
+.lm-depth-b:hover { color: var(--text-heading); }
+.lm-depth-b:focus-visible { outline: 2px solid var(--text-muted); outline-offset: 1px; }
+.lm-depth-b[aria-pressed="true"] { background: rgba(var(--bt), .12); color: var(--text-heading); }
+.lm-depth-p[hidden] { display: none; }
+.lm-depth-p > :first-child { margin-top: 0; } .lm-depth-p > :last-child { margin-bottom: 0; }
+/* The band's own markdown rules are for direct children of .dd; a version sits one level down. */
+.lm .lm-dl .dd .lm-depth-p > ul:not([class]), .lm .lm-dl .dd .lm-depth-p > ol:not([class]) { margin: 0 0 10px; padding-left: 20px; }
+.lm .lm-dl .dd .lm-depth-p > ul:not([class]) > li, .lm .lm-dl .dd .lm-depth-p > ol:not([class]) > li { margin: 3px 0; padding-left: 2px; }
 .lm-xpl-in ul, .lm-xpl-in ol { padding-left: 1.3em; }
 
 /* ── The title is the last step of a path; This task / Just now move to a

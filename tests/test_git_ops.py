@@ -42,6 +42,8 @@ class TestDoGitSync:
         monkeypatch.setattr(git_ops, "_default_branch", lambda *a: "main")
         # requirements.txt unchanged by this pull (see TestPullInstallsRequirements).
         monkeypatch.setattr(git_ops, "_requirements_blob", lambda *a: "abc")
+        # No clash left over from an earlier Update (checked before stashing).
+        monkeypatch.setattr(git_ops, "_unmerged_paths", lambda *a: [])
 
         mock_run = MagicMock()
         # stash returns "No local changes"

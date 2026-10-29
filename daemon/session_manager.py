@@ -8490,6 +8490,66 @@ class SessionManager:
             pass
         return True
 
+    @staticmethod
+    def _nested_repo_roots(cwd_path: Path) -> list:
+        """The repos directly under a wrapper folder, each counted ONCE.
+
+        A child whose ``.git`` is a directory is a repo.  A child whose
+        ``.git`` is a FILE is a linked worktree (``gitdir: <repo>/.git/
+        worktrees/<name>``): another checkout of a repo, so it is skipped
+        when that repo is one of the children, and kept when it belongs to
+        a repo outside the folder.
+
+        Counting every worktree as its own repo made the CustomerNode
+        wrapper (one repo plus 14 worktrees of it) list 143,442 files
+        instead of ~10,800, so every turn's mtime scan hit its 2s budget
+        and bailed with a partial, useless result: 2-12s added before each
+        message was sent (measured 2026-10-28).
+        """
+        repos: list = []
+        worktrees: list = []
+        try:
+            children = sorted(cwd_path.iterdir())
+        except OSError:
+            return []
+        for child in children:
+            try:
+                if not child.is_dir():
+                    continue
+                dotgit = child / ".git"
+                if dotgit.is_dir():
+                    repos.append(child)
+                elif dotgit.is_file():
+                    worktrees.append(child)
+            except OSError:
+                continue
+
+        def _norm(p: Path) -> str:
+            try:
+                p = p.resolve()
+            except OSError:
+                pass
+            return os.path.normcase(str(p))
+
+        repo_gitdirs = [_norm(r / ".git") for r in repos]
+        roots = list(repos)
+        for wt in worktrees:
+            try:
+                text = (wt / ".git").read_text(encoding="utf-8",
+                                               errors="replace").strip()
+            except OSError:
+                continue
+            if not text.startswith("gitdir:"):
+                continue
+            target = Path(text[len("gitdir:"):].strip())
+            if not target.is_absolute():
+                target = wt / target
+            gd = _norm(target)
+            if any(gd == r or gd.startswith(r + os.sep) for r in repo_gitdirs):
+                continue  # another checkout of a repo already listed
+            roots.append(wt)
+        return roots
+
     def _git_ls_files(self, cwd_path: Path, info: "SessionInfo | None" = None) -> list:
         """Use `git ls-files` to get tracked files, respecting .gitignore.
 
@@ -8502,7 +8562,8 @@ class SessionManager:
              ``cwd_path``'s immediate children for nested repos and
              union their ``git ls-files`` output.  This handles wrapper
              layouts like ``CustomerNode/customerNode_root/.git`` where
-             the session CWD sits one level above the real repo.
+             the session CWD sits one level above the real repo.  Linked
+             worktrees of a listed repo are skipped (``_nested_repo_roots``).
 
         When *info* is provided, caches the result on the SessionInfo so
         subsequent calls within the TTL window skip the subprocess entirely.
@@ -8544,17 +8605,10 @@ class SessionManager:
         # nested repos (CustomerNode wrapper-folder layout).
         if paths is None:
             paths = []
-            try:
-                for child in sorted(cwd_path.iterdir()):
-                    if not child.is_dir():
-                        continue
-                    if not (child / ".git").exists():
-                        continue
-                    child_paths = _run_ls_files(child)
-                    if child_paths is not None:
-                        paths.extend(child_paths)
-            except OSError:
-                pass
+            for child in self._nested_repo_roots(cwd_path):
+                child_paths = _run_ls_files(child)
+                if child_paths is not None:
+                    paths.extend(child_paths)
             if not paths:
                 return None
 

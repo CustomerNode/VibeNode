@@ -299,10 +299,23 @@ def do_git_sync(action: str, confirm_branch: bool = False,
     pip_result = None
 
     if action in ("pull", "both"):
+        # A clash left by an earlier Update's stash pop blocks everything after
+        # it: `git stash` refuses ("needs merge") and the pull fails with git's
+        # raw "you have unmerged files" (2026-10-29, the second press of Update
+        # after a clash).  Say what it is instead, and touch nothing.
+        clashed = _unmerged_paths(proj)
+        if clashed:
+            return {"ok": False, "messages": [
+                "An earlier Update left a clash between your local changes and the pulled "
+                "code in: " + ", ".join(clashed) + ".",
+                "Nothing was pulled or published. Resolve the clash, then Update again.",
+            ], "conflicts": clashed}
         reqs_before = _requirements_blob(proj)
         stash = subprocess.run(["git", "-C", str(proj), "stash", "--include-untracked"],
                                capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW)
-        stashed = "No local changes" not in stash.stdout
+        # Only a stash that ran and saved something may be popped later: a
+        # failed `git stash` must never lead to popping an older, unrelated one.
+        stashed = stash.returncode == 0 and "No local changes" not in stash.stdout
         pull = subprocess.run(
             ["git", "-C", str(proj), "pull", "--rebase", "-X", "theirs"],
             capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)

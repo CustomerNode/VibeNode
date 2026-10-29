@@ -277,8 +277,10 @@ const set = (id, s, verb) => { st[id] = s; rows[id] = { message_count: 3, next_s
 set('dec', 'idle', 'decide'); set('rev', 'idle', 'review'); set('snd', 'idle', 'send'); set('q', 'question');
 set('w', 'working'); set('wt', 'idle', 'waiting'); set('dn', 'sleeping'); rows.dn.hold = 'done';
 set('sl', 'sleeping', 'review');
+st.nw = 'idle'; rows.nw = { message_count: 0 };   // a new session, nothing sent yet
 const out = {};
 for (const id of Object.keys(st)) { const p = SV.cardParts(id); out[id] = [p.label, p.cls, SV.filterBucket(id)]; }
+out.nw_rank = SV.rank('nw'); out.dec_rank = SV.rank('dec');
 process.stdout.write(JSON.stringify(out));
 """)
     res = subprocess.run([NODE, str(h), str(JS)], capture_output=True, text=True, timeout=30)
@@ -289,3 +291,7 @@ process.stdout.write(JSON.stringify(out));
     assert out["w"][:2] == ["Working", "vs-working"] and out["wt"][:2] == ["Working", "vs-working"]
     assert out["dn"] == ["Done", "vs-done", "sleeping"]       # marked Done by the person
     assert out["sl"] == needs                                   # slept, no verdict: still his
+    # New (owner, 2026-10-29: "i think it should be branded as new"): its own
+    # label, first in "Active first", still under the Needs-you filter.
+    assert out["nw"] == ["New", "vs-new", "question"]
+    assert out["nw_rank"] < out["dec_rank"]

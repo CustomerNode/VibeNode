@@ -91,7 +91,8 @@ async function pollWaiting() {
     // Exception: keep the live panel session — it may briefly drop out of the
     // server scan while transitioning (e.g. process just starting up).
     guiOpenSessions.forEach(id => {
-      if (!newRunning.has(id) && id !== liveSessionId) {
+      if (!newRunning.has(id) && id !== liveSessionId
+          && !(typeof _isUnsentNewSession === 'function' && _isUnsentNewSession(id))) {
         guiOpenDelete(id);
       }
     });

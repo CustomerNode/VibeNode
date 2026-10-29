@@ -32,7 +32,12 @@
   'use strict';
 
   const ORDER = ['decide', 'unblock', 'approve', 'review', 'read', 'send', 'working', 'waiting', 'standby', 'done'];
-  const RANK = { decide: 0, unblock: 0, approve: 0, review: 1, read: 1, send: 1, working: 2, waiting: 3, idle: 4, standby: 4.5, done: 5 };
+  // A brand-new session (`idle`: nothing sent yet) ranks first in "Active
+  // first": it is the one the person just made and is about to type into
+  // (owner, 2026-10-29: "should be immediate").  Server lists never hold an
+  // empty session, so only this tab's own new ones (and a just-started stub)
+  // ever rank here.
+  const RANK = { idle: -1, decide: 0, unblock: 0, approve: 0, review: 1, read: 1, send: 1, working: 2, waiting: 3, standby: 4.5, done: 5 };
   const LABEL = { decide: 'Decide', unblock: 'Unblock', approve: 'Approve', review: 'Review', read: 'Read', send: 'Send',
     working: 'Working', waiting: 'Waiting', idle: 'New', standby: 'Standby', done: 'Done' };
   // Review / Read / Send end with a verdict: accept (the session sleeps: Done)
@@ -68,16 +73,20 @@
   // static/scratch/status-merge.html): the sidebar says whose move it is, not
   // what kind of work it is.  display() keeps the fine verb (the hover title
   // says it, and behaviour reads it); everything drawn goes through shown().
-  //   Needs you  decide · unblock · approve · review · read · send · new
+  //   Needs you  decide · unblock · approve · review · read · send
+  //   New        a session with nothing sent yet (owner, 2026-10-29: a new
+  //              session read "Needs you"; "i think it should be branded as
+  //              new").  Drawn with set A's own `idle` picture and quiet look.
   //   Working    working · waiting
   //   Done       done (the person's verdict, not sleep)
-  const GROUP = { decide: 'needs', unblock: 'needs', approve: 'needs', review: 'needs', read: 'needs', send: 'needs', idle: 'needs',
+  const GROUP = { decide: 'needs', unblock: 'needs', approve: 'needs', review: 'needs', read: 'needs', send: 'needs', idle: 'new',
     working: 'working', waiting: 'working', standby: 'standby', done: 'done' };
   // Standby (owner, 2026-10-28, static/scratch/standby-status.html option A):
   // seen, not now, still on the list.  Set by the person (double-click on a
   // Needs-you session, or its Standby button); any new message ends it.
-  const GROUP_LABEL = { needs: 'Needs you', working: 'Working', standby: 'Standby', done: 'Done' };
+  const GROUP_LABEL = { needs: 'Needs you', new: 'New', working: 'Working', standby: 'Standby', done: 'Done' };
   GLYPH.needs = '<circle cx="12" cy="12" r="9.5"/><path d="M12 7.5v5.5"/><path d="M12 16.5h.01"/>';
+  GLYPH.new = GLYPH.idle;
   function shown(d) { return GROUP[d] || 'done'; }
   const PICKAXE_FILTER = 'filter:brightness(0) saturate(100%) invert(55%) sepia(78%) saturate(1000%) hue-rotate(215deg);';
 
@@ -274,7 +283,9 @@
    *  in getSessionStatus() vocabulary so the filter code keeps its shape. */
   function filterBucket(sid, status) {
     const g = shown(display(sid, status));
-    if (g === 'needs') return 'question';
+    // New stays under the Needs-you filter, where it was before it had its
+    // own label: its first message is the person's move.
+    if (g === 'needs' || g === 'new') return 'question';
     if (g === 'working') return 'working';
     if (g === 'standby') return 'standby';
     return 'sleeping';   // done
@@ -287,7 +298,7 @@
 
   function _title(sid, d) {
     const step = _cardStep(sid);
-    const line = (step && step.line && RANK[d] <= 1) ? step.line : '';
+    const line = (step && step.line && RANK[d] >= 0 && RANK[d] <= 1) ? step.line : '';
     return GROUP_LABEL[shown(d)] + ': ' + (line || MEANS[d]);
   }
 

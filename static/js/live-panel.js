@@ -1235,9 +1235,25 @@ async function openInGUI(id) {
   const _lpProjQ = _lpProj ? '&project=' + encodeURIComponent(_lpProj) : '';
   const resp = await fetch('/api/session/' + id + '?meta_only=1' + _lpProjQ);
 
+  // The person clicked something else while this was loading: leave it, or
+  // a slow reply drew this session over the one they picked.  A remap of
+  // this very session meanwhile (temp id -> CLI id) is still this session.
+  if (activeId !== id) {
+    const _re = window._idRemaps && window._idRemaps[id];
+    if (_re && _re === activeId) id = _re;
+    else return;
+  }
+
   // New session with no .jsonl yet — re-show the new session input
   if (!resp.ok) {
-    if (guiOpenSessions.has(id) && !runningIds.has(id)) {
+    // Sent from this tab a moment ago and still starting (the engine has not
+    // registered it yet): show its live panel, which fills in as it starts,
+    // instead of "Session not found" (2026-10-29).
+    if (guiOpenSessions.has(id) && runningIds.has(id)) {
+      startLivePanel(id);
+      return;
+    }
+    if ((guiOpenSessions.has(id) || (typeof _isUnsentNewSession === 'function' && _isUnsentNewSession(id))) && !runningIds.has(id)) {
       // Re-create the new session chat view — preserve auto-name from sidebar if available
       const _ct = cached && cached.custom_title ? cached.custom_title : (cached && cached.display_title && cached.display_title !== 'New Session' ? cached.display_title : '');
       setToolbarSession(id, _ct || 'New Session', !_ct, _ct || '');
@@ -1278,6 +1294,13 @@ async function openInGUI(id) {
         // gate on _wantAutofocus in updateLiveInputBar() below.
         const _wantFocusHere = !_isMobileViewport();
         const _taSync = document.getElementById('live-input-ta');
+        // What was typed before clicking away (saved by openInGUI /
+        // addNewAgent through _savePendingInputAsDraft) comes back with it;
+        // this branch used to draw an empty box (2026-10-29).
+        if (_taSync && typeof _getDraft === 'function') {
+          const _d = _getDraft(id);
+          if (_d) { _taSync.value = _d; if (typeof _hideTemplateGrid === 'function') _hideTemplateGrid(); }
+        }
         if (_taSync && _wantFocusHere) _taSync.focus();
         setTimeout(() => { const ta = document.getElementById('live-input-ta'); if (ta) { if (_wantFocusHere) ta.focus(); _initAutoResize(ta); ta.addEventListener('input', function() { if (typeof _hideTemplateGrid === 'function') _hideTemplateGrid(); }); } }, 50);
       }

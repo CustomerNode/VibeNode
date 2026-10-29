@@ -441,7 +441,11 @@
     // static/scratch/card-lost.html, 2026-10-28): under the This task / Just
     // now lines, the card's quiet grey on every status, no icon.
     const ex = typeof m.explained === 'string' && m.explained.trim() ? m.explained.trim() : '';
-    const exH = ex ? '<div class="lm-xpl"><button type="button" class="lm-xpl-tg" aria-expanded="false">Explain more <span class="tg">▾</span></button>' +
+    // A card with an answer draws its "explained" text as the answer's Plain
+    // words version, in the Answer band's switch, not up here (owner's pick C,
+    // 2026-10-28, static/scratch/answer-depth.html: "explain more is in short
+    // answer").
+    const exH = ex && !m.answer ? '<div class="lm-xpl"><button type="button" class="lm-xpl-tg" aria-expanded="false">Explain more <span class="tg">▾</span></button>' +
       '<div class="lm-xpl-body"><div><div class="lm-xpl-in">' + dvBodyHtml('markdown', ex) + '</div></div></div></div>' : '';
     // The way to the thing the title names (owner, 2026-10-28,
     // static/scratch/card-title-crumb.html): the title is the last step of
@@ -560,14 +564,22 @@
       } else
       h += band('Validate', '<div class="lm-rows">' + vr + shots.map(linkRow).join('') + '</div>' + later, 'lm-sec');
     }
-    // "Full answer": the detailed answer in markdown, folded under the short
-    // one (owner's pick A, 2026-10-28, static/scratch/answer-detail.html:
-    // "shouldn't there be a more detailed answer too, perhaps like expandable
-    // markdown").  The same toggle as Explain more, which stays up top for
-    // when the card itself is confusing.
+    // One Answer band, one switch: Short (the "answer"), Full (the
+    // "full_answer", markdown) and Plain words (the card's "explained"), shown
+    // one at a time in the same spot (owner's pick C, 2026-10-28,
+    // static/scratch/answer-depth.html).  It replaced an "In short" band with
+    // a Full answer fold under it AND an Explain more fold up top, which said
+    // the same thing up to four times.  Short is always first and open.
     const fa = typeof m.full_answer === 'string' && m.full_answer.trim() ? m.full_answer.trim() : '';
-    if (m.answer) h += band('In short', paras(m.answer) + (fa ? '<div class="lm-xpl lm-fullans"><button type="button" class="lm-xpl-tg" aria-expanded="false">Full answer <span class="tg">▾</span></button>' +
-      '<div class="lm-xpl-body"><div><div class="lm-xpl-in">' + dvBodyHtml('markdown', fa) + '</div></div></div></div>' : ''), 'lm-sec');
+    if (m.answer) {
+      const vers = [['short', 'Short', paras(m.answer)]];
+      if (fa) vers.push(['full', 'Full', dvBodyHtml('markdown', fa)]);
+      if (ex) vers.push(['plain', 'Plain words', dvBodyHtml('markdown', ex)]);
+      h += band('Answer', vers.length < 2 ? vers[0][2]
+        : '<div class="lm-depth" role="group" aria-label="How much to read">' + vers.map(([k, l], i) =>
+            '<button type="button" class="lm-depth-b" data-depth="' + k + '" aria-pressed="' + (i ? 'false' : 'true') + '">' + l + '</button>').join('') + '</div>' +
+          vers.map(([k, , body], i) => '<div class="lm-depth-p" data-depth="' + k + '"' + (i ? ' hidden' : '') + '>' + body + '</div>').join(''), 'lm-sec lm-answer');
+    }
     if (m.compare) h += band(esc(m.compare.label || 'Change'), compareBlock(m.compare), 'lm-sec');
     if (m.deliverable) h += band('Deliverable', deliverableBlock(m.deliverable), 'lm-sec');
     if (shots.length && !shotsInValidate) h += band('Screens', '<div class="lm-rows">' + shots.map(linkRow).join('') + '</div>', 'lm-sec');
@@ -2139,6 +2151,14 @@
   // depends on the order of the card's other click handling).
   document.addEventListener('click', e => {
     if (window.VNLastCard !== _api) return;
+    // The Answer band's Short / Full / Plain words switch: one version at a time.
+    const db = e.target && e.target.closest && e.target.closest('.lm-depth-b');
+    if (db) {
+      const dd = db.closest('.dd') || db.parentElement.parentElement;
+      dd.querySelectorAll('.lm-depth-b').forEach(b => b.setAttribute('aria-pressed', String(b === db)));
+      dd.querySelectorAll('.lm-depth-p').forEach(p => { p.hidden = p.dataset.depth !== db.dataset.depth; });
+      return;
+    }
     const xm = e.target && e.target.closest && e.target.closest('.lm-xpl-tg');
     if (!xm) return;
     const o = xm.parentElement.classList.toggle('open');

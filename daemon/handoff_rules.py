@@ -730,7 +730,8 @@ def format_problems(card: dict) -> list[str]:
             out.append("\"full_answer\" is the detailed answer in markdown; leave it out rather than "
                        "sending it empty.")
         elif not _s(card.get("answer")):
-            out.append("\"full_answer\" is drawn under \"In short\": it needs \"answer\" (the short one) too.")
+            out.append("\"full_answer\" is the answer's Full version, beside its Short one: it needs "
+                       "\"answer\" (the short one) too.")
     if t == "working":
         if kind != "none":
             out.append("A \"working\" card has needs.kind \"none\". If the user must act, use \"needs_you\".")
@@ -1121,8 +1122,9 @@ def length_problems(card: dict) -> list[str]:
     for where, text in _strings(card):
         # zoom: smart_termination.zoom_problems; explained: the "Explain more"
         # text, long on purpose (smart_termination.explained_problems);
-        # full_answer: the "Full answer" under "In short", folded away and long
-        # on purpose (owner's pick A, 2026-10-28, static/scratch/answer-detail.html).
+        # full_answer: the answer's "Full" version, behind the Answer band's
+        # switch and long on purpose (owner's pick C, 2026-10-28,
+        # static/scratch/answer-depth.html).
         # finding: the "Also found" band, three capped lines outside the 120
         # (finding_problems); the per-line cap below still applies.
         if where.startswith(("deliverable", "asks", "zoom", "explained", "full_answer")):
@@ -1434,9 +1436,10 @@ link: such a card is sent back.
 - explain: an answer to a question, in "answer" (or a "compare" block). \
 When there is reasoning, evidence or examples behind it (most answers), add \
 "full_answer": the detailed answer in markdown (## headings, - lists, \
-tables), no length limit, drawn folded under "In short" as "Full answer". \
-"answer" stays the short version; "explained" stays the whole card for \
-someone lost.
+tables), no length limit. The card's Answer band has one switch, Short / \
+Full / Plain words: "answer" is Short, "full_answer" is Full, and \
+"explained" is Plain words (on a card with an "answer" there is no \
+separate Explain more), so write each as its own version, not a repeat.
 When earlier work in this session is still unfinished and this card is \
 about something else, add "back_to": {"label": "that work, in a few words", \
 "status": "where it stands", "reply": "the message to send to resume it"}. \

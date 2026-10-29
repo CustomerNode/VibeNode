@@ -701,7 +701,12 @@ async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
     if (r.scan && !r.scan.ok) {
       btns.unshift({label: 'Fix with AI', primary: true, onclick: () => { closeGitSyncModal(); _launchRemediationSession(r.scan); }});
     }
-    showGitSyncModal(r.ok ? btnLabel + ' \u2713' : 'Push Blocked \u2014 Security Issue', body, btns);
+    // Only a scan finding is a security issue. A clash or a failed pull used
+    // to get the same "Security Issue" title too (2026-10-29).
+    const failTitle = (r.scan && !r.scan.ok) ? 'Push Blocked \u2014 Security Issue'
+      : (r.conflicts && r.conflicts.length) ? btnLabel + ' \u2014 Stopped: Changes Clash'
+      : btnLabel + ' \u2014 Not Finished';
+    showGitSyncModal(r.ok ? btnLabel + ' \u2713' : failTitle, body, btns);
     if (r.git_status) {
       _applyGitStatus(r.git_status);
     } else {
