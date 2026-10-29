@@ -92,17 +92,40 @@ def install_requirements(python: str | None = None, requirements: Path = REQUIRE
     cmd = [python, "-m", "pip", "install", "--disable-pip-version-check",
            "--only-binary=:all:", "-r", str(requirements)]
     run = runner or subprocess.run
+    out, ok = _run_pip(run, cmd, timeout)
+    # PEP 668 (Ubuntu 23.04+, Debian 12+): a system interpreter refuses every
+    # install, --user included, with "externally-managed-environment".  The
+    # server then runs on that interpreter with its packages in the user site
+    # (~/.local), put there by launch.sh's own fallback.  Install the same way:
+    # into the user site, never into the system's site-packages.  Only for an
+    # interpreter outside a virtual environment; a venv never says this.
+    if not ok and _EXTERNALLY_MANAGED in out and not _in_venv(python):
+        cmd = cmd[:4] + ["--user", "--break-system-packages"] + cmd[4:]
+        out, ok = _run_pip(run, cmd, timeout)
+    return {"pip_ran": True, "pip_ok": ok, "pip_installed": installed_count(out),
+            "pip_output_tail": _tail(out), "pip_command": cmd}
+
+
+_EXTERNALLY_MANAGED = "externally-managed-environment"
+
+
+def _run_pip(run, cmd, timeout):
     try:
         r = run(cmd, capture_output=True, text=True, timeout=timeout,
                 creationflags=_NO_WINDOW)
-        out = (r.stdout or "") + (r.stderr or "")
-        ok = r.returncode == 0
+        return (r.stdout or "") + (r.stderr or ""), r.returncode == 0
     except subprocess.TimeoutExpired:
-        out, ok = "pip install timed out after %ds" % timeout, False
+        return "pip install timed out after %ds" % timeout, False
     except Exception as exc:  # noqa: BLE001  (never let pip break the caller)
-        out, ok = "pip could not run: %s" % exc, False
-    return {"pip_ran": True, "pip_ok": ok, "pip_installed": installed_count(out),
-            "pip_output_tail": _tail(out), "pip_command": cmd}
+        return "pip could not run: %s" % exc, False
+
+
+def _in_venv(python: str) -> bool:
+    """True when ``python`` belongs to a virtual environment (has pyvenv.cfg)."""
+    if python == sys.executable:
+        return sys.prefix != sys.base_prefix
+    exe = Path(python)
+    return any((d / "pyvenv.cfg").is_file() for d in (exe.parent, exe.parent.parent))
 
 
 def install_if_changed(requirements: Path = REQUIREMENTS, stamp: Path = STAMP,

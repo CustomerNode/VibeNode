@@ -110,6 +110,63 @@ def test_pip_timeout_and_crash_are_reported_not_raised(tmp_path):
     assert res["pip_ok"] is False and "no such interpreter" in res["pip_output_tail"]
 
 
+# ── PEP 668: a system Python on Ubuntu/Debian (2026-10-29) ────────────────
+
+_PEP668 = ("error: externally-managed-environment\n"
+           "× This environment is externally managed")
+
+
+def _pep668_run():
+    """Refuses a plain install the way Debian's pip does; accepts --user."""
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(list(cmd))
+        if "--break-system-packages" in cmd:
+            return MagicMock(returncode=0, stdout="Successfully installed psutil-7.0.0", stderr="")
+        return MagicMock(returncode=1, stdout="", stderr=_PEP668)
+    run.calls = calls
+    return run
+
+
+def test_a_system_python_installs_into_the_user_site(tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("psutil>=5.9\n", encoding="utf-8")
+    py = tmp_path / "usr" / "bin" / "python3"   # no pyvenv.cfg near it
+    run = _pep668_run()
+
+    res = rs.install_requirements(str(py), req, runner=run)
+
+    assert res["pip_ok"] is True and res["pip_installed"] == 1
+    assert len(run.calls) == 2
+    assert run.calls[1] == [str(py), "-m", "pip", "install", "--user", "--break-system-packages",
+                            "--disable-pip-version-check", "--only-binary=:all:", "-r", str(req)]
+
+
+def test_a_venv_python_is_never_given_the_override(tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("psutil>=5.9\n", encoding="utf-8")
+    venv = tmp_path / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    run = _pep668_run()
+
+    res = rs.install_requirements(str(venv / "bin" / "python"), req, runner=run)
+
+    assert res["pip_ok"] is False and len(run.calls) == 1
+    assert "--break-system-packages" not in run.calls[0]
+
+
+def test_other_failures_are_not_retried_with_the_override(tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("nope-xyz\n", encoding="utf-8")
+    run = _fake_run(returncode=1, stderr="ERROR: No matching distribution found for nope-xyz")
+
+    res = rs.install_requirements(str(tmp_path / "python3"), req, runner=run)
+
+    assert res["pip_ok"] is False and len(run.calls) == 1
+
+
 def test_launch_pip_timeout_stays_under_the_boot_watchdog_budget():
     # run.py's "deps" boot step has a 600s watchdog budget; a longer pip wait
     # would be declared a hang instead of reported.
