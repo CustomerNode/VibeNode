@@ -119,7 +119,7 @@ function runTests(mode) {
   const label = mode === 'fast' ? 'Run Tests (Fast)' : 'Run Tests (Full)';
   const desc = mode === 'fast'
     ? 'Running unit and API tests...'
-    : 'Running full test suite including e2e...';
+    : 'Running the full test suite with the longer per-test timeout...';
 
   _testRunning = true;
 

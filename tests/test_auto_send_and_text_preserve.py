@@ -5,10 +5,6 @@ These read the raw JS source files and verify critical functions, call sites,
 and logic patterns are present. They catch "clanker stripped my code"
 regressions without needing a running server.
 
-The Selenium browser-driven counterparts live in
-``tests/e2e/test_auto_send_and_text_preserve_e2e.py`` (run with the e2e
-suite, not the fast suite).
-
 Run:
     pytest tests/test_auto_send_and_text_preserve.py
 """

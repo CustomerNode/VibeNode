@@ -1,10 +1,11 @@
 """
 Test runner API — runs pytest and streams results via SSE.
 
-Two modes, both running the SAME files (pytest.ini's addopts carries
-``--ignore=tests/e2e``, so the Selenium e2e suite never runs here; it runs in
-CI, .github/workflows/e2e-tests.yml).  Unit, API and headless-browser
-(Playwright) tests are all in tests/ and run in both modes.  What differs:
+Two modes, both running the SAME files: unit, API and headless-browser
+(Playwright) tests are all in tests/ and run in both modes.  (The Selenium
+e2e folder and its CI workflow were removed 2026-10-28; nothing had run them
+for months and they targeted screen elements that no longer exist.)  What
+differs:
   - fast: 60s per-test timeout
   - full: 120s per-test timeout, so a slow browser test is not cut short
 The honest labels are in MODES below and reach the browser in the "run" and
@@ -67,10 +68,10 @@ CODE_PIPELINE_TESTS = "--ignore-glob=tests/test_code_pipeline*.py"
 MODES = {
     "fast": {
         "label": "Fast: unit + browser tests, 60s timeout (Code Pipeline tests run in CI)",
-        "pytest_args": ["--ignore=tests/e2e", CODE_PIPELINE_TESTS, "--timeout=60"],
+        "pytest_args": [CODE_PIPELINE_TESTS, "--timeout=60"],
     },
     "full": {
-        "label": "Full: unit + browser tests, 120s timeout (e2e and Code Pipeline tests run in CI)",
+        "label": "Full: unit + browser tests, 120s timeout (Code Pipeline tests run in CI)",
         "pytest_args": [CODE_PIPELINE_TESTS, "--timeout=120"],
     },
 }

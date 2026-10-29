@@ -6079,8 +6079,8 @@ paths:
       operationId: getTestModes
       description: |
         Labels and pytest arguments for the `fast` and `full` modes (app/routes/test_api.py
-        MODES). Both modes run the same files (pytest.ini ignores tests/e2e); only the
-        per-test timeout differs. The Publish dialog shows these labels.
+        MODES). Both modes run the same files; only the per-test timeout differs.
+        The Publish dialog shows these labels.
       responses:
         "200":
           description: Mode descriptions

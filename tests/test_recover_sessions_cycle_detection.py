@@ -1,21 +1,16 @@
 """
-[subsessions phase -1] Cycle detection scaffold for recover_sessions.
+Cycle detection in ``recover_sessions`` (subsessions spec §6.8).
 
-Once Phase 1 lands the new ``parent_session_id`` field, ``recover_sessions``
-must walk each session's parent chain to enforce the no-cycle invariant
-defined in spec §6.8.  A corrupted or hand-edited registry could contain
-A.parent_session_id = B and B.parent_session_id = A; recovery must
-detect the cycle, force-clear one side's ``parent_session_id`` with a
-logged warning, and continue without raising or looping forever.
+A corrupted or hand-edited registry can contain A.parent_session_id = B and
+B.parent_session_id = A.  Recovery must detect the cycle, force-clear one
+side's ``parent_session_id`` with a logged warning, and continue without
+raising or looping forever.
 
-At today's HEAD the cycle-walking code does NOT exist yet — there is no
-parent_session_id field, and ``recover_sessions`` iterates the session
-dict exactly once.  So the "no infinite loop" half of the contract is
-trivially true today.  The "force-cleared parent on cycle" half cannot
-be verified until Phase 1 ships, so it lives behind a ``pytest.mark.xfail``.
-
-This test file is the scaffold: it pins the assertion shape so Phase 1
-just removes the xfail mark and the test goes green.
+History: this file began as a scaffold while ``parent_session_id`` did not
+exist, with the cycle-clearing half behind ``pytest.mark.xfail``.  The field
+shipped (``daemon/session_manager.py``, SessionInfo), the xfail marks were
+removed, and both tests have passed since.  They are regular regression
+tests now.
 
 See ``docs/plans/subsessions-spec.md`` §6.8 + §13.1 test 3.
 """
@@ -50,12 +45,8 @@ def _make_mock_store():
 
 def test_recover_sessions_terminates_on_cyclic_parent_graph(tmp_path):
     """A registry whose parent_session_id pointers form a cycle (A→B, B→A)
-    must NOT cause ``recover_sessions`` to loop or raise.
-
-    At HEAD the field is unread, so termination is trivially guaranteed
-    by the single ``for sid, meta in sessions.items()`` loop.  Phase 1
-    will add a parent walk; this test then verifies the walk is
-    depth-bounded.
+    must NOT cause ``recover_sessions`` to loop or raise: the parent walk
+    is depth-bounded, and both sessions are still recovered.
     """
     reg = SessionRegistry()
     registry_file = tmp_path / "registry.json"
@@ -98,7 +89,7 @@ def test_recover_sessions_terminates_on_cyclic_parent_graph(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Lands in Phase 1: force-clear one side of the cycle with a logged warning
+# Force-clear one side of the cycle with a logged warning
 # ---------------------------------------------------------------------------
 
 def test_recover_sessions_force_clears_one_side_of_cycle(tmp_path, caplog):
@@ -107,10 +98,6 @@ def test_recover_sessions_force_clears_one_side_of_cycle(tmp_path, caplog):
 
     The test is intentionally lenient on WHICH side is cleared — the
     invariant is "the cycle is broken," not a particular tie-breaker.
-
-    Phase 1: this test becomes the spec for ``recover_sessions`` after the
-    parent-walk lands.  When the implementation is in place, remove the
-    xfail mark and the assertion shape below should pass as-is.
 
     State ``"working"`` keeps both sessions in the recovery-eligible set
     so the cleared parent is observable through ``start_session_fn``'s
@@ -150,7 +137,7 @@ def test_recover_sessions_force_clears_one_side_of_cycle(tmp_path, caplog):
     with patch('daemon.session_registry.REGISTRY_PATH', registry_file):
         reg.recover_sessions(start_fn, store)
 
-    # Phase 1 contract: at least one side must have had its
+    # Contract: at least one side must have had its
     # parent_session_id cleared on the in-memory SessionInfo that
     # start_session was called with.  We accept either side.
     cleared_sides = [

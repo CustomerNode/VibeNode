@@ -39,7 +39,7 @@ Engine ends every running session, so the app only does that when you ask
 ### Running Tests
 
 ```bash
-# The suite (fast tests; e2e is excluded by pytest.ini)
+# The suite: unit, API and headless-browser (Playwright) tests
 pytest
 
 # One file
@@ -48,10 +48,10 @@ pytest tests/test_session_manager.py -v
 # The JavaScript suites
 node tests/test_thread_scroll.js
 node tests/test_thread_scroll_classic.js
-
-# End-to-end (needs a running server, Selenium and Chrome; also runs nightly in CI)
-pytest tests/e2e -m e2e -v --timeout=300 --reruns 2
 ```
+
+The browser tests drive the real page in headless Chromium through Python
+Playwright (`tests/_browser.py`); without Playwright installed they skip.
 
 On Linux the suite re-executes itself inside a PID namespace (see
 `tests/conftest.py`) so a bug in the process-kill path can only reach the test

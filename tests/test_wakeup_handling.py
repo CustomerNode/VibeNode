@@ -398,11 +398,13 @@ class TestListenerPreDetectAutoResume:
                 info.task = task
                 try:
                     # Run with a timeout — the listener never returns
-                    # normally; we expect it to exit on CancelledError
-                    # when the test cancels.
+                    # normally: once the batches are drained the fake SDK
+                    # blocks forever, so the timeout is always waited out.
+                    # The batches are processed in memory within
+                    # milliseconds; 0.5s is margin, not a wait.
                     await asyncio.wait_for(
                         sm._extended_post_turn_listener(info.session_id, info),
-                        timeout=2.0,
+                        timeout=0.5,
                     )
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     pass
@@ -635,8 +637,7 @@ class TestPreCompactHook:
         sm = SessionManager()
         cb = sm._make_pre_compact_callback("test-sid")
         assert cb is not None
-        import asyncio
-        assert asyncio.iscoroutinefunction(cb)
+        assert inspect.iscoroutinefunction(cb)
 
     def test_pre_compact_callback_flips_substatus(self):
         import asyncio

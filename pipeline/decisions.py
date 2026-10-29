@@ -58,7 +58,7 @@ SCRIPT_MARK = "⟦VN-EVENT"
 # Fields the agent MAY add to an issued card without voiding it: the user's
 # own requests (the card rules require them, in his words), screenshots and
 # the "Left waiting" strip.  None of them carries the decision's words.
-AGENT_MAY_ADD = ("asks", "links", "back_to", "zoom", "explained", "context")
+AGENT_MAY_ADD = ("asks", "links", "back_to")
 
 
 def card_core(card: dict) -> dict:

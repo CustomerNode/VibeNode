@@ -76,11 +76,10 @@ let _publishGate = null;       // {mode, passed, skipped, failed, seconds, anywa
 
 // What each test mode really runs, from /api/test-modes (app/routes/test_api.py
 // MODES).  The fallback matches it; both modes run the same files, and only
-// the per-test timeout differs.  The e2e suite and the Code Pipeline tests run
-// in CI, never here.
+// the per-test timeout differs.  The Code Pipeline tests run in CI, never here.
 const _TEST_MODE_FALLBACK = {
   fast: {label: 'Fast: unit + browser tests, 60s timeout (Code Pipeline tests run in CI)'},
-  full: {label: 'Full: unit + browser tests, 120s timeout (e2e and Code Pipeline tests run in CI)'},
+  full: {label: 'Full: unit + browser tests, 120s timeout (Code Pipeline tests run in CI)'},
 };
 let _testModesCache = null;
 async function _testModes() {
@@ -226,7 +225,7 @@ function _testFailureReport(lines, d, mode) {
   // Same command the Publish gate runs (app/routes/test_api.py), including the
   // parallel workers, so "passes for the fix session" means "passes Publish".
   const cmd = 'python -m pytest --tb=short -q --no-header'
-    + (mode === 'fast' ? ' --ignore=tests/e2e --ignore-glob=tests/test_code_pipeline*.py --timeout=60'
+    + (mode === 'fast' ? ' --ignore-glob=tests/test_code_pipeline*.py --timeout=60'
                        : ' --ignore-glob=tests/test_code_pipeline*.py --timeout=120')
     + ' -n 8 --dist loadfile tests/';
 

@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._browser import shared_browser_scope
+
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "static"
 
@@ -130,14 +132,10 @@ def _page(reply_json):
 
 @pytest.fixture(scope="module")
 def browser():
-    pw = pytest.importorskip("playwright.sync_api", reason="playwright not installed")
-    with pw.sync_playwright() as p:
-        try:
-            b = p.chromium.launch()
-        except Exception as exc:  # pragma: no cover - environment dependent
-            pytest.skip(f"chromium unavailable: {str(exc).splitlines()[0][:80]}")
+    # This worker's shared browser (tests/_browser.py); contexts this file
+    # opens are closed when it is done.
+    with shared_browser_scope() as b:
         yield b
-        b.close()
 
 
 def _open(browser, reply, width=390):

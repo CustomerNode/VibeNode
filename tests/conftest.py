@@ -1,8 +1,8 @@
 """Shared test fixtures for VibeNode.
 
-These fixtures are available to ALL tests (both fast unit tests and e2e tests).
-No server is started here — the e2e/ subfolder has its own conftest.py that
-handles server lifecycle for Selenium tests.
+These fixtures are available to ALL tests.  No server is started here: the
+browser tests build their own page in headless Chromium (tests/_browser.py)
+with the network faked.
 
 PRODUCTION-PATH GUARD
 =====================

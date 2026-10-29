@@ -169,14 +169,18 @@ class TestModeLabels:
     def test_both_modes_run_the_same_files_and_the_labels_say_so(self):
         import app.routes.test_api as ta
         assert set(ta.MODES) == {"fast", "full"}
-        # pytest.ini already ignores tests/e2e, so "full" must not claim e2e.
+        # The Selenium e2e folder is gone (2026-10-28); no mode may claim e2e,
+        # and nothing ignores a folder that does not exist.
         ini = (ta._REPO_ROOT / "pytest.ini").read_text(encoding="utf-8")
-        assert "--ignore=tests/e2e" in ini
-        assert "e2e" not in ta.MODES["fast"]["label"].lower().replace("e2e suite runs in ci", "")
+        assert "--ignore=tests/e2e" not in ini
+        assert not (ta._REPO_ROOT / "tests" / "e2e").exists()
+        for mode in ta.MODES.values():
+            assert "e2e" not in mode["label"].lower()
+            assert not any("e2e" in a for a in mode["pytest_args"])
         assert "CI" in ta.MODES["full"]["label"]
         assert "60s" in ta.MODES["fast"]["label"] and "120s" in ta.MODES["full"]["label"]
         cp = "--ignore-glob=tests/test_code_pipeline*.py"
-        assert ta.MODES["fast"]["pytest_args"] == ["--ignore=tests/e2e", cp, "--timeout=60"]
+        assert ta.MODES["fast"]["pytest_args"] == [cp, "--timeout=60"]
         assert ta.MODES["full"]["pytest_args"] == [cp, "--timeout=120"]
 
     def test_code_pipeline_tests_never_gate_a_publish_but_ci_runs_them(self):

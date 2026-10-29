@@ -102,6 +102,7 @@ class Card:
         self.srv = _Server(("127.0.0.1", 0), _Handler)
         self.srv.card = self
         self.port = self.srv.server_address[1]
+        _CLOSED_PORTS.discard(self.port)        # the OS may hand out a port a closed card had
         self.url = f"http://127.0.0.1:{self.port}/"
         self._serving = False
         self.serve()
@@ -123,6 +124,18 @@ class Card:
         """The script has exited: nothing listens on the port."""
         self.go_silent()
         self.srv.server_close()
+        _CLOSED_PORTS.add(self.port)
+
+
+# Ports whose Card has been closed in the current test. On Windows a connect
+# to a closed loopback port is retried by the OS and takes ~2s to be refused
+# (REFUSAL_WAIT_S in app/approval_watch.py); nine tests here close a card and
+# paid that for real on every check that followed. ``_fast_refusal`` below
+# answers those ports with ConnectionRefusedError at once, which is exactly
+# what the OS says, only sooner. One test (``test_what_one_check_can_tell``)
+# opts out through ``real_refusal`` so the real refused-port path stays covered.
+_CLOSED_PORTS: set[int] = set()
+_FAKE_REFUSAL = [True]
 
 
 class Clock:
@@ -140,6 +153,29 @@ class Clock:
 def _short_timeout(monkeypatch):
     # A check of a silent page waits this long for real.
     monkeypatch.setattr(aw, "PROBE_TIMEOUT_S", 0.3)
+
+
+@pytest.fixture(autouse=True)
+def _fast_refusal(monkeypatch):
+    """A closed card's port is refused at once instead of after Windows' ~2s
+    connect retry (see ``_CLOSED_PORTS``). Every other address connects for real."""
+    _CLOSED_PORTS.clear()
+    _FAKE_REFUSAL[0] = True
+    real = socket.create_connection
+
+    def create_connection(address, timeout=None, *args, **kwargs):
+        if _FAKE_REFUSAL[0] and address[1] in _CLOSED_PORTS:
+            raise ConnectionRefusedError(111, "closed card")
+        return real(address, timeout, *args, **kwargs)
+
+    monkeypatch.setattr(aw.socket, "create_connection", create_connection)
+
+
+@pytest.fixture
+def real_refusal():
+    """Connect to closed ports for real: the one place the OS refusal, and
+    REFUSAL_WAIT_S on Windows, are exercised."""
+    _FAKE_REFUSAL[0] = False
 
 
 @pytest.fixture
@@ -713,7 +749,7 @@ def test_every_page_that_stops_being_watched_leaves_a_line_in_the_log(cards, wat
 
 # ── one check ───────────────────────────────────────────────────────────────
 
-def test_what_one_check_can_tell(cards):
+def test_what_one_check_can_tell(cards, real_refusal):
     card = cards()
     assert aw.fetch_page(card.url, 1.0) == (aw.PAGE, card.page.encode("utf-8"))
 

@@ -50,6 +50,12 @@ CASES = {
     "unknown": {"grade": "MEDIUM", "findings": [{"code": "brief-long", "severity": "medium",
                 "message": "04-test.md: checker a1's brief is 13000 chars"}], "criteria": []},
     "none": {"grade": "MEDIUM", "findings": [], "criteria": []},
+    "impl": {"grade": "MEDIUM", "findings": [{"code": "pipeline-impl-mismatch", "severity": "medium",
+             "message": "criterion suite was produced by pipeline implementation 44fe, not 3ff4"},
+             {"code": "unexecuted", "severity": "medium", "message": "criterion ui cannot run here: no browser"}],
+             "criteria": [{"id": "ui", "status": "unexecuted", "reason": "no browser"}]},
+    "tampered": {"grade": "MEDIUM", "findings": [{"code": "stage-tampered", "severity": "medium",
+                 "message": "08-audit.md changed after its checker attested it"}], "criteria": []},
 }
 
 

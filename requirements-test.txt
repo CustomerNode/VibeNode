@@ -1,6 +1,7 @@
 # Test dependencies — install with: pip install -r requirements-test.txt
+#
+# The suite needs nothing beyond requirements.txt (pytest, pytest-timeout,
+# pytest-xdist and Playwright are already there).  The Selenium, pytest-html
+# and pytest-rerunfailures lines that used to live here served only the
+# tests/e2e folder, removed 2026-10-28.
 -r requirements.txt
-selenium>=4.15
-webdriver-manager>=4.0
-pytest-html>=4.0
-pytest-rerunfailures>=13.0

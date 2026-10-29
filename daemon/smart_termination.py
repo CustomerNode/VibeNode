@@ -35,6 +35,14 @@ PREF_KEY = "smart_termination"
 #: costs the user at most two short extra replies.
 MAX_SENDBACKS = 2
 
+#: Past MAX_SENDBACKS, a summary is still sent back while it cannot be used
+#: at all (no type, a question with no answer buttons), up to this many
+#: send-backs in total; then it is let through and flagged on screen.  The
+#: owner, 2026-10-29, on an Approve section with nothing to tap that got
+#: through on the third try: "The idea was this could not happen."  Below
+#: the CLI's own cap of 8 consecutive blocks, so a session still never loops.
+HARD_CEILING = 5
+
 # The approved last-message card (docs/plans/last-message-cards-spec.md):
 # the schema, the types and the banned-phrase rules live in
 # daemon/handoff_rules.py; this module adds the guards around them.
@@ -212,15 +220,29 @@ def review(message: str, *, continued: bool, sendbacks: int,
     session waiting on its own work writes a "working" card).  Never more
     than ``MAX_SENDBACKS`` per stop, never on an error or usage-limit stop.
     """
-    if message is None or sendbacks >= MAX_SENDBACKS:
+    if message is None or sendbacks >= HARD_CEILING:
         return None
     text = _norm(message).strip()
     if not text or _ERROR_STOP.search(text[:400]):
         return None
     card, prose, err = _rules.extract(text)
-    if not err and prose.strip():
-        return "Smart termination: " + OUTSIDE_CARD
+    if sendbacks >= MAX_SENDBACKS:
+        # The polish rules have had their two tries; only a summary he cannot
+        # use at all goes back again.
+        bad = unusable_problems(card, err)
+        if not bad:
+            return None
+        return ("Smart termination: this summary cannot be used as it stands, so it was sent back "
+                f"again (try {sendbacks + 1} of {HARD_CEILING}). Fix exactly these:\n"
+                + "\n".join("- " + b for b in bad)
+                + "\n\nRewrite only your final message: the ```handoff card alone.")
+    outside = (not err) and bool(prose.strip())
     reason = _rules.review(text, facts)
+    if outside:
+        # Report the text outside the card AND every fault in the card in the
+        # same pass, so no send-back is spent on one layer alone (2026-10-29).
+        reason = ("Smart termination: " + OUTSIDE_CARD
+                  + ("\n\n" + reason.split("\n\n", 1)[1] if reason and "\n\n" in reason else ""))
     zoom = zoom_problems(card) if not err else []
     expl = explained_problems(card) if not err else []
     if not zoom and not expl:
@@ -230,6 +252,47 @@ def review(message: str, *, continued: bool, sendbacks: int,
     if reason:
         return reason + "\n\n" + note
     return "Smart termination: your handoff card was sent back.\n\n" + note
+
+
+def unusable_problems(card, err=None) -> list:
+    """Faults that leave the summary useless to him, as opposed to rough: no
+    card, no type, or a request for his answer with nothing to answer with.
+    These keep being sent back past MAX_SENDBACKS, up to HARD_CEILING."""
+    if err or not isinstance(card, dict):
+        return [err or "There is no ```handoff card at the end of the message."]
+    out = []
+    t = card.get("type")
+    if t not in _rules.TYPES:
+        out.append(f"\"type\" must be one of: {', '.join(_rules.TYPES)}.")
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    kind = needs.get("kind")
+    replies = [r for r in (needs.get("replies") or []) if isinstance(r, dict)]
+    if t == "needs_you" or kind in ("decision", "approve", "action"):
+        if kind not in ("decision", "approve", "action"):
+            out.append("needs.kind must say what he does: decision, approve or action.")
+        if not str(needs.get("ask") or "").strip():
+            out.append("needs.ask is empty: the one thing he must decide or do.")
+        if kind == "decision" and len(replies) < 2:
+            out.append("A decision needs at least two buttons in needs.replies "
+                       "(not at the top level of the card).")
+        if kind == "approve" and not replies and not (needs.get("look") or []):
+            out.append("An approval needs its buttons in needs.replies (not at the top level of "
+                       "the card), or the page it is answered on in needs.look.")
+        if kind == "action" and not replies:
+            out.append("An action needs a done button in needs.replies.")
+    return out
+
+
+def released_faults(message: str, sendbacks: int) -> list:
+    """When the summary is let through at HARD_CEILING still unusable, the
+    faults it carries, so the engine can say so on screen; [] otherwise."""
+    if message is None or sendbacks < HARD_CEILING:
+        return []
+    text = _norm(message).strip()
+    if not text or _ERROR_STOP.search(text[:400]):
+        return []
+    card, _prose, err = _rules.extract(text)
+    return unusable_problems(card, err)
 
 
 # Big picture / this task / just now (the owner picked "three lines under

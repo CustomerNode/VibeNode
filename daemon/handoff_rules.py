@@ -637,7 +637,11 @@ def format_problems(card: dict) -> list[str]:
     out = []
     t = card.get("type")
     if t not in TYPES:
-        return [f"\"type\" must be one of: {', '.join(TYPES)} (got {json.dumps(t)})."]
+        # Keep going: returning here hid every other fault until the type was
+        # fixed, so a summary with no answer buttons used up a send-back on the
+        # type alone and was let through untested (2026-10-29).  The checks
+        # below that depend on the type simply do not fire.
+        out.append(f"\"type\" must be one of: {', '.join(TYPES)} (got {json.dumps(t)}).")
     if not _s(card.get("headline")):
         out.append("\"headline\" is empty: one sentence saying what happened.")
     # A short title drawn big above the headline, so a card skims (owner,

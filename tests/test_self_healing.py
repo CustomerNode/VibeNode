@@ -252,7 +252,7 @@ class TestStreamClosedTriggersReconnect:
     def test_reconnect_client_exists(self, sm_module):
         """_reconnect_client method must exist on SessionManager."""
         assert hasattr(sm_module.SessionManager, '_reconnect_client')
-        assert asyncio.iscoroutinefunction(sm_module.SessionManager._reconnect_client)
+        assert inspect.iscoroutinefunction(sm_module.SessionManager._reconnect_client)
 
 
 class TestReconnectRetriesLastMessage:
@@ -628,7 +628,13 @@ class TestUserStopBeatsSelfHeal:
         session_manager._sdk.create_session = _create
         session_manager._sdk.connect = AsyncMock()
         session_manager._sdk.extract_process_pid = MagicMock(return_value=1)
-        with patch.object(session_manager, "_prepare_resume_transcript"):
+        # Chrome control (System -> Preferences, opt-in) adds "--chrome" to every
+        # launch when it is ON in this machine's kanban_config.json; a test must
+        # not depend on the owner's preference (it failed on a machine with it
+        # on, 2026-10-28).  Its own coverage is tests/test_chrome_control.py.
+        with patch.object(session_manager, "_prepare_resume_transcript"), \
+                patch.object(sm_module.SessionManager, "_chrome_control_on",
+                             staticmethod(lambda: False)):
             assert asyncio.run(session_manager._reconnect_client(sid, info)) is True
         assert captured["opts"].extra_args == want_args
         assert captured["opts"].model == want_model

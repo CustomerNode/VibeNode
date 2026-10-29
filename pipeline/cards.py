@@ -52,10 +52,17 @@ WORDS: dict[str, tuple[str, str, str]] = {
     "decision-forged": ("An approval was altered", "An approval record for \u201c{task}\u201d was written by hand.", "{detail}"),
     "self-graded": ("Checked by its author", "\u201c{task}\u201d was checked by the same agent that wrote it.", "{detail}"),
     "committed-before-delivery": ("Committed too early", "\u201c{task}\u201d was committed before you approved it.", "{detail}"),
+    "pipeline-impl-mismatch": ("Checker changed mid-run", "The checking program changed after \u201c{task}\u201d was checked.",
+                               "The checks have to run again under the current program before they count."),
+    "pipeline-impl-unknown": ("Checker not identified", "A check on \u201c{task}\u201d came from an unknown checking program.", "{detail}"),
+    "stage-tampered": ("Report changed after signing", "A checker\u2019s report on \u201c{task}\u201d changed after it was signed.", "{detail}"),
+    "stage-unattested": ("Report not signed", "A checker\u2019s report on \u201c{task}\u201d was never signed.", "{detail}"),
+    "plan-changed": ("Plan changed after checks", "The plan for \u201c{task}\u201d changed after its checks ran.", "{detail}"),
 }
 DEFAULT_WORDS = ("Not every check passed", "\u201c{task}\u201d didn't pass every check.", "{detail}")
 # The order in which findings are told: the one named on the card first.
-PRIORITY = ("check-failed", "never-ran", "evidence-forged", "decision-forged", "evidence-unrecorded",
+PRIORITY = ("check-failed", "never-ran", "evidence-forged", "decision-forged", "evidence-unrecorded", "stage-tampered",
+            "stage-unattested", "pipeline-impl-mismatch", "pipeline-impl-unknown", "plan-changed",
             "unauthorized", "committed-before-delivery", "finding-unresolved", "finding-dropped",
             "unexecuted", "baseline-passed", "baseline-unrelated", "baseline-missing", "no-change-detection",
             "no-suite", "coverage", "stale-tree", "checker-stale", "self-graded", "fourth-question")

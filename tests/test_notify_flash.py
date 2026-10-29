@@ -1322,10 +1322,33 @@ def page():
         ctx.add_init_script(_INIT)
         pg = ctx.new_page()
         pg.route("**/*", route)
+        # The page's timers and clocks (setInterval, Date.now, performance.now)
+        # are Playwright's: the 1s title-flash tick and the lease, which is
+        # held against both clocks, run on them. ``install()`` alone keeps
+        # real time; ``pause_at`` after load freezes it, and ``_run_for``
+        # moves it, so a test that used to sleep 3.5s for real takes
+        # milliseconds. The far-future time is required: ``pause_at`` refuses
+        # a time at or before the clock's reading.
+        pg.clock.install()
         pg.goto(ORIGIN + "/", wait_until="load")
         pg.wait_for_function("window.VNNotify && typeof socket !== 'undefined' && socket.listeners('approvals_open').length === 1")
+        pg.clock.pause_at("2100-01-01T00:00:00Z")
         pg.evaluate("window.__watchTitle()")
         yield pg
+
+
+def _run_for(page, ms):
+    """Advance the page's clock by ``ms``, firing every timer due."""
+    page.clock.run_for(ms)
+
+
+def _tick_until(page, expr, ticks=5, step=1000):
+    """Advance the clock a tick at a time until ``expr`` holds (or fail)."""
+    for _ in range(ticks):
+        if page.evaluate(expr):
+            return
+        _run_for(page, step)
+    assert page.evaluate(expr), f"{expr} not true after {ticks} ticks of {step}ms"
 
 
 CARD = {"id": "c1", "title": "Release 4.2", "source": "pipeline", "since": 1,
@@ -1345,9 +1368,10 @@ def test_real_page_the_title_flashes_while_open_and_stops_on_the_answer(page):
     page.evaluate("window.__setHidden(true)")
     page.evaluate("d => window.__push('external_notice', d)", dict(CARD, id="c1"))
     page.evaluate("d => window.__push('approvals_open', d)", {"open": [CARD], "ttl_ms": 10000})
-    page.wait_for_function(f"document.title === {json.dumps(WARN)}", timeout=5000)
-    page.wait_for_function(f"document.title === {json.dumps(PAGE)}", timeout=5000)
-    page.wait_for_function(f"document.title === {json.dumps(WARN)}", timeout=5000)
+    _tick_until(page, f"document.title === {json.dumps(WARN)}")
+    _tick_until(page, f"document.title === {json.dumps(PAGE)}")
+    _tick_until(page, f"document.title === {json.dumps(WARN)}")
+    # The dot is drawn once the logo image has loaded (real I/O, not the clock).
     page.wait_for_function("window.__icon().startsWith('data:image/png')", timeout=5000)
     assert page.evaluate("VNNotify.state().flashing") is True
 
@@ -1355,7 +1379,7 @@ def test_real_page_the_title_flashes_while_open_and_stops_on_the_answer(page):
     assert page.title() == PAGE, "the title goes back in the same turn as the snapshot"
     assert page.evaluate("window.__icon()") == icon
     page.evaluate("window.__titles.length = 0")
-    page.wait_for_timeout(3500)
+    _run_for(page, 3500)
     assert page.evaluate("window.__titles") == [], "and is not touched again"
     state = page.evaluate("VNNotify.state()")
     assert (state["flashing"], state["warning"], state["dot"], state["approvals"], state["attention"]) == (
@@ -1370,7 +1394,7 @@ def test_real_page_a_release_finished_ping_and_a_stale_approval_never_flash(page
     page.evaluate("window.__setHidden(true)")                                      # ...then hidden
     page.evaluate("""window.__push('external_notice', {title: '4.2: live',
         message: 'Released in 9m 12s', source: 'pipeline', id: ''})""")
-    page.wait_for_timeout(3500)
+    _run_for(page, 3500)
     assert page.evaluate("window.__titles") == [] and page.title() == PAGE
     assert page.evaluate("VNNotify.state().flashing") is False
 
@@ -1381,9 +1405,9 @@ def test_real_page_the_flash_dies_with_its_lease(page):
     _reset(page)
     page.evaluate("window.__setHidden(true)")
     page.evaluate("d => window.__push('approvals_open', d)", {"open": [dict(CARD, id="c9")], "ttl_ms": 2500})
-    page.wait_for_function(f"document.title === {json.dumps(WARN)}", timeout=5000)
-    page.wait_for_function("VNNotify.state().flashing === false", timeout=6000)
+    _tick_until(page, f"document.title === {json.dumps(WARN)}")
+    _tick_until(page, "VNNotify.state().flashing === false", ticks=6)
     assert page.title() == PAGE
     page.evaluate("window.__titles.length = 0")
-    page.wait_for_timeout(2500)
+    _run_for(page, 2500)
     assert page.evaluate("window.__titles") == []

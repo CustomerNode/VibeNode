@@ -264,28 +264,44 @@ def tree_fingerprint(repo: Path) -> str:
     # finding 8).  A symlink's content id is that of its target path.
     entries: dict[str, str] = {}
     index_mode: dict[str, str] = {}
-    for ent in git(repo, "ls-files", "-s", "-z").split("\0"):
-        if not ent or "\t" not in ent:
-            continue
-        meta, path = ent.split("\t", 1)
-        parts = meta.split()
-        if len(parts) >= 3 and parts[2] == "0" and not _excluded(path):
-            entries[path] = f"{parts[0]} {parts[1]}"
-            index_mode[path] = parts[0]
-    deleted = {p for p in git(repo, "ls-files", "--deleted", "-z", check=False).split("\0") if p}
-    for p in deleted:
-        entries.pop(p, None)
-    modified = {p for p in git(repo, "diff", "--name-only", "-z", check=False).split("\0") if p}
-    untracked = set(untracked_files(repo))
+    # ONE git call (it was four: ``ls-files -s``, ``ls-files --deleted``,
+    # ``diff --name-only`` and ``ls-files -v``).  Each git start costs about
+    # 30 ms on Windows and a fingerprint is taken many times per run.  With
+    # ``-c -d -m -s -v`` every line is "<tag> <mode> <id> <stage>\t<path>":
+    #   - ``R``: deleted from the worktree (what ``--deleted`` listed);
+    #   - ``C``: modified against the index, deleted ones included (what
+    #     ``diff --name-only`` listed);
+    #   - any other tag is the cached entry; ``-v`` lowercases it for an
+    #     assume-unchanged file, and ``S`` is skip-worktree (what ``-v``
+    #     listed).
+    # ``-m`` honours assume-unchanged and skip-worktree exactly as ``diff``
+    # does, which is why the flagged files are still hashed below.
+    deleted: set[str] = set()
+    modified: set[str] = set()
     # ``git update-index --assume-unchanged`` (lowercase tag) or
     # ``--skip-worktree`` (``S``) makes git stop looking at the file: ``diff``
     # and ``--deleted`` report nothing however much it changes, and the index
     # blob would stand in for content that is no longer there.  Hash those
     # files from the worktree like any modified file.
     flagged = set()
-    for ent in git(repo, "ls-files", "-v", "-z", check=False).split("\0"):
-        if len(ent) > 2 and ent[1] == " " and (ent[0].islower() or ent[0] == "S"):
-            flagged.add(ent[2:])
+    for ent in git(repo, "ls-files", "-c", "-d", "-m", "-s", "-v", "-z").split("\0"):
+        if not ent or "\t" not in ent or len(ent) < 2 or ent[1] != " ":
+            continue
+        meta, path = ent.split("\t", 1)
+        tag, parts = meta[0], meta[2:].split()
+        if tag in "Rr":
+            deleted.add(path)
+        elif tag in "Cc":
+            modified.add(path)
+        else:
+            if tag.islower() or tag == "S":
+                flagged.add(path)
+            if len(parts) >= 3 and parts[2] == "0" and not _excluded(path):
+                entries[path] = f"{parts[0]} {parts[1]}"
+                index_mode[path] = parts[0]
+    for p in deleted:
+        entries.pop(p, None)
+    untracked = set(untracked_files(repo))
     for p in flagged:
         if not (repo / p).is_file():
             entries.pop(p, None)

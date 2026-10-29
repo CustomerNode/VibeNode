@@ -56,7 +56,7 @@ jobs:
       - name: Run the unit suite
         # tests/conftest.py re-execs the run inside a PID namespace (unshare)
         # on Linux and falls back with a warning where that is unavailable;
-        # nothing is set here on purpose.  pytest.ini already ignores tests/e2e.
+        # nothing is set here on purpose.
         run: |
           python -m pytest -q -p no:cacheprovider --timeout=120 \
             --junitxml=junit-py${{ matrix.python-version }}.xml

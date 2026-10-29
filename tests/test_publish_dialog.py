@@ -19,7 +19,7 @@ XDIST_SPLITTABLE = True
 ROOT = Path(__file__).resolve().parents[1]
 
 MODES = {"fast": {"label": "Fast: unit + browser tests, 60s timeout"},
-         "full": {"label": "Full: unit + browser tests, 120s timeout (e2e suite runs in CI only)"}}
+         "full": {"label": "Full: unit + browser tests, 120s timeout (Code Pipeline tests run in CI)"}}
 
 
 def _page_html() -> str:
