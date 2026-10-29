@@ -643,6 +643,7 @@ function navigateToFolder(folderId, skipHistory) {
   // Push to browser history so back/forward works
   if (!skipHistory) {
     const url = new URL(window.location);
+  url.searchParams.delete('panel');   // a popup belongs to the view it was opened on (last-card.js)
     if (folderId) {
       url.searchParams.set('folder', folderId);
     } else {

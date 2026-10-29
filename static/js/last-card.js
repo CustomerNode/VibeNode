@@ -1913,6 +1913,13 @@
   //    button from the end of the thread), review:<url>, img:<src>,
   //    page:<src>.  A URL only reopens what a card in the open thread shows,
   //    so a crafted link can never frame some other page in the app.
+  //    It reopens ONLY on the history entry this file wrote when he opened it,
+  //    in the same chat (state.vnPanel + state.vnChat): Back / Forward, or a
+  //    reload of that entry.  A ?panel carried into another session's address,
+  //    a pasted link or a fresh load opens nothing (owner, 2026-10-29: "a
+  //    review popup keeps spamming up. that should not fucking happen unless
+  //    i fucking click it"; decide:1 means the newest Decide of whatever
+  //    session is open, so a carried ?panel opened another session's card).
   const _P = 'panel';
   const _hasHistory = typeof history !== 'undefined' && typeof location !== 'undefined' && !!location.href && typeof window.addEventListener === 'function';
   const _bootState = _hasHistory ? history.state : null;   // read before app.js / workspace.js replace it
@@ -1925,10 +1932,13 @@
     if (key) u.searchParams.set(_P, key); else u.searchParams.delete(_P);
     return u;
   }
+  const _chatOf = () => (typeof location !== 'undefined' && location.href ? new URL(location.href).searchParams.get('chat') || '' : '');
+  // The entry is ours, for this panel, in the chat on screen.
+  const _ownEntry = (st, key) => !!(st && st.vnPanel === key && (st.vnChat || '') === _chatOf());
   function _panelOpened(key) {
     _curKey = key || '';
-    if (!_hasHistory || !key || _urlKey === key) return;          // reopened from the URL: it is already there
-    const st = Object.assign({}, history.state || {}, { vnPanel: key });
+    if (!_hasHistory || !key || (_urlKey === key && _ownEntry(history.state, key))) return;   // reopened from its own entry
+    const st = Object.assign({}, history.state || {}, { vnPanel: key, vnChat: _chatOf() });
     if (_urlKey && history.state && history.state.vnPanel) history.replaceState(st, '', _panelUrl(key));
     else history.pushState(st, '', _panelUrl(key));
     _urlKey = key;
@@ -1969,8 +1979,15 @@
     return null;
   }
   // The thread renders after the session opens, so wait for the card.
-  function _restorePanel(key, tries) {
+  function _dropPanelParam() {
+    _urlKey = '';
+    const st = Object.assign({}, history.state || {});
+    delete st.vnPanel; delete st.vnChat;
+    history.replaceState(st, '', _panelUrl(null));
+  }
+  function _restorePanel(key, tries, st) {
     if (window.VNLastCard !== _api || _urlKey !== key || _curKey === key) return;
+    if (!_ownEntry(st, key)) { _dropPanelParam(); return; }   // not opened here by him: open nothing
     const open = _findPanel(key);
     if (open) {
       open();
@@ -1981,7 +1998,7 @@
         history.replaceState(Object.assign({}, history.state || {}, { vnPanel: key }), '', location.href);
       return;
     }
-    if ((tries || 0) < 60) { setTimeout(() => _restorePanel(key, (tries || 0) + 1), 300); return; }
+    if ((tries || 0) < 60) { setTimeout(() => _restorePanel(key, (tries || 0) + 1, st), 300); return; }
     _urlKey = '';
     history.replaceState(history.state, '', _panelUrl(null));   // nothing to show: drop it
   }
@@ -1999,9 +2016,11 @@
       _navClosing = true;
       try { _closeDecide(); _closeReview(); } finally { _navClosing = false; }
     }
-    if (key && key !== _curKey) _restorePanel(key, 0);
+    if (key && key !== _curKey) _restorePanel(key, 0, e.state);
   }, true);
-  if (_urlKey) setTimeout(() => _restorePanel(_urlKey, 0), 0);
+  // At load: only a reload of the entry he opened it on (history.state lives
+  // through a reload; a link or a new tab has none).
+  if (_urlKey) setTimeout(() => _restorePanel(_urlKey, 0, _bootState), 0);
 
   // ── The sticky title bar (titled cards).  The card's head scrolls away
   //    normally; once it has, the slim .lm-stick bar (sticky, zero height,

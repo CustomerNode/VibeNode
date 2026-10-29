@@ -159,6 +159,7 @@ function _pushChatUrl(chatId) {
   // Don't push chat URLs in kanban mode — kanban manages its own history
   if (typeof viewMode !== 'undefined' && viewMode === 'kanban') return;
   const url = new URL(window.location);
+  url.searchParams.delete('panel');   // a popup belongs to the view it was opened on (last-card.js)
   if (chatId) url.searchParams.set('chat', chatId);
   else url.searchParams.delete('chat');
   history.pushState({
