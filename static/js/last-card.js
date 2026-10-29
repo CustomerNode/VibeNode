@@ -956,6 +956,37 @@
     go(); requestAnimationFrame(go); setTimeout(go, 250);
   }
 
+  // A card that passed the checks can still have a list written as a
+  // sentence (the checks stop polishing after two send-backs).  Give every
+  // list the shape render() expects instead of letting .map throw.
+  function _shapeCard(card) {
+    const m = Object.assign({}, card);
+    const list = v => Array.isArray(v) ? v : (v == null || v === '' ? [] : [v]);
+    const asCheck = v => (v && typeof v === 'object') ? v : { check: String(v), ok: true };
+    m.verified = list(m.verified).map(asCheck);
+    ['links', 'asks'].forEach(k => { if (k in m) m[k] = list(m[k]).filter(x => x && typeof x === 'object'); });
+    if (m.compare && typeof m.compare === 'object') {
+      m.compare = Object.assign({}, m.compare);
+      if ('rows' in m.compare) m.compare.rows = list(m.compare.rows).filter(x => x && typeof x === 'object');
+      ['before', 'after'].forEach(k => { if (k in m.compare) m.compare[k] = list(m.compare[k]).map(String); });
+    } else if ('compare' in m) delete m.compare;
+    if (m.status && typeof m.status === 'object') {
+      m.status = Object.assign({}, m.status);
+      ['done', 'remaining', 'broken'].forEach(k => { if (k in m.status) m.status[k] = list(m.status[k]); });
+    } else if ('status' in m) delete m.status;
+    if (m.needs && typeof m.needs === 'object') {
+      m.needs = Object.assign({}, m.needs);
+      ['look', 'steps', 'replies', 'tried'].forEach(k => { if (k in m.needs) m.needs[k] = list(m.needs[k]); });
+    } else m.needs = { kind: 'none' };
+    return m;
+  }
+
+  function _plainCard(card) {
+    const s = v => (typeof v === 'string' ? v.trim() : '');
+    const parts = [s(card.title), s(card.headline), s(card.answer)].filter(Boolean);
+    return '<div class="lm skim lm-plain">' + parts.map((p, i) => (i ? '<p>' : '<h3 class="lm-title">') + inl(p) + (i ? '</p>' : '</h3>')).join('') + '</div>';
+  }
+
   function renderIn(container) {
     if (!container || !container.querySelectorAll) return;
     const fresh = !container.isConnected;
@@ -967,7 +998,16 @@
       const msg = ph.closest('.msg');
       const ts = msg && msg.dataset.ts ? Number(msg.dataset.ts) * 1000 : 0;
       const wrap = document.createElement('div');
-      wrap.innerHTML = render(card, { clock: ts ? String(ts) : '', when: _when(ts) });
+      // One card that cannot be drawn must never stop the thread: an
+      // exception here escaped into the log render and every message after
+      // it vanished (2026-10-29, a card whose "verified" was a sentence).
+      // Draw it from a cleaned copy; if even that fails, draw its words.
+      try {
+        wrap.innerHTML = render(_shapeCard(card), { clock: ts ? String(ts) : '', when: _when(ts) });
+      } catch (err) {
+        try { console.warn('[last-card] could not draw a card, drawing its text', err); } catch (_e) { /* no console */ }
+        wrap.innerHTML = _plainCard(card);
+      }
       const el = wrap.firstElementChild;
       // Keep the card's JSON on it so live-assets.js can redraw it when
       // this file changes on disk (no page reload, 2026-10-28).
@@ -2236,7 +2276,7 @@
     const o = xm.parentElement.classList.toggle('open');
     xm.setAttribute('aria-expanded', String(o));
   });
-  const _api = { render, renderIn, openReview: _openReview, closeReview: _closeReview, reviewSrc: _reviewSrc,
-    openDecide: _openDecide, closeDecide: _closeDecide, syncDone: _syncDone, syncAnswered: _syncAnswered, markAnswered: _markAnswered, themedSrc: _themedSrc, screenOption: _screenOption, tplStage: _tplStage, switchInPlace: _switchInPlace, deliverableBody: dvBodyHtml };
+  const _api = { render, renderIn, shapeCard: _shapeCard, openReview: _openReview, closeReview: _closeReview, reviewSrc: _reviewSrc,
+    openDecide: _openDecide, closeDecide: _closeDecide, syncDone: _syncDone, syncAnswered: _syncAnswered, markAnswered: _markAnswered, themedSrc: _themedSrc, screenOption: _screenOption, tplStage: _tplStage, deliverableBody: dvBodyHtml };
   window.VNLastCard = _api;
 })();
