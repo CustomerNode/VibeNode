@@ -644,12 +644,13 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
 /* An answer (Read) and a text to send (Send) get their own rows (owner's
    pick A, 2026-10-28, static/scratch/card-next-cta.html).  Read: Got it,
    Do what it suggested, Ask more, Standby.  Send: Sent it, Change it,
-   Standby.  Every other state hides them; Read and Send hide the
+   Something else, Standby.  Every other state hides them; Read and Send hide the
    finished-fix rows. */
 .lm .lm-finish .v-gotit, .lm .lm-finish .v-offer, .lm .lm-finish .v-sent,
-.lm .lm-finish .v-ask, .lm .lm-finish .v-change { display: none !important; }
+.lm .lm-finish .v-ask, .lm .lm-finish .v-change, .lm .lm-finish .v-other { display: none !important; }
 .lm .lm-finish[data-state="read"] .v-gotit, .lm .lm-finish[data-state="read"] .v-offer, .lm .lm-finish[data-state="read"] .v-ask,
-.lm .lm-finish[data-state="send"] .v-sent, .lm .lm-finish[data-state="send"] .v-change { display: grid !important; }
+.lm .lm-finish[data-state="send"] .v-sent, .lm .lm-finish[data-state="send"] .v-change,
+.lm .lm-finish[data-state="send"] .v-other { display: grid !important; }
 .lm .lm-finish[data-state="read"] .v-done, .lm .lm-finish[data-state="read"] .v-next, .lm .lm-finish[data-state="read"] .v-bad,
 .lm .lm-finish[data-state="send"] .v-done, .lm .lm-finish[data-state="send"] .v-next, .lm .lm-finish[data-state="send"] .v-bad { display: none !important; }
 .lm .lm-finish[data-state="verdict"] .v-done, .lm .lm-finish[data-state="question"] .v-done,
@@ -659,6 +660,7 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
 .lm .lm-verdict .v-offer .ic { color: rgb(180, 140, 255); }
 .lm .lm-verdict .v-ask .ic { color: rgb(96, 158, 255); }
 .lm .lm-verdict .v-change .ic { color: rgb(255, 149, 0); }
+.lm .lm-verdict .v-other .ic { color: rgb(96, 158, 255); }
 .lm .lm-verdict button:disabled { cursor: default; opacity: .6; }
 /* An older answer or text card has no rows to show: no empty band. */
 .lm-dl.lm-act:not(:has(.lm-finish:not([hidden]))):not(:has(.lm-backto:not([hidden]))) { display: none; }

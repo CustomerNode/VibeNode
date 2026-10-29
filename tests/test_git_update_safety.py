@@ -4,7 +4,7 @@ Step 2 tests for git-update safety.
 Two focused areas:
 
 1. ``do_git_sync("pull")`` MUST preserve uncommitted local changes to tracked
-   files by stashing them before ``git pull --rebase -X theirs`` runs and
+   files by stashing them before ``git pull --rebase`` runs and
    restoring them afterwards. The concern raised by both prior reports:
    an operator with local edits to launch.bat (or any machine-specific
    tracked file) could see them silently disappear on the daily pull. The
@@ -36,7 +36,7 @@ import pytest
 def test_pull_stashes_before_pulling_and_pops_after(tmp_path, monkeypatch):
     """The exact command sequence must be:
         1. git stash --include-untracked  (save local changes)
-        2. git pull --rebase -X theirs    (upstream lands cleanly)
+        2. git pull --rebase              (upstream lands cleanly)
         3. git stash pop                  (local changes reapplied)
 
     In that order. If step 2 lands upstream changes to launch.bat, step 3's
@@ -137,12 +137,15 @@ def test_pull_still_pops_stash_after_upstream_landed(tmp_path, monkeypatch):
     ), "stash pop must run even when upstream advanced"
 
 
-def test_pull_uses_rebase_strategy_not_bare_merge(tmp_path, monkeypatch):
-    """The primary pull command is ``git pull --rebase -X theirs``, not a
-    bare ``git pull -X theirs``. During a rebase, ``-X theirs`` means
-    'prefer the commit being replayed' (i.e. the local commit) — the
-    opposite meaning of a merge's ``-X theirs``. Locking in the exact
-    flag combo prevents an accidental refactor from swapping meaning.
+def test_pull_never_picks_a_side_on_a_clash(tmp_path, monkeypatch):
+    """Every pull Update runs is a plain one: no ``-X theirs`` / ``-X ours``.
+
+    This test used to lock ``git pull --rebase -X theirs`` in.  In a rebase
+    that keeps the LOCAL line of every clashing hunk, and on 2026-10-29 it
+    silently deleted a line another commit had added.  The owner then asked:
+    "Make Update stop on a clash instead of overwriting the pulled code", so
+    the contract is reversed; ``tests/test_git_scanner_gaps.py`` proves the
+    stop against real repositories.
     """
     from app import git_ops
 
@@ -156,17 +159,17 @@ def test_pull_uses_rebase_strategy_not_bare_merge(tmp_path, monkeypatch):
     def _dispatch(cmd, *a, **kw):
         if len(cmd) >= 4 and cmd[3] == "pull":
             seen_pull.append(list(cmd))
+            # Fail the rebase so the fallback pull runs too.
+            return MagicMock(stdout="", returncode=1 if "--rebase" in cmd else 0, stderr="")
         return MagicMock(stdout="", returncode=0, stderr="")
 
     monkeypatch.setattr(subprocess, "run", _dispatch)
     git_ops.do_git_sync("pull")
-    assert seen_pull, "no pull command was invoked"
-    primary = seen_pull[0]
-    assert "--rebase" in primary
-    assert "-X" in primary and "theirs" in primary
-    # Fingerprint: exact position matters less than the flag set.
-    idx_x = primary.index("-X")
-    assert primary[idx_x + 1] == "theirs"
+    assert len(seen_pull) == 2, seen_pull
+    assert "--rebase" in seen_pull[0]
+    assert "--no-rebase" in seen_pull[1]
+    for cmd in seen_pull:
+        assert "-X" not in cmd and "theirs" not in cmd and "ours" not in cmd, cmd
 
 
 # ---------------------------------------------------------------------------

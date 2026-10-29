@@ -4,6 +4,7 @@ static/js/last-card.js in headless Chrome (--dump-dom) on a chat with five
 earlier summaries."""
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -12,7 +13,16 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-CHROME = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+CHROME = (shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+          or shutil.which("chrome")
+          or next((str(c) for c in (Path("C:/Program Files/Google/Chrome/Application/chrome.exe"),
+                                    Path("C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"),
+                                    Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+                   if c.exists()), None))
+# The environment as it was before conftest's isolate_home moved USERPROFILE
+# and APPDATA: Chrome on Windows does not start without them.  Its own
+# profile is never touched: --dump-dom runs in a throwaway one.
+_CHROME_ENV = dict(os.environ)
 
 
 def _card(type_, task, needs=None):
@@ -50,7 +60,8 @@ window.requestAnimationFrame=cb=>setTimeout(()=>cb(performance.now()),0);</scrip
 <script>VNLastCard.renderIn(document.getElementById('live-log'));</script></body></html>""", "utf-8")
     r = subprocess.run([CHROME, "--headless=new", "--no-sandbox", "--disable-gpu", "--allow-file-access-from-files",
                         "--virtual-time-budget=3000", "--dump-dom", page.as_uri()],
-                       capture_output=True, text=True, timeout=90)
+                       capture_output=True, encoding="utf-8", errors="replace", timeout=90,
+                       env=_CHROME_ENV)
     return r.stdout
 
 

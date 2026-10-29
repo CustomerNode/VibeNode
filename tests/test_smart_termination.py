@@ -689,3 +689,25 @@ def test_manager_marks_an_unproven_claim_let_through_at_the_ceiling(sm):
     assert _fire(m, message=CLAIMS_TESTS, continued=True) is None
     assert len(emitted) == 1 and emitted[0].is_error
     assert "Not proven" in emitted[0].text and "no test run" in emitted[0].text
+
+
+# ── Fix list, 2026-10-29: a false Working card is never let through quietly ─
+WORKING_CARD = _card(type="working", headline="The phone header suite is running in the background",
+                     needs={"kind": "none", "why": "The suite takes a while.",
+                            "next": "I read the result when it ends.", "eta": "about 10 minutes"})
+
+
+def _nothing_running_facts():
+    return _ev.facts_from_entries([_E(kind="user", text="fix the phone header please"),
+                                   _E(kind="tool_use", name="ScheduleWakeup", desc="delaySeconds: 600", id="w1"),
+                                   _E(kind="tool_result", tool_use_id="w1", text="Error: not scheduled", is_error=True)])
+
+
+def test_a_false_working_card_goes_back_past_the_soft_cap():
+    reason = _review(WORKING_CARD, continued=True, sendbacks=st.MAX_SENDBACKS, facts=_nothing_running_facts())
+    assert reason and "working" in reason.lower()
+
+
+def test_released_faults_name_a_false_working_card_at_the_ceiling():
+    faults = st.released_faults(WORKING_CARD, st.HARD_CEILING, facts=_nothing_running_facts())
+    assert faults and any("working" in x.lower() for x in faults)

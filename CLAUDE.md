@@ -144,6 +144,15 @@ The web server is spawned detached on every platform. Reverting any of the piece
 
 4. **`server-reachable` health check in `static/js/healthchecks.js`** — registers a blocker overlay (same machinery as the wifi check) that probes `/api/ping` every 5s and shows "VibeNode Server Unreachable" after 3 consecutive failures. Catches any post-load server death (crash, manual kill, port conflict) that the detached spawn doesn't prevent. The `/api/ping` route lives in `app/routes/main.py` and must stay side-effect-free so it never lies about reachability. Do NOT remove the check or repurpose `/api/auth-status` — auth-status is a heavier call that can stall on a slow Claude CLI shell-out and would produce false positives.
 
+## One VibeNode at a time: a second launch reuses the running one (fixed 2026-10-29)
+
+The sign-in autostart started VibeNode and opened a window; a minute later the owner clicked VibeNode, and that cold start killed the running web server and Session Engine (`_kill_port` in `run.py`) and opened a second window. Two pieces, both in `session_manager.py`:
+
+- **A launch that finds a healthy VibeNode reuses it** (`_reuse_running_instance`): if `/api/ping` answers `{"ok": true}` (the reviver answers 503) AND the Session Engine port accepts, it opens a window with `run.py`'s own `open_browser` (compiled from its source by `_load_browser_opener`, since importing `run.py` runs it) and exits. Nothing is killed. Restarts skip the check (`VIBENODE_PRESERVE_DAEMON`), and a Session Engine restart closes the engine port before relaunching, so it proceeds as before. Do NOT drop the engine-port condition: without it an engine restart would open a window and leave the engine dead.
+- **The sign-in entry passes `--background`** (`vibenode.py` `_autostart_body`): no splash, no window (`VIBENODE_NO_BROWSER`, popped by `run.py`). Run `vibenode.py autostart install` again to update an existing entry.
+
+Tests: `tests/test_launch_reuses_running.py`.
+
 ## Sleep must stick — user-stop intent beats ghost recovery (fixed 2026-07-20)
 
 `_liveSubmitDirect()` in `static/js/live-panel.js` arms "ghost recovery" timers on every
@@ -583,6 +592,10 @@ Until this change, only 5 of ~218 routes checked where a request came from. With
 - **Secrets.** `GET /api/kanban/config` returns the Supabase key masked (`••••` + last 4) plus `supabase_secret_key_set`; `PUT` ignores a masked value. The settings form never holds the saved key, so `_supabase_credentials` fills it in server-side when the URL equals the saved one, and never for another URL. Do NOT return the full key again, and do NOT send the saved key to a URL it was not saved for.
 - **Socket origin.** `cors_allowed_origins` is the function `mobile_auth.origin_allowed` (loopback on any port plus the Mobile Command `.ts.net` host). Do NOT put `'*'` back.
 - Tests: `tests/test_mobile_auth.py`.
+
+## Update stops on a clash; it never picks a side (fixed 2026-10-29)
+
+`do_git_sync` (`app/git_ops.py`) pulled with `--rebase -X theirs`, which in a rebase keeps the LOCAL line of every clashing hunk: an Update silently deleted a line another commit had added to `last-card.js`, and only a test noticed. The owner: "Make Update stop on a clash instead of overwriting the pulled code". The pull is now plain `git pull --rebase`, falling back to `git pull --no-rebase` only when the rebase failed without a clash. On a clash it aborts the rebase or merge, pops the stash back onto the unchanged commit, and returns `conflicts` plus `pull_clash: true`; nothing is pulled or published. The dialog (`static/js/git-sync.js`) titles it "Stopped: Changes Clash" and offers **Fix with AI** (`_launchClashSession`), whose prompt tells the session to redo the pull by hand when `pull_clash` is set. Do NOT put `-X theirs` / `-X ours` back on either pull. Tests: `tests/test_git_scanner_gaps.py` (real repositories), `tests/test_git_update_safety.py`, `tests/test_publish_dialog.py`.
 
 ## Update installs what it pulls, and the SDK cannot jump a series (added 2026-10-23)
 

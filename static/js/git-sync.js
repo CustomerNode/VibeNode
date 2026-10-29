@@ -700,6 +700,10 @@ async function executeGitAction(action, btnId, btnLabel, confirmBranch) {
     const btns = [{label:'OK', primary: r.ok, onclick: closeGitSyncModal}];
     if (r.scan && !r.scan.ok) {
       btns.unshift({label: 'Fix with AI', primary: true, onclick: () => { closeGitSyncModal(); _launchRemediationSession(r.scan); }});
+    } else if (r.conflicts && r.conflicts.length) {
+      // A clash stopped it: offer the same way out as a scan finding.  It used
+      // to show only OK, so the owner had nothing to press (2026-10-29).
+      btns.unshift({label: 'Fix with AI', primary: true, onclick: () => { closeGitSyncModal(); _launchClashSession(r.conflicts, !!r.pull_clash); }});
     }
     // Only a scan finding is a security issue. A clash or a failed pull used
     // to get the same "Security Issue" title too (2026-10-29).
@@ -868,6 +872,28 @@ function _launchRemediationSession(scan) {
   prompt += '\nIMPORTANT: This is a public repository. Everything committed will be visible on the internet.\n';
 
   _startFixSession('Security Remediation', 'Fixing security scan violations...', prompt);
+}
+
+// ── Launch AI clash-resolution session ──
+// An Update pulled code that clashed with local changes (app/git_ops.py
+// returns `conflicts`).  The session resolves the clash; it never publishes.
+// `pulled` (the result's `pull_clash`): the pull itself clashed and was undone,
+// so there are no markers on disk yet; the session redoes the pull by hand.
+function _launchClashSession(files, pulled) {
+  let prompt = 'UPDATE STOPPED: CHANGES CLASH\n\n';
+  prompt += 'Publishing VibeNode stopped because the pulled code clashed with local changes in:\n';
+  files.forEach(f => { prompt += '- `' + f + '`\n'; });
+  prompt += '\n## Instructions\n';
+  if (pulled) {
+    prompt += '0. The Update undid its pull, so the files have no conflict markers yet. Stash any uncommitted changes, run `git pull --rebase` (never with -X theirs or -X ours), and for each clash: resolve it keeping the intent of both sides, `git add` the file, `git rebase --continue`. Then `git stash pop` and resolve the same way.\n';
+  }
+  prompt += '1. Open each file and resolve every <<<<<<< / ======= / >>>>>>> block, keeping the intent of both sides.\n';
+  prompt += '2. Run `git status`: no file may stay unmerged (UU). Unstage with `git reset` so the tree is back to plain local changes.\n';
+  prompt += '3. Leave the stash git kept (`git stash list`) alone; it is a backup of the same changes.\n';
+  prompt += '4. Run the tests for the files you touched, then grep the repo for leftover conflict markers.\n';
+  prompt += '5. Do NOT make new commits or push (finishing the rebase is fine). The developer will press Publish again.\n';
+  prompt += '\nIMPORTANT: This is a public repository. Everything committed will be visible on the internet.\n';
+  _startFixSession('Resolve Update Clash', 'Resolving the clash...', prompt);
 }
 
 /**

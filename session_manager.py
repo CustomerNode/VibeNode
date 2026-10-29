@@ -371,6 +371,138 @@ def _load_local_env() -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# One VibeNode at a time: a second launch reuses the running one (2026-10-29).
+#
+# On 2026-10-29 the sign-in autostart started VibeNode and opened a window;
+# a minute later the owner clicked VibeNode, and that cold start killed the
+# running web server and Session Engine (run.py's _kill_port) and opened a
+# SECOND window. Two fixes, both here:
+#
+#   * ``--background`` (what the sign-in entry passes, see vibenode.py
+#     _autostart_body) starts VibeNode with no splash and no window.
+#   * A launch that finds a healthy VibeNode already running (the web
+#     server answers /api/ping AND the Session Engine port is accepting)
+#     opens a window to it, or does nothing in background mode, and exits.
+#     Nothing is killed.
+#
+# Restarts are untouched: /api/restart scope=web and the phone's Start
+# button set VIBENODE_PRESERVE_DAEMON=1 and skip this check; a Session
+# Engine restart kills the engine before relaunching, so its port is closed
+# and the launch proceeds as before. A web server that is up but not
+# answering, or an engine that is down, also proceeds as before (that cold
+# start is the recovery).
+# ---------------------------------------------------------------------------
+
+_BROWSER_FUNCS = ("_find_chrome", "_find_chrome_linux", "_find_chrome_macos",
+                  "_chrome_running", "open_browser")
+
+
+def _web_port() -> int:
+    return int(os.environ.get("VIBENODE_WEB_PORT", 0) or 5050)
+
+
+def _daemon_port() -> int:
+    return int(os.environ.get("VIBENODE_DAEMON_PORT", 0) or 5051)
+
+
+def _port_accepting(port: int, timeout: float = 0.6) -> bool:
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def _vibenode_already_running() -> bool:
+    """True only when a healthy VibeNode is serving: web AND Session Engine.
+
+    /api/ping is answered 200 {"ok": true} by the real web server only; the
+    reviver's Start page answers every /api/ path with 503.
+    """
+    import json
+    import urllib.request
+    try:
+        with urllib.request.urlopen(  # noqa: S310 (loopback only)
+                "http://127.0.0.1:%d/api/ping" % _web_port(), timeout=3) as r:
+            if r.status != 200 or not json.loads(r.read() or b"{}").get("ok"):
+                return False
+    except Exception:
+        return False
+    return _port_accepting(_daemon_port())
+
+
+def _load_browser_opener():
+    """Return run.py's own open_browser(), without running run.py.
+
+    run.py does its work at import time (port kills, daemon spawn), so it
+    cannot be imported here. Its browser functions are self-contained, so we
+    compile just those definitions from its source. The window therefore
+    opens exactly as a normal launch opens it (Chrome first, app or tab mode
+    per browser_launch_mode; CLAUDE.md item 18).
+    """
+    import ast
+    import shutil
+    import subprocess
+    import webbrowser
+    src = _HERE / "run.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"), filename=str(src))
+    defs = [n for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name in _BROWSER_FUNCS]
+    missing = set(_BROWSER_FUNCS) - {n.name for n in defs}
+    if missing:
+        raise RuntimeError("run.py is missing %s" % ", ".join(sorted(missing)))
+    ns = {"__file__": str(src), "__name__": "vibenode_browser_opener",
+          "os": os, "sys": sys, "shutil": shutil, "subprocess": subprocess,
+          "webbrowser": webbrowser, "Path": Path, "_WEB_PORT": _web_port()}
+    exec(compile(ast.Module(body=defs, type_ignores=[]), str(src), "exec"), ns)
+    return ns["open_browser"]
+
+
+def _log_line(msg: str) -> None:
+    try:
+        import time as _time
+        print("[%s] %s" % (_time.strftime("%Y-%m-%d %H:%M:%S"), msg), flush=True)
+    except Exception:
+        pass
+
+
+def _reuse_running_instance(background: bool) -> bool:
+    """If a healthy VibeNode is running, open a window to it (unless in
+    background mode) and return True so the caller exits. Else False."""
+    if os.environ.get("VIBENODE_PRESERVE_DAEMON") == "1":
+        return False  # a restart: the old copy is going away on purpose
+    if os.environ.get("VIBENODE_TEST_PORT"):
+        return False
+    if not _vibenode_already_running():
+        return False
+    if background:
+        _log_line("VibeNode is already running on port %d -- background "
+                  "start has nothing to do" % _web_port())
+        return True
+    _log_line("VibeNode is already running on port %d -- opening a window "
+              "to it, not starting a second copy" % _web_port())
+    try:
+        _load_browser_opener()()
+    except Exception as e:
+        _log_line("could not use run.py's opener (%s) -- opening the default "
+                  "browser instead" % e)
+        try:
+            import webbrowser
+            webbrowser.open("http://127.0.0.1:%d" % _web_port())
+        except Exception:
+            pass
+    return True
+
+
 def _startup() -> None:
     """Full VibeNode startup sequence.
 
@@ -418,12 +550,23 @@ def _startup() -> None:
     # environment on every startup path.
     _load_local_env()
 
+    # Sign-in start: no splash, no window (run.py reads VIBENODE_NO_BROWSER).
+    background = "--background" in sys.argv[1:]
+    if background:
+        os.environ["VIBENODE_NO_BROWSER"] = "1"
+
+    # A second launch reuses a healthy running VibeNode instead of killing it.
+    if _reuse_running_instance(background):
+        return
+
     # Try the splash first; fall back to a simple OS notification.
     # On Linux, if tkinter is the missing piece, surface the apt hint in
     # the toast itself — otherwise the user just sees a generic
     # "starting up" with no indication that the splash *would* work
     # after one apt-get away.
-    if not _launch_splash():
+    if background:
+        pass
+    elif not _launch_splash():
         _msg = "Starting up…"
         if sys.platform == "linux":
             try:

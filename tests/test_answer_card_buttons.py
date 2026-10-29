@@ -160,6 +160,18 @@ def test_a_text_to_send_ends_in_send_it_and_a_report_in_read_it(out):
     assert '<div class="dt">Read it</div>' in out["report"]
 
 
+def test_a_text_to_send_offers_something_else(out):
+    """Owner, 2026-10-29: a session drafted emails when he wanted the podcast
+    reviewed, and Send it had no way to say "not that".  Send: Sent it ·
+    Change it · Something else · Standby, and the new row is shown for Send."""
+    b = _band(out["email"], "Send it")
+    seen = [a for a in re.findall(r'data-verdict="(\w+)"', b) if a in ("sent", "change", "other", "standby")]
+    assert seen == ["sent", "change", "other", "standby"]
+    css = CSS.read_text(encoding="utf-8")
+    assert '.lm .lm-finish[data-state="send"] .v-other { display: grid !important; }' in css
+    assert "other: 'Not that. Instead: '" in LAST_CARD.read_text(encoding="utf-8")
+
+
 def test_a_finished_fix_keeps_its_next_band(out):
     # Next says what the session does, and the verdict chips sit right under
     # that line in the same band (owner's pick A, 2026-10-28,

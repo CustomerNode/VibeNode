@@ -147,3 +147,46 @@ def test_a_failed_dependency_install_shows_pips_output(page):
     page.wait_for_function("() => window.__toasts.length === 1")
     assert "Dependency install failed" in page.evaluate("() => window.__toasts[0]")
     page.wait_for_function("() => /No matching distribution/.test(document.getElementById('git-sync-body').textContent)")
+
+
+def test_a_clash_is_not_a_security_issue_and_offers_fix_with_ai(page):
+    """2026-10-29: an Update whose pull clashed with local changes showed only
+    OK, so the owner had no way to get it fixed.  It gets the same Fix with AI
+    as a scan finding, and the session it opens names the clashed files."""
+    page.evaluate("""() => {
+      window.__syncResult = {ok: false, conflicts: ['tests/test_card_answered.py'],
+        messages: ['Pulled the update, but your local changes clashed with it in: tests/test_card_answered.py.',
+                   'Nothing was published.']};
+      window.__fix = null;
+      _startFixSession = (title, preview, prompt) => { window.__fix = {title, prompt}; };
+    }""")
+    page.evaluate("() => executeGitAction('both', 'btn-git-publish', 'Publish App Update')")
+    page.wait_for_function("() => /Clash/.test(document.getElementById('git-sync-title').textContent)")
+    assert "Security" not in page.locator("#git-sync-title").text_content()
+    _click(page, "Fix with AI")
+    fix = page.evaluate("() => window.__fix")
+    assert fix["title"] == "Resolve Update Clash"
+    assert "tests/test_card_answered.py" in fix["prompt"]
+    assert "Do NOT make new commits or push" in fix["prompt"]
+    assert "git pull --rebase" not in fix["prompt"]   # a stash clash: markers are on disk
+
+
+def test_a_clash_in_the_pull_itself_tells_the_session_to_redo_the_pull(page):
+    """The pull was undone (app/git_ops.py `pull_clash`), so there are no
+    markers yet: the session must redo the pull, and never with -X theirs."""
+    page.evaluate("""() => {
+      window.__syncResult = {ok: false, conflicts: ['static/js/last-card.js'], pull_clash: true,
+        messages: ['The update clashes with your saved changes in: static/js/last-card.js.']};
+      window.__fix = null;
+      _startFixSession = (title, preview, prompt) => { window.__fix = {title, prompt}; };
+    }""")
+    page.evaluate("() => executeGitAction('both', 'btn-git-publish', 'Publish App Update')")
+    page.wait_for_function("() => /Clash/.test(document.getElementById('git-sync-title').textContent)")
+    _click(page, "Fix with AI")
+    prompt = page.evaluate("() => window.__fix.prompt")
+    assert "git pull --rebase" in prompt and "never with -X theirs" in prompt
+
+
+def test_the_publish_dialog_code_refreshes_in_an_open_tab():
+    src = (ROOT / "static" / "js" / "live-assets.js").read_text(encoding="utf-8")
+    assert "'js/git-sync.js'" in src

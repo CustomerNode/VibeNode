@@ -43,6 +43,13 @@ class PermissionManager:
         r'\bmkfs\b',                      # format filesystem
         r'\bdd\s+if=',                    # dd disk overwrite
         r'\bmv\s+.*\s+/dev/null\b',       # mv to /dev/null (data gone)
+        # Windows folder wipes (the owner, 2026-10-29: "Stop sessions wiping
+        # folders on Windows under Auto mode"; the list above only knew the
+        # Mac/Linux forms).  cmd's /s switch, PowerShell's -Recurse (any
+        # abbreviation, any alias).
+        r'\b(del|erase)\s+.*/s\b',        # del /s, erase /s
+        r'\b(rmdir|rd)\s+.*/s\b',         # rmdir /s, rd /s
+        r'\b(Remove-Item|ri|rmdir|rd|del|erase)\b.*\s-r(e(c(u(r(s(e)?)?)?)?)?)?\b',  # Remove-Item -Recurse
 
         # ── Git operations that rewrite shared history ──
         r'\bgit\s+push\s+.*--force',      # force push (overwrites remote)

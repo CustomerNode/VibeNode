@@ -126,6 +126,8 @@ KNOBS = [
      "Path of the config file; default kanban_config.json beside the repo."),
     ("VIBENODE_BOOT_STATUS_FILE", "Ports and paths", "",
      "File the launcher writes boot progress to for the splash screen."),
+    ("VIBENODE_NO_BROWSER", "Ports and paths", "",
+     "Set by the launcher's --background start (the sign-in entry) so VibeNode starts without opening a window. Not for manual use."),
     # Updates
     ("VIBENODE_NO_AUTO_UPDATE", "Updates", "",
      "Set to 1 to skip the automatic Claude CLI and SDK update at launch."),
@@ -147,6 +149,7 @@ KNOBS = [
 ]
 
 _INTERNAL = {"VIBENODE_PRESERVE_DAEMON", "VIBENODE_DAEMON_PATH_AUGMENTED",
+             "VIBENODE_NO_BROWSER",
              "VIBENODE_HOST_FORBID_REAL_CLI", "VIBENODE_HOST_TEST_OWNER",
              # Engine → settings-hook handshake (daemon/smart_termination_hook.py)
              "VIBENODE_SMART_TERMINATION_ENGINE"}

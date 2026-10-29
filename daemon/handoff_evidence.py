@@ -97,14 +97,21 @@ def _background_live(entries: list, last_human: int) -> bool:
     launches than completion notices, or a wake-up scheduled since his
     latest message."""
     launched = notified = 0
+    wakes = set()   # wake-up calls since his latest message, by call id
     for i, e in enumerate(entries):
         kind = getattr(e, "kind", "")
-        if kind == "tool_result" and _BG_LAUNCHED.search((getattr(e, "text", "") or "")[:400]):
+        if kind == "tool_result" and getattr(e, "tool_use_id", "") in wakes:
+            # A wake-up counts only once it came back without an error
+            # (2026-10-29: a failed or unanswered one kept a false Working card).
+            if not getattr(e, "is_error", False):
+                return True
+        elif kind == "tool_result" and _BG_LAUNCHED.search((getattr(e, "text", "") or "")[:400]):
             launched += 1
         elif kind == "user" and (getattr(e, "text", "") or "").lstrip().startswith("<task-notification>"):
             notified += 1
         elif kind == "tool_use" and i > last_human and (getattr(e, "name", "") or "") in _WAKE_TOOLS:
-            return True
+            if getattr(e, "id", ""):
+                wakes.add(e.id)
     return launched > notified
 
 
@@ -240,6 +247,11 @@ _BACKGROUND = re.compile(r"running in (?:the )?background|background (?:task|job
 _BROWSER_TOOL = re.compile(r"browser|playwright|chrom|puppeteer|selenium|screenshot|preview", re.I)
 _BROWSER_CMD = re.compile(r"playwright|chromium|chrome|puppeteer|selenium|screenshot|/api/preview", re.I)
 _IMAGE = re.compile(r"\.(?:png|jpe?g|webp|gif)\b", re.I)
+# Asking a browser its version, finding it, or installing it looks at nothing
+# (2026-10-29: "chromium --version" passed for a browser check).
+_BROWSER_NOT_A_CHECK = re.compile(
+    r"--version\b|^\s*(?:which|where|command\s+-v|type)\s|\bpip3?\s+(?:show|install|list|download)\b"
+    r"|\bplaywright\s+install\b|\bnpm\s+(?:i|install|ls|list)\b", re.I)
 
 # "git push", "git -C <dir> push", or a push's own output wherever it shows
 # up (a release script pushes for the session).
@@ -394,7 +406,8 @@ def _delegated_says(a: Action, kind: str) -> bool:
 
 def _app_checked(facts: TurnFacts) -> bool:
     for a in facts.actions:
-        if a.ok and (_BROWSER_TOOL.search(a.tool) or _BROWSER_CMD.search(a.detail) or _IMAGE.search(a.detail)):
+        if a.ok and (_BROWSER_TOOL.search(a.tool) or _IMAGE.search(a.detail)
+                     or (_BROWSER_CMD.search(a.detail) and not _BROWSER_NOT_A_CHECK.search(a.detail))):
             return True
         if _delegated_says(a, "app"):
             return True

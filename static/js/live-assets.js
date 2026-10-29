@@ -129,7 +129,10 @@
   // Can't be loaded twice: reload the tab when it is out of view.
   ['js/sessions.js', 'js/session-verb.js', 'js/session-verdict.js', 'js/socket.js', 'js/live-panel.js', 'js/app.js', 'js/toolbar.js',
    // The thread's scroll rules (the classic facade wraps it, so never twice).
-   'js/thread-scroll.js', 'js/thread-scroll-classic.js']
+   'js/thread-scroll.js', 'js/thread-scroll-classic.js',
+   // The publish dialog: a tab open since before a fix still titled a clash
+   // "Security Issue" with nothing to press (2026-10-29).
+   'js/git-sync.js']
     .forEach(p => watch(p, 'reload', null));
 
   document.addEventListener('visibilitychange', () => {

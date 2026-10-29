@@ -343,7 +343,7 @@
     // static/scratch/card-next-cta.html: "Problem: not done, needs
     // remediation" made no sense under an answer or an email).  Read: Got it
     // / Do what it suggested (only with the card's "offer") / Ask more /
-    // Standby.  Send: Sent it / Change it / Standby.
+    // Standby.  Send: Sent it / Change it / Something else / Standby.
     offer = typeof offer === 'string' ? offer.trim() : '';
     // One rule for every set (owner, 2026-10-28): the answer the card expects
     // first, other ways to keep going next, Standby last.  An offer is the
@@ -354,7 +354,10 @@
       r('sent', I.check, 'Sent it', 'Put the session to sleep') +
       r('ask', I.chat, 'Ask more', 'A follow-up question in the chat box') +
       (offer ? gotit : '') +
-      r('change', I.pen, 'Change it', 'Tell it what to change');
+      r('change', I.pen, 'Change it', 'Tell it what to change') +
+      // Send: a text was not what he wanted at all (owner, 2026-10-29: "it
+      // was assuming i wanted an email i want it to review the podcast").
+      r('other', I.chat, 'Something else', 'Not what I wanted: say what instead');
     // Which rows show depends on the session's status (_syncDone sets
     // data-state): "verdict" (Review / Read / Send), "question" (Decide /
     // Unblock: "Not answering now?"), "standby".  Standby, owner 2026-10-28,
@@ -820,7 +823,7 @@
   }
   // Something else / Problem / Change it: the chat box opens with a starter
   // line; Ask more opens it empty.
-  const _VERDICT_PREFIX = { next: 'That’s done. Next: ', bad: 'Problem: ', change: 'Change: ', ask: '' };
+  const _VERDICT_PREFIX = { next: 'That’s done. Next: ', bad: 'Problem: ', change: 'Change: ', other: 'Not that. Instead: ', ask: '' };
   function _verdictPrefix(kind) {
     const ta = document.getElementById('live-input-ta');
     if (!ta) return;
@@ -881,10 +884,17 @@
     const said = _norm(text);
     if (!said) return false;
     const rs = (Array.isArray(n.replies) ? n.replies : []).map(r => r || {});
-    if (rs.some(r => [r.reply, r.label].some(x => { const v = _norm(x); return v.length >= 3 && said.indexOf(v.slice(0, 40)) !== -1; }))) return true;
+    // The reply's own words (what its button sends) count wherever they sit.
+    if (rs.some(r => { const v = _norm(r.reply); return v.length >= 3 && said.indexOf(v.slice(0, 40)) !== -1; })) return true;
+    // A label or key counts only as the whole message, after an optional
+    // "go with" / "pick": a message that only names a choice ("What does
+    // Always a demo mean?", "not sure Always a demo fits") answers nothing
+    // (2026-10-29).
+    const pick = said.replace(/^(?:(?:go with|pick|choose|i pick|i choose|let's do|lets do|let's go with|lets go with)\s+)?(?:option\s+)?/, '')
+      .replace(/[.!,]?(?:\s+(?:please|thanks))?[.!]?$/, '').trim();
+    if (rs.some(r => { const v = _norm(r.label).replace(/[.!]+$/, ''); return v.length >= 3 && pick === v; })) return true;
     const keys = rs.map((r, i) => String(r.key || String.fromCharCode(65 + i)).toLowerCase());
-    const m = said.match(/^(?:(?:go with|pick|choose|option|i pick|i choose|let's do|lets do)\s+)?(?:option\s+)?([a-z0-9])[.!,]?(?:\s+(?:please|thanks))?[.!]?$/);
-    if (m && keys.indexOf(m[1]) !== -1) return true;
+    if (/^[a-z0-9]$/.test(pick) && keys.indexOf(pick) !== -1) return true;
     if (n.kind === 'action' && /^(?:done|did it|i did it|i've done it|logged in|i logged in|finished)\b/.test(said) && !/\?\s*$/.test(said)) return true;
     return false;
   }
@@ -2277,6 +2287,6 @@
     xm.setAttribute('aria-expanded', String(o));
   });
   const _api = { render, renderIn, shapeCard: _shapeCard, openReview: _openReview, closeReview: _closeReview, reviewSrc: _reviewSrc,
-    openDecide: _openDecide, closeDecide: _closeDecide, syncDone: _syncDone, syncAnswered: _syncAnswered, markAnswered: _markAnswered, themedSrc: _themedSrc, screenOption: _screenOption, tplStage: _tplStage, deliverableBody: dvBodyHtml };
+    openDecide: _openDecide, closeDecide: _closeDecide, syncDone: _syncDone, syncAnswered: _syncAnswered, markAnswered: _markAnswered, themedSrc: _themedSrc, screenOption: _screenOption, tplStage: _tplStage, switchInPlace: _switchInPlace, deliverableBody: dvBodyHtml };
   window.VNLastCard = _api;
 })();

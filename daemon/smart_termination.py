@@ -234,7 +234,7 @@ def review(message: str, *, continued: bool, sendbacks: int,
         # use at all goes back again.
         # A success claim with nothing behind it ("tests pass", "pushed")
         # keeps going back too: let through, it reads as verified (2026-10-29).
-        bad = unusable_problems(card, err) + unproven_claims(card, facts)
+        bad = unusable_problems(card, err) + unproven_claims(card, facts) + false_working(card, facts)
         if not bad:
             return None
         return ("Smart termination: this summary cannot be used as it stands, so it was sent back "
@@ -300,6 +300,19 @@ def unproven_claims(card, facts) -> list:
         return []
 
 
+def false_working(card, facts) -> list:
+    """A "working" card while nothing this session launched is still out.
+    Let through, he waits on work that will never report back, so it keeps
+    going back past MAX_SENDBACKS too (2026-10-29); [] without facts."""
+    if facts is None or not isinstance(card, dict):
+        return []
+    try:
+        from daemon import handoff_evidence as _ev
+        return list(_ev.working_problems(card, facts))
+    except Exception:
+        return []
+
+
 def released_faults(message: str, sendbacks: int, facts=None) -> list:
     """When the summary is let through at HARD_CEILING still unusable or
     still claiming what it did not prove, the faults it carries, so the
@@ -310,7 +323,7 @@ def released_faults(message: str, sendbacks: int, facts=None) -> list:
     if not text or _ERROR_STOP.search(text[:400]):
         return []
     card, _prose, err = _rules.extract(text)
-    return unusable_problems(card, err) + unproven_claims(card, facts)
+    return unusable_problems(card, err) + unproven_claims(card, facts) + false_working(card, facts)
 
 
 # Big picture / this task / just now (the owner picked "three lines under

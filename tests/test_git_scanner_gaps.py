@@ -202,3 +202,50 @@ def test_update_refuses_to_publish_a_leftover_clash(tmp_path, monkeypatch):
     assert result["ok"] is False, result
     assert result.get("conflicts") == ["f.txt"], result
     assert _git(remote, "rev-parse", "main").stdout == head_before
+
+
+# ── 4. A clash in the pull itself stops it; nothing is overwritten ──
+
+def test_a_clash_with_a_saved_commit_stops_and_overwrites_nothing(tmp_path, monkeypatch):
+    """2026-10-29: the pull ran `--rebase -X theirs`, which keeps the local
+    line of a clashing hunk, and a line someone else pushed was silently
+    lost.  Now the pull is undone and Update says which files clash."""
+    from app import git_ops
+    remote, b = _clone_pair(tmp_path)
+    _git(b, "commit", "-qam", "mine")                 # the local edit is now a saved commit
+    (b / "notes.txt").write_text("unsaved\n")         # plus an uncommitted file
+    local_head = _git(b, "rev-parse", "HEAD").stdout
+    remote_head = _git(remote, "rev-parse", "main").stdout
+    monkeypatch.setattr(git_ops, "_VIBENODE_DIR", b)
+    monkeypatch.setattr(git_ops, "_requirements_blob", lambda *a: "same")
+    monkeypatch.setattr("app.git_scanner.scan_staged_files",
+                        lambda *a, **k: {"ok": True, "findings": [], "blocked_files": [], "summary": ""})
+
+    result = git_ops.do_git_sync("both")
+
+    assert result["ok"] is False, result
+    assert result.get("conflicts") == ["f.txt"], result
+    assert result.get("pull_clash") is True, result
+    assert any("clashes with your saved changes" in m for m in result["messages"]), result["messages"]
+    assert _git(b, "rev-parse", "HEAD").stdout == local_head, "the pull was not undone"
+    assert (b / "f.txt").read_text() == "mine\n"
+    assert (b / "notes.txt").read_text() == "unsaved\n", "uncommitted work was not put back"
+    assert not _git(b, "stash", "list").stdout.strip(), "the stash was left behind"
+    assert not (b / ".git" / "rebase-merge").exists() and not (b / ".git" / "MERGE_HEAD").exists()
+    assert _git(remote, "rev-parse", "main").stdout == remote_head, "something was published"
+
+
+def test_a_pull_that_does_not_clash_still_lands(tmp_path, monkeypatch):
+    from app import git_ops
+    remote, b = _clone_pair(tmp_path)
+    (b / "f.txt").write_text("base\n")                # drop the clashing edit
+    (b / "other.txt").write_text("mine\n")
+    _git(b, "add", "-A"); _git(b, "commit", "-qm", "other file")
+    monkeypatch.setattr(git_ops, "_VIBENODE_DIR", b)
+    monkeypatch.setattr(git_ops, "_requirements_blob", lambda *a: "same")
+
+    result = git_ops.do_git_sync("pull")
+
+    assert result["ok"] is True, result
+    assert (b / "f.txt").read_text() == "theirs\n"
+    assert (b / "other.txt").read_text() == "mine\n"

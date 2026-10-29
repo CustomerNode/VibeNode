@@ -1437,7 +1437,12 @@ if __name__ == "__main__":
         # Only open browser on cold start. On web restarts
         # (VIBENODE_PRESERVE_DAEMON=1) the user already has the tab open
         # and Socket.IO will auto-reconnect — no duplicate window needed.
-        if os.environ.get("VIBENODE_PRESERVE_DAEMON") != "1":
+        # Nor on the sign-in start (session_manager.py --background sets
+        # VIBENODE_NO_BROWSER): VibeNode starts quietly and the window opens
+        # when the user clicks VibeNode. Popped so later restarts launched
+        # from this process do not inherit it.
+        _no_browser = os.environ.pop("VIBENODE_NO_BROWSER", "") == "1"
+        if os.environ.get("VIBENODE_PRESERVE_DAEMON") != "1" and not _no_browser:
             threading.Thread(target=open_browser, daemon=True).start()
     # Bind the web port EXCLUSIVELY on Windows.
     #

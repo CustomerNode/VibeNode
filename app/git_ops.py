@@ -334,21 +334,46 @@ def do_git_sync(action: str, confirm_branch: bool = False,
         # Only a stash that ran and saved something may be popped later: a
         # failed `git stash` must never lead to popping an older, unrelated one.
         stashed = stash.returncode == 0 and "No local changes" not in stash.stdout
+        # A clash stops the Update; git never picks a side.  It used to pull
+        # with `-X theirs`, which in a rebase keeps the LOCAL line of every
+        # clashing hunk: on 2026-10-29 it silently deleted a line another
+        # commit had added to static/js/last-card.js, and only a test noticed.
+        # The owner: "Make Update stop on a clash instead of overwriting the
+        # pulled code".  Do NOT put `-X theirs` / `-X ours` back on either pull.
         pull = subprocess.run(
-            ["git", "-C", str(proj), "pull", "--rebase", "-X", "theirs"],
+            ["git", "-C", str(proj), "pull", "--rebase"],
             capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)
+        clashed = []
         if pull.returncode != 0:
+            clashed = _unmerged_paths(proj)
             subprocess.run(["git", "-C", str(proj), "rebase", "--abort"],
                           capture_output=True, creationflags=_NO_WINDOW)
-            pull2 = subprocess.run(["git", "-C", str(proj), "pull", "-X", "theirs"],
-                                   capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)
-            if pull2.returncode != 0:
-                ok = False
-                messages.append("Could not pull: " + pull2.stderr.strip())
-                return {"ok": ok, "messages": messages}
-            out = pull2.stdout.strip()
-        else:
-            out = pull.stdout.strip()
+            if not clashed:
+                # Not a clash (e.g. a rebase git refuses): try a plain merge,
+                # which also stops on a clash.
+                pull = subprocess.run(["git", "-C", str(proj), "pull", "--no-rebase"],
+                                      capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)
+                if pull.returncode != 0:
+                    clashed = _unmerged_paths(proj)
+                    subprocess.run(["git", "-C", str(proj), "merge", "--abort"],
+                                  capture_output=True, creationflags=_NO_WINDOW)
+        if pull.returncode != 0:
+            # Back to exactly where we started: the pull was undone above, and
+            # the stash goes back on top of the same commit, so it applies.
+            kept = ""
+            if stashed:
+                pop = subprocess.run(["git", "-C", str(proj), "stash", "pop"],
+                                     capture_output=True, text=True, creationflags=_NO_WINDOW)
+                if pop.returncode != 0 or _unmerged_paths(proj):
+                    kept = " Your uncommitted changes are kept in git stash."
+            if clashed:
+                return {"ok": False, "messages": messages + [
+                    "The update clashes with your saved changes in: " + ", ".join(clashed) + ".",
+                    "Nothing was pulled or published, and your code is as it was." + kept,
+                ], "conflicts": clashed, "pull_clash": True}
+            messages.append("Could not pull: " + (pull.stderr.strip() or pull.stdout.strip()) + kept)
+            return {"ok": False, "messages": messages}
+        out = pull.stdout.strip()
         if stashed:
             pop = subprocess.run(["git", "-C", str(proj), "stash", "pop"],
                                  capture_output=True, text=True, creationflags=_NO_WINDOW)

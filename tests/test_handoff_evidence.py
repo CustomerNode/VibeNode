@@ -495,3 +495,29 @@ def test_a_working_card_is_not_judged_when_history_was_trimmed():
 
 def test_a_working_card_is_not_judged_without_facts():
     assert [p for p in ev.problems(WORKING, None) if "working" in p.lower()] == []
+
+
+# ── Fix list, 2026-10-29: failed wake-ups and version checks prove nothing ─
+
+def test_a_failed_wake_up_does_not_keep_a_working_card_alive():
+    failed = tool("ScheduleWakeup", "delaySeconds: 600", "Error: wake-up could not be scheduled", error=True)
+    assert _working_faults(failed)
+
+
+def test_a_wake_up_call_with_no_result_does_not_keep_a_working_card_alive():
+    assert _working_faults(_no_result("ScheduleWakeup", "delaySeconds: 600"))
+
+
+def test_asking_chrome_its_version_is_not_a_browser_check():
+    card = dict(DONE, verified=[{"check": "Checked it in the real app on a phone width", "result": "Sorted.", "ok": True}],
+                headline="CustomerNode's sort fix is in")
+    for step in (tool("Bash", "chromium --version", "Chromium 131.0"),
+                 tool("Bash", "google-chrome --version", "Google Chrome 131"),
+                 tool("Bash", "which chromium", "/usr/bin/chromium"),
+                 tool("Bash", "pip show playwright", "Name: playwright"),
+                 tool("Bash", "python -m playwright install chromium", "done")):
+        p = ev.problems(card, facts(user("fix the status sort"), step))
+        assert p and "browser" in p[0], step[0].desc
+    # a real headless run still counts
+    run = tool("Bash", "chromium --headless=new --screenshot=/tmp/s.png http://127.0.0.1:5050", "written")
+    assert ev.problems(card, facts(user("fix the status sort"), run)) == []

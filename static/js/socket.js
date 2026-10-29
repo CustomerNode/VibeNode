@@ -2154,7 +2154,8 @@ socket.on('session_log', (data) => {
             frag.appendChild(_createLoadMoreButton());
         }
         entries.forEach((entry) => {
-            frag.appendChild(renderLiveEntry(entry));
+            try { frag.appendChild(renderLiveEntry(entry)); }
+            catch (err) { console.warn('[WS] session_log: could not draw older entry', entry && entry.kind, err); }
         });
         logEl.insertBefore(frag, logEl.firstChild);
 
@@ -2211,10 +2212,17 @@ socket.on('session_log', (data) => {
             if (entries[i] && entries[i].kind === 'asst') { _lastAsstIdx = i; break; }
         }
         entries.forEach((entry, i) => {
-            const _el = renderLiveEntry(entry, i === _lastAsstIdx ? { forceExpand: true } : undefined);
-            if (i === _lastAsstIdx) _expandedAsstEl = _el;
-            logEl.appendChild(_el);
-            if (typeof _tryAddOutputCard === 'function') _tryAddOutputCard(entry);
+            // One entry that cannot be drawn must never stop the thread: a
+            // throw here aborted the loop and every later message vanished
+            // (2026-10-29, a card whose "verified" was a sentence).
+            try {
+                const _el = renderLiveEntry(entry, i === _lastAsstIdx ? { forceExpand: true } : undefined);
+                if (i === _lastAsstIdx) _expandedAsstEl = _el;
+                logEl.appendChild(_el);
+                if (typeof _tryAddOutputCard === 'function') _tryAddOutputCard(entry);
+            } catch (err) {
+                console.warn('[WS] session_log: could not draw entry', i, entry && entry.kind, err);
+            }
         });
         liveLineCount = total;
     } else {

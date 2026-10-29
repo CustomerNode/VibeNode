@@ -15,6 +15,7 @@ import asyncio
 import functools
 import http.server
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -26,9 +27,17 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-CHROME = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+CHROME = (shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+          or shutil.which("chrome")
+          or next((str(c) for c in (Path("C:/Program Files/Google/Chrome/Application/chrome.exe"),
+                                    Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+                   if c.exists()), None))
 websockets = pytest.importorskip("websockets")
 pytestmark = pytest.mark.skipif(not CHROME, reason="needs Chrome or Chromium")
+# The environment as it was before conftest's isolate_home moved USERPROFILE
+# and APPDATA: Chrome on Windows does not start without them.  Its own
+# --user-data-dir keeps it away from the real profile either way.
+_CHROME_ENV = dict(os.environ)
 
 
 def _card(title, kind="decision", **needs):
@@ -53,6 +62,12 @@ PAGE = f"""<!doctype html><meta charset=utf-8>
 <div class="msg user"><div class="msg-body">different thing: the sidebar is slow today</div></div>
 <div class="msg assistant" id="m6"><div class="msg-body"><div class="vn-card-ph" data-card='{_card("Answered by its key")}'></div></div></div>
 <div class="msg user"><div class="msg-body">B</div></div>
+<div class="msg assistant" id="m7"><div class="msg-body"><div class="vn-card-ph" data-card='{_card("Asked about a choice by name")}'></div></div></div>
+<div class="msg user"><div class="msg-body">What does Always a demo mean?</div></div>
+<div class="msg assistant" id="m8"><div class="msg-body"><div class="vn-card-ph" data-card='{_card("Mentioned a choice in passing")}'></div></div></div>
+<div class="msg user"><div class="msg-body">not sure Always a demo fits the sidebar work, let me think</div></div>
+<div class="msg assistant" id="m9"><div class="msg-body"><div class="vn-card-ph" data-card='{_card("Picked a choice by name")}'></div></div></div>
+<div class="msg user"><div class="msg-body">go with Always a demo</div></div>
 </div>
 <script>window.liveSessionId = 's1'; window.sessionKinds = {{}}; window.__sent = [];
 window._liveSubmitDirect = (sid, t) => window.__sent.push(t);</script>
@@ -89,7 +104,7 @@ async def _drive(url):
     prof = tempfile.mkdtemp()
     proc = subprocess.Popen([CHROME, "--headless=new", "--no-sandbox", "--disable-gpu", "--remote-debugging-port=0",
                              "--user-data-dir=" + prof, "about:blank"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_CHROME_ENV)
     try:
         port_file = Path(prof) / "DevToolsActivePort"
         for _ in range(600):   # 60 s: a cold Chrome on a GitHub runner took over 10
@@ -118,7 +133,7 @@ async def _drive(url):
 
             await call("Page.navigate", url=url)
             for _ in range(50):
-                if await ev("document.querySelectorAll('.lm').length === 6"):
+                if await ev("document.querySelectorAll('.lm').length === 9"):
                     break
                 await asyncio.sleep(0.1)
             await asyncio.sleep(0.2)   # the rAF that marks answered cards
@@ -131,7 +146,11 @@ async def _drive(url):
             return out
     finally:
         proc.terminate()
-        proc.wait(timeout=10)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:   # Windows Chrome can ignore terminate
+            proc.kill()
+            proc.wait(timeout=10)
         shutil.rmtree(prof, ignore_errors=True)
 
 
@@ -161,9 +180,20 @@ def test_a_question_back_or_a_new_topic_leaves_the_card_waiting(site):
     # 2026-10-29: any later message of his used to turn a Needs-you card
     # green.  A question back, or a change of subject, is not an answer.
     r = asyncio.run(_drive(site))
-    m4, m5, m6 = r["loaded"][3:]
+    m4, m5, m6 = r["loaded"][3:6]
     assert (m4["answered"], m4["pill"]) == (False, "Needs you")
     assert (m5["answered"], m5["pill"]) == (False, "Needs you")
     # the choice's key typed alone in the chat box still counts
     assert (m6["answered"], m6["pill"]) == (True, "Decided")
     assert r["resynced"][3]["answered"] is False and r["resynced"][4]["answered"] is False
+
+
+def test_a_message_that_only_names_a_choice_does_not_answer_it(site):
+    # 2026-10-29 fix list: "What does Always a demo mean?" contains the
+    # label "Always a demo" and used to mark the decision made.
+    r = asyncio.run(_drive(site))
+    m7, m8, m9 = r["loaded"][6:9]
+    assert (m7["answered"], m7["pill"]) == (False, "Needs you")
+    assert (m8["answered"], m8["pill"]) == (False, "Needs you")
+    # picking it by its label still counts
+    assert (m9["answered"], m9["pill"]) == (True, "Decided")

@@ -140,14 +140,16 @@ def _autostart_body(entry: Path) -> str:
         pyw = py.with_name("pythonw.exe")
         exe = pyw if pyw.exists() else py
         # Same hidden-launch shape as the reviver's Startup entry.
-        return ('CreateObject("WScript.Shell").Run """%s"" ""%s""", 0, False\r\n'
+        # --background: start quietly, no splash and no window; the window
+        # opens when the user clicks VibeNode (session_manager.py).
+        return ('CreateObject("WScript.Shell").Run """%s"" ""%s"" --background", 0, False\r\n'
                 % (exe, launcher))
     if sys.platform == "darwin":
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.vibenode.start</string>
-  <key>ProgramArguments</key><array><string>{sys.executable}</string><string>{launcher}</string></array>
+  <key>ProgramArguments</key><array><string>{sys.executable}</string><string>{launcher}</string><string>--background</string></array>
   <key>WorkingDirectory</key><string>{ROOT}</string>
   <key>RunAtLoad</key><true/>
 </dict></plist>
@@ -155,7 +157,7 @@ def _autostart_body(entry: Path) -> str:
     return f"""[Desktop Entry]
 Type=Application
 Name=VibeNode
-Exec={sys.executable} {launcher}
+Exec={sys.executable} {launcher} --background
 Path={ROOT}
 X-GNOME-Autostart-enabled=true
 """
