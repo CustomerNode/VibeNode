@@ -25,11 +25,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -62,21 +65,50 @@ def _git(repo: Path, *args: str) -> str:
     return r.stdout
 
 
+def _remove_tree(path: Path) -> None:
+    """Delete a test repository.  Git marks its object files read-only on
+    Windows, which a plain rmtree cannot delete; anything still held open is
+    left behind rather than failing the test."""
+    def _retry(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_retry)
+    else:
+        shutil.rmtree(path, onerror=_retry)
+
+
 @pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    r = tmp_path / "proj"
-    r.mkdir()
-    _git(r, "init", "-q")
-    _git(r, "config", "user.email", "pipeline@test.local")
-    _git(r, "config", "user.name", "pipeline test")
-    _git(r, "config", "commit.gpgsign", "false")
-    (r / "thing.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
-    (r / "daemon").mkdir()
-    (r / "daemon" / "core.py").write_text("X = 1\n", encoding="utf-8")
-    (r / ".gitignore").write_text("docs/plans/\n__pycache__/\n", encoding="utf-8")
-    _git(r, "add", "-A")
-    _git(r, "commit", "-q", "-m", "base")
-    return r
+def repo() -> Path:
+    # A short folder in the system temp, not tmp_path.  FakeSession writes the
+    # transcripts into a folder named after this path (the CLI's encoded cwd)
+    # inside the sandboxed home, which is itself under pytest's temp folder, so
+    # tmp_path appeared twice in every transcript path.  On Windows that came to
+    # 264-278 characters, past the 260 limit, and 124 Code Pipeline tests failed
+    # with FileNotFoundError (2026-10-29).  Resolved, because Windows may hand
+    # out the temp folder under its 8.3 short name and the harness compares
+    # resolved paths.  The prefix runs into mkdtemp's random letters as ONE
+    # word: a folder named "cp-…" read as the copy command to the harness's
+    # shell-write check (pipeline/transcripts.py _SHELL_WRITE_RE) and turned a
+    # plain `cat` of the evidence into a forgery.
+    r = Path(tempfile.mkdtemp(prefix="vnpipe")).resolve()
+    try:
+        _git(r, "init", "-q")
+        _git(r, "config", "user.email", "pipeline@test.local")
+        _git(r, "config", "user.name", "pipeline test")
+        _git(r, "config", "commit.gpgsign", "false")
+        (r / "thing.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        (r / "daemon").mkdir()
+        (r / "daemon" / "core.py").write_text("X = 1\n", encoding="utf-8")
+        (r / ".gitignore").write_text("docs/plans/\n__pycache__/\n", encoding="utf-8")
+        _git(r, "add", "-A")
+        _git(r, "commit", "-q", "-m", "base")
+        yield r
+    finally:
+        _remove_tree(r)
 
 
 # ── transcripts in the CLI's shape ───────────────────────────────────────────
@@ -87,6 +119,22 @@ def repo(tmp_path: Path) -> Path:
 # (``…pytest-of-…-proj``).  conftest's guards were in place, so that run did
 # not go through them; this check lives here so it holds even then.
 _REAL_PROJECTS = (Path.home() / ".claude" / "projects").resolve()
+
+# Each entry is stamped strictly later than the one before, as in a real
+# transcript.  Python before 3.13 reads the Windows clock in 15.6 ms steps, so
+# two entries written back to back got the SAME time, and the decision reader
+# (pipeline.decisions.answer: "a reply after the card") counted a reply written
+# BEFORE its card (test_an_answer_sent_before_the_card_does_not_count, 2026-10-29).
+_LAST_STAMP = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _stamp() -> str:
+    global _LAST_STAMP
+    now = datetime.now(timezone.utc)
+    if now <= _LAST_STAMP:
+        now = _LAST_STAMP + timedelta(microseconds=1)
+    _LAST_STAMP = now
+    return now.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 class FakeSession:
@@ -120,7 +168,7 @@ class FakeSession:
              is_error: bool = False, result: str | None = None) -> str:
         tid = self._id()
         self._append(path, {"type": "assistant", "sessionId": self.sid, "uuid": str(uuid.uuid4()),
-                            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                            "timestamp": _stamp(),
                             "message": {"role": "assistant", "content": [
                                 {"type": "tool_use", "id": tid, "name": name, "input": inp}]}})
         entry = {"type": "user", "sessionId": self.sid, "uuid": str(uuid.uuid4()),
@@ -138,13 +186,13 @@ class FakeSession:
     def assistant_text(self, text: str, path: Path | None = None) -> None:
         """The agent's own words (its final message with a card, say)."""
         self._append(path or self.root, {"type": "assistant", "sessionId": self.sid, "uuid": str(uuid.uuid4()),
-                                         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                                         "timestamp": _stamp(),
                                          "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
 
     def user_text(self, text: str, path: Path | None = None) -> None:
         """A message the user sent (a card button sends its reply this way)."""
         self._append(path or self.root, {"type": "user", "sessionId": self.sid, "uuid": str(uuid.uuid4()),
-                                         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                                         "timestamp": _stamp(),
                                          "message": {"role": "user", "content": text}})
 
     def write_root(self, file_path: Path, content: str) -> str:
