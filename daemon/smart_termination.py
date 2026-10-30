@@ -70,8 +70,8 @@ INSTRUCTIONS = _rules.INSTRUCTIONS + (
     "same on every card unless he starts a new topic. \"task\" is his latest ask in "
     "his words; \"now\" is what changed for him.\n"
     "Every card also has \"explained\": the same card written out for someone who is "
-    "lost, drawn behind an \"Explain more\" button under the zoom lines (on a card with "
-    "an \"answer\", as the answer's \"Plain words\" version instead). Markdown with "
+    "lost, drawn as the \"Plain words\" version in the card's Short / Plain words / "
+    "Full switch. Markdown with "
     "short ## headings: what this is about, what happened and why, what it means for "
     "him, and what (if anything) he does next. Plain words, his names for things, "
     f"no file names; at least {EXPLAINED_MIN_WORDS} words and no upper limit. It is "
@@ -82,7 +82,10 @@ INSTRUCTIONS = _rules.INSTRUCTIONS + (
     "Screenshots and previews go inside the card as well: a \"links\" entry "
     "{\"label\": \"what it shows\", \"kind\": \"image\", \"url\": \"/api/preview/asset/<id>\"} "
     "is drawn as a picture in the card; on a card with a Validate row it is drawn inside "
-    "Validate, under the row to try. Never put a VN-PREVIEW marker in the final message.\n"
+    "Validate, under the row to try. Never put a VN-PREVIEW marker in the final message. "
+    "Link only addresses that exist: <id> is the one POST /api/preview/render returned; a "
+    "picture you already have (an upload, a saved image) is copied into static/scratch/ and "
+    "linked as /static/scratch/<name>. A link to this app that loads nothing is sent back.\n"
     "Mockups are SHOWN, never only linked: a card that links a mockup page "
     "(static/scratch/) carries a screenshot of each option as a \"kind\": \"image\" "
     "link (a decision may use its replies' \"screens\" instead).\n"
@@ -249,11 +252,11 @@ def review(message: str, *, continued: bool, sendbacks: int,
         reason = ("Smart termination: " + OUTSIDE_CARD
                   + ("\n\n" + reason.split("\n\n", 1)[1] if reason and "\n\n" in reason else ""))
     zoom = zoom_problems(card) if not err else []
-    expl = explained_problems(card) if not err else []
+    expl = (explained_problems(card) + depth_problems(card)) if not err else []
     if not zoom and not expl:
         return reason
     note = "\n\n".join(([("Zoom levels:\n" + "\n".join("- " + z for z in zoom))] if zoom else [])
-                       + (["Explain more:\n" + "\n".join("- " + x for x in expl)] if expl else []))
+                       + (["Short / Plain words / Full:\n" + "\n".join("- " + x for x in expl)] if expl else []))
     if reason:
         return reason + "\n\n" + note
     return "Smart termination: your handoff card was sent back.\n\n" + note
@@ -365,9 +368,31 @@ def explained_problems(card) -> list:
         return ['Add "explained": the same card written out for someone who is lost, in '
                 "markdown with short ## headings (what this is about, what happened and why, "
                 "what it means for him, what he does next), plain words, no length limit. "
-                "The card shows it behind an \"Explain more\" button."]
+                "The card shows it as the \"Plain words\" version."]
     n = len(v.split())
     if n < EXPLAINED_MIN_WORDS:
         return [f'"explained" is {n} words; it must be at least {EXPLAINED_MIN_WORDS}. It is the '
                 "long version for when the card is not enough: say what the card leaves out."]
     return []
+
+
+def depth_problems(card) -> list:
+    """Short and Full on every card, beside Plain words ("explained"): the
+    owner, 2026-10-30, after one session's token answer had a Full tab and
+    another's did not ("the entire idea of smart termination is to have
+    something that's easy to look at, consistent, cognitively effortless").
+    A deliverable's body is its Full."""
+    if not isinstance(card, dict):
+        return []
+    out = []
+    if not (isinstance(card.get("answer"), str) and card["answer"].strip()):
+        out.append('Add "answer": the Short version, two or three sentences that go one level past '
+                   "the headline (on an explain card the answer; on any other card what happened or "
+                   "what is asked). Every card shows Short / Plain words / Full.")
+    d = card.get("deliverable") if isinstance(card.get("deliverable"), dict) else {}
+    has_body = isinstance(d.get("body"), str) and d["body"].strip()
+    fa = card.get("full_answer")
+    if not has_body and not (isinstance(fa, str) and fa.strip()):
+        out.append('Add "full_answer": the Full version in markdown, everything behind the Short one '
+                   "(the detail, numbers, tables, checks), no length limit.")
+    return out

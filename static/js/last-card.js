@@ -526,6 +526,34 @@
       // Explain more belongs to the top block, with no rule above it (owner,
       // 2026-10-28: "should be integrated into the crumbs title subtitle block").
       exH + '</div>';
+    // One Answer band, one switch: Short (the "answer"), Full (the
+    // "full_answer", markdown) and Plain words (the card's "explained"), shown
+    // one at a time in the same spot (owner's pick C, 2026-10-28,
+    // static/scratch/answer-depth.html).  It replaced an "In short" band with
+    // a Full answer fold under it AND an Explain more fold up top, which said
+    // the same thing up to four times.  Short is always first and open.
+    //
+    // Every summary reads the same since 2026-10-30 (the owner: "easy to look
+    // at, consistent, cognitively effortless"): the order is Short, Plain
+    // words, Full (simplest to most detailed), a deliverable's text is its
+    // Full (Copy and full screen kept), and a small Copy copies the open tab.
+    // The band is "Answer" on an answer and "Summary" on any other card,
+    // and it sits right under the headline on every kind of summary.
+    const fa = typeof m.full_answer === 'string' && m.full_answer.trim() ? m.full_answer.trim() : '';
+    const dv = m.deliverable && typeof m.deliverable === 'object' ? m.deliverable : null;
+    const dvBody = dv && typeof dv.body === 'string' && dv.body.trim() ? dv.body : '';
+    let dvInFull = false;
+    if (m.answer) {
+      const vers = [['short', 'Short', paras(m.answer), String(m.answer)]];
+      if (ex) vers.push(['plain', 'Plain words', dvBodyHtml('markdown', ex), ex]);
+      if (fa) vers.push(['full', 'Full', dvBodyHtml('markdown', fa), fa]);
+      else if (dvBody) { dvInFull = true; vers.push(['full', 'Full', deliverableBlock(Object.assign({}, dv, { files: [] })), dvBody]); }
+      const cpy = '<button type="button" class="lm-depth-copy" title="Copy what this tab says">' + I.copy + '<span>Copy</span></button>';
+      h += band(m.type === 'explain' ? 'Answer' : 'Summary',
+        '<div class="lm-depth-bar">' + (vers.length < 2 ? '' : '<div class="lm-depth" role="group" aria-label="How much to read">' + vers.map(([k, l], i) =>
+            '<button type="button" class="lm-depth-b" data-depth="' + k + '" aria-pressed="' + (i ? 'false' : 'true') + '">' + l + '</button>').join('') + '</div>') + cpy + '</div>' +
+          vers.map(([k, , body, raw], i) => '<div class="lm-depth-p" data-depth="' + k + '" data-raw="' + esc(raw) + '"' + (i ? ' hidden' : '') + '>' + body + '</div>').join(''), 'lm-sec lm-answer');
+    }
     // Big picture / this task / just now: three lines under the title (the
     // owner's pick, 2026-10-28, static/scratch/card-zoom.html option A), drawn
     // as a nested dial ladder with the label on the same line
@@ -632,24 +660,10 @@
       } else
       h += band('Validate', '<div class="lm-rows">' + vr + shots.map(linkRow).join('') + '</div>' + later, 'lm-sec');
     }
-    // One Answer band, one switch: Short (the "answer"), Full (the
-    // "full_answer", markdown) and Plain words (the card's "explained"), shown
-    // one at a time in the same spot (owner's pick C, 2026-10-28,
-    // static/scratch/answer-depth.html).  It replaced an "In short" band with
-    // a Full answer fold under it AND an Explain more fold up top, which said
-    // the same thing up to four times.  Short is always first and open.
-    const fa = typeof m.full_answer === 'string' && m.full_answer.trim() ? m.full_answer.trim() : '';
-    if (m.answer) {
-      const vers = [['short', 'Short', paras(m.answer)]];
-      if (fa) vers.push(['full', 'Full', dvBodyHtml('markdown', fa)]);
-      if (ex) vers.push(['plain', 'Plain words', dvBodyHtml('markdown', ex)]);
-      h += band('Answer', vers.length < 2 ? vers[0][2]
-        : '<div class="lm-depth" role="group" aria-label="How much to read">' + vers.map(([k, l], i) =>
-            '<button type="button" class="lm-depth-b" data-depth="' + k + '" aria-pressed="' + (i ? 'false' : 'true') + '">' + l + '</button>').join('') + '</div>' +
-          vers.map(([k, , body], i) => '<div class="lm-depth-p" data-depth="' + k + '"' + (i ? ' hidden' : '') + '>' + body + '</div>').join(''), 'lm-sec lm-answer');
-    }
     if (m.compare) h += band(esc(m.compare.label || 'Change'), compareBlock(m.compare), 'lm-sec');
-    if (m.deliverable) h += band('Deliverable', deliverableBlock(m.deliverable), 'lm-sec');
+    // Files to download stay in their own band, with their buttons in view.
+    if (dv && dvInFull) { const fl = deliverableBlock(Object.assign({}, dv, { body: '', meta: null })); if (fl) h += band('Download', fl, 'lm-sec'); }
+    else if (dv) h += band('Deliverable', deliverableBlock(dv), 'lm-sec');
     if (shots.length && !shotsInValidate) h += band('Screens', '<div class="lm-rows">' + shots.map(linkRow).join('') + '</div>', 'lm-sec');
 
     const n = m.needs || { kind: 'none' };
@@ -2366,6 +2380,21 @@
     if (dvo && dvo === e.target) { e.preventDefault(); _openDeliverable(dvo); }
   });
 
+  // A download in the home-screen app (iOS standalone) must not replace the app.
+  // A plain <a download> there swaps the whole app for iOS's file viewer, which
+  // has no Back button or address bar: the owner was stuck on a .zip's
+  // "Open in… / More…" page (2026-10-30). Open it in a separate browser view
+  // instead, so the app stays where it was. Synchronous, inside the tap.
+  const _iosHomeScreen = () => window.navigator.standalone === true;
+  document.addEventListener('click', e => {
+    if (window.VNLastCard !== _api || !_iosHomeScreen()) return;
+    const a = e.target && e.target.closest && e.target.closest('a[download], a.lm-dlfile');
+    if (!a || !a.href || e.defaultPrevented) return;
+    e.preventDefault();
+    e.stopPropagation();
+    window.open(a.href, '_blank');
+  }, true);
+
   document.addEventListener('click', async e => {
     if (window.VNLastCard !== _api) return;   // a newer copy of this file took over (live-assets.js)
     const root = e.target.closest && e.target.closest('.lm');
@@ -2522,6 +2551,19 @@
       const dd = db.closest('.dd') || db.parentElement.parentElement;
       dd.querySelectorAll('.lm-depth-b').forEach(b => b.setAttribute('aria-pressed', String(b === db)));
       dd.querySelectorAll('.lm-depth-p').forEach(p => { p.hidden = p.dataset.depth !== db.dataset.depth; });
+      return;
+    }
+    // Copy: the text of the tab that is open (Short, Plain words or Full).
+    const dc = e.target && e.target.closest && e.target.closest('.lm-depth-copy');
+    if (dc) {
+      const dd = dc.closest('.dd'), p = dd && [...dd.querySelectorAll('.lm-depth-p')].find(x => !x.hidden);
+      if (!p) return;
+      _copy(p.dataset.raw || p.innerText || '').then(ok => {
+        if (!ok) return;
+        const lb = dc.querySelector('span'), old = lb.textContent;
+        dc.classList.add('copied'); lb.textContent = 'Copied';
+        setTimeout(() => { dc.classList.remove('copied'); lb.textContent = old; }, 1400);
+      });
       return;
     }
     const xm = e.target && e.target.closest && e.target.closest('.lm-xpl-tg');

@@ -179,6 +179,14 @@ def delivery_card(verdict: dict, action: str, nonce: str, task: str) -> tuple[di
             ],
         },
         "explained": explained,
+        # Every summary has Short / Plain words / Full (2026-10-30).
+        "answer": f"Graded {grade}. {means}",
+        "full_answer": (
+            f"## The grade\n\n{grade}, from what actually ran.\n\n## Findings\n\n"
+            + ("\n".join(f"- **{WORDS.get(f.get('code', ''), DEFAULT_WORDS)[0]}**: {_plain(f.get('message', ''))}"
+                         for f in findings) or "- None recorded")
+            + f"\n\n## Your two answers\n\n- **Fix it first**: the task goes back to close the gap and asks again.\n"
+              f"- **{verb} it anyway**: this exact version is accepted; a later change needs a new approval."),
     }
     return card, {"allow": allow, "deny": deny}
 
@@ -226,6 +234,11 @@ def permission_card(operation: dict, nonce: str, task: str) -> tuple[dict, dict]
             f"runs nothing, and the task is told.\n\n## What you do next\n\nTap Run the tests, or Don’t "
             f"run them. Nothing runs until you do."
         ),
+        "answer": f"The check {crit} is ready; it runs once, only if you allow it.",
+        "full_answer": (
+            f"## The command\n\n```\n{cmd}\n```\n\nIt runs in the project folder with secret-shaped settings "
+            f"removed from its environment.\n\n## Your two answers\n\n- **Run the tests**: this exact command runs "
+            f"once and its result is recorded.\n- **Don’t run them**: nothing runs, and the task is told."),
     }
     return card, {"allow": allow, "deny": deny}
 

@@ -27,7 +27,9 @@ reason to send the session back, or None to let the turn end.
 from __future__ import annotations
 
 import json
+import os
 import re
+import urllib.parse
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -1506,13 +1508,15 @@ a PDF, a deck) go in "files": [{"label": "what it is", "url": \
 a text file there with "copy": true is drawn as a Copy button instead (a long \
 text to paste). "body" is then optional. Never hand a file over as a Validate row or a \
 link: such a card is sent back.
-- explain: an answer to a question, in "answer" (or a "compare" block). \
-When there is reasoning, evidence or examples behind it (most answers), add \
-"full_answer": the detailed answer in markdown (## headings, - lists, \
-tables), no length limit. The card's Answer band has one switch, Short / \
-Full / Plain words: "answer" is Short, "full_answer" is Full, and \
-"explained" is Plain words (on a card with an "answer" there is no \
-separate Explain more), so write each as its own version, not a repeat.
+- explain: an answer to a question, in "answer" (or a "compare" block).
+EVERY card, of every type, reads the same: the title, the headline, then one \
+switch with three versions, Short / Plain words / Full. "answer" is Short: \
+two or three sentences that go one level past the headline, never a repeat \
+of it (on an explain card, the answer; on any other, what happened or what \
+is asked). "explained" is Plain words. "full_answer" is Full: everything \
+behind it in markdown (## headings, - lists, tables), no length limit. On a \
+deliverable with a "body", that body is its Full, so it needs no \
+full_answer. A card missing one of the three is sent back.
 When earlier work in this session is still unfinished and this card is \
 about something else, add "back_to": {"label": "that work, in a few words", \
 "status": "where it stands", "reply": "the message to send to resume it"}. \
@@ -1600,6 +1604,74 @@ text (the user can't open them from a chat; put files in "links"); asking "want 
 _REWRITE = "Rewrite only your final message unless the problem is unfinished work; then do the work first."
 
 
+# Every picture and page a summary points at on this app must load (2026-10-30:
+# a session linked two pictures as /api/preview/asset/<upload name>, an address
+# that only serves screenshots the preview tool rendered; on the owner's iPhone
+# both opened to nothing, and nothing had checked them).  Only this app's own
+# addresses are checked, against the files that serve them: /static/... must be
+# a file under static/, /api/preview/asset/<id> a rendered screenshot.  Other
+# addresses are not fetched (that would slow every summary).
+_STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
+_PREVIEW_DIR = Path(__file__).resolve().parents[1] / "data" / "previews"
+_PREVIEW_ASSET = re.compile(r"^/api/preview/(?:asset|thumb)/([^/?#]*)")
+
+
+def _card_urls(card: dict):
+    """(where, url) for every address the summary shows or opens."""
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    for i, l in enumerate(_items(card.get("links"))):
+        if isinstance(l, dict):
+            yield f"links[{i}]", _s(l.get("url"))
+    for i, l in enumerate(_items(needs.get("look"))):
+        if isinstance(l, dict):
+            yield f"needs.look[{i}]", _s(l.get("url"))
+    v = card.get("validate")
+    if isinstance(v, dict):
+        yield "validate.url", _s(v.get("url"))
+    for i, r in enumerate(_items(needs.get("replies"))):
+        if isinstance(r, dict):
+            for j, s in enumerate(_items(r.get("screens"))):
+                if isinstance(s, dict):
+                    yield f"needs.replies[{i}].screens[{j}]", _s(s.get("url"))
+    d = card.get("deliverable")
+    if isinstance(d, dict):
+        for i, f in enumerate(_items(d.get("files"))):
+            if isinstance(f, dict):
+                yield f"deliverable.files[{i}]", _s(f.get("url"))
+
+
+def _app_address_missing(url: str) -> bool:
+    """True when *url* is one of this app's own addresses and nothing serves it."""
+    u = re.sub(r"^https?://(?:localhost|127\.0\.0\.1)(?::5050)?(?=/)", "", url or "", flags=re.I)
+    m = _PREVIEW_ASSET.match(u)
+    if m:
+        pid = m.group(1)
+        return not (re.fullmatch(r"[0-9a-f]{32}", pid) and (_PREVIEW_DIR / (pid + ".png")).is_file())
+    if u.startswith("/static/"):
+        rel = urllib.parse.unquote(re.sub(r"[?#].*$", "", u)[len("/static/"):])
+        try:
+            f = (_STATIC_DIR / rel).resolve()
+            f.relative_to(_STATIC_DIR.resolve())
+        except (OSError, ValueError):
+            return True
+        return not f.is_file()
+    return False
+
+
+def broken_link_problems(card: dict) -> list[str]:
+    # VIBENODE_LINK_CHECK=0 turns it off (the test suite does, for its
+    # made-up addresses; see tests/conftest.py).
+    if not isinstance(card, dict) or os.environ.get("VIBENODE_LINK_CHECK") == "0":
+        return []
+    bad = [f"{where} ({url})" for where, url in _card_urls(card) if url and _app_address_missing(url)]
+    if not bad:
+        return []
+    return ["These addresses open to nothing, so the user taps them and sees a blank: "
+            + "; ".join(bad[:4]) + ". Link only what exists. A screenshot of a page: render it with "
+            "POST /api/preview/render and use the \"src\" it returns. A picture you already have (an "
+            "upload, a saved image): copy it into static/scratch/ and link /static/scratch/<name>."]
+
+
 def review(message: str, facts=None) -> Optional[str]:
     """The reason to send the session back, or None when the card passes.
 
@@ -1617,7 +1689,8 @@ def review(message: str, facts=None) -> Optional[str]:
         return ("Smart termination: " + err + " End every turn with one ```" + FENCE_LANG
                 + " card as the last thing in your message.\n\n" + INSTRUCTIONS)
     problems = (format_problems(card) + download_problems(card) + handover_problems(card)
-                + length_problems(card) + machinery_problems(card) + variant_name_problems(card))
+                + length_problems(card) + machinery_problems(card) + variant_name_problems(card)
+                + broken_link_problems(card))
     hits = _checks(card, prose)
     labels = label_problems(card, prose)
     from daemon import handoff_evidence

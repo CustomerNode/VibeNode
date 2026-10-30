@@ -68,13 +68,14 @@ def test_one_answer_band_with_a_short_full_plain_words_switch(out):
     band = _band(out["full"])
     assert ">In short<" not in out["full"]
     btns = re.findall(r'<button type="button" class="lm-depth-b" data-depth="(\w+)" aria-pressed="(\w+)">([^<]+)</button>', band)
-    assert btns == [("short", "true", "Short"), ("full", "false", "Full"), ("plain", "false", "Plain words")]
-    panes = re.findall(r'<div class="lm-depth-p" data-depth="(\w+)"( hidden)?>', band)
-    assert panes == [("short", ""), ("full", " hidden"), ("plain", " hidden")]
-    # Short is the answer; Full is the markdown (a heading, a list, a table); Plain words is "explained"
-    short, full, plain = (band.index(f'class="lm-depth-p" data-depth="{k}"') for k in ("short", "full", "plain"))
-    assert short < band.index("Word order isn") < full < band.index("<table") < plain < band.index("Plain words. ")
-    assert "<li" in band[full:plain]
+    # Simplest to most detailed (owner, 2026-10-30): Short, Plain words, Full.
+    assert btns == [("short", "true", "Short"), ("plain", "false", "Plain words"), ("full", "false", "Full")]
+    panes = re.findall(r'<div class="lm-depth-p" data-depth="(\w+)" data-raw="[^"]*"( hidden)?>', band)
+    assert panes == [("short", ""), ("plain", " hidden"), ("full", " hidden")]
+    # Short is the answer; Plain words is "explained"; Full is the markdown (a heading, a list, a table)
+    short, plain, full = (band.index(f'class="lm-depth-p" data-depth="{k}"') for k in ("short", "plain", "full"))
+    assert short < band.index("Word order isn") < plain < band.index("Plain words. ") < full < band.index("<table")
+    assert "<li" in band[full:]
 
 
 def test_explain_more_moves_into_the_switch(out):
@@ -91,7 +92,7 @@ def test_no_full_answer_no_full_tab(out):
 
 def test_an_answer_alone_has_no_switch(out):
     band = _band(out["alone"])
-    assert "lm-depth" not in band and "Word order isn" in band
+    assert 'class="lm-depth"' not in band and 'class="lm-depth-b"' not in band and "Word order isn" in band
 
 
 def test_a_card_without_an_answer_keeps_explain_more_up_top(out):
@@ -118,7 +119,7 @@ def test_the_instructions_describe_it():
 
 def test_the_instructions_describe_the_switch():
     text = handoff_rules.INSTRUCTIONS
-    assert "Short / Full / Plain words" in text and "In short" not in text
+    assert "Short / Plain words / Full" in text and "In short" not in text
 
 
 # ── The switch in a real browser: the real last-card.js and last-card.css ──
@@ -157,5 +158,76 @@ def test_tapping_a_version_shows_only_that_version(browser):
         # the three tabs sit on one line on a phone
         tops = pg.evaluate("() => [...document.querySelectorAll('.lm-depth-b')].map(b => Math.round(b.getBoundingClientRect().top))")
         assert len(set(tops)) == 1
+        # Copy copies the open tab (2026-10-30), and sits on the tabs' line
+        pg.evaluate("() => { window.__copied = []; window.vnCopyText = t => { window.__copied.push(t); return true; }; }")
+        pg.click('.lm-depth-copy')
+        pg.click('.lm-depth-b[data-depth="full"]')
+        pg.click('.lm-depth-copy')
+        pg.wait_for_function("() => window.__copied.length === 2")
+        got = pg.evaluate("() => window.__copied")
+        assert got[0] == BASE["answer"] and got[1] == FULL.strip()
+        tops = pg.evaluate("() => [...document.querySelectorAll('.lm-depth-b, .lm-depth-copy')].map(b => Math.round(b.getBoundingClientRect().top))")
+        assert max(tops) - min(tops) <= 4
     finally:
         pg.close()
+
+
+# ── Every summary reads the same (owner, 2026-10-30: "easy to look at,
+# consistent, cognitively effortless") ──
+
+DV = {"type": "deliverable", "title": "Token cost table", "headline": "The build used 18M tokens, about $6.88.",
+      "answer": "Main agent only; cached reads were 98% of tokens but $3.59 of the cost.",
+      "explained": EX, "zoom": BASE["zoom"], "needs": {"kind": "none", "why": "Answered.", "next": "Nothing planned."},
+      "deliverable": {"kind": "report", "title": "Token use", "body": "| Agent | Tokens |\n|---|---|\n| Main | 18M |",
+                      "files": [{"label": "The table as CSV", "url": "/static/scratch/tokens.csv", "size": "1 KB"}]}}
+DONE = {"type": "done", "title": "Archive button", "headline": "Sessions can be archived from the right-click menu.",
+        "answer": "Archive sits under Rename; archived sessions leave the list and come back from the filter.",
+        "full_answer": "## What changed\n- the menu item\n- the filter", "explained": EX, "zoom": BASE["zoom"],
+        "links": [{"label": "Try it", "kind": "link", "url": "/"}],
+        "needs": {"kind": "none", "why": "Done.", "next": "Nothing planned."}}
+
+
+@pytest.fixture(scope="module")
+def out2():
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    r = subprocess.run(["node", "-e", SCRIPT, str(LAST_CARD), json.dumps({"dv": DV, "done": DONE})],
+                       capture_output=True, text=True, timeout=30, check=True)
+    return json.loads(r.stdout)
+
+
+def test_a_deliverables_text_is_its_full_tab(out2):
+    h = out2["dv"]
+    band = h[h.index(">Summary<"):]
+    assert re.findall(r'class="lm-depth-b" data-depth="(\w+)"', band) == ["short", "plain", "full"]
+    full = band[band.index('data-depth="full" data-raw'):]
+    assert "<table" in full and "Copy the text" in full and "lm-dvopen" in full
+    # no second Deliverable band repeating the text; the file keeps its Download button in view
+    assert '<div class="dt">Deliverable<' not in h
+    dl = h[h.index(">Download<"):]
+    assert "tokens.csv" in dl and "Copy the text" not in dl
+
+
+def test_every_kind_of_summary_has_the_same_switch(out2):
+    h = out2["done"]
+    band = h[h.index(">Summary<"):]
+    assert re.findall(r'class="lm-depth-b" data-depth="(\w+)"', band) == ["short", "plain", "full"]
+    assert "Explain more" not in h
+
+
+def test_every_summary_has_a_copy_button(out, out2):
+    for h in (out["full"], out["alone"], out2["dv"], out2["done"]):
+        assert h.count('class="lm-depth-copy"') == 1
+
+
+def test_the_rules_ask_every_card_for_short_and_full():
+    from daemon import smart_termination as st
+    assert st.depth_problems(dict(BASE, full_answer=FULL)) == []
+    assert st.depth_problems(DV) == []                      # the deliverable's body is its Full
+    assert st.depth_problems(DONE) == []
+    no_short = dict(DONE)
+    del no_short["answer"]
+    assert any('"answer"' in p for p in st.depth_problems(no_short))
+    assert any('"full_answer"' in p for p in st.depth_problems(dict(BASE)))
+    files_only = dict(DV, deliverable={"files": DV["deliverable"]["files"]})
+    assert any('"full_answer"' in p for p in st.depth_problems(files_only))

@@ -908,6 +908,15 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
 .lm-depth-b:focus-visible { outline: 2px solid var(--text-muted); outline-offset: 1px; }
 .lm-depth-b[aria-pressed="true"] { background: rgba(var(--bt), .12); color: var(--text-heading); }
 .lm-depth-p[hidden] { display: none; }
+/* The switch and a small Copy (the open tab's text) on one line (2026-10-30). */
+.lm-depth-bar { display: flex; align-items: flex-start; gap: 8px; margin: 0 0 10px; }
+.lm-depth-bar .lm-depth { margin: 0; }
+.lm-depth-copy { all: unset; cursor: pointer; margin-left: auto; display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; font-weight: 600;
+  line-height: 1.5; color: var(--text-muted); padding: 7px 8px; border-radius: 7px; }
+.lm-depth-copy svg { width: 14px; height: 14px; }
+.lm-depth-copy:hover { color: var(--text-heading); background: rgba(var(--bt), .06); }
+.lm-depth-copy:focus-visible { outline: 2px solid var(--text-muted); outline-offset: 1px; }
+.lm-depth-copy.copied { color: var(--success, #16a34a); }
 .lm-depth-p > :first-child { margin-top: 0; } .lm-depth-p > :last-child { margin-bottom: 0; }
 /* The band's own markdown rules are for direct children of .dd; a version sits one level down. */
 .lm .lm-dl .dd .lm-depth-p > ul:not([class]), .lm .lm-dl .dd .lm-depth-p > ol:not([class]) { margin: 0 0 10px; padding-left: 20px; }

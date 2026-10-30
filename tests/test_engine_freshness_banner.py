@@ -69,7 +69,7 @@ def test_outdated_engine_shows_the_banner_with_a_restart_when_idle_button(page):
     assert "2 engine files have changed" in text
     assert "not running until it restarts" in text
     buttons = [b.strip() for b in page.locator("#engine-freshness-banner button").all_text_contents()]
-    assert buttons == ["Now", "When sessions done", "Hide"]
+    assert buttons == ["Now", "When sessions done", "Hide▾"]
 
 
 def test_restart_when_idle_arms_the_server_and_shows_what_it_waits_on(page):
@@ -92,9 +92,15 @@ def test_current_engine_shows_nothing(page):
     assert page.locator("#engine-freshness-banner").count() == 0
 
 
+def _hide(page, key):
+    page.click("#engine-freshness-banner [data-act=later]")
+    page.wait_for_selector("#engine-freshness-hide-menu")
+    page.click(f"#engine-freshness-hide-menu [data-hide=\"{key}\"]")
+
+
 def test_later_hides_it(page):
     page.evaluate("() => EngineFreshness.check()")
-    page.click("#engine-freshness-banner [data-act=later]")
+    _hide(page, "4h")
     assert page.locator("#engine-freshness-banner").count() == 0
     page.evaluate("() => EngineFreshness.check()")
     page.wait_for_timeout(200)
@@ -109,15 +115,65 @@ def test_the_waiting_bar_can_be_hidden_and_the_restart_stays_queued(page):
     page.click("#engine-freshness-banner [data-act=arm]")
     page.wait_for_selector("#engine-freshness-banner [data-act=now]")
     buttons = [b.strip() for b in page.locator("#engine-freshness-banner button").all_text_contents()]
-    assert buttons == ["Now", "When sessions done", "Cancel", "Hide"]
+    assert buttons == ["Now", "When sessions done", "Cancel", "Hide▾"]
     assert page.get_attribute("#engine-freshness-banner [data-act=armed]", "aria-pressed") == "true"
-    page.click("#engine-freshness-banner [data-act=later]")
+    _hide(page, "1h")
     assert page.locator("#engine-freshness-banner").count() == 0
     page.evaluate("() => EngineFreshness.check()")
     page.wait_for_timeout(200)
     assert page.locator("#engine-freshness-banner").count() == 0
     # Hiding never sent a cancel: the only post is the arm.
     assert page.evaluate("() => window.__posts") == [["/api/engine/restart-when-idle", {"arm": True}]]
+
+
+def test_hide_offers_a_menu_of_times(page):
+    """2026-10-30, the owner: "a button that delays the window from returning
+    and give some menu of time options"."""
+    page.evaluate("() => EngineFreshness.check()")
+    page.wait_for_selector("#engine-freshness-banner")
+    page.click("#engine-freshness-banner [data-act=later]")
+    items = [t.strip() for t in page.locator("#engine-freshness-hide-menu [data-hide]").all_text_contents()]
+    assert items == ["For 1 hour", "For 4 hours", "Until tomorrow morning", "For a week", "Until it restarts"]
+    # The banner stays until a time is picked; Escape closes the menu only.
+    page.keyboard.press("Escape")
+    assert page.locator("#engine-freshness-hide-menu").count() == 0
+    assert page.locator("#engine-freshness-banner").count() == 1
+
+
+def test_each_choice_hides_for_its_own_time(page):
+    got = page.evaluate("""() => {
+      const now = new Date(2026, 9, 30, 11, 54).getTime();
+      const f = EngineFreshness._hideUntil;
+      const m = new Date(f('morning', now));
+      return {h1: (f('1h', now) - now) / 3600000, h4: (f('4h', now) - now) / 3600000,
+              wk: (f('week', now) - now) / 86400000,
+              morning: [m.getDate(), m.getHours(), m.getMinutes()]};
+    }""")
+    assert got == {"h1": 1, "h4": 4, "wk": 7, "morning": [31, 8, 0]}
+
+
+def test_a_hide_that_runs_out_brings_the_banner_back(page):
+    page.evaluate("() => EngineFreshness.check()")
+    _hide(page, "1h")
+    page.evaluate("() => EngineFreshness.check()")
+    page.wait_for_timeout(200)
+    assert page.locator("#engine-freshness-banner").count() == 0
+    # Two hours later the hour is over.
+    page.evaluate("() => { const real = Date.now; Date.now = () => real() + 2 * 3600 * 1000; }")
+    page.evaluate("() => EngineFreshness.check()")
+    page.wait_for_selector("#engine-freshness-banner")
+
+
+def test_until_it_restarts_holds_for_this_engine_and_returns_after_a_restart(page):
+    page.evaluate("() => EngineFreshness.check()")
+    _hide(page, "restart")
+    page.evaluate("() => EngineFreshness.check()")
+    page.wait_for_timeout(200)
+    assert page.locator("#engine-freshness-banner").count() == 0
+    # The engine restarted and is behind again: the banner is back.
+    page.evaluate("() => { window.__status = Object.assign({}, window.__status, {started_at: 1791400000}); }")
+    page.evaluate("() => EngineFreshness.check()")
+    page.wait_for_selector("#engine-freshness-banner")
 
 
 def test_the_waiting_bar_is_at_most_two_lines_on_a_phone(browser):

@@ -30,7 +30,10 @@ def _card(**over):
          "zoom": {"big": "Make the VibeNode chat usable on phones.",
                   "task": "Stop the header covering the chat.",
                   "now": "Fixed the header, checked on a phone."},
-         "explained": EXPLAINED}
+         "explained": EXPLAINED,
+         # Short and Full: every summary has all three versions (2026-10-30).
+         "answer": "The bar at the top of a phone chat now takes its own space.",
+         "full_answer": "## What changed\nThe header is no longer fixed over the thread."}
     c.update(over)
     return "```handoff\n" + _json.dumps(c) + "\n```"
 
@@ -620,7 +623,7 @@ def test_screenshots_go_inside_the_card_not_beside_it():
 
 def test_every_card_carries_its_long_version():
     reason = _review(_card(explained=None))
-    assert reason and '"explained"' in reason and "Explain more" in reason
+    assert reason and '"explained"' in reason and "Plain words" in reason
     short = _review(_card(explained="It was broken; now it works."))
     assert short and "at least" in short
     assert _review(GOOD) is None
@@ -634,7 +637,7 @@ def test_the_long_version_is_not_counted_in_the_card_length():
 
 
 def test_the_instructions_ask_for_the_long_version():
-    assert '"explained"' in st.INSTRUCTIONS and "Explain more" in st.INSTRUCTIONS
+    assert '"explained"' in st.INSTRUCTIONS and "Plain words" in st.INSTRUCTIONS
 
 
 # ── A false success claim is never let through silently (2026-10-29) ────

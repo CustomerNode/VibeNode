@@ -102,6 +102,8 @@ KNOBS = [
      "Set by the test suite: a Session Host refuses to launch the real Claude CLI (tests pass a fake one). Not for manual use."),
     ("VIBENODE_HOST_TEST_OWNER", "Tests", "",
      "Set by the test suite to <pid>:<create time> of the pytest process; a Session Host shuts down once that process is gone, so a stopped test run leaves no host behind. Not for manual use."),
+    ("VIBENODE_LINK_CHECK", "Session Engine", "1",
+     "Set to 0 to stop Smart termination from sending back a summary whose pictures or pages on this app do not load. The test suite sets it to 0 for its made-up addresses."),
     ("VIBENODE_SMART_TERMINATION_ENGINE", "Session Engine", "",
      "Set by the Session Engine in the environment of each CLI it starts with its own Smart termination check, so the settings-file copy (daemon/smart_termination_hook.py) stays out of the way. Not for manual use; the on/off switch is the Smart termination preference."),
     ("VIBENODE_WATCHDOG_HOT_RELOAD", "Session Engine", "1",

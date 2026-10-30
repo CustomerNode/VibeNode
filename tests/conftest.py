@@ -326,6 +326,11 @@ os.environ["VIBENODE_HOST_FORBID_REAL_CLI"] = "1"
 # test starts in a subprocess, or before the per-test fixture runs, also
 # defaults to in-process.
 os.environ["VIBENODE_SESSION_HOST"] = "0"
+# Smart termination checks that a summary's own-app links load, against this
+# checkout's static/ and data/previews/.  Test cards use made-up addresses
+# ("/static/scratch/x.png"), and static/scratch is gitignored, so the check is
+# off for the suite; tests/test_broken_links.py turns it on per test.
+os.environ["VIBENODE_LINK_CHECK"] = "0"
 try:
     import tempfile as _tempfile
     from daemon import session_host_protocol as _shp_mod

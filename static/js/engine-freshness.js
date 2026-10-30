@@ -26,6 +26,10 @@
   var BANNER_ID = 'engine-freshness-banner';
   var SDK_BANNER_ID = 'sdk-patch-banner';
   var SNOOZE_KEY = 'engineFreshnessSnoozedUntil';
+  // "Until it restarts" (2026-10-30): the engine start this hide was for.
+  // A later engine start shows the banner again whatever the clock says.
+  var SNOOZE_START_KEY = 'engineFreshnessSnoozedStart';
+  var MENU_ID = 'engine-freshness-hide-menu';
   var _sdkDismissed = false;   // this page view only: the engine is still unpatched
   var BOOT_DELAY_MS = 4000;
   var RECHECK_MS = 10 * 60 * 1000;
@@ -35,6 +39,8 @@
   // In-memory copy, so "Later" holds for this page even where storage is
   // blocked (private windows, sandboxed documents).
   var _memSnooze = 0;
+  var _memSnoozeStart = 0;
+  var _lastStartedAt = 0;
 
   function _snoozedUntil() {
     var stored = 0;
@@ -43,14 +49,118 @@
     return Math.max(stored, _memSnooze);
   }
 
-  function _snooze(hours) {
-    _memSnooze = Date.now() + hours * 3600 * 1000;
+  function _snoozedStart() {
+    var stored = 0;
+    try { stored = parseInt(localStorage.getItem(SNOOZE_START_KEY) || '0', 10) || 0; }
+    catch (e) { /* storage blocked */ }
+    return stored || _memSnoozeStart;
+  }
+
+  /** Hidden right now: a time snooze still running, or a hide "until it
+   *  restarts" for the engine start that is still running. */
+  function _isSnoozed(data) {
+    if (Date.now() < _snoozedUntil()) return true;
+    var start = _snoozedStart();
+    return !!(start && data && data.started_at && Number(data.started_at) === start);
+  }
+
+  // The Hide menu's choices (owner, 2026-10-30: "a button that delays the
+  // window from returning ... some menu of time options").
+  var HIDE_CHOICES = [
+    { key: '1h', label: 'For 1 hour' },
+    { key: '4h', label: 'For 4 hours' },
+    { key: 'morning', label: 'Until tomorrow morning' },
+    { key: 'week', label: 'For a week' },
+    { key: 'restart', label: 'Until it restarts' },
+  ];
+
+  /** When a choice ends, as a clock time (ms); 0 for "until it restarts". */
+  function _hideUntil(key, now) {
+    now = now || Date.now();
+    if (key === '1h') return now + 3600 * 1000;
+    if (key === '4h') return now + 4 * 3600 * 1000;
+    if (key === 'week') return now + 7 * 24 * 3600 * 1000;
+    if (key === 'morning') {
+      var d = new Date(now);
+      d.setDate(d.getDate() + 1);
+      d.setHours(8, 0, 0, 0);
+      return d.getTime();
+    }
+    return 0;
+  }
+
+  function _snoozeChoice(key) {
+    if (key === 'restart' && !Number(_lastStartedAt)) key = '4h';  // no start time to key on
+    if (key === 'restart') {
+      _memSnoozeStart = Number(_lastStartedAt) || 0;
+      try { localStorage.setItem(SNOOZE_START_KEY, String(_memSnoozeStart)); }
+      catch (e) { /* this page view only */ }
+      _remove();
+      return;
+    }
+    _memSnooze = _hideUntil(key);
     try { localStorage.setItem(SNOOZE_KEY, String(_memSnooze)); }
     catch (e) { /* this page view only */ }
     _remove();
+    // Come back when the hide ends, not up to ten minutes after it.
+    _schedule(Math.max(1000, Math.min(RECHECK_MS, _memSnooze - Date.now() + 500)));
   }
 
+  function _closeMenu() {
+    var m = document.getElementById(MENU_ID);
+    if (m && m.parentNode) m.parentNode.removeChild(m);
+    var b = document.querySelector('#' + BANNER_ID + ' [data-act=later]');
+    if (b) b.setAttribute('aria-expanded', 'false');
+  }
+
+  function _openMenu(btn) {
+    _closeMenu();
+    var r = btn.getBoundingClientRect();
+    var m = document.createElement('div');
+    m.id = MENU_ID;
+    m.setAttribute('role', 'menu');
+    m.style.cssText = [
+      'position:fixed', 'top:' + Math.round(r.bottom + 4) + 'px',
+      'right:' + Math.max(8, Math.round(window.innerWidth - r.right)) + 'px',
+      'z-index:10000', 'background:#2e1a00', 'color:#ffd9a0',
+      'border:1px solid #7a4a10', 'border-radius:8px', 'padding:4px',
+      'min-width:190px', 'box-shadow:0 6px 18px rgba(0,0,0,.4)', 'font-size:13px',
+    ].join(';');
+    m.innerHTML = '<div style="padding:6px 10px 4px;opacity:.7;font-size:12px">Hide this banner</div>'
+      + HIDE_CHOICES.map(function (c) {
+        return '<button role="menuitem" data-hide="' + c.key + '" style="display:block;width:100%;'
+          + 'text-align:left;background:none;border:0;color:inherit;font:inherit;padding:7px 10px;'
+          + 'border-radius:6px;cursor:pointer">' + _esc(c.label) + '</button>';
+      }).join('');
+    document.body.appendChild(m);
+    btn.setAttribute('aria-expanded', 'true');
+    m.addEventListener('mouseover', function (e) {
+      var t = e.target.closest && e.target.closest('[data-hide]');
+      Array.prototype.forEach.call(m.querySelectorAll('[data-hide]'), function (b) {
+        b.style.background = (b === t) ? 'rgba(255,217,160,.12)' : 'none';
+      });
+    });
+    m.addEventListener('click', function (e) {
+      var t = e.target && e.target.closest && e.target.closest('[data-hide]');
+      if (!t) return;
+      _closeMenu();
+      _snoozeChoice(t.getAttribute('data-hide'));
+    });
+  }
+
+  document.addEventListener('mousedown', function (e) {
+    var m = document.getElementById(MENU_ID);
+    if (!m) return;
+    if (m.contains(e.target)) return;
+    if (e.target.closest && e.target.closest('#' + BANNER_ID + ' [data-act=later]')) return;
+    _closeMenu();
+  }, true);
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') _closeMenu();
+  });
+
   function _remove() {
+    _closeMenu();
     var el = document.getElementById(BANNER_ID);
     if (el && el.parentNode) el.parentNode.removeChild(el);
   }
@@ -170,13 +280,20 @@
           : '<button data-act="arm" class="pm-btn pm-btn-primary" style="padding:4px 10px" '
             + 'title="Restart once no session is busy">When sessions done</button>')
       + '<button data-act="later" class="pm-btn pm-btn-secondary" style="padding:4px 10px" '
-      +   'title="' + (armed ? 'The restart still happens once no session is busy' : 'Hide for 4 hours') + '">Hide</button>'
+      +   'aria-haspopup="menu" aria-expanded="false" '
+      +   'title="' + (armed ? 'Hide it; the restart still happens once no session is busy' : 'Hide it for a while') + '">'
+      +   'Hide<span aria-hidden="true" style="margin-left:5px;font-size:10px;opacity:.75;pointer-events:none">▾</span></button>'
       + '</span>';
     document.body.appendChild(bar);
     bar.addEventListener('click', function (e) {
-      var act = e.target && e.target.getAttribute && e.target.getAttribute('data-act');
+      var hit = e.target && e.target.closest && e.target.closest('[data-act]');
+      var act = hit && hit.getAttribute('data-act');
       if (!act) return;
-      if (act === 'later') { _snooze(4); return; }
+      if (act === 'later') {
+        if (document.getElementById(MENU_ID)) _closeMenu();
+        else _openMenu(e.target.closest('[data-act]'));
+        return;
+      }
       if (act === 'arm') { _post(true).then(_check); return; }
       if (act === 'cancel') { _post(false).then(_check); return; }
       if (act === 'now') {
@@ -229,18 +346,20 @@
         }
         // A snooze hides the waiting bar too; the queued restart is server
         // side and still fires (app/engine_freshness.py).
-        if (Date.now() < _snoozedUntil()) {
+        _lastStartedAt = data.started_at || 0;
+        if (_isSnoozed(data)) {
           _remove();
           _schedule(RECHECK_MS);
           return;
         }
-        _render(data);
+        // Leave an open Hide menu alone; the next check redraws.
+        if (!document.getElementById(MENU_ID)) _render(data);
         _schedule(data.restart_armed ? ARMED_RECHECK_MS : RECHECK_MS);
       })
       .catch(function () { _schedule(RECHECK_MS); });
   }
 
-  window.EngineFreshness = { check: _check, last: null };
+  window.EngineFreshness = { check: _check, last: null, _hideUntil: _hideUntil };
 
   function _boot() { setTimeout(_check, BOOT_DELAY_MS); }
   if (document.readyState === 'loading') {
