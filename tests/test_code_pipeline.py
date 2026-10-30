@@ -394,7 +394,9 @@ def cli_run(run_dir: Path, cid: str, capsys, *, baseline: bool = False) -> int:
     Returns execute's exit code (or authorize's when it fails); capsys holds
     execute's output afterwards."""
     flag = ["--baseline"] if baseline else []
-    code = run_check.main(["authorize", str(run_dir), cid, *flag])
+    # --rerun: these tests want an execution even when the evidence on disk
+    # already proves the same operation (authorize would otherwise reuse it).
+    code = run_check.main(["authorize", str(run_dir), cid, *flag, "--rerun"])
     out = capsys.readouterr().out
     if code != 0:
         return code
@@ -1307,11 +1309,16 @@ def test_a_blocking_finding_needs_a_resolution_from_a_later_checker(repo):
     (run_dir / "03-review.md").write_text("# 03 Review\n\nBLOCKING: neg-input\nRESOLVED: neg-input\n",
                                           encoding="utf-8")
     assert "finding-unresolved" in codes(harness.grade_run(run_dir))
-    # A later checker stage can: a fresh tester records the resolution and a
-    # fresh auditor follows, in order.
+    # A later checker stage that only says RESOLVED has settled nothing.
     (run_dir / "03-review.md").write_text("# 03 Review\n\nBLOCKING: neg-input\n", encoding="utf-8")
     _write_stage(sess, run_dir, "04-test.md", "# 04 Test\n\nRESOLVED: neg-input (test_sub covers 0 - 4)\n")
-    _audit(run_dir, COVERAGE_OK, sess)
+    assert "resolution-unproven" in codes(harness.grade_run(run_dir))
+    # It is settled by a check whose plan entry covers it and that passed on
+    # the final tree: a fresh tester records it, a fresh auditor follows.
+    tester = _replan(run_dir, sess, PLAN_BLOCK.replace("  suite: true\n", "  suite: true\n  covers: neg-input\n"))
+    record_baseline(tester, run_dir, "unit")
+    _write_stage(sess, run_dir, "04-test.md", "# 04 Test\n\nNOT-A-DEFECT: neg-input by=unit (sub(0, 4) is -4)\n")
+    _audit(run_dir, COVERAGE_OK.replace("Verdict", "neg-input: unit calls sub(0, 4).\n\nVerdict"), sess)
     v = harness.grade_run(run_dir)
     assert "finding-unresolved" not in codes(v) and v.grade == "HIGH", harness.format_verdict(v)
 

@@ -286,8 +286,11 @@ def test_blocking_findings_survive_a_rewrite_of_the_report(repo):
     _attest(reviewer, run_dir, "03-review.md")
     v = harness.grade_run(run_dir)
     assert any(f.code == "finding-dropped" and "neg-input" in f.message for f in v.findings), harness.format_verdict(v)
+    # A later stage that answers it with the bare word RESOLVED has settled it
+    # in name only: the finding is no longer "dropped", it is "unproven".
     _write_stage(sess, run_dir, "04-test.md", "# 04 Test\n\nRESOLVED: neg-input (test_sub covers 0 - 4)\n")
-    assert "finding-dropped" not in codes(harness.grade_run(run_dir))
+    v = harness.grade_run(run_dir)
+    assert "finding-dropped" not in codes(v) and "resolution-unproven" in codes(v), harness.format_verdict(v)
 
 
 # ── escalation, renames, risk signals ────────────────────────────────────────
@@ -698,8 +701,13 @@ def test_an_audit_blocking_finding_is_cleared_only_by_a_fresh_auditor(repo):
     first.write(run_dir / "08-audit.md", "audit")
     _attest(first, run_dir, "08-audit.md")
     assert "finding-dropped" in codes(harness.grade_run(run_dir))
-    # A fresh auditor clears it.
-    _write_stage(sess, run_dir, "08-audit.md", AUDIT_TEXT + "\nRESOLVED: rename-gap test_moving_protected_code passes\n")
+    # A fresh auditor settles it, with a check that covers it and passed on
+    # the final tree (the word RESOLVED alone no longer settles anything).
+    tester = _replan(run_dir, sess, PLAN_BLOCK.replace("  suite: true\n", "  suite: true\n  covers: rename-gap\n"))
+    record_baseline(tester, run_dir, "unit")
+    _write_stage(sess, run_dir, "08-audit.md",
+                 AUDIT_TEXT.replace("Verdict: covered", "rename-gap: unit exercises it.\n\nVerdict: covered")
+                 + "\nNOT-A-DEFECT: rename-gap by=unit\n")
     v = harness.grade_run(run_dir)
     assert "finding-dropped" not in codes(v) and v.grade == "HIGH", harness.format_verdict(v)
 

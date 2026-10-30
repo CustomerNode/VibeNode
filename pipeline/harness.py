@@ -34,8 +34,14 @@ none of which an agent can produce by writing a file:
 * **The pinned suite** runs on the final tree; **the change is detected**
   (on routes a, b, c a regression demonstration fails on the starting
   snapshot for the reason the plan named); **checkers are distinct and in
-  order**; a ``BLOCKING:`` finding, including one in an earlier attested
-  version of a report, needs a ``RESOLVED:`` from a later checker stage.
+  order**.
+* **The register** (``pipeline.findings``): every ``SCENARIO:`` the plan
+  names and every ``FINDING:``/``BLOCKING:`` a checker raises (including one
+  in an earlier attested version of a report, and a ``NOTE:`` worded as a
+  correctness concern) reaches FIXED, NOT-A-DEFECT or VERIFIED with a check
+  that covers it and passed on the final tree (FIXED also needs a recorded
+  failure before the fix), or is disclosed UNRESOLVED.  ``RESOLVED:`` alone
+  settles nothing.  An open or unresolved item caps the grade at MEDIUM.
 
 Severities: ``block`` (the run cannot be graded), ``low`` (a failed, forged
 or tampered fact: LOW), ``medium`` (missing independence or stale evidence:
@@ -54,10 +60,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from pipeline import depth as depth_mod
+from pipeline import findings as findings_mod
+from pipeline import metrics as metrics_mod
 from pipeline.attest import ATTEST_PREFIX, load_attestations
 from pipeline.escalate import ESCALATE_PREFIX
 from pipeline.evidence import (_is_git_repo, git, EVIDENCE_DIR, EVIDENCE_PREFIX, RUNS_SUBDIR, _file_sha, baseline_label, evidence_sha,
-                               impl_identity, interpreter_site_dirs, load_run, local_excludes, run_repo,
+                               history_records, impl_identity, interpreter_site_dirs, load_run, local_excludes, run_repo,
                                site_fingerprint, tree_fingerprint)
 from pipeline.decisions import (DECISION_PREFIX, DECISIONS_DIR, DecisionError, answer as decision_answer,
                                 load as load_decision)
@@ -94,9 +102,6 @@ COVERAGE_VERDICT_RE = re.compile(r"^[\s>*_-]*verdict[\s*_]*:[\s*_]*(not\s+covere
 BASELINE_ROUTES = ("a", "b", "c")
 # An audit written this long before the evidence it relies on is stale.
 STALE_TOLERANCE_S = 2.0
-# Structured checker outcomes: a material finding a later checker must clear.
-BLOCKING_RE = re.compile(r"^[\s>*_-]*BLOCKING[\s*_]*:[\s*_]*([A-Za-z0-9][A-Za-z0-9_.-]*)", re.MULTILINE)
-RESOLVED_RE = re.compile(r"^[\s>*_-]*RESOLVED[\s*_]*:[\s*_]*([A-Za-z0-9][A-Za-z0-9_.-]*)", re.MULTILINE)
 # A checker's brief is the request, the run directory, the spec path and the
 # diff summary; a brief longer than this is carrying someone's transcript.
 MAX_BRIEF_CHARS = 12_000
@@ -118,6 +123,9 @@ class Verdict:
     findings: list[Finding] = field(default_factory=list)
     criteria: list[dict] = field(default_factory=list)
     facts: dict = field(default_factory=dict)
+    # Where the run's time and tokens went (pipeline.metrics).  Kept out of
+    # to_dict: it never takes part in the grade.
+    metrics: dict = field(default_factory=dict)
 
     def add(self, code: str, severity: str, message: str) -> None:
         # One finding per fact: a checker that wrote the plan twice is one
@@ -180,11 +188,14 @@ def _check_brief(v: Verdict, stage: str, t: Transcript, builder_lines: list[str]
               f"report; a checker judges from the code and the artifacts, not from the builder's account")
 
 
-def grade_run(run_dir: Path) -> Verdict:
+def grade_run(run_dir: Path, *, prices: dict | None = None) -> Verdict:
     """Compute the verdict for the run in *run_dir* from the engine's records.
 
     Reads ``run.json``, the stage files, the evidence folder, the working tree
     and the CLI transcripts under ``~/.claude/projects``; writes nothing.
+    The run's metrics (``pipeline.metrics``) are computed from the same
+    records into ``v.metrics``; *prices* (per-million-token, per model)
+    turns token counts into an API-equivalent cost.
     """
     v = Verdict()
     run_dir = run_dir.resolve()
@@ -312,7 +323,7 @@ def grade_run(run_dir: Path) -> Verdict:
     history = _attest_history(run_dir, lenient_calls)
     # Every checker stage that exists counts here, whatever the depth: a review
     # written at light depth is optional, but its BLOCKING findings are not.
-    stage_last = _check_checker_sequence(v, run_dir, everything, CHECKER_STAGES_FULL, history)
+    stage_last, stage_last_writer = _check_checker_sequence(v, run_dir, everything, CHECKER_STAGES_FULL, history)
 
     # 5. The verification plan and its executions.
     try:
@@ -361,6 +372,10 @@ def grade_run(run_dir: Path) -> Verdict:
               f"a shell command touched the decisions folder outside the pipeline programs: {c.command[:120]!r}")
     # When each piece of evidence the grade relies on was produced.
     evidence_times: list[datetime] = []
+    # What the register (pipeline.findings) may cite: criteria whose current
+    # evidence passed, was recorded, and ran on this tree with this plan.
+    passed_now: set[str] = set()
+    stale: dict[str, str] = {}
     for crit in criteria:
         entry = {"id": crit.id, "required": crit.required, "executable": crit.executable, "status": "unknown"}
         v.criteria.append(entry)
@@ -415,6 +430,14 @@ def grade_run(run_dir: Path) -> Verdict:
         _check_decision(v, run_dir, run, crit.id, rec, sha, shell_calls)
         if rec.get("passed"):
             entry["status"] = "passed"
+            if rec.get("fingerprint") != now_fp:
+                stale[crit.id] = f"its evidence ran on an earlier tree ({str(rec.get('fingerprint'))[:12]}), not the final one"
+            elif rec.get("plan_sha") != plan_sha:
+                stale[crit.id] = "the plan changed after its evidence was produced"
+            elif not rec.get("tree_stable", True):
+                stale[crit.id] = "it changed the working tree while it ran"
+            else:
+                passed_now.add(crit.id)
         else:
             entry["status"] = "failed"
             entry["exit_code"] = rec.get("exit_code")
@@ -434,6 +457,22 @@ def grade_run(run_dir: Path) -> Verdict:
                 continue
             _check_decision(v, run_dir, run, c.id, brec, evidence_sha(bp), shell_calls, baseline=True)
     _check_commits(v, run_dir, run, repo)
+
+    # 5b. The register: planned scenarios and suspected defects, each settled
+    # by evidence or disclosed (pipeline.findings).
+    view = findings_mod.EvidenceView(
+        criteria={c.id: c for c in criteria}, passed_now=passed_now,
+        red=_red_runs(run_dir, criteria, now_fp, shell_calls),
+        baseline_ok=set(v.facts.get("baseline_demonstrated") or []), stale=stale)
+    outcomes = _check_register(v, run_dir, plan_src, stage_last, stage_last_writer, history, view, everything)
+    v.facts["register"] = [asdict(o) for o in outcomes]
+    v.facts["verification"] = {
+        "criteria_passed": sum(1 for c in v.criteria if c["status"] == "passed"),
+        "criteria_total": len(v.criteria),
+        "on_final_tree": sorted(passed_now),
+    }
+    v.facts["outcome"] = {k: sorted(o.id for o in outcomes if o.state == k)
+                          for k in ("verified", "fixed", "not-a-defect", "unresolved", "open", "invalid")}
     # The audit is the last judgment, so it must postdate the evidence it
     # judged.  Together with the fingerprint check (the tree has not changed
     # since that evidence) this binds the audit to the final code by content:
@@ -455,9 +494,42 @@ def grade_run(run_dir: Path) -> Verdict:
         if not m or len(re.sub(r"\s+", " ", answer).strip()) < 40:
             v.add("fourth-question", "medium",
                   "08-audit.md does not answer 'what could still be wrong that no check would catch?'")
-        _check_coverage(v, text, criteria)
+        _check_coverage(v, text, criteria, [o.id for o in outcomes])
 
     v.facts["graded_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        # Timing only: any recorded call that ran pipeline.start and printed
+        # this run's line marks the start (a chained prefix does not matter
+        # here, unlike for the start line's fields).
+        start_call = next((c for c in root.calls_named("Bash", "PowerShell")
+                           if "pipeline.start" in c.command.replace("/", ".")
+                           and f"PIPELINE-RUN nonce={nonce}" in c.output), None)
+        writers: dict[str, list[str]] = {}
+        for t in subs:
+            for c in t.calls_named("Write", "Edit", "MultiEdit"):
+                m = metrics_mod.STAGE_FILE_RE.search(c.file_path.replace("\\", "/"))
+                if m and same_file(Path(c.file_path).parent, run_dir):
+                    writers.setdefault(t.agent_id, [])
+                    if m.group(1) not in writers[t.agent_id]:
+                        writers[t.agent_id].append(m.group(1))
+        # The run ends at its last recorded step: every pipeline command and
+        # every stage write names the run directory.  A session that went on
+        # to other work afterwards does not stretch the run.
+        # The ledger row is the documented last step; a later re-grade in the
+        # same session is not part of the run's time.
+        steps = [c.timestamp for t in everything for c in t.calls
+                 if c.timestamp and (_names_run(c.command, run_dir)
+                                     or (c.file_path and same_file(Path(c.file_path).parent, run_dir)))]
+        ledger_steps = [c.timestamp for c in root.calls_named("Bash", "PowerShell")
+                        if c.timestamp and is_pipeline_call(c.command, "ledger") and _names_run(c.command, run_dir)]
+        steps = ledger_steps[:1] or steps
+        v.metrics = metrics_mod.collect(root, subs, start_at=start_call.timestamp if start_call else "",
+                                        end_at=max(steps, key=lambda s: _parse_ts(s) or datetime.min.replace(
+                                            tzinfo=timezone.utc)) if steps else "",
+                                        register=v.facts.get("register"), prices=prices, writers=writers,
+                                        belongs=lambda cmd: not _names_other_run(cmd, run_dir))
+    except Exception as e:  # noqa: BLE001 - instrumentation must never change or block a grade
+        v.facts["metrics_error"] = f"{type(e).__name__}: {e}"
     return v.finish()
 
 
@@ -818,12 +890,37 @@ def _attest_history(run_dir: Path, shell_calls) -> dict[str, list[dict]]:
 
 # ── the rest of the checks ───────────────────────────────────────────────────
 
-def _check_coverage(v: Verdict, audit_text: str, criteria) -> None:
+def _red_runs(run_dir: Path, criteria, now_fp: str, shell_calls) -> dict[str, list[dict]]:
+    """Recorded FAILING executions of each criterion on an earlier tree: the
+    "before" half of a FIXED disposition.  A history file counts only when a
+    recorded run_check call printed its sha (so a hand-written failure is not
+    one), it ran the command the plan has now, exited non-zero without timing
+    out, and ran on a tree other than the final one."""
+    out: dict[str, list[dict]] = {}
+    for c in criteria:
+        if not c.covers_ids():
+            continue
+        for path, rec in history_records(run_dir, c.id):
+            needle = f"{EVIDENCE_PREFIX} id={c.id} sha={evidence_sha(path)}"
+            if not any(needle in call.output and is_run_check_call(call.command) for _t, call in shell_calls):
+                continue
+            if rec.get("passed") or rec.get("timed_out") or rec.get("exit_code") in (0, None):
+                continue
+            if rec.get("cmd") != c.cmd or rec.get("fingerprint") == now_fp:
+                continue
+            out.setdefault(c.id, []).append({"fingerprint": rec.get("fingerprint"), "started": rec.get("started"),
+                                             "exit_code": rec.get("exit_code")})
+    return out
+
+
+def _check_coverage(v: Verdict, audit_text: str, criteria, register_ids=()) -> None:
     """Require the audit to judge whether the checks prove the request.
 
     The section is the text under a heading containing "checks prove the
     request", up to the next heading.  It must name every required criterion
-    by id (the audit went criterion by criterion, not one blanket sentence) and
+    by id (the audit went criterion by criterion, not one blanket sentence),
+    every id in the register (each planned scenario and each finding, so the
+    audit has to say whether the check cited for it really exercises it), and
     end in ``Verdict: covered`` or ``Verdict: not covered``.  Anything short of
     an explicit "covered" caps the grade at MEDIUM."""
     m = COVERAGE_RE.search(audit_text)
@@ -840,6 +937,11 @@ def _check_coverage(v: Verdict, audit_text: str, criteria) -> None:
     if missing:
         v.add("coverage", "medium",
               f"the coverage section does not account for criterion {', '.join(missing)}")
+    unnamed = [i for i in register_ids if not re.search(rf"(?<![\w-]){re.escape(i)}(?![\w-])", section)]
+    if unnamed:
+        v.add("coverage", "medium",
+              f"the coverage section does not account for scenario or finding {', '.join(sorted(unnamed))}; the "
+              f"audit judges whether the evidence cited for each really exercises it")
     verdict = COVERAGE_VERDICT_RE.search(section)
     if not verdict:
         v.add("coverage", "medium",
@@ -1053,51 +1155,103 @@ def _check_checker_sequence(v: Verdict, run_dir: Path, everything, checker_stage
     for a, b in zip(present, present[1:]):
         if last[a] > last[b]:
             v.add("stage-order", "medium", f"{a} was last written after {b}; the checkers run in order")
+    return last, last_writer
+
+
+def _check_register(v: Verdict, run_dir: Path, plan_src: Path | None, last: dict, last_writer: dict,
+                    history: dict[str, list[dict]], view: findings_mod.EvidenceView,
+                    everything) -> list[findings_mod.Outcome]:
+    """Every planned scenario and every suspected defect reaches a disposition
+    the evidence supports (``pipeline.findings``).
+
+    A finding is settled only by a LATER checker stage than the one that
+    raised it (or, for the last stage, by a fresh checker that signed the
+    current version and never signed one carrying the finding).  Findings an
+    earlier signed version carried do not vanish with a rewrite.  A scenario
+    may be settled by any checker stage, or by a passing check that covers it.
+    Anything open, unresolved or settled without valid evidence caps the
+    grade at MEDIUM, with the reason named."""
+    stages = CHECKER_STAGES_FULL
+    order = {s: i for i, s in enumerate(stages)}
     texts = {s: (run_dir / s).read_text(encoding="utf-8", errors="replace")
-             for s in checker_stages if (run_dir / s).is_file()}
-    order = {s: i for i, s in enumerate(checker_stages)}
-    resolved_in = {s: set(RESOLVED_RE.findall(t)) for s, t in texts.items()}
-    for s, text in texts.items():
-        for fid in BLOCKING_RE.findall(text):
-            cleared = any(fid in resolved_in[s2] for s2 in texts
-                          if s2 != s and last.get(s2) and last.get(s) and last[s2] > last[s])
-            if not cleared:
-                v.add("finding-unresolved", "medium",
-                      f"{s} raised BLOCKING: {fid}, and no later checker stage records RESOLVED: {fid}")
-    # Findings an earlier signed version carried do not vanish with a rewrite.
+             for s in stages if (run_dir / s).is_file()}
+    disps = {s: findings_mod.dispositions_in(t, s) for s, t in texts.items()}
+    entries: dict[str, findings_mod.Entry] = {}
+    if plan_src is not None and plan_src.is_file():
+        plan_text = plan_src.read_text(encoding="utf-8", errors="replace")
+        for e in findings_mod.scenarios_in(plan_text, plan_src.name):
+            entries[e.id] = e
+        # A scenario the plan once named cannot silently leave it: every
+        # SCENARIO id a recorded file tool ever wrote into the plan counts.
+        for _t, c in writers_of(everything, plan_src):
+            written = "\n".join(str(x) for x in (c.input.get("content"), c.input.get("new_string"),
+                                                  *[(ed or {}).get("new_string") for ed in (c.input.get("edits") or [])
+                                                    if isinstance(ed, dict)]) if x)
+            for e in findings_mod.scenarios_in(written, plan_src.name):
+                if e.id not in entries:
+                    v.add("obligation-dropped", "medium",
+                          f"scenario {e.id} was written into {plan_src.name} during the run and is gone now; a "
+                          f"planned scenario is settled by a disposition, not removed")
+    for s in stages:
+        for e in findings_mod.findings_in(texts.get(s, ""), s):
+            if e.id not in entries or entries[e.id].kind == "scenario":
+                entries[e.id] = e
+        for line in findings_mod.unstructured_observations(texts.get(s, "")):
+            v.add("observation-unstructured", "medium",
+                  f"{s}: {line[:120]!r} labels an observation non-blocking outside the structured forms; record it "
+                  f"as FINDING: <id> (a correctness concern) or NOTE: <id> (cosmetic, optional, a preference)")
+    raisers: dict[str, set] = {}
     for s, recs in (history or {}).items():
         if s not in order:
             continue
-        open_now = set(BLOCKING_RE.findall(texts.get(s, "")))
-        for fid in sorted({f for r in recs for f in (r.get("blocking") or [])}):
-            if fid in open_now:
-                continue
-            raisers = {r.get("agent") for r in recs if fid in (r.get("blocking") or [])}
-            cleared = any(fid in resolved_in.get(s2, set()) for s2 in texts if order.get(s2, -1) > order[s])
-            # The last stage (the audit) has no later stage.  A FRESH checker
-            # rewriting the same stage may clear it: a different subagent from
-            # every one that signed a version carrying the finding.
-            # The fresh checker must also be the one that SIGNED the current
-            # version: otherwise the raising auditor writes its own RESOLVED,
-            # has any other subagent re-Write the same text, and attests it
-            # itself (found by the Review Team, loop 3).
-            if not cleared and fid in resolved_in.get(s, set()):
-                writer = last_writer.get(s)
-                current = _file_sha(run_dir / s)
-                signers_now = {r.get("agent") for r in recs if r.get("sha") == current and r.get("agent")}
-                cleared = (bool(writer) and writer != "root" and writer not in raisers
-                           and writer in signers_now and not (signers_now & raisers))
-            if not cleared:
-                v.add("finding-dropped", "medium",
-                      f"{s} raised BLOCKING: {fid} in an earlier attested version; it is neither open now nor "
-                      f"RESOLVED: {fid} by a later checker stage")
-    return last
+        for r in recs:
+            for fid in r.get("blocking") or []:
+                raisers.setdefault(fid, set()).add(r.get("agent"))
+                if fid not in entries:
+                    entries[fid] = findings_mod.Entry(fid, "finding", s, "(raised in an earlier signed version)",
+                                                      dropped=True)
+
+    def eligible(e: findings_mod.Entry) -> list:
+        out = []
+        for s2 in stages:
+            for d in disps.get(s2, []):
+                if d.id != e.id:
+                    continue
+                if e.kind == "scenario":
+                    out.append(d)
+                elif order[s2] > order.get(e.stage, -1):
+                    if last.get(s2) and last.get(e.stage) and not last[s2] > last[e.stage]:
+                        continue  # written before the stage that raised it
+                    out.append(d)
+                elif s2 == e.stage and e.dropped:
+                    # The last stage (the audit) has no later stage.  A FRESH
+                    # checker rewriting the same stage may settle it: one that
+                    # signed the current version, when no raiser did (else the
+                    # raising auditor launders its own verdict through a
+                    # stooge that re-Writes the text; Review, loop 3).
+                    recs = (history or {}).get(s2, [])
+                    writer = last_writer.get(s2)
+                    current = _file_sha(run_dir / s2)
+                    signers_now = {r.get("agent") for r in recs if r.get("sha") == current and r.get("agent")}
+                    who = raisers.get(e.id, set())
+                    if writer and writer != "root" and writer not in who and writer in signers_now \
+                            and not (signers_now & who):
+                        out.append(d)
+        return out
+
+    outcomes = [findings_mod.evaluate(e, eligible(e), view) for e in entries.values()]
+    for o in outcomes:
+        if o.code:
+            v.add(o.code, "medium", o.message)
+    return outcomes
 
 
 def write_verdict(run_dir: Path, v: Verdict) -> Path:
     """Write ``verdict.json`` into the run directory."""
     p = run_dir / "verdict.json"
     p.write_text(json.dumps(v.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+    if v.metrics:
+        (run_dir / "metrics.json").write_text(json.dumps(v.metrics, indent=2, sort_keys=True), encoding="utf-8")
     return p
 
 
@@ -1108,9 +1262,19 @@ def format_verdict(v: Verdict) -> str:
         lines.append(f"depth: {v.facts['depth']}  tree: {str(v.facts.get('fingerprint', ''))[:12]}")
     passed = sum(1 for c in v.criteria if c["status"] == "passed")
     if v.criteria:
+        # Verification status: did the prescribed checks run, with valid evidence?
         lines.append(f"criteria: {passed}/{len(v.criteria)} passed on the final tree")
         for c in v.criteria:
             lines.append(f"  - {c['id']}: {c['status']}")
+    reg = v.facts.get("register") or []
+    if reg:
+        # Outcome confidence: did the evidence settle every planned scenario and
+        # every suspected defect?  Anything not settled is named here.
+        counts = {k: len(ids) for k, ids in (v.facts.get("outcome") or {}).items() if ids}
+        lines.append(f"register: {len(reg)} item(s): " + ", ".join(f"{n} {k}" for k, n in counts.items()))
+        for o in reg:
+            by = f" by {','.join(o['by'])}" if o.get("by") else ""
+            lines.append(f"  - {o['id']} ({o['kind']}): {o['state']}{by}")
     if v.findings:
         lines.append("findings:")
         for f in v.findings:
@@ -1127,10 +1291,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--expect", choices=GRADES, default=None, help="exit 1 unless the grade is this")
     a = ap.parse_args(argv)
     run_dir = Path(a.run_dir)
-    v = grade_run(run_dir)
+    v = grade_run(run_dir, prices=metrics_mod.load_prices(None))
     if run_dir.is_dir():
         write_verdict(run_dir, v)
     print(json.dumps(v.to_dict(), indent=2) if a.json else format_verdict(v))
+    if v.metrics and not a.json:
+        print(metrics_mod.format_metrics(v.metrics))
     if a.expect and v.grade != a.expect:
         return 1
     return 0

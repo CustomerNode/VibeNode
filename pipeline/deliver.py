@@ -66,6 +66,11 @@ def deliver(run_dir: Path, *, request: str | None = None, decision: str | None =
         "how": "grade" if v.grade == "HIGH" else "",
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "findings": [f.code for f in v.findings if f.severity != "info"],
+        # Every planned scenario or suspected defect the evidence did not
+        # settle travels with the delivery record, whatever the grade.
+        "unsettled": [{"id": o["id"], "kind": o["kind"], "state": o["state"], "text": o.get("text", "")}
+                      for o in (v.facts.get("register") or []) if o["state"] not in ("verified", "fixed",
+                                                                                     "not-a-defect")],
     }
     if v.grade != "HIGH" and v.grade != "BLOCKED":
         if decision:

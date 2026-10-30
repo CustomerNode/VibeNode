@@ -21,6 +21,9 @@ Risk signals are a short list of things an added or removed line can do that
 the file count cannot see: run a shell, swallow an exception, skip a test,
 remove an assertion or an access check, disable TLS, inject raw HTML.  One hit
 is full depth.  A pure rename (identical content) does not count toward size.
+A comment line counts only for a suppressed check, and a test file does not
+count for signals about production capabilities (a subprocess, a thread, an
+HTML or SQL fixture); whatever weakens the tests themselves still counts.
 
 The harness recomputes the depth at grading time; the stages required are the
 ones the diff demands, whatever an agent wrote in ``run.json``.  A checker that
@@ -243,12 +246,46 @@ def diff_lines(repo: Path, base_rev: str) -> tuple[list[tuple[str, str]], list[t
     return added, removed
 
 
+# A comment line describes code; it does not run.  Only the "suppressed check"
+# signal lives in comments (``# noqa``, ``eslint-disable``), so it is the one
+# label still read there.
+_COMMENT_RE = re.compile(r"^\s*(?:#|//|/\*|\*|<!--)")
+_COMMENT_LABELS = ("suppressed check",)
+# Signals about what PRODUCTION code can do.  In a test file, a subprocess, a
+# thread, an ``innerHTML`` fixture or a ``DROP TABLE`` string is how the test
+# exercises the code, not a new capability of the product.  Everything that
+# weakens the tests themselves (a skip, a suppressed check, a swallowed
+# exception, a removed assertion or test) and every credential literal and
+# destructive command still counts in a test file.
+_TEST_EXEMPT_LABELS = ("shell execution", "process execution", "dynamic code execution", "concurrency",
+                       "raw HTML injection", "TLS verification disabled", "schema change")
+_TEST_DIRS = ("tests", "test", "__tests__", "spec", "specs")
+_TEST_NAME_RE = re.compile(r"^(?:test_.*\.py|.*_test\.py|.*\.(?:test|spec)\.[cm]?[jt]sx?)$")
+
+
+def is_test_file(rel: str) -> bool:
+    """A test file by location or name.  ``conftest.py`` steers every test
+    and is NOT one: its changes are scanned like production code."""
+    parts = rel.replace("\\", "/").split("/")
+    if parts[-1] == "conftest.py":
+        return False
+    return any(p in _TEST_DIRS for p in parts[:-1]) or _TEST_NAME_RE.match(parts[-1]) is not None
+
+
 def risk_signals(added: list[tuple[str, str]], removed: list[tuple[str, str]]) -> list[str]:
-    """One reason per (file, label): the first line that showed it."""
+    """One reason per (file, label): the first line that showed it.  Comment
+    lines count only for suppressed checks, and test files do not count for
+    signals about production capabilities (``_TEST_EXEMPT_LABELS``)."""
     seen: dict[tuple[str, str], str] = {}
     prev_file, prev_except = "", False
     for f, line in added:
+        comment = _COMMENT_RE.match(line) is not None
+        test = is_test_file(f)
         for rx, label in ADDED_RISK:
+            if comment and label not in _COMMENT_LABELS:
+                continue
+            if test and label in _TEST_EXEMPT_LABELS:
+                continue
             if rx.search(line):
                 seen.setdefault((f, label), line.strip())
         # A two-line swallowed exception: ``except …:`` then ``pass``.

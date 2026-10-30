@@ -3,7 +3,7 @@ id: test-team
 name: Test Team
 department: compose
 source: vibenode
-version: 2.0.1
+version: 2.1.0
 depends_on: []
 type: prompt-template
 ---
@@ -41,7 +41,7 @@ Run as a coordinated team. Each role tests from their lane, but findings feed in
 Every Test Team run checks:
 
 ### Full suite — mandatory, every run
-- **Under Code Pipeline (and Execute Pipeline, its alias), run every criterion through `python -m pipeline.run_check <run-dir> <criterion-id>`, never by hand** (see `code-pipeline.md`): only a run_check execution counts as evidence there, and the harness, not this report, decides the grade. The rules below still apply to what you run.
+- **Under Code Pipeline (and Execute Pipeline, its alias), run every criterion through `python -m pipeline.run_check <run-dir> <criterion-id>`, never by hand** (see `code-pipeline.md`): only a run_check execution counts as evidence there, and the harness, not this report, decides the grade. For each `FINDING:` an earlier checker raised, settle it in `04-test.md` with a check whose plan entry says `covers: <id>` (the builder adds that check to the plan and runs it through run_check once on the defective tree before fixing, so its failure is the "before" evidence; a checker never edits the plan), run it on the final tree, and record `FIXED: <id> by=<criterion>`; record `NOT-A-DEFECT: <id> by=<criterion>` only when a covering check exercises the suspected failure and passes; otherwise `UNRESOLVED: <id> <what is unknown>`. The rules below still apply to what you run.
 - Run the project's own full test command in the foreground: the one its publish, CI or release step runs (CLAUDE.md, README, CI config, `package.json` scripts, `Makefile`, `pyproject.toml`, ...). Never use another project's command. For VibeNode it is `python -m pytest --tb=short -q --no-header --timeout=120 -n 8 --dist loadfile tests/` (several minutes; allow a 10-minute timeout). If the project has none, say so, run the strongest available substitute, and confidence cannot be HIGH.
 - Run it on the FINAL code: after the last code change. If code changes after your run (a fix from a later stage included), the run is void and the suite is run again.
 - Paste its final summary line verbatim in the report (passed / failed / skipped counts and exit code). Running only new or nearby tests does not satisfy this.

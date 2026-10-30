@@ -17,10 +17,12 @@ is NOW (a report changed after the checker signed it is not the checker's
 report), and whose ``fingerprint`` is the tree as it is NOW (a Review that
 examined an earlier tree has not reviewed the final code).
 
-The line also carries every ``BLOCKING:`` id the report held when it was
-signed (the attest record file keeps them too, but the printed line is the
-record an agent cannot delete), so a finding cannot disappear by rewriting
-the report: it is either still open or ``RESOLVED:`` by a later checker.
+The line also carries every accountable finding id the report held when it
+was signed (``FINDING:``/``BLOCKING:`` lines and a ``NOTE:`` worded as a
+correctness concern; the attest record file keeps them too, but the printed
+line is the record an agent cannot delete), so a finding cannot disappear by
+rewriting the report: it stays open until a later checker settles it with
+evidence (``pipeline.findings``).
 """
 
 from __future__ import annotations
@@ -33,18 +35,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from pipeline.evidence import EVIDENCE_DIR, _file_sha, load_run, tree_fingerprint
+from pipeline.findings import accountable_ids, dispositions_in
 from pipeline.plan import PlanError
 
 ATTEST_PREFIX = "PIPELINE-ATTEST"
 STAGE_NAME_RE = re.compile(r"^\d{2}-[a-z][a-z0-9-]*\.md$")
-BLOCKING_RE = re.compile(r"^[\s>*_-]*BLOCKING[\s*_]*:[\s*_]*([A-Za-z0-9][A-Za-z0-9_.-]*)", re.MULTILINE)
-RESOLVED_RE = re.compile(r"^[\s>*_-]*RESOLVED[\s*_]*:[\s*_]*([A-Za-z0-9][A-Za-z0-9_.-]*)", re.MULTILINE)
 
 
 def attest_line(rec: dict) -> str:
     """The one line ``attest`` prints; the harness parses exactly this.  The
     ``blocking=`` field appears only when the signed report carries findings
-    (ids never contain commas: see ``BLOCKING_RE``)."""
+    (ids never contain commas: see ``pipeline.findings.ID_PATTERN``)."""
     line = f"{ATTEST_PREFIX} stage={rec['stage']} sha={rec['sha']} fingerprint={rec['fingerprint']}"
     if rec.get("blocking"):
         line += " blocking=" + ",".join(rec["blocking"])
@@ -84,8 +85,10 @@ def attest_stage(run_dir: Path, stage: str, *, repo: Path | None = None) -> tupl
         "sha": _file_sha(target),
         "fingerprint": tree_fingerprint(repo),
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "blocking": sorted(set(BLOCKING_RE.findall(text))),
-        "resolved": sorted(set(RESOLVED_RE.findall(text))),
+        # Every id the report holds accountable: FINDING/BLOCKING lines and a
+        # NOTE worded as a correctness concern (pipeline.findings).
+        "blocking": accountable_ids(text),
+        "dispositions": [f"{d.kind}:{d.id}" for d in dispositions_in(text, stage)],
         "run_id": run.get("run_id"),
         "recorder": "pipeline.attest",
     }
@@ -109,7 +112,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     print(attest_line(rec))
     if rec["blocking"]:
-        print(f"attest: {a.stage} carries BLOCKING: {', '.join(rec['blocking'])}; a later checker must RESOLVE each")
+        print(f"attest: {a.stage} carries findings {', '.join(rec['blocking'])}; a later checker settles each "
+              f"(FIXED or NOT-A-DEFECT with by=<criterion>, or UNRESOLVED)")
     return 0
 
 

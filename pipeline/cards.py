@@ -40,6 +40,18 @@ WORDS: dict[str, tuple[str, str, str]] = {
                             "No test was named as the one that fails without the change."),
     "finding-unresolved": ("A problem is unfixed", "A reviewer found a problem in \u201c{task}\u201d that isn't fixed.", "{detail}"),
     "finding-dropped": ("A problem went missing", "A reviewer's problem with \u201c{task}\u201d disappeared from the report.", "{detail}"),
+    # The register (pipeline.findings): a problem or a planned risk settled
+    # without proof, or not settled at all.
+    "resolution-unproven": ("A fix has no proof", "A problem in “{task}” was marked settled with nothing to show it.", "{detail}"),
+    "evidence-missing": ("Proof cites a missing check", "A problem in “{task}” cites a check that doesn't exist.", "{detail}"),
+    "evidence-unrelated": ("Proof cites the wrong check", "A problem in “{task}” cites a check that doesn't test it.", "{detail}"),
+    "evidence-stale": ("Proof from old code", "A problem in “{task}” was shown settled on an earlier version.", "{detail}"),
+    "fix-unproven": ("Unproven fix", "Nothing shows the problem in “{task}” existed before its fix.", "{detail}"),
+    "disposition-invalid": ("A problem closed wrongly", "A problem in “{task}” was closed with the wrong kind of answer.", "{detail}"),
+    "obligation-open": ("A risk was never checked", "A risk the plan for “{task}” named was never checked.", "{detail}"),
+    "obligation-unresolved": ("A risk is still open", "A risk the plan for “{task}” named is still unverified.", "{detail}"),
+    "obligation-dropped": ("A planned risk was removed", "A risk the plan for “{task}” named was taken out of it.", "{detail}"),
+    "observation-unstructured": ("A concern wasn't tracked", "A reviewer of “{task}” noted a concern without tracking it.", "{detail}"),
     "coverage": ("Checks don't cover the ask", "The checks don't cover all of \u201c{task}\u201d.", "{detail}"),
     "fourth-question": ("Audit incomplete", "The audit of \u201c{task}\u201d didn't say what the checks could miss.", "{detail}"),
     "stale-tree": ("Changed after checking", "\u201c{task}\u201d changed after it was checked.",
@@ -64,7 +76,9 @@ DEFAULT_WORDS = ("Not every check passed", "\u201c{task}\u201d didn't pass every
 PRIORITY = ("check-failed", "never-ran", "evidence-forged", "decision-forged", "evidence-unrecorded", "stage-tampered",
             "stage-unattested", "pipeline-impl-mismatch", "pipeline-impl-unknown", "plan-changed",
             "unauthorized", "committed-before-delivery", "finding-unresolved", "finding-dropped",
-            "unexecuted", "baseline-passed", "baseline-unrelated", "baseline-missing", "no-change-detection",
+            "fix-unproven", "resolution-unproven", "evidence-missing", "evidence-unrelated", "evidence-stale",
+            "disposition-invalid", "obligation-unresolved", "obligation-open", "obligation-dropped",
+            "observation-unstructured", "unexecuted", "baseline-passed", "baseline-unrelated", "baseline-missing", "no-change-detection",
             "no-suite", "coverage", "stale-tree", "checker-stale", "self-graded", "fourth-question")
 ACTIONS = {"commit": "Commit", "push": "Push", "merge": "Merge", "deploy": "Deploy", "package": "Package"}
 MAX_TITLE = 32

@@ -44,6 +44,11 @@ Coverage keys:
   demonstration applies (config only, documentation, no observable behavior).
   It does not cap the grade by itself; the independent audit must name it in
   its coverage section and still judge the request covered.
+* ``covers: <id>[, <id>]`` names the planned scenarios (``SCENARIO:`` lines in
+  the plan file) and checker findings (``FINDING:``) this check exercises.
+  It is the structured link ``pipeline.findings`` requires before a
+  disposition may cite the check as evidence; a pinned project check covers
+  nothing specific and may not declare it.
 
 ``run_check`` records the SHA-256 of the block it read into every evidence
 file, and the harness compares that with the block on disk at grading time,
@@ -108,9 +113,14 @@ class Criterion:
     baseline_files: str = ""
     waiver: bool = False
     pinned: bool = False
+    covers: str = ""
 
     def baseline_globs(self) -> list[str]:
         return [g.strip() for g in self.baseline_files.split(",") if g.strip()]
+
+    def covers_ids(self) -> list[str]:
+        """The scenario and finding ids this check exercises (``covers:``)."""
+        return [x.strip() for x in self.covers.split(",") if x.strip()]
 
 
 class PlanError(ValueError):
@@ -144,7 +154,7 @@ def _value(raw: str):
 
 
 KNOWN_KEYS = frozenset({"id", "cmd", "expect", "required", "executable", "reason", "cwd", "timeout", "suite",
-                        "detects_change", "fails_with", "baseline_files", "waiver"})
+                        "detects_change", "fails_with", "baseline_files", "waiver", "covers"})
 
 
 def check_pinnable(crits: list[Criterion]) -> None:
@@ -155,6 +165,9 @@ def check_pinnable(crits: list[Criterion]) -> None:
         if c.waiver or not c.executable:
             raise PlanError(f"pinned criterion {c.id!r} must be executable and cannot be waived; "
                             f"a project's mandatory checks always run")
+        if c.covers:
+            raise PlanError(f"pinned criterion {c.id!r} declares covers; a project-wide check is not evidence "
+                            f"for one scenario or finding (the run's plan names a specific check)")
 
 
 def parse_criteria(block: str) -> list[Criterion]:
@@ -216,6 +229,13 @@ def parse_criteria(block: str) -> list[Criterion]:
                     raise PlanError(f"verification {cid}: timeout must be an integer") from None
             elif k in ("cmd", "expect", "reason", "cwd", "fails_with", "baseline_files"):
                 setattr(c, k, str(v))
+            elif k == "covers":
+                ids = [x.strip() for x in str(v).split(",") if x.strip()]
+                bad = [x for x in ids if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", x)]
+                if not ids or bad:
+                    raise PlanError(f"verification {cid}: covers is a comma-separated list of scenario or "
+                                    f"finding ids ({', '.join(bad) or 'empty'})")
+                c.covers = ",".join(ids)
         if c.executable and not c.cmd:
             raise PlanError(f"verification {cid}: executable but has no cmd")
         if not c.executable and not c.reason:

@@ -37,6 +37,7 @@ from pipeline.plan import Criterion, PlanError, load_plan
 
 RUNS_SUBDIR = Path("docs") / "plans" / "runs"
 EVIDENCE_DIR = "evidence"
+HISTORY_DIR = "history"  # every execution of a criterion, under evidence/
 EVIDENCE_PREFIX = "PIPELINE-EVIDENCE"
 # Characters of stdout and of stderr kept in the evidence file.  Enough for a
 # full pytest failure section; the transcript holds the rest.
@@ -685,4 +686,28 @@ def run_criterion(run_dir: Path, cid: str, *, repo: Path | None = None,
     path = edir / f"{c.id}.json"
     data = json.dumps(record, indent=2, sort_keys=True).encode("utf-8")
     path.write_bytes(data)
+    # Keep every execution, byte-identical, under its own name: ``<id>.json``
+    # is overwritten by the next run, and a FIXED disposition needs the run
+    # that FAILED before the fix (pipeline.findings).  The harness accepts a
+    # history file only when a recorded run_check line carries its sha.
+    hist = edir / HISTORY_DIR
+    hist.mkdir(exist_ok=True)
+    (hist / f"{c.id}.{hashlib.sha256(data).hexdigest()[:16]}.json").write_bytes(data)
     return record, path
+
+
+def history_records(run_dir: Path, cid: str) -> list[tuple[Path, dict]]:
+    """Every archived execution of *cid* (``evidence/history/<id>.<sha>.json``),
+    unordered; unreadable files are skipped (the harness verifies each one
+    against the transcript before using it)."""
+    hist = run_dir / EVIDENCE_DIR / HISTORY_DIR
+    out = []
+    if not hist.is_dir():
+        return out
+    for p in hist.glob(f"{cid}.*.json"):
+        if p.name[len(cid) + 1:-5].isalnum():
+            try:
+                out.append((p, json.loads(p.read_text(encoding="utf-8"))))
+            except ValueError:
+                continue
+    return out

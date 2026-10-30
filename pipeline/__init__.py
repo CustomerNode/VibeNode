@@ -14,7 +14,12 @@ Commands (all ``python -m pipeline.<name>``):
 * ``escalate``   a checker demands full depth, for good;
 * ``harness``    compute the grade for a run from the engine's own records;
 * ``deliver``    the delivery gate: recompute the grade, refuse below HIGH;
-* ``ledger``     append the finished run to ``LEDGER.md`` with a recomputed grade.
+* ``ledger``     append the finished run to ``LEDGER.md`` with a recomputed grade;
+* ``metrics``    where the run's time and tokens went, per stage, and why any
+                 check ran more than once (the harness writes it too).
+
+``findings`` is the register the harness enforces: every planned scenario
+and every suspected defect is settled by a check that covers it, or disclosed.
 
 Nothing here imports ``app`` or ``daemon``; the package is usable from any
 repository.

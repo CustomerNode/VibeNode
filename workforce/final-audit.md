@@ -3,7 +3,7 @@ id: final-audit
 name: Final Audit
 department: compose
 source: vibenode
-version: 1.4.1
+version: 1.5.0
 depends_on: []
 type: prompt-template
 ---
@@ -75,7 +75,7 @@ INSTRUCTIONS:
 - Be skeptical. Do not rubber-stamp.
 - Trace the result from the user's actual goal through implementation to real behavior.
 - Review both the changed area and the blast radius around it.
-- Under Code Pipeline (and Execute Pipeline, its alias): follow `code-pipeline.md`. Record each material defect as `BLOCKING: <short-id> <what is wrong>`; a defect stops HIGH until a later checker stage records `RESOLVED: <short-id>`. Any change you make moves the tree, so every required criterion must run again through `pipeline.run_check` before grading; the harness flags evidence from the earlier tree as stale. The grade is the harness's, not yours.
+- Under Code Pipeline (and Execute Pipeline, its alias): follow `code-pipeline.md`. Record each suspected correctness defect as `FINDING: <short-id> <what is wrong>`; it stops HIGH until a later checker settles it with a covering check (`FIXED` / `NOT-A-DEFECT` with `by=<criterion>`) or it is disclosed `UNRESOLVED`. In the coverage section, name every SCENARIO and FINDING id and judge whether the check cited for it really exercises it; record `UNRESOLVED: <id> <why>` for a citation you cannot stand behind, and challenge consequential scenarios the plan never named. Any change you make moves the tree, so every required criterion must run again through `pipeline.run_check` before grading; the harness flags evidence from the earlier tree as stale. The grade is the harness's, not yours.
 - Invoked on its own: you may fix problems that are clear, low-risk, and unambiguous (typos, missing imports, obvious logic errors, dead code), directly related to the completed work. Any code you change voids earlier test runs: run the project's full test command again, and your own fixes are not independently checked, so list them; with code fixes applied, confidence cannot be HIGH.
 - For anything that requires a judgment call, changes user-facing behavior, or has broader risk — do not fix it. Explain it clearly and recommend the next action.
 - Only conclude success if the solution is genuinely sound as a whole.
