@@ -3,9 +3,14 @@ id: code-pipeline
 name: Code Pipeline
 department: compose
 source: vibenode
-version: 1.5.0
+version: 1.5.4
 depends_on: [plan-team, build-team, review-team, test-team, final-audit, debug-team, hotfix-team, refactor-team]
 type: prompt-template
+playbook: true
+playbook_line: Your code change, built, checked and graded
+playbook_what: Describe a change. It plans, builds, has fresh reviewers test it, and grades the result from what actually ran.
+playbook_say: code pipeline fix the sidebar search | code pipeline add a Standby filter
+playbook_how: Works out the kind of job: new feature, bug, urgent fix or cleanup. | Writes a plan that names the checks that will prove it works. | Builds the change. | Fresh reviewers and testers check the finished code, without the builder's notes. | A program grades it HIGH, MEDIUM or LOW from the checks that ran. | Asks you before new checks run and before committing anything below HIGH.
 ---
 
 # Code Pipeline

@@ -132,7 +132,10 @@
    'js/thread-scroll.js', 'js/thread-scroll-classic.js',
    // The publish dialog: a tab open since before a fix still titled a clash
    // "Security Issue" with nothing to press (2026-10-29).
-   'js/git-sync.js']
+   'js/git-sync.js',
+   // Settings: a tab open since before Playbooks was added showed the old
+   // Settings window with no Playbooks under Tools (2026-10-31).
+   'js/modals.js']
     .forEach(p => watch(p, 'reload', null));
 
   document.addEventListener('visibilitychange', () => {

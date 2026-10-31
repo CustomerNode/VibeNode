@@ -129,6 +129,7 @@ var _SX_ICONS = {
   'Mobile Command': '<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18h2"/>',
   'Bulk Operations': '<rect x="3" y="4" width="18" height="5" rx="1.5"/><rect x="3" y="15" width="18" height="5" rx="1.5"/><path d="M7 9v6M17 9v6"/>',
   'Keyboard Shortcuts': '<rect x="2.5" y="6" width="19" height="12" rx="2.5"/><path d="M6.5 10h.01M10 10h.01M13.5 10h.01M17 10h.01M7 14h10"/>',
+  'Playbooks': '<path d="M5 4h10a4 4 0 0 1 4 4v12H9a4 4 0 0 1-4-4z"/><path d="M10 9l4 2.5-4 2.5z"/>',
   'Recently Deleted': '<path d="M4 7h16M10 3h4M6 7l1 13h10l1-13M10 11v6M14 11v6"/>',
   'Recovery & Watchdog': '<path d="M3 12h4l2-5 4 10 2-5h6"/>',
   'Developer Tools': '<path d="M8 8l-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/>'
@@ -247,6 +248,94 @@ function openSettings(key) {
   overlay.classList.add('sx');
   _sxShow(want);
 }
+// --- Playbooks ---
+// Things VibeNode can run when you type their words (A/B test, Code Pipeline…).
+// The list is the workforce entries whose frontmatter says `playbook: true`
+// (served as `playbook` by /api/workforce/assets), so a new playbook shows up
+// here without editing this file.  Each row is one line until tapped; one is
+// open at a time.  Nothing here runs anything: Try it only fills the text box.
+var _PB_CHEV = '<svg class="pbk-chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>';
+function _pbRowHtml(a, i) {
+  var p = a.playbook || {};
+  var say = (p.say || []).map(function(s) {
+    return '<span class="pbk-say"><i>Say</i>' + _rwEsc(s) + '</span>';
+  }).join('');
+  return '<div class="pbk-row" data-pb="' + i + '">'
+    + '<button type="button" class="pbk-hd" aria-expanded="false">'
+    + '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + _SX_ICONS['Playbooks'] + '</svg>'
+    + '<span class="pbk-name">' + _rwEsc(a.name) + '</span>'
+    + '<span class="pbk-line">' + _rwEsc(p.line) + '</span>' + _PB_CHEV + '</button>'
+    + '<div class="pbk-bd"><div>'
+    + (p.what ? '<div class="pbk-what">' + _rwEsc(p.what) + '</div>' : '')
+    + '<div class="pbk-act">' + say
+    + ((p.say || []).length ? '<button type="button" class="pbk-try" data-say="' + _rwEsc(p.say[0]) + '">Try it</button>' : '')
+    + '</div>'
+    + (p.how ? '<button type="button" class="pbk-more">How it works</button><div class="pbk-how">' + _pbHowHtml(p.how) + '</div>' : '')
+    + '</div></div></div>';
+}
+// How it works: steps separated by '|' in the playbook's frontmatter, drawn as a numbered list.
+function _pbHowHtml(how) {
+  var steps = String(how).split('|').map(function(x) { return x.trim(); }).filter(Boolean);
+  if (steps.length < 2) return _rwEsc(steps[0] || '');
+  return '<ol class="pbk-steps">' + steps.map(function(x) { return '<li>' + _rwEsc(x) + '</li>'; }).join('') + '</ol>';
+}
+function _pbBodyHtml(assets) {
+  var list = (assets || []).filter(function(a) { return a && a.playbook; });
+  if (!list.length) {
+    var oldServer = (assets || []).length && !(assets || []).some(function(a) { return a && 'playbook' in a; });
+    return '<div class="rw-empty">' + (oldServer
+      ? 'The list loads after the web server restarts.'
+      : 'No playbooks yet.') + '</div>';
+  }
+  list.sort(function(a, b) { return String(a.name).localeCompare(String(b.name)); });
+  return '<div class="pbk">' + list.map(_pbRowHtml).join('') + '</div>';
+}
+function _pbTry(text) {
+  _closePm();
+  var ta = document.getElementById('live-input-ta') || document.getElementById('live-queue-ta');
+  if (!ta) { if (typeof showToast === 'function') showToast('Open a session, then type: ' + text); return; }
+  ta.value = text;
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  ta.focus();
+  try { ta.setSelectionRange(text.length, text.length); } catch (e) {}
+}
+function openPlaybooks() {
+  var overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+  overlay.innerHTML = '<div class="pm-card pm-enter pbk-card" style="width:620px;max-height:76vh;display:flex;flex-direction:column;">'
+    + '<h2 class="pm-title">Playbooks</h2>'
+    + '<div class="pm-body pbk-intro"><p>Type the words in any session to run one.</p></div>'
+    + '<div id="pbk-list" class="pbk-list" style="overflow:auto;flex:1;min-height:60px">'
+    + '<div class="rw-empty">Loading…</div></div>'
+    + '<div class="pm-actions"><button type="button" class="pm-btn pm-btn-secondary" onclick="_closePm()">Close</button></div>'
+    + '</div>';
+  overlay.classList.add('show');
+  requestAnimationFrame(function() { var c = overlay.querySelector('.pm-card'); if (c) c.classList.remove('pm-enter'); });
+  overlay.onclick = function(e) { if (e.target === overlay) _closePm(); };
+  var list = overlay.querySelector('#pbk-list');
+  list.addEventListener('click', function(e) {
+    var t = e.target.closest('button');
+    if (!t) return;
+    if (t.classList.contains('pbk-try')) { _pbTry(t.getAttribute('data-say') || ''); return; }
+    if (t.classList.contains('pbk-more')) { t.closest('.pbk-row').classList.toggle('how-open'); return; }
+    if (t.classList.contains('pbk-hd')) {
+      var row = t.parentNode, was = row.classList.contains('open');
+      list.querySelectorAll('.pbk-row.open').forEach(function(r) {
+        r.classList.remove('open', 'how-open');
+        r.querySelector('.pbk-hd').setAttribute('aria-expanded', 'false');
+      });
+      if (!was) { row.classList.add('open'); t.setAttribute('aria-expanded', 'true'); }
+    }
+  });
+  fetch('/api/workforce/assets').then(function(r) { return r.ok ? r.json() : null; }).then(function(d) {
+    if (!list.isConnected) return;
+    if (!d || !d.ok) { list.innerHTML = '<div class="rw-empty">Could not read the playbooks.</div>'; return; }
+    list.innerHTML = _pbBodyHtml(d.assets);
+  }).catch(function() {
+    if (list.isConnected) list.innerHTML = '<div class="rw-empty">Could not read the playbooks.</div>';
+  });
+}
+
 // --- Recovery & Watchdog (read-only) ---
 // Every VIBENODE_* behaviour switch the web server and the Session Engine
 // read, from GET /api/engine/knobs (app/engine_knobs.py), grouped as the

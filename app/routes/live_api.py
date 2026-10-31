@@ -1135,10 +1135,32 @@ def get_workforce_assets():
             "version": frontmatter.get('version'),
             "allowed_tools": frontmatter.get('allowed-tools'),
             "source": frontmatter.get('source'),
+            "playbook": _playbook_fields(frontmatter),
             "systemPrompt": body,
         })
 
     return jsonify({"ok": True, "assets": assets, "map": wf_map, "source": "disk"})
+
+
+def _playbook_fields(frontmatter):
+    """What Settings → Tools → Playbooks shows for a workforce entry, or None.
+
+    An entry is listed only when its frontmatter has ``playbook: true``.
+    ``playbook_say`` holds the words to type, separated by ``|`` (the simple
+    frontmatter parser splits ``[a, b]`` lists on commas, and these phrases
+    can contain commas).
+    """
+    if frontmatter.get('playbook') is not True:
+        return None
+    say = frontmatter.get('playbook_say') or ''
+    if isinstance(say, list):
+        say = ' | '.join(say)
+    return {
+        "line": frontmatter.get('playbook_line') or '',
+        "what": frontmatter.get('playbook_what') or '',
+        "say": [s.strip() for s in str(say).split('|') if s.strip()],
+        "how": frontmatter.get('playbook_how') or '',
+    }
 
 
 # ---------------------------------------------------------------------------
