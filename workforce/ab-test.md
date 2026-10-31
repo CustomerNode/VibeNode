@@ -3,7 +3,7 @@ id: ab-test
 name: A/B Test
 department: compose
 source: vibenode
-version: 1.2.0
+version: 1.2.1
 depends_on: []
 type: prompt-template
 playbook: true
@@ -11,6 +11,7 @@ playbook_line: Prompts and models compared side by side
 playbook_what: Runs each variant in its own new session, on the model you pick, and lays the answers side by side.
 playbook_say: a b test who is the president | a b test on opus, sonnet and haiku: summarize this
 playbook_how: Opens one new session per variant: A, B, C and on. | Sends each its prompt and model: the same for all, or one each. | Waits until every session has answered. | Lays the answers side by side with time, model and tools. | Says where they agree, where they differ, and which did better. | The sessions stay in your sidebar to open later.
+playbook_use: Use A/B test
 ---
 
 # A/B Test

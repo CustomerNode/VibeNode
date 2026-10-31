@@ -1160,6 +1160,8 @@ def _playbook_fields(frontmatter):
         "what": frontmatter.get('playbook_what') or '',
         "say": [s.strip() for s in str(say).split('|') if s.strip()],
         "how": frontmatter.get('playbook_how') or '',
+        # The short phrase Try it puts in front of the user's words ("Use A/B test:").
+        "use": frontmatter.get('playbook_use') or ('Use ' + str(frontmatter.get('name') or '')).strip(),
     }
 
 

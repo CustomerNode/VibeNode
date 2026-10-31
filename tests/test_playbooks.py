@@ -50,6 +50,7 @@ def test_server_lists_the_two_playbooks(assets):
     cp = books["code-pipeline"]
     assert cp["say"] and all(s.startswith("code pipeline ") for s in cp["say"])
     assert cp["what"] and "HIGH" in cp["how"]
+    assert ab["use"] == "Use A/B test" and cp["use"] == "Use code pipeline"
     # a glance, not a page: every entry stays short
     for b in books.values():
         assert len(b["line"].split()) <= 8 and len(b["what"].split()) <= 22 and all(len(st.split()) <= 14 for st in b["how"].split("|")) and 3 <= len(b["how"].split("|")) <= 6
@@ -66,16 +67,25 @@ def test_settings_menu_has_playbooks_under_tools():
     assert "openPlaybooks()" in tools
 
 
-def _page(payload):
+def _page(payload, box=True):
     style = (STATIC / "style.css").read_text(encoding="utf-8")
     modals = (STATIC / "js" / "modals.js").read_text(encoding="utf-8")
     return f"""<!doctype html><html data-theme="dark"><head><meta charset="utf-8">
 <style>{style}</style></head><body>
 <div id="hdr-sys"><div id="hdr-sys-dropdown"></div></div><div id="summary-overlay"></div>
 <div id="pm-overlay"></div>
-<textarea id="live-input-ta"></textarea>
+{'<textarea id="live-input-ta"></textarea>' if box else ''}
+<div id="new-home"></div>
 <script>
   window.__sent = 0;
+  window.__newSessions = 0;
+  // Stands in for the app's addNewAgent: a new session draws an empty text box.
+  window.addNewAgent = async () => {{
+    window.__newSessions++;
+    const old = document.getElementById('live-input-ta'); if (old) old.remove();
+    setTimeout(() => {{ const t = document.createElement('textarea'); t.id = 'live-input-ta';
+      document.getElementById('new-home').appendChild(t); }}, 120);
+  }};
   window.fetch = () => Promise.resolve({{ ok: true, json: () => Promise.resolve({payload}) }});
   function _closePm() {{ document.getElementById('pm-overlay').classList.remove('show'); }}
   function showToast() {{}}
@@ -112,15 +122,48 @@ def test_rows_fold_open_one_at_a_time_and_try_it_fills_the_box(browser, assets):
     rows.nth(1).locator(".pbk-hd").click()
     assert pg.locator(".pbk-row.open").count() == 0
 
-    ab = rows.filter(has_text="A/B Test")
-    ab.locator(".pbk-hd").click()
-    first = ab.locator(".pbk-say").first.inner_text().replace("Say", "", 1).strip()
-    ab.locator(".pbk-try").click()
-    assert pg.input_value("#live-input-ta") == first
     # How it works is a numbered list of short steps
-    assert pg.locator(".pbk-row").first.locator(".pbk-steps li").count() >= 3
-    assert "show" not in (pg.get_attribute("#pm-overlay", "class") or "")
+    assert rows.first.locator(".pbk-steps li").count() >= 3
     assert not errors
+
+
+def _open_ab(pg):
+    pg.evaluate("openPlaybooks()")
+    pg.wait_for_selector(".pbk-row")
+    ab = pg.locator(".pbk-row").filter(has_text="A/B Test")
+    ab.locator(".pbk-hd").click()
+    return ab
+
+
+def test_add_to_this_session_puts_the_phrase_before_what_was_typed(browser, assets):
+    pg = browser.new_page()
+    pg.set_content(_page(json.dumps({"ok": True, "assets": assets})))
+    pg.fill("#live-input-ta", "who is the president")
+    _open_ab(pg).locator('.pbk-try[data-where="here"]').click()
+    assert pg.input_value("#live-input-ta") == "Use A/B test: who is the president"
+    assert "show" not in (pg.get_attribute("#pm-overlay", "class") or "")
+    # a second tap does not add it twice, and nothing was sent or opened
+    _open_ab(pg).locator('.pbk-try[data-where="here"]').click()
+    assert pg.input_value("#live-input-ta") == "Use A/B test: who is the president"
+    assert pg.evaluate("window.__newSessions") == 0
+
+
+def test_new_session_opens_one_with_the_phrase_ready(browser, assets):
+    pg = browser.new_page()
+    pg.set_content(_page(json.dumps({"ok": True, "assets": assets})))
+    pg.fill("#live-input-ta", "text in the old session")
+    _open_ab(pg).locator('.pbk-try[data-where="new"]').click()
+    pg.wait_for_function("() => document.querySelector('#new-home #live-input-ta')")
+    pg.wait_for_function("() => document.querySelector('#new-home #live-input-ta').value")
+    assert pg.input_value("#new-home #live-input-ta") == "Use A/B test: "
+    assert pg.evaluate("window.__newSessions") == 1
+
+
+def test_add_to_this_session_is_off_without_an_open_session(browser, assets):
+    pg = browser.new_page()
+    pg.set_content(_page(json.dumps({"ok": True, "assets": assets}), box=False))
+    here = _open_ab(pg).locator('.pbk-try[data-where="here"]')
+    assert here.is_disabled()
 
 
 def test_an_old_web_server_says_the_list_needs_a_restart(browser):

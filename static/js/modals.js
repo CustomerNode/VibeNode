@@ -268,7 +268,10 @@ function _pbRowHtml(a, i) {
     + '<div class="pbk-bd"><div>'
     + (p.what ? '<div class="pbk-what">' + _rwEsc(p.what) + '</div>' : '')
     + '<div class="pbk-act">' + say
-    + ((p.say || []).length ? '<button type="button" class="pbk-try" data-say="' + _rwEsc(p.say[0]) + '">Try it</button>' : '')
+    + '<span class="pbk-tries">'
+    + '<button type="button" class="pbk-try" data-pb-use="' + _rwEsc(p.use || ('Use ' + a.name)) + '" data-where="new">New session</button>'
+    + '<button type="button" class="pbk-try" data-pb-use="' + _rwEsc(p.use || ('Use ' + a.name)) + '" data-where="here"' + (_pbBox() ? '' : ' disabled title="Open a session first"') + '>Add to this session</button>'
+    + '</span>'
     + '</div>'
     + (p.how ? '<button type="button" class="pbk-more">How it works</button><div class="pbk-how">' + _pbHowHtml(p.how) + '</div>' : '')
     + '</div></div></div>';
@@ -290,14 +293,36 @@ function _pbBodyHtml(assets) {
   list.sort(function(a, b) { return String(a.name).localeCompare(String(b.name)); });
   return '<div class="pbk">' + list.map(_pbRowHtml).join('') + '</div>';
 }
-function _pbTry(text) {
-  _closePm();
-  var ta = document.getElementById('live-input-ta') || document.getElementById('live-queue-ta');
-  if (!ta) { if (typeof showToast === 'function') showToast('Open a session, then type: ' + text); return; }
-  ta.value = text;
+function _pbBox() {
+  return document.getElementById('live-input-ta') || document.getElementById('live-queue-ta');
+}
+// Put the playbook's phrase ("Use A/B test: ") in front of what is in the box.
+// Nothing is sent: the person finishes the prompt and presses Send.
+function _pbFill(ta, use) {
+  var lead = use.replace(/[:\s]+$/, '') + ': ';
+  var cur = ta.value || '';
+  if (cur.toLowerCase().indexOf(lead.toLowerCase()) !== 0) ta.value = lead + cur.replace(/^\s+/, '');
   ta.dispatchEvent(new Event('input', { bubbles: true }));
   ta.focus();
-  try { ta.setSelectionRange(text.length, text.length); } catch (e) {}
+  try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch (e) {}
+}
+function _pbTry(use, where) {
+  _closePm();
+  if (where === 'here') {
+    var ta = _pbBox();
+    if (ta) { _pbFill(ta, use); return; }
+    if (typeof showToast === 'function') showToast('Open a session first');
+    return;
+  }
+  // A new session: open it, then fill its text box once it is drawn.
+  Promise.resolve(typeof addNewAgent === 'function' ? addNewAgent() : null).then(function() {
+    var tries = 0;
+    (function wait() {
+      var box = document.getElementById('live-input-ta');
+      if (box) { _pbFill(box, use); return; }
+      if (++tries < 40) setTimeout(wait, 50);
+    })();
+  });
 }
 function openPlaybooks() {
   var overlay = document.getElementById('pm-overlay');
@@ -316,7 +341,7 @@ function openPlaybooks() {
   list.addEventListener('click', function(e) {
     var t = e.target.closest('button');
     if (!t) return;
-    if (t.classList.contains('pbk-try')) { _pbTry(t.getAttribute('data-say') || ''); return; }
+    if (t.classList.contains('pbk-try')) { _pbTry(t.getAttribute('data-pb-use') || '', t.getAttribute('data-where')); return; }
     if (t.classList.contains('pbk-more')) { t.closest('.pbk-row').classList.toggle('how-open'); return; }
     if (t.classList.contains('pbk-hd')) {
       var row = t.parentNode, was = row.classList.contains('open');
