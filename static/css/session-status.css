@@ -106,3 +106,34 @@ svg.vs-ic.vs-done { color: var(--text-faint); }
 .vn-card[data-st="standby"] { --vs: 40, 190, 175; }
 [data-theme="light"] .vn-card[data-st="standby"] { --vs: 10, 135, 125; }
 .vn-card[data-st="standby"] .vn-st-ico, .vn-card[data-st="standby"] .vn-st-lbl { color: rgb(var(--vs)); }
+
+/* Status picker in the text box (owner's pick A, 2026-10-31,
+   static/scratch/status-picker.html): a stopped session's status line shows
+   Needs you / Standby / Done and opens a menu to change it (live-panel.js
+   _pickCardOpen / _togglePickMenu). */
+.vn-card[data-st="needs"], .vn-pick-mi[data-st="needs"] { --vs: 255, 149, 0; }
+[data-theme="light"] .vn-card[data-st="needs"], [data-theme="light"] .vn-pick-mi[data-st="needs"] { --vs: 210, 120, 0; }
+.vn-card[data-st="done"], .vn-pick-mi[data-st="done"] { --vs: 140, 145, 160; }
+[data-theme="light"] .vn-card[data-st="done"], [data-theme="light"] .vn-pick-mi[data-st="done"] { --vs: 120, 125, 140; }
+.vn-pick-mi[data-st="standby"] { --vs: 40, 190, 175; }
+[data-theme="light"] .vn-pick-mi[data-st="standby"] { --vs: 10, 135, 125; }
+.vn-card[data-st="needs"] .vn-st-ico, .vn-card[data-st="needs"] .vn-st-lbl,
+.vn-card[data-st="done"] .vn-st-ico, .vn-card[data-st="done"] .vn-st-lbl { color: rgb(var(--vs)); }
+.vn-pick-wrap { position: relative; display: inline-flex; flex: none; }
+.vn-pick { all: unset; box-sizing: border-box; cursor: pointer; display: inline-flex; align-items: center; gap: 8px;
+  margin: -2px 0 -2px -5px; padding: 2px 6px 2px 5px; border-radius: 7px; }
+.vn-pick:hover, .vn-pick[aria-expanded="true"] { background: rgba(var(--vs, 140, 145, 160), .12); }
+.vn-pick:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.vn-pick .vn-pick-car { color: rgb(var(--vs, 140, 145, 160)); opacity: .55; margin-left: -3px; }
+.vn-pick-menu { position: absolute; z-index: 60; bottom: calc(100% + 10px); left: -6px; min-width: 260px; max-width: calc(100vw - 24px);
+  padding: 6px; border-radius: 12px; background: var(--bg-card); border: 1px solid var(--border-light);
+  box-shadow: 0 12px 34px rgba(0, 0, 0, .35); font-family: var(--font-sans); }
+.vn-pick-mh { font: 700 10.5px/1 var(--font-sans); letter-spacing: .08em; text-transform: uppercase; color: var(--text-faint); padding: 8px 10px 6px; }
+.vn-pick-mi { all: unset; box-sizing: border-box; cursor: pointer; display: flex; gap: 10px; align-items: flex-start; width: 100%; padding: 8px 10px; border-radius: 8px; }
+.vn-pick-mi:hover, .vn-pick-mi:focus-visible { background: var(--bg-hover); }
+.vn-pick-ic { color: rgb(var(--vs)); display: inline-flex; padding-top: 1px; }
+.vn-pick-tx b { display: block; font: 600 13px/1.3 var(--font-sans); color: var(--text-heading); }
+.vn-pick-tx span { display: block; font-size: 11.5px; color: var(--text-muted); line-height: 1.35; margin-top: 1px; white-space: normal; }
+.vn-pick-ck { margin-left: auto; color: var(--accent-text, var(--accent)); visibility: hidden; padding-top: 2px; }
+.vn-pick-mi.cur .vn-pick-ck { visibility: visible; }
+.vn-pick-note { font-size: 11.5px; color: var(--text-faint); padding: 8px 10px 6px; border-top: 1px solid var(--border-light); margin-top: 4px; white-space: normal; }

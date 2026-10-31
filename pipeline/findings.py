@@ -14,11 +14,22 @@ Raised (each id is persistent; one namespace per run):
   obligation, not a defect.
 * ``FINDING: <id> <what is wrong>`` (``BLOCKING:`` is the same line) in a
   checker report: a suspected correctness defect.
-* ``NOTE: <id> <text>``: an observation that is NOT about correctness
-  (cosmetic, an optional enhancement, a preference).  It needs no evidence.
-  A note whose text uses correctness vocabulary (a race, lost or stale data,
-  a crash, wrong output ...) is held accountable like a finding: a label
-  cannot move a correctness concern out of the gate.
+* ``NOTE: <id> cosmetic: <text>`` (or ``enhancement:`` / ``preference:``):
+  an observation that is NOT about correctness.  It needs no evidence, but
+  the class is an explicit claim: the audit must name the id and may
+  challenge it.  A NOTE without one of those classes is held accountable
+  like a finding, whatever its words: the cheap path is a stated claim, not
+  a missing keyword.  A classed note whose text still uses correctness
+  vocabulary (a race, lost or stale data, a crash, wrong output ...) is held
+  accountable too.
+* ``NO-SCENARIOS: <why none apply>`` in the plan file, when the plan names
+  no SCENARIO: an affirmative decision, not a silence.  The audit must name
+  it and judge the reason.
+
+One id, one issue.  An id raised twice for two different things (two
+FINDING lines, a FINDING and a SCENARIO, a NOTE and a FINDING with different
+text) is a collision: the second issue would otherwise vanish, so the harness
+reports it and the grade cannot be HIGH until the ids are made distinct.
 
 Dispositions (in a checker report; for a finding, a LATER checker stage than
 the one that raised it, as before):
@@ -69,6 +80,13 @@ CORRECTNESS_RE = re.compile(
     r"inconsisten\w*|crash\w*|incorrect\w*|wrong|stale|overwrit\w*|deadlock\w*|leak\w*|vulnerab\w*|"
     r"inject\w*|bypass\w*|bug|bugs|defect\w*|regress\w*|broken|desync\w*|out of sync|unsafe)\b",
     re.IGNORECASE)
+
+# The classes that make a NOTE free of evidence: it must open with one of them.
+NOTE_CLASS_RE = re.compile(r"^[ \t*_(\[]*(cosmetic|enhancement|preference)[ \t*_)\]]*[:\-–—][ \t]*",
+                           re.IGNORECASE)
+NO_SCENARIOS_RE = re.compile(_LEAD + r"NO[- ]SCENARIOS" + _SEP + r"(.*)$", re.MULTILINE)
+NO_SCENARIOS_ID = "NO-SCENARIOS"
+NO_SCENARIOS_MIN_WORDS = 4
 
 # A checker line that labels an observation "non-blocking" without one of the
 # structured forms above is how a concern escaped the gate.  "Non-blocking:
@@ -129,16 +147,67 @@ def scenarios_in(text: str, stage: str) -> list[Entry]:
     return list(out.values())
 
 
+def note_is_free(text: str) -> bool:
+    """A NOTE needs no evidence only when it states a non-correctness class
+    and its words are not about correctness."""
+    m = NOTE_CLASS_RE.match(text or "")
+    return bool(m) and not CORRECTNESS_RE.search(text[m.end():])
+
+
 def findings_in(text: str, stage: str) -> list[Entry]:
     """Accountable findings in a checker report: FINDING/BLOCKING lines, and
-    NOTE lines whose words are about correctness."""
+    every NOTE that does not state a non-correctness class (or does, but is
+    worded as a correctness concern)."""
     out: dict[str, Entry] = {}
     for m in FINDING_RE.finditer(text or ""):
         out.setdefault(m.group(1), Entry(m.group(1), "finding", stage, m.group(2).strip()))
     for m in NOTE_RE.finditer(text or ""):
-        if m.group(1) not in out and CORRECTNESS_RE.search(m.group(2)):
+        if m.group(1) not in out and not note_is_free(m.group(2)):
             out[m.group(1)] = Entry(m.group(1), "finding", stage, m.group(2).strip(), promoted=True)
     return list(out.values())
+
+
+def free_note_ids(text: str) -> list[str]:
+    """The NOTE ids that claim a non-correctness class (the audit must name
+    each one, so the claim is looked at, not taken)."""
+    return sorted({m.group(1) for m in NOTE_RE.finditer(text or "") if note_is_free(m.group(2))})
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip().rstrip(".;:").lower()
+
+
+def raises_in(text: str, stage: str) -> list[tuple[str, str, str, str]]:
+    """Every raising line, undeduplicated: (id, kind, stage, text), kind one
+    of scenario / finding / note."""
+    out = []
+    for rx, kind in ((SCENARIO_RE, "scenario"), (FINDING_RE, "finding"), (NOTE_RE, "note")):
+        for m in rx.finditer(text or ""):
+            out.append((m.group(1), kind, stage, m.group(2).strip()))
+    return out
+
+
+def collisions(raises) -> list[str]:
+    """Messages for ids raised for more than one issue.  Repeating a line
+    word for word (the same issue named again) is not a collision; a second
+    text, or a second kind of item, under the same id is."""
+    by_id: dict[str, list] = {}
+    for rid, kind, stage, text in raises:
+        by_id.setdefault(rid, []).append((kind, stage, text))
+    out = []
+    for rid, items in sorted(by_id.items()):
+        distinct = {(k, _norm(t)) for k, _s, t in items}
+        if len(distinct) > 1:
+            where = "; ".join(f"{s} {k.upper()}: {t[:60]!r}" for k, s, t in items)
+            out.append(f"id {rid} is used for more than one issue ({where}); give each issue its own id so none "
+                       f"drops out of the register")
+    return out
+
+
+def no_scenarios_reason(plan_text: str) -> str | None:
+    """The plan's NO-SCENARIOS justification, or None when it declares none."""
+    m = NO_SCENARIOS_RE.search(plan_text or "")
+    return m.group(1).strip() if m else None
 
 
 def accountable_ids(text: str) -> list[str]:

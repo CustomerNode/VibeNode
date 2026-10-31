@@ -33,11 +33,18 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pipeline.evidence import RUNS_SUBDIR, baseline_snapshot, head_rev, site_fingerprint, tree_fingerprint
+from pipeline.evidence import (RUNS_SUBDIR, baseline_snapshot, head_rev, impl_identity, site_fingerprint,
+                               tree_fingerprint, workflow_identity)
 from pipeline.plan import (PINNED_FILE, PINNED_PROTECTED_FILE, PROTECTED_FILE, REQUEST_MARKER, VERIFY_FILE,
                            PlanError, block_sha, check_pinnable, parse_criteria, request_sha)
 
-PIPELINE_VERSION = "1.2.0"
+# 1.3.0: run.json carries ``impl`` / ``impl_path``, the identity of the pipeline
+# package that created the run.  A launcher older than this writes neither, so
+# the outside provenance check (scripts/pipeline_provenance.py) can tell from
+# the first file of a run that an outdated copy started it.
+# 1.4.0: it also carries ``workflow`` / ``workflow_path``, the identity of the
+# guides (workforce/code-pipeline.md and the team guides it depends on).
+PIPELINE_VERSION = "1.4.0"
 ROUTES = {"a": "new feature or major change", "b": "bug with unknown cause",
           "c": "production issue where speed matters", "d": "internal cleanup, no behavior change"}
 
@@ -90,7 +97,13 @@ def create_run(repo: Path, slug: str, route: str, request_text: str, *,
         (run_dir / PINNED_PROTECTED_FILE).write_text(protected_text, encoding="utf-8")
     body = request_text.rstrip("\n") + "\n"
     nonce = secrets.token_hex(12)
+    impl, impl_path = impl_identity()
+    workflow, workflow_path = workflow_identity()
     run = {
+        "impl": impl,
+        "impl_path": impl_path,
+        "workflow": workflow,
+        "workflow_path": workflow_path,
         "run_id": run_id,
         "pipeline": "code-pipeline",
         "pipeline_version": PIPELINE_VERSION,

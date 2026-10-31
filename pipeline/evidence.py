@@ -400,6 +400,32 @@ def impl_identity() -> tuple[str, str]:
     return h.hexdigest(), str(here)
 
 
+WORKFLOW_GUIDE = "code-pipeline.md"
+
+
+def workflow_identity(workforce: Path | None = None) -> tuple[str, str]:
+    """(sha, directory) of the instructions the workflow runs on: the Code
+    Pipeline guide and every team guide its ``depends_on`` names, beside this
+    package (``<repo>/workforce``).  The guides steer the run as much as the
+    code does, so the launcher stamps this next to ``impl``; a missing guide
+    hashes as missing.  ``scripts/pipeline_provenance.py`` computes the same
+    value without importing this package (a test holds the two equal)."""
+    wf = Path(workforce) if workforce else Path(__file__).resolve().parents[1] / "workforce"
+    names = [WORKFLOW_GUIDE]
+    try:
+        text = (wf / WORKFLOW_GUIDE).read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"^depends_on:\s*\[([^\]]*)\]", text, re.MULTILINE)
+        if m:
+            names += [f"{n.strip()}.md" for n in m.group(1).split(",") if n.strip()]
+    except OSError:
+        pass
+    h = hashlib.sha256()
+    for name in sorted(set(names)):
+        h.update(name.encode())
+        h.update(_file_sha(wf / name).encode())
+    return h.hexdigest(), str(wf.resolve())
+
+
 def evidence_line(cid: str, sha: str, passed: bool, fingerprint: str, impl: str | None = None) -> str:
     """The line ``run_check`` prints first and last; the harness searches
     transcripts for its ``id=`` and ``sha=`` part and reads ``impl=``."""

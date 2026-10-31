@@ -2637,7 +2637,7 @@ function _tickSetAside() {
   _setAsideTicker = setInterval(() => {
     const el = document.querySelector('#live-input-bar .vn-st-since');
     if (!el) { clearInterval(_setAsideTicker); _setAsideTicker = null; return; }
-    el.textContent = _setAsideText(el.dataset.since);
+    el.textContent = el.dataset.done ? _markedDoneText(el.dataset.since) : _setAsideText(el.dataset.since);
   }, 30000);
 }
 /** Session substatus -> header state for a WORKING session. */
@@ -2658,6 +2658,106 @@ function _stHeader(kind, extra, right) {
     '<span class="vn-st-lbl" id="live-st-lbl">' + _ST_LABELS[kind] + '</span>' + (extra || '') +
     (right ? '<span class="vn-st-grow"></span>' + right : '') + '</div>';
 }
+
+// ── Status picker in the text box (owner's pick A, 2026-10-31,
+// static/scratch/status-picker.html + status-picker-a-flow.html) ──
+// A stopped session's status line shows the person's status (Needs you,
+// Standby, Done) and opens a menu to change it.  The menu runs the same
+// actions as the sidebar's right-click (SessionVerdict), so a pick is a hold
+// that any new message ends, and a running turn still shows Working.  Only
+// while the person-oriented statuses are on (window.SessionVerb).
+const _PICK_ICONS = {
+  needs: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9.5"/><path d="M12 7.5v5.5"/><path d="M12 16.5h.01"/></svg>',
+  standby: _ST_ICONS.standby,
+  done: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5"/><path d="M8 12.5l2.7 2.7L16 9.8"/></svg>',
+};
+const _PICK_LABELS = {needs: 'Needs you', standby: 'Standby', done: 'Done'};
+const _PICK_CHOICES = [
+  ['needs', 'Back on your list; automatic status shows'],
+  ['standby', 'Seen, not now. Ends at the next message'],
+  ['done', 'Your verdict. Ends at the next message'],
+];
+/** 'needs' | 'standby' | 'done' to draw in the picker, or '' (no picker). */
+function _pickGroup(id) {
+  const SV = window.SessionVerb;
+  if (!SV || !SV.display || !SV.shown || !window.SessionVerdict) return '';
+  const g = SV.shown(SV.display(id));
+  return (g === 'needs' || g === 'standby' || g === 'done') ? g : '';
+}
+function _markedDoneText(since) {
+  const t = _setAsideText(since);
+  return t ? t.replace('Set aside', 'Marked done') : '';
+}
+/** The vn-card's opening tag plus its status row, with the picker. */
+function _pickCardOpen(id, g) {
+  const since = (window.SessionVerb && window.SessionVerb.holdSince) ? window.SessionVerb.holdSince(id) : 0;
+  let hint;
+  if (g === 'standby' && since) hint = '<span class="vn-st-hint vn-st-since" data-since="' + since + '">' + _setAsideText(since) + '</span>';
+  else if (g === 'done' && since) hint = '<span class="vn-st-hint vn-st-since" data-since="' + since + '" data-done="1">' + _markedDoneText(since) + '</span>';
+  else if (g === 'needs') hint = '<span class="vn-st-hint">Its reply is waiting for you</span>';
+  else hint = '';
+  return '<div class="vn-card" data-st="' + g + '"><div class="vn-st">' +
+    '<span class="vn-pick-wrap"><button type="button" class="vn-pick" aria-haspopup="menu" aria-expanded="false" title="Change status"' +
+    ' onclick="_togglePickMenu(event, \'' + id + '\')">' +
+    '<span class="vn-st-ico" id="live-st-ico">' + _PICK_ICONS[g] + '</span>' +
+    '<span class="vn-st-lbl" id="live-st-lbl">' + _PICK_LABELS[g] + '</span>' +
+    '<svg class="vn-pick-car" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>' +
+    '</button></span>' + hint + '</div>';
+}
+function _closePickMenu() {
+  const m = document.querySelector('#live-input-bar .vn-pick-menu');
+  if (m) m.remove();
+  const b = document.querySelector('#live-input-bar .vn-pick');
+  if (b) b.setAttribute('aria-expanded', 'false');
+}
+function _togglePickMenu(e, id) {
+  if (e) { e.preventDefault(); e.stopPropagation(); }
+  const btn = e && e.currentTarget;
+  const wrap = btn && btn.parentElement;
+  if (!wrap) return;
+  if (wrap.querySelector('.vn-pick-menu')) { _closePickMenu(); return; }
+  const cur = _pickGroup(id);
+  const check = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
+  const menu = document.createElement('div');
+  menu.className = 'vn-pick-menu';
+  menu.setAttribute('role', 'menu');
+  menu.innerHTML = '<div class="vn-pick-mh">Status</div>' + _PICK_CHOICES.map(([k, d]) =>
+    '<button type="button" role="menuitemradio" aria-checked="' + (k === cur) + '" class="vn-pick-mi' + (k === cur ? ' cur' : '') + '" data-st="' + k + '" data-pick="' + k + '">' +
+    '<span class="vn-pick-ic">' + _PICK_ICONS[k] + '</span><span class="vn-pick-tx"><b>' + _PICK_LABELS[k] + '</b><span>' + d + '</span></span>' +
+    '<span class="vn-pick-ck">' + check + '</span></button>').join('') +
+    '<div class="vn-pick-note">Working and New are set by the session itself.</div>';
+  menu.addEventListener('click', ev => {
+    ev.stopPropagation();
+    const it = ev.target.closest('[data-pick]');
+    if (!it) return;
+    _closePickMenu();
+    _pickStatus(id, it.dataset.pick);
+  });
+  wrap.appendChild(menu);
+  btn.setAttribute('aria-expanded', 'true');
+  const first = menu.querySelector('.vn-pick-mi.cur') || menu.querySelector('.vn-pick-mi');
+  if (first) first.focus();
+}
+/** Same actions as the sidebar's right-click Standby / Mark done / Back to Needs you. */
+function _pickStatus(id, to) {
+  const V = window.SessionVerdict;
+  if (!V || to === _pickGroup(id)) return;
+  if (to === 'done') V.accept(id);
+  else if (to === 'standby') V.standby(id);
+  else V.unpark(id);
+}
+document.addEventListener('click', e => { if (!e.target.closest || !e.target.closest('.vn-pick-wrap')) _closePickMenu(); });
+// Capture phase, and stop it there: the app's own Escape closes the open
+// session, and Escape on an open menu must only close the menu.
+window.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && document.querySelector('#live-input-bar .vn-pick-menu')) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    _closePickMenu();
+    const b = document.querySelector('#live-input-bar .vn-pick');
+    if (b) b.focus();
+  }
+}, true);
 
 function updateLiveInputBar() {
   if (!liveSessionId) return;
@@ -2735,12 +2835,17 @@ function updateLiveInputBar() {
   const _SV = window.SessionVerb;
   const _standby = !isRunning && !!(_SV && _SV.holdOf && _SV.holdOf(id) === 'standby');
   const _standbySince = _standby && _SV.holdSince ? _SV.holdSince(id) : 0;
-  if (!isRunning) stateKey = 'ended' + _limitKey + (_standby ? ':standby:' + _standbySince : '');
+  // The status picker's status (Needs you / Standby / Done) and its time:
+  // a change redraws the text box (owner's pick A, status-picker.html).
+  const _pickG = (!isRunning || (kind === 'idle' && _idleSub !== 'auto-resuming')) ? _pickGroup(id) : '';
+  const _pickKey = _pickG ? ':pick:' + _pickG + ':' + ((_SV && _SV.holdSince) ? _SV.holdSince(id) : 0) : '';
+  if (!isRunning) stateKey = 'ended' + _limitKey + (_standby ? ':standby:' + _standbySince : '') + _pickKey;
   else if (kind === 'question') stateKey = 'question:' + (wd ? wd.question || '' : '');
   else if (kind === 'idle') stateKey = 'idle:' + _idleSub
     + (_retrySt ? ':retry:' + _retrySt.retry_at + ':' + _retrySt.retry_attempt : '')
     + _limitKey
-    + (!_retrySt && _sessErr ? ':err:1' : '');
+    + (!_retrySt && _sessErr ? ':err:1' : '')
+    + _pickKey;
   else {
     // Include sub-agent count + status in state key so bar re-renders when agents change
     const _sa = (window._subAgents && window._subAgents[id]) || {};
@@ -2802,13 +2907,16 @@ function updateLiveInputBar() {
     bar.innerHTML =
       (_limitBanner || '') +
       // No limit banner: the "asleep" header is attached to the text box.
-      (_limitBanner ? '' : _standby
+      (_limitBanner ? '' : _pickG
+        ? _pickCardOpen(id, _pickG)
+        : _standby
         ? '<div class="vn-card" data-st="standby">' + _stHeader('standby', _standbySince
             ? '<span class="vn-st-hint vn-st-since" data-since="' + _standbySince + '">' + _setAsideText(_standbySince) + '</span>' : '')
         : '<div class="vn-card">' +
         _stHeader('asleep', '<span class="vn-st-hint">Wakes when you send a message</span>')) +
       '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="' +
-      (_limitBanner ? 'Type a message to continue\u2026' : _standby ? 'Type to pick it back up' : 'Type a message to wake it') + '"' +
+      (_limitBanner ? 'Type a message to continue\u2026' : _standby ? 'Type to pick it back up'
+        : _pickG === 'done' ? 'Type to reopen it' : 'Type a message to wake it') + '"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitContinue(\'' + id + '\')}"' +
       ' onblur="if(_wasKeyboardDismissBlur()){liveSubmitContinue(\'' + id + '\')}"></textarea>' +
       (_limitBanner ? '' : '</div>') +
@@ -2819,7 +2927,7 @@ function updateLiveInputBar() {
       '</div>';
     const btnClose = document.getElementById('btn-close');
     if (btnClose) btnClose.disabled = true;
-    if (_standbySince && !_limitBanner) _tickSetAside();
+    if (!_limitBanner && (_standbySince || (_pickG === 'done' || _pickG === 'standby'))) _tickSetAside();
     // Tick the "resets in …" text if the CTA is showing with a known reset.
     if (_limitBanner && _limitSt && (_limitSt.limit_reset_at > 0 || _retrySt)) _startLimitCountdown();
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), () => liveSubmitContinue(id));
@@ -2961,15 +3069,18 @@ function updateLiveInputBar() {
     bar.innerHTML =
       _retryBanner +
       (_sleeping ? '<div class="vn-card">' +
-        _stHeader('waking', '<span class="vn-st-hint">Send a message to take over</span>') : '') +
+        _stHeader('waking', '<span class="vn-st-hint">Send a message to take over</span>')
+        : _pickG ? _pickCardOpen(id, _pickG) : '') +
       '<textarea id="live-input-ta" class="live-textarea" rows="2" placeholder="' +
       (_sleeping
         ? 'Type to override the scheduled wake-up\u2026'
+        : _pickG === 'standby' ? 'Type to pick it back up'
+        : _pickG === 'done' ? 'Type to reopen it'
         : 'Type your next command\u2026') +
       '"' +
       ' onkeydown="if(_shouldSend(event)){event.preventDefault();liveSubmitIdle()}"' +
       ' onblur="if(_wasKeyboardDismissBlur()){liveSubmitIdle()}"></textarea>' +
-      (_sleeping ? '</div>' : '') +
+      ((_sleeping || _pickG) ? '</div>' : '') +
       '<div class="live-bar-row">' +
       (typeof _buildBarLeftGroup === 'function' ? _buildBarLeftGroup(_buildCtxBarCompact(id), false, _liveSessionModel) : _buildCtxBarCompact(id)) +
       '<span class="send-hint" style="font-size:10px;color:var(--text-faint);">' + _sendHint() + '</span>' +
@@ -2977,6 +3088,7 @@ function updateLiveInputBar() {
       '</div>';
     setupVoiceButton(document.getElementById('live-input-ta'), document.getElementById('live-voice-btn'), liveSubmitIdle);
     if (_barHadFocus) { const ta = document.getElementById('live-input-ta'); if (ta) ta.focus(); }
+    if (_pickG === 'standby' || _pickG === 'done') _tickSetAside();
     // Usage-limit countdown, same in-place text-node pattern as the retry
     // countdown below.  Shares _liveRetryTimer because the two banners are
     // mutually exclusive (the limit banner wins) and the bar teardown already

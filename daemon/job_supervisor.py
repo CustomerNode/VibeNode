@@ -146,6 +146,12 @@ class JobSupervisor:
             return {"id": jid, "action": "alive", "reason": "process present", "progress": progress}
         if lines is None:
             return {"id": jid, "action": "unknown", "reason": "process list unavailable", "progress": progress}
+        if rec.get("acknowledged"):
+            # Leave it was pressed while the job still ran (Relaunch by a
+            # person clears the flag).  It stopped after the person decided:
+            # no notice, no relaunch.
+            return {"id": jid, "action": "left", "progress": progress,
+                    "reason": "stopped after it was left alone"}
         if dj.is_past_irreversible(rec):
             return {"id": jid, "action": "needs_person", "progress": progress,
                     "reason": "stopped past an irreversible step (%r matched); not relaunched"
@@ -196,6 +202,11 @@ class JobSupervisor:
                 dj.note(rec, d["reason"])
                 logger.error("job %s failed: %s", rec["id"], d["reason"])
                 self._push(rec)
+            elif action == "left":
+                rec["state"] = "failed"
+                rec["reason"] = d["reason"]
+                dj.note(rec, d["reason"])
+                logger.info("job %s %s", rec["id"], d["reason"])
             elif action == "relaunch":
                 result = dj.apply_relaunch(rec, by="supervisor", launch=self._launch, streak=d["streak"])
                 if result.get("ok"):

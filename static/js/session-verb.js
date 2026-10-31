@@ -339,6 +339,8 @@
       else if (typeof filterSessions === 'function') filterSessions();
     }
     if (typeof viewMode !== 'undefined' && viewMode === 'homepage' && typeof _updateHomepageStats === 'function') _updateHomepageStats();
+    // The open session's text box shows this status too (its status picker).
+    _refreshComposer(sid);
   }
 
   /** Called for every `session_entry` (socket.js).  The newest assistant text

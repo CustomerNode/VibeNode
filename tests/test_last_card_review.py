@@ -199,8 +199,12 @@ def test_screenshots_sit_inside_validate_never_beside_it(out):
     # the Try it row first, then the screenshot row, in the one band
     assert band.index('lm-row lm-validate') < band.index('lm-row shot')
     assert 'data-view="/static/scratch/d.png"' in band and "Desktop shot" in band
-    # a card with no Validate row keeps its Screens band
-    assert '<div class="dt">Screens</div>' in out["shots_only"]
+    # a card with no Validate row gets a Validate of just its screenshots
+    # (owner, 2026-10-31: "if there is no validate create a validate because
+    # we have screens")
+    s = out["shots_only"]
+    assert '<div class="dt">Screens</div>' not in s and 'lm-vshots' in s
+    assert '<div class="dt">Validate</div>' in s
 
 
 def _validate_band(h):
@@ -240,7 +244,10 @@ def test_nothing_to_open_keeps_the_plain_rows(out):
 
 def test_history_sits_above_next_which_sits_above_more(out):
     """Owner, 2026-10-28: "history should go before next which goes before more"."""
+    # Six fixed sections (2026-10-31): History, then Review & respond with the
+    # action inside it; what More held now sits in Checked / What was done.
     h = out["ordered"]
-    assert h.index('<div class="dt">History</div>') < h.index('<div class="dt">Next</div>') < h.index('<div class="dt">More</div>')
+    assert h.index('<div class="dt">Checked</div>') < h.index('<div class="dt">History</div>') < h.index('<div class="dt">Review &amp; respond</div>') < h.index('<div class="dt">Next</div>')
     h = out["ordered_ask"]
-    assert h.index('<div class="dt">History</div>') < h.index('<div class="dt">To do</div>') < h.index('<div class="dt">More</div>')
+    assert h.index('<div class="dt">History</div>') < h.index('<div class="dt">Review &amp; respond</div>') < h.index('<div class="dt">To do</div>')
+    assert '<div class="dt">More</div>' not in h

@@ -484,7 +484,7 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
 .dv-pv .dv-plain { font: 12.5px/1.55 var(--font-mono, monospace); }
 .dv-pv + .dv-meta, .dv-pv + .lm-rows { margin-top: 10px; }
 
-/* ── Your move: buttons inside the card (design A, picked by the owner
+/* ── Review & respond: buttons inside the card (design A, picked by the owner
    2026-10-28 from static/scratch/card-buttons.html; the ruled rows with a
    "REPLY" label "looked like shit").  Replies are buttons in the card's
    colour, the recommended one filled; links are chips; steps a numbered
@@ -1138,3 +1138,23 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
   .lm-rd .act { bottom: calc(-14px - env(safe-area-inset-bottom)); margin-bottom: calc(-14px - env(safe-area-inset-bottom)); padding-bottom: calc(14px + env(safe-area-inset-bottom)); }
 }
 @media (prefers-reduced-motion: reduce) { .lm-rd, .lm-rd-scrim { transition: none; } }
+
+/* ── Six fixed sections (owner's pick, 2026-10-31, static/scratch/summary-sections.html):
+   Header · Summary · What was done · Checked · History · Review & respond.  Review & respond holds the
+   old action sections nested; each keeps its classes and behaviour, drawn as a stacked part. */
+.lm .lm-line { margin: 0 0 6px; font-size: 13.5px; line-height: 1.55; color: var(--text-primary); }
+.lm .lm-line:last-child { margin-bottom: 0; }
+.lm .lm-line.lm-none { color: var(--text-muted); }
+.lm.skim .lm-move > .dd > .lm-dl { display: block; padding: 0; margin: 0; border: 0; border-radius: 0; background: none; box-shadow: none; }
+.lm.skim .lm-move > .dd > .lm-dl + .lm-dl { margin-top: 14px; padding-top: 12px; border-top: 1px dashed rgba(var(--bt), .12); }
+.lm.skim .lm-move > .dd > .lm-dl > .dt { font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--text-muted); line-height: 1.4; margin: 0 0 7px; }
+.lm.skim .lm-move > .dd > .lm-dl > .dd { font-size: 13.5px; }
+.lm.skim .lm-move.lm-move-needs { box-shadow: inset 2px 0 0 rgb(var(--tone)); }
+[data-theme="light"] .lm.skim .lm-move.lm-move-needs { background: rgba(var(--tone), .05); }
+/* "Nothing needed from you" only when every part of Review & respond is hidden. */
+.lm.skim .lm-move .lm-mv-none { display: none; }
+.lm.skim .lm-move:not(:has(> .dd > .lm-dl:not(.lm-act))):not(:has(.lm-finish:not([hidden]))):not(:has(.lm-backto:not([hidden]))) .lm-mv-none { display: block; }
+.lm .lm-whyask { margin: 8px 0 0; font-size: 13px; color: var(--text-muted); }
+.lm .lm-wdone .lm-sub, .lm .lm-checked .lm-sub { margin-top: 10px; }
+/* A Read it / Send it part with no buttons showing (an older summary) stays hidden inside Review & respond. */
+.lm.skim .lm-move > .dd > .lm-dl.lm-act:not(:has(.lm-finish:not([hidden]))):not(:has(.lm-backto:not([hidden]))) { display: none; }

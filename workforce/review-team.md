@@ -3,7 +3,7 @@ id: review-team
 name: Review Team
 department: compose
 source: vibenode
-version: 1.5.0
+version: 1.6.0
 depends_on: [compose-test-engineer, compose-quality-engineer, compose-product-manager, compose-senior-engineer, compose-expert-user]
 type: prompt-template
 ---
@@ -74,7 +74,7 @@ Regardless of who calls this review or what context is provided, the team always
 
 ## Fix Policy
 
-**Under Code Pipeline (and Execute Pipeline, its alias):** follow `code-pipeline.md`. Review's fixes land before Test runs, and Test and Audit, both fresh, check the result on the final tree; the harness grades only evidence produced on that tree. Record every suspected correctness defect on its own line as `FINDING: <short-id> <what is wrong>`, however minor it looks: you do not decide whether it is tracked, the evidence decides how it is settled. Only what is not about correctness (cosmetic, optional, a preference) is `NOTE: <short-id> <text>`; never label an observation "non-blocking" in prose. A later checker settles each finding with a check that covers it (`FIXED` / `NOT-A-DEFECT` with `by=<criterion>`) or discloses it as `UNRESOLVED`; an argument that it cannot happen is not a settlement. See `code-pipeline.md`.
+**Under Code Pipeline (and Execute Pipeline, its alias):** follow `code-pipeline.md`. Review's fixes land before Test runs, and Test and Audit, both fresh, check the result on the final tree; the harness grades only evidence produced on that tree. Record every suspected correctness defect on its own line as `FINDING: <short-id> <what is wrong>`, however minor it looks: you do not decide whether it is tracked, the evidence decides how it is settled. Only what is not about correctness is a NOTE, and it names its kind after the id: `NOTE: <short-id> cosmetic: <text>` (or `enhancement:` / `preference:`); a NOTE without that word is tracked as a finding. Give every issue its own id; never label an observation "non-blocking" in prose. A later checker settles each finding with a check that covers it (`FIXED` / `NOT-A-DEFECT` with `by=<criterion>`) or discloses it as `UNRESOLVED`; an argument that it cannot happen is not a settlement. See `code-pipeline.md`.
 
 **Invoked on its own, with the caller asking for auto-fix:** the team fixes what it finds. Don't report problems back to me unless:
 - The fix would change the spec or user-facing behavior

@@ -281,7 +281,7 @@
     if (typeof location !== 'undefined' && u.host === location.host) return '';
     return '/api/preview/proxy?u=' + encodeURIComponent(String(url).trim());
   }
-  // Replies are real buttons in the card's colour, inside the "Your move"
+  // Replies are real buttons in the card's colour, inside the "Review & respond"
   // band (design A, picked by the owner 2026-10-28 from
   // static/scratch/card-buttons.html): the recommended one (else the first)
   // is filled, the others outlined.  The hidden .tile keeps the key and .tt
@@ -549,7 +549,7 @@
       if (fa) vers.push(['full', 'Full', dvBodyHtml('markdown', fa), fa]);
       else if (dvBody) { dvInFull = true; vers.push(['full', 'Full', deliverableBlock(Object.assign({}, dv, { files: [] })), dvBody]); }
       const cpy = '<button type="button" class="lm-depth-copy" title="Copy what this tab says">' + I.copy + '<span>Copy</span></button>';
-      h += band(m.type === 'explain' ? 'Answer' : 'Summary',
+      h += band('Summary',
         '<div class="lm-depth-bar">' + (vers.length < 2 ? '' : '<div class="lm-depth" role="group" aria-label="How much to read">' + vers.map(([k, l], i) =>
             '<button type="button" class="lm-depth-b" data-depth="' + k + '" aria-pressed="' + (i ? 'false' : 'true') + '">' + l + '</button>').join('') + '</div>') + cpy + '</div>' +
           vers.map(([k, , body, raw], i) => '<div class="lm-depth-p" data-depth="' + k + '" data-raw="' + esc(raw) + '"' + (i ? ' hidden' : '') + '>' + body + '</div>').join(''), 'lm-sec lm-answer');
@@ -572,38 +572,60 @@
       histH = band('History', '<div class="lm-zoom">' + zr('big', 'Big picture', 0) + zr('task', 'This task', 1) + zr('now', 'Just now', 2) + '</div>', 'lm-hist');
     }
 
+    // Six fixed sections on every summary (owner's pick, 2026-10-31,
+    // static/scratch/summary-sections.html: "same questions yet diffrent
+    // outputs"): Header · Summary · What was done · Checked · History · Your
+    // move.  What was done and Checked are always drawn, with the session's
+    // own plain line ("Answered from training data; no web search");  Review & respond
+    // stacks every action that applies, in one fixed order.  The parts of Your
+    // move keep their old section markup, nested, so their behaviour is
+    // unchanged.
+    const mv = [];
     if (m.late) {
-      h += band('Late', '<p class="lm-apol">' + inl(m.late.apology) + '</p><dl class="lm-kv">' +
+      mv.push(band('Late', '<p class="lm-apol">' + inl(m.late.apology) + '</p><dl class="lm-kv">' +
         '<dt>Why</dt><dd>' + inl(m.late.why) + '</dd>' +
-        '<dt>New time</dt><dd><b>' + esc(m.late.new_eta_minutes) + ' more minutes</b>' + (m.late.confidence ? ' · ' + inl(m.late.confidence) : '') + '</dd></dl>', 'lm-sec lm-late');
+        '<dt>New time</dt><dd><b>' + esc(m.late.new_eta_minutes) + ' more minutes</b>' + (m.late.confidence ? ' · ' + inl(m.late.confidence) : '') + '</dd></dl>', 'lm-sec lm-late'));
     }
     const nn = m.needs || {};
     if (nn.eta_minutes && opts.clock) {
       const eta = Number(nn.eta_minutes) * 60000;
-      h += band('Timing', '<div class="tm" data-clock="' + esc(opts.clock) + '" data-eta="' + eta + '">' +
+      mv.push(band('Timing', '<div class="tm" data-clock="' + esc(opts.clock) + '" data-eta="' + eta + '">' +
         '<div class="tm-figs"><div class="f"><span class="n" data-f="since">0:00</span><span class="l">since it stopped</span></div>' +
         '<div class="f"><span class="n">' + fmtDur(eta) + '</span><span class="l">it said it would take</span></div>' +
         '<div class="f dl"><span class="n" data-f="delta">' + fmtDur(eta) + '</span><span class="l" data-f="dlabel">left</span></div></div>' +
-        '<div class="tm-bar"><i class="fill"></i><i class="over"></i><i class="mark"></i></div></div>', 'lm-sec lm-timing');
+        '<div class="tm-bar"><i class="fill"></i><i class="over"></i><i class="mark"></i></div></div>', 'lm-sec lm-timing'));
     }
 
     const st = Object.assign({}, m.status || {});
     if (m.did) st.done = (st.done || []).concat(m.did);
     const D = (st.done || []).length, L = (st.remaining || []).length, B = (st.broken || []).length;
+    const item = (o, kind) => { o = typeof o === 'string' ? { what: o } : (o || {});
+      const ic = kind === 'b' ? I.x : kind === 'l' ? I.circ : I.check;
+      return '<li class="' + kind + '"><span class="ic">' + ic + '</span><span><span class="w">' + inl(o.what) + '</span>' + (o.why ? '<span class="y">' + inl(o.why) + '</span>' : '') + '</span></li>'; };
+    const col = (label, arr, kind) => '<div class="col"><div class="ch">' + label + '</div><ul>' + arr.map(o => item(o, kind)).join('') + '</ul></div>';
+    const line = v => typeof v === 'string' && v.trim() ? '<p class="lm-line">' + inl(v.trim()) + '</p>' : '';
+    // What was done: the session's plain line, then its list.  A Done card
+    // with nothing left or broken lists only what changed (owner's pick D,
+    // 2026-10-28, static/scratch/done-status.html); otherwise the columns.
+    let wd = line(m.what_was_done);
     if (D + L + B) {
-      const item = (o, kind) => { o = typeof o === 'string' ? { what: o } : (o || {});
-        const ic = kind === 'b' ? I.x : kind === 'l' ? I.circ : I.check;
-        return '<li class="' + kind + '"><span class="ic">' + ic + '</span><span><span class="w">' + inl(o.what) + '</span>' + (o.why ? '<span class="y">' + inl(o.why) + '</span>' : '') + '</span></li>'; };
-      const col = (label, arr, kind) => '<div class="col"><div class="ch">' + label + '</div><ul>' + arr.map(o => item(o, kind)).join('') + '</ul></div>';
-      const cols = (D ? col('Done', st.done, 'd') : '') + (B ? col('Broken', st.broken, 'b') : '') + (L ? col('Not done yet', st.remaining, 'l') : '');
-      // A Done card with nothing left or broken: "What changed", the list with
-      // its checks and nothing else (no meter, no counts, no column header).
-      // Owner's pick D, 2026-10-28, static/scratch/done-status.html.
-      if (m.type === 'done' && !L && !B) h += band('What changed', '<div class="lm-statcols one"><div class="col"><ul>' + st.done.map(o => item(o, 'd')).join('') + '</ul></div></div>', 'lm-sec lm-status lm-changed');
-      // No meter / "2 done · 1 left" row above the columns: the columns already
-      // say it (owner, 2026-10-28).
-      else h += band('Status', '<div class="lm-statcols' + ((D ? 1 : 0) + (B ? 1 : 0) + (L ? 1 : 0) === 1 ? ' one' : '') + '">' + cols + '</div>', 'lm-sec lm-status');
+      wd += (!L && !B)
+        ? '<div class="lm-statcols one"><div class="col"><ul>' + st.done.map(o => item(o, 'd')).join('') + '</ul></div></div>'
+        : '<div class="lm-statcols' + ((D ? 1 : 0) + (B ? 1 : 0) + (L ? 1 : 0) === 1 ? ' one' : '') + '">' +
+          (D ? col('Done', st.done, 'd') : '') + (B ? col('Broken', st.broken, 'b') : '') + (L ? col('Not done yet', st.remaining, 'l') : '') + '</div>';
     }
+    if (m.compare) wd += '<div class="lm-sub">' + esc(m.compare.label || 'Change') + '</div>' + compareBlock(m.compare);
+    if (m.watch_for && m.watch_for.length) wd += '<div class="lm-sub">Worth knowing</div>' + list(m.watch_for, 'dot');
+    if (m.details && m.details.length) wd += '<div class="lm-sub">Technical details</div>' + list(m.details, 'dot');
+    h += band('What was done', wd || '<p class="lm-line lm-none">Nothing listed.</p>',
+      'lm-sec lm-status lm-wdone' + (m.type === 'done' && !L && !B ? ' lm-changed' : ''));
+    // Checked: the session's plain line, the checks it ran, the links it used.
+    let ck = line(m.checked);
+    if (m.verified && m.verified.length) ck += list(m.verified.map(v => ({ what: v.check, why: v.result, ok: v.ok })), 'ok');
+    const ckLinks = (m.links || []).filter(l => !isImg(l));
+    if (ckLinks.length) ck += '<div class="lm-rows">' + ckLinks.map(linkRow).join('') + '</div>';
+    h += band('Checked', ck || '<p class="lm-line lm-none">Nothing listed.</p>', 'lm-sec lm-checked');
+    h += histH;
 
     // "Validate": how the owner checks the work himself, as a row he taps
     // (owner, 2026-10-28: "we need to force a validate row so i have a way to
@@ -656,32 +678,30 @@
           (more.length ? '<span class="vt-more">' + more.map(l => '<button type="button" class="lm-row shot vt-thumb"' + shotAttrs(l) + ' title="' + esc(l.label || 'Screenshot') + '">' +
             '<img src="' + esc(_imgSrc(l.url)) + '" alt="" loading="lazy"></button>').join('') + '</span>' : '') +
           '<span class="vt-act">Tap a screenshot</span></div>';
-        h += band('Validate', '<div class="lm-vpair">' + tryTile + seeTile + '</div>' + later, 'lm-sec');
+        mv.push(band('Validate', '<div class="lm-vpair">' + tryTile + seeTile + '</div>' + later, 'lm-sec'));
       } else
-      h += band('Validate', '<div class="lm-rows">' + vr + shots.map(linkRow).join('') + '</div>' + later, 'lm-sec');
+      mv.push(band('Validate', '<div class="lm-rows">' + vr + shots.map(linkRow).join('') + '</div>' + later, 'lm-sec'));
     }
-    if (m.compare) h += band(esc(m.compare.label || 'Change'), compareBlock(m.compare), 'lm-sec');
-    // Files to download stay in their own band, with their buttons in view.
-    if (dv && dvInFull) { const fl = deliverableBlock(Object.assign({}, dv, { body: '', meta: null })); if (fl) h += band('Download', fl, 'lm-sec'); }
-    else if (dv) h += band('Deliverable', deliverableBlock(dv), 'lm-sec');
-    if (shots.length && !shotsInValidate) h += band('Screens', '<div class="lm-rows">' + shots.map(linkRow).join('') + '</div>', 'lm-sec');
+    // Screenshots always live in Validate: with nothing to try, a Validate of
+    // just the pictures (owner, 2026-10-31: "if there is no validate create a
+    // validate because we have screens").
+    if (shots.length && !shotsInValidate) mv.push(band('Validate', '<div class="lm-rows">' + shots.map(linkRow).join('') + '</div>', 'lm-sec lm-vshots'));
+    // Files to download stay together, with their buttons in view.
+    if (dv && dvInFull) { const fl = deliverableBlock(Object.assign({}, dv, { body: '', meta: null })); if (fl) mv.push(band('Download', fl, 'lm-sec')); }
+    else if (dv) mv.push(band('Deliverable', deliverableBlock(dv), 'lm-sec'));
 
     const n = m.needs || { kind: 'none' };
     if (n.kind === 'action' && n.tried && n.tried.length) {
-      h += band('Tried', '<ul class="lm-tried">' + n.tried.map(x => '<li><span class="ic">' + I.x + '</span><span><span class="w">' + inl(x.what) + '</span><span class="y">' + inl(x.result) + '</span></span></li>').join('') + '</ul>' +
-        (n.only_you ? '<p class="lm-onlyyou"><b>Why only you:</b> ' + inl(n.only_you) + '</p>' : ''), 'lm-sec');
+      mv.push(band('Tried', '<ul class="lm-tried">' + n.tried.map(x => '<li><span class="ic">' + I.x + '</span><span><span class="w">' + inl(x.what) + '</span><span class="y">' + inl(x.result) + '</span></span></li>').join('') + '</ul>' +
+        (n.only_you ? '<p class="lm-onlyyou"><b>Why only you:</b> ' + inl(n.only_you) + '</p>' : ''), 'lm-sec'));
     }
-    // History sits above the action band (Next, Decide, To do, Read it…),
-    // which sits above More (owner, 2026-10-28: "history should go before
-    // next which goes before more").
-    h += histH;
     // An answer or a text to send: the band is named for what he does and
     // holds only its own buttons, no "Nothing needed" (owner's pick A,
     // 2026-10-28, static/scratch/card-next-cta.html).  A finished fix keeps
     // its Next band as it was.
     const vb = (!n.kind || n.kind === 'none') ? _cardVerb(m) : '';
     if (vb === 'read' || vb === 'send') {
-      h += band(vb === 'read' ? 'Read it' : 'Send it', backToStrip(m.back_to) + (!m.late ? verdictRows(m.offer) : ''), 'lm-quiet lm-act');
+      mv.push(band(vb === 'read' ? 'Read it' : 'Send it', backToStrip(m.back_to) + (!m.late ? verdictRows(m.offer) : ''), 'lm-quiet lm-act'));
     } else if (!n.kind || n.kind === 'none') {
       // Still running: "Nothing needed until 11:40" when the time is a clock time.
       const clock = m.type === 'working' && typeof n.eta === 'string' && !n.eta_minutes &&
@@ -693,7 +713,7 @@
       // actions ... its like it does need me").  "Nothing needed." stays only
       // while the chips are not shown (an older card, a working one); CSS
       // hides it and the empty band otherwise.
-      h += band('Next', (clock ? '<b>Nothing needed until ' + esc(clock) + '.</b> ' : '<b class="lm-nn">Nothing needed.</b> ') +
+      mv.push(band('Next', (clock ? '<b>Nothing needed until ' + esc(clock) + '.</b> ' : '<b class="lm-nn">Nothing needed.</b> ') +
         '<span class="lm-nx">' + inl(n.next || n.why || '') + '</span>' +
         (n.eta && !n.eta_minutes && !clock ? '<span class="lm-eta">' + esc(n.eta) + '</span>' : '') +
         // The verdict chips sit right under the Next line, in the same band
@@ -702,7 +722,7 @@
         // .lm-yv chip styles and hides itself while the chips are hidden.
         // A "Left waiting" strip stays above the verdict (owner's pick C).
         backToStrip(m.back_to) +
-        (m.type !== 'working' && !m.late ? '<div class="lm-yv lm-yv-in">' + verdictRows() + '</div>' : ''), 'lm-quiet');
+        (m.type !== 'working' && !m.late ? '<div class="lm-yv lm-yv-in">' + verdictRows() + '</div>' : ''), 'lm-quiet'));
     } else {
       let x = '<p class="lm-ask">' + inl(n.ask) + '</p>';
       let look = (n.look || []).filter(l => !isImg(l));
@@ -747,22 +767,20 @@
         : row({ tile: String(i + 1), title: inl(sp.text), cls: 'static' })).join('') + '</div>';
       if (!decide && n.replies && n.replies.length) x += replyButtons(n.replies);
       x += '<div class="lm-sent">' + I.check + '<span>Reply sent:</span><b class="v"></b></div>';
+      if (n.why) x += '<p class="lm-whyask"><b>Why I’m asking:</b> ' + inl(n.why) + '</p>';
       if (n.next) x += '<p class="lm-next"><b>Then:</b> ' + inl(n.next) + '</p>';
       if ((n.kind === 'decision' || n.kind === 'action') && !m.late) x += verdictRows();
-      h += band(({ decision: 'Decide', approve: 'Approve', action: 'To do' })[n.kind] || 'Needed from you', x, 'lm-sec lm-needs');
+      mv.push(band(({ decision: 'Decide', approve: 'Approve', action: 'To do' })[n.kind] || 'Needed from you', x, 'lm-sec lm-needs'));
     }
-    // After the action band, before More: a side finding and its one button.
-    h += findingBand(m.finding);
-
-    let more = '', bits = [];
-    if (n.why && n.kind && n.kind !== 'none') { bits.push('why I’m asking'); more += '<div class="lm-sub">Why I’m asking</div><div style="font-size:13px;color:var(--text-muted)">' + inl(n.why) + '</div>'; }
-    if (m.verified && m.verified.length) { bits.push('checked ' + m.verified.length + (m.verified.length > 1 ? ' ways' : ' way')); more += '<div class="lm-sub">How I checked it</div>' + list(m.verified.map(v => ({ what: v.check, why: v.result, ok: v.ok })), 'ok'); }
-    if (m.watch_for && m.watch_for.length) { bits.push(m.watch_for.length + (m.watch_for.length > 1 ? ' notes' : ' note')); more += '<div class="lm-sub">Worth knowing</div>' + list(m.watch_for, 'dot'); }
-    const links = (m.links || []).filter(l => !isImg(l));
-    if (links.length) { bits.push(links.length + (links.length > 1 ? ' links' : ' link')); more += '<div class="lm-sub">Look at</div><div class="lm-rows">' + links.map(linkRow).join('') + '</div>'; }
-    if (m.details && m.details.length) { bits.push('technical details'); more += '<div class="lm-sub">Technical details</div>' + list(m.details, 'dot'); }
-    if (more) h += band('More', '<button type="button" class="lm-more">' + I.chev + ' ' + bits.map(b => b.charAt(0).toUpperCase() + b.slice(1)).join(' · ') + '</button><div class="lm-fold">' + more + '</div>', 'lm-morebar');
+    // Last in Review & respond: a side finding and its one button.
+    mv.push(findingBand(m.finding));
+    // When the only part is a Read it / Send it whose buttons are hidden (an
+    // older summary), Review & respond says so instead of standing empty.
+    const onlyAct = mv.every(x => !x || x.indexOf('lm-act') !== -1);
+    h += band('Review &amp; respond', (onlyAct ? '<p class="lm-line lm-none lm-mv-none">Nothing to do here.</p>' : '') + mv.join(''),
+      'lm-sec lm-move' + (n.kind && n.kind !== 'none' ? ' lm-move-needs' : ''));
     return h + '</div>';
+
   }
 
   // A deliverable file marked "copy": true is a Copy row (owner, 2026-10-29:
@@ -1337,7 +1355,7 @@
       const sec = document.createElement('div');
       sec.className = 'lm-dl lm-hist';
       sec.innerHTML = '<div class="dt">History</div><div class="dd"><div class="lm-zoom"></div></div>';
-      const after = last.querySelector(':scope > .lm-dl.lm-quiet, :scope > .lm-dl.lm-needs, :scope > .lm-dl.lm-morebar');
+      const after = last.querySelector(':scope > .lm-dl.lm-move, :scope > .lm-dl.lm-quiet, :scope > .lm-dl.lm-needs, :scope > .lm-dl.lm-morebar');
       if (after) last.insertBefore(sec, after); else last.appendChild(sec);
       zoom = sec.querySelector('.lm-zoom');
     }

@@ -99,10 +99,11 @@ def test_the_text_box_of_a_standby_session_says_standby(browser):
         assert app.eval("() => getComputedStyle(document.querySelector('#live-input-bar .vn-st-lbl')).color") in (
             "rgb(40, 190, 175)", "rgb(10, 135, 125)")
 
-        # Taken off Standby on another device: the box goes back to Sleeping at once.
+        # Taken off Standby on another device: the box goes back to Needs you
+        # at once (the status picker, owner's pick A, 2026-10-31).
         app.push("session_hold", {"session_id": ids[0], "state": None})
         app.page.wait_for_timeout(200)
-        assert app.eval(STRIP) == ["", "Sleeping", "Wakes when you send a message", "Type a message to wake it"]
+        assert app.eval(STRIP) == ["needs", "Needs you", "Its reply is waiting for you", "Type a message to wake it"]
 
         # Put back on Standby from elsewhere: "just now".
         app.push("session_hold", {"session_id": ids[0], "state": "standby", "since": time.time()})
@@ -113,11 +114,13 @@ def test_the_text_box_of_a_standby_session_says_standby(browser):
 
 
 @pytest.mark.slow
-def test_a_session_that_is_not_on_standby_still_says_sleeping(browser):
+def test_with_person_statuses_off_a_sleeping_session_still_says_sleeping(browser):
+    # With Smart termination off there are no person statuses, so no picker:
+    # the box keeps the process status.  With it on, see test_status_picker.py.
     from tests._fake_app import CWD, FakeApp, fake_sessions, init_script
     s = fake_sessions(1)
     sid = s[0]["id"]
-    app = FakeApp(browser, s, init=init_script("sessions", "grid"),
+    app = FakeApp(browser, s, init=init_script("sessions", "grid", "localStorage.setItem('vnSmartTermination', 'off');"),
                   extra_routes={"/api/session/": lambda r: (200, {"id": sid, "display_title": "T", "messages": []})})
     try:
         app.push("session_state", {"session_id": sid, "state": "stopped", "cwd": CWD})

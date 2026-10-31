@@ -230,7 +230,12 @@ class FakeAgent:
 # demonstration now rules out (test_a_test_that_misses_the_change_is_not_high).
 SUB_TEST = "import thing\nassert thing.sub(5, 3) == 2\nassert thing.sub(0, 4) == -4\nprint('2 passed')\n"
 
-PLAN_BLOCK = """```verification
+# A plan names its failure scenarios or says why none apply (pipeline/findings.py);
+# the toy helper has none, and the audit fixture names the declaration.
+NO_SCENARIOS = "NO-SCENARIOS: one pure arithmetic helper keeps no state, identity or ordering to get wrong\n"
+
+PLAN_BLOCK = NO_SCENARIOS + """
+```verification
 - id: unit
   cmd: {python} test_sub.py
   expect: \\d+ passed
@@ -252,6 +257,7 @@ Intent matched. Blast radius: thing.py only.
 
 The request is a sub() helper beside add(). unit calls sub() with a positive and a negative result,
 and its baseline run shows it fails without sub(); lint is optional hygiene and proves nothing about the request.
+NO-SCENARIOS holds: sub() is a pure function with no state, ordering or identity to fail.
 
 Verdict: covered
 
@@ -569,15 +575,15 @@ def test_an_unexecutable_criterion_caps_the_grade_at_medium(repo):
     is the only finding, and it caps the grade at MEDIUM, not lower."""
     run_dir, sess = make_valid_run(repo)
     p = run_dir / "01-plan.md"
-    unit = PLAN_BLOCK.split("- id: lint")[0].replace("```verification\n", "")
-    p.write_text("# plan\n\n```verification\n" + unit +
+    unit = PLAN_BLOCK.split("- id: lint")[0].split("```verification\n")[1]
+    p.write_text("# plan\n\n" + NO_SCENARIOS + "\n```verification\n" + unit +
                  "- id: native-ui\n  executable: false\n  reason: no desktop here\n```\n", encoding="utf-8")
     tester = sess.agent("brief")
     record_check(tester, run_dir, "unit")
     record_baseline(tester, run_dir, "unit")
     # The audit accounts for both criteria, the one that cannot run included.
     _audit(run_dir, "## Do the checks prove the request?\n\nunit exercises sub(); native-ui would prove the "
-                    "desktop screen but cannot run here.\n\nVerdict: covered\n\n", sess)
+                    "desktop screen but cannot run here. NO-SCENARIOS holds.\n\nVerdict: covered\n\n", sess)
     v = harness.grade_run(run_dir)
     # Informational notes (the fixture repository pins no suite) do not grade.
     assert {f.code for f in v.findings if f.severity != "info"} == {"unexecuted"}, harness.format_verdict(v)
@@ -624,7 +630,8 @@ def _audit(run_dir: Path, coverage: str, sess=None) -> None:
         _write_stage(sess, run_dir, "08-audit.md", text)
 
 
-COVERAGE_OK = "## Do the checks prove the request?\n\nunit exercises sub() directly.\n\nVerdict: covered\n\n"
+COVERAGE_OK = ("## Do the checks prove the request?\n\nunit exercises sub() directly. NO-SCENARIOS holds for a "
+               "pure helper.\n\nVerdict: covered\n\n")
 
 
 def test_an_audit_that_does_not_judge_coverage_is_medium(repo):
@@ -654,7 +661,7 @@ def test_the_coverage_section_must_name_every_required_criterion(repo):
     assert v.grade == "MEDIUM"
     assert any(f.code == "coverage" and "unit" in f.message for f in v.findings)
     # The optional criterion need not be named; the required one must.
-    _audit(run_dir, "## Do the checks prove the request?\n\nunit exercises sub() directly.\n\nVerdict: covered\n\n")
+    _audit(run_dir, COVERAGE_OK)
     v = harness.grade_run(run_dir)
     assert "coverage" not in codes(v)
 
@@ -1109,7 +1116,7 @@ def test_a_waiver_holds_only_when_the_independent_audit_names_it(repo):
     assert "no-change-detection" not in codes(v)
     assert any(f.code == "coverage" and "no-baseline" in f.message for f in v.findings)
     _audit(run_dir, "## Do the checks prove the request?\n\nunit exercises sub(); no-baseline: agreed, nothing "
-                    "observable changes.\n\nVerdict: covered\n\n", sess)
+                    "observable changes. NO-SCENARIOS holds.\n\nVerdict: covered\n\n", sess)
     v = harness.grade_run(run_dir)
     assert {f.code for f in v.findings if f.severity != "info"} == set(), harness.format_verdict(v)
     assert v.grade == "HIGH"
@@ -1200,7 +1207,7 @@ def test_the_pinned_suite_is_required_even_when_the_plan_leaves_it_out(repo):
     record_baseline(sess.agent("brief"), run_dir, "unit")
     # New evidence means a fresh audit of it.
     _audit(run_dir, "## Do the checks prove the request?\n\nsuite is the project's own suite; unit exercises "
-                    "sub().\n\nVerdict: covered\n\n", sess)
+                    "sub(). NO-SCENARIOS holds.\n\nVerdict: covered\n\n", sess)
     v = harness.grade_run(run_dir)
     assert v.grade == "HIGH", harness.format_verdict(v)
     assert "suite-unpinned" not in codes(v)

@@ -95,8 +95,9 @@ FOURTH_QUESTION_RE = re.compile(r"^#+[^\n]*what\s+could\s+still\s+be\s+wrong[^\n
 # reads.  The judgment stays an agent's; the program enforces that a fresh
 # checker made it, explicitly, and that a "no" costs the grade.
 COVERAGE_RE = re.compile(r"^#+[^\n]*checks\s+prove\s+the\s+request[^\n]*$", re.IGNORECASE | re.MULTILINE)
-COVERAGE_VERDICT_RE = re.compile(r"^[\s>*_-]*verdict[\s*_]*:[\s*_]*(not\s+covered|covered)\b",
+COVERAGE_VERDICT_RE = re.compile(r"^[\s>*_-]*verdict[\s*_]*:[\s*_]*(not\s+covered|covered)[\s*_.]*$",
                                  re.IGNORECASE | re.MULTILINE)
+VERDICT_LINE_RE = re.compile(r"^[ \t>*_-]*verdict[ \t*_]*:", re.IGNORECASE | re.MULTILINE)
 # Routes whose request changes behavior, so a regression demonstration
 # applies; (d) is cleanup with no behavior change.
 BASELINE_ROUTES = ("a", "b", "c")
@@ -464,7 +465,8 @@ def grade_run(run_dir: Path, *, prices: dict | None = None) -> Verdict:
         criteria={c.id: c for c in criteria}, passed_now=passed_now,
         red=_red_runs(run_dir, criteria, now_fp, shell_calls),
         baseline_ok=set(v.facts.get("baseline_demonstrated") or []), stale=stale)
-    outcomes = _check_register(v, run_dir, plan_src, stage_last, stage_last_writer, history, view, everything)
+    outcomes = _check_register(v, run_dir, plan_src, stage_last, stage_last_writer, history, view, everything,
+                               route=route)
     v.facts["register"] = [asdict(o) for o in outcomes]
     v.facts["verification"] = {
         "criteria_passed": sum(1 for c in v.criteria if c["status"] == "passed"),
@@ -494,7 +496,7 @@ def grade_run(run_dir: Path, *, prices: dict | None = None) -> Verdict:
         if not m or len(re.sub(r"\s+", " ", answer).strip()) < 40:
             v.add("fourth-question", "medium",
                   "08-audit.md does not answer 'what could still be wrong that no check would catch?'")
-        _check_coverage(v, text, criteria, [o.id for o in outcomes])
+        _check_coverage(v, text, criteria, [o.id for o in outcomes] + list(v.facts.get("audit_must_name") or []))
 
     v.facts["graded_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:
@@ -942,11 +944,22 @@ def _check_coverage(v: Verdict, audit_text: str, criteria, register_ids=()) -> N
         v.add("coverage", "medium",
               f"the coverage section does not account for scenario or finding {', '.join(sorted(unnamed))}; the "
               f"audit judges whether the evidence cited for each really exercises it")
+    # Exactly one verdict, and a valid one: the first line no longer decides
+    # when a later one in the same section says the opposite.
+    lines = VERDICT_LINE_RE.findall(section)
+    valid = [m.group(1) for m in COVERAGE_VERDICT_RE.finditer(section)]
+    if len(lines) > len(valid):
+        v.add("coverage", "medium",
+              "the coverage section has a Verdict line that is neither 'covered' nor 'not covered'")
+    if len(valid) > 1:
+        v.add("coverage", "medium",
+              f"the coverage section has {len(valid)} Verdict lines; it must reach exactly one")
     verdict = COVERAGE_VERDICT_RE.search(section)
     if not verdict:
-        v.add("coverage", "medium",
-              "the coverage section has no 'Verdict: covered' or 'Verdict: not covered' line")
-    elif not re.fullmatch(r"covered", verdict.group(1), re.IGNORECASE):
+        if len(lines) == len(valid):
+            v.add("coverage", "medium",
+                  "the coverage section has no 'Verdict: covered' or 'Verdict: not covered' line")
+    elif any(not re.fullmatch(r"covered", x, re.IGNORECASE) for x in valid):
         v.add("coverage", "medium",
               "the audit judged that the checks do not prove the request was met")
 
@@ -1160,7 +1173,7 @@ def _check_checker_sequence(v: Verdict, run_dir: Path, everything, checker_stage
 
 def _check_register(v: Verdict, run_dir: Path, plan_src: Path | None, last: dict, last_writer: dict,
                     history: dict[str, list[dict]], view: findings_mod.EvidenceView,
-                    everything) -> list[findings_mod.Outcome]:
+                    everything, route: str = "a") -> list[findings_mod.Outcome]:
     """Every planned scenario and every suspected defect reaches a disposition
     the evidence supports (``pipeline.findings``).
 
@@ -1177,10 +1190,27 @@ def _check_register(v: Verdict, run_dir: Path, plan_src: Path | None, last: dict
              for s in stages if (run_dir / s).is_file()}
     disps = {s: findings_mod.dispositions_in(t, s) for s, t in texts.items()}
     entries: dict[str, findings_mod.Entry] = {}
+    raises: list = []
+    must_name: list[str] = []
     if plan_src is not None and plan_src.is_file():
         plan_text = plan_src.read_text(encoding="utf-8", errors="replace")
+        raises += findings_mod.raises_in(plan_text, plan_src.name)
         for e in findings_mod.scenarios_in(plan_text, plan_src.name):
             entries[e.id] = e
+        # A plan that names no scenario says so, with a reason the audit
+        # judges; silence would look the same as having thought it through.
+        reason = findings_mod.no_scenarios_reason(plan_text)
+        if route in BASELINE_ROUTES and not entries:
+            if reason is None:
+                v.add("scenarios-undeclared", "medium",
+                      f"{plan_src.name} names no SCENARIO and does not declare 'NO-SCENARIOS: <why none apply>'; "
+                      f"a plan that considered none must say so")
+            elif len(reason.split()) < findings_mod.NO_SCENARIOS_MIN_WORDS:
+                v.add("scenarios-undeclared", "medium",
+                      f"{plan_src.name} declares NO-SCENARIOS without a reason (at least "
+                      f"{findings_mod.NO_SCENARIOS_MIN_WORDS} words saying why no failure scenario applies)")
+            else:
+                must_name.append(findings_mod.NO_SCENARIOS_ID)
         # A scenario the plan once named cannot silently leave it: every
         # SCENARIO id a recorded file tool ever wrote into the plan counts.
         for _t, c in writers_of(everything, plan_src):
@@ -1193,13 +1223,19 @@ def _check_register(v: Verdict, run_dir: Path, plan_src: Path | None, last: dict
                           f"scenario {e.id} was written into {plan_src.name} during the run and is gone now; a "
                           f"planned scenario is settled by a disposition, not removed")
     for s in stages:
+        raises += findings_mod.raises_in(texts.get(s, ""), s)
+        must_name += findings_mod.free_note_ids(texts.get(s, ""))
         for e in findings_mod.findings_in(texts.get(s, ""), s):
-            if e.id not in entries or entries[e.id].kind == "scenario":
+            if e.id not in entries:
                 entries[e.id] = e
         for line in findings_mod.unstructured_observations(texts.get(s, "")):
             v.add("observation-unstructured", "medium",
                   f"{s}: {line[:120]!r} labels an observation non-blocking outside the structured forms; record it "
-                  f"as FINDING: <id> (a correctness concern) or NOTE: <id> (cosmetic, optional, a preference)")
+                  f"as FINDING: <id> (a correctness concern) or NOTE: <id> cosmetic: (or enhancement: / "
+                  f"preference:) <text>")
+    for msg in findings_mod.collisions(raises):
+        v.add("finding-id-collision", "medium", msg)
+    v.facts["audit_must_name"] = sorted(set(must_name) - set(entries))
     raisers: dict[str, set] = {}
     for s, recs in (history or {}).items():
         if s not in order:

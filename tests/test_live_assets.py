@@ -48,7 +48,7 @@ def _old_copy(src: str) -> str:
     """The card script as it was before the rename: both headings 'Your move'."""
     old = src.replace("band(({ decision: 'Decide', approve: 'Approve', action: 'To do' })[n.kind] || 'Needed from you'",
                       "band('Your move'")
-    old = old.replace("h += band('Next', (clock ? ", "h += band('Your move', (clock ? ")
+    old = old.replace("mv.push(band('Next', (clock ? ", "mv.push(band('Your move', (clock ? ")
     assert old.count("'Your move'") == 2, "the card's heading code moved; update this test's old copy"
     return old
 

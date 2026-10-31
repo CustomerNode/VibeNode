@@ -133,8 +133,8 @@ def test_a_planned_scenario_with_a_passing_covering_check_is_verified(repo):
 
 
 def test_a_cosmetic_note_needs_no_evidence(repo):
-    r = Run(repo, review="# 03 Review\n\nNOTE: doc-wording the docstring could name the operands\n",
-            covers=None, red=False, audit=audit_text(names=()))
+    r = Run(repo, review="# 03 Review\n\nNOTE: doc-wording cosmetic: the docstring could name the operands\n",
+            covers=None, red=False, audit=audit_text(names=("doc-wording",)))
     assert_high(r.grade())
 
 
@@ -323,7 +323,7 @@ def test_the_audit_must_name_every_register_item(repo):
 
 REGISTER_CODES = ("resolution-unproven", "evidence-missing", "evidence-unrelated", "evidence-stale", "fix-unproven",
                   "disposition-invalid", "obligation-open", "obligation-unresolved", "obligation-dropped",
-                  "observation-unstructured", "finding-unresolved")
+                  "observation-unstructured", "finding-unresolved", "finding-id-collision", "scenarios-undeclared")
 
 
 @pytest.mark.parametrize("code", REGISTER_CODES)
@@ -344,9 +344,13 @@ def test_every_register_finding_has_its_own_words_on_a_card_that_passes_the_vali
 
 
 def test_the_parser_reads_the_structured_lines():
-    text = ("FINDING: a1 wrong total\n**BLOCKING:** b2 crash on empty input\nNOTE: c3 rename the helper\n"
-            "NOTE: d4 the cache can go stale\nFIXED: a1 by=t1,t2\nNOT A DEFECT: b2 by=t3\nUNRESOLVED: x9 unknown\n")
-    assert findings.accountable_ids(text) == ["a1", "b2", "d4"]
+    text = ("FINDING: a1 wrong total\n**BLOCKING:** b2 crash on empty input\nNOTE: c3 cosmetic: rename the helper\n"
+            "NOTE: d4 cosmetic: the cache can go stale\nNOTE: e5 the retry keeps the old choice\n"
+            "FIXED: a1 by=t1,t2\nNOT A DEFECT: b2 by=t3\nUNRESOLVED: x9 unknown\n")
+    # c3 states a class and reads as cosmetic; d4 states one but is worded as
+    # a correctness concern; e5 states none, so it is held whatever its words.
+    assert findings.accountable_ids(text) == ["a1", "b2", "d4", "e5"]
+    assert findings.free_note_ids(text) == ["c3"]
     ds = {d.id: (d.kind, d.by) for d in findings.dispositions_in(text, "04-test.md")}
     assert ds == {"a1": ("fixed", ["t1", "t2"]), "b2": ("not-a-defect", ["t3"]), "x9": ("unresolved", [])}
     assert plan.parse_criteria("- id: t\n  cmd: x\n  covers: a1, b2\n")[0].covers_ids() == ["a1", "b2"]

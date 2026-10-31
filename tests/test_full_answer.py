@@ -43,7 +43,8 @@ EX = "## What this is about\nYou asked about titles.\n\n## What happened\n" + "P
 BASE = {"type": "explain", "title": "A fixed title format", "headline": "Word order won't fix vague titles.",
         "context": "Titles", "answer": "Word order isn't the problem; a first slot naming a place is.",
         "zoom": {"big": "Clearer titles", "task": "Enforce a title format", "now": "Tested formats"},
-        "explained": EX, "needs": {"kind": "none", "why": "Answered.", "next": "Nothing planned."}}
+        "explained": EX, "needs": {"kind": "none", "why": "Answered.", "next": "Nothing planned."},
+        "what_was_done": "Compared title formats.", "checked": "No research beyond base training data."}
 
 
 @pytest.fixture(scope="module")
@@ -61,7 +62,7 @@ def out():
 
 
 def _band(h):
-    return h[h.index(">Answer<"):]
+    return h[h.index(">Summary<"):]
 
 
 def test_one_answer_band_with_a_short_full_plain_words_switch(out):
@@ -178,12 +179,14 @@ def test_tapping_a_version_shows_only_that_version(browser):
 DV = {"type": "deliverable", "title": "Token cost table", "headline": "The build used 18M tokens, about $6.88.",
       "answer": "Main agent only; cached reads were 98% of tokens but $3.59 of the cost.",
       "explained": EX, "zoom": BASE["zoom"], "needs": {"kind": "none", "why": "Answered.", "next": "Nothing planned."},
+      "what_was_done": "Added up the logs.", "checked": "Read the session logs.",
       "deliverable": {"kind": "report", "title": "Token use", "body": "| Agent | Tokens |\n|---|---|\n| Main | 18M |",
                       "files": [{"label": "The table as CSV", "url": "/static/scratch/tokens.csv", "size": "1 KB"}]}}
 DONE = {"type": "done", "title": "Archive button", "headline": "Sessions can be archived from the right-click menu.",
         "answer": "Archive sits under Rename; archived sessions leave the list and come back from the filter.",
         "full_answer": "## What changed\n- the menu item\n- the filter", "explained": EX, "zoom": BASE["zoom"],
         "links": [{"label": "Try it", "kind": "link", "url": "/"}],
+        "what_was_done": "Added Archive.", "checked": "Ran the archive tests.",
         "needs": {"kind": "none", "why": "Done.", "next": "Nothing planned."}}
 
 

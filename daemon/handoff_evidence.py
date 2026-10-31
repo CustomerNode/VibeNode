@@ -57,6 +57,12 @@ class TurnFacts:
     # (a background shell or agent, a scheduled wake-up).  None when it
     # cannot be told (history trimmed).
     background_live: Optional[bool] = None
+    # The last Decide / Approve card that ended a turn and that none of his
+    # later messages answered (open_choice()).  None when there is none.
+    open_choice: Optional[dict] = None
+    # The tool calls made since the user's latest message (this turn), for
+    # the What was done / Checked lines.  None when it cannot be told.
+    turn_actions: Optional[list] = None
 
 
 # A user message that carries no request of its own.
@@ -144,7 +150,8 @@ def facts_from_entries(entries: Iterable, *, trimmed: bool = False, max_requests
     entries = list(entries or ())
     facts = TurnFacts(complete=not trimmed)
     pending = {}
-    for e in entries:
+    called_at = []   # (entry index, Action) for each tool call, for turn_actions
+    for idx, e in enumerate(entries):
         kind = getattr(e, "kind", "")
         if kind == "tool_use":
             # Not a success until its result comes back (2026-10-29): a call
@@ -152,6 +159,7 @@ def facts_from_entries(entries: Iterable, *, trimmed: bool = False, max_requests
             a = Action(tool=getattr(e, "name", "") or "", detail=getattr(e, "desc", "") or "",
                        ok=False, returned=False)
             facts.actions.append(a)
+            called_at.append((idx, a))
             if getattr(e, "id", ""):
                 pending[e.id] = a
         elif kind == "tool_result":
@@ -168,6 +176,8 @@ def facts_from_entries(entries: Iterable, *, trimmed: bool = False, max_requests
     if not trimmed:
         facts.background_live = _background_live(entries, human[-1] if human else -1)
     if human:
+        facts.turn_actions = [a for i, a in called_at if i > human[-1]]
+    if human:
         last_human = human[-1]
         start = -1
         for i in range(last_human - 1, -1, -1):
@@ -183,7 +193,181 @@ def facts_from_entries(entries: Iterable, *, trimmed: bool = False, max_requests
             break
     facts.prev_big, facts.prev_path = _prev_big(entries, with_path=True)
     facts.history = [clean_request(entries[i].text) for i in human][-60:]
+    facts.open_choice = open_choice(entries)
     return facts
+
+
+# ── An unanswered choice stays open ───────────────────────────────────────
+#
+# The owner, 2026-10-31, on the status picker session: it asked him to pick
+# between a status line, a header chip or both; he asked for an explanation,
+# then for a demo of the first one, and the next card ended as Done with
+# "stays unchanged until a picker is chosen" and nothing to tap.  A question
+# back or another request is not a pick, so the choice stays open until he
+# sends one of its replies, hands the pick over, or drops it.
+
+_PICK_LEAD = re.compile(r"^(?:(?:go with|pick|choose|i pick|i choose|let'?s do|let'?s go with)\s+)?(?:option\s+)?")
+_PICK_TAIL = re.compile(r"[.!,]?(?:\s+(?:please|thanks))?[.!]?$")
+_DONE_SAID = re.compile(r"^(?:done|did it|i did it|i'?ve done it|logged in|i logged in|finished)\b")
+# He lets the choice go, or hands it to the session.
+_RELEASES = re.compile(
+    r"\b(?:forget|never\s*mind|nevermind|drop|skip|scrap|ditch|cancel)\s+(?:about\s+)?(?:it|that|this|the\s+(?:choice|decision|pick|options?|question))\b"
+    r"|^\W*(?:never\s*mind|nevermind|forget\s+it|skip\s+it|drop\s+it)\b"
+    r"|\b(?:you|u)\s+(?:pick|choose|decide)\b|\byour\s+(?:call|choice|pick)\b|\bwhatever\s+you\s+(?:think|prefer|recommend)\b"
+    r"|\b(?:go|do)\s+(?:with\s+)?(?:what|whichever)\s+you\s+(?:think|prefer|recommend)"
+    r"|\b(?:either|any|both)\s+(?:one\s+)?(?:is|are)\s+fine\b|\bgo\s+with\s+(?:your|the)\s+recommend", re.I)
+
+
+_LOOKS_FIRST = re.compile(r"\?|\b(?:mock|mockup|demo|show|explain|compare|differen|preview|example|what|how|why|which|"
+                          r"look\s+like|see|not\s+sure|unsure)", re.I)
+
+
+# A go-ahead on what is in front of him ("ok build it" after a demo of one
+# choice) settles the choice: he took that one (2026-10-31, the status picker
+# session, where the first version of this rule missed it and the session
+# added a strip and a confirm card he could not follow: "i am totaly lost").
+# The card's own "Yes, do that: …" offer button is a different yes and does
+# not count.
+_GO_AHEAD = re.compile(
+    r"^\W*(?:(?:ok(?:ay)?|yes|yeah|yep|sure|great|cool|perfect|good|nice|love\s+it|looks\s+good)\W*)*"
+    r"(?:(?:then\s+|now\s+|please\s+)?(?:build|ship|do|make|implement|use|keep|apply|go\s+with|go\s+ahead\s+(?:with|and)?|"
+    r"roll\s+out|put\s+in|add)\s*(?:it|that|this|them|that\s+one|this\s+one)?\b.*)?$", re.I)
+
+
+def _go_ahead(said: str) -> bool:
+    s = (said or "").strip()
+    if not s or s.lower().startswith("yes, do that:") or "?" in s or len(s.split()) > 8:
+        return False
+    return bool(_GO_AHEAD.match(s)) and bool(_ACK.match(s) or re.search(
+        r"\b(?:build|ship|do|make|implement|use|keep|apply|go\s+with|go\s+ahead|roll\s+out|put\s+in|add)\b", s, re.I))
+
+
+def _norm_said(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def answers_choice(card: dict, text: str) -> bool:
+    """Does his message answer this Decide / Approve card?  The same test
+    the card itself uses to mark a choice answered (``_answers`` in
+    static/js/last-card.js): a reply's own words anywhere, its label or key
+    as the whole message, "done" for an action."""
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    said = _norm_said(text)
+    if not said:
+        return False
+    rs = [r for r in (needs.get("replies") or []) if isinstance(r, dict)]
+    for r in rs:
+        v = _norm_said(r.get("reply") if isinstance(r.get("reply"), str) else "")
+        if len(v) >= 3 and v[:40] in said:
+            return True
+    pick = _PICK_TAIL.sub("", _PICK_LEAD.sub("", said)).strip()
+    for r in rs:
+        v = _norm_said(r.get("label") if isinstance(r.get("label"), str) else "").rstrip(".!")
+        if len(v) >= 3 and pick == v:
+            return True
+    keys = [str(r.get("key") or chr(65 + i)).lower() for i, r in enumerate(rs)]
+    if re.fullmatch(r"[a-z0-9]", pick) and pick in keys:
+        return True
+    # A direction in his own words that names exactly one choice ("…cancel
+    # hide" for "Hide it until reload").  Not a question, and not a request
+    # to see or compare them first: that is what left the status picker
+    # choice unmade.
+    if not _LOOKS_FIRST.search(said):
+        mine = _stem(_words(said))
+        own = [_stem(_words(r.get("label") if isinstance(r.get("label"), str) else "")) for r in rs]
+        named = [i for i, w in enumerate(own) if (w - set().union(*(own[:i] + own[i + 1:]))) & mine]
+        if len(named) == 1:
+            return True
+    return needs.get("kind") == "action" and bool(_DONE_SAID.match(said)) and not said.rstrip().endswith("?")
+
+
+def _his(e) -> str:
+    """His own words in a user entry, or '' for anything the app or the CLI posted."""
+    if getattr(e, "kind", "") != "user":
+        return ""
+    t = clean_request(getattr(e, "text", ""))
+    if not t or t.startswith(_NOT_ASKED + ("Stop hook feedback", "<task-notification>")):
+        return ""
+    return t
+
+
+def open_choice(entries: list) -> Optional[dict]:
+    """The last Decide / Approve card with buttons that ended a turn, when
+    none of his messages since answered it, handed the pick over, or let it
+    go.  A card sent back (Stop hook feedback follows) and the card being
+    checked now (nothing follows) do not count."""
+    from daemon import handoff_rules  # local: handoff_rules imports this module
+    entries = list(entries or ())
+    last = None
+    for i, e in enumerate(entries):
+        if getattr(e, "kind", "") != "asst" or "```handoff" not in (getattr(e, "text", "") or ""):
+            continue
+        nxt = next((x for x in entries[i + 1:] if getattr(x, "kind", "") == "user"), None)
+        if nxt is None or (getattr(nxt, "text", "") or "").lstrip().startswith("Stop hook feedback"):
+            continue
+        card, _, err = handoff_rules.extract(e.text)
+        if err or not isinstance(card, dict):
+            continue
+        needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+        if needs.get("kind") in ("decision", "approve") and \
+                any(isinstance(r, dict) for r in (needs.get("replies") or [])):
+            last = (i, card)
+        elif needs.get("kind") in ("decision", "approve", "action"):
+            last = None   # a newer question replaced it
+    if last is None:
+        return None
+    i, card = last
+    for e in entries[i + 1:]:
+        said = _his(e)
+        if not said:
+            continue
+        if said.startswith("Wrong kind of card:") or answers_choice(card, said) or _RELEASES.search(said) or _go_ahead(said):
+            return None
+    return card
+
+
+def _choice_words(card: dict) -> str:
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    bits = [card.get("title"), needs.get("ask")]
+    for r in needs.get("replies") or []:
+        if isinstance(r, dict):
+            bits += [r.get("label"), r.get("reply")]
+    return " ".join(b for b in bits if isinstance(b, str))
+
+
+def open_choice_problems(card: dict, facts: TurnFacts) -> list:
+    """A choice he has not made yet is carried on every card until he makes
+    it: asked again with its buttons, or held in "back_to"."""
+    old = getattr(facts, "open_choice", None)
+    if not isinstance(old, dict) or not isinstance(card, dict):
+        return []
+    if facts.last_user and (answers_choice(old, facts.last_user) or _RELEASES.search(facts.last_user)
+                           or _go_ahead(facts.last_user)):
+        return []
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    old_words = _stem(_words(_choice_words(old)))
+    if needs.get("kind") in ("decision", "approve") and needs.get("replies"):
+        old_r = {_norm_said(r.get(k)) for r in (old.get("needs") or {}).get("replies") or [] if isinstance(r, dict)
+                 for k in ("label", "reply") if isinstance(r.get(k), str) and r.get(k).strip()}
+        new_r = {_norm_said(r.get(k)) for r in needs.get("replies") or [] if isinstance(r, dict)
+                 for k in ("label", "reply") if isinstance(r.get(k), str) and r.get(k).strip()}
+        if old_r & new_r or len(old_words & _stem(_words(_choice_words(card)))) >= 2:
+            return []
+    bt = card.get("back_to")
+    if isinstance(bt, dict) and isinstance(bt.get("label"), str) and bt["label"].strip():
+        said = " ".join(bt.get(k) for k in ("label", "status", "reply") if isinstance(bt.get(k), str))
+        if old_words & _stem(_words(said)):
+            return []
+    on = (old.get("needs") or {})
+    what = _short(on.get("ask") if isinstance(on.get("ask"), str) else (old.get("title") or ""), 110)
+    labels = [r.get("label") for r in on.get("replies") or [] if isinstance(r, dict) and isinstance(r.get("label"), str)]
+    return [f"An earlier card asked the user to choose (\"{what}\": {', '.join(labels[:4])}), and he has not "
+            "picked yet: his messages since were questions or other requests, not one of its replies. Do not "
+            "drop the choice. Either end on that choice again (needs.kind \"decision\" with the same replies, "
+            "your answer to his message in \"answer\"), or keep this card's type and add \"back_to\": "
+            "{\"label\": \"<the choice, in a few words>\", \"status\": \"waiting on your pick\", \"reply\": "
+            "\"Show me the choices again\"}. The choice closes when he sends one of its replies, hands you the "
+            "pick, or says to drop it."]
 
 
 def _prev_big(entries: list, with_path: bool = False):
@@ -352,6 +536,9 @@ def _claim_fields(card: dict):
             for k in ("check", "result"):
                 if isinstance(v.get(k), str):
                     yield f"verified[{i}].{k}", v[k]
+    for k in ("what_was_done", "checked"):
+        if isinstance(card.get(k), str):
+            yield k, card[k]
 
 
 def claims(card: dict) -> list:
@@ -446,6 +633,63 @@ def claim_problems(card: dict, facts: TurnFacts) -> list:
     if "pushed" in kinds and facts.complete and not _pushed(facts):
         out.append(f"The card says it was pushed, {first['pushed']}, but no successful push shows up in this "
                    "session. Push it, or take the claim out.")
+    return out
+
+
+# ── The What was done / Checked lines against the tools run this turn ─────
+#
+# The owner, 2026-10-31, on two answers to "who is the president": one had
+# searched the web and one had answered from memory, and only the sections
+# that came and went showed it.  Every summary now carries "what_was_done" and
+# "checked" lines, and they must be true: a line may not deny a web search or
+# tool use that happened this turn, nor claim a search that did not.
+
+_IGNORED_TOOLS = frozenset({"ToolSearch", "TodoWrite"})
+_WEB_TOOL = re.compile(r"WebSearch|WebFetch|web[-_ ]?fetch|navigate|get_page_text|read_page|claude-in-chrome|"
+                       r"Claude_Browser|browser", re.I)
+_WEB_DETAIL = re.compile(r"https?://|\bweb\b|\burl\b|web page|search the web", re.I)
+_DENY_WEB = re.compile(r"\bno (?:web|online|internet)[- ]?(?:search(?:es|ing)?|research|look-?ups?|browsing|sources?)\b"
+                       r"|\bno (?:research|searching|search)\b|\bwithout (?:a )?(?:web )?(?:search(?:ing)?|research)\b"
+                       r"|\bdid(?:n'?t| not) (?:search|look (?:it )?up|browse)\b|\bbeyond (?:the )?(?:base )?training data\b"
+                       r"|\bonly (?:from )?(?:my )?(?:training data|memory)\b|\bnothing (?:searched|looked up)\b", re.I)
+_DENY_TOOLS = re.compile(r"\bno tools?(?: (?:used|run|calls?))?\b|\bwithout (?:any )?tools\b|\bnothing (?:run|ran|read|opened)\b"
+                         r"|\bno files? (?:read|opened)\b|\bno commands? (?:run|ran)\b", re.I)
+_CLAIM_WEB = re.compile(r"\bweb search(?:es|ed)?\b|\bsearched (?:the web|online|for)\b|\blooked (?:it |this )?up online\b"
+                        r"|\bonline sources?\b|\bnews sources?\b|\bfetched (?:the )?(?:page|site|url)\b|\bbrowsed\b", re.I)
+_NEG_BEFORE = re.compile(r"\b(?:no|not|without|never|didn'?t|did not|nor|zero)\b[^.;]{0,12}$", re.I)
+
+
+def _web_action(a: Action) -> bool:
+    if _WEB_TOOL.search(a.tool or ""):
+        return True
+    return a.tool in DELEGATION_TOOLS and bool(_WEB_DETAIL.search(a.detail or ""))
+
+
+def research_problems(card: dict, facts: TurnFacts) -> list:
+    acts = facts.turn_actions
+    if acts is None or not facts.complete:
+        return []
+    used = [a for a in acts if a.tool and a.tool not in _IGNORED_TOOLS]
+    web = [a for a in used if _web_action(a)]
+    out = []
+    for key in ("what_was_done", "checked"):
+        text = card.get(key)
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if web and _DENY_WEB.search(text):
+            out.append(f"\"{key}\" says \"{_DENY_WEB.search(text).group(0)}\", but this turn ran {web[0].tool}. "
+                       "Say what you looked up.")
+        elif used and _DENY_TOOLS.search(text):
+            names = ", ".join(dict.fromkeys(a.tool for a in used))
+            out.append(f"\"{key}\" says \"{_DENY_TOOLS.search(text).group(0)}\", but this turn used {names}. "
+                       "Say what they were for.")
+        for m in _CLAIM_WEB.finditer(text):
+            if _NEG_BEFORE.search(text[:m.start()]):
+                continue
+            if not web:
+                out.append(f"\"{key}\" says \"{m.group(0)}\", but no web search or page fetch ran this turn. "
+                           "Say what you actually did, e.g. \"Answered from training data; no web search\".")
+            break
     return out
 
 
@@ -864,5 +1108,6 @@ def problems(card: dict, facts: Optional[TurnFacts]) -> list:
            + blame_problems(card, getattr(facts, "others_working", None) if facts is not None else None))
     if facts is None:
         return out
-    return (out + claim_problems(card, facts) + request_problems(card, facts) + reviewer_problems(card, facts)
-            + working_problems(card, facts) + redo_kind_problems(card, facts))
+    return (out + claim_problems(card, facts) + research_problems(card, facts)
+            + request_problems(card, facts) + reviewer_problems(card, facts)
+            + working_problems(card, facts) + redo_kind_problems(card, facts) + open_choice_problems(card, facts))

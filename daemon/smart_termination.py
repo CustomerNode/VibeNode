@@ -389,6 +389,17 @@ def depth_problems(card) -> list:
         out.append('Add "answer": the Short version, two or three sentences that go one level past '
                    "the headline (on an explain card the answer; on any other card what happened or "
                    "what is asked). Every card shows Short / Plain words / Full.")
+    # The What was done and Checked sections each open on one plain line the
+    # session writes (owner, 2026-10-31: "answered directly from training data
+    # no web search (or whatever is actually true)").  handoff_evidence
+    # holds them to the tools the session ran.
+    for key, what in (("what_was_done", 'what you actually did this turn, e.g. "Answered directly from '
+                                         'training data; no web search, no tools used"'),
+                      ("checked", 'what you looked at to be sure, e.g. "No research beyond base training '
+                                  'data" or "One web search; two news sources below"')):
+        v = card.get(key)
+        if not (isinstance(v, str) and v.strip()):
+            out.append(f'Add "{key}": one plain, true line, {what}.')
     d = card.get("deliverable") if isinstance(card.get("deliverable"), dict) else {}
     has_body = isinstance(d.get("body"), str) and d["body"].strip()
     fa = card.get("full_answer")

@@ -52,6 +52,8 @@ WORDS: dict[str, tuple[str, str, str]] = {
     "obligation-unresolved": ("A risk is still open", "A risk the plan for “{task}” named is still unverified.", "{detail}"),
     "obligation-dropped": ("A planned risk was removed", "A risk the plan for “{task}” named was taken out of it.", "{detail}"),
     "observation-unstructured": ("A concern wasn't tracked", "A reviewer of “{task}” noted a concern without tracking it.", "{detail}"),
+    "finding-id-collision": ("Two problems sharing one name", "Two different problems in “{task}” were filed under one name.", "{detail}"),
+    "scenarios-undeclared": ("Risks never considered", "The plan for “{task}” names no risks and doesn't say why.", "{detail}"),
     "coverage": ("Checks don't cover the ask", "The checks don't cover all of \u201c{task}\u201d.", "{detail}"),
     "fourth-question": ("Audit incomplete", "The audit of \u201c{task}\u201d didn't say what the checks could miss.", "{detail}"),
     "stale-tree": ("Changed after checking", "\u201c{task}\u201d changed after it was checked.",
@@ -78,7 +80,7 @@ PRIORITY = ("check-failed", "never-ran", "evidence-forged", "decision-forged", "
             "unauthorized", "committed-before-delivery", "finding-unresolved", "finding-dropped",
             "fix-unproven", "resolution-unproven", "evidence-missing", "evidence-unrelated", "evidence-stale",
             "disposition-invalid", "obligation-unresolved", "obligation-open", "obligation-dropped",
-            "observation-unstructured", "unexecuted", "baseline-passed", "baseline-unrelated", "baseline-missing", "no-change-detection",
+            "observation-unstructured", "finding-id-collision", "scenarios-undeclared", "unexecuted", "baseline-passed", "baseline-unrelated", "baseline-missing", "no-change-detection",
             "no-suite", "coverage", "stale-tree", "checker-stale", "self-graded", "fourth-question")
 ACTIONS = {"commit": "Commit", "push": "Push", "merge": "Merge", "deploy": "Deploy", "package": "Package"}
 MAX_TITLE = 32
@@ -193,6 +195,10 @@ def delivery_card(verdict: dict, action: str, nonce: str, task: str) -> tuple[di
             ],
         },
         "explained": explained,
+        # Every summary says what was done and what was checked (2026-10-31),
+        # in the table's own words, never the agent's.
+        "what_was_done": f"Code Pipeline graded the finished work on “{task}” from the checks it recorded.",
+        "checked": "The recorded check results, the review findings and the audit.",
         # Every summary has Short / Plain words / Full (2026-10-30).
         "answer": f"Graded {grade}. {means}",
         "full_answer": (
@@ -201,6 +207,9 @@ def delivery_card(verdict: dict, action: str, nonce: str, task: str) -> tuple[di
                          for f in findings) or "- None recorded")
             + f"\n\n## Your two answers\n\n- **Fix it first**: the task goes back to close the gap and asks again.\n"
               f"- **{verb} it anyway**: this exact version is accepted; a later change needs a new approval."),
+        # The What was done / Checked lines every summary carries (2026-10-31).
+        "what_was_done": f"Finished the work and graded it {grade} from what actually ran.",
+        "checked": "The project's own checks, as recorded by Code Pipeline.",
     }
     return card, {"allow": allow, "deny": deny}
 
@@ -248,11 +257,15 @@ def permission_card(operation: dict, nonce: str, task: str) -> tuple[dict, dict]
             f"runs nothing, and the task is told.\n\n## What you do next\n\nTap Run the tests, or Don’t "
             f"run them. Nothing runs until you do."
         ),
+        "what_was_done": f"Prepared the check {crit} and is holding it until you answer.",
+        "checked": "The command it would run and the plan it comes from.",
         "answer": f"The check {crit} is ready; it runs once, only if you allow it.",
         "full_answer": (
             f"## The command\n\n```\n{cmd}\n```\n\nIt runs in the project folder with secret-shaped settings "
             f"removed from its environment.\n\n## Your two answers\n\n- **Run the tests**: this exact command runs "
             f"once and its result is recorded.\n- **Don’t run them**: nothing runs, and the task is told."),
+        "what_was_done": f"Prepared the check {crit}; nothing has run yet.",
+        "checked": "Nothing yet: the check runs only if you allow it.",
     }
     return card, {"allow": allow, "deny": deny}
 

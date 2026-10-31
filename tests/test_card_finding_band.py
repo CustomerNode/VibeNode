@@ -101,14 +101,16 @@ def test_no_finding_no_band_and_a_bad_shape_is_ignored(out):
 
 
 def test_the_band_sits_after_the_action_band_and_before_more(out):
-    # a finished fix: Next, then Also found, then More
+    # Last part of Review & respond, after the action (six fixed sections, 2026-10-31;
+    # there is no More section any more).
     h = out["with"]
-    assert h.index(">Next<") < h.index(">Also found<") < h.index(">More<")
+    assert h.index(">Review &amp; respond<") < h.index(">Next<") < h.index(">Also found<")
     # an answer: Read it, then Also found
     assert out["explain"].index(">Read it<") < out["explain"].index(">Also found<")
-    # a decision: Decide, then Also found, then More (why I'm asking)
+    # a decision: Decide (with why I'm asking), then Also found
     d = out["decide"]
-    assert d.index(">Decide<") < d.index(">Also found<") < d.index(">More<")
+    assert d.index(">Decide<") < d.index("lm-whyask") < d.index(">Also found<")
+    assert ">More<" not in h and ">More<" not in d
 
 
 def test_the_text_is_escaped(out):

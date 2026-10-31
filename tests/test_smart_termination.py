@@ -33,7 +33,10 @@ def _card(**over):
          "explained": EXPLAINED,
          # Short and Full: every summary has all three versions (2026-10-30).
          "answer": "The bar at the top of a phone chat now takes its own space.",
-         "full_answer": "## What changed\nThe header is no longer fixed over the thread."}
+         "full_answer": "## What changed\nThe header is no longer fixed over the thread.",
+         # What was done / Checked lines on every summary (2026-10-31).
+         "what_was_done": "Moved the phone header out of the chat's way.",
+         "checked": "Read the header's style rules."}
     c.update(over)
     return "```handoff\n" + _json.dumps(c) + "\n```"
 

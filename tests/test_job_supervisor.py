@@ -234,6 +234,32 @@ def test_non_resumable_jobs_fail_instead_of_relaunching(w):
     assert w.sm.pushes[0][1]["state"] == "failed"
 
 
+@pytest.mark.parametrize("resumable", [True, False])
+def test_a_job_left_while_running_stops_quietly(w, resumable):
+    """Leave it pressed on a running job, which then stops: no notice, no
+    relaunch.  Relaunch by a person re-arms the notice."""
+    w.register(resumable=resumable, progress=None)
+    w.procs = ["python -u authorship.py --workers 30"]
+    sup = w.supervisor()
+    assert sup.tick()[0]["action"] == "alive"
+    dj.leave_job("auth", path=w.reg)
+    w.procs = []
+    d = sup.tick()
+    assert d[0]["action"] == "left"
+    rec = w.job()
+    assert rec["state"] == "failed" and rec["acknowledged"] is True
+    assert w.sm.pushes == [] and len(w.launches) == 1
+    assert sup.tick() == []
+
+    dj.relaunch_job("auth", by="user", launch=w.launch, path=w.reg)
+    w.now += 10
+    d = sup.tick()
+    assert d[0]["action"] in ("relaunch", "fail")
+    assert d[0]["action"] == ("relaunch" if resumable else "fail")
+    if not resumable:
+        assert [ev for ev, _ in w.sm.pushes] == ["job_needs_person"]
+
+
 def test_dry_run_decides_without_changing_anything(w):
     w.register()
     w.procs = []

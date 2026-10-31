@@ -318,6 +318,10 @@ _WAITS_ON_USER = re.compile(
     r"|\b(?<!nothing\sis\s)(?<!nothing's\s)(?<!nothing\s)(?<!not\s)(?<!isn't\s)(?<!no\sone\sis\s)(?:on|with|after|pending|awaiting|waiting\s+(?:on|for))\s+your\s+(?:go-?ahead|ok(?:ay)?|confirmation|approval|"
     r"sign-?off|word|yes|pick|choice|decision|answer|reply|call|green\s+light)\b"
     r"|\b(?:the\s+one|whichever|whatever|the\s+version|the\s+option)\s+you\s+(?:pick|choose|approve)\b"
+    # "The real app stays unchanged until a picker is chosen" (2026-10-31:
+    # a Done card that had dropped his open choice).
+    r"|\buntil\s+(?:you\s+(?:pick|choose|decide|approve|confirm|say)\b|(?:\w+\s+){1,4}(?:is|are|gets?|has\s+been|have\s+been)\s+"
+    r"(?:chosen|picked|approved|decided|confirmed|selected|agreed)\b)"
     r"|\b(?<!nothing\sis\s)(?<!nothing's\s)(?<!nothing\s)(?<!not\s)(?<!isn't\s)(?<!no\sone\sis\s)waiting\s+(?:on|for)\s+you\b|\bup\s+to\s+you\b|\bwhen(?:ever)?\s+you'?re\s+ready\b", re.I)
 
 
@@ -1199,7 +1203,10 @@ def length_problems(card: dict) -> list[str]:
         # (finding_problems); the per-line cap below still applies.
         if where.startswith(("deliverable", "asks", "zoom", "explained", "full_answer")):
             continue
-        if where.startswith("finding"):
+        # what_was_done / checked: the two lines every summary carries in its
+        # What was done and Checked sections (2026-10-31); outside the 120,
+        # each still capped like any line.
+        if where.startswith(("finding", "what_was_done", "checked")):
             if n_f := _words(text):
                 if n_f > MAX_LINE_WORDS:
                     long_lines.append(f"{where} is {n_f} words (limit {MAX_LINE_WORDS})")
@@ -1517,6 +1524,17 @@ is asked). "explained" is Plain words. "full_answer" is Full: everything \
 behind it in markdown (## headings, - lists, tables), no length limit. On a \
 deliverable with a "body", that body is its Full, so it needs no \
 full_answer. A card missing one of the three is sent back.
+Every card is drawn in the same six sections: the header (path, title, \
+headline), Summary, What was done, Checked, History, Review & respond. Two of them come from one plain line each, \
+required on every card: "what_was_done" says what you actually did this \
+turn ("Answered directly from training data; no web search, no tools used", \
+"Changed the archive menu and its filter") and "checked" says what you \
+looked at to be sure ("No research beyond base training data", "One web \
+search; two news sources below", "Ran the archive tests: 14 passed"). Say \
+what is TRUE: both lines are compared with the tools you ran this turn, and \
+a line that claims a search, file read or test you did not run, or denies \
+one you did, is sent back. Status items and "did" add to What was done; \
+"verified" and links add to Checked; screenshots go in Validate.
 When earlier work in this session is still unfinished and this card is \
 about something else, add "back_to": {"label": "that work, in a few words", \
 "status": "where it stands", "reply": "the message to send to resume it"}. \
