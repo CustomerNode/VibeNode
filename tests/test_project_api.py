@@ -148,3 +148,20 @@ class TestNewSession:
         assert resp.status_code == 200
         data = resp.get_json()
         assert "session_id" in data or "ok" in data
+
+    def test_new_session_passes_the_model(self, project_app):
+        app, client, _ = project_app
+        app.session_manager.start_session.return_value = {"ok": True}
+        resp = client.post('/api/new-session', json={"prompt": "hi", "model": "claude-sonnet-5-5"})
+        assert resp.status_code == 200
+        assert app.session_manager.start_session.call_args.kwargs["model"] == "claude-sonnet-5-5"
+        client.post('/api/new-session', json={"prompt": "hi"})
+        assert app.session_manager.start_session.call_args.kwargs["model"] is None
+
+    def test_new_session_refuses_a_model_that_is_not_a_plain_id(self, project_app):
+        app, client, _ = project_app
+        app.session_manager.start_session.reset_mock()
+        for bad in ("--dangerously-skip-permissions", "opus; rm -rf x", "a b"):
+            resp = client.post('/api/new-session', json={"prompt": "hi", "model": bad})
+            assert resp.status_code == 400
+        assert not app.session_manager.start_session.called

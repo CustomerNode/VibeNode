@@ -1846,6 +1846,9 @@ paths:
                   description: If provided, resume this session instead of creating new
                 prompt:
                   type: string
+                model:
+                  type: string
+                  description: Model id for a new session (e.g. claude-sonnet-5-5); omitted means the default
       responses:
         "200":
           description: Session started

@@ -76,3 +76,44 @@ def test_short_answer_reads_the_card():
     text = 'intro\n```handoff\n{"headline": "h", "answer": "short one"}\n```'
     assert ab.short_answer(text) == "short one"
     assert ab.short_answer("plain reply") == "plain reply"
+
+
+CATALOG = [
+    {"id": "claude-opus-5-5[1m]", "name": "Opus 5.5[1m]"},
+    {"id": "claude-opus-5-5", "name": "Opus 5.5"},
+    {"id": "claude-opus-4-7", "name": "Opus 4.7"},
+    {"id": "claude-sonnet-5-5", "name": "Sonnet 5.5"},
+    {"id": "claude-sonnet-5", "name": "Sonnet 5"},
+    {"id": "claude-haiku-4-5", "name": "Haiku 4.5"},
+]
+
+
+def test_friendly_model_names_resolve_to_ids():
+    r = lambda t: ab.resolve_model(t, CATALOG)["id"]
+    assert r("opus") == "claude-opus-5-5"          # newest, without 1M
+    assert r("Sonnet") == "claude-sonnet-5-5"
+    assert r("sonnet 5") == "claude-sonnet-5"
+    assert r("Haiku 4.5") == "claude-haiku-4-5"
+    assert r("claude-opus-4-7") == "claude-opus-4-7"
+    assert r("opus 5.5 [1m]") == "claude-opus-5-5[1m]"
+    import pytest
+    with pytest.raises(ValueError):
+        r("gpt")
+
+
+def test_models_pair_with_variants_one_for_all_or_one_each():
+    v = [("A", "p"), ("B", "p"), ("C", "p")]
+    each = ab.assign_models(v, ["opus", "sonnet", "haiku"], CATALOG)
+    assert [m["id"] for _, _, m in each] == ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"]
+    one = ab.assign_models(v, ["sonnet"], CATALOG)
+    assert {m["id"] for _, _, m in one} == {"claude-sonnet-5-5"}
+    assert [m for _, _, m in ab.assign_models(v, [], CATALOG)] == [None, None, None]
+    import pytest
+    with pytest.raises(ValueError):
+        ab.assign_models(v, ["opus", "sonnet"], CATALOG)
+
+
+def test_a_model_that_did_not_take_is_caught():
+    assert ab._same_model("claude-opus-5-5", "claude-opus-5-5")
+    assert ab._same_model("claude-opus-5-5[1m]", "claude-opus-5-5")
+    assert not ab._same_model("claude-haiku-4-5", "claude-opus-5-5")

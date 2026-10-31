@@ -21,6 +21,8 @@ Usage (any number of variants from two up, same prompt or different):
     python scripts/ab_test.py --each "say it in one line" "say it in a paragraph"
     python scripts/ab_test.py --prompt "who is the president" --names "test a" "test b"
     python scripts/ab_test.py "short=answer in one line" "long=explain in detail"
+    python scripts/ab_test.py --prompt "who is the president" --models opus sonnet haiku
+    python scripts/ab_test.py --each "one line" "a paragraph" --models opus sonnet
     python scripts/ab_test.py ... --json results.json
 """
 
@@ -138,7 +140,46 @@ def build_variants(pairs, prompt, names, count, each):
     return variants
 
 
+def _norm(s: str) -> str:
+    return "".join(ch for ch in str(s).lower() if ch.isalnum() or ch == "[" or ch == "]")
+
+
+def resolve_model(text: str, catalog: list) -> dict:
+    """A friendly model name ("opus", "sonnet 5", "Haiku 4.5", or an id) as a
+    ``{"id", "name"}`` entry of VibeNode's model list. A bare family name means
+    its newest model (the list is newest first) without the 1M marker."""
+    want = _norm(text)
+    for m in catalog:
+        if want in (_norm(m["id"]), _norm(m["name"]), _norm(m["id"]).replace("claude", "", 1)):
+            return m
+    for m in catalog:
+        if "[1m]" not in m["id"] and _norm(m["name"]).rstrip("0123456789") == want:
+            return m
+    raise ValueError(f"unknown model {text!r}; choose from: " + ", ".join(m["name"] for m in catalog))
+
+
+def assign_models(variants, models, catalog):
+    """Pair each variant with a model entry (or None): one model for all, or one each."""
+    if not models:
+        return [(n, p, None) for n, p in variants]
+    picked = [resolve_model(m, catalog) for m in models]
+    if len(picked) == 1:
+        picked = picked * len(variants)
+    if len(picked) != len(variants):
+        raise ValueError(f"{len(models)} models for {len(variants)} variants: give one model, or one per variant")
+    return [(n, p, m) for (n, p), m in zip(variants, picked)]
+
+
+def _same_model(asked: str, ran: str) -> bool:
+    strip = lambda x: str(x or "").split("[", 1)[0]
+    return strip(asked) == strip(ran)
+
+
 def main() -> int:
+    try:  # a Windows console would print the names' "·" as "?"
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("variants", nargs="*", help='"name=prompt" pairs')
     ap.add_argument("--prompt", help="one prompt for every variant (--names or --count)")
@@ -147,24 +188,36 @@ def main() -> int:
                     help="with --prompt: run it this many times, named A/B test A, B, C…")
     ap.add_argument("--each", nargs="*", default=[],
                     help="a different prompt per variant, named A/B test A, B, C…")
+    ap.add_argument("--models", nargs="*", default=[],
+                    help='a model for all variants, or one per variant ("opus", "sonnet 5", "haiku"); '
+                         'with --prompt alone, one variant per model')
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("--settle", type=float, default=8)
     ap.add_argument("--json", help="also write the results here")
     a = ap.parse_args()
+    if a.prompt and a.models and not (a.names or a.count or a.each or a.variants):
+        a.count = len(a.models)          # one prompt, one variant per model
     try:
         variants = build_variants(a.variants, a.prompt, a.names, a.count, a.each)
+        catalog = _http("GET", "/api/models") if a.models else []
+        variants = assign_models(variants, a.models, catalog)
     except ValueError as e:
         ap.error(str(e))
+    auto = not (a.names or a.variants)
+    variants = [((f"{n} · {m['name']}" if (m and auto) else n), p, m) for n, p, m in variants]
 
     project = active_project()
     project_dir = claude_projects_dir() / project
     runs = []
-    for name, prompt in variants:
-        r = _http("POST", "/api/new-session", {"name": name, "prompt": prompt})
+    for name, prompt, model in variants:
+        body = {"name": name, "prompt": prompt}
+        if model:
+            body["model"] = model["id"]
+        r = _http("POST", "/api/new-session", body)
         if not r.get("ok"):
             raise SystemExit(f"{name}: {r.get('error')}")
         runs.append({"name": name, "prompt": prompt, "launch_id": r["new_id"],
-                     "sent_at": time.time()})
+                     "asked_model": model["id"] if model else "", "sent_at": time.time()})
         print(f"started {name!r} ({r['new_id']})", flush=True)
 
     deadline = time.time() + a.timeout
@@ -192,6 +245,9 @@ def main() -> int:
             continue
         print(f"  {run['seconds']}s | model {run['model']} | tools: "
               f"{', '.join(run['tools']) or 'none'}")
+        if run["asked_model"] and not _same_model(run["asked_model"], run["model"]):
+            run["model_mismatch"] = True
+            print(f"  WARNING: asked for {run['asked_model']} but it ran on {run['model']}")
         print("  " + short_answer(run["text"]).replace("\n", "\n  ") + "\n")
     if a.json:
         Path(a.json).write_text(json.dumps(runs, indent=2), encoding="utf-8")

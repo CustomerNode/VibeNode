@@ -302,6 +302,12 @@ def api_new_session():
         name = (data.get("name") or "").strip()
         resume_id = (data.get("resume_id") or "").strip()
         prompt = (data.get("prompt") or "").strip()
+        # Optional model for a NEW session (an A/B test runs each variant on
+        # its own model).  A model id is short and plain; anything else is
+        # refused rather than handed to the CLI as an argument.
+        model = (data.get("model") or "").strip() or None
+        if model and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._\-\[\]]{0,63}", model):
+            return jsonify({"error": "Invalid model"}), 400
         active_project = get_active_project()
 
         # Find the actual project directory
@@ -371,6 +377,7 @@ def api_new_session():
             cwd=proj_dir,
             name=name,
             resume=False,
+            model=model,
         )
 
         if result.get("ok"):
