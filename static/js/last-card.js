@@ -2403,14 +2403,51 @@
   // has no Back button or address bar: the owner was stuck on a .zip's
   // "Open in… / More…" page (2026-10-30). Open it in a separate browser view
   // instead, so the app stays where it was. Synchronous, inside the tap.
+  //
+  // That separate view did not save files either (2026-10-31: "still doesn't
+  // work"), so where the share sheet takes files it is used instead: its
+  // "Save to Files" is what works in the home-screen app (a page doing this
+  // reached share-ok on the owner's iPhone the night before).  iOS opens the
+  // sheet only inside the tap itself, never after a fetch, so the first tap
+  // fetches the file and the button reads "Tap again to save"; the next tap
+  // opens the sheet with the file already in hand.
   const _iosHomeScreen = () => window.navigator.standalone === true;
+  const _dlReady = new Map();   // href -> File, fetched on the first tap
+  function _dlLabel(a, text) {
+    const vb = a.querySelector('.vb');
+    if (vb) vb.innerHTML = I.dl + ' ' + esc(text);
+  }
+  function _shareFile(a, f) {
+    navigator.share({ files: [f], title: f.name }).then(
+      () => _dlLabel(a, 'Saved'),
+      err => { if (!err || err.name !== 'AbortError') _dlLabel(a, 'Tap again to save'); });
+  }
   document.addEventListener('click', e => {
     if (window.VNLastCard !== _api || !_iosHomeScreen()) return;
     const a = e.target && e.target.closest && e.target.closest('a[download], a.lm-dlfile');
     if (!a || !a.href || e.defaultPrevented) return;
     e.preventDefault();
     e.stopPropagation();
-    window.open(a.href, '_blank');
+    const href = a.href;
+    const ready = _dlReady.get(href);
+    if (ready) { _shareFile(a, ready); return; }
+    if (!navigator.canShare || a.dataset.dlState === 'fetching') {
+      if (!navigator.canShare) window.open(href, '_blank');
+      return;
+    }
+    a.dataset.dlState = 'fetching';
+    _dlLabel(a, 'Getting it ready…');
+    const name = a.getAttribute('download') || decodeURIComponent(href.split(/[?#]/)[0].split('/').pop() || 'file');
+    fetch(href, { credentials: 'same-origin' }).then(r => {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.blob();
+    }).then(b => {
+      const f = new File([b], name, { type: b.type || 'application/octet-stream' });
+      if (!navigator.canShare({ files: [f] })) { delete a.dataset.dlState; _dlLabel(a, 'Download'); window.open(href, '_blank'); return; }
+      _dlReady.set(href, f);
+      a.dataset.dlState = 'ready';
+      _dlLabel(a, 'Tap again to save');
+    }).catch(() => { delete a.dataset.dlState; _dlLabel(a, 'Download'); window.open(href, '_blank'); });
   }, true);
 
   document.addEventListener('click', async e => {

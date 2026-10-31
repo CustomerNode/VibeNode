@@ -153,7 +153,7 @@ def check(run_dir: Path, approved: Path = DEFAULT_APPROVED) -> tuple[bool, list[
         if not wf:
             problems.append("run.json does not record which guides the run started on: a launcher before 1.4.0 "
                             "created this run")
-        elif False:
+        elif wf != want_wf:
             problems.append(f"the run started on guides {str(wf)[:12]}, not the approved guides {want_wf[:12]} "
                             f"(a guide in {guides} differs or changed since the start)")
     foreign: dict[str, list[str]] = {}   # "identity …, location …" -> records

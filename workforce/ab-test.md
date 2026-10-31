@@ -3,7 +3,7 @@ id: ab-test
 name: A/B Test
 department: compose
 source: vibenode
-version: 1.2.1
+version: 1.3.0
 depends_on: []
 type: prompt-template
 playbook: true
@@ -40,7 +40,7 @@ Run this directly in the session the user typed it in. It needs no subagent: the
    - a different prompt per variant (named A, B, C…): `python scripts/ab_test.py --each "<prompt A>" "<prompt B>" "<prompt C>" --json <temp file>`
    - a different prompt per variant under his names: `python scripts/ab_test.py "<name 1>=<prompt 1>" "<name 2>=<prompt 2>" --json <temp file>`
    - models: add `--models <model> …` to any of these, one model for all variants or one per variant in order ("opus", "sonnet", "haiku", "sonnet 5", "Opus 4.7" or an exact id). One prompt plus `--models opus sonnet haiku` runs one variant per model. The report warns when a session ran on a different model than asked.
-   The prompts are the user's words, passed through unchanged; split them into variants only where he did.
+   The prompts are the user's words, passed through unchanged, with one exception the script makes itself: every file a prompt asks to save in Downloads gets the run's date in its name (`archive.zip` becomes `archive-2026-10-31.zip`, with the time added when that name is already taken), and each prompt ends with a line telling the session to date anything it saves there and never overwrite a file. Split prompts into variants only where he did.
    The script starts each variant as a real session in the active project (it shows in the sidebar under its name), follows each session to the ID it switches to, and prints each final reply about 8 seconds after it lands.
 2. Read the JSON file for the full replies. The printed summary shows only each reply's short answer.
 3. Compare the variants on what the user asked for. Say where they agree, where they differ, and which one did better and why, from the replies themselves, never from guesses.
@@ -53,6 +53,7 @@ Do not edit any code. The only thing this agent creates is the sessions the user
 - Each result is reported from that session's own reply, with its time, model and tools.
 - A variant that did not finish before the timeout is reported as unfinished, never dropped.
 - Sessions are named exactly as the user said.
+- Every file a variant saves to Downloads is dated, so a rerun never overwrites an earlier run's deliverable. The report lists any undated file that appeared in Downloads during the test (WARNING line, `undated_downloads` in the JSON).
 
 ## Escalate when
 
@@ -68,4 +69,4 @@ Return one report in this numbered structure:
 2. **Results**: a table with one row per variant: time, model, tools used, short answer.
 3. **Comparison**: where they agree, where they differ, and which did better on what the user wanted compared.
 4. **What was not validated or could not be fully verified**: unfinished variants, or claims in a reply nobody checked.
-5. **Obstacles encountered**: script errors verbatim, timeouts, anything the next run should know.
+5. **Obstacles encountered**: script errors verbatim, timeouts, undated Downloads files the script warned about, anything the next run should know.

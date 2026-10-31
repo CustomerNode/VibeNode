@@ -117,3 +117,47 @@ def test_a_model_that_did_not_take_is_caught():
     assert ab._same_model("claude-opus-5-5", "claude-opus-5-5")
     assert ab._same_model("claude-opus-5-5[1m]", "claude-opus-5-5")
     assert not ab._same_model("claude-haiku-4-5", "claude-opus-5-5")
+
+
+# -- Every Downloads file a variant saves is dated (owner's rule, 2026-10-31) --
+
+_DELIVER = ("Run the tests. When finished, create archive-session-standard.zip in my Downloads folder "
+            "containing the patch.\nRead notes.md before you start.")
+
+
+def test_downloads_file_names_get_the_run_date():
+    out = ab.date_downloads(_DELIVER, "2026-10-31")
+    assert "archive-session-standard-2026-10-31.zip in my Downloads" in out
+    assert "archive-session-standard.zip" not in out
+    assert "Read notes.md before" in out          # not a Downloads sentence: left alone
+    assert out.rstrip().endswith("must never overwrite a file already there.")
+    assert "2026-10-31" in out.split("A/B test rule:")[1]
+
+
+def test_an_already_dated_name_is_left_alone():
+    p = "Save report-2026-10-31.pdf to Downloads."
+    assert ab.download_names(p) == []
+    assert ab.date_downloads(p, "2026-11-02").startswith(p)
+
+
+def test_no_download_mentioned_still_gets_the_rule():
+    out = ab.date_downloads("who is the president", "2026-10-31")
+    assert out.startswith("who is the president") and "A/B test rule" in out
+
+
+def test_a_taken_dated_name_adds_the_time(tmp_path):
+    import time as _t
+    now = _t.mktime((2026, 10, 31, 14, 5, 0, 0, 0, -1))
+    names = ["x.zip"]
+    assert ab.dated_stamp(names, tmp_path, now) == "2026-10-31"
+    (tmp_path / "x-2026-10-31.zip").write_text("earlier run")
+    assert ab.dated_stamp(names, tmp_path, now) == "2026-10-31-1405"
+
+
+def test_undated_new_downloads_are_reported(tmp_path):
+    import os, time as _t
+    old = tmp_path / "old.zip"; old.write_text("o")
+    os.utime(old, (1, 1))
+    (tmp_path / "new.zip").write_text("n")
+    (tmp_path / "new-2026-10-31.zip").write_text("n")
+    assert ab.undated_new_downloads(tmp_path, _t.time() - 60) == ["new.zip"]

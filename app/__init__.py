@@ -27,6 +27,20 @@ _os.environ.setdefault("SPEECHNODE_MODEL_DIR", str(_VIBENODE_DIR / ".cache" / "s
 _os.environ.setdefault("SPEECHNODE_VENV_DIR", str(_VIBENODE_DIR / ".cache" / "speechnode-venv"))
 
 
+# Files served from /static as downloads, with the type every browser knows
+# (Windows' registry names .zip application/x-zip-compressed, which iOS does
+# not save).  PDFs and pictures stay viewable: they are not here.
+_DOWNLOAD_TYPES = {
+    ".zip": "application/zip",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".7z": "application/x-7z-compressed",
+    ".gz": "application/gzip",
+    ".tgz": "application/gzip",
+}
+
+
 def create_app(testing=False) -> Flask:
     """Create and configure the Flask application.
 
@@ -235,6 +249,16 @@ def create_app(testing=False) -> Flask:
                 response.headers['Cache-Control'] = 'no-cache'
                 response.headers['Pragma'] = 'no-cache'
                 response.headers['Expires'] = '0'
+            # A file a summary card hands over as a Download (deliverable.files)
+            # is SAVED, never shown: iPhone Safari would not save a .zip the
+            # server sent "inline" as Windows' own type
+            # (application/x-zip-compressed, from the registry), so the
+            # Download button did nothing on the phone (2026-10-31).
+            ext = _os.path.splitext(request.path)[1].lower()
+            if ext in _DOWNLOAD_TYPES and response.status_code in (200, 206):
+                name = _os.path.basename(request.path)
+                response.headers['Content-Type'] = _DOWNLOAD_TYPES[ext]
+                response.headers['Content-Disposition'] = f'attachment; filename="{name}"'
         elif response.mimetype == 'text/html':
             # The SPA shell must revalidate every load. Without this the browser
             # (esp. iOS Safari / home-screen PWA) serves a cached HTML that points

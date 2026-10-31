@@ -24,7 +24,9 @@ MD = ROOT / "static" / "js" / "markdown.js"
 SCRIPT = r"""
 global.window = global;
 const fs = require('fs');
-const live = fs.readFileSync(process.argv[1], 'utf8');
+// A Windows checkout (core.autocrlf) has CRLF line endings; the end marker
+// below is written with "\n", so normalise or indexOf misses it.
+const live = fs.readFileSync(process.argv[1], 'utf8').replace(/\r\n/g, '\n');
 const start = live.indexOf('function _truncateAtWord(');
 const end = live.indexOf('/**\n * Populate (or re-populate)');
 eval(fs.readFileSync(process.argv[2], 'utf8') + '\n' + live.slice(start, end) +

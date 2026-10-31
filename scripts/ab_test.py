@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 import urllib.request
@@ -170,6 +171,64 @@ def assign_models(variants, models, catalog):
     return [(n, p, m) for (n, p), m in zip(variants, picked)]
 
 
+# Every file a variant saves to Downloads carries the run's date, so a rerun
+# never overwrites an earlier run's deliverable (the owner's rule, 2026-10-31).
+_DATED = re.compile(r"\d{4}-\d{2}-\d{2}")
+_DOWNLOAD_NAME = re.compile(
+    r"(?<![\w./\\-])([\w][\w.()-]*?)\.(zip|7z|tar\.gz|tgz|pdf|docx|xlsx|pptx|csv|md|txt|json|html|patch|diff)\b",
+    re.IGNORECASE)
+DATE_RULE = ("\n\nA/B test rule: every file you save to the Downloads folder must have the date {date} "
+             "in its name (for example name-{date}.zip), and must never overwrite a file already there.")
+
+
+def downloads_dir() -> Path:
+    return Path.home() / "Downloads"
+
+
+def dated_stamp(names: list[str], folder: Path, now: float | None = None) -> str:
+    """Today's date, or date + time when a dated name is already taken in ``folder``."""
+    t = time.localtime(now if now is not None else time.time())
+    day = time.strftime("%Y-%m-%d", t)
+    if any((folder / _with_stamp(n, day)).exists() for n in names):
+        return time.strftime("%Y-%m-%d-%H%M", t)
+    return day
+
+
+def _with_stamp(name: str, stamp: str) -> str:
+    m = _DOWNLOAD_NAME.fullmatch(name)
+    return f"{m.group(1)}-{stamp}.{m.group(2)}" if m else name
+
+
+def download_names(prompt: str) -> list[str]:
+    """Undated file names in the sentences of ``prompt`` that mention Downloads."""
+    out = []
+    for sentence in re.split(r"(?<=[.!?])\s+|\n", prompt):
+        if "download" not in sentence.lower():
+            continue
+        for m in _DOWNLOAD_NAME.finditer(sentence):
+            if not _DATED.search(m.group(0)) and m.group(0) not in out:
+                out.append(m.group(0))
+    return out
+
+
+def date_downloads(prompt: str, stamp: str) -> str:
+    """The prompt with each Downloads file name dated, plus the standing date rule."""
+    for name in download_names(prompt):
+        prompt = re.sub(r"(?<![\w./\\-])" + re.escape(name) + r"\b",
+                        lambda _m, n=name: _with_stamp(n, stamp), prompt)
+    return prompt + DATE_RULE.format(date=stamp[:10])
+
+
+def undated_new_downloads(folder: Path, since: float) -> list[str]:
+    """Files that appeared in ``folder`` after ``since`` without a date in the name."""
+    try:
+        return sorted(p.name for p in folder.iterdir()
+                      if p.is_file() and p.stat().st_mtime >= since and not _DATED.search(p.name)
+                      and not p.name.startswith("~$"))
+    except OSError:
+        return []
+
+
 def _same_model(asked: str, ran: str) -> bool:
     strip = lambda x: str(x or "").split("[", 1)[0]
     return strip(asked) == strip(ran)
@@ -208,15 +267,21 @@ def main() -> int:
 
     project = active_project()
     project_dir = claude_projects_dir() / project
+    started_at = time.time()
+    downloads = downloads_dir()
+    stamp = dated_stamp([n for _, p, _ in variants for n in download_names(p)], downloads, started_at)
     runs = []
-    for name, prompt, model in variants:
+    for name, asked_prompt, model in variants:
+        prompt = date_downloads(asked_prompt, stamp)
+        for old in download_names(asked_prompt):
+            print(f"{name}: saves {_with_stamp(old, stamp)!r} instead of {old!r}", flush=True)
         body = {"name": name, "prompt": prompt}
         if model:
             body["model"] = model["id"]
         r = _http("POST", "/api/new-session", body)
         if not r.get("ok"):
             raise SystemExit(f"{name}: {r.get('error')}")
-        runs.append({"name": name, "prompt": prompt, "launch_id": r["new_id"],
+        runs.append({"name": name, "prompt": prompt, "asked_prompt": asked_prompt, "launch_id": r["new_id"],
                      "asked_model": model["id"] if model else "", "sent_at": time.time()})
         print(f"started {name!r} ({r['new_id']})", flush=True)
 
@@ -249,6 +314,11 @@ def main() -> int:
             run["model_mismatch"] = True
             print(f"  WARNING: asked for {run['asked_model']} but it ran on {run['model']}")
         print("  " + short_answer(run["text"]).replace("\n", "\n  ") + "\n")
+    undated = undated_new_downloads(downloads, started_at)
+    for f in undated:
+        print(f"WARNING: {f!r} was saved to Downloads during the test without a date")
+    for run in runs:
+        run["undated_downloads"] = undated
     if a.json:
         Path(a.json).write_text(json.dumps(runs, indent=2), encoding="utf-8")
     return 1 if pending else 0
