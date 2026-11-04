@@ -303,6 +303,62 @@ def test_the_route_reads_the_last_lines_of_running_work_only(tmp_path, monkeypat
     assert live_api._read_session_live(_transcript(tmp_path, out)) == []
 
 
+def _write(tmp_path, lines):
+    p = tmp_path / "s2.jsonl"
+    p.write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
+    return p
+
+
+def test_a_job_that_writes_its_own_log_shows_that_log(tmp_path, monkeypatch):
+    # The usual shape: `./gate.sh > /tmp/gate.log 2>&1` leaves the CLI's
+    # output file empty for the whole run, which is why the feed showed
+    # nothing.  The feed follows the log the command writes instead.
+    from web.routes import live_api
+    root = tmp_path / "claude-tmp"
+    (root / "tasks").mkdir(parents=True)
+    out = root / "tasks" / "bq1.output"
+    out.write_text("", encoding="utf-8")
+    log = tmp_path / "gate.log"
+    log.write_text("== bootstrap\nBOOTSTRAP OK\n== build\n", encoding="utf-8")
+    monkeypatch.setattr(live_api, "_live_roots", lambda: [root.resolve()])
+    monkeypatch.setattr(live_api, "_log_roots", lambda: [tmp_path.resolve()])
+    t = _write(tmp_path, [
+        {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "tu9", "name": "Bash",
+            "input": {"command": f"cd {tmp_path} && ./gate.sh > gate.log 2>&1; echo done",
+                      "description": "Run the gate", "run_in_background": True}}]}},
+        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "tu9",
+            "content": f"Command running in background with ID: bq1. Output is being written to: {out}. ok"}]}},
+    ])
+    got = live_api._read_session_live(t)
+    assert got and got[0]["what"] == "Run the gate"
+    assert got[0]["lines"] == ["== bootstrap", "BOOTSTRAP OK", "== build"]
+
+
+def test_a_log_outside_temp_and_home_is_never_read(tmp_path, monkeypatch):
+    from web.routes import live_api
+    assert live_api._redirect_logs("x > /dev/null 2>&1") == []
+    monkeypatch.setattr(live_api, "_log_roots", lambda: [(tmp_path / "nowhere").resolve()])
+    log = tmp_path / "secret.log"
+    log.write_text("secret\n", encoding="utf-8")
+    assert live_api._freshest([log], 0, live_api._log_roots()) is None
+
+
+def test_a_long_foreground_command_is_running_work(tmp_path, monkeypatch):
+    # Without this the summary said "Nothing running in the background" while
+    # the session sat in a 20-minute command.
+    from web.routes import live_api
+    monkeypatch.setattr(live_api, "_log_roots", lambda: [tmp_path.resolve()])
+    log = tmp_path / "suite.log"
+    log.write_text("Unit tests: 900 of 4,100\n", encoding="utf-8")
+    use = {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "tf1", "name": "Bash",
+        "input": {"command": f"./suite.sh > {log} 2>&1", "description": "Run the suite"}}]}}
+    got = live_api._read_session_live(_write(tmp_path, [use]))
+    assert got and got[0]["what"] == "Run the suite" and got[0]["foreground"] is True and got[0]["no_log"] is False
+    assert got[0]["lines"] == ["Unit tests: 900 of 4,100"]
+    res = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "tf1", "content": "ok"}]}}
+    assert live_api._read_session_live(_write(tmp_path, [use, res])) == []
+
+
 def test_the_route_never_reads_a_file_outside_the_cli_temp_folder(tmp_path, monkeypatch):
     from web.routes import live_api
     secret = tmp_path / "elsewhere" / "x.output"
@@ -329,5 +385,41 @@ window.fetch=(u)=>{{ window.__asked.push(u); return Promise.resolve({{ok:true, j
         assert page.evaluate("window.__asked[0]") == "/api/session-live/s1"
         assert page.locator(".lm-live .feed li.empty").is_hidden()
         assert page.locator(".lm-run .ago").inner_text() in ("printing now", "last output 5s ago", "last output 6s ago")
+    finally:
+        page.close()
+
+
+def test_what_the_job_prints_moves_the_stage_track(browser, tmp_path):
+    now = int(time.time())
+    f = tmp_path / "stages.html"
+    card = _working(eta_minutes=20, stages=["Bootstrap", "Build", "Tests", "Release"], stage="Bootstrap")
+    f.write_text(f"""<!doctype html><html><head><meta charset="utf-8"></head><body><div id="live-log">{_card_msg(card, now - 60)}</div>
+<script>var liveSessionId='s1', sessionKinds={{s1:'working'}};
+window.fetch=(u)=>Promise.resolve({{ok:true, json:()=>Promise.resolve({{running:[{{id:'b1', what:'Run the gate', lines:['== build', 'compiling 40 of 90'], quiet_s:1}}]}})}});</script>
+<script src="{LAST_CARD.as_uri()}"></script>
+<script>VNLastCard.renderIn(document.getElementById('live-log'));</script></body></html>""", encoding="utf-8")
+    page = browser.new_page()
+    try:
+        page.goto(f.as_uri(), wait_until="load")
+        page.wait_for_function("document.querySelector('.lm-live .st-track .s.now span') && document.querySelector('.lm-live .st-track .s.now span').textContent === 'Build'")
+    finally:
+        page.close()
+
+
+def test_a_command_with_no_log_says_how_long_it_has_run(browser, tmp_path):
+    # Its output reaches nobody until it ends, so "last output 16s ago" was false.
+    now = int(time.time())
+    f = tmp_path / "nolog.html"
+    card = _working(eta_minutes=20)
+    f.write_text(f"""<!doctype html><html><head><meta charset="utf-8"></head><body><div id="live-log">{_card_msg(card, now - 60)}</div>
+<script>var liveSessionId='s1', sessionKinds={{s1:'working'}};
+window.fetch=(u)=>Promise.resolve({{ok:true, json:()=>Promise.resolve({{running:[{{id:'t1', foreground:true, no_log:true, what:'Run the suite', lines:[], quiet_s:125}}]}})}});</script>
+<script src="{LAST_CARD.as_uri()}"></script>
+<script>VNLastCard.renderIn(document.getElementById('live-log'));</script></body></html>""", encoding="utf-8")
+    page = browser.new_page()
+    try:
+        page.goto(f.as_uri(), wait_until="load")
+        page.wait_for_function("document.querySelector('.lm-run .ago') && document.querySelector('.lm-run .ago').textContent.startsWith('running 2 min')")
+        assert "running for" in page.locator(".tm-figs").inner_text().lower()
     finally:
         page.close()

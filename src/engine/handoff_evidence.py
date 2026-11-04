@@ -276,10 +276,14 @@ _RELEASES = re.compile(
     r"|\b(?:go|do)\s+(?:with\s+)?(?:what|whichever)\s+you\s+(?:think|prefer|recommend)"
     r"|\b(?:either|any|both)\s+(?:one\s+)?(?:is|are)\s+fine\b|\bgo\s+with\s+(?:your|the)\s+recommend"
     # a flat rejection closes the choice too ("i said i didn't want that", "get the left waiting out")
-    r"|\b(?:did|do)\s*(?:n'?t|not)\s*(?:f\w*ing\s*)?want\s+(?:it|that|this|these|those|any)\b"
+    r"|\b(?:did|do)\s*(?:n'?t|not)\s*(?:(?:even|really|necessarily|actually|f\w*ing)\s*)*want\s+(?:it|that|this|these|those|any|to\s+\w+)\b"
+    # "not the one i liked": the user wants what was shown before, not these choices
+    r"|\bno[t]?\s+the\s+one\s+i\s+(?:f\w*ing\s+)?(?:liked|wanted|picked|chose)\b"
     r"|\bleft\s+waiting\b"
     # his own answer instead of a button ("we could try X", "how about X", "let's go with X")
-    r"|^\W*(?:we\s+could\s+(?:try|do|use)|let'?s\s+(?:try|go\s+with|use|do)|how\s+about|what\s+about)\b", re.I)
+    r"|^\W*(?:we\s+could\s+(?:try|do|use)|let'?s\s+(?:try|go\s+with|use|do)|how\s+about|what\s+about)\b"
+    # ... or opening a later sentence, when it is not a question ("i don't want to trim. what about X")
+    r"|[.!]\s*(?:how|what)\s+about\b(?![^?]*\?)", re.I)
 
 
 _LOOKS_FIRST = re.compile(r"\?|\b(?:mock|mockup|demo|show|explain|compare|differen|preview|example|what|how|why|which|"

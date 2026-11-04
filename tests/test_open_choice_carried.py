@@ -212,3 +212,17 @@ def test_other_work_may_still_carry_it_in_back_to():
                  back_to={"label": "Ship the new header", "status": "waiting on your pick",
                           "reply": "Show me the choices again"})
     assert ev.open_choice_problems(other, f) == []
+
+
+def test_walking_away_from_the_choices_closes_it():
+    # Turning the choices down and asking for something else, or asking for
+    # what was shown before instead, must not bring the choices back in a
+    # Left waiting strip.
+    for said in ("I dont even necessarily want to trim.\n\nWhat about putting the bottom line below the fold",
+                 "i don't really want to change the toolbar",
+                 "no the one i liked",
+                 "not the one I wanted"):
+        f = ev.facts_from_entries(_entries(E("user", said), E("asst", "on it")))
+        assert f.open_choice is None, said
+    # a question about another case stays a question
+    assert ev.facts_from_entries(_entries(E("user", "ok but\nwhat about phones?"))).open_choice is not None

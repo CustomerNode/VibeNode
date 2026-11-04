@@ -549,13 +549,112 @@ def _tail_lines(p: Path, n: int = 3) -> list:
     return [ln[:240] for ln in lines if ln][-n:]
 
 
+# Sessions usually send a long job's output to a log of their own
+# (``./gate.sh > /tmp/gate.log 2>&1``), so the CLI's output file stays EMPTY
+# until the job ends and the summary showed nothing for the whole run.  The
+# feed therefore also follows the files the command itself writes to.
+_REDIRECT_RE = re.compile(r"(?:&>>?|(?<![<>&\d])\d?>>?)\s*(['\"]?)([^\s'\";|&<>()]+)\1")
+_TEE_RE = re.compile(r"\btee\s+(?:-[a-z]+\s+)*(['\"]?)([^\s'\";|&<>()]+)\1")
+_CD_RE = re.compile(r"(?:^|[;&|]\s*)cd\s+(['\"]?)([^\s'\";|&]+)\1")
+_LIVE_FG_TAIL_BYTES = 256 * 1024
+
+
+def _redirect_logs(command: str) -> list:
+    """Files a shell command writes its output to (``> f``, ``>> f``, ``&> f``, ``| tee f``)."""
+    if not command:
+        return []
+    cd = _CD_RE.search(command)
+    base = Path(os.path.expanduser(cd.group(2))) if cd else None
+    out = []
+    for m in list(_REDIRECT_RE.finditer(command)) + list(_TEE_RE.finditer(command)):
+        target = m.group(2)
+        if not target or target.startswith("&") or (target.startswith("/dev/") and not target.startswith("/dev/shm/")):
+            continue
+        p = Path(os.path.expanduser(target))
+        if not p.is_absolute():
+            if base is None or not base.is_absolute():
+                continue
+            p = base / p
+        if p not in out:
+            out.append(p)
+    return out
+
+
+def _log_roots() -> list:
+    """Where a command's own log may be read from: the temp folder and home."""
+    out = []
+    for r in (Path(tempfile.gettempdir()), Path.home()):
+        try:
+            out.append(r.resolve())
+        except OSError:
+            pass
+    return out
+
+
+def _freshest(paths, since: float, roots: list):
+    """The most recently written file among ``paths`` that the job wrote (mtime >= since)."""
+    best = None
+    for f in paths:
+        p = _live_file_ok(str(f), roots)
+        if p is None:
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if st.st_size == 0 or (since and st.st_mtime < since - 2):
+            continue
+        if best is None or st.st_mtime > best[1]:
+            best = (p, st.st_mtime)
+    return best
+
+
+def _ts(obj) -> float:
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(obj.get("timestamp", "")).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, AttributeError):
+        return 0.0
+
+
+def _foreground_command(raw: bytes):
+    """The shell command the session is running in the foreground right now, if any.
+
+    It is the last tool call in the transcript with no result yet.  Without it
+    a Working summary said "Nothing running in the background" while the
+    session sat in a 20-minute command.
+    """
+    pending = None
+    for line in raw.split(b"\n"):
+        if b'"tool_use"' not in line and b'"tool_result"' not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        content = (obj.get("message") or {}).get("content") if isinstance(obj, dict) else None
+        if not isinstance(content, list):
+            continue
+        for blk in content:
+            if not isinstance(blk, dict):
+                continue
+            if blk.get("type") == "tool_use":
+                inp = blk.get("input") if isinstance(blk.get("input"), dict) else {}
+                pending = None
+                if blk.get("name") == "Bash" and not inp.get("run_in_background"):
+                    pending = (blk.get("id"), inp, _ts(obj))
+            elif blk.get("type") == "tool_result" and pending and blk.get("tool_use_id") == pending[0]:
+                pending = None
+    return pending
+
+
 def _read_session_live(path) -> list:
     """The background work the transcript says is still running, newest first."""
     with open(path, "rb") as fh:
         size = fh.seek(0, 2)
         fh.seek(max(0, size - _LIVE_TAIL_BYTES))
         raw = fh.read()
-    launches, done, monitors, descs = {}, set(), {}, {}
+    launches, done, monitors, descs, cmds, starts = {}, set(), {}, {}, {}, {}
     order = 0
     for line in raw.split(b"\n"):
         if b"Output is being written to" not in line and b"<task-id>" not in line \
@@ -583,8 +682,11 @@ def _read_session_live(path) -> list:
                     if m:
                         order += 1
                         monitors[blk.get("id")] = (order, desc, m.group(1).strip("'\""))
-                elif desc:
-                    descs[blk.get("id")] = desc
+                else:
+                    if desc:
+                        descs[blk.get("id")] = desc
+                    cmds[blk.get("id")] = str(inp.get("command") or "")
+                    starts[blk.get("id")] = _ts(obj)
             elif blk.get("type") == "tool_result":
                 text = blk.get("content")
                 if isinstance(text, list):
@@ -593,16 +695,19 @@ def _read_session_live(path) -> list:
                 out, tid = _LIVE_OUT_RE.search(text), _LIVE_ID_RE.search(text)
                 if out and tid:
                     order += 1
-                    launches[tid.group(1)] = (order, descs.get(blk.get("tool_use_id"), ""), out.group(1))
+                    tuid = blk.get("tool_use_id")
+                    launches[tid.group(1)] = (order, descs.get(tuid, ""), out.group(1),
+                                              _redirect_logs(cmds.get(tuid, "")), starts.get(tuid, 0.0))
                 elif blk.get("tool_use_id") in monitors:
                     m = re.search(r"(?:Monitor started|task)[^\w]*(?:ID:?\s*)?(\w{6,})", text)
                     if m:
                         o, d, f = monitors.pop(blk.get("tool_use_id"))
-                        launches[m.group(1)] = (o, d, f)
+                        launches[m.group(1)] = (o, d, f, [], 0.0)
     roots = _live_roots()
+    log_roots = _log_roots()
     now = time.time()
     items = []
-    for tid, (o, desc, f) in launches.items():
+    for tid, (o, desc, f, logs, started) in launches.items():
         if tid in done:
             continue
         p = _live_file_ok(f, roots)
@@ -612,13 +717,32 @@ def _read_session_live(path) -> list:
             mtime = p.stat().st_mtime
         except OSError:
             continue
+        own = _tail_lines(p, 4)
+        if own and re.match(r"^\[exited with code -?\d+\]$", own[-1]):
+            continue   # finished; its notice is on its way
+        # The command's own log, when it writes to one and has written more
+        # recently than the CLI's (usually empty) output file.
+        log = _freshest(logs, started, log_roots)
+        lines = own
+        if log and (not own or log[1] > mtime):
+            lines, mtime = _tail_lines(log[0], 3), log[1]
         if now - mtime > 3 * 3600:
             continue   # nothing written for hours: not running work
-        lines = _tail_lines(p, 4)
-        if lines and re.match(r"^\[exited with code -?\d+\]$", lines[-1]):
-            continue   # finished; its notice is on its way
         items.append((o, {"id": tid, "what": desc, "lines": lines[-3:],
                           "quiet_s": max(0, int(now - mtime))}))
+    # A long command run in the foreground is running work too.
+    fg = _foreground_command(raw[-_LIVE_FG_TAIL_BYTES:])
+    if fg:
+        tuid, inp, started = fg
+        log = _freshest(_redirect_logs(str(inp.get("command") or "")), started, log_roots)
+        if log:
+            lines, quiet = _tail_lines(log[0], 3), max(0, int(now - log[1]))
+        else:
+            lines, quiet = [], max(0, int(now - started)) if started else 0
+        if not started or now - started < 3 * 3600:
+            items.append((order + 1, {"id": str(tuid or "fg"), "foreground": True, "no_log": not log,
+                                      "what": str(inp.get("description") or "").strip() or "Running a command",
+                                      "lines": lines, "quiet_s": quiet}))
     items.sort(key=lambda x: -x[0])
     return [it for _, it in items[:3]]
 

@@ -806,7 +806,7 @@
     if (etaMin && opts.clock) {
       const eta = Math.round(etaMin * 60000);
       mv.push(band('Timing', '<div class="tm" data-clock="' + esc(opts.clock) + '" data-eta="' + eta + '">' +
-        '<div class="tm-figs"><div class="f"><span class="n" data-f="since">0:00</span><span class="l">since it stopped</span></div>' +
+        '<div class="tm-figs"><div class="f"><span class="n" data-f="since">0:00</span><span class="l">' + (m.type === 'working' ? 'running for' : 'since it stopped') + '</span></div>' +
         '<div class="f"><span class="n">' + fmtDur(eta) + '</span><span class="l">it said it would take</span></div>' +
         '<div class="f dl"><span class="n" data-f="delta">' + fmtDur(eta) + '</span><span class="l" data-f="dlabel">left</span></div></div>' +
         '<div class="tm-bar"><i class="fill"></i><i class="over"></i><i class="mark"></i></div></div>' +
@@ -3059,12 +3059,12 @@
     // A job's updates: background-job notices AND the lines a local script
     // posts through the message hook (a release page's events).
     const autos = [...document.querySelectorAll('.vn-auto-msg, .msg.user.vn-event-msg')];
-    const sig = cards.length + ':' + autos.length + ':' + (newest && newest.querySelector('.lm-live') ? 1 : 0);
     const now = Date.now();
     lives.forEach(lv => { if (!newest || !newest.contains(lv)) lv.hidden = true; });
     const lv = newest && newest.querySelector('.lm-live');
     if (!lv) return;
     lv.hidden = false;
+    const sig = cards.length + ':' + autos.length + ':1:' + (lv._running ? lv._running.at : 0);
     if (sig !== _liveSig || !lv.dataset.filled) {
       _liveSig = sig; lv.dataset.filled = '1';
       // The feed starts at the user's last message, not at this summary: each
@@ -3079,7 +3079,10 @@
         .filter(e => !/^\[?monitor expired/i.test(e.text));
       const card = _cardOf(newest) || {}, st = liveStages(card.needs || {});
       let at = Number(lv.dataset.at), done = at;
-      evs.forEach(e => {
+      // What the running job prints moves the stages too: a job that logs
+      // "== build" is at Build long before its notice arrives.
+      const printed = ((lv._running && lv._running.items) || []).reduce((a, it) => a.concat((it.lines || []).map(t => ({ text: String(t) }))), []);
+      evs.concat(printed).forEach(e => {
         const low = e.text.toLowerCase();
         for (let i = st.length - 1; i >= 0; i--) {
           if (low.indexOf(st[i].toLowerCase()) < 0) continue;
@@ -3118,13 +3121,14 @@
       if (!d || !Array.isArray(d.running) || !lv.isConnected) return;
       lv._running = { at: Date.now(), items: d.running };
       _paintRunning(lv);
+      try { _syncLive(); } catch (_e) { /* the stages catch up on the next tick */ }
     });
   }
   function _paintRunning(lv) {
     const st = lv._running; if (!st) return;
     let box = lv.querySelector('.lm-run');
     if (!box) { box = document.createElement('div'); box.className = 'lm-run'; lv.insertBefore(box, lv.querySelector('.feed')); }
-    box.innerHTML = st.items.length ? st.items.map(it => '<div class="r" data-quiet="' + Number(it.quiet_s || 0) + '"><div class="h"><i class="pulse"></i><b>' +
+    box.innerHTML = st.items.length ? st.items.map(it => '<div class="r" data-quiet="' + Number(it.quiet_s || 0) + '"' + (it.no_log || (it.foreground && !(it.lines || []).length) ? ' data-nolog="1"' : '') + '><div class="h"><i class="pulse"></i><b>' +
         esc(it.what || 'Background job') + '</b><em class="ago"></em></div>' +
         (it.lines || []).map(l => '<code>' + esc(l) + '</code>').join('') + '</div>').join('')
       : '<div class="r none"><div class="h"><b>Nothing running in the background right now</b></div></div>';
@@ -3137,6 +3141,9 @@
     lv.querySelectorAll('.lm-run .r[data-quiet]').forEach(r => {
       const s = Number(r.dataset.quiet) + Math.max(0, Math.round((now - st.at) / 1000));
       const g = r.querySelector('.ago');
+      // A foreground command with no log of its own prints nothing anyone can
+      // read until it ends: say how long it has run, never a made-up "last output".
+      if (r.dataset.nolog) { if (g) g.textContent = 'running ' + (s < 60 ? s + 's' : Math.floor(s / 60) + ' min') + ', output when it ends'; return; }
       if (g) g.textContent = s < 5 ? 'printing now' : s < 60 ? 'last output ' + s + 's ago' : 'quiet ' + Math.floor(s / 60) + ' min';
       r.classList.toggle('quiet', s >= 120);
     });
