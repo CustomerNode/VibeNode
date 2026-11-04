@@ -83,7 +83,7 @@ OLD_DIRS = {"app": "src/web", "daemon": "src/engine", "common": "src/shared",
             # new top-level names, for old processes importing moved code
             "engine": "src/engine", "web": "src/web", "shared": "src/shared",
             "features": "src/features", "launcher": "src/launcher"}
-OLD_SCRIPTS = ("run.py", "reviver.py")
+OLD_SCRIPTS = ("run.py",)
 OLD_MODULES = ("_early_boot", "process_label")
 _FORWARDER = """# Local forwarder (not published): something started before VibeNode's code
 # moved to src/ ran this path. It runs the file's new home.
@@ -152,7 +152,7 @@ def _repoint(path: Path, proj: Path) -> bool:
         return False
     new = text
     root = str(proj)
-    for name in ("reviver.py", "run.py"):         # session_manager.py never moved
+    for name in ("run.py",):                      # the two start files never moved
         for sep in ("/", "\\"):
             old = root + sep + name
             moved = root + sep + "src" + sep + "launcher" + sep + name

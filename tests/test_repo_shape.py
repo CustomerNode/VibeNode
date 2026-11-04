@@ -1,11 +1,13 @@
 """VibeNode's published shape is fixed: a change to it fails here and says where things go.
 
-The top level holds four folders and ten files. All code lives under src/, one
+The top level holds four folders and eleven files. All code lives under src/, one
 folder per part of the app. Anything new finds a home inside one of them; the
 shape changes only by editing SHAPE below together with the top of .gitignore
 (the one list of what may be published), on purpose."""
 import os
 import subprocess
+
+import pytest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SHAPE = {
     "folders": {"docs", "scripts", "src", "tests"},
     "files": {".gitattributes", ".gitignore", "CLAUDE.md", "CONTRIBUTING.md", "LICENSE",
-              "README.md", "pyproject.toml", "requirements.txt", "session_manager.py",
+              "README.md", "pyproject.toml", "requirements.txt", "reviver.py", "session_manager.py",
               "vibenode.py"},
 }
 SRC = {"engine", "web", "shared", "launcher", "features"}
@@ -57,12 +59,14 @@ def test_the_code_folder_is_the_approved_shape():
                                f"an agreed home first" if feats - FEATURES else f"missing {sorted(FEATURES - feats)}")
 
 
-def test_the_start_file_never_moves():
-    """Shortcuts, sign-in entries and the recovery helper of every installed copy
-    run session_manager.py at the top of the folder; moving it leaves them dead."""
-    start = ROOT / "session_manager.py"
-    assert start.is_file() and not start.is_symlink(), "session_manager.py must stay at the top"
-    assert '"src" / "launcher" / "session_manager.py"' in start.read_text(encoding="utf-8")
+@pytest.mark.parametrize("name", ["session_manager.py", "reviver.py"])
+def test_the_start_files_never_move(name):
+    """Shortcuts, sign-in entries, boot tasks and the recovery helper of every
+    installed copy run these paths at the top of the folder; moving one leaves
+    them dead."""
+    start = ROOT / name
+    assert start.is_file() and not start.is_symlink(), f"{name} must stay at the top"
+    assert f'"src" / "launcher" / "{name}"' in start.read_text(encoding="utf-8")
 
 
 def test_the_ignore_list_allows_exactly_the_shape():
@@ -123,8 +127,8 @@ def test_sign_in_entries_and_the_hook_are_repointed(tmp_path, monkeypatch):
         % proj.as_posix())
     monkeypatch.delenv("APPDATA", raising=False)
     done = pu.repoint_entries(proj, home)
-    assert len(done) == 2
+    assert len(done) == 1
     assert f"{proj}/session_manager.py --background" in (auto / "vibenode.desktop").read_text()
-    assert f"{proj}/src/launcher/reviver.py" in (auto / "vibenode-reviver.desktop").read_text()
+    assert f"{proj}/reviver.py\n" in (auto / "vibenode-reviver.desktop").read_text()
     assert "/src/engine/smart_termination_hook.py" in (home / ".claude" / "settings.json").read_text()
     assert pu.repoint_entries(proj, home) == []               # already pointing at the new home

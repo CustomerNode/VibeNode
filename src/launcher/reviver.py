@@ -446,7 +446,7 @@ def _startup_vbs_path() -> str:
 
 def _register_windows() -> None:
     py = _python_for_spawn()
-    script_path = str(_LAUNCHER / "reviver.py")
+    script_path = str(_HERE / "reviver.py")          # the start file that never moves
 
     # PRIMARY — filesystem autostart. A tiny .vbs in the user's Startup folder
     # launches the reviver (windowless) at every logon. This is plain file I/O:
@@ -521,7 +521,7 @@ def _launchd_plist_bytes() -> bytes:
     log_path = str(_HERE / "logs" / "reviver_launchd.log")
     plist = {
         "Label": _launchd_label(),
-        "ProgramArguments": [sys.executable, str(_LAUNCHER / "reviver.py")],
+        "ProgramArguments": [sys.executable, str(_HERE / "reviver.py")],
         "WorkingDirectory": str(_HERE),
         "RunAtLoad": True,     # start at login
         "KeepAlive": True,     # restart the instant it dies (broad kill, crash)
@@ -591,7 +591,7 @@ def _systemd_unit_text() -> str:
         "RestartSec=5\n\n"
         "[Install]\n"
         "WantedBy=default.target\n"
-        % (sys.executable, str(_LAUNCHER / "reviver.py"), str(_HERE))
+        % (sys.executable, str(_HERE / "reviver.py"), str(_HERE))
     )
 
 
