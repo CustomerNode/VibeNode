@@ -268,3 +268,17 @@ def test_ordinary_wording_is_not_a_note():
 def test_a_name_after_an_escaped_line_break_is_caught(made_up_people):
     g = made_up_people
     assert [f["type"] for f in g.scan_text("tests/test_x.py", 'body = "Thanks,\\n\\nJordan"')] == ["Owner First Name"]
+
+
+def test_versions_waiting_to_publish_are_checked_for_notes_too(tmp_path):
+    from web import git_scanner as g
+    remote, work = tmp_path / "remote.git", tmp_path / "work"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "clone", "-q", str(remote), str(work)], check=True)
+    for k, v in {"user.email": "t@example.org", "user.name": "t"}.items():
+        _git(work, "config", k, v)
+    (work / "a.py").write_text("x = 1\n"); _git(work, "add", "-A"); _git(work, "commit", "-qm", "one")
+    _git(work, "push", "-q", "origin", "HEAD")
+    (work / "a.py").write_text("x = 1\n# " + _O + "'s pick B of the mockup\n"); _git(work, "commit", "-qam", "two")
+    (work / "a.py").write_text("x = 1\n"); _git(work, "commit", "-qam", "three")
+    assert [f["type"] for f in g.scan_outgoing_commits(work)] == ["Owner Decision Note"]

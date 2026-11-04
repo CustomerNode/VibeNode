@@ -504,7 +504,7 @@ def scan_outgoing_commits(proj: Path = None) -> list:
         sha, _, body = chunk.partition("\n")
         added = "\n".join(l[1:] for l in body.splitlines()
                           if not (l.startswith("+++") or l.startswith("---") or l.startswith("-")))
-        for f in _identity_findings(added):
+        for f in _identity_findings(added) + _note_findings(added):
             out.append({"commit": sha[:10], **f})
     return out
 
