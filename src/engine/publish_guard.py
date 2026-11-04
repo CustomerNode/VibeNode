@@ -92,6 +92,99 @@ def findings(rel: str, text: str) -> list:
     return out if isinstance(out, list) else []
 
 
+import re
+
+# The user's own words, cursing or not, must never be copied into a tracked
+# file. A swear-word list can't do that (rants and tone are not single words),
+# so this compares the write against what the user actually typed this session:
+# a run of this many identical words in a row is a quote, not a coincidence.
+_USER_WORDS_NGRAM = 8
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_MOBILE_BLOCK = re.compile(r"⟦VN-MOBILE⟧.*?⟦/VN-MOBILE⟧", re.S)
+
+
+def _norm_words(s: str) -> list:
+    return _WORD_RE.findall(s.lower())
+
+
+def _user_messages(session_id: str) -> list:
+    """The user's own message texts this session (not tool results, not the
+    automated/system or stop-hook messages, not the mobile preamble)."""
+    out = []
+    if not session_id:
+        return out
+    try:
+        base = Path.home() / ".claude" / "projects"
+        for f in base.glob(f"*/{session_id}.jsonl"):
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        o = json.loads(line)
+                    except Exception:
+                        continue
+                    m = o.get("message") if isinstance(o.get("message"), dict) else o
+                    if (m.get("role") or o.get("type")) != "user":
+                        continue
+                    if o.get("isMeta") or o.get("auto"):
+                        continue
+                    c = m.get("content")
+                    text = ""
+                    if isinstance(c, str):
+                        text = c
+                    elif isinstance(c, list):
+                        for part in c:
+                            if isinstance(part, dict):
+                                if part.get("type") == "text":
+                                    text += (part.get("text") or "") + "\n"
+                                elif part.get("type") == "tool_result":
+                                    text = ""  # a tool result, not the user's words
+                                    break
+                            elif isinstance(part, str):
+                                text += part + "\n"
+                    if not text.strip():
+                        continue
+                    stripped = text.lstrip()
+                    if stripped.startswith(("Stop hook feedback:", "[SYSTEM NOTIFICATION",
+                                            "Caveat:", "<system-reminder>")):
+                        continue
+                    text = _MOBILE_BLOCK.sub(" ", text)
+                    text = re.sub(r"(?m)^\s*Sent from .*$", " ", text)
+                    out.append(text)
+    except Exception:
+        return []
+    return out
+
+
+def _user_words_problem(text: str, session_id=None):
+    """Refuse a write that copies a run of the user's own words into the repo."""
+    try:
+        if os.environ.get("VIBENODE_USER_WORDS_GUARD", "1") == "0":
+            return None
+        sid = session_id if session_id is not None else os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        msgs = _user_messages(sid)
+        if not msgs:
+            return None
+        grams = set()
+        for m in msgs:
+            w = _norm_words(m)
+            for i in range(len(w) - _USER_WORDS_NGRAM + 1):
+                grams.add(tuple(w[i:i + _USER_WORDS_NGRAM]))
+        if not grams:
+            return None
+        tw = _norm_words(text)
+        for i in range(len(tw) - _USER_WORDS_NGRAM + 1):
+            if tuple(tw[i:i + _USER_WORDS_NGRAM]) in grams:
+                span = " ".join(tw[i:i + _USER_WORDS_NGRAM])
+                return (f"this write copies the user's own words into the public repo (a run of "
+                        f"{_USER_WORDS_NGRAM}+ words from one of the user's messages: \"{span}…\"). "
+                        f"Never put the user's words, messages, rants or tone into a tracked file. "
+                        f"Write the rule and its technical reason in your own neutral words instead, "
+                        f"then write it again. (Kill switch: VIBENODE_USER_WORDS_GUARD=0.)")
+    except Exception:
+        return None
+    return None
+
+
 CLAUDE_MD_MAX_LINES = 60   # src/web/git_scanner.py's limit; a test keeps the two equal
 
 
@@ -135,6 +228,9 @@ def decide(tool_name: str, tool_input, cwd: str = ""):
             why = _public_file_problem(tool_name, tool_input)
             if why:
                 return why
+        quoted = _user_words_problem(text)
+        if quoted:
+            return quoted
         found = findings(rel, text)
         if not found:
             return None

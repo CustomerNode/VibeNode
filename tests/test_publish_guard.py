@@ -372,3 +372,37 @@ def test_binary_bytes_are_not_mistaken_for_personal_data():
     # An image's random bytes can look like an address; images are left out of the
     # text PII checks (a name planted in one is still caught by the identity rules).
     assert g.scan_text("docs/screenshots/x.png", "o56U@a.UWwug Y@25W.nm") == []
+
+
+# ── The user's own words (cursing or not) never get copied into the repo ──
+# The write-guard compares a write against what the user typed this session and
+# refuses a run of their words. Off by default in the suite; on per test here.
+
+def test_a_write_copying_the_users_own_words_is_refused(monkeypatch):
+    monkeypatch.setenv("VIBENODE_USER_WORDS_GUARD", "1")
+    monkeypatch.setattr(pg, "_user_messages",
+                        lambda sid: ["ok so make it happen and do exactly what i said right now please"])
+    # A run of >=8 of the user's words, dropped into a comment, is refused.
+    why = pg._user_words_problem("# make it happen and do exactly what i said right now", "x")
+    assert why and "user's own words" in why
+    # Neutral code that shares no long run with the user is fine.
+    assert pg._user_words_problem("def add(a, b):\n    return a + b\n", "x") is None
+
+
+def test_the_user_words_guard_has_a_kill_switch(monkeypatch):
+    monkeypatch.setenv("VIBENODE_USER_WORDS_GUARD", "0")
+    monkeypatch.setattr(pg, "_user_messages",
+                        lambda sid: ["make it happen and do exactly what i said right now please"])
+    assert pg._user_words_problem("make it happen and do exactly what i said right now", "x") is None
+
+
+def test_the_guard_refuses_a_real_write_that_quotes_the_user(monkeypatch):
+    monkeypatch.setenv("VIBENODE_USER_WORDS_GUARD", "1")
+    monkeypatch.setattr(pg, "_user_messages",
+                        lambda sid: ["please add a note that the quick brown fox jumps over the lazy dog today"])
+    why = pg.decide("Write", {"file_path": _src("src/web/zz_userwords.py"),
+                              "content": "# the quick brown fox jumps over the lazy dog today\n"})
+    assert why and "own words" in why
+    # The same write without the user's words passes the guard.
+    assert pg.decide("Write", {"file_path": _src("src/web/zz_userwords.py"),
+                               "content": "def f():\n    return 42\n"}) is None

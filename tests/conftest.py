@@ -461,6 +461,10 @@ os.environ["VIBENODE_TEST_REUSE"] = "0"
 # did not pass.  The suite's cards are written in tests, never checked, so the
 # requirement is off here; tests/test_handoff_check.py turns it on per test.
 os.environ["VIBENODE_HANDOFF_SELF_CHECK"] = "0"
+# The write-guard's "don't copy the user's own words" check reads the real
+# session transcript; off here so it never false-fires on unrelated tests.
+# tests/test_publish_guard.py turns it on per test with a fake transcript.
+os.environ["VIBENODE_USER_WORDS_GUARD"] = "0"
 try:
     import tempfile as _tempfile
     from engine import session_host_protocol as _shp_mod
