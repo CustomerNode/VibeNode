@@ -58,6 +58,9 @@ def test_pull_stashes_before_pulling_and_pops_after(tmp_path, monkeypatch):
     # The stash-pop clash check is its own git call; no clash in these tests
     # (a real clash is covered in tests/test_git_scanner_gaps.py).
     monkeypatch.setattr(git_ops, "_unmerged_paths", lambda *a: [])
+    # The republished-history check is its own set of git calls (covered by its
+    # own tests below); this test is about the ordinary stash/pull/pop path.
+    monkeypatch.setattr(git_ops, "_remote_history_is_unrelated", lambda *a: False)
 
     # Model a WORKING TREE WITH LOCAL EDITS: stash reports it did save
     # something. pull runs cleanly. stash pop restores.
@@ -247,3 +250,107 @@ def test_launch_bat_is_tracked_but_has_no_machine_specific_paths():
             f"Move machine-specific interpreter selection to the Windows "
             f"shortcut target (untracked) or a gitignored sidecar."
         )
+
+
+# ── Adopting a republished (history-rewritten) VibeNode ─────────────────────
+#
+# When VibeNode's published history is rewritten (a scrub, a squash), an older
+# clone shares NO commit with the new remote.  A plain ``git pull --rebase``
+# then tries to replay the clone's whole history onto the new root and drowns
+# in conflicts; ``--no-rebase`` refuses "unrelated histories".  Either way the
+# one-click Update would die and never recover, stranding the install on old
+# code for good.  ``do_git_sync`` detects the no-common-ancestor case and adopts
+# the new history: it saves the old tip on a local backup branch, keeps local
+# edits in the stash, and hard-resets onto ``origin/<default>``.  These tests
+# drive REAL git repositories (no network) so the behaviour, not a mock, is
+# what is checked.
+
+import os
+import subprocess as _sp
+
+from web import git_ops as _go
+
+
+def _git(d, *a):
+    return _sp.run(["git", "-C", str(d), *a], capture_output=True, text=True, check=True)
+
+
+def _commit(d, name, body="x\n"):
+    (d / name).write_text(body)
+    _git(d, "add", "-A")
+    _git(d, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", name)
+
+
+def _make_remote_and_old_clone(tmp_path):
+    """A 'republished' remote (orphan root, new layout) and an old clone that
+    shares no commit with it."""
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "build"
+    work.mkdir()
+    _git(work, "init", "-q", "-b", "main")
+    # The "old" line of history.
+    _commit(work, "README.md", "old readme\n")
+    _commit(work, "session_manager.py", "old top-level start\n")
+    old_tip = _git(work, "rev-parse", "HEAD").stdout.strip()
+    # Publish the old line to a bare origin, then clone it as the "old install".
+    _sp.run(["git", "init", "--bare", "-q", "-b", "main", str(origin)], check=True)
+    _git(work, "remote", "add", "origin", str(origin))
+    _git(work, "push", "-q", "origin", "main")
+    clone = tmp_path / "install"
+    _sp.run(["git", "clone", "-q", str(origin), str(clone)], check=True)
+    # Now REWRITE the published history: an orphan root with the new layout.
+    _git(work, "checkout", "-q", "--orphan", "fresh")
+    for p in list(work.iterdir()):
+        if p.name != ".git":
+            if p.is_dir():
+                _sp.run(["rm", "-rf", str(p)], check=True)
+            else:
+                p.unlink()
+    (work / "README.md").write_text("new readme\n")
+    (work / "session_manager.py").write_text("new top-level start\n")
+    _git(work, "add", "-A")
+    _git(work, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "VibeNode")
+    _git(work, "branch", "-M", "fresh", "main")
+    _git(work, "push", "-q", "-f", "origin", "main")
+    return origin, clone, old_tip
+
+
+def test_update_adopts_a_republished_history(tmp_path, monkeypatch):
+    origin, clone, old_tip = _make_remote_and_old_clone(tmp_path)
+    monkeypatch.setattr(_go, "_VIBENODE_DIR", clone)
+    monkeypatch.setattr(_go, "_run_post_update", lambda proj: True)
+    monkeypatch.setattr(_go, "_default_branch", lambda proj: "main")
+    monkeypatch.setattr(_go, "_install_pulled_requirements",
+                        lambda proj: {"pip_ok": True, "pip_installed": 0})
+
+    assert _go._remote_history_is_unrelated(clone, "main") is True
+    res = _go.do_git_sync("pull", confirm_branch=True)
+    assert res["ok"], res
+    # The clone is now ON the republished history, with the new file contents.
+    assert (clone / "README.md").read_text() == "new readme\n"
+    assert (clone / "session_manager.py").read_text() == "new top-level start\n"
+    head = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    assert head == _git(clone, "rev-parse", "origin/main").stdout.strip()
+    # The old tip is saved on a local backup branch, and never pushed.
+    branches = _git(clone, "branch").stdout
+    assert "before-republish-" in branches
+    assert old_tip in _git(clone, "rev-parse", "before-republish-"
+                           + branches.split("before-republish-")[1].split()[0]).stdout
+
+
+def test_a_normal_update_is_not_treated_as_a_rewrite(tmp_path, monkeypatch):
+    """A clone that shares history with the remote must take the ordinary pull
+    path, NOT the hard-reset adopt path."""
+    origin = tmp_path / "o.git"
+    _sp.run(["git", "init", "--bare", "-q", "-b", "main", str(origin)], check=True)
+    work = tmp_path / "w"; work.mkdir()
+    _git(work, "init", "-q", "-b", "main")
+    _commit(work, "README.md", "one\n")
+    _git(work, "remote", "add", "origin", str(origin))
+    _git(work, "push", "-q", "origin", "main")
+    clone = tmp_path / "c"
+    _sp.run(["git", "clone", "-q", str(origin), str(clone)], check=True)
+    # Remote advances by one ordinary commit on the SAME line.
+    _commit(work, "NEW.txt", "two\n")
+    _git(work, "push", "-q", "origin", "main")
+    assert _go._remote_history_is_unrelated(clone, "main") is False

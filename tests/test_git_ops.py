@@ -44,6 +44,8 @@ class TestDoGitSync:
         monkeypatch.setattr(git_ops, "_requirements_blob", lambda *a: "abc")
         # No clash left over from an earlier Update (checked before stashing).
         monkeypatch.setattr(git_ops, "_unmerged_paths", lambda *a: [])
+        # Ordinary pull, not a republished-history adopt (its own tests cover that).
+        monkeypatch.setattr(git_ops, "_remote_history_is_unrelated", lambda *a: False)
 
         mock_run = MagicMock()
         # stash returns "No local changes"

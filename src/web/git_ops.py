@@ -277,6 +277,71 @@ def _unmerged_paths(proj) -> list:
     return [p for p in r.stdout.splitlines() if p.strip()] if r.returncode == 0 else []
 
 
+def _remote_history_is_unrelated(proj, default: str) -> bool:
+    """True when origin/<default> shares NO commit with HEAD — the signature of a
+    republished (history-rewritten) VibeNode.  A normal divergence has a common
+    ancestor and must NOT take the adopt path (it is handled by rebase/merge,
+    which stops on a clash).  Fetches the remote branch first."""
+    subprocess.run(["git", "-C", str(proj), "fetch", "origin", default],
+                   capture_output=True, text=True, timeout=120, creationflags=_NO_WINDOW)
+    have = subprocess.run(["git", "-C", str(proj), "rev-parse", "--verify", "--quiet",
+                           "refs/remotes/origin/" + default],
+                          capture_output=True, text=True, creationflags=_NO_WINDOW)
+    if have.returncode != 0 or not have.stdout.strip():
+        return False
+    head = subprocess.run(["git", "-C", str(proj), "rev-parse", "--verify", "--quiet", "HEAD"],
+                          capture_output=True, text=True, creationflags=_NO_WINDOW)
+    if head.returncode != 0 or not head.stdout.strip():
+        return False      # an unborn HEAD: an ordinary checkout handles it
+    mb = subprocess.run(["git", "-C", str(proj), "merge-base", "HEAD", "origin/" + default],
+                        capture_output=True, text=True, creationflags=_NO_WINDOW)
+    return mb.returncode != 0 and not mb.stdout.strip()
+
+
+def _adopt_republished_history(proj, default: str) -> dict:
+    """Move this clone onto a republished history that shares no commit with it.
+    The clone's old tip is saved on a local backup branch and any local edits in
+    the stash, then the branch is hard-reset onto origin/<default>.  Nothing is
+    silently dropped, and the backup branch is never pushed (it stays local)."""
+    import time as _time
+    reqs_before = _requirements_blob(proj)
+    stash = subprocess.run(["git", "-C", str(proj), "stash", "--include-untracked"],
+                           capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)
+    stashed = stash.returncode == 0 and "No local changes" not in stash.stdout
+    backup = "before-republish-" + _time.strftime("%Y%m%d-%H%M%S")
+    subprocess.run(["git", "-C", str(proj), "branch", "-f", backup, "HEAD"],
+                   capture_output=True, text=True, creationflags=_NO_WINDOW)
+    sw = subprocess.run(["git", "-C", str(proj), "checkout", "-B", default, "origin/" + default],
+                        capture_output=True, text=True, timeout=120, creationflags=_NO_WINDOW)
+    if sw.returncode != 0:
+        if stashed:
+            subprocess.run(["git", "-C", str(proj), "stash", "pop"],
+                           capture_output=True, creationflags=_NO_WINDOW)
+        return {"ok": False, "messages": [
+            "Could not move onto the republished VibeNode: "
+            + (sw.stderr.strip() or sw.stdout.strip()),
+            "Nothing changed; your copy is as it was."]}
+    subprocess.run(["git", "-C", str(proj), "reset", "--hard", "origin/" + default],
+                   capture_output=True, text=True, creationflags=_NO_WINDOW)
+    msgs = ["Your VibeNode was rebuilt from the republished version (its history was "
+            "rewritten). Your old copy is saved on branch '" + backup + "'."]
+    if stashed:
+        pop = subprocess.run(["git", "-C", str(proj), "stash", "pop"],
+                             capture_output=True, text=True, creationflags=_NO_WINDOW)
+        if pop.returncode != 0 or _unmerged_paths(proj):
+            # The edits don't apply to the new code: keep them in the stash and
+            # leave a clean tree, so the push step never publishes conflict markers.
+            subprocess.run(["git", "-C", str(proj), "reset", "--hard", "origin/" + default],
+                           capture_output=True, creationflags=_NO_WINDOW)
+            msgs.append("Your local edits didn't fit the new version and are kept in git stash.")
+    pip_result = None
+    reqs_after = _requirements_blob(proj)
+    if reqs_after and reqs_after != reqs_before:
+        pip_result = _install_pulled_requirements(proj)
+    _run_post_update(proj)
+    return {"ok": True, "messages": msgs, "pip_result": pip_result, "adopted": True}
+
+
 def _run_post_update(proj) -> bool:
     """Run ``src/web/post_update.py`` in a fresh interpreter from the pulled tree.
     The running server's own modules are the OLD code, so importing them
@@ -336,6 +401,7 @@ def do_git_sync(action: str, confirm_branch: bool = False,
     ok = True
     pip_result = None
 
+    adopted = False
     if action in ("pull", "both"):
         # A clash left by an earlier Update's stash pop blocks everything after
         # it: `git stash` refuses ("needs merge") and the pull fails with git's
@@ -347,86 +413,104 @@ def do_git_sync(action: str, confirm_branch: bool = False,
                 "code in: " + ", ".join(clashed) + ".",
                 "Nothing was pulled or published. Resolve the clash, then Update again.",
             ], "conflicts": clashed}
-        reqs_before = _requirements_blob(proj)
-        stash = subprocess.run(["git", "-C", str(proj), "stash", "--include-untracked"],
-                               capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW)
-        # Only a stash that ran and saved something may be popped later: a
-        # failed `git stash` must never lead to popping an older, unrelated one.
-        stashed = stash.returncode == 0 and "No local changes" not in stash.stdout
-        # A clash stops the Update; git never picks a side.  `-X theirs` in a
-        # rebase keeps the LOCAL line of every clashing hunk, which silently
-        # drops lines another commit added.  Do NOT put `-X theirs` / `-X ours`
-        # back on either pull.
-        pull = subprocess.run(
-            ["git", "-C", str(proj), "pull", "--rebase"],
-            capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)
-        clashed = []
-        if pull.returncode != 0:
-            clashed = _unmerged_paths(proj)
-            subprocess.run(["git", "-C", str(proj), "rebase", "--abort"],
-                          capture_output=True, creationflags=_NO_WINDOW)
-            if not clashed:
-                # Not a clash (e.g. a rebase git refuses): try a plain merge,
-                # which also stops on a clash.
-                pull = subprocess.run(["git", "-C", str(proj), "pull", "--no-rebase"],
-                                      capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)
-                if pull.returncode != 0:
-                    clashed = _unmerged_paths(proj)
-                    subprocess.run(["git", "-C", str(proj), "merge", "--abort"],
-                                  capture_output=True, creationflags=_NO_WINDOW)
-        if pull.returncode != 0:
-            # Back to exactly where we started: the pull was undone above, and
-            # the stash goes back on top of the same commit, so it applies.
-            kept = ""
+        # A republished (history-rewritten) VibeNode shares NO commit with an
+        # older clone, so a plain `git pull --rebase` tries to replay the clone's
+        # whole history onto the new root and drowns in conflicts, and
+        # `--no-rebase` refuses "unrelated histories": the Update dies and never
+        # recovers.  When the remote's default branch has no common ancestor
+        # with this clone, the only safe way on is to adopt it wholesale.
+        default = _default_branch(proj) or "main"
+        if _remote_history_is_unrelated(proj, default):
+            res = _adopt_republished_history(proj, default)
+            messages += res["messages"]
+            if not res["ok"]:
+                out = {"ok": False, "messages": messages}
+                if res.get("conflicts"):
+                    out["conflicts"] = res["conflicts"]
+                return out
+            pip_result = res.get("pip_result") or pip_result
+            adopted = True
+        if not adopted:
+            reqs_before = _requirements_blob(proj)
+            stash = subprocess.run(["git", "-C", str(proj), "stash", "--include-untracked"],
+                                   capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW)
+            # Only a stash that ran and saved something may be popped later: a
+            # failed `git stash` must never lead to popping an older, unrelated one.
+            stashed = stash.returncode == 0 and "No local changes" not in stash.stdout
+            # A clash stops the Update; git never picks a side.  `-X theirs` in a
+            # rebase keeps the LOCAL line of every clashing hunk, which silently
+            # drops lines another commit added.  Do NOT put `-X theirs` / `-X ours`
+            # back on either pull.
+            pull = subprocess.run(
+                ["git", "-C", str(proj), "pull", "--rebase"],
+                capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)
+            clashed = []
+            if pull.returncode != 0:
+                clashed = _unmerged_paths(proj)
+                subprocess.run(["git", "-C", str(proj), "rebase", "--abort"],
+                              capture_output=True, creationflags=_NO_WINDOW)
+                if not clashed:
+                    # Not a clash (e.g. a rebase git refuses): try a plain merge,
+                    # which also stops on a clash.
+                    pull = subprocess.run(["git", "-C", str(proj), "pull", "--no-rebase"],
+                                          capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW)
+                    if pull.returncode != 0:
+                        clashed = _unmerged_paths(proj)
+                        subprocess.run(["git", "-C", str(proj), "merge", "--abort"],
+                                      capture_output=True, creationflags=_NO_WINDOW)
+            if pull.returncode != 0:
+                # Back to exactly where we started: the pull was undone above, and
+                # the stash goes back on top of the same commit, so it applies.
+                kept = ""
+                if stashed:
+                    pop = subprocess.run(["git", "-C", str(proj), "stash", "pop"],
+                                         capture_output=True, text=True, creationflags=_NO_WINDOW)
+                    if pop.returncode != 0 or _unmerged_paths(proj):
+                        kept = " Your uncommitted changes are kept in git stash."
+                if clashed:
+                    return {"ok": False, "messages": messages + [
+                        "The update clashes with your saved changes in: " + ", ".join(clashed) + ".",
+                        "Nothing was pulled or published, and your code is as it was." + kept,
+                    ], "conflicts": clashed, "pull_clash": True}
+                messages.append("Could not pull: " + (pull.stderr.strip() or pull.stdout.strip()) + kept)
+                return {"ok": False, "messages": messages}
+            out = pull.stdout.strip()
             if stashed:
                 pop = subprocess.run(["git", "-C", str(proj), "stash", "pop"],
                                      capture_output=True, text=True, creationflags=_NO_WINDOW)
-                if pop.returncode != 0 or _unmerged_paths(proj):
-                    kept = " Your uncommitted changes are kept in git stash."
-            if clashed:
-                return {"ok": False, "messages": messages + [
-                    "The update clashes with your saved changes in: " + ", ".join(clashed) + ".",
-                    "Nothing was pulled or published, and your code is as it was." + kept,
-                ], "conflicts": clashed, "pull_clash": True}
-            messages.append("Could not pull: " + (pull.stderr.strip() or pull.stdout.strip()) + kept)
-            return {"ok": False, "messages": messages}
-        out = pull.stdout.strip()
-        if stashed:
-            pop = subprocess.run(["git", "-C", str(proj), "stash", "pop"],
-                                 capture_output=True, text=True, creationflags=_NO_WINDOW)
-            # A pop that clashes with the pulled code leaves conflict markers in
-            # the working tree and the stash in place. Carrying on would let the
-            # push step `git add -A` and publish the markers. Stop here; nothing is lost, the stash is still there.
-            clashed = _unmerged_paths(proj)
-            if pop.returncode != 0 or clashed:
-                where = ", ".join(clashed) if clashed else (pop.stderr or pop.stdout or "").strip()
-                return {"ok": False, "messages": messages + [
-                    "Pulled the update, but your local changes clashed with it in: " + where + ".",
-                    "Nothing was published. Your changes are kept (git stash); resolve the clash, then Update again.",
-                ], "conflicts": clashed}
-        if "Already up to date" in out:
-            messages.append("VibeNode is already up to date.")
-        else:
-            messages.append("Pulled latest VibeNode updates from remote.")
-        # The update changed requirements.txt: install what it asks for, with
-        # the interpreter that runs this server.  A pip failure is reported
-        # but never undoes the pull.
-        reqs_after = _requirements_blob(proj)
-        if reqs_after and reqs_after != reqs_before:
-            pip_result = _install_pulled_requirements(proj)
-            if pip_result["pip_ok"]:
-                n = pip_result.get("pip_installed", 0)
-                messages.append("Installed %d new or updated dependenc%s." % (n, "y" if n == 1 else "ies")
-                                if n else "Dependencies already satisfied.")
+                # A pop that clashes with the pulled code leaves conflict markers in
+                # the working tree and the stash in place. Carrying on would let the
+                # push step `git add -A` and publish the markers. Stop here; nothing is lost, the stash is still there.
+                clashed = _unmerged_paths(proj)
+                if pop.returncode != 0 or clashed:
+                    where = ", ".join(clashed) if clashed else (pop.stderr or pop.stdout or "").strip()
+                    return {"ok": False, "messages": messages + [
+                        "Pulled the update, but your local changes clashed with it in: " + where + ".",
+                        "Nothing was published. Your changes are kept (git stash); resolve the clash, then Update again.",
+                    ], "conflicts": clashed}
+            if "Already up to date" in out:
+                messages.append("VibeNode is already up to date.")
             else:
-                messages.append("Dependency install failed; the code update landed but some "
-                                "features may not work until it is fixed. See the pip output below.")
-        # Data migrations that ship with the update run NOW, with the pulled
-        # code, not at the web server's next restart (src/web/post_update.py).
-        if "Already up to date" not in out:
-            _run_post_update(proj)
+                messages.append("Pulled latest VibeNode updates from remote.")
+            # The update changed requirements.txt: install what it asks for, with
+            # the interpreter that runs this server.  A pip failure is reported
+            # but never undoes the pull.
+            reqs_after = _requirements_blob(proj)
+            if reqs_after and reqs_after != reqs_before:
+                pip_result = _install_pulled_requirements(proj)
+                if pip_result["pip_ok"]:
+                    n = pip_result.get("pip_installed", 0)
+                    messages.append("Installed %d new or updated dependenc%s." % (n, "y" if n == 1 else "ies")
+                                    if n else "Dependencies already satisfied.")
+                else:
+                    messages.append("Dependency install failed; the code update landed but some "
+                                    "features may not work until it is fixed. See the pip output below.")
+            # Data migrations that ship with the update run NOW, with the pulled
+            # code, not at the web server's next restart (src/web/post_update.py).
+            if "Already up to date" not in out:
+                _run_post_update(proj)
 
-    if action in ("push", "both") and ok:
+    if action in ("push", "both") and ok and not adopted:
         # A clash left over from an earlier run is never committed: `git add -A`
         # would mark it resolved and publish the conflict markers.
         clashed = _unmerged_paths(proj)
