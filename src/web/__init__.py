@@ -193,6 +193,22 @@ def create_app(testing=False) -> Flask:
         except Exception:
             _logging.getLogger("app").exception("ai-title orphan cleanup failed")
 
+        # Finish a move onto the src layout on this computer even when the
+        # post-Update step could not run (an older server pulled it): keep the
+        # old file spots working for processes started before, re-point the
+        # sign-in entries and the end-of-turn hook, restore the private notes.
+        # Idempotent and off the request path.
+        def _settle_layout():
+            try:
+                from . import post_update as _pu
+                out = {"bridge": _pu.bridge_old_layout(), "entries": _pu.repoint_entries(),
+                       "private_notes": _pu.restore_private_notes()}
+                _logging.getLogger("app").info("layout settle: %s", out)
+            except Exception:
+                _logging.getLogger("app").exception("layout settle failed")
+        import threading as _threading
+        _threading.Thread(target=_settle_layout, daemon=True, name="layout-settle").start()
+
         # Start background git fetch at startup
         from .git_ops import start_bg_fetch
         start_bg_fetch()
