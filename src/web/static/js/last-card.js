@@ -760,13 +760,16 @@
       if (ex) vers.push(['plain', 'Plain words', dvBodyHtml('markdown', ex), ex]);
       if (fa) vers.push(['full', 'Full', dvBodyHtml('markdown', fa), fa]);
       // The Summary band draws the three depths as a horizontal Short /
-      // Plain words / Full switch across the top with Copy to the right, one
-      // pane visible at a time.  This keeps the depth shape the same as the
-      // info popups' depthPanel.
+      // Plain words / Full switch, one pane visible at a time, the same depth
+      // shape as the info popups' depthPanel.  Like Details and Review &
+      // respond it is a group: a "Summary" heading with Copy on its line,
+      // then the switch (underline tabs) and the open pane on the 14px
+      // indent, so every edge in the card lines up with the other groups.
       const cpy = '<button type="button" class="lm-depth-copy" title="Copy what this tab says">' + I.copy + '<span>Copy</span></button>';
       h += band('Summary',
+        '<div class="lm-sumhead"><span class="lm-sumh">Summary</span>' + cpy + '</div>' +
         '<div class="lm-depth-bar">' + (vers.length < 2 ? '' : '<div class="lm-depth" role="group" aria-label="How much to read">' + vers.map(([k, l], i) =>
-            '<button type="button" class="lm-depth-b" data-depth="' + k + '" aria-pressed="' + (i ? 'false' : 'true') + '">' + l + '</button>').join('') + '</div>') + cpy + '</div>' +
+            '<button type="button" class="lm-depth-b" data-depth="' + k + '" aria-pressed="' + (i ? 'false' : 'true') + '">' + l + '</button>').join('') + '</div>') + '</div>' +
           vers.map(([k, , body, raw], i) => '<div class="lm-depth-p" data-depth="' + k + '" data-raw="' + esc(raw) + '"' + (i ? ' hidden' : '') + '>' + body + '</div>').join(''), 'lm-sec lm-answer');
     }
     // Big picture / this task / just now: three lines under the title, drawn

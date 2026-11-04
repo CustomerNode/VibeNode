@@ -1457,3 +1457,17 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
 .lm.skim .vn-sub:not(.shut) .vn-less-top::before { content: '\2303'; font-size: 11px; position: relative; top: 2px; }
 .lm.skim .vn-sub:not(.shut) .vn-less-top:hover { color: var(--text-heading); }
 .lm.skim .vn-sub:not(.shut) .vn-less-top:focus-visible { outline: 2px solid var(--text-muted); outline-offset: 2px; border-radius: 4px; }
+
+/* Summary is a group like Details and Review & respond: a heading with Copy on
+   its line, then the switch and the open pane on the indent.  The switch is
+   underline tabs, so each word sits exactly on the indent and Copy's last
+   letter on the right edge.  Held by tests/test_card_alignment.py. */
+.lm.skim .lm-sumhead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.lm.skim .lm-sumh { font-size: 13px; font-weight: 600; line-height: 24.75px; color: var(--text-heading); }
+.lm.skim .lm-sumhead .lm-depth-copy { margin-right: -8px !important; }
+.lm.skim .lm-answer .lm-depth-bar, .lm.skim .lm-answer .lm-depth-p { margin-left: 14px !important; }
+.lm.skim .lm-answer .lm-depth-bar:empty { display: none; }
+.lm.skim .lm-answer .lm-depth { margin-left: 0 !important; gap: 18px !important; }
+.lm.skim .lm-answer .lm-depth-b { padding: 3px 0 !important; border-radius: 0 !important; }
+.lm.skim .lm-answer .lm-depth-b[aria-pressed="true"] { background: none !important; box-shadow: inset 0 -1.5px 0 var(--text-secondary) !important; }
+@media (max-width: 640px) { .lm.skim .lm-answer .lm-depth-bar, .lm.skim .lm-answer .lm-depth-p { margin-left: 10px !important; } }

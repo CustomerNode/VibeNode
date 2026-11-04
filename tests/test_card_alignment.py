@@ -95,6 +95,7 @@ GEOM = r"""() => {
   return {
     left: edge.left, right: edge.right,
     swText: textBox(sw).left, swBase: baseline(sw),
+    headBase: baseline(document.querySelector('.lm-answer .lm-sumh')),
     cpText: cp.querySelector('span').getBoundingClientRect().right, cpBase: baseline(cp),
     paraLeft: para.getBoundingClientRect().left,
     lists, dlistMarker: getComputedStyle(dli).listStyleType,
@@ -104,12 +105,12 @@ GEOM = r"""() => {
 
 
 def test_switch_and_copy_sit_on_the_content_edges_and_share_a_baseline(page):
-    """Horizontal switch, so the card reads as it did before the vertical
-    trial: Short on the left, Copy on the right, same baseline."""
+    """Summary is a group like the others: its heading carries Copy, and the
+    underline tabs start exactly on the indent where its text starts."""
     g = page.evaluate(GEOM)
-    assert abs(g["swText"] - g["left"]) <= 1.5, g        # "Short" starts on the content edge
+    assert abs(g["swText"] - g["left"]) <= 1.5, g        # "Short" starts on the indent
     assert abs(g["cpText"] - g["right"]) <= 1.5, g       # Copy's text ends on the right edge
-    assert abs(g["cpBase"] - g["swBase"]) <= 1.5, g      # one baseline
+    assert abs(g["cpBase"] - g["headBase"]) <= 1.5, g    # Copy on the Summary heading's line
 
 
 def test_every_list_has_one_shape_on_the_content_edge(page):

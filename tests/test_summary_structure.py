@@ -104,3 +104,12 @@ def test_details_sub_items_are_parted_by_space_and_a_hairline(page):
     not run into each other.  Summary itself uses a horizontal switch, so
     only the Details bands keep the hairline rule between them."""
     assert _style(page, "#done .lm > .lm-checked", "border-top-style", "::after") == "solid"
+
+
+def test_summary_is_a_group_with_underline_tabs_on_the_indent(page):
+    left = page.evaluate("""() => { const c = document.querySelector('#done .lm'); const r = document.createRange();
+      const tx = s => { const e = document.querySelector(s); r.selectNodeContents(e.firstChild); return Math.round(r.getBoundingClientRect().left - c.getBoundingClientRect().left); };
+      return [tx('#done .lm-sumh'), tx('#done .lm-depth-b'), tx('#done .lm-checked > .dt')]; }""")
+    assert left[1] - left[0] == 14 and left[1] == left[2], left
+    assert _style(page, "#done .lm-depth-b[aria-pressed=true]", "background-color") in ("rgba(0, 0, 0, 0)", "transparent")
+    assert "inset" in _style(page, "#done .lm-depth-b[aria-pressed=true]", "box-shadow")
