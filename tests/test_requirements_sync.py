@@ -253,3 +253,21 @@ def test_stamp_lives_in_data_and_is_gitignored():
     assert rs.STAMP == rs.ROOT / "data" / "requirements.stamp"
     gitignore = (rs.ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert "data/requirements.stamp" in gitignore
+
+
+def test_a_reworded_comment_is_not_a_new_dependency(tmp_path):
+    from web import requirements_sync as rs
+    a, b = tmp_path / "a.txt", tmp_path / "b.txt"
+    a.write_text("# floors checked\nflask>=3.0  # web\nrequests\n")
+    b.write_text("# floors checked again, reworded\r\nflask>=3.0  # the web server\r\n\r\nrequests\r\n")
+    assert rs.requirements_sha256(a) == rs.requirements_sha256(b)
+    b.write_text("flask>=3.1\nrequests\n")
+    assert rs.requirements_sha256(a) != rs.requirements_sha256(b)
+
+
+def test_update_records_a_successful_install(tmp_path, monkeypatch):
+    from web import git_ops, requirements_sync as rs
+    (tmp_path / "requirements.txt").write_text("requests\n")
+    monkeypatch.setattr(rs, "install_requirements", lambda *a, **k: {"pip_ran": True, "pip_ok": True})
+    git_ops._install_pulled_requirements(tmp_path)
+    assert rs.read_stamp(tmp_path / "data" / "requirements.stamp") == rs.requirements_sha256(tmp_path / "requirements.txt")

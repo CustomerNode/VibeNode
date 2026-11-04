@@ -44,11 +44,18 @@ _INSTALLED_LINE = re.compile(r"^Successfully installed\s+(.+)$", re.MULTILINE)
 
 
 def requirements_sha256(path: Path = REQUIREMENTS) -> str:
-    """sha256 of the file's bytes, or '' when it does not exist."""
+    """sha256 of the file's requirement lines, or '' when it does not exist.
+
+    Comments, blank lines and line endings are left out: a reworded comment is
+    not a new dependency, and reinstalling everything at launch delays the web
+    server by minutes."""
     try:
-        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
+    lines = [l.split(" #", 1)[0].strip() for l in text.splitlines()]
+    lines = [l for l in lines if l and not l.startswith("#")]
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
 def read_stamp(path: Path = STAMP) -> str:

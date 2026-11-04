@@ -161,7 +161,16 @@ def _requirements_blob(proj) -> str:
 def _install_pulled_requirements(proj) -> dict:
     """Run pip for the requirements the pull just landed, with the server's
     interpreter.  Never raises; the result feeds the sync response."""
-    return _reqs.install_requirements(sys.executable, proj / "requirements.txt")
+    req = proj / "requirements.txt"
+    result = _reqs.install_requirements(sys.executable, req)
+    if result.get("pip_ok"):
+        # Record it, or the next launch installs the same thing again before
+        # the web server can start.
+        try:
+            _reqs.write_stamp(_reqs.requirements_sha256(req), proj / "data" / "requirements.stamp")
+        except OSError:
+            pass
+    return result
 
 
 # ---------------------------------------------------------------------------
