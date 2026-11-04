@@ -113,7 +113,7 @@ def test_api_run_launches_and_registers_for_a_local_caller(client, reg, tmp_path
 
 def test_api_run_refuses_remote_callers_and_missing_done_test(client, reg, tmp_path):
     body = _run_body(tmp_path)
-    for headers in ({"X-Forwarded-For": "100.64.0.9"}, {"Tailscale-User-Login": "don@x"},
+    for headers in ({"X-Forwarded-For": "100.64.0.9"}, {"Tailscale-User-Login": "guest@x"},
                     {"Origin": "https://evil.example"}):
         r = client.post("/api/jobs/run", json=body, headers=headers,
                         environ_base={"REMOTE_ADDR": "127.0.0.1"})

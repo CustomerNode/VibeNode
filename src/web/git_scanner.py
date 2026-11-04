@@ -244,11 +244,17 @@ class _IdentityRule:
             if s > 0 and content[s - 1] in _WORDY_PREV:
                 return False
             if e < len(content) and content[e] in _WORDY_NEXT:
-                # A possessive ("<name>'s") is the name; any other contraction
-                # ("Don't" style) or an entity is not.
-                possessive = (content[e] in "'\u2019" and content[e + 1:e + 2].lower() == "s"
-                              and not content[e + 2:e + 3].isalpha())
-                if not possessive:
+                if content[e] in "'\u2019":
+                    # An apostrophe after the name is a contraction ("Don't") or
+                    # a regex for one ("don'?t") when a letter or a regex
+                    # quantifier follows it; the possessive "'s" is the name, and
+                    # a bare closing quote ("'...don'", "'Don')") is the name.
+                    nxt = content[e + 1:e + 2]
+                    if nxt and (nxt.isalpha() or nxt in "?*+{") and not (
+                            nxt.lower() == "s" and not content[e + 2:e + 3].isalpha()):
+                        return False
+                else:
+                    # "&" (entity), "\\" (escape) or ";" after the name.
                     return False
         return True
 
@@ -263,7 +269,20 @@ _IDENTITY_RULES = [
                   case=True, as_name=True),
     _IdentityRule("Collaborator Name", "Collaborator first name found in file", ["ba02680dcc2a17ceb4fb"], [7],
                   case=True, as_name=True),
+    # A second collaborator, caught case-insensitively so it cannot hide in a
+    # lowercase identifier (e.g. ``..._by_<name>``). ``as_name`` keeps it off
+    # contractions. Add another person the same way: fingerprint the lowercase
+    # name and append it here, never the name itself.
+    _IdentityRule("Collaborator Name", "Collaborator first name found in file", ["cb40f6c0f3d454f7b907"], [3],
+                  as_name=True),
     _IdentityRule("Owner Machine Name", "Owner machine name found in file", ["04a8272a6298084a87db"], [5]),
+    # Another project's product name, a job name, or a build-host name, baked
+    # into tracked code or tests. This is the one public app; data from other
+    # projects the owner runs must never leak in. A maintained blocklist, not a
+    # pattern: add a new term by fingerprinting its lowercase form and appending
+    # the fingerprint and length here (never the word). Caught case-insensitively.
+    _IdentityRule("Foreign Project Or Host", "Another project's name, job or host found in file",
+                  ["3a55210fd7f64e7e4413", "5104a62b522ff63a7eaa", "b24abea9bc4f6abfb234"], [6, 10, 8]),
     # Swearing, usually a quote copied into a comment or a note.
     # Quote the point, not the words. Fingerprints only, like the rest.
     _IdentityRule("Swearing", "Swearing found in file (reword the quote)",
@@ -325,10 +344,27 @@ _NOTE_RULES = [
     ("Dated Build Note", re.compile(r"(?i)\b(?:fixed|added|changed|hardened|reverted|removed|updated|split|picked)"
                                     r"\s+(?:on\s+)?20\d\d-\d\d-\d\d\b"),
      "A dated build-history note: git history records when; say what and why"),
+    # A date in parentheses is almost always a dated annotation of a change or
+    # incident ("(2026-09-25) ... bug"); a bare date in fixture data or an ISO
+    # timestamp is not parenthesised, so this stays false-positive free.
+    ("Parenthetical Date", re.compile(r"\(\s*20\d\d-\d\d-\d\d"),
+     "A dated note in parentheses: git history records when; say what and why"),
+    # "pre-<date>" / "before <date>" references pin a change to a day. Name the
+    # change ("the previous design"), not the date.
+    ("Change-Date Reference", re.compile(r"(?i)\b(?:pre-|before\s+)20\d\d-\d\d-\d\d\b"),
+     "A change pinned to a date: name the change, not the day git already records"),
+    # A personal device or source codename on outgoing messages ("Sent from Q").
+    # A generic label ("Sent from Mobile") is longer and does not match.
+    ("Device Label", re.compile(r"\bSent from [A-Z0-9]{1,2}\b"),
+     "A personal device or source codename: use a generic label"),
 ]
 
 
 def _note_findings(content: str) -> list:
+    # Blank the two-char escapes ("\\n" etc.) to spaces so a note that starts
+    # right after one ("...\\nSent from Q") still has a word boundary. Same
+    # length, no newline inserted, so line numbers are unchanged.
+    content = _ESCAPE.sub("  ", content)
     out = []
     for label, rx, desc in _NOTE_RULES:
         for m in rx.finditer(content):
@@ -338,12 +374,20 @@ def _note_findings(content: str) -> list:
 
 
 _ESCAPE = re.compile(r"\\[nrtbfv0]")
+# Boundaries inside an identifier: lowercase->uppercase (camelCase) and
+# letter<->digit. A space is inserted at each so the tokenizer sees the parts.
+_CAMEL_SPLIT = re.compile(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])")
 
 
 def _identity_findings(content: str) -> list:
     # In source text a line break is written "\\n": blank such escapes (same
     # length, so line numbers hold) or "\\n\\nName" reads as one word "nName".
     content = _ESCAPE.sub("  ", content)
+    # Split camelCase and letter/digit runs so a name cannot hide inside an
+    # identifier ("notApprovedByDon" -> "...By Don"; snake_case already splits
+    # on the underscore). Only spaces are inserted, never newlines, so line
+    # numbers are unchanged.
+    content = _CAMEL_SPLIT.sub(" ", content)
     rules = _IDENTITY_RULES
     lengths = set().union(*(r.lengths | {n + 1 for n in r.lengths} for r in rules)) if rules else set()
     out = []

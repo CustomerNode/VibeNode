@@ -142,7 +142,7 @@ def test_a_session_writing_the_owner_into_notes_is_refused(made_up_people):
 def test_the_real_rules_keep_only_fingerprints():
     from web import git_scanner as g
     src = (ROOT / "src" / "web" / "git_scanner.py").read_text()
-    assert len(g._IDENTITY_RULES) == 7  # six identity rules and swearing
+    assert len(g._IDENTITY_RULES) == 9  # eight identity rules and swearing
     for r in g._IDENTITY_RULES:
         assert r.fingerprints and all(len(f) == 20 for f in r.fingerprints)
         for f in r.fingerprints:
@@ -282,3 +282,55 @@ def test_versions_waiting_to_publish_are_checked_for_notes_too(tmp_path):
     (work / "a.py").write_text("x = 1\n# " + _O + "'s pick B of the mockup\n"); _git(work, "commit", "-qam", "two")
     (work / "a.py").write_text("x = 1\n"); _git(work, "commit", "-qam", "three")
     assert [f["type"] for f in g.scan_outgoing_commits(work)] == ["Owner Decision Note"]
+
+
+# ── Generalized rules added after a line-by-line review found leaks a pattern
+#    scan had missed (a collaborator's name in an identifier, another project's
+#    data, a device codename, parenthetical/"pre-" dates). Triggering strings
+#    are assembled at run time so this test file itself stays clean.
+
+def test_a_name_hidden_in_camelcase_or_at_a_quote_end_is_caught(made_up_people):
+    g = made_up_people
+    # camelCase: a name needs no surrounding spaces to be found.
+    assert [f["type"] for f in g.scan_text("src/web/x.py", "if (approvedByJordan) ok();")] == ["Owner First Name"]
+    # a name at the very end of a quoted string (a closing quote is not a contraction).
+    assert g.scan_text("src/web/x.py", "label = 'Approved by Jordan'")
+    assert g.scan_text("src/web/x.py", "x = ('By Jordan')")
+    # a regex for a contraction is not the bare name.
+    assert not g.scan_text("src/web/x.py", 'pat = "Jordan' + "'?t\"")
+
+
+def test_another_projects_name_job_or_host_is_caught():
+    from web import git_scanner as g
+    for term in ["Alt" + "ium", "author" + "ship", "build" + "box"]:
+        assert any(f["type"] == "Foreign Project Or Host"
+                   for f in g.scan_text("src/web/x.py", 'project="' + term + '"')), term
+    # case-insensitive
+    assert any(f["type"] == "Foreign Project Or Host"
+               for f in g.scan_text("src/web/x.py", ("ALT" + "IUM")))
+
+
+def test_a_second_collaborator_name_is_caught_but_not_a_contraction():
+    from web import git_scanner as g
+    name = "d" + "on"
+    assert any(f["type"] == "Collaborator Name" for f in g.scan_text("src/web/x.py", "'not_approved_by_" + name + "'"))
+    assert any(f["type"] == "Collaborator Name" for f in g.scan_text("src/web/x.py", "'Not approved by " + name.capitalize() + "'"))
+    assert not g.scan_text("src/web/x.py", "we " + name + "'t do that")         # contraction
+    assert not g.scan_text("src/web/x.py", 'r"' + name + "'?t\"")               # regex for one
+
+
+def test_parenthetical_and_change_dates_and_device_labels_are_caught():
+    from web import git_scanner as g
+    assert any(f["type"] == "Parenthetical Date"
+               for f in g.scan_text("src/web/x.py", "# step 3 (" + "2026-09-25" + ") bug"))
+    assert any(f["type"] == "Change-Date Reference"
+               for f in g.scan_text("src/web/x.py", "// the " + "pre-" + "2026-10-14" + " design"))
+    assert any(f["type"] == "Change-Date Reference"
+               for f in g.scan_text("src/web/x.py", "restored from " + "before " + "2026-10-14"))
+    assert any(f["type"] == "Device Label"
+               for f in g.scan_text("src/web/x.py", "tag = '" + "Sent from " + "Q at ' + ts"))
+    # Legitimate forms stay clean: a generic label, an ISO timestamp, a bare
+    # date not in parentheses.
+    assert not g.scan_text("src/web/x.py", "ts = 'Sent from Mobile at ' + now")
+    assert not g.scan_text("src/web/x.py", "created = '" + "2026-03-01" + "T10:00:00Z'")
+    assert not g.scan_text("src/web/x.py", "# ubuntu runner from " + "2026-10-19" + ") exits 127")
