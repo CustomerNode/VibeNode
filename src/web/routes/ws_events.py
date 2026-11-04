@@ -648,7 +648,7 @@ def register_ws_events(socketio, app):
         voice = bool(data.get('voice'))
         if prompt and session_type not in ('planner', 'title'):
             from datetime import datetime as _dt
-            _ts_tag = '\n\nSent from Q at ' + _dt.now().strftime('%Y-%m-%d %I:%M %p')
+            _ts_tag = '\n\nSent from Mobile at ' + _dt.now().strftime('%Y-%m-%d %I:%M %p')
             if voice:
                 _ts_tag += ' (transcribed from voice \u2014 may contain transcription errors)'
             prompt = prompt + _ts_tag

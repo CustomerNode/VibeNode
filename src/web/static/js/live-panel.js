@@ -452,12 +452,12 @@ function _queueDisplayText(text) {
   return ev ? ev.source + ': ' + ev.body : text;
 }
 
-// ── Strip "Sent from Q at ..." footer from message text for display ──
+// ── Strip "Sent from Mobile at ..." footer from message text for display ──
 function _stripVnMeta(text) {
   // Remove the server-injected headless-mobile preamble (⟦VN-MOBILE⟧…⟦/VN-MOBILE⟧)
   // so it never shows in the user's own bubble — it's context for the agent only.
   text = text.replace(/⟦VN-MOBILE⟧[\s\S]*?⟦\/VN-MOBILE⟧\s*/g, '');
-  const m = text.match(/\n{1,2}Sent from Q at (\d{4}-\d{2}-\d{2} \d{1,2}:\d{2} [AP]M)(\s*\(transcribed from voice[^)]*\))?\s*$/);
+  const m = text.match(/\n{1,2}Sent from Mobile at (\d{4}-\d{2}-\d{2} \d{1,2}:\d{2} [AP]M)(\s*\(transcribed from voice[^)]*\))?\s*$/);
   if (!m) return {clean: text, sentAt: null, voice: false};
   return {clean: text.replace(m[0], ''), sentAt: m[1], voice: !!m[2]};
 }

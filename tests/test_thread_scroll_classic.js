@@ -1,6 +1,6 @@
 /**
  * Unit tests for src/web/static/js/thread-scroll-classic.js: "Classic scroll", the
- * pre-2026-10-14 thread restored on a switch beside the current design.
+ * pre-redesign thread restored on a switch beside the current design.
  *
  * Run:  node tests/test_thread_scroll_classic.js
  *
@@ -9,9 +9,9 @@
  * tests/test_thread_scroll.js. Pins:
  *   - off by default: the current design runs, untouched, with a faint flip
  *   - the flip swaps the open thread to the old behaviour at once, and back
- *   - in classic mode the thread behaves as before 2026-10-14 (follows, the
+ *   - in classic mode the thread behaves as before the redesign (follows, the
  *     old "N new" pill, one tap to the bottom)
- *   - the restored code is the pre-2026-10-14 file verbatim, except [classic]
+ *   - the restored code is the pre-redesign file verbatim, except [classic]
  */
 'use strict';
 
@@ -303,8 +303,8 @@ test("the current design's Auto scroll setting stays its own", () => {
   finally { off(); }
 });
 
-test('the restored code is the pre-2026-10-14 file verbatim, except [classic] lines', () => {
-  // The fingerprint of the pre-2026-10-14 thread-scroll.js body (from its
+test('the restored code is the pre-redesign file verbatim, except [classic] lines', () => {
+  // The fingerprint of the pre-redesign thread-scroll.js body (from its
   // opening "(function () {" up to "window.ThreadScroll = {", line endings
   // normalised, trailing blank lines dropped). Kept as a fingerprint so the
   // check holds without the old file or its history.

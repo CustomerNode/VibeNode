@@ -7,7 +7,6 @@ approach. Instead of replacing entire SDK methods, it wraps the Transport
 at the ABC boundary — intercepting write() to reformat permission responses
 and suppressing end_input() to keep stdin open for the control protocol.
 
- for full context.
 
 ── CRITICAL: updatedInput must never be null ──────────────────────────────
 

@@ -72,7 +72,7 @@ def test_actions_pair_calls_with_results():
 def test_requests_skip_acks_injected_preambles_and_system_text():
     f = facts(
         user("⟦VN-MOBILE⟧ IMPORTANT — HEADLESS MOBILE SESSION ⟦/VN-MOBILE⟧fix the sort on the journey picker"
-             "\n\nSent from Q at 2026-10-27 05:44 PM"),
+             "\n\nSent from Mobile at 2026-10-27 05:44 PM"),
         user("yes"), user("go ahead"), user("<task-notification>done</task-notification>"),
         user("and make Other the last choice in the menus"),
     )

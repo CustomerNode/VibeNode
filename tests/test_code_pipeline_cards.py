@@ -179,7 +179,7 @@ def test_the_phone_preamble_and_sent_from_line_do_not_hide_the_answer(repo):
     d = _pending(run_dir)
     sess.assistant_text(cards.fenced(d["card"]))
     sess.user_text("⟦VN-MOBILE⟧ headless phone session, show previews ⟦/VN-MOBILE⟧\n"
-                   + d["replies"]["allow"] + "\n\nSent from Q at 2026-10-28 09:12 PM")
+                   + d["replies"]["allow"] + "\n\nSent from Mobile at 2026-10-28 09:12 PM")
     assert decisions.answer(run_dir, d)[0] == "allow"
 
 

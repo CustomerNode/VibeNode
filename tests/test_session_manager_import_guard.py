@@ -71,7 +71,7 @@ class TestImportIsNoOp:
             "module (e.g. from tooling or a dependency scan) will call "
             "`runpy.run_path('run.py')` at import time and launch the full "
             "Flask + SocketIO server, binding a port and spawning children. "
-            "This is exactly the Step 3 (2026-09-25) ARM64 import-scan bug."
+            "Importing this module must stay a no-op (no server, port bind or child spawn)."
         )
 
     def test_no_top_level_runpy(self, module_tree: ast.Module) -> None:

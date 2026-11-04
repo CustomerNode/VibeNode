@@ -614,7 +614,7 @@ def migrate_resume_jobs(src: Path, rd_dir: Path, collect_dir: Path,
     for j in cfg.get("jobs", []):
         name = j.get("name", "job")
         launch = j.get("launch") or {}
-        fields = dict(name=name, running_match=j.get("running", ""), project="Altium")
+        fields = dict(name=name, running_match=j.get("running", ""), project="Imported")
         if launch.get("via") == "collect":
             fields.update(command=launch["command"], cwd=str(collect_dir),
                           log_path=str(rd_dir / (launch["name"] + "-{ts}.log")),

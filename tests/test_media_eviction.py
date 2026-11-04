@@ -1,6 +1,6 @@
 """Tests for lossless large-session media eviction + change-gated resume pass.
 
-Covers Workstreams 1-3 of :
+Covers Workstreams 1-3:
 
 - WS1: OLD inline image tool_results are externalized (content-addressed by
   sha256 to ~/.claude/session-env/<sid>/vibenode-media/) and replaced in the

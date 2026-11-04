@@ -608,7 +608,7 @@
     if (fails.length) bad.push('<li class="b"><span class="ic">' + I.x + '</span><span><span class="w">Failed: ' +
       fails.length + '</span><span class="y">' + fails.map(k => esc(k) + ' (' + esc(String((r.fails[k] || {}).violations)) +
       ' violations, ' + esc(String((r.fails[k] || {}).journeys)) + ' journeys)').join('; ') + '</span></span></li>');
-    [['not_run', 'Not run'], ['changed_since_run', 'Changed since this run'], ['not_approved_by_don', 'Not approved by Don']]
+    [['not_run', 'Not run'], ['changed_since_run', 'Changed since this run'], ['not_approved', 'Not approved']]
       .forEach(([k, label]) => { if (Array.isArray(r[k]) && r[k].length) bad.push('<li class="b"><span class="ic">' + I.x +
         '</span><span><span class="w">' + label + ': ' + r[k].length + '</span><span class="y">' + ids(r[k]) + '</span></span></li>'); });
     const held = Array.isArray(r.holds) ? r.holds.length : 0;

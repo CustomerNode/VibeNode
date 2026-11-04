@@ -623,7 +623,7 @@ class TestWhatTheNamerReads:
 
     def _wrapped(self, words):
         from web.routes.ws_events import _with_mobile_preamble
-        return _with_mobile_preamble(words) + "\n\nSent from Q at 2026-11-02 05:52 PM"
+        return _with_mobile_preamble(words) + "\n\nSent from Mobile at 2026-11-02 05:52 PM"
 
     def test_phone_instructions_never_reach_the_namer(self):
         texts = _extract_user_texts([{"role": "user", "content": self._wrapped("the release tests are failing")}])
@@ -633,10 +633,10 @@ class TestWhatTheNamerReads:
         assert _clean_message("⟦VN-MOBILE⟧ IMPORTANT cut off here").strip() == ""
 
     def test_sent_from_line_is_not_the_persons_words(self):
-        assert _clean_message("fix the pills\n\nSent from Q at 2026-11-02 05:52 PM") == "fix the pills"
+        assert _clean_message("fix the pills\n\nSent from Mobile at 2026-11-02 05:52 PM") == "fix the pills"
 
     def test_keyboard_mash_waits_for_a_real_message(self):
-        assert _extract_user_texts([{"role": "user", "content": "qwrtplkjhgf\n\nSent from Q at 2026-11-02 05:52 PM"}]) == []
+        assert _extract_user_texts([{"role": "user", "content": "qwrtplkjhgf\n\nSent from Mobile at 2026-11-02 05:52 PM"}]) == []
         assert _extract_user_texts([{"role": "user", "content": "deploy"}]) == ["deploy"]
 
     def test_a_long_paste_keeps_the_request_at_its_end(self):

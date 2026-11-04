@@ -340,7 +340,7 @@
 
   function _buildPill() {
     _pillWrap = document.createElement('div');
-    _pillWrap.className = 'vn-jump-wrap vn-classic';   // [classic] scopes the pre-10-14 pill look
+    _pillWrap.className = 'vn-jump-wrap vn-classic';   // [classic] scopes the earlier pill look
     _pillWrap.setAttribute('aria-hidden', 'true');
 
     _pillEl = document.createElement('button');

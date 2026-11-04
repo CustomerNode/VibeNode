@@ -18,7 +18,6 @@ Patch inventory:
 Patches 2b and 3 from the original session_manager.py monkey-patching have been
 replaced by the Transport Adapter pattern (see sdk_transport_adapter.py).
 
- for full context.
 """
 
 import inspect

@@ -45,7 +45,7 @@ def _fields(tmp_path, **over):
 def test_record_has_the_spec_fields(tmp_path):
     rec = dj.new_record(**_fields(tmp_path, session_id="s1", project="P",
                                   progress=r"cells (\d+)/(\d+)",
-                                  irreversible_after="rebuild launched on buildbox"))
+                                  irreversible_after="rebuild launched on builder"))
     for field in ("id", "name", "project", "session_id", "command", "cwd", "env_file",
                   "running_match", "done_test", "progress", "irreversible_after",
                   "log_path", "registered_at", "last_seen_alive", "relaunch_count", "state"):
@@ -53,7 +53,7 @@ def test_record_has_the_spec_fields(tmp_path):
     assert rec["state"] == "running"
     assert rec["running_match"] == "python -c pass"     # defaults to the command
     assert rec["done_test"] == {"pattern": "DONE", "file": "", "last_line": False}
-    assert rec["irreversible_after"]["pattern"] == "rebuild launched on buildbox"
+    assert rec["irreversible_after"]["pattern"] == "rebuild launched on builder"
     assert "{ts}" in rec["log_path"]
 
 

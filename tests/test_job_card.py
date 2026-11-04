@@ -30,9 +30,9 @@ STATIC = ROOT / "src" / "web" / "static"
 
 PAYLOAD = {
     "job_id": "final-rebuild-waiter", "name": "final rebuild waiter", "state": "needs_person",
-    "reason": "stopped past an irreversible step ('rebuild launched on buildbox' matched); not relaunched",
+    "reason": "stopped past an irreversible step ('rebuild launched on builder' matched); not relaunched",
     "progress": {"n": 90000, "m": 143719, "pct": 62.6, "text": "cells 90000/143719"},
-    "session_id": "sess-1", "project": "Altium",
+    "session_id": "sess-1", "project": "AcmeBoard",
 }
 
 
@@ -99,7 +99,7 @@ def test_the_push_shows_a_card_with_reason_progress_and_two_buttons(page):
     card = page.locator(".vn-job-toast")
     assert card.count() == 1
     assert "final rebuild waiter" in card.locator(".vn-job-toast-title").text_content()
-    assert "rebuild launched on buildbox" in card.locator(".vn-job-toast-reason").text_content()
+    assert "rebuild launched on builder" in card.locator(".vn-job-toast-reason").text_content()
     assert card.locator(".vn-job-toast-pct").text_content() == "63%"
     buttons = [b.strip() for b in card.locator("button").all_text_contents()]
     assert buttons == ["Relaunch", "Leave it"]
@@ -120,7 +120,7 @@ def test_relaunch_posts_relaunch_and_leave_posts_leave(page):
     assert "Relaunched" in page.evaluate("() => document.getElementById('toast').textContent")
 
     page.evaluate("() => { window.__posts = []; }")
-    page.evaluate("(d) => handlers['job_needs_person'](d)", dict(PAYLOAD, job_id="auth", name="authorship read",
+    page.evaluate("(d) => handlers['job_needs_person'](d)", dict(PAYLOAD, job_id="auth", name="indexing read",
                                                                   state="failed", reason="launch failed: no python",
                                                                   progress=None))
     page.wait_for_selector(".vn-job-toast.show")
@@ -151,8 +151,8 @@ def test_the_registry_error_is_a_plain_toast(page):
 
 def test_the_system_list_shows_progress_as_a_percentage(page):
     """Acceptance test 7, card side: "cells 90000/143719" reads 63% on the card."""
-    jobs = [{"id": "auth", "name": "authorship read", "state": "running", "command": "python authorship.py",
-             "project": "Altium", "last_seen_alive": 1, "relaunch_count": 1, "reason": "",
+    jobs = [{"id": "auth", "name": "indexing read", "state": "running", "command": "python indexing.py",
+             "project": "AcmeBoard", "last_seen_alive": 1, "relaunch_count": 1, "reason": "",
              "progress_value": {"n": 90000, "m": 143719, "pct": 62.6, "text": "cells 90000/143719"}},
             {"id": "w", "name": "waiter", "state": "finished", "command": "python w.py", "progress_value": None}]
     page.evaluate("(j) => { window.__jobs = j; }", jobs)

@@ -45,7 +45,7 @@ RESUME_JOBS = {
         {
             "name": "final rebuild waiter",
             "running": "*final_rebuild_waiter.py*",
-            "stopIfFileMatches": "Z rebuild launched on buildbox|Z DONE$|Z STOP: ",
+            "stopIfFileMatches": "Z rebuild launched on builder|Z DONE$|Z STOP: ",
             "matchFile": "final-rebuild-waiter.log",
             "launch": {"via": "task", "task": "ClaudeRunDetached_final-rebuild-waiter"},
         },
@@ -104,7 +104,7 @@ def test_migration_registers_the_three_jobs_without_launching(world):
     assert disc["irreversible_after"] == {"pattern": "needs a person", "file": "reports_after_indexing.state.txt", "last_line": True}
     assert waiter["command"] == WAITER_CMD and waiter["cwd"] == str(w["rd"])
     assert waiter["done_test"]["pattern"] == "Z DONE$" and waiter["done_test"]["file"] == "final-rebuild-waiter.log"
-    assert waiter["irreversible_after"]["pattern"] == "Z rebuild launched on buildbox|Z STOP: "
+    assert waiter["irreversible_after"]["pattern"] == "Z rebuild launched on builder|Z STOP: "
     assert dj.load_registry(w["reg"])["jobs"].keys() == {"indexing", "reports-after-indexing", "final-rebuild-waiter"}
 
 
@@ -156,7 +156,7 @@ def test_6_as_in_3_irreversible_steps_need_a_person(world):
     with (w["rd"] / "reports_after_indexing.state.txt").open("a") as fh:
         fh.write("12:00 commit failed (needs a person)\n")
     with (w["rd"] / "final-rebuild-waiter.log").open("a") as fh:
-        fh.write("Z rebuild launched on buildbox\n")
+        fh.write("Z rebuild launched on builder\n")
     d = {x["id"]: x for x in _sup(w, []).tick(dry_run=True)}
     assert d["reports-after-indexing"]["action"] == "needs_person"
     assert d["final-rebuild-waiter"]["action"] == "needs_person"

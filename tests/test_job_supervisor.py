@@ -1,6 +1,6 @@
 """Durable Jobs step 3: the supervisor (src/engine/job_supervisor.py).
 
-Acceptance tests 1-5 from , run against the
+Acceptance tests 1-5, run against the
 real registry and the real decision code, with the process list and the
 launch faked (a "daemon restart" is a fresh JobSupervisor over the same file,
 whose first tick is the reconcile):
@@ -73,11 +73,11 @@ class World:
                                 launch=self.launch, path=self.reg, clock=lambda: self.now)
 
     def register(self, **over):
-        fields = dict(name="authorship read", command="python -u authorship.py --workers 30",
-                      cwd=str(self.dir), done_test="AUTHORSHIP_DONE", session_id="sess-1",
-                      running_match="*authorship.py*--workers*",
+        fields = dict(name="indexing read", command="python -u indexing.py --workers 30",
+                      cwd=str(self.dir), done_test="INDEXING_DONE", session_id="sess-1",
+                      running_match="*indexing.py*--workers*",
                       job_id="auth", log_path=str(self.dir / "auth-{ts}.log"),
-                      progress=r"cells (\d+)/(\d+)", irreversible_after="rebuild launched on buildbox")
+                      progress=r"cells (\d+)/(\d+)", irreversible_after="rebuild launched on builder")
         fields.update(over)
         return dj.run_job(launch=self.launch, path=self.reg, **fields)
 
@@ -99,7 +99,7 @@ def w(tmp_path):
 
 def test_1_a_killed_job_is_relaunched_once_after_a_daemon_restart(w):
     w.register()
-    w.procs = ["C:\\py\\python.exe -u authorship.py --tp x --workers 30"]
+    w.procs = ["C:\\py\\python.exe -u indexing.py --tp x --workers 30"]
     w.write("cells 100/200\n")
     assert w.supervisor().tick()[0]["action"] == "alive"
     assert w.job()["state"] == "running" and w.job()["progress_value"]["pct"] == 50.0
@@ -120,13 +120,13 @@ def test_1_a_killed_job_is_relaunched_once_after_a_daemon_restart(w):
     assert sid == "sess-1" and "relaunched after restart" in text and "cells 100/200" in text
     assert w.sm._sessions["sess-1"].entries[0].kind == "system"
     # It comes back alive; the next tick does not launch again.
-    w.procs = ["python -u authorship.py --workers 30"]
+    w.procs = ["python -u indexing.py --workers 30"]
     assert sup.tick()[0]["action"] == "alive" and len(w.launches) == 2
 
 
 def test_2_a_job_with_the_done_marker_is_finished_not_relaunched(w):
     w.register()
-    w.write("cells 200/200\nAUTHORSHIP_DONE\n")
+    w.write("cells 200/200\nINDEXING_DONE\n")
     w.procs = []
     assert w.supervisor().tick()[0]["action"] == "finish"
     assert w.job()["state"] == "finished"
@@ -137,7 +137,7 @@ def test_2_a_job_with_the_done_marker_is_finished_not_relaunched(w):
 
 def test_3_past_the_irreversible_marker_needs_a_person_and_pushes(w):
     w.register()
-    w.write("gates ok\nZ rebuild launched on buildbox\n")
+    w.write("gates ok\nZ rebuild launched on builder\n")
     w.procs = []
     d = w.supervisor().tick()
     assert d[0]["action"] == "needs_person" and "irreversible" in d[0]["reason"]
@@ -147,7 +147,7 @@ def test_3_past_the_irreversible_marker_needs_a_person_and_pushes(w):
     ev, data = w.sm.pushes[0]
     assert ev == "job_needs_person"
     assert data["job_id"] == "auth" and data["state"] == "needs_person"
-    assert "rebuild launched on buildbox" in data["reason"] and data["session_id"] == "sess-1"
+    assert "rebuild launched on builder" in data["reason"] and data["session_id"] == "sess-1"
     # Asked once: a later tick does not push again or relaunch.
     assert w.supervisor().tick() == [] and len(w.sm.pushes) == 1
     # The irreversible marker wins even over a done-looking run: Relaunch by a
@@ -239,7 +239,7 @@ def test_a_job_left_while_running_stops_quietly(w, resumable):
     """Leave it pressed on a running job, which then stops: no notice, no
     relaunch.  Relaunch by a person re-arms the notice."""
     w.register(resumable=resumable, progress=None)
-    w.procs = ["python -u authorship.py --workers 30"]
+    w.procs = ["python -u indexing.py --workers 30"]
     sup = w.supervisor()
     assert sup.tick()[0]["action"] == "alive"
     dj.leave_job("auth", path=w.reg)
@@ -278,7 +278,7 @@ def test_an_unreadable_process_list_relaunches_nothing(w):
     assert d[0]["action"] == "unknown"
     assert w.job()["state"] == "running" and len(w.launches) == 1
     # ...but a done marker is still honoured.
-    w.write("AUTHORSHIP_DONE\n")
+    w.write("INDEXING_DONE\n")
     assert sup.tick()[0]["action"] == "finish"
 
 

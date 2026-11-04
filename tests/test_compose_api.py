@@ -568,15 +568,15 @@ class TestListProjectsFiltering:
     def test_filter_by_parent_project(self, client):
         """Only compositions belonging to the requested project are returned."""
         client.post('/api/compose/projects',
-                    json={'name': 'test-filter-altium', 'parent_project': 'altium'})
+                    json={'name': 'test-filter-acmeboard', 'parent_project': 'acmeboard'})
         client.post('/api/compose/projects',
                     json={'name': 'test-filter-other', 'parent_project': 'other-proj'})
 
-        resp = client.get('/api/compose/projects?project=altium')
+        resp = client.get('/api/compose/projects?project=acmeboard')
         data = resp.get_json()
         assert data['ok'] is True
         names = [p['name'] for p in data['projects']]
-        assert 'test-filter-altium' in names
+        assert 'test-filter-acmeboard' in names
         assert 'test-filter-other' not in names
 
     def test_pinned_projects_always_returned(self, client):
@@ -586,7 +586,7 @@ class TestListProjectsFiltering:
         pid = resp.get_json()['project']['id']
         client.put(f'/api/compose/projects/{pid}', json={'pinned': True})
 
-        resp = client.get('/api/compose/projects?project=altium')
+        resp = client.get('/api/compose/projects?project=acmeboard')
         data = resp.get_json()
         names = [p['name'] for p in data['projects']]
         assert 'test-filter-pinned' in names
