@@ -759,38 +759,15 @@
       const vers = [['short', 'Short', paras(m.answer), String(m.answer)]];
       if (ex) vers.push(['plain', 'Plain words', dvBodyHtml('markdown', ex), ex]);
       if (fa) vers.push(['full', 'Full', dvBodyHtml('markdown', fa), fa]);
-      // Levels, not a switch: Summary is a
-      // group heading; Short is open; Plain words and Full show their first
-      // lines and open in place with Show more; Copy opens a menu of the
-      // levels (one level: a plain Copy of it).
-      const cpy = vers.length < 2
-        ? '<button type="button" class="lm-copy-menu" data-copy="short" title="Copy">' + I.copy + '<span>Copy</span></button>'
-        : '<div class="vn-cmw"><button type="button" class="lm-copy-menu" aria-haspopup="menu" aria-expanded="false" title="Copy">' + I.copy + '<span>Copy</span><i class="car">▾</i></button>' +
-          '<div class="vn-cm" role="menu" hidden>' + vers.map(([k, l]) => '<button type="button" role="menuitem" data-copy="' + k + '">' + l + '</button>').join('') +
-          '<button type="button" role="menuitem" data-copy="all">All ' + (vers.length === 2 ? 'both' : 'three') + '</button></div></div>';
-      // A closed level previews its words as plain sentences, never its
-      // rendered markdown: the top of a table or a heading cut in half read
-      // as broken.  Headings, table rows, code fences and
-      // list / emphasis marks are dropped; the rest is two clamped lines.
-      const prevText = raw => {
-        const lines = String(raw).split('\n'), out = [];
-        let fence = false;
-        for (const ln of lines) {
-          if (/^\s*```/.test(ln)) { fence = !fence; continue; }
-          if (fence || /^\s*(#{1,6}\s|\||[-:| ]+$)/.test(ln) || !ln.trim()) continue;
-          out.push(ln.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, '').replace(/[*_`]+/g, '').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').trim());
-        }
-        const t = out.join(' ').replace(/\s+/g, ' ').trim();
-        return t || lines.filter(x => /^\s*#{1,6}\s/.test(x)).map(x => x.replace(/^\s*#+\s*/, '')).join(' · ');
-      };
+      // The Summary band draws the three depths as a horizontal Short /
+      // Plain words / Full switch across the top with Copy to the right, one
+      // pane visible at a time.  This keeps the depth shape the same as the
+      // info popups' depthPanel.
+      const cpy = '<button type="button" class="lm-depth-copy" title="Copy what this tab says">' + I.copy + '<span>Copy</span></button>';
       h += band('Summary',
-        '<div class="vn-ghrow"><b>Summary</b>' + cpy + '</div>' +
-          vers.map(([k, l, body, raw], i) => '<div class="vn-sub' + (i ? ' shut' : '') + '"><div class="dt">' + l +
-            // a second Show less under the label while open
-            (i ? '<button type="button" class="vn-less-top">Show less</button>' : '') + '</div><div class="dd">' +
-            (i ? '<p class="vn-prev">' + esc(prevText(raw)) + '</p>' : '') +
-            '<div class="lm-depth-p" data-depth="' + k + '" data-name="' + l + '" data-raw="' + esc(raw) + '">' + body + '</div>' +
-            (i ? '<button type="button" class="vn-more" aria-expanded="false">Show more</button>' : '') + '</div></div>').join(''), 'lm-sec lm-answer');
+        '<div class="lm-depth-bar">' + (vers.length < 2 ? '' : '<div class="lm-depth" role="group" aria-label="How much to read">' + vers.map(([k, l], i) =>
+            '<button type="button" class="lm-depth-b" data-depth="' + k + '" aria-pressed="' + (i ? 'false' : 'true') + '">' + l + '</button>').join('') + '</div>') + cpy + '</div>' +
+          vers.map(([k, , body, raw], i) => '<div class="lm-depth-p" data-depth="' + k + '" data-raw="' + esc(raw) + '"' + (i ? ' hidden' : '') + '>' + body + '</div>').join(''), 'lm-sec lm-answer');
     }
     // Big picture / this task / just now: three lines under the title, drawn
     // as a nested dial ladder with the label on the same line.  The dial's filled part says
@@ -3197,37 +3174,6 @@
       const dd = db.closest('.lm-depth-scope') || db.closest('.dd') || db.parentElement.parentElement;
       dd.querySelectorAll('.lm-depth-b').forEach(b => b.setAttribute('aria-pressed', String(b === db)));
       dd.querySelectorAll('.lm-depth-p').forEach(p => { p.hidden = p.dataset.depth !== db.dataset.depth; });
-      return;
-    }
-    // Summary levels: Show more opens a level in place; Copy opens its menu;
-    // a menu item copies that level, or all of them under their names.
-    const vm = e.target && e.target.closest && e.target.closest('.lm-answer .vn-more, .lm-answer .vn-less-top');
-    if (vm) {
-      const row = vm.closest('.vn-sub'), shut = row.classList.toggle('shut'), more = row.querySelector('.vn-more');
-      if (more) { more.textContent = shut ? 'Show more' : 'Show less'; more.setAttribute('aria-expanded', String(!shut)); }
-      return;
-    }
-    const openMenu = document.querySelector('.lm-answer .vn-cm:not([hidden])');
-    const cm = e.target && e.target.closest && e.target.closest('.lm-answer .lm-copy-menu:not([data-copy])');
-    if (cm) {
-      const menu = cm.parentElement.querySelector('.vn-cm');
-      if (openMenu && openMenu !== menu) openMenu.hidden = true;
-      menu.hidden = !menu.hidden; cm.setAttribute('aria-expanded', String(!menu.hidden));
-      return;
-    }
-    if (openMenu && !(e.target.closest && e.target.closest('.vn-cm'))) { openMenu.hidden = true; const b = openMenu.parentElement.querySelector('.lm-copy-menu'); if (b) b.setAttribute('aria-expanded', 'false'); }
-    const ci = e.target && e.target.closest && e.target.closest('.lm-answer [data-copy]');
-    if (ci) {
-      const sec = ci.closest('.lm-answer'), panes = [...sec.querySelectorAll('.lm-depth-p')];
-      const txt = ci.dataset.copy === 'all' ? panes.map(p => p.dataset.name + '\n\n' + (p.dataset.raw || p.innerText || '')).join('\n\n')
-        : ((panes.find(p => p.dataset.depth === ci.dataset.copy) || {}).dataset || {}).raw || '';
-      const menu = ci.closest('.vn-cm'); if (menu) menu.hidden = true;
-      const btn = sec.querySelector('.lm-copy-menu'), lb = btn && btn.querySelector('span');
-      _copy(txt).then(ok => {
-        if (!ok || !lb) return;
-        const old = lb.textContent; btn.classList.add('copied'); lb.textContent = 'Copied';
-        setTimeout(() => { btn.classList.remove('copied'); lb.textContent = old; }, 1400);
-      });
       return;
     }
     // Copy: the text of the tab that is open (Short, Plain words or Full).

@@ -258,13 +258,14 @@ def test_the_summary_a_session_starts_from_when_asked_to_improve(store):
     assert [n["note"] for n in s["notes"]] == ["show options first"]
 
 
-def test_the_project_notes_say_where_the_data_is_and_how_to_use_it():
-    # The project notes are private (docs/plans/PROJECT-NOTES.md, gitignored): only a
-    # copy that has them can check them.
+def test_claude_md_says_where_the_data_is_and_how_to_use_it():
+    # The project notes moved out of the public CLAUDE.md into the private,
+    # gitignored notes file it loads; a public checkout has no notes to check.
     notes = ROOT / "docs" / "plans" / "PROJECT-NOTES.md"
     if not notes.exists():
-        pytest.skip("no private project notes on this machine")
+        pytest.skip("private project notes are not in this checkout")
     text = notes.read_text(encoding="utf-8")
+    assert "@docs/plans/PROJECT-NOTES.md" in (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
     assert "data/card_feedback.jsonl" in text and "python -m app.card_feedback" in text
 
 

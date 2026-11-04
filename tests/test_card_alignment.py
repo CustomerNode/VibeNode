@@ -78,10 +78,11 @@ GEOM = r"""() => {
     const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, { acceptNode: n => n.textContent.trim() ? 1 : 3 });
     const t = w.nextNode(); const r = document.createRange(); r.selectNodeContents(t); return r.getBoundingClientRect();
   }
-  const sub = document.querySelector('.lm-answer .vn-sub > .dd');
-  const edge = sub.getBoundingClientRect();
+  const bar = document.querySelector('.lm-answer .lm-depth-bar');
+  const edge = bar.getBoundingClientRect();
+  const sub = document.querySelector('.lm-answer .lm-depth-p:not([hidden])');
   const para = document.querySelector('.lm-checked .dd') || sub;
-  const head = document.querySelector('.lm-answer .vn-ghrow b'), cp = document.querySelector('.lm-answer .lm-copy-menu');
+  const sw = document.querySelector('.lm-answer .lm-depth-b'), cp = document.querySelector('.lm-answer .lm-depth-copy');
   const lists = {};
   for (const sel of ['.lm-statcols ul', '.lm-list', '.lm-tried']) {
     const li = document.querySelector(sel + ' li'); if (!li) continue;
@@ -93,8 +94,8 @@ GEOM = r"""() => {
   const dli = document.querySelector('.lm-dlist li');
   return {
     left: edge.left, right: edge.right,
-    headBase: baseline(head), shortLeft: textBox(sub).left,
-    cpText: cp.lastElementChild.getBoundingClientRect().right, cpBase: baseline(cp),
+    swText: textBox(sw).left, swBase: baseline(sw),
+    cpText: cp.querySelector('span').getBoundingClientRect().right, cpBase: baseline(cp),
     paraLeft: para.getBoundingClientRect().left,
     lists, dlistMarker: getComputedStyle(dli).listStyleType,
     dlistLeft: dli.getBoundingClientRect().left,
@@ -102,11 +103,13 @@ GEOM = r"""() => {
 }"""
 
 
-def test_copy_sits_on_the_right_edge_and_the_summary_headings_line(page):
+def test_switch_and_copy_sit_on_the_content_edges_and_share_a_baseline(page):
+    """Horizontal switch, so the card reads as it did before the vertical
+    trial: Short on the left, Copy on the right, same baseline."""
     g = page.evaluate(GEOM)
-    assert abs(g["shortLeft"] - g["left"]) <= 1, g        # Short's text starts on the content edge
-    assert abs(g["cpText"] - g["right"]) <= 1.5, g        # Copy's last mark (the menu caret) ends on the right edge
-    assert abs(g["cpBase"] - g["headBase"]) <= 1.5, g     # on the Summary heading's line
+    assert abs(g["swText"] - g["left"]) <= 1.5, g        # "Short" starts on the content edge
+    assert abs(g["cpText"] - g["right"]) <= 1.5, g       # Copy's text ends on the right edge
+    assert abs(g["cpBase"] - g["swBase"]) <= 1.5, g      # one baseline
 
 
 def test_every_list_has_one_shape_on_the_content_edge(page):

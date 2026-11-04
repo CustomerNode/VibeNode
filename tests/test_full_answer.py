@@ -1,11 +1,11 @@
-""""Full answer" on an answer card: one version in the Answer band.
-
-An answer card has ONE Answer band with a Short / Full / Plain words switch:
-"answer" is Short (open), the optional "full_answer" is Full, and the card's
-"explained" is Plain words.  On a card with an answer there is no separate
-Explain more up top and no Full answer fold.  "full_answer" is not counted
-toward the card's length and needs the short "answer" beside it.  There is
-no separate "In short" fold, which would say the same thing again.
+""""Full answer" on an answer card: ONE Summary / Answer band with a
+horizontal Short / Plain words / Full switch across the top and Copy on the
+right, one pane visible at a time (the horizontal layout is the one kept
+after the vertical trial).  "answer" is Short (open), the card's
+"explained" is Plain words, the optional "full_answer" is Full.  On a card
+with an answer there is no separate Explain more up top and no Full answer
+fold.  "full_answer" is not counted toward the card's length and needs the
+short "answer" beside it.
 """
 import json
 import re
@@ -61,23 +61,21 @@ def _band(h):
     return h[h.index(">Summary<"):]
 
 
-def test_one_summary_with_short_plain_words_and_full_as_levels(out):
-    """Levels, not a switch: Short open, Plain words and Full previewed with
-    Show more."""
+def test_one_summary_with_short_plain_words_and_full_as_a_horizontal_switch(out):
+    """Horizontal Short / Plain words / Full switch, the layout kept after the
+    vertical trial."""
     band = _band(out["full"])
-    assert ">In short<" not in out["full"] and 'class="lm-depth-b"' not in band
-    rows = re.findall(r'<div class="vn-sub( shut)?"><div class="dt">([^<]+)<', band)
-    # Simplest to most detailed: Short, Plain words, Full.
-    assert rows == [("", "Short"), (" shut", "Plain words"), (" shut", "Full")]
-    assert band.count('class="vn-more"') == 2 and band.count('class="vn-less-top"') == 2
-    panes = re.findall(r'<div class="lm-depth-p" data-depth="(\w+)"', band)
-    assert panes == ["short", "plain", "full"]
-    # Short is the answer; Plain words is "explained"; Full is the markdown (a heading, a list, a table)
+    assert ">In short<" not in out["full"]
+    # Three tab buttons in order: Short pressed, the other two not pressed.
+    tabs = re.findall(r'class="lm-depth-b" data-depth="(\w+)" aria-pressed="(true|false)">([^<]+)<', band)
+    assert tabs == [("short", "true", "Short"), ("plain", "false", "Plain words"), ("full", "false", "Full")]
+    # Three panes in the same order; the first visible, the others hidden.
+    panes = re.findall(r'class="lm-depth-p" data-depth="(\w+)"([^>]*)>', band)
+    assert [p[0] for p in panes] == ["short", "plain", "full"]
+    assert " hidden" not in panes[0][1] and " hidden" in panes[1][1] and " hidden" in panes[2][1]
+    # Short is the answer; Plain words is "explained"; Full is the markdown (a heading, a list, a table).
     short, plain, full = (band.index(f'class="lm-depth-p" data-depth="{k}"') for k in ("short", "plain", "full"))
     assert short < band.index("Word order isn") < plain < band.index("Plain words. ", plain) < full < band.index("<table")
-    # closed levels carry a plain-text preview before their rendered text
-    prevs = re.findall(r'<p class="vn-prev">([^<]*)</p>', band)
-    assert len(prevs) == 2 and all(p and "#" not in p and "|" not in p for p in prevs)
     assert "<li" in band[full:]
 
 
@@ -96,6 +94,8 @@ def test_no_full_answer_no_full_tab(out):
 def test_an_answer_alone_has_no_switch(out):
     band = _band(out["alone"])
     assert 'class="lm-depth"' not in band and 'class="lm-depth-b"' not in band and "Word order isn" in band
+    # Copy is still present when there is only one level.
+    assert 'class="lm-depth-copy"' in band
 
 
 def test_a_card_without_an_answer_keeps_explain_more_up_top(out):
@@ -144,40 +144,30 @@ def browser():
         yield b
 
 
-def test_show_more_opens_a_level_and_copy_offers_each_level(browser):
+def test_clicking_a_tab_switches_the_pane_and_copy_copies_the_open_tab(browser):
     pg = browser.new_page(viewport={"width": 390, "height": 844})
     try:
         pg.set_content(_page_html(dict(BASE, full_answer=FULL)))
-        h = "k => document.querySelector('.lm-depth-p[data-depth=\"' + k + '\"]').getBoundingClientRect().height"
-        assert pg.evaluate(h, "plain") < 60 and pg.evaluate(h, "full") < 60      # previews: a couple of lines
-        # a closed level previews plain sentences, never its rendered markdown
-        prev = pg.inner_text('.vn-sub:has([data-depth="full"]) .vn-prev')
-        assert prev and "|" not in prev and "#" not in prev
-        assert not pg.locator('.lm-depth-p[data-depth="full"] table').is_visible()
-        pg.click('.vn-sub:has([data-depth="full"]) .vn-more')
-        assert pg.evaluate(h, "full") > 100 and pg.locator('.lm-depth-p[data-depth="full"] table').is_visible()
-        assert not pg.is_visible('.vn-sub:has([data-depth="full"]) .vn-prev')
-        assert pg.inner_text('.vn-sub:has([data-depth="full"]) .vn-more') == "Show less"
-        pg.click('.vn-sub:has([data-depth="full"]) .vn-more')
-        assert pg.evaluate(h, "full") < 60
-        # an open level also folds from under its label
-        assert not pg.is_visible('.vn-sub:has([data-depth="full"]) .vn-less-top')
-        pg.click('.vn-sub:has([data-depth="full"]) .vn-more')
-        assert pg.is_visible('.vn-sub:has([data-depth="full"]) .vn-less-top')
-        pg.click('.vn-sub:has([data-depth="full"]) .vn-less-top')
-        assert pg.evaluate(h, "full") < 60 and pg.inner_text('.vn-sub:has([data-depth="full"]) .vn-more') == "Show more"
-        # Copy opens a menu of the levels; each copies its own text, All copies them under their names
+        # Short visible, the other panes hidden.
+        assert pg.locator('.lm-depth-p[data-depth="short"]').is_visible()
+        assert not pg.locator('.lm-depth-p[data-depth="full"]').is_visible()
+        # Click Full: that pane shows, the others hide, the Full tab is pressed.
+        pg.click('.lm-depth-b[data-depth="full"]')
+        assert pg.locator('.lm-depth-p[data-depth="full"]').is_visible()
+        assert not pg.locator('.lm-depth-p[data-depth="short"]').is_visible()
+        assert pg.get_attribute('.lm-depth-b[data-depth="full"]', "aria-pressed") == "true"
+        assert pg.get_attribute('.lm-depth-b[data-depth="short"]', "aria-pressed") == "false"
+        assert pg.locator('.lm-depth-p[data-depth="full"] table').is_visible()
+        # Copy copies whichever pane is open.
         pg.evaluate("() => { window.__copied = []; window.vnCopyText = t => { window.__copied.push(t); return true; }; }")
-        assert not pg.is_visible('.vn-cm')
-        pg.click('.lm-copy-menu')
-        assert pg.inner_text('.vn-cm').split() == ["Short", "Plain", "words", "Full", "All", "three"]
-        pg.click('.vn-cm [data-copy="full"]')
-        assert not pg.is_visible('.vn-cm')
-        pg.click('.lm-copy-menu'); pg.click('.vn-cm [data-copy="all"]')
+        pg.click('.lm-depth-copy')
+        pg.wait_for_function("() => window.__copied.length === 1")
+        assert pg.evaluate("() => window.__copied[0]") == FULL.strip()
+        # Switch back to Short, Copy, confirm we grab the short text.
+        pg.click('.lm-depth-b[data-depth="short"]')
+        pg.click('.lm-depth-copy')
         pg.wait_for_function("() => window.__copied.length === 2")
-        got = pg.evaluate("() => window.__copied")
-        assert got[0] == FULL.strip()
-        assert got[1].startswith("Short\n\n" + BASE["answer"]) and "\n\nFull\n\n" in got[1]
+        assert pg.evaluate("() => window.__copied[1]") == BASE["answer"]
     finally:
         pg.close()
 
@@ -223,13 +213,13 @@ def test_every_kind_of_summary_has_the_same_switch(out2):
     h = out2["done"]
     band = h[h.index(">Summary<"):]
     assert re.findall(r'class="lm-depth-p" data-depth="(\w+)"', band) == ["short", "plain", "full"]
-    assert re.findall(r'data-copy="(\w+)"', band) == ["short", "plain", "full", "all"]
+    assert re.findall(r'class="lm-depth-b" data-depth="(\w+)"', band) == ["short", "plain", "full"]
     assert "Explain more" not in h
 
 
 def test_every_summary_has_a_copy_button(out, out2):
     for h in (out["full"], out["alone"], out2["dv"], out2["done"]):
-        assert h.count('class="lm-copy-menu"') == 1
+        assert h.count('class="lm-depth-copy"') == 1
 
 
 def test_the_rules_ask_every_card_for_short_and_full():

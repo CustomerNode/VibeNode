@@ -83,11 +83,12 @@ def test_answer_buttons_are_chips_with_their_coloured_icons(page):
 
 
 def test_the_groups_summary_details_and_review_and_respond(page):
-    assert page.inner_text("#done .lm-answer .vn-ghrow b") == "Summary"
+    """Summary band draws a horizontal Short / Plain words / Full switch across
+    the top with its own "Summary" label; the Details group heading still
+    appears before the first .lm-status / .lm-checked / .lm-hist band."""
+    assert page.inner_text("#done .lm-answer > .dt") == "Summary"
+    assert 'class="lm-depth' in page.inner_html("#done .lm-answer > .dd")
     assert _style(page, "#done .lm > .lm-answer + .lm-status", "content", "::before") == '"Details"'
-    left = page.evaluate("() => { const c = document.querySelector('#done .lm'); const L = s => document.querySelector(s).getBoundingClientRect().left - c.getBoundingClientRect().left;"
-                         " return [L('#done .vn-ghrow b'), L('#done .vn-sub > .dt'), L('#done .lm-checked > .dt')]; }")
-    assert abs(left[1] - left[0] - 14) <= 1 and abs(left[2] - left[1]) <= 1, left   # parts indented 14px under the heading
 
 
 def test_status_words_keep_their_colour(page):
@@ -98,8 +99,8 @@ def test_status_words_keep_their_colour(page):
         assert max(r, g, b) - min(r, g, b) > 40, (k, c)
 
 
-def test_sub_items_are_parted_by_space_and_a_hairline(page):
-    """Sub-items are parted so they do not bleed into each other."""
-    assert _style(page, "#done .vn-sub + .vn-sub", "border-top-style") == "solid"
-    assert float(_style(page, "#done .vn-sub + .vn-sub", "padding-top")[:-2]) >= 18
+def test_details_sub_items_are_parted_by_space_and_a_hairline(page):
+    """Details sub-items are parted by space and a hairline so the three do
+    not run into each other.  Summary itself uses a horizontal switch, so
+    only the Details bands keep the hairline rule between them."""
     assert _style(page, "#done .lm > .lm-checked", "border-top-style", "::after") == "solid"
