@@ -1,0 +1,108 @@
+"""Earlier tasks on the newest summary: the ladder grows upward.  Runs the real
+src/web/static/js/last-card.js in headless Chrome (--dump-dom) on a chat with five
+earlier summaries."""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+CHROME = (shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+          or shutil.which("chrome")
+          or next((str(c) for c in (Path("C:/Program Files/Google/Chrome/Application/chrome.exe"),
+                                    Path("C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"),
+                                    Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+                   if c.exists()), None))
+# The environment as it was before conftest's isolate_home moved USERPROFILE
+# and APPDATA: Chrome on Windows does not start without them.  Its own
+# profile is never touched: --dump-dom runs in a throwaway one.
+_CHROME_ENV = dict(os.environ)
+
+
+def _card(type_, task, needs=None):
+    return {"type": type_, "title": task, "headline": "VibeNode " + task.lower(), "context": "x",
+            "zoom": {"big": "Supervising ten VibeNode sessions", "task": task, "now": "Step"},
+            "needs": needs or {"kind": "none", "why": "x", "next": "y"}}
+
+
+DECIDE = {"kind": "decision", "ask": "Pick one", "replies": [{"key": "A", "label": "one two three", "reply": "Go with A"},
+                                                             {"key": "B", "label": "four five six", "reply": "Go with B"}]}
+SEQ = [("u", "make the popup premium"), ("c", _card("done", "Premium motion")),
+       ("u", "default templates"), ("c", _card("needs_you", "Default templates", DECIDE)),
+       ("u", "fix the notes card"), ("c", _card("done", "Fix the notes summary")),
+       ("u", "cards from my seat"), ("c", _card("needs_you", "Summaries for you", DECIDE)),
+       ("u", "Go with A"), ("c", _card("blocked", "Summaries for you")),
+       ("u", "queue line please"), ("c", _card("done", "Queue line"))]
+
+
+@pytest.fixture(scope="module")
+def dom(tmp_path_factory):
+    if not CHROME:
+        pytest.skip("no Chrome")
+    msgs = "".join(
+        f'<div class="msg user">{v}</div>' if k == "u" else
+        "<div class=\"msg asst\"><div class=\"msg-body\"><div class=\"vn-card-ph\" data-card='"
+        + json.dumps(v).replace("'", "&#39;") + "'></div></div></div>" for k, v in SEQ)
+    page = tmp_path_factory.mktemp("ladder") / "page.html"
+    page.write_text(f"""<!doctype html><html><head><meta charset="utf-8"></head><body><div id="live-log">{msgs}</div>
+<script>var liveSessionId='s1',sessionKinds={{s1:'idle'}};window.fetch=()=>Promise.reject(new Error('offline'));
+// renderIn draws the ladder on the next animation frame.  --dump-dom does not
+// always produce a frame before it dumps (the ladder was missing in about one
+// dump in three), but it always runs timers inside the virtual-time budget.
+window.requestAnimationFrame=cb=>setTimeout(()=>cb(performance.now()),0);</script>
+<script src="{(ROOT / 'src/web/static/js/last-card.js').as_uri()}"></script>
+<script>VNLastCard.renderIn(document.getElementById('live-log'));</script></body></html>""", "utf-8")
+    # Read the dump as soon as Chrome prints it, then close Chrome.  On Windows
+    # Chrome prints the page within a second but can take 30-90 s more to exit
+    # under load (measured), and waiting for the exit timed the
+    # fixture out in the publish run although the page had rendered.
+    out_path = page.with_name("dom.html")
+    with open(out_path, "wb") as out:
+        p = subprocess.Popen([CHROME, "--headless=new", "--no-sandbox", "--disable-gpu", "--allow-file-access-from-files",
+                              "--virtual-time-budget=3000", "--dump-dom", page.as_uri()],
+                             stdout=out, stderr=subprocess.DEVNULL, env=_CHROME_ENV)
+        try:
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                if "</html>" in out_path.read_text("utf-8", errors="replace") or p.poll() is not None:
+                    break
+                time.sleep(0.2)
+        finally:
+            if p.poll() is None:
+                p.kill()
+            try:
+                p.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                pass  # killed; a slow exit under load must not fail the test
+    dom = out_path.read_text("utf-8", errors="replace")
+    assert "</html>" in dom, "Chrome printed no page within 90 s"
+    return dom
+
+
+def test_only_the_newest_summary_gets_the_ladder(dom):
+    assert dom.count('class="lm-earlier"') == 1
+    last = dom.rsplit('class="lm skim', 1)[1]
+    assert 'class="lm-earlier"' in last
+
+
+def test_the_last_two_tasks_show_and_the_rest_fold(dom):
+    ladder = dom.split('class="lm-earlier"', 1)[1].split('class="r z1"', 1)[0]
+    assert "+ 2 earlier" in ladder
+    rows = re.findall(r'lm-emark (\w+)".*?<span class="t">([^<]+)</span>', ladder)
+    assert rows == [("done", "Premium motion"), ("you", "Default templates"),
+                    ("done", "Fix the notes summary"), ("blocked", "Summaries for you")]
+
+
+def test_moving_on_is_not_answering_but_a_reply_is(dom):
+    # "Default templates" was never answered (the user moved on): still needs the user.
+    # "Summaries for you" was answered ("Go with A") and then blocked: its
+    # latest summary decides, so it reads Blocked, once.
+    ladder = dom.split('class="lm-earlier"', 1)[1].split('class="r z1"', 1)[0]
+    assert ladder.count('<span class="t">Summaries for you</span>') == 1
+    assert 'lm-emark you" title="Needs you"' in ladder

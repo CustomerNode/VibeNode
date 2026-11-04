@@ -1,0 +1,254 @@
+# Agent Authoring Best Practices
+
+This file is the standard for every prompt-template agent in `src/features/workforce/`. When you create a new agent here, or edit an existing one, your output MUST follow these rules. They are derived from real subagent failure modes documented by the Claude Code team and adapted to VibeNode's workforce mechanism (catalog-injected prompts via `/api/workforce/assets`).
+
+Read this file before touching any `src/features/workforce/*.md` file. If a rule conflicts with a specific agent's needs, document the divergence in that agent's file with a clear "Why this agent diverges" note — do not silently violate the standard.
+
+---
+
+## Why these rules exist
+
+Every workforce agent is loaded into the parent Claude session's system prompt at runtime. The parent uses the agent's body to decide **when** to spawn a subagent and **what** to write in the kickoff prompt. The subagent then operates in an isolated context window, returns a summary, and that summary is the only artifact the parent sees.
+
+This architecture has four reliable failure modes:
+
+1. **Vague descriptions** → parent writes vague kickoff prompts → subagent wastes context re-deriving what it should have been told.
+2. **No defined output format** → subagent has no stopping point → runs long, returns shapeless prose the parent cannot parse.
+3. **No obstacle reporting** → workarounds and env quirks die in the subagent's context → the next stage rediscovers them at cost.
+4. **Test/result summarization** → diagnostic detail compresses into "tests failed" → parent must rerun to debug.
+
+Every rule below targets one of these failure modes.
+
+---
+
+## Required sections (in order)
+
+Every prompt-template agent in `src/features/workforce/` MUST contain these sections, in this order:
+
+```
+---
+id: <kebab-case-id>
+name: <Human Name>
+department: compose
+source: vibenode
+version: <semver>
+depends_on: [<other-agent-ids>]
+type: prompt-template
+---
+
+# <Human Name>
+
+Reusable prompt template. Invoke by typing: **<lowercase invocation>**
+
+**Unique value**: <one sentence — what failure class this agent catches that no other agent catches>
+
+## Invocation Contract
+
+The caller MUST include in the kickoff prompt:
+- <thing 1>
+- <thing 2>
+- <thing 3 …>
+
+If any of these are missing and cannot be inferred reliably from conversation context, request them before starting.
+
+## The Prompt
+
+<the actual instructions to the subagent — what to do, how to think>
+
+## Standing Criteria  (or equivalent — "Standing Review Criteria", "Standing Hotfix Criteria", etc.)
+
+<the non-negotiable checks this agent always performs>
+
+## Fix Policy  (or "Escalate when" — whichever fits)
+
+<when to auto-fix vs. when to escalate>
+
+## Output Format
+
+Return one combined team report in this numbered structure:
+
+1. <section>
+2. <section>
+…
+N-1. **What was not validated or could not be fully verified** — Blind spots, skipped areas, env limits.
+N.   **Obstacles encountered** — Setup issues, workarounds discovered, commands that needed special flags or configuration, dependencies or imports that caused problems, env quirks. Report anything the next stage would otherwise have to rediscover.
+```
+
+Confidence rating (`HIGH / MEDIUM / LOW` with one-sentence rationale) is required for any agent that produces a judgment about whether work is shippable.
+
+---
+
+## Rule 1: Unique value statement (one sentence)
+
+Every agent's body must open with a `**Unique value**:` line that names the specific failure class this agent catches. If you cannot complete the sentence "No other agent catches X," the agent does not earn its slot — merge it into an existing agent or delete it.
+
+**Good:** "Catches integration failures, workflow breakage, concurrency issues, and performance regressions through broad validation."
+**Bad:** "Helps with testing." (Vague. Does not identify a unique failure class.)
+
+---
+
+## Rule 2: Invocation Contract (mandatory, top of agent body)
+
+Every agent must have an `## Invocation Contract` section listing exactly what the caller must include in the kickoff prompt. This is the single biggest lever for steering the parent agent's behavior — the catalog injects the agent body into the parent's system prompt, so the contract is read every time the parent decides to delegate.
+
+**The contract must:**
+- Be 3–6 specific bullet points. Fewer is too vague; more is unread.
+- Name concrete inputs, not abstract qualities. "the spec path" beats "context about the spec."
+- End with a fallback sentence: "If any of these are missing and cannot be inferred reliably from conversation context, request them before starting."
+
+**Anti-patterns:**
+- "The caller should provide enough context." (Useless. Specify what counts as enough.)
+- "Include any relevant files." (Useless. Which files?)
+- A contract that overlaps with `## The Prompt`. The contract is about **what to pass in**; The Prompt is about **what to do with it**.
+
+---
+
+## Rule 3: Output format = numbered sections (mandatory)
+
+Every agent must have an `## Output Format` section that defines the return structure as a **numbered list**. Numbered sections create explicit stopping points — the agent knows it's done when every section is filled.
+
+**Required final two sections** (in this order, at the end of every agent's output format):
+- **What was not validated or could not be fully verified** — Blind spots and non-completion.
+- **Obstacles encountered** — Setup issues, workarounds discovered, commands that needed special flags or configuration, dependencies or imports that caused problems, env quirks. Report anything the next stage would otherwise have to rediscover.
+
+These are different concerns. "What was not validated" is about **scope coverage**. "Obstacles encountered" is about **practical hacks the next stage needs to know about**. Do not collapse them into one section.
+
+---
+
+## Rule 4: Raw output discipline for any agent that runs tests, queries, or external commands
+
+When an agent runs a command whose output is **diagnostic** (test failures, query results, log greps), the report MUST include the raw verbatim output for failures or unexpected results. Summarizing diagnostic output is the single worst subagent failure mode — the parent cannot debug what is hidden.
+
+Rules for diagnostic output:
+1. **Failures or errors → include verbatim.** Full stack trace, full assertion message, full stderr. Do not paraphrase.
+2. **Successes → summarize freely.** One-line counts are fine.
+3. **Flaky results → include at least one failing run's raw output AND note the flake.** Do not silently retry until green.
+4. **Document non-default commands.** If you ran `pytest -x --tb=long`, say so in Obstacles so the next stage can reproduce.
+
+This rule is enforced explicitly in Test Team. Any new agent that runs diagnostic commands MUST adopt the same rule.
+
+---
+
+## Rule 5: Don't claim expertise — claim a frame
+
+The "expert persona" anti-pattern (e.g. "you are a Python expert") adds no value. Claude already has the knowledge. What an agent CAN add is a **distinct frame** that changes the questions being asked.
+
+**Bad:** "You are an expert in performance optimization."
+**Good:** "You evaluate every change from the perspective of someone who uses VibeNode 8 hours a day." (Compose Expert User does this — different lens, different questions.)
+
+Agents with multiple internal roles ("Run the Plan Team: Spec Analyst, Product Strategist, Architect…") are fine. Those are **role frames within one agent**, not separate subagents. The anti-pattern is spawning a subagent whose only differentiator is "expert."
+
+---
+
+## Rule 6: Avoid sequential subagent pipelines unless artifacts are on disk
+
+Multi-stage pipelines where each stage depends on the previous stage's discoveries lose information at every handoff — the summary returned to the parent strips out detail the next stage needs.
+
+**Mitigation pattern** (used in Code Pipeline):
+- Each stage writes its full findings to a numbered file in `docs/plans/runs/<run-id>/`.
+- The next stage reads the prior artifact in full, not just the in-context summary.
+
+If you build a new pipeline-style agent, you MUST adopt this pattern. The artifact directory should be:
+
+```
+docs/plans/runs/<YYYY-MM-DD-HHMM>-<short-slug>-<4 hex>/
+  00-request.md
+  01-<stage>.md
+  02-<stage>.md
+  ...
+```
+
+`docs/plans/` is gitignored — these artifacts are safe to write freely. Reference them by path in the final pipeline report so the user can dig into any stage without rerunning.
+
+---
+
+## Rule 7: Tool restrictions are encoded in prose
+
+The VibeNode workforce mechanism does not have a YAML `tools:` field, so any restriction on what a subagent should touch must be written explicitly in The Prompt. Examples:
+
+- Read-only agents: "Do not modify code files. Read and analyze only."
+- Plan-stage agents: "Write to `docs/plans/` only. Do not modify source code."
+- Audit agents: "Fix problems that are clear, low-risk, and unambiguous. For anything requiring judgment or with broader risk, do not fix — escalate."
+
+State the restriction once, in clear language, near the top of The Prompt or in the Fix Policy. Repeating it in three places is noise.
+
+---
+
+## Rule 8: Versioning and depends_on
+
+Every agent file has a YAML `version:` field. Bump it when you make a substantive change:
+- Patch (1.0.0 → 1.0.1): typo fix, wording tightening, no behavior change.
+- Minor (1.0.0 → 1.1.0): added section, added rule, expanded scope.
+- Major (1.0.0 → 2.0.0): changed output format, removed required behavior, breaking change for callers that depend on the prior structure.
+
+The `depends_on` field lists other agent IDs this agent invokes or builds on. Keep it accurate — Code Pipeline reads this to construct its workflow.
+
+---
+
+## Rule 9: Standing criteria belong in the agent, not in the kickoff prompt
+
+If an agent always evaluates the same checklist (CLAUDE.md compliance, PERF-CRITICAL preservation, public-repo safety, lifecycle states), encode that checklist in a `## Standing Criteria` section within the agent body. Do not require the caller to remember these — the catalog injects the agent body, so standing criteria are always in context.
+
+Standing criteria should be **non-negotiable**. If a check is optional, it belongs in The Prompt or the Fix Policy, not Standing Criteria.
+
+---
+
+## Rule 10: One agent = one failure class
+
+Every agent must remove a **distinct class of failure** the other agents cannot remove. If two agents repeatedly catch the same issues, one of them is redundant — merge, narrow, or delete the weaker one.
+
+This is enforced by Code Pipeline's list of teams and the failure each one removes. When you add a new agent to `src/features/workforce/`, you must be able to add it to that list with a one-sentence "catches X failures that nothing else catches" statement.
+
+---
+
+## Rule 11: Pipelines share one spine, and the grade is computed
+
+A pipeline is an agent that takes a request through plan, build and independent checks to a graded result. `code-pipeline.md` is the first built on this spine; a Writing, Deck or Workbook pipeline follows the same spine with its own teams and its own kind of evidence. The spine, which every pipeline keeps:
+
+1. **The request is on disk verbatim** (`00-request.md`), created by `python -m features.pipeline.start`, before any team runs, and **the start line is the run's fixed point**: the engine records the route, the hash of the request, and the hashes of the repository's pinned checks and pinned protection. A route, a request or a declaration that later differs from that line is tampering, graded LOW. Nothing is ever appended to `00-request.md`; a light run's plan goes in `00-plan.md`.
+2. **Acceptance criteria are written before building**, as a fenced `verification` block the programs read, naming what proves each criterion for this project.
+3. **Checkers are fresh subagents, one at a time, and they sign what they judged.** Review, Test and Audit run as Agent-tool subagents whose brief holds only the request, the run directory, the spec path and the diff, and they run in sequence: Review's fixes land before Test runs, Test's evidence is on the tree Audit reads. Each checker ends by running `python -m features.pipeline.attest <run-dir> <its stage file>`: the recorded line binds the report's content and the tree it examined to that checker, so a report changed after signing is not the checker's report, and a reviewer whose tree is not the final tree must look again. A checker stage the root session wrote or attested is self-grading, a plan a checker edited is self-graded criteria, and the harness says so in each case. A checker may demand full depth with `python -m features.pipeline.escalate`; that cannot be undone.
+4. **One artifact per stage** in `docs/plans/runs/<run>/` (Rule 6), and the next stage reads the previous file in full.
+5. **Evidence is what the Session Engine recorded**, never what an agent typed: `pipeline.run_check` authorizes and then executes each criterion and the harness matches its evidence file against the transcript that shows it being produced, on the tree being graded, under a decision the policy or the user allowed (`src/features/pipeline/decisions.py`). The user answers on a Smart termination card the pipeline writes (`src/features/pipeline/cards.py`), so the user's tap is a message in the transcript no agent can forge; the pipeline reads that card format and never changes it.
+6. **The grade is computed** by `python -m features.pipeline.harness`, reported verbatim, and bound to the final tree by content (a commit of unchanged code changes nothing). HIGH, MEDIUM, LOW are grades of evidence strength; BLOCKED is an execution status. **Delivery goes through `python -m features.pipeline.deliver`**, which recomputes the grade and exits non-zero below HIGH unless the user accepted the lower grade on a card (`--request-acceptance`, then `--decision`); no flag accepts on the user's behalf. The ledger recomputes too and never trusts `verdict.json`.
+7. **The audit answers the fourth question**: if every check passed, what could still be wrong that no check would catch? A material answer changes the grade, adds a check, or goes to the user. **And it judges coverage**: criterion by criterion, do the checks prove the request was met? Anything short of an explicit `Verdict: covered` caps the grade at MEDIUM, because passing checks can all be trivial. Where the program can check coverage, it does: the project's pinned checks (`.pipeline-verify`) always run, and on behavior-changing routes at least one test must FAIL on the code as it was before the change, for the reason the plan named (`run_check --baseline`, in an isolated worktree).
+8. **The ledger remembers; tests converge.** Every run appends one row to `LEDGER.md` and every defect a checker found becomes a regression test in the project.
+
+A new pipeline that drops any of these is not a pipeline. What it may change is the team roster, the routes, and what counts as evidence for its kind of deliverable. The programs live in `pipeline/` and import nothing from `app` or `daemon`, so they work in any repository. Tests: `tests/test_code_pipeline.py`, which starts from one valid run and breaks one thing at a time.
+
+---
+
+## Rule 12: Playbooks meet the Playbook Standard, and VibeNode checks it
+
+A playbook is an entry with `playbook: true`; it is listed in Settings → Playbooks and started by its words. Its required parts (identity, purpose, inputs, execution, outputs, verification, safety) are defined once, in code: `src/shared/playbook_standard.py`. They scale with `playbook_risk`: `low` (talks only) needs the first five, `medium` (creates things or runs commands) adds Standing Criteria, an escalation section and the two closing output sections, `high` (changes code, runs experiments, sends anything out) must also say in its prompt what it must not touch.
+
+Every playbook also declares `playbook_capabilities`; `delete`, `publish`, `send_out`, `modify_code` and `run_experiments` need `high` (`read_only_sessions`, sessions that can only read, needs `medium`), and the check refuses a capability its instructions show but it does not declare. Ids, names and the words that start a playbook must be unique across the library, and replacing a playbook must raise its version. A session runs a playbook only from `--show` / `/api/playbooks/<id>`, which checks it at that moment; a failing one is never served.
+
+VibeNode enforces it on every path: `/api/workforce/write-asset` refuses a failing playbook, `/api/workforce/assets` leaves one out of the Playbooks list (with `playbook_problems`), and `tests/test_playbook_standard.py` fails the suite. Check a file with `python -m shared.playbook_standard src/features/workforce/<id>.md`; print the rules with `--explain`. The **Playbook Builder** playbook creates and fixes playbooks against it. Change a rule in the module, never in a playbook's prose.
+
+---
+
+## When you edit an existing agent
+
+1. Read this file first.
+2. Read the existing agent file in full — do not edit blind.
+3. Bump the `version:` field per Rule 8.
+4. Preserve the agent's distinct frame (Rule 5) and unique value (Rule 10).
+5. If your edit changes the output format, also update any agent in `depends_on` that consumes the output.
+6. After saving, re-read the file to confirm the edit landed correctly and the structure is intact.
+
+## When you create a new agent
+
+1. Read this file first.
+2. State the unique value in one sentence (Rule 1). If you can't, stop — the agent doesn't earn a slot.
+3. Use the template in "Required sections" above. Every section is required unless you have a documented reason to diverge.
+4. Add the new agent to Code Pipeline's list of teams and its routes if applicable (Execute Pipeline is an alias for Code Pipeline).
+5. Test the agent by invoking it on a real task and reading the output. If the output is shapeless or runs too long, the format is wrong.
+
+---
+
+## What this file is not
+
+- Not a place to list all agents. The runtime catalog (built from `src/features/workforce/*.md` by `/api/workforce/assets`) is the authoritative list.
+- Not the spec for the workforce loader. That lives in `src/web/routes/live_api.py` (`get_workforce_assets`).
+- Not advice for one-off Agent tool invocations in the middle of a session. Those don't go through this catalog. This file is specifically for the reusable prompt-template agents stored in `src/features/workforce/`.

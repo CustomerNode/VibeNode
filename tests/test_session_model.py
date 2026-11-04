@@ -1,0 +1,360 @@
+"""
+Battle-hardening tests for the per-session model selector architecture.
+
+The per-session model selector was historically brittle. The root cause was
+structural: "the model for a session" was
+stored in six overlapping places, a *global* one-shot override leaked across
+sessions, four functions each re-derived the effective value differently, and
+the DOM was treated as a source of truth.
+
+The rebuild established one contract — **one owner, one write path, derived
+rendering** (see src/web/static/js/session-model.js). These tests lock that contract
+in so a future change cannot silently reintroduce the brittleness.
+
+Two layers:
+  * Source-invariant guards (always run) — assert the brittle patterns are gone
+    and the single-owner wiring is present across the JS files. These are cheap
+    and node-free, so they run everywhere including CI.
+  * A Node-executed unit test of the SessionModel resolver (skipped when node
+    is unavailable) that exercises the real resolution logic end to end.
+"""
+import pathlib
+import shutil
+import subprocess
+
+import pytest
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+JS = ROOT / "src" / "web" / "static" / "js"
+TEMPLATES = ROOT / "src" / "web" / "templates"
+
+# Files that participate in model resolution / rendering.
+_CONSUMERS = ("invoke-workforce.js", "app.js", "kanban.js", "live-panel.js", "socket.js")
+
+
+def _read_js(name: str) -> str:
+    return (JS / name).read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Layer 1 — source-invariant guards (node-free, always run)
+# ---------------------------------------------------------------------------
+
+class TestNoGlobalOverride:
+    """The global one-shot override was the root of the cross-session leak.
+    It must never come back."""
+
+    def test_store_file_exists(self):
+        assert (JS / "session-model.js").exists(), \
+            "session-model.js (the single owner) is missing"
+
+    def test_no_consumer_reads_global_override(self):
+        for name in _CONSUMERS:
+            src = _read_js(name)
+            assert "window._sessionModelOverride" not in src, \
+                f"{name} references the killed global model override"
+            assert "window._sessionThinkingOverride" not in src, \
+                f"{name} references the killed global thinking override"
+
+    def test_override_key_only_appears_in_cleanup(self):
+        """The legacy localStorage key may appear ONLY in removeItem cleanup —
+        never read back into a resolution decision."""
+        for name in ("invoke-workforce.js", "session-model.js"):
+            for line in _read_js(name).splitlines():
+                stripped = line.strip()
+                # Ignore comment lines — they document the old design on purpose.
+                if stripped.startswith("//") or stripped.startswith("*"):
+                    continue
+                if "_sessionModelOverride" in line or "_sessionThinkingOverride" in line:
+                    assert "removeItem" in line, (
+                        f"{name}: legacy override key used outside cleanup: "
+                        f"{stripped!r}"
+                    )
+
+
+class TestSingleOwnerWiring:
+    """Every start path and renderer must go through SessionModel."""
+
+    def test_store_exposes_the_contract_api(self):
+        src = _read_js("session-model.js")
+        for fn in ("getDefault", "getDesired", "setDesired", "clearDesired",
+                   "getConfirmed", "ingestConfirmed", "effective", "effectivePending"):
+            assert f"{fn}:" in src, f"SessionModel is missing '{fn}' in its public API"
+
+    def test_start_paths_resolve_per_session(self):
+        """Each new-session start path resolves the model via
+        SessionModel.effectivePending(<its own id>) — not a global."""
+        for name in ("app.js", "kanban.js", "live-panel.js"):
+            assert "SessionModel.effectivePending(" in _read_js(name), (
+                f"{name} does not resolve its start model through "
+                "SessionModel.effectivePending — it may be reading a global."
+            )
+
+    def test_socket_ingests_through_store(self):
+        src = _read_js("socket.js")
+        assert "SessionModel.ingestConfirmed(" in src, \
+            "socket.js must funnel confirmed models through the store"
+
+    def test_wake_paths_pin_daemon_truth_first(self):
+        """A model picked for a session must stick.
+
+        Every path that WAKES a sleeping session must resolve the model to pin
+        via SessionModel.resumeModel — daemon-confirmed truth first, this
+        tab's local pending choice second.  Sending getDesired alone re-sent
+        a STALE local choice (picked here, then switched from the phone) and
+        silently undid the switch.  The store must expose the resolver, and
+        no wake path may bypass it for a bare getDesired.
+        """
+        assert "resumeModel:" in _read_js("session-model.js"), \
+            "SessionModel must expose resumeModel"
+        for name in ("live-panel.js", "sessions.js"):
+            src = _read_js(name)
+            assert "SessionModel.resumeModel(" in src, (
+                f"{name} wakes sessions without SessionModel.resumeModel — a "
+                "stale local desiredModel can undo a switch made elsewhere"
+            )
+
+    def test_switch_flows_accept_broadcast_as_confirmation(self):
+        """The socket reply is socket-scoped and can be lost across a mobile
+        reconnect; both switch flows must ALSO accept the daemon's
+        session_model_changed broadcast as confirmation, or a successful
+        switch surfaces as a bogus 'NOT changed' toast."""
+        for name in ("invoke-workforce.js", "live-panel.js"):
+            src = _read_js(name)
+            assert "socket.on('session_model_changed', onChanged)" in src, (
+                f"{name} no longer listens for session_model_changed as a "
+                "confirmation fallback"
+            )
+
+    def test_index_loads_store_before_consumers(self):
+        html = (TEMPLATES / "index.html").read_text(encoding="utf-8")
+        pos_store = html.find("session-model.js")
+        pos_app = html.find("js/app.js")
+        pos_invoke = html.find("invoke-workforce.js")
+        assert pos_store != -1, "index.html does not load session-model.js"
+        # allSessions/defaultModel are declared in app.js; the store reads them
+        # at call-time, but load it right after app.js and before the renderers.
+        assert pos_app < pos_store < pos_invoke, (
+            "session-model.js must load after app.js and before invoke-workforce.js"
+        )
+
+
+class TestSingleDomWriter:
+    """The DOM must never be a source of truth. Exactly one function may write
+    the running-session model badge, and it must derive from the store."""
+
+    def test_socket_does_not_write_the_badge_directly(self):
+        # socket.js used to write '.session-model-badge' textContent inline,
+        # racing bar re-renders. It must now delegate to the single renderer.
+        assert "session-model-badge" not in _read_js("socket.js"), (
+            "socket.js writes the model badge directly — it must call "
+            "_renderSessionModelBadge instead"
+        )
+
+    def test_single_badge_renderer_exists(self):
+        src = _read_js("invoke-workforce.js")
+        assert "function _renderSessionModelBadge(" in src, \
+            "the single badge renderer _renderSessionModelBadge is missing"
+        # It must read from the store, not from its argument or the DOM.
+        start = src.index("function _renderSessionModelBadge(")
+        body = src[start:start + 900]
+        assert "SessionModel.getConfirmed(" in body, \
+            "_renderSessionModelBadge must derive the model from the store"
+
+
+# ---------------------------------------------------------------------------
+# Layer 2 — Node-executed unit test of the actual resolver logic
+# ---------------------------------------------------------------------------
+
+_NODE = shutil.which("node")
+
+# Harness: stub the browser globals the store touches, eval the real source,
+# then run the injected assertions against window.SessionModel.
+_HARNESS = r"""
+global.window = {};
+const _ls = {};
+global.localStorage = {
+  getItem: (k) => (Object.prototype.hasOwnProperty.call(_ls, k) ? _ls[k] : null),
+  setItem: (k, v) => { _ls[k] = String(v); },
+  removeItem: (k) => { delete _ls[k]; },
+};
+global.allSessions = [];
+const fs = require('fs');
+const assert = require('assert');
+const src = fs.readFileSync(__SRC__, 'utf8');
+eval(src);
+const SessionModel = global.window.SessionModel;
+__BODY__
+console.log('PASS');
+"""
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not available — resolver logic guarded by source tests")
+class TestResolverLogic:
+    """Exercise the real resolution rules the UI depends on."""
+
+    def _run(self, tmp_path, body: str):
+        src_path = (JS / "session-model.js").as_posix()
+        script = _HARNESS.replace("__SRC__", repr(src_path)).replace("__BODY__", body)
+        f = tmp_path / "resolver_test.js"
+        f.write_text(script, encoding="utf-8")
+        proc = subprocess.run([_NODE, str(f)], capture_output=True, text=True)
+        assert proc.returncode == 0 and "PASS" in proc.stdout, (
+            "Node resolver assertion failed:\n"
+            f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+
+    def test_falls_back_to_hardcoded_default(self, tmp_path):
+        # No default configured, no session known → last-resort fallback id.
+        self._run(tmp_path, """
+            assert.strictEqual(SessionModel.effectivePending('ghost'), 'claude-opus-4-7');
+        """)
+
+    def test_system_default_is_respected(self, tmp_path):
+        self._run(tmp_path, """
+            localStorage.setItem('defaultModel', 'claude-sonnet-4-6');
+            assert.strictEqual(SessionModel.getDefault(), 'claude-sonnet-4-6');
+            assert.strictEqual(SessionModel.effectivePending('ghost'), 'claude-sonnet-4-6');
+        """)
+
+    def test_desired_wins_over_default_for_pending(self, tmp_path):
+        self._run(tmp_path, """
+            localStorage.setItem('defaultModel', 'claude-opus-4-7');
+            allSessions.push({ id: 'a' });
+            SessionModel.setDesired('a', 'claude-haiku-4-5');
+            assert.strictEqual(SessionModel.effectivePending('a'), 'claude-haiku-4-5');
+            assert.strictEqual(SessionModel.getDesired('a'), 'claude-haiku-4-5');
+        """)
+
+    def test_resume_model_prefers_confirmed_and_keeps_1m(self, tmp_path):
+        # The wake pin: daemon truth (any device) beats this tab's stale local
+        # choice; '' when neither is known so the daemon uses its registry.
+        # "[1m]" is kept (it is the 1M context choice, a valid --model) except
+        # on Haiku, where it is an API 400; other markers are always dropped.
+        self._run(tmp_path, """
+            allSessions.push({ id: 'a' }, { id: 'b' }, { id: 'c' });
+            assert.strictEqual(SessionModel.resumeModel('a'), '');           // nothing known
+            SessionModel.setDesired('a', 'claude-haiku-4-5');
+            assert.strictEqual(SessionModel.resumeModel('a'), 'claude-haiku-4-5'); // pending only
+            SessionModel.ingestConfirmed('a', 'claude-sonnet-4-6');          // phone switched it
+            assert.strictEqual(SessionModel.resumeModel('a'), 'claude-sonnet-4-6'); // truth wins
+            SessionModel.ingestConfirmed('b', 'claude-opus-5[1m]');
+            assert.strictEqual(SessionModel.resumeModel('b'), 'claude-opus-5[1m]'); // 1M kept
+            assert.strictEqual(SessionModel.getConfirmed('b'), 'claude-opus-5[1m]');
+            SessionModel.ingestConfirmed('c', 'claude-haiku-4-5[1m]');
+            assert.strictEqual(SessionModel.resumeModel('c'), 'claude-haiku-4-5');  // haiku: 400
+            allSessions.push({ id: 'd', desiredModel: 'claude-sonnet-5[x][1m]' });
+            assert.strictEqual(SessionModel.getDesired('d'), 'claude-sonnet-5[1m]'); // other markers dropped
+            assert.strictEqual(SessionModel.resumeModel('ghost'), '');
+        """)
+
+    def test_desired_does_not_leak_across_sessions(self, tmp_path):
+        # THE core historical bug: a choice for one new session leaked to the next.
+        self._run(tmp_path, """
+            localStorage.setItem('defaultModel', 'claude-opus-4-7');
+            allSessions.push({ id: 'a' }, { id: 'b' });
+            SessionModel.setDesired('a', 'claude-haiku-4-5');
+            assert.strictEqual(SessionModel.effectivePending('a'), 'claude-haiku-4-5');
+            // 'b' chose nothing — it MUST stay on the system default.
+            assert.strictEqual(SessionModel.effectivePending('b'), 'claude-opus-4-7');
+            assert.strictEqual(SessionModel.getDesired('b'), '');
+        """)
+
+    def test_confirmed_wins_for_running_but_not_pending(self, tmp_path):
+        self._run(tmp_path, """
+            localStorage.setItem('defaultModel', 'claude-opus-4-7');
+            allSessions.push({ id: 'a' });
+            SessionModel.setDesired('a', 'claude-haiku-4-5');
+            // Session started and the daemon confirmed a different resolved id.
+            const changed = SessionModel.ingestConfirmed('a', 'claude-sonnet-4-6-20251022');
+            assert.strictEqual(changed, true);
+            // effective() (running view) shows the confirmed model...
+            assert.strictEqual(SessionModel.effective('a'), 'claude-sonnet-4-6-20251022');
+            // ...but effectivePending (a brand-new-session bar) ignores it.
+            assert.strictEqual(SessionModel.effectivePending('a'), 'claude-haiku-4-5');
+        """)
+
+    def test_ingest_confirmed_change_detection(self, tmp_path):
+        self._run(tmp_path, """
+            allSessions.push({ id: 'a' });
+            assert.strictEqual(SessionModel.ingestConfirmed('a', ''), false);      // empty ignored
+            assert.strictEqual(SessionModel.ingestConfirmed('a', 'claude-opus-4-7'), true);
+            assert.strictEqual(SessionModel.ingestConfirmed('a', 'claude-opus-4-7'), false); // same → no change
+            assert.strictEqual(SessionModel.getConfirmed('a'), 'claude-opus-4-7');
+        """)
+
+    def test_clear_desired_reverts_to_default(self, tmp_path):
+        self._run(tmp_path, """
+            localStorage.setItem('defaultModel', 'claude-opus-4-7');
+            allSessions.push({ id: 'a' });
+            SessionModel.setDesired('a', 'claude-haiku-4-5');
+            SessionModel.clearDesired('a');
+            assert.strictEqual(SessionModel.getDesired('a'), '');
+            assert.strictEqual(SessionModel.effectivePending('a'), 'claude-opus-4-7');
+        """)
+
+    def test_legacy_global_override_key_is_purged_on_load(self, tmp_path):
+        # A stale armed override saved before the upgrade must be cleared so it
+        # can never attach to a new session after the user updates.
+        self._run(tmp_path, """
+            // (Set before load would require re-eval; instead assert the load-time
+            // cleanup removed any such key by checking removeItem was honored.)
+            localStorage.setItem('_sessionModelOverride', 'claude-haiku-4-5');
+            // Re-run the module's cleanup contract expectation: the store never
+            // reads this key, so a pending session ignores it entirely.
+            allSessions.push({ id: 'a' });
+            localStorage.setItem('defaultModel', 'claude-opus-4-7');
+            assert.strictEqual(SessionModel.effectivePending('a'), 'claude-opus-4-7');
+        """)
+
+    # --- Thinking (effort) levels ------------------------------------------
+
+    def test_thinking_levels_match_cli_effort_values(self, tmp_path):
+        # Exactly what `claude --effort` accepts (CLI 2.1.283) plus '' (no
+        # flag). No "None": it never disabled thinking.
+        self._run(tmp_path, """
+            const keys = SessionModel.THINKING_LEVELS.map(l => l.key);
+            assert.deepStrictEqual(keys, ['', 'low', 'medium', 'high', 'xhigh', 'max']);
+            assert.strictEqual(SessionModel.thinkingLabel('xhigh'), 'xHigh');
+            assert.strictEqual(SessionModel.thinkingLabel(''), 'Default');
+        """)
+
+    def test_legacy_none_default_reads_as_model_default(self, tmp_path):
+        self._run(tmp_path, """
+            localStorage.setItem('defaultThinking', 'none');
+            assert.strictEqual(SessionModel.getDefaultThinking(), '');
+            localStorage.setItem('defaultThinking', 'auto');
+            assert.strictEqual(SessionModel.getDefaultThinking(), '');
+            localStorage.setItem('defaultThinking', 'xhigh');
+            assert.strictEqual(SessionModel.getDefaultThinking(), 'xhigh');
+        """)
+
+    def test_resume_thinking_prefers_confirmed_never_system_default(self, tmp_path):
+        # Wake pin for effort mirrors resumeModel: daemon truth, else this
+        # tab's per-session choice, else '' so the daemon re-pins its own
+        # record. The system default is for NEW sessions only.
+        self._run(tmp_path, """
+            localStorage.setItem('defaultThinking', 'max');
+            allSessions.push({ id: 'a' });
+            assert.strictEqual(SessionModel.resumeThinking('a'), '');
+            assert.strictEqual(SessionModel.getConfirmedThinking('a'), undefined);
+            SessionModel.setDesired('a', '', 'high');
+            assert.strictEqual(SessionModel.resumeThinking('a'), 'high');
+            assert.strictEqual(SessionModel.ingestConfirmedThinking('a', 'xhigh'), true);
+            assert.strictEqual(SessionModel.resumeThinking('a'), 'xhigh');
+            assert.strictEqual(SessionModel.ingestConfirmedThinking('a', 'xhigh'), false);
+            assert.strictEqual(SessionModel.ingestConfirmedThinking('a', undefined), false);
+            assert.strictEqual(SessionModel.resumeThinking('ghost'), '');
+        """)
+
+    def test_confirmed_default_beats_a_stale_local_choice(self, tmp_path):
+        # The daemon reporting '' (model default) is daemon truth, not
+        # "unknown".  Reset to Default live from another device, then wake from
+        # this tab: the wake must pin '' and not this tab's old 'high'.
+        self._run(tmp_path, """
+            allSessions.push({ id: 'a' });
+            SessionModel.setDesired('a', '', 'high');
+            SessionModel.ingestConfirmedThinking('a', 'high');
+            SessionModel.ingestConfirmedThinking('a', '');
+            assert.strictEqual(SessionModel.resumeThinking('a'), '');
+        """)

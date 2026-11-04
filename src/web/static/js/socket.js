@@ -1,0 +1,2648 @@
+/* socket.js — WebSocket (Socket.IO) event handling, replaces polling.js */
+
+// Pass activeProject as a query param so the server can filter the initial
+// state_snapshot by the correct project — before the client has a chance to
+// send request_state_snapshot.  This fixes sessions from the wrong project
+// appearing (or real sessions being excluded) on the very first snapshot.
+const _socketProject = localStorage.getItem('activeProject') || '';
+const socket = io({ query: { project: _socketProject } });
+let _wsConnected = false;
+
+// ── Sub-agent team tracking ──
+// Maps session_id → { toolUseId: { desc, startTime, status: 'working'|'done' } }
+window._subAgents = {};
+
+
+/**
+ * Returns true if a session ID belongs to a hidden utility session
+ * (planner, auto-title, etc.) that must NEVER appear in the workspace.
+ * Called at every entry point where a session can enter the UI.
+ *
+ * Cross-project isolation is handled at the DISPLAY level (filterSessions,
+ * server-side snapshot filtering) — NOT here. Filtering events at this level
+ * blocks streaming for newly started sessions.
+ */
+// Persistent set of session IDs known to be hidden utilities.
+// Populated when _isHiddenSession detects one, so subsequent events
+// (e.g. session_entry which lacks session_type) can still filter them.
+const _hiddenSessionIds = new Set();
+
+function _isHiddenSession(id, data) {
+    if (!id) return false;
+    // Fast path: already known hidden utility
+    if (_hiddenSessionIds.has(id)) return true;
+    // Convention: any session ID starting with "_" is a system/utility session
+    // (_title_*, _planner_*, and any future utility sessions).
+    if (id.startsWith('_')) { _hiddenSessionIds.add(id); return true; }
+    if (data && (data.session_type === 'planner' || data.session_type === 'title')) {
+        _hiddenSessionIds.add(id);
+        return true;
+    }
+    // NOTE: Cross-project filtering is NOT done here. Blocking events at this
+    // level breaks streaming for new sessions. Instead, cross-project sessions
+    // are filtered at the DISPLAY level in filterSessions() and state_snapshot.
+    return false;
+}
+
+// Clear cross-project caches when switching projects. _hiddenSessionIds
+// can accumulate IDs from the old project that would incorrectly suppress
+// events for the new project if IDs overlap.  Also clear staleness
+// timestamps so the incoming snapshot is authoritative.
+function _clearCrossProjectCache() {
+    _hiddenSessionIds.clear();
+    window._sessionStateTs = {};
+}
+
+/**
+ * Check if a session's cwd belongs to the currently active project.
+ * Used at the DISPLAY level to prevent cross-project sessions from
+ * bleeding into the sidebar/allSessions. NOT used to block events.
+ */
+function _sessionBelongsToActiveProject(cwd) {
+    if (!cwd) return true;  // no cwd → don't filter
+    if (window.VNAllProjects && VNAllProjects.on()) return true;  // All projects view shows every project
+    const active = localStorage.getItem('activeProject');
+    if (!active) return true;  // no active project → don't filter
+    const encoded = cwd.replace(/\\/g, '-').replace(/\//g, '-').replace(/:/g, '-').replace(/_/g, '-').replace(/\./g, '-');
+    return encoded.toLowerCase() === active.toLowerCase();
+}
+
+socket.on('connect', () => {
+    _wsConnected = true;
+    console.log('[WS] Connected');
+    // Usage-limits pill: one cheap REST read per (re)connect.  Socket.IO does
+    // not replay events, so a `usage_limits` push sent while disconnected is
+    // otherwise lost.  Passive: never touches the socket itself.
+    if (typeof _loadUsageLimits === 'function') _loadUsageLimits();
+    // Cancel any pending "flash red" from a recent short disconnect \u2014
+    // the socket came back inside the grace window, so the user never
+    // needs to see a "Disconnected" state.
+    if (typeof _disconnectFlashTimer !== 'undefined' && _disconnectFlashTimer) {
+        clearTimeout(_disconnectFlashTimer);
+        _disconnectFlashTimer = null;
+    }
+    // Update SocketIO query params with current project so reconnects
+    // and the server's handle_connect use the right project context.
+    const _curProj = localStorage.getItem('activeProject') || '';
+    if (socket.io && socket.io.opts) socket.io.opts.query = { project: _curProj };
+    // Update status bar connection indicator
+    const sbConn = document.getElementById('sb-connection');
+    if (sbConn) { sbConn.textContent = '\u25CF'; sbConn.style.color = 'var(--idle-label)'; sbConn.title = 'Connected'; }
+    // Fetch persisted permission policy from backend (don't push localStorage defaults)
+    socket.emit('get_permission_policy');
+    // Fetch persisted UI preferences (sendBehavior, etc.) from backend
+    socket.emit('get_ui_prefs');
+    // Refresh session list on reconnect — but only AFTER initial load
+    // is complete.  On first connect, loadProjects() handles session loading
+    // (with proper project sync).  Calling loadSessions() here too causes
+    // a race that tears down the live panel mid-stream.
+    if (typeof loadSessions === 'function' && window._initialLoadDone) {
+        loadSessions();
+    }
+    // Request full state snapshot to resync indicators.
+    // Include activeProject so the server syncs its _active_project
+    // (which resets to VibeNode on web restart) before filtering.
+    const _ap = _curProj;
+    socket.emit('request_state_snapshot', {project: _ap});
+    // Retry after 3s in case the first snapshot was silently dropped
+    // (e.g. DaemonClient not yet reconnected when server just restarted).
+    // Read activeProject fresh at fire time — user may have switched projects
+    // within 3s of connect, and a stale project here causes cross-project bleed.
+    setTimeout(() => {
+        if (socket.connected) {
+            const _retryProj = localStorage.getItem('activeProject') || '';
+            socket.emit('request_state_snapshot', {project: _retryProj});
+        }
+    }, 3000);
+
+    // Cure BOTH "skeletons forever" AND "stale entries, nothing new" on any
+    // reconnect: unconditionally re-fetch the live session log if one is open.
+    // Socket.IO does NOT replay events missed while disconnected, so any
+    // session_entry / session_state pushed during the outage is lost forever
+    // — the only way to recover the missing tail is to explicitly re-fetch.
+    // The server-side handler at ws_events.py:825 guards against destructive
+    // re-render when its response covers fewer entries than the DOM already
+    // shows (socket.js:1634), so re-emitting is safe when liveLineCount > 0.
+    // A reconnect that fetched the policy and prefs but not the log would
+    // leave the thread on stale entries.
+    if (typeof liveSessionId !== 'undefined' && liveSessionId) {
+        const _lpProj = localStorage.getItem('activeProject') || '';
+        const _limit = (typeof LIVE_PAGE_SIZE !== 'undefined') ? LIVE_PAGE_SIZE : 100;
+        console.log('[WS] connect: re-emitting get_session_log for', liveSessionId);
+        socket.emit('get_session_log', {
+            session_id: liveSessionId, since: 0, limit: _limit, project: _lpProj,
+        });
+    }
+});
+
+// Restore persisted permission policy from backend on connect
+socket.on('permission_policy_loaded', (data) => {
+    if (data && data.policy && ['manual', 'auto', 'almost_always', 'claude_auto', 'custom'].includes(data.policy)) {
+        permissionPolicy = data.policy;
+        localStorage.setItem('permPolicy', data.policy);
+        if (data.custom_rules && typeof data.custom_rules === 'object') {
+            customPolicies = data.custom_rules;
+            localStorage.setItem('customPolicies', JSON.stringify(data.custom_rules));
+        }
+        // Redraw the sidebar's policy button. It may already have been drawn
+        // from this browser's localStorage, which can differ from the policy
+        // the server enforces.
+        const permEl = document.getElementById('sidebar-perm-panel');
+        if (permEl && typeof _buildPermissionPanel === 'function') permEl.innerHTML = _buildPermissionPanel();
+    }
+});
+
+// Restore persisted UI preferences (sendBehavior, etc.) from backend on connect.
+// If the server has no prefs yet, seed it from localStorage so existing
+// preferences are captured immediately.
+socket.on('ui_prefs_loaded', (data) => {
+    if (!data || typeof data !== 'object') return;
+    if (data.sendBehavior && ['enter', 'ctrl-enter'].includes(data.sendBehavior)) {
+        // Server has a saved preference — apply it
+        sendBehavior = data.sendBehavior;
+        localStorage.setItem('sendBehavior', data.sendBehavior);
+        if (typeof _refreshSendHints === 'function') _refreshSendHints();
+    } else {
+        // Server has no saved sendBehavior — seed it from current localStorage
+        const local = localStorage.getItem('sendBehavior');
+        if (local && ['enter', 'ctrl-enter'].includes(local)) {
+            socket.emit('set_ui_prefs', { sendBehavior: local });
+        }
+    }
+    // Session retention policy (drives the "Recently Deleted" selector).
+    // Cache the value and, if the trash modal is open, sync the dropdown.
+    // Absent/invalid values default to Forever (36500) inside
+    // applyRetentionPref — never 30.
+    const rd = Number(data.session_retention_days);
+    window._sessionRetentionDays = Number.isFinite(rd) && rd > 0 ? rd : 36500;
+    if (typeof applyRetentionPref === 'function') {
+        applyRetentionPref(window._sessionRetentionDays);
+    }
+});
+
+// Server-initiated session list refresh — emitted by admin maintenance
+// routes (e.g. /api/admin/scrub-phantoms when entries are removed). Open
+// tabs reload their sidebar so they don't keep displaying scrubbed names.
+socket.on('sessions_refresh', (data) => {
+    try {
+        // The server just removed names (e.g. scrubbed phantom titles).  Drop
+        // the page's title memory so the reload can't paint them back.
+        if (typeof _knownSessionTitles !== 'undefined') _knownSessionTitles.clear();
+        if (typeof loadSessions === 'function') {
+            loadSessions();
+        }
+    } catch (e) { /* best-effort */ }
+});
+
+// Session name changed on the server (rename / autoname / remap) by THIS or
+// ANOTHER client. The server persists the title and broadcasts here so every
+// open client patches the affected sidebar row in place — without this, a
+// client that didn't originate the change (a second tab, or a desktop watching
+// a session created + auto-named on mobile) showed the stale "New Session"
+// placeholder until a manual refresh re-fetched /api/sessions.
+//
+// Deliberately patches a single row rather than reloading the whole list
+// (autoname fires often, so a full reload per name change would be a storm).
+// Standby / marked Done set on another device or tab (src/web/session_holds.py).
+socket.on('session_hold', (data) => {
+  if (!data || !data.session_id || !window.SessionVerbCore || !window.SessionVerbCore.applyHold) return;
+  window.SessionVerbCore.applyHold(data.session_id, data.state || null, data.since || 0);
+});
+
+// A session pinned or unpinned on another device or tab (src/web/session_pins.py).
+socket.on('session_pin', (data) => {
+  if (!data || !data.session_id || typeof _applyPin !== 'function') return;
+  const rank = typeof data.rank === 'number' ? data.rank : undefined;
+  if (typeof isSessionPinned === 'function' && isSessionPinned(data.session_id) === !!data.pinned
+      && (!data.pinned || rank === undefined || (typeof pinRankOf === 'function' && pinRankOf(data.session_id) === rank))) return;
+  _applyPin(data.session_id, !!data.pinned, rank);
+});
+
+// Pinned sessions dragged into a new order on another device or tab.
+socket.on('session_pin_order', (data) => {
+  if (!data || !Array.isArray(data.order) || typeof _applyPinOrder !== 'function') return;
+  if (typeof pinRankOf === 'function' && data.order.every((sid, i) => pinRankOf(sid) === i)) return;
+  _applyPinOrder(data.order);
+});
+
+socket.on('session_renamed', (data) => {
+    try {
+        const id = data && data.session_id;
+        const title = data && data.title;
+        if (!id || !title) return;
+
+        // Follow any old->new ID remap so a name that arrives under a
+        // pre-remap ID still lands on the current row.
+        const remappedId = (window._idRemaps && window._idRemaps[id]) || null;
+        // Remember it even when this client has no row for the session yet.
+        // A tab that didn't start the session usually gets this broadcast
+        // BEFORE its row exists (the row comes later from a state_snapshot);
+        // the stub picks the title up from here instead of showing
+        // "New Session" until a refresh.  See _knownSessionTitles (app.js).
+        if (typeof _rememberSessionTitle === 'function') {
+            _rememberSessionTitle(remappedId || id, title);
+            if (remappedId) _rememberSessionTitle(id, title);
+        }
+        const s = (typeof allSessions !== 'undefined')
+            ? (allSessions.find(x => x.id === (remappedId || id)) || allSessions.find(x => x.id === id))
+            : null;
+        // Scope naturally to the current project: if the session isn't in this
+        // client's list, there is no row to patch (never synthesize a phantom
+        // row).  The title is remembered above for when the row shows up.
+        if (!s) return;
+
+        // No-op if we already show this title (e.g. the client that just
+        // originated the autoname). Cheap guard to avoid needless re-render.
+        if (s.custom_title === title && s.display_title === title) return;
+
+        s.custom_title = title;
+        s.display_title = title;
+
+        // Keep the open-session toolbar/breadcrumb in sync when this is active.
+        if (typeof activeId !== 'undefined' && (s.id === activeId || id === activeId)) {
+            const titleEl = document.getElementById('main-title');
+            if (titleEl) {
+                titleEl.textContent = title;
+                titleEl.classList.remove('untitled');
+                titleEl.dataset.customTitle = title;
+            }
+            const kbTitle = document.querySelector('.kanban-session-title');
+            if (kbTitle) kbTitle.textContent = title;
+        }
+        const _kbRow = document.querySelector('.kanban-drill-session-row[data-session-id="' + s.id + '"] .kanban-drill-session-name');
+        if (_kbRow) _kbRow.textContent = title;
+
+        if (typeof filterSessions === 'function') filterSessions();
+    } catch (e) { /* best-effort live update */ }
+});
+
+// Daemon reconnection status — live toasts showing recovery progress
+socket.on('daemon_reconnect', (data) => {
+    const status = data.status;
+    const msg = data.message || 'Session Engine connection issue';
+    // Bridge to healthchecks.js so the "engine stopped" overlay clears the
+    // instant the daemon reconnects (don't wait for the next /api/health poll).
+    try {
+        window.dispatchEvent(new CustomEvent('vn-daemon-status', {
+            detail: { up: status === 'connected' }
+        }));
+    } catch (e) { /* ignore */ }
+    if (status === 'connected') {
+        showToast(msg);
+        // Resync state after reconnect
+        setTimeout(() => {
+            if (socket.connected) socket.emit('request_state_snapshot', {project: localStorage.getItem('activeProject') || ''});
+        }, 500);
+    } else if (status === 'disconnected' || status === 'connecting' || status === 'restarting') {
+        showToast(msg, true);
+    }
+    // Update status bar indicator
+    const sbConn = document.getElementById('sb-connection');
+    if (sbConn) {
+        if (status === 'connected') {
+            sbConn.style.color = 'var(--accent)';
+            sbConn.title = 'Connected';
+        } else {
+            sbConn.style.color = 'var(--warning, orange)';
+            sbConn.title = msg;
+        }
+    }
+});
+
+// Delay flipping the status-bar indicator to red \u2014 mobile Tailscale drops
+// the socket briefly during wifi/cellular handoffs and Socket.IO reconnects
+// within 1\u20133s. Flashing "Disconnected" on every micro-drop is visual noise
+// that reads as broken even when recovery is imminent. Only mark the bar
+// red if the disconnect persists past _DISCONNECT_GRACE_MS. `connect`
+// clears the pending timer so a fast reconnect leaves the bar green.
+let _disconnectFlashTimer = null;
+const _DISCONNECT_GRACE_MS = 4000;
+socket.on('disconnect', () => {
+    _wsConnected = false;
+    console.log('[WS] Disconnected');
+    // Clear staleness timestamps so reconnect snapshot is authoritative
+    window._sessionStateTs = {};
+    if (_disconnectFlashTimer) { clearTimeout(_disconnectFlashTimer); _disconnectFlashTimer = null; }
+    _disconnectFlashTimer = setTimeout(() => {
+        _disconnectFlashTimer = null;
+        // Only flip if we're STILL disconnected \u2014 otherwise a fast reconnect
+        // already put us back to green.
+        if (socket.connected) return;
+        const sbConn = document.getElementById('sb-connection');
+        if (sbConn) { sbConn.textContent = '\u25CF'; sbConn.style.color = 'var(--result-err)'; sbConn.title = 'Disconnected'; }
+    }, _DISCONNECT_GRACE_MS);
+});
+
+// \u2500\u2500 Wake-up socket resync: fix for "stale/frozen UI until manual refresh" on mobile \u2500\u2500
+//
+// Mobile browsers (iOS Safari, Android Chrome) freeze WebSocket traffic and JS
+// timers while the tab is backgrounded, and the OS may silently kill the socket
+// without the client noticing. When the user returns:
+//   \u2022 The HTTP-level healthchecks in healthchecks.js (server-reachable,
+//     daemon-reachable) both PASS \u2014 the web server and daemon are fine.
+//   \u2022 But `socket.connected` can still report true even though the underlying
+//     WebSocket transport is dead ("zombie socket"), so no events flow.
+//   \u2022 The 30s heartbeat setInterval that would eventually request a snapshot
+//     was ALSO frozen while backgrounded \u2014 it fires whenever the timer wheel
+//     resumes, not immediately on wake.
+//   \u2022 Socket.IO's own ping/pong takes 25-45s to detect a zombie, and even
+//     that clock may have been frozen. Result: user sees stale UI until they
+//     manually refresh, which rebuilds the socket from scratch.
+//
+// This is especially bad over Tailscale \u2014 network handoffs between wifi and
+// cellular (or a phone waking from lockscreen) cause the socket to die
+// frequently, and each such death produces a "why is nothing updating"
+// moment for the user.
+//
+// On every path back to the foreground we:
+//   1. If the socket is disconnected, call socket.connect() immediately
+//      (don't wait for the client's built-in reconnect timer, which may
+//      itself have been frozen mid-countdown).
+//   2. If the socket claims connected but no incoming event arrived in the
+//      last _ZOMBIE_THRESHOLD_MS, treat it as a zombie and cycle the socket
+//      (disconnect + connect) so a fresh transport is negotiated.
+//   3. Otherwise emit request_state_snapshot so the UI catches up on any
+//      incremental events that fired while backgrounded.
+//
+// Debounced so a burst of visibilitychange/focus/pageshow/online in the same
+// wake doesn't cause a storm. Never causes a reload \u2014 worst case it cycles
+// the socket, which the existing 'connect' handler cleanly resyncs from.
+// \u2500\u2500 Wake resync \u2014 MINIMAL, passive-only \u2500\u2500
+//
+// An active client-ping / client-pong heartbeat does not work here: under
+// load (Flask worker thread blocked on concurrent daemon IPC) the pong is
+// delayed, the heartbeat cycles the socket, the fresh handle_connect triggers
+// more get_all_states IPC, the congestion gets worse, and the result is a
+// chain of "Engine Stopped" flashes.
+//
+// Rule: this file NEVER cycles a healthy socket.
+//   - If socket.connected is false AND it is not mid-handshake \u2192 call
+//     socket.connect().  Mid-handshake it must be left alone (see below).
+//   - If socket.connected is true \u2192 emit request_state_snapshot only.
+//
+// A genuinely dead socket will surface as either a Socket.IO 'disconnect'
+// event (its own ping/pong takes 25-45s to notice) or as user-visible
+// staleness that the user can fix by refreshing the page. Both of those
+// outcomes are STRICTLY BETTER than a flashing "Engine Stopped" overlay
+// during real work.
+let _lastWakeResyncAt = 0;
+const _WAKE_DEBOUNCE_MS = 750;
+
+function _wakeSocketResync() {
+    const now = Date.now();
+    if (now - _lastWakeResyncAt < _WAKE_DEBOUNCE_MS) return;
+    _lastWakeResyncAt = now;
+
+    if (!socket.connected) {
+        // A socket that is still CONNECTING is not disconnected, and calling
+        // socket.connect() on it is NOT harmless.  While
+        // the transport is open and the namespace handshake is pending,
+        // connect() sends a second CONNECT packet.  The server answers the
+        // duplicate with CONNECT_ERROR ("Unable to connect"), and the client
+        // then destroys the socket's listeners while socket.connected goes
+        // true from the first handshake: a socket that looks connected, still
+        // sends, and never receives.  `pageshow` fires on every page load,
+        // normally before the handshake finishes (handle_connect does a
+        // daemon IPC first), so without this guard almost every load would
+        // leave the first chat thread on its skeleton until the 16s watchdog
+        // cycled the socket.  socket.active is true while the socket is connecting or
+        // will reconnect by itself; only a socket that has given up needs us.
+        const mgrState = socket.io && socket.io._readyState;
+        if (socket.active && mgrState !== 'closed') return;
+        console.log('[WS] wake: socket disconnected \u2014 forcing reconnect');
+        try { socket.connect(); } catch (e) { /* ignore */ }
+        return;
+    }
+
+    // Refresh state snapshot \u2014 cheap, covers UI catch-up.
+    const proj = localStorage.getItem('activeProject') || '';
+    socket.emit('request_state_snapshot', { project: proj });
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') _wakeSocketResync();
+});
+// pageshow: distinguish bfcache restore from a normal show. bfcache means
+// iOS Safari (and other browsers) froze the entire JS runtime with the
+// WebSocket state intact but the underlying transport dead. socket.connected
+// still reports true, socket.disconnect()+connect() often cannot rebuild
+// cleanly because the engine.io state is corrupted by the freeze/thaw.
+// The definitive recovery is a full reload, done here automatically.
+window.addEventListener('pageshow', function(e) {
+    if (e && e.persisted) {
+        // Guard: don't fight an in-app restart's own reload flow.
+        if (document.getElementById('restart-overlay')) return;
+        console.warn('[WS] pageshow persisted=true (bfcache restore) — reloading to rebuild transport');
+        try { window.location.reload(); } catch (_e) { /* ignore */ }
+        return;
+    }
+    _wakeSocketResync();
+});
+window.addEventListener('focus', _wakeSocketResync);
+window.addEventListener('online', _wakeSocketResync);
+
+// Expose so any code path that starts to trust "the socket must be alive"
+// (e.g. opening a session and expecting its log to stream) can force a
+// health check first. Cheap on a healthy socket (a debounced snapshot emit),
+// definitive on a zombie (cycle + reconnect + connect-handler re-emit).
+window._wakeSocketResync = _wakeSocketResync;
+
+// Server-side error messages
+socket.on('error', (data) => {
+    const msg = (data && data.message) || 'Unknown error';
+    const errSid = data && data.session_id;
+    console.error('[WS] Server error:', msg, errSid ? '(session: ' + errSid + ')' : '');
+    showToast(msg, true);
+
+    // Reset UI state for the affected session so the user isn't stuck on a
+    // "working" bar that will never resolve. Force a state resync to get the
+    // real state from the server instead of guessing.
+    if (errSid) {
+        if (typeof _cancelMessageWatchdog === 'function') _cancelMessageWatchdog(errSid);
+        // Request authoritative state from the server via WS
+        socket.emit('request_state_snapshot', {project: localStorage.getItem('activeProject') || ''});
+        // Also do an HTTP check as ultimate fallback (bypasses WS entirely)
+        if (typeof _watchdogHttpCheck === 'function') {
+            setTimeout(() => _watchdogHttpCheck(errSid, true), 2000);
+        }
+        // Immediately revert to idle so the user can at least retry.
+        // The snapshot/HTTP check will correct this within a moment.
+        if (sessionKinds[errSid] === 'working') {
+            sessionKinds[errSid] = 'idle';
+            if (errSid === liveSessionId) {
+                liveBarState = null;
+                if (typeof updateLiveInputBar === 'function') updateLiveInputBar();
+            }
+        }
+    }
+});
+
+/**
+ * THE single write path for per-session usage-limit state.
+ *
+ * The daemon reports an exhausted plan quota as two always-present fields on
+ * session state: `limited_model` (which model ran out) and `limit_reset_at`
+ * (absolute epoch SECONDS when it frees up, or 0 when the CLI gave no
+ * machine-readable time).  `limited_model` is the presence flag — an empty
+ * string means "not limited".
+ *
+ * Both `session_state` and `state_snapshot` funnel through here so the two
+ * paths can never drift (e.g. `_sessionError` surviving on one path and
+ * vanishing on the other).
+ *
+ * @param {string} id  session id
+ * @param {object} s   the state payload (session_state data or a snapshot row)
+ */
+function _ingestLimitState(id, s) {
+    if (!window._sessionLimitState) window._sessionLimitState = {};
+    if (s && s.limited_model) {
+        window._sessionLimitState[id] = {
+            limited_model: s.limited_model,
+            // 0 is a legitimate value meaning "reset time unknown" — the banner
+            // then renders without a countdown instead of inventing one.
+            limit_reset_at: Number(s.limit_reset_at) || 0,
+            // Set while the daemon is about to switch this session to another
+            // model and continue (usage-limit auto-switch): the banner then
+            // says "switching to Opus 5.5 in 5s" instead of waiting for reset.
+            limit_switch_to: s.limit_switch_to || '',
+        };
+    } else {
+        delete window._sessionLimitState[id];
+    }
+}
+
+// Full state snapshot on connect
+// Track when each session last got an incremental state update so
+// heartbeat snapshots don't revert fresher data.
+if (!window._sessionStateTs) window._sessionStateTs = {};
+
+socket.on('state_snapshot', (data) => {
+    // Guard: discard snapshots that arrive after a project switch.
+    // _projectSwitchGen is bumped by setProject(); if a snapshot was requested
+    // for the old project, its response arrives with a stale generation.
+    const _snapGen = (typeof _projectSwitchGen !== 'undefined') ? _projectSwitchGen : 0;
+    const snapTime = Date.now();
+    const newWaiting = {};
+    const newRunning = new Set();
+    const newKinds = {};
+
+    // Rebuild working_since map from scratch so stale entries are cleared
+    // (fixes timers stuck ticking after a missed WORKING->IDLE event)
+    window._workingSinceMap = {};
+    if (!window._sessionSubstatus) window._sessionSubstatus = {};
+    if (!window._sessionUsage) window._sessionUsage = {};
+
+    (data.sessions || []).forEach(s => {
+        const id = s.session_id;
+        if (_isHiddenSession(id, s)) return;
+        // Skip this session if we got a fresher incremental update
+        // in the last 5 seconds (avoids heartbeat snapshot reverting
+        // a real-time session_state event that arrived after the
+        // snapshot was built on the server).
+        const lastTs = window._sessionStateTs[id] || 0;
+        if (lastTs > snapTime - 5000) {
+            // Preserve existing state for this session
+            if (sessionKinds[id]) newKinds[id] = sessionKinds[id];
+            if (runningIds.has(id)) newRunning.add(id);
+            if (waitingData[id]) newWaiting[id] = waitingData[id];
+            if (window._workingSinceMap[id]) {
+                // keep existing — don't clear
+            }
+            return; // skip snapshot data for this session
+        }
+        // Sync substatus and usage from snapshot
+        if (s.substatus) {
+            window._sessionSubstatus[id] = s.substatus;
+        } else {
+            delete window._sessionSubstatus[id];
+        }
+        // Sync API-error auto-retry countdown from snapshot (survives refresh).
+        if (!window._sessionRetryState) window._sessionRetryState = {};
+        if (s.retry_at && Number(s.retry_at) > 0) {
+            window._sessionRetryState[id] = {
+                retry_at: Number(s.retry_at),
+                retry_attempt: Number(s.retry_attempt) || 0,
+                retry_max: Number(s.retry_max) || 0,
+                retry_reason: s.retry_reason || '',
+            };
+        } else {
+            delete window._sessionRetryState[id];
+        }
+        // Sync the usage-limit CTA + the plain error banner from the snapshot.
+        // Without this pair, a refresh (or any reconnect that rebuilds state
+        // from a snapshot rather than an incremental event) silently dropped
+        // BOTH — you came back to a session that looked merely idle with no
+        // hint that it had stopped because the quota ran out.
+        _ingestLimitState(id, s);
+        if (!window._sessionError) window._sessionError = {};
+        if (s.error) {
+            window._sessionError[id] = s.error;
+        } else {
+            delete window._sessionError[id];
+        }
+        if (s.usage) {
+            window._sessionUsage[id] = s.usage;
+        }
+        // Store working_since for elapsed timer — keyed per session
+        // so it's available when the user opens the live panel later
+        if (s.working_since && s.state === 'working') {
+            window._workingSinceMap[id] = s.working_since * 1000;
+            if (id === liveSessionId) _liveWorkingStart = s.working_since * 1000;
+        } else if (id === liveSessionId) {
+            _liveWorkingStart = null;
+        }
+        if (s.state === 'waiting') {
+            // Claude Auto with a pending tool prompt: keep showing "working".
+            // newWaiting is still filled so _updatePermissionQueue() below
+            // answers it (this is also the recovery path if the live
+            // session_permission event was lost to a reconnect).
+            const _caAuto = s.permission && typeof _claudeAutoActive === 'function' && _claudeAutoActive();
+            newKinds[id] = _caAuto ? 'working' : 'question';
+            if (s.permission) {
+                newWaiting[id] = {
+                    question: _formatPermissionQuestion(s.permission.tool_name, s.permission.tool_input),
+                    options: ['y', 'n', 'aa', 'a'],
+                    kind: 'tool',
+                    tool_name: s.permission.tool_name,
+                    tool_input: s.permission.tool_input,
+                };
+            }
+        } else if (s.state === 'working' || s.state === 'starting') {
+            newKinds[id] = 'working';
+        } else if (s.state === 'idle') {
+            newKinds[id] = 'idle';
+        }
+        if (s.state !== 'stopped') newRunning.add(id);
+    });
+
+    // Detect working→idle transition for the live session before replacing
+    // state. If we missed the real-time session_state/session_entry events
+    // (SocketIO transport hiccup, tab sleeping, etc.), entries would be
+    // missing from the DOM. Re-fetch them so the response appears without
+    // requiring a manual page refresh.
+    //
+    // BUT: only re-fetch if the DOM looks empty or stale. If real-time
+    // streaming already populated the log, a re-fetch would destructively
+    // wipe the DOM and re-render with pagination (LIVE_PAGE_SIZE), slicing
+    // off the tail of the response the user just watched stream in.
+    if (liveSessionId && sessionKinds[liveSessionId] === 'working' &&
+        newKinds[liveSessionId] && newKinds[liveSessionId] !== 'working') {
+        const logEl = document.getElementById('live-log');
+        const domHasEntries = logEl && logEl.querySelectorAll('.msg').length > 0;
+        if (!domHasEntries) {
+            console.warn('[state_snapshot] Live session', liveSessionId,
+                'transitioned from working →', newKinds[liveSessionId],
+                '— DOM is empty, re-fetching entries');
+            socket.emit('get_session_log', {session_id: liveSessionId, since: 0, limit: LIVE_PAGE_SIZE, project: localStorage.getItem('activeProject') || ''});
+        } else {
+            console.log('[state_snapshot] Live session', liveSessionId,
+                'transitioned from working →', newKinds[liveSessionId],
+                '— DOM already has entries, skipping destructive re-fetch');
+        }
+    }
+
+    // Preserve optimistic state for sessions the frontend knows are running
+    // but the server snapshot doesn't include yet (e.g. just-started session
+    // whose start_session hasn't registered on the daemon before the snapshot
+    // was built — common during project switch).
+    // Only preserve if the session is in allSessions (belongs to active
+    // project). Without this guard, sessions from the OLD project bleed
+    // into the new project's state after a project switch.
+    for (const id in sessionKinds) {
+        if (sessionKinds[id] === 'working' && !newKinds[id]) {
+            if (_hiddenSessionIds.has(id)) continue;
+            if (!allSessionIds.has(id) && id !== liveSessionId) continue;
+            newKinds[id] = 'working';
+            newRunning.add(id);
+        }
+    }
+
+    // Final guard: if the user switched projects while we were processing
+    // this snapshot, discard everything — the new project's snapshot will
+    // arrive shortly and we don't want to pollute its state.
+    if (typeof _projectSwitchGen !== 'undefined' && _snapGen !== _projectSwitchGen) {
+        console.warn('[state_snapshot] project switched during processing — discarding stale snapshot');
+        return;
+    }
+
+    // All projects view: a snapshot for one project must not wipe the live
+    // state of the others' sessions (all-projects.js).  Only a reply that
+    // covers every project (all_projects) replaces it all.
+    if (window.VNAllProjects && VNAllProjects.on() && !data.all_projects) {
+        const _here = localStorage.getItem('activeProject') || '';
+        const _keep = id => { const p = VNAllProjects.projectOf(id); return p && p !== _here; };
+        for (const id in sessionKinds) if (!(id in newKinds) && _keep(id)) newKinds[id] = sessionKinds[id];
+        runningIds.forEach(id => { if (!newRunning.has(id) && _keep(id)) newRunning.add(id); });
+        for (const id in waitingData) if (!(id in newWaiting) && _keep(id)) newWaiting[id] = waitingData[id];
+    }
+    waitingData = newWaiting;
+    runningIds = newRunning;
+    sessionKinds = newKinds;
+
+    // Purge stale sub-agents for sessions that are no longer working.
+    // The real-time session_state handler clears on idle, but if that
+    // event was missed (tab sleeping, transport hiccup), old agents
+    // would persist and reappear when the session starts a new turn.
+    if (window._subAgents) {
+        for (const _saId in window._subAgents) {
+            if (newKinds[_saId] !== 'working') {
+                delete window._subAgents[_saId];
+            }
+        }
+    }
+
+    // Populate _idRemaps from server aliases so kanban and other code
+    // can resolve old→new session IDs even after a page refresh
+    if (data.aliases) {
+        if (!window._idRemaps) window._idRemaps = {};
+        for (const oldId in data.aliases) {
+            window._idRemaps[oldId] = data.aliases[oldId];
+        }
+    }
+
+    // Purge stale alias entries — if a session was remapped (old→new), remove
+    // the old-ID entry so it doesn't duplicate the new-ID entry.
+    if (window._idRemaps) {
+        SessionStore.replaceAll(allSessions.filter(s => !window._idRemaps[s.id]));
+        _rebuildSessionIds();  // multi-selection prune
+    }
+
+    // Inject stub entries into allSessions for SDK-managed sessions that
+    // haven't written a .jsonl yet (e.g. first response still in progress).
+    // Without this, sessions disappear from the sidebar on page refresh
+    // until their first .jsonl flush completes.
+    let _injectedStubs = false;
+    (data.sessions || []).forEach(s => {
+        const id = s.session_id;
+        if (s.state === 'stopped') return;
+        if (_isHiddenSession(id, s)) return;
+        // Skip old pre-remap IDs that have already been replaced
+        if (window._idRemaps && window._idRemaps[id]) return;
+        if (!allSessionIds.has(id)) {
+            // Reject stubs from stale/wrong-project snapshots
+            if (s.cwd && !_sessionBelongsToActiveProject(s.cwd)) return;
+            // Don't inject stub if an old alias for this ID still exists
+            if (window._idRemaps) {
+                let _hasOld = false;
+                for (const oldId in window._idRemaps) {
+                    if (window._idRemaps[oldId] === id && allSessionIds.has(oldId)) {
+                        _hasOld = true; break;
+                    }
+                }
+                if (_hasOld) return;
+            }
+            // The daemon's `name` is empty for GUI sessions, so a stub would
+            // read "New Session" even when this page had already been told
+            // the session's title (it arrived before the row did).
+            const _stubTitle = (typeof _knownSessionTitle === 'function' && _knownSessionTitle(id)) || s.name || '';
+            SessionStore.set(id, {   // new id: inserted at the front
+                id: id,
+                display_title: _stubTitle || 'New Session',
+                custom_title: _stubTitle,
+                last_activity: '',
+                last_activity_ts: Date.now() / 1000,
+                sort_ts: Date.now() / 1000,
+                size: '',
+                file_bytes: 0,
+                message_count: 0,
+                preview: '',
+                model: s.model || '',
+            });
+            _injectedStubs = true;
+        }
+    });
+
+    // No dedup pass needed: SessionStore.set() never inserts an id twice and
+    // replaceAll() dedups (first copy wins).
+    _rebuildSessionIds();
+    // The dedup keeps the FIRST copy, which can be the nameless one.
+    if (typeof _knownSessionTitles !== 'undefined' && _knownSessionTitles.size) {
+        for (const _row of allSessions) _applyKnownSessionTitle(_row);
+    }
+
+    // Sync model from daemon snapshot into existing allSessions entries.
+    // Without this, idle/dormant sessions show "assumed system default" in
+    // the model badge until a state-change session_state event fires — which
+    // may never happen for truly dormant sessions.
+    //
+    // Route through SessionModel.ingestConfirmed (the single writer for
+    // .model) instead of writing the field directly, and REPLACE any prior
+    // value rather than only filling empties.  An "only if empty" guard
+    // would mean a snapshot could never repair a stale client: once a
+    // mid-session model switch on another tab had made the local .model
+    // wrong, no reconnect or refresh could correct it.  Repaint the badge if the
+    // change applies to the currently-live session.
+    var _liveChanged = false;
+    (data.sessions || []).forEach(function(s) {
+        if (typeof s.effort === 'string' && typeof SessionModel !== 'undefined'
+                && SessionModel.ingestConfirmedThinking) {
+            if (SessionModel.ingestConfirmedThinking(s.session_id, s.effort)
+                    && s.session_id === liveSessionId
+                    && typeof _renderSessionThinkingBadge === 'function') {
+                _renderSessionThinkingBadge(s.session_id);
+            }
+        }
+        if (!s.model) return;
+        if (typeof SessionModel !== 'undefined') {
+            if (SessionModel.ingestConfirmed(s.session_id, s.model)
+                    && s.session_id === liveSessionId) {
+                _liveChanged = true;
+            }
+        }
+    });
+    if (_liveChanged && typeof _renderSessionModelBadge === 'function') {
+        _renderSessionModelBadge(liveSessionId);
+    }
+
+    // Update sidebar row classes
+    document.querySelectorAll('.session-item[data-sid]').forEach(row => {
+        const id = row.dataset.sid;
+        row.classList.remove('si-question', 'si-working', 'si-idle');
+        if (newRunning.has(id)) row.classList.add('si-' + (newKinds[id] || 'working'));
+    });
+
+    // Clean up guiOpenSessions: if a session the user previously opened in GUI
+    // is no longer reported as running by the server, stop treating it as idle.
+    // Exception: keep the live panel session, and a new session this tab has
+    // not sent yet (the server cannot report it; _isUnsentNewSession).
+    guiOpenSessions.forEach(id => {
+        if (!newRunning.has(id) && id !== liveSessionId
+                && !(typeof _isUnsentNewSession === 'function' && _isUnsentNewSession(id))) {
+            guiOpenDelete(id);
+        }
+    });
+
+    // If currently showing a popup for a session that is no longer waiting, close it
+    if (respondTarget && !waitingData[respondTarget]) closeRespond();
+
+    // Re-render views
+    filterSessions();
+
+    // Re-apply row state CSS classes AFTER filterSessions() re-creates the DOM.
+    // The earlier class update (lines above) targeted rows that filterSessions()
+    // just destroyed and rebuilt, so those classes were lost.
+    for (const id in sessionKinds) {
+        const kind = sessionKinds[id];
+        const state = kind === 'question' ? 'waiting' : kind;
+        _updateRowState(id, state);
+    }
+
+    // Session restoration is handled by loadSessions() + /api/resolve-session.
+    // Do NOT call openInGUI here — it races with loadSessions and causes
+    // double-initialization of the live panel, dropping messages.
+
+    // Update live panel input bar state
+    if (liveSessionId) updateLiveInputBar();
+
+    // Refresh dashboard if no session selected (but not in workplace mode —
+    // workplace owns main-body and the dashboard would clobber the workspace canvas)
+    if (!activeId && !workspaceActive) {
+        const dash = document.querySelector('.dashboard');
+        if (dash) document.getElementById('main-body').innerHTML = _buildDashboard();
+    }
+
+    // Update workspace permission queue after state refresh
+    // Auto-approve policies are global — run regardless of view mode
+    if (typeof _updatePermissionQueue === 'function') {
+        _updatePermissionQueue(waitingData);
+    }
+
+    // Sync server-side queue cache from snapshot.
+    //
+    // The snapshot is PROJECT-SCOPED (server filters sessions + queues by project — see
+    // ws_events.py request_state_snapshot), so it is authoritative ONLY for the sessions
+    // it reports on. Reconcile just those — set or clear each in-scope session's queue —
+    // and LEAVE out-of-scope sessions' cached queues intact.
+    //
+    // Wiping the ENTIRE cache and repopulating from the scoped snapshot would make a
+    // queued message on any session outside the snapshot vanish on every session
+    // switch (request_state_snapshot fires on every session open), until a hard refresh.
+    if (typeof _sessionQueues !== 'undefined') {
+        // Build the snapshot's queue map (top-level dict preferred, else per-session field).
+        const _snapQ = {};
+        if (data.queues) {
+            for (const k in data.queues) {
+                if (Array.isArray(data.queues[k]) && data.queues[k].length) _snapQ[k] = data.queues[k];
+            }
+        } else {
+            (data.sessions || []).forEach(s => {
+                if (s.queue && Array.isArray(s.queue) && s.queue.length) _snapQ[s.session_id] = s.queue;
+            });
+        }
+        const _scope = data.sessions || [];
+        if (_scope.length || data.queues) {
+            // Authoritative for in-scope sessions: set if queued, clear if the snapshot
+            // shows none (i.e. it was dispatched/cleared server-side).
+            _scope.forEach(s => {
+                const sid = s.session_id;
+                if (_snapQ[sid]) _sessionQueues[sid] = _snapQ[sid];
+                else delete _sessionQueues[sid];
+            });
+            // Honor any queue keys present in the dict but not in the session list.
+            for (const k in _snapQ) _sessionQueues[k] = _snapQ[k];
+        } else {
+            // No scope info at all — safest to fully replace (original behavior).
+            for (const k in _sessionQueues) delete _sessionQueues[k];
+            for (const k in _snapQ) _sessionQueues[k] = _snapQ[k];
+        }
+        _queueViewIndex = 0;
+        if (typeof _renderQueueBanner === 'function') _renderQueueBanner();
+    }
+
+    // Update Close Session button enabled state
+    const btnClose = document.getElementById('btn-close');
+    if (btnClose && activeId) btnClose.disabled = !newRunning.has(activeId) && !guiOpenSessions.has(activeId);
+});
+
+// Incremental state updates
+socket.on('session_state', (data) => {
+    // "Claude Auto" never stops to ask: the browser answers the permission
+    // prompt that follows this event on its own (workspace.js
+    // _claudeAutoVerdict), so present the momentary WAITING as WORKING.
+    // Without this the input bar flashes "Claude has a question" for a frame.
+    if (data && data.state === 'waiting' && typeof _claudeAutoActive === 'function' && _claudeAutoActive()) {
+        data = Object.assign({}, data, {state: 'working'});
+    }
+    const {session_id, state, cost_usd, error, name, model, working_since} = data;
+    if (_isHiddenSession(session_id, data)) return;
+    // Cross-project filtering: drop state events from other projects so
+    // sessions don't bleed into sessionKinds/runningIds/sidebar.
+    // Always allow the live session through (user is actively watching it).
+    if (data.cwd && session_id !== liveSessionId && !_sessionBelongsToActiveProject(data.cwd)) return;
+    const substatus = data.substatus || '';
+    const usage = data.usage || null;
+    // The status BEFORE this event, for the render decision at the end: under
+    // "Active first" a rank change moves the row, anything else is in-place.
+    const _prevStatus = (typeof getSessionStatus === 'function') ? getSessionStatus(session_id) : '';
+
+    // Cancel watchdog on definitive state changes (idle/stopped/waiting).
+    // For working/starting events, RESET the watchdog so it keeps monitoring
+    // for the final IDLE event (which can be silently lost).
+    if (state !== 'working' && state !== 'starting') {
+        if (typeof _cancelMessageWatchdog === 'function') _cancelMessageWatchdog(session_id);
+    } else {
+        if (typeof _resetMessageWatchdog === 'function') _resetMessageWatchdog(session_id);
+    }
+
+    // Stamp receipt time so heartbeat snapshots don't revert this
+    SessionStore.mapSet('stateTs', session_id, Date.now());
+
+    // Track substatus (e.g. "compacting") per session.
+    // Rules:
+    //   • Only store a substatus for sessions that are actively WORKING —
+    //     idle/stopped/waiting sessions must never carry a stale substatus.
+    //   • EXCEPTION: ``auto-resuming`` may persist into ``idle`` state to
+    //     mark a session that's sleeping with a scheduled wake-up pending
+    //     (ScheduleWakeup / Bash run_in_background).  Without this
+    //     exception the UI would show a plain-idle indicator the entire
+    //     time the agent is asleep, which is the UX half of the wake-up
+    //     bug — sessions look ready when they're actually waiting.
+    //   • For working sessions: preserve an optimistic "compacting" value if
+    //     the server sends a working event without an explicit substatus field
+    //     (compact_boundary is the authoritative confirmation that arrives
+    //     shortly after the optimistic set in liveCompact()).
+    //   • Any explicit substatus="" from the server always wins (clears it).
+    const substatusExplicit = data.hasOwnProperty('substatus');
+    if (substatus && state === 'working') {
+        // Server says "compacting" (or future substatus) and session is working
+        SessionStore.mapSet('substatus', session_id, substatus);
+    } else if (substatus === 'auto-resuming' && state === 'idle') {
+        // Session is sleeping with a scheduled wake-up pending — keep the
+        // substatus visible so the idle indicator can show "Awaiting wake-up…"
+        // instead of plain ready.  Cleared by a fresh substatus='' from the
+        // server at the wake-up's final RESULT.
+        SessionStore.mapSet('substatus', session_id, substatus);
+    } else if (state !== 'working') {
+        // Non-working state (idle/stopped/waiting) — clear substatus unless
+        // the wake-up branch above preserved it.
+        SessionStore.mapDelete('substatus', session_id);
+    } else if (substatusExplicit || SessionStore.map('substatus')[session_id] !== 'compacting') {
+        // Working state, no substatus: clear unless we're preserving optimistic "compacting"
+        SessionStore.mapDelete('substatus', session_id);
+    }
+
+    // Track API-error auto-retry countdown per session.  The server sends the
+    // absolute fire time (retry_at, epoch seconds); the live panel renders a
+    // local "Auto-retrying in Ns…" countdown from it.  retry_at == 0 means no
+    // retry pending — clear the entry so the banner disappears.
+    if (data.retry_at && Number(data.retry_at) > 0) {
+        SessionStore.mapSet('retry', session_id, {
+            retry_at: Number(data.retry_at),
+            retry_attempt: Number(data.retry_attempt) || 0,
+            retry_max: Number(data.retry_max) || 0,
+            retry_reason: data.retry_reason || '',
+        });
+    } else {
+        SessionStore.mapDelete('retry', session_id);
+    }
+    // Track the last error string per session — drives the manual "Retry"
+    // button shown on an idle session that ended with a (non-retrying) error.
+    if (error) {
+        SessionStore.mapSet('error', session_id, error);
+    } else {
+        SessionStore.mapDelete('error', session_id);
+    }
+    // Track an exhausted plan quota per session.  When set, the live panel
+    // replaces the generic error banner (whose only action, "Retry", re-hits
+    // the same wall) with a model-switch CTA — the one action that unblocks.
+    _ingestLimitState(session_id, data);
+
+    // Track token usage per session for context window indicator
+    if (usage) {
+        SessionStore.mapSet('usage', session_id, usage);
+    }
+
+    // Sync server-side working_since for elapsed timer (survives refresh)
+    if (working_since && state === 'working') {
+        SessionStore.mapSet('workingSince', session_id, working_since * 1000);
+        if (session_id === liveSessionId) _liveWorkingStart = working_since * 1000;
+    } else if (state !== 'working') {
+        SessionStore.mapDelete('workingSince', session_id);
+        if (session_id === liveSessionId) _liveWorkingStart = null;
+    }
+
+    // Map SDK states to existing UI state names
+    if (state === 'waiting') {
+        SessionStore.mapSet('kinds', session_id, 'question');
+    } else if (state === 'working' || state === 'starting') {
+        // Clear sub-agents from previous turns when starting a new turn
+        // (idle/question → working transition means old agents are stale)
+        if (sessionKinds[session_id] && sessionKinds[session_id] !== 'working') {
+            SessionStore.mapDelete('subAgents', session_id);
+        }
+        SessionStore.mapSet('kinds', session_id, 'working');
+    } else if (state === 'idle') {
+        SessionStore.mapSet('kinds', session_id, 'idle');
+        // Clean up any leftover streaming bubble when session goes idle
+        if (session_id === liveSessionId) {
+            const _sb = document.querySelector('.msg.assistant.streaming-bubble');
+            if (_sb) _sb.remove();
+        }
+        // Clear sub-agent tracking when session finishes
+        SessionStore.mapDelete('subAgents', session_id);
+    } else if (state === 'stopped') {
+        SessionStore.mapDelete('kinds', session_id);
+        SessionStore.mapDelete('subAgents', session_id);
+    }
+
+    if (state === 'stopped') {
+        SessionStore.mapDelete('running', session_id);
+    } else {
+        SessionStore.mapSet('running', session_id, true);
+    }
+
+    // Update cost display if this is the active session
+    if (session_id === activeId && cost_usd != null) {
+        const costEl = document.getElementById('session-cost');
+        if (costEl) costEl.textContent = '$' + Number(cost_usd).toFixed(4);
+        const sbCost = document.getElementById('sb-cost');
+        if (sbCost) sbCost.textContent = '$' + Number(cost_usd).toFixed(4);
+    }
+
+    // Update status bar model display
+    if (session_id === activeId && model) {
+        const sbModel = document.getElementById('sb-model');
+        if (sbModel) sbModel.textContent = model;
+    }
+
+    // Keep the in-memory session record's model truthful via the store's
+    // SINGLE write path, then repaint the badge through the SINGLE renderer.
+    // Running bars derive their model badge from the store, so funnelling the
+    // update here means a late bar re-render can never win with a stale model.
+    if (model && typeof SessionModel !== 'undefined') {
+        const _changed = SessionModel.ingestConfirmed(session_id, model);
+        if (_changed && session_id === liveSessionId &&
+            typeof _renderSessionModelBadge === 'function') {
+            _renderSessionModelBadge(session_id);
+        }
+    }
+    // Launch effort (daemon truth).  Absent on a daemon that predates it, in
+    // which case the store keeps reporting "unknown" rather than guessing.
+    if (typeof data.effort === 'string' && typeof SessionModel !== 'undefined'
+            && SessionModel.ingestConfirmedThinking) {
+        if (SessionModel.ingestConfirmedThinking(session_id, data.effort)
+                && session_id === liveSessionId
+                && typeof _renderSessionThinkingBadge === 'function') {
+            _renderSessionThinkingBadge(session_id);
+        }
+    }
+
+    if (state !== 'waiting') {
+        SessionStore.mapDelete('waiting', session_id);
+        // Update workspace permission queue if permission was cleared
+        if (workspaceActive && typeof _updatePermissionQueue === 'function') {
+            _updatePermissionQueue(waitingData);
+        }
+    }
+
+    // Sync queue cache from server state event (authoritative source).
+    // Every session_state event now carries the current queue from the server.
+    // Auto-dispatch is handled server-side in SessionManager._emit_state.
+    if (typeof _sessionQueues !== 'undefined') {
+        if (data.queue && Array.isArray(data.queue) && data.queue.length) {
+            _sessionQueues[session_id] = data.queue;
+        } else {
+            delete _sessionQueues[session_id];
+        }
+        _queueViewIndex = 0;
+    }
+    if (session_id === liveSessionId && typeof _renderQueueBanner === 'function') {
+        _renderQueueBanner();
+    }
+
+    // Update sidebar row classes
+    _updateRowState(session_id, state);
+
+    // If currently showing a popup for a session that is no longer waiting, close it
+    if (respondTarget === session_id && !waitingData[session_id]) closeRespond();
+
+    // Clear MC streaming indicator when a session goes idle
+    if ((state === 'idle' || state === 'stopped') &&
+        typeof sessionDisplayMode !== 'undefined' && sessionDisplayMode === 'control') {
+      const _mcPreview = document.getElementById('mc-preview-' + session_id);
+      if (_mcPreview) _mcPreview.classList.remove('mc-preview-streaming');
+    }
+
+    // Refresh active views.  The row/card was repainted in place above
+    // (_updateRowState covers the state classes, the state icon or avatar
+    // including the compacting / awaiting-wake-up indicators, the status label
+    // and the unread dot).  A full filterSessions() is scheduled ONLY when an
+    // in-place update cannot express the change — see _renderSessionStateChange.
+    // An unconditional render would mean 200 events = 200 full sidebar
+    // rebuilds (tests/test_session_render_perf.py).
+    _renderSessionStateChange(session_id, _prevStatus);
+    // Kanban view: filterSessions doesn't re-render kanban, so use a
+    // targeted in-place refresh for any kanban session rows mounted for
+    // this session_id.  Without this, kanban indicators desync from
+    // the sidebar / live panel during the wake-up cycle.  No-op if no kanban
+    // rows are mounted (typical when not in kanban view).
+    if (typeof _kanbanRefreshSessionIndicators === 'function') {
+        _kanbanRefreshSessionIndicators(session_id);
+    }
+    if (liveSessionId === session_id) {
+        liveBarState = null;  // force re-render
+        updateLiveInputBar();
+        // The working bar appearing/disappearing resizes the log. Keep a
+        // caught-up reader pinned; never reveal new content (thread-scroll.js, D).
+        if (window.vnClassicScroll && vnClassicScroll()) {
+            // [classic] Classic scroll: the original settle (thread-scroll-classic.js).
+            // Settle scroll on state change (working bar appears/disappears).
+            // Route through _autoScrollLiveLog so it top-aligns the most-recent
+            // expanded AI message instead of stomping it back to the bottom.
+            const _logEl = document.getElementById('live-log');
+            if (_logEl && liveAutoScroll) setTimeout(() => {
+                if (typeof _autoScrollLiveLog === 'function') _autoScrollLiveLog(_logEl);
+                else _logEl.scrollTop = _logEl.scrollHeight;
+            }, 100);
+        } else if (window.ThreadScroll) {
+            ThreadScroll.refresh();   // jump button label: Working / Needs you / Done
+            if (window.WorkTrail) WorkTrail.refresh();   // the newest steps line goes live or settles
+            setTimeout(() => ThreadScroll.holdBottom(), 100);
+        }
+
+        // Self-healing: check if frontend is missing entries vs backend.
+        // Only re-fetch if the backend genuinely has MORE entries than the
+        // DOM. Never do a blind re-fetch — it wipes the DOM and re-renders
+        // with pagination, slicing off the tail of the response.
+        if (state === 'idle' || state === 'stopped') {
+            const sc = data.entry_count;
+            if (sc != null && sc > liveLineCount) {
+                console.warn('[entry-catchup] Backend has', sc, 'entries but frontend has', liveLineCount, '— re-fetching');
+                socket.emit('get_session_log', {session_id: session_id, since: 0, limit: LIVE_PAGE_SIZE, project: localStorage.getItem('activeProject') || ''});
+            }
+            // No blind 500ms re-fetch — it destroys already-rendered content
+        }
+    }
+
+    // Refresh dashboard if no session selected (skip in workplace mode)
+    if (!activeId && !workspaceActive) {
+        const dash = document.querySelector('.dashboard');
+        if (dash) document.getElementById('main-body').innerHTML = _buildDashboard();
+    }
+
+    // Update Close Session button enabled state
+    const btnClose = document.getElementById('btn-close');
+    if (btnClose && activeId === session_id) {
+        btnClose.disabled = state === 'stopped' && !guiOpenSessions.has(session_id);
+    }
+
+    // ── Compose session-dot live update ──
+    // When a session changes state, find any compose card linked to it
+    // and update just the dot (no full board re-render).
+    if (typeof _composeSections !== 'undefined' && _composeSections) {
+        const _cSec = _composeSections.find(s => s.session_id === session_id);
+        if (_cSec) {
+            const _cCard = document.querySelector('.compose-card[data-section-id="' + _cSec.id + '"]');
+            if (_cCard) {
+                const _dot = _cCard.querySelector('.compose-session-dot');
+                if (_dot) {
+                    if (state === 'working' || state === 'starting') {
+                        _dot.className = 'compose-session-dot running';
+                    } else if (state === 'stopped') {
+                        _dot.className = 'compose-session-dot idle';
+                    } else {
+                        _dot.className = 'compose-session-dot idle';
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Kanban task-session state bridge ──
+    // When a session changes state, check if it's linked to a kanban task
+    // and trigger the appropriate task state machine transition.
+    if (state === 'working' || state === 'idle' || state === 'stopped') {
+        fetch('/api/kanban/session-state-change', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: session_id, state: state }),
+        }).catch(() => { /* ignore — kanban bridge is best-effort */ });
+    }
+
+    // ── Update kanban drill-down session badges in-place ──
+    const sessRow = document.querySelector('.kanban-drill-session-row[data-session-id="' + session_id + '"]');
+    if (sessRow) {
+        const badge = sessRow.querySelector('.kanban-drill-session-badge');
+        if (badge) {
+            const label = state === 'working' ? 'Working' : state === 'idle' ? 'Idle' : 'Sleeping';
+            badge.textContent = label;
+            if (state === 'working') badge.style.cssText = 'background:var(--status-working-dim);color:var(--status-working);';
+            else if (state === 'idle') badge.style.cssText = 'background:var(--status-complete-dim);color:var(--status-complete);';
+            else badge.style.cssText = 'background:var(--status-not-started-dim);color:var(--text-dim);';
+        }
+        // Update row highlight
+        if (state === 'working') {
+            sessRow.style.background = 'var(--status-working-dim)';
+            sessRow.style.border = '1px solid var(--status-working)';
+            sessRow.style.borderRadius = '6px';
+        } else {
+            sessRow.style.background = '';
+            sessRow.style.border = '';
+            sessRow.style.borderRadius = '';
+        }
+    }
+});
+
+// Cross-tab / cross-device model sync.  Fired by SessionManager.set_session_model
+// AFTER the CLI has confirmed the switch.  The switch itself deliberately does
+// NOT call _emit_state (that would auto-dispatch any queued message on the
+// freshly-switched idle session and produce a surprise WORKING turn), so this
+// dedicated broadcast is the only signal every non-initiating tab receives.
+// Without it, the badge on other tabs kept showing the OLD model until the
+// next natural state transition, which for an idle session can be hours away.
+socket.on('session_model_changed', (data) => {
+    if (!data || !data.session_id || !data.model) return;
+    if (_isHiddenSession(data.session_id, data)) return;
+    // Mirror the limit-CTA cleanup set_session_model does server-side, so a
+    // switch from the usage-limit banner clears the CTA on every tab.  Honor
+    // the payload rather than clearing unconditionally: this event is also
+    // sent when the CLI's init merely refines the resolved id (e.g. adds the
+    // [1m] marker), and a still-limited session must keep its CTA then.
+    if (!data.limited_model && !data.limit_reset_at) {
+        if (window._sessionLimitState) delete window._sessionLimitState[data.session_id];
+        if (window._sessionError) delete window._sessionError[data.session_id];
+    }
+    if (typeof SessionModel !== 'undefined') {
+        const _changed = SessionModel.ingestConfirmed(data.session_id, data.model);
+        if (_changed && data.session_id === liveSessionId &&
+                typeof _renderSessionModelBadge === 'function') {
+            _renderSessionModelBadge(data.session_id);
+        }
+    }
+    // Keep the status-bar model label honest too (session_state does this).
+    if (typeof activeId !== 'undefined' && data.session_id === activeId) {
+        const _sbModel = document.getElementById('sb-model');
+        if (_sbModel) _sbModel.textContent = data.model;
+    }
+    // Refresh any visible session row so the sidebar model column stays honest.
+    if (typeof filterSessions === 'function') filterSessions();
+});
+
+// Cross-tab / cross-device thinking-level sync.  Fired by
+// SessionManager.set_session_effort AFTER the CLI confirmed an in-place change.
+// Like set_session_model it deliberately skips _emit_state (that would
+// dispatch a queued message on an idle session), so this broadcast is how
+// every other tab, and this one when a mobile reconnect lost the reply, learns
+// the new level.
+socket.on('session_effort_changed', (data) => {
+    if (!data || !data.session_id || typeof data.effort !== 'string') return;
+    if (_isHiddenSession(data.session_id, data)) return;
+    if (typeof SessionModel !== 'undefined' && SessionModel.ingestConfirmedThinking) {
+        if (SessionModel.ingestConfirmedThinking(data.session_id, data.effort)
+                && data.session_id === liveSessionId
+                && typeof _renderSessionThinkingBadge === 'function') {
+            _renderSessionThinkingBadge(data.session_id);
+        }
+    }
+    // A relaunch queued in this tab for the session's turn end must not undo
+    // the level that just took effect (invoke-workforce.js).
+    if (typeof window._noteLiveEffort === 'function') {
+        window._noteLiveEffort(data.session_id, data.effort);
+    }
+});
+
+// Server confirms it received and accepted our send_message.
+// This is the positive acknowledgment that the message pipeline is working.
+// Reset the watchdog — we know the server got it, so events should follow.
+socket.on('message_ack', (data) => {
+    if (!data || !data.session_id) return;
+    console.log('[WS] message_ack for', data.session_id, data.queued ? '(queued)' : '');
+    // Reset watchdog timer — server confirmed receipt, give it more time
+    // for the first response event to arrive
+    if (typeof _resetMessageWatchdog === 'function') _resetMessageWatchdog(data.session_id);
+});
+
+// Message send failed — show a clear inline error with the user's text
+// preserved so they can copy/paste and retry. This happens when the daemon
+// is overloaded (e.g. multiple long sessions doing heavy I/O).
+socket.on('send_failed', (data) => {
+    if (!data || !data.session_id) return;
+    const sid = data.session_id;
+    console.error('[WS] send_failed for', sid, data.error);
+
+    // Cancel watchdog — we know it failed
+    if (typeof _cancelMessageWatchdog === 'function') _cancelMessageWatchdog(sid);
+
+    // Revert session to idle so user can retry
+    sessionKinds[sid] = 'idle';
+    runningIds.delete(sid);
+    if (sid === liveSessionId) {
+        liveBarState = null;
+        if (typeof updateLiveInputBar === 'function') updateLiveInputBar();
+
+        // Put the message text back in the input box so it's not lost
+        const ta = document.getElementById('live-input-ta');
+        if (ta && data.text && !ta.value.trim()) {
+            ta.value = data.text;
+            if (typeof _resetTextareaHeight === 'function') _resetTextareaHeight(ta);
+        }
+
+        // Remove the optimistic bubble — it didn't go through.
+        // Tail-aware lookup: ThreadScroll pins its pill/sentinel as the last
+        // children of #live-log, so `:last-child` can never match. See
+        // _findTrailingOptimisticBubble() in live-panel.js.
+        const logEl = document.getElementById('live-log');
+        if (logEl) {
+            const optimistic = (typeof _findTrailingOptimisticBubble === 'function')
+                ? _findTrailingOptimisticBubble(logEl)
+                : logEl.querySelector('.msg.user.optimistic-bubble:last-child');
+            if (optimistic) optimistic.remove();
+        }
+
+        // Show an inline system message explaining what happened,
+        // including the user's original text so it's never truly lost
+        if (logEl && typeof renderLiveEntry === 'function') {
+            const isTimeout = (data.error || '').includes('timeout');
+            let hint = isTimeout
+                ? '⚠️ Message not delivered — the server was busy processing other sessions. This can happen when running many long sessions at once. Try closing some idle sessions or sending again in a moment.'
+                : '⚠️ Message not delivered. Error: ' + (data.error || 'unknown');
+            if (data.text) {
+                hint += '\n\nYour message (also restored to the input box):\n> ' + data.text;
+            }
+            logEl.appendChild(renderLiveEntry({
+                kind: 'system',
+                text: hint,
+                is_error: true,
+            }));
+            if (liveAutoScroll) logEl.scrollTop = logEl.scrollHeight;
+        }
+    }
+    _updateRowState(sid, 'idle');
+});
+
+// Lightweight per-call token usage updates (from StreamEvent message_start).
+// This gives us the REAL context window size, not cumulative session totals.
+socket.on('session_usage', (data) => {
+    if (!data || !data.session_id || !data.usage) return;
+    if (_hiddenSessionIds.has(data.session_id)) return;
+    // Reset (not cancel) watchdog — usage data means response is flowing
+    // but session hasn't completed yet.  Keep monitoring for IDLE.
+    if (typeof _resetMessageWatchdog === 'function') _resetMessageWatchdog(data.session_id);
+    if (!window._sessionUsage) window._sessionUsage = {};
+    window._sessionUsage[data.session_id] = data.usage;
+    // Force re-render of input bar so ctx % updates (clear stateKey cache)
+    if (data.session_id === liveSessionId) {
+        liveBarState = null;
+        if (typeof updateLiveInputBar === 'function') updateLiveInputBar();
+    }
+});
+
+// ── Real-time streaming text deltas ──────────────────────────────────
+// The backend forwards raw Claude SDK StreamEvents. We use
+// content_block_delta events to build a live-typing assistant bubble
+// that gets replaced by the final 'asst' session_entry when complete.
+socket.on('stream_event', (data) => {
+    if (!data || !data.session_id || !data.event) return;
+    if (_hiddenSessionIds.has(data.session_id)) return;
+
+    // Context reading, taken from the raw message_start.  The daemon's own
+    // extraction (which feeds `session_usage`) missed the current SDK shape,
+    // where `event` IS the payload dict and `data` is empty, so no context
+    // number ever reached the UI.  Reading it here works with both shapes and
+    // with a daemon that has not been restarted onto the fixed extraction.
+    {
+        const _ev = data.event.event, _dt = data.event.data;
+        const _p = (_ev && typeof _ev === 'object') ? _ev : _dt;
+        const _u = _p && _p.type === 'message_start' && _p.message && _p.message.usage;
+        if (_u && typeof _u === 'object') {
+            if (!window._sessionUsage) window._sessionUsage = {};
+            const _prev = window._sessionUsage[data.session_id] || {};
+            const _same = _prev.input_tokens === _u.input_tokens
+                && _prev.cache_read_input_tokens === _u.cache_read_input_tokens
+                && _prev.cache_creation_input_tokens === _u.cache_creation_input_tokens;
+            if (!_same) {
+                window._sessionUsage[data.session_id] = Object.assign({}, _u, {model: _p.message.model || ''});
+                if (data.session_id === liveSessionId) {
+                    liveBarState = null;
+                    if (typeof updateLiveInputBar === 'function') updateLiveInputBar();
+                }
+            }
+        }
+    }
+
+    // ── Session ID match (same alias logic as session_entry) ──
+    let _sidMatch = (data.session_id === liveSessionId);
+    if (!_sidMatch && liveSessionId && window._idRemaps) {
+        if (window._idRemaps[liveSessionId] === data.session_id) {
+            _sidMatch = true;
+        }
+        for (const oldId in window._idRemaps) {
+            if (window._idRemaps[oldId] === liveSessionId && oldId === data.session_id) {
+                _sidMatch = true;
+                break;
+            }
+        }
+    }
+    // ── Route to Mission Control cards if in MC mode (all sessions) ──
+    if (typeof sessionDisplayMode !== 'undefined' && sessionDisplayMode === 'control') {
+      const _mcEvtType = data.event.event || '';
+      const _mcEvtData = data.event.data || {};
+      if (_mcEvtType === 'content_block_delta') {
+        const _mcDelta = _mcEvtData.delta;
+        let _mcChunk = '';
+        if (typeof _mcDelta === 'string') {
+          _mcChunk = _mcDelta;
+        } else if (_mcDelta && typeof _mcDelta === 'object') {
+          _mcChunk = _mcDelta.text || '';
+        }
+        if (_mcChunk && typeof mcUpdateStreamPreview === 'function') {
+          mcUpdateStreamPreview(data.session_id, _mcChunk);
+        }
+      }
+    }
+
+    if (!_sidMatch) return;
+
+    const evtType = data.event.event || '';
+    const evtData = data.event.data || {};
+
+    // ── content_block_delta → append text to streaming bubble ──
+    if (evtType === 'content_block_delta') {
+        // SDK shape: data.delta may be {type:"text_delta", text:"..."} or a plain string
+        let chunk = '';
+        const delta = evtData.delta;
+        if (typeof delta === 'string') {
+            chunk = delta;
+        } else if (delta && typeof delta === 'object') {
+            chunk = delta.text || '';
+        }
+        if (!chunk) return;
+
+        const logEl = document.getElementById('live-log');
+        if (!logEl) return;
+
+        // Find or create the streaming bubble
+        let bubble = logEl.querySelector('.msg.assistant.streaming-bubble');
+        if (!bubble) {
+            // Clear skeleton on first real content
+            if (liveLineCount === 0) {
+                const skel = logEl.querySelector('.skel-bar, .skeleton-loader, .live-log-empty, .empty-state');
+                if (skel) logEl.innerHTML = '';
+            }
+            bubble = document.createElement('div');
+            bubble.className = 'msg assistant streaming-bubble';
+            bubble.innerHTML =
+                '<div class="msg-role">claude <span class="msg-time" style="color:var(--text-faint);font-size:10px;">streaming\u2026</span></div>' +
+                '<div class="msg-body msg-content"></div>';
+            logEl.appendChild(bubble);
+        }
+
+        // Append chunk to raw text accumulator, then re-render markdown
+        // Throttle markdown re-parsing to avoid jank on fast streams
+        if (!bubble._rawText) bubble._rawText = '';
+        bubble._rawText += chunk;
+        const bodyEl = bubble.querySelector('.msg-body');
+        if (bodyEl) {
+            const now = Date.now();
+            const elapsed = now - (bubble._lastRender || 0);
+            if (elapsed >= 80 && typeof mdParse === 'function') {
+                bodyEl.innerHTML = mdParse(bubble._rawText);
+                bubble._lastRender = now;
+                clearTimeout(bubble._renderTimer);
+                bubble._renderTimer = 0;
+            } else if (!bubble._renderTimer) {
+                // Schedule a trailing render so the last chunk always shows
+                bubble._renderTimer = setTimeout(() => {
+                    if (bodyEl && typeof mdParse === 'function') {
+                        bodyEl.innerHTML = mdParse(bubble._rawText || '');
+                    }
+                    bubble._lastRender = Date.now();
+                    bubble._renderTimer = 0;
+                }, 80);
+            }
+        }
+
+        // Never follow the stream: new content does not move the reader's view
+        // (thread-scroll.js, D). It lights the jump button instead.
+        if (window.vnClassicScroll && vnClassicScroll()) {
+            // [classic] Classic scroll: the original stream follow.
+            if (liveAutoScroll) {
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+        } else if (window.ThreadScroll) ThreadScroll.noteNewContent();
+
+        // Reset watchdog — data is flowing
+        if (typeof _resetMessageWatchdog === 'function') _resetMessageWatchdog(liveSessionId);
+    }
+});
+
+// Bump a session's last-activity timestamp in memory AND in the sidebar DOM.
+// The server derives `last_activity` from the newest message it can find in
+// the .jsonl on disk; live entries streaming over the socket haven't been
+// scanned yet, so a session resumed today from an older .jsonl keeps showing
+// its OLD date (e.g. "Friday") in the sidebar even while the current turn
+// is in flight. Fix: on every real-time entry, refresh the row's date so
+// active sessions display "just now" instead of their file's stale mtime.
+function _bumpSessionActivity(sid) {
+    if (!sid) return;
+    const now = new Date();
+    const epoch = now.getTime() / 1000;
+    const isoStr = now.toISOString();
+
+    // Pretty string matching the server's "%b %d, %Y  %I:%M %p" format so
+    // tooltips read like the rest of the app.
+    const months = ['Jan','Feb','Mar','Apr','May','Jun',
+                    'Jul','Aug','Sep','Oct','Nov','Dec'];
+    let h12 = now.getHours();
+    const ampm = h12 >= 12 ? 'PM' : 'AM';
+    h12 = h12 % 12 || 12;
+    const pretty = months[now.getMonth()] + ' ' + now.getDate() + ', ' + now.getFullYear()
+        + '  ' + String(h12).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0')
+        + ' ' + ampm;
+
+    // 1. In-memory record — keeps sort order fresh and survives re-renders.
+    if (typeof allSessions !== 'undefined' && Array.isArray(allSessions)) {
+        for (let i = 0; i < allSessions.length; i++) {
+            if (allSessions[i].id === sid) {
+                allSessions[i].last_activity = pretty;
+                allSessions[i].last_activity_ts = epoch;
+                allSessions[i].effective_ts = epoch;
+                break;
+            }
+        }
+    }
+    // 2. Live DOM patch on the visible row(s) — sidebar list + workforce grid,
+    //    so the update lands without waiting for the next loadSessions() poll.
+    try {
+        const rows = document.querySelectorAll(
+            '.session-item[data-sid="' + sid + '"], .wf-card[data-sid="' + sid + '"]');
+        for (let j = 0; j < rows.length; j++) {
+            const cell = rows[j].querySelector('.session-col-date');
+            if (cell) {
+                cell.setAttribute('data-short-date', isoStr);
+                cell.setAttribute('title', pretty);
+                if (typeof _shortDate === 'function') cell.textContent = _shortDate(isoStr);
+            }
+        }
+    } catch (e) { /* DOM update is best-effort */ }
+}
+
+// Live log entries pushed in real-time
+socket.on('session_entry', (data) => {
+    // Never process entries for hidden utility sessions (planner, title).
+    if (_hiddenSessionIds.has(data.session_id)) return;
+
+    // Skip entries for sessions not in the current project.
+    // session_entry lacks cwd, but if this session_id isn't the live session
+    // and isn't in allSessions, it's cross-project — drop it entirely so the
+    // consistency check below doesn't inject it into the sidebar.
+    if (data.session_id !== liveSessionId && !allSessionIds.has(data.session_id)) return;
+
+    // Bump last-activity for THIS session on every real-time entry, before
+    // the live-session sid-match bail-out below so background sessions get
+    // the same freshness treatment as the live one.
+    _bumpSessionActivity(data.session_id);
+    // The newest message's handoff card decides the sidebar status (session-verb.js).
+    // Core, not SessionVerb: cards seen while Smart termination is off still
+    // count the moment it is turned on.
+    const _sv = window.SessionVerbCore || window.SessionVerb;
+    if (_sv) _sv.noteEntry(data.session_id, data.entry);
+
+    // NOTE: The watchdog reset lives AFTER the session_id match check below.
+    // Here, entries for a mismatched session_id (e.g. a stale pre-remap
+    // alias) would keep resetting the watchdog without rendering,
+    // permanently defeating the recovery safety net.
+
+    // PERF-CRITICAL: performance.mark/measure instrumentation — do NOT remove. See CLAUDE.md #17.
+    // Performance: measure time from submit to first entry (once per turn)
+    if (performance.getEntriesByName('submit-' + data.session_id).length) {
+        performance.mark('first-entry-' + data.session_id);
+        try {
+            performance.measure(
+                'time-to-first-entry-' + data.session_id,
+                'submit-' + data.session_id,
+                'first-entry-' + data.session_id
+            );
+            var _perfMeasure = performance.getEntriesByName('time-to-first-entry-' + data.session_id)[0];
+            if (_perfMeasure) {
+                console.debug('[PERF] Time to first entry for %s: %dms', data.session_id.slice(0, 12), Math.round(_perfMeasure.duration));
+            }
+        } catch (_e) { /* ignore measurement errors */ }
+        performance.clearMarks('submit-' + data.session_id);
+        performance.clearMarks('first-entry-' + data.session_id);
+        performance.clearMeasures('time-to-first-entry-' + data.session_id);
+    }
+
+    // Consistency check: if we're getting entries for a session the UI
+    // thinks is idle/stopped, our state is stale — request a refresh.
+    // This catches the case where the WORKING event was silently lost.
+    if (data.session_id && sessionKinds[data.session_id] !== 'working' && sessionKinds[data.session_id] !== 'question') {
+        const _entryKind = data.entry && data.entry.kind;
+        // Only for assistant/tool content (not user echoes which can arrive after idle)
+        if (_entryKind === 'asst' || _entryKind === 'tool_use' || _entryKind === 'tool_result') {
+            console.warn('[entry-consistency] Got', _entryKind, 'entry for', data.session_id,
+                'but UI thinks state is', sessionKinds[data.session_id] || 'unknown', '— requesting state refresh');
+            sessionKinds[data.session_id] = 'working';
+            runningIds.add(data.session_id);
+            if (data.session_id === liveSessionId) {
+                liveBarState = null;
+                if (typeof updateLiveInputBar === 'function') updateLiveInputBar();
+            }
+            _updateRowState(data.session_id, 'working');
+            socket.emit('request_state_snapshot', {project: localStorage.getItem('activeProject') || ''});
+        }
+    }
+
+    // ── Unread flag (iOS-style dot) ──
+    // Assistant output landed. Raise the flag here, ABOVE the `_sidMatch`
+    // bail-out below, so background sessions (which return early) are covered.
+    //
+    // Deliberately does NOT filter on `!== liveSessionId`: the live session
+    // earns a dot too, which is the "parked in one chat, never navigate away,
+    // so nothing ever marks it read" case. It is cleared by interacting with
+    // the thread rather than by never being set. Re-adding a liveSessionId
+    // guard here makes that whole path unreachable.
+    if (data.session_id && data.entry && data.entry.kind === 'asst'
+        && typeof markSessionUnread === 'function') {
+        markSessionUnread(data.session_id);
+    }
+
+    // Session ID match — also check aliases. The daemon resolves session IDs
+    // through its alias table, so entries can arrive under the canonical (new)
+    // ID while liveSessionId still holds the old pre-remap ID. Auto-heal.
+    let _sidMatch = (data.session_id === liveSessionId);
+    if (!_sidMatch && liveSessionId && window._idRemaps) {
+        if (window._idRemaps[liveSessionId] === data.session_id) {
+            console.warn('[entry] auto-healing liveSessionId alias:',
+                liveSessionId, '→', data.session_id);
+            liveSessionId = data.session_id;
+            _sidMatch = true;
+        }
+        for (const oldId in window._idRemaps) {
+            if (window._idRemaps[oldId] === liveSessionId && oldId === data.session_id) {
+                console.warn('[entry] accepting late pre-remap entry:', data.session_id,
+                    '(remapped to', liveSessionId, ')');
+                _sidMatch = true;
+                break;
+            }
+        }
+    }
+    // ── Route completed entries to Mission Control preview ──
+    if (typeof sessionDisplayMode !== 'undefined' && sessionDisplayMode === 'control' &&
+        typeof mcFinalizeEntry === 'function' && data.entry) {
+      mcFinalizeEntry(data.session_id, data.entry.text, data.entry.kind);
+    }
+
+    if (!_sidMatch) {
+        console.warn('[entry] sid mismatch:', data.session_id, '!=', liveSessionId,
+            'kind:', data.entry && data.entry.kind, 'idx:', data.index);
+        return;
+    }
+
+    // Reset (not cancel) watchdog — data is flowing AND matches our live
+    // session. Must be AFTER the session_id match check above.
+    if (typeof _resetMessageWatchdog === 'function') _resetMessageWatchdog(liveSessionId);
+    if (!data.entry) return;
+    const logEl = document.getElementById('live-log');
+    if (!logEl) {
+        console.warn('[entry-drop] live-log not in DOM! kind:', data.entry.kind, 'idx:', data.index);
+        return;
+    }
+    // Remove streaming bubble when the final assistant entry arrives
+    // (or any other entry type — the complete entry replaces the stream)
+    const _streamBubble = logEl.querySelector('.msg.assistant.streaming-bubble');
+    if (_streamBubble) {
+        _streamBubble.remove();
+    }
+    // Clear skeleton/placeholder on first real entry
+    if (liveLineCount === 0) {
+        const skel = logEl.querySelector('.skel-bar, .skeleton-loader, .live-log-empty, .empty-state');
+        if (skel) logEl.innerHTML = '';
+    }
+    // Optimistic bubble dedup: if this is a user entry echoed back by the
+    // server, check if we already have an optimistic bubble for it. Remove
+    // the optimistic bubble and render the server-confirmed version instead.
+    // Uses position (last optimistic bubble), NOT text matching — so
+    // legitimate duplicate messages ("yes", "ok") always render.
+    //
+    // Do NOT go back to `:last-child` here. ThreadScroll pins .vn-jump-wrap and
+    // .vn-thread-sentinel as the last children of #live-log and re-pins them on
+    // every append, so `:last-child` never matches a message and every sent
+    // message renders twice. See _findTrailingOptimisticBubble() in live-panel.js.
+    if (data.entry.kind === 'user') {
+        const optimistic = (typeof _findTrailingOptimisticBubble === 'function')
+            ? _findTrailingOptimisticBubble(logEl)
+            : logEl.querySelector('.msg.user.optimistic-bubble:last-child');
+        if (optimistic) {
+            // The last element is our optimistic bubble — replace it with
+            // the server-confirmed entry (which has correct formatting/index).
+            optimistic.remove();
+        }
+    }
+    // When a new assistant message arrives it becomes the most-recent AI
+    // message: collapse the previously auto-expanded one (if any) back to its
+    // truncated "show more" form, then render the new one fully expanded so
+    // only the latest AI message stays open.
+    const _isAsstEntry = data.entry.kind === 'asst';
+    if (_isAsstEntry && typeof _collapseRecentAsst === 'function') _collapseRecentAsst(logEl);
+    const _newEntryEl = renderLiveEntry(data.entry, _isAsstEntry ? { forceExpand: true } : undefined);
+    logEl.appendChild(_newEntryEl);
+    // PERF FIX #5: cap #live-log at ~400 `.msg` children so long-lived
+    // sessions don't grow the DOM unbounded. See _trimLiveLogIfOversized()
+    // in live-panel.js.
+    // No-op when the user is scrolled up viewing older content.
+    if (typeof _trimLiveLogIfOversized === 'function') _trimLiveLogIfOversized(logEl);
+    if (typeof _tryAddOutputCard === 'function') _tryAddOutputCard(data.entry);
+    liveLineCount = (data.index != null) ? data.index + 1 : liveLineCount + 1;
+    if (typeof _updateLastMessageTimes === 'function') _updateLastMessageTimes();
+    // No auto-scroll for a new entry: the reader's view never moves on its own
+    // (thread-scroll.js, D). ThreadScroll's MutationObserver sees the append and
+    // lights the jump button if it landed below the fold.
+    // [classic] Classic scroll restores the original follow, verbatim.
+    if (window.vnClassicScroll && vnClassicScroll() && liveAutoScroll) {
+        // For a freshly-arrived AI message, top-align it (when taller than the
+        // viewport) so the user can start reading from its first line; for any
+        // other entry, scroll to bottom as usual.
+        if (typeof _autoScrollLiveLog === 'function') {
+            _autoScrollLiveLog(logEl, _isAsstEntry ? _newEntryEl : null);
+        } else {
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+    }
+    // ── Sub-agent team tracking ──
+    if (data.entry.kind === 'tool_use' && data.entry.name === 'Agent') {
+        if (!window._subAgents[data.session_id]) window._subAgents[data.session_id] = {};
+        window._subAgents[data.session_id][data.entry.id] = {
+            desc: data.entry.desc || 'Sub-agent',
+            startTime: Date.now(),
+            status: 'working'
+        };
+        // Trigger working bar re-render to show new agent
+        if (data.session_id === liveSessionId && typeof updateLiveInputBar === 'function') {
+            liveBarState = null;  // force re-render
+            updateLiveInputBar();
+        }
+    }
+    if (data.entry.kind === 'tool_result' && data.entry.tool_use_id) {
+        const agents = window._subAgents[data.session_id];
+        if (agents && agents[data.entry.tool_use_id]) {
+            agents[data.entry.tool_use_id].status = 'done';
+            agents[data.entry.tool_use_id].endTime = Date.now();
+            // Trigger working bar re-render to show completion
+            if (data.session_id === liveSessionId && typeof updateLiveInputBar === 'function') {
+                liveBarState = null;  // force re-render
+                updateLiveInputBar();
+            }
+        }
+    }
+    // ── Kanban AI status markers: detect and forward to backend ──
+    if (data.entry.kind === 'asst' && data.entry.text) {
+        _processKanbanStatusMarkers(data.entry.text);
+    }
+});
+
+// Permission requests
+socket.on('session_permission', (data) => {
+    if (_hiddenSessionIds.has(data.session_id)) return;
+    // ── Cross-project filtering: permission events don't include cwd,
+    // but if this session_id isn't in allSessions and isn't the live session,
+    // it belongs to another project — drop it so permission prompts from
+    // other projects don't appear in the current project's UI.
+    if (data.session_id !== liveSessionId && !allSessionIds.has(data.session_id)) return;
+    // "Claude Auto": answer immediately and paint nothing.
+    if (typeof _claudeAutoActive === 'function' && _claudeAutoActive()
+            && typeof wsPermissionAnswer === 'function') {
+        wsPermissionAnswer(data.session_id, _claudeAutoVerdict(data.tool_name, data.tool_input));
+        return;
+    }
+    waitingData[data.session_id] = {
+        question: _formatPermissionQuestion(data.tool_name, data.tool_input),
+        options: ['y', 'n', 'aa', 'a'],
+        kind: 'tool',
+        tool_name: data.tool_name,
+        tool_input: data.tool_input,
+    };
+    sessionKinds[data.session_id] = 'question';
+
+    if (liveSessionId === data.session_id) {
+        liveBarState = null;
+        updateLiveInputBar();
+    }
+    // Update sidebar
+    _updateRowState(data.session_id, 'waiting');
+    // Update workspace permission queue if active
+    // Auto-approve policies are global — run regardless of view mode
+    if (typeof _updatePermissionQueue === 'function') {
+        _updatePermissionQueue(waitingData);
+    }
+    if (viewMode === 'sessions' || viewMode === 'workplace' || viewMode === 'homepage') filterSessions();
+});
+
+// A local script pinged the user — broadcast by POST /api/notify/approval
+// (e.g. a project's release script: an approval page is waiting, a
+// test went red, a release is live). Every open VibeNode client, phones on
+// Tailscale included, chimes ONCE. Nothing here may start a title flash: a
+// ping is an event, and only approvals_open below says an approval is still
+// open. Separate from session_permission, which is Claude tool-approval and
+// stays silent.
+function _onExternalNotice(data) {
+    try {
+        if (window.VNNotify && typeof window.VNNotify.notice === 'function') {
+            const d = data || {};
+            window.VNNotify.notice({
+                key: 'external:' + (d.source || 'unknown'),
+                title: d.title || 'VibeNode',
+                body: d.message || '',
+                // A ping with an id is an approval page the server is now
+                // watching. Its banner belongs to approvals_open, which also
+                // takes it down when the page is answered.
+                banner: !d.id,
+            });
+        }
+    } catch (e) { /* notify failures never break other handlers */ }
+}
+socket.on('external_notice', _onExternalNotice);
+// The same ping under its old name, from a web server that has not been
+// restarted since this file changed: static files are live the moment they
+// are pulled, Python only after a restart. It chimes here too, and like any
+// ping it cannot start a flash. A current server never sends it.
+socket.on('approval_needed', _onExternalNotice);
+
+// The approval pages that are still waiting for an answer, as the server sees
+// them right now (src/web/approval_watch.py). Sent when the list changes and every
+// few seconds while it is not empty. Background tabs flash their title for an
+// approval only while these keep naming it: answered, or no longer heard about,
+// both end the flash (VNNotify.syncApprovals in notify.js).
+function _onApprovalsOpen(data) {
+    try {
+        if (window.VNNotify && typeof window.VNNotify.syncApprovals === 'function') {
+            const d = data || {};
+            window.VNNotify.syncApprovals(d.open, d.ttl_ms);
+        }
+    } catch (e) { /* notify failures never break other handlers */ }
+}
+socket.on('approvals_open', _onApprovalsOpen);
+
+// Watchdog escalation — the daemon found a session idle and "waiting" on
+// background work that is not making progress, and its one nudge did not fix
+// it (src/engine/health_monitor.py job 5). Broadcast to every client so the user
+// hears about it even when that session is not on screen.
+socket.on('session_stalled', (data) => {
+    try {
+        if (window.VNNotify && typeof window.VNNotify.attention === 'function') {
+            const d = data || {};
+            const name = d.name || 'A session';
+            window.VNNotify.attention({
+                sessionId: d.session_id || '',
+                sessionName: name,
+                title: 'Session stalled',
+                body: name + ' is stuck waiting on background work that is not running.',
+            });
+        }
+    } catch (e) { /* notify failures never break other handlers */ }
+});
+
+// Durable Jobs (src/engine/job_supervisor.py, src/web/static/js/jobs.js). The supervisor
+// relaunches dead jobs by itself and says nothing; only a job that needs a
+// person (irreversible step, three deaths without progress, or a failed
+// launch) reaches the browser, as a card with Relaunch and Leave it.
+socket.on('job_needs_person', (data) => {
+    try {
+        if (window.VNJobs && typeof window.VNJobs.onNeedsPerson === 'function') window.VNJobs.onNeedsPerson(data || {});
+    } catch (e) { /* job card failures never break other handlers */ }
+});
+socket.on('job_registry_error', (data) => {
+    try {
+        if (window.VNJobs && typeof window.VNJobs.onRegistryError === 'function') window.VNJobs.onRegistryError(data || {});
+    } catch (e) { /* ditto */ }
+});
+
+// Server-side queue updates — replaces client-side localStorage queue
+socket.on('queue_updated', (data) => {
+    const sid = data.session_id;
+    const items = data.queue || [];
+    // Update local cache from authoritative server data
+    if (items.length) {
+        _sessionQueues[sid] = items;
+    } else {
+        delete _sessionQueues[sid];
+    }
+    _queueViewIndex = 0;
+    // Re-render queue banner if viewing this session
+    if (sid === liveSessionId && typeof _renderQueueBanner === 'function') {
+        _renderQueueBanner();
+    }
+});
+
+// A local script posted a line into a session through the message hook
+// (POST /api/hook/message). The daemon gives it to the agent, or queues it, but
+// pushes no bubble for a message that no client typed. So the tab showing that
+// session draws it now; every other tab, and a line that was queued or could
+// not be delivered, gets a toast. A queued line's bubble comes with
+// queue_dispatched below.
+socket.on('hook_message', (data) => {
+    try {
+        const d = data || {};
+        const sid = d.session_id || '';
+        if (!sid || (sid !== liveSessionId && !allSessionIds.has(sid))) return;   // another project's session
+        if (sid === liveSessionId && d.delivered === 'sent' && d.message
+            && typeof _addOptimisticBubble === 'function') {
+            _addOptimisticBubble(sid, d.message, false, { passive: true });
+            return;
+        }
+        if (d.text && typeof showToast === 'function') {
+            const line = (d.source ? d.source + ': ' : '') + d.text;
+            showToast(line.length > 160 ? line.slice(0, 157) + '\u2026' : line, d.delivered === 'no');
+        }
+    } catch (e) { /* a notice never breaks the other handlers */ }
+});
+
+// Server auto-dispatched a queued message — show toast + optimistic user bubble
+socket.on('queue_dispatched', (data) => {
+    const sid = data.session_id;
+    const text = data.text || '';
+    const remaining = data.remaining || 0;
+    showToast('Sending queued command\u2026' + (remaining ? ' (' + remaining + ' remaining)' : ''));
+    // Add optimistic user bubble for the dispatched message
+    if (sid === liveSessionId && text && typeof _addOptimisticBubble === 'function') {
+        _addOptimisticBubble(sid, text, false, { passive: true });
+    }
+    // Clear local queue when all items dispatched
+    if (remaining === 0) {
+        delete _sessionQueues[sid];
+        if (sid === liveSessionId && typeof _renderQueueBanner === 'function') _renderQueueBanner();
+    }
+});
+
+// System messages from SDK (debug/info)
+socket.on('system_message', (data) => {
+    console.log('[WS] SystemMessage:', data.subtype, data.data);
+});
+
+// Session started confirmation
+socket.on('session_started', (data) => {
+    if (data.session_id) {
+        if (_isHiddenSession(data.session_id, data)) return;
+        runningIds.add(data.session_id);
+        // Don't overwrite optimistic 'working' state (set before start_session emit)
+        if (sessionKinds[data.session_id] !== 'working') {
+            sessionKinds[data.session_id] = 'idle';
+        }
+        // Only inject stub into allSessions if this session belongs to the
+        // current project. Otherwise it bleeds into the sidebar.
+        const _isSameProject = !data.cwd || _sessionBelongsToActiveProject(data.cwd);
+        if (_isSameProject && !allSessionIds.has(data.session_id)) {
+            const _stubTitle = (typeof _knownSessionTitle === 'function' && _knownSessionTitle(data.session_id)) || data.name || '';
+            SessionStore.set(data.session_id, {   // new id: inserted at the front
+                id: data.session_id,
+                display_title: _stubTitle || 'New Session',
+                custom_title: _stubTitle,
+                last_activity: '',
+                last_activity_ts: Date.now() / 1000,
+                sort_ts: Date.now() / 1000,
+                size: '',
+                file_bytes: 0,
+                message_count: 0,
+                preview: '',
+            });
+            filterSessions();
+        }
+        if (_isSameProject) _updateRowState(data.session_id, sessionKinds[data.session_id] || 'idle');
+    }
+});
+
+// Track old→new ID remaps so in-flight autoname calls can save under the new ID
+if (!window._idRemaps) window._idRemaps = {};  // oldId -> newId
+
+// Session ID remapped — SDK assigned a different ID than the one we generated
+// Bulk "Name N untitled sessions" progress (POST /api/sessions/name-untitled).
+// {project, done, total, current_title, named, skipped, failed, finished}
+socket.on('naming_progress', (data) => {
+    if (typeof _onNamingProgress === 'function') _onNamingProgress(data);
+});
+
+// Account usage windows changed (broadcast by the daemon on a real change).
+socket.on('usage_limits', (data) => {
+    if (typeof _ingestUsageLimits === 'function') _ingestUsageLimits(data);
+});
+
+socket.on('session_id_remapped', (data) => {
+    const oldId = data.old_id;
+    const newId = data.new_id;
+    if (!oldId || !newId) return;
+    console.log('[WS] Session ID remapped:', oldId, '->', newId);
+
+    // Update planner session ID if it was remapped (before hidden check)
+    if (typeof _plannerSessionId !== 'undefined' && _plannerSessionId === oldId) {
+        _plannerSessionId = newId;
+    }
+
+    if (_isHiddenSession(oldId, data)) return;
+
+    // A title learned under the launch id belongs to the new id now.
+    if (typeof _remapSessionTitle === 'function') _remapSessionTitle(oldId, newId);
+    // So does a pin (sessions.js _pinRekey).
+    if (typeof _pinRekey === 'function') _pinRekey(oldId, newId);
+
+    // Update the list and its id index.  If the list already has this
+    // session under the new id, SessionStore.rekey() MERGES: a session-list
+    // reload during the first turn returns it twice (the daemon's stub under
+    // the launch id and the CLI transcript under the CLI's id), and renaming
+    // the stub left two cards with the same id, one titled and one showing
+    // the first message.  It keeps the transcript row (real size and dates),
+    // carries the title over, and drops the stub.  Otherwise it renames the
+    // row in place.  Either way the id Set is in step (PERF-CRITICAL #15).
+    const s = SessionStore.has(oldId) ? SessionStore.rekey(oldId, newId) : null;
+    if (s) _rebuildSessionIds();   // multi-selection prune
+    if (s && typeof _applyKnownSessionTitle === 'function') _applyKnownSessionTitle(s);
+
+    // Update activeId and URL — use replaceState (not pushState) so the
+    // temporary client-generated UUID does not linger in browser history
+    // and break back/forward/refresh navigation
+    if (activeId === oldId) {
+        activeId = newId;
+        localStorage.setItem('activeSessionId', newId);
+        const _remapUrl = new URL(window.location);
+        _remapUrl.searchParams.set('chat', newId);
+        history.replaceState({
+            folder: (typeof _currentFolderId !== 'undefined' ? _currentFolderId : null),
+            chat: newId
+        }, '', _remapUrl);
+    }
+
+    // Update liveSessionId
+    if (liveSessionId === oldId) liveSessionId = newId;
+
+    // Update runningIds
+    if (runningIds.has(oldId)) {
+        runningIds.delete(oldId);
+        runningIds.add(newId);
+    }
+
+    // Update sessionKinds
+    if (sessionKinds[oldId] !== undefined) {
+        sessionKinds[newId] = sessionKinds[oldId];
+        delete sessionKinds[oldId];
+    }
+
+    // Update waitingData
+    if (waitingData[oldId]) {
+        waitingData[newId] = waitingData[oldId];
+        delete waitingData[oldId];
+    }
+
+    // Update guiOpenSessions
+    if (guiOpenSessions.has(oldId)) {
+        guiOpenDelete(oldId);
+        guiOpenAdd(newId);
+    }
+
+    // Update _userNamedSessions (remap user-set name protection to new ID)
+    if (typeof _userNamedSessions !== 'undefined' && _userNamedSessions.has(oldId)) {
+        _userNamedSessions.delete(oldId);
+        _userNamedSessions.add(newId);
+    }
+    // Always remap the persisted name (covers both user-set AND auto-named titles).
+    // Without this, auto-names saved under the old client-generated UUID are lost
+    // when the SDK remaps to a new ID.
+    window._idRemaps[oldId] = newId;
+    fetch('/api/remap-name', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({old_id:oldId, new_id:newId, project: localStorage.getItem('activeProject') || ''})}).catch(()=>{});
+
+    // Update working since map
+    if (window._workingSinceMap && window._workingSinceMap[oldId]) {
+        window._workingSinceMap[newId] = window._workingSinceMap[oldId];
+        delete window._workingSinceMap[oldId];
+    }
+
+    // Update folder tree mapping (workplace mode)
+    if (typeof _remapSessionInFolders === 'function') {
+        _remapSessionInFolders(oldId, newId);
+    }
+
+    // Remap kanban task-session link (server-side DB is updated by session_manager,
+    // but update client-side kanban state and URL hash too)
+    if (window.location.hash.includes(oldId)) {
+        const newHash = window.location.hash.replace(oldId, () => newId);
+        history.replaceState(history.state, '', window.location.pathname + newHash);
+    }
+    if (history.state && history.state.sessionId === oldId) {
+        history.replaceState(Object.assign({}, history.state, { sessionId: newId }), '', window.location.href);
+    }
+
+    // Update toolbar data attribute — only when this session is the one on
+    // screen.  A new session is remapped seconds into its first turn; if the
+    // person has opened another session by then, writing this title over the
+    // toolbar would put the wrong name (and the wrong target for Rename,
+    // Delete...) above the session they are reading.
+    if (activeId === newId || liveSessionId === newId) {
+        setToolbarSession(newId,
+            s ? (s.custom_title || s.display_title) : 'New Session',
+            s ? !s.custom_title : true,
+            s ? (s.custom_title || '') : '');
+    }
+
+    // Track remapped planner session ID so state/entry listeners match both IDs.
+    // Don't overwrite _plannerSessionId — entry events still use the original ID.
+    if (typeof _plannerSessionId !== 'undefined' && _plannerSessionId === oldId) {
+        _plannerRemappedId = newId;
+    }
+
+    // Re-render sidebar
+    filterSessions();
+
+    // Re-schedule auto-naming with the new ID (the old setTimeout closures
+    // captured the old ID, which won't match any .jsonl file on disk).
+    // Skip if the user has manually named this session.
+    if (typeof autoName === 'function' && !(typeof _userNamedSessions !== 'undefined' && _userNamedSessions.has(newId))) {
+        setTimeout(() => autoName(newId, true), 3000);
+    }
+});
+
+// Session log response — server-side pagination.
+// Server sends only the requested page; "Load older" fetches from server.
+socket.on('session_log', (data) => {
+    // Clear the live-panel.js skeleton-stuck watchdog on any matching response.
+    // Set BEFORE the liveSessionId guard so a late reply for a session the user
+    // has since backed out of still clears its own timer (harmless if none).
+    if (window._skeletonStuckTimer && window._skeletonStuckSid === data.session_id) {
+        clearTimeout(window._skeletonStuckTimer);
+        window._skeletonStuckTimer = null;
+    }
+    // Same for the load-more (prepend) watchdog. A prepend response has
+    // data.prepend === true and its own sid tracking key.
+    if (window._loadMoreStuckTimer && data.prepend &&
+        window._loadMoreStuckSid === data.session_id) {
+        clearTimeout(window._loadMoreStuckTimer);
+        window._loadMoreStuckTimer = null;
+    }
+    if (data.session_id !== liveSessionId) return;
+    const logEl = document.getElementById('live-log');
+    if (!logEl) return;
+
+    const entries = data.entries || [];
+    const total = data.total || entries.length;
+    const offset = data.offset || 0;
+    const hasMore = data.has_more || false;
+    const isPrepend = data.prepend || false;
+
+    console.log('[WS] session_log: received', entries.length, 'entries (offset=' + offset +
+        ', total=' + total + ', has_more=' + hasMore + ', prepend=' + isPrepend + ')');
+
+    // --- Prepend path: "Load older" response ---
+    if (isPrepend) {
+        const existingBtn = logEl.querySelector('.live-load-more');
+        if (existingBtn) existingBtn.remove();
+
+        const prevHeight = logEl.scrollHeight;
+        const prevScroll = logEl.scrollTop;
+        const frag = document.createDocumentFragment();
+
+        // Update pagination state
+        _liveRenderedFrom = offset;
+        _liveEntryStash = [];  // not used in server-pagination mode
+
+        if (offset > 0) {
+            frag.appendChild(_createLoadMoreButton());
+        }
+        entries.forEach((entry) => {
+            try { frag.appendChild(renderLiveEntry(entry)); }
+            catch (err) { console.warn('[WS] session_log: could not draw older entry', entry && entry.kind, err); }
+        });
+        logEl.insertBefore(frag, logEl.firstChild);
+
+        // Restore scroll position so viewport stays on the same messages
+        const newHeight = logEl.scrollHeight;
+        logEl.scrollTop = prevScroll + (newHeight - prevHeight);
+        // PERF FIX #5: attempt trim (a defensive no-op in the common case,
+        // because the user is scrolled up to the top to have clicked "Load
+        // older", so ThreadScroll.atBottom() is false and the helper bails).
+        // Once they return to the bottom, subsequent session_entry appends
+        // will trim the excess.
+        if (typeof _trimLiveLogIfOversized === 'function') _trimLiveLogIfOversized(logEl);
+        return;
+    }
+
+    // --- Initial load path ---
+
+    // Guard: if the DOM already has MORE entries than this response covers
+    // (e.g. daemon restarted and hasn't fully re-read the JSONL yet), do NOT
+    // wipe the DOM — we'd be destroying data the user can already see.
+    const effectiveCount = offset + entries.length;
+    if (effectiveCount < liveLineCount && liveLineCount > 0) {
+        console.warn('[WS] session_log covers fewer entries (' + effectiveCount +
+            ') than DOM (' + liveLineCount + ') — skipping destructive re-render');
+        return;
+    }
+
+    // Clear and re-render
+    _liveEntryStash = [];  // server pagination — no client stash needed
+    _liveRenderedFrom = offset;
+
+    // Clear stale sub-agent tracking — the full reload replaces everything
+    // and historical entries should NOT re-populate the agent bar.
+    delete window._subAgents[data.session_id];
+
+    logEl.innerHTML = '';
+    _optimisticMsgId = 0;
+    if (typeof _clearOutputShelf === 'function') _clearOutputShelf();
+
+    // Show "Load older" button if server says there are more
+    if (hasMore) {
+        logEl.appendChild(_createLoadMoreButton());
+    }
+
+    // The most-recent expanded AI message, captured during render so we can
+    // top-align it (rather than scroll-to-bottom) once the page is laid out.
+    let _expandedAsstEl = null;
+    if (entries.length) {
+        // Find the most-recent assistant entry so it renders fully expanded
+        // (no "show more"). This is the tail page, so its last 'asst' entry is
+        // the newest AI message in the whole conversation.
+        let _lastAsstIdx = -1;
+        for (let i = entries.length - 1; i >= 0; i--) {
+            if (entries[i] && entries[i].kind === 'asst') { _lastAsstIdx = i; break; }
+        }
+        entries.forEach((entry, i) => {
+            // One entry that cannot be drawn must never stop the thread: a
+            // throw here would abort the loop and every later message would
+            // vanish.
+            try {
+                const _el = renderLiveEntry(entry, i === _lastAsstIdx ? { forceExpand: true } : undefined);
+                if (i === _lastAsstIdx) _expandedAsstEl = _el;
+                logEl.appendChild(_el);
+                if (typeof _tryAddOutputCard === 'function') _tryAddOutputCard(entry);
+            } catch (err) {
+                console.warn('[WS] session_log: could not draw entry', i, entry && entry.kind, err);
+            }
+        });
+        liveLineCount = total;
+    } else {
+        liveLineCount = 0;
+    }
+
+    if (typeof _updateLastMessageTimes === 'function') _updateLastMessageTimes();
+    if (liveAutoScroll) {
+        // Top-align the most-recent AI message if it's taller than the viewport
+        // so the user starts reading from its first line; otherwise scroll to
+        // bottom as usual.
+        if (typeof _autoScrollLiveLog === 'function') _autoScrollLiveLog(logEl, _expandedAsstEl);
+        else logEl.scrollTop = logEl.scrollHeight;
+    }
+    // A fresh render is the thread itself, not news for the jump button.
+    if (window.ThreadScroll) ThreadScroll.positioned();
+
+    // Performance: measure session switch time (from get_session_log emit to render complete)
+    if (performance.getEntriesByName('switch-' + data.session_id).length) {
+        performance.mark('switch-rendered-' + data.session_id);
+        try {
+            performance.measure(
+                'session-switch-' + data.session_id,
+                'switch-' + data.session_id,
+                'switch-rendered-' + data.session_id
+            );
+            var _switchMeasure = performance.getEntriesByName('session-switch-' + data.session_id)[0];
+            if (_switchMeasure) {
+                console.debug('[PERF] Session switch for %s: %dms (%d entries)',
+                    data.session_id.slice(0, 12), Math.round(_switchMeasure.duration), entries.length);
+            }
+        } catch (_e) { /* ignore measurement errors */ }
+        performance.clearMarks('switch-' + data.session_id);
+        performance.clearMarks('switch-rendered-' + data.session_id);
+        performance.clearMeasures('session-switch-' + data.session_id);
+    }
+});
+
+// Helper: format permission question for display
+function _formatPermissionQuestion(toolName, toolInput) {
+    let desc = '';
+    if (!toolInput) {
+        desc = '(no details)';
+    } else if (toolInput.command) {
+        desc = toolInput.command;
+    } else if (toolInput.file_path) {
+        desc = toolInput.file_path;
+    } else if (toolInput.path) {
+        desc = toolInput.path;
+    } else if (toolInput.pattern) {
+        desc = toolInput.pattern;
+    } else {
+        desc = JSON.stringify(toolInput).slice(0, 200);
+    }
+    return 'Claude wants to use ' + toolName + ':\n\n' + desc;
+}
+
+// Helper: repaint ONE session's sidebar row and/or grid card in place.
+//
+// This is the surgical path a session_state event takes.  It
+// covers everything the renderers derive from state: the list row's
+// si-*/waiting/running classes and state icon (pickaxe, check, clock, the
+// compacting and awaiting-wake-up icons), the card's wf-* class, avatar,
+// status label and title hint, and the unread dot.  The markup comes from the
+// same helpers the full renderers use (_sessionStateIconHtml in sessions.js,
+// _wfCardStatusParts in workforce.js), so the two paths cannot drift.
+//
+// `state` is the daemon's state as handed to the caller; a few call sites run
+// before sessionKinds catches up (see _syncUnreadDom), so the classes are
+// derived from it rather than from getSessionStatus().
+function _updateRowState(sessionId, state) {
+    const row = document.querySelector('.session-item[data-sid="' + sessionId + '"]');
+    const card = document.querySelector('.wf-card[data-sid="' + sessionId + '"]');
+    if (!row && !card) return;
+    // The renderers' status vocabulary (question|working|idle|sleeping), from
+    // the authoritative `state` when it maps, else from the page's own map.
+    const status = state === 'waiting' ? 'question'
+        : (state === 'working' || state === 'starting') ? 'working'
+        : state === 'idle' ? 'idle'
+        : state === 'stopped' ? 'sleeping'
+        : ((typeof getSessionStatus === 'function') ? getSessionStatus(sessionId) : 'sleeping');
+    if (row) {
+        row.classList.remove('si-question', 'si-working', 'si-idle', 'waiting', 'running');
+        if (state === 'waiting') row.classList.add('si-question');
+        else if (state === 'working' || state === 'starting') row.classList.add('si-working');
+        else if (state === 'idle') row.classList.add('si-idle');
+        const _sc = (typeof _sessionRowStateClass === 'function') ? _sessionRowStateClass(status) : '';
+        if (_sc) row.classList.add(_sc);
+        // Person-oriented status classes (session-verb.js; sessions.js _sessionVerbRowClass).
+        if (typeof _sessionVerbRowClass === 'function') {
+            row.classList.forEach(c => { if (c.startsWith('vs-row-')) row.classList.remove(c); });
+            _sessionVerbRowClass(sessionId, status).split(' ').forEach(c => { if (c) row.classList.add(c); });
+        }
+        if (typeof _sessionStateIconHtml === 'function') {
+            const host = row.querySelector('.session-col-name');
+            if (host) {
+                const html = _sessionStateIconHtml(sessionId, status);
+                const old = host.querySelector(':scope > .state-icon');
+                let fresh = null;
+                if (html) {
+                    const tpl = document.createElement('template');
+                    tpl.innerHTML = html;
+                    fresh = tpl.content.firstElementChild;
+                }
+                if (old && fresh) old.replaceWith(fresh);
+                else if (old) old.remove();
+                else if (fresh) {
+                    // Same slot the renderer uses: after caret / glyph / unread dot,
+                    // before the title text.
+                    const anchor = host.querySelector(':scope > .unread-dot')
+                        || host.querySelector(':scope > .subsession-glyph')
+                        || host.querySelector(':scope > .subsession-caret');
+                    if (anchor) anchor.after(fresh); else host.prepend(fresh);
+                }
+            }
+        }
+    }
+    if (card) {
+        card.classList.remove('wf-question', 'wf-working', 'wf-idle', 'wf-sleeping');
+        card.classList.add('wf-' + status);
+        if (typeof _wfCardStatusParts === 'function') {
+            const parts = _wfCardStatusParts(sessionId, status);
+            // Person-oriented colour class (session-verb.js): vs-decide, vs-read, ...
+            card.classList.forEach(c => { if (c.startsWith('vs-')) card.classList.remove(c); });
+            if (parts.cls) card.classList.add(parts.cls);
+            const avatar = card.querySelector('.wf-avatar');
+            if (avatar && avatar.innerHTML !== parts.emoji) avatar.innerHTML = parts.emoji;
+            const label = card.querySelector('.wf-status-label');
+            if (label && label.textContent !== parts.label) label.textContent = parts.label;
+            // The verdict buttons (Accept / Back) take the date line's place
+            // while the session waits for your verdict (session-verdict.js).
+            const foot = card.querySelector(':scope > .vs-verdict');
+            if (parts.foot && !foot) {
+                const meta = card.querySelector(':scope > .wf-meta');
+                const tpl = document.createElement('template');
+                tpl.innerHTML = parts.foot;
+                if (meta) meta.replaceWith(tpl.content.firstElementChild); else card.appendChild(tpl.content.firstElementChild);
+            } else if (foot && parts.foot && foot.dataset.k !== parts.status) {
+                const tpl = document.createElement('template');
+                tpl.innerHTML = parts.foot;
+                foot.replaceWith(tpl.content.firstElementChild);
+            } else if (foot && !parts.foot) {
+                const row = (typeof SessionStore !== 'undefined' && SessionStore.get) ? SessionStore.get(sessionId) : null;
+                const meta = document.createElement('div');
+                meta.className = 'wf-meta';
+                meta.textContent = (row && typeof _shortDate === 'function') ? _shortDate(row.last_activity) : '';
+                foot.replaceWith(meta);
+            }
+            const t = card.getAttribute('title') || '';
+            const dash = t.lastIndexOf(' — ');
+            if (dash >= 0) card.setAttribute('title', t.slice(0, dash) + ' — ' + parts.hint);
+        }
+    }
+    // The unread dot is idle-only, so it has to be re-evaluated on every state
+    // change: the flag is raised while the session is still working and only
+    // becomes visible when it settles. This is the surgical path — a full
+    // filterSessions() also renders it, but not every state change triggers one.
+    if (typeof _syncUnreadDom === 'function') _syncUnreadDom(sessionId, state);
+    // The open session's "Is this right?" strip follows its status too.
+    if (window.SessionVerdict && typeof liveSessionId !== 'undefined' && liveSessionId === sessionId) window.SessionVerdict.sync();
+}
+
+// ── Debounced full sidebar render ───────────────────────────────────────
+// A session_state event repaints its own row in place (_updateRowState).  A
+// full filterSessions() is needed only when the change cannot be expressed on
+// one row; those are coalesced here: trailing debounce of 150ms, with a 500ms
+// ceiling so a continuous stream of events still renders twice a second.
+const _FILTER_SESSIONS_DEBOUNCE_MS = 150;
+const _FILTER_SESSIONS_MAX_WAIT_MS = 500;
+let _filterSessionsTimer = null;
+let _filterSessionsFirstAt = 0;
+function _scheduleFilterSessions() {
+    const now = Date.now();
+    if (!_filterSessionsTimer) _filterSessionsFirstAt = now;
+    else clearTimeout(_filterSessionsTimer);
+    const waited = now - _filterSessionsFirstAt;
+    const delay = Math.max(0, Math.min(_FILTER_SESSIONS_DEBOUNCE_MS, _FILTER_SESSIONS_MAX_WAIT_MS - waited));
+    _filterSessionsTimer = setTimeout(() => {
+        _filterSessionsTimer = null;
+        if (typeof filterSessions === 'function') filterSessions();
+    }, delay);
+}
+// "Active first" rank; anything unknown sorts with sleeping, as the sorters do.
+const _STATUS_RANK = {question: 0, working: 1, idle: 2, sleeping: 3};
+/**
+ * Decide whether a session_state event needs a full re-render after its row
+ * was updated in place.  It does when:
+ *   - the view is not the list or card grid (Mission Control, Workforce,
+ *     Subsessions, the homepage stats): those renderers own their DOM;
+ *   - the sort is "Active first" and the session's rank changed, so its
+ *     position in the order changed;
+ *   - the session is in the list but has no row on screen (filtered out, or
+ *     not yet rendered by the windowed list), so there was nothing to patch.
+ * A session that is not in the list at all has nothing to render.
+ */
+function _renderSessionStateChange(sessionId, prevStatus) {
+    const inSessions = (typeof viewMode !== 'undefined') && viewMode === 'sessions';
+    const mode = (typeof sessionDisplayMode !== 'undefined') ? sessionDisplayMode : 'grid';
+    if (!inSessions || (mode !== 'grid' && mode !== 'list')) { _scheduleFilterSessions(); return; }
+    const inList = SessionStore.has(sessionId);
+    if (!inList) return;
+    const statusSort = mode === 'grid'
+        ? ((typeof wfSort !== 'undefined') && wfSort === 'status')
+        : ((typeof sortMode !== 'undefined') && sortMode === 'status');
+    const statusChanged = typeof getSessionStatus === 'function' && prevStatus !== getSessionStatus(sessionId);
+    if (statusSort && statusChanged) {
+        const _r = s => (_STATUS_RANK[s] == null ? 3 : _STATUS_RANK[s]);
+        const _moved = window.SessionVerb
+            ? window.SessionVerb.rank(sessionId, prevStatus) !== window.SessionVerb.rank(sessionId)
+            : _r(prevStatus) !== _r(getSessionStatus(sessionId));
+        if (_moved) { _scheduleFilterSessions(); return; }
+    }
+    // A state/unread filter chip is on: the session may enter or leave the list.
+    if (statusChanged && typeof _sessionFiltersDependOnState === 'function'
+            && _sessionFiltersDependOnState()) { _scheduleFilterSessions(); return; }
+    // Outside the rendered window (filtered out, or past the first N rows of a
+    // windowed list): it has no row by design, so there is nothing to render.
+    if (typeof _sessionInRenderWindow === 'function' && !_sessionInRenderWindow(sessionId)) return;
+    const onScreen = document.querySelector(
+        (mode === 'grid' ? '.wf-card' : '.session-item') + '[data-sid="' + sessionId + '"]');
+    if (!onScreen) _scheduleFilterSessions();
+}
+
+// Helper: get the active project's filesystem path
+function _currentProjectDir() {
+    const encoded = localStorage.getItem('activeProject');
+    if (!encoded) return '';
+    const p = _allProjects.find(x => x.encoded === encoded);
+    return p ? p.display : '';
+}
+
+// Replace pokeWaiting - no longer needed but keep as no-op for compatibility
+function pokeWaiting() {
+    // WebSocket push makes this unnecessary
+}
+
+// ── Kanban board real-time events ──
+// These handlers call functions defined in kanban.js (loaded before socket.js).
+socket.on('kanban_task_created', (data) => {
+    if (typeof _kanbanOnTaskCreated === 'function') _kanbanOnTaskCreated(data);
+});
+socket.on('kanban_task_updated', (data) => {
+    if (typeof _kanbanOnTaskUpdated === 'function') _kanbanOnTaskUpdated(data);
+});
+// No kanban_task_deleted — tasks are NEVER deleted
+socket.on('kanban_task_moved', (data) => {
+    if (typeof _kanbanOnTaskMoved === 'function') _kanbanOnTaskMoved(data);
+});
+socket.on('kanban_board_refresh', (data) => {
+    if (typeof _kanbanOnBoardRefresh === 'function') _kanbanOnBoardRefresh(data);
+});
+
+// ── Compose board real-time events ──
+// These handlers call functions defined in compose.js (loaded before socket.js).
+socket.on('compose_task_created', (data) => {
+    if (typeof _composeOnTaskCreated === 'function') _composeOnTaskCreated(data);
+});
+socket.on('compose_task_updated', (data) => {
+    if (typeof _composeOnTaskUpdated === 'function') _composeOnTaskUpdated(data);
+});
+socket.on('compose_task_moved', (data) => {
+    if (typeof _composeOnTaskMoved === 'function') _composeOnTaskMoved(data);
+});
+socket.on('compose_board_refresh', (data) => {
+    if (typeof _composeOnBoardRefresh === 'function') _composeOnBoardRefresh(data);
+});
+// Changing-flag protocol: agents set changing=true before mutations,
+// clear it when done.  Siblings see the yellow dot update in real time.
+socket.on('compose_changing', (data) => {
+    if (typeof _composeOnChanging === 'function') _composeOnChanging(data);
+});
+
+// Directive conflict detection: when a directive is logged and the backend
+// detects ambiguous conflicts, surface the resolution UI in the live chat.
+socket.on('compose_directive_logged', (data) => {
+    if (typeof _injectDirectiveConflict === 'function') _injectDirectiveConflict(data);
+});
+
+// Context-updated push: compose-context.json was modified (either via API
+// or detected by the file watcher when an agent writes directly to disk).
+// Refreshes the board so parallel agents' progress reflects in real time.
+socket.on('compose_context_updated', (data) => {
+    if (typeof _composeOnContextUpdated === 'function') _composeOnContextUpdated(data);
+});
+
+// Directive conflict resolved: update any open conflict cards in the chat.
+// Backend emits { project_id, conflict_id, action }. Match cards by
+// data-conflict-id attribute or by element id 'dc-{conflict_id}'.
+socket.on('compose_directive_conflict_resolved', (data) => {
+    if (!data || !data.conflict_id) return;
+    const cards = document.querySelectorAll('.live-directive-conflict:not(.dc-resolved)');
+    cards.forEach(card => {
+        const cardConflictId = card.dataset.conflictId || '';
+        const matchById = card.id === 'dc-' + data.conflict_id;
+        if (cardConflictId === data.conflict_id || matchById) {
+            if (typeof _markConflictResolved === 'function') {
+                _markConflictResolved(card.id, data.action, data);
+            }
+        }
+    });
+});
+
+// ---- Kanban AI status marker processing ----
+// Detects <!-- kanban:status task_id=UUID status=VALUE --> markers in AI
+// output and forwards them to the backend for automatic status transitions.
+const _kanbanStatusMarkerRe = /<!--\s*kanban:status\s+task_id=([a-f0-9-]+)\s+status=(\w+)\s*-->/gi;
+const _processedKanbanMarkers = new Set();
+
+function _processKanbanStatusMarkers(text) {
+    if (!text) return;
+    let match;
+    _kanbanStatusMarkerRe.lastIndex = 0;
+    while ((match = _kanbanStatusMarkerRe.exec(text)) !== null) {
+        const taskId = match[1];
+        const newStatus = match[2];
+        const key = taskId + ':' + newStatus;
+        // Dedup — don't send the same status change twice
+        if (_processedKanbanMarkers.has(key)) continue;
+        _processedKanbanMarkers.add(key);
+        // Clear dedup after 30s so the same transition can fire again later
+        setTimeout(() => _processedKanbanMarkers.delete(key), 30000);
+        // Fire and forget — send to backend
+        fetch('/api/kanban/tasks/' + taskId + '/ai-status', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ new_status: newStatus, session_id: liveSessionId || '' }),
+        }).then(r => {
+            if (r.ok) console.log('[kanban-ai] Status updated:', taskId, '->', newStatus);
+            else r.json().then(d => console.warn('[kanban-ai] Status change rejected:', d.error || d));
+        }).catch(e => console.warn('[kanban-ai] Status change failed:', e));
+    }
+}
+
+// ---- Periodic state resync heartbeat ----
+// SocketIO events can be silently lost (transport hiccup, emit failure,
+// tab sleep). Re-request full state every 30s so stale UI self-corrects
+// within one interval instead of requiring a manual refresh.
+setInterval(() => {
+    // Include the tab's active project so the server filters the snapshot to
+    // THIS tab's project. Without it the server falls back to its global
+    // _active_project; when that differs (multiple projects/sessions open) the
+    // current project's idle sessions get filtered OUT of the snapshot and the
+    // full-replace below demotes them from "idle" to "sleeping" until refresh.
+    if (socket.connected) socket.emit('request_state_snapshot', {project: localStorage.getItem('activeProject') || ''});
+}, 30000);
+
+// NOTE: No foreground zombie-socket watchdog here: cycling the socket after
+// a stretch of silence fires on healthy idle sockets and drops in-flight
+// session_entry pushes mid-stream. If a foregrounded socket
+// really did die silently, the 30s heartbeat above (request_state_snapshot)
+// will get no reply, Socket.IO's own ping/pong will time out within another
+// ~25s, and the disconnect handler + auto-reconnect will kick in. Erring on
+// the side of stale-UI instead of blowing away live streams.
+
+
+// ---- Continuous stuck-session watchdog ----
+// Catches sessions stuck in "working" that the per-submit watchdog missed
+// (e.g. page refresh during active session, or submit before JS loaded).
+// Runs every 10s, checks if any session has been "working" for >20s with
+// no state events, and forces an HTTP state check to get ground truth.
+setInterval(() => {
+    if (!window._sessionStateTs) return;
+    const now = Date.now();
+    for (const sid in sessionKinds) {
+        if (sessionKinds[sid] !== 'working') continue;
+        // Skip if per-submit watchdog is already monitoring this session
+        if (window._watchdogSid === sid && window._watchdogTimer) continue;
+        const lastEvent = window._sessionStateTs[sid] || 0;
+        // If we got a state event within the last 20s, it's probably fine
+        if (lastEvent && (now - lastEvent) < 20000) continue;
+        // This session looks stuck — do an HTTP check
+        if (typeof _watchdogHttpCheck === 'function') {
+            console.warn('[bg-watchdog] Session', sid, 'appears stuck working (no events for',
+                Math.round((now - lastEvent) / 1000) + 's) — checking via HTTP');
+            _watchdogHttpCheck(sid, true);
+        }
+    }
+}, 10000);
+
+// ---- Startup ----
+window._initialLoadDone = false;
+// Default wrong-session detection to true; overwritten once kanban config loads
+window._wrongSessionDetectionEnabled = true;
+loadProjects().then(() => { window._initialLoadDone = true; }).catch(() => { window._initialLoadDone = true; });
+// Load wrong-session detection preference from kanban config.
+// Fail-open: defaults to true on error.
+fetch('/api/kanban/config').then(r => r.ok ? r.json() : {}).then(cfg => {
+  window._wrongSessionDetectionEnabled = cfg.wrong_session_detection !== false;
+  // opt-in; redraws the sidebar statuses if it differs from the cached value
+  if (typeof cfg.smart_termination !== 'boolean') { /* unknown: keep the cached value */ }
+  else if (typeof window.applySmartTerminationView === 'function') window.applySmartTerminationView(cfg.smart_termination);
+  else window._smartTerminationEnabled = cfg.smart_termination;
+}).catch(() => { /* fail-open: keep default true */ });
+// Git status polling — initial check + 60s interval
+if (typeof pollGitStatus === 'function') {
+  pollGitStatus();
+  setInterval(pollGitStatus, 60000);
+}
+// Initialize folder tree from server (shows template selector on first run)
+if (typeof initFolderTree === 'function') {
+  initFolderTree().catch(function(e) { console.error('initFolderTree failed', e); });
+}

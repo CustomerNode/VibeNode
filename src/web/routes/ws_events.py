@@ -1,0 +1,1387 @@
+"""
+WebSocket event handlers for real-time session communication via Flask-SocketIO.
+
+Server -> Client events:
+    state_snapshot, session_state, session_entry, session_permission,
+    session_started, session_log, session_model_result, session_effort_result
+
+Client -> Server events:
+    connect, start_session, send_message, permission_response,
+    interrupt_session, close_session, get_session_log, set_permission_policy,
+    set_session_model, set_session_effort
+"""
+
+import json
+import logging
+import os
+import re
+import time
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+
+from flask import request as flask_request
+from flask_socketio import emit
+
+logger = logging.getLogger(__name__)
+
+# TTFT wall-clock instrumentation. When VIBENODE_TIMING_TTFT=1 the socket
+# handler captures a wall-clock timestamp before the IPC hop to the daemon
+# and passes it through so the daemon can compute T0->T1. Zero cost when
+# unset (single environ.get() per send_message).
+#
+# NOTE: use an explicit token match, NOT ``bool(os.environ.get(...))`` — the
+# latter treats "0", "false", "no" as truthy simply because they are non-empty
+# strings, silently INVERTING the user's intent to disable the flag.  Accepts
+# the standard on-tokens (case-insensitive); everything else — unset, empty,
+# "0", "false", "no" — evaluates to False.
+_TTFT_TIMING_ENABLED = (
+    (os.environ.get("VIBENODE_TIMING_TTFT", "") or "").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
+# Conditional profiling flag — matches daemon's _PROFILE_PIPELINE pattern.
+# Set to False to disable WebSocket handler timing logs.
+_PROFILE_WS = True
+
+# PERF-CRITICAL: Module-level executor — do NOT create per-request. See CLAUDE.md #12.
+#
+# LESSON LEARNED: Compose prompt resolution and cross-session
+# awareness injection are independent operations that both modify system_prompt
+# before start_session.  They were originally sequential, adding up to 200ms
+# for compose sessions.  This module-level ThreadPoolExecutor runs them in
+# parallel.  Creating it per-request would defeat the purpose — thread pool
+# startup overhead would exceed the parallelization benefit.  When only one
+# operation is needed (the common case), it runs directly without the executor.
+_setup_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ws-setup")
+
+# System-user message classification — shared with live_api.py
+from ..platform_utils import is_system_user_content as _is_system_user_content
+from shared.transcripts import sent_back_entry as _sent_back_entry
+from shared.transcripts import automated_source as _automated_source
+from ..platform_utils import system_user_label as _system_user_label
+
+# Sidebar sort uses max(last_msg_ts, file_mtime, access_ts).  We bump
+# access_ts whenever the user clearly interacts with a session via WS
+# (send_message, start_session) so the session bubbles to the top even if
+# the SDK routes the actual write to a different file (resume + remap).
+from ..config import _record_session_access
+
+
+# ---- Entry cache for fast repeated loads ----------------------------------
+# Maps session_id -> (mtime, file_size, entries_list).
+# Invalidated when the .jsonl file's mtime or size changes.
+_entry_cache: dict = {}
+_ENTRY_CACHE_MAX = 200  # max sessions to keep cached
+
+# ---- User-text display cap ------------------------------------------------
+# User messages are capped before display so a runaway prompt can't bloat the
+# log / IPC payload.  But an /invoke message wraps the ENTIRE skill body in
+#     [[invoke::name::path=...]] ...skill... [[/invoke]] <user's own text>
+# and the web client renders that as a gradient pill keyed on the trailing
+# [[/invoke]] closing tag.  A blind text[:CAP] slice on a skill larger than the
+# cap chops off the closing tag, so the pill regex never matches and the client
+# dumps the raw multi-thousand-char skill body into the chat instead of the
+# pill (intermittent, because only skills bigger than the cap break).  Keep the invoke envelope whole regardless
+# of size and cap only the user's own trailing text after [[/invoke]].
+_USER_TEXT_CAP = 20000
+
+
+# ---- Mobile visual channel: headless-over-Tailscale detection + injection ---
+# When you message VibeNode from a phone over Tailscale you cannot see the dev
+# machine's screen. On those turns we prepend a loud preamble telling the agent
+# to SHOW visual results (via preview markers the client renders as cards) rather
+# than describe them. See src/web/static/js/mobile-preview.js for the client side.
+#
+# DETECTION (NOT source-IP based): `tailscale serve` proxies the phone to
+# 127.0.0.1, so request.remote_addr is localhost and useless as a signal. We use,
+# in order: an explicit client flag, the Tailscale identity header serve injects,
+# or the .ts.net Host the phone connected through.
+_MOBILE_PREAMBLE = (
+    "⟦VN-MOBILE⟧\n"
+    "IMPORTANT — HEADLESS MOBILE SESSION (over Tailscale). The user is on a "
+    "phone and CANNOT see this machine's screen. Do NOT describe visual results "
+    "in prose — SHOW them by emitting a preview marker on its own line:\n"
+    "  [[VN-PREVIEW {\"type\":\"image\",\"name\":\"<short name>\",\"src\":\"<url>\"}]]\n"
+    "Two ways to produce a preview:\n"
+    "  1. SCREENSHOT (most reliable — works even though the phone can't reach this "
+    "machine's localhost). Render any URL to an image the phone can see:\n"
+    "       curl -s -X POST http://127.0.0.1:5050/api/preview/render \\\n"
+    "         -H 'Content-Type: application/json' \\\n"
+    "         -d '{\"url\":\"http://localhost:5173\",\"name\":\"Settings screen\"}'\n"
+    "     It returns {\"src\":\"/api/preview/asset/<id>\", \"file\":\"<abs path>\", ...}. "
+    "Emit the src as an \"image\" marker: "
+    "[[VN-PREVIEW {\"type\":\"image\",\"name\":\"Settings screen\",\"src\":\"/api/preview/asset/<id>\"}]]\n"
+    "     ALWAYS VERIFY THE SHOT before sending it: open the returned \"file\" path "
+    "and LOOK at the image. If it's blank, a bare shell, or missing the content you "
+    "expected (a single-page app may still be loading), re-render with a larger "
+    "\"wait_ms\" (e.g. 6000–10000) and/or the correct URL, and look again. Only emit "
+    "a marker once the screenshot actually shows the intended content — never send a "
+    "preview you haven't visually confirmed.\n"
+    "  2. LIVE (interactive) — a \"browser\" marker whose src is a URL. A localhost "
+    "dev-server URL is auto-routed through the tailnet proxy so it loads on the "
+    "phone. Prefer the SCREENSHOT path for reliability; use \"browser\" when the "
+    "user needs to tap through the real UI.\n"
+    "Each marker renders as a tappable card in the user's chat and collects in the "
+    "session's preview gallery. Prefer showing over telling.\n"
+    "NAME THEM DISTINCTLY: the gallery shows each preview's real content (a "
+    "screenshot thumbnails itself; a browser preview shows its URL), and \"name\" is "
+    "the caption under it. Use a specific one (\"Settings — dark mode\", not "
+    "\"Preview\") so a gallery of ten is scannable.\n"
+    "⟦/VN-MOBILE⟧"
+)
+
+
+def _is_tailnet_turn(data: dict) -> bool:
+    """True when this turn came from a phone over the Tailscale tunnel.
+
+    Cheap and defensive: any signal is enough, and any failure means "not mobile"
+    (the feature simply stays off rather than misfiring on a local turn)."""
+    try:
+        if isinstance(data, dict) and data.get("remote_tailnet"):
+            return True
+    except Exception:
+        pass
+    try:
+        # `tailscale serve` injects this identity header on proxied requests.
+        if flask_request.headers.get("Tailscale-User-Login"):
+            return True
+        host = (flask_request.host or "").lower()
+        if host.endswith(".ts.net") or ".ts.net:" in host:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+_POLICY_CHANGE_LOG = Path(__file__).resolve().parents[3] / "logs" / "permission_policy.log"
+
+
+def _describe_client() -> str:
+    """Who sent this socket event, as far as the request can tell.
+
+    remote_addr alone is useless for phones (tailscale serve proxies them to
+    127.0.0.1), so the Tailscale identity header and Host come first."""
+    parts = []
+    try:
+        login = flask_request.headers.get("Tailscale-User-Login")
+        if login:
+            parts.append("tailnet=" + login)
+        host = flask_request.host or ""
+        if host:
+            parts.append("host=" + host)
+        parts.append("addr=" + (flask_request.remote_addr or "?"))
+        ua = flask_request.headers.get("User-Agent") or ""
+        if ua:
+            parts.append("ua=" + ua[:160])
+        sid = getattr(flask_request, "sid", None)
+        if sid:
+            parts.append("sid=" + str(sid))
+    except Exception:
+        pass
+    return " ".join(parts) or "unknown"
+
+
+def _record_policy_change(old: str, new: str, source: str) -> None:
+    """Write one line per permission-policy change to logs/permission_policy.log.
+
+    The policy applies to every device, and before this nothing recorded who
+    changed it, so an unexpected change could not be traced."""
+    line = "%s  %s -> %s  via=%s  %s" % (
+        time.strftime("%Y-%m-%d %H:%M:%S"), old or "?", new, source or "?",
+        _describe_client())
+    logger.info("Permission policy change: %s", line)
+    try:
+        _POLICY_CHANGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(_POLICY_CHANGE_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        logger.warning("Could not write %s: %s", _POLICY_CHANGE_LOG, e)
+
+
+_CARD_SHOTS_NOTE = (
+    "SMART TERMINATION IS ON: your turn ends with the ```handoff card alone. In the "
+    "final message, put each screenshot INSIDE the card as a \"links\" entry "
+    "{\"label\": \"<short name>\", \"kind\": \"image\", \"url\": \"/api/preview/asset/<id>\"}, "
+    "never as a marker outside it.\n"
+)
+
+
+def _with_mobile_preamble(text: str) -> str:
+    """Prepend the headless-mobile preamble to an outgoing user message."""
+    if not text:
+        return text
+    pre = _MOBILE_PREAMBLE
+    try:
+        from shared.config import get_kanban_config
+        if get_kanban_config().get("smart_termination") is True:
+            pre = pre.replace("⟦/VN-MOBILE⟧", _CARD_SHOTS_NOTE + "⟦/VN-MOBILE⟧")
+    except Exception:
+        pass
+    return pre + "\n\n" + text
+
+
+def _cap_user_text(text: str, limit: int = _USER_TEXT_CAP) -> str:
+    """Cap user text for display without ever splitting an [[invoke]] block."""
+    if not text:
+        return text
+    if "[[invoke::" in text:
+        end = text.rfind("[[/invoke]]")
+        if end != -1:
+            end += len("[[/invoke]]")
+            return text[:end] + text[end:end + limit]
+    return text[:limit]
+
+
+def _user_row(text, obj):
+    """A user timeline row; one the owner did not type carries ``auto``
+    (who sent it), drawn as an Automated session message."""
+    auto = _automated_source(text, bool(obj.get("isMeta")) if isinstance(obj, dict) else False)
+    return {"kind": "user", "text": text, "auto": auto} if auto else {"kind": "user", "text": text}
+
+
+def _parse_raw_line(raw: str) -> list:
+    """Parse a single JSONL line into zero or more structured entries."""
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return []
+    t = obj.get("type", "")
+    if t in ("file-history-snapshot", "custom-title", "progress"):
+        return []
+    entries = []
+    if t == "user":
+        msg = obj.get("message", {})
+        content = msg.get("content", "")
+        if isinstance(content, str) and content.strip():
+            text = _cap_user_text(content.strip())
+            if _sent_back_entry(text):
+                entries.append(_sent_back_entry(text))
+            elif _is_system_user_content(text):
+                entries.append({"kind": "system", "text": _system_user_label(text)})
+            else:
+                entries.append(_user_row(text, obj))
+        elif isinstance(content, list):
+            for block in content:
+                bt = block.get("type", "")
+                if bt == "text" and block.get("text", "").strip():
+                    text = _cap_user_text(block["text"].strip())
+                    if _sent_back_entry(text):
+                        entries.append(_sent_back_entry(text))
+                    elif _is_system_user_content(text):
+                        entries.append({"kind": "system", "text": _system_user_label(text)})
+                    else:
+                        entries.append(_user_row(text, obj))
+                elif bt == "tool_result":
+                    rc = block.get("content", "")
+                    if isinstance(rc, list):
+                        rt = " ".join(
+                            b.get("text", "") for b in rc
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
+                    else:
+                        rt = str(rc)
+                    entries.append({
+                        "kind": "tool_result",
+                        "tool_use_id": block.get("tool_use_id", ""),
+                        "text": rt[:20000],
+                        "is_error": bool(block.get("is_error")),
+                    })
+    elif t == "assistant":
+        msg = obj.get("message", {})
+        content = msg.get("content", "")
+        if isinstance(content, str) and content.strip():
+            entries.append({"kind": "asst", "text": content.strip()[:50000]})
+        elif isinstance(content, list):
+            for block in content:
+                bt = block.get("type", "")
+                if bt == "text" and block.get("text", "").strip():
+                    entries.append({"kind": "asst", "text": block["text"].strip()[:50000]})
+                elif bt == "tool_use":
+                    inp = block.get("input") or {}
+                    if "command" in inp:
+                        desc = inp["command"][:300]
+                    elif "path" in inp:
+                        desc = inp["path"]
+                        if "content" in inp:
+                            desc += f" (write {len(str(inp.get('content', '')))} chars)"
+                    elif "pattern" in inp:
+                        desc = inp["pattern"][:200]
+                    elif inp:
+                        first_key = next(iter(inp))
+                        desc = f"{first_key}: {str(inp[first_key])[:200]}"
+                    else:
+                        desc = ""
+                    entries.append({
+                        "kind": "tool_use",
+                        "id": block.get("id", ""),
+                        "name": block.get("name", ""),
+                        "desc": desc,
+                    })
+    return entries
+
+
+def _parse_jsonl_entries(app, session_id: str, since: int = 0, project: str = "",
+                         tail: int = 0) -> list:
+    """Parse .jsonl file on disk to produce structured log entries.
+
+    Reuses the same logic as live_api.py's api_session_log endpoint so that
+    historical sessions display correctly in the live panel.
+
+    Performance optimisations for long sessions:
+    - mtime-based in-memory cache: second+ loads are near-instant.
+    - ``tail`` parameter: when set, only the last ``tail`` *lines* of the
+      file are read from disk (binary seek from EOF). This avoids reading
+      the entire multi-MB file for the common case of showing the latest
+      messages. The caller is responsible for requesting enough tail lines
+      to cover the desired entry count (lines != entries because some lines
+      are filtered and some produce multiple entries).
+    """
+    import os
+    from ..config import _sessions_dir
+
+    path = _sessions_dir(project) / f"{session_id}.jsonl"
+    if not path.exists():
+        return []
+
+    try:
+        st = os.stat(path)
+        mtime = st.st_mtime
+        fsize = st.st_size
+    except OSError:
+        return []
+
+    # --- Cache hit? --------------------------------------------------------
+    cached = _entry_cache.get(session_id)
+    if cached and cached[0] == mtime and cached[1] == fsize:
+        entries = cached[2]
+        return entries[since:] if since else entries
+
+    # --- Read file (full or tail) ------------------------------------------
+    raw_lines: list
+    is_partial = False  # True when we only read the tail
+
+    if tail and tail > 0 and fsize > 0:
+        # Binary tail-read: seek back from EOF to get ~tail lines.
+        # Over-read by 50% to account for filtered lines.
+        try:
+            with open(path, 'rb') as fh:
+                # Estimate bytes: read last chunk sized for the requested
+                # number of lines.  Average JSONL line is ~1-2KB but tool
+                # results can be much larger.  Start with a generous guess
+                # and expand if we don't get enough lines.
+                target_lines = int(tail * 1.5) + 20
+                chunk = min(fsize, target_lines * 3000)
+                fh.seek(max(0, fsize - chunk))
+                if fh.tell() != 0:
+                    fh.readline()  # discard partial first line
+                data = fh.read().decode('utf-8', errors='replace')
+            raw_lines = [l for l in data.splitlines() if l.strip()]
+            is_partial = True
+        except Exception:
+            return []
+    else:
+        try:
+            raw_lines = [l for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+        except Exception:
+            return []
+
+    # --- Parse lines -------------------------------------------------------
+    entries = []
+    for raw in raw_lines[since if not is_partial else 0:]:
+        entries.extend(_parse_raw_line(raw))
+
+    # --- Populate cache (only for full reads) ------------------------------
+    if not is_partial:
+        # Evict oldest if cache is too large
+        if len(_entry_cache) >= _ENTRY_CACHE_MAX:
+            try:
+                oldest_key = next(iter(_entry_cache))
+                del _entry_cache[oldest_key]
+            except StopIteration:
+                pass
+        _entry_cache[session_id] = (mtime, fsize, entries)
+        return entries[since:] if since else entries
+
+    return entries
+
+
+def register_ws_events(socketio, app):
+    """Register all WebSocket event handlers with the SocketIO instance."""
+
+    def _filter_sessions_for_project(sessions: list, project: str = "") -> list:
+        """Return only sessions whose cwd matches the active project."""
+        from ..config import cwd_matches_active_project
+        return [s for s in sessions
+                if not s.get("cwd") or cwd_matches_active_project(s["cwd"], project=project)]
+
+    @socketio.on('connect')
+    def handle_connect():
+        """On connect, send a full state snapshot immediately.
+
+        Uses the project from the SocketIO query param (set from localStorage
+        at page load) so sessions are filtered correctly.  The client also
+        sends request_state_snapshot right after connect as a backup, but
+        this initial snapshot ensures running sessions show their true state
+        without any delay.
+        """
+        from flask import request as flask_request
+        # Same two-tier rule as the HTTP routes (src/web/mobile_auth.py): the
+        # Origin must be loopback or the Mobile Command host, and the caller
+        # must be local or paired. False refuses the connection.
+        from .. import mobile_auth
+        allowed, why = mobile_auth.socket_connection_allowed(app)
+        if not allowed:
+            logger.warning("WebSocket connect refused (%s): %s", why, _describe_client())
+            return False
+        project = ""
+        try:
+            project = (flask_request.args.get("project") or "").strip()
+        except Exception:
+            pass
+        sm = app.session_manager
+        sessions = _filter_sessions_for_project(sm.get_all_states(), project=project)
+        queues = {}
+        for s in sessions:
+            q = s.get('queue')
+            if q:
+                queues[s['session_id']] = q
+        aliases = dict(sm._id_aliases) if hasattr(sm, '_id_aliases') else {}
+        emit('state_snapshot', {'sessions': sessions, 'queues': queues, 'aliases': aliases})
+        logger.debug("WebSocket client connected, sent %d session states", len(sessions))
+
+    @socketio.on('disconnect')
+    def handle_disconnect():
+        logger.debug("WebSocket client disconnected")
+    # NOTE: A client_ping / client_pong handler used to live here (added and
+    # reverted). It fed a client-side heartbeat that cycled the
+    # WebSocket transport when pongs came back too slowly under load, which
+    # cascaded into daemon IPC pressure and "Engine Stopped" flashing. See
+    # CLAUDE.md "Mobile socket recovery" section. Do NOT re-add without
+    # (a) proving pong latency is decoupled from Flask worker load, and
+    # (b) a strict guarantee that no socket cycle can ever chain into
+    #     another socket cycle within the same 60s.
+
+    @socketio.on('request_state_snapshot')
+    def handle_request_state_snapshot(data=None):
+        """Re-send full state snapshot on demand (e.g. after workspace switch).
+
+        Accepts optional ``{project: "encoded-name"}`` so the snapshot is
+        filtered to the correct project without mutating _active_project.
+        """
+        project = ""
+        if isinstance(data, dict):
+            project = (data.get("project") or "").strip()
+        # Sync the global _active_project as a safety net for endpoints
+        # that don't receive an explicit project param (e.g. get_session_log).
+        if project:
+            from ..config import set_active_project, get_active_project, _CLAUDE_PROJECTS
+            if get_active_project() != project and (_CLAUDE_PROJECTS / project).is_dir():
+                set_active_project(project)
+                logger.info("Synced active project from client: %s", project)
+        sm = app.session_manager
+        if hasattr(sm, "is_connected") and not sm.is_connected:
+            emit("state_snapshot", {"sessions": [], "queues": {}, "aliases": {}})
+            return
+        # The All projects view (src/web/static/js/all-projects.js) asks for every
+        # project's sessions; the reply says so, and the client replaces its
+        # whole state only from such a reply.
+        all_projects = isinstance(data, dict) and bool(data.get("all_projects"))
+        states = sm.get_all_states()
+        sessions = list(states) if all_projects else _filter_sessions_for_project(states, project=project)
+        queues = {}
+        for s in sessions:
+            q = s.get('queue')
+            if q:
+                queues[s['session_id']] = q
+        aliases = dict(sm._id_aliases) if hasattr(sm, '_id_aliases') else {}
+        payload = {'sessions': sessions, 'queues': queues, 'aliases': aliases}
+        if all_projects:
+            payload['all_projects'] = True
+        emit('state_snapshot', payload)
+
+    @socketio.on('start_session')
+    def handle_start_session(data):
+        """Start a new or resumed SDK session."""
+        if _PROFILE_WS:
+            _t0_start = time.perf_counter()
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        session_id = data.get('session_id', '').strip()
+        prompt = data.get('prompt', '').strip()
+        cwd = data.get('cwd', '').strip()
+        name = data.get('name', '').strip()
+        resume = bool(data.get('resume', False))
+
+        # Optional session options
+        model = (data.get('model') or '').strip() or None
+        system_prompt = (data.get('system_prompt') or '').strip() or None
+        thinking_level = (data.get('thinking_level') or '').strip() or None
+        max_turns = data.get('max_turns')
+        if max_turns is not None:
+            try:
+                max_turns = int(max_turns)
+            except (ValueError, TypeError):
+                max_turns = None
+        allowed_tools = data.get('allowed_tools')
+        if not isinstance(allowed_tools, list):
+            allowed_tools = None
+        permission_mode = (data.get('permission_mode') or '').strip() or None
+        if permission_mode and permission_mode not in ('default', 'plan', 'acceptEdits', 'bypassPermissions'):
+            permission_mode = None
+        session_type = (data.get('session_type') or '').strip() or ""
+
+        # --- Compose task detection + cross-session awareness ----
+        # These two operations are independent and can run in parallel
+        # when both are needed.  Each modifies system_prompt, so we
+        # collect results and apply them sequentially after both finish.
+        compose_task_id = (data.get('compose_task_id') or '').strip() or None
+
+        # Route utility sessions to a separate project so their JSONL files
+        # never appear in the user's project.
+        if session_type in ('planner', 'title'):
+            from pathlib import Path as _Path
+            from ..config import _SYSTEM_UTILITY_CWD
+            _Path(_SYSTEM_UTILITY_CWD).mkdir(parents=True, exist_ok=True)
+            cwd = _SYSTEM_UTILITY_CWD
+
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+
+        # Record interaction so the sidebar sort surfaces this session.
+        # Skip utility/title sessions — those are background helpers the
+        # user never sees and shouldn't bubble in their sidebar.
+        if session_type not in ('planner', 'title'):
+            try:
+                _record_session_access(session_id,
+                                       (data.get('project') or '').strip())
+            except Exception:
+                pass
+
+        # Check if cross-session awareness is enabled (for non-utility sessions)
+        want_awareness = False
+        if session_type not in ('planner', 'title'):
+            try:
+                from ..config import get_kanban_config
+                want_awareness = get_kanban_config().get("cross_session_awareness", True)
+            except Exception:
+                pass
+
+        # -- Helper functions for parallel execution --
+        def _resolve_compose():
+            """Resolve compose system prompt.  Returns prompt string or None."""
+            try:
+                from .compose_api import resolve_compose_system_prompt
+                cp_result = resolve_compose_system_prompt(compose_task_id)
+                if cp_result.get('ok') and cp_result.get('system_prompt'):
+                    logger.info(
+                        "Injected compose system prompt for task %s "
+                        "(role=%s) into session %s",
+                        compose_task_id, cp_result.get('agent_role', '?'),
+                        session_id,
+                    )
+                    return cp_result['system_prompt']
+                else:
+                    logger.warning(
+                        "Could not resolve compose prompt for task %s: %s",
+                        compose_task_id, cp_result.get('error', 'unknown'),
+                    )
+            except Exception:
+                logger.exception(
+                    "Error resolving compose prompt for task %s", compose_task_id
+                )
+            return None
+
+        def _resolve_awareness():
+            """Build cross-session awareness context.  Returns context string or None."""
+            try:
+                from ..config import _encode_cwd
+                from ..session_awareness import build_cross_session_context
+                return build_cross_session_context(
+                    daemon_client=app.session_manager,
+                    project=_encode_cwd(cwd),
+                    current_session_id=session_id,
+                )
+            except Exception:
+                logger.debug("Cross-session awareness injection failed", exc_info=True)
+            return None
+
+        compose_prompt = None
+        cross_ctx = None
+
+        if compose_task_id and want_awareness:
+            # Both needed — run in parallel
+            compose_future = _setup_executor.submit(_resolve_compose)
+            awareness_future = _setup_executor.submit(_resolve_awareness)
+            try:
+                compose_prompt = compose_future.result(timeout=10)
+            except Exception:
+                logger.debug("Compose resolution timed out or failed", exc_info=True)
+            try:
+                cross_ctx = awareness_future.result(timeout=10)
+            except Exception:
+                logger.debug("Awareness resolution timed out or failed", exc_info=True)
+        elif compose_task_id:
+            compose_prompt = _resolve_compose()
+        elif want_awareness:
+            cross_ctx = _resolve_awareness()
+
+        if _PROFILE_WS:
+            logger.info("PROFILE start_session [%s] compose+awareness resolved: %.3fs",
+                        session_id[:12], time.perf_counter() - _t0_start)
+
+        # Apply results to system_prompt (order: compose first, awareness second)
+        if compose_prompt:
+            system_prompt = (
+                system_prompt + '\n\n' + compose_prompt
+                if system_prompt else compose_prompt
+            )
+        if cross_ctx:
+            system_prompt = (
+                system_prompt + '\n\n' + cross_ctx
+                if system_prompt else cross_ctx
+            )
+
+        # Tag initial prompt with metadata (timestamp + voice indicator)
+        voice = bool(data.get('voice'))
+        if prompt and session_type not in ('planner', 'title'):
+            from datetime import datetime as _dt
+            _ts_tag = '\n\nSent from Q at ' + _dt.now().strftime('%Y-%m-%d %I:%M %p')
+            if voice:
+                _ts_tag += ' (transcribed from voice \u2014 may contain transcription errors)'
+            prompt = prompt + _ts_tag
+
+        # Mobile visual channel: on a headless-over-Tailscale turn, prepend the
+        # loud preamble so the agent shows visual results instead of describing
+        # them. Client strips the \u27e6VN-MOBILE\u27e7 block from the user's own bubble.
+        if prompt and session_type not in ('planner', 'title') and _is_tailnet_turn(data):
+            prompt = _with_mobile_preamble(prompt)
+
+        # Build extra_args from thinking_level — maps to the --effort CLI flag.
+        # The allowlist is exactly what `claude --effort` accepts (verified
+        # against `claude --help`, CLI 2.1.283); the CLI only warns on anything
+        # else and silently runs at the default (verified live with
+        # `--effort auto`), so it is filtered here.  '' / missing sends no flag: a new session runs
+        # at the model's default and a resumed one keeps the effort the daemon
+        # remembers.  'default' is an explicit reset to the model default on a
+        # resume (the live effort switch), so the remembered effort is dropped.
+        # 'none' is a legacy value from the removed "None" option; it never
+        # disabled thinking and is treated as no flag.
+        extra_args: dict = {}
+        effort_reset = thinking_level == 'default'
+        if thinking_level in ('low', 'medium', 'high', 'xhigh', 'max'):
+            extra_args['effort'] = thinking_level
+        _start_kwargs = {'effort_reset': True} if effort_reset else {}
+
+        sm = app.session_manager
+        if _PROFILE_WS:
+            logger.info("PROFILE start_session [%s] pre-processing done: %.3fs",
+                        session_id[:12], time.perf_counter() - _t0_start)
+        result = sm.start_session(
+            session_id=session_id,
+            prompt=prompt,
+            cwd=cwd,
+            name=name,
+            resume=resume,
+            model=model,
+            system_prompt=system_prompt,
+            max_turns=max_turns,
+            allowed_tools=allowed_tools,
+            permission_mode=permission_mode,
+            session_type=session_type,
+            extra_args=extra_args or None,
+            **_start_kwargs,
+        )
+
+        if result.get('ok'):
+            # Emit immediately so the client isn't blocked
+            emit('session_started', {'session_id': session_id})
+            if _PROFILE_WS:
+                logger.info("PROFILE start_session [%s] session_started emitted: %.3fs",
+                            session_id[:12], time.perf_counter() - _t0_start)
+            # Link session to compose task after emitting (non-blocking)
+            if compose_task_id:
+                try:
+                    from .compose_api import link_session_to_compose_task
+                    link_session_to_compose_task(compose_task_id, session_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to auto-link session %s to compose task %s",
+                        session_id, compose_task_id,
+                    )
+        else:
+            emit('error', {
+                'message': result.get('error', 'Failed to start session'),
+                'session_id': session_id,
+            })
+
+    @socketio.on('send_message')
+    def handle_send_message(data):
+        """Send a follow-up message to an idle session."""
+        # TTFT #0: capture T0 (wall-clock) BEFORE any parsing/validation, so
+        # the measured delta faithfully includes even the small guard cost.
+        # time.time_ns() is comparable across processes (server↔daemon), which
+        # perf_counter() is not. Zero cost when instrumentation is disabled.
+        _ttft_t0_ns = time.time_ns() if _TTFT_TIMING_ENABLED else 0
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        session_id = data.get('session_id', '').strip()
+        text = data.get('text', '').strip()
+        voice = bool(data.get('voice'))
+
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+        if not text:
+            emit('error', {'message': 'text is required'})
+            return
+
+        # Mobile visual channel: follow-up turns don't re-set system_prompt, so
+        # inject the headless-mobile preamble into the message text on every
+        # Tailscale turn. Client strips the ⟦VN-MOBILE⟧ block from display.
+        if _is_tailnet_turn(data):
+            text = _with_mobile_preamble(text)
+
+        sm = app.session_manager
+        result = sm.send_message(session_id, text, voice=voice, _ttft_t0_ns=_ttft_t0_ns)
+
+        # Record interaction even on failure — the user touched this session,
+        # they expect the sidebar to reflect that regardless of IPC outcome.
+        try:
+            project = (data.get('project') or '').strip()
+            _record_session_access(session_id, project)
+        except Exception:
+            pass
+
+        if result.get('ok'):
+            # Acknowledge receipt so the client knows the message was accepted.
+            emit('message_ack', {'session_id': session_id})
+            try:   # the user sent something: the card's queue line starts over
+                from web import queue_history
+                queue_history.note_direct(session_id)
+            except Exception:
+                pass
+        elif result.get('queued'):
+            # Daemon auto-queued because session wasn't idle
+            emit('message_ack', {'session_id': session_id, 'queued': True})
+        else:
+            # Send failed (IPC timeout, daemon busy, etc).
+            # Emit a send_failed event so the frontend can show the user
+            # exactly what happened and preserve their message text inline.
+            err = result.get('error', 'Unknown error')
+            logger.warning("send_message failed for %s: %s", session_id, err)
+            emit('send_failed', {
+                'session_id': session_id,
+                'error': err,
+                'text': text,
+            })
+
+    @socketio.on('permission_response')
+    def handle_permission_response(data):
+        """Resolve a pending permission request."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        session_id = data.get('session_id', '').strip()
+        action = data.get('action', '').strip().lower()
+
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+        if action not in ('y', 'n', 'a', 'aa'):
+            emit('error', {'message': 'action must be y, n, a, or aa'})
+            return
+
+        allow = action in ('y', 'a', 'aa')
+        always = action == 'a'
+        almost_always = action == 'aa'
+
+        sm = app.session_manager
+
+        # Daemon handles both hook and SDK permissions via resolve_permission
+        result = sm.resolve_permission(session_id, allow=allow, always=always,
+                                       almost_always=almost_always)
+        if isinstance(result, dict) and not result.get('ok'):
+            emit('error', {
+                'message': result.get('error', 'Failed to resolve permission'),
+                'session_id': session_id,
+            })
+
+    @socketio.on('interrupt_session')
+    def handle_interrupt_session(data):
+        """Interrupt a running session."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        session_id = data.get('session_id', '').strip()
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+
+        sm = app.session_manager
+        result = sm.interrupt_session(session_id)
+
+        if not result.get('ok'):
+            emit('error', {
+                'message': result.get('error', 'Failed to interrupt session'),
+                'session_id': session_id,
+            })
+
+    @socketio.on('set_session_model')
+    def handle_set_session_model(data):
+        """Switch a running session's model mid-session (applies from the
+        next turn).  Always replies with 'session_model_result' carrying the
+        daemon's honest outcome — the UI must only update its badge on
+        ok=True.  The daemon only reports ok=True after the Claude CLI
+        confirmed the switch via the control protocol."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        session_id = (data.get('session_id') or '').strip()
+        model = (data.get('model') or '').strip()
+        if not session_id or not model:
+            emit('session_model_result', {
+                'ok': False, 'session_id': session_id,
+                'error': 'session_id and model are required',
+            })
+            return
+
+        # resume_turn: also re-run the turn an error interrupted.  Sent only by
+        # the usage-limit CTA ("switch AND carry on"), never by the plain model
+        # badge — changing models there must not silently spend a turn.
+        resume_turn = bool(data.get('resume_turn'))
+
+        sm = app.session_manager
+        try:
+            result = sm.set_session_model(session_id, model,
+                                          resume_turn=resume_turn)
+        except Exception as e:
+            result = {'ok': False, 'error': str(e)}
+
+        payload = {
+            'ok': bool(result.get('ok')),
+            'session_id': session_id,
+            'model': result.get('model', model),
+            # True when the daemon had to RESUME a not-live session with
+            # --model rather than send a live set_model control request.  The
+            # usage-limit CTA needs this: a resumed session is already coming
+            # back up on its own, so firing retry_now at it would be rejected
+            # for not being idle, whereas a live switch leaves the interrupted
+            # turn unfinished and does need that nudge.
+            'resumed': bool(result.get('resumed')),
+            # True when that resume ALSO carried the interrupted turn's prompt,
+            # so the UI can say "resuming your request" honestly instead of
+            # claiming a continuation that did not happen.
+            'turn_resumed': bool(result.get('turn_resumed')),
+        }
+        if not payload['ok']:
+            payload['error'] = result.get('error', 'Model switch failed')
+        emit('session_model_result', payload)
+
+    @socketio.on('set_session_effort')
+    def handle_set_session_effort(data):
+        """Change a session's thinking level in place, mid-turn included.
+
+        Always replies with 'session_effort_result'.  ``ok`` is True only after
+        the CLI confirmed the level; otherwise exactly one of ``not_live``,
+        ``not_ready`` or ``live_unavailable`` tells the browser which fallback
+        applies (see SessionManager.set_session_effort).  ``effort`` is a CLI
+        level, or 'default' / '' for the model's own default.
+        """
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        # str(): a malformed (non-string) field must still get a reply; the
+        # browser waits for one before it falls back.
+        session_id = str(data.get('session_id') or '').strip()
+        effort = str(data.get('effort') or '').strip().lower()
+        if not session_id:
+            emit('session_effort_result', {
+                'ok': False, 'session_id': session_id,
+                'error': 'session_id is required',
+            })
+            return
+
+        sm = app.session_manager
+        try:
+            result = sm.set_session_effort(session_id, effort)
+        except Exception as e:
+            result = {'ok': False, 'error': str(e)}
+        if not isinstance(result, dict):
+            result = {'ok': False, 'error': 'No reply from the Session Engine'}
+
+        payload = {
+            'ok': bool(result.get('ok')),
+            'session_id': session_id,
+            'effort': result.get('effort', '' if effort == 'default' else effort),
+            'applied': result.get('applied'),
+            'not_live': bool(result.get('not_live')),
+            'not_ready': bool(result.get('not_ready')),
+            'live_unavailable': bool(result.get('live_unavailable')),
+        }
+        if not payload['ok']:
+            payload['error'] = result.get('error', 'Thinking change failed')
+        emit('session_effort_result', payload)
+
+    @socketio.on('cancel_auto_retry')
+    def handle_cancel_auto_retry(data):
+        """Cancel a pending API-error auto-retry countdown (Cancel button)."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        session_id = data.get('session_id', '').strip()
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+
+        sm = app.session_manager
+        result = sm.cancel_auto_retry(session_id)
+
+        if not result.get('ok'):
+            emit('error', {
+                'message': result.get('error', 'Failed to cancel auto-retry'),
+                'session_id': session_id,
+            })
+
+    @socketio.on('retry_now')
+    def handle_retry_now(data):
+        """Fire the auto-retry / manual retry immediately (Retry-now button)."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        session_id = data.get('session_id', '').strip()
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+
+        sm = app.session_manager
+        result = sm.retry_now(session_id)
+
+        if not result.get('ok'):
+            emit('error', {
+                'message': result.get('error', 'Failed to retry'),
+                'session_id': session_id,
+            })
+
+    @socketio.on('close_session')
+    def handle_close_session(data):
+        """Close and disconnect a session."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        session_id = data.get('session_id', '').strip()
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+
+        sm = app.session_manager
+        result = sm.close_session(session_id)
+
+        # "Session not found" is not a failure for a stop — the requested end
+        # state (this session is not running) already holds.  The client now
+        # emits close_session unconditionally so a stop is authoritative even
+        # when its local runningIds is stale, which makes this the common,
+        # expected reply.  Surfacing it as an error toast would spam the user
+        # on every stop of an already-dormant session.
+        err = result.get('error', '')
+        if not result.get('ok') and err != 'Session not found':
+            emit('error', {
+                'message': err or 'Failed to close session',
+                'session_id': session_id,
+            })
+
+    @socketio.on('get_session_log')
+    def handle_get_session_log(data):
+        """Return accumulated log entries for a session.
+
+        First checks the SDK SessionManager for live entries, then falls
+        back to parsing the .jsonl file on disk for historical sessions.
+
+        LESSON LEARNED: An optimization attempted to skip the
+        daemon IPC calls (has_session + get_entries) when the client passed
+        an ``is_working`` flag indicating the session was idle.  This caused
+        a race condition: when the user sent a command to Session A and
+        quickly switched to Session B, then back to A, the client's
+        ``sessionKinds`` state could be stale.  The server would skip the
+        daemon check and return old JSONL data, losing the new command's
+        entries from view.  The optimization was reverted.
+
+        KEY PRINCIPLE: Never use client-side state (sessionKinds, is_working
+        flags) to make server-side correctness decisions about data freshness.
+        Client state is ALWAYS eventually stale during fast switching.  The
+        daemon is the source of truth for live session entries.
+
+        Supports pagination via ``limit`` and ``before`` parameters:
+        - ``limit``: max entries to return (omit for all — backwards compat)
+        - ``before``: return entries ending before this index (for "load older")
+        Response includes ``total``, ``offset``, ``has_more``, and ``prepend``
+        so the client can render a "Load older messages" button and prepend.
+        """
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        session_id = data.get('session_id', '').strip()
+        try:
+            since = int(data.get('since', 0))
+        except (ValueError, TypeError):
+            since = 0
+
+        # Pagination params
+        limit = data.get('limit')  # None = all (backwards compat)
+        before = data.get('before')  # Load entries before this index
+        if limit is not None:
+            try:
+                limit = int(limit)
+            except (ValueError, TypeError):
+                limit = None
+        if before is not None:
+            try:
+                before = int(before)
+            except (ValueError, TypeError):
+                before = None
+
+        project = (data.get("project") or "").strip()
+
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+
+        if _PROFILE_WS:
+            _t0 = time.perf_counter()
+
+        sm = app.session_manager
+
+        # PERF-CRITICAL: initial-page fast path. Reading the WHOLE JSONL and
+        # fetching ALL daemon entries on every session switch / reconnect is
+        # O(N-entries) even though the UI only paints the last LIVE_PAGE_SIZE
+        # entries. For managed sessions we ask the daemon for its cheap
+        # `get_entry_count()` (0-1ms per CLAUDE.md #6) and then fetch just the
+        # last `limit` entries via a bounded `since=count-limit`. For dormant
+        # sessions we tail-read the JSONL instead of the entire file.
+        # Invariant: initial-page reads must tail the JSONL, not read whole.
+        # Load-more (`before` set) keeps its full-parse path — an accurate
+        # `total` is required for older-page pagination and the user has
+        # explicitly asked for older data.
+        initial_page = (before is None
+                        and limit is not None
+                        and limit > 0
+                        and since == 0)
+        managed = sm.has_session(session_id)
+
+        if initial_page and managed:
+            # Prefer the combined status call (count + sticky "was ever
+            # trimmed" flag).  If a rolling-upgrade window exposes an older
+            # daemon that doesn't yet know the method, the client returns
+            # (0, False) which safely falls through to the legacy path.
+            if hasattr(sm, "get_entry_trim_status"):
+                daemon_count, daemon_trimmed = sm.get_entry_trim_status(session_id)
+            else:
+                daemon_count = sm.get_entry_count(session_id)
+                daemon_trimmed = False
+            if _PROFILE_WS:
+                logger.info("PROFILE get_session_log [%s] daemon_count: %.3fs "
+                            "(count=%d trimmed=%s)",
+                            session_id[:12], time.perf_counter() - _t0,
+                            daemon_count, daemon_trimmed)
+            # Fast path is safe ONLY when the daemon has the full history.
+            # Two ways it may not:
+            #   (a) sticky trim flag -- info.entries was trimmed to 200 while
+            #       the JSONL grew unbounded (2000+).  daemon_count is then
+            #       strictly < JSONL entry count, so a fast-path response
+            #       would emit total=daemon_count and hide the older entries.
+            #   (b) daemon just resumed and info.entries hasn't been hydrated
+            #       yet -- daemon_count could be 0 or smaller than the JSONL.
+            # For (b) we cheaply consult the module-level _entry_cache: if a
+            # warm entry exists for this session it IS the JSONL length; if
+            # cold we fall through to the legacy full-parse path (which
+            # warms the cache).  Cold-cache fall-through preserves
+            # correctness at the cost of one legacy-parse per session; every
+            # subsequent visit hits the fast path.
+            if daemon_count > 0 and not daemon_trimmed:
+                _cached = _entry_cache.get(session_id)
+                jsonl_len_hint = len(_cached[2]) if _cached else None
+                # BUGFIX: a prior condition `jsonl_len_hint is None
+                # or daemon_count >= jsonl_len_hint` accidentally took the
+                # fast path on cold cache, contradicting the comment above
+                # and reintroducing the same class of coordinate-mismatch
+                # bug that the trim-flag fix addressed. Cold cache => cannot
+                # verify daemon has full history => fall through to legacy
+                # parse (which warms the cache; subsequent visits fast).
+                if jsonl_len_hint is not None and daemon_count >= jsonl_len_hint:
+                    start_idx = max(0, daemon_count - limit)
+                    page = sm.get_entries(session_id, since=start_idx)
+                    if page:
+                        if _PROFILE_WS:
+                            logger.info("PROFILE get_session_log [%s] fast-managed total: %.3fs "
+                                        "(returned=%d of total=%d, offset=%d)",
+                                        session_id[:12], time.perf_counter() - _t0,
+                                        len(page), daemon_count, start_idx)
+                        emit('session_log', {
+                            'session_id': session_id,
+                            'entries': page,
+                            'total': daemon_count,
+                            'offset': start_idx,
+                            'has_more': start_idx > 0,
+                        })
+                        return
+            # Trimmed / cache-mismatch / daemon_count == 0 / empty page:
+            # fall through to the legacy full-parse path below.
+
+        if initial_page and not managed:
+            # Dormant session initial page: only take the fast path when the
+            # entry cache is warm (i.e. a previous full parse for this exact
+            # (mtime,fsize) is available). Otherwise fall through to the
+            # legacy full-parse path — a cold-cache tail parse cannot advertise
+            # an accurate `total`, and if we report an approximated offset
+            # the subsequent load-more emits `before=offset` into the
+            # full-parse path with a truncated `end`, causing the client to
+            # receive far fewer than `limit` older entries. Correctness beats
+            # a marginal first-hit win here; the second visit is served from
+            # the (now warm) cache below by the legacy path's own cache hit.
+            from ..config import _sessions_dir as _sd
+            import os as _os
+            _p = _sd(project) / f"{session_id}.jsonl"
+            try:
+                _st = _os.stat(_p)
+                _cached = _entry_cache.get(session_id)
+            except OSError:
+                _st = None
+                _cached = None
+            if (_cached
+                    and _st is not None
+                    and _cached[0] == _st.st_mtime
+                    and _cached[1] == _st.st_size):
+                total = len(_cached[2])
+                page = _cached[2][-limit:] if total > limit else _cached[2]
+                start_idx = max(0, total - len(page))
+                if _PROFILE_WS:
+                    logger.info("PROFILE get_session_log [%s] dormant-cache-warm: %.3fs "
+                                "(returned=%d of total=%d)",
+                                session_id[:12], time.perf_counter() - _t0,
+                                len(page), total)
+                emit('session_log', {
+                    'session_id': session_id,
+                    'entries': page,
+                    'total': total,
+                    'offset': start_idx,
+                    'has_more': start_idx > 0,
+                })
+                return
+            # Cold cache: fall through to legacy path (does the full parse,
+            # populates the cache, and returns accurate total/offset).
+
+        # ---- Legacy full-parse path (load-more, no-limit callers, or a
+        # fast-path fall-through). Preserved verbatim for compatibility.
+        entries = _parse_jsonl_entries(app, session_id, since, project=project)
+        if _PROFILE_WS:
+            logger.info("PROFILE get_session_log [%s] jsonl_parsed: %.3fs (%d entries)",
+                        session_id[:12], time.perf_counter() - _t0, len(entries))
+
+        if managed:
+            sdk_entries = sm.get_entries(session_id, since=0)
+            if len(sdk_entries) > len(entries):
+                # Daemon has current-turn data not yet on disk — use it
+                entries = sdk_entries
+            if _PROFILE_WS:
+                logger.info("PROFILE get_session_log [%s] daemon_ipc: %.3fs",
+                            session_id[:12], time.perf_counter() - _t0)
+        if not entries:
+            # Fallback: brand-new session with no JSONL file yet
+            entries = sm.get_entries(session_id, since=0) if managed else []
+
+        total = len(entries)
+
+        if _PROFILE_WS:
+            logger.info("PROFILE get_session_log [%s] total: %.3fs (%d entries returned)",
+                        session_id[:12], time.perf_counter() - _t0, total)
+
+        if before is not None:
+            # Loading older entries: return entries ending before `before` index
+            end = min(before, total)
+            start = max(0, end - (limit or 50))
+            page = entries[start:end]
+            emit('session_log', {
+                'session_id': session_id,
+                'entries': page,
+                'total': total,
+                'offset': start,
+                'has_more': start > 0,
+                'prepend': True,
+            })
+        elif limit and total > limit:
+            # Initial load with pagination: return last `limit` entries
+            start = total - limit
+            page = entries[start:]
+            emit('session_log', {
+                'session_id': session_id,
+                'entries': page,
+                'total': total,
+                'offset': start,
+                'has_more': start > 0,
+            })
+        else:
+            # No pagination needed (backwards compat or small log)
+            emit('session_log', {
+                'session_id': session_id,
+                'entries': entries,
+                'total': total,
+                'offset': 0,
+                'has_more': False,
+            })
+
+    @socketio.on('get_permission_policy')
+    def handle_get_permission_policy():
+        """Return the persisted permission policy to the browser."""
+        sm = app.session_manager
+        try:
+            result = sm.get_permission_policy()
+            emit('permission_policy_loaded', result)
+        except Exception as e:
+            logger.warning("Failed to get permission policy: %s", e)
+            emit('permission_policy_loaded', {'policy': 'manual', 'custom_rules': {}})
+
+    @socketio.on('set_permission_policy')
+    def handle_set_permission_policy(data):
+        """Sync permission policy from browser to server."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+
+        policy = (data.get('policy') or '').strip()
+        custom_rules = data.get('customRules') or {}
+
+        if policy not in ('manual', 'auto', 'almost_always', 'claude_auto', 'custom'):
+            emit('error', {'message': 'Invalid policy: must be manual, auto, almost_always, claude_auto, or custom'})
+            return
+
+        sm = app.session_manager
+        try:
+            old = (sm.get_permission_policy() or {}).get('policy', '')
+        except Exception:
+            old = ''
+        if not isinstance(old, str):
+            old = ''
+        sm.set_permission_policy(policy, custom_rules)
+        source = str(data.get('source') or '')[:40]
+        if old != policy or source == 'custom_rules':
+            _record_policy_change(old, policy, source)
+
+    @socketio.on('get_ui_prefs')
+    def handle_get_ui_prefs():
+        """Return persisted UI preferences to the browser."""
+        sm = app.session_manager
+        try:
+            result = sm.get_ui_prefs()
+            emit('ui_prefs_loaded', result)
+        except Exception as e:
+            logger.warning("Failed to get UI prefs: %s", e)
+            emit('ui_prefs_loaded', {})
+
+    @socketio.on('set_ui_prefs')
+    def handle_set_ui_prefs(data):
+        """Persist UI preferences from browser."""
+        if not isinstance(data, dict):
+            return
+        sm = app.session_manager
+        sm.set_ui_prefs(data)
+        logger.debug("UI prefs synced: %s", list(data.keys()))
+
+    # ------------------------------------------------------------------
+    # Server-side message queue events
+    # ------------------------------------------------------------------
+
+    @socketio.on('queue_message')
+    def handle_queue_message(data):
+        """Add a message to a session's server-side queue."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+        session_id = (data.get('session_id') or '').strip()
+        text = (data.get('text') or '').strip()
+        if not session_id or not text:
+            emit('error', {'message': 'session_id and text are required'})
+            return
+        sm = app.session_manager
+        result = sm.queue_message(session_id, text)
+        if not result.get('ok'):
+            emit('error', {'message': result.get('error', 'Failed to queue'), 'session_id': session_id})
+        else:
+            try:   # for the card's "Also handled" line (src/web/queue_history.py)
+                from web import queue_history
+                queue_history.note_queued(session_id, text)
+            except Exception:
+                pass
+
+    @socketio.on('remove_queue_item')
+    def handle_remove_queue_item(data):
+        """Remove one item from a session's queue."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+        session_id = (data.get('session_id') or '').strip()
+        index = data.get('index', -1)
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+        sm = app.session_manager
+        result = sm.remove_queue_item(session_id, int(index))
+        if not result.get('ok'):
+            emit('error', {'message': result.get('error', 'Failed to remove'), 'session_id': session_id})
+
+    @socketio.on('edit_queue_item')
+    def handle_edit_queue_item(data):
+        """Edit one item in a session's queue."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+        session_id = (data.get('session_id') or '').strip()
+        index = data.get('index', -1)
+        text = (data.get('text') or '').strip()
+        if not session_id or not text:
+            emit('error', {'message': 'session_id and text are required'})
+            return
+        sm = app.session_manager
+        result = sm.edit_queue_item(session_id, int(index), text)
+        if not result.get('ok'):
+            emit('error', {'message': result.get('error', 'Failed to edit'), 'session_id': session_id})
+
+    @socketio.on('clear_queue')
+    def handle_clear_queue(data):
+        """Clear all queued messages for a session."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+        session_id = (data.get('session_id') or '').strip()
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+        sm = app.session_manager
+        result = sm.clear_queue(session_id)
+        if not result.get('ok'):
+            emit('error', {'message': result.get('error', 'Failed to clear'), 'session_id': session_id})
+
+    @socketio.on('get_queue')
+    def handle_get_queue(data):
+        """Return the current queue for a session."""
+        if not isinstance(data, dict):
+            emit('error', {'message': 'Invalid data'})
+            return
+        session_id = (data.get('session_id') or '').strip()
+        if not session_id:
+            emit('error', {'message': 'session_id is required'})
+            return
+        sm = app.session_manager
+        items = sm.get_queue(session_id)
+        emit('queue_updated', {'session_id': session_id, 'queue': items})

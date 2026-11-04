@@ -1,0 +1,453 @@
+"""
+SessionRegistry -- persistent session registry for crash recovery.
+
+Extracted from SessionManager (Phase 3 OOP decomposition).
+"""
+
+import json
+import logging
+import os
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Registry file for crash recovery
+# ---------------------------------------------------------------------------
+REGISTRY_PATH = Path.home() / ".claude" / "gui_active_sessions.json"
+
+# Maximum age (seconds) for a session to be eligible for recovery
+MAX_RECOVERY_AGE = 3600  # 1 hour
+
+# A session with an armed auto-retry or usage-limit continue
+# (src/engine/session_durable.py) is recovered for longer: a weekly limit can
+# reset many hours after the session last did anything.
+ARMED_RECOVERY_AGE = 7 * 86400
+
+# States that mean a session was in active use before the last shutdown.
+# These are the states we "remember" across a restart so the UI can mark the
+# session as previously-active instead of collapsing it to a generic
+# "sleeping".  "starting"/"working"/"waiting" are mid-task; "idle" is at rest
+# but still an open, in-use session the user was tracking.
+_MEMORY_ELIGIBLE_STATES = ("working", "waiting", "starting", "idle")
+
+
+class SessionRegistry:
+    """Persistent session registry for crash recovery."""
+
+    # Debounce window for schedule_registry_save().  A class attribute so tests
+    # can shorten it instead of sleeping through the real 3 seconds.
+    _SAVE_DEBOUNCE_S = 3.0
+
+    def __init__(self):
+        """Initialize the SessionRegistry.
+
+        The registry uses a debounced save pattern: state changes mark
+        the registry dirty and schedule a timer.  When the timer fires,
+        it snapshots the current state and writes it atomically.  This
+        avoids hammering disk on every state transition.
+
+        No arguments -- the registry path is module-level (REGISTRY_PATH)
+        to keep the class stateless with respect to configuration.
+        """
+        self._registry_timer: Optional[threading.Timer] = None
+        self._registry_dirty = False
+
+    # ------------------------------------------------------------------
+    # Registry persistence
+    # ------------------------------------------------------------------
+
+    def load_registry(self) -> dict:
+        """Read the session registry from disk. Returns empty dict on error."""
+        try:
+            if REGISTRY_PATH.exists():
+                data = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and "sessions" in data:
+                    return data
+        except Exception as e:
+            logger.warning("Failed to load session registry: %s", e)
+        return {"sessions": {}}
+
+    def load_last_known_states(self) -> dict:
+        """Snapshot previously-active sessions for restart memory.
+
+        MUST be read once at daemon startup — BEFORE the first debounced
+        registry save (see SessionManager._save_registry_now) overwrites the
+        file with ONLY currently-live sessions.  At that point the file still
+        contains every session that was open before the restart, including the
+        idle ones.
+
+        recover_sessions() deliberately re-launches only mid-task sessions
+        (working/waiting/starting) and leaves idle sessions dormant so the
+        machine doesn't spin up a pile of processes on boot.  The side effect
+        is that dormant sessions vanish from the daemon's live state and the UI
+        shows them as "sleeping", losing the idle/working distinction the user
+        relied on to track their work.  This snapshot preserves that memory.
+
+        Returns a map keyed by session id::
+
+            {
+              "<sid>": {
+                "last_state": "idle" | "working",  # collapsed for display
+                "name": str,
+                "cwd": str,
+                "session_type": str,
+                "last_activity": float,
+              },
+              ...
+            }
+
+        This is display memory only — it never launches or resumes a process.
+        Planner/utility sessions are excluded (never user-tracked work).
+        """
+        out = {}
+        try:
+            registry = self.load_registry()
+            for sid, meta in registry.get("sessions", {}).items():
+                if not isinstance(meta, dict):
+                    continue
+                state = meta.get("state", "")
+                if state not in _MEMORY_ELIGIBLE_STATES:
+                    continue
+                if meta.get("session_type") == "planner":
+                    continue
+                # Collapse the mid-task states to a single "working" marker and
+                # keep "idle" distinct.  A session that was mid-task but failed
+                # to auto-recover is accurately described as "was working".
+                last_state = "idle" if state == "idle" else "working"
+                out[sid] = {
+                    "last_state": last_state,
+                    "name": meta.get("name", ""),
+                    "cwd": meta.get("cwd", ""),
+                    "session_type": meta.get("session_type", ""),
+                    "last_activity": meta.get("last_activity", 0),
+                    # Include the last-confirmed model so /api/sessions can
+                    # render an honest badge for stopped/dormant sessions
+                    # instead of falling back to the client's system default
+                    # (which frequently disagrees with what the session
+                    # actually last ran on).
+                    "model": meta.get("model", ""),
+                    # Launch effort, so a dormant session resumes at the level
+                    # it was running at rather than the CLI default.
+                    "effort": meta.get("effort", ""),
+                }
+        except Exception as e:
+            logger.warning("Failed to snapshot last-known session states: %s", e)
+        return out
+
+    def save_registry_now(self, sessions_snapshot: dict) -> None:
+        """Write the session state to the registry file atomically.
+
+        sessions_snapshot is a dict of {sid: {name, cwd, model, ...}} already
+        prepared by SessionManager (under its lock). This avoids the registry
+        module needing to know about SessionInfo or SessionState.
+
+        Snapshot format on disk:
+            {
+              "sessions": {
+                "<session_id>": {
+                  "name": str,       # user-visible session name
+                  "state": str,      # "working", "waiting", "idle", etc.
+                  "cwd": str,        # working directory path
+                  "model": str,      # model identifier
+                  "last_activity": float,  # time.time() of last state change
+                  "session_type": str,     # "normal" or "planner"
+                },
+                ...
+              }
+            }
+        """
+        try:
+            REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            registry = {"sessions": sessions_snapshot}
+            payload = json.dumps(registry, indent=2, ensure_ascii=False)
+
+            # Atomic write pattern: write to a temp file in the same
+            # directory, then os.replace() to atomically swap.  This
+            # ensures that a crash mid-write never leaves a half-written
+            # registry file that would prevent recovery of ALL sessions.
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=str(REGISTRY_PATH.parent), suffix=".tmp"
+            )
+            try:
+                os.write(tmp_fd, payload.encode("utf-8"))
+                os.close(tmp_fd)
+                # os.replace is used instead of os.rename because on Windows,
+                # os.rename fails if the destination already exists.
+                os.replace(tmp_path, str(REGISTRY_PATH))
+            except Exception:
+                try:
+                    os.close(tmp_fd)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception as e:
+            logger.warning("Failed to save session registry: %s", e)
+
+    def schedule_registry_save(self, save_fn: Callable[[], None]) -> None:
+        """Debounced save -- batches writes so we don't hit disk on every event.
+
+        If a timer is already pending, skip (the pending save will capture
+        the latest state).  Otherwise set a 3-second timer.
+
+        save_fn is the callback that prepares the snapshot and calls
+        save_registry_now(). This avoids the registry needing to know
+        about SessionManager internals.
+        """
+        # Debounce pattern: if a timer is already running, skip this call.
+        # The already-scheduled timer will capture the latest state when it
+        # fires (since save_fn reads state at execution time, not at schedule
+        # time).  This collapses N rapid state changes into a single disk
+        # write, preventing I/O contention during burst activity.
+        if self._registry_timer and self._registry_timer.is_alive():
+            return
+        self._registry_timer = threading.Timer(self._SAVE_DEBOUNCE_S, save_fn)
+        self._registry_timer.daemon = True
+        self._registry_timer.start()
+
+    def recover_sessions(
+        self,
+        start_session_fn: Callable,
+        store,
+        max_age: int = None,
+        mark_inbox_dirty_fn: Optional[Callable[[str], bool]] = None,
+        skip_sids: Optional[set] = None,
+        armed_sids: Optional[set] = None,
+    ) -> None:
+        """Recover sessions that were active before a crash.
+
+        Called once at startup in a background thread. Reads the registry,
+        filters out stale or stopped entries, and resumes each one via the
+        SDK's --resume flag.
+
+        start_session_fn: callback to SessionManager.start_session
+        store: ChatStore instance for finding/repairing session files
+        max_age: override MAX_RECOVERY_AGE for testing
+        mark_inbox_dirty_fn: optional callback to SessionManager.mark_inbox_dirty.
+            When provided, the recovery path checks each recovered session's
+            on-disk inbox.json for ``delivered: false`` entries and flips the
+            in-memory inbox_dirty flag back on so the next send_message turn
+            drains them.  Without this, daemon restart strands undelivered
+            reports.
+        skip_sids: sessions already re-attached to their live Session Host
+            (``src/engine/session_host_registry.reconcile``).  Their CLI never
+            died, so a ``--resume`` would start a SECOND CLI on the same
+            transcript.  Never relaunched here.
+        armed_sids: sessions whose SessionDurable record carries an armed
+            auto-retry or usage-limit continue (``session_durable.
+            armed_session_ids``).  Relaunched even when they were idle at the
+            restart (within ``ARMED_RECOVERY_AGE``), so the timer fires.
+        """
+        if max_age is None:
+            max_age = MAX_RECOVERY_AGE
+        skip_sids = set(skip_sids or ())
+        armed_sids = set(armed_sids or ())
+        try:
+            registry = self.load_registry()
+            sessions = registry.get("sessions", {})
+            if not sessions:
+                logger.debug("No sessions to recover from registry")
+                return
+
+            # ── Subsessions cycle detection ────────────────────────────────
+            # Walk each session's parent_session_id chain up to 32 hops.
+            # If a cycle is detected (which should be impossible given the
+            # spawn-time guard but could happen from registry corruption or
+            # manual edits), force-clear the offending session's
+            # parent_session_id and log a warning.  Recovery must never
+            # crash or loop on a cyclic graph.
+            _MAX_PARENT_CHAIN = 32
+            cleared_parents: set = set()
+            for sid, meta in sessions.items():
+                if sid in cleared_parents:
+                    continue
+                visited = {sid}
+                cursor = meta.get("parent_session_id")
+                hops = 0
+                while cursor and hops < _MAX_PARENT_CHAIN:
+                    if cursor in visited:
+                        logger.warning(
+                            "Subsession parent cycle detected at %s — "
+                            "force-clearing parent_session_id (was %s)",
+                            sid, meta.get("parent_session_id"),
+                        )
+                        meta["parent_session_id"] = None
+                        cleared_parents.add(sid)
+                        break
+                    visited.add(cursor)
+                    parent_meta = sessions.get(cursor)
+                    if not parent_meta:
+                        break
+                    cursor = parent_meta.get("parent_session_id")
+                    hops += 1
+                else:
+                    if cursor and hops >= _MAX_PARENT_CHAIN:
+                        logger.warning(
+                            "Subsession parent chain for %s exceeded %d "
+                            "hops — force-clearing parent_session_id",
+                            sid, _MAX_PARENT_CHAIN,
+                        )
+                        meta["parent_session_id"] = None
+                        cleared_parents.add(sid)
+
+            now = time.time()
+            recovered = 0
+            # Read persisted queues — sessions with messages waiting in their
+            # queue at restart time MUST be recovered too, otherwise the
+            # message sits orphaned with no session task to consume it.  Build
+            # the set once outside the loop so the per-session check is O(1).
+            queued_sids = set()
+            try:
+                from pathlib import Path
+                qpath = Path.home() / ".claude" / "gui_message_queues.json"
+                if qpath.exists():
+                    import json as _json
+                    qdata = _json.loads(qpath.read_text(encoding="utf-8"))
+                    queued_sids = {
+                        sid for sid, msgs in qdata.items()
+                        if isinstance(msgs, list) and msgs
+                    }
+            except Exception as _qerr:
+                logger.warning("Could not read queue file for recovery: %s", _qerr)
+
+            for sid, meta in sessions.items():
+                if sid in skip_sids:
+                    logger.info("Not recovering %s: re-attached to its live "
+                                "Session Host", sid)
+                    continue
+                state = meta.get("state", "stopped")
+                armed = sid in armed_sids
+                # Recover sessions that were mid-task (working/waiting/
+                # starting) OR sessions that have queued messages waiting to
+                # be delivered.  Pure-idle sessions with no queue are skipped
+                # — the user isn't expecting them to do anything until they
+                # send a new message (which auto-resumes them via the
+                # send_message fallback path).
+                if state not in ("working", "waiting", "starting") \
+                        and sid not in queued_sids and not armed:
+                    continue
+
+                # Never recover planner sessions
+                if meta.get("session_type") == "planner":
+                    continue
+
+                last_activity = meta.get("last_activity", 0)
+                age = now - last_activity
+                if age > (max(max_age, ARMED_RECOVERY_AGE) if armed else max_age):
+                    logger.info(
+                        "Skipping stale session %s (%.0f min old)", sid, age / 60
+                    )
+                    continue
+
+                name = meta.get("name", "")
+                cwd = meta.get("cwd", "")
+                if cwd:
+                    cwd = os.path.normpath(cwd)
+                model = meta.get("model", "")
+
+                # Guard: if the .jsonl file was deleted (user chose to delete
+                # the session), do NOT recover it — that would undo the delete.
+                jsonl_path = store.find_session_path(sid, cwd=cwd)
+                if not jsonl_path:
+                    logger.info(
+                        "Skipping recovery of %s — .jsonl file was deleted", sid
+                    )
+                    continue
+
+                # Repair incomplete assistant turns so --resume doesn't choke.
+                # If the daemon was killed mid-response, the last .jsonl entry
+                # is an assistant message with stop_reason=null — the CLI can't
+                # resume from that state and the stream dies immediately.
+                store.repair_incomplete_turn(sid, cwd=cwd)
+
+                logger.info(
+                    "Recovering session %s (%s) from registry", sid, name or "unnamed"
+                )
+
+                # Subsessions: read parent
+                # pointer + origin turn + orphan tombstone back with safe
+                # defaults.  Older registry files written by a
+                # pre-subsessions daemon will be missing these keys;
+                # .get() supplies the documented defaults so recovery
+                # is forward- and backward-compat.
+                parent_sid = meta.get("parent_session_id")
+                subsession_origin_turn = meta.get(
+                    "subsession_origin_turn", 0
+                )
+                # Pass the parent_deleted_at tombstone through recovery.
+                # _save_registry_now() writes it to the snapshot; dropping it
+                # here would let a daemon restart erase the orphan state and
+                # flip the UI back to "reports to: <parent>" for a parent
+                # that no longer exists.
+                parent_deleted_at = meta.get("parent_deleted_at")
+                # Persist the auto-report-on-idle preference
+                # through recovery.  Default False for legacy registries.
+                auto_report_on_idle = bool(
+                    meta.get("auto_report_on_idle", False)
+                )
+
+                # Use start_session with resume=True to reconnect via SDK --resume
+                result = start_session_fn(
+                    session_id=sid,
+                    prompt="",       # no new prompt; just reconnect
+                    cwd=cwd,
+                    name=name,
+                    resume=True,
+                    model=model if model else None,
+                    parent_session_id=parent_sid,
+                    subsession_origin_turn=subsession_origin_turn,
+                    parent_deleted_at=parent_deleted_at,
+                    auto_report_on_idle=auto_report_on_idle,
+                )
+                if result.get("ok"):
+                    recovered += 1
+                    # ── Rehydrate inbox_dirty from disk ──
+                    # If this recovered session has on-disk undelivered
+                    # subsession reports, set its in-memory inbox_dirty
+                    # flag so the next send_message turn drains them.
+                    # Without this, the fast-path in send_message reads
+                    # the cleared flag and skips the disk read forever,
+                    # stranding reports written before the daemon restart.
+                    if mark_inbox_dirty_fn is not None:
+                        try:
+                            from engine.subsession_inbox import has_undelivered
+                            if has_undelivered(sid):
+                                mark_inbox_dirty_fn(sid)
+                                logger.info(
+                                    "Rehydrated inbox_dirty=True for "
+                                    "recovered session %s", sid,
+                                )
+                        except Exception as e:
+                            logger.debug(
+                                "inbox_dirty rehydration soft-fail for %s: %s",
+                                sid, e,
+                            )
+                else:
+                    logger.warning(
+                        "Failed to recover session %s: %s",
+                        sid, result.get("error", "unknown")
+                    )
+
+            if recovered:
+                logger.info("Recovered %d session(s) from crash registry", recovered)
+
+            # Clear the registry now that recovery is done; ongoing state
+            # changes will re-populate it via _schedule_registry_save()
+            # (Don't clear -- let the normal emit_state cycle keep it updated)
+
+        except Exception as e:
+            logger.exception("Session recovery failed: %s", e)
+
+    def cancel_timer(self) -> None:
+        """Cancel any pending debounced save timer."""
+        if self._registry_timer:
+            self._registry_timer.cancel()
+            self._registry_timer = None

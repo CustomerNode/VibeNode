@@ -1,0 +1,3491 @@
+/* sessions.js — sorting, list rendering, tooltips, column resize, click handling */
+
+// _shortDate() lives in time-utils.js
+
+// ===========================================================================
+// Unread indicator (iOS-style dot)
+// ===========================================================================
+//
+// A session is "unread" when it produced assistant output while the user was
+// NOT looking at it.  The dot is deliberately conservative:
+//
+//   * Only set from `session_entry` for a session that is not the live one
+//     (see socket.js — the flag is raised next to the entry-consistency block).
+//   * Only RENDERED when the session has settled to `idle`.  A working session
+//     already advertises itself with the pickaxe icon and a moving row; adding
+//     a second "look at me" signal there is noise.  The dot is the quiet
+//     "this one finished and you haven't read it" cue, which is exactly the
+//     iOS Mail semantic.
+//   * Never rendered on the active session — you're looking at it.
+//
+// Persisted to localStorage so a refresh (or a phone waking up) doesn't lose
+// the "you haven't read this" state.  Storage is bounded by a size cap on save
+// (see `_saveUnreadSessions`) so deleted sessions can't accumulate forever.
+const _UNREAD_STORAGE_KEY = 'vn_unread_sessions';
+const _UNREAD_PREF_KEY = 'unreadDots';   // 'off' disables; absent/anything else = on
+
+/** Session IDs with unread assistant output. @type {Set<string>} */
+let _unreadSessions = (function () {
+  try {
+    const raw = JSON.parse(localStorage.getItem(_UNREAD_STORAGE_KEY) || '[]');
+    return new Set(Array.isArray(raw) ? raw : []);
+  } catch (_e) {
+    return new Set();
+  }
+})();
+
+/**
+ * Is the unread-dot feature turned on?  Controlled by the "Unread indicators"
+ * toggle in Preferences.  Defaults to ON when the key has never been written.
+ * @returns {boolean}
+ */
+function unreadDotsEnabled() {
+  return localStorage.getItem(_UNREAD_PREF_KEY) !== 'off';
+}
+
+/**
+ * Mirror the preference onto <body> so CSS can reserve the list-mode dot lane.
+ *
+ * The gutter that keeps read and unread rows aligned has to exist on EVERY row,
+ * including read ones — but only when the feature is on, otherwise disabling
+ * the preference would leave a permanent empty margin in the sidebar. CSS can't
+ * read localStorage, hence the class.
+ */
+function _applyUnreadBodyClass() {
+  if (document.body) document.body.classList.toggle('unread-enabled', unreadDotsEnabled());
+}
+window._applyUnreadBodyClass = _applyUnreadBodyClass;
+
+/** Hard cap on stored unread IDs, so deleted sessions can't grow the key forever. */
+const _UNREAD_MAX = 300;
+
+/**
+ * Persist the unread set, trimming the OLDEST entries past `_UNREAD_MAX`.
+ *
+ * Deliberately does NOT prune against `allSessionIds`: that set only holds the
+ * ACTIVE project's sessions, so pruning by it would silently wipe every unread
+ * flag belonging to other projects the moment the user switched projects.
+ * A size cap bounds storage without needing cross-project knowledge, and Set
+ * preserves insertion order so the trim drops the least-recent flags first.
+ */
+function _saveUnreadSessions() {
+  try {
+    if (_unreadSessions.size > _UNREAD_MAX) {
+      _unreadSessions = new Set(Array.from(_unreadSessions).slice(-_UNREAD_MAX));
+    }
+    localStorage.setItem(_UNREAD_STORAGE_KEY, JSON.stringify(Array.from(_unreadSessions)));
+  } catch (_e) { /* quota / private mode — in-memory set still works */ }
+}
+
+/**
+ * Does this session have unread output the user hasn't opened?
+ * @param {string} sessionId
+ * @returns {boolean}
+ */
+function hasUnread(sessionId) {
+  return unreadDotsEnabled() && _unreadSessions.has(sessionId);
+}
+
+/**
+ * Flag a session as unread and paint its dot immediately (no full re-render).
+ *
+ * This is the SINGLE place that decides whether something counts as unread,
+ * and the rule is deliberately simple: ANY session that produces assistant
+ * output gets a dot, including the one you are currently sitting in.
+ *
+ * Why no "is the user actually looking" gate (tab hidden / window unfocused)?
+ * It was tried and removed. It made the dot invisible for the most common
+ * situation — parked in one chat at a focused window — which is precisely the
+ * case that has no other way to get marked read, since you never navigate away
+ * and back. Presence is also unknowable: a focused window says nothing about
+ * whether a human is in front of it. Clearing on interaction (see
+ * `_initUnreadInteractionClearing`) is the honest signal, because it is
+ * evidence the user was actually there rather than a guess that they were.
+ *
+ * The renderers just reflect the flag — they do not re-test `activeId`.
+ * @param {string} sessionId
+ */
+function markSessionUnread(sessionId) {
+  if (!sessionId || !unreadDotsEnabled()) return;
+  if (_unreadSessions.has(sessionId)) return;
+  const _vsBefore = window.SessionVerb ? window.SessionVerb.display(sessionId) : null;
+  _unreadSessions.add(sessionId);
+  _saveUnreadSessions();
+  _syncUnreadDom(sessionId);
+  _unreadHomepageRefresh();
+  // Unread turns Idle into Review / Read / Send (session-verb.js).
+  if (window.SessionVerb && window.SessionVerb.display(sessionId) !== _vsBefore) window.SessionVerb.repaint(sessionId, _vsBefore);
+}
+
+/** The homepage's "Needs you" list includes unread finished sessions; an
+ *  unread flag changing is the one input to it that no state event carries. */
+function _unreadHomepageRefresh() {
+  if (typeof viewMode !== 'undefined' && viewMode === 'homepage'
+      && typeof _updateHomepageStats === 'function') _updateHomepageStats();
+}
+
+/**
+ * Clear a session's unread flag — called wherever the user actually opens it.
+ * @param {string} sessionId
+ */
+function clearSessionUnread(sessionId) {
+  if (!sessionId || !_unreadSessions.has(sessionId)) return;
+  const _vsBefore = window.SessionVerb ? window.SessionVerb.display(sessionId) : null;
+  _unreadSessions.delete(sessionId);
+  _saveUnreadSessions();
+  _syncUnreadDom(sessionId);
+  _unreadHomepageRefresh();
+  // Opened: Review / Read / Send become Idle (session-verb.js).
+  if (window.SessionVerb && window.SessionVerb.display(sessionId) !== _vsBefore) window.SessionVerb.repaint(sessionId, _vsBefore);
+}
+
+/** Wipe every unread flag (used when the preference is switched off). */
+function clearAllUnread() {
+  if (!_unreadSessions.size) return;
+  const ids = Array.from(_unreadSessions);
+  _unreadSessions.clear();
+  _saveUnreadSessions();
+  // Wrap the call — a bare `forEach(_syncUnreadDom)` would leak the array index
+  // into the `stateHint` parameter.
+  ids.forEach(id => _syncUnreadDom(id));
+}
+
+/**
+ * Surgically add/remove the dot on one row without re-rendering the sidebar.
+ * Mirrors the `_updateRowState` pattern in socket.js: a full `filterSessions()`
+ * on every assistant entry would be a per-token re-render of the whole list.
+ *
+ * The dot only appears once the row is idle, so raising the flag mid-turn
+ * paints nothing; the row's own idle transition calls `filterSessions()`
+ * (socket.js) which renders the dot through `_renderSessionRow`.
+ *
+ * @param {string} sessionId
+ * @param {string} [stateHint] Authoritative state from the caller. `_updateRowState`
+ *   passes the state it was handed, because a few of its call sites (e.g. the
+ *   permission-resolved path) update the row BEFORE `sessionKinds` catches up —
+ *   reading `getSessionStatus()` there would see a stale kind and skip the dot.
+ */
+function _syncUnreadDom(sessionId, stateHint) {
+  // Both sidebar surfaces carry the dot: `.session-item` (list mode) and
+  // `.wf-card` (grid mode — the DEFAULT, see app.js `sessionDisplayMode`).
+  // Querying both here is what keeps the surgical path in step with the two
+  // renderers; missing `.wf-card` made the feature invisible by default.
+  const els = document.querySelectorAll(
+    '.session-item[data-sid="' + sessionId + '"], .wf-card[data-sid="' + sessionId + '"]');
+  if (!els.length) return;
+  const state = stateHint
+    || (typeof getSessionStatus === 'function' ? getSessionStatus(sessionId) : '');
+  // No `activeId` test here on purpose: `markSessionUnread` already decided
+  // whether the flag was earned, including for the session you're sitting in.
+  const want = hasUnread(sessionId) && state === 'idle';
+  els.forEach(el => {
+    el.classList.toggle('has-unread', want);
+    const isCard = el.classList.contains('wf-card');
+    // List rows anchor the dot inside the name cell; cards pin it to the
+    // card corner (no leading text edge to sit against).
+    const host = isCard ? el : el.querySelector('.session-col-name');
+    if (!host) return;
+    const existing = host.querySelector(':scope > .unread-dot');
+    if (want && !existing) {
+      const dot = document.createElement('span');
+      dot.className = 'unread-dot';
+      dot.setAttribute('aria-label', 'Unread');
+      dot.title = 'Unread — new response you haven’t opened';
+      if (isCard) {
+        host.insertBefore(dot, host.firstChild);
+      } else {
+        // Ahead of the state icon, so the dot sits at the leading edge of the
+        // label but after any subsession caret/glyph.
+        const icon = host.querySelector('.state-icon');
+        if (icon) host.insertBefore(dot, icon);
+        else host.insertBefore(dot, host.firstChild);
+      }
+    } else if (!want && existing) {
+      existing.remove();
+    }
+  });
+}
+
+/**
+ * "Any interaction marks it read" for the session you never navigate away from.
+ *
+ * Clicking a sidebar row is the normal mark-read gesture, but it is unreachable
+ * when you stay parked in one chat: you were away, the reply landed, the dot went
+ * up — and you come back to the panel already on screen with nothing to click.
+ * So touching the thread itself counts.
+ *
+ * Scoped to `.live-panel` rather than the document: a bare document-level
+ * listener would clear the dot when you click a DIFFERENT session in the
+ * sidebar, marking the parked chat read without you ever having looked at it.
+ *
+ * Note for future maintainers: the visibilitychange/focus handlers here are
+ * display-only — they touch localStorage and DOM classes, never the socket.
+ * See the mobile socket-recovery section in CLAUDE.md for why anything that
+ * cycles a connection off these events is a foot-gun.
+ */
+function _initUnreadInteractionClearing() {
+  const clearLiveIfInPanel = (e) => {
+    if (!_unreadSessions.size) return;   // cheap bail — the common case
+    const sid = (typeof liveSessionId !== 'undefined' && liveSessionId) || activeId;
+    if (!sid || !_unreadSessions.has(sid)) return;
+    const t = e && e.target;
+    if (!t || typeof t.closest !== 'function') return;
+    if (!t.closest('.live-panel, #live-log, .live-input-bar')) return;
+    clearSessionUnread(sid);
+  };
+  ['pointerdown', 'keydown', 'wheel', 'touchstart'].forEach(ev => {
+    document.addEventListener(ev, clearLiveIfInPanel, {passive: true, capture: true});
+  });
+
+  // Deliberately NO visibilitychange/focus handler here.
+  //
+  // An earlier version cleared the live session's dot on tab return whenever
+  // its panel was mounted. That destroyed the feature's whole point: you switch
+  // away, a reply lands, the dot goes up — and the instant you come back it is
+  // wiped before you can see it. Returning to a tab is not an interaction, it
+  // is the exact moment the user needs the dot to still be there to learn what
+  // happened while they were gone.
+  //
+  // Only real input (above) counts as reading. Same class of mistake as the
+  // removed _userIsAway() gate: inferring "they must have seen it" from
+  // window state rather than from evidence the user actually did something.
+}
+_initUnreadInteractionClearing();
+_applyUnreadBodyClass();
+
+// Exported for cross-script use (socket.js, live-panel.js, toolbar.js, app.js).
+window.markSessionUnread = markSessionUnread;
+window.clearSessionUnread = clearSessionUnread;
+window.clearAllUnread = clearAllUnread;
+window.hasUnread = hasUnread;
+window.unreadDotsEnabled = unreadDotsEnabled;
+window._syncUnreadDom = _syncUnreadDom;
+
+// ===========================================================================
+// Sidebar multi-selection (Ctrl/Cmd+click)
+// ===========================================================================
+//
+// Independent of `activeId` and `allSessionIds`.
+// - `activeId`         = single session displayed in the main panel.
+// - `allSessionIds`    = O(1) lookup for streaming-event filtering
+//                        (PERF-CRITICAL #15 in CLAUDE.md). DO NOT conflate.
+// - `multiSelectedIds` = transient working set for batch actions; cleared
+//                        aggressively (see lifecycle table in
+//                        , Section 4).
+//
+// Mutation discipline: every change MUST call `_syncMultiSelectionDom()` and
+// `_renderMultiSelectionBadge()` so DOM and badge stay in sync without a
+// full sidebar re-render.  Selection is NOT persisted across page reloads
+// (resolved decision 3 in the spec).
+let multiSelectedIds = new Set();
+
+// Re-entrancy guard for bulk actions.  Multiple bulk runs concurrently would
+// race overlays, double-fire confirmations, and produce confusing toasts.
+let _bulkInFlight = false;
+
+/**
+ * Add or remove a session ID from the multi-select set, then sync DOM + badge.
+ * Idempotent: clicking the same row toggles its membership.
+ * @param {string} sessionId
+ */
+function _toggleMultiSelect(sessionId) {
+  if (!sessionId) return;
+  if (multiSelectedIds.has(sessionId)) {
+    multiSelectedIds.delete(sessionId);
+  } else {
+    multiSelectedIds.add(sessionId);
+  }
+  _syncMultiSelectionDom();
+  _renderMultiSelectionBadge();
+}
+
+/**
+ * Empty the multi-select set and sync DOM + badge.
+ * Safe to call when the set is already empty (no-op if so).
+ */
+function _clearMultiSelect() {
+  if (multiSelectedIds.size === 0) {
+    // Still ensure badge is gone in case of stale DOM
+    _renderMultiSelectionBadge();
+    return;
+  }
+  multiSelectedIds.clear();
+  _syncMultiSelectionDom();
+  _renderMultiSelectionBadge();
+}
+
+/**
+ * For each rendered .session-item row, toggle the .multi-selected class
+ * to reflect set membership.  O(N) over visible rows; cheap for the
+ * sidebar.  Avoids full re-render (which would lose scroll position,
+ * tooltip state, and naming-badge in-flight DOM).
+ */
+function _syncMultiSelectionDom() {
+  // Both list-mode (.session-item) and grid-mode (.wf-card) rows participate
+  // in multi-select.  Both carry data-sid and react to .multi-selected.
+  const rows = document.querySelectorAll('.session-item[data-sid], .wf-card[data-sid]');
+  rows.forEach(row => {
+    const sid = row.getAttribute('data-sid');
+    if (multiSelectedIds.has(sid)) {
+      row.classList.add('multi-selected');
+    } else {
+      row.classList.remove('multi-selected');
+    }
+  });
+}
+
+/**
+ * Render or remove the count badge above the column header.  The badge
+ * lives in a fixed container at the top of #session-list (created on
+ * demand) so we don't have to re-render the list to show/hide it.
+ *
+ * Uses aria-live="polite" so screen readers announce count changes
+ * without interrupting the user.
+ */
+function _renderMultiSelectionBadge() {
+  const list = document.getElementById('session-list');
+  if (!list) return;
+  let badge = document.getElementById('sidebar-multi-badge');
+  const count = multiSelectedIds.size;
+
+  if (count === 0) {
+    if (badge) badge.remove();
+    return;
+  }
+
+  if (!badge) {
+    badge = document.createElement('div');
+    badge.id = 'sidebar-multi-badge';
+    badge.className = 'sidebar-multi-badge';
+    badge.setAttribute('aria-live', 'polite');
+    // Insert as first child of session-list (above col-header-row).
+    list.insertBefore(badge, list.firstChild);
+  }
+  badge.innerHTML =
+    '<span class="sidebar-multi-badge-text">' + count + ' selected</span>'
+    + '<button type="button" class="sidebar-multi-badge-clear" '
+    + 'onclick="_clearMultiSelect()" title="Clear selection (Esc)">'
+    + '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" '
+    + 'stroke="currentColor" stroke-width="2.5" stroke-linecap="round">'
+    + '<line x1="18" y1="6" x2="6" y2="18"/>'
+    + '<line x1="6" y1="6" x2="18" y2="18"/></svg></button>';
+}
+
+/**
+ * Drop IDs from the multi-select set that no longer exist in
+ * `allSessionIds`.  Call this from any code that reassigns or filters
+ * `allSessions` in bulk (loadSessions, deleteSession, deleteEmptySessions,
+ * project switch teardown).  Without this, stale IDs accumulate and the
+ * count badge lies.
+ */
+function _pruneMultiSelectionToExisting() {
+  if (multiSelectedIds.size === 0) return;
+  let changed = false;
+  for (const id of Array.from(multiSelectedIds)) {
+    if (!allSessionIds.has(id)) {
+      multiSelectedIds.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) {
+    _syncMultiSelectionDom();
+    _renderMultiSelectionBadge();
+  }
+}
+
+// One-shot flag set by _sessionRowMouseDown when a Ctrl/Cmd+click has just
+// been handled.  The cell's subsequent click event still fires (preventDefault
+// on mousedown does NOT cancel click), so singleOrDouble and handleNameClick
+// check this flag and bail to avoid opening the session.  The flag is cleared
+// by every consumer and after a short timeout as a safety net in case the
+// click event never reaches a cell handler (e.g. user dragged off the row).
+let _msSuppressNextClick = false;
+
+function _consumeMsSuppression() {
+  if (_msSuppressNextClick) {
+    _msSuppressNextClick = false;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Mousedown handler attached to every .session-item row.  Intercepts
+ * Ctrl/Cmd+left-click to toggle multi-selection without opening the
+ * session.  Plain clicks fall through to the cell's existing onclick
+ * (singleOrDouble or handleNameClick).
+ *
+ * Mousedown fires BEFORE the cell onclick.  preventDefault() suppresses
+ * text-selection side effects, but the click event still fires — so we
+ * also raise the `_msSuppressNextClick` flag for the cell handlers to
+ * consume.
+ */
+function _sessionRowMouseDown(e, sessionId) {
+  // Only left button; right-click is routed via oncontextmenu.
+  if (e.button !== 0) return;
+  if (window.VNAllProjects) VNAllProjects.adopt(sessionId);   // All projects: act in its own project
+  // Note on view-mode scoping: previously we blocked Ctrl+click outside the
+  // 'sessions' view, but the sidebar (and its session rows) are also visible
+  // in 'workplace', 'kanban', and 'compose' views.  Blocking the toggle there
+  // made the feature appear broken to users who Ctrl+click while a session
+  // is open in the main panel.  The toggle itself is harmless in any view —
+  // it's only the BULK MENU that needs the sessions-view guard (enforced in
+  // sessionContextMenu below) so the menu doesn't surface in compose where
+  // it would target sessions across composition boundaries confusingly.
+  // Shift+click selects the range from the anchor (the last session plain- or
+  // Ctrl-clicked) to this one, in on-screen order; Ctrl/Cmd+Shift adds the
+  // range to the current selection instead of replacing it.  The anchor stays
+  // put, so repeated Shift+clicks re-span from the same start (Explorer rule).
+  if (e.shiftKey) {
+    e.preventDefault();
+    e.stopPropagation();
+    _selectMultiRange(e, sessionId, e.ctrlKey || e.metaKey);
+    _msSuppressNextClick = true;
+    setTimeout(function() { _msSuppressNextClick = false; }, 200);
+    return;
+  }
+  if (e.ctrlKey || e.metaKey) {
+    e.preventDefault();
+    e.stopPropagation();
+    _msAnchorId = sessionId;
+    _toggleMultiSelect(sessionId);
+    // Raise the suppression flag so the upcoming click on the inner
+    // cell does NOT open the session.  Auto-clear after one tick as a
+    // safety net in case the click never arrives.
+    _msSuppressNextClick = true;
+    setTimeout(function() { _msSuppressNextClick = false; }, 200);
+  }
+  // Plain click: do nothing here — let the cell's onclick fire as today.
+  // (Plain-click selection clear happens inside singleOrDouble/handleNameClick.)
+  // It does become the anchor for a following Shift+click.
+  _msAnchorId = sessionId;
+}
+
+// Anchor for Shift+click ranges: the last session plain- or Ctrl-clicked.
+let _msAnchorId = null;
+
+/**
+ * Select every rendered session between the anchor and `sessionId`, in the
+ * order the rows are drawn (pinned first, current sort, filters applied).
+ * Rows of the same kind as the clicked one (sidebar list rows or Workforce
+ * cards) are used, so a range never mixes two views.  With no usable anchor
+ * the open session is the anchor; failing that, just this row is selected.
+ * @param {MouseEvent} e
+ * @param {string} sessionId
+ * @param {boolean} additive  keep the existing selection (Ctrl/Cmd+Shift)
+ */
+function _selectMultiRange(e, sessionId, additive) {
+  if (!sessionId) return;
+  const row = e && e.target && e.target.closest
+    ? e.target.closest('.session-item[data-sid], .wf-card[data-sid]') : null;
+  const kind = row && row.classList.contains('wf-card')
+    ? '.wf-card[data-sid]' : '.session-item[data-sid]';
+  const scope = (row && row.closest('#session-list')) || document;
+  const ids = Array.from(scope.querySelectorAll(kind)).map(r => r.getAttribute('data-sid'));
+  const to = ids.indexOf(sessionId);
+  let anchor = _msAnchorId;
+  if (!anchor || ids.indexOf(anchor) < 0) {
+    anchor = (typeof activeId !== 'undefined' && ids.indexOf(activeId) >= 0) ? activeId : sessionId;
+    _msAnchorId = anchor;
+  }
+  const from = ids.indexOf(anchor);
+  if (!additive) multiSelectedIds.clear();
+  if (to < 0 || from < 0) {
+    multiSelectedIds.add(sessionId);
+  } else {
+    const lo = Math.min(from, to), hi = Math.max(from, to);
+    for (let i = lo; i <= hi; i++) multiSelectedIds.add(ids[i]);
+  }
+  _syncMultiSelectionDom();
+  _renderMultiSelectionBadge();
+}
+
+/**
+ * Bounded-concurrency runner for bulk actions.  Iterates `ids`, invoking
+ * `asyncFn(id)` with at most `concurrency` in flight at once.  Continues
+ * past per-item failures and collects them for the summary toast.
+ *
+ * @param {string[]} ids
+ * @param {(id:string) => Promise<void>} asyncFn
+ * @param {number} concurrency
+ * @returns {Promise<{ok:string[], fail:Array<{id:string, err:string}>}>}
+ */
+async function _runBulk(ids, asyncFn, concurrency) {
+  const results = { ok: [], fail: [] };
+  if (!ids || !ids.length) return results;
+  let i = 0;
+  async function worker() {
+    while (i < ids.length) {
+      const id = ids[i++];
+      try {
+        await asyncFn(id);
+        results.ok.push(id);
+      } catch (e) {
+        results.fail.push({ id: id, err: String(e && e.message ? e.message : e) });
+      }
+    }
+  }
+  const n = Math.min(Math.max(1, concurrency || 1), ids.length);
+  await Promise.all(Array.from({ length: n }, worker));
+  return results;
+}
+
+// Escape key clears the multi-selection (matches Finder/Explorer/VS Code).
+// Attached once at script load; safe to bind multiple times because of
+// the `_msEscBound` flag.
+if (typeof window !== 'undefined' && !window._msEscBound) {
+  window._msEscBound = true;
+  document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Escape') return;
+    if (multiSelectedIds.size === 0) return;
+    // Don't steal Esc from open modals (pm-overlay, project-overlay, etc.).
+    const pmOverlay = document.getElementById('pm-overlay');
+    if (pmOverlay && pmOverlay.classList.contains('show')) return;
+    const projOverlay = document.getElementById('project-overlay');
+    if (projOverlay && projOverlay.classList.contains('show')) return;
+    // Don't steal Esc from a focused editable field — user may be canceling
+    // an inline rename or clearing a search.
+    const ae = document.activeElement;
+    if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
+    _clearMultiSelect();
+  });
+}
+
+function setSort(mode) {
+  if (sortMode === mode) {
+    sortAsc = !sortAsc;   // same column — toggle direction
+  } else {
+    sortMode = mode;
+    sortAsc = false;      // new column — default descending
+  }
+  localStorage.setItem('sortMode', sortMode);
+  localStorage.setItem('sortAsc', sortAsc);
+  // Keep the card grid on the same choice as the list.
+  if (typeof wfSort !== 'undefined') { wfSort = (sortMode === 'date') ? 'recent' : sortMode; localStorage.setItem('wfSort', wfSort); }
+  filterSessions();
+}
+
+function sortedSessions(sessions) {
+  const copy = [...sessions];
+  const dir = sortAsc ? 1 : -1;
+  if (sortMode === 'status') {
+    // "Active first": by state, newest first within each state (same as the cards).
+    const order = {question: 0, working: 1, idle: 2, sleeping: 3};
+    const key = s => s.effective_ts || s.last_activity_ts || s.sort_ts || 0;
+    // With session-verb.js: you decide (can't go on), you check (when you can),
+    // Working, Waiting, Idle, Sleeping.
+    const rank = window.SessionVerb ? (s => window.SessionVerb.rank(s.id))
+      : (s => { const r = order[(typeof getSessionStatus === 'function') ? getSessionStatus(s.id) : 'sleeping']; return r == null ? 3 : r; });
+    copy.sort((a, b) => (rank(a) - rank(b)) || (key(b) - key(a)));
+  } else if (sortMode === 'size') {
+    copy.sort((a, b) => dir * ((a.file_bytes || 0) - (b.file_bytes || 0)));
+  } else if (sortMode === 'name') {
+    copy.sort((a, b) => dir * (a.display_title || '').localeCompare(b.display_title || ''));
+  } else {
+    // Date sort uses effective_ts = max(last_message_ts, file_mtime) so
+    // sessions you've interacted with (rename, autoname, fork) bubble up
+    // even when no new conversation was added. Falls back to legacy fields
+    // for clients/payloads that pre-date the effective_ts field.
+    const key = s => s.effective_ts || s.last_activity_ts || s.sort_ts || 0;
+    copy.sort((a, b) => dir * (key(a) - key(b)));
+  }
+  return _pinnedFirst(copy);
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Pinned sessions
+// ───────────────────────────────────────────────────────────────────────
+// A pinned session stays first whatever the sort.  Pin it from the right-click
+// menu ("Pin to top") or the pin on its card or row: faint grey on hover,
+// purple on a soft purple dot once pinned (style.css .vn-pin).  Saved per
+// project on the server (src/web/session_pins.py, POST /api/session-pin/<id>) and
+// broadcast as `session_pin`, so the phone and the computer show one order.
+const _PIN_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>';
+// sid -> bool / rank: this page's newest word on a pin and its place (its own
+// taps and drags, and the broadcasts).  They beat the `pinned` / `pin_rank`
+// fields of a list load that was computed before the save landed, as
+// SessionVerb's holds do.
+const _pinLocal = new Map();
+const _pinRankLocal = new Map();
+const _pinSeq = new Map();   // sid -> number of the newest toggle
+let _pinOrderSeq = 0;        // number of the newest drag
+const _PIN_RETRY_MS = 1500;
+
+function _pinRow(sid) {
+  return (typeof SessionStore !== 'undefined' && SessionStore.get) ? SessionStore.get(sid) : null;
+}
+
+function isSessionPinned(sid) {
+  if (_pinLocal.has(sid)) return _pinLocal.get(sid);
+  const row = _pinRow(sid);
+  return !!(row && row.pinned);
+}
+
+/** A pinned session's place among the pinned ones, smallest first. */
+function pinRankOf(sid) {
+  if (_pinRankLocal.has(sid)) return _pinRankLocal.get(sid);
+  const row = _pinRow(sid);
+  return (row && typeof row.pin_rank === 'number') ? row.pin_rank : 0;
+}
+
+/** Pinned sessions first, in pin order (drag to reorder); equal places and
+ *  everything unpinned keep the order the sort gave them. */
+function _pinnedFirst(list) {
+  const pinned = [], rest = [];
+  for (const s of list) (isSessionPinned(s.id) ? pinned : rest).push(s);
+  if (!pinned.length) return list;
+  const at = new Map(pinned.map((s, i) => [s.id, i]));
+  pinned.sort((a, b) => (pinRankOf(a.id) - pinRankOf(b.id)) || (at.get(a.id) - at.get(b.id)));
+  return pinned.concat(rest);
+}
+
+/** The place a new pin takes: the top of the pinned group. */
+function _topPinRank() {
+  let min = 1;
+  for (const s of (typeof allSessions !== 'undefined' ? allSessions : [])) {
+    if (isSessionPinned(s.id)) min = Math.min(min, pinRankOf(s.id));
+  }
+  return min - 1;
+}
+
+/** Show a pin (from this page or another device) and re-sort.  No save. */
+function _applyPin(sid, on, rank) {
+  if (!sid) return;
+  _pinLocal.set(sid, !!on);
+  const row = _pinRow(sid);
+  if (on && typeof rank === 'number') _pinRankLocal.set(sid, rank);
+  if (row) {
+    if (on) { row.pinned = true; if (typeof rank === 'number') row.pin_rank = rank; }
+    else { delete row.pinned; delete row.pin_rank; }
+  }
+  if (!on) _pinRankLocal.delete(sid);
+  if (typeof filterSessions === 'function') filterSessions();
+}
+
+/** Show an order of pinned sessions (top first) and re-sort.  No save.
+ *  `render` false records the places without redrawing. */
+function _applyPinOrder(order, render) {
+  if (!Array.isArray(order)) return;
+  order.forEach((sid, i) => {
+    _pinRankLocal.set(sid, i);
+    const row = _pinRow(sid);
+    if (row) row.pin_rank = i;
+  });
+  if (render !== false && typeof filterSessions === 'function') filterSessions();
+}
+
+/** A session that adopted the CLI's id keeps its pin (socket.js remap). */
+function _pinRekey(oldId, newId) {
+  if (!oldId || !newId) return;
+  if (_pinLocal.has(oldId)) { _pinLocal.set(newId, _pinLocal.get(oldId)); _pinLocal.delete(oldId); }
+  if (_pinRankLocal.has(oldId)) { _pinRankLocal.set(newId, _pinRankLocal.get(oldId)); _pinRankLocal.delete(oldId); }
+}
+
+function _postJson(url, body) {
+  return fetch(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }).then(r => r.ok).catch(() => false);
+}
+
+/** Save once, and once more after a pause if that failed. */
+function _saveWithRetry(url, body) {
+  return _postJson(url, body)
+    .then(ok => ok ? true : new Promise(res => setTimeout(res, _PIN_RETRY_MS)).then(() => _postJson(url, body)));
+}
+
+/** Pin or unpin.  The screen changes at once; a failed save is retried once,
+ *  then the screen goes back to what is saved and says so (the rule
+ *  SessionVerb.setHold follows: never show a choice the server did not keep). */
+function toggleSessionPin(sid) {
+  if (!sid) return Promise.resolve(false);
+  const on = !isSessionPinned(sid);
+  const prevRank = pinRankOf(sid);
+  _applyPin(sid, on, on ? _topPinRank() : undefined);
+  const project = (window.VNAllProjects ? VNAllProjects.projectFor(sid) : (localStorage.getItem('activeProject') || ''));
+  const seq = (_pinSeq.get(sid) || 0) + 1;
+  _pinSeq.set(sid, seq);
+  return _saveWithRetry('/api/session-pin/' + encodeURIComponent(sid), { pinned: on, project: project })
+    .then(ok => {
+      // A newer tap on this session owns the screen now; leave it be.
+      if (ok || _pinSeq.get(sid) !== seq) return ok;
+      _applyPin(sid, !on, on ? undefined : prevRank);
+      if (typeof showToast === 'function') showToast(on ? 'Couldn’t pin it. Try again.' : 'Couldn’t unpin it. Try again.', true);
+      return false;
+    });
+}
+
+/** The pinned sessions, top first, as the sidebar shows them now. */
+function _pinnedOrder() {
+  const list = typeof allSessions !== 'undefined' ? allSessions : [];
+  const sorter = (typeof sessionDisplayMode !== 'undefined' && sessionDisplayMode === 'list') || typeof wfSortedSessions !== 'function'
+    ? sortedSessions : wfSortedSessions;
+  return sorter(list).filter(s => isSessionPinned(s.id)).map(s => s.id);
+}
+
+/** Drop a pinned session before or after another pinned one, and save the
+ *  new order.  The order covers every pinned session, including any a
+ *  filter hides, so a drag never loses one's place.  Same save rule as a pin. */
+function movePinnedSession(sid, targetSid, after) {
+  const order = _pinnedOrder();
+  if (sid === targetSid || order.indexOf(sid) < 0 || order.indexOf(targetSid) < 0) return Promise.resolve(false);
+  order.splice(order.indexOf(sid), 1);
+  order.splice(order.indexOf(targetSid) + (after ? 1 : 0), 0, sid);
+  return _savePinOrder(order, true);
+}
+
+/** Show and save a whole pinned order (top first).  `render` false: the
+ *  screen already shows it (a drag moved the cards), so only the places are
+ *  recorded.  A failed save puts the old order back and says so. */
+function _savePinOrder(order, render) {
+  const before = new Map(_pinnedOrder().map(id => [id, pinRankOf(id)]));
+  _applyPinOrder(order, render);
+  const project = localStorage.getItem('activeProject') || '';
+  const seq = ++_pinOrderSeq;
+  return _saveWithRetry('/api/session-pin-order', { order: order, project: project })
+    .then(ok => {
+      if (ok || seq !== _pinOrderSeq) return ok;
+      before.forEach((r, id) => { _pinRankLocal.set(id, r); const row = _pinRow(id); if (row) row.pin_rank = r; });
+      if (typeof filterSessions === 'function') filterSessions();
+      if (typeof showToast === 'function') showToast('Couldn’t save the new order. Try again.', true);
+      return false;
+    });
+}
+
+/** The pin on a card or list row.  Its own mousedown / click / double-click
+ *  stop at the button, so tapping it never opens, renames or sleeps the session. */
+function _pinButtonHtml(sid) {
+  const on = isSessionPinned(sid);
+  const label = on ? 'Unpin' : 'Pin to top';
+  return '<button type="button" class="vn-pin' + (on ? ' on' : '') + '" aria-pressed="' + on + '" aria-label="' + label + '" title="' + label + '"'
+    + ' onmousedown="event.stopPropagation()" ondblclick="event.stopPropagation()"'
+    + ' onclick="event.stopPropagation();toggleSessionPin(\'' + sid + '\')">' + _PIN_SVG + '</button>';
+}
+
+// ── Drag to reorder pinned sessions, live (desktop) ──
+// The others reorder live as the card moves, as on iOS: the card (or row) itself
+// lifts and follows the mouse, and the other pinned ones slide out of its way
+// the moment it passes over them; letting go settles it into its slot and
+// saves the order.  No browser drag ghost, no drop marker.
+//
+// Mouse only: on a touch screen press-and-hold opens the session menu
+// (mobile.js), so nothing there carries data-pin-drag.  A drag starts after
+// _PIN_DRAG_START px of movement, so a plain click still opens the session;
+// the click that ends a drag is swallowed.  While a drag runs, full sidebar
+// redraws wait (filterSessions checks window._pinDragActive), because a
+// redraw would replace the card under the mouse.  Escape puts it back.
+const _PIN_DRAG_OK = !!(typeof window !== 'undefined' && window.matchMedia
+  && window.matchMedia('(hover: hover) and (pointer: fine)').matches);
+const _PIN_DRAG_START = 5;      // px of movement before a press becomes a drag
+const _PIN_SLIDE_MS = 180;      // how long the others take to slide out of the way
+
+// Pin visibility: set html.vn-has-hover on the first mouse-or-pen pointermove
+// (not a touch tap).  The style.css hide rule applies while the class is
+// absent, so pure-touch devices keep an unpinned pin hidden by default.  On a
+// Windows touchscreen laptop with a mouse, moving the mouse once flips the
+// class and the pin becomes hoverable from then on.  This is load-bearing: the
+// Chrome on a Windows touchscreen can report (any-hover: none) even with a
+// mouse plugged in, so no media query can detect the mouse.
+(function () {
+  if (typeof document === 'undefined') return;
+  const html = document.documentElement;
+  if (!html) return;
+  // If a hover-capable input is already reported, mark it synchronously so the
+  // pin is visible at page load (desktops with a plain mouse).
+  try {
+    if (window.matchMedia && window.matchMedia('(any-hover: hover)').matches) {
+      html.classList.add('vn-has-hover');
+    }
+  } catch (_e) { /* matchMedia missing */ }
+  if (html.classList.contains('vn-has-hover')) return;
+  function onMove(e) {
+    // e.pointerType is 'mouse', 'pen', or 'touch'.  Only mouse/pen count.
+    if (e.pointerType && e.pointerType !== 'touch') {
+      html.classList.add('vn-has-hover');
+      window.removeEventListener('pointermove', onMove, true);
+      window.removeEventListener('mousemove', onMoveFallback, true);
+    }
+  }
+  function onMoveFallback() {
+    // Browsers that only dispatch mousemove (not pointermove): assume mouse.
+    html.classList.add('vn-has-hover');
+    window.removeEventListener('pointermove', onMove, true);
+    window.removeEventListener('mousemove', onMoveFallback, true);
+  }
+  window.addEventListener('pointermove', onMove, true);
+  window.addEventListener('mousemove', onMoveFallback, true);
+})();
+
+/** Marks a pinned card or row as draggable ('' otherwise). */
+function _pinDragAttrs(sid) {
+  // Not in All projects: pins are ordered per project, and one drag can't span them.
+  if (window.VNAllProjects && VNAllProjects.on()) return '';
+  return (_PIN_DRAG_OK && isSessionPinned(sid)) ? ' data-pin-drag="1"' : '';
+}
+
+let _pinDrag = null;   // the drag in progress, see _pinDragDown
+
+/** What moves for a pinned element: a list row with subsessions moves with
+ *  its family box. */
+function _pinUnit(el) {
+  const fam = el.classList.contains('family-parent') ? el.closest('.subsession-family') : null;
+  return fam || el;
+}
+
+/** The movable pinned units in a container, in screen order. */
+function _pinUnits(container) {
+  return [...container.children].filter(u => u.matches('[data-pin-drag][data-sid]')
+    || (u.classList.contains('subsession-family') && u.querySelector(':scope > [data-pin-drag].family-parent')));
+}
+
+function _pinUnitSid(u) {
+  return u.dataset.sid || (u.querySelector(':scope > [data-pin-drag].family-parent') || {}).dataset.sid;
+}
+
+/** Slide every unit but the lifted one from where it was to where it is now. */
+function _pinSlide(units, before) {
+  units.forEach(u => {
+    if (u === (_pinDrag && _pinDrag.unit)) return;
+    const a = before.get(u);
+    if (!a) return;
+    // Where it is now without any slide still running (a is where it showed).
+    u.style.transition = 'none';
+    u.style.transform = '';
+    const b = u.getBoundingClientRect();
+    const dx = a.left - b.left, dy = a.top - b.top;
+    if (!dx && !dy) { u.style.transition = ''; return; }
+    u.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
+    void u.offsetWidth;   // apply the start position before animating from it
+    u.style.transition = 'transform ' + _PIN_SLIDE_MS + 'ms cubic-bezier(.2,.8,.2,1)';
+    u.style.transform = '';
+    clearTimeout(u._pinSlideT);
+    u._pinSlideT = setTimeout(() => { u.style.transition = ''; }, _PIN_SLIDE_MS + 20);
+  });
+}
+
+/** Keep the lifted unit under the mouse, wherever its slot now is. */
+function _pinFollow(x, y) {
+  const d = _pinDrag, u = d.unit;
+  u.style.transform = 'none';
+  const r = u.getBoundingClientRect();
+  u.style.transform = 'translate(' + (x - d.gx - r.left) + 'px,' + (y - d.gy - r.top) + 'px) scale(1.04)';
+}
+
+function _pinDragDown(e) {
+  if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.pointerType !== 'mouse') return;
+  const el = e.target && e.target.closest ? e.target.closest('[data-pin-drag][data-sid]') : null;
+  if (!el || e.target.closest('.vn-pin') || el.classList.contains('family-child') || el.classList.contains('wf-child')) return;
+  _pinDrag = { el: el, unit: _pinUnit(el), container: _pinUnit(el).parentElement, id: e.pointerId,
+               x0: e.clientX, y0: e.clientY, live: false };
+}
+
+function _pinDragStart(e) {
+  const d = _pinDrag;
+  d.live = true;
+  window._pinDragActive = true;
+  // The press-and-hold menu (mobile.js) must not open in the middle of a drag.
+  document.dispatchEvent(new CustomEvent('vn:press-cancel'));
+  const tip = document.getElementById('session-tooltip');
+  if (tip) tip.classList.remove('visible');
+  try { window.getSelection().removeAllRanges(); } catch (_e) { /* nothing selected */ }
+  try { d.el.setPointerCapture(d.id); } catch (_e) { /* still follows document moves */ }
+  const r = d.unit.getBoundingClientRect();
+  d.gx = d.x0 - r.left; d.gy = d.y0 - r.top;
+  d.startOrder = _pinUnits(d.container).map(_pinUnitSid);
+  d.lockUntil = 0; d.lockOn = null;
+  document.body.classList.add('vn-pin-dragging');
+  d.unit.classList.add('vn-pin-lifted');
+}
+
+function _pinDragMove(e) {
+  const d = _pinDrag;
+  if (!d || (d.id != null && e.pointerId !== d.id)) return;
+  if (!d.live) {
+    if (Math.abs(e.clientX - d.x0) < _PIN_DRAG_START && Math.abs(e.clientY - d.y0) < _PIN_DRAG_START) return;
+    if (!d.unit.isConnected) { _pinDrag = null; return; }
+    _pinDragStart(e);
+  }
+  e.preventDefault();
+  if (!d.unit.isConnected) { _pinDragEnd(false); return; }
+  _pinFollow(e.clientX, e.clientY);
+  // Over another pinned one?  Take its slot at once; the others slide.
+  const units = _pinUnits(d.container);
+  const from = units.indexOf(d.unit);
+  const now = performance.now();
+  for (let i = 0; i < units.length; i++) {
+    const u = units[i];
+    if (u === d.unit) continue;
+    const r = u.getBoundingClientRect();
+    if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) continue;
+    // A unit sliding away can pass under the mouse again; wait for it to land.
+    if (u === d.lockOn && now < d.lockUntil) break;
+    const before = new Map(units.map(x => [x, x.getBoundingClientRect()]));
+    if (i > from) u.after(d.unit); else u.before(d.unit);
+    _pinSlide(units, before);
+    d.lockOn = u; d.lockUntil = now + _PIN_SLIDE_MS + 40;
+    _pinFollow(e.clientX, e.clientY);
+    break;
+  }
+}
+
+/** Let go (keep = true) or give up (Escape, a lost pointer). */
+function _pinDragEnd(keep) {
+  const d = _pinDrag;
+  _pinDrag = null;
+  if (!d || !d.live) return;
+  window._pinDragActive = false;
+  document.body.classList.remove('vn-pin-dragging');
+  // The click that ends a drag is not a click on the session.  After Escape
+  // the button is still down: swallow the click its release brings.
+  window._pinDragClickUntil = keep ? Date.now() + 400 : Infinity;
+  const u = d.unit;
+  const order = d.unit.isConnected ? _pinUnits(d.container).map(_pinUnitSid) : d.startOrder;
+  const moved = keep && order.join('\n') !== d.startOrder.join('\n');
+  // Settle into the slot, then draw the list from the data again.
+  u.classList.remove('vn-pin-lifted');
+  u.classList.add('vn-pin-settling');
+  u.style.transition = '';
+  u.style.transform = '';
+  setTimeout(() => {
+    u.classList.remove('vn-pin-settling');
+    if (moved) {
+      // Pinned sessions this view does not show (a filter) keep their place
+      // among the others.
+      const shown = new Set(order);
+      const full = _pinnedOrder();
+      let k = 0;
+      _savePinOrder(full.map(id => shown.has(id) ? order[k++] : id), true);
+    } else if (typeof filterSessions === 'function') filterSessions();
+  }, _PIN_SLIDE_MS);
+}
+
+if (typeof document !== 'undefined' && !window._pinDragBound) {
+  window._pinDragBound = true;
+  document.addEventListener('pointerdown', _pinDragDown);
+  document.addEventListener('pointermove', _pinDragMove, { passive: false });
+  document.addEventListener('pointerup', e => {
+    if (window._pinDragClickUntil === Infinity) window._pinDragClickUntil = Date.now() + 400;
+    if (_pinDrag && (_pinDrag.id == null || e.pointerId === _pinDrag.id)) _pinDragEnd(true);
+  });
+  document.addEventListener('pointercancel', () => _pinDragEnd(false));
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && _pinDrag && _pinDrag.live) _pinDragEnd(false); });
+  // The card's icon is an image the browser would drag on its own.
+  document.addEventListener('dragstart', e => {
+    if (e.target && e.target.closest && e.target.closest('[data-pin-drag]')) e.preventDefault();
+  });
+  document.addEventListener('click', e => {
+    if (window._pinDragClickUntil && Date.now() < window._pinDragClickUntil) {
+      window._pinDragClickUntil = 0;
+      e.stopPropagation(); e.preventDefault();
+    }
+  }, true);
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Subsessions (spec §4.4 / §4.6.1) — sidebar tree helpers
+// ───────────────────────────────────────────────────────────────────────
+// Disclosure caret state for parents.  Persisted per-parent in
+// localStorage so a user's collapse choices survive reload.
+function _subsessionCaretKey(parentSid) {
+  return 'vn.subsession.caret.' + parentSid;
+}
+function _isSubsessionExpanded(parentSid) {
+  // Default: expanded.  Only collapsed when user explicitly toggled.
+  const v = localStorage.getItem(_subsessionCaretKey(parentSid));
+  return v === null ? true : v === '1';
+}
+function _toggleSubsessionCaret(parentSid) {
+  const next = !_isSubsessionExpanded(parentSid);
+  localStorage.setItem(_subsessionCaretKey(parentSid), next ? '1' : '0');
+  // Re-render the sidebar to apply the new collapse state.
+  if (typeof filterSessions === 'function') filterSessions();
+}
+
+// Build a parent_sid -> [child rows] index from the flat session list.
+// Sessions whose parent_session_id is NOT a sibling in the current list
+// (e.g. parent was deleted or is in another project) get treated as
+// top-level so they never disappear from the UI.
+function _buildSubsessionIndex(sessions) {
+  const idsInList = new Set(sessions.map(s => s.id));
+  const childrenByParent = new Map();
+  for (const s of sessions) {
+    const p = s.parent_session_id;
+    if (p && idsInList.has(p)) {
+      if (!childrenByParent.has(p)) childrenByParent.set(p, []);
+      childrenByParent.get(p).push(s);
+    }
+  }
+  return childrenByParent;
+}
+
+// Reorder an already-sorted flat session list so each subsession sits
+// immediately after its parent, regardless of the active sort.  Used by
+// the flat renderers (grid) that would otherwise scatter children away
+// from their parent when sorting by date/name/size.  The list renderer
+// uses its own family-box path and does not call this.
+//
+// Returns { ordered, roleOf } where:
+//   ordered: the reordered session array (same objects, never mutated)
+//   roleOf:  Map(session_id -> 'parent' | 'child') for rows in a family;
+//            normal sessions are absent from the map.
+// Sort is preserved: top-level rows keep their order, and each parent's
+// children keep their order (children arrive pre-sorted in `sorted`).
+function _orderSessionsByFamily(sorted) {
+  const childrenByParent = _buildSubsessionIndex(sorted);
+  const roleOf = new Map();
+  if (!childrenByParent.size) {
+    return { ordered: sorted, roleOf };  // nothing to regroup — cheap exit
+  }
+  const claimed = new Set();
+  for (const kids of childrenByParent.values()) {
+    for (const k of kids) claimed.add(k.id);
+  }
+  const ordered = [];
+  for (const s of sorted) {
+    if (claimed.has(s.id)) continue;  // emitted under its parent below
+    const kids = childrenByParent.get(s.id);
+    if (kids && kids.length) {
+      roleOf.set(s.id, 'parent');
+      ordered.push(s);
+      for (const kid of kids) {
+        roleOf.set(kid.id, 'child');
+        ordered.push(kid);
+      }
+    } else {
+      ordered.push(s);
+    }
+  }
+  return { ordered, roleOf };
+}
+
+// Return a (sub)session's pre-defined name lookup helper.
+function _findSessionById(sessions, sid) {
+  for (const s of sessions) if (s.id === sid) return s;
+  return null;
+}
+
+/**
+ * The list row's state icon for a session, as HTML ('' for a plain sleeping
+ * row).  ONE source for both the full render (`_renderSessionRow`) and the
+ * surgical per-event update (`_updateRowState` in socket.js), so a state
+ * event no longer needs a full `filterSessions()` to repaint the compacting
+ * or awaiting-wake-up icon.
+ * @param {string} sid
+ * @param {string} status  getSessionStatus() value: question|working|idle|sleeping
+ */
+function _sessionStateIconHtml(sid, status) {
+  const isWaiting = status === 'question';
+  const isRunning = status === 'working';
+  const isIdle = status === 'idle';
+  const _isCompacting = isRunning && window._sessionSubstatus && window._sessionSubstatus[sid] === 'compacting';
+  // Sleeping/awaiting-wake-up = substatus 'auto-resuming' regardless of state.
+  // Spans both phases:
+  //  * idle + auto-resuming = asleep waiting for wake-up to fire
+  //  * working + auto-resuming = wake-up firing right now
+  // Both phases share the same moon icon so the sidebar/kanban/workforce
+  // visually agree with the live panel's "Awaiting wake-up…" label
+  // throughout the cycle.  Without this, the sidebar flipped to a
+  // pickaxe icon the moment the wake-up fired (state went idle→working)
+  // while the live panel still said "Awaiting wake-up…" — a state desync.
+  const _isSleeping = window._sessionSubstatus && window._sessionSubstatus[sid] === 'auto-resuming';
+  // Person-oriented status (session-verb.js): Decide / Unblock /
+  // Approve / Review / Read / Send / Working / Waiting / Idle / Sleeping.
+  // "Awaiting wake-up" is Waiting there.  Compacting keeps its own icon.
+  if (window.SessionVerb && !_isCompacting) return window.SessionVerb.listIconHtml(sid, status);
+  return isWaiting
+    ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2" stroke-linecap="round" title="Waiting for input"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>'
+    : _isCompacting
+    ? '<svg class="state-icon compacting-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#aa88ff" stroke-width="2" stroke-linecap="round" title="Compacting context"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>'
+    : _isSleeping
+    ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#8aa9ff" stroke-width="2" stroke-linecap="round" title="Awaiting wake-up"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>'
+    : isRunning
+    ? '<img class="state-icon" src="/static/svg/pickaxe.svg" width="12" height="12" style="filter:brightness(0) saturate(100%) invert(55%) sepia(78%) saturate(1000%) hue-rotate(215deg);" title="Working">'
+    : isIdle
+    ? '<svg class="state-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#44aa66" stroke-width="2" stroke-linecap="round" title="Idle"><polyline points="20 6 9 17 4 12"/></svg>'
+    : '';
+}
+
+/** ' vs-row-<status>' (+ ' vs-row-yours' when it's the person's move) for a
+ *  list row; '' without session-verb.js.  socket.js _updateRowState mirrors it. */
+function _sessionVerbRowClass(sid, status) {
+  if (!window.SessionVerb) return '';
+  const d = window.SessionVerb.display(sid, status);
+  const r = window.SessionVerb.rank(sid, status);   // New ranks -1: first, but not a move to warm
+  return ' vs-row-' + d + (r >= 0 && r <= 1 ? ' vs-row-yours' : '');
+}
+
+/** The row classes that follow the session's state: 'waiting' or 'running'. */
+function _sessionRowStateClass(status) {
+  return status === 'question' ? 'waiting' : (status === 'working' || status === 'idle' ? 'running' : '');
+}
+
+function _renderSessionRow(s, extraClass) {
+  const status = getSessionStatus(s.id);
+  const isIdle = status === 'idle';
+  const _sc = _sessionRowStateClass(status);
+  const stateClass = _sc ? ' ' + _sc : '';
+  const activeClass = s.id === activeId ? ' active' : '';
+  const colClick = `onclick="singleOrDouble('${s.id}',event)" style="cursor:pointer;"`;
+  const icon = _sessionStateIconHtml(s.id, status);
+  // multi-select: include .multi-selected class on initial render so the
+  // visual stays in sync after sort/filter re-renders without needing an
+  // extra _syncMultiSelectionDom() pass.  onmousedown intercepts Ctrl/Cmd+
+  // click to toggle the selection without opening the session.
+  const msClass = multiSelectedIds.has(s.id) ? ' multi-selected' : '';
+
+  // \u2500\u2500 Subsessions (spec \u00a74.4 + \u00a74.6.1) \u2500\u2500
+  // Subsession child row: indent 16 px, prefix with the \u21b3 glyph, and
+  // add a "from: <parent_name>" secondary line.  Pure CSS class \u2014 the
+  // existing row markup keeps working unchanged.
+  const isSubsession = !!s.parent_session_id;
+  const subsessionClass = isSubsession ? ' subsession-row' : '';
+  const subsessionGlyph = isSubsession
+    ? '<span class="subsession-glyph" aria-hidden="true">\u21b3 </span>'
+    : '';
+  // "from: <parent name>" secondary line.  Look up the parent's display
+  // title from allSessions; fall back to the SID short form when the
+  // parent isn't in the current list (e.g. closed-but-not-managed).
+  let subsessionFromLine = '';
+  if (isSubsession && typeof allSessions !== 'undefined') {
+    const parent = allSessions.find(x => x.id === s.parent_session_id);
+    const parentName = parent
+      ? (parent.custom_title || parent.display_title || s.parent_session_id.slice(0, 8))
+      : s.parent_session_id.slice(0, 8);
+    subsessionFromLine = '<div class="subsession-from-line" title="Parent session">from: '
+      + escHtml(parentName) + '</div>';
+  }
+
+  // Inbox badge (\ud83d\udcec N) on parents whose inbox_dirty flag is set.  Tap
+  // does NOT pull updates \u2014 it just toasts "N reports waiting" so the
+  // user understands what the count means.  Click handler stops
+  // propagation so it doesn't open the session.
+  const inboxCount = (typeof window.__subsessionInboxCounts === 'object'
+    && window.__subsessionInboxCounts) ? window.__subsessionInboxCounts[s.id] : 0;
+  const inboxBadge = s.inbox_dirty
+    ? `<span class="subsession-inbox-badge"
+            aria-label="${escHtml(String(inboxCount || ''))} subsession reports pending"
+            onclick="event.stopPropagation(); _showSubsessionBadgeToast('${s.id}');"
+            title="Subsession reports waiting \u2014 included on your next message">\ud83d\udcec${inboxCount ? ' ' + inboxCount : ''}</span>`
+    : '';
+
+  // Disclosure caret for parents that have at least one child in the
+  // current list.  Caret state persists per parent in localStorage.
+  const hasChildren = !!(window.__subsessionChildrenIndex
+    && window.__subsessionChildrenIndex.has(s.id));
+  const isExpanded = hasChildren ? _isSubsessionExpanded(s.id) : true;
+  const caretSpan = hasChildren
+    ? `<span class="subsession-caret" tabindex="0"
+            onclick="event.stopPropagation(); _toggleSubsessionCaret('${s.id}');"
+            onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();_toggleSubsessionCaret('${s.id}');}"
+            aria-label="Toggle subsessions"
+            title="${isExpanded ? 'Collapse' : 'Expand'} subsessions">${isExpanded ? '\u25be' : '\u25b8'}</span>`
+    : '';
+
+  // Unread dot — idle sessions only, and never the one you're looking at.
+  // Working/waiting/sleeping rows already carry their own state icon; adding a
+  // second attention cue there would compete with it.  See the unread section
+  // at the top of this file for the full rationale.
+  const isUnread = isIdle && hasUnread(s.id);
+  const unreadClass = isUnread ? ' has-unread' : '';
+  const unreadDot = isUnread
+    ? '<span class="unread-dot" aria-label="Unread" title="Unread — new response you haven’t opened"></span>'
+    : '';
+  const vsClass = _sessionVerbRowClass(s.id, status);
+  const pinClass = isSessionPinned(s.id) ? ' is-pinned' : '';
+
+  return `
+  <div class="session-item${activeClass}${stateClass}${msClass}${subsessionClass}${unreadClass}${vsClass}${pinClass}${extraClass || ''}" data-sid="${s.id}"${_pinDragAttrs(s.id)} onmousedown="_sessionRowMouseDown(event,'${s.id}')" ondblclick="_dblclickSleepIfIdle('${s.id}',event)" oncontextmenu="sessionContextMenu(event,'${s.id}')">
+    <div class="session-col-name" onclick="handleNameClick('${s.id}')" style="cursor:text;" title="Click to rename">
+      ${caretSpan}${subsessionGlyph}${unreadDot}${icon}${escHtml(s.display_title)}${_autoNamingInFlight.has(s.id) ? '<span class="naming-badge"><span class="naming-dot"></span>Naming\u2026</span>' : ''}${inboxBadge}${_pinButtonHtml(s.id)}
+      ${subsessionFromLine}
+    </div>
+    <div class="session-col-date" ${colClick} title="${escHtml(s.last_activity)}" data-short-date="${escHtml(s.last_activity)}">${escHtml(_shortDate(s.last_activity))}</div>
+    <div class="session-col-size" ${colClick}>${escHtml(s.size)}</div>
+  </div>`;
+}
+
+// Toast shown when the user taps the inbox badge.  Does NOT trigger a
+// pull \u2014 that's an explicit affordance in the live panel (Phase 6) to
+// avoid accidental "send empty message" surprises.
+function _showSubsessionBadgeToast(parentSid) {
+  if (typeof showToast === 'function') {
+    showToast('Subsession reports waiting. Open the parent session to see and Pull updates.');
+  }
+  // Open the parent session so the user can see its children.
+  if (typeof openInGUI === 'function' && parentSid !== activeId) {
+    openInGUI(parentSid);
+  }
+}
+
+function renderList(sessions) {
+  const el = document.getElementById('session-list');
+  if (!sessions.length) {
+    el.innerHTML = '<div style="padding:20px;color:var(--text-muted);font-size:12px;">No sessions found</div>';
+    return;
+  }
+
+  const arrow = sortAsc ? '\u2191' : '\u2193';
+  const header = `
+    <div class="col-header-row">
+      <div class="col-header sortable ${sortMode==='name'?'sort-active':''}" id="col-h-name" onclick="setSort('name')" title="Sort by name">
+        Name ${sortMode==='name' ? arrow : ''}
+        <span class="col-resize-grip" data-col="name"></span>
+      </div>
+      <div class="col-header sortable ${sortMode==='date'?'sort-active':''}" id="col-h-date" onclick="setSort('date')" title="Sort by date">
+        Date ${sortMode==='date' ? arrow : ''}
+        <span class="col-resize-grip" data-col="date"></span>
+      </div>
+      <div class="col-header sortable ${sortMode==='size'?'sort-active':''}" id="col-h-size" onclick="setSort('size')" title="Sort by size">
+        Size ${sortMode==='size' ? arrow : ''}
+      </div>
+    </div>`;
+
+  // --- NB-10: Compose session grouping ---
+  if (typeof viewMode !== 'undefined' && viewMode === 'compose' && typeof getComposeSessionGroups === 'function') {
+    const grouped = getComposeSessionGroups(sessions);
+    if (grouped && grouped.groups && grouped.groups.length > 0) {
+      let rows = '';
+      for (const group of grouped.groups) {
+        // Group header (uses existing CSS class)
+        rows += `<div class="compose-session-group-header">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+          ${escHtml(group.name)}
+        </div>`;
+        // Root session first with left border accent
+        if (group.root) {
+          rows += _renderSessionRow(group.root, ' compose-session-root');
+        }
+        // Section sessions indented
+        for (const s of group.sections) {
+          rows += _renderSessionRow(s, ' compose-session-section');
+        }
+      }
+      // Other sessions below with separator
+      if (grouped.other && grouped.other.length > 0) {
+        rows += '<div class="compose-session-other-sep" style="height:1px;background:var(--border,#30363d);margin:6px 12px;opacity:0.5;"></div>';
+        for (const s of grouped.other) {
+          rows += _renderSessionRow(s, '');
+        }
+      }
+      el.innerHTML = header + rows;
+      initColResize();
+      attachTooltipListeners();
+      // Re-render the multi-select badge after the list re-render destroys
+      // it (innerHTML = ...) so the count stays visible across sort/filter
+      // updates.  Pruning also handles cases where a selected session was
+      // filtered out by search and is no longer in `sessions`.
+      _renderMultiSelectionBadge();
+      return;
+    }
+  }
+  // --- End NB-10 ---
+
+  // ── Subsessions tree layout (spec §4.4 + §4.6.1) ──
+  // Build a parent_sid -> [child rows] index from the flat session list.
+  // We render top-level sessions in the user's chosen sort order, then
+  // immediately after each parent we render its children indented and
+  // sorted by their own ts.  Children are also "claimed" so they don't
+  // appear again at the top level.
+  const childrenIdx = _buildSubsessionIndex(sessions);
+  window.__subsessionChildrenIndex = childrenIdx;  // for _renderSessionRow
+  const claimedChildren = new Set();
+  for (const kids of childrenIdx.values()) {
+    for (const k of kids) claimedChildren.add(k.id);
+  }
+
+  let rows = '';
+  for (const s of sessions) {
+    if (claimedChildren.has(s.id)) continue;  // rendered below its parent
+    const kids = childrenIdx.get(s.id);
+    const hasKids = !!(kids && kids.length);
+    // When a session has subsessions, wrap the parent + its children in a
+    // distinct "family" box so the hierarchy reads as one unit at a glance
+    // (the flat indent+glyph alone was too subtle to notice).  Sessions
+    // with no children render exactly as before — no wrapper, no visual
+    // change to the normal sidebar.
+    if (hasKids) {
+      const expanded = _isSubsessionExpanded(s.id);
+      rows += '<div class="subsession-family' + (expanded ? '' : ' collapsed') + '" data-family="' + s.id + '">';
+      rows += _renderSessionRow(s, ' family-parent');
+      if (expanded) {
+        const kidsSorted = sortedSessions(kids);
+        for (const kid of kidsSorted) {
+          rows += _renderSessionRow(kid, ' family-child');
+        }
+      }
+      rows += '</div>';
+    } else {
+      rows += _renderSessionRow(s, '');
+    }
+  }
+
+  el.innerHTML = header + rows;
+  initColResize();
+  attachTooltipListeners();
+  // See note above — keep the badge visible across re-renders.
+  _renderMultiSelectionBadge();
+}
+
+/* ---- Hover tooltip ---- */
+function attachTooltipListeners() {
+  document.querySelectorAll('.session-item[data-sid]').forEach(row => {
+    row.addEventListener('mouseenter', onRowEnter);
+    row.addEventListener('mouseleave', onRowLeave);
+    row.addEventListener('mousemove',  onRowMove);
+  });
+}
+
+function onRowEnter(e) {
+  const id = e.currentTarget.dataset.sid;
+  if (!id) return;
+  const s = allSessions.find(x => x.id === id);
+  if (!s) return;
+
+  const status = getSessionStatus(id);
+  const stateLabels = {
+    question:'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r=".5" fill="currentColor"/></svg> Question',
+    working:'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Working',
+    idle:'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><polyline points="20 6 9 17 4 12"/></svg> Idle',
+    sleeping:'<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg> Awaiting wake-up'
+  };
+  const _isCompactingTip = status === 'working' && window._sessionSubstatus && window._sessionSubstatus[id] === 'compacting';
+  // Sleeping tooltip: substatus 'auto-resuming' regardless of state, so the
+  // tooltip stays "Awaiting wake-up" across idle→working→idle within the
+  // wake-up cycle.  Without this, the tooltip flickered to "Working" the
+  // moment the wake-up fired.
+  const _isSleepingTip = window._sessionSubstatus && window._sessionSubstatus[id] === 'auto-resuming';
+  const stateLabel = _isCompactingTip
+    ? '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#aa88ff" stroke-width="2" stroke-linecap="round" style="vertical-align:middle;"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg> Compacting'
+    : _isSleepingTip
+    ? stateLabels.sleeping
+    : (stateLabels[status] || status);
+
+  const tip = document.getElementById('session-tooltip');
+  tip.innerHTML = `
+    <div class="tt-title">${escHtml(s.display_title)}</div>
+    <div class="tt-meta">
+      <span class="tt-state ${status}">${stateLabel}</span>
+      <span>${escHtml(s.last_activity)}</span>
+      <span>${escHtml(s.size)}</span>
+    </div>`;
+  tip.classList.add('visible');
+  positionTooltip(e);
+}
+
+function onRowLeave() {
+  const tip = document.getElementById('session-tooltip');
+  tip.classList.remove('visible');
+}
+
+function onRowMove(e) {
+  positionTooltip(e);
+}
+
+function positionTooltip(e) {
+  const tip = document.getElementById('session-tooltip');
+  const margin = 12;
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const tw = tip.offsetWidth, th = tip.offsetHeight;
+  let x = e.clientX + margin;
+  let y = e.clientY + margin;
+  if (x + tw > vw - 8) x = e.clientX - tw - margin;
+  if (y + th > vh - 8) y = e.clientY - th - margin;
+  tip.style.left = x + 'px';
+  tip.style.top  = y + 'px';
+}
+
+/* ---- Column resize ---- */
+function initColResize() {
+  document.querySelectorAll('.col-resize-grip').forEach(grip => {
+    grip.addEventListener('mousedown', e => {
+      e.stopPropagation();
+      const col = grip.dataset.col;
+      const startX = e.clientX;
+      const sidebar = document.querySelector('.sidebar');
+
+      // Get current pixel widths from the computed grid
+      const computed = getComputedStyle(sidebar);
+      const gridCols = getComputedStyle(document.querySelector('.col-header-row'))
+        .gridTemplateColumns.split(' ').map(v => parseFloat(v));
+      const [wName, wDate, wSize] = gridCols;
+
+      const startVal = col === 'name' ? wName : wDate;
+
+      grip.classList.add('dragging');
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+
+      function onMove(ev) {
+        const delta = ev.clientX - startX;
+        const newVal = Math.max(60, startVal + delta);
+        if (col === 'name') {
+          document.documentElement.style.setProperty('--col-name', newVal + 'px');
+        } else {
+          document.documentElement.style.setProperty('--col-date', newVal + 'px');
+        }
+      }
+      function onUp() {
+        grip.classList.remove('dragging');
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      }
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+  });
+}
+
+/* ---- Single / double click ---- */
+let _clickTimer = null;
+let _lastClickId = null;
+let _lastClickTime = 0;
+
+function singleOrDouble(id, e) {
+  // If the prior mousedown was a Ctrl/Cmd+click that already toggled
+  // multi-select, swallow this click instead of opening the session.
+  // (preventDefault on mousedown does not cancel the subsequent click.)
+  if (_consumeMsSuppression()) return;
+  // Plain click on a row clears any active multi-selection.  Matches
+  // Finder/Explorer/VS Code semantics: clicking elsewhere collapses the
+  // working set down to whatever you just clicked.
+  if (typeof multiSelectedIds !== 'undefined' && multiSelectedIds.size > 0) {
+    _clearMultiSelect();
+  }
+  openInGUI(id);
+}
+
+/**
+ * Double-click gesture on a session row (list-table view) or card (grid view)
+ * TOGGLES a session between IDLE and SLEEPING:
+ *
+ *   • SLEEPING   → wake it to idle (start_session with resume=true, no prompt)
+ *   • anything else (idle, working, waiting on a question) → sleep it.  The
+ *     user is in charge: a working session is not a reason to refuse.  Undo
+ *     on a session slept mid-turn wakes it rather than restoring "working".
+ *
+ * The idle→sleep and sleeping→wake paths are exact inverses of each other so
+ * the same double-click gesture flips between the two states repeatedly.  Both
+ * paths use the SAME undo-toast pattern (bottom-left, ~6s) so an accidental
+ * gesture is one click away from being reversed in either direction.
+ *
+ * Fires BESIDE the two single-click `singleOrDouble()` invocations that
+ * precede any dblclick — the session briefly opens in the live panel before
+ * the sleep/wake completes.  That's acceptable and gives visual confirmation
+ * the right session was targeted; the alternative (a 250ms debounce on every
+ * single click just to detect a double) would add latency to the far more
+ * common single-click-to-open path for every user, everywhere.
+ *
+ * No confirmation modal — neither sleep nor wake is destructive (a slept
+ * session resumes with full context; a woken session is one Sleep click away
+ * from being asleep again).  Instead we surface a **bottom-left Undo toast**
+ * that gives the user ~6 seconds to reverse an accidental gesture.
+ *
+ * The sleep leg mirrors the client-side stop steps in `closeSession()`
+ * (live-panel.js) and `_bulkStop()`: mark user-stop intent to block ghost-
+ * recovery timers, emit `close_session`, then clear all local state that
+ * would otherwise cause `getSessionStatus()` to keep reporting idle.
+ *
+ * The wake leg mirrors the resume path used by `_liveSubmitDirect()` for a
+ * sleeping session (live-panel.js, ~line 3510): clear user-stop intent so
+ * ghost-recovery/send-message auto-resume no longer suppress the session,
+ * emit `start_session` with `resume: true` and no prompt, then optimistically
+ * update local state (runningIds/guiOpenSessions/sessionKinds='working') so
+ * the row reflects the wake immediately.  The daemon's session_state stream
+ * (starting → idle) takes over from there.
+ */
+function _dblclickSleepIfIdle(sessionId, e, toastLabel) {
+  if (e && typeof e.preventDefault === 'function') e.preventDefault();
+  if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+  if (!sessionId) return;
+  if (window.VNAllProjects) VNAllProjects.adopt(sessionId);   // All projects: act in its own project
+  // Two quick Ctrl/Shift+clicks are selection, not a double-click: never
+  // sleep a session because the person was picking a range.
+  if (e && (e.shiftKey || e.ctrlKey || e.metaKey)) return;
+  // Standby:
+  // a double-click steps a session down one level, Needs you → Standby →
+  // Done, sleeping it on the way (Undo puts both back).  A Done session goes
+  // back to Standby without waking; chatting with it wakes
+  // it.  Only while the person-oriented statuses are on (SessionVerb); an
+  // explicit caller (toastLabel, e.g. Accept) keeps the plain sleep.
+  const SV = window.SessionVerb;
+  if (SV && SV.setHold && !toastLabel) {
+    const g = SV.shown(SV.display(sessionId));
+    const st = (typeof getSessionStatus === 'function') ? getSessionStatus(sessionId) : null;
+    const prev = SV.holdOf(sessionId);
+    if (g === 'needs' || g === 'standby') {
+      const to = g === 'needs' ? 'standby' : 'done', label = to === 'standby' ? 'Standby' : 'Done';
+      SV.setHold(sessionId, to);
+      const undoHold = () => SV.setHold(sessionId, prev);
+      if (st === 'sleeping') { _holdUndoToast(sessionId, label, undoHold); return; }
+      return _sleepOrWake(sessionId, null, label, undoHold);
+    }
+    if (g === 'done') {
+      SV.setHold(sessionId, 'standby');
+      _holdUndoToast(sessionId, 'Standby', () => SV.setHold(sessionId, prev));
+      return;
+    }
+  }
+  return _sleepOrWake(sessionId, null, toastLabel);
+}
+
+/** A hold changed on a session that was already asleep: just the Undo toast. */
+function _holdUndoToast(sessionId, label, undo) {
+  const s = (typeof allSessions !== 'undefined' && allSessions.find) ? allSessions.find(x => x.id === sessionId) : null;
+  const name = (s && s.display_title) || sessionId.slice(0, 8);
+  if (typeof _showUndoToast === 'function') _showUndoToast(label + ' — ' + name, 'Undo', undo, 6000);
+}
+
+/** Sleep an awake session (or wake a sleeping one), with Undo.  extraUndo
+ *  runs first when Undo is pressed (the hold a double-click set). */
+function _sleepOrWake(sessionId, e, toastLabel, extraUndo, collectUndo) {
+  if (e && typeof e.preventDefault === 'function') e.preventDefault();
+  if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+  if (!sessionId) return;
+  const status = (typeof getSessionStatus === 'function')
+    ? getSessionStatus(sessionId) : null;
+  if (status === 'sleeping') {
+    _dblclickWakeSleeping(sessionId);
+    return;
+  }
+  // The user is in charge of sleep.  A working session, or one waiting on a
+  // question, sleeps too: refusing it read as the session not letting the
+  // user sleep it.  close_session ends the turn and the
+  // CLI; the conversation resumes with full context on wake.  Do NOT bring
+  // back a refusal for any state.
+  const wasBusy = status !== 'idle';
+
+  // ── Snapshot the pre-sleep state so Undo can restore it exactly ──
+  // Idle can mean any of three flavors (see workforce.js getSessionStatus):
+  // in runningIds, in guiOpenSessions, or restored via window.sessionLastState.
+  // We capture all three so Undo doesn't downgrade an in-runningIds session to
+  // only a restart-memory one.
+  const wasInRunning = (typeof runningIds !== 'undefined' && runningIds.has)
+    ? runningIds.has(sessionId) : false;
+  const priorKind = (typeof sessionKinds !== 'undefined')
+    ? sessionKinds[sessionId] : undefined;
+  const wasInGuiOpen = (typeof guiOpenSessions !== 'undefined' && guiOpenSessions.has)
+    ? guiOpenSessions.has(sessionId) : false;
+  const priorLastState = (window.sessionLastState) ? window.sessionLastState[sessionId] : undefined;
+  const wasActive = (typeof activeId !== 'undefined' && activeId === sessionId);
+
+  // ── Perform the sleep ──
+  if (typeof markUserStopped === 'function') markUserStopped(sessionId);
+  if (typeof socket !== 'undefined') {
+    try { socket.emit('close_session', { session_id: sessionId }); } catch (err) {}
+  }
+  if (typeof guiOpenDelete === 'function') guiOpenDelete(sessionId);
+  if (typeof runningIds !== 'undefined' && runningIds.delete) runningIds.delete(sessionId);
+  if (typeof sessionKinds !== 'undefined') delete sessionKinds[sessionId];
+  if (window.sessionLastState) delete window.sessionLastState[sessionId];
+  // If this was the active/open session, reset the live input bar state so
+  // the panel reflects the stopped session rather than lingering on the old
+  // input mode.  Mirrors closeSession() in live-panel.js.
+  if (wasActive) {
+    if (typeof liveBarState !== 'undefined') liveBarState = null;
+    if (typeof updateLiveInputBar === 'function') updateLiveInputBar();
+  }
+  if (typeof filterSessions === 'function') filterSessions();
+
+  // ── Show bottom-left Undo toast ──
+  const displayName = (typeof allSessions !== 'undefined' && allSessions.find)
+    ? (function() {
+        const s = allSessions.find(x => x.id === sessionId);
+        return (s && s.display_title) || sessionId.slice(0, 8);
+      })()
+    : sessionId.slice(0, 8);
+  // A bulk caller (`collectUndo`) gathers every session's undo into ONE toast
+  // instead of one toast per session.
+  const _toast = (typeof collectUndo === 'function')
+    ? function(_msg, _lbl, fn) { collectUndo(fn); }
+    : _showUndoToast;
+  _toast(
+    (toastLabel || 'Session sleeping') + ' — ' + displayName,   // 'Done' from Accept (session-verdict.js)
+    'Undo',
+    function undo() {
+      if (typeof extraUndo === 'function') { try { extraUndo(); } catch (_e) { /* the sleep undo still runs */ } }
+      // A session slept mid-turn has no idle state to restore: its turn and
+      // CLI are gone.  Undo wakes it instead (resume, no prompt).
+      if (wasBusy) { _dblclickWakeSleeping(sessionId); return; }
+      // Clear user-stop intent so the client no longer suppresses ghost
+      // recovery / send-message auto-resume for this session.
+      if (typeof clearUserStopped === 'function') clearUserStopped(sessionId);
+      // Restore every flavor of local state we cleared.  The daemon session
+      // is genuinely stopped; the next real interaction with the session
+      // triggers the send-message error fallback in live-panel.js which
+      // resumes it transparently.  Until then the UI shows the session as
+      // it appeared before the accidental double-click.
+      if (wasInRunning && typeof runningIds !== 'undefined' && runningIds.add) {
+        runningIds.add(sessionId);
+      }
+      if (priorKind !== undefined && typeof sessionKinds !== 'undefined') {
+        sessionKinds[sessionId] = priorKind;
+      }
+      if (wasInGuiOpen && typeof guiOpenAdd === 'function') {
+        guiOpenAdd(sessionId);
+      }
+      if (priorLastState !== undefined) {
+        if (!window.sessionLastState) window.sessionLastState = {};
+        window.sessionLastState[sessionId] = priorLastState;
+      }
+      if (typeof filterSessions === 'function') filterSessions();
+      if (wasActive && typeof updateLiveInputBar === 'function') updateLiveInputBar();
+      if (typeof showToast === 'function' && typeof collectUndo !== 'function') showToast('Sleep undone');
+    },
+    6000
+  );
+}
+// Expose for cross-script use (workforce.js's grid card ondblclick).
+if (typeof window !== 'undefined') window._dblclickSleepIfIdle = _dblclickSleepIfIdle;
+if (typeof window !== 'undefined') window._sleepOrWake = _sleepOrWake;
+
+/**
+ * Inverse of the sleep leg above: wake a SLEEPING session back to idle.
+ * Called by `_dblclickSleepIfIdle` when the double-clicked session is asleep.
+ *
+ * Resume path is identical to `_liveSubmitDirect()` in live-panel.js (the
+ * live panel's "type a message on a sleeping session" flow) minus the prompt:
+ * emit `start_session` with `resume: true` and no prompt, and let the daemon's
+ * session_state stream (starting → idle) drive the UI transition.  Optimistic
+ * local state (runningIds, guiOpenSessions, sessionKinds='working') fills the
+ * gap until the first state event arrives so the row doesn't flash-sleep for
+ * a beat before the wake registers.
+ *
+ * Undo restores the sleeping state via the same close_session/markUserStopped
+ * combo the sleep leg uses, so a double-click there → Undo here → double-click
+ * again round-trips cleanly.
+ */
+function _dblclickWakeSleeping(sessionId) {
+  // Snapshot pre-wake state — currently sleeping means we do NOT restore any
+  // active local state on Undo (that IS what sleeping means).  We only need
+  // the display name for the toast.
+  const displayName = (typeof allSessions !== 'undefined' && allSessions.find)
+    ? (function() {
+        const s = allSessions.find(x => x.id === sessionId);
+        return (s && s.display_title) || sessionId.slice(0, 8);
+      })()
+    : sessionId.slice(0, 8);
+
+  // ── Perform the wake ──
+  // Clear user-stop intent so ghost-recovery / send-message auto-resume no
+  // longer suppress this session (mirror of the sleep leg's markUserStopped).
+  if (typeof clearUserStopped === 'function') clearUserStopped(sessionId);
+
+  // Resolve model preference the same way _liveSubmitDirect does so a wake
+  // via double-click honors the session's model: daemon-confirmed truth first
+  // (fresh from every device), else this tab's explicit pending choice.
+  let _desiredModel = '';
+  try {
+    if (typeof SessionModel !== 'undefined') {
+      _desiredModel = (SessionModel.resumeModel
+        ? SessionModel.resumeModel(sessionId)
+        : (SessionModel.getDesired ? SessionModel.getDesired(sessionId) : '')) || '';
+    }
+  } catch (_) { /* SessionModel may not be defined in some views */ }
+  let _resumeThinking = '';
+  try {
+    if (typeof SessionModel !== 'undefined' && SessionModel.resumeThinking) {
+      _resumeThinking = SessionModel.resumeThinking(sessionId) || '';
+    }
+  } catch (_) { /* store unavailable — daemon re-pins remembered effort */ }
+
+  if (typeof socket !== 'undefined') {
+    try {
+      socket.emit('start_session', {
+        session_id: sessionId,
+        cwd: (typeof _currentProjectDir === 'function') ? _currentProjectDir() : '',
+        resume: true,
+        model: _desiredModel || undefined,
+        thinking_level: _resumeThinking || undefined,
+      });
+    } catch (err) { /* transport dead — the wake toast still shows */ }
+  }
+
+  // Optimistic local state so the row updates immediately (before the daemon's
+  // first session_state broadcast).  Mirror of the sleep leg's clears.
+  if (typeof runningIds !== 'undefined' && runningIds.add) runningIds.add(sessionId);
+  if (typeof guiOpenAdd === 'function') guiOpenAdd(sessionId);
+  if (typeof sessionKinds !== 'undefined') sessionKinds[sessionId] = 'working';
+  if (window.sessionLastState) window.sessionLastState[sessionId] = 'working';
+  if (typeof filterSessions === 'function') filterSessions();
+
+  // ── Show bottom-left Undo toast ──
+  _showUndoToast(
+    'Session waking — ' + displayName,
+    'Undo',
+    function undo() {
+      // Reverse the wake exactly the way the sleep leg would: user-stop
+      // intent + close_session + clear local state.  Matches _dblclickSleepIfIdle's
+      // sleep block so a rapid wake→undo puts the session back in the same
+      // "sleeping" bucket getSessionStatus() reports.
+      if (typeof markUserStopped === 'function') markUserStopped(sessionId);
+      if (typeof socket !== 'undefined') {
+        try { socket.emit('close_session', { session_id: sessionId }); } catch (err) {}
+      }
+      if (typeof guiOpenDelete === 'function') guiOpenDelete(sessionId);
+      if (typeof runningIds !== 'undefined' && runningIds.delete) runningIds.delete(sessionId);
+      if (typeof sessionKinds !== 'undefined') delete sessionKinds[sessionId];
+      if (window.sessionLastState) delete window.sessionLastState[sessionId];
+      if (typeof filterSessions === 'function') filterSessions();
+      if (typeof showToast === 'function') showToast('Wake undone');
+    },
+    6000
+  );
+}
+if (typeof window !== 'undefined') window._dblclickWakeSleeping = _dblclickWakeSleeping;
+
+/**
+ * Bottom-left toast with an actionable button that auto-times-out.  Used by
+ * `_dblclickSleepIfIdle()` — kept generic so future flows (delete, move,
+ * batch actions) can reuse the same visual pattern without each rebuilding
+ * their own DOM.
+ *
+ * A single toast is shown at a time: calling this while one is up dismisses
+ * the prior one first (its onUndo is NOT invoked — replacement means "the
+ * prior action stands").  This avoids two toasts stacking in the same corner
+ * and makes it obvious which action Undo would reverse.
+ *
+ * @param {string} msg           — plain-text message (no HTML; escaped).
+ * @param {string} actionLabel   — button label, e.g. "Undo".
+ * @param {Function} onAction    — called when the button is clicked. Not
+ *                                 called on timeout or replacement.
+ * @param {number}  timeoutMs    — auto-dismiss timer (5-8s is typical).
+ */
+let _vnUndoToastEl = null;
+let _vnUndoToastTimer = null;
+function _showUndoToast(msg, actionLabel, onAction, timeoutMs) {
+  // Dismiss any prior undo toast without invoking its handler — see comment above.
+  // (The layout call below, after the new one is appended, restacks.)
+  if (_vnUndoToastEl) {
+    try { _vnUndoToastEl.remove(); } catch (e) {}
+    _vnUndoToastEl = null;
+  }
+  if (_vnUndoToastTimer) {
+    clearTimeout(_vnUndoToastTimer);
+    _vnUndoToastTimer = null;
+  }
+
+  const el = document.createElement('div');
+  el.className = 'vn-undo-toast';
+  const msgSpan = document.createElement('span');
+  msgSpan.className = 'vn-undo-toast-msg';
+  msgSpan.textContent = msg;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'vn-undo-toast-btn';
+  btn.textContent = actionLabel;
+  el.appendChild(msgSpan);
+  el.appendChild(btn);
+  document.body.appendChild(el);
+  // Place it in the shared float stack (utils.js) before it fades in.
+  if (typeof _updateFloatOffset === 'function') _updateFloatOffset();
+  // Trigger CSS enter transition on next frame — appending with .show already
+  // set would skip the transition entirely (opacity/transform start at target).
+  requestAnimationFrame(() => { el.classList.add('show'); });
+  _vnUndoToastEl = el;
+
+  const dismiss = function() {
+    if (_vnUndoToastTimer) { clearTimeout(_vnUndoToastTimer); _vnUndoToastTimer = null; }
+    if (_vnUndoToastEl !== el) return;  // already replaced
+    el.classList.remove('show');
+    // Let the fade-out play before removing so the last frame doesn't clip.
+    setTimeout(() => {
+      try { el.remove(); } catch (e) {}
+      if (_vnUndoToastEl === el) _vnUndoToastEl = null;
+      if (typeof _layoutFloats === 'function') _layoutFloats();
+    }, 250);
+  };
+
+  btn.addEventListener('click', function(ev) {
+    ev.stopPropagation();
+    try { if (typeof onAction === 'function') onAction(); }
+    finally { dismiss(); }
+  });
+
+  _vnUndoToastTimer = setTimeout(dismiss, Math.max(1500, timeoutMs || 5000));
+}
+if (typeof window !== 'undefined') window._showUndoToast = _showUndoToast;
+
+/* ---- Right-click / long-press context menu ----
+ *
+ * Two rendering modes:
+ *   - Desktop  → floating `.ws-ctx-menu` popup anchored at the pointer.
+ *   - Mobile   → iOS-style bottom action sheet (reuses #mobile-sheet DOM/CSS
+ *                that mobile.js installs for the ••• toolbar action sheet),
+ *                so this menu feels identical to the ••• menu: backdrop,
+ *                slide-up from bottom, full-width rows with dividers, and
+ *                a separate "Cancel" button.
+ *
+ * Both modes are driven by the same data-shaped `items` list built once,
+ * so action coverage is identical.  The only per-mode divergence is the
+ * DOM the items get rendered into.
+ */
+
+// Detect touch/phone width.  Kept in sync with mobile.js's own check so
+// both paths agree on where the ••• sheet UI kicks in.
+function _isMobileCtx() {
+  return !!(window.matchMedia && window.matchMedia('(max-width:768px)').matches);
+}
+
+// Reuse the same #mobile-sheet DOM the ••• toolbar sheet installs.  If it
+// hasn't been created yet (rare — mobile.js typically creates it on first
+// ••• tap), we create it here with the exact same ids/classes so the
+// existing mobile.css rules apply automatically.  No CSS edits required.
+function _closeSessionSheet() {
+  var s = document.getElementById('mobile-sheet');
+  var b = document.getElementById('mobile-sheet-backdrop');
+  if (s) s.classList.remove('show');
+  if (b) b.classList.remove('show');
+}
+
+/**
+ * Render a data-driven action sheet using the same iOS-style DOM as the
+ * ••• toolbar sheet.
+ *
+ * @param {Array<{divider?:boolean, label?:string, icon?:string,
+ *                action?:string, danger?:boolean, disabled?:boolean,
+ *                headerHtml?:string}>} items
+ * @param {(action:string, item:Object) => void} onAction
+ */
+function _openSessionSheet(items, onAction) {
+  var backdrop = document.getElementById('mobile-sheet-backdrop');
+  if (!backdrop) {
+    backdrop = document.createElement('div');
+    backdrop.id = 'mobile-sheet-backdrop';
+    document.body.appendChild(backdrop);
+  }
+  // Rewire the backdrop click each time — we don't want a stale handler
+  // (the ••• sheet's closeSheet vs. ours) firing for the wrong sheet.
+  backdrop.onclick = _closeSessionSheet;
+
+  var sheet = document.getElementById('mobile-sheet');
+  if (!sheet) {
+    sheet = document.createElement('div');
+    sheet.id = 'mobile-sheet';
+    document.body.appendChild(sheet);
+  }
+
+  // Strip dividers for the sheet.  On iOS action sheets, groups aren't
+  // separated by visible dividers within the card — every row has the
+  // same hairline separator.  Collapsing dividers keeps the row count
+  // dense (important on a phone) without losing any actions.
+  var actionable = items.filter(function(it) { return !it.divider; });
+
+  var html = '';
+  // Optional header row (used by the bulk sheet to show "N selected").
+  var headerItem = items.find(function(it) { return it.headerHtml; });
+  if (headerItem) {
+    html += '<div class="sheet-card" style="margin-bottom:8px;">'
+         + '<div class="sheet-item" style="justify-content:center;'
+         + 'font-weight:600;color:var(--text-secondary);cursor:default;">'
+         + headerItem.headerHtml + '</div></div>';
+  }
+  html += '<div class="sheet-card">';
+  actionable.forEach(function(it, i) {
+    if (it.headerHtml) return;  // already rendered above
+    var styles = it.danger ? ' style="color:var(--result-err);"' : '';
+    var disabled = it.disabled ? ' disabled' : '';
+    var iconHtml = it.icon
+      ? '<span style="display:inline-flex;align-items:center;margin-right:12px;flex:0 0 auto;">'
+        + it.icon + '</span>'
+      : '';
+    html += '<button class="sheet-item" data-i="' + i + '"' + disabled + styles + '>'
+         + iconHtml + escHtml(it.label || '') + '</button>';
+  });
+  html += '</div><button class="sheet-cancel">Cancel</button>';
+  sheet.innerHTML = html;
+
+  sheet.querySelectorAll('.sheet-item').forEach(function(el) {
+    el.addEventListener('click', function() {
+      var idx = +el.getAttribute('data-i');
+      var it = actionable[idx];
+      if (!it || it.disabled || it.headerHtml) return;
+      _closeSessionSheet();
+      // Let the slide-down animation get started before dispatching the
+      // action — matches the ••• sheet's 80ms delay for a snappier feel.
+      setTimeout(function() { onAction(it.action, it); }, 80);
+    });
+  });
+  var cancelBtn = sheet.querySelector('.sheet-cancel');
+  if (cancelBtn) cancelBtn.addEventListener('click', _closeSessionSheet);
+
+  requestAnimationFrame(function() {
+    backdrop.classList.add('show');
+    sheet.classList.add('show');
+  });
+}
+
+// ---- Icon strings, factored out so both mobile and desktop paths share ----
+var _ICONS = {
+  pause:    '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9.5"/><path d="M10 9v6"/><path d="M14 9v6"/></svg>',
+  pin:      _PIN_SVG.replace('<svg ', '<svg width="18" height="18" '),
+  checkc:   '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5"/><polyline points="16.5 9 10.5 15 7.5 12"/></svg>',
+  open:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>',
+  autoname: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
+  rename:   '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>',
+  link:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>',
+  compose:  '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
+  spawn:    '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 3v6"/><path d="M6 9c0 4 4 6 8 6"/><polyline points="11 12 14 15 11 18"/></svg>',
+  plus:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+  cont:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/></svg>',
+  dup:      '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  template: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>',
+  terminal: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>',
+  compact:  '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>',
+  stop:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/></svg>',
+  trash:    '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
+  grid:     '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
+  x:        '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+  folder:   '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
+};
+
+// Downscaled 14×14 icon variant for the tighter desktop popup.
+function _iconDesktop(svg) {
+  return svg.replace('width="18" height="18"', 'width="14" height="14"');
+}
+
+function sessionContextMenu(e, sessionId) {
+  e.preventDefault();
+  e.stopPropagation();
+  if (window.VNAllProjects) VNAllProjects.adopt(sessionId);   // All projects: act in its own project
+
+  // Hide tooltip if visible
+  const tip = document.getElementById('session-tooltip');
+  if (tip) tip.classList.remove('visible');
+
+  // Remove any existing context menu (desktop popup or mobile sheet)
+  var old = document.querySelector('.session-ctx-menu');
+  if (old) old.remove();
+  _closeSessionSheet();
+
+  // ----- Multi-selection routing (Finder/Explorer/VS Code semantics) -----
+  // Right-click on a row that's part of a 2+ selection -> show bulk menu.
+  // Right-click on a row NOT in the selection -> clear the selection and
+  // show the single-row menu (the user expects "act on just this row").
+  // Right-click with selection size <= 1 falls through to the single-row
+  // path so the bulk menu only appears for multi-target operations.
+  //
+  // NOTE: We previously gated this on viewMode === 'sessions', but the
+  // sidebar (and these rows) are rendered in 'workplace', 'kanban', and
+  // 'compose' views too — gating made the bulk menu silently disappear
+  // and the single-row menu appear instead, which looked exactly like
+  // "only one row is selected" to the user.  The bulk actions themselves
+  // are sensible regardless of which main view is active.  Compose view
+  // is the one nuance: there sessions are grouped by composition, but the
+  // bulk actions (stop/delete/etc) are still well-defined per session ID.
+  if (multiSelectedIds.size >= 2 && multiSelectedIds.has(sessionId)) {
+    return _bulkContextMenu(e);
+  }
+  if (multiSelectedIds.size > 0 && !multiSelectedIds.has(sessionId)) {
+    _clearMultiSelect();
+  }
+
+  const isActive = sessionId === activeId;
+  const isRunning = runningIds.has(sessionId);
+  const isOpenInGui = guiOpenSessions.has(sessionId);
+  // "Appears active" drives the Stop item.  getSessionStatus() is the single
+  // source of truth for the row icon — it returns working/idle/question for
+  // live sessions AND for sessions restored from before a restart, and only
+  // 'sleeping' for genuinely dormant, never-active sessions.  Gating Stop on
+  // it (rather than runningIds/guiOpenSessions alone) keeps the menu and the
+  // icon consistent: a session that shows an idle/working icon always offers
+  // Stop.  Without this, restored sessions displayed as idle but had no Stop
+  // item, which read as "the Stop button vanished".  closeSession() is safe
+  // for a dormant session — it always messages the daemon, which no-ops for a
+  // session it doesn't hold.  (It used to skip the daemon unless runningIds
+  // had the session, which made Stop a no-op for every session this condition
+  // newly exposed it for — see closeSession() in live-panel.js.)
+  const appearsActive = (typeof getSessionStatus === 'function')
+    ? getSessionStatus(sessionId) !== 'sleeping'
+    : (isRunning || isOpenInGui);
+
+  // Build items as data — rendered as EITHER a floating popup (desktop)
+  // OR a bottom sheet (mobile).
+  var items = [];
+  if (!isActive) items.push({ label: 'Open',        icon: _ICONS.open,     action: 'open' });
+  items.push({ label: 'Auto-name',                  icon: _ICONS.autoname, action: 'autoname' });
+  items.push({ label: 'Rename',                     icon: _ICONS.rename,   action: 'rename' });
+  // Pinned sessions stay first whatever the sort.
+  items.push(isSessionPinned(sessionId)
+    ? { label: 'Unpin',      icon: _ICONS.pin, action: 'unpin' }
+    : { label: 'Pin to top', icon: _ICONS.pin, action: 'pin' });
+  // Standby / Mark done,
+  // while the person-oriented statuses are on.
+  if (window.SessionVerb && window.SessionVerb.setHold) {
+    const _g = window.SessionVerb.shown(window.SessionVerb.display(sessionId));
+    items.push({ divider: true });
+    if (_g === 'standby') items.push({ label: 'Back to Needs you', icon: _ICONS.cont, action: 'unpark' });
+    else items.push({ label: 'Standby', icon: _ICONS.pause, action: 'standby' });
+    if (_g !== 'done') items.push({ label: 'Mark done', icon: _ICONS.checkc, action: 'mark-done' });
+  }
+  items.push({ divider: true });
+  items.push({ label: 'Link to Workflow Task',      icon: _ICONS.link,     action: 'link-workflow' });
+  items.push({ label: 'Add to Structured composition', icon: _ICONS.compose, action: 'add-compose' });
+  items.push({ label: 'Spawn Subsession',           icon: _ICONS.spawn,    action: 'spawn-subsession' });
+  items.push({ label: 'Create Workflow Task',       icon: _ICONS.plus,     action: 'create-workflow' });
+  items.push({ divider: true });
+  items.push({ label: 'Continue',                   icon: _ICONS.cont,     action: 'continue' });
+  items.push({ label: 'Duplicate',                  icon: _ICONS.dup,      action: 'duplicate' });
+  items.push({ label: 'Move to Project…',           icon: _ICONS.folder,   action: 'move-project' });
+  items.push({ label: 'Save as Template',           icon: _ICONS.template, action: 'save-template' });
+  items.push({ label: 'Open in Terminal',           icon: _ICONS.terminal, action: 'terminal' });
+  if (isActive) {
+    items.push({ divider: true });
+    items.push({ label: 'Compact Context',          icon: _ICONS.compact,  action: 'compact' });
+  }
+  if (appearsActive) {
+    items.push({ divider: true });
+    items.push({ label: 'Stop Session',             icon: _ICONS.stop,     action: 'stop',   danger: true });
+  }
+  items.push({ divider: true });
+  items.push({ label: 'Delete',                     icon: _ICONS.trash,    action: 'delete', danger: true });
+
+  // ----- Mobile: iOS-style bottom sheet -----
+  if (_isMobileCtx()) {
+    _openSessionSheet(items, function(action) { _sessCtx(action, sessionId); });
+    return;
+  }
+
+  // ----- Desktop: floating popup at the pointer -----
+  var menu = document.createElement('div');
+  menu.className = 'session-ctx-menu ws-ctx-menu';
+
+  var html = '';
+  items.forEach(function(it) {
+    if (it.divider) { html += '<div class="ws-ctx-divider"></div>'; return; }
+    var cls = 'ws-ctx-item' + (it.danger ? ' danger' : '');
+    html += '<div class="' + cls + '" onclick="_sessCtx(\'' + it.action + '\',\'' + sessionId + '\')">'
+         + _iconDesktop(it.icon) + ' ' + escHtml(it.label) + '</div>';
+  });
+  menu.innerHTML = html;
+  menu.style.left = e.clientX + 'px';
+  menu.style.top = e.clientY + 'px';
+  document.body.appendChild(menu);
+
+  // Ensure menu stays within viewport
+  requestAnimationFrame(function() {
+    var rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth) {
+      menu.style.left = (window.innerWidth - rect.width - 8) + 'px';
+    }
+    if (rect.bottom > window.innerHeight) {
+      menu.style.top = (window.innerHeight - rect.height - 8) + 'px';
+    }
+  });
+
+  // Close on click outside
+  var closer = function(ev) {
+    if (!menu.contains(ev.target)) {
+      menu.remove();
+      document.removeEventListener('click', closer);
+    }
+  };
+  setTimeout(function() { document.addEventListener('click', closer); }, 0);
+}
+
+function _sessCtx(action, sessionId) {
+  // Remove context menu (desktop popup) and dismiss mobile sheet if open
+  var menu = document.querySelector('.session-ctx-menu');
+  if (menu) menu.remove();
+  _closeSessionSheet();
+
+  switch (action) {
+    case 'pin':
+    case 'unpin':
+      if (isSessionPinned(sessionId) !== (action === 'pin')) toggleSessionPin(sessionId);
+      break;
+    case 'standby':
+      if (window.SessionVerdict) window.SessionVerdict.standby(sessionId);
+      break;
+    case 'mark-done':
+      if (window.SessionVerdict) window.SessionVerdict.accept(sessionId);
+      break;
+    case 'unpark':
+      if (window.SessionVerdict) window.SessionVerdict.unpark(sessionId);
+      break;
+    case 'open':
+      openInGUI(sessionId);
+      break;
+    case 'autoname':
+      autoName(sessionId);
+      break;
+    case 'rename':
+      // Open the session first if not active, then trigger inline rename
+      if (sessionId !== activeId) {
+        openInGUI(sessionId).then(function() {
+          setTimeout(function() { handleNameClick(sessionId); }, 200);
+        });
+      } else {
+        handleNameClick(sessionId);
+      }
+      break;
+    case 'link-workflow':
+      openTaskPickerModal(sessionId, 'workflow');
+      break;
+    case 'add-compose':
+      _addToCompose(sessionId);
+      break;
+    case 'spawn-subsession':
+      _spawnSubsession(sessionId);
+      break;
+    case 'create-workflow':
+      createWorkflowTaskFromSession(sessionId);
+      break;
+    case 'continue':
+      continueSession(sessionId);
+      break;
+    case 'duplicate':
+      duplicateSession(sessionId);
+      break;
+    case 'move-project':
+      _moveSessionToProject(sessionId);
+      break;
+    case 'save-template':
+      if (typeof _saveSessionAsTemplate === 'function') {
+        _saveSessionAsTemplate(sessionId);
+      } else {
+        showToast('Template system not available', true);
+      }
+      break;
+    case 'terminal':
+      openInClaude(sessionId);
+      break;
+    case 'compact':
+      liveCompact();
+      break;
+    case 'stop':
+      closeSession(sessionId);
+      break;
+    case 'delete':
+      deleteSession(sessionId);
+      break;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Spawn Subsession (spec §4.2 + §4.6) — peel off a side investigation
+// ═══════════════════════════════════════════════════════════════
+//
+// POSTs to /api/sessions/<parent_sid>/spawn-subsession, then opens
+// the resulting child in the live panel.  Reloads the session list so
+// the new child appears indented under its parent.  Fires a soft
+// highlight pulse on both rows for 600 ms (CSS handles the animation).
+async function _spawnSubsession(parentSid) {
+  if (!parentSid) return;
+  const proj = localStorage.getItem('activeProject') || '';
+  const url = '/api/sessions/' + encodeURIComponent(parentSid)
+    + '/spawn-subsession'
+    + (proj ? '?project=' + encodeURIComponent(proj) : '');
+  let resp;
+  try {
+    resp = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+  } catch (e) {
+    if (typeof showToast === 'function') {
+      showToast('Spawn failed: network error', true);
+    }
+    return;
+  }
+  let data = null;
+  try { data = await resp.json(); } catch (e) {}
+  if (!resp.ok || !data || data.ok !== true) {
+    const errMsg = (data && data.error) || ('HTTP ' + resp.status);
+    if (typeof showToast === 'function') {
+      showToast('Spawn failed: ' + errMsg, true);
+    }
+    return;
+  }
+
+  // One-time intro tooltip (spec §4.6.1).
+  if (!localStorage.getItem('vn.tip.subsession_intro')) {
+    localStorage.setItem('vn.tip.subsession_intro', '1');
+    if (typeof showToast === 'function') {
+      showToast(
+        'This is a subsession. It knows everything its parent knew when it was spawned. '
+        + 'Reports flow back to the parent on your next message there.'
+      );
+    }
+  } else if (typeof showToast === 'function') {
+    showToast('Subsession spawned under "' + (data.title || parentSid.slice(0, 8)) + '"');
+  }
+
+  // Reload the session list so the child appears under its parent.
+  if (typeof loadSessions === 'function') {
+    try { await loadSessions(); } catch (e) {}
+  }
+
+  // Open the new subsession in the live panel.
+  if (typeof openInGUI === 'function' && data.new_id) {
+    try { await openInGUI(data.new_id); } catch (e) {}
+  }
+
+  // Spawn-pulse animation — CSS .subsession-spawn-pulse fades a soft
+  // yellow background over 600 ms.  Defer one tick so the new row
+  // exists in the DOM before we attach the class.
+  setTimeout(function() {
+    const childRow = document.querySelector('.session-item[data-sid="' + (data.new_id || '') + '"]');
+    if (childRow) childRow.classList.add('subsession-spawn-pulse');
+    const parentRow = document.querySelector('.session-item[data-sid="' + parentSid + '"]');
+    if (parentRow) parentRow.classList.add('subsession-spawn-pulse');
+    setTimeout(function() {
+      if (childRow) childRow.classList.remove('subsession-spawn-pulse');
+      if (parentRow) parentRow.classList.remove('subsession-spawn-pulse');
+    }, 700);
+  }, 50);
+}
+
+// Ctrl+Shift+S keyboard shortcut — spawn a subsession from whatever
+// session is currently open in the live panel.
+document.addEventListener('keydown', function(e) {
+  if (e.ctrlKey && e.shiftKey && (e.key === 'S' || e.key === 's')) {
+    // Skip if user is typing in an input/textarea.
+    const tag = (e.target && e.target.tagName) || '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+    if (e.target && e.target.isContentEditable) return;
+    if (typeof activeId !== 'undefined' && activeId) {
+      e.preventDefault();
+      _spawnSubsession(activeId);
+    }
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 6.5 P1-5 — Rewind-orphan UI prompt
+// ═══════════════════════════════════════════════════════════════
+//
+// When the rewind endpoint returns a non-empty `rewind_orphans` array,
+// surface a modal listing each orphaned child with [Re-anchor] and
+// [Detach] buttons (spec §6.3).
+//
+// Re-anchor → POST /api/sessions/<child>/reanchor (server resolves the
+//   new origin_turn from the current parent tip)
+// Detach    → POST /api/sessions/<child>/detach (clears parent pointer,
+//   stamps parent_deleted_at like §6.2 orphan)
+//
+// Exposed on window so toolbar.js (which holds the rewind response
+// handler) can call us without taking a hard dependency on this file.
+window._handleRewindOrphans = function(parentSid, orphanSids) {
+  if (!Array.isArray(orphanSids) || !orphanSids.length) return;
+  const proj = localStorage.getItem('activeProject') || '';
+  const projQ = proj ? '?project=' + encodeURIComponent(proj) : '';
+
+  function nameFor(sid) {
+    // Best-effort lookup in the existing session list; falls back to
+    // the SID prefix so the modal is never empty-labelled.
+    if (typeof allSessions !== 'undefined' && Array.isArray(allSessions)) {
+      const hit = allSessions.find(function(s) { return s && s.id === sid; });
+      if (hit && hit.title) return hit.title;
+    }
+    return (sid || '').slice(0, 8);
+  }
+
+  let modal = document.getElementById('rewind-orphans-modal');
+  if (modal) modal.remove();
+  modal = document.createElement('div');
+  modal.id = 'rewind-orphans-modal';
+  modal.className = 'subsession-report-modal';
+  let rows = '';
+  orphanSids.forEach(function(sid) {
+    const safe = String(sid).replace(/[^A-Za-z0-9_-]/g, '');
+    rows +=
+      '<div class="rewind-orphan-row" data-sid="' + safe + '">'
+      + '<div class="rewind-orphan-name">' + escHtml(nameFor(sid)) + '</div>'
+      + '<button type="button" class="rewind-orphan-reanchor">Re-anchor at current parent tip</button>'
+      + '<button type="button" class="rewind-orphan-detach">Detach</button>'
+      + '</div>';
+  });
+  modal.innerHTML =
+    '<div class="subsession-report-card">'
+    + '<div class="subsession-report-title">Subsessions orphaned by rewind</div>'
+    + '<div class="subsession-report-help">'
+    + 'These subsessions were spawned past the line you rewound to.  '
+    + 'Pick an action for each.'
+    + '</div>'
+    + '<div class="rewind-orphans-list">' + rows + '</div>'
+    + '<div class="subsession-report-actions">'
+    + '<button type="button" class="rewind-orphan-close">Close</button>'
+    + '</div>'
+    + '</div>';
+  document.body.appendChild(modal);
+
+  modal.querySelector('.rewind-orphan-close').addEventListener('click', function() {
+    modal.remove();
+  });
+
+  Array.prototype.forEach.call(
+    modal.querySelectorAll('.rewind-orphan-row'),
+    function(row) {
+      const childSid = row.getAttribute('data-sid');
+      row.querySelector('.rewind-orphan-reanchor').addEventListener('click', async function() {
+        try {
+          const url = '/api/sessions/' + encodeURIComponent(childSid) + '/reanchor' + projQ;
+          const resp = await fetch(url, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({}),
+          });
+          const data = await resp.json().catch(function() { return null; });
+          if (!resp.ok || !data || data.ok !== true) {
+            const err = (data && data.error) || ('HTTP ' + resp.status);
+            if (typeof showToast === 'function') showToast('Re-anchor failed: ' + err, true);
+            return;
+          }
+          if (typeof showToast === 'function') {
+            showToast('Re-anchored at line ' + (data.subsession_origin_turn || '?'));
+          }
+          row.remove();
+          if (!modal.querySelectorAll('.rewind-orphan-row').length) modal.remove();
+        } catch (e) {
+          if (typeof showToast === 'function') showToast('Re-anchor failed: network error', true);
+        }
+      });
+      row.querySelector('.rewind-orphan-detach').addEventListener('click', async function() {
+        try {
+          const url = '/api/sessions/' + encodeURIComponent(childSid) + '/detach' + projQ;
+          const resp = await fetch(url, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({}),
+          });
+          const data = await resp.json().catch(function() { return null; });
+          if (!resp.ok || !data || data.ok !== true) {
+            const err = (data && data.error) || ('HTTP ' + resp.status);
+            if (typeof showToast === 'function') showToast('Detach failed: ' + err, true);
+            return;
+          }
+          if (typeof showToast === 'function') showToast('Subsession detached.');
+          row.remove();
+          if (!modal.querySelectorAll('.rewind-orphan-row').length) modal.remove();
+        } catch (e) {
+          if (typeof showToast === 'function') showToast('Detach failed: network error', true);
+        }
+      });
+    }
+  );
+};
+
+// ═══════════════════════════════════════════════════════════════
+// Add to Structured composition — unified tree picker
+// ═══════════════════════════════════════════════════════════════
+
+// Sanitize an ID for safe embedding in onclick attributes
+function _atcSafeId(id) { return String(id || '').replace(/[^a-zA-Z0-9_-]/g, ''); }
+
+// State for the active picker (reset on close)
+let _atcSessionId = null;
+let _atcProjectId = null;
+let _atcSections = [];
+
+function _atcSessionName() {
+  const sess = (typeof allSessions !== 'undefined')
+    ? allSessions.find(s => s.id === _atcSessionId) : null;
+  if (!sess) return 'Untitled Session';
+  return sess.custom_title || sess.display_title || 'Untitled Session';
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Move to Project — relocate a session into another project
+// ═══════════════════════════════════════════════════════════════
+//
+// A session belongs to a project purely by which
+// ~/.claude/projects/<encoded-cwd>/ directory its .jsonl lives in.  The working
+// directory used on resume is resolved live from the ACTIVE project on the
+// client (_currentProjectDir in socket.js), so relocating the .jsonl (backend:
+// POST /api/move-session/<id>) is a complete, correct move — when the user
+// opens the session under the target project it resumes in that project's dir.
+//
+// Flow: right-click → "Move to Project…" → pick an existing project or create a
+// new one → the session leaves the current project and is cleaned out of the
+// current view (mirrors the delete cleanup, minus the trash semantics).
+let _mtpSessionId = null;
+
+async function _moveSessionToProject(sessionId) {
+  const overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+  _mtpSessionId = sessionId;
+
+  const current = localStorage.getItem('activeProject') || '';
+
+  // Prefer the app-wide cached list; refetch if empty (same self-heal as
+  // openProjectOverlay, where a slow/failed startup fetch leaves it empty).
+  let projects = Array.isArray(_allProjects) ? _allProjects.slice() : [];
+  if (!projects.length) {
+    try {
+      const res = await fetch('/api/projects', { cache: 'no-store' });
+      if (res.ok) projects = await res.json();
+    } catch (e) { /* offline — the create-new path still works */ }
+  }
+  _mtpRenderPicker(overlay, projects, current);
+}
+
+function _mtpRenderPicker(overlay, projects, current) {
+  const others = (projects || []).filter(p => p && p.encoded !== current);
+  const esc = (typeof escHtml === 'function') ? escHtml : (s => s);
+
+  let html = '<div class="pm-card pm-enter" style="max-width:480px;">';
+  html += '<h2 class="pm-title">Move to Project</h2>';
+  html += '<div class="pm-body" style="padding:0;"><div class="kanban-create-section">';
+
+  if (!others.length) {
+    html += '<div class="kanban-create-section-label">No other projects yet. Create one:</div>';
+  } else {
+    html += '<div class="kanban-create-section-label">Choose a destination</div>';
+    for (const p of others) {
+      const name = (typeof _projectShortName === 'function')
+        ? _projectShortName(p) : (p.custom_name || p.display || p.encoded);
+      html += '<div class="kanban-drill-chooser-card" style="cursor:pointer;" '
+        + 'onclick="_mtpDoMove(\'' + encodeURIComponent(p.encoded) + '\')">'
+        + '<div class="kanban-drill-chooser-icon" style="color:var(--accent);">' + _ICONS.folder + '</div>'
+        + '<div style="min-width:0;"><div class="kanban-drill-chooser-title">' + esc(name) + '</div>'
+        + '<div style="font-size:11px;color:var(--text-faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(p.display || '') + '</div></div></div>';
+    }
+  }
+
+  // Create-new row (always offered).
+  html += '<div class="kanban-drill-chooser-card" style="cursor:pointer;margin-top:6px;" onclick="_mtpShowCreate()">'
+    + '<div class="kanban-drill-chooser-icon" style="color:var(--accent);">' + _ICONS.plus + '</div>'
+    + '<div><div class="kanban-drill-chooser-title">Create new project…</div></div></div>';
+
+  html += '</div></div></div>';
+  _atcShowOverlay(overlay, html);
+}
+
+function _mtpShowCreate() {
+  const overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+  let html = '<div class="pm-card pm-enter" style="max-width:420px;">';
+  html += '<h2 class="pm-title">Create New Project</h2>';
+  html += '<div class="pm-body">';
+  html += '<div class="kanban-create-section-label">A new folder is created under your Documents folder, then the session is moved into it.</div>';
+  html += '<input type="text" id="mtp-new-name" class="kanban-input" placeholder="Project name" style="width:100%;margin:8px 0;">';
+  html += '<button class="kanban-sidebar-btn" style="width:100%;" onclick="_mtpCreateAndMove()">Create &amp; Move</button>';
+  html += '</div></div>';
+  _atcShowOverlay(overlay, html);
+  setTimeout(() => {
+    const i = document.getElementById('mtp-new-name');
+    if (i) { i.focus(); i.onkeydown = e => { if (e.key === 'Enter') _mtpCreateAndMove(); }; }
+  }, 60);
+}
+
+async function _mtpCreateAndMove() {
+  const inp = document.getElementById('mtp-new-name');
+  const name = (inp ? inp.value : '').trim();
+  if (!name) { if (inp) inp.focus(); return; }
+
+  let encoded = '';
+  try {
+    const resp = await fetch('/api/add-project', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode: 'create', name}),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!data.ok || !data.encoded) {
+      showToast((data && data.error) || 'Failed to create project', true);
+      return;
+    }
+    encoded = data.encoded;
+  } catch (e) {
+    showToast('Failed to create project', true);
+    return;
+  }
+
+  // Refresh the app-wide project cache so the new project is known everywhere
+  // (project switcher, counts) after the move completes.
+  try {
+    const r = await fetch('/api/projects');
+    if (r.ok) _allProjects = await r.json();
+  } catch (e) { /* non-fatal — move still proceeds */ }
+
+  _mtpDoMove(encodeURIComponent(encoded));
+}
+
+async function _mtpDoMove(encEncoded) {
+  const toProject = decodeURIComponent(encEncoded || '');
+  const sessionId = _mtpSessionId;
+  if (!sessionId || !toProject) return;
+  const fromProject = localStorage.getItem('activeProject') || '';
+  _closePm();
+
+  // If the session is running, stop it client-side too and block ghost
+  // recovery from resurrecting it — the backend stops it as well, but the
+  // client owns runningIds and the ghost-recovery timers. Mirrors delete.
+  if (typeof runningIds !== 'undefined' && runningIds.has && runningIds.has(sessionId)) {
+    if (typeof markUserStopped === 'function') markUserStopped(sessionId);
+    try { socket.emit('close_session', {session_id: sessionId}); } catch (e) {}
+    if (typeof guiOpenDelete === 'function') guiOpenDelete(sessionId);
+    runningIds.delete(sessionId);
+  }
+
+  showToast('Moving session…');
+  let ok = false, dispName = '';
+  try {
+    const url = '/api/move-session/' + encodeURIComponent(sessionId)
+      + (fromProject ? '?project=' + encodeURIComponent(fromProject) : '');
+    const resp = await fetch(url, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({from_project: fromProject, to_project: toProject}),
+    });
+    const data = await resp.json().catch(() => ({}));
+    ok = !!(data && data.ok);
+    dispName = (data && data.to_project_display) || '';
+    if (!ok) showToast((data && data.error) || 'Move failed', true);
+  } catch (e) {
+    showToast('Move failed: network error', true);
+  }
+  if (!ok) return;
+
+  // The session left the current project — clean it out of the current view,
+  // matching delete's local cleanup (minus the trash/kanban-unlink semantics;
+  // the session and its kanban links still exist, just under another project).
+  SessionStore.remove(sessionId);
+  if (typeof multiSelectedIds !== 'undefined' && multiSelectedIds.has(sessionId)) {
+    multiSelectedIds.delete(sessionId);
+    if (typeof _renderMultiSelectionBadge === 'function') _renderMultiSelectionBadge();
+  }
+  if (typeof _clearDraft === 'function') _clearDraft(sessionId);
+  if (typeof removeSessionFromAllFolders === 'function') removeSessionFromAllFolders(sessionId);
+  if (typeof liveSessionId !== 'undefined' && liveSessionId === sessionId && typeof stopLivePanel === 'function') {
+    stopLivePanel();
+  }
+  if (typeof viewMode !== 'undefined' && viewMode === 'kanban' && window._kanbanSessionTaskId) {
+    if (typeof _kanbanSessionClose === 'function') _kanbanSessionClose(window._kanbanSessionTaskId);
+  } else if (typeof deselectSession === 'function') {
+    deselectSession();
+  }
+  const searchEl = document.getElementById('search');
+  if (searchEl && typeof allSessions !== 'undefined') {
+    searchEl.placeholder = 'Search ' + allSessions.length + ' sessions…';
+  }
+  if (typeof filterSessions === 'function') filterSessions();   // repaint sidebar
+  if (typeof loadProjects === 'function') loadProjects();       // refresh project counts
+
+  const shortDest = dispName ? (dispName.split(/[\\/]/).filter(Boolean).pop() || dispName) : 'project';
+  showToast('Moved to ' + shortDest);
+}
+
+async function _addToCompose(sessionId) {
+  const overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+
+  _atcSessionId = sessionId;
+
+  // Fetch compositions filtered to the active project.
+  // MUST pass ?project= so the API only returns compositions belonging to
+  // this project (+ pinned). Without it every composition across all projects
+  // is returned and the picker shows unrelated items.
+  const _proj = localStorage.getItem('activeProject') || '';
+  let projects = [];
+  try {
+    const resp = await fetch('/api/compose/projects' + (_proj ? '?project=' + encodeURIComponent(_proj) : ''));
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.ok) projects = data.projects || [];
+    }
+  } catch (e) {}
+
+  // Sort: current project first, others dimmed
+  projects.forEach(p => {
+    p._isCurrentProject = !_proj || !p.parent_project || p.parent_project === _proj;
+  });
+  projects.sort((a, b) => (a._isCurrentProject ? 0 : 1) - (b._isCurrentProject ? 0 : 1));
+
+  // Zero compositions — inline create
+  if (projects.length === 0) {
+    _atcShowCreateComposition(overlay);
+    return;
+  }
+
+  // One composition — skip straight to tree picker
+  if (projects.length === 1) {
+    _atcLoadTree(overlay, projects[0].id);
+    return;
+  }
+
+  // Multiple — show composition picker
+  let html = '<div class="pm-card pm-enter" style="max-width:480px;">';
+  html += '<h2 class="pm-title">Add to Structured composition</h2>';
+  html += '<div class="pm-body" style="padding:0;"><div class="kanban-create-section">';
+  html += '<div class="kanban-create-section-label">Choose composition</div>';
+
+  for (const p of projects) {
+    const dim = p._isCurrentProject ? '' : ' opacity:0.5;';
+    const tag = p._isCurrentProject ? '' : ' <span style="font-size:10px;color:var(--text-faint);">(other project)</span>';
+    const esc = typeof escHtml === 'function' ? escHtml(p.name) : p.name;
+    html += '<div class="kanban-drill-chooser-card" style="cursor:pointer;' + dim + '"'
+      + ' onclick="_atcLoadTree(document.getElementById(\'pm-overlay\'),\'' + _atcSafeId(p.id) + '\')">'
+      + '<div class="kanban-drill-chooser-icon" style="color:var(--accent);">'
+      + '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg></div>'
+      + '<div><div class="kanban-drill-chooser-title">' + esc + tag + '</div></div></div>';
+  }
+
+  html += '</div></div></div>';
+  _atcShowOverlay(overlay, html);
+}
+
+// --- Zero compositions: inline create ---
+function _atcShowCreateComposition(overlay) {
+  let html = '<div class="pm-card pm-enter" style="max-width:400px;">';
+  html += '<h2 class="pm-title">Add to Structured composition</h2>';
+  html += '<div class="pm-body">';
+  html += '<div class="kanban-create-section-label">No compositions yet. Create one:</div>';
+  html += '<input type="text" id="atc-new-comp-name" class="kanban-input" placeholder="Composition name" style="width:100%;margin:8px 0;" autofocus>';
+  html += '<button class="kanban-sidebar-btn" style="width:100%;" onclick="_atcCreateComposition()">Create</button>';
+  html += '</div></div>';
+  _atcShowOverlay(overlay, html);
+  setTimeout(() => { const inp = document.getElementById('atc-new-comp-name'); if (inp) inp.focus(); }, 60);
+}
+
+async function _atcCreateComposition() {
+  const inp = document.getElementById('atc-new-comp-name');
+  const name = (inp ? inp.value : '').trim();
+  if (!name) { if (inp) inp.focus(); return; }
+
+  try {
+    const resp = await fetch('/api/compose/projects', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name}),
+    });
+    const data = await resp.json();
+    if (data.ok && data.project) {
+      _atcLoadTree(document.getElementById('pm-overlay'), data.project.id);
+    } else {
+      showToast(data.error || 'Failed to create composition', 'error');
+    }
+  } catch (e) {
+    showToast('Failed to create composition', 'error');
+  }
+}
+
+// --- Tree picker ---
+async function _atcLoadTree(overlay, projectId) {
+  if (!overlay) return;
+  _atcProjectId = projectId;
+
+  // Show loading state
+  let html = '<div class="pm-card pm-enter" style="max-width:520px;">';
+  html += '<h2 class="pm-title">Add to Structured composition</h2>';
+  html += '<div class="pm-body" style="text-align:center;padding:24px;color:var(--text-muted);">Loading sections...</div>';
+  html += '</div>';
+  _atcShowOverlay(overlay, html);
+
+  // Fetch sections
+  try {
+    const resp = await fetch('/api/compose/board?project_id=' + encodeURIComponent(projectId));
+    const data = await resp.json();
+    _atcSections = (data && data.sections) || [];
+  } catch (e) {
+    _atcSections = [];
+  }
+
+  _atcRenderTree(overlay);
+}
+
+function _atcRenderTree(overlay) {
+  if (!overlay) return;
+
+  // Build tree from flat list
+  const sections = _atcSections;
+  const byParent = {};
+  for (const s of sections) {
+    const pid = s.parent_id || '__root__';
+    if (!byParent[pid]) byParent[pid] = [];
+    byParent[pid].push(s);
+  }
+
+  // Sort children within each parent per spec:
+  // 1. Unlinked first (actionable), 2. Has unlinked children, 3. Linked (greyed)
+  // Within each group, preserve order field
+  function _hasUnlinkedDescendant(s) {
+    const children = byParent[s.id] || [];
+    for (const c of children) {
+      if (!c.session_id) return true;
+      if (_hasUnlinkedDescendant(c)) return true;
+    }
+    return false;
+  }
+
+  for (const pid of Object.keys(byParent)) {
+    byParent[pid].sort((a, b) => {
+      const aLinked = !!a.session_id;
+      const bLinked = !!b.session_id;
+      if (aLinked !== bLinked) return aLinked ? 1 : -1; // unlinked first
+      if (aLinked && bLinked) {
+        const aDesc = _hasUnlinkedDescendant(a);
+        const bDesc = _hasUnlinkedDescendant(b);
+        if (aDesc !== bDesc) return aDesc ? -1 : 1;
+      }
+      return (a.order || 0) - (b.order || 0);
+    });
+  }
+
+  // Status dot colors
+  const statusColors = {
+    not_started: 'var(--text-faint)',
+    draft: 'var(--text-faint)',
+    writing: '#4a9eff',
+    working: '#4a9eff',
+    waiting: '#e8a838',
+    blocked: '#e85050',
+    complete: '#50c878',
+    archived: '#666',
+  };
+
+  // Render tree recursively
+  function renderLevel(parentId, depth) {
+    const children = byParent[parentId] || [];
+    if (depth > 5) return ''; // max depth
+    let out = '';
+
+    // [+ Add here] at top of this level
+    out += '<div class="atc-add-marker" style="padding-left:' + (depth * 20 + 8) + 'px;">'
+      + '<button class="atc-add-btn" onclick="_atcStartAdd(\'' + (parentId === '__root__' ? '' : _atcSafeId(parentId))
+      + '\',' + (children.length ? (children[0].order || 0) - 1 : 0) + ')">'
+      + '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>'
+      + ' Add here</button></div>';
+
+    for (let i = 0; i < children.length; i++) {
+      const s = children[i];
+      const linked = !!s.session_id;
+      const color = statusColors[s.status] || statusColors.not_started;
+      const esc = typeof escHtml === 'function' ? escHtml(s.name) : s.name;
+      const indent = depth * 20 + 8;
+
+      out += '<div class="atc-section' + (linked ? ' atc-linked' : '') + '" style="padding-left:' + indent + 'px;">';
+      // Status dot + name
+      out += '<span class="atc-dot" style="background:' + color + ';"></span>';
+      out += '<span class="atc-name">' + esc + '</span>';
+      out += '<span class="atc-status">' + (s.status || '').replace(/_/g, ' ') + '</span>';
+
+      if (linked) {
+        // Greyed out — show linked session name
+        const sessName = s.session_id.slice(0, 8);
+        out += '<span class="atc-linked-label">linked</span>';
+      } else {
+        // Unlinked — show [Attach here]
+        out += '<button class="atc-attach-btn" onclick="_atcAttach(\'' + _atcSafeId(s.id) + '\')">'
+          + 'Attach here</button>';
+      }
+      out += '</div>';
+
+      // [+ Add as child]
+      out += '<div class="atc-add-marker" style="padding-left:' + ((depth + 1) * 20 + 8) + 'px;">'
+        + '<button class="atc-add-btn atc-add-child" onclick="_atcStartAdd(\'' + _atcSafeId(s.id) + '\',0)">'
+        + '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>'
+        + ' Add as child</button></div>';
+
+      // Render children recursively
+      out += renderLevel(s.id, depth + 1);
+
+      // [+ Add here] after this sibling (insertion point)
+      if (i < children.length - 1) {
+        const nextOrder = children[i + 1] ? ((s.order || 0) + ((children[i + 1].order || 0) - (s.order || 0)) / 2) : (s.order || 0) + 1;
+        out += '<div class="atc-add-marker" style="padding-left:' + (depth * 20 + 8) + 'px;">'
+          + '<button class="atc-add-btn" onclick="_atcStartAdd(\'' + (parentId === '__root__' ? '' : _atcSafeId(parentId))
+          + '\',' + nextOrder + ')">'
+          + '<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>'
+          + ' Add here</button></div>';
+      }
+    }
+    return out;
+  }
+
+  let html = '<div class="pm-card pm-enter" style="max-width:520px;">';
+  html += '<h2 class="pm-title">Add to Structured composition</h2>';
+  html += '<div class="pm-body" style="padding:0;">';
+  html += '<div class="atc-tree" id="atc-tree">';
+  html += renderLevel('__root__', 0);
+  if (sections.length === 0) {
+    // Empty composition — just the root add button is already rendered
+  }
+  html += '</div>';
+  // Inline naming area (hidden until user clicks Add)
+  html += '<div id="atc-naming" style="display:none;padding:12px;border-top:1px solid var(--border,#30363d);">';
+  html += '<div class="kanban-create-section-label" id="atc-naming-label">Section name</div>';
+  html += '<input type="text" id="atc-name-input" class="kanban-input" style="width:100%;margin:4px 0 8px;" placeholder="Section name">';
+  html += '<div style="display:flex;gap:8px;">';
+  html += '<button class="kanban-sidebar-btn" style="flex:1;" onclick="_atcConfirmAdd()">Add</button>';
+  html += '<button class="kanban-sidebar-btn" style="flex:1;opacity:0.6;" onclick="_atcCancelAdd()">Cancel</button>';
+  html += '</div></div>';
+  html += '</div></div>';
+
+  _atcShowOverlay(overlay, html);
+}
+
+// --- Add action: show naming input ---
+let _atcPendingParentId = null;
+let _atcPendingOrder = 0;
+
+function _atcStartAdd(parentId, order) {
+  _atcPendingParentId = parentId || null;
+  _atcPendingOrder = order;
+  const naming = document.getElementById('atc-naming');
+  const input = document.getElementById('atc-name-input');
+  const label = document.getElementById('atc-naming-label');
+  if (!naming || !input) return;
+
+  input.value = _atcSessionName();
+  label.textContent = parentId ? 'Add as child — section name:' : 'New section name:';
+  naming.style.display = '';
+  input.focus();
+  input.select();
+
+  // Enter to confirm
+  input.onkeydown = function(e) {
+    if (e.key === 'Enter') { e.preventDefault(); _atcConfirmAdd(); }
+    if (e.key === 'Escape') { e.preventDefault(); _atcCancelAdd(); }
+  };
+}
+
+function _atcCancelAdd() {
+  const naming = document.getElementById('atc-naming');
+  if (naming) naming.style.display = 'none';
+  _atcPendingParentId = null;
+}
+
+async function _atcConfirmAdd() {
+  const input = document.getElementById('atc-name-input');
+  const name = (input ? input.value : '').trim();
+  if (!name) { if (input) input.focus(); return; }
+
+  // Disable UI while saving
+  const btns = document.querySelectorAll('#atc-naming button');
+  btns.forEach(b => b.disabled = true);
+  if (input) input.disabled = true;
+
+  try {
+    const resp = await fetch('/api/compose/projects/' + _atcProjectId + '/sections/add-and-link', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        name: name,
+        session_id: _atcSessionId,
+        parent_id: _atcPendingParentId,
+        order: _atcPendingOrder,
+      }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      _closePm();
+      showToast('Added to Structured composition: ' + name);
+    } else if (resp.status === 409) {
+      // Session already linked
+      showToast('Session already linked to "' + (data.linked_section || 'another section') + '"', 'error');
+      btns.forEach(b => b.disabled = false);
+      if (input) input.disabled = false;
+    } else {
+      showToast(data.error || 'Failed to add section', 'error');
+      btns.forEach(b => b.disabled = false);
+      if (input) input.disabled = false;
+    }
+  } catch (e) {
+    showToast('Failed to add section', 'error');
+    btns.forEach(b => b.disabled = false);
+    if (input) input.disabled = false;
+  }
+}
+
+// --- Attach to existing unlinked section ---
+async function _atcAttach(sectionId) {
+  try {
+    const resp = await fetch('/api/compose/projects/' + _atcProjectId + '/sections/' + sectionId, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({session_id: _atcSessionId}),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      _closePm();
+      showToast('Session attached to section');
+    } else {
+      showToast(data.error || 'Failed to attach', 'error');
+    }
+  } catch (e) {
+    showToast('Failed to attach session', 'error');
+  }
+}
+
+// --- Overlay helpers ---
+function _atcShowOverlay(overlay, html) {
+  overlay.innerHTML = html;
+  overlay.classList.add('show');
+  requestAnimationFrame(() => {
+    const card = overlay.querySelector('.pm-card');
+    if (card) card.classList.remove('pm-enter');
+  });
+  overlay.onclick = function(e) { if (e.target === overlay) _closePm(); };
+}
+
+// ===========================================================================
+// Bulk context menu (multi-selection right-click)
+// ===========================================================================
+//
+// Built and styled to match the single-row context menu (`.ws-ctx-menu`,
+// `.ws-ctx-item`) so users carry the same muscle memory.  The bulk menu
+// only appears when right-clicking a row that's in a selection of size
+// >= 2 — single-target right-clicks always get the existing single-row
+// menu instead.
+//
+// Action coverage and reasoning are documented in the spec
+//.
+
+/**
+ * Render and show the bulk context menu at the click position.
+ * @param {MouseEvent} e
+ */
+function _bulkContextMenu(e) {
+  // Build a snapshot of IDs at menu-open time.  The selection set may
+  // mutate before the user picks an item (e.g. project switch teardown)
+  // and we want every action to operate on what was on screen when the
+  // menu opened, not what's in the set when the user clicks.
+  const ids = Array.from(multiSelectedIds);
+  const count = ids.length;
+  if (count < 2) return; // safety: routing should have prevented this
+
+  // Dismiss any prior menu (desktop popup or mobile sheet).
+  var old = document.querySelector('.session-ctx-menu');
+  if (old) old.remove();
+  _closeSessionSheet();
+
+  // Data-shaped item list — same in both render modes.
+  var headerHtml = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" '
+    + 'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+    + 'style="vertical-align:-2px;margin-right:6px;">'
+    + '<rect x="3" y="3" width="7" height="7" rx="1"/>'
+    + '<rect x="14" y="3" width="7" height="7" rx="1"/>'
+    + '<rect x="3" y="14" width="7" height="7" rx="1"/>'
+    + '<rect x="14" y="14" width="7" height="7" rx="1"/></svg>'
+    + count + ' selected';
+
+  var items = [];
+  items.push({ headerHtml: headerHtml });
+  items.push({ divider: true });
+  items.push({ label: 'Stop all',                          icon: _ICONS.stop,     action: 'stop' });
+  items.push({ label: 'Auto-name all',                     icon: _ICONS.autoname, action: 'autoname' });
+  items.push({ label: 'Duplicate all',                     icon: _ICONS.dup,      action: 'duplicate' });
+  items.push({ label: 'Add all to Structured composition', icon: _ICONS.compose,  action: 'add-compose' });
+  // The person's verdicts for the whole batch, while the person-oriented
+  // statuses are on (same rule as the single-session menu).
+  if (window.SessionVerb && window.SessionVerb.setHold) {
+    items.push({ divider: true });
+    items.push({ label: 'Mark all done',  icon: _ICONS.checkc, action: 'mark-done' });
+    items.push({ label: 'Standby all',    icon: _ICONS.pause,  action: 'standby' });
+  }
+  items.push({ divider: true });
+  items.push({ label: 'Delete all',                        icon: _ICONS.trash,    action: 'delete', danger: true });
+  items.push({ divider: true });
+  items.push({ label: 'Clear selection',                   icon: _ICONS.x,        action: 'clear' });
+
+  function dispatch(action) {
+    switch (action) {
+      case 'stop':        _bulkStop();        break;
+      case 'autoname':    _bulkAutoName();    break;
+      case 'duplicate':   _bulkDuplicate();   break;
+      case 'add-compose': _bulkAddToCompose();break;
+      case 'delete':      _bulkDelete();      break;
+      case 'mark-done':   _bulkVerdict('done');    break;
+      case 'standby':     _bulkVerdict('standby'); break;
+      case 'clear':
+        _clearMultiSelect();
+        var m = document.querySelector('.session-ctx-menu');
+        if (m) m.remove();
+        _closeSessionSheet();
+        break;
+    }
+  }
+
+  // ----- Mobile: iOS-style bottom sheet -----
+  if (_isMobileCtx()) {
+    _openSessionSheet(items, function(action) { dispatch(action); });
+    return;
+  }
+
+  // ----- Desktop: floating popup at the pointer -----
+  const menu = document.createElement('div');
+  menu.className = 'session-ctx-menu ws-ctx-menu sidebar-bulk-ctx-menu';
+
+  let html = '<div class="ws-ctx-bulk-header">' + headerHtml + '</div>';
+  html += '<div class="ws-ctx-divider"></div>';
+  items.forEach(function(it) {
+    if (it.headerHtml) return;               // already rendered above
+    if (it.divider) { html += '<div class="ws-ctx-divider"></div>'; return; }
+    var cls = 'ws-ctx-item' + (it.danger ? ' danger' : '');
+    // Escape the action into the onclick attribute safely — actions are
+    // static tokens from the items list above, so no user input flows here.
+    html += '<div class="' + cls + '" onclick="(function(){'
+         + 'var m=document.querySelector(\'.session-ctx-menu\');if(m)m.remove();'
+         + 'window._bulkDispatch(\'' + it.action + '\');})()">'
+         + _iconDesktop(it.icon) + ' ' + escHtml(it.label) + '</div>';
+  });
+
+  menu.innerHTML = html;
+  menu.style.left = e.clientX + 'px';
+  menu.style.top = e.clientY + 'px';
+  document.body.appendChild(menu);
+
+  // Publish dispatcher for the onclick handlers above.  We use a function
+  // hoisted onto window so inline handlers can call it without needing to
+  // capture the closure.
+  window._bulkDispatch = dispatch;
+
+  // Keep menu in viewport
+  requestAnimationFrame(function() {
+    const rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth) {
+      menu.style.left = (window.innerWidth - rect.width - 8) + 'px';
+    }
+    if (rect.bottom > window.innerHeight) {
+      menu.style.top = (window.innerHeight - rect.height - 8) + 'px';
+    }
+  });
+
+  // Close on click outside
+  const closer = function(ev) {
+    if (!menu.contains(ev.target)) {
+      menu.remove();
+      document.removeEventListener('click', closer);
+    }
+  };
+  setTimeout(function() { document.addEventListener('click', closer); }, 0);
+}
+
+/**
+ * Bulk Done / Standby: the single-session verdict (session-verdict.js
+ * `_verdict`) applied to every selected session, with ONE Undo toast that
+ * puts every verdict back and undoes every sleep.  A working session is
+ * skipped, as the single verdict refuses it ("decide when it stops").
+ * @param {'done'|'standby'} to
+ */
+function _bulkVerdict(to) {
+  const SV = window.SessionVerb;
+  if (!SV || !SV.setHold) return;
+  const ids = _msSnapshot();
+  if (ids.length === 0) return;
+  const label = to === 'done' ? 'Done' : 'Standby';
+  const undos = [];
+  let skipped = 0;
+  ids.forEach(function(sid) {
+    const st = (typeof getSessionStatus === 'function') ? getSessionStatus(sid) : '';
+    if (st === 'working') { skipped++; return; }
+    const prev = SV.holdOf ? SV.holdOf(sid) : null;
+    SV.setHold(sid, to);
+    const undoHold = function() { SV.setHold(sid, prev); };
+    if (st === 'sleeping') { undos.push(undoHold); return; }
+    let collected = false;
+    _sleepOrWake(sid, null, label, undoHold, function(fn) { collected = true; undos.push(fn); });
+    if (!collected) undos.push(undoHold);
+  });
+  _clearMultiSelect();
+  if (window.SessionVerdict && window.SessionVerdict.sync) window.SessionVerdict.sync();
+  if (typeof filterSessions === 'function') filterSessions();
+  const n = undos.length;
+  if (n === 0) {
+    if (skipped) showToast(skipped + ' working; decide when they stop', true);
+    return;
+  }
+  const msg = label + ' — ' + n + ' session' + (n === 1 ? '' : 's')
+    + (skipped ? ' (' + skipped + ' working, skipped)' : '');
+  _showUndoToast(msg, 'Undo', function() {
+    undos.forEach(function(fn) { try { fn(); } catch (_e) { /* the rest still undo */ } });
+    if (typeof filterSessions === 'function') filterSessions();
+    showToast(label + ' undone');
+  }, 6000);
+}
+
+/**
+ * Snapshot the current multi-selection.  Used by every bulk action to
+ * freeze the working set at action time so async work isn't disturbed
+ * by later user clicks.
+ */
+function _msSnapshot() {
+  return Array.from(multiSelectedIds);
+}
+
+/**
+ * Acquire the bulk-in-flight lock.  Returns true if acquired, false if
+ * a bulk action is already running (in which case the caller shows a
+ * toast and bails).
+ */
+function _bulkAcquire() {
+  if (_bulkInFlight) {
+    showToast('Another bulk action is in progress', true);
+    return false;
+  }
+  _bulkInFlight = true;
+  return true;
+}
+
+/** Release the bulk-in-flight lock.  Always pair with _bulkAcquire(). */
+function _bulkRelease() {
+  _bulkInFlight = false;
+}
+
+/**
+ * Bulk Stop.  Iterates the selection and emits `close_session` for each
+ * running ID; non-running IDs are silently skipped (resolved decision 2
+ * in the spec).  No confirmation modal — Stop is non-destructive (nothing
+ * is deleted) and matches the single-action UX pattern of "fire and
+ * forget" for terminations.
+ */
+function _bulkStop() {
+  // Close the menu first so it doesn't linger.
+  const menu = document.querySelector('.session-ctx-menu');
+  if (menu) menu.remove();
+
+  if (!_bulkAcquire()) return;
+  try {
+    const ids = _msSnapshot();
+    let stopped = 0;
+    for (const id of ids) {
+      // Stop anything that DISPLAYS as active, not just what's in runningIds.
+      // getSessionStatus() is what drew the icon and gated the Stop menu item
+      // (see _sessionContextMenu), and it reports idle for sessions known only
+      // via guiOpenSessions or restart memory — which are absent from
+      // runningIds.  Gating the emit on runningIds therefore skipped exactly
+      // the sessions the user could see and asked to stop, leaving them alive
+      // on the daemon to reappear as idle on the next refresh.
+      const _active = (typeof getSessionStatus === 'function')
+        ? getSessionStatus(id) !== 'sleeping'
+        : (typeof runningIds !== 'undefined' && runningIds.has(id));
+      if (_active) {
+        // Explicit user stop — see markUserStopped() in live-panel.js.
+        if (typeof markUserStopped === 'function') markUserStopped(id);
+        if (typeof socket !== 'undefined') {
+          socket.emit('close_session', { session_id: id });
+        }
+        if (typeof guiOpenDelete === 'function') guiOpenDelete(id);
+        runningIds.delete(id);
+        if (typeof sessionKinds !== 'undefined') delete sessionKinds[id];
+        // Drop restart-memory too, or getSessionStatus() keeps reporting idle
+        // and the row never falls back to 'sleeping'.
+        if (window.sessionLastState) delete window.sessionLastState[id];
+        stopped++;
+      }
+    }
+    showToast('Stopped ' + stopped + ' session' + (stopped === 1 ? '' : 's'));
+    _clearMultiSelect();
+    if (typeof filterSessions === 'function') filterSessions();
+  } finally {
+    _bulkRelease();
+  }
+}
+
+/**
+ * Bulk Delete.  Modal confirmation listing count + sample of names,
+ * then deletes per-ID via the existing /api/delete/<id> endpoint with
+ * concurrency=4.  Mirrors single-session deleteSession's cleanup steps
+ * (allSessions filter, allSessionIds delete, draft clear, folder unlink,
+ * kanban unlink, deselect if active) without firing the per-session
+ * confirm modal each time.
+ */
+async function _bulkDelete() {
+  const menu = document.querySelector('.session-ctx-menu');
+  if (menu) menu.remove();
+
+  if (!_bulkAcquire()) return;
+  try {
+    const ids = _msSnapshot();
+    // Diagnostic for "deletes only one" reports — captured at action time so
+    // the count we operated on is recorded even if state mutates later.
+    console.log('[bulk-delete] starting with', ids.length, 'ids:', ids);
+    if (!ids.length) return;
+
+    // Build name preview: first 3 names + "and N-3 more".
+    const names = ids.map(id => {
+      const s = (typeof allSessions !== 'undefined') ? allSessions.find(x => x.id === id) : null;
+      return (s && s.display_title) || id.slice(0, 8);
+    });
+    const sample = names.slice(0, 3).map(n => '<li>' + escHtml(n) + '</li>').join('');
+    const more = names.length > 3 ? '<li>and ' + (names.length - 3) + ' more…</li>' : '';
+    const body = '<p>Delete <strong>' + ids.length + '</strong> session'
+      + (ids.length === 1 ? '' : 's') + '?</p>'
+      + '<ul style="margin:6px 0 8px 20px;color:var(--text-secondary);font-size:12px;">'
+      + sample + more + '</ul>'
+      + '<p>This cannot be undone.</p>';
+    const confirmed = await showConfirm('Delete sessions', body, {
+      danger: true,
+      confirmText: 'Delete ' + ids.length,
+      icon: '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
+        + '<polyline points="3 6 5 6 21 6"/>'
+        + '<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
+    });
+    if (!confirmed) return;
+
+    showToast('Deleting ' + ids.length + ' session' + (ids.length === 1 ? '' : 's') + '…');
+
+    // Track which IDs were active so we can deselect at the end.
+    const hadActive = (typeof activeId !== 'undefined') && activeId && ids.indexOf(activeId) >= 0;
+    const proj = localStorage.getItem('activeProject') || '';
+    const projQ = proj ? '?project=' + encodeURIComponent(proj) : '';
+
+    /**
+     * Delete a single session by ID.  Mirrors the per-action half of
+     * deleteSession() in toolbar.js: stop if running, DELETE the JSONL,
+     * clean up local state.  Treats 404 as success (matches existing
+     * logic for "another tab already deleted it").  Throws on hard
+     * failure so _runBulk records it.
+     */
+    async function deleteOne(id) {
+      // Stop if running so the daemon releases the file before we delete it.
+      if (typeof runningIds !== 'undefined' && runningIds.has(id)) {
+        // Deleting is an even stronger stop intent than sleeping — never let
+        // ghost recovery restart it. See markUserStopped() in live-panel.js.
+        if (typeof markUserStopped === 'function') markUserStopped(id);
+        if (typeof socket !== 'undefined') socket.emit('close_session', { session_id: id });
+        if (typeof guiOpenDelete === 'function') guiOpenDelete(id);
+        runningIds.delete(id);
+      }
+      let okFlag = false;
+      try {
+        const _p1 = (window.VNAllProjects ? VNAllProjects.projectFor(id) : (localStorage.getItem('activeProject') || ''));   // All projects: each session's own
+      const resp = await fetch('/api/delete/' + id + (_p1 ? '?project=' + encodeURIComponent(_p1) : projQ), { method: 'DELETE' });
+        try {
+          const data = await resp.json();
+          okFlag = !!(data && data.ok) || resp.status === 404;
+        } catch (_jsonErr) {
+          // Non-JSON response (e.g. 500 HTML) — server-side tombstone is
+          // already set; treat as ok so card is removed locally.
+          okFlag = true;
+        }
+      } catch (_fetchErr) {
+        // Network error — clean up locally; reload will reconcile.
+        okFlag = true;
+      }
+      if (!okFlag) throw new Error('delete failed');
+
+      // Local cleanup (mirrors deleteSession in toolbar.js).
+      SessionStore.remove(id);
+      if (typeof _clearDraft === 'function') _clearDraft(id);
+      if (typeof removeSessionFromAllFolders === 'function') removeSessionFromAllFolders(id);
+      // Best-effort kanban unlink; do not block on it.
+      fetch('/api/kanban/sessions/' + id + '/unlink-all', { method: 'DELETE' }).catch(() => {});
+      if (typeof liveSessionId !== 'undefined' && liveSessionId === id
+          && typeof stopLivePanel === 'function') {
+        stopLivePanel();
+      }
+    }
+
+    const result = await _runBulk(ids, deleteOne, 4);
+    console.log('[bulk-delete] result:', { ok: result.ok, fail: result.fail });
+
+    // If the active session was in the deleted set, navigate away from it.
+    if (hadActive && typeof deselectSession === 'function'
+        && typeof activeId !== 'undefined' && !allSessionIds.has(activeId)) {
+      deselectSession();
+    }
+
+    // Refresh sidebar count + project counts.
+    const searchEl = document.getElementById('search');
+    if (searchEl && typeof allSessions !== 'undefined') {
+      searchEl.placeholder = 'Search ' + allSessions.length + ' sessions…';
+    }
+    if (typeof loadProjects === 'function') loadProjects();
+    if (typeof filterSessions === 'function') filterSessions();
+
+    _clearMultiSelect();
+
+    if (result.fail.length === 0) {
+      showToast('Deleted ' + result.ok.length + ' session' + (result.ok.length === 1 ? '' : 's'));
+    } else if (result.ok.length === 0) {
+      showToast('Delete failed for ' + result.fail.length + ' session(s)', true);
+    } else {
+      showToast('Deleted ' + result.ok.length + ' of ' + ids.length
+        + '. ' + result.fail.length + ' failed.', true);
+    }
+    if (result.fail.length) {
+      // Console table for diagnostics (per spec error-handling table).
+      try { console.table(result.fail); } catch (_) {}
+    }
+  } finally {
+    _bulkRelease();
+  }
+}
+
+/**
+ * Bulk Auto-name.  Confirmation modal warns about API token cost
+ * (resolved decision 1 in the spec), then invokes the existing
+ * autoName(id, silent=true) per ID with concurrency=2 (LLM rate-limit
+ * aware).  Per-call toasts are suppressed by the silent flag; we show
+ * one summary toast at the end.
+ */
+async function _bulkAutoName() {
+  const menu = document.querySelector('.session-ctx-menu');
+  if (menu) menu.remove();
+
+  if (!_bulkAcquire()) return;
+  try {
+    const ids = _msSnapshot();
+    if (!ids.length) return;
+
+    const confirmed = await showConfirm('Auto-name sessions',
+      '<p>Auto-name <strong>' + ids.length + '</strong> session'
+      + (ids.length === 1 ? '' : 's') + '?</p>'
+      + '<p style="color:var(--text-muted);font-size:12px;">This will cost API tokens '
+      + '(one short LLM call per session).</p>',
+      { confirmText: 'Auto-name ' + ids.length });
+    if (!confirmed) return;
+
+    showToast('Auto-naming ' + ids.length + ' session' + (ids.length === 1 ? '' : 's') + '…');
+
+    const result = await _runBulk(ids, function(id) {
+      return autoName(id, true);
+    }, 2);
+
+    _clearMultiSelect();
+    if (result.fail.length === 0) {
+      showToast('Auto-named ' + result.ok.length + ' session' + (result.ok.length === 1 ? '' : 's'));
+    } else {
+      showToast('Auto-named ' + result.ok.length + ' of ' + ids.length
+        + '. ' + result.fail.length + ' failed.', true);
+      try { console.table(result.fail); } catch (_) {}
+    }
+  } finally {
+    _bulkRelease();
+  }
+}
+
+/**
+ * Bulk Duplicate.  No confirmation (file copy is cheap and reversible).
+ * Concurrency=4.  Each duplicate hits POST /api/duplicate/<id>; we skip
+ * the per-call loadSessions() that single-action duplicateSession does
+ * and call it once at the end so we don't re-render the sidebar four
+ * times in a row.
+ */
+async function _bulkDuplicate() {
+  const menu = document.querySelector('.session-ctx-menu');
+  if (menu) menu.remove();
+
+  if (!_bulkAcquire()) return;
+  try {
+    const ids = _msSnapshot();
+    if (!ids.length) return;
+
+    showToast('Duplicating ' + ids.length + ' session' + (ids.length === 1 ? '' : 's') + '…');
+
+    const proj = localStorage.getItem('activeProject') || '';
+    const projQ = proj ? '?project=' + encodeURIComponent(proj) : '';
+
+    async function dupOne(id) {
+      const _p1 = (window.VNAllProjects ? VNAllProjects.projectFor(id) : (localStorage.getItem('activeProject') || ''));   // All projects: each session's own
+      const resp = await fetch('/api/duplicate/' + id + (_p1 ? '?project=' + encodeURIComponent(_p1) : projQ), { method: 'POST' });
+      const data = await resp.json();
+      if (!data || !data.ok) throw new Error((data && data.error) || 'duplicate failed');
+    }
+
+    const result = await _runBulk(ids, dupOne, 4);
+
+    // Single sidebar refresh at the end surfaces all the new IDs.
+    if (typeof loadSessions === 'function') {
+      try { await loadSessions(); } catch (_) {}
+    }
+    _clearMultiSelect();
+
+    if (result.fail.length === 0) {
+      showToast('Duplicated ' + result.ok.length + ' session' + (result.ok.length === 1 ? '' : 's'));
+    } else {
+      showToast('Duplicated ' + result.ok.length + ' of ' + ids.length
+        + '. ' + result.fail.length + ' failed.', true);
+      try { console.table(result.fail); } catch (_) {}
+    }
+  } finally {
+    _bulkRelease();
+  }
+}
+
+/**
+ * Bulk Add to Structured composition.  Sequentially opens the existing _addToCompose()
+ * picker for each selected session.  Reusing the single-session function
+ * preserves the `?project=` filter rule (CLAUDE.md Compose project-scoping
+ * item 1) and the existing modal UX users already know.
+ *
+ * "Apply to all remaining" affordance is deferred to v1.1 (resolved
+ * decision 4 in the spec).  v1 ships sequential single-prompt.
+ *
+ * Picker close detection: we poll pm-overlay's `.show` class via
+ * requestAnimationFrame.  If the user closes the picker without picking
+ * (cancel or backdrop click), we treat that session as skipped and move on.
+ */
+async function _bulkAddToCompose() {
+  const menu = document.querySelector('.session-ctx-menu');
+  if (menu) menu.remove();
+
+  if (!_bulkAcquire()) return;
+  try {
+    const ids = _msSnapshot();
+    if (!ids.length) return;
+
+    const overlay = document.getElementById('pm-overlay');
+    if (!overlay) {
+      showToast('Cannot open Add to Structured composition picker', true);
+      return;
+    }
+
+    let added = 0;
+    let skipped = 0;
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      // Skip IDs that disappeared between selection and now.
+      if (typeof allSessionIds !== 'undefined' && !allSessionIds.has(id)) {
+        skipped++;
+        continue;
+      }
+      // Open the picker for this session.  _addToCompose() awaits the
+      // composition list fetch but returns before the user interacts.
+      try {
+        await _addToCompose(id);
+      } catch (_e) {
+        skipped++;
+        continue;
+      }
+      // Wait for the overlay to close (user picks or cancels).  Cap
+      // the wait at 5 minutes per session to avoid hanging forever if
+      // something glitches.
+      const closed = await _waitForOverlayClose(overlay, 5 * 60 * 1000);
+      if (closed === 'timeout') {
+        // Safety bail: stop the bulk loop, leave overlay alone.
+        showToast('Add to Structured composition timed out — bulk halted', true);
+        break;
+      }
+      // We can't easily distinguish "added" from "cancelled" without
+      // hooking into _atc internals; rely on the per-call success toast
+      // for that.  Treat every closed iteration as +1 attempted.
+      added++;
+    }
+    _clearMultiSelect();
+    showToast('Add to Structured composition finished (' + added + ' processed'
+      + (skipped ? ', ' + skipped + ' skipped' : '') + ')');
+  } finally {
+    _bulkRelease();
+  }
+}
+
+/**
+ * Resolve when the pm-overlay loses its `.show` class (i.e. the picker
+ * has been closed by the user or by a successful action).
+ * Resolves to 'closed' on close, 'timeout' if we exceed the cap.
+ *
+ * Uses requestAnimationFrame for cheap polling (~16ms) so the next
+ * picker can open as soon as the previous one finishes its 150ms
+ * close transition.
+ */
+function _waitForOverlayClose(overlay, timeoutMs) {
+  return new Promise(function(resolve) {
+    const start = Date.now();
+    function tick() {
+      if (!overlay.classList.contains('show')) {
+        resolve('closed');
+        return;
+      }
+      if (Date.now() - start > timeoutMs) {
+        resolve('timeout');
+        return;
+      }
+      requestAnimationFrame(tick);
+    }
+    // Give the overlay a tick to register .show after _addToCompose's
+    // async fetch resolves and _atcShowOverlay runs.
+    setTimeout(tick, 50);
+  });
+}

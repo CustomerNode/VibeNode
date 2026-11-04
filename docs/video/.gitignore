@@ -1,0 +1,8 @@
+vibenode_explainer.mp4
+*.webm
+*.jpg
+frames/
+segments/
+__pycache__/
+.render_status
+vibenode_explainerTEMP_MPY_wvf_snd.mp4

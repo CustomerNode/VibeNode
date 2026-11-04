@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ChatGPT Bridge — VibeNode</title>
+<link rel="icon" href="/static/images/logo.png" type="image/png">
+<link rel="stylesheet" href="{{ versioned_static('style.css') }}">
+<script>
+// Apply saved theme immediately to avoid flash (same bootstrap as index.html)
+(function(){
+  var t = localStorage.getItem('theme') || 'dark';
+  if (t === 'auto') {
+    var sr = localStorage.getItem('_sunriseMin'), ss = localStorage.getItem('_sunsetMin');
+    var mins = new Date().getHours() * 60 + new Date().getMinutes();
+    if (sr !== null && ss !== null) { t = (mins < +sr || mins >= +ss) ? 'dark' : 'light'; }
+    else { t = (mins < 420 || mins >= 1140) ? 'dark' : 'light'; }
+  }
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
+<style>
+  .cgb-wrap { max-width: 860px; margin: 0 auto; padding: 28px 20px 60px; }
+  .cgb-head { display:flex; align-items:center; gap:10px; margin-bottom:6px; }
+  .cgb-head img { width:26px; height:auto; }
+  .cgb-head h1 { font-size:1.35rem; margin:0; }
+  .cgb-sub { opacity:.7; font-size:.85rem; margin:0 0 20px; }
+  .cgb-status { display:flex; align-items:center; gap:8px; font-size:.85rem; margin-bottom:16px; }
+  .cgb-dot { width:9px; height:9px; border-radius:50%; background:#888; flex:0 0 auto; }
+  .cgb-dot.ok { background:#2ecc71; } .cgb-dot.bad { background:#e74c3c; } .cgb-dot.warn { background:#f1c40f; }
+  .cgb-row { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
+  textarea#cgb-prompt { width:100%; min-height:120px; resize:vertical; padding:12px;
+    border-radius:10px; border:1px solid var(--border, #444);
+    background: var(--input-bg, #1e1e1e); color: var(--text, #eee);
+    font-family:inherit; font-size:.95rem; box-sizing:border-box; }
+  button.cgb-btn { padding:9px 16px; border-radius:8px; border:1px solid var(--border,#444);
+    background: var(--accent, #6c5ce7); color:#fff; font-weight:600; cursor:pointer; font-size:.9rem; }
+  button.cgb-btn.secondary { background:transparent; color:var(--text,#eee); }
+  button.cgb-btn:disabled { opacity:.5; cursor:not-allowed; }
+  label.cgb-check { display:flex; align-items:center; gap:6px; font-size:.82rem; opacity:.85; }
+  .cgb-result { margin-top:22px; }
+  .cgb-result h2 { font-size:.8rem; text-transform:uppercase; letter-spacing:.05em; opacity:.6; margin:0 0 8px; }
+  pre#cgb-output { white-space:pre-wrap; word-wrap:break-word; background:var(--input-bg,#1e1e1e);
+    border:1px solid var(--border,#444); border-radius:10px; padding:16px; min-height:60px;
+    font-family:inherit; font-size:.92rem; line-height:1.5; margin:0; }
+  .cgb-err { color:#e74c3c; }
+  .cgb-spin { display:inline-block; width:14px; height:14px; border:2px solid #ffffff66;
+    border-top-color:#fff; border-radius:50%; animation:cgbspin .7s linear infinite; vertical-align:-2px; }
+  @keyframes cgbspin { to { transform:rotate(360deg); } }
+  .cgb-back { font-size:.82rem; opacity:.7; text-decoration:none; color:var(--text,#eee); }
+</style>
+</head>
+<body>
+<div class="cgb-wrap">
+  <div class="cgb-head">
+    <img src="/static/images/logo.png" alt="VibeNode">
+    <h1>ChatGPT Bridge</h1>
+  </div>
+  <p class="cgb-sub">
+    Type a prompt, send it to your logged-in ChatGPT, get the reply back here.
+    <a class="cgb-back" href="/">&larr; Back to VibeNode</a>
+  </p>
+
+  <div class="cgb-status">
+    <span id="cgb-dot" class="cgb-dot warn"></span>
+    <span id="cgb-status-text">Checking ChatGPT login…</span>
+    <button id="cgb-login" class="cgb-btn secondary" style="margin-left:auto;">Log in to ChatGPT</button>
+  </div>
+
+  <textarea id="cgb-prompt" placeholder="Ask ChatGPT anything…"></textarea>
+  <div class="cgb-row" style="margin-top:10px; align-items:center;">
+    <button id="cgb-send" class="cgb-btn">Send to ChatGPT</button>
+    <span style="font-size:.78rem; opacity:.6;">
+      A Chrome window opens to do the work (ChatGPT blocks hidden browsers). Let it run; it closes itself.
+    </span>
+  </div>
+
+  <div class="cgb-result">
+    <h2>Reply</h2>
+    <pre id="cgb-output">—</pre>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const dot = $("cgb-dot"), statusText = $("cgb-status-text");
+const sendBtn = $("cgb-send"), loginBtn = $("cgb-login"), output = $("cgb-output");
+
+function setStatus(state, text) {
+  dot.className = "cgb-dot " + state;
+  statusText.textContent = text;
+}
+
+async function refreshStatus() {
+  try {
+    const r = await fetch("/api/chatgpt/status");
+    const d = await r.json();
+    if (d.busy) { setStatus("warn", "ChatGPT browser busy (login window open?)"); return; }
+    if (d.logged_in) { setStatus("ok", "Logged in to ChatGPT."); }
+    else { setStatus("bad", "Not logged in — click 'Log in to ChatGPT'."); }
+  } catch (e) {
+    setStatus("bad", "Status check failed: " + e.message);
+  }
+}
+
+loginBtn.addEventListener("click", async () => {
+  loginBtn.disabled = true;
+  setStatus("warn", "Opening login window…");
+  try {
+    const r = await fetch("/api/chatgpt/login", { method: "POST" });
+    const d = await r.json();
+    setStatus("warn", d.message || "Log in via the Chrome window that opened.");
+  } catch (e) {
+    setStatus("bad", "Could not open login: " + e.message);
+  } finally {
+    setTimeout(() => { loginBtn.disabled = false; refreshStatus(); }, 8000);
+  }
+});
+
+sendBtn.addEventListener("click", async () => {
+  const prompt = $("cgb-prompt").value.trim();
+  if (!prompt) { output.textContent = "Enter a prompt first."; return; }
+  sendBtn.disabled = true;
+  output.classList.remove("cgb-err");
+  output.innerHTML = '<span class="cgb-spin"></span> Sending to ChatGPT… a Chrome window will do the work (this can take a while)';
+  try {
+    const r = await fetch("/api/chatgpt/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    });
+    const d = await r.json();
+    if (d.ok) { output.textContent = d.result; }
+    else { output.classList.add("cgb-err"); output.textContent = "Error: " + (d.error || "unknown"); }
+  } catch (e) {
+    output.classList.add("cgb-err");
+    output.textContent = "Request failed: " + e.message;
+  } finally {
+    sendBtn.disabled = false;
+    refreshStatus();
+  }
+});
+
+refreshStatus();
+</script>
+</body>
+</html>

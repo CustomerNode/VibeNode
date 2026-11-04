@@ -1,0 +1,1169 @@
+/* voice.js — Web Speech API voice input for textareas */
+
+const _micSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8.5" y="2" width="7" height="13" rx="3.5" fill="currentColor" stroke="none"/><path d="M19 10.5v1.5a7 7 0 0 1-14 0v-1.5"/><path d="M12 19v3"/></svg>';
+const _micActiveSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--result-err)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8.5" y="2" width="7" height="13" rx="3.5" fill="var(--result-err)" stroke="none"/><path d="M19 10.5v1.5a7 7 0 0 1-14 0v-1.5"/><path d="M12 19v3"/></svg>';
+const _sendSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M3.4 20.4 20.85 12.92a1 1 0 0 0 0-1.84L3.4 3.6a1 1 0 0 0-1.38 1.17L4.1 10.6a1 1 0 0 0 .85.68L13 12l-8.05.72a1 1 0 0 0-.85.68l-2.08 5.83A1 1 0 0 0 3.4 20.4z"/></svg>';
+const _cancelSvg = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>';
+// While recording: pause = stop and leave the words in the box, unsent; the send
+// icon replaces the red mic and stops and sends.
+const _pauseSvg = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1.2"/><rect x="14" y="5" width="4" height="14" rx="1.2"/></svg>';
+const _sendRecSvg = '<svg width="15" height="15" viewBox="0 0 24 24" fill="var(--result-err)" stroke="none"><path d="M3.4 20.4 20.85 12.92a1 1 0 0 0 0-1.84L3.4 3.6a1 1 0 0 0-1.38 1.17L4.1 10.6a1 1 0 0 0 .85.68L13 12l-8.05.72a1 1 0 0 0-.85.68l-2.08 5.83A1 1 0 0 0 3.4 20.4z"/></svg>';
+
+let _activeRecognition = null;
+let _activeSpeechNode = null;   // active SpeechNode (MediaRecorder) capture controller
+let _snHiddenControls = null;   // bar buttons hidden while the premium panel owns the controls
+let _snSharedAudioCtx = null;   // ONE reused AudioContext (creating/closing per capture is flaky)
+// Flag set true when the most recent submit was triggered by voice transcription.
+// Consumed (read + cleared) by the submit path to tag the message for AI context.
+let _lastSubmitWasVoice = false;
+
+/* ------------------------------------------------------------------ *
+ * Voice transcript post-processing pipeline
+ * ------------------------------------------------------------------ *
+ * The raw output of the Web Speech API used to flow straight into the
+ * textarea: `textarea.value = finalTranscript`. Because the submit path
+ * reads `textarea.value`, the raw recognition string was ALSO exactly
+ * what got sent to the backend — recognition, display, and payload were
+ * all the same value with no seam to intervene at.
+ *
+ * This pipeline introduces that seam. The final transcript is routed
+ * through an ordered chain of processor functions before it lands in the
+ * textarea (and is therefore submitted). Each processor receives the
+ * current text plus a context object and returns the next text (sync or
+ * async). This is the landing spot for future phases — punctuation/format
+ * cleanup, voice-command parsing, LLM rewrite, etc.
+ *
+ * Scaffolding only: the chain ships EMPTY, so the pipeline is a pure
+ * identity pass today and there is no behavior change. Future phases add
+ * stages via `registerVoiceTranscriptProcessor()`.
+ *
+ * Processor contract:
+ *   fn(text: string, context: object) -> string | Promise<string>
+ *   - Return the transformed text. Returning a non-string is ignored
+ *     (the prior text is kept), so a processor can no-op safely.
+ *   - Throwing is caught and the prior text is preserved — a broken
+ *     processor must never destroy the user's dictated message.
+ *   context currently carries: { textarea, onSubmit, source }.
+ */
+const _voiceTranscriptProcessors = [];
+
+/**
+ * Register a post-processing stage for finalized voice transcripts.
+ * Stages run in registration order, each fed the previous stage's output.
+ * @param {(text: string, context: object) => (string|Promise<string>)} fn
+ */
+function registerVoiceTranscriptProcessor(fn) {
+  if (typeof fn === 'function') _voiceTranscriptProcessors.push(fn);
+}
+
+/**
+ * Run a finalized transcript through the processor chain.
+ * Always returns a Promise<string>. With no processors registered it
+ * resolves to the input unchanged. A processor that throws or returns a
+ * non-string is skipped so the dictated text is never lost.
+ */
+async function _processVoiceTranscript(rawTranscript, context = {}) {
+  let text = rawTranscript;
+  for (const processor of _voiceTranscriptProcessors) {
+    try {
+      const result = await processor(text, context);
+      if (typeof result === 'string') text = result;
+    } catch (err) {
+      console.warn('[voice] transcript processor failed; keeping prior text', err);
+    }
+  }
+  return text;
+}
+
+/** Stop any active voice capture cleanly (called on session switch, etc.) */
+function _stopActiveVoice() {
+  if (_activeRecognition) {
+    if (_activeRecognition._mark) _activeRecognition._mark('stopped: left the session or started another capture');
+    _activeRecognition._intentionalStop = true;
+    try { _activeRecognition.stop(); } catch (_) {}
+    _activeRecognition = null;
+  }
+  if (_activeSpeechNode) {
+    _activeSpeechNode._userCancelled = true;   // context change (session switch / new capture) -> discard
+    try { _activeSpeechNode.cancel(); } catch (_) {}
+    _activeSpeechNode = null;
+  }
+}
+
+/**
+ * Which voice engine to use right now.
+ * SpeechNode (cross-browser, codebase-aware) wins when ready — this is what
+ * lets Firefox/Safari users dictate at all. Otherwise fall back to the
+ * Chromium-only Web Speech API, then to "no voice" (button acts as send).
+ */
+function _voiceMode() {
+  if (window.SpeechNode && window.SpeechNode.isReady && window.SpeechNode.isReady()) return 'speechnode';
+  // Transcribe on the device itself (src/web/static/js/voice-local.js) when the PC has no
+  // transcriber: on a phone always (the browser's own recognizer cuts off on
+  // iPhone), on a computer only when it has no recognizer at all.
+  if (window.VoiceLocal && window.VoiceLocal.canRun && window.VoiceLocal.canRun()
+      && (_isPhoneLike() || !(window.SpeechRecognition || window.webkitSpeechRecognition))) return 'local';
+  if (window.SpeechRecognition || window.webkitSpeechRecognition) return 'webspeech';
+  return 'none';
+}
+
+function _isPhoneLike() {
+  try {
+    if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent || '')) return true;
+    // iPadOS reports itself as a Mac; a Mac with a touch screen is an iPad.
+    if (/Macintosh/.test(navigator.userAgent || '') && navigator.maxTouchPoints > 1) return true;
+    return !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+  } catch (_) { return false; }
+}
+
+function _hasVoiceSupport() {
+  return _voiceMode() !== 'none';
+}
+
+function setupVoiceButton(textarea, button, onSubmit) {
+  if (!textarea || !button) return;
+
+  // Create a separate send button next to the voice button
+  let sendBtn = button.nextElementSibling;
+  if (!sendBtn || !sendBtn.classList.contains('live-send-btn-send')) {
+    sendBtn = document.createElement('button');
+    sendBtn.className = 'live-send-btn live-send-btn-send';
+    // Carry over the waiting class if the voice button has it
+    if (button.classList.contains('waiting')) sendBtn.classList.add('waiting');
+    sendBtn.innerHTML = _sendSvg;
+    sendBtn.title = 'Send (' + _MOD + '+Enter)';
+    sendBtn.style.display = 'none';
+    button.parentNode.insertBefore(sendBtn, button.nextSibling);
+  }
+
+  // While recording, three buttons sit LEFT-to-right: cancel (X), pause (stop, keep
+  // the words in the box, don't send), then the voice button itself (stop & send).
+  // A pulsing "Listening" cue sits before them.
+  let insertBtn = button.previousElementSibling;
+  if (!insertBtn || !insertBtn.classList.contains('voice-insert-btn')) {
+    insertBtn = document.createElement('button');
+    insertBtn.type = 'button';
+    insertBtn.className = 'voice-insert-btn';
+    insertBtn.innerHTML = _pauseSvg;
+    insertBtn.title = 'Stop & keep in the box (don’t send)';
+    insertBtn.setAttribute('aria-label', 'Stop recording and keep the text without sending');
+    insertBtn.style.display = 'none';
+    button.parentNode.insertBefore(insertBtn, button);
+  }
+  let cancelBtn = insertBtn.previousElementSibling;
+  if (!cancelBtn || !cancelBtn.classList.contains('voice-cancel-btn')) {
+    cancelBtn = document.createElement('button');
+    cancelBtn.className = 'voice-cancel-btn';
+    cancelBtn.innerHTML = _cancelSvg;
+    cancelBtn.title = 'Cancel recording & discard';
+    cancelBtn.setAttribute('aria-label', 'Cancel recording and discard');
+    cancelBtn.style.display = 'none';
+    button.parentNode.insertBefore(cancelBtn, insertBtn);
+  }
+  let listenCue = cancelBtn.previousElementSibling;
+  if (!listenCue || !listenCue.classList.contains('voice-listening')) {
+    listenCue = document.createElement('span');
+    listenCue.className = 'voice-listening';
+    listenCue.setAttribute('role', 'status');
+    listenCue.innerHTML = '<i></i><span>Listening</span>';
+    listenCue.style.display = 'none';
+    button.parentNode.insertBefore(listenCue, cancelBtn);
+  }
+
+  insertBtn.onclick = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (_activeRecognition && _activeRecognition._target === textarea) {
+      _activeRecognition._noSend = true;        // onend keeps the text and does not submit
+      if (_activeRecognition._mark) _activeRecognition._mark('stopped: pause button');
+      _activeRecognition._intentionalStop = true;
+      try { _activeRecognition.stop(); } catch (_) {}
+      _activeRecognition = null;
+    }
+    if (_activeSpeechNode && _activeSpeechNode._target === textarea) {
+      try { _activeSpeechNode.insert(); } catch (_) {}
+    }
+    updateIcon();
+  };
+
+  cancelBtn.onclick = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (_activeRecognition && _activeRecognition._target === textarea) {
+      if (_activeRecognition._mark) _activeRecognition._mark('stopped: cancel button');
+      _activeRecognition._intentionalStop = true;
+      _activeRecognition._discarded = true;   // flag so onend knows to discard
+      try { _activeRecognition.stop(); } catch (_) {}
+      _activeRecognition = null;
+    }
+    if (_activeSpeechNode && _activeSpeechNode._target === textarea) {
+      _activeSpeechNode._userCancelled = true;
+      try { _activeSpeechNode.cancel(); } catch (_) {}
+      _activeSpeechNode = null;
+    }
+    // Clear the textarea entirely (discard composed message)
+    textarea.value = '';
+    textarea.dispatchEvent(new Event('input'));
+    textarea.focus();
+    updateIcon();
+  };
+
+  sendBtn.onclick = () => {
+    if (onSubmit) onSubmit();
+  };
+
+  const updateIcon = () => {
+    const hasText = textarea.value.trim().length > 0 || !!window._pendingInvoke;
+    const isRecording = (_activeRecognition && _activeRecognition._target === textarea)
+      || (_activeSpeechNode && _activeSpeechNode._target === textarea);
+
+    // Primary hand-off: the mic is the call to action while the box is empty;
+    // once there is text the send button takes over (styled in style.css,
+    // ".live-bar-row .live-send-btn.vn-primary").  Without voice support this
+    // button IS the send button, so it stays primary.
+    button.classList.toggle('vn-primary', !isRecording && (!hasText || !_hasVoiceSupport()));
+
+    insertBtn.style.display = isRecording ? '' : 'none';
+    listenCue.style.display = isRecording ? '' : 'none';
+    if (isRecording) {
+      button.innerHTML = _sendRecSvg;
+      button.title = 'Stop & send';
+      button.classList.add('recording');
+      sendBtn.style.display = 'none';
+      cancelBtn.style.display = '';
+    } else if (_hasVoiceSupport()) {
+      button.innerHTML = _micSvg;
+      button.title = 'Voice input';
+      button.classList.remove('recording');
+      sendBtn.style.display = hasText ? '' : 'none';
+      cancelBtn.style.display = 'none';
+    } else {
+      // No voice support — button acts as send
+      button.innerHTML = _sendSvg;
+      button.title = 'Send (' + _MOD + '+Enter)';
+      button.classList.remove('recording');
+      sendBtn.style.display = 'none';
+      cancelBtn.style.display = 'none';
+    }
+  };
+
+  textarea.addEventListener('input', updateIcon);
+  updateIcon();
+
+  button.onclick = () => {
+    // Stop an active SpeechNode capture (manual click while recording)
+    if (_activeSpeechNode && _activeSpeechNode._target === textarea) {
+      try { _activeSpeechNode.stop(); } catch (_) {}
+      return;
+    }
+    if (_activeRecognition && _activeRecognition._target === textarea) {
+      // Stop recording (manual click)
+      if (_activeRecognition._mark) _activeRecognition._mark('stopped: your tap');
+      _activeRecognition._intentionalStop = true;
+      _activeRecognition.stop();
+      _activeRecognition = null;
+      updateIcon();
+      return;
+    }
+
+    const _mode = _voiceMode();
+
+    // No voice support fallback — act as send button
+    if (_mode === 'none') {
+      if (textarea.value.trim().length > 0 && onSubmit) onSubmit();
+      return;
+    }
+
+    // Start voice input — kill any stale capture from a previous textarea (e.g. bar rebuild)
+    _stopActiveVoice();
+
+    // SpeechNode (cross-browser, codebase-aware) path — works in every browser.
+    if (_mode === 'speechnode') {
+      _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon);
+      return;
+    }
+    // Same capture, transcribed on the device itself. Start loading the model in
+    // the tap (first use downloads it); recording begins at once, so by the time
+    // you stop the model is usually ready.
+    if (_mode === 'local') {
+      try {
+        window.VoiceLocal.load((msg) => { try { if (!window.VoiceLocal.isReady()) _snCaptionNote(msg); } catch (_) {} }).catch(() => {});
+      } catch (_) {}
+      _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon, window.VoiceLocal);
+      return;
+    }
+
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const recognition = new SR();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'en-US';
+    recognition._target = textarea;
+    recognition._intentionalStop = false;
+    _activeRecognition = recognition;
+
+    // Preserve any existing text so voice appends to it
+    const existingText = textarea.value;
+    let finalTranscript = existingText ? existingText + ' ' : '';
+    let silenceTimer = null;
+    let restartCount = 0;
+    const MAX_RESTARTS = 5;
+
+    // Why did this dictation end? Every event goes into one trail, written to
+    // logs/client_diag.log when the dictation is over, so a phone cut-off names
+    // its cause instead of being guessed at. Words are counted, never
+    // logged.
+    const _t0 = Date.now();
+    const _trail = [];
+    const _mark = (what) => { if (_trail.length < 80) _trail.push(((Date.now() - _t0) / 1000).toFixed(1) + 's ' + what); };
+    const _shipTrail = (outcome) => {
+      _mark(outcome);
+      try {
+        fetch('/api/client-log', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tag: 'voice', msg: (navigator.userAgent || '').slice(0, 120) + ' | ' + _trail.join(' > ') }) }).catch(() => {});
+      } catch (_) {}
+    };
+    recognition._mark = _mark;
+
+    const resetSilenceTimer = () => {
+      if (silenceTimer) clearTimeout(silenceTimer);
+      silenceTimer = setTimeout(() => {
+        _mark('quiet-12s-timer');
+        recognition._intentionalStop = true;
+        recognition.stop();
+      }, 12000);  // 12s silence timeout — generous room to pause/think mid-message before auto-send
+      // Mobile dictation naturally has 3–8s pauses (read a note, think, breathe). The old 7s cut users
+      // off mid-sentence; 12s is still well short of "I forgot I was recording" territory, and the
+      // manual stop button is one tap away for anything shorter.
+    };
+
+    // Words on screen that the browser has not marked final yet. iPhone Safari can
+    // end recognition without ever finalizing them; onend folds them in so they are
+    // never dropped (otherwise dictation can stop mid-sentence on the phone).
+    let pendingInterim = '';
+
+    let _results = 0, _lastResultAt = 0;
+    recognition.onresult = (e) => {
+      restartCount = 0;
+      _results++; _lastResultAt = Date.now();
+      let interim = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        if (e.results[i].isFinal) {
+          finalTranscript += e.results[i][0].transcript;
+        } else {
+          interim += e.results[i][0].transcript;
+        }
+      }
+      // Live, in-progress feedback shows the RAW transcript intentionally —
+      // post-processing runs once on the finalized transcript in onend (see
+      // the _processVoiceTranscript pipeline), not on every interim tick.
+      pendingInterim = interim;
+      textarea.value = finalTranscript + interim;
+      textarea.dispatchEvent(new Event('input'));
+      resetSilenceTimer();
+    };
+
+    recognition.onend = () => {
+      if (silenceTimer) clearTimeout(silenceTimer);
+      _mark('end (results ' + _results + ', last ' + (_lastResultAt ? ((_lastResultAt - _t0) / 1000).toFixed(1) + 's' : 'none')
+        + ', unfinalized words ' + (pendingInterim.trim() ? pendingInterim.trim().split(/\s+/).length : 0) + ')');
+      if (pendingInterim) {
+        finalTranscript += pendingInterim;
+        pendingInterim = '';
+      }
+
+      // If the browser killed recognition unexpectedly (not silence / not manual),
+      // try to seamlessly restart and keep recording.
+      if (recognition._started && !recognition._intentionalStop && restartCount < MAX_RESTARTS && _activeRecognition === recognition) {
+        restartCount++;
+        if (!/\s$/.test(finalTranscript) && finalTranscript) finalTranscript += ' ';
+        try { recognition.start(); _mark('restart ok'); return; } catch (err) { _mark('restart refused: ' + ((err && err.name) || 'error')); }
+      }
+      // The browser ended it and would not restart (iPhone Safari does this after a
+      // pause or a time limit): you did not finish, so never send. Keep the words in
+      // the box; the mic or Send carries on.
+      if (!recognition._intentionalStop || recognition._browserEnded) {
+        recognition._noSend = true;
+        if (!recognition._discarded && finalTranscript.trim()) {
+          try { showToast('Voice input stopped by itself. Your words are in the box: tap the mic to keep going, or Send.'); } catch (_) {}
+        }
+      }
+
+      if (_activeRecognition === recognition) _activeRecognition = null;
+      _shipTrail(recognition._discarded ? 'outcome: cancelled' : recognition._noSend ? 'outcome: kept in box'
+        : finalTranscript.trim() ? 'outcome: sent (' + finalTranscript.trim().split(/\s+/).length + ' words)' : 'outcome: nothing heard');
+      // If the user hit the cancel (X) button, discard everything
+      if (recognition._discarded) {
+        textarea.value = '';
+        textarea.dispatchEvent(new Event('input'));
+        updateIcon();
+        textarea.focus();
+        return;
+      }
+      // Commit the (post-processed) transcript into the textarea and, if
+      // non-empty, submit it. Factored out so it can run either inline
+      // (no processors) or as the pipeline's continuation (processors
+      // registered). `text` is the value AFTER post-processing.
+      const commitTranscript = (text) => {
+        textarea.value = text;
+        textarea.dispatchEvent(new Event('input'));
+        updateIcon();
+        if (recognition._noSend) {
+          // Pause: the words stay in the box for the user to edit; nothing is sent.
+          textarea.focus();
+          try { textarea.setSelectionRange(text.length, text.length); } catch (_) {}
+        } else if (text.trim() && onSubmit) {
+          _lastSubmitWasVoice = true;
+          onSubmit();
+        } else {
+          textarea.focus();
+        }
+        // Apply any bar updates that were deferred while voice was active.
+        // Force liveBarState=null so the re-render isn't skipped by the
+        // stateKey===liveBarState guard — the bar HTML is stale because
+        // updateLiveInputBar returned early while we were recording.
+        if (typeof updateLiveInputBar === 'function') {
+          if (typeof liveBarState !== 'undefined') liveBarState = null;
+          setTimeout(updateLiveInputBar, 0);
+        }
+      };
+
+      // Decouple raw recognition from the committed/submitted value: the
+      // final transcript passes through the post-processing pipeline first.
+      // Fast path — with no processors registered, commit synchronously so
+      // behavior is byte-for-byte identical to before this seam existed.
+      if (_voiceTranscriptProcessors.length === 0) {
+        commitTranscript(finalTranscript);
+      } else {
+        _processVoiceTranscript(finalTranscript, { textarea, onSubmit, source: 'voice' })
+          .then(commitTranscript);
+      }
+    };
+
+    recognition.onerror = (e) => {
+      // Transient errors — let onend handle restart
+      const transient = ['network', 'aborted', 'audio-capture'];
+      _mark('error ' + e.error);
+      if (transient.includes(e.error)) return;
+      if (e.error !== 'no-speech') showToast('Voice error: ' + e.error, true);
+      recognition._intentionalStop = true;
+      recognition._browserEnded = true;   // not your stop: onend keeps the words, unsent
+      if (_activeRecognition === recognition) _activeRecognition = null;
+      updateIcon();
+    };
+
+    // Only auto-restart (in onend) once the engine has actually STARTED — i.e. mic
+    // permission was granted and audio is flowing. Without this guard, a first-time
+    // permission prompt that ends recognition before it ever ran would trip the
+    // restart loop and trap the UI in listen mode until the prompt is answered.
+    recognition.onstart = () => { _mark('listening'); recognition._started = true; restartCount = 0; };
+
+    recognition.start();
+    updateIcon();
+    showToast('Listening…');
+  };
+}
+
+/**
+ * Pick the best transcript between the final single-pass result and the
+ * streaming's last-known-good text.
+ *
+ * The streaming LocalAgreement builds a committed prefix through multiple passes;
+ * those words are more reliable for project-specific proper nouns and identifiers
+ * (e.g. "SpeechNode", function names) than a single-pass final transcription.
+ * When the final regresses on committed words — e.g. "SpeechNode" → "speech note"
+ * — prefer the streaming version for the whole transcript.
+ *
+ * Guard: require ≥2 committed words to avoid false-positives on very short
+ * utterances where the committed prefix could be a common substring.
+ */
+function _mergeWithCommitted(finalText, streamingText, committedWords) {
+  if (!finalText || !finalText.trim()) return (streamingText || '').trim();
+  if (!streamingText || !streamingText.trim()) return finalText;
+  if (!committedWords || committedWords.length < 2) return finalText;
+  const norm = (s) => s.toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
+  const committed = norm(committedWords.join(' '));
+  if (norm(finalText).includes(committed)) return finalText;      // final agrees — trust it
+  if (norm(streamingText).includes(committed)) return streamingText; // final regressed — use streaming
+  return finalText;   // neither clearly aligns — trust the higher-quality decoder
+}
+
+/**
+ * SpeechNode capture path — used when SpeechNode is enabled & ready.
+ * Records via MediaRecorder (works in EVERY browser, so Firefox/Safari users
+ * finally get voice) and transcribes server-side with codebase-biased Whisper.
+ * In Chromium it ALSO shows live Web Speech interim text for feedback, but the
+ * authoritative transcript always comes from SpeechNode.
+ */
+function _startSpeechNodeCapture(textarea, button, onSubmit, updateIcon, engine) {
+  // `engine` transcribes the recording: SpeechNode on the PC by default, or
+  // VoiceLocal (src/web/static/js/voice-local.js) inside this browser. Both answer
+  // transcribeBlob(blob, opts) -> {ok, text, gap}. An engine with `noPartials`
+  // gets no live-caption loop (a whole pass per partial is too slow on a phone).
+  engine = engine || window.SpeechNode;
+  const engineLabel = (engine === window.VoiceLocal) ? 'Voice' : 'SpeechNode';
+  // iOS FIRST-PERMISSION FIX — prime the AudioContext HERE, synchronously inside the
+  // tap gesture. On iOS an AudioContext only resumes from a real user gesture. The
+  // silence-detection analyser below lives inside getUserMedia's .then, which on the
+  // FIRST use runs only after you tap "Allow" on the system prompt — no longer a page
+  // gesture — so resume() stays 'suspended', the analyser gets no samples, and that
+  // first recording never auto-stops (stuck in listen mode). Every later capture skips
+  // the prompt so it resumed in-gesture and worked. Resuming in the tap makes the very
+  // first capture behave like the rest. Safe/idempotent when the context is already live.
+  try {
+    const _AC = window.AudioContext || window.webkitAudioContext;
+    if (_AC) {
+      if (!_snSharedAudioCtx) _snSharedAudioCtx = new _AC();
+      if (_snSharedAudioCtx.state === 'suspended') _snSharedAudioCtx.resume().catch(() => {});
+    }
+  } catch (_) {}
+
+  const existingText = textarea.value ? textarea.value.replace(/\s+$/, '') : '';
+  // Bias SpeechNode toward the ACTIVE project's vocabulary: capture the current
+  // project dir once (so partials + the final all learn from the same codebase).
+  const snCwd = (typeof _currentProjectDir === 'function') ? (_currentProjectDir() || '') : '';
+  let interimRecog = null;
+  let stopped = false;
+
+  const controller = {
+    _target: textarea,
+    _discarded: false,
+    _recorder: null,
+    _stream: null,
+    stop() { this._finish(); },
+    // Pause: finish exactly like stop (full-quality final transcript), but commitSend
+    // leaves the text in the box instead of sending it.
+    insert() { this._noSend = true; this._finish(); },
+    cancel() { this._discarded = true; this._finish(); },
+    _finish() {
+      if (stopped) return;
+      stopped = true;
+      if (this._silenceTimer) { clearTimeout(this._silenceTimer); this._silenceTimer = null; }
+      if (this._finishFallback) { clearTimeout(this._finishFallback); this._finishFallback = null; }
+      if (this._maxTimer) { clearTimeout(this._maxTimer); this._maxTimer = null; }
+      if (this._levelTimer) { clearInterval(this._levelTimer); this._levelTimer = null; }
+      if (this._streamKick) { clearTimeout(this._streamKick); this._streamKick = null; }
+      try { if (this._audioSrc) this._audioSrc.disconnect(); } catch (_) {}
+      try { button.style.boxShadow = ''; } catch (_) {}
+      // Cancel -> discard the panel. Normal stop -> KEEP it through finalize so the
+      // message never appears to vanish; onstop fades it out after the handoff.
+      if (this._discarded) { try { _snCaptionHide(); } catch (_) {} }
+      else {
+        try { _snCaptionFinalize(); } catch (_) {}
+        // Backstop: guarantee a send even if recorder.onstop NEVER fires (recorder error
+        // / already-inactive). commitSend is idempotent, so this can't double-send.
+        if (!this._sendBackstop && this._commitSend) {
+          this._sendBackstop = setTimeout(() => { try { this._commitSend(''); } catch (_) {} }, 7000);
+        }
+      }
+      if (interimRecog) { try { interimRecog._intentionalStop = true; interimRecog.stop(); } catch (_) {} }
+      try { if (this._recorder && this._recorder.state !== 'inactive') this._recorder.stop(); } catch (_) {}
+      try { if (this._stream) this._stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+    },
+  };
+
+  navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+    if (stopped || controller._discarded) {
+      try { stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+      return;
+    }
+    controller._stream = stream;
+    let recorder;
+    try {
+      recorder = new MediaRecorder(stream);
+    } catch (e) {
+      try { stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+      _speechNodeFail(updateIcon, 'Recording is not supported in this browser.', engineLabel);
+      return;
+    }
+    controller._recorder = recorder;
+
+    // --- Silence-based auto-stop (cross-browser via Web Audio) ---
+    // When you finish speaking, a short pause ends the turn: stop -> transcribe
+    // -> auto-send. Works in EVERY browser (Firefox has no Web Speech VAD), and
+    // mirrors the old Web Speech 3s silence behavior. Manual click still stops too.
+    // Silence thresholds are deliberately generous — mobile dictation has natural 3–6s pauses
+    // (read a note, think, breathe) and tight thresholds read as "it keeps cutting me off."
+    // Manual stop (tap the stop button) is always one tap away for anything shorter.
+    const SILENCE_SHORT = 5000;   // pause-to-send in a quiet room
+    const SILENCE_LONG = 8000;    // pause-to-send when background noise/music is present
+    const MAX_MS = 300000;        // hard cap on one recording (5 min); silence detection ends it sooner
+    const RMS_THRESHOLD = 0.015;  // absolute speech floor (a fast path for QUIET rooms)
+    const QUIET_RMS = 0.02;       // background above this = "noisy" -> use the long window
+    const SPEECH_FACTOR = 2.2;    // (reserved)
+    const STABLE_MS = 6000;       // committed words unchanged this long -> end of speech (client fallback)
+    const GAP_S = 5.0;            // Whisper-VAD trailing silence (real, noise-immune) -> end of speech
+    // Whisper processes at most 30 seconds of audio per inference call. Sending more
+    // is wasteful: the model silently truncates the front, serialization is slower,
+    // and the larger blob causes partial-transcription latency to grow unboundedly as
+    // the session gets longer. Always send the most recent PARTIAL_WINDOW chunks so
+    // response time stays constant regardless of how long the user has been talking.
+    const PARTIAL_WINDOW = 75;    // ~30s at 400ms timeslice — Whisper's per-chunk context limit
+    let hasSpoken = false;
+    let noiseFloor = 1;           // tracks background (min rms); starts high, drops to real floor
+    let streamBusy = false;       // a partial transcription is in flight
+    let streamCooldown = 0;
+    // _lastSpeechAt: timestamp of the most recent mic sample above RMS_THRESHOLD.
+    // Used as ground-truth "is the user currently talking?" — the model's signals
+    // (GAP_S, STABLE_MS) are computed on audio that was submitted seconds ago, so
+    // when the model is slow they can fire while the user is still speaking.
+    // Requiring mic-confirmation before honouring model-side signals prevents that.
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (AudioCtx) {
+      try {
+        if (!_snSharedAudioCtx) _snSharedAudioCtx = new AudioCtx();
+        const ctx = _snSharedAudioCtx;           // reuse one context (avoids per-capture churn)
+        try { if (ctx.state === 'suspended') ctx.resume(); } catch (_) {}
+        const src = ctx.createMediaStreamSource(stream);
+        controller._audioSrc = src;              // disconnect on finish; never close the shared ctx
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 1024;
+        src.connect(analyser);                   // not to destination — no echo
+        const buf = new Uint8Array(analyser.fftSize);
+        // Finalize-and-send, but only once the model has caught up (compute gate):
+        // if a partial is still transcribing, defer until it returns so a stall on
+        // a long utterance can't trigger a premature send.
+        // micSilentFor(ms): has the mic been below RMS_THRESHOLD for at least ms?
+        // Used as ground-truth confirmation before any signal fires a send.
+        const micSilentFor = (ms) => (_now() - (controller._lastSpeechAt || 0)) >= ms;
+
+        const maybeFinish = () => {
+          controller._silenceTimer = null;
+          if (stopped || controller._discarded) return;
+          controller._finishing = true;          // stop issuing new partials
+          if (!streamBusy) { controller.stop(); return; }   // model idle -> send now
+          // Model is busy — wait for the in-flight partial to return (its handler
+          // calls controller.stop() when _finishing is set). Hard fallback guards
+          // against a stuck/slow request, but first re-checks the mic: if the user
+          // started speaking again while we were waiting, retract the finish.
+          controller._finishFallback = setTimeout(() => {
+            if (!controller._finishing) return;          // retracted by level timer
+            if (!micSilentFor(SILENCE_SHORT * 0.6)) return;  // mic says still talking
+            try { controller.stop(); } catch (_) {}
+          }, 2500);
+        };
+        controller._levelTimer = setInterval(() => {
+          if (stopped) return;
+          analyser.getByteTimeDomainData(buf);
+          let sum = 0;
+          for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v; }
+          const rms = Math.sqrt(sum / buf.length);
+          // Honest live feedback: glow the mic with the actual mic level.
+          try { button.style.boxShadow = '0 0 0 ' + (2 + Math.min(10, rms * 55)).toFixed(1) + 'px rgba(239,68,68,0.30)'; } catch (_) {}
+          // Drive the premium caption's audio-reactive glow from the same level.
+          try { const _cap = document.getElementById('sn-live-caption'); if (_cap) _cap.style.setProperty('--sn-level', Math.min(1, rms * 9).toFixed(2)); } catch (_) {}
+          // Track the background-noise floor (quietest recent level) — used ONLY to
+          // pick the pause window, NEVER to gate speech. Speech uses a fixed floor so
+          // it can't mis-calibrate and refuse to ever end.
+          if (rms < noiseFloor) noiseFloor = rms;
+          else noiseFloor = noiseFloor * 0.995 + rms * 0.005;
+          const silenceMs = (noiseFloor > QUIET_RMS) ? SILENCE_LONG : SILENCE_SHORT;
+          if (rms > RMS_THRESHOLD) {
+            hasSpoken = true;
+            controller._lastSpeechAt = _now();
+            if (controller._silenceTimer) { clearTimeout(controller._silenceTimer); controller._silenceTimer = null; }
+            // Retract a pending finish if the user is speaking again. The model's
+            // GAP_S / STABLE_MS signals are computed on audio that was submitted
+            // seconds ago — they can fire while you're still mid-sentence. The mic
+            // is the ground truth: if it's hearing you, we're not done.
+            if (controller._finishing && !controller._sent) {
+              controller._finishing = false;
+              if (controller._finishFallback) { clearTimeout(controller._finishFallback); controller._finishFallback = null; }
+            }
+          } else if (hasSpoken && !controller._finishing && !controller._silenceTimer) {
+            // Adaptive silence window: give longer messages more patience.
+            // Short dictations stay snappy; long ones tolerate natural inter-sentence
+            // pauses without prematurely ending mid-thought.
+            const wordCount = committedWords.length;
+            const adaptedSilenceMs = wordCount > 30 ? silenceMs + 4000
+                                   : wordCount > 12 ? silenceMs + 2000
+                                   : silenceMs;
+            controller._silenceTimer = setTimeout(maybeFinish, adaptedSilenceMs);
+          }
+        }, 100);
+      } catch (_) { /* no silence detection available — manual stop still works */ }
+    }
+    controller._maxTimer = setTimeout(() => { controller.stop(); }, MAX_MS);
+
+    const chunks = [];
+    recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+
+    // --- Near-real-time streaming (chunked Whisper) ---
+    // Re-transcribe the audio-so-far continuously and show the REAL SpeechNode
+    // text building up as you talk. Single request in flight; it re-chains the
+    // moment it returns, so it runs as fast as the machine allows. The ONLY
+    // throttle is ADAPTIVE — it stays at full speed and backs off (and drops
+    // partials to fast/greedy decode) only if a partial actually comes back slow.
+    // The final pause-snap always uses the full-quality pass, so committed text
+    // is unchanged.
+    const _now = () => ((window.performance && performance.now) ? performance.now() : Date.now());
+
+    // LocalAgreement stabilization: words that two consecutive partials agree on
+    // get "committed" and never rewrite again — this is what kills the jumpiness.
+    // Only the unstable tail keeps updating; the final snap replaces everything.
+    let committedWords = [];
+    let prevWords = [];
+    const _normW = (w) => w.toLowerCase().replace(/[^a-z0-9']/g, '');
+    const _commonPrefix = (a, b) => {
+      let i = 0; const n = Math.min(a.length, b.length);
+      while (i < n && _normW(a[i]) === _normW(b[i])) i++;
+      return i;
+    };
+    const applyPartial = (text) => {
+      const cur = text.trim().split(/\s+/).filter(Boolean);
+      const agree = _commonPrefix(prevWords, cur);
+      if (agree > committedWords.length) committedWords = cur.slice(0, agree);  // grow committed, never shrink
+      prevWords = cur;
+      // Prepend the permanent prefix (committed words from prior PARTIAL_WINDOW cycles) so
+      // _lastFullText always holds the FULL dictation, not just the current 30-second window.
+      // This is the watchdog fallback — without it, long recordings silently lose their first
+      // N paragraphs whenever the window shifts and the final transcription times out.
+      const perm = controller._permanentPrefix || '';
+      controller._lastFullText = perm ? (perm + ' ' + cur.join(' ')).trim() : cur.join(' ');
+      // Premium live surface: permanent prefix words show solid (never rewrites); current
+      // committed words also solid; tail shimmers as Whisper refines each partial.
+      // Long dictations keep their full history visible without ever losing committed text.
+      const permWords = perm ? perm.trim().split(/\s+/).filter(Boolean) : [];
+      _snCaptionUpdate(permWords.concat(committedWords), cur.slice(committedWords.length));
+    };
+
+    const _reschedule = (ms) => {
+      if (stopped || controller._discarded || controller._finishing) return;
+      controller._streamKick = setTimeout(pumpPartial, ms);
+    };
+    function pumpPartial() {
+      if (stopped || controller._discarded) return;
+      // Not ready yet (no audio captured, request in-flight, or too little audio for Whisper's
+      // VAD to confidently detect speech): keep the loop ALIVE by retrying soon. Requiring ≥ 2
+      // chunks (~800ms) before the first partial prevents empty early transcriptions that confuse
+      // LocalAgreement and waste an inference slot right before the user starts speaking clearly.
+      if (streamBusy || chunks.length < 2) { _reschedule(250); return; }
+      streamBusy = true;
+      const t0 = _now();
+      // Partials are ALWAYS fast/greedy (beam=1) so they return in well under a second
+      // and the live preview keeps up while you talk. If they still come back slow we
+      // additionally back OFF the rate (below). The final pause-snap uses full quality,
+      // so the committed message is never lower-quality. Full-quality partials were the
+      // bug: the first one was too slow to land before a short utterance finalized.
+      const useFast = true;
+      // Cap partial audio at Whisper's 30-second context window. Sending more
+      // audio than the model can process causes two problems: (1) response time
+      // grows linearly with audio length — the model processes a 60s blob as
+      // slowly as two 30s blobs while producing no better output; (2) the model
+      // silently truncates the front, so LocalAgreement sees a different word at
+      // position 0 each cycle, preventing committed words from growing and
+      // triggering the stability check. Using a fixed-size window keeps partial
+      // latency constant and LocalAgreement working regardless of session
+      // length. The final recorder.onstop still uses ALL audio for the full transcript.
+      //
+      // SEGMENTED WINDOW — the start advances in whole PARTIAL_WINDOW hops
+      // (segment k covers chunks [k*W, (k+1)*W)), NOT a continuous slide. Two
+      // load-bearing reasons: (a) a stable start between hops lets LocalAgreement
+      // actually re-commit words — a continuously-sliding start advanced on EVERY
+      // pump past 30s, tripping the reset below each cycle so committed words
+      // never grew again; (b) a promoted segment's audio is never re-covered by
+      // the next window, so the caption/fallback can't show duplicated text.
+      const partialStart = Math.floor(Math.max(0, chunks.length - 1) / PARTIAL_WINDOW) * PARTIAL_WINDOW;
+      // When the window start advances, the transcript baseline shifts by one word
+      // and the previous prevWords comparison is off-by-one. Reset LocalAgreement
+      // so it rebuilds cleanly over the next two partials instead of staying stuck.
+      if (partialStart > (controller._lastPartialStart || 0)) {
+        // Before resetting LocalAgreement for the new window, promote the finished
+        // segment's words to the permanent prefix. This prevents _lastFullText (the
+        // watchdog fallback) from losing dictated text when the 30-second window shifts.
+        // Without this, a 60-second recording that triggers a window shift loses its
+        // first half if the final transcription times out. permanentPrefix grows
+        // monotonically and is never cleared. Promote prevWords (the segment's last
+        // full greedy transcript) rather than just committedWords: the settling tail's
+        // audio is NOT covered by the next segment, so dropping it would lose the last
+        // few words of every segment from the caption/fallback. A single rough settling
+        // word beats a hole at every 30s seam — and the final full-audio pass still
+        // produces the authoritative sent message.
+        if (prevWords.length > 0) {
+          controller._permanentPrefix = ((controller._permanentPrefix || '') + ' ' + prevWords.join(' ')).trim();
+        }
+        prevWords = [];
+        committedWords = [];
+        controller._lastCommitLen = undefined;
+        controller._lastCommitTs = undefined;
+      }
+      controller._lastPartialStart = partialStart;
+      // WINDOW-HEADER: a MediaRecorder stream is ONE continuous container — only
+      // chunk 0 carries the WebM/EBML (or MP4) header. A mid-stream slice alone is
+      // headerless and ffmpeg rejects it ("Invalid data found when processing
+      // input"), so before this fix EVERY partial past ~30s failed server-side:
+      // the live caption froze, end-of-speech signals died, and the fallback
+      // transcript was capped at the first window — long mobile dictations
+      // arrived truncated. Prepending chunk 0 restores a valid container; the
+      // decoder resyncs onto the later clusters (verified against faster-whisper's
+      // decoder). Cost: ~400ms of stale audio at the blob's front — usually the
+      // pre-speech silence right after the mic tap, at most a word fragment, and
+      // only in live partials. The final pass still sends all chunks in order.
+      const winChunks = partialStart > 0 ? [chunks[0]].concat(chunks.slice(partialStart)) : chunks.slice(partialStart);
+      const partial = new Blob(winChunks, { type: (chunks[0] && chunks[0].type) || 'audio/webm' });
+      engine.transcribeBlob(partial, { fast: useFast, cwd: snCwd }).then((res) => {
+        streamBusy = false;
+        const dur = _now() - t0;
+        if (dur > 1200) streamCooldown = Math.min(1500, streamCooldown + 300);
+        else streamCooldown = Math.max(0, streamCooldown - 200);
+        if (stopped || controller._discarded) return;
+        if (res && res.ok && typeof res.text === 'string') {
+          if (res.text.trim()) applyPartial(res.text);
+          const haveText = !!(controller._lastFullText || '').trim();
+          // END-OF-SPEECH — both model-side signal AND mic must agree before we finish.
+          // When the model is slow (streamBusy for several seconds), _lastSpeechAt is
+          // updated live by the level timer while the model processes old audio. So if
+          // the model says "gap = 3s" but the mic saw speech 0.5s ago, the model is
+          // looking at stale audio — the user is still talking. Require mic silence of
+          // at least the same duration as the trigger before honouring either signal.
+          // (1) Whisper-VAD trailing-silence gap — noise-immune, but only trustworthy
+          //     when the mic confirms you've also been quiet that long.
+          if (haveText && typeof res.gap === 'number' && res.gap >= GAP_S &&
+              micSilentFor(GAP_S * 1000)) controller._finishing = true;
+          // (2) committed-words stability — recognizer stops growing when you stop.
+          //     Same mic-confirmation guard: don't fire if the model was just slow.
+          //     Adaptive: require more stable time for longer messages, matching the
+          //     longer inter-sentence pauses that long dictations naturally produce.
+          const adaptedStableMs = committedWords.length > 30 ? STABLE_MS + 4000
+                                 : committedWords.length > 12 ? STABLE_MS + 2500
+                                 : STABLE_MS;
+          if (committedWords.length === controller._lastCommitLen) {
+            if (haveText && committedWords.length > 0 &&
+                _now() - (controller._lastCommitTs || _now()) >= adaptedStableMs &&
+                micSilentFor(adaptedStableMs)) controller._finishing = true;
+          } else {
+            controller._lastCommitLen = committedWords.length;
+            controller._lastCommitTs = _now();
+          }
+        } else if (res && !res.ok) {
+          console.warn('[SpeechNode] partial transcribe not ok:', res.error);
+        }
+        if (controller._finishing) { controller.stop(); return; }  // end of speech -> finalize
+        _reschedule(streamCooldown);
+      }).catch((e) => {
+        streamBusy = false;
+        streamCooldown = Math.min(1500, streamCooldown + 300);
+        console.warn('[SpeechNode] partial transcribe failed:', e);
+        if (controller._finishing) { controller.stop(); return; }
+        _reschedule(streamCooldown);
+      });
+    }
+    if (!engine.noPartials) controller._streamKick = setTimeout(pumpPartial, 400);
+
+    // Bulletproof send: NEVER drop a message. Idempotent (sends exactly once), and
+    // gated ONLY by an explicit ✕ cancel. Empty/failed/slow transcribes fall back to
+    // the best live transcript. (Pre-emptively sending is fine; dropping is not.)
+    const commitSend = (text) => {
+      if (controller._sent) return;
+      controller._sent = true;
+      if (controller._sendBackstop) { clearTimeout(controller._sendBackstop); controller._sendBackstop = null; }
+      if (_activeSpeechNode === controller) _activeSpeechNode = null;
+      try { button.classList.remove('processing'); } catch (_) {}
+      if (controller._userCancelled) {            // the ONLY thing that discards a message
+        try { _snCaptionHide(); } catch (_) {}
+        updateIcon();
+        _refreshBarSoon();
+        return;
+      }
+      let t = (text || '').trim();
+      if (!t) t = (controller._lastFullText || '').trim();   // best available transcript
+      const joined = (existingText ? (existingText + ' ' + t) : t).trim();
+      if (joined && controller._noSend) {
+        // Pause: put the words in the CURRENT live box (the bar may have re-rendered)
+        // and stop there. Nothing is submitted.
+        try { _snCaptionHide(); } catch (_) {}
+        const liveTa = (textarea.id && document.getElementById(textarea.id)) || textarea;
+        liveTa.value = joined;
+        try { liveTa.dispatchEvent(new Event('input')); } catch (_) {}
+        if (liveTa !== textarea) { try { textarea.value = joined; } catch (_) {} }
+        updateIcon();
+        _refreshBarSoon();
+        setTimeout(() => {
+          const ta = (textarea.id && document.getElementById(textarea.id)) || liveTa;
+          if (!ta.value) { ta.value = joined; try { ta.dispatchEvent(new Event('input')); } catch (_) {} }
+          try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch (_) {}
+        }, 30);
+        return;
+      }
+      if (joined) {
+        try { _snCaptionSetFinal(t || joined); } catch (_) {}
+        try { _snCaptionSend(); } catch (_) {}    // lift + fade as the message lands
+        // The input bar can re-render mid-capture (e.g. the session you're dictating to
+        // keeps streaming), swapping the textarea node. onSubmit re-queries the input by
+        // id, so write the message into the CURRENT live element — not the stale node we
+        // captured at start. (Writing to the detached node = "send motion plays, then it
+        // vanishes" — the message was put somewhere onSubmit never reads.)
+        const liveTa = (textarea.id && document.getElementById(textarea.id)) || textarea;
+        liveTa.value = joined;
+        try { liveTa.dispatchEvent(new Event('input')); } catch (_) {}
+        if (liveTa !== textarea) { try { textarea.value = joined; } catch (_) {} }
+        updateIcon();
+        _lastSubmitWasVoice = true;
+        // If onSubmit throws, the text is already sitting in the live input -> recoverable,
+        // not lost. Tell the user so a failed auto-send never silently swallows a message.
+        try {
+          if (onSubmit) onSubmit();
+        } catch (e) {
+          console.warn('[SpeechNode] onSubmit threw; text left in the input box', e);
+          try { if (typeof showToast === 'function') showToast('Your dictation is ready — press Enter to send.', true); } catch (_) {}
+        }
+      } else {                                     // model recognized nothing -> say so, don't vanish silently
+        try { _snCaptionHide(); } catch (_) {}
+        updateIcon();
+        // If the mic captured audio but Whisper returned nothing, the issue is likely
+        // speech too quiet, accented, or in a noisy environment — give an actionable hint.
+        // If there was no real audio (very short click, mic not ready), use the generic message.
+        const hadAudio = chunks && chunks.length >= 2;
+        const emptyMsg = hadAudio
+          ? "Didn't catch that — try speaking louder or closer to the mic."
+          : "Didn't catch that — try again.";
+        try { if (typeof showToast === 'function') showToast(emptyMsg, true); } catch (_) {}
+        textarea.focus();
+      }
+      setTimeout(() => { try { _snCaptionHide(); } catch (_) {} }, 340);
+      _refreshBarSoon();
+    };
+    controller._commitSend = commitSend;   // let the finalize-time backstop reach it
+
+    recorder.onstop = () => {
+      // onstop DID fire — retire the finalize-time 7s backstop; it exists solely
+      // for the recorder-never-stops case. From here the adaptive watchdog below
+      // owns the send guarantee. Leaving it armed preempted any final transcription
+      // slower than 7s (long recording + mobile upload + _INFER_LOCK wait), sending
+      // the lower-quality live transcript and discarding the real final result.
+      if (controller._sendBackstop) { clearTimeout(controller._sendBackstop); controller._sendBackstop = null; }
+      try { if (controller._stream) controller._stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+      if (controller._userCancelled) { commitSend(''); return; }   // ✕ -> discard (inside commitSend)
+      const blob = new Blob(chunks, { type: (chunks[0] && chunks[0].type) || 'audio/webm' });
+      try { button.classList.add('processing'); button.title = 'Transcribing…'; } catch (_) {}
+      // Adaptive watchdog: scale with audio size so the final transcription always has
+      // enough time. The old 6000ms fired before Whisper finished on any recording over
+      // ~12 seconds, especially when an in-flight partial was holding _INFER_LOCK. Formula:
+      //   base 12s  — covers lock-wait (up to 3s) + short-clip inference (up to 6s)
+      //   +500ms/chunk — base.en on CPU processes ~30s of audio per second; 500ms/chunk
+      //                  at 400ms/chunk gives 1.25× the recording length as processing budget
+      //   cap 60s   — no real dictation should need more than a minute of Whisper time
+      // On the device itself the model may still be downloading when you stop, and
+      // a phone's processor is slower than the PC: give it a longer leash.
+      const watchdogMs = engine.noPartials ? Math.min(180000, Math.max(60000, chunks.length * 1500)) : Math.min(60000, Math.max(12000, chunks.length * 500));
+      const watchdog = setTimeout(() => { commitSend(''); }, watchdogMs);
+      if (engine.noPartials) { try { _snCaptionNote(engine.isReady && engine.isReady() ? 'Transcribing on this device…' : 'Finishing the model download, then transcribing…'); } catch (_) {} }
+      engine.transcribeBlob(blob, { cwd: snCwd }).then((res) => {
+        clearTimeout(watchdog);
+        if (res && res.ok && typeof res.text === 'string' && res.text.trim()) {
+          // Prefer the streaming's committed words when the single-pass final regresses
+          // on them. LocalAgreement locked those words across multiple partial passes;
+          // the final's beam-search is higher quality overall but can still produce a
+          // worse result for specific proper nouns (e.g. "SpeechNode" → "speech note").
+          const best = _mergeWithCommitted(res.text, controller._lastFullText, committedWords);
+          _processVoiceTranscript(best, { textarea, onSubmit, source: 'speechnode' })
+            .then((t) => commitSend(t || best))
+            .catch(() => commitSend(best));
+        } else {
+          commitSend('');     // empty/failed final -> fall back to the live transcript
+        }
+      }).catch((err) => {
+        clearTimeout(watchdog);
+        console.warn('[SpeechNode] final transcribe failed:', err);
+        commitSend('');       // salvage from the live transcript -> never drop
+      });
+    };
+
+    // NO fake live preview. We deliberately do NOT paint Web Speech (Google's
+    // recognizer) text while recording — it's a DIFFERENT, worse engine than
+    // SpeechNode, so it looked broken mid-speech and then snapped to the real
+    // result. Honest feedback only: the mic glows with your live audio level
+    // (above), then the real SpeechNode transcript appears on pause.
+    interimRecog = null;
+
+    recorder.start(400);   // emit a chunk every 400ms so streaming has fresh audio
+    _activeSpeechNode = controller;
+    updateIcon();
+    try { _snCaptionShow(textarea); } catch (_) {}
+    // Hand the controls to the premium panel: hide the bar's mic/cancel buttons
+    // (visibility, not display — so the bar doesn't reflow and shift the panel).
+    try {
+      _snHiddenControls = [];
+      _snHiddenControls.push([button, button.style.visibility || '']);
+      button.style.visibility = 'hidden';
+      ['.voice-cancel-btn', '.voice-insert-btn', '.voice-listening'].forEach((sel) => {
+        const _xb = button.parentElement && button.parentElement.querySelector(sel);
+        if (_xb) { _snHiddenControls.push([_xb, _xb.style.visibility || '']); _xb.style.visibility = 'hidden'; }
+      });
+    } catch (_) {}
+    if (typeof showToast === 'function') showToast('Listening…');
+  }).catch((err) => {
+    _speechNodeFail(updateIcon,
+      (err && err.name === 'NotAllowedError') ? 'Microphone permission denied.' : 'Could not access the microphone.', engineLabel);
+  });
+}
+
+function _speechNodeFail(updateIcon, msg, label) {
+  _activeSpeechNode = null;
+  if (typeof showToast === 'function') showToast((label || 'SpeechNode') + ': ' + msg, true);
+  if (typeof updateIcon === 'function') { try { updateIcon(); } catch (_) {} }
+}
+
+function _refreshBarSoon() {
+  if (typeof updateLiveInputBar === 'function') {
+    if (typeof liveBarState !== 'undefined') liveBarState = null;
+    setTimeout(updateLiveInputBar, 0);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * SpeechNode Live caption — the premium streaming surface.
+ * A floating glassy pill anchored above the active input. Committed words
+ * (locked by LocalAgreement) render solid; the settling tail shimmers, so the
+ * chunked stream reads as an intentional "resolving" effect instead of a janky
+ * textarea. The textarea is left untouched until the final transcript lands.
+ * ------------------------------------------------------------------ */
+function _snEsc(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function _snCaptionEl() {
+  let el = document.getElementById('sn-live-caption');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'sn-live-caption';
+    el.className = 'sn-live-caption';
+    el.innerHTML =
+      '<span class="sn-cap-eq"><i></i><i></i><i></i><i></i></span>' +
+      '<span class="sn-cap-spinner" aria-hidden="true"></span>' +
+      '<span class="sn-cap-text"></span>' +
+      '<button class="sn-cap-btn sn-cap-cancel" type="button" title="Cancel (discard)" aria-label="Cancel">' +
+        '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>' +
+      '</button>' +
+      '<button class="sn-cap-btn sn-cap-pause" type="button" title="Stop & keep in the box (don’t send)" aria-label="Stop and keep the text without sending">' +
+        '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1.2"/><rect x="14" y="5" width="4" height="14" rx="1.2"/></svg>' +
+      '</button>' +
+      '<button class="sn-cap-btn sn-cap-stop" type="button" title="Stop & send" aria-label="Stop and send">' +
+        '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M3.4 20.4 20.85 12.92a1 1 0 0 0 0-1.84L3.4 3.6a1 1 0 0 0-1.38 1.17L4.1 10.6a1 1 0 0 0 .85.68L13 12l-8.05.72a1 1 0 0 0-.85.68l-2.08 5.83A1 1 0 0 0 3.4 20.4z"/></svg>' +
+      '</button>' +
+      '<span class="sn-cap-listen" role="status"><i></i>Listening</span>';
+    el.querySelector('.sn-cap-stop').onclick = (e) => {
+      e.preventDefault(); e.stopPropagation();
+      if (_activeSpeechNode) { try { _activeSpeechNode.stop(); } catch (_) {} }
+    };
+    el.querySelector('.sn-cap-pause').onclick = (e) => {
+      e.preventDefault(); e.stopPropagation();
+      if (_activeSpeechNode) { try { _activeSpeechNode.insert(); } catch (_) {} }
+    };
+    el.querySelector('.sn-cap-cancel').onclick = (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const c = _activeSpeechNode;
+      if (c) {
+        c._userCancelled = true;        // explicit cancel — the ONLY thing that drops a message
+        c._discarded = true;
+        try { c.cancel(); } catch (_) {}
+      }
+      _activeSpeechNode = null;
+      _snCaptionHide();
+    };
+    document.body.appendChild(el);
+  }
+  return el;
+}
+// Animated "Listening…" placeholder using the SAME shimmer gradient as the settling
+// tail, so the panel ALWAYS reads as alive — even when partials are empty/slow and no
+// text has streamed yet. Without it, "no live text" looked like a dead/broken capture.
+const _SN_LISTENING_HTML =
+  '<span class="sn-cap-word sn-cap-tail sn-cap-listening" style="font-style:italic">Listening…</span>';
+function _snCaptionShow(textarea) {
+  const el = _snCaptionEl();
+  el.classList.remove('finalizing', 'finalized', 'sn-cap-sending');
+  el.querySelector('.sn-cap-text').innerHTML = _SN_LISTENING_HTML;
+  try {
+    const r = textarea.getBoundingClientRect();
+    // Cover the textarea's box, but anchor to its BOTTOM so the panel grows UPWARD
+    // as the transcript gets longer — instead of expanding off the bottom of the screen.
+    el.style.left = Math.round(r.left) + 'px';
+    el.style.width = Math.round(r.width) + 'px';
+    el.style.minHeight = Math.round(r.height) + 'px';
+    el.style.top = 'auto';
+    el.style.bottom = Math.round(window.innerHeight - r.bottom) + 'px';
+  } catch (_) {}
+  document.body.classList.add('sn-live');   // premium recording controls
+  requestAnimationFrame(() => el.classList.add('show'));
+}
+function _snCaptionUpdate(committed, tail) {
+  const el = document.getElementById('sn-live-caption');
+  if (!el || !el.classList.contains('show')) return;
+  const textEl = el.querySelector('.sn-cap-text');
+  const committedN = (committed || []).length;
+  const words = (committed || []).concat(tail || []);
+  if (words.length === 0) {   // nothing recognized yet -> keep the shimmering "Listening…"
+    if (!textEl.querySelector('.sn-cap-listening')) textEl.innerHTML = _SN_LISTENING_HTML;
+    return;
+  }
+  if (textEl.firstElementChild && textEl.firstElementChild.classList.contains('sn-cap-listening')) {
+    textEl.innerHTML = '';    // leaving the placeholder -> render real words clean
+  }
+  // Reconcile per word: only re-render words that actually changed, and glow-
+  // highlight those so a retroactive correction reads as a deliberate refinement.
+  for (let i = 0; i < words.length; i++) {
+    let span = textEl.children[i];
+    if (!span) {
+      span = document.createElement('span');
+      span.className = 'sn-cap-word';
+      textEl.appendChild(span);
+    }
+    if (span.dataset.w !== words[i]) {
+      const wasShown = span.dataset.w !== undefined;   // an existing word being corrected?
+      span.dataset.w = words[i];
+      span.textContent = words[i] + ' ';
+      if (wasShown) {   // glow only TRUE retroactive changes, not freshly-appended words
+        span.classList.remove('sn-word-anim');
+        void span.offsetWidth;               // restart the highlight animation
+        span.classList.add('sn-word-anim');
+      }
+    }
+    const isCommitted = i < committedN;
+    span.classList.toggle('sn-cap-committed', isCommitted);
+    span.classList.toggle('sn-cap-tail', !isCommitted);
+  }
+  while (textEl.children.length > words.length) textEl.removeChild(textEl.lastChild);
+}
+// A plain status line in the caption panel while no words are being shown
+// (the on-device engine has no live partials): download progress, then
+// "Transcribing on this device…". Real words, when they come, replace it.
+function _snCaptionNote(msg) {
+  const el = document.getElementById('sn-live-caption');
+  if (!el || !el.classList.contains('show')) return;
+  const textEl = el.querySelector('.sn-cap-text');
+  if (!textEl) return;
+  if (textEl.querySelector('.sn-cap-word')) return;   // words are on screen: leave them
+  textEl.innerHTML = '<span class="sn-cap-listening">' + _snEsc(msg) + '</span>';
+}
+function _snCaptionFinalize() {
+  const el = document.getElementById('sn-live-caption');
+  if (!el) return;
+  el.classList.add('finalizing');   // collapses the equalizer; keeps the text visible
+}
+function _snCaptionSetFinal(text) {
+  const el = document.getElementById('sn-live-caption');
+  if (!el || !el.classList.contains('show')) return;
+  el.classList.remove('finalizing');
+  const textEl = el.querySelector('.sn-cap-text');
+  if (textEl) textEl.innerHTML = '<span class="sn-cap-word sn-cap-committed">' + _snEsc(text) + '</span>';
+  el.classList.add('finalized');    // brief polish pop, then the caller fades it out
+}
+function _snCaptionSend() {
+  const el = document.getElementById('sn-live-caption');
+  if (el) el.classList.add('sn-cap-sending');   // panel lifts + fades as the message lands in chat
+}
+function _snCaptionHide() {
+  const el = document.getElementById('sn-live-caption');
+  if (el) el.classList.remove('show', 'finalizing', 'finalized', 'sn-cap-sending');
+  document.body.classList.remove('sn-live');
+  // Restore the bar controls — but let the bar re-render replace them FIRST, so the
+  // old voice button never flashes back in. Only restore if they're somehow still in
+  // the DOM after a beat (a context that didn't re-render).
+  if (_snHiddenControls) {
+    const hidden = _snHiddenControls;
+    _snHiddenControls = null;
+    setTimeout(() => {
+      hidden.forEach((p) => { try { if (document.body.contains(p[0])) p[0].style.visibility = p[1]; } catch (_) {} });
+    }, 700);
+  }
+}

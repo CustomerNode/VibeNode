@@ -1,0 +1,988 @@
+/**
+ * thread-scroll.js — the session thread's scroll + collapse state machine.
+ *
+ * ── The problem this replaces ──────────────────────────────────────────────
+ * The old model was a single boolean (`liveAutoScroll`) flipped by a `scroll`
+ * listener that compared `scrollHeight - scrollTop - clientHeight < 60`.  Two
+ * defects fell out of that:
+ *
+ *   1. Intent was inferred from scroll *position*, which is noisy.  A
+ *      programmatic scroll fires an indistinguishable `scroll` event, so a
+ *      150ms blind-spot hack (`_autoScrollTopAlignTs`) was needed to tell them
+ *      apart — and on mobile, momentum scrolling and iOS Safari's address-bar
+ *      collapse (which changes `clientHeight`) both defeat it.
+ *
+ *   2. Auto-collapse was unsafe *regardless* of state.  Reading a tall, newly
+ *      arrived AI message means scrolling DOWN, toward the bottom — so the old
+ *      "user scrolled away" heuristic never fired, `_collapseRecentAsst()` ran
+ *      anyway, and the message you were mid-way through shrank by thousands of
+ *      pixels under your eyes.
+ *
+ * ── The model ─────────────────────────────────────────────────────────────
+ * Three states, on a descending ladder of automation:
+ *
+ *   LIVE     auto-collapse superseded messages (once well off screen)
+ *   FOLLOW   never auto-collapse
+ *   READING  touch nothing
+ *
+ * (These rungs used to also tail-follow new content. They no longer do: see D.)
+ *
+ *                     ┌──────────────────────────────┐
+ *     session open ──▶ │            LIVE              │
+ *                     └──┬───────────────────────▲───┘
+ *         userScroll-away│           send /       │
+ *         or userExpand  │           catchUp()    │
+ *                     ┌──▼───────────────────────┴───┐
+ *                     │           FOLLOW             │
+ *                     └──┬───────────────────────▲───┘
+ *         userScroll-away│           atBottom     │
+ *                        │           (settled)    │
+ *                     ┌──▼───────────────────────┴───┐
+ *                     │           READING            │
+ *                     └──────────────────────────────┘
+ *          READING ──send / catchUp()──▶ LIVE (+ scroll to bottom)
+ *
+ * The governing principle, and the reason FOLLOW exists as a distinct rung:
+ *
+ *     RESTORE AUTOMATION IN ORDER OF HOW DESTRUCTIVE IT IS.
+ *
+ * Scrolling is cheap and reversible — you can always scroll back — so it is
+ * restored on a *weak* signal (drifting to the bottom).  Collapsing is
+ * destructive: it discards the expanded state of something you were reading and
+ * there is no undo.  So it is restored only on a *strong, deliberate* signal —
+ * sending a message, or tapping the jump-to-latest pill.
+ *
+ * ── Three mechanisms make it work ─────────────────────────────────────────
+ *
+ * A. INTENT COMES FROM INPUT EVENTS, NOT SCROLL EVENTS.  `wheel`, `touchmove`,
+ *    `mousedown` (scrollbar drags) and navigation `keydown` set a "user is
+ *    driving" flag.  A programmatic `scrollTop =` produces none of these, so it
+ *    can never be mistaken for user intent.  This is what lets us delete the
+ *    150ms blind-spot hack outright.
+ *
+ * B. "CAUGHT UP" IS A SENTINEL, NOT ARITHMETIC.  A zero-height element pinned
+ *    as the last child of the log, watched by an IntersectionObserver.  Immune
+ *    to iOS address-bar resize, sub-pixel rounding and high-DPI off-by-ones.
+ *    It also resolves defect (2) for free: reading a tall message means the
+ *    sentinel is NOT visible, so you are — correctly — not caught up.
+ *
+ * C. COLLAPSE IS VIEWPORT-SAFE IN EVERY STATE.  `requestCollapse()` never
+ *    collapses an element inside the KEEP-ALIVE ZONE — the viewport plus one
+ *    viewport of hysteresis on each side; it queues it and fires once the
+ *    element is well clear.  The hysteresis matters because the common move is
+ *    read a message, scroll down to the newer one, then scroll back up a little
+ *    to re-check something: a tight margin would collapse the older message the
+ *    instant it cleared the edge and that round trip would lose it.  When a
+ *    queued collapse does fire on content ABOVE the viewport, the resulting
+ *    height delta is compensated in `scrollTop` so the reader's position does
+ *    not jump — the same anchoring technique already used by the load-older
+ *    prepend path in socket.js.
+ *
+ * D. NEW CONTENT NEVER MOVES THE VIEW.  A session must not scroll by itself
+ *    when updates arrive, so no state tail-follows any more.  LIVE /
+ *    FOLLOW / READING now only govern auto-collapse.  The view moves for exactly
+ *    four reasons, all of them the user's own action or a fresh load: opening a
+ *    session (the log render positions it), sending a message (`onSend`),
+ *    clicking the jump button (`catchUp`: to the TOP of the final message, then
+ *    the bottom on a second tap), and `holdBottom()` keeping a reader
+ *    who is already caught up pinned when the composer or keyboard resizes the
+ *    log (a layout correction that never reveals anything new).
+ *
+ *    Instead the jump button shows whenever anything is below the fold, and
+ *    carries the session's status: "Working", "Needs you", or "Done" (finished
+ *    with output you have not seen). Idle with nothing new: a quiet arrow.
+ *
+ *    This is the default ("static scroll"). A per-device preference, "Live
+ *    scroll" (Preferences, or the session's actions menu), brings back
+ *    follow-along for a reader who has not scrolled away: see setLiveScroll().
+ *
+ *    "Unseen" is measured geometrically (`_tailInView`): the sentinel strictly
+ *    inside the log's box. The observer's BOTTOM_SLOP is right for the state
+ *    machine but too loose here: a line 60px below the fold is not "seen".
+ *
+ * PERF: one IntersectionObserver + one MutationObserver + one passive scroll
+ * listener per attached log, all torn down in attach()/detach().  The scroll
+ * listener is rAF-coalesced and only does work when a collapse is queued or
+ * new content is waiting to be seen.
+ */
+(function () {
+  'use strict';
+
+  var LIVE = 'LIVE', FOLLOW = 'FOLLOW', READING = 'READING';
+
+  // ── Tunables ────────────────────────────────────────────────────────────
+  // Sentinel visible AND no input for this long => genuinely caught up.
+  // Without a settle delay a fast mobile flick that overshoots into the bottom
+  // rubber-band would flip us into FOLLOW mid-flick and then yank the view.
+  var SETTLE_MS = 200;
+  // How long the "user is driving" flag survives the last input event. Covers
+  // iOS momentum scrolling, which keeps firing scroll events after touchend.
+  var DRIVE_DECAY_MS = 150;
+  // Multiplier on the viewport height defining the "keep alive" zone around
+  // the visible box. A message is collapsed only once it is this far BEYOND
+  // the edge — merely being off-screen is not enough.
+  //
+  // Why a whole viewport instead of a few px of slack: the common move is to
+  // read a message, scroll down to the newer one, then scroll back up a little
+  // to re-check something. With a tight margin the older message collapses the
+  // instant it clears the edge, so scrolling back finds a truncated stub. One
+  // viewport of hysteresis makes that round trip lossless, and costs only one
+  // screenful of extra expanded DOM.
+  var KEEP_ALIVE_VIEWPORTS = 1;
+  var KEEP_ALIVE_FALLBACK_PX = 600;   // if clientHeight is not measurable yet
+  // Bottom tolerance for the sentinel. Touch devices get more: rubber-banding
+  // and dynamic viewport chrome make the exact bottom edge fuzzy.
+  var _isTouch = (function () {
+    try { return window.matchMedia('(pointer: coarse)').matches; } catch (e) { return false; }
+  })();
+  var BOTTOM_SLOP = _isTouch ? 120 : 80;
+  // A childList mutation adding more than this many nodes is a full re-render
+  // (innerHTML replace), not new chat activity — don't count it toward the pill.
+  var RERENDER_NODE_THRESHOLD = 5;
+
+  // ── Per-attachment state ────────────────────────────────────────────────
+  var _state = LIVE;
+  var _sid = null;
+  var _logEl = null;
+  var _sentinel = null;
+  var _pillWrap = null;
+  var _pillEl = null;
+  var _autoEl = null;     // standalone Auto switch (only while following at the bottom)
+  var _menuEl = null;     // the selector the bubble opens
+  var _io = null;
+  var _mo = null;
+  var _atBottom = true;
+  var _driving = false;
+  var _driveTimer = null;
+  var _settleTimer = null;
+  var _rafId = null;
+  var _pending = [];      // deferred collapses: [{el, fn}]
+  var _newCount = 0;      // new message entries below the fold
+  var _hasNew = false;    // anything new below the fold (incl. streaming growth)
+  var _skipNextBatch = false;   // set by positioned(): the render batch is not "new"
+  var _listeners = [];    // [[target, type, fn, opts]] for teardown
+
+  // ── State transitions ───────────────────────────────────────────────────
+
+  function _setState(next, why) {
+    if (next === _state) return;
+    var prev = _state;
+    _state = next;
+    // Scrolling away ends a follow armed by a decision (followWork).
+    if (_state === READING) _followWorkSid = null;
+
+    // Keep the legacy global in sync. Many call sites across live-panel.js and
+    // socket.js still do `if (liveAutoScroll) logEl.scrollTop = ...`; mapping
+    // READING -> false makes every one of them correct with no edit.
+    try { liveAutoScroll = (_state !== READING); } catch (e) { /* not loaded yet */ }
+    window._threadScrollState = _state;
+
+    if (_state === LIVE) _flushPending();
+    _renderPill();
+
+    if (window._threadScrollDebug) {
+      console.log('[thread-scroll]', prev, '->', _state, '(' + (why || '') + ')');
+    }
+  }
+
+  function _markDriving() {
+    _driving = true;
+    _lastDriveAt = Date.now();
+    if (_driveTimer) clearTimeout(_driveTimer);
+    _driveTimer = setTimeout(function () {
+      _driving = false;
+      _maybeSettle();
+    }, DRIVE_DECAY_MS);
+    // If we already know we're off the bottom, drop out immediately rather than
+    // waiting for the observer to fire.
+    if (!_atBottom && _state !== READING) _setState(READING, 'user-scroll');
+  }
+
+  function _maybeSettle() {
+    if (_settleTimer) { clearTimeout(_settleTimer); _settleTimer = null; }
+    if (!_atBottom || _state !== READING) return;
+    _settleTimer = setTimeout(function () {
+      _settleTimer = null;
+      // Re-check everything — the user may have flicked away again.
+      if (_atBottom && !_driving && _state === READING) {
+        _setState(FOLLOW, 'settled-at-bottom');
+      }
+    }, SETTLE_MS);
+  }
+
+  // ── Sentinel / observers ────────────────────────────────────────────────
+
+  /**
+   * Keep the tail as [ ...content, pillWrap, sentinel ].
+   *
+   * The bail-out check must test BOTH slots together. Checking them
+   * independently ("is pillWrap last? is sentinel last?") is an infinite loop:
+   * satisfying one condition breaks the other, so every MutationObserver pass
+   * reorders the pair and schedules another pass, forever.
+   */
+  function _placeTail() {
+    if (!_logEl || !_sentinel) return;
+    var kids = _logEl.children;
+    var n = kids.length;
+    var last = n ? kids[n - 1] : null;
+    var secondLast = n >= 2 ? kids[n - 2] : null;
+    if (last === _sentinel && (!_pillWrap || secondLast === _pillWrap)) return;
+    if (_pillWrap) _logEl.appendChild(_pillWrap);
+    _logEl.appendChild(_sentinel);
+  }
+
+  /** Is the very end of the thread strictly inside the visible box? */
+  function _tailInView() {
+    if (!_logEl || !_sentinel) return true;
+    var s = _sentinel.getBoundingClientRect();
+    var c = _logEl.getBoundingClientRect();
+    return s.top <= c.bottom + 2;   // 2px absorbs sub-pixel rounding
+  }
+
+  function _clearNew() {
+    _newCount = 0;
+    _hasNew = false;
+  }
+
+  // ── Auto scroll ("live scroll") ─────────────────────────────────────
+  // Off: new content never moves the view; the button announces it.
+  // On: the old follow-along behaviour, but only while the reader has not
+  // scrolled away (state !== READING). Scrolling up still pauses it, and the
+  // button still announces what lands below.
+  //
+  // Two levels:
+  //   DEFAULT   System → Preferences. Per device (localStorage 'liveScroll').
+  //             Every session starts with it.
+  //   SESSION   the Auto switch on the jump pill and the ••• menu item. Changes
+  //             only the session on screen, for as long as this tab is open
+  //             (sessionStorage, so a reload keeps it).
+  // Changing the default clears the session overrides: "default off" means off.
+  var LIVE_SCROLL_KEY = 'liveScroll';
+  var LIVE_SCROLL_SESSIONS_KEY = 'liveScrollSessions';
+
+  function _readDefault() {
+    try { return localStorage.getItem(LIVE_SCROLL_KEY) === 'on'; } catch (e) { return false; }
+  }
+  function _readOverrides() {
+    try { return JSON.parse(sessionStorage.getItem(LIVE_SCROLL_SESSIONS_KEY) || '{}') || {}; }
+    catch (e) { return {}; }
+  }
+  function _writeOverrides(o) {
+    try { sessionStorage.setItem(LIVE_SCROLL_SESSIONS_KEY, JSON.stringify(o)); } catch (e) { /* in-memory */ }
+  }
+
+  var _liveDefault = _readDefault();
+  var _liveOverrides = _readOverrides();     // { sessionId: true|false }
+  var _liveScroll = _liveDefault;            // effective value for the session on screen
+
+  /** The effective value for a session: its override, else the default. */
+  function _liveFor(sid) {
+    return (sid && Object.prototype.hasOwnProperty.call(_liveOverrides, sid))
+      ? !!_liveOverrides[sid] : _liveDefault;
+  }
+
+  function isLiveScroll() { return _liveScroll; }
+  function getDefaultLiveScroll() { return _liveDefault; }
+
+  function _applyLive(on) {
+    _liveScroll = !!on;
+    _renderPill();   // the pill's switch reflects a change made from a menu too
+    // Turning it on while caught up: catch up now, so it starts following.
+    if (_liveScroll && _logEl && _state !== READING) _follow();
+    return _liveScroll;
+  }
+
+  /** This session only (pill switch, ••• menu). */
+  function setLiveScroll(on) {
+    on = !!on;
+    if (_sid) {
+      if (on === _liveDefault) delete _liveOverrides[_sid];   // back to default: no override
+      else _liveOverrides[_sid] = on;
+      _writeOverrides(_liveOverrides);
+    }
+    return _applyLive(on);
+  }
+
+  /** The default for every session (System → Preferences). */
+  function setDefaultLiveScroll(on) {
+    _liveDefault = !!on;
+    try {
+      if (_liveDefault) localStorage.setItem(LIVE_SCROLL_KEY, 'on');
+      else localStorage.removeItem(LIVE_SCROLL_KEY);
+    } catch (e) { /* private mode: in-memory only */ }
+    _liveOverrides = {};
+    _writeOverrides(_liveOverrides);
+    return _applyLive(_liveDefault);
+  }
+
+  /**
+   * Follow the tail the way the thread always did in live mode: the bottom
+   * while a reply streams, the TOP of a finished reply taller than the
+   * viewport, otherwise the bottom. `_autoScrollLiveLog` (live-panel.js) owns
+   * that rule; fall back to the bottom if it is not loaded.
+   */
+  function _follow() {
+    if (!_logEl) return;
+    if (typeof window._autoScrollLiveLog === 'function') window._autoScrollLiveLog(_logEl);
+    else _logEl.scrollTop = _logEl.scrollHeight;
+    if (_tailInView()) _clearNew();
+    _renderPill();
+  }
+
+  /**
+   * New content landed. If the reader cannot see it: in live mode (and not
+   * reading) follow it; otherwise light up the button.
+   */
+  // ── Follow the work after a decision ────────────────────────────────────
+  // Answering a card makes the thread follow the work that answer starts,
+  // until the reader scrolls, whatever the Auto scroll setting says. followWork() arms a follow for the session
+  // on screen; the first scroll away ends it (scrolling back does not re-arm).
+  // It is not the Auto scroll setting: the switch and the default are untouched.
+  var _followWorkSid = null;
+
+  function _followingWork() { return !!_sid && _followWorkSid === _sid; }
+
+  function followWork() {
+    if (!_sid) return;
+    _followWorkSid = _sid;
+    _setState(LIVE, 'follow-work');
+    scrollToBottom();
+  }
+
+  function _noteArrival(count) {
+    if (_tailInView()) return;
+    if ((_liveScroll || _followingWork()) && _state !== READING) { _follow(); return; }
+    _hasNew = true;
+    _newCount += count || 0;
+    _renderPill();
+  }
+
+  function _onSentinel(entries) {
+    if (!entries || !entries.length) return;
+    _atBottom = !!entries[entries.length - 1].isIntersecting;
+
+    if (_atBottom) {
+      if (_tailInView()) _clearNew();
+      _renderPill();
+      _maybeSettle();
+      return;
+    }
+
+    // Scrolled off the bottom. Only a USER-driven scroll demotes us to READING;
+    // a programmatic top-align must not. This is the replacement for the old
+    // 150ms `_autoScrollTopAlignTs` blind spot.
+    if (_driving && _state !== READING) _setState(READING, 'user-scroll-away');
+    _renderPill();
+  }
+
+  function _onMutation(records) {
+    if (!_logEl) return;
+
+    // Re-pin the tail. Our own append arrives as a later record, by which point
+    // the sentinel IS last, so this cannot loop.
+    _placeTail();
+
+    // The batch a fresh render produced (session open, reconnect re-fetch) is
+    // the thread itself, not news. positioned() flags it.
+    if (_skipNextBatch) { _skipNextBatch = false; return; }
+
+    var msgs = 0, other = 0;
+    for (var i = 0; i < records.length; i++) {
+      // Only APPENDS are news. A prepend ("Load older") inserts before an
+      // existing node; an append lands at the end, or before our own tail.
+      var next = records[i].nextSibling;
+      if (next && next !== _sentinel && next !== _pillWrap) continue;
+      var nodes = records[i].addedNodes;
+      for (var j = 0; j < nodes.length; j++) {
+        var n = nodes[j];
+        if (n.nodeType !== 1) continue;
+        if (n === _sentinel || n === _pillWrap) continue;
+        if (n.classList && (n.classList.contains('msg') || n.classList.contains('live-entry'))) msgs++;
+        else other++;
+      }
+    }
+    // A big batch is a full re-render, not new chat activity.
+    if (msgs > RERENDER_NODE_THRESHOLD) return;
+    if (!msgs && !other) return;
+    var card = msgs ? _cardJustLanded(records) : null;
+    if (card) { _showCardTop(card); return; }
+    _noteArrival(msgs);
+  }
+
+  // ── An end-of-turn card lands at the top of the screen ──────────────────
+  // The one exception to D: a newly arrived summary card scrolls its title to
+  // the top, ALWAYS, whatever the Auto scroll setting and wherever the reader
+  // is. Do not hold it back for a reader who scrolled away: with Auto scroll
+  // off the thread never follows the work, so the reader is usually screens
+  // behind when the card lands. The only wait is a finger on the glass: the
+  // jump happens the moment the swipe ends.
+  function _cardJustLanded(records) {
+    for (var i = 0; i < records.length; i++) {
+      var nodes = records[i].addedNodes;
+      for (var j = 0; j < nodes.length; j++) {
+        var n = nodes[j];
+        if (n.nodeType === 1 && n.classList && n.classList.contains('msg') &&
+            n.querySelector && n.querySelector('.lm')) return n;
+      }
+    }
+    return null;
+  }
+
+  var _lastDriveAt = 0;
+
+  // The card being landed. last-card.js asks for the same card a frame after
+  // the observer here saw it (its ask is what reaches a tab running older
+  // thread code): one landing, not two.
+  var _landing = null;
+
+  function _showCardTop(el) {
+    if (!el || _landing === el) return;
+    _landing = el;
+    var waited = 0;
+    (function start() {
+      if (_driving && waited++ < 30) { setTimeout(start, 100); return; }
+      _settleCardTop(el);
+    })();
+  }
+
+  /** Public: land this `.msg` (holding a card) with its top at the top. */
+  function landCard(el) {
+    if (!_logEl || !el || !_logEl.contains(el)) return;
+    _showCardTop(el);
+  }
+
+  function _settleCardTop(el) {
+    var landed = Date.now();
+    var go = function () {
+      // A scroll by the reader after the card landed wins over the settle passes.
+      if (!_logEl || !el.isConnected || _driving || _lastDriveAt > landed || !_finalIsCard()) return;
+      var t = _finalBoxScrollTop();
+      if (t == null) return;
+      _logEl.scrollTop = t;
+      // No longer at the bottom: holdBottom() (composer redraw on the turn's
+      // end) must not pull the view back down before the observer says so.
+      if (!_tailInView()) _atBottom = false;
+      _clearNew();
+      _renderPill();
+    };
+    go();
+    // The card can still grow a frame later (fonts, pictures): settle again.
+    try { requestAnimationFrame(go); } catch (e) { /* no rAF */ }
+    setTimeout(go, 250);
+  }
+
+  function _onScrollPassive() {
+    if (_rafId) return;
+    _rafId = requestAnimationFrame(function () {
+      _rafId = null;
+      _flushPending();
+      // The reader scrolled down to the new content: it has been seen.
+      if ((_hasNew || _newCount) && _tailInView()) { _clearNew(); _renderPill(); }
+    });
+  }
+
+  // ── Viewport-safe collapse ──────────────────────────────────────────────
+
+  /**
+   * Is `el` inside the keep-alive zone — the viewport plus one viewport of
+   * hysteresis on each side? Anything in here is off limits for auto-collapse.
+   */
+  function _inKeepAliveZone(el) {
+    if (!_logEl || !el || !el.isConnected) return false;
+    var pad = (_logEl.clientHeight || KEEP_ALIVE_FALLBACK_PX) * KEEP_ALIVE_VIEWPORTS;
+    var r = el.getBoundingClientRect();
+    var c = _logEl.getBoundingClientRect();
+    return r.bottom > c.top - pad && r.top < c.bottom + pad;
+  }
+
+  /**
+   * Run `fn` (which changes `el`'s height) while holding the reader's position
+   * steady. Only content ABOVE the viewport can displace what the user is
+   * looking at, so that is the only case we compensate.
+   */
+  function _anchored(el, fn) {
+    if (!_logEl) { fn(); return; }
+    var cTop = _logEl.getBoundingClientRect().top;
+    var isAbove = el.getBoundingClientRect().bottom <= cTop;
+    var beforeH = _logEl.scrollHeight;
+    var beforeTop = _logEl.scrollTop;
+    fn();
+    if (!isAbove) return;
+    var delta = _logEl.scrollHeight - beforeH;
+    if (delta) _logEl.scrollTop = Math.max(0, beforeTop + delta);
+  }
+
+  function _flushPending() {
+    if (_state !== LIVE || !_pending.length) return;
+    var keep = [];
+    for (var i = 0; i < _pending.length; i++) {
+      var p = _pending[i];
+      if (!p.el || !p.el.isConnected) continue;         // element went away
+      if (_inKeepAliveZone(p.el)) { keep.push(p); continue; }
+      try { _anchored(p.el, p.fn); } catch (e) { /* non-fatal */ }
+    }
+    _pending = keep;
+  }
+
+  // ── Jump-to-latest pill ─────────────────────────────────────────────────
+
+  function _buildPill() {
+    _pillWrap = document.createElement('div');
+    _pillWrap.className = 'vn-jump-wrap';
+    _pillWrap.setAttribute('aria-hidden', 'true');
+
+    // Tapping the bubble opens a small selector:
+    //   ↓ Jump to latest
+    //   Auto scroll  [switch]   (this session; default in System → Preferences)
+    // The bubble itself never jumps.
+    _pillEl = document.createElement('button');
+    _pillEl.type = 'button';
+    _pillEl.className = 'vn-jump-pill';
+    _pillEl.setAttribute('aria-haspopup', 'menu');
+    _pillEl.setAttribute('aria-expanded', 'false');
+    _pillEl.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (_menuOpen) _closeMenu(); else _openMenu();
+    });
+    _pillWrap.appendChild(_pillEl);
+
+    // A standalone Auto switch, shown ONLY while auto scroll is following a
+    // running session at the bottom, where there is no bubble to tap. Without
+    // it, following could not be turned off without scrolling away first.
+    _autoEl = document.createElement('button');
+    _autoEl.type = 'button';
+    _autoEl.className = 'vn-jump-auto solo';
+    _autoEl.setAttribute('role', 'switch');
+    _autoEl.innerHTML = '<span class="vn-jump-auto-label">Auto</span>' + _SWITCH_HTML;
+    _autoEl.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      _toggleAuto();
+    });
+    _pillWrap.appendChild(_autoEl);
+
+    // The selector.
+    _menuEl = document.createElement('div');
+    _menuEl.className = 'vn-jump-menu';
+    _menuEl.setAttribute('role', 'menu');
+    _menuEl.innerHTML =
+      '<button type="button" class="vn-jump-menu-item" data-act="jump" role="menuitem">' +
+        _ARROW_SVG + '<span class="vn-jump-menu-text">Jump to latest</span></button>' +
+      '<button type="button" class="vn-jump-menu-item" data-act="auto" role="menuitemcheckbox">' +
+        '<span class="vn-jump-menu-text">Auto scroll<small>This session</small></span>' +
+        _SWITCH_HTML + '</button>';
+    _menuEl.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      var item = ev.target && ev.target.closest ? ev.target.closest('[data-act]') : null;
+      if (!item) return;
+      var act = item.getAttribute('data-act');
+      _closeMenu();
+      if (act === 'jump') catchUp();
+      else if (act === 'auto') _toggleAuto();
+    });
+    _pillWrap.appendChild(_menuEl);
+  }
+
+  var _SWITCH_HTML =
+    '<span class="vn-jump-auto-track"><span class="vn-jump-auto-knob"></span></span>';
+  var _menuOpen = false;
+
+  function _onOutside(ev) {
+    if (_pillWrap && ev.target && _pillWrap.contains && _pillWrap.contains(ev.target)) return;
+    _closeMenu();
+  }
+  function _onMenuKey(ev) { if (ev.key === 'Escape') _closeMenu(); }
+
+  function _openMenu() {
+    if (!_menuEl) return;
+    _menuOpen = true;
+    _renderAuto();
+    _menuEl.classList.add('open');
+    _pillEl.setAttribute('aria-expanded', 'true');
+    try {
+      document.addEventListener('pointerdown', _onOutside, true);
+      document.addEventListener('keydown', _onMenuKey, true);
+    } catch (e) { /* no document listeners in tests */ }
+  }
+
+  function _closeMenu() {
+    if (!_menuOpen) return;
+    _menuOpen = false;
+    if (_menuEl) _menuEl.classList.remove('open');
+    if (_pillEl) _pillEl.setAttribute('aria-expanded', 'false');
+    try {
+      document.removeEventListener('pointerdown', _onOutside, true);
+      document.removeEventListener('keydown', _onMenuKey, true);
+    } catch (e) { /* ignore */ }
+  }
+
+  /** Flip auto scroll for this session (selector row or standalone switch). */
+  function _toggleAuto() {
+    var next = !_liveScroll;
+    // One code path for every switch, so the ••• menu label and the toast
+    // stay in step (modals.js). Fallback: set it here.
+    if (typeof window.toggleLiveScroll === 'function') window.toggleLiveScroll(next);
+    else setLiveScroll(next);
+    // Turning it ON means "follow it now": take the reader to the latest and
+    // leave READING, or nothing would follow until they scrolled back down.
+    if (next) catchUp();
+    _renderPill();
+  }
+
+  function _renderAuto() {
+    var t = _liveScroll ? 'Auto scroll is on. Tap to keep the chat still'
+                        : 'Auto scroll is off. Tap to follow new output';
+    var els = [_autoEl, _menuEl && _menuEl.querySelector ? _menuEl.querySelector('[data-act="auto"]') : null];
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (!el) continue;
+      el.classList.toggle('on', _liveScroll);
+      el.setAttribute('aria-checked', _liveScroll ? 'true' : 'false');
+      el.setAttribute('aria-label', t);
+      el.title = t;
+    }
+  }
+
+  var _ARROW_SVG =
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">' +
+    '<line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>';
+  var _pillKey = '';
+
+  /**
+   * What the session is doing right now, from the page's own state map
+   * (`sessionKinds`, written by socket.js on every session_state).
+   *   'working'  a turn is running
+   *   'waiting'  a question or permission prompt needs the user
+   *   'idle'     anything else
+   */
+  function _activity() {
+    try {
+      var sid = (typeof liveSessionId !== 'undefined' && liveSessionId) || _sid;
+      var kind = (typeof sessionKinds !== 'undefined' && sid) ? sessionKinds[sid] : '';
+      if (kind === 'working') return 'working';
+      // A session that ended its turn but is still waiting on its own work
+      // (a Working summary, a scheduled wake-up, a retry or usage-limit
+      // countdown) is busy, not finished: the drawn status says Waiting, so
+      // the pill says Working, never a green Done.
+      var sv = window.SessionVerb;
+      if (sid && kind !== 'question' && sv && sv.display && sv.display(sid) === 'waiting') return 'working';
+      if (kind === 'question') return 'waiting';
+    } catch (e) { /* globals not loaded yet */ }
+    return 'idle';
+  }
+
+  var _MODES = {
+    //          label        class          aria / title
+    working: ['Working',   'is-working', 'Still working. Tap for jump and auto scroll'],
+    waiting: ['Needs you', 'is-waiting', 'Waiting on you. Tap for jump and auto scroll'],
+    done:    ['Done',      'is-done',    'Finished. Tap for jump and auto scroll'],
+    quiet:   ['',          '',           'Tap for jump and auto scroll'],
+  };
+
+  function _renderPill() {
+    if (!_pillEl || !_pillWrap) return;
+    // The button answers "is it still going?", not "how many entries?" (a
+    // count is noise: one reply can be a dozen tool steps). It shows whenever
+    // there is anything below the fold, and its look is the session's status:
+    //   Working    a turn is running            (blue, animated dots)
+    //   Needs you  a question / permission      (amber)
+    //   Done       finished, and unseen output  (green)
+    //   quiet      idle, nothing new            (muted arrow only)
+    var fresh = _hasNew || _newCount > 0;
+    var act = _activity();
+    var showPill = fresh || !_atBottom;
+    // At the bottom the pill has nothing to jump to, so the Auto chip shows by
+    // itself instead. It is PERSISTENT: do not gate it on Auto being on or the
+    // session working, or turning Auto off makes the chip vanish and leaves no
+    // way to turn it back on. It is there whenever the thread has messages. Only an empty thread shows nothing.
+    var hasThread = !!(_logEl && _logEl.querySelector && _logEl.querySelector('.msg'));
+    var showAuto = showPill || hasThread;
+    _renderAuto();   // keep it truthful even while hidden: it can reappear any time
+    if (!showAuto) {
+      _closeMenu();
+      _pillWrap.classList.remove('visible');
+      _pillWrap.setAttribute('aria-hidden', 'true');
+      _pillKey = '';
+      return;
+    }
+    // Bubble when there is something to jump to; otherwise only the switch.
+    _pillEl.style.display = showPill ? '' : 'none';
+    if (_autoEl) _autoEl.style.display = showPill ? 'none' : '';
+    if (!showPill) _closeMenu();
+    var mode = act === 'working' ? 'working'
+             : act === 'waiting' ? 'waiting'
+             : fresh ? 'done' : 'quiet';
+    if (mode !== _pillKey) {      // don't churn the DOM on every streamed chunk
+      _pillKey = mode;
+      var m = _MODES[mode];
+      _pillEl.innerHTML = _ARROW_SVG +
+        (m[0] ? '<span>' + m[0] + '</span>' : '') +
+        (mode === 'working' ? '<span class="vn-jump-dots"><i></i><i></i><i></i></span>' : '');
+      _pillEl.className = 'vn-jump-pill' + (m[1] ? ' ' + m[1] : '');
+      _pillEl.setAttribute('aria-label', m[2]);
+      _pillEl.title = m[2];
+    }
+    _renderAuto();
+    _pillWrap.classList.add('visible');
+    _pillWrap.setAttribute('aria-hidden', 'false');
+  }
+
+  /** The session's status changed: repaint the button's label. */
+  function refresh() { _renderPill(); }
+
+  // ── Public API ──────────────────────────────────────────────────────────
+
+  function _on(target, type, fn, opts) {
+    target.addEventListener(type, fn, opts);
+    _listeners.push([target, type, fn, opts]);
+  }
+
+  /**
+   * Bind the state machine to a live-log scroll container. Idempotent per
+   * element; re-attaching (e.g. on session switch) tears the old one down and
+   * resets to LIVE — state must never leak across sessions.
+   */
+  function attach(logEl, sessionId) {
+    detach();
+    if (!logEl) return;
+    _logEl = logEl;
+    _sid = sessionId || null;
+    _liveScroll = _liveFor(_sid);   // this session's auto scroll: its override, else the default
+    _state = LIVE;
+    _atBottom = true;
+    _driving = false;
+    _clearNew();
+    _skipNextBatch = false;
+    _pillKey = '';
+    _pending = [];
+    try { liveAutoScroll = true; } catch (e) { /* not loaded yet */ }
+    window._threadScrollState = LIVE;
+
+    if (!_sentinel) {
+      _sentinel = document.createElement('div');
+      _sentinel.className = 'vn-thread-sentinel';
+      _sentinel.setAttribute('aria-hidden', 'true');
+    }
+    if (!_pillWrap) _buildPill();
+    _placeTail();
+    _renderPill();
+
+    // (B) "Caught up" is an observed sentinel, not arithmetic.
+    if (typeof IntersectionObserver === 'function') {
+      _io = new IntersectionObserver(_onSentinel, {
+        root: _logEl,
+        rootMargin: '0px 0px ' + BOTTOM_SLOP + 'px 0px',
+        threshold: 0,
+      });
+      _io.observe(_sentinel);
+    }
+
+    // Keeps the sentinel pinned last across every append site, and counts new
+    // entries for the pill — no edits needed at the ~8 append call sites.
+    if (typeof MutationObserver === 'function') {
+      _mo = new MutationObserver(_onMutation);
+      _mo.observe(_logEl, { childList: true });
+    }
+
+    // (A) Intent comes from input events, never from the scroll event.
+    _on(_logEl, 'wheel', _markDriving, { passive: true });
+    _on(_logEl, 'touchmove', _markDriving, { passive: true });
+    _on(_logEl, 'touchstart', _markDriving, { passive: true });
+    _on(_logEl, 'mousedown', _markDriving, { passive: true });   // scrollbar drag
+    _on(_logEl, 'keydown', function (e) {
+      var t = e.target;
+      if (t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT' || t.isContentEditable)) return;
+      if (/^(ArrowUp|ArrowDown|PageUp|PageDown|Home|End)$/.test(e.key)) _markDriving();
+    });
+    // Position-only listener: drains the deferred-collapse queue. Never used
+    // to decide intent.
+    _on(_logEl, 'scroll', _onScrollPassive, { passive: true });
+  }
+
+  function detach() {
+    _closeMenu();
+    for (var i = 0; i < _listeners.length; i++) {
+      var l = _listeners[i];
+      try { l[0].removeEventListener(l[1], l[2], l[3]); } catch (e) { /* ignore */ }
+    }
+    _listeners = [];
+    if (_io) { try { _io.disconnect(); } catch (e) {} _io = null; }
+    if (_mo) { try { _mo.disconnect(); } catch (e) {} _mo = null; }
+    if (_driveTimer) { clearTimeout(_driveTimer); _driveTimer = null; }
+    if (_settleTimer) { clearTimeout(_settleTimer); _settleTimer = null; }
+    if (_rafId) { cancelAnimationFrame(_rafId); _rafId = null; }
+    _pending = [];
+    _logEl = null;
+    _sid = null;
+  }
+
+  /**
+   * Ask to collapse `el` by running `fn`. Honors the state machine AND the
+   * hard keep-alive rule: content the user can see — or could reach with a
+   * small scroll back — is never collapsed, in any state. Deferred work is
+   * retried as the user scrolls (in LIVE) and flushed wholesale on re-entering
+   * LIVE.
+   */
+  function requestCollapse(el, fn) {
+    if (typeof fn !== 'function') return;
+    if (!el) { fn(); return; }
+    if (_state === LIVE && !_inKeepAliveZone(el)) {
+      try { _anchored(el, fn); } catch (e) { fn(); }
+      return;
+    }
+    for (var i = 0; i < _pending.length; i++) if (_pending[i].el === el) return;  // already queued
+    _pending.push({ el: el, fn: fn });
+  }
+
+  /** The user expanded something — that is a reading signal. */
+  function noteUserExpand() {
+    if (_state !== READING) _setState(READING, 'user-expand');
+  }
+
+  /**
+   * The user sent a message. Unambiguous "I'm driving again" intent, so it
+   * restores full LIVE from ANY scroll position and jumps to the bottom — if
+   * you scrolled up to copy something and then sent, you want the reply.
+   */
+  function onSend() {
+    _setState(LIVE, 'send');
+    scrollToBottom();
+  }
+
+  // Gap left above the final message when its top is aligned to the viewport.
+  var FINAL_BOX_TOP_PAD = 8;
+
+  /**
+   * scrollTop that puts the top of the final message box (the last user or
+   * assistant `.msg`) at the top of the viewport, clamped to the real bottom.
+   * Returns null when there is no message to align to.
+   */
+  function _finalBoxScrollTop() {
+    if (!_logEl || !_logEl.querySelectorAll) return null;
+    var boxes = _logEl.querySelectorAll('.msg');
+    if (!boxes.length) return null;
+    var box = boxes[boxes.length - 1];
+    var top = box.getBoundingClientRect().top - _logEl.getBoundingClientRect().top +
+              _logEl.scrollTop - FINAL_BOX_TOP_PAD;
+    // A summary card stops below the pinned "you asked" pill
+    // (--vn-stick-top, last-card.css), so its Done line is not hidden.
+    if (box.querySelector && box.querySelector('.lm') && typeof getComputedStyle === 'function') {
+      try { top -= parseFloat(getComputedStyle(_logEl).getPropertyValue('--vn-stick-top')) || 0; } catch (e) { /* no styles (tests) */ }
+    }
+    var max = Math.max(0, _logEl.scrollHeight - _logEl.clientHeight);
+    return Math.max(0, Math.min(top, max));
+  }
+
+  /** Is the final message box an end-of-turn summary card (last-card.js)? */
+  function _finalIsCard() {
+    if (!_logEl || !_logEl.querySelectorAll) return false;
+    var boxes = _logEl.querySelectorAll('.msg');
+    var box = boxes.length ? boxes[boxes.length - 1] : null;
+    return !!(box && box.querySelector && box.querySelector('.lm'));
+  }
+
+  /**
+   * Explicit catch-up (jump button). The strong signal that restores LIVE.
+   *
+   * Lands on the FIRST line of the final message, not the bottom of it, so a
+   * long reply is read from its start. A short one
+   * clamps to the bottom, which is the same view. If the reader is already at
+   * or past that point, a second tap goes all the way to the bottom, so the
+   * button can never get stuck.
+   */
+  function catchUp() {
+    _setState(LIVE, 'catch-up');
+    var target = _finalBoxScrollTop();
+    // An end-of-turn summary card is read from its top: from anywhere inside
+    // it, the jump goes back UP to its title, never down to its last line.
+    // Only when already at its top
+    // does a tap go on to the bottom, so the button still never gets stuck.
+    var atCardTop = _finalIsCard() && target != null && _logEl &&
+                    Math.abs(_logEl.scrollTop - target) <= 4;
+    var pastTop = !_finalIsCard() && target != null && _logEl && _logEl.scrollTop >= target - 4;
+    if (target == null || !_logEl || atCardTop || pastTop) {
+      scrollToBottom();
+      return;
+    }
+    _logEl.scrollTop = target;
+    _clearNew();       // the reader asked to see it: it is no longer "new"
+    _renderPill();
+  }
+
+  function scrollToBottom() {
+    if (!_logEl) return;
+    _logEl.scrollTop = _logEl.scrollHeight;
+    _atBottom = true;
+    _clearNew();
+    _renderPill();
+  }
+
+  /**
+   * The log was just rendered from scratch and positioned (session open,
+   * reconnect re-fetch). What was rendered is the thread, not news: the
+   * mutation batch it produced must not light up the button.
+   */
+  function positioned() {
+    _clearNew();
+    _skipNextBatch = true;
+    // The render's mutation callback is already queued ahead of this
+    // microtask, so this only drops the flag if the render added nothing.
+    Promise.resolve().then(function () { _skipNextBatch = false; });
+    _renderPill();
+  }
+
+  /**
+   * Content grew in place without adding a node (a streaming bubble getting
+   * more text). Announce it if it is below the fold. Never scrolls.
+   */
+  function noteNewContent() { _noteArrival(0); }
+
+  /**
+   * Keep a caught-up reader at the bottom when the LOG resizes (composer bar
+   * re-render, on-screen keyboard). A layout correction only: it does nothing
+   * when new content is waiting below, so it can never reveal an update the
+   * reader has not chosen to see.
+   */
+  function holdBottom() {
+    if (!_logEl || !_atBottom || _hasNew || _newCount || _driving) return;
+    _logEl.scrollTop = _logEl.scrollHeight;
+  }
+
+  function state() { return _state; }
+  function isReading() { return _state === READING; }
+  function mayAutoScroll() { return _state !== READING; }
+  function mayAutoCollapse() { return _state === LIVE; }
+  /** Caught up: at the bottom AND nothing new waiting below it. */
+  function atBottom() { return _atBottom && !_hasNew && !_newCount; }
+  function hasNew() { return _hasNew || _newCount > 0; }
+
+  window.ThreadScroll = {
+    attach: attach,
+    detach: detach,
+    requestCollapse: requestCollapse,
+    noteUserExpand: noteUserExpand,
+    onSend: onSend,
+    followWork: followWork,
+    landCard: landCard,
+    catchUp: catchUp,
+    scrollToBottom: scrollToBottom,
+    positioned: positioned,
+    noteNewContent: noteNewContent,
+    holdBottom: holdBottom,
+    hasNew: hasNew,
+    refresh: refresh,
+    isLiveScroll: isLiveScroll,
+    setLiveScroll: setLiveScroll,
+    getDefaultLiveScroll: getDefaultLiveScroll,
+    setDefaultLiveScroll: setDefaultLiveScroll,
+    state: state,
+    isReading: isReading,
+    mayAutoScroll: mayAutoScroll,
+    mayAutoCollapse: mayAutoCollapse,
+    atBottom: atBottom,
+    STATES: { LIVE: LIVE, FOLLOW: FOLLOW, READING: READING },
+  };
+})();

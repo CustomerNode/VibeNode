@@ -1,0 +1,113 @@
+/* Work trail: the steps between two messages, one line on the thread's rail.
+   See static/js/work-trail.js. The rows it stands for stay in #live-log, hidden. */
+.vn-trail-on > .vt-hidden { display: none !important; }
+
+.vn-trail { --vt-stack: 106px; --vt-amber: #e0a33a; --vt-ok: #4fbf7f; --vt-accent: #a5a5ff; --bt: 255,255,255;
+  --vt-add: rgba(79,191,127,.10); --vt-del: rgba(229,115,115,.10);
+  position: relative; margin: -4px 0 18px 3px; border-left: 1px solid rgba(var(--bt), .11); font-family: var(--font-sans); }
+[data-theme="light"] .vn-trail { --vt-amber: #a86a00; --vt-ok: #16874a; --vt-accent: #5b5be0; --bt: 0,0,0;
+  --vt-add: rgba(22,135,74,.09); --vt-del: rgba(200,60,60,.08); }
+
+/* A light runs down the rail while it works. */
+@keyframes vt-run { from { background-position: 0 -120%; } to { background-position: 0 220%; } }
+.vn-trail.vt-live::before { content: ''; position: absolute; left: -1px; top: 0; bottom: 0; width: 2px; border-radius: 2px; pointer-events: none;
+  background: linear-gradient(transparent, #9a9aff, #e07cff, transparent) 0 0 / 100% 45% no-repeat; animation: vt-run 1.5s linear infinite; }
+.vn-trail.vt-trouble { border-left-color: var(--vt-amber); }
+.vn-trail.vt-live.vt-trouble::before { background: var(--vt-amber); animation: none; }
+
+/* The line. The columns are fixed, so the words never shift sideways as icons
+   land, and every trail in a thread starts its words at the same place. */
+.vt-bar { all: unset; box-sizing: border-box; width: 100%; cursor: pointer; display: grid;
+  grid-template-columns: var(--vt-stack) minmax(0, 1fr) auto 10px; column-gap: 10px; align-items: center;
+  padding: 3px 10px 3px 13px; min-height: 34px; font-size: 13px; line-height: 1.45; color: var(--text-secondary); border-radius: 8px; }
+.vt-bar:hover { background: rgba(var(--bt), .03); }
+.vt-bar:focus-visible { outline: 1px solid var(--vt-accent); outline-offset: -1px; }
+
+/* Icons */
+@keyframes vt-chip-in { 0% { transform: translateX(26px) scale(.3) rotate(25deg); opacity: 0; } 62% { transform: translateX(-3px) scale(1.14) rotate(-4deg); opacity: 1; } 100% { transform: none; } }
+.vt-stack { display: flex; align-items: center; height: 26px; width: var(--vt-stack); overflow: visible; }
+.vt-chip { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; margin-left: -10px; flex: none; position: relative;
+  color: var(--text-secondary); background: var(--bg-body); box-shadow: 0 0 0 1px rgba(var(--bt), .16), 0 2px 5px rgba(0,0,0,.25); }
+.vt-chip:first-child { margin-left: 0; }
+.vt-chip.new { animation: vt-chip-in .46s cubic-bezier(.2,.8,.3,1.1); }
+.vt-chip.change { color: var(--vt-accent); box-shadow: 0 0 0 1px rgba(124,124,255,.5), 0 2px 5px rgba(0,0,0,.25); }
+.vt-chip.test { color: var(--vt-ok); box-shadow: 0 0 0 1px rgba(79,191,127,.45), 0 2px 5px rgba(0,0,0,.25); }
+.vt-chip.err { color: var(--vt-amber); box-shadow: 0 0 0 1px var(--vt-amber), 0 2px 5px rgba(0,0,0,.25); }
+
+/* Rolling words and count */
+@keyframes vt-roll-in { from { transform: translateY(100%); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes vt-roll-out { from { transform: none; opacity: 1; } to { transform: translateY(-100%); opacity: 0; } }
+.vt-roll { position: relative; display: block; overflow: hidden; height: 19px; }
+.vt-roll > span { position: absolute; left: 0; right: 0; top: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 19px; }
+.vt-roll > .vt-in-roll { animation: vt-roll-in .3s cubic-bezier(.2,.8,.2,1); }
+.vt-roll > .vt-out { animation: vt-roll-out .3s cubic-bezier(.4,0,.8,.4) forwards; }
+.vt-settled .vt-lab { height: auto; overflow: visible; }
+.vt-settled .vt-lab > span { position: static; display: block; white-space: normal; }
+/* The number and "steps" share one line box: the number used to ride high. */
+.vt-count { display: inline-flex; align-items: center; gap: 4px; height: 16px; font-size: 11.5px; line-height: 16px; color: var(--text-faint); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.vt-cnt { width: 3ch; height: 16px; text-align: right; }
+.vt-cnt > span { line-height: 16px; }
+.vt-ok { display: inline-grid; place-items: center; color: var(--vt-ok); }
+.vt-ok:empty { display: none; }
+@keyframes vt-pop { 0% { transform: scale(0) rotate(-30deg); } 60% { transform: scale(1.3) rotate(6deg); } 100% { transform: none; } }
+.vt-ok.pop { animation: vt-pop .42s cubic-bezier(.2,.8,.3,1.2); }
+.vt-chev { color: var(--text-faint); font-size: 11px; transition: transform .18s; display: inline-block; text-align: center; }
+.vn-trail.vt-open > .vt-bar .vt-chev { transform: rotate(90deg); }
+.vn-trail .vt-warn { color: var(--vt-amber); }
+.vn-trail .vt-good { color: var(--vt-ok); }
+.vn-trail .vt-faint { color: var(--text-faint); }
+.vt-num { font-variant-numeric: tabular-nums; }
+
+/* The steps */
+.vt-wrap { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .32s cubic-bezier(.2,.7,.2,1); }
+.vn-trail.vt-open > .vt-wrap { grid-template-rows: 1fr; }
+.vt-in { overflow: hidden; min-height: 0; }
+.vt-body { padding: 2px 0 6px 13px; }
+.vt-files { display: flex; flex-direction: column; gap: 4px; padding: 6px 0 0; }
+.vt-notes { padding: 6px 0 0; }
+.vt-note { font-size: 12px; line-height: 1.5; color: var(--text-muted); padding: 2px 0; overflow-wrap: anywhere; }
+.vt-note.err { color: var(--result-err, #e0a030); }
+.vt-step { all: unset; box-sizing: border-box; width: 100%; cursor: pointer; display: grid; grid-template-columns: 18px minmax(0, 1fr) auto 10px; column-gap: 10px; align-items: center;
+  padding: 5px 10px 5px 4px; font-size: 13px; line-height: 1.45; color: var(--text-secondary); border-radius: 7px; }
+.vt-step:hover { background: rgba(var(--bt), .03); }
+.vt-step .ic { color: var(--text-faint); display: grid; place-items: center; }
+.vt-step .v { color: var(--text-muted); }
+.vt-step .o { color: var(--text-heading); font-weight: 550; word-break: break-word; }
+.vt-step .mt { font-size: 11.5px; color: var(--text-faint); white-space: nowrap; display: inline-flex; align-items: center; gap: 7px; }
+.vt-step.change .ic { color: var(--vt-accent); }
+.vt-step.err .ic, .vt-step.err .mt { color: var(--vt-amber); }
+.vt-step.open .vt-chev { transform: rotate(90deg); }
+.vt-dots { display: inline-flex; gap: 2px; }
+.vt-dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--vt-ok); opacity: .85; }
+.vt-dots i.f { background: var(--vt-amber); opacity: 1; }
+
+/* What opens under a step */
+.vt-det { margin: 2px 10px 8px 4px; border-radius: 10px; background: rgba(var(--bt), .028); box-shadow: inset 0 0 0 1px rgba(var(--bt), .05); overflow: hidden; }
+.vt-capt { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 7px 12px 0; font-size: 11.5px; color: var(--text-muted); }
+.vt-capt > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono, monospace); font-size: 11px; }
+.vt-rawlink { all: unset; cursor: pointer; font-size: 11px; font-weight: 550; color: var(--text-faint); white-space: nowrap; flex: none; }
+.vt-rawlink:hover { color: var(--text-primary); }
+.vt-plain { margin: 0; padding: 7px 12px 10px; font: 11.5px/1.6 var(--font-mono, ui-monospace, monospace); color: var(--text-secondary); white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow: auto; background: none; border: 0; }
+.vt-diff { font: 11.5px/1.7 var(--font-mono, ui-monospace, monospace); padding: 6px 0 8px; max-height: 420px; overflow: auto; }
+.vt-diff > div { display: grid; grid-template-columns: 38px 16px minmax(0, 1fr); white-space: pre-wrap; word-break: break-word; color: var(--text-secondary); }
+.vt-diff .n { text-align: right; padding-right: 10px; white-space: nowrap; color: var(--text-faint); opacity: .7; user-select: none; font-variant-numeric: tabular-nums; }
+.vt-diff .s { color: var(--text-faint); }
+.vt-diff .add { background: var(--vt-add); color: var(--text-primary); } .vt-diff .add .s { color: var(--vt-ok); }
+.vt-diff .del { background: var(--vt-del); color: var(--text-muted); } .vt-diff .del .s { color: #e57373; }
+.vt-diff .gap { height: 8px; }
+.vt-raw { padding: 2px 12px 10px; }
+
+@media (max-width: 520px) {
+  .vn-trail { --vt-stack: 74px; }
+  .vt-chip:nth-last-child(n+5) { display: none; }
+  .vt-chip:nth-last-child(4) { margin-left: 0; }
+  .vt-cw { display: none; }
+  .vt-bar { column-gap: 8px; padding-right: 6px; }
+  .vt-step .vt-tx { display: none; }
+  .vt-det { margin-right: 4px; }
+  .vt-diff > div { grid-template-columns: 34px 14px minmax(0, 1fr); }
+  .vt-diff .n { padding-right: 6px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .vn-trail::before, .vn-trail *, .vt-wrap { animation: none !important; transition: none !important; }
+}

@@ -1,0 +1,262 @@
+"""GUARDS for three holes in the pre-push secret scan.
+
+1. **Per-file "Env Variable Secret" suppressions blinded whole files.**
+   Constants named ``*_KEY(S)`` whose value is code (``frozenset({...})``,
+   ``re.compile(...)``, a tuple) tripped the rule, and the fix each time was to
+   suppress the rule for the file. A real generic secret in that file
+   (``SERVICE_TOKEN = "..."``) then went unreported. The rule now ignores values
+   that are code, and the suppressions are gone.
+2. **The owner's username/email slipped past the surname rule.** The rule
+   needed a word break before the surname; an initial in front of it (a
+   username, an email address) has none.
+3. **Update published conflict markers.** After a pull, Update puts local work
+   back with ``git stash pop`` and never checked for a clash; ``git add -A``
+   would then commit the ``<<<<<<<`` lines.
+
+Every secret-shaped or name-shaped string below is assembled at run time so this
+file does not trip the scanner it tests.
+
+Run: python -m pytest tests/test_git_scanner_gaps.py -q
+"""
+from __future__ import annotations
+
+import subprocess
+
+import pytest
+
+from web.git_scanner import _FINDING_SUPPRESSIONS, scan_staged_files
+
+ENV = "Env Variable Secret"
+# A made-up family name stands in for the owner's: the real rules hold only
+# fingerprints, and no test file may carry the name (src/web/git_scanner.py).
+STEM = "rive"
+OWNER = "Owner Family Name"
+SURNAME = STEM + "rs"
+VAR_NAME = "SERV" + "ICE_TOK" + "EN"
+FAKE_VALUE = "Zq81" + "LmPx4Rt9"
+
+
+def _repo(tmp_path, files: dict):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    for rel, body in files.items():
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body, encoding="utf-8")
+    return tmp_path
+
+
+def _hits(result, label, rel=None):
+    return [f for f in result["findings"]
+            if f["type"] == label and (rel is None or f["file"] == rel)]
+
+
+# ── 1. code values are not secrets; no file is blinded ──
+
+def test_code_valued_key_constants_are_not_flagged(tmp_path):
+    body = (
+        "ZOOM" + "_KEYS = ((\"big\", \"Big picture\"),)\n"
+        "KNOWN" + "_KEYS = frozenset({\"id\", \"cmd\"})\n"
+        "_JS_OPTION" + "_KEY = re.compile(r\"key\")\n"
+        "API" + "_KEY = os.environ.get(\"X\")\n"
+        "_SKIP" + "_KEYS = {\"url\", \"href\"}\n"
+        "ALL" + "_TOKENS = [\"a\", \"b\"]\n"
+    )
+    r = scan_staged_files(_repo(tmp_path, {"mod.py": body}))
+    assert _hits(r, ENV) == [], r["findings"]
+
+
+def test_a_generic_secret_is_flagged_in_every_formerly_exempt_file(tmp_path):
+    files = {rel: "ZOOM" + "_KEYS = ((\"big\", \"x\"),)\n"
+                  + VAR_NAME + " = \"" + FAKE_VALUE + "\"\n"
+             for rel in ("src/engine/handoff_rules.py", "src/engine/smart_termination.py",
+                         "src/features/pipeline/plan.py", "src/web/session_store.py")}
+    r = scan_staged_files(_repo(tmp_path, files))
+    for rel in files:
+        hits = _hits(r, ENV, rel)
+        assert [h["line"] for h in hits] == [2], (rel, r["findings"])
+
+
+def test_no_file_suppresses_the_env_secret_rule():
+    assert [p.pattern for p, t in _FINDING_SUPPRESSIONS if t == ENV] == []
+
+
+# ── 2. owner name with a leading initial ──
+
+@pytest.fixture
+def made_up_owner(monkeypatch):
+    from web import git_scanner as g
+    rule = g._IdentityRule.of(OWNER, "Owner family name found in file", [STEM, SURNAME], initial=True)
+    monkeypatch.setattr(g, "_IDENTITY_RULES", [rule])
+
+
+def test_owner_username_and_email_are_flagged(tmp_path, made_up_owner):
+    body = ("who = \"d" + SURNAME + "@example.org\"\n"
+            "home = \"m" + SURNAME + "\"\n"
+            "plain = \"" + SURNAME.capitalize() + "\"\n")
+    r = scan_staged_files(_repo(tmp_path, {"who.py": body}))
+    assert sorted(h["line"] for h in _hits(r, OWNER)) == [1, 2, 3], r["findings"]
+
+
+def test_longer_words_containing_the_surname_are_not_flagged(tmp_path, made_up_owner):
+    body = "x = \"pre" + STEM + "\"\ny = \"" + SURNAME + "ide\"\n"
+    r = scan_staged_files(_repo(tmp_path, {"words.py": body}))
+    assert _hits(r, OWNER) == [], r["findings"]
+
+
+# ── 3. Update stops on a stash-pop clash ──
+
+def _git(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True,
+                          capture_output=True, text=True)
+
+
+def _clone_pair(tmp_path):
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
+    a, b = tmp_path / "a", tmp_path / "b"
+    for d in (a, b):
+        subprocess.run(["git", "clone", "-q", str(remote), str(d)], check=True,
+                       capture_output=True)
+        _git(d, "config", "user.email", "t@example.org")
+        _git(d, "config", "user.name", "t")
+        _git(d, "checkout", "-q", "-B", "main")
+    (a / "f.txt").write_text("base\n")
+    _git(a, "add", "-A"); _git(a, "commit", "-qm", "base"); _git(a, "push", "-q", "-u", "origin", "main")
+    _git(b, "pull", "-q", "origin", "main"); _git(b, "branch", "-q", "-u", "origin/main")
+    (a / "f.txt").write_text("theirs\n")
+    _git(a, "commit", "-qam", "theirs"); _git(a, "push", "-q")
+    (b / "f.txt").write_text("mine\n")          # uncommitted local edit on the same line
+    return remote, b
+
+
+def test_update_stops_when_local_changes_clash_with_the_pull(tmp_path, monkeypatch):
+    from web import git_ops
+    remote, b = _clone_pair(tmp_path)
+    head_before = _git(remote, "rev-parse", "main").stdout
+    monkeypatch.setattr(git_ops, "_VIBENODE_DIR", b)
+    monkeypatch.setattr(git_ops, "_requirements_blob", lambda *a: "same")
+    monkeypatch.setattr("web.git_scanner.scan_staged_files",
+                        lambda *a, **k: {"ok": True, "findings": [], "blocked_files": [], "summary": ""})
+
+    result = git_ops.do_git_sync("both")
+
+    assert result["ok"] is False, result
+    assert result.get("conflicts") == ["f.txt"], result
+    assert any("clashed" in m for m in result["messages"]), result["messages"]
+    assert _git(remote, "rev-parse", "main").stdout == head_before, "the clash was published"
+    assert _git(b, "stash", "list").stdout.strip(), "local changes were not kept"
+
+
+def test_a_second_update_after_a_clash_says_so_and_touches_nothing(tmp_path, monkeypatch):
+    """After an Update that clashed on its stash pop, the next press must not
+    run `git stash` (refused: "needs merge"), count that as a stash, and show
+    git's raw "Pulling is not possible because you have unmerged files"."""
+    from web import git_ops
+    remote, b = _clone_pair(tmp_path)
+    monkeypatch.setattr(git_ops, "_VIBENODE_DIR", b)
+    monkeypatch.setattr(git_ops, "_requirements_blob", lambda *a: "same")
+    monkeypatch.setattr("web.git_scanner.scan_staged_files",
+                        lambda *a, **k: {"ok": True, "findings": [], "blocked_files": [], "summary": ""})
+    first = git_ops.do_git_sync("both")
+    assert first.get("conflicts") == ["f.txt"], first
+    stashes = _git(b, "stash", "list").stdout
+    clash_text = (b / "f.txt").read_text()
+    head_before = _git(remote, "rev-parse", "main").stdout
+
+    second = git_ops.do_git_sync("both")
+
+    assert second["ok"] is False, second
+    assert second.get("conflicts") == ["f.txt"], second
+    assert any("earlier Update left a clash" in m for m in second["messages"]), second["messages"]
+    assert not any("Could not pull" in m for m in second["messages"]), second["messages"]
+    assert _git(b, "stash", "list").stdout == stashes, "a stash was added or popped"
+    assert (b / "f.txt").read_text() == clash_text
+    assert _git(remote, "rev-parse", "main").stdout == head_before
+
+
+def test_a_failed_stash_never_pops_an_older_one(tmp_path, monkeypatch):
+    """If `git stash` itself fails, the pop after the pull must not run: it
+    would apply someone's older, unrelated stash."""
+    from unittest.mock import MagicMock
+    from web import git_ops
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(git_ops, "_VIBENODE_DIR", tmp_path)
+    monkeypatch.setattr(git_ops, "_current_branch", lambda *a: "main")
+    monkeypatch.setattr(git_ops, "_default_branch", lambda *a: "main")
+    monkeypatch.setattr(git_ops, "_requirements_blob", lambda *a: "same")
+    monkeypatch.setattr(git_ops, "_unmerged_paths", lambda *a: [])
+    calls = []
+
+    def _run(cmd, *a, **kw):
+        calls.append(list(cmd))
+        if "stash" in cmd and "pop" not in cmd:
+            return MagicMock(stdout="", stderr="error: could not write index", returncode=1)
+        return MagicMock(stdout="Already up to date.", stderr="", returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    git_ops.do_git_sync("pull")
+    assert not any("stash" in c and "pop" in c for c in calls), calls
+
+
+def test_update_refuses_to_publish_a_leftover_clash(tmp_path, monkeypatch):
+    from web import git_ops
+    remote, b = _clone_pair(tmp_path)
+    _git(b, "stash", "-q"); _git(b, "pull", "-q")
+    subprocess.run(["git", "-C", str(b), "stash", "pop"], capture_output=True)  # clashes
+    head_before = _git(remote, "rev-parse", "main").stdout
+    monkeypatch.setattr(git_ops, "_VIBENODE_DIR", b)
+    monkeypatch.setattr("web.git_scanner.scan_staged_files",
+                        lambda *a, **k: {"ok": True, "findings": [], "blocked_files": [], "summary": ""})
+
+    result = git_ops.do_git_sync("push")
+
+    assert result["ok"] is False, result
+    assert result.get("conflicts") == ["f.txt"], result
+    assert _git(remote, "rev-parse", "main").stdout == head_before
+
+
+# ── 4. A clash in the pull itself stops it; nothing is overwritten ──
+
+def test_a_clash_with_a_saved_commit_stops_and_overwrites_nothing(tmp_path, monkeypatch):
+    """A pull with `--rebase -X theirs` keeps the local line of a clashing
+    hunk and silently loses a line someone else pushed.  The pull is undone
+    instead, and Update says which files clash."""
+    from web import git_ops
+    remote, b = _clone_pair(tmp_path)
+    _git(b, "commit", "-qam", "mine")                 # the local edit is now a saved commit
+    (b / "notes.txt").write_text("unsaved\n")         # plus an uncommitted file
+    local_head = _git(b, "rev-parse", "HEAD").stdout
+    remote_head = _git(remote, "rev-parse", "main").stdout
+    monkeypatch.setattr(git_ops, "_VIBENODE_DIR", b)
+    monkeypatch.setattr(git_ops, "_requirements_blob", lambda *a: "same")
+    monkeypatch.setattr("web.git_scanner.scan_staged_files",
+                        lambda *a, **k: {"ok": True, "findings": [], "blocked_files": [], "summary": ""})
+
+    result = git_ops.do_git_sync("both")
+
+    assert result["ok"] is False, result
+    assert result.get("conflicts") == ["f.txt"], result
+    assert result.get("pull_clash") is True, result
+    assert any("clashes with your saved changes" in m for m in result["messages"]), result["messages"]
+    assert _git(b, "rev-parse", "HEAD").stdout == local_head, "the pull was not undone"
+    assert (b / "f.txt").read_text() == "mine\n"
+    assert (b / "notes.txt").read_text() == "unsaved\n", "uncommitted work was not put back"
+    assert not _git(b, "stash", "list").stdout.strip(), "the stash was left behind"
+    assert not (b / ".git" / "rebase-merge").exists() and not (b / ".git" / "MERGE_HEAD").exists()
+    assert _git(remote, "rev-parse", "main").stdout == remote_head, "something was published"
+
+
+def test_a_pull_that_does_not_clash_still_lands(tmp_path, monkeypatch):
+    from web import git_ops
+    remote, b = _clone_pair(tmp_path)
+    (b / "f.txt").write_text("base\n")                # drop the clashing edit
+    (b / "other.txt").write_text("mine\n")
+    _git(b, "add", "-A"); _git(b, "commit", "-qm", "other file")
+    monkeypatch.setattr(git_ops, "_VIBENODE_DIR", b)
+    monkeypatch.setattr(git_ops, "_requirements_blob", lambda *a: "same")
+
+    result = git_ops.do_git_sync("pull")
+
+    assert result["ok"] is True, result
+    assert (b / "f.txt").read_text() == "theirs\n"
+    assert (b / "other.txt").read_text() == "mine\n"

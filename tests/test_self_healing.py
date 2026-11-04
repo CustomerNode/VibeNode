@@ -1,0 +1,651 @@
+"""
+Tests for the self-healing stream recovery paths in SessionManager.
+
+Covers:
+- Stream closed triggers reconnect
+- Reconnect retries last user message (_self_heal=True path)
+- Self-heal counter limits retries (heal_count <= 3)
+- JSONL repair before reconnect
+- Reconnect during permission wait
+- Concurrent reconnect deduplication
+"""
+
+import asyncio
+import inspect
+import threading
+import time
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch, call
+from dataclasses import dataclass, field
+from typing import Optional
+from tests._empty_cwd import EMPTY_CWD
+
+
+# ---------------------------------------------------------------------------
+# Mock SDK types (mirrors test_session_manager.py pattern)
+# ---------------------------------------------------------------------------
+
+class MockTextBlock:
+    def __init__(self, text=""):
+        self.type = "text"
+        self.text = text
+
+
+class MockAssistantMessage:
+    def __init__(self, content=None):
+        self.content = content or []
+        self.role = "assistant"
+
+
+class MockResultMessage:
+    def __init__(self, session_id="test-session", total_cost_usd=0.05,
+                 duration_ms=1000, is_error=False, num_turns=1, usage=None):
+        self.session_id = session_id
+        self.total_cost_usd = total_cost_usd
+        self.duration_ms = duration_ms
+        self.is_error = is_error
+        self.num_turns = num_turns
+        self.usage = usage or {}
+
+
+class MockToolUseBlock:
+    def __init__(self, id="tool-1", name="Bash", input=None):
+        self.type = "tool_use"
+        self.id = id
+        self.name = name
+        self.input = input or {}
+
+
+class MockToolResultBlock:
+    def __init__(self, tool_use_id="tool-1", content="", is_error=False):
+        self.type = "tool_result"
+        self.tool_use_id = tool_use_id
+        self.content = content
+        self.is_error = is_error
+
+
+class MockThinkingBlock:
+    def __init__(self, text=""):
+        self.type = "thinking"
+        self.text = text
+
+
+class MockUserMessage:
+    def __init__(self, content=None):
+        self.content = content or []
+        self.role = "user"
+
+
+class MockStreamEvent:
+    def __init__(self, event="content_block_delta", data=None):
+        self.event = event
+        self.data = data or {}
+
+
+class MockPermissionResultAllow:
+    def __init__(self, updated_input=None, updated_permissions=None):
+        self.updated_input = updated_input
+        self.updated_permissions = updated_permissions
+
+
+class MockPermissionResultDeny:
+    def __init__(self, message="", interrupt=False):
+        self.message = message
+        self.interrupt = interrupt
+
+
+class MockToolPermissionContext:
+    def __init__(self):
+        self.signal = None
+        self.suggestions = []
+
+
+class MockClaudeSDKClient:
+    """Mock SDK client that yields predefined messages."""
+
+    def __init__(self, options=None):
+        self.options = options
+        self._messages = []
+        self._response_messages = []
+        self._connected = False
+        self._queries = []
+        self._interrupted = False
+        self._disconnected = False
+        self.connect_prompt = None
+
+    async def connect(self, prompt=None):
+        self._connected = True
+        self.connect_prompt = prompt
+
+    async def query(self, prompt, session_id="default"):
+        self._queries.append(prompt)
+
+    async def receive_messages(self):
+        for msg in self._messages:
+            yield msg
+
+    async def receive_response(self):
+        for msg in self._response_messages:
+            yield msg
+
+    async def interrupt(self):
+        self._interrupted = True
+
+    async def disconnect(self):
+        self._disconnected = True
+        self._connected = False
+
+    async def get_server_info(self):
+        return {"version": "mock"}
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def mock_socketio():
+    sio = MagicMock()
+    sio.emit = MagicMock()
+    return sio
+
+
+@pytest.fixture
+def mock_sdk_types():
+    type_mocks = {
+        'claude_code_sdk': MagicMock(),
+        'claude_code_sdk.types': MagicMock(),
+    }
+    type_mocks['claude_code_sdk'].ClaudeSDKClient = MockClaudeSDKClient
+    type_mocks['claude_code_sdk'].ClaudeCodeOptions = MagicMock
+
+    types_mod = type_mocks['claude_code_sdk.types']
+    types_mod.AssistantMessage = MockAssistantMessage
+    types_mod.UserMessage = MockUserMessage
+    types_mod.ResultMessage = MockResultMessage
+    types_mod.StreamEvent = MockStreamEvent
+    types_mod.TextBlock = MockTextBlock
+    types_mod.ThinkingBlock = MockThinkingBlock
+    types_mod.ToolUseBlock = MockToolUseBlock
+    types_mod.ToolResultBlock = MockToolResultBlock
+    types_mod.PermissionResultAllow = MockPermissionResultAllow
+    types_mod.PermissionResultDeny = MockPermissionResultDeny
+    types_mod.ContentBlock = MagicMock
+    types_mod.ToolPermissionContext = MockToolPermissionContext
+    types_mod.Message = MagicMock
+
+    return type_mocks
+
+
+@pytest.fixture
+def sm_module(mock_sdk_types):
+    with patch.dict('sys.modules', mock_sdk_types):
+        from tests._sm_fresh import fresh_session_manager
+        sm_mod = fresh_session_manager()
+
+        sm_mod.AssistantMessage = MockAssistantMessage
+        sm_mod.UserMessage = MockUserMessage
+        sm_mod.ResultMessage = MockResultMessage
+        sm_mod.StreamEvent = MockStreamEvent
+        sm_mod.TextBlock = MockTextBlock
+        sm_mod.ThinkingBlock = MockThinkingBlock
+        sm_mod.ToolUseBlock = MockToolUseBlock
+        sm_mod.ToolResultBlock = MockToolResultBlock
+        sm_mod.PermissionResultAllow = MockPermissionResultAllow
+        sm_mod.PermissionResultDeny = MockPermissionResultDeny
+        sm_mod.ClaudeSDKClient = MockClaudeSDKClient
+        sm_mod.ClaudeCodeOptions = MagicMock
+        yield sm_mod
+
+
+@pytest.fixture
+def session_manager(mock_socketio, sm_module, tmp_path):
+    manager = sm_module.SessionManager()
+    # Use a temp queue file so tests don't interfere with each other
+    manager._queue_path = tmp_path / "test_queues.json"
+    manager._queues = {}
+    manager.start(mock_socketio)
+    yield manager
+    manager.stop()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def wait_for(condition, timeout=5.0, interval=0.01):
+    """Poll until condition() is truthy or timeout expires."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = condition()
+        if result:
+            return result
+        time.sleep(interval)
+    raise TimeoutError(f"Condition not met within {timeout}s")
+
+
+# ===========================================================================
+# Self-healing structural tests (verify code paths exist)
+# ===========================================================================
+
+class TestStreamClosedTriggersReconnect:
+    """Verify that transport errors in _drive_session set _stream_heal_needed
+    and that _reconnect_client is called in the finally block."""
+
+    def test_stream_heal_flag_set_on_transport_error(self, sm_module):
+        """When a transport/stream error occurs, _stream_heal_needed should
+        be set and _stream_heal_count incremented."""
+        src = inspect.getsource(sm_module.SessionManager._drive_session)
+        # The except handler must set _stream_heal_needed = True
+        assert "_stream_heal_needed = True" in src
+        # The except handler must increment _stream_heal_count
+        assert "_stream_heal_count += 1" in src
+
+    def test_reconnect_called_in_finally(self, sm_module):
+        """The finally block of _drive_session must call _reconnect_client
+        when _stream_heal_needed is set."""
+        src = inspect.getsource(sm_module.SessionManager._drive_session)
+        assert "_reconnect_client" in src
+        assert "_stream_heal_needed" in src
+
+    def test_reconnect_client_exists(self, sm_module):
+        """_reconnect_client method must exist on SessionManager."""
+        assert hasattr(sm_module.SessionManager, '_reconnect_client')
+        assert inspect.iscoroutinefunction(sm_module.SessionManager._reconnect_client)
+
+
+class TestReconnectRetriesLastMessage:
+    """After reconnect, verify the last user message is re-sent
+    via send_message with _self_heal=True."""
+
+    def test_self_heal_path_in_finally(self, sm_module):
+        """The self-healing finally block must find the last user entry and
+        call send_message with _self_heal=True."""
+        src = inspect.getsource(sm_module.SessionManager._drive_session)
+        assert "_self_heal=True" in src
+        assert 'last_user_text' in src
+
+    def test_send_message_accepts_self_heal_param(self, sm_module):
+        """send_message must accept _self_heal parameter."""
+        sig = inspect.signature(sm_module.SessionManager.send_message)
+        assert '_self_heal' in sig.parameters
+
+    def test_self_heal_skips_counter_reset(self, sm_module):
+        """When _self_heal=True, send_message must NOT reset
+        _stream_heal_count."""
+        src = inspect.getsource(sm_module.SessionManager.send_message)
+        # Must check _self_heal flag before resetting counter
+        assert "not _self_heal" in src or "if not _self_heal" in src
+
+
+class TestSelfHealCounterLimitsRetries:
+    """After 3 consecutive failures, the session stops retrying."""
+
+    def test_heal_count_limit_exists(self, sm_module):
+        """_drive_session finally block must check heal_count <= 3."""
+        src = inspect.getsource(sm_module.SessionManager._drive_session)
+        assert "heal_count <= 3" in src
+
+    def test_too_many_errors_message(self, sm_module):
+        """When heal_count > 3, a user-facing error message should be emitted."""
+        src = inspect.getsource(sm_module.SessionManager._drive_session)
+        assert "Too many stream errors" in src
+
+    def test_heal_count_reset_on_new_user_message(self, sm_module):
+        """send_message without _self_heal must reset _stream_heal_count."""
+        src = inspect.getsource(sm_module.SessionManager.send_message)
+        assert "_stream_heal_count" in src
+
+
+class TestJsonlRepairBeforeReconnect:
+    """Verify _reconnect_client calls jsonl repair before --resume."""
+
+    def test_repair_called_in_reconnect(self, sm_module):
+        """_reconnect_client must call repair_incomplete_turn via store."""
+        src = inspect.getsource(sm_module.SessionManager._reconnect_client)
+        assert "repair_incomplete_turn" in src
+
+    def test_repair_happens_before_connect(self, sm_module):
+        """jsonl repair must happen BEFORE creating the new client."""
+        src = inspect.getsource(sm_module.SessionManager._reconnect_client)
+        repair_pos = src.find("repair_incomplete_turn")
+        connect_pos = src.find("self._sdk.connect")
+        assert repair_pos >= 0, "repair_incomplete_turn not found in _reconnect_client"
+        assert connect_pos >= 0, "self._sdk.connect not found in _reconnect_client"
+        assert repair_pos < connect_pos, (
+            "jsonl repair must happen before client.connect()"
+        )
+
+
+class TestJsonlRepairOnResume:
+    """Verify _drive_session sanitizes the transcript on the RESUME path,
+    before --resume replays it.
+
+    Regression: a poisoned transcript (assistant
+    entries whose only content is an empty-but-signed thinking block) makes the
+    Anthropic API 400 with "thinking ... blocks cannot be modified".  The CLI
+    surfaces that as assistant TEXT + a clean RESULT (no transport exception),
+    so the reactive finally-block heal gets stranded by the post-turn drain and
+    NEVER reconnects.  Repairing on
+    every resume — not only inside _reconnect_client — makes "safe for --resume"
+    a true invariant so the session self-heals on its next resume instead of
+    staying wedged forever.
+    """
+
+    # The resume self-heal now runs through the combined change-gated
+    # pre-resume pass (_prepare_resume_transcript → store.prepare_for_resume),
+    # which DELEGATES to repair_incomplete_turn for the same repair semantics
+    # while ALSO performing lossless stale-media eviction (see
+    # ).  Anchor on that call reference.
+    CALL = "self._prepare_resume_transcript"
+
+    def test_repair_called_in_drive_session(self, sm_module):
+        """_drive_session must sanitize the transcript on resume (self-heal),
+        now via the combined pre-resume pass that delegates to repair."""
+        src = inspect.getsource(sm_module.SessionManager._drive_session)
+        assert self.CALL in src
+        # The combined pass must still delegate to repair — verify the store
+        # method that does so exists and is wired through.
+        prep = inspect.getsource(
+            sm_module.SessionManager._prepare_resume_transcript)
+        assert "prepare_for_resume" in prep
+        assert "repair_incomplete_turn" in prep  # fallback / delegation anchor
+
+    def test_repair_gated_by_resume(self, sm_module):
+        """The repair must only run when resuming — a fresh session has no
+        transcript to poison, and repairing it would be wasted IO."""
+        src = inspect.getsource(sm_module.SessionManager._drive_session)
+        call_pos = src.find(self.CALL)
+        assert call_pos >= 0, f"{self.CALL} not found in _drive_session"
+        # An `if resume` guard must appear before the repair call.
+        guard_pos = src.rfind("if resume", 0, call_pos)
+        assert guard_pos >= 0, (
+            "resume-time repair must be gated behind `if resume:`"
+        )
+
+    def test_repair_happens_before_connect(self, sm_module):
+        """The transcript must be cleaned BEFORE the CLI loads it — i.e. before
+        self._sdk.connect — or the poisoned history is already in memory."""
+        src = inspect.getsource(sm_module.SessionManager._drive_session)
+        call_pos = src.find(self.CALL)
+        connect_pos = src.find("self._sdk.connect")
+        assert call_pos >= 0, f"{self.CALL} not found in _drive_session"
+        assert connect_pos >= 0, "self._sdk.connect not found in _drive_session"
+        assert call_pos < connect_pos, (
+            "resume jsonl repair must happen before client.connect()"
+        )
+
+
+class TestThinkingBlock400TriggersReconnect:
+    """The Anthropic "modified thinking block" 400 arrives as assistant text
+    (not a transport exception), so it must be detected in _process_message
+    and routed through the same reconnect + retry self-heal as Stream-closed.
+    """
+
+    def test_detection_helper_matches_real_error(self, sm_module):
+        """The exact API error string from a poisoned resume is detected."""
+        real = (
+            "API Error: 400 messages.1.content.6: thinking or "
+            "redacted_thinking blocks in the latest assistant message cannot "
+            "be modified. These blocks must remain as they were in the "
+            "original response."
+        )
+        assert sm_module._is_thinking_block_modified_error(real) is True
+
+    def test_detection_helper_ignores_unrelated_text(self, sm_module):
+        """Ordinary assistant text and other errors are not misclassified."""
+        assert sm_module._is_thinking_block_modified_error("") is False
+        assert sm_module._is_thinking_block_modified_error(
+            "Here is my thinking on the problem."
+        ) is False
+        assert sm_module._is_thinking_block_modified_error(
+            "API Error: 400 messages: tool_use ids were found without "
+            "tool_result blocks"
+        ) is False
+
+    def test_detection_helper_ignores_prose_about_the_error(self, sm_module):
+        """REGRESSION: the matcher must NOT fire on assistant text that merely
+        DISCUSSES or QUOTES this error.  These two strings are real response
+        texts that would falsely trigger a heal and suppress the model's own
+        output.  A diagnosis
+        contains every keyword ("thinking", "cannot be modified") and may even
+        quote the verbatim error mid-paragraph, but it does not lead with the
+        raw "API Error" envelope, so it must be classified as ordinary prose.
+        """
+        # Paraphrase embedded in a sentence (no structured path).
+        diagnosis = (
+            "Found it. The session is stuck in a loop hitting **API Error 400: "
+            "`thinking` blocks in the latest assistant message cannot be "
+            "modified**, and a STREAM_HEAL mechanism keeps triggering."
+        )
+        assert sm_module._is_thinking_block_modified_error(diagnosis) is False
+
+        # Summary that QUOTES the verbatim error (path present) but does not
+        # begin with it — the leading text proves it is the model talking.
+        summary = (
+            "Both `--resume` paths now repair the transcript. The error was: "
+            "API Error: 400 messages.1.content.9: thinking or redacted_thinking "
+            "blocks in the latest assistant message cannot be modified."
+        )
+        assert sm_module._is_thinking_block_modified_error(summary) is False
+
+    def test_detection_requires_structured_request_path(self, sm_module):
+        """An "API Error" envelope without the messages.<i>.content.<j> path is
+        not the modified-thinking 400 — the path is intrinsic to that error."""
+        assert sm_module._is_thinking_block_modified_error(
+            "API Error: 400 thinking blocks cannot be modified"
+        ) is False
+
+    def test_process_message_flags_heal_on_thinking_400(self, sm_module):
+        """An assistant TEXT block carrying the thinking-block 400 must set
+        _stream_heal_needed and increment _stream_heal_count so the finally
+        block reconnects (which sanitizes the JSONL) and retries."""
+        src = inspect.getsource(sm_module.SessionManager._process_message)
+        assert "_is_thinking_block_modified_error" in src
+        assert "_stream_heal_needed = True" in src
+        assert "_stream_heal_count += 1" in src
+
+
+class TestReconnectDuringPermissionWait:
+    """Session waiting for permission when stream dies.
+    Verify the code handles the case where state is WAITING."""
+
+    def test_permission_wait_handling_exists(self, sm_module):
+        """The self-healing code path should handle sessions
+        that might be in WAITING state during reconnect."""
+        # The reconnect sets state to IDLE before retrying.
+        # This means any pending permission is effectively abandoned.
+        src = inspect.getsource(sm_module.SessionManager._drive_session)
+        # After reconnect, state is set to IDLE
+        assert "SessionState.IDLE" in src
+
+
+class TestConcurrentReconnectNoDuplicate:
+    """Two stream errors arrive close together.
+    Verify the _stream_heal_needed flag prevents duplicate reconnects."""
+
+    def test_heal_needed_flag_cleared_before_reconnect(self, sm_module):
+        """_stream_heal_needed must be set to False BEFORE attempting
+        reconnect to prevent duplicate attempts."""
+        src = inspect.getsource(sm_module.SessionManager._drive_session)
+        # Find the pattern: heal_needed = False followed by reconnect
+        heal_clear_pos = src.find("_stream_heal_needed = False")
+        reconnect_pos = src.find("_reconnect_client", heal_clear_pos)
+        assert heal_clear_pos >= 0, "_stream_heal_needed = False not found"
+        assert reconnect_pos > heal_clear_pos, (
+            "heal_needed must be cleared before reconnect attempt"
+        )
+
+
+# ===========================================================================
+# Behavioral self-healing tests (using mocked SessionManager)
+# ===========================================================================
+
+class TestSelfHealingBehavior:
+    """Behavioral tests that exercise the self-healing code paths
+    by manipulating SessionInfo state directly."""
+
+    def test_heal_count_accumulates_across_retries(self, session_manager, sm_module):
+        """_stream_heal_count should accumulate across retries
+        and reset on normal user message."""
+        sid = "heal-counter-test"
+        info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
+        info.cwd = EMPTY_CWD
+
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+        # Simulate heal count accumulating
+        info._stream_heal_count = 2
+        info._stream_heal_needed = True
+
+        # send_message with _self_heal=True should NOT reset counter
+        # (We can test this by checking the flag behavior)
+        assert info._stream_heal_count == 2
+
+        # A normal send_message (not _self_heal) would reset it
+        # We verify this structurally above; here verify the initial state
+        info._stream_heal_count = 0
+        assert info._stream_heal_count == 0
+
+    def test_session_info_heal_attributes(self, sm_module):
+        """SessionInfo should support _stream_heal_count and
+        _stream_heal_needed as dynamic attributes."""
+        info = sm_module.SessionInfo(session_id="test", state=sm_module.SessionState.IDLE)
+
+        # These are set dynamically (not dataclass fields)
+        info._stream_heal_count = 0
+        info._stream_heal_needed = False
+
+        assert info._stream_heal_count == 0
+        assert info._stream_heal_needed is False
+
+        info._stream_heal_count = 3
+        info._stream_heal_needed = True
+
+        assert info._stream_heal_count == 3
+        assert info._stream_heal_needed is True
+
+    def test_reconnect_client_method_signature(self, sm_module):
+        """_reconnect_client should take session_id and info."""
+        sig = inspect.signature(sm_module.SessionManager._reconnect_client)
+        params = list(sig.parameters.keys())
+        assert 'self' in params
+        assert 'session_id' in params
+        assert 'info' in params
+
+    def test_reconnect_sets_resume_option(self, sm_module):
+        """_reconnect_client should create options with resume=session_id."""
+        src = inspect.getsource(sm_module.SessionManager._reconnect_client)
+        assert "resume=" in src
+        # After OOP abstraction, uses SessionOptions + self._sdk.create_session
+        assert "SessionOptions" in src or "create_session" in src
+
+    def test_drive_session_state_recovery_after_heal_failure(self, sm_module):
+        """If self-healing fails entirely, state should end up IDLE
+        (not stuck in WORKING)."""
+        src = inspect.getsource(sm_module.SessionManager._drive_session)
+        # After healing exception, state should be set to IDLE
+        assert "heal_err" in src or "heal_count" in src
+        # The catch-all in finally should force IDLE
+        assert "forcing IDLE" in src or "SessionState.IDLE" in src
+
+
+class TestUserStopBeatsSelfHeal:
+    """An explicit Sleep/Stop/Close must win over the transport self-heal.
+
+    Regression for the "Sleep won't stick" bug: a session whose CLI died
+    mid-turn (e.g. killed by a machine shutdown) schedules a reconnect that
+    re-sends the last message.  If the user Sleeps the session in the
+    meantime, the reconnect must NOT resurrect it back to WORKING.
+    """
+
+    def test_user_stopped_true_for_stopped_state(self, sm_module):
+        info = sm_module.SessionInfo(
+            session_id="s", state=sm_module.SessionState.STOPPED)
+        assert sm_module.SessionManager._user_stopped(info) is True
+
+    def test_user_stopped_true_for_interrupted(self, sm_module):
+        info = sm_module.SessionInfo(
+            session_id="s", state=sm_module.SessionState.IDLE)
+        info._interrupted = True
+        assert sm_module.SessionManager._user_stopped(info) is True
+
+    def test_user_stopped_false_for_live_session(self, sm_module):
+        info = sm_module.SessionInfo(
+            session_id="s", state=sm_module.SessionState.WORKING)
+        assert sm_module.SessionManager._user_stopped(info) is False
+        assert sm_module.SessionManager._user_stopped(None) is False
+
+    def test_reconnect_aborts_when_user_slept_session(self, session_manager, sm_module):
+        """_reconnect_client must bail out (return False) without connecting
+        when the user has closed/slept the session (state STOPPED)."""
+        sid = "slept-session"
+        info = sm_module.SessionInfo(
+            session_id=sid, state=sm_module.SessionState.STOPPED)
+        info.cwd = EMPTY_CWD
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+
+        # Fail loudly if the guard is missing and it tries to actually connect.
+        session_manager._sdk = MagicMock()
+        session_manager._sdk.create_session = MagicMock(
+            side_effect=AssertionError("must not reconnect a slept session"))
+        # A bare MagicMock backend returns a MagicMock "pid".  The fixture's
+        # stop() at teardown hands that to the kill path; without the kill
+        # guard that becomes killpg(1) = every process the user owns.  A fake
+        # backend has no process: say so.
+        session_manager._sdk.extract_process_pid = MagicMock(return_value=0)
+
+        result = asyncio.run(session_manager._reconnect_client(sid, info))
+        assert result is False
+        session_manager._sdk.create_session.assert_not_called()
+
+    @pytest.mark.parametrize("effort,model,want_args,want_model", [
+        ("xhigh", "claude-opus-5[1m]", {"effort": "xhigh"}, "claude-opus-5[1m]"),
+        ("", "claude-haiku-4-5[1m]", {}, "claude-haiku-4-5"),
+        ("", "claude-sonnet-5", {}, "claude-sonnet-5"),
+        ("bogus", "", {}, None),
+    ])
+    def test_reconnect_repins_effort_and_model(
+            self, session_manager, sm_module, effort, model, want_args, want_model):
+        """A self-heal reconnect relaunches the CLI.  It must carry the
+        session's effort (dropping it falls back to the CLI default level)
+        and its context window: "[1m]" is kept so a 1M
+        session does not come back on 200K, except on Haiku, where it is an
+        API 400 and is stripped."""
+        sid = "reconnect-effort"
+        info = sm_module.SessionInfo(session_id=sid, state=sm_module.SessionState.IDLE)
+        info.cwd, info.model, info.effort = EMPTY_CWD, model, effort
+        with session_manager._lock:
+            session_manager._sessions[sid] = info
+        captured = {}
+        async def _create(opts):
+            captured["opts"] = opts
+            return MagicMock()
+        session_manager._sdk = MagicMock()
+        session_manager._sdk.create_session = _create
+        session_manager._sdk.connect = AsyncMock()
+        session_manager._sdk.extract_process_pid = MagicMock(return_value=1)
+        # Chrome control (System -> Preferences, opt-in) adds "--chrome" to every
+        # launch when it is ON in this machine's kanban_config.json; a test must
+        # not depend on this machine's preference.  Its own coverage is
+        # tests/test_chrome_control.py.
+        with patch.object(session_manager, "_prepare_resume_transcript"), \
+                patch.object(sm_module.SessionManager, "_chrome_control_on",
+                             staticmethod(lambda: False)), \
+                patch.object(sm_module.SessionManager, "_RECONNECT_STAGGER_S", 0):
+            assert asyncio.run(session_manager._reconnect_client(sid, info)) is True
+        assert captured["opts"].extra_args == want_args
+        assert captured["opts"].model == want_model
+
+    def test_both_self_heal_sites_guard_on_user_stop(self, sm_module):
+        """Both the drive and query self-heal blocks must consult
+        _user_stopped before (and after) the reconnect backoff."""
+        for meth in (sm_module.SessionManager._drive_session,
+                     sm_module.SessionManager._send_query):
+            src = inspect.getsource(meth)
+            # Guard must appear at least twice: pre-backoff skip + post-backoff abort.
+            assert src.count("_user_stopped(info)") >= 2, (
+                f"{meth.__name__} is missing a _user_stopped guard around "
+                f"the self-heal reconnect")

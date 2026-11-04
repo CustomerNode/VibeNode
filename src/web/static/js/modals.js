@@ -1,0 +1,1360 @@
+/* modals.js — header system dropdown, summary, group dropdowns, respond popup */
+
+// --- Header System dropdown ---
+// Phones (≤768px) get the same iOS-style bottom action sheet the ••• toolbar
+// menu and the long-press session menu use. Same DOM (#mobile-sheet), same CSS
+// (.sheet-card / .sheet-item / .sheet-cancel from mobile.css), so this menu
+// visually matches the rest of the mobile UI — backdrop + slide-up + rounded
+// card + separate Cancel button — instead of the tiny desktop dropdown.
+function _hdrSysIsMobile() {
+  return !!(window.matchMedia && window.matchMedia('(max-width:768px)').matches);
+}
+function _hdrSysEsc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function _hdrSysCloseSheet() {
+  var s = document.getElementById('mobile-sheet');
+  var b = document.getElementById('mobile-sheet-backdrop');
+  if (s) s.classList.remove('show');
+  if (b) b.classList.remove('show');
+}
+// Scan the existing #hdr-sys-dropdown so dynamic value labels (Model, Thinking,
+// Persistent Storage, Mobile Command, Developer Tools badge) and any future
+// items flow through automatically — no second source of truth.
+function _hdrSysBuildGroups() {
+  var dd = document.getElementById('hdr-sys-dropdown');
+  var groups = [[]];
+  if (!dd) return groups;
+  Array.prototype.forEach.call(dd.children, function(el) {
+    if (el.classList && el.classList.contains('sys-separator')) {
+      if (groups[groups.length - 1].length) groups.push([]);
+      return;
+    }
+    if (el.tagName !== 'BUTTON') return;
+    var valEl = el.querySelector('.sys-item-value');
+    var value = valEl ? (valEl.textContent || '').trim() : '';
+    // Label = button text minus the value badge.
+    var clone = el.cloneNode(true);
+    var vc = clone.querySelector('.sys-item-value');
+    if (vc) vc.remove();
+    var label = (clone.textContent || '').trim();
+    groups[groups.length - 1].push({ label: label, value: value, source: el });
+  });
+  return groups;
+}
+function _hdrSysOpenSheet() {
+  // Make sure the desktop dropdown isn't visible underneath (a leftover from a
+  // resize from desktop → mobile with it open).
+  var ddEl = document.getElementById('hdr-sys-dropdown');
+  if (ddEl) ddEl.classList.remove('open');
+
+  var backdrop = document.getElementById('mobile-sheet-backdrop');
+  if (!backdrop) {
+    backdrop = document.createElement('div');
+    backdrop.id = 'mobile-sheet-backdrop';
+    document.body.appendChild(backdrop);
+  }
+  // Rewire backdrop each open — the ••• sheet and the session long-press
+  // sheet reuse this same node with their own close handlers.
+  backdrop.onclick = _hdrSysCloseSheet;
+
+  var sheet = document.getElementById('mobile-sheet');
+  if (!sheet) {
+    sheet = document.createElement('div');
+    sheet.id = 'mobile-sheet';
+    document.body.appendChild(sheet);
+  }
+
+  var groups = _hdrSysBuildGroups();
+  var html = '';
+  groups.forEach(function(rows, gi) {
+    if (!rows.length) return;
+    var mt = gi === 0 ? '' : ' style="margin-top:8px;"';
+    html += '<div class="sheet-card"' + mt + '>';
+    rows.forEach(function(r, i) {
+      var value = r.value
+        ? '<span style="margin-left:auto;color:var(--text-secondary);font-size:13px;">'
+          + _hdrSysEsc(r.value) + '</span>'
+        : '';
+      html += '<button class="sheet-item" data-g="' + gi + '" data-i="' + i + '">'
+           + _hdrSysEsc(r.label) + value + '</button>';
+    });
+    html += '</div>';
+  });
+  html += '<button class="sheet-cancel">Cancel</button>';
+  sheet.innerHTML = html;
+
+  sheet.querySelectorAll('.sheet-item').forEach(function(el) {
+    el.addEventListener('click', function() {
+      var g = +el.getAttribute('data-g');
+      var i = +el.getAttribute('data-i');
+      var r = groups[g] && groups[g][i];
+      _hdrSysCloseSheet();
+      // Defer 80ms so the slide-down animation starts before we fire the
+      // original button's onclick — matches the ••• sheet's feel.
+      setTimeout(function() {
+        if (r && r.source) r.source.click();
+      }, 80);
+    });
+  });
+  var cancel = sheet.querySelector('.sheet-cancel');
+  if (cancel) cancel.addEventListener('click', _hdrSysCloseSheet);
+
+  requestAnimationFrame(function() {
+    backdrop.classList.add('show');
+    sheet.classList.add('show');
+  });
+}
+
+function toggleHdrSys() {
+  if (_hdrSysIsMobile()) { _hdrSysOpenSheet(); return; }
+  openSettings();
+}
+
+// --- Settings window (desktop) ---
+// The gear opens ONE large window: the sections down the left, the chosen
+// section's content on the right.  The sections are the #hdr-sys-dropdown
+// buttons (still the single source of truth for labels, values and handlers),
+// and each section's content is the dialog that button already opens, drawn
+// into #pm-overlay as before.  This only adds the nav beside the dialog card
+// and sizes the pair as one window; no dialog was rewritten.
+var _sx = { on: false, key: '', explicit: false, shown: false, obs: null };
+var _SX_ICONS = {
+  'Model': '<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.7 1.8 1.8.7-1.8.7L19 20l-.7-1.8-1.8-.7 1.8-.7z"/>',
+  'Thinking': '<path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-3.6 10.8c.6.5 1 1.2 1.1 2h5c.1-.8.5-1.5 1.1-2A6 6 0 0 0 12 3z"/>',
+  'Preferences': '<path d="M4 7h9M18 7h2M4 17h2M11 17h9"/><circle cx="15.5" cy="7" r="2.5"/><circle cx="8.5" cy="17" r="2.5"/>',
+  'Permission Policy': '<path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6z"/><path d="M9 12l2 2 4-4"/>',
+  'Persistent Storage': '<ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/><path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/>',
+  'Mobile Command': '<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18h2"/>',
+  'Bulk Operations': '<rect x="3" y="4" width="18" height="5" rx="1.5"/><rect x="3" y="15" width="18" height="5" rx="1.5"/><path d="M7 9v6M17 9v6"/>',
+  'Keyboard Shortcuts': '<rect x="2.5" y="6" width="19" height="12" rx="2.5"/><path d="M6.5 10h.01M10 10h.01M13.5 10h.01M17 10h.01M7 14h10"/>',
+  'Playbooks': '<path d="M5 4h10a4 4 0 0 1 4 4v12H9a4 4 0 0 1-4-4z"/><path d="M10 9l4 2.5-4 2.5z"/>',
+  'Recently Deleted': '<path d="M4 7h16M10 3h4M6 7l1 13h10l1-13M10 11v6M14 11v6"/>',
+  'Recovery & Watchdog': '<path d="M3 12h4l2-5 4 10 2-5h6"/>',
+  'Developer Tools': '<path d="M8 8l-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/>'
+};
+var _SX_GROUPS = ['Defaults', 'Access', 'Tools', 'Maintenance'];
+// Sections that are a list to pick from: choosing closes the dialog, and the
+// window comes back on the same section showing the new choice.
+var _SX_STAY = { 'Model': 1, 'Thinking': 1, 'Permission Policy': 1 };
+
+function _sxNavHtml() {
+  var groups = _hdrSysBuildGroups();
+  var named = groups.length === _SX_GROUPS.length;
+  var html = '<div class="sx-nav-title">Settings</div>';
+  groups.forEach(function(rows, gi) {
+    if (!rows.length) return;
+    html += '<div class="sx-group">' + (named ? '<div class="sx-group-label">' + _SX_GROUPS[gi] + '</div>' : '');
+    rows.forEach(function(r) {
+      html += '<button class="sx-item' + (r.label === _sx.key ? ' active' : '') + '" data-key="' + _hdrSysEsc(r.label) + '">'
+        + '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+        + (_SX_ICONS[r.label] || '<circle cx="12" cy="12" r="3"/>') + '</svg>'
+        + '<span class="sx-item-label">' + _hdrSysEsc(r.label) + '</span>'
+        + (r.value ? '<span class="sx-item-value">' + _hdrSysEsc(r.value) + '</span>' : '')
+        + '</button>';
+    });
+    html += '</div>';
+  });
+  return html;
+}
+function _sxSource(key) {
+  var found = null;
+  _hdrSysBuildGroups().forEach(function(rows) { rows.forEach(function(r) { if (r.label === key) found = r.source; }); });
+  return found;
+}
+function _sxAttach() {
+  var overlay = document.getElementById('pm-overlay');
+  if (!_sx.on || !overlay || overlay.querySelector('.sx-nav') || !overlay.querySelector('.pm-card')) return;
+  var nav = document.createElement('div');
+  nav.className = 'sx-nav';
+  nav.innerHTML = _sxNavHtml();
+  nav.addEventListener('click', function(e) {
+    var it = e.target.closest('.sx-item');
+    if (it) _sxShow(it.getAttribute('data-key'));
+  });
+  overlay.insertBefore(nav, overlay.firstChild);
+  var x = document.createElement('div');
+  x.className = 'sx-x';
+  x.innerHTML = '<button class="sx-close" title="Close" aria-label="Close settings"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>';
+  x.firstChild.addEventListener('click', closeSettings);
+  overlay.appendChild(x);
+  // The window has its own close button, so a footer holding only "Close" is dropped.
+  overlay.querySelectorAll('.pm-card .pm-actions').forEach(function(f) {
+    var bs = f.querySelectorAll('button');
+    if (bs.length === 1 && /^close$/i.test((bs[0].textContent || '').trim())) f.classList.add('sx-hidden');
+  });
+  overlay.querySelectorAll('.pm-card button').forEach(function(b) {
+    var t = (b.textContent || '').trim();
+    if (t === '\u00d7' || t === '\u2715') b.classList.add('sx-hidden');
+  });
+  // Default-model list: the same family rows of chips as the status panel under the composer.
+  var ml = overlay.querySelector('.pm-card > .msel-list');
+  if (ml && !ml.querySelector('.sm-fam') && typeof _groupModelChips === 'function') { _groupModelChips(ml); ml.classList.add('sx-chips'); }
+  var tc = overlay.querySelector('#trash-close');
+  if (tc) tc.classList.add('sx-hidden');
+}
+function _sxShow(key) {
+  var src = _sxSource(key);
+  if (!src) return;
+  _sx.key = key;
+  _sx.explicit = false;
+  _sx.shown = false;
+  try { localStorage.setItem('settingsSection', key); } catch (e) {}
+  // A pending close from the previous section must not wipe the new one.
+  if (typeof _pmCloseTimer !== 'undefined' && _pmCloseTimer) { clearTimeout(_pmCloseTimer); _pmCloseTimer = null; }
+  src.click();
+  _sxAttach();
+}
+function _sxEnd() {
+  _sx.on = false;
+  var overlay = document.getElementById('pm-overlay');
+  if (overlay) overlay.classList.remove('sx');
+}
+function closeSettings() {
+  _sx.explicit = true;
+  if (typeof _closePm === 'function') _closePm();
+}
+function openSettings(key) {
+  var overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+  var dd = document.getElementById('hdr-sys-dropdown');
+  if (dd) dd.classList.remove('open');
+  if (!_sx.obs) {
+    _sx.obs = new MutationObserver(function() {
+      if (!_sx.on) return;
+      if (overlay.classList.contains('show')) { _sx.shown = true; _sxAttach(); return; }
+      if (!_sx.shown) return;   // a section that loads first (storage, mobile) has not drawn yet
+      // The dialog closed.  A pick in a list section returns to that section;
+      // anything else (Close, Esc, the backdrop, an action that leaves) ends it.
+      if (!_sx.explicit && _SX_STAY[_sx.key]) _sxShow(_sx.key); else _sxEnd();
+    });
+    _sx.obs.observe(overlay, { childList: true, attributes: true, attributeFilter: ['class'] });
+    overlay.addEventListener('click', function(e) {
+      if (!_sx.on) return;
+      var b = e.target.closest && e.target.closest('button');
+      if (e.target === overlay || (b && !b.closest('.sx-nav') && /^(close|cancel|done)$/i.test((b.textContent || '').trim()))) _sx.explicit = true;
+    }, true);
+    document.addEventListener('keydown', function(e) {
+      if (_sx.on && e.key === 'Escape' && overlay.classList.contains('show')) closeSettings();
+    }, true);
+  }
+  var saved = '';
+  try { saved = localStorage.getItem('settingsSection') || ''; } catch (e) {}
+  var first = (_hdrSysBuildGroups()[0][0] || {}).label || '';
+  var want = (key && _sxSource(key)) ? key : (_sxSource(saved) ? saved : first);
+  if (!want) return;
+  _sx.on = true;
+  overlay.classList.add('sx');
+  _sxShow(want);
+}
+// --- Playbooks ---
+// Things VibeNode can run when you type their words (AI Compare, Code Pipeline…).
+// The list is the workforce entries whose frontmatter says `playbook: true`
+// (served as `playbook` by /api/workforce/assets), so a new playbook shows up
+// here without editing this file.  Each row is one line until tapped; one is
+// open at a time.  Nothing here runs anything: Try it only fills the text box.
+var _PB_CHEV = '<svg class="pbk-chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>';
+function _pbRowHtml(a, i) {
+  var p = a.playbook || {};
+  var say = (p.say || []).map(function(s) {
+    return '<span class="pbk-say"><i>Say</i>' + _rwEsc(s) + '</span>';
+  }).join('');
+  return '<div class="pbk-row" data-pb="' + i + '">'
+    + '<button type="button" class="pbk-hd" aria-expanded="false">'
+    + '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + _SX_ICONS['Playbooks'] + '</svg>'
+    + '<span class="pbk-name">' + _rwEsc(a.name) + '</span>'
+    + '<span class="pbk-line">' + _rwEsc(p.line) + '</span>' + _PB_CHEV + '</button>'
+    + '<div class="pbk-bd"><div>'
+    + (p.what ? '<div class="pbk-what">' + _rwEsc(p.what) + '</div>' : '')
+    + '<div class="pbk-act">' + say
+    + '<span class="pbk-tries">'
+    + '<button type="button" class="pbk-try" data-pb-use="' + _rwEsc(p.use || ('Use ' + a.name)) + '" data-where="new">New session</button>'
+    + '<button type="button" class="pbk-try" data-pb-use="' + _rwEsc(p.use || ('Use ' + a.name)) + '" data-where="here"' + (_pbBox() ? '' : ' disabled title="Open a session first"') + '>Add to this session</button>'
+    + '</span>'
+    + '</div>'
+    + (p.how ? '<button type="button" class="pbk-more">How it works</button><div class="pbk-how">' + _pbHowHtml(p.how) + '</div>' : '')
+    + '</div></div></div>';
+}
+// How it works: steps separated by '|' in the playbook's frontmatter, drawn as a numbered list.
+function _pbHowHtml(how) {
+  var steps = String(how).split('|').map(function(x) { return x.trim(); }).filter(Boolean);
+  if (steps.length < 2) return _rwEsc(steps[0] || '');
+  return '<ol class="pbk-steps">' + steps.map(function(x) { return '<li>' + _rwEsc(x) + '</li>'; }).join('') + '</ol>';
+}
+function _pbBodyHtml(assets) {
+  var list = (assets || []).filter(function(a) { return a && a.playbook; });
+  if (!list.length) {
+    var oldServer = (assets || []).length && !(assets || []).some(function(a) { return a && 'playbook' in a; });
+    return '<div class="rw-empty">' + (oldServer
+      ? 'The list loads after the web server restarts.'
+      : 'No playbooks yet.') + '</div>';
+  }
+  list.sort(function(a, b) { return String(a.name).localeCompare(String(b.name)); });
+  return '<div class="pbk">' + list.map(_pbRowHtml).join('') + '</div>';
+}
+function _pbBox() {
+  return document.getElementById('live-input-ta') || document.getElementById('live-queue-ta');
+}
+// Put the playbook's phrase ("Use AI compare: ") in front of what is in the box.
+// Nothing is sent: the person finishes the prompt and presses Send.
+function _pbFill(ta, use) {
+  var lead = use.replace(/[:\s]+$/, '') + ': ';
+  var cur = ta.value || '';
+  if (cur.toLowerCase().indexOf(lead.toLowerCase()) !== 0) ta.value = lead + cur.replace(/^\s+/, '');
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  ta.focus();
+  try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch (e) {}
+}
+function _pbTry(use, where) {
+  _closePm();
+  if (where === 'here') {
+    var ta = _pbBox();
+    if (ta) { _pbFill(ta, use); return; }
+    if (typeof showToast === 'function') showToast('Open a session first');
+    return;
+  }
+  // A new session: open it, then fill its text box once it is drawn.
+  Promise.resolve(typeof addNewAgent === 'function' ? addNewAgent() : null).then(function() {
+    var tries = 0;
+    (function wait() {
+      var box = document.getElementById('live-input-ta');
+      if (box) { _pbFill(box, use); return; }
+      if (++tries < 40) setTimeout(wait, 50);
+    })();
+  });
+}
+function openPlaybooks() {
+  var overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+  overlay.innerHTML = '<div class="pm-card pm-enter pbk-card" style="width:620px;max-height:76vh;display:flex;flex-direction:column;">'
+    + '<h2 class="pm-title">Playbooks</h2>'
+    + '<div class="pm-body pbk-intro"><p>Type the words in any session to run one.</p></div>'
+    + '<div id="pbk-list" class="pbk-list" style="overflow:auto;flex:1;min-height:60px">'
+    + '<div class="rw-empty">Loading…</div></div>'
+    + '<div class="pm-actions"><button type="button" class="pm-btn pm-btn-secondary" onclick="_closePm()">Close</button></div>'
+    + '</div>';
+  overlay.classList.add('show');
+  requestAnimationFrame(function() { var c = overlay.querySelector('.pm-card'); if (c) c.classList.remove('pm-enter'); });
+  overlay.onclick = function(e) { if (e.target === overlay) _closePm(); };
+  var list = overlay.querySelector('#pbk-list');
+  list.addEventListener('click', function(e) {
+    var t = e.target.closest('button');
+    if (!t) return;
+    if (t.classList.contains('pbk-try')) { _pbTry(t.getAttribute('data-pb-use') || '', t.getAttribute('data-where')); return; }
+    if (t.classList.contains('pbk-more')) { t.closest('.pbk-row').classList.toggle('how-open'); return; }
+    if (t.classList.contains('pbk-hd')) {
+      var row = t.parentNode, was = row.classList.contains('open');
+      list.querySelectorAll('.pbk-row.open').forEach(function(r) {
+        r.classList.remove('open', 'how-open');
+        r.querySelector('.pbk-hd').setAttribute('aria-expanded', 'false');
+      });
+      if (!was) { row.classList.add('open'); t.setAttribute('aria-expanded', 'true'); }
+    }
+  });
+  fetch('/api/workforce/assets').then(function(r) { return r.ok ? r.json() : null; }).then(function(d) {
+    if (!list.isConnected) return;
+    if (!d || !d.ok) { list.innerHTML = '<div class="rw-empty">Could not read the playbooks.</div>'; return; }
+    list.innerHTML = _pbBodyHtml(d.assets);
+  }).catch(function() {
+    if (list.isConnected) list.innerHTML = '<div class="rw-empty">Could not read the playbooks.</div>';
+  });
+}
+
+// --- Recovery & Watchdog (read-only) ---
+// Every VIBENODE_* behaviour switch the web server and the Session Engine
+// read, from GET /api/engine/knobs (src/web/engine_knobs.py), grouped as the
+// server groups them.  Nothing here edits: the values are environment
+// variables read at start, so the honest UI is a reference card.
+function _rwEsc(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function _rwRowHtml(k) {
+  var val = (k.value === '' || k.value == null) ? '<span class="rw-unset">unset</span>' : _rwEsc(k.value);
+  return '<div class="rw-row" data-knob="' + _rwEsc(k.name) + '">'
+    + '<div class="rw-head"><code class="rw-name">' + _rwEsc(k.name) + '</code>'
+    + '<span class="rw-value">' + val + '</span>'
+    + (k.source === 'env' ? '<span class="rw-set" title="Set in the environment">set</span>' : '')
+    + '</div>'
+    + (k.description ? '<div class="rw-desc">' + _rwEsc(k.description) + '</div>' : '')
+    + '</div>';
+}
+function _rwBodyHtml(knobs) {
+  var order = [], groups = {}, internal = [];
+  (knobs || []).forEach(function(k) {
+    if (!k || !k.name) return;
+    if (k.internal) { internal.push(k); return; }
+    var g = k.group || 'Other';
+    if (!groups[g]) { groups[g] = []; order.push(g); }
+    groups[g].push(k);
+  });
+  var html = '';
+  order.forEach(function(g) {
+    html += '<div class="rw-group"><div class="rw-group-label">' + _rwEsc(g) + '</div>'
+      + groups[g].map(_rwRowHtml).join('') + '</div>';
+  });
+  if (internal.length) {
+    html += '<details class="rw-group rw-internal"><summary class="rw-group-label">Internal (' + internal.length + ')</summary>'
+      + internal.map(_rwRowHtml).join('') + '</details>';
+  }
+  return html || '<div class="rw-empty">No settings reported.</div>';
+}
+function openRecoveryWatchdog() {
+  var overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+  overlay.innerHTML = '<div class="pm-card pm-enter rw-card" style="width:620px;max-height:76vh;display:flex;flex-direction:column;">'
+    + '<h2 class="pm-title">Recovery &amp; Watchdog</h2>'
+    + '<div class="pm-body rw-intro"><p>These are set with environment variables before VibeNode starts. '
+    + 'Changing one needs a restart of the part that reads it.</p></div>'
+    + '<div id="rw-list" class="rw-list" style="overflow:auto;flex:1;min-height:60px">'
+    + '<div class="rw-empty">Loading…</div></div>'
+    + '<div class="pm-actions"><button type="button" class="pm-btn pm-btn-secondary" onclick="_closePm()">Close</button></div>'
+    + '</div>';
+  overlay.classList.add('show');
+  requestAnimationFrame(function() { var c = overlay.querySelector('.pm-card'); if (c) c.classList.remove('pm-enter'); });
+  overlay.onclick = function(e) { if (e.target === overlay) _closePm(); };
+  var list = overlay.querySelector('#rw-list');
+  fetch('/api/engine/knobs').then(function(r) { return r.ok ? r.json() : null; }).then(function(d) {
+    if (!list.isConnected) return;
+    if (!d || !d.ok || !Array.isArray(d.knobs)) { list.innerHTML = '<div class="rw-empty">Could not read the settings.</div>'; return; }
+    list.innerHTML = _rwBodyHtml(d.knobs);
+  }).catch(function() {
+    if (list.isConnected) list.innerHTML = '<div class="rw-empty">Could not read the settings.</div>';
+  });
+}
+
+function closeHdrSys() {
+  // On mobile the menu lives in #mobile-sheet, not the dropdown — close both
+  // so callers (each dropdown button's inline `closeHdrSys()`) work in both
+  // modes without knowing which is active.
+  var dd = document.getElementById('hdr-sys-dropdown');
+  if (dd) dd.classList.remove('open');
+  if (_hdrSysIsMobile()) _hdrSysCloseSheet();
+}
+document.addEventListener('click', function(e) {
+  if (!document.getElementById('hdr-sys').contains(e.target)) {
+    var dd = document.getElementById('hdr-sys-dropdown');
+    if (dd) dd.classList.remove('open');
+  }
+});
+
+// --- Recently Deleted (session trash) ---
+function _trashEsc(x) {
+  if (typeof escHtml === 'function') return escHtml(x);
+  return String(x == null ? '' : x).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function _trashTimeAgo(epochSec) {
+  if (!epochSec) return '';
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - epochSec));
+  if (s < 60) return 'just now';
+  const m = Math.floor(s / 60); if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60); if (h < 24) return h + 'h ago';
+  return Math.floor(h / 24) + 'd ago';
+}
+function _trashFmtSize(bytes) {
+  if (!bytes) return '0 B';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+function openTrash() {
+  const proj = localStorage.getItem('activeProject') || '';
+  // Drawn in the shared #pm-overlay like every other System dialog (it used to
+  // build its own overlay), so it also works as a section of the Settings window.
+  const overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+  overlay.innerHTML = `
+    <div class="pm-card pm-enter" style="width:560px;max-height:72vh;display:flex;flex-direction:column;">
+      <h2 class="pm-title">Recently Deleted</h2>
+      <div class="pm-body" style="margin-bottom:14px;"><p>Items are kept for the period you choose below. Restore brings the conversation back; permanent delete cannot be undone.</p></div>
+      <div class="retention-control" style="display:flex;align-items:center;gap:8px;font-size:12px;margin:0 0 12px">
+        <label for="retention-select" style="color:var(--text-muted)">Keep deleted sessions for:</label>
+        <select id="retention-select" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-primary);cursor:pointer;font-size:12px">
+          <option value="30">30 days</option>
+          <option value="60">60 days</option>
+          <option value="90">90 days</option>
+          <option value="36500">Forever</option>
+        </select>
+        <span id="retention-status" style="color:var(--text-muted)"></span>
+      </div>
+      <div id="trash-list" style="overflow:auto;flex:1;min-height:60px">
+        <div style="padding:18px;text-align:center;color:var(--text-muted);font-size:13px">Loading…</div>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:16px">
+        <button id="trash-empty" class="pm-btn pm-btn-secondary" style="color:var(--danger,#e55);border-color:var(--danger,#e55);display:none">Empty trash</button>
+        <button id="trash-close" class="pm-btn pm-btn-secondary" style="margin-left:auto">Close</button>
+      </div>
+    </div>`;
+  overlay.classList.add('show');
+  requestAnimationFrame(() => { const c = overlay.querySelector('.pm-card'); if (c) c.classList.remove('pm-enter'); });
+  overlay.querySelector('#trash-close').onclick = () => _closePm();
+  overlay.querySelector('#trash-empty').onclick = () => _trashEmpty(proj);
+  overlay.onclick = (e) => { if (e.target === overlay) _closePm(); };
+
+  // Retention selector: default to Forever (safe default — never 30), apply
+  // any cached pref, then ask the server for the authoritative value.  The
+  // ui_prefs_loaded handler in socket.js calls applyRetentionPref() to set
+  // the dropdown when the value arrives.
+  const sel = overlay.querySelector('#retention-select');
+  if (sel) {
+    sel.value = '36500';
+    if (typeof window._sessionRetentionDays === 'number') {
+      applyRetentionPref(window._sessionRetentionDays);
+    }
+    if (typeof socket !== 'undefined' && socket && socket.emit) {
+      socket.emit('get_ui_prefs');
+    }
+    sel.onchange = () => _retentionChanged(proj);
+  }
+
+  _trashRender(proj);
+}
+
+// Allowed retention values (days).  36500 == Forever.  Mirrors
+// PermissionManager.RETENTION_CHOICES on the backend.
+const RETENTION_CHOICES = [30, 60, 90, 36500];
+
+// Apply a retention value to the dropdown if the modal is open.  Defaults the
+// dropdown to Forever (36500) when the value is absent or not an allowed
+// choice — never 30.
+function applyRetentionPref(days) {
+  const sel = document.getElementById('retention-select');
+  if (!sel) return;
+  const d = Number(days);
+  sel.value = RETENTION_CHOICES.includes(d) ? String(d) : '36500';
+}
+
+// On change: drive BOTH targets.  VibeNode retention (source of truth) is
+// saved first via set_ui_prefs; the Claude Code mirror is best-effort via a
+// GET-merge-PUT of /api/config (the endpoint is a whole-file replace, so we
+// must merge into the full object — a partial PUT would wipe the user's
+// permissions/theme/hooks).
+async function _retentionChanged(proj) {
+  const sel = document.getElementById('retention-select');
+  const status = document.getElementById('retention-status');
+  if (!sel) return;
+  const days = Number(sel.value);
+  // (a) source of truth — VibeNode retention.
+  if (typeof socket !== 'undefined' && socket && socket.emit) {
+    socket.emit('set_ui_prefs', { session_retention_days: days });
+  }
+  window._sessionRetentionDays = days;
+  // (b) mirror to Claude Code's cleanupPeriodDays via read-modify-write.
+  try {
+    const cur = await (await fetch('/api/config')).json();
+    if (cur && !cur.error) {
+      cur.cleanupPeriodDays = days;
+      await fetch('/api/config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cur),
+      });
+      if (status) status.textContent = 'Saved.';
+    } else {
+      // Corrupt/unreadable settings.json — never PUT a body that would
+      // clobber it.  VibeNode retention is still saved.
+      if (status) status.textContent = 'Saved. (Claude settings file unreadable — cleanup period there unchanged.)';
+    }
+  } catch (e) {
+    if (status) status.textContent = 'Saved. (Could not update Claude cleanup setting right now.)';
+  }
+  // Purge dates change with the policy — refresh the list.
+  _trashRender(proj);
+}
+
+async function _trashRender(proj) {
+  const listEl = document.getElementById('trash-list');
+  if (!listEl) return;
+  try {
+    const resp = await fetch('/api/trash?project=' + encodeURIComponent(proj));
+    const data = await resp.json();
+    const items = (data && data.trash) ? data.trash : [];
+    const emptyBtn = document.getElementById('trash-empty');
+    if (emptyBtn) emptyBtn.style.display = items.length ? 'inline-block' : 'none';
+    if (!items.length) {
+      listEl.innerHTML = '<div style="padding:24px;text-align:center;color:var(--text-muted);font-size:13px">No recently deleted sessions.</div>';
+      return;
+    }
+    let html = '';
+    for (const it of items) {
+      const title = it.name ? _trashEsc(it.name) : '<span style="color:var(--text-muted)">Untitled session</span>';
+      html += '<div class="trash-row" data-id="' + _trashEsc(it.id) + '" style="display:flex;align-items:center;gap:10px;padding:10px 4px;border-bottom:1px solid var(--border)">'
+        + '<div style="flex:1;min-width:0">'
+        +   '<div style="font-size:13px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + title + '</div>'
+        +   '<div style="font-size:11px;color:var(--text-muted)">deleted ' + _trashTimeAgo(it.deleted_at) + ' · ' + _trashFmtSize(it.size) + ' · ' + _trashPurgeLabel(it.purge_at) + '</div>'
+        + '</div>'
+        + '<button class="trash-restore" style="padding:5px 12px;border-radius:6px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;font-size:12px">Restore</button>'
+        + '<button class="trash-purge" title="Delete permanently — cannot be undone" style="padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--danger,#e55);cursor:pointer;font-size:12px">Delete forever</button>'
+        + '</div>';
+    }
+    listEl.innerHTML = html;
+    listEl.querySelectorAll('.trash-row').forEach(row => {
+      const id = row.dataset.id;
+      row.querySelector('.trash-restore').onclick = () => _trashRestore(id, proj);
+      row.querySelector('.trash-purge').onclick = () => _trashPurge(id, proj);
+    });
+  } catch (e) {
+    listEl.innerHTML = '<div style="padding:24px;text-align:center;color:var(--danger,#e55);font-size:13px">Failed to load trash.</div>';
+  }
+}
+
+async function _trashRestore(id, proj) {
+  try {
+    const resp = await fetch('/api/trash/' + encodeURIComponent(id) + '/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project: proj }),
+    });
+    const data = await resp.json();
+    if (data && data.ok) {
+      if (typeof showToast === 'function') showToast('Restored: ' + (data.title || 'session'));
+      if (typeof loadSessions === 'function') loadSessions();
+      _trashRender(proj);
+    } else {
+      if (typeof showToast === 'function') showToast((data && data.error) || 'Restore failed', 'error');
+    }
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Restore failed', 'error');
+  }
+}
+
+async function _trashPurge(id, proj) {
+  if (!confirm('Permanently delete this session? This cannot be undone.')) return;
+  try {
+    await fetch('/api/trash/' + encodeURIComponent(id) + '?project=' + encodeURIComponent(proj), { method: 'DELETE' });
+    if (typeof showToast === 'function') showToast('Permanently deleted');
+    _trashRender(proj);
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Delete failed', 'error');
+  }
+}
+
+async function _trashEmpty(proj) {
+  let ids = [];
+  try {
+    const resp = await fetch('/api/trash?project=' + encodeURIComponent(proj));
+    const data = await resp.json();
+    ids = ((data && data.trash) ? data.trash : []).map(it => it.id);
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Failed to load trash', 'error');
+    return;
+  }
+  if (!ids.length) return;
+  if (!confirm('Permanently delete all ' + ids.length + ' session(s) in the trash? This cannot be undone.')) return;
+  let ok = 0, fail = 0;
+  for (const id of ids) {
+    try {
+      const r = await fetch('/api/trash/' + encodeURIComponent(id) + '?project=' + encodeURIComponent(proj), { method: 'DELETE' });
+      if (r.ok) ok++; else fail++;
+    } catch (e) { fail++; }
+  }
+  if (typeof showToast === 'function') {
+    showToast('Emptied trash: ' + ok + ' deleted' + (fail ? ', ' + fail + ' failed' : ''), fail ? 'error' : undefined);
+  }
+  _trashRender(proj);
+}
+
+// --- Restart server ---
+function restartServer() {
+  // Build a modal popup letting the user choose scope
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML = `
+    <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:10px;padding:24px 28px;min-width:340px;max-width:420px;color:var(--text-primary);font-family:inherit">
+      <h3 style="margin:0 0 14px;font-size:16px;color:var(--text-heading)">Restart Server</h3>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <button class="restart-opt" data-scope="web" style="padding:10px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-primary);cursor:pointer;text-align:left">
+          <strong>Application</strong><br><span style="font-size:12px;color:var(--text-muted)">Quick refresh. Your running sessions stay alive.</span>
+        </button>
+        <button class="restart-opt" data-scope="daemon" style="padding:10px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-primary);cursor:pointer;text-align:left">
+          <strong>Session Engine</strong><br><span style="font-size:12px;color:var(--text-muted)">Restarts the Session Engine. All running sessions will stop.</span>
+        </button>
+        <button class="restart-opt" data-scope="both" style="padding:10px 14px;border-radius:6px;border:1px solid var(--border);background:var(--bg-tertiary);color:var(--text-primary);cursor:pointer;text-align:left">
+          <strong>Everything</strong><br><span style="font-size:12px;color:var(--text-muted)">Full restart. All running sessions will stop.</span>
+        </button>
+      </div>
+      <button id="restart-cancel" style="margin-top:14px;padding:6px 16px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-primary);cursor:pointer;float:right">Cancel</button>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  overlay.querySelector('#restart-cancel').onclick = () => overlay.remove();
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+
+  overlay.querySelectorAll('.restart-opt').forEach(btn => {
+    btn.onmouseenter = () => { btn.style.borderColor = 'var(--accent)'; };
+    btn.onmouseleave = () => { btn.style.borderColor = 'var(--border)'; };
+    btn.onclick = () => {
+      const scope = btn.dataset.scope;
+      overlay.remove();
+      _doRestart(scope);
+    };
+  });
+}
+
+async function _doRestart(scope) {
+  const labels = { web: 'Application', daemon: 'Session Engine', both: 'Everything' };
+  const label = labels[scope] || scope;
+
+  // Show full-page reboot overlay
+  const overlay = document.createElement('div');
+  overlay.id = 'restart-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:var(--bg-primary);z-index:99999;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;opacity:0;transition:opacity .3s ease';
+  overlay.innerHTML = `
+    <div style="text-align:center">
+      <div id="restart-spinner" style="width:32px;height:32px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 16px"></div>
+      <h2 style="margin:0 0 6px;font-size:18px;color:var(--text-heading);font-weight:600">Restarting ${label}</h2>
+      <p id="restart-status" style="margin:0;font-size:13px;color:var(--text-muted)">Shutting down…</p>
+    </div>
+    <style>@keyframes spin{to{transform:rotate(360deg)}}</style>`;
+  document.body.appendChild(overlay);
+  requestAnimationFrame(() => { overlay.style.opacity = '1'; });
+
+  const statusEl = overlay.querySelector('#restart-status');
+
+  // Elapsed timer so the user knows it's not frozen
+  const _t0 = Date.now();
+  const _timerEl = document.createElement('p');
+  _timerEl.style.cssText = 'margin:6px 0 0;font-size:12px;color:var(--text-muted);font-variant-numeric:tabular-nums';
+  statusEl.parentElement.appendChild(_timerEl);
+  const _timer = setInterval(() => {
+    const s = Math.floor((Date.now() - _t0) / 1000);
+    _timerEl.textContent = `${s}s`;
+  }, 1000);
+
+  try {
+    await fetch('/api/restart', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: scope }),
+    });
+  } catch (e) { /* expected — server is going down */ }
+
+  // Phase 1: Wait for the old server to actually go down.
+  // Without this, the poll below catches the still-alive old process.
+  statusEl.textContent = 'Shutting down…';
+  let sawDown = false;
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 500));
+    try {
+      const r = await fetch('/', { method: 'HEAD', cache: 'no-store', signal: AbortSignal.timeout(2000) });
+      // Still responding — keep waiting
+    } catch (e) {
+      sawDown = true;
+      break;
+    }
+  }
+  // If we never saw it go down after 15s, proceed anyway (maybe it restarted instantly)
+
+  // Phase 2: Wait for the new server to be fully ready.
+  statusEl.textContent = 'Starting up…';
+  let attempts = 0;
+  const check = setInterval(async () => {
+    attempts++;
+    if (attempts > 8) statusEl.textContent = 'Almost there…';
+    try {
+      const r = await fetch('/', { method: 'GET', cache: 'no-store', signal: AbortSignal.timeout(3000) });
+      if (r.ok) {
+        const html = await r.text();
+        // Make sure we got a real, fully-rendered page — AND that it is the
+        // real VibeNode app, not the mobile "reviver" Start/Starting page.
+        // Over Tailscale the reviver races to bind 5050 the instant the old
+        // server dies, and its page also ends in </html>; without the sentinel
+        // guard the restart flow would reload early onto the reviver's static
+        // Start button and get stuck there until a hard refresh. Waiting past
+        // the reviver keeps this progress overlay up until VibeNode is truly back.
+        if (html.includes('</html>') && !html.includes('vibenode-reviver-page')) {
+          clearInterval(check);
+          clearInterval(_timer);
+          statusEl.textContent = 'Back online — reloading';
+          const s = Math.floor((Date.now() - _t0) / 1000);
+          _timerEl.textContent = `${s}s`;
+          overlay.querySelector('#restart-spinner').style.borderTopColor = 'var(--success, #3fb950)';
+          setTimeout(() => window.location.reload(), 500);
+          return;
+        }
+      }
+    } catch (e) { /* still down */ }
+    if (attempts > 45) {
+      clearInterval(check);
+      clearInterval(_timer);
+      statusEl.textContent = 'Taking longer than expected — reloading';
+      setTimeout(() => window.location.reload(), 800);
+    }
+  }, 1000);
+}
+
+// --- Shutdown server ---
+function shutdownServer() {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML = `
+    <div style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:10px;padding:24px 28px;min-width:340px;max-width:420px;color:var(--text-primary);font-family:inherit">
+      <h3 style="margin:0 0 14px;font-size:16px;color:var(--text-heading)">Turn Off Server</h3>
+      <p style="margin:0 0 18px;font-size:13px;color:var(--text-muted)">This will kill both the web server (5050) and Session Engine (5051). All running sessions and agents will be terminated. You will need to manually restart VibeNode to use it again.</p>
+      <div style="display:flex;justify-content:flex-end;gap:8px">
+        <button id="shutdown-cancel" style="padding:8px 18px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text-primary);cursor:pointer">Cancel</button>
+        <button id="shutdown-confirm" style="padding:8px 18px;border-radius:6px;border:1px solid transparent;background:var(--danger,#e55);color:#fff;cursor:pointer;font-weight:600">Turn Off</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  overlay.querySelector('#shutdown-cancel').onclick = () => overlay.remove();
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+
+  overlay.querySelector('#shutdown-confirm').onclick = async () => {
+    overlay.remove();
+    if (typeof showToast === 'function') showToast('Shutting down server…');
+    try {
+      await fetch('/api/shutdown', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+    } catch (e) { /* expected — server going down */ }
+    // Replace page content with a shutdown notice
+    setTimeout(() => {
+      document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;background:var(--bg-primary);color:var(--text-primary);font-family:inherit;flex-direction:column;gap:12px">'
+        + '<h2 style="margin:0;color:var(--text-heading)">Server has been turned off</h2>'
+        + '<p style="margin:0;color:var(--text-muted);font-size:14px">Restart VibeNode manually to continue.</p></div>';
+    }, 1500);
+  };
+}
+
+// --- Scrub Phantom Names ---
+// Removes _session_names.json entries that point to deleted sessions.
+//
+// On click, runs dry_run=true first to compute the count across all
+// projects. If non-zero, shows a confirm dialog. On confirm, fires
+// dry_run=false. Then refreshes the
+// phantom-count badge regardless of outcome.
+async function scrubPhantomNames() {
+  let dry;
+  try {
+    const r = await fetch('/api/admin/scrub-phantoms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dry_run: true }),
+    });
+    dry = await r.json();
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Scrub preview failed: ' + e);
+    return;
+  }
+  if (!dry || dry.ok !== true) {
+    if (typeof showToast === 'function') showToast('Scrub preview failed.');
+    return;
+  }
+  const n = dry.total_removed || 0;
+  if (n === 0) {
+    if (typeof showToast === 'function') showToast('No phantom session names to remove.');
+    _refreshPhantomBadge();
+    return;
+  }
+  const msg = `Remove ${n} session-name entries that point to deleted sessions?\n\n`
+    + `No actual sessions will be deleted. A backup of each project's `
+    + `_session_names.json will be written before any change.`;
+  if (!window.confirm(msg)) return;
+  let result;
+  try {
+    const r = await fetch('/api/admin/scrub-phantoms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dry_run: false }),
+    });
+    result = await r.json();
+  } catch (e) {
+    if (typeof showToast === 'function') showToast('Scrub failed: ' + e);
+    return;
+  }
+  if (!result || result.ok !== true) {
+    if (typeof showToast === 'function') showToast('Scrub failed.');
+    return;
+  }
+  if (typeof showToast === 'function') {
+    showToast(`Removed ${result.total_removed} phantom session-name entries.`);
+  }
+  _refreshPhantomBadge();
+}
+
+// Silent dry-run on page load and after a scrub — updates the badge on the
+// System → Scrub Phantom Names button so the user can see at a glance
+// whether residue is present. No toast, no modal, no auto-cleanup. Scoped
+// to the *active* project so users with many projects aren't surprised by
+// a count that includes places they never use.
+async function _refreshPhantomBadge() {
+  const badge = document.getElementById('sys-phantom-badge');
+  if (!badge) return;
+  try {
+    let project = '';
+    try { project = localStorage.getItem('activeProject') || ''; } catch (e) {}
+    const body = { dry_run: true };
+    if (project) body.project = project;
+    const r = await fetch('/api/admin/scrub-phantoms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) { badge.textContent = ''; return; }
+    const data = await r.json();
+    const n = (data && data.total_removed) || 0;
+    badge.textContent = n > 0 ? String(n) : '';
+  } catch (e) {
+    badge.textContent = '';
+  }
+}
+
+// Refresh the badge once on initial load (after the rest of the UI boots).
+if (typeof window !== 'undefined') {
+  window.addEventListener('load', () => {
+    // Defer slightly so initial page boot work finishes first.
+    setTimeout(() => { try { _refreshPhantomBadge(); } catch (e) {} }, 1500);
+  });
+}
+
+// --- Persistent Storage modal (System → Persistent Storage) ---
+async function openPersistentStorage() {
+  let config = {};
+  try {
+    const r = await fetch('/api/kanban/config');
+    if (r.ok) config = await r.json();
+  } catch (e) { /* defaults */ }
+
+  const isSupa = config.kanban_backend === 'supabase';
+  const overlay = document.getElementById('pm-overlay');
+  if (!overlay) return;
+
+  // Update the System dropdown label
+  const label = document.getElementById('sys-storage-label');
+  if (label) label.textContent = isSupa ? 'Cloud' : 'Local';
+
+  let html = `<div class="pm-card pm-enter" style="max-width:520px;">
+    <h2 class="pm-title">Persistent Storage</h2>
+    <div class="pm-body">
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:16px;">
+        Controls where your <strong>Workflow tasks</strong> are stored. This applies to all projects &mdash; not sessions.
+        Sessions always stay local. Switching copies all existing tasks to the new backend.
+      </div>
+      <div style="display:flex;gap:12px;margin-bottom:16px;">
+        <div id="kb-opt-sqlite" class="kanban-backend-option${!isSupa ? ' active' : ''}" onclick="selectBackend('sqlite')">
+          <div style="font-weight:600;color:${!isSupa ? 'var(--accent)' : 'var(--text)'};margin-bottom:4px;">Local (SQLite)</div>
+          <div style="font-size:12px;color:var(--text-muted);">Tasks stay on this machine. Zero config.</div>
+          ${!isSupa ? '<div style="font-size:11px;color:var(--green);margin-top:4px;">Currently active</div>' : ''}
+          ${isSupa ? '<button class="kanban-settings-btn-accent" onclick="event.stopPropagation();switchToLocal()" id="kb-local-btn" style="margin-top:8px;padding:6px 14px;font-size:12px;">Switch to Local</button><span id="kb-local-status" style="font-size:11px;display:block;margin-top:4px;"></span>' : ''}
+        </div>
+        <div id="kb-opt-supabase" class="kanban-backend-option${isSupa ? ' active' : ''}" onclick="selectBackend('supabase')">
+          <div style="font-weight:600;color:${isSupa ? 'var(--accent)' : 'var(--text)'};margin-bottom:4px;">Cloud (Supabase)</div>
+          <div style="font-size:12px;color:var(--text-muted);">Tasks sync to a hosted PostgreSQL database.</div>
+          ${isSupa ? '<div style="font-size:11px;color:var(--green);margin-top:4px;">Currently active</div>' : ''}
+        </div>
+      </div>
+      <div id="kb-supabase-config" style="${isSupa ? '' : 'display:none;'}padding:16px;border:1px solid var(--border);border-radius:8px;">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:var(--text-muted);">Supabase Connection</div>
+        <div class="kanban-settings-field"><label>Project URL</label><input type="text" id="kb-supa-url" value="${typeof escHtml === 'function' ? escHtml(config.supabase_url || '') : (config.supabase_url || '')}" placeholder="https://your-project.supabase.co"></div>
+        <!-- The server never returns the stored key, only a mask (••••last4) and supabase_secret_key_set.
+             The field starts EMPTY with the mask as its placeholder; saveAllKanbanSettings (kanban.js) only
+             sends supabase_secret_key when the user typed one, so the stored key is never clobbered. -->
+        <div class="kanban-settings-field"><label>Secret Key <span style="font-size:10px;color:var(--orange);">(service_role)</span>${config.supabase_secret_key_set ? ' <span style="font-size:10px;color:var(--text-muted);">saved; type a new one to replace it</span>' : ''}</label><input type="password" id="kb-supa-key" value="" data-key-set="${config.supabase_secret_key_set ? '1' : ''}" placeholder="${config.supabase_secret_key_set ? (typeof escHtml === 'function' ? escHtml(config.supabase_secret_key || '••••') : '••••') : 'eyJhbGciOi…'}"></div>
+        <div style="display:flex;gap:8px;margin-top:10px;align-items:center;">
+          <button class="kanban-settings-btn-accent" id="kb-test-btn" onclick="testConnection()" style="padding:8px 18px;font-size:13px;">Step 1: Test Connection</button>
+          <span id="kb-conn-status" style="font-size:12px;margin-left:4px;"></span>
+        </div>
+        <!-- Decision panel populated by renderMigrationDecision() in kanban.js
+             after Test Connection succeeds. Stays empty until the preflight
+             call returns row counts for both backends. -->
+        <div id="kb-action-area" style="margin-top:14px;"></div>
+        <div id="kb-schema-setup" style="display:none;margin-top:12px;padding:16px;border:2px solid var(--orange);border-radius:8px;background:rgba(210,153,34,0.08);">
+          <div style="font-size:14px;font-weight:700;color:var(--orange);margin-bottom:8px;">Step 2: Create database tables</div>
+          <div style="font-size:13px;color:var(--text-secondary);margin-bottom:4px;">Your Supabase project is connected but empty. To create the tables automatically:</div>
+          <ol style="font-size:12px;color:var(--text-secondary);margin:4px 0 12px 16px;padding:0;line-height:1.8;">
+            <li>Go to <strong>supabase.com/dashboard/account/tokens</strong></li>
+            <li>Click <strong>Generate new token</strong>, copy it</li>
+            <li>Paste it below and click <strong>Setup Database</strong></li>
+          </ol>
+          <div class="kanban-settings-field" style="margin-bottom:10px;"><label style="font-weight:600;">Access Token</label><input type="password" id="kb-access-token" placeholder="sbp_…" style="font-size:13px;"></div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <button class="kanban-settings-btn-accent" onclick="setupSupabaseSchema()" id="kb-setup-btn" style="padding:8px 18px;font-size:13px;">Setup Database</button>
+            <span id="kb-setup-status" style="font-size:12px;"></span>
+          </div>
+        </div>
+        <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border);">
+          <div style="font-size:13px;font-weight:600;margin-bottom:10px;color:var(--text-muted);">Backups</div>
+          <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px;">Save a snapshot of your cloud data locally, or restore from a previous backup.</div>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;">
+            <button class="kanban-settings-btn-accent" id="kb-backup-dl-btn" onclick="downloadCloudBackup()" style="padding:7px 16px;font-size:12px;">Download Backup</button>
+            <span id="kb-backup-dl-status" style="font-size:11px;"></span>
+          </div>
+          <div id="kb-backup-list-container">
+            <div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:6px;">Saved Backups</div>
+            <div id="kb-backup-list" style="font-size:12px;color:var(--text-muted);">Loading…</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="pm-actions">
+      <button class="pm-btn pm-btn-secondary" onclick="_closePm()">Close</button>
+    </div>
+  </div>`;
+
+  overlay.innerHTML = html;
+  overlay.classList.add('show');
+  requestAnimationFrame(() => overlay.querySelector('.pm-card')?.classList.remove('pm-enter'));
+  overlay.onclick = (e) => { if (e.target === overlay && typeof _closePm === 'function') _closePm(); };
+
+  // Auto-load backup list if Supabase section is visible
+  if (isSupa && typeof loadBackupList === 'function') loadBackupList();
+}
+
+// Update the storage label on page load (retry until element exists)
+(async function _updateStorageLabel() {
+  for (let i = 0; i < 20; i++) {
+    const label = document.getElementById('sys-storage-label');
+    if (label) {
+      try {
+        const r = await fetch('/api/kanban/config');
+        if (r.ok) {
+          const cfg = await r.json();
+          label.textContent = cfg.kanban_backend === 'supabase' ? 'Cloud' : 'Local';
+        }
+      } catch (e) { /* ignore */ }
+      return;
+    }
+    await new Promise(r => setTimeout(r, 200));
+  }
+})();
+
+// --- Summary modal ---
+async function showSummary(id) {
+  document.getElementById('summary-body').innerHTML = '<div style="color:var(--text-faint);font-size:13px;"><span class="spinner"></span> Building summary\u2026</div>';
+  document.getElementById('summary-overlay').classList.add('show');
+
+  const _p = localStorage.getItem('activeProject') || '';
+  const resp = await fetch('/api/summary/' + id + '?project=' + encodeURIComponent(_p));
+  const data = await resp.json();
+  document.getElementById('summary-body').innerHTML = data.html || ('<p style="color:var(--text-muted)">' + (data.error||'No summary available') + '</p>');
+}
+
+function closeSummary() {
+  document.getElementById('summary-overlay').classList.remove('show');
+}
+
+document.getElementById('summary-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeSummary();
+});
+
+// --- Group dropdowns ---
+function toggleGrpDropdown(grpId) {
+  const grp = document.getElementById(grpId);
+  const label = grp.querySelector('.btn-group-label');
+
+  // Close any existing popup
+  if (_activeGrpPopup) {
+    _activeGrpPopup.remove();
+    const prevLabel = document.querySelector('.btn-group-label.grp-open');
+    if (prevLabel) prevLabel.classList.remove('grp-open');
+    if (_activeGrpPopup._grpId === grpId) { _activeGrpPopup = null; return; }
+    _activeGrpPopup = null;
+  }
+
+  label.classList.add('grp-open');
+
+  // Clone the btn-group-inner buttons into a floating popup
+  const inner = grp.querySelector('.btn-group-inner');
+  const popup = document.createElement('div');
+  popup.className = 'grp-popup';
+  popup._grpId = grpId;
+
+  // Session header (desktop): ONE menu holds every session action, grouped and
+  // all visible at once.  It used to be an Analyze dropdown plus a separate
+  // Actions button opening a tabbed popup; chaining the two (menu -> popup with
+  // tabs) was confusing.  Built from the existing buttons, which stay the
+  // single source of truth: each row mirrors its source's label, icon and
+  // disabled state and simply clicks it.
+  if (label.classList.contains('toolbar-dots')) {
+    _fillSessionMenu(popup);
+    const r = label.getBoundingClientRect();
+    popup.style.top = (r.bottom + 6) + 'px';
+    popup.style.right = (window.innerWidth - r.right) + 'px';
+    document.body.appendChild(popup);
+    _activeGrpPopup = popup;
+    return;
+  }
+
+  Array.from(inner.children).forEach(el => {
+    // Skip permanently hidden elements
+    if (el.style.display === 'none') return;
+    const clone = el.cloneNode(true);
+    // Only wire up click handlers for actual buttons
+    if (el.tagName === 'BUTTON') {
+      const oc = el.getAttribute('onclick');
+      if (oc) clone.setAttribute('onclick', oc);
+      clone.addEventListener('click', () => { closeAllGrpDropdowns(); });
+    }
+    popup.appendChild(clone);
+  });
+
+  // Position below the label, aligned to the right edge
+  const rect = label.getBoundingClientRect();
+  popup.style.top  = (rect.bottom + 4) + 'px';
+  popup.style.right = (window.innerWidth - rect.right) + 'px';
+  document.body.appendChild(popup);
+  _activeGrpPopup = popup;
+}
+
+const _SESSION_MENU = [
+  ['Analyze',  ['btn-summary', 'btn-find', 'btn-extract', 'btn-export', 'btn-compare']],
+  ['Branch',   ['btn-continue', 'btn-duplicate', 'btn-fork', 'btn-rewind', 'btn-fork-rewind']],
+  ['Organize', ['btn-autoname', 'btn-spawn-subsession']],
+  ['Session',  ['btn-open', 'btn-compact', 'btn-clear']],
+];
+const _SESSION_MENU_DANGER = ['btn-close', 'btn-delete'];
+
+function _sessionMenuRow(id) {
+  const src = document.getElementById(id);
+  if (!src || src.style.display === 'none') return null;
+  const nameEl = src.querySelector('.actions-item-name');
+  const descEl = src.querySelector('.actions-item-desc');
+  const svg = src.querySelector('svg');
+  const row = document.createElement('button');
+  row.className = 'btn';
+  row.type = 'button';
+  row.disabled = !!src.disabled;
+  row.title = descEl ? descEl.textContent.trim() : (src.title || '');
+  row.innerHTML = (svg ? svg.outerHTML : '') + '<span>' + escHtml((nameEl ? nameEl.textContent : src.textContent).trim()) + '</span>';
+  row.addEventListener('click', () => { closeAllGrpDropdowns(); src.click(); });
+  return row;
+}
+
+function _fillSessionMenu(popup) {
+  popup.classList.add('session-menu');
+  for (const [title, ids] of _SESSION_MENU) {
+    const rows = ids.map(_sessionMenuRow).filter(Boolean);
+    if (!rows.length) continue;
+    const sec = document.createElement('div');
+    sec.className = 'sm-sec-block';
+    sec.innerHTML = '<div class="sm-sec-hd">' + title + '</div>';
+    rows.forEach(r => sec.appendChild(r));
+    popup.appendChild(sec);
+  }
+  const danger = _SESSION_MENU_DANGER.map(_sessionMenuRow).filter(Boolean);
+  if (danger.length) {
+    const foot = document.createElement('div');
+    foot.className = 'sm-danger';
+    danger.forEach(r => { r.classList.add('danger'); foot.appendChild(r); });
+    popup.appendChild(foot);
+  }
+}
+
+function closeAllGrpDropdowns() {
+  if (_activeGrpPopup) { _activeGrpPopup.remove(); _activeGrpPopup = null; }
+  document.querySelectorAll('.btn-group-label.grp-open').forEach(l => l.classList.remove('grp-open'));
+}
+
+// Close popup when clicking outside
+document.addEventListener('click', e => {
+  if (!_activeGrpPopup) return;
+  if (e.target.closest('.grp-popup') || e.target.closest('.btn-group-label')) return;
+  closeAllGrpDropdowns();
+});
+
+// The session header's Analyze label becomes the single "•••" trigger.  Done
+// here rather than in the template so the label's click handler and the
+// group markup (which the phone action sheet and kanban reuse) stay untouched.
+(function () {
+  function init() {
+    const l = document.querySelector('#main-toolbar #grp-analyze .btn-group-label');
+    if (!l || l.classList.contains('toolbar-dots')) return;
+    l.classList.add('toolbar-dots');
+    l.title = 'More';
+    l.setAttribute('aria-label', 'More');
+    l.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.9"/><circle cx="12" cy="12" r="1.9"/><circle cx="19" cy="12" r="1.9"/></svg>';
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+})();
+
+// Top nav: the "System ▾" text button becomes a gear icon button, the same
+// shape as the theme toggle next to it.  Same element, same click handler and
+// dropdown; only its face changes.
+(function () {
+  function init() {
+    const b = document.querySelector('header .hdr-sys-btn');
+    if (!b || b.classList.contains('hdr-gear')) return;
+    b.classList.add('hdr-gear');
+    b.title = 'System';
+    b.setAttribute('aria-label', 'System');
+    b.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>';
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+})();
+
+// --- Actions popup ---
+function openActionsPopup() {
+  // Update the status badge
+  const statusEl = document.getElementById('actions-status');
+  if (activeId) {
+    const kind = sessionKinds[activeId] || 'sleeping';
+    const icons = {
+      question: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#ff9500" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r=".5" fill="#ff9500"/></svg>',
+      working: '<img src="/static/svg/pickaxe.svg" width="12" height="12" style="filter:brightness(0) saturate(100%) invert(55%) sepia(78%) saturate(1000%) hue-rotate(215deg);">',
+      idle: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--idle-label)" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>',
+      sleeping: '<img src="/static/svg/sleeping.svg" width="12" height="12" class="sleeping-icon">',
+    };
+    const labels = {question:'Waiting for input', working:'Working', idle:'Idle', sleeping:'Not running'};
+    statusEl.innerHTML = (icons[kind] || icons.sleeping) + ' ' + (labels[kind] || 'Not running');
+  } else {
+    statusEl.innerHTML = '';
+  }
+  _renderLiveScrollAction();
+  const ov = document.getElementById('actions-overlay');
+  ov.classList.remove('actions-closing'); // cancel any in-flight slide-down (mobile)
+  ov.classList.add('show');
+}
+
+/**
+ * Auto scroll on/off for THE SESSION ON SCREEN (thread-scroll.js
+ * setLiveScroll). Used by the Auto switch on the jump pill and the ••• menu.
+ * The default every session starts with is set in System → Preferences
+ * (ThreadScroll.setDefaultLiveScroll). `on` omitted = flip the current value.
+ */
+function toggleLiveScroll(on) {
+  if (!window.ThreadScroll) return;
+  const next = (typeof on === 'boolean') ? on : !ThreadScroll.isLiveScroll();
+  ThreadScroll.setLiveScroll(next);
+  _renderLiveScrollAction();
+  if (typeof showToast === 'function') {
+    showToast(next ? 'Auto scroll on for this session'
+                   : 'Auto scroll off for this session');
+  }
+}
+
+function _renderLiveScrollAction() {
+  const btn = document.getElementById('btn-live-scroll');
+  if (!btn || !window.ThreadScroll) return;
+  const on = ThreadScroll.isLiveScroll();
+  const name = btn.querySelector('.actions-item-name');
+  const desc = btn.querySelector('.actions-item-desc');
+  if (name) name.textContent = 'Auto scroll: ' + (on ? 'On' : 'Off');
+  if (desc) desc.textContent = (on
+    ? 'Following new output in this session. Tap to keep it still'
+    : 'This session stays still. Tap to follow new output') +
+    '. Default: System → Preferences';
+  btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+}
+
+function closeActionsPopup() {
+  const ov = document.getElementById('actions-overlay');
+  // On phones the popup is an iOS bottom sheet (see mobile.css). Animate it back
+  // down instead of vanishing, mirroring the ••• sheet's dismissal. Desktop closes
+  // instantly. Guard against double-invoke while a close animation is in flight.
+  if (window.matchMedia && window.matchMedia('(max-width: 768px)').matches) {
+    if (ov.classList.contains('actions-closing')) return;
+    ov.classList.add('actions-closing');
+    setTimeout(function () {
+      ov.classList.remove('show', 'actions-closing');
+    }, 250);
+  } else {
+    ov.classList.remove('show');
+  }
+}
+
+function switchActionsTab(tabName) {
+  document.querySelectorAll('.actions-tab').forEach(t => t.classList.toggle('active', t.getAttribute('onclick').includes("'" + tabName + "'")));
+  document.querySelectorAll('.actions-tab-panel').forEach(p => p.classList.toggle('active', p.dataset.tab === tabName));
+}
+
+document.getElementById('actions-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeActionsPopup();
+});
+
+// --- Respond popup ---
+function openRespond(id) {
+  const w = waitingData[id];
+  if (!w) return;
+  respondTarget = id;
+
+  // Question text
+  document.getElementById('respond-question').innerHTML = mdParse(w.question || '(no question text)');
+
+  // Option buttons
+  const optsEl = document.getElementById('respond-options');
+  const orEl   = document.getElementById('respond-or');
+  optsEl.innerHTML = '';
+  if (w.options && w.options.length) {
+    w.options.forEach(opt => {
+      const btn = document.createElement('button');
+      btn.className = 'respond-opt';
+      btn.textContent = opt;
+      btn.onclick = () => sendRespond(opt);
+      optsEl.appendChild(btn);
+    });
+    orEl.style.display = 'block';
+  } else {
+    orEl.style.display = 'none';
+  }
+
+  document.getElementById('respond-input').value = '';
+  document.getElementById('respond-overlay').classList.add('open');
+  // Scroll question to bottom so the most recent part (the actual ask) is visible
+  setTimeout(() => {
+    const qEl = document.getElementById('respond-question');
+    qEl.scrollTop = qEl.scrollHeight;
+    const ri = document.getElementById('respond-input');
+    ri.value = '';
+    _resetTextareaHeight(ri);
+    _initAutoResize(ri);
+    ri.focus();
+  }, 60);
+}
+
+function closeRespond() {
+  document.getElementById('respond-overlay').classList.remove('open');
+  respondTarget = null;
+}
+
+function sendRespond(text) {
+  if (!text || !respondTarget) return;
+  const sid = respondTarget;
+
+  // If it's a permission response (from waitingData), use permission_response event
+  if (waitingData[sid]) {
+    socket.emit('permission_response', {session_id: sid, action: text});
+  } else {
+    socket.emit('send_message', {session_id: sid, text: text});
+  }
+
+  // Optimistic UI update
+  delete waitingData[sid];
+  sessionKinds[sid] = 'working';
+  closeRespond();
+  showToast('Response sent');
+}
+
+async function submitRespond() {
+  const ri = document.getElementById('respond-input');
+  const text = ri.value.trim();
+  if (text) {
+    _resetTextareaHeight(ri);
+    await sendRespond(text);
+  }
+}
+
+document.getElementById('respond-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeRespond();
+});
+
+// Close modal on overlay click
+document.getElementById('rename-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeRename();
+});
+document.getElementById('git-sync-overlay').addEventListener('click', function(e) {
+  if (e.target !== this) return;
+  if (this.dataset.sticky === '1') return;  // results dialog: buttons only (see showGitSyncModal)
+  // During in-progress (no action buttons), minimize instead of close
+  const acts = document.getElementById('git-sync-actions');
+  if (acts && acts.children.length === 0) {
+    minimizeGitSyncModal();
+  } else {
+    closeGitSyncModal();
+  }
+});
