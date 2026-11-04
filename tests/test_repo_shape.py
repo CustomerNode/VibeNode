@@ -1,6 +1,6 @@
 """VibeNode's published shape is fixed: a change to it fails here and says where things go.
 
-The top level holds four folders and nine files. All code lives under src/, one
+The top level holds four folders and ten files. All code lives under src/, one
 folder per part of the app. Anything new finds a home inside one of them; the
 shape changes only by editing SHAPE below together with the top of .gitignore
 (the one list of what may be published), on purpose."""
@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SHAPE = {
     "folders": {"docs", "scripts", "src", "tests"},
     "files": {".gitattributes", ".gitignore", "CLAUDE.md", "CONTRIBUTING.md", "LICENSE",
-              "README.md", "pyproject.toml", "requirements.txt", "vibenode.py"},
+              "README.md", "pyproject.toml", "requirements.txt", "session_manager.py",
+              "vibenode.py"},
 }
 SRC = {"engine", "web", "shared", "launcher", "features"}
 FEATURES = {"pipeline", "experiments", "workforce", "__init__.py"}
@@ -56,6 +57,14 @@ def test_the_code_folder_is_the_approved_shape():
                                f"an agreed home first" if feats - FEATURES else f"missing {sorted(FEATURES - feats)}")
 
 
+def test_the_start_file_never_moves():
+    """Shortcuts, sign-in entries and the recovery helper of every installed copy
+    run session_manager.py at the top of the folder; moving it leaves them dead."""
+    start = ROOT / "session_manager.py"
+    assert start.is_file() and not start.is_symlink(), "session_manager.py must stay at the top"
+    assert '"src" / "launcher" / "session_manager.py"' in start.read_text(encoding="utf-8")
+
+
 def test_the_ignore_list_allows_exactly_the_shape():
     text = (ROOT / ".gitignore").read_text(encoding="utf-8")
     block = text[text.index("/*\n"):text.index("/docs/*\n")]
@@ -85,6 +94,7 @@ def test_the_bridge_keeps_old_spots_working(tmp_path):
     (tmp_path / "src" / "launcher" / "session_manager.py").write_text(
         "import sys; open(sys.argv[1], 'w').write('ran ' + ' '.join(sys.argv[2:]))\n", encoding="utf-8")
     # A folder the pull emptied still holds Python's caches; it is replaced by a link.
+    (tmp_path / "session_manager.py").write_text((ROOT / "session_manager.py").read_text())
     (tmp_path / "app" / "__pycache__").mkdir(parents=True)
     (tmp_path / "app" / "__pycache__" / "config.cpython-312.pyc").write_bytes(b"x")
     first = pu.bridge_old_layout(tmp_path)["made"]
@@ -106,6 +116,7 @@ def test_sign_in_entries_and_the_hook_are_repointed(tmp_path, monkeypatch):
     auto = home / ".config" / "autostart"
     auto.mkdir(parents=True)
     (auto / "vibenode.desktop").write_text(f"Exec=/usr/bin/python3 {proj}/session_manager.py --background\n")
+    (auto / "vibenode-reviver.desktop").write_text(f"Exec=/usr/bin/python3 {proj}/reviver.py\n")
     (home / ".claude").mkdir()
     (home / ".claude" / "settings.json").write_text(
         '{"hooks": {"Stop": [{"hooks": [{"command": "python3 -P %s/daemon/smart_termination_hook.py"}]}]}}'
@@ -113,6 +124,7 @@ def test_sign_in_entries_and_the_hook_are_repointed(tmp_path, monkeypatch):
     monkeypatch.delenv("APPDATA", raising=False)
     done = pu.repoint_entries(proj, home)
     assert len(done) == 2
-    assert f"{proj}/src/launcher/session_manager.py --background" in (auto / "vibenode.desktop").read_text()
+    assert f"{proj}/session_manager.py --background" in (auto / "vibenode.desktop").read_text()
+    assert f"{proj}/src/launcher/reviver.py" in (auto / "vibenode-reviver.desktop").read_text()
     assert "/src/engine/smart_termination_hook.py" in (home / ".claude" / "settings.json").read_text()
     assert pu.repoint_entries(proj, home) == []               # already pointing at the new home

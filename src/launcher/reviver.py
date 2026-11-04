@@ -280,7 +280,9 @@ def _spawn_reviver_process(extra_args: list[str] | None = None) -> None:
 
 def _launch_vibenode() -> None:
     """Spawn session_manager.py fully detached — mirrors launch.bat/launch.sh."""
-    entry = _LAUNCHER / "session_manager.py"
+    entry = _HERE / "session_manager.py"          # the start file that never moves
+    if not entry.exists():
+        entry = _LAUNCHER / "session_manager.py"
     if not entry.exists():
         _log("cannot launch: session_manager.py not found at %s" % entry)
         return

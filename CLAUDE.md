@@ -19,7 +19,7 @@ VibeNode is an open-source **public repository**. Everything committed is publis
 - No direct process management (no kill, taskkill, spawning terminals).
 
 ## Files
-- The shape is fixed (`tests/test_repo_shape.py`): at the top only `docs/`, `scripts/`, `src/`, `tests/` and nine files. Code lives in `src/`: `engine` (the Session Engine), `web` (the web server, its pages and browser code), `shared` (code both use), `launcher` (start and stop), `features` (Code Pipeline, experiments, the agent library). Run code from `src/` or with it on the path (`python -m engine.x` from `src/`); start the app with `python vibenode.py`.
+- The shape is fixed (`tests/test_repo_shape.py`): at the top only `docs/`, `scripts/`, `src/`, `tests/` and ten files. `session_manager.py` at the top is how every installed copy starts VibeNode: never move it. Code lives in `src/`: `engine` (the Session Engine), `web` (the web server, its pages and browser code), `shared` (code both use), `launcher` (start and stop), `features` (Code Pipeline, experiments, the agent library). Run code from `src/` or with it on the path (`python -m engine.x` from `src/`); start the app with `python vibenode.py`.
 - Plans, specs and working docs go in `docs/plans/` (gitignored), never the repo root.
 - Code near a `PERF-CRITICAL` marker was profiled: understand the reason in its comment before changing it, and ask if unsure.
 - Before editing a `.md` file in `src/features/workforce/`, read `src/features/workforce/AGENT_BEST_PRACTICES.md`.

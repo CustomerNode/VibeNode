@@ -134,7 +134,7 @@ def _autostart_entry() -> Path:
 
 
 def _autostart_body(entry: Path) -> str:
-    launcher = ROOT / "src" / "launcher" / "session_manager.py"
+    launcher = ROOT / "session_manager.py"      # the start file that never moves
     if sys.platform == "win32":
         py = Path(sys.executable)
         pyw = py.with_name("pythonw.exe")

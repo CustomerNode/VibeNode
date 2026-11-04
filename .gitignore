@@ -15,6 +15,7 @@
 !/pyproject.toml
 !/requirements.txt
 !/scripts/
+!/session_manager.py
 !/src/
 !/tests/
 !/vibenode.py
