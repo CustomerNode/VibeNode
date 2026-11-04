@@ -8,6 +8,7 @@ from engine import tool_guards as tg
 
 ROOT = pg.ROOT
 KEY = "AKIA" + "Q7" * 8          # AWS key shape, built here so the source stays clean
+SOFT = 'api_key = "' + "k" * 28 + '"'  # an assignment-style secret, still skipped in markdown
 
 
 def _src(rel):
@@ -40,8 +41,10 @@ def test_clean_text_ignored_folders_other_projects_and_other_tools_pass(tmp_path
 
 
 def test_the_scanner_s_own_skip_list_applies():
-    # Markdown is not content-scanned by Publish, so the guard lets it through as well.
-    assert pg.decide("Write", {"file_path": _src("README.md"), "content": KEY}) is None
+    # Markdown is not content-scanned for assignment-style secrets, so the guard lets one through.
+    assert pg.decide("Write", {"file_path": _src("README.md"), "content": SOFT}) is None
+    # But a strong, unmistakable secret is caught everywhere, markdown included.
+    assert pg.decide("Write", {"file_path": _src("README.md"), "content": KEY})
 
 
 def test_a_relative_path_resolves_against_the_session_folder():
@@ -73,7 +76,7 @@ def test_the_full_scan_still_reports_what_scan_text_finds(tmp_path):
     from web import git_scanner as g
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     (tmp_path / "a.py").write_text(f"k = '{KEY}'\n")
-    (tmp_path / "README.md").write_text(KEY)
+    (tmp_path / "README.md").write_text(SOFT)
     res = g.scan_staged_files(tmp_path)
     assert [(f["file"], f["line"], f["type"]) for f in res["findings"]] == [("a.py", 1, "AWS Access Key")]
     import json
@@ -123,7 +126,7 @@ def test_ordinary_words_are_not_the_owner(made_up_people):
 def test_the_full_scan_reads_skipped_files_for_identity_only(tmp_path, made_up_people):
     g = made_up_people
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    (tmp_path / "NOTES.md").write_text(f"{KEY}\nQuestion from Jordan\n")
+    (tmp_path / "NOTES.md").write_text(f"{SOFT}\nQuestion from Jordan\n")
     (tmp_path / "docs").mkdir()
     (tmp_path / "docs" / "shot.png").write_bytes(b"\x89PNG\x00\x00 Jordan ")
     res = g.scan_staged_files(tmp_path)
@@ -334,3 +337,38 @@ def test_parenthetical_and_change_dates_and_device_labels_are_caught():
     assert not g.scan_text("src/web/x.py", "ts = 'Sent from Mobile at ' + now")
     assert not g.scan_text("src/web/x.py", "created = '" + "2026-03-01" + "T10:00:00Z'")
     assert not g.scan_text("src/web/x.py", "# ubuntu runner from " + "2026-10-19" + ") exits 127")
+
+
+# ── Every-file personal-data checks (added to cover every conceivable piece of
+#    private or personal information). Triggers
+#    are assembled at run time so this file stays clean.
+
+def test_personal_data_is_caught_but_placeholders_are_not():
+    from web import git_scanner as g
+    s = g.scan_text
+    # Real email, phone, and a Tailscale machine FQDN are flagged.
+    assert [f["type"] for f in s("src/web/x.py", "write me at jdoe@gmail" + ".com")] == ["Email Address"]
+    assert [f["type"] for f in s("src/web/x.py", "call 415-555" + "-0137")] == ["Phone Number"]
+    assert [f["type"] for f in s("src/web/x.py", "ring +1 415 555" + " 0137")] == ["Phone Number"]
+    assert [f["type"] for f in s("src/web/x.py", "host = 'box.tail1ee172.ts" + ".net'")] == ["Tailnet Machine"]
+    # Reserved/example/noreply addresses, placeholder tailnets and decimals are not.
+    for clean in ["sam@example.com", "t@test.local", "customernode@users.noreply.github.com",
+                  "box.example.ts.net", "x.tail0000.ts.net", "d = '167.3125 and 191.8125'"]:
+        assert s("src/web/x.py", clean) == [], clean
+
+
+def test_personal_data_and_strong_secrets_are_checked_even_in_docs():
+    from web import git_scanner as g
+    # Markdown/docs are skipped for assignment-style secrets but NOT for personal
+    # data or a strong, unmistakable key.
+    assert [f["type"] for f in g.scan_text("docs/guide.md", "mail jdoe@gmail" + ".com")] == ["Email Address"]
+    assert any(f["type"] == "AWS Access Key" for f in g.scan_text("CLAUDE.md", "AKIA" + "Q7" * 8))
+    assert any(f["type"] == "Anthropic Key"
+               for f in g.scan_text("src/features/workforce/a.md", "sk-ant-" + "api03" + "A" * 24))
+
+
+def test_binary_bytes_are_not_mistaken_for_personal_data():
+    from web import git_scanner as g
+    # An image's random bytes can look like an address; images are left out of the
+    # text PII checks (a name planted in one is still caught by the identity rules).
+    assert g.scan_text("docs/screenshots/x.png", "o56U@a.UWwug Y@25W.nm") == []

@@ -408,6 +408,81 @@ def _identity_findings(content: str) -> list:
 
 _SCANNER_ITSELF = re.compile(r'src/web/git_scanner\.py$')
 
+# ── Personal data checked on EVERY file (notes/docs/guides included), the way
+# the identity and note rules are. A leaked email, phone, machine FQDN or a
+# real key is private wherever it sits, so these are not behind the skip list.
+# Binary files are left out (their bytes read as random text and coin false
+# emails); a name planted in an image is still caught by the identity rules.
+_BINARY_EXT = re.compile(r'\.(?:png|jpe?g|gif|ico|bmp|webp|woff2?|ttf|otf|eot|'
+                         r'pdf|zip|gz|tgz|mp4|mov|webm|wasm|so|dylib|dll)$', re.I)
+
+# Strong, prefix/structure-based secrets never false-fire on ordinary prose, so
+# they run everywhere — a key pasted into a markdown doc is just as exposed.
+_ALWAYS_SECRET_TYPES = frozenset({
+    "AWS Access Key", "Google API Key", "DigitalOcean Token", "GitHub Token",
+    "GitHub OAuth", "npm Token", "PyPI Token", "OpenAI Key", "Anthropic Key",
+    "Slack Token", "Stripe Key", "Private Key", "JWT Token"})
+
+
+def _email_reportable(m: str) -> bool:
+    """True for an email worth flagging. Reserved/example/test/noreply domains
+    are not personal data, so they pass."""
+    dom = m.split('@', 1)[1].lower()
+    if dom.endswith((".local", ".example", ".invalid", ".test")):
+        return False
+    if any(dom == d or dom.endswith('.' + d)
+           for d in ("example.com", "example.org", "example.net", "localhost")):
+        return False
+    if "noreply" in m.lower() or "no-reply" in m.lower():
+        return False
+    return True
+
+
+def _tailnet_reportable(m: str) -> bool:
+    """A Tailscale machine FQDN is a device name; the doc placeholders are not."""
+    return not any(x in m for x in ("example", "tail0000", "tail1234"))
+
+
+# (label, compiled pattern, description, reportable-predicate-or-None). The
+# email domain is required lowercase so random bytes and "Name.Case" tokens do
+# not read as addresses; a dash/space (not a dot) separates phone groups so a
+# decimal like "167.3125" is never a phone.
+_PII_PATTERNS = [
+    ("Email Address", re.compile(r'\b[A-Za-z0-9._%+-]+@[a-z0-9][a-z0-9.-]*\.[a-z]{2,24}\b'),
+     "A personal email address", _email_reportable),
+    ("Phone Number", re.compile(r'(?<![\d.\-])\d{3}-\d{3}-\d{4}(?![\d.\-])'),
+     "A phone number", None),
+    ("Phone Number", re.compile(r'\+\d{1,3}[ \-]\(?\d{2,4}\)?[ \-]\d{3,4}[ \-]\d{3,4}'),
+     "A phone number", None),
+    ("Tailnet Machine", re.compile(r'\b[a-z0-9][a-z0-9-]*\.(?:tail[0-9a-z]+|ts)\.net\b'),
+     "A Tailscale machine name (tailnet FQDN)", _tailnet_reportable),
+]
+
+
+def _pii_findings(norm: str, content: str) -> list:
+    """Personal data and strong secrets, checked on every non-binary file."""
+    if _BINARY_EXT.search(norm):
+        return []
+    # Blank the two-char escapes so "...\\n@decorator" is not read as an email
+    # and a name/label after one keeps its boundary (same length, no newline).
+    content = _ESCAPE.sub("  ", content)
+    out = []
+    for label, pattern, desc in _SECRET_PATTERNS:
+        if label not in _ALWAYS_SECRET_TYPES:
+            continue
+        for m in pattern.finditer(content):
+            matched = m.group(0)
+            out.append({"line": content[:m.start()].count('\n') + 1, "type": label,
+                        "desc": desc, "match": matched[:6] + '***'})
+    for label, pattern, desc, ok in _PII_PATTERNS:
+        for m in pattern.finditer(content):
+            matched = m.group(0)
+            if ok is not None and not ok(matched):
+                continue
+            out.append({"line": content[:m.start()].count('\n') + 1, "type": label,
+                        "desc": desc, "match": matched[:4] + '***'})
+    return out
+
 
 def skipped(norm: str) -> bool:
     """True when a file (forward-slash path from the repo root) is not content-scanned at all."""
@@ -427,10 +502,12 @@ def scan_text(norm: str, content: str) -> list:
     """
     if _SCANNER_ITSELF.search(norm):
         return []
-    out = _identity_findings(content) + _note_findings(content)
+    out = _identity_findings(content) + _note_findings(content) + _pii_findings(norm, content)
     if skipped(norm):
         return out
     for label, pattern, desc in _SECRET_PATTERNS:
+        if label in _ALWAYS_SECRET_TYPES:
+            continue      # already checked on every file by _pii_findings
         if any(stype == label and spat.search(norm) for spat, stype in _FINDING_SUPPRESSIONS):
             continue
         for match in pattern.finditer(content):
