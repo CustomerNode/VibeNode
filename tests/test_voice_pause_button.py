@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._browser import launch_chromium
+
 sync_api = pytest.importorskip("playwright.sync_api")
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,7 +63,7 @@ PAGE = """<!doctype html><html data-theme="dark"><head><style>{css}</style></hea
 def browser():
     with sync_api.sync_playwright() as p:
         try:
-            b = p.chromium.launch()
+            b = launch_chromium(p.chromium)
         except Exception as e:  # no Chromium installed
             pytest.skip(f"Chromium unavailable: {e}")
         yield b

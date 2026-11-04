@@ -130,7 +130,7 @@
     // tab instead of a popup.  What it points at decides, like any other page.
     if (u.pathname === '/api/preview/proxy' && (/\.ts\.net$/i.test(u.hostname) || _LOOPBACK.test(u.hostname))) {
       const inner = _reviewSrc(u.searchParams.get('u'));
-      if (inner) return inner;
+      if (inner || /\.ts\.net$/i.test(u.hostname)) return inner;
     }
     if (typeof location !== 'undefined' && u.host === location.host) return u.pathname + u.search + u.hash;
     if (_LOOPBACK.test(u.hostname)) {
@@ -139,6 +139,12 @@
       }
       return '/api/preview/proxy?u=' + encodeURIComponent(url);
     }
+    // A page on the owner's tailnet (another app on this machine served to
+    // the phone over Tailscale, e.g. https://<machine>.<tailnet>.ts.net:8796/):
+    // every device that runs VibeNode reaches it, so it is framed as itself,
+    // in the viewer, never a new tab.  Not through the proxy: that sends no
+    // cookies and sends the page's own script requests to VibeNode.
+    if (u.protocol === 'https:' && /\.ts\.net$/i.test(u.hostname)) return url;
     return '';
   }
 
@@ -1556,6 +1562,10 @@
     _syncCopySrc(container);
     _syncTiming();
     _tick();
+    // A summary that arrives live is drawn before its message is on the page,
+    // so the ticker above found no clock and never started: the summary sat on
+    // "running for 0:00".  Start it again once the message is in the thread.
+    if (fresh) { const again = () => { _syncTiming(); _tick(); }; setTimeout(again, 0); setTimeout(again, 400); setTimeout(again, 1500); }
     _hookSocket();
     requestAnimationFrame(() => { _syncDone(); _syncAnswered(); _queueSoon(); _syncEarlier(); });
   }
@@ -3050,20 +3060,85 @@
     return { text: (m ? m[3] : raw).replace(/\s+/g, ' ').trim() || raw, at: ts ? (ts < 1e12 ? ts * 1000 : ts) : 0,
       clock: (a.querySelector('.vn-auto-time, .msg-time') || {}).textContent || (m && m[1]) || '' };
   }
+  // ── One live Working summary at the bottom of the thread ──
+  // Each job notice wakes the session: it runs a few steps, writes a line or
+  // two, then a fresh Working summary.  Drawn as they come, the steps landed
+  // UNDER the summary and every wake added another copy of it.  While the
+  // newest summary is a Working one, everything automatic after it (steps,
+  // job notices, the session's short notes, send-back lines) and the earlier
+  // Working summaries of the same task with their in-between work are folded
+  // away; the summary's Live part says what the session is doing now and the
+  // feed lists the job's events.  Nothing is moved, only hidden, and a
+  // message from the user ends the fold.
+  const _FOLDABLE = '.vn-trail, .live-entry, .vn-auto-msg, .msg.user.vn-event-msg, .vn-sent-back, .vn-sb-group';
+  function _foldable(el) {
+    return el.matches(_FOLDABLE) || (el.matches('.msg.assistant') && !el.querySelector('.lm, .vn-card-ph'));
+  }
+  function _foldUnderWorking(newest) {
+    const log = newest && newest.closest('#live-log');
+    const folded = new Set();
+    let now = '';
+    const card = newest ? (_cardOf(newest) || {}) : {};
+    const msg = newest && newest.closest('.msg');
+    if (log && msg && msg.parentElement === log && card.type === 'working') {
+      const task = (card.zoom || {}).task || '';
+      for (let el = msg.nextElementSibling; el; el = el.nextElementSibling) {
+        if (el.matches('.vn-jump-wrap, .vn-thread-sentinel, .vn-verdict-strip')) continue;
+        if (!_foldable(el)) break;
+        folded.add(el);
+        if (el.matches('.vn-trail')) {
+          const t = (el.querySelector('.vt-lab') || {}).textContent || '';
+          if (t.trim()) now = t.trim();
+        } else if (el.matches('.msg.assistant')) {
+          const t = ((el.querySelector('.msg-body') || {}).textContent || '').replace(/\s+/g, ' ').trim();
+          if (t) now = t;
+        }
+      }
+      let pending = [];
+      for (let el = msg.previousElementSibling; el; el = el.previousElementSibling) {
+        if (_foldable(el)) { pending.push(el); continue; }
+        const lm = el.matches('.msg.assistant') ? el.querySelector('.lm[data-card]') : null;
+        const c = lm ? _cardOf(lm) : null;
+        if (c && c.type === 'working' && ((c.zoom || {}).task || '') === task) {
+          folded.add(el); pending.forEach(x => folded.add(x)); pending = [];
+          continue;
+        }
+        break;
+      }
+    }
+    document.querySelectorAll('.lm-folded').forEach(x => { if (!folded.has(x)) x.classList.remove('lm-folded'); });
+    folded.forEach(x => { if (!x.classList.contains('lm-folded')) x.classList.add('lm-folded'); });
+    return now;
+  }
+  function _paintNow(lv, text) {
+    const sid = typeof liveSessionId !== 'undefined' ? liveSessionId : '';
+    const kinds = typeof sessionKinds !== 'undefined' ? sessionKinds : {};
+    const working = !!(sid && kinds && kinds[sid] === 'working');
+    let el = lv.querySelector('.lm-now');
+    const want = working ? (text || 'Checking on the job') : '';
+    if (!want) { if (el) el.remove(); return; }
+    if (!el) { el = document.createElement('div'); el.className = 'lm-now'; el.innerHTML = '<b>Now</b><span></span>';
+      const after = lv.querySelector('.st-track') || lv.querySelector('.lm-live-h'); after.after(el); }
+    const sp = el.querySelector('span');
+    if (sp.textContent !== want) sp.textContent = want;
+  }
+
   let _liveSig = '';
   function _syncLive() {
-    const lives = [...document.querySelectorAll('.lm .lm-live')];
-    if (!lives.length) { _liveSig = ''; return; }
     const cards = [...document.querySelectorAll('.lm[data-card]')];
     const newest = cards[cards.length - 1];
+    const nowText = _foldUnderWorking(newest);
+    const lives = [...document.querySelectorAll('.lm .lm-live')];
+    if (!lives.length) { _liveSig = ''; return; }
     // A job's updates: background-job notices AND the lines a local script
     // posts through the message hook (a release page's events).
     const autos = [...document.querySelectorAll('.vn-auto-msg, .msg.user.vn-event-msg')];
     const now = Date.now();
-    lives.forEach(lv => { if (!newest || !newest.contains(lv)) lv.hidden = true; });
+    lives.forEach(lv => { if ((!newest || !newest.contains(lv)) && !lv.hidden) lv.hidden = true; });
     const lv = newest && newest.querySelector('.lm-live');
     if (!lv) return;
-    lv.hidden = false;
+    if (lv.hidden) lv.hidden = false;
+    _paintNow(lv, nowText);
     const sig = cards.length + ':' + autos.length + ':1:' + (lv._running ? lv._running.at : 0);
     if (sig !== _liveSig || !lv.dataset.filled) {
       _liveSig = sig; lv.dataset.filled = '1';
@@ -3095,8 +3170,10 @@
       lv.querySelectorAll('.st-track .s').forEach(s => { const i = Number(s.dataset.i);
         s.className = 's' + (i < done ? ' done' : i === at ? ' now' : ''); });
       const feed = lv.querySelector('.feed');
-      if (evs.length) feed.innerHTML = evs.slice(-3).reverse().map(e =>
+      const fh = evs.slice(-3).reverse().map(e =>
         '<li data-at="' + e.at + '"><time>' + esc(e.clock) + '</time><span>' + esc(e.text) + '</span><em class="ago"></em></li>').join('');
+      // Redraw only when the events changed: a redraw every 5 s made the summary flicker.
+      if (evs.length && feed.dataset.html !== fh) { feed.dataset.html = fh; feed.innerHTML = fh; }
     }
     _pollRunning(newest, lv, now);
     const first = lv.querySelector('.feed li[data-at]');
@@ -3128,10 +3205,15 @@
     const st = lv._running; if (!st) return;
     let box = lv.querySelector('.lm-run');
     if (!box) { box = document.createElement('div'); box.className = 'lm-run'; lv.insertBefore(box, lv.querySelector('.feed')); }
-    box.innerHTML = st.items.length ? st.items.map(it => '<div class="r" data-quiet="' + Number(it.quiet_s || 0) + '"' + (it.no_log || (it.foreground && !(it.lines || []).length) ? ' data-nolog="1"' : '') + '><div class="h"><i class="pulse"></i><b>' +
+    const html = st.items.length ? st.items.map(it => '<div class="r" data-quiet="' + Number(it.quiet_s || 0) + '"' + (it.no_log || (it.foreground && !(it.lines || []).length) ? ' data-nolog="1"' : '') + '><div class="h"><i class="pulse"></i><b>' +
         esc(it.what || 'Background job') + '</b><em class="ago"></em></div>' +
-        (it.lines || []).map(l => '<code>' + esc(l) + '</code>').join('') + '</div>').join('')
+        // Always three line slots, so the box never changes height.
+        (it.lines || []).slice(-3).concat(['', '', '']).slice(0, 3).map(l => '<code>' + esc(l) + '</code>').join('') + '</div>').join('')
       : '<div class="r none"><div class="h"><b>Nothing running in the background right now</b></div></div>';
+    // Same text, same box: rebuilding it every poll restarted the pulse and shook the layout.
+    const same = html.replace(/ data-quiet="\d+"/g, '');
+    if (box.dataset.html !== same) { box.dataset.html = same; box.innerHTML = html; }
+    else box.querySelectorAll('.r[data-quiet]').forEach((r, i) => { const q = String(Number((st.items[i] || {}).quiet_s || 0)); if (r.dataset.quiet !== q) r.dataset.quiet = q; });
     const empty = lv.querySelector('.feed li.empty');
     if (empty) empty.hidden = st.items.length > 0 || lv.querySelectorAll('.feed li[data-at]').length > 0;
     _paintRunAgo(lv, Date.now());

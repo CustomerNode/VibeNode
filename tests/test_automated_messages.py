@@ -19,6 +19,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests._browser import launch_chromium
+
 from shared.transcripts import automated_source
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -127,7 +129,7 @@ def page():
             "</script></body></html>")
     with pw.sync_playwright() as p:
         try:
-            browser = p.chromium.launch()
+            browser = launch_chromium(p.chromium)
         except Exception as exc:  # pragma: no cover - no browser installed
             pytest.skip(f"no Chromium: {exc}")
         pg = browser.new_page()

@@ -125,7 +125,26 @@ _MOBILE_MAX_WIDTH = 600   # at or below this, emulate a phone (touch + mobile UA
 _MOBILE_DEVICE = "iPhone 13"
 
 
+# A render whose browser was killed from outside (another project's test
+# runner sweeping "orphaned" Playwright browsers by their shared profile name
+# sends SIGTERM to this one too) or whose load Chromium aborted on a network
+# interface change never looked at the page: it is tried once more.
+_RETRYABLE = ("has been closed", "ERR_NETWORK_CHANGED")
+
+
 def _render_with_playwright(url: str, out: Path, width: int, height: int, wait_ms: int):
+    """``_render_once``, tried a second time when the first attempt died for a
+    reason outside the page (see ``_RETRYABLE``)."""
+    try:
+        return _render_once(url, out, width, height, wait_ms)
+    except RuntimeError as e:
+        if not any(m in str(e) for m in _RETRYABLE):
+            raise
+        _log.info("preview: render interrupted (%s); trying once more", e)
+        return _render_once(url, out, width, height, wait_ms)
+
+
+def _render_once(url: str, out: Path, width: int, height: int, wait_ms: int):
     """Render with Playwright device emulation. Returns a dict describing the
     render, or None when Playwright (or its browser) is unavailable so the
     caller falls back to the Chrome CLI. Exceptions from a page that will not

@@ -381,7 +381,7 @@ window.fetch=(u)=>{{ window.__asked.push(u); return Promise.resolve({{ok:true, j
     try:
         page.goto(f.as_uri(), wait_until="load")
         page.wait_for_function("document.querySelector('.lm-run .r b') && document.querySelector('.lm-run .r b').textContent === 'Run the release'")
-        assert page.locator(".lm-run code").inner_text() == "Unit tests: 1,200 of 4,100"
+        assert page.locator(".lm-run code").first.inner_text() == "Unit tests: 1,200 of 4,100"
         assert page.evaluate("window.__asked[0]") == "/api/session-live/s1"
         assert page.locator(".lm-live .feed li.empty").is_hidden()
         assert page.locator(".lm-run .ago").inner_text() in ("printing now", "last output 5s ago", "last output 6s ago")
@@ -423,3 +423,85 @@ window.fetch=(u)=>Promise.resolve({{ok:true, json:()=>Promise.resolve({{running:
         assert "running for" in page.locator(".tm-figs").inner_text().lower()
     finally:
         page.close()
+
+
+def test_a_summary_drawn_before_it_is_on_the_page_still_ticks(browser, tmp_path):
+    # A live summary is drawn into a detached message first; the clock must
+    # still start once the message lands, never sit on 0:00.
+    now = int(time.time())
+    f = tmp_path / "detached.html"
+    card = _working(eta_minutes=20)
+    f.write_text(f"""<!doctype html><html><head><meta charset="utf-8"></head><body><div id="live-log"></div>
+<script src="{LAST_CARD.as_uri()}"></script>
+<script>const box=document.createElement('div'); box.innerHTML={json.dumps(_card_msg(card, now - 90))};
+VNLastCard.renderIn(box); document.getElementById('live-log').appendChild(box.firstElementChild);</script></body></html>""", encoding="utf-8")
+    page = browser.new_page()
+    try:
+        page.goto(f.as_uri(), wait_until="load")
+        page.wait_for_function("(()=>{const n=document.querySelector('.tm [data-f=since]'); return n && n.textContent !== '0:00';})()")
+    finally:
+        page.close()
+
+
+def test_history_read_from_disk_keeps_each_messages_time():
+    # Without the time a Working summary read from disk had no clock at all.
+    from web.routes import ws_events
+    line = json.dumps({"type": "assistant", "timestamp": "2026-01-02T03:04:05.000Z",
+                       "message": {"content": [{"type": "text", "text": "hi"}]}})
+    got = ws_events._parse_raw_line(line)
+    assert got and abs(got[0]["timestamp"] - 1767323045.0) < 1
+
+
+def _plain_msg(cls, text, ts):
+    return f'<div class="{cls}" data-ts="{ts}"><div class="msg-body">{text}</div></div>'
+
+
+def test_work_after_a_working_summary_folds_into_it(browser, tmp_path):
+    # Each job notice woke the session; its steps and notes landed UNDER the
+    # Working summary and every wake added another copy of the summary.
+    now = int(time.time())
+    w1, w2 = _working(eta_minutes=30), _working(eta_minutes=40)
+    log = (_plain_msg("msg user", "Merge it", now - 900) + _card_msg(w1, now - 800)
+           + _event("gate failed", now - 600)
+           + '<div class="vn-trail" id="t1"><span class="vt-lab">Read the gate log</span></div>'
+           + _plain_msg("msg assistant", "Re-running with a fresh stack.", now - 590)
+           + _card_msg(w2, now - 580)
+           + '<div class="vn-trail" id="t2"><span class="vt-lab">Read the stack log</span></div>'
+           + _plain_msg("msg assistant", "Checking the stack.", now - 10))
+    f = tmp_path / "fold.html"
+    f.write_text(f"""<!doctype html><html><head><meta charset="utf-8"><style>.lm-folded{{display:none!important}}</style></head><body><div id="live-log">{log}</div>
+<script>var liveSessionId='s1', sessionKinds={{s1:'working'}}; window.fetch=()=>Promise.resolve({{ok:true, json:()=>Promise.resolve({{running:[]}})}});</script>
+<script src="{LAST_CARD.as_uri()}"></script>
+<script>VNLastCard.renderIn(document.getElementById('live-log'));</script></body></html>""", encoding="utf-8")
+    page = browser.new_page()
+    try:
+        page.goto(f.as_uri(), wait_until="load")
+        page.wait_for_function("document.querySelector('.lm-now span') && document.querySelector('.lm-now span').textContent === 'Checking the stack.'")
+        shown = page.evaluate("[...document.getElementById('live-log').children].filter(e => !e.classList.contains('lm-folded')).map(e => e.querySelector('.lm') ? 'card' : (e.className.split(' ')[1] || e.className))")
+        assert shown == ["user", "card"]
+        assert page.evaluate("document.querySelectorAll('.lm').length") == 2
+    finally:
+        page.close()
+
+
+def test_the_job_box_keeps_its_height_whatever_the_job_prints(browser, tmp_path):
+    # A long log line wrapped differently on every poll and the summary jumped.
+    now = int(time.time())
+    css = (LAST_CARD.parents[1] / "css" / "last-card.css").as_uri()
+
+    def height(lines):
+        f = tmp_path / f"height{len(lines)}.html"
+        f.write_text(f"""<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="{css}"></head><body style="width:400px"><div id="live-log">{_card_msg(_working(eta_minutes=20), now - 60)}</div>
+<script>var liveSessionId='s1', sessionKinds={{s1:'working'}};
+window.fetch=()=>Promise.resolve({{ok:true, json:()=>Promise.resolve({{running:[{{id:'b1', what:'Gate', lines:{json.dumps(lines)}, quiet_s:1}}]}})}});</script>
+<script src="{LAST_CARD.as_uri()}"></script>
+<script>VNLastCard.renderIn(document.getElementById('live-log'));</script></body></html>""", encoding="utf-8")
+        page = browser.new_page()
+        try:
+            page.goto(f.as_uri(), wait_until="load")
+            page.wait_for_function("document.querySelector('.lm-run code')")
+            return page.evaluate("document.querySelector('.lm-run .r').offsetHeight")
+        finally:
+            page.close()
+
+    assert height(["x" * 600]) == height(["a", "b", "c"]) == height(["one"])

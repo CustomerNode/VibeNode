@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._browser import launch_chromium
+
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL = ROOT / "src" / "web" / "static" / "js" / "voice-local.js"
 SENTENCE = ("Fix the login page so that the header lines up with the sidebar, "
@@ -38,7 +40,7 @@ def test_the_real_model_transcribes_a_clip_inside_the_browser(tmp_path):
                  "window.__go = async () => { const b = await (await fetch('/clip.wav')).blob();"
                  " return await VoiceLocal.transcribeBlob(b); };</script>")
     with pw.sync_playwright() as p:
-        b = p.chromium.launch()
+        b = launch_chromium(p.chromium)
         pg = b.new_page()
         pg.route("http://vn.test/", lambda r: r.fulfill(body=page_html, content_type="text/html"))
         pg.route("http://vn.test/voice-local.js", lambda r: r.fulfill(body=LOCAL.read_bytes(), content_type="text/javascript"))

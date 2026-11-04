@@ -150,3 +150,31 @@ def test_playwright_page_failure_is_a_clear_500(client, monkeypatch):
     r = client.post("/api/preview/render", json={"url": "http://localhost:1/"})
     assert r.status_code == 500
     assert "ERR_CONNECTION_REFUSED" in r.get_json()["error"]
+
+
+def test_a_render_whose_browser_was_killed_from_outside_is_tried_once_more(monkeypatch, tmp_path):
+    calls = []
+
+    def once(*a):
+        calls.append(a)
+        if len(calls) == 1:
+            raise RuntimeError("BrowserContext.new_page: Target page, context or browser has been closed")
+        return {"renderer": "playwright"}
+
+    monkeypatch.setattr(preview_api, "_render_once", once)
+    assert preview_api._render_with_playwright("http://x/", tmp_path / "a.png", 800, 600, 0) == \
+        {"renderer": "playwright"}
+    assert len(calls) == 2
+
+
+def test_a_page_that_will_not_load_is_not_retried(monkeypatch, tmp_path):
+    calls = []
+
+    def once(*a):
+        calls.append(a)
+        raise RuntimeError("Page.goto: net::ERR_CONNECTION_REFUSED")
+
+    monkeypatch.setattr(preview_api, "_render_once", once)
+    with pytest.raises(RuntimeError, match="REFUSED"):
+        preview_api._render_with_playwright("http://x/", tmp_path / "a.png", 800, 600, 0)
+    assert len(calls) == 1

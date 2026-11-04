@@ -61,7 +61,8 @@ def _run(host):
     reply = {"screens": [SCREEN]}
     t = {"src": [LIVE, "http://localhost:8000/app/x#top", "http://127.0.0.1:5050/static/scratch/x.html",
                  "https://example.com/page", "http://[::1]:3001/", "http://localhost:5050/static/scratch/x.html#b",
-                 "https://my-pc.tail1234.ts.net/api/preview/proxy?u=http%3A%2F%2F127.0.0.1%3A41791%2F"],
+                 "https://my-pc.tail1234.ts.net/api/preview/proxy?u=http%3A%2F%2F127.0.0.1%3A41791%2F",
+                 "https://my-pc.tail1234.ts.net:8796/app/journeys", "http://my-pc.tail1234.ts.net:8796/x"],
          "themed": [LIVE + "#v-b", "http://127.0.0.1:8000/app/x?theme=light"],
          "card": _card(),
          # A Decide card draws no screenshots, so the picture
@@ -106,6 +107,16 @@ def test_a_card_written_for_the_phone_opens_on_both(desk, phone):
     # the Mobile Command address + the proxy: as itself here, by the proxy there
     assert desk["src"][6] == "http://127.0.0.1:41791/"
     assert phone["src"][6] == "/api/preview/proxy?u=http%3A%2F%2F127.0.0.1%3A41791%2F"
+
+
+def test_a_tailnet_page_on_another_port_opens_in_the_viewer(desk, phone):
+    # a Validate row pointing at another app's Tailscale address: framed as
+    # itself on both devices, never '' (which opened a new tab)
+    url = "https://my-pc.tail1234.ts.net:8796/app/journeys"
+    assert desk["src"][7] == url
+    assert phone["src"][7] == url
+    # plain http on the tailnet is not a Tailscale serve address
+    assert desk["src"][8] == ""
 
 
 def test_a_framed_app_is_told_the_theme_on_its_address(desk):

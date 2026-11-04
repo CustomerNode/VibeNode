@@ -28,6 +28,8 @@ KNOBS = [
     # Publish scan write guard (src/engine/publish_guard.py)
     ("VIBENODE_PUBLISH_GUARD", "Publish scan", "1",
      "Set to 0 to let sessions write text the Publish scan would refuse (names, keys) into this repository."),
+    ("VIBENODE_USER_WORDS_GUARD", "Publish scan", "1",
+     "Set to 0 to let sessions copy runs of the user's own message text into tracked files of this repository."),
     # Stall watchdog (health_monitor.py jobs 1-3)
     ("VIBENODE_STALL_MINUTES", "Stall watchdog", "10",
      "Minutes of zero output before a WORKING session counts as stalled."),

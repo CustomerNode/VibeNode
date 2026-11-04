@@ -7,6 +7,8 @@ import pathlib
 
 import pytest
 
+from tests._browser import launch_chromium
+
 sync_api = pytest.importorskip("playwright.sync_api")
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -24,7 +26,7 @@ CARD = {"type": "done", "title": "Dark mode switch", "path": ["Settings"],
 def page():
     with sync_api.sync_playwright() as p:
         try:
-            b = p.chromium.launch()
+            b = launch_chromium(p.chromium)
         except Exception as e:  # no browser installed
             pytest.skip(f"no Chromium: {e}")
         pg = b.new_page()

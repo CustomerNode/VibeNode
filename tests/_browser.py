@@ -140,6 +140,81 @@ def _launch_args() -> list:
             "--num-raster-threads=1"]
 
 
+# ── a browser no other project's cleanup mistakes for its own ──────────────
+# Playwright gives every browser it launches a temporary profile named
+# "playwright_chromiumdev_profile-XXXX", and that name is on the browser's
+# command line.  Other projects' test runners on the same machine sweep
+# "orphaned" browsers by matching that name, so a sweep that ran while this
+# suite ran sent SIGTERM to every test browser at once (exit code 143): about
+# 200 browser tests failed or errored with "Target page, context or browser
+# has been closed", and passed when run again.  On POSIX the browser is started
+# through a small wrapper that hands Chromium the same profile through a link
+# with a VibeNode name, so the command line carries no shared name.  Nothing
+# else about the launch changes.
+_WRAP_NAME = "vibenode-test-browser"
+_WRAPPER = r"""#!/bin/sh
+for a; do shift
+  case $a in --user-data-dir=*playwright_chromiumdev_profile-*)
+    d=${a#--user-data-dir=}; base=${d%/*}
+    for s in "$base"/__NAME__-*; do [ -L "$s" ] && [ ! -e "$s" ] && rm -f "$s"; done
+    l="$base/__NAME__-${d##*-}"; ln -sfn "$d" "$l"; a="--user-data-dir=$l";;
+  esac
+  set -- "$@" "$a"
+done
+exec '__REAL__' "$@"
+"""
+
+
+def _headless_shell(browser_type):
+    """The headless build Playwright itself would start, or None."""
+    import glob
+    import os
+    import re
+    full = browser_type.executable_path
+    m = re.search(r"[\\/]chromium-(\d+)[\\/]", full)
+    if not m:
+        return None
+    root = full[:m.start()]
+    found = glob.glob(os.path.join(root, f"chromium_headless_shell-{m.group(1)}", "*",
+                                   "chrome-headless-shell"))
+    return found[0] if found and os.access(found[0], os.X_OK) else None
+
+
+def _wrapper_for(real):
+    import hashlib
+    import os
+    import tempfile
+    if "'" in real:
+        return None
+    body = _WRAPPER.replace("__NAME__", _WRAP_NAME).replace("__REAL__", real)
+    tag = hashlib.sha256(body.encode()).hexdigest()[:12]
+    path = os.path.join(tempfile.gettempdir(), f"{_WRAP_NAME}-{os.getuid()}-{tag}.sh")
+    if not os.path.exists(path):
+        tmp = f"{path}.{os.getpid()}"
+        with open(tmp, "w") as fh:
+            fh.write(body)
+        os.chmod(tmp, 0o700)
+        os.replace(tmp, path)
+    return path
+
+
+def launch_chromium(browser_type, **kwargs):
+    """``browser_type.launch(**kwargs)``, with no shared profile name on the
+    command line on POSIX (see above).  Falls back to a plain launch when the
+    headless build cannot be found or the caller chose its own executable."""
+    import os
+    if (os.name == "posix" and kwargs.get("headless", True)
+            and "executable_path" not in kwargs and "channel" not in kwargs):
+        try:
+            real = _headless_shell(browser_type)
+            wrapper = _wrapper_for(real) if real else None
+        except Exception:
+            wrapper = None
+        if wrapper:
+            return browser_type.launch(executable_path=wrapper, **kwargs)
+    return browser_type.launch(**kwargs)
+
+
 def shared_browser():
     """This worker's browser, started on first use; skips if unavailable."""
     if _shared["browser"] is None:
@@ -147,7 +222,7 @@ def shared_browser():
         pw = pytest.importorskip("playwright.sync_api", reason="playwright not installed")
         mgr = pw.sync_playwright().start()
         try:
-            browser = mgr.chromium.launch(args=_launch_args())
+            browser = launch_chromium(mgr.chromium, args=_launch_args())
         except Exception as exc:  # browser binary not downloaded on this machine
             mgr.stop()
             pytest.skip(f"chromium unavailable: {str(exc).splitlines()[0][:80]}")
@@ -202,6 +277,18 @@ def _warm_class(page_class):
             return page_class.expose_binding(self, *a, **k)
 
         # route: _reset_page's unroute_all takes those off.
+
+        def goto(self, *a, **k):
+            # Chromium aborts a navigation in flight when a network interface
+            # changes (a VPN or virtual-machine link going up or down), even
+            # one to localhost: ERR_NETWORK_CHANGED.  The page was never
+            # loaded, so loading it again tests exactly the same thing.
+            try:
+                return page_class.goto(self, *a, **k)
+            except Exception as exc:
+                if "ERR_NETWORK_CHANGED" not in str(exc):
+                    raise
+                return page_class.goto(self, *a, **k)
 
         def route_from_har(self, *a, **k):
             self._vn.retire = True

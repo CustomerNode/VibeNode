@@ -565,11 +565,20 @@ def test_an_order_from_another_device_resorts_this_sidebar(browser):
         app.close()
 
 
+# Headless Chromium sends one trusted mouse move at (0, 0) about 50 ms after a
+# page loads, even in a touch-only context; a phone has no mouse and never does.
+# Whether sessions.js was listening by then is a race, so the touch page drops
+# mouse moves before the app sees them: the page is what a phone would show.
+_NO_MOUSE = """for (const t of ['pointermove', 'mousemove'])
+  window.addEventListener(t, e => { if (e.pointerType !== 'touch') e.stopImmediatePropagation(); }, true);"""
+
+
 @pytest.mark.slow
 def test_a_touch_screen_shows_only_pinned_pins(browser):
     rows = _sessions(pinned_index=1)
     app = FakeApp(browser, rows, viewport={"width": 390, "height": 844},
-                  context={"is_mobile": True, "has_touch": True}, clock=True)
+                  context={"is_mobile": True, "has_touch": True}, clock=True,
+                  init=_NO_MOUSE + "\n" + init_script())
     try:
         if not app.eval("() => matchMedia('(hover: none)').matches"):
             pytest.skip("this Chromium does not emulate a touch-only screen")

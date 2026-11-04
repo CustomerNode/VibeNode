@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._browser import launch_chromium
+
 sync_api = pytest.importorskip("playwright.sync_api")
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -22,7 +24,7 @@ CARD = {"type": "done", "title": "Night theme", "headline": "The night theme is 
 def page():
     with sync_api.sync_playwright() as p:
         try:
-            b = p.chromium.launch()
+            b = launch_chromium(p.chromium)
         except Exception as e:  # no browser installed
             pytest.skip(f"no Chromium: {e}")
         pg = b.new_page()

@@ -317,7 +317,28 @@ def _parse_raw_line(raw: str) -> list:
                         "name": block.get("name", ""),
                         "desc": desc,
                     })
+    # When it was written (epoch seconds, as the Session Engine sends it).  A
+    # session read from disk lost this, so a Working summary had no start
+    # time and its clock and live progress never drew (last-card.js reads
+    # the message's data-ts).
+    ts = _entry_time(obj)
+    if ts:
+        for e in entries:
+            e.setdefault("timestamp", ts)
     return entries
+
+
+def _entry_time(obj) -> float:
+    raw = obj.get("timestamp") if isinstance(obj, dict) else None
+    if isinstance(raw, (int, float)):
+        return float(raw) / 1000.0 if raw > 1e12 else float(raw)
+    if not isinstance(raw, str) or not raw:
+        return 0.0
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def _parse_jsonl_entries(app, session_id: str, since: int = 0, project: str = "",
