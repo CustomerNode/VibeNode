@@ -176,7 +176,7 @@ def test_the_note_is_written_shown_and_edited_on_both_sides(browser):
     # A change from the other side is announced and kept for the call's menu.
     app.push("pf_note", dict(st["in"][0], note="Pinned the clock", note_by="Priya"))
     app.page.wait_for_function("PF.state().incoming[0].note === 'Pinned the clock'")
-    assert "Pinned the clock" in app.page.inner_text("#toast")
+    app.page.wait_for_function("(document.getElementById('toast') || {}).innerText && document.getElementById('toast').innerText.includes('Pinned the clock')")
     assert not app.errors
 
 
