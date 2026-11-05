@@ -14311,6 +14311,18 @@ header #git-badge-push svg, header #git-badge-pull svg, header #git-badge-sync s
   .hp-cta svg { width: 12px; height: 12px; }
 }
 
+/* Open Sessions: the homepage's main way in, a large full-width button on every screen size.
+   ".homepage-card.hp-sessions" outranks the desktop block's ".hp-sessions .hp-cta" rules above. */
+.homepage-card.hp-sessions .hp-cta {
+  align-self: stretch; justify-content: center; box-sizing: border-box;
+  padding: 15px 20px; margin-top: 6px; border-radius: 12px;
+  background: var(--accent); color: #fff !important;
+  font-size: 16px; font-weight: 600; gap: 8px;
+  box-shadow: 0 4px 16px rgba(88,166,255,.28);
+}
+.homepage-card.hp-sessions .hp-cta svg { width: 18px; height: 18px; }
+.homepage-card.hp-sessions:hover .hp-cta { color: #fff; filter: brightness(1.1); gap: 12px; }
+
 /* "Beta" marker: Workforce and Subsessions, in the view picker and on their homepage cards */
 .beta-tag { display: inline-block; vertical-align: middle; margin-left: 6px; padding: 1px 6px 2px; border-radius: 5px;
   font-family: var(--font-sans); font-size: 9.5px; font-weight: 600; letter-spacing: .07em; line-height: 1.4; text-transform: uppercase;
