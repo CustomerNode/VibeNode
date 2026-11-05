@@ -223,6 +223,8 @@ BEGIN
         RAISE EXCEPTION 'not_allowed' USING ERRCODE = '42501';
     END IF;
     UPDATE org_members SET removed_at = now() WHERE id = t.id;
+    PERFORM pf_bump_share(s.id) FROM pf_shared_sessions s
+      WHERE s.owner_id = t.id OR EXISTS (SELECT 1 FROM pf_grants g WHERE g.share_id = s.id AND g.guest_id = t.id);
     UPDATE pf_grants g SET revoked_at = now()
       FROM pf_shared_sessions s
      WHERE g.share_id = s.id AND g.revoked_at IS NULL AND (g.guest_id = t.id OR s.owner_id = t.id);
@@ -257,6 +259,7 @@ BEGIN
       FROM pf_shared_sessions s
      WHERE g.id = p_grant AND g.share_id = s.id AND s.owner_id = m.id;
     GET DIAGNOSTICS n = ROW_COUNT;
+    IF n > 0 THEN PERFORM pf_bump_share((SELECT share_id FROM pf_grants WHERE id = p_grant)); END IF;
     RETURN n > 0;
 END $$;
 
@@ -297,6 +300,31 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, extensions AS $$
         'note_by', (SELECT username FROM org_members WHERE id = coalesce(g.note_by, s.owner_id)))
 $$;
 
+-- A change counter per member, so a VibeNode that checks often learns "nothing
+-- changed" from one tiny lookup instead of re-reading its calls and threads.
+-- Every function that changes what a member would see bumps it, once per call.
+CREATE TABLE IF NOT EXISTS pf_changes (
+    member_id UUID PRIMARY KEY REFERENCES org_members(id) ON DELETE CASCADE,
+    v         BIGINT NOT NULL DEFAULT 0
+);
+ALTER TABLE pf_changes ENABLE ROW LEVEL SECURITY;
+CREATE INDEX IF NOT EXISTS pf_posts_kind_time ON pf_posts (share_id, kind, created_at);
+CREATE INDEX IF NOT EXISTS pf_grants_share ON pf_grants (share_id);
+
+CREATE OR REPLACE FUNCTION pf_bump(p_member UUID) RETURNS VOID
+LANGUAGE sql SECURITY DEFINER SET search_path = public, extensions AS $$
+    INSERT INTO pf_changes (member_id, v) VALUES (p_member, 1)
+    ON CONFLICT (member_id) DO UPDATE SET v = pf_changes.v + 1
+$$;
+
+-- Bump the owner of a shared session and everyone holding a call on it.
+CREATE OR REPLACE FUNCTION pf_bump_share(p_share UUID) RETURNS VOID
+LANGUAGE sql SECURITY DEFINER SET search_path = public, extensions AS $$
+    SELECT pf_bump(x.id) FROM (
+        SELECT owner_id AS id FROM pf_shared_sessions WHERE id = p_share
+        UNION SELECT guest_id FROM pf_grants WHERE share_id = p_share) x
+$$;
+
 -- Open one of your sessions to one member. p_minutes NULL = until revoked.
 -- p_project has a default so a VibeNode that does not send it still calls
 -- this one function (the eight-argument version it replaced is dropped).
@@ -328,6 +356,7 @@ BEGIN
          VALUES (s.id, p_guest, p_level, coalesce(p_note, ''),
                  CASE WHEN p_minutes IS NULL THEN NULL ELSE now() + make_interval(mins => p_minutes) END)
       RETURNING * INTO g;
+    PERFORM pf_bump_share(s.id);
     RETURN pf_grant_json(g, s);
 END $$;
 
@@ -340,6 +369,7 @@ BEGIN
      WHERE g.id = p_grant AND g.share_id = s.id AND g.revoked_at IS NULL
        AND (s.owner_id = m.id OR g.guest_id = m.id);
     GET DIAGNOSTICS n = ROW_COUNT;
+    IF n > 0 THEN PERFORM pf_bump_share((SELECT share_id FROM pf_grants WHERE id = p_grant)); END IF;
     RETURN n > 0;
 END $$;
 
@@ -359,6 +389,7 @@ BEGIN
         RAISE EXCEPTION 'no_access' USING ERRCODE = '42501';
     END IF;
     UPDATE pf_grants SET note = p_note, note_by = m.id, note_at = now() WHERE id = g.id RETURNING * INTO g;
+    PERFORM pf_bump_share(s.id);
     RETURN pf_grant_json(g, s);
 END $$;
 
@@ -399,6 +430,7 @@ BEGIN
         END LOOP;
     END IF;
     UPDATE pf_shared_sessions SET last_seq = n, status = coalesce(p_status, status) WHERE id = s.id;
+    PERFORM pf_bump_share(s.id);
     RETURN n;
 END $$;
 
@@ -445,6 +477,7 @@ BEGIN
          VALUES (s.id, n, 'guest_msg', m.id, g.id,
                  jsonb_build_object('text', p_text, 'level', g.level));
     UPDATE pf_shared_sessions SET last_seq = n WHERE id = s.id;
+    PERFORM pf_bump_share(s.id);
     RETURN n;
 END $$;
 
@@ -470,11 +503,18 @@ END $$;
 -- the calls it gave and holds, friends' new messages on its sessions, and the
 -- new posts of each phoned session after the cursor it sends
 -- (p_cursors: {share_id: last seq seen}; a session not in it starts at 0).
-CREATE OR REPLACE FUNCTION pf_sync(p_token TEXT, p_cursors JSONB, p_inbox_since TIMESTAMPTZ, p_days INT)
+DROP FUNCTION IF EXISTS pf_sync(TEXT, JSONB, TIMESTAMPTZ, INT);
+CREATE OR REPLACE FUNCTION pf_sync(p_token TEXT, p_cursors JSONB, p_inbox_since TIMESTAMPTZ, p_days INT,
+                                   p_seen BIGINT DEFAULT NULL)
 RETURNS JSONB
 LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, extensions AS $$
-DECLARE m org_members := orgs_member(p_token); posts JSONB := '{}'::jsonb; k TEXT; after BIGINT;
+DECLARE m org_members := orgs_member(p_token); posts JSONB := '{}'::jsonb; k TEXT; after BIGINT; cur BIGINT;
 BEGIN
+    -- Nothing changed for this member since the counter it last saw: say so.
+    cur := coalesce((SELECT v FROM pf_changes WHERE member_id = m.id), 0);
+    IF p_seen IS NOT NULL AND p_seen = cur THEN
+        RETURN jsonb_build_object('unchanged', true, 'v', cur);
+    END IF;
     -- Every phoned session with a live call to this member: its posts after
     -- the cursor sent for it (0 for one not seen yet).
     FOR k, after IN
@@ -490,6 +530,7 @@ BEGIN
              ORDER BY p.seq LIMIT 300) x), '[]'::jsonb));
     END LOOP;
     RETURN jsonb_build_object(
+        'v', cur,
         'in', pf_grants_list(p_token, 'in', p_days),
         'out', pf_grants_list(p_token, 'out', p_days),
         'inbox', pf_inbox(p_token, p_inbox_since),
@@ -501,7 +542,7 @@ END $$;
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated;
 REVOKE EXECUTE ON FUNCTION orgs_hash(TEXT), orgs_new_secret(), orgs_member(TEXT),
     pf_grant_live(pf_grants), pf_grant_json(pf_grants, pf_shared_sessions),
-    orgs_create(TEXT, TEXT) FROM PUBLIC, anon, authenticated;
+    orgs_create(TEXT, TEXT), pf_bump(UUID), pf_bump_share(UUID) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION orgs_create(TEXT, TEXT) TO service_role;
 REVOKE EXECUTE ON FUNCTION orgs_me(TEXT), orgs_members(TEXT), orgs_create_invite(TEXT, INT),
     orgs_redeem_invite(TEXT, TEXT), orgs_revoke_invites(TEXT), orgs_remove_member(TEXT, UUID),
@@ -509,7 +550,7 @@ REVOKE EXECUTE ON FUNCTION orgs_me(TEXT), orgs_members(TEXT), orgs_create_invite
     pf_grants_list(TEXT, TEXT, INT), pf_post(TEXT, UUID, JSONB, TEXT),
     pf_read(TEXT, UUID, BIGINT, INT, BIGINT), pf_guest_message(TEXT, UUID, TEXT),
     pf_inbox(TEXT, TIMESTAMPTZ), pf_set_note(TEXT, UUID, TEXT),
-    pf_sync(TEXT, JSONB, TIMESTAMPTZ, INT), orgs_set_key(TEXT, TEXT),
+    pf_sync(TEXT, JSONB, TIMESTAMPTZ, INT, BIGINT), orgs_set_key(TEXT, TEXT),
     pf_set_wrapped(TEXT, UUID, TEXT, INT), pf_prune(TEXT, INT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION orgs_me(TEXT), orgs_members(TEXT), orgs_create_invite(TEXT, INT),
     orgs_redeem_invite(TEXT, TEXT), orgs_revoke_invites(TEXT), orgs_remove_member(TEXT, UUID),
@@ -517,7 +558,7 @@ GRANT EXECUTE ON FUNCTION orgs_me(TEXT), orgs_members(TEXT), orgs_create_invite(
     pf_grants_list(TEXT, TEXT, INT), pf_post(TEXT, UUID, JSONB, TEXT),
     pf_read(TEXT, UUID, BIGINT, INT, BIGINT), pf_guest_message(TEXT, UUID, TEXT),
     pf_inbox(TEXT, TIMESTAMPTZ), pf_set_note(TEXT, UUID, TEXT),
-    pf_sync(TEXT, JSONB, TIMESTAMPTZ, INT), orgs_set_key(TEXT, TEXT),
+    pf_sync(TEXT, JSONB, TIMESTAMPTZ, INT, BIGINT), orgs_set_key(TEXT, TEXT),
     pf_set_wrapped(TEXT, UUID, TEXT, INT), pf_prune(TEXT, INT) TO anon, authenticated, service_role;
 
 -- Tell the API to see the new functions now, not on its next schema refresh.

@@ -196,3 +196,16 @@ def test_only_the_caller_hands_out_thread_keys_and_prunes_its_own(pg, org):
     assert pg.call("pf_prune", sam["token"], 7) == 0          # not Sam's to prune
     assert pg.call("pf_prune", dana, 7) >= 1
     assert all(x["share_id"] != g["share_id"] for x in pg.call("pf_grants_list", dana, "out", 30))
+
+
+def test_an_unchanged_sync_is_one_tiny_answer(pg, org):
+    dana, sam = org["owner"]["token"], org["Sam"]
+    first = pg.call("pf_sync", sam["token"], {}, None, 7, None)
+    v = first["v"]
+    assert pg.call("pf_sync", sam["token"], {}, None, 7, v) == {"unchanged": True, "v": v}
+    g = pg.call("pf_share", dana, sam["member_id"], "box", "s-30", "T", "view", 60, "")
+    after = pg.call("pf_sync", sam["token"], {}, None, 7, v)
+    assert "unchanged" not in after and after["v"] > v
+    assert any(x["grant_id"] == g["grant_id"] for x in after["in"])
+    pg.call("pf_post", dana, g["share_id"], [{"kind": "entry", "body": {"enc": "x", "kv": 1}}], None)
+    assert "unchanged" not in pg.call("pf_sync", sam["token"], {}, None, 7, after["v"])

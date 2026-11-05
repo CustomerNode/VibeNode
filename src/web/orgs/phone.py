@@ -43,8 +43,12 @@ log = logging.getLogger("web.orgs.phone")
 
 STATE_FILE: Path = Path(os.environ.get("VIBENODE_PHONE_FILE")
                         or (_VIBENODE_DIR / "data" / "phone_a_friend.json"))
-TICK_S = 0.5          # while a call is live, on either side
-IDLE_TICK_S = 3.0     # in an org with no live call
+# How often the loop asks the cloud storage. An unchanged ask costs one tiny
+# lookup (the member's change counter, pf_sync's p_seen); a full read happens
+# only when something changed, or every FULL_EVERY_S (a call can end by time).
+TICK_S = 1.0          # while a call is live, on either side
+IDLE_TICK_S = 10.0    # in an org with no live call
+FULL_EVERY_S = 60.0
 MAX_FIELD = 4000
 MAX_BATCH = 150
 LEVELS = ("view", "suggest", "drive")
@@ -492,8 +496,14 @@ def tick(sm=None, status_of=None, notify=lambda e, d: None) -> bool:
     with _lock:
         state = _load_state()
     cursors = {sid: m.get("cursor", 0) for sid, m in state.get("mirrors", {}).items()}
+    now = time.monotonic()
+    me = (store.load() or {}).get("member_id")
+    if _sync_cache.get("member") != me:             # another membership: start over
+        _sync_cache.update(member=me, v=None, data=None, full_at=0.0)
+    seen = _sync_cache["v"] if now - _sync_cache["full_at"] < FULL_EVERY_S else None
     try:
-        data = store.call("pf_sync", p_cursors=cursors, p_inbox_since=state.get("inbox_since"), p_days=7)
+        data = store.call("pf_sync", p_cursors=cursors, p_inbox_since=state.get("inbox_since"), p_days=7,
+                          p_seen=seen)
     except OrgsError as e:
         if e.code != "schema_missing":
             raise
@@ -505,6 +515,12 @@ def tick(sm=None, status_of=None, notify=lambda e, d: None) -> bool:
         return True
     refresh_org_names()
     _housekeeping()
+    if data.get("unchanged") and _sync_cache["data"] is not None:
+        # Nothing new from the others: only this side's own changes to post.
+        cached = _sync_cache["data"]
+        publish_once(status_of=status_of, grants=cached.get("out") or [])
+        return any(g.get("live") for g in (cached.get("out") or []) + (cached.get("in") or []))
+    _sync_cache.update(v=data.get("v"), data=data, full_at=now)
     out, inn = data.get("out") or [], data.get("in") or []
     publish_once(status_of=status_of, grants=out)
     inbox_once(sm=sm, notify=notify, msgs=data.get("inbox") or [])
@@ -520,6 +536,7 @@ def tick(sm=None, status_of=None, notify=lambda e, d: None) -> bool:
 
 
 _last_lists: dict = {"key": None}
+_sync_cache: dict = {"member": None, "v": None, "data": None, "full_at": 0.0}
 _names_at: dict = {"t": 0.0}
 NAMES_EVERY_S = 300.0
 
