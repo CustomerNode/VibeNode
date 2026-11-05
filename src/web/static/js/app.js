@@ -509,8 +509,10 @@ function _renderProjectOverlay() {
       </div>
       <span class="project-item-count">${_total} sessions</span>
     </div>` : '';
-  // All projects sits last, after the projects.
-  list.innerHTML = _allProjects.map(p => {
+  // All projects sits last, after the projects. Friends who phoned you
+  // (Phone a Friend) sit first; none shows when nobody has.
+  const _pfRows = (window.PF && !_asking) ? PF.projectRows() : '';
+  list.innerHTML = _pfRows + _allProjects.map(p => {
     const shortName = _projectShortName(p);
     const isActive = !_inAll && p.encoded === saved;
     return `
@@ -535,7 +537,8 @@ function _renderProjectOverlay() {
   // Event delegation for project items
   const _allItem = list.querySelector('.project-item-all');
   if (_allItem) _allItem.querySelector('.project-item-info').onclick = () => selectProjectFromOverlay(VNAllProjects.ALL);
-  list.querySelectorAll('.project-item:not(.project-item-all)').forEach(item => {
+  if (_pfRows) PF.wireProjectRows(list);
+  list.querySelectorAll('.project-item:not(.project-item-all):not(.pf-friend-row)').forEach(item => {
     const enc = item.dataset.encoded;
     const name = item.dataset.name;
     item.querySelector('.project-item-info').onclick = () => selectProjectFromOverlay(enc);

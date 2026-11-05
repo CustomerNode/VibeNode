@@ -1,0 +1,88 @@
+/* Phone a Friend (VibeNode Orgs), the quiet look: a phone mark, plain
+   popovers and toasts, one project row per friend. static/js/phone-a-friend.js */
+:root { --pf-live: 63, 185, 80; }
+[data-theme="light"] { --pf-live: 34, 140, 60; }
+
+.pf-mark { display: inline-flex; align-items: center; margin-left: 6px; color: rgb(var(--pf-live)); vertical-align: -1px; }
+.pf-head-mark { all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 1px; padding: 3px 6px; margin-left: 6px;
+  border-radius: 6px; color: rgb(var(--pf-live)); }
+.pf-head-mark:hover { background: var(--bg-hover); }
+.pf-head-mark sup { font-size: 10px; margin-left: 1px; }
+
+.pf-pop { position: fixed; z-index: 10050; width: 300px; max-width: calc(100vw - 16px); padding: 12px;
+  background: var(--bg-elevated, var(--bg-sidebar)); color: var(--text-secondary); font-size: 13px;
+  border: 1px solid var(--border, rgba(127,127,127,.25)); border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+.pf-pop h4 { margin: 0 0 8px; font-size: 13px; color: var(--text-heading); }
+.pf-lab { display: block; font-size: 11px; color: var(--text-faint); margin: 10px 0 4px; }
+.pf-seg { display: flex; gap: 4px; flex-wrap: wrap; }
+.pf-seg button { all: unset; cursor: pointer; padding: 4px 9px; border-radius: 7px; font-size: 12px; color: var(--text-muted);
+  border: 1px solid var(--border, rgba(127,127,127,.25)); }
+.pf-seg button.on { color: var(--text-heading); background: var(--bg-hover); border-color: var(--text-muted); }
+.pf-members { display: flex; flex-direction: column; gap: 2px; max-height: 180px; overflow: auto; }
+.pf-opt { all: unset; cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 7px; color: var(--text-secondary); }
+.pf-opt:hover, .pf-opt.on { background: var(--bg-hover); color: var(--text-heading); }
+.pf-tick { margin-left: auto; }
+.pf-av { width: 20px; height: 20px; border-radius: 50%; display: inline-grid; place-items: center; flex: none;
+  font-size: 10.5px; font-weight: 700; color: var(--text-heading); background: var(--bg-hover); }
+.pf-acts { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+.pf-go { all: unset; cursor: pointer; padding: 6px 13px; border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--text-heading);
+  border: 1px solid var(--text-muted); }
+.pf-go:hover { background: var(--bg-hover); }
+.pf-go[disabled] { opacity: .5; cursor: default; }
+.pf-ghost { all: unset; cursor: pointer; font-size: 12px; color: var(--text-muted); padding: 4px 8px; border-radius: 7px; }
+.pf-ghost:hover { color: var(--text-heading); background: var(--bg-hover); }
+.pf-note { font-size: 12px; color: var(--accent-red, #f85149); min-height: 0; margin-top: 6px; }
+.pf-note:empty { display: none; }
+.pf-glist { display: flex; flex-direction: column; gap: 6px; }
+.pf-gl { display: flex; align-items: center; gap: 8px; }
+.pf-gl .pf-meta, .pf-mrow .pf-meta { flex: 1; text-align: right; color: var(--text-faint); font-size: 12px; }
+
+/* Toasts sit in the shared float stack (utils.js _floatEls). */
+.pf-toast { position: fixed; right: 20px; bottom: 20px; z-index: 10040; max-width: 360px; display: flex; align-items: center; gap: 8px;
+  padding: 9px 10px 9px 12px; font-size: 13px; color: var(--text-secondary); background: var(--bg-elevated, var(--bg-sidebar));
+  border: 1px solid var(--border, rgba(127,127,127,.25)); border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.35);
+  animation: pfIn .2s ease-out; transition: opacity .2s; }
+.pf-toast > svg { color: rgb(var(--pf-live)); flex: none; }
+.pf-toast b { color: var(--text-heading); font-weight: 600; }
+.pf-toast span { flex: 1; min-width: 0; }
+.pf-x { all: unset; cursor: pointer; color: var(--text-faint); padding: 0 4px; font-size: 15px; }
+@keyframes pfIn { from { transform: translateY(10px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* One row per friend at the top of the project list. */
+.pf-friend-mark { color: rgb(var(--pf-live)); display: inline-grid; place-items: center; }
+
+/* A friend's shared sessions. */
+.pf-view { position: fixed; inset: 0; z-index: 10030; background: rgba(0,0,0,.45); display: grid; place-items: center; }
+.pf-vcard { width: min(1000px, calc(100vw - 24px)); height: min(720px, calc(100vh - 24px)); display: flex; flex-direction: column;
+  background: var(--bg-body); border: 1px solid var(--border, rgba(127,127,127,.25)); border-radius: 14px; overflow: hidden; }
+.pf-vhead { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border, rgba(127,127,127,.2)); }
+.pf-vhead h3 { flex: 1; margin: 0; font-size: 14px; color: var(--text-heading); }
+.pf-vbody { flex: 1; display: grid; grid-template-columns: 230px 1fr; min-height: 0; }
+.pf-vlist { border-right: 1px solid var(--border, rgba(127,127,127,.2)); padding: 8px; overflow: auto; background: var(--bg-sidebar, var(--bg-body)); }
+.pf-vrow { all: unset; cursor: pointer; display: block; width: calc(100% - 16px); padding: 7px 8px; border-radius: 8px; font-size: 13px; color: var(--text-secondary); }
+.pf-vrow small { display: block; color: var(--text-faint); font-size: 11px; }
+.pf-vrow:hover, .pf-vrow.on { background: var(--bg-hover); color: var(--text-heading); }
+.pf-vrow.ended { opacity: .6; }
+.pf-vmain { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.pf-banner { padding: 8px 14px; font-size: 12.5px; color: var(--text-muted); border-bottom: 1px solid var(--border, rgba(127,127,127,.2)); }
+.pf-thread { flex: 1; overflow: auto; padding: 14px; font-size: 13.5px; line-height: 1.55; color: var(--text-secondary); }
+.pf-e { margin: 0 0 10px; max-width: 760px; }
+.pf-user, .pf-guest { margin-left: auto; padding: 8px 12px; border-radius: 10px; background: var(--bg-hover); width: fit-content; max-width: 80%; white-space: pre-wrap; }
+.pf-guest b { color: var(--text-heading); margin-right: 4px; }
+.pf-tool, .pf-sys { font-size: 12px; color: var(--text-faint); }
+.pf-compose { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border, rgba(127,127,127,.2)); }
+.pf-compose:empty { display: none; }
+.pf-compose textarea { flex: 1; resize: none; font: inherit; font-size: 13px; padding: 8px 10px; border-radius: 8px; color: var(--text-heading);
+  background: var(--bg-sidebar, var(--bg-body)); border: 1px solid var(--border, rgba(127,127,127,.25)); }
+@media (max-width: 700px) { .pf-vbody { grid-template-columns: 1fr; grid-template-rows: auto 1fr; } .pf-vlist { border-right: 0; max-height: 120px; } }
+
+/* System → VibeNode Orgs */
+.pf-obody p { margin: 0 0 10px; }
+.pf-in { width: 100%; box-sizing: border-box; font: inherit; font-size: 13px; padding: 7px 9px; border-radius: 8px; color: var(--text-heading);
+  background: var(--bg-body); border: 1px solid var(--border, rgba(127,127,127,.25)); }
+.pf-obody .pf-go { margin-top: 12px; }
+.pf-small { font-size: 12px; color: var(--text-faint); }
+.pf-oname { font-size: 15px; font-weight: 600; color: var(--text-heading); }
+.pf-mlist { margin: 10px 0; }
+.pf-mrow { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border, rgba(127,127,127,.15)); }
+.pf-prompt { white-space: pre-wrap; font: 11.5px/1.5 var(--font-mono, monospace); background: var(--bg-hover); border-radius: 8px; padding: 10px; margin: 10px 0 0; max-height: 180px; overflow: auto; }

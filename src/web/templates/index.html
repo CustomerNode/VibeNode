@@ -34,6 +34,7 @@
 <link rel="stylesheet" href="{{ versioned_static('css/mobile.css') }}">   <!-- mobile responsive layer (<=768px only) -->
 <link rel="stylesheet" href="{{ versioned_static('css/usage-pace.css') }}">   <!-- weekly usage pace pop-ups (usage-pace.js) -->
 <link rel="stylesheet" href="{{ versioned_static('css/session-status.css') }}">   <!-- sidebar status oriented to the person (session-verb.js) -->
+<link rel="stylesheet" href="{{ versioned_static('css/phone-a-friend.css') }}">   <!-- Phone a Friend (VibeNode Orgs) -->
 <link rel="stylesheet" href="{{ versioned_static('css/mobile-preview.css') }}">   <!-- mobile visual channel: preview cards + sheet -->
 <link rel="stylesheet" href="/speechnode/speechnode.css">   <!-- SpeechNode package assets -->
 <link rel="stylesheet" href="{{ versioned_static('css/embed.css') }}">   <!-- embed mode: hides project/view chrome, only active with ?embed=1 -->
@@ -156,6 +157,7 @@ html[data-theme="light"] .vn-splash .vns-track { background: rgba(0,0,0,.08); }
       <button onclick="openPersistentStorage();closeHdrSys()">Persistent Storage <span class="sys-item-value" id="sys-storage-label">Local</span></button>
       <button onclick="openMobileCommand();closeHdrSys()">Mobile Command <span class="sys-item-value" id="sys-mobile-label">Off</span></button>
       <button onclick="openDurableJobs();closeHdrSys()" title="Long jobs that survive a restart: list and logs">Durable Jobs</button>
+      <button onclick="openVibeNodeOrgs();closeHdrSys()" title="People you can Phone a Friend with">VibeNode Orgs</button>
       <div class="sys-separator"></div>
       <button onclick="openBulkOperations();closeHdrSys()">Bulk Operations</button>
       <button onclick="_showHelpModal();closeHdrSys()">Keyboard Shortcuts</button>
@@ -875,6 +877,7 @@ html[data-theme="light"] .vn-splash .vns-track { background: rgba(0,0,0,.08); }
      flashing and the layered iOS/Android/desktop capability matrix. -->
 <script src="{{ versioned_static('js/notify.js') }}"></script>
 <script src="{{ versioned_static('js/socket.js') }}"></script>
+<script src="{{ versioned_static('js/phone-a-friend.js') }}"></script>   <!-- Phone a Friend (VibeNode Orgs) -->
 <script src="{{ versioned_static('js/usage-pace.js') }}"></script>   <!-- weekly usage pace pop-ups; uses socket.js's socket -->
 <!-- Themed replacement for native OS tooltips. Fully delegated off document,
      so it covers every existing title="" and anything rendered later without

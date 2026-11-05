@@ -49,6 +49,8 @@ def auth(tmp_path, monkeypatch):
     config_mod._kanban_config_cache = None
     monkeypatch.setattr(mobile_auth, "PAIR_FILE", tmp_path / "data" / "mobile_pair.json")
     mobile_auth._state_cache.update(mtime=None, state={})
+    monkeypatch.setattr(mobile_auth, "OWNER_FILE", tmp_path / "data" / "mobile_owner.json")
+    monkeypatch.setitem(mobile_auth._owner, "login", None)
     mobile_auth.reset_rate_limit()
     mobile_auth._mobile_host.update(host="", checked=1e18, refreshing=False)   # never shell out
 

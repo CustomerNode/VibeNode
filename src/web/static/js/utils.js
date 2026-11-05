@@ -46,7 +46,7 @@ function _floatEls() {
   const out = [];
   const mini = document.getElementById('git-sync-mini');
   if (mini && mini.classList.contains('show')) out.push(mini);
-  document.querySelectorAll('.vn-undo-toast, .compose-undo-toast, .vn-job-toast').forEach(e => out.push(e));
+  document.querySelectorAll('.vn-undo-toast, .compose-undo-toast, .vn-job-toast, .pf-toast').forEach(e => out.push(e));
   const t = document.getElementById('toast');
   if (t && t.classList.contains('show')) out.push(t);
   return out;

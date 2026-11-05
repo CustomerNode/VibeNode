@@ -7154,6 +7154,189 @@ paths:
                     type: boolean
                     description: True only when the daemon is connected
 
+  /api/orgs/me:
+    get:
+      tags: [Orgs]
+      summary: This VibeNode's org membership
+      operationId: orgsMe
+      description: Org name, your username and role, whether cloud storage is on and whether its publishable key is saved. Never includes the member token.
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/orgs/setup-sql:
+    get:
+      tags: [Orgs]
+      summary: The SQL that adds VibeNode Orgs to cloud storage
+      operationId: orgsSetupSql
+      description: Plain text, for the Supabase SQL Editor when no access token is given to setup.
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/orgs/setup:
+    post:
+      tags: [Orgs]
+      summary: Start an org with you as its owner
+      operationId: orgsSetup
+      description: 'Needs cloud storage (the Workflow board on Supabase). Body: org_name, username, optional publishable_key and access_token (applies the SQL first).'
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/orgs/join:
+    post:
+      tags: [Orgs]
+      summary: Join an org from an invite prompt
+      operationId: orgsJoin
+      description: 'Body: username, and prompt (the copied text) or invite (its JSON block). The invite works once.'
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/orgs/members:
+    get:
+      tags: [Orgs]
+      summary: Members of your org
+      operationId: orgsMembers
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/orgs/invite:
+    post:
+      tags: [Orgs]
+      summary: A single-use invite prompt to copy
+      operationId: orgsInvite
+      description: 'Owner or admin. Body: days (1 to 30). Returns prompt and expires_at; the prompt carries the publishable key and the code, never the secret key.'
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/orgs/invites/revoke:
+    post:
+      tags: [Orgs]
+      summary: Cancel every unused invite
+      operationId: orgsRevokeInvites
+      description: Owner or admin.
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/orgs/members/{member_id}/remove:
+    post:
+      tags: [Orgs]
+      summary: Remove a member
+      operationId: orgsRemoveMember
+      description: Owner or admin, or yourself. Every grant they gave or hold ends at once.
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/orgs/leave:
+    post:
+      tags: [Orgs]
+      summary: Leave the org and forget the membership
+      operationId: orgsLeave
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/phone/call:
+    post:
+      tags: [Orgs]
+      summary: Phone a friend on one session
+      operationId: phoneCall
+      description: 'Body: session_id, guest_id, level (view, suggest, drive), duration (1h, 4h, today, 1d, 7d, revoked), title, note. One grant per person per session; calling again replaces it.'
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/phone/revoke/{grant_id}:
+    post:
+      tags: [Orgs]
+      summary: End one grant at once
+      operationId: phoneRevoke
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/phone/out:
+    get:
+      tags: [Orgs]
+      summary: Grants you gave
+      operationId: phoneOut
+      description: 'days (default 0): include grants that ended in that many days.'
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/phone/in:
+    get:
+      tags: [Orgs]
+      summary: Grants others gave you
+      operationId: phoneIn
+      description: days (default 7).
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/phone/read/{share_id}:
+    get:
+      tags: [Orgs]
+      summary: Read a shared thread
+      operationId: phoneRead
+      description: after, before, limit. Its owner, or a guest with a live grant.
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/phone/send/{grant_id}:
+    post:
+      tags: [Orgs]
+      summary: Write into a friend's shared session
+      operationId: phoneSend
+      description: 'Suggest or Drive grants only. Body: text.'
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/phone/suggestions:
+    get:
+      tags: [Orgs]
+      summary: Friends' suggestions waiting for you
+      operationId: phoneSuggestions
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
+  /api/phone/suggestions/{key}/{action}:
+    post:
+      tags: [Orgs]
+      summary: Send or dismiss a friend's suggestion
+      operationId: phoneSuggestionAction
+      description: 'action: send (queued into your session, labelled) or dismiss.'
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not allowed for this member, or not the owner of this VibeNode
   /api/usage-pace:
     get:
       tags: [App]

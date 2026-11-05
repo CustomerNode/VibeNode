@@ -41,6 +41,7 @@ import importlib
 import itertools
 import json
 import os
+import tempfile
 import shlex
 import sqlite3
 import subprocess
@@ -447,6 +448,10 @@ os.environ["VIBENODE_SESSION_HOST"] = "0"
 # ("/static/scratch/x.png"), and src/web/static/scratch is gitignored, so the check is
 # off for the suite; tests/test_broken_links.py turns it on per test.
 os.environ["VIBENODE_LINK_CHECK"] = "0"
+# The owner's saved tailnet login (src/web/mobile_auth.py) must never decide a
+# test: tests send made-up logins. Point it at a file that does not exist.
+os.environ["VIBENODE_TAILNET_OWNER_LEARN"] = "0"
+os.environ["VIBENODE_OWNER_FILE"] = os.path.join(tempfile.gettempdir(), "vibenode-test-no-owner.json")
 # A passing summary saves copies of its pictures (src/shared/card_pictures.py);
 # the suite's made-up summaries must never write into data/card_pictures.
 # tests/test_card_pictures.py points it at a temp folder per test.

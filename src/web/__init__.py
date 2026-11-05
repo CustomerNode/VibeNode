@@ -116,6 +116,7 @@ def create_app(testing=False) -> Flask:
     from .routes.search_api import bp as search_bp
     from .routes.jobs_api import bp as jobs_bp
     from .routes.usage_pace_api import bp as usage_pace_bp
+    from .routes.orgs_api import bp as orgs_bp
 
     app.register_blueprint(main_bp)
     app.register_blueprint(sessions_bp)
@@ -136,6 +137,7 @@ def create_app(testing=False) -> Flask:
     app.register_blueprint(search_bp)
     app.register_blueprint(jobs_bp)
     app.register_blueprint(usage_pace_bp)
+    app.register_blueprint(orgs_bp)
 
     # SpeechNode (extracted package) — mount its routes + serve its web assets.
     # Optional: if the package isn't importable, VibeNode still runs (voice off).
@@ -225,6 +227,9 @@ def create_app(testing=False) -> Flask:
         from .engine_freshness import start_auto_restart; start_auto_restart(app)
         # Weekly usage pace pop-ups (src/web/usage_pace.py); never in a test app.
         from .usage_pace import start as start_usage_pace; start_usage_pace(app, socketio)
+        # Phone a Friend: post shared threads, pick up friends' messages, ping
+        # on a new call (src/web/orgs/phone.py); quiet when not in an org.
+        from .orgs.phone import start as start_phone_a_friend; start_phone_a_friend(app, socketio)
 
         # Mobile Command: if the user left phone access ON, re-establish the private
         # tailnet bridge (tailscale serve) now so it persists across restarts —

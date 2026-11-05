@@ -390,6 +390,8 @@ def request_is_owner() -> bool:
         return True
     if not _via_mobile_command():
         return False
+    if request_is_foreign_tailnet_user():
+        return False
     return (not auth_enabled()) or has_valid_cookie()
 
 
@@ -424,9 +426,17 @@ def require_local():
 
 
 def _gate():
+    path = request.path or "/"
+    if request_is_foreign_tailnet_user():
+        if (request.endpoint == "static" or path in OPEN_PATHS
+                or path.startswith(OPEN_PREFIXES)):
+            return None
+        if path.startswith("/api/"):
+            return jsonify(ok=False, error="not_owner"), 403
+        return ("This VibeNode belongs to someone else. Open what they shared "
+                "with you from your own VibeNode."), 403
     if not auth_enabled():
         return None
-    path = request.path or "/"
     if request.endpoint == "static" or path in OPEN_PATHS or path.startswith(OPEN_PREFIXES):
         return None
     if path in SELF_GUARDED_PATHS or path.startswith(SELF_GUARDED_PREFIXES):
@@ -464,12 +474,80 @@ def _refresh_mobile_host() -> None:
         from . import mobile_command
         host = ""
         if mobile_command.is_flag_enabled() and mobile_command.tailscale_bin():
-            host = mobile_command._dns_from_status(mobile_command._status_json()).lower()
+            status = mobile_command._status_json()
+            host = mobile_command._dns_from_status(status).lower()
+            login = mobile_command.account_email(status)
+            if login and "@" in login and os.environ.get("VIBENODE_TAILNET_OWNER_LEARN") != "0":
+                set_owner_login(login)
         _mobile_host.update(host=host, checked=time.monotonic())
     except Exception:
         _mobile_host.update(checked=time.monotonic())
     finally:
         _mobile_host["refreshing"] = False
+
+
+# ── whose tailnet login is the owner's ───────────────────────────────────────
+#
+# ``tailscale serve`` names the signed-in person of every device it relays in
+# ``Tailscale-User-Login``. A device shared in from another person's tailnet
+# carries THAT person's login. Without this check every tailnet device counted
+# as the owner, so sharing this machine with anyone handed them every session
+# and every command route. The owner's login is read from ``tailscale status``
+# (refreshed with the MagicDNS name) and kept in OWNER_FILE so a restart knows
+# it at once. A request whose login is known not to be the owner's reaches
+# only the open paths. Phone a Friend never needs one: a friend reads a shared
+# session through the org's cloud storage, never through this machine.
+
+OWNER_FILE: Path = Path(os.environ.get("VIBENODE_OWNER_FILE")
+                        or (_VIBENODE_DIR / "data" / "mobile_owner.json"))
+_owner: dict = {"login": None}
+
+
+def _norm_login(value) -> str:
+    return str(value or "").strip().lower()
+
+
+def owner_login() -> str:
+    """The owner's tailnet login, lowercased, or "" while unknown."""
+    if _owner["login"] is None:
+        try:
+            data = json.loads(OWNER_FILE.read_text(encoding="utf-8"))
+            _owner["login"] = _norm_login(data.get("login"))
+        except (OSError, ValueError, AttributeError):
+            _owner["login"] = ""
+    return _owner["login"] or ""
+
+
+def set_owner_login(login: str) -> None:
+    login = _norm_login(login)
+    if not login or login == owner_login():
+        return
+    _owner["login"] = login
+    try:
+        OWNER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = OWNER_FILE.parent / (OWNER_FILE.name + ".tmp")
+        tmp.write_text(json.dumps({"login": login}), encoding="utf-8")
+        os.replace(tmp, OWNER_FILE)
+    except OSError:
+        log.warning("could not save the owner's tailnet login")
+
+
+def request_tailnet_login() -> str:
+    try:
+        return _norm_login(request.headers.get("Tailscale-User-Login"))
+    except Exception:
+        return ""
+
+
+def request_is_foreign_tailnet_user() -> bool:
+    """The request names a tailnet person who is not the owner. An unknown
+    owner login cannot tell, and keeps the earlier behaviour."""
+    login = request_tailnet_login()
+    if not login:
+        return False
+    known_mobile_host()                       # keeps the owner login fresh
+    owner = owner_login()
+    return bool(owner) and not hmac.compare_digest(login, owner)
 
 
 def known_mobile_host() -> str:
@@ -539,6 +617,8 @@ def socket_connection_allowed(app=None) -> tuple[bool, str]:
     try:
         if not origin_allowed(request.headers.get("Origin"), request.environ):
             return False, "origin"
+        if request_is_foreign_tailnet_user():
+            return False, "not_owner"
         if (app is None or installed(app)) and auth_enabled() and not request_is_authorized():
             return False, "pairing_required"
         return True, ""
