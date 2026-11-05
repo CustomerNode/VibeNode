@@ -2,8 +2,9 @@
  *
  * The working parts live in the web server (src/web/orgs/, /api/orgs/*,
  * /api/phone/*). This file draws them, in the quiet look:
- *   - "Phone a friend" in a session's menu (only while this VibeNode is in an
- *     org): pick a member, what they can do and for how long, Call.
+ *   - "Phone a friend" in the composer's four-squares menu beside Send (and a
+ *     session's right-click menu), only while this VibeNode is in an org:
+ *     pick members, what they can do, how long, a note, Call.
  *   - A phone mark on the session's row and in the chat header while a call
  *     is live; the header mark lists who is on it, with Revoke / Revoke all.
  *   - A plain toast (and a notification when the tab is hidden) when a friend
@@ -373,9 +374,22 @@
     view.el.querySelectorAll('.pf-vrow').forEach(function (b) { b.classList.toggle('on', b.dataset.share === shareId); });
     var thread = view.el.querySelector('.pf-thread');
     thread.innerHTML = '';
-    view.el.querySelector('.pf-banner').textContent = g.live
+    var banner = view.el.querySelector('.pf-banner');
+    banner.textContent = g.live
       ? g.owner + "'s session on " + g.source + ' · you ' + LEVEL_WORDS[g.level] + ' · ' + left(g)
-      : g.owner + ' ended this call. What you saw is gone from here.';
+      : 'This call has ended.';
+    if (g.live) {
+      var hang = document.createElement('button');
+      hang.type = 'button'; hang.className = 'pf-ghost pf-hang'; hang.textContent = 'Hang up';
+      hang.onclick = function () {
+        api('/api/phone/revoke/' + g.grant_id, { body: {} }).then(function (d) {
+          if (!d.ok) { toastText(d.message || 'Could not hang up.', true); return; }
+          toastText('Hung up on ' + g.owner + "'s session.");
+          refresh().then(function () { if (view) pickShare(shareId); });
+        });
+      };
+      banner.appendChild(hang);
+    }
     var nb = view.el.querySelector('.pf-vnotebox');
     nb.innerHTML = noteHtml(g); wireNotes(nb);
     var comp = view.el.querySelector('.pf-compose');
@@ -404,7 +418,20 @@
     var kind = b.kind || '', text = b.text || b.summary || b.content || '';
     if (typeof text !== 'string') text = JSON.stringify(text);
     if (kind === 'user') return '<div class="pf-e pf-user">' + esc(text) + '</div>';
-    if (kind === 'asst' || kind === 'assistant') return '<div class="pf-e pf-asst">' + (window.mdParse ? mdParse(text) : esc(text)) + '</div>';
+    if (kind === 'asst' || kind === 'assistant') {
+      // An end-of-turn summary is a fenced handoff card: show its words, not its JSON.
+      var m = /```handoff\s*\n([\s\S]*?)\n```/.exec(text);
+      if (m) {
+        var card = null;
+        try { card = JSON.parse(m[1]); } catch (e) { card = null; }
+        var before = text.slice(0, m.index).trim();
+        if (card) return (before ? '<div class="pf-e pf-asst">' + (window.mdParse ? mdParse(before) : esc(before)) + '</div>' : '')
+          + '<div class="pf-e pf-card">' + (card.title ? '<b>' + esc(card.title) + '</b>' : '')
+          + (card.headline ? '<div>' + esc(card.headline) + '</div>' : '')
+          + (card.answer ? '<div class="pf-card-a">' + esc(card.answer) + '</div>' : '') + '</div>';
+      }
+      return '<div class="pf-e pf-asst">' + (window.mdParse ? mdParse(text) : esc(text)) + '</div>';
+    }
     if (kind === 'tool_use') return '<div class="pf-e pf-tool">' + esc((b.name || 'Tool') + (b.desc ? ': ' + b.desc : '')) + '</div>';
     if (kind === 'tool_result') return '';
     return text ? '<div class="pf-e pf-sys">' + esc(text.slice(0, 400)) + '</div>' : '';

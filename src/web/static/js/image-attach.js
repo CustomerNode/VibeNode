@@ -390,6 +390,10 @@
     '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
     'stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
     '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>';
+  var PHONE_SVG =
+    '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.7a2 2 0 0 1-.5 2.1L8 9.8a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.7.7a2 2 0 0 1 1.7 2z"/></svg>';
   var ENTER_SVG =
     '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
     'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
@@ -419,6 +423,19 @@
         window._openInvokeModal();
       });
       menu.appendChild(inv);
+    }
+
+    // Phone a Friend (phone-a-friend.js): open this session to org members.
+    // Only while this VibeNode is in an org and a session is open.
+    var sid = (typeof activeId !== 'undefined') ? activeId : null;
+    if (sid && window.PF && window.PF.isMember()) {
+      var call = menuRow('button', PHONE_SVG, 'Phone a friend', 'Open this session to your org');
+      call.addEventListener('click', function (e) {
+        e.preventDefault();
+        hideChip();
+        window.PF.openCall(sid, btn);
+      });
+      menu.appendChild(call);
     }
 
     var paste = menuRow('button', CLIP_SVG, 'Paste image', 'From the clipboard');
@@ -499,7 +516,7 @@
     btn.type = 'button';
     btn.className = 'live-send-btn live-image-btn';
     btn.id = 'live-image-btn';
-    btn.title = 'More: invoke, attach an image, send shortcut';
+    btn.title = 'More: invoke, phone a friend, attach an image, send shortcut';
     btn.setAttribute('aria-label', 'More actions');
     btn.setAttribute('aria-haspopup', 'menu');
     btn.innerHTML = PLUS_SVG;

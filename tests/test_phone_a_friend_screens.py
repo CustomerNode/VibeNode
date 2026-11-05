@@ -216,3 +216,44 @@ def test_one_call_can_reach_several_people(browser):
     text = app.page.inner_text(".pf-pop")
     assert "Shared with 2" in text and "Sam" in text and "Lee" in text
     assert not app.errors
+
+
+def test_phone_a_friend_is_in_the_composer_menu_beside_send(browser):
+    """The four-squares More button beside Send lists Phone a friend while this
+    VibeNode is in an org, and opens the call popover from there."""
+    from tests.test_enter_to_send import ROW, _open
+    pg = _open(browser, 1400)
+    pg.evaluate("() => { for (const id of ['vn-splash', 'health-blocker']) document.getElementById(id)?.remove(); }")
+    pg.wait_for_selector("#live-image-btn", state="attached")
+    pg.wait_for_function("window.PF && PF.state().loaded")
+    pg.evaluate("document.getElementById('live-image-btn').click()")
+    assert "Phone a friend" not in pg.inner_text(".vn-more-menu")      # not in an org
+    pg.evaluate("document.getElementById('live-image-btn').click()")    # close
+    pg.evaluate("sid => { PF.state().me = {ok: true, member: true, username: 'Dana'}; activeId = sid; }", ROW["id"])
+    pg.evaluate("document.getElementById('live-image-btn').click()")
+    assert "Phone a friend" in pg.inner_text(".vn-more-menu")
+    pg.evaluate("() => [...document.querySelectorAll('.vn-more-menu .vn-more-row')].find(r => r.innerText.includes('Phone a friend')).click()")
+    pg.wait_for_selector(".pf-pop")
+    assert not pg.query_selector(".vn-more-menu")
+    assert "Phone a friend" in pg.inner_text(".pf-pop h4")
+
+
+def test_the_friend_view_shows_summaries_as_words_and_can_hang_up(browser):
+    rows = fake_sessions(1)
+    owner = "33333333-3333-3333-3333-333333333333"
+    st = _state(**{"in": [_grant("x-1", gid="gin", owner="Priya", owner_id=owner, title="Flaky login test")]})
+    routes = _routes(st)
+    card = json.dumps({"type": "done", "title": "Login test fixed", "headline": "The clock is pinned now.", "answer": "Short answer here."})
+    posts = [{"seq": 1, "kind": "entry", "body": {"kind": "user", "text": "why does it flake"}},
+             {"seq": 2, "kind": "entry", "body": {"kind": "asst", "text": "Done.\n\n```handoff\n" + card + "\n```"}}]
+    routes = dict({"/api/phone/read/": lambda req: (200, {"ok": True, "posts": posts, "status": "idle"})}, **routes)
+    app = FakeApp(browser, rows, extra_routes=routes)
+    app.page.wait_for_function("window.PF && PF.isMember() && PF.state().incoming.length")
+    app.page.evaluate(f"() => PF.openFriend('{owner}')")
+    app.page.wait_for_selector(".pf-thread .pf-card")
+    text = app.page.inner_text(".pf-thread")
+    assert "Login test fixed" in text and "The clock is pinned now." in text and '"type"' not in text
+    app.page.click(".pf-banner .pf-hang")
+    app.page.wait_for_function("document.querySelector('.pf-toast, #toast.show') || true")
+    assert st["revoked"] == ["gin"]
+    assert not app.errors

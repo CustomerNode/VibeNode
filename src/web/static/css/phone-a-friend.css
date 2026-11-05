@@ -100,3 +100,9 @@
 .pf-vnote { font-style: italic; }
 
 .pf-lab-top { margin-top: 0; }
+
+.pf-banner { display: flex; align-items: center; gap: 8px; }
+.pf-hang { margin-left: auto; }
+.pf-card { padding: 9px 12px; border-radius: 10px; border: 1px solid var(--border, rgba(127,127,127,.25)); }
+.pf-card b { color: var(--text-heading); display: block; margin-bottom: 2px; }
+.pf-card-a { margin-top: 4px; color: var(--text-muted); font-size: 12.5px; }
