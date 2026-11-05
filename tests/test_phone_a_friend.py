@@ -285,3 +285,71 @@ def test_the_friend_sees_the_project_the_session_is_in(world):
     assert g["project"] == "CustomerNode"
     sam.use(mods)
     assert _ok(client.get("/api/phone/in"))["grants"][0]["project"] == "CustomerNode"
+
+
+def _use_mirror(node, monkeypatch):
+    import web.config as cfg
+    import web.routes.project_api as project_api
+    from web.orgs import mirror
+    monkeypatch.setattr(cfg, "_CLAUDE_PROJECTS", node.projects)
+    monkeypatch.setattr(project_api, "_CLAUDE_PROJECTS", node.projects, raising=False)
+    monkeypatch.setattr(cfg, "_PROJECT_NAMES_FILE", node.dir / "project_names.json")
+    # The project list shows only folders under home (each test has its own).
+    from pathlib import Path
+    monkeypatch.setattr(mirror, "ROOT", Path.home() / node.name / "vibenode-phoned")
+    return mirror
+
+
+def test_the_friend_gets_a_real_session_that_never_runs(world, monkeypatch):
+    import web.config as cfg
+    app, client, mods, dana, sam = world
+    sam_id = _org(client, mods, dana, sam, "Mirror")
+    dana.use(mods)
+    dana.transcript("s-11", ["why does login fail", "the key is " + FAKE_API], cwd="/home/someone/code/Acme")
+    g = _ok(client.post("/api/phone/call", json={"session_id": "s-11", "guest_id": sam_id, "level": "drive",
+                                                  "duration": "1h", "title": "Login bug"}))["grant"]
+    # Sam's VibeNode writes the thread into a session of its own.
+    sam.use(mods)
+    mirror = _use_mirror(sam, monkeypatch)
+    pushed = []
+    assert mirror.sync_once(notify=lambda e, d: pushed.append(e)) >= 2
+    path = sam.projects / mirror.project_encoded("Dana") / f"{g['share_id']}.jsonl"
+    text = path.read_text()
+    assert '"customTitle": "Acme · Login bug"' in text and "why does login fail" in text and FAKE_API not in text
+    assert "session_entry" in pushed
+    # It is a normal project, first in the list, named after who phoned.
+    projects = _ok(client.get("/api/projects"))
+    assert projects[0]["encoded"] == mirror.project_encoded("Dana")
+    assert projects[0]["custom_name"] == "Dana phoned you" and projects[0]["session_count"] == 1
+    assert mirror.is_mirror(g["share_id"])
+    # A reply typed in it goes to Dana through the call, never to a session here.
+    sent, words = mirror.reply(g["share_id"], "try the tests")
+    assert sent and "Dana" in words
+    dana.use(mods)
+    sm = MagicMock(); sm.has_session.return_value = True
+    assert mods[2].inbox_once(sm=sm) == 1
+    # New lines arrive on the next sync; once the call is gone, so is the project.
+    dana.transcript("s-11", ["second question"], cwd="/home/someone/code/Acme")
+    mods[2].publish_once()
+    sam.use(mods); _use_mirror(sam, monkeypatch)
+    mirror.sync_once()
+    assert "second question" in path.read_text()
+    dana.use(mods)
+    _ok(client.post(f"/api/phone/revoke/{g['grant_id']}"))
+    sam.use(mods); _use_mirror(sam, monkeypatch)
+    mirror.sync_once()
+    sent, words = mirror.reply(g["share_id"], "late")
+    assert not sent and "ended" in words
+
+
+def test_the_socket_never_sends_a_phoned_session_to_the_session_engine(world, monkeypatch):
+    from web.routes import ws_events
+    from web.orgs import mirror
+    monkeypatch.setattr(mirror, "is_mirror", lambda sid: sid == "m-1")
+    monkeypatch.setattr(mirror, "reply", lambda sid, text: (True, "Sent to Dana's session."))
+    emitted = []
+    monkeypatch.setattr(ws_events, "emit", lambda ev, data=None, **k: emitted.append((ev, data)))
+    assert ws_events._phoned_session_reply("m-1", "hello") is True
+    assert ("pf_notice", {"session_id": "m-1", "ok": True, "message": "Sent to Dana's session."}) in emitted
+    assert any(ev == "session_state" and d["state"] == "idle" for ev, d in emitted)
+    assert ws_events._phoned_session_reply("other", "hello") is False

@@ -7283,6 +7283,16 @@ paths:
           description: Done
         "403":
           description: Not a side of this call, or not the owner of this VibeNode
+  /api/phone/mirror/{session_id}:
+    get:
+      tags: [Orgs]
+      summary: The project a phoned session lives in on this computer
+      operationId: phoneMirror
+      responses:
+        "200":
+          description: The project's folder name
+        "404":
+          description: Not a phoned session
   /api/phone/out:
     get:
       tags: [Orgs]

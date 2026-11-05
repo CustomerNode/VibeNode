@@ -80,6 +80,10 @@ def api_projects():
             "session_count": count,
             "active": d.name == active_project,
         })
+    # Friends who phoned you (src/web/orgs/mirror.py) come first.
+    from ..orgs import mirror
+    pre = mirror.project_prefix()
+    results.sort(key=lambda r: not r["encoded"].startswith(pre))
     return jsonify(results)
 
 
@@ -299,6 +303,10 @@ def api_new_session():
         data = request.get_json() or {}
         name = (data.get("name") or "").strip()
         resume_id = (data.get("resume_id") or "").strip()
+        if resume_id:
+            from ..orgs import mirror
+            if mirror.is_mirror(resume_id):
+                return jsonify({"error": "This session belongs to the friend who phoned you; reply in it instead."}), 409
         # The prompt is passed through exactly: AI Compare may be comparing
         # prompts that differ only in spacing. Only a prompt that
         # is all whitespace counts as no prompt.

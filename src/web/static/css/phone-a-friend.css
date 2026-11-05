@@ -48,34 +48,6 @@
 .pf-x { all: unset; cursor: pointer; color: var(--text-faint); padding: 0 4px; font-size: 15px; }
 @keyframes pfIn { from { transform: translateY(10px); opacity: 0; } to { transform: none; opacity: 1; } }
 
-/* One row per friend at the top of the project list. */
-.pf-friend-mark { color: rgb(var(--pf-live)); display: inline-grid; place-items: center; }
-
-/* A friend's shared sessions. */
-.pf-view { position: fixed; inset: 0; z-index: 10030; background: rgba(0,0,0,.45); display: grid; place-items: center; }
-.pf-vcard { width: min(1000px, calc(100vw - 24px)); height: min(720px, calc(100vh - 24px)); display: flex; flex-direction: column;
-  background: var(--bg-body); border: 1px solid var(--border, rgba(127,127,127,.25)); border-radius: 14px; overflow: hidden; }
-.pf-vhead { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border, rgba(127,127,127,.2)); }
-.pf-vhead h3 { flex: 1; margin: 0; font-size: 14px; color: var(--text-heading); }
-.pf-vbody { flex: 1; display: grid; grid-template-columns: 230px 1fr; min-height: 0; }
-.pf-vlist { border-right: 1px solid var(--border, rgba(127,127,127,.2)); padding: 8px; overflow: auto; background: var(--bg-sidebar, var(--bg-body)); }
-.pf-vrow { all: unset; cursor: pointer; display: block; width: calc(100% - 16px); padding: 7px 8px; border-radius: 8px; font-size: 13px; color: var(--text-secondary); }
-.pf-vrow small { display: block; color: var(--text-faint); font-size: 11px; }
-.pf-vrow:hover, .pf-vrow.on { background: var(--bg-hover); color: var(--text-heading); }
-.pf-vrow.ended { opacity: .6; }
-.pf-vmain { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-.pf-banner { padding: 8px 14px; font-size: 12.5px; color: var(--text-muted); border-bottom: 1px solid var(--border, rgba(127,127,127,.2)); }
-.pf-thread { flex: 1; overflow: auto; padding: 14px; font-size: 13.5px; line-height: 1.55; color: var(--text-secondary); }
-.pf-e { margin: 0 0 10px; max-width: 760px; }
-.pf-user, .pf-guest { margin-left: auto; padding: 8px 12px; border-radius: 10px; background: var(--bg-hover); width: fit-content; max-width: 80%; white-space: pre-wrap; }
-.pf-guest b { color: var(--text-heading); margin-right: 4px; }
-.pf-tool, .pf-sys { font-size: 12px; color: var(--text-faint); }
-.pf-compose { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border, rgba(127,127,127,.2)); }
-.pf-compose:empty { display: none; }
-.pf-compose textarea { flex: 1; resize: none; font: inherit; font-size: 13px; padding: 8px 10px; border-radius: 8px; color: var(--text-heading);
-  background: var(--bg-sidebar, var(--bg-body)); border: 1px solid var(--border, rgba(127,127,127,.25)); }
-@media (max-width: 700px) { .pf-vbody { grid-template-columns: 1fr; grid-template-rows: auto 1fr; } .pf-vlist { border-right: 0; max-height: 120px; } }
-
 /* System → VibeNode Orgs */
 .pf-obody p { margin: 0 0 10px; }
 .pf-in { width: 100%; box-sizing: border-box; font: inherit; font-size: 13px; padding: 7px 9px; border-radius: 8px; color: var(--text-heading);
@@ -89,7 +61,6 @@
 
 /* The call's note: shown on every view, either side edits it. */
 .pf-callnote { margin: 4px 0 8px 28px; font-size: 12.5px; color: var(--text-secondary); }
-.pf-vnotebox .pf-callnote { margin: 0; padding: 8px 14px; border-bottom: 1px solid var(--border, rgba(127,127,127,.2)); }
 .pf-ntext { white-space: pre-wrap; overflow-wrap: anywhere; }
 .pf-nempty { color: var(--text-faint); }
 .pf-nmeta { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
@@ -97,19 +68,9 @@
 .pf-nin { width: 100%; box-sizing: border-box; resize: vertical; font: inherit; font-size: 12.5px; padding: 6px 8px; border-radius: 7px;
   color: var(--text-heading); background: var(--bg-body); border: 1px solid var(--border, rgba(127,127,127,.25)); }
 .pf-tnote { color: var(--text-muted); font-size: 12px; }
-.pf-vnote { font-style: italic; }
 
 .pf-lab-top { margin-top: 0; }
 
-.pf-banner { display: flex; align-items: center; gap: 8px; }
-.pf-hang { margin-left: auto; }
-.pf-card { padding: 9px 12px; border-radius: 10px; border: 1px solid var(--border, rgba(127,127,127,.25)); }
-.pf-card b { color: var(--text-heading); display: block; margin-bottom: 2px; }
-.pf-card-a { margin-top: 4px; color: var(--text-muted); font-size: 12.5px; }
-
-/* A friend always sees which project a shared session is in. */
-.pf-vproj { display: block; font-size: 11px; font-weight: 600; color: var(--text-faint); letter-spacing: .01em; }
-.pf-vrow .pf-vproj { margin-bottom: 1px; }
 
 /* Phone: the call, list and note popovers are a bottom sheet with finger-sized
    targets; every text box is 16px so iOS never zooms in on focus. */

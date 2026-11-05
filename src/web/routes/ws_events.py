@@ -239,6 +239,25 @@ def _user_row(text, obj):
     return {"kind": "user", "text": text, "auto": auto} if auto else {"kind": "user", "text": text}
 
 
+def _phoned_session_reply(session_id, text):
+    """A phoned session (src/web/orgs/mirror.py) is never run here: a message
+    typed in it goes to the friend who phoned, through the call. Returns True
+    when ``session_id`` is one, after telling the browser what happened."""
+    try:
+        from ..orgs import mirror
+        if not mirror.is_mirror(session_id):
+            return False
+        if text:
+            sent, words = mirror.reply(session_id, text)
+            emit('pf_notice', {'session_id': session_id, 'ok': sent, 'message': words})
+        emit('session_state', {'session_id': session_id, 'state': 'idle'})
+        return True
+    except Exception:
+        logger.exception("phoned session reply failed")
+        emit('pf_notice', {'session_id': session_id, 'ok': False, 'message': 'Not sent.'})
+        return True
+
+
 def _parse_raw_line(raw: str) -> list:
     """Parse a single JSONL line into zero or more structured entries."""
     try:
@@ -534,6 +553,8 @@ def register_ws_events(socketio, app):
         cwd = data.get('cwd', '').strip()
         name = data.get('name', '').strip()
         resume = bool(data.get('resume', False))
+        if session_id and _phoned_session_reply(session_id, prompt):
+            return
 
         # Optional session options
         model = (data.get('model') or '').strip() or None
@@ -753,6 +774,8 @@ def register_ws_events(socketio, app):
         session_id = data.get('session_id', '').strip()
         text = data.get('text', '').strip()
         voice = bool(data.get('voice'))
+        if session_id and _phoned_session_reply(session_id, text):
+            return
 
         if not session_id:
             emit('error', {'message': 'session_id is required'})
@@ -1333,6 +1356,8 @@ def register_ws_events(socketio, app):
         text = (data.get('text') or '').strip()
         if not session_id or not text:
             emit('error', {'message': 'session_id and text are required'})
+            return
+        if _phoned_session_reply(session_id, text):
             return
         sm = app.session_manager
         result = sm.queue_message(session_id, text)

@@ -216,8 +216,15 @@ def dismiss_suggestion(key: str) -> dict | None:
 
 # ── the loop ─────────────────────────────────────────────────────────────────
 
-def _entries_since(path: Path, line_no: int) -> tuple[list, int]:
-    from ..routes.ws_events import _parse_raw_line
+# Transcript line types a friend's copy needs; the rest (file snapshots,
+# progress ticks, the caller's own title) are left out.
+_SHARED_TYPES = {"user", "assistant", "system"}
+MAX_LINE_BYTES = 60000
+
+
+def _lines_since(path: Path, line_no: int) -> tuple[list, int]:
+    """The transcript lines added since ``line_no``, redacted and trimmed, as
+    the friend's VibeNode writes them into its own copy of the session."""
     try:
         lines = [l for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
     except OSError:
@@ -226,7 +233,20 @@ def _entries_since(path: Path, line_no: int) -> tuple[list, int]:
         line_no = max(0, len(lines) - 40)
     out = []
     for raw in lines[line_no:]:
-        out.extend(_parse_raw_line(raw))
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or obj.get("type") not in _SHARED_TYPES:
+            continue
+        obj = clean_entry(obj)
+        if len(json.dumps(obj)) > MAX_LINE_BYTES:
+            # Still too big (many long fields): keep only its words.
+            from ..routes.ws_events import _parse_raw_line
+            text = " ".join((e.get("text") or e.get("desc") or "") for e in _parse_raw_line(raw))
+            obj = {"type": obj.get("type"), "message": {"role": (obj.get("message") or {}).get("role", "assistant"),
+                   "content": redact(text)[:MAX_FIELD]}}
+        out.append(obj)
     return out, len(lines)
 
 
@@ -248,12 +268,12 @@ def publish_once(only_share: str | None = None, status_of=None) -> int:
             cur = cursors.get(share_id)
             if cur is None:                       # a new share: start with the recent part
                 total = sum(1 for l in path.read_text(encoding="utf-8").splitlines() if l.strip())
-                cur = max(0, total - 60)
-            entries, new_cur = _entries_since(path, cur)
+                cur = max(0, total - 150)
+            lines, new_cur = _lines_since(path, cur)
             status = status_of(g["session_id"]) if status_of else None
-            if not entries and new_cur == cur and status is None:
+            if not lines and new_cur == cur and status is None:
                 continue
-            batch = [{"kind": "entry", "body": clean_entry(e)} for e in entries[-MAX_BATCH:]]
+            batch = [{"kind": "entry", "body": {"line": ln}} for ln in lines[-MAX_BATCH:]]
             store.call("pf_post", p_share=share_id, p_posts=batch, p_status=status)
             cursors[share_id] = new_cur
             posted += len(batch)
@@ -384,6 +404,8 @@ def start(app, socketio) -> None:
                 inbox_once(sm=app.session_manager, notify=notify)
                 pings_once(notify=notify)
                 notes_once(notify=notify)
+                from . import mirror
+                mirror.sync_once(notify=notify)
                 backoff = TICK_S
             except OrgsError as e:
                 if e.code in ("not_a_member",):

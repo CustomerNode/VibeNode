@@ -192,6 +192,8 @@ def api_leave():
             if e.code not in ("not_a_member",):
                 return _fail(e)
     store.clear()
+    from ..orgs import mirror
+    mirror.remove_all()
     return jsonify(ok=True)
 
 
@@ -241,6 +243,17 @@ def api_note(grant_id):
     except Exception:
         pass
     return jsonify(ok=True, grant=g)
+
+
+@bp.route("/api/phone/mirror/<session_id>")
+@local_only
+def api_mirror(session_id):
+    """Which project a phoned session lives in on this computer."""
+    from ..orgs import mirror
+    m = mirror.grant_for(session_id)
+    if not m or not mirror.is_mirror(session_id):
+        return jsonify(ok=False, error="not_found"), 404
+    return jsonify(ok=True, project=mirror.project_encoded(m.get("owner") or "friend"))
 
 
 @bp.route("/api/phone/out")

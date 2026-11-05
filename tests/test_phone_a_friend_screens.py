@@ -121,7 +121,7 @@ def test_calling_marks_the_row_and_revoke_clears_it(browser):
     assert not app.errors
 
 
-def test_a_call_to_you_shows_a_toast_and_a_project_row(browser):
+def test_a_call_to_you_shows_a_toast_with_the_project(browser):
     rows = fake_sessions(1)
     st = _state(**{"in": [dict(_grant("x-1", owner="Priya", owner_id="33333333-3333-3333-3333-333333333333", title="Flaky login test"), project="Acme")]})
     app = FakeApp(browser, rows, extra_routes=_routes(st))
@@ -129,19 +129,8 @@ def test_a_call_to_you_shows_a_toast_and_a_project_row(browser):
     app.push("pf_incoming", st["in"][0])
     toast = app.page.wait_for_selector(".pf-toast")
     assert "Priya phoned you" in toast.inner_text() and "Acme · Flaky login test" in toast.inner_text()
-    app.page.evaluate("() => PF.openFriend('33333333-3333-3333-3333-333333333333')")
-    assert "Acme" in app.page.wait_for_selector(".pf-vrow .pf-vproj").inner_text()
-    assert "in Acme on box" in app.page.inner_text(".pf-banner")
-    app.page.evaluate("() => document.querySelector('.pf-view').remove()")
-    html = app.page.evaluate("() => PF.projectRows()")
-    assert "Priya phoned you" in html and html.count("pf-friend-row") == 1
+    assert app.page.evaluate("() => PF.isPhoned('s-gin') || PF.isPhoned('" + st["in"][0]["share_id"] + "')")
     assert not app.errors
-
-
-def test_no_friend_row_when_nobody_phoned(browser):
-    app = FakeApp(browser, fake_sessions(1), extra_routes=_routes(_state()))
-    app.page.wait_for_function("window.PF && PF.isMember()")
-    assert app.page.evaluate("() => PF.projectRows()") == ""
 
 
 def test_the_orgs_panel_copies_an_invite(browser):
@@ -184,12 +173,10 @@ def test_the_note_is_written_shown_and_edited_on_both_sides(browser):
     app.page.keyboard.press("Escape")
     app.push("pf_incoming", st["in"][0])
     assert "Login flakes on CI" in app.page.wait_for_selector(".pf-toast").inner_text()
-    assert "Login flakes on CI" in app.page.evaluate("() => PF.projectRows()")
-    app.page.evaluate("() => PF.openFriend('33333333-3333-3333-3333-333333333333')")
-    assert "Login flakes on CI" in app.page.wait_for_selector(".pf-vnotebox .pf-callnote").inner_text()
-    # A change from the other side repaints every copy.
+    # A change from the other side is announced and kept for the call's menu.
     app.push("pf_note", dict(st["in"][0], note="Pinned the clock", note_by="Priya"))
-    app.page.wait_for_function("document.querySelector('.pf-vnotebox').innerText.includes('Pinned the clock')")
+    app.page.wait_for_function("PF.state().incoming[0].note === 'Pinned the clock'")
+    assert "Pinned the clock" in app.page.inner_text("#toast")
     assert not app.errors
 
 
@@ -240,27 +227,6 @@ def test_phone_a_friend_is_in_the_composer_menu_beside_send(browser):
     pg.wait_for_selector(".pf-pop")
     assert not pg.query_selector(".vn-more-menu")
     assert "Phone a friend" in pg.inner_text(".pf-pop h4")
-
-
-def test_the_friend_view_shows_summaries_as_words_and_can_hang_up(browser):
-    rows = fake_sessions(1)
-    owner = "33333333-3333-3333-3333-333333333333"
-    st = _state(**{"in": [_grant("x-1", gid="gin", owner="Priya", owner_id=owner, title="Flaky login test")]})
-    routes = _routes(st)
-    card = json.dumps({"type": "done", "title": "Login test fixed", "headline": "The clock is pinned now.", "answer": "Short answer here."})
-    posts = [{"seq": 1, "kind": "entry", "body": {"kind": "user", "text": "why does it flake"}},
-             {"seq": 2, "kind": "entry", "body": {"kind": "asst", "text": "Done.\n\n```handoff\n" + card + "\n```"}}]
-    routes = dict({"/api/phone/read/": lambda req: (200, {"ok": True, "posts": posts, "status": "idle"})}, **routes)
-    app = FakeApp(browser, rows, extra_routes=routes)
-    app.page.wait_for_function("window.PF && PF.isMember() && PF.state().incoming.length")
-    app.page.evaluate(f"() => PF.openFriend('{owner}')")
-    app.page.wait_for_selector(".pf-thread .pf-card")
-    text = app.page.inner_text(".pf-thread")
-    assert "Login test fixed" in text and "The clock is pinned now." in text and '"type"' not in text
-    app.page.click(".pf-banner .pf-hang")
-    app.page.wait_for_function("document.querySelector('.pf-toast, #toast.show') || true")
-    assert st["revoked"] == ["gin"]
-    assert not app.errors
 
 
 PHONE = {"has_touch": True, "is_mobile": True}
@@ -317,3 +283,19 @@ def test_a_call_lasts_until_revoked_unless_you_pick_a_time(browser):
     app.page.click(".pf-pop .pf-go")
     app.page.wait_for_function("!document.querySelector('.pf-pop')")
     assert st["calls"][0]["duration"] == "revoked"
+
+
+def test_a_phoned_session_gets_its_call_rows_in_the_composer_menu(browser):
+    """In a session a friend phoned you about, the four-squares menu offers the
+    call's note and Hang up, not Phone a friend."""
+    from tests.test_enter_to_send import ROW, _open
+    pg = _open(browser, 1400)
+    pg.evaluate("() => { for (const id of ['vn-splash', 'health-blocker']) document.getElementById(id)?.remove(); }")
+    pg.wait_for_selector("#live-image-btn", state="attached")
+    pg.wait_for_function("window.PF && PF.state().loaded")
+    pg.evaluate("""sid => { PF.state().me = {ok: true, member: true, username: 'Sam'};
+        PF.state().incoming = [{grant_id: 'g9', share_id: sid, owner: 'Priya', live: true, level: 'drive', note: 'CI fails'}];
+        activeId = sid; }""", ROW["id"])
+    pg.evaluate("document.getElementById('live-image-btn').click()")
+    menu = pg.inner_text(".vn-more-menu")
+    assert "Hang up" in menu and "Call note" in menu and "Phone a friend" not in menu

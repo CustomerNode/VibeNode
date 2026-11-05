@@ -428,7 +428,14 @@
     // Phone a Friend (phone-a-friend.js): open this session to org members.
     // Only while this VibeNode is in an org and a session is open.
     var sid = (typeof activeId !== 'undefined') ? activeId : null;
-    if (sid && window.PF && window.PF.isMember()) {
+    // A session a friend phoned you about: its call's note and Hang up instead.
+    if (sid && window.PF && window.PF.isPhoned && window.PF.isPhoned(sid)) {
+      window.PF.composerRows(sid).forEach(function (r) {
+        var row = menuRow('button', PHONE_SVG, r.label, r.sub);
+        row.addEventListener('click', function (e) { e.preventDefault(); hideChip(); r.run(btn); });
+        menu.appendChild(row);
+      });
+    } else if (sid && window.PF && window.PF.isMember()) {
       var call = menuRow('button', PHONE_SVG, 'Phone a friend', 'Open this session to your org');
       call.addEventListener('click', function (e) {
         e.preventDefault();

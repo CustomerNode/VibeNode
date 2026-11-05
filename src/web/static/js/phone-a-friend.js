@@ -9,8 +9,9 @@
  *     is live; the header mark lists who is on it, with Revoke / Revoke all.
  *   - A plain toast (and a notification when the tab is hidden) when a friend
  *     phones you, with Open; and one when a friend suggests a message.
- *   - One row per friend who phoned you, at the top of the project list,
- *     only while they have a call to you (live or ended in the last 7 days).
+ *   - A session someone phoned you about is a real session in a "<caller>
+ *     phoned you" project at the top of the project list (src/web/orgs/
+ *     mirror.py): the app's own list, chat and composer show it.
  *   - System → VibeNode Orgs: set up, members, Add member (a one-time invite
  *     prompt to copy), leave.
  */
@@ -334,154 +335,63 @@
     if (d && d.from) toastText(d.from + ' sent a message to “' + sessionTitle(d.session_id) + '”.');
   }
 
-  // ── friends who phoned you (top of the project list) ─────────────────────
-  function friends() {
-    var by = {};
-    st.incoming.forEach(function (g) {
-      var f = by[g.owner_id] || (by[g.owner_id] = { id: g.owner_id, name: g.owner, live: 0, grants: [] });
-      f.grants.push(g); if (g.live) f.live++;
-      if (g.note && (!f.noteAt || (g.note_at || '') > f.noteAt)) { f.note = g.note; f.noteAt = g.note_at || ''; }
-    });
-    return Object.keys(by).map(function (k) { return by[k]; }).sort(function (a, b) { return b.live - a.live || a.name.localeCompare(b.name); });
+  // ── a phoned session is a real session ───────────────────────────────────
+  //
+  // The friend's VibeNode writes the shared thread into a session of its own,
+  // in a "<caller> phoned you" project (src/web/orgs/mirror.py), so the app's
+  // own list, chat, summary cards and composer show it. A message typed there
+  // goes to the caller (the socket handlers' _phoned_session_reply). This file
+  // only opens it from the call toast and adds Hang up / the note to the
+  // composer's four-squares menu.
+  function grantForSession(sid) {
+    return st.incoming.filter(function (g) { return g.share_id === sid; })
+      .sort(function (a, b) { return (b.live ? 1 : 0) - (a.live ? 1 : 0); })[0] || null;
   }
+  function isPhoned(sid) { return !!grantForSession(sid); }
 
-  function projectRows() {
-    var fs = friends();
-    if (!fs.length) return '';
-    return fs.map(function (f) {
-      return '<div class="project-item pf-friend-row" data-pf-friend="' + esc(f.id) + '" title="Sessions ' + esc(f.name) + ' shared with you">'
-        + '<span class="project-item-mark pf-friend-mark" aria-hidden="true">' + PHONE_SVG + '</span>'
-        + '<div class="project-item-info"><div class="project-item-name">' + esc(f.name) + ' phoned you</div>'
-        + '<div class="project-item-path">' + (f.note ? esc(f.note) : (f.live ? f.live + ' open now' : 'Ended')) + '</div></div>'
-        + '<span class="project-item-count">' + f.grants.length + ' ' + (f.grants.length === 1 ? 'session' : 'sessions') + '</span></div>';
-    }).join('');
+  function openShare(shareId) {
+    var g = grantForSession(shareId);
+    var go = function (enc) {
+      var open = function () { if (typeof openInGUI === 'function') openInGUI(shareId); };
+      var cur = localStorage.getItem('activeProject') || '';
+      if (enc && cur !== enc && typeof selectProjectFromOverlay === 'function') {
+        selectProjectFromOverlay(enc);
+        var tries = 0;
+        (function wait() {
+          var ok = window.SessionStore && SessionStore.has && SessionStore.has(shareId);
+          if (ok || ++tries > 40) open(); else setTimeout(wait, 250);
+        })();
+      } else open();
+    };
+    api('/api/phone/mirror/' + encodeURIComponent(shareId)).then(function (d) { go(d && d.project); });
+    return g;
   }
-
-  function wireProjectRows(list) {
-    list.querySelectorAll('[data-pf-friend]').forEach(function (row) {
-      row.onclick = function () {
-        if (window.closeProjectOverlay) closeProjectOverlay();
-        else { var ov = document.getElementById('project-overlay'); if (ov) ov.classList.remove('show'); }
-        openFriend(row.getAttribute('data-pf-friend'));
-      };
-    });
-  }
-
-  // ── a friend's shared sessions ───────────────────────────────────────────
-  var view = null;
   function openFriend(ownerId, shareId) {
-    var f = friends().filter(function (x) { return x.id === ownerId; })[0];
-    if (!f) { refresh().then(function () { if (friends().some(function (x) { return x.id === ownerId; })) openFriend(ownerId, shareId); }); return; }
-    closeFriend();
-    var ov = document.createElement('div');
-    ov.className = 'pf-view';
-    ov.innerHTML = '<div class="pf-vcard"><div class="pf-vhead"><span class="pf-friend-mark">' + PHONE_SVG + '</span><h3>' + esc(f.name) + ' phoned you</h3><button type="button" class="pf-ghost pf-close">Close</button></div>'
-      + '<div class="pf-vbody"><div class="pf-vlist"></div><div class="pf-vmain"><div class="pf-banner"></div><div class="pf-vnotebox"></div><div class="pf-thread"></div><div class="pf-compose"></div></div></div></div>';
-    document.body.appendChild(ov);
-    ov.querySelector('.pf-close').onclick = closeFriend;
-    ov.onclick = function (e) { if (e.target === ov) closeFriend(); };
-    view = { el: ov, owner: ownerId, share: null, grant: null, last: 0, timer: null };
-    var listEl = ov.querySelector('.pf-vlist');
-    listEl.innerHTML = f.grants.map(function (g) {
-      return '<button type="button" class="pf-vrow' + (g.live ? '' : ' ended') + '" data-share="' + esc(g.share_id) + '">' + (g.project ? '<small class="pf-vproj">' + esc(g.project) + '</small>' : '') + esc(g.title || 'Untitled session') + '<small>' + (g.live ? esc(LEVEL_WORDS[g.level]) + ' · ' + esc(left(g)) : 'ended') + '</small>' + (g.note ? '<small class="pf-vnote">' + esc(g.note) + '</small>' : '') + '</button>';
-    }).join('');
-    listEl.onclick = function (e) { var b = e.target.closest('[data-share]'); if (b) pickShare(b.dataset.share); };
-    var first = shareId || ((f.grants.filter(function (g) { return g.live; })[0] || f.grants[0]) || {}).share_id;
-    if (first) pickShare(first);
+    var gs = st.incoming.filter(function (g) { return g.owner_id === ownerId; });
+    var g = gs.filter(function (x) { return x.share_id === shareId; })[0] || gs.filter(function (x) { return x.live; })[0] || gs[0];
+    if (g) openShare(g.share_id);
   }
 
-  function closeFriend() {
-    if (!view) return;
-    clearTimeout(view.timer); view.el.remove(); view = null;
+  // Composer menu rows for a phoned session (image-attach.js asks for them).
+  function composerRows(sid) {
+    var g = grantForSession(sid);
+    if (!g) return [];
+    var rows = [{ label: 'Call note', sub: g.note || 'Add a note for ' + g.owner, run: function (btn) {
+      var p = popAt('<h4>Call with ' + esc(g.owner) + '</h4>' + noteHtml(g), btn);
+      wireNotes(p);
+    } }];
+    if (g.live) rows.push({ label: 'Hang up', sub: 'End ' + g.owner + '’s call', run: function () {
+      api('/api/phone/revoke/' + g.grant_id, { body: {} }).then(function (d) {
+        if (!d.ok) { toastText(d.message || 'Could not hang up.', true); return; }
+        toastText('Hung up on ' + g.owner + '’s session.');
+        refresh();
+      });
+    } });
+    return rows;
   }
 
-  function pickShare(shareId) {
-    if (!view) return;
-    var g = st.incoming.filter(function (x) { return x.share_id === shareId; }).sort(function (a, b) { return (b.live ? 1 : 0) - (a.live ? 1 : 0); })[0];
-    if (!g) return;
-    clearTimeout(view.timer);
-    view.share = shareId; view.grant = g; view.last = 0;
-    view.el.querySelectorAll('.pf-vrow').forEach(function (b) { b.classList.toggle('on', b.dataset.share === shareId); });
-    var thread = view.el.querySelector('.pf-thread');
-    thread.innerHTML = '';
-    var banner = view.el.querySelector('.pf-banner');
-    banner.textContent = g.live
-      ? g.owner + "'s session" + (g.project ? ' in ' + g.project : '') + ' on ' + g.source + ' · you ' + LEVEL_WORDS[g.level] + ' · ' + left(g)
-      : 'This call has ended.';
-    if (g.live) {
-      var hang = document.createElement('button');
-      hang.type = 'button'; hang.className = 'pf-ghost pf-hang'; hang.textContent = 'Hang up';
-      hang.onclick = function () {
-        api('/api/phone/revoke/' + g.grant_id, { body: {} }).then(function (d) {
-          if (!d.ok) { toastText(d.message || 'Could not hang up.', true); return; }
-          toastText('Hung up on ' + g.owner + "'s session.");
-          refresh().then(function () { if (view) pickShare(shareId); });
-        });
-      };
-      banner.appendChild(hang);
-    }
-    var nb = view.el.querySelector('.pf-vnotebox');
-    nb.innerHTML = noteHtml(g); wireNotes(nb);
-    var comp = view.el.querySelector('.pf-compose');
-    if (g.live && (g.level === 'suggest' || g.level === 'drive')) {
-      comp.innerHTML = '<textarea rows="2" placeholder="' + (g.level === 'drive' ? 'Message the session as ' + esc(st.me.username) : 'Suggest a message; ' + esc(g.owner) + ' decides') + '"></textarea><button type="button" class="pf-go">' + (g.level === 'drive' ? 'Send' : 'Suggest') + '</button>';
-      var ta = comp.querySelector('textarea'), btn = comp.querySelector('button');
-      btn.onclick = function () {
-        var text = ta.value.trim(); if (!text) return;
-        btn.disabled = true;
-        api('/api/phone/send/' + g.grant_id, { body: { text: text } }).then(function (d) {
-          btn.disabled = false;
-          if (!d.ok) { toastText(d.message || 'Not sent.', true); return; }
-          ta.value = '';
-          toastText(g.level === 'drive' ? 'Sent to ' + g.owner + "'s session." : 'Suggested to ' + g.owner + '.');
-          poll();
-        });
-      };
-    } else comp.innerHTML = '';
-    if (g.live) poll();
-  }
-
-  function entryHtml(p) {
-    var b = p.body || {};
-    if (p.kind === 'guest_msg') return '<div class="pf-e pf-guest"><b>' + esc(p.author) + '</b> ' + esc(b.text || '') + '</div>';
-    if (p.kind === 'status') return '';
-    var kind = b.kind || '', text = b.text || b.summary || b.content || '';
-    if (typeof text !== 'string') text = JSON.stringify(text);
-    if (kind === 'user') return '<div class="pf-e pf-user">' + esc(text) + '</div>';
-    if (kind === 'asst' || kind === 'assistant') {
-      // An end-of-turn summary is a fenced handoff card: show its words, not its JSON.
-      var m = /```handoff\s*\n([\s\S]*?)\n```/.exec(text);
-      if (m) {
-        var card = null;
-        try { card = JSON.parse(m[1]); } catch (e) { card = null; }
-        var before = text.slice(0, m.index).trim();
-        if (card) return (before ? '<div class="pf-e pf-asst">' + (window.mdParse ? mdParse(before) : esc(before)) + '</div>' : '')
-          + '<div class="pf-e pf-card">' + ((view && view.grant && view.grant.project) ? '<small class="pf-vproj">' + esc(view.grant.project) + '</small>' : '') + (card.title ? '<b>' + esc(card.title) + '</b>' : '')
-          + (card.headline ? '<div>' + esc(card.headline) + '</div>' : '')
-          + (card.answer ? '<div class="pf-card-a">' + esc(card.answer) + '</div>' : '') + '</div>';
-      }
-      return '<div class="pf-e pf-asst">' + (window.mdParse ? mdParse(text) : esc(text)) + '</div>';
-    }
-    if (kind === 'tool_use') return '<div class="pf-e pf-tool">' + esc((b.name || 'Tool') + (b.desc ? ': ' + b.desc : '')) + '</div>';
-    if (kind === 'tool_result') return '';
-    return text ? '<div class="pf-e pf-sys">' + esc(text.slice(0, 400)) + '</div>' : '';
-  }
-
-  function poll() {
-    if (!view || !view.share) return;
-    var shareId = view.share;
-    api('/api/phone/read/' + shareId + '?after=' + view.last + '&limit=200').then(function (d) {
-      if (!view || view.share !== shareId) return;
-      var thread = view.el.querySelector('.pf-thread');
-      if (!d.ok) {
-        if (d._status === 403) { view.el.querySelector('.pf-banner').textContent = 'This call has ended.'; view.el.querySelector('.pf-compose').innerHTML = ''; refresh(); return; }
-      } else {
-        var atEnd = thread.scrollTop + thread.clientHeight >= thread.scrollHeight - 30;
-        (d.posts || []).forEach(function (p) { view.last = Math.max(view.last, p.seq); var h = entryHtml(p); if (h) thread.insertAdjacentHTML('beforeend', h); });
-        if (atEnd || view.last && thread.childElementCount && !thread.dataset.seen) { thread.scrollTop = thread.scrollHeight; thread.dataset.seen = '1'; }
-      }
-      view.timer = setTimeout(poll, 3000);
-    });
+  function onNotice(d) {
+    if (d && d.message) toastText(d.message, d.ok === false);
   }
 
   // ── System → VibeNode Orgs ───────────────────────────────────────────────
@@ -588,6 +498,7 @@
     s.on('pf_suggestion', onSuggestion);
     s.on('pf_message', onMessage);
     s.on('pf_note', onNote);
+    s.on('pf_notice', onNotice);
   }
 
   var _lastActive = null;
@@ -603,7 +514,7 @@
 
   window.PF = {
     isMember: isMember, rowMark: rowMark, openCall: openCall, openList: openList, openOrgs: openOrgs,
-    openFriend: openFriend, projectRows: projectRows, wireProjectRows: wireProjectRows, refresh: refresh,
+    openFriend: openFriend, openShare: openShare, isPhoned: isPhoned, composerRows: composerRows, refresh: refresh,
     state: function () { return st; },
   };
   window.openVibeNodeOrgs = openOrgs;
