@@ -235,6 +235,7 @@
         + '<div class="pf-call-sec">They can</div><div class="pf-seg pf-grid3" data-k="level">' + LEVELS.map(function (l) {
             return '<button type="button" class="add-mode-card' + (l[0] === pick.level ? ' active on' : '') + '" data-v="' + l[0] + '"><div class="add-mode-info"><div class="add-mode-title">' + l[1] + '</div><div class="add-mode-desc">' + LEVEL_DESC[l[0]] + '</div></div></button>';
           }).join('') + '</div>'
+        + '<div class="pf-drive-warn" role="note"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg><span><b>Drive runs their messages in this session as if you typed them.</b> Whatever this session may do without asking (commands, file changes) they can make it do. Pick Suggest to approve each message yourself.</span></div>'
         + '<div class="pf-call-sec">For</div><div class="pf-seg pf-grid4" data-k="dur">' + DURS.map(function (d) {
             return '<button type="button" class="add-mode-card' + (d[0] === pick.dur ? ' active on' : '') + '" data-v="' + d[0] + '"><div class="add-mode-info"><div class="add-mode-title">' + d[1] + '</div></div></button>';
           }).join('') + '</div>'
@@ -249,6 +250,7 @@
     } else {
       p = popAt('<h4>Phone a friend</h4><div class="pf-lab pf-lab-top">Pick one or more</div><div class="pf-members">Loading members…</div>'
         + '<div class="pf-lab">They can</div><div class="pf-seg" data-k="level">' + LEVELS.map(function (l) { return '<button type="button" data-v="' + l[0] + '"' + (l[0] === pick.level ? ' class="on"' : '') + '>' + l[1] + '</button>'; }).join('') + '</div>'
+        + '<div class="pf-drive-warn" role="note"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg><span><b>Drive runs their messages in this session as if you typed them.</b> Whatever this session may do without asking (commands, file changes) they can make it do. Pick Suggest to approve each message yourself.</span></div>'
         + '<div class="pf-lab">For</div><div class="pf-seg" data-k="dur">' + DURS.map(function (d) { return '<button type="button" data-v="' + d[0] + '"' + (d[0] === pick.dur ? ' class="on"' : '') + '>' + d[1] + '</button>'; }).join('') + '</div>'
         + '<div class="pf-lab">Note</div><textarea class="pf-nin pf-callnote-in" maxlength="500" rows="2" placeholder="What you need help with"></textarea>'
         + '<div class="pf-note"></div><div class="pf-acts"><button type="button" class="pf-go" disabled>Pick someone to call</button><button type="button" class="pf-ghost pf-cancel">Cancel</button></div>', anchor);
@@ -261,8 +263,12 @@
         var b = e.target.closest('button'); if (!b) return;
         pick[seg.dataset.k] = b.dataset.v;
         seg.querySelectorAll('button').forEach(function (x) { mark(x, x === b); });
+        showWarn();
       };
     });
+    // The Drive warning shows only while Drive is picked.
+    var showWarn = function () { var w = p.querySelector('.pf-drive-warn'); if (w) w.hidden = pick.level !== 'drive'; };
+    showWarn();
     var go = p.querySelector('.pf-go');
     api('/api/orgs/members').then(function (d) {
       var box = p.querySelector('.pf-members');

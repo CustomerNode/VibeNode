@@ -315,3 +315,19 @@ def test_a_friends_message_shows_a_quiet_caption_not_brackets(browser):
     assert got[1] == ["Suggested to DanaLaptop", "check the settings file"]
     assert got[2] == [None, "a plain message"]
     assert not app.errors
+
+
+def test_the_call_dialog_warns_while_drive_is_picked(browser):
+    rows = fake_sessions(1)
+    for ctx, vp, sel in ((None, None, ".pf-call"), (PHONE, {"width": 390, "height": 844}, ".pf-sheet")):
+        app = FakeApp(browser, rows, extra_routes=_routes(_state()), viewport=vp, context=ctx)
+        app.page.wait_for_function("window.PF && PF.isMember()")
+        app.page.evaluate("sid => PF.openCall(sid, null)", rows[0]["id"])
+        app.page.wait_for_selector(sel + " .pf-opt")
+        warn = app.page.locator(sel + " .pf-drive-warn")
+        assert warn.is_visible() and "as if you typed them" in warn.inner_text()
+        app.page.locator(sel + " .pf-seg[data-k='level'] button[data-v='suggest']").click()
+        assert not warn.is_visible()
+        app.page.locator(sel + " .pf-seg[data-k='level'] button[data-v='drive']").click()
+        assert warn.is_visible()
+        assert not app.errors

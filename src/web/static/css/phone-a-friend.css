@@ -130,3 +130,12 @@
 .pf-call .pf-grid4 .add-mode-title { font-size: 13px; margin: 0; }
 .pf-call textarea.pm-input { width: 100%; box-sizing: border-box; resize: vertical; font: inherit; }
 .pf-call .pf-note { margin-top: 6px; }
+
+/* The Drive warning in the call dialog and sheet. */
+.pf-drive-warn { display: flex; gap: 8px; align-items: flex-start; margin: 8px 0 2px; padding: 9px 11px; border-radius: 8px;
+  font-size: 12.5px; line-height: 1.45; color: var(--text-secondary);
+  background: rgba(255, 149, 0, .10); border: 1px solid rgba(255, 149, 0, .40); }
+.pf-drive-warn[hidden] { display: none; }
+.pf-drive-warn svg { flex: none; margin-top: 2px; color: #ff9500; }
+.pf-drive-warn b { color: var(--text-heading); font-weight: 600; }
+.pf-sheet .pf-drive-warn { font-size: 14px; }
