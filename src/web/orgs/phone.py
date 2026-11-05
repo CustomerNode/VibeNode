@@ -43,7 +43,8 @@ log = logging.getLogger("web.orgs.phone")
 
 STATE_FILE: Path = Path(os.environ.get("VIBENODE_PHONE_FILE")
                         or (_VIBENODE_DIR / "data" / "phone_a_friend.json"))
-TICK_S = 1.0
+TICK_S = 0.5          # while a call is live, on either side
+IDLE_TICK_S = 3.0     # in an org with no live call
 MAX_FIELD = 4000
 MAX_BATCH = 150
 LEVELS = ("view", "suggest", "drive")
@@ -389,7 +390,7 @@ def notes_once(notify=lambda e, d: None, grants: list | None = None) -> list:
     return changed
 
 
-def tick(sm=None, status_of=None, notify=lambda e, d: None) -> None:
+def tick(sm=None, status_of=None, notify=lambda e, d: None) -> bool:
     """One pass of the background loop in ONE round trip to the cloud storage
     (``pf_sync``): the calls on both sides, friends' new messages and the new
     posts of each phoned session come back together, then each job works from
@@ -408,7 +409,7 @@ def tick(sm=None, status_of=None, notify=lambda e, d: None) -> None:
         pings_once(notify=notify)
         notes_once(notify=notify)
         mirror.sync_once(notify=notify)
-        return
+        return True
     out, inn = data.get("out") or [], data.get("in") or []
     publish_once(status_of=status_of, grants=out)
     inbox_once(sm=sm, notify=notify, msgs=data.get("inbox") or [])
@@ -420,6 +421,7 @@ def tick(sm=None, status_of=None, notify=lambda e, d: None) -> None:
     if key != _last_lists.get("key"):
         _last_lists["key"] = key
         notify("pf_changed", {})
+    return any(g.get("live") for g in out + inn)
 
 
 _last_lists: dict = {"key": None}
@@ -452,8 +454,8 @@ def start(app, socketio) -> None:
                 backoff = 15.0
                 continue
             try:
-                tick(sm=app.session_manager, status_of=status_of, notify=notify)
-                backoff = TICK_S
+                live = tick(sm=app.session_manager, status_of=status_of, notify=notify)
+                backoff = TICK_S if live else IDLE_TICK_S
             except OrgsError as e:
                 if e.code in ("not_a_member",):
                     log.warning("this VibeNode's org membership was removed")
