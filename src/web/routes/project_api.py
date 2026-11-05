@@ -83,6 +83,8 @@ def api_projects():
     # Friends who phoned you (src/web/orgs/mirror.py) come first.
     from ..orgs import mirror
     pre = mirror.project_prefix()
+    # A phoned project with no session left is never shown.
+    results = [r for r in results if not (r["encoded"].startswith(pre) and r["session_count"] == 0)]
     results.sort(key=lambda r: not r["encoded"].startswith(pre))
     return jsonify(results)
 

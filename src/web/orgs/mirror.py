@@ -140,13 +140,13 @@ def _ensure_project(owner: str) -> Path:
 
 
 def _drop_project(encoded: str) -> None:
+    """Remove a phoned project folder and everything in it. VibeNode writes
+    its own bookkeeping files into every project folder it lists, so removing
+    only the transcripts left an empty, nameless project behind."""
     d = _cfg._CLAUDE_PROJECTS / encoded
-    try:
-        for f in d.glob("*.jsonl"):
-            f.unlink()
-        d.rmdir()
-    except OSError:
-        pass
+    if not (d.name.startswith(project_prefix()) or d.name.startswith(_cfg._encode_cwd(str(_LEGACY_ROOT)) + "-")):
+        return
+    shutil.rmtree(d, ignore_errors=True)
     names = _cfg._load_project_names()
     if names.pop(encoded, None) is not None:
         _cfg._save_project_names(names)
@@ -218,11 +218,12 @@ def sync_once(notify=lambda e, d: None) -> int:
         for gone in [s for s in mirrors if s not in by_share]:
             mirrors.pop(gone, None)
         try:
-            for d in _cfg._CLAUDE_PROJECTS.iterdir():
+            for d in list(_cfg._CLAUDE_PROJECTS.iterdir()):
                 if not d.name.startswith(pre):
                     continue
                 if d.name not in keep_projects:
                     _drop_project(d.name)
+                    shutil.rmtree(ROOT / d.name[len(pre):], ignore_errors=True)
                     continue
                 for f in d.glob("*.jsonl"):
                     if f.stem not in by_share:

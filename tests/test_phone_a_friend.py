@@ -340,6 +340,14 @@ def test_the_friend_gets_a_real_session_that_never_runs(world, monkeypatch):
     mirror.sync_once()
     sent, words = mirror.reply(g["share_id"], "late")
     assert not sent and "ended" in words
+    # Once the call is gone from the list, the project goes entirely, even with
+    # VibeNode's own bookkeeping files in its folder.
+    d = sam.projects / mirror.project_encoded("Dana")
+    (d / "_session_holds.json").write_text("{}")
+    monkeypatch.setattr(mods[2], "incoming", lambda days=7: [])
+    mirror.sync_once()
+    assert not d.exists()
+    assert all(not p["encoded"].startswith(mirror.project_prefix()) for p in _ok(client.get("/api/projects")))
 
 
 def test_the_socket_never_sends_a_phoned_session_to_the_session_engine(world, monkeypatch):
