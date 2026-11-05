@@ -456,8 +456,13 @@
     // carries a session id. Using [data-sid] as the universal handle means
     // we don't have to enumerate every layout the app renders sessions in.
     var _armedFor = null;   // sid we've armed for this interaction
+    // Chat messages and end-of-turn summaries also carry data-sid (so their
+    // buttons answer the right session), but holding on them means "select
+    // this text", never "open the session menu": anything inside the open
+    // thread is excluded.
     function findSessionEl(target) {
       if (!target || !target.closest) return null;
+      if (target.closest("#live-log, .msg, .lm")) return null;
       return target.closest("[data-sid]");
     }
     function startPress(kind, clientX, clientY, target, ptrId, button) {
