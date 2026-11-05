@@ -264,7 +264,7 @@ def test_the_note_travels_both_ways_and_stays_editable(world):
                                                   "duration": "1h", "note": "CI fails on Node 20"}))["grant"]
     phone.notes_once()
     sam.use(mods)
-    assert _ok(client.get("/api/phone/in"))["grants"][0]["note"] == "CI fails on Node 20"
+    assert _ok(client.get("/api/phone/in?v=2"))["grants"][0]["note"] == "CI fails on Node 20"
     phone.notes_once()
     _ok(client.post(f"/api/phone/note/{g['grant_id']}", json={"note": "Lockfile, fixed"}))
     dana.use(mods)
@@ -284,7 +284,7 @@ def test_the_friend_sees_the_project_the_session_is_in(world):
                                                   "level": "view", "duration": "1h", "title": "Login bug"}))["grant"]
     assert g["project"] == "CustomerNode"
     sam.use(mods)
-    assert _ok(client.get("/api/phone/in"))["grants"][0]["project"] == "CustomerNode"
+    assert _ok(client.get("/api/phone/in?v=2"))["grants"][0]["project"] == "CustomerNode"
 
 
 def _use_mirror(node, monkeypatch):
@@ -361,3 +361,14 @@ def test_the_socket_never_sends_a_phoned_session_to_the_session_engine(world, mo
     assert ("pf_notice", {"session_id": "m-1", "ok": True, "message": "Sent to Dana's session."}) in emitted
     assert any(ev == "session_state" and d["state"] == "idle" for ev, d in emitted)
     assert ws_events._phoned_session_reply("other", "hello") is False
+
+
+def test_an_old_tab_gets_no_calls_to_draw_its_own_rows(world):
+    app, client, mods, dana, sam = world
+    sam_id = _org(client, mods, dana, sam, "Old tab")
+    dana.use(mods)
+    dana.transcript("s-12", ["hello"])
+    _ok(client.post("/api/phone/call", json={"session_id": "s-12", "guest_id": sam_id, "level": "view", "duration": "1h"}))
+    sam.use(mods)
+    assert _ok(client.get("/api/phone/in?days=7"))["grants"] == []
+    assert len(_ok(client.get("/api/phone/in?days=7&v=2"))["grants"]) == 1

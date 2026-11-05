@@ -60,7 +60,7 @@
     return api('/api/orgs/me').then(function (me) {
       st.me = me && me.ok ? me : null;
       if (!isMember()) { st.out = []; st.incoming = []; st.loaded = true; paint(); return; }
-      return Promise.all([api('/api/phone/out'), api('/api/phone/in?days=7')]).then(function (r) {
+      return Promise.all([api('/api/phone/out'), api('/api/phone/in?days=7&v=2')]).then(function (r) {
         if (r[0].ok) st.out = r[0].grants || [];
         if (r[1].ok) st.incoming = r[1].grants || [];
         st.loaded = true; paint();

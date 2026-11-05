@@ -268,6 +268,11 @@ def api_out():
 @bp.route("/api/phone/in")
 @local_only
 def api_in():
+    # Only the current screens ask with v=2. A tab still running the first
+    # version drew its own "phoned you" rows and popup from this list; it gets
+    # an empty one, so nothing but the real phoned-you project ever shows.
+    if request.args.get("v") != "2":
+        return jsonify(ok=True, grants=[])
     try:
         return jsonify(ok=True, grants=phone.incoming(days=int(request.args.get("days", 7) or 7)))
     except OrgsError as e:
