@@ -205,7 +205,7 @@ def api_call():
         return jsonify(ok=False, error="bad_id"), 400
     try:
         g = phone.call_friend(str(d.get("session_id") or ""), d["guest_id"],
-                              str(d.get("level") or "view"), str(d.get("duration") or "4h"),
+                              str(d.get("level") or "view"), str(d.get("duration") or "revoked"),
                               title=str(d.get("title") or ""), note=str(d.get("note") or ""))
     except OrgsError as e:
         return _fail(e)

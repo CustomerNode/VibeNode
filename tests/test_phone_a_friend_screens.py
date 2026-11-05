@@ -303,3 +303,17 @@ def test_the_only_other_member_is_picked_already(browser):
     assert app.page.inner_text(".pf-sheet .pf-go") == "Call Sam"
     app.page.touchscreen.tap(195, 40)          # above the sheet, on the dimmed page
     app.page.wait_for_function("!document.querySelector('.pf-sheet')")
+
+
+def test_a_call_lasts_until_revoked_unless_you_pick_a_time(browser):
+    rows = fake_sessions(1)
+    st = _state()
+    app = FakeApp(browser, rows, extra_routes=_routes(st))
+    app.page.wait_for_function("window.PF && PF.isMember()")
+    app.page.evaluate("sid => PF.openCall(sid, null)", rows[0]["id"])
+    app.page.wait_for_selector(".pf-pop .pf-opt")
+    assert app.page.inner_text(".pf-pop .pf-seg[data-k='dur'] button.on") == "Until I revoke"
+    app.page.click(".pf-pop .pf-opt >> text=Sam")
+    app.page.click(".pf-pop .pf-go")
+    app.page.wait_for_function("!document.querySelector('.pf-pop')")
+    assert st["calls"][0]["duration"] == "revoked"

@@ -217,7 +217,7 @@
   function openCall(sid, anchor) {
     if (!isMember()) { openOrgs(); return; }
     // One or more people: each gets their own call (grant), revoked on its own.
-    var pick = { guests: {}, level: 'drive', dur: '4h' };
+    var pick = { guests: {}, level: 'drive', dur: 'revoked' };
     var p = popAt('<h4>Phone a friend</h4><div class="pf-lab pf-lab-top">Pick one or more</div><div class="pf-members">Loading members…</div>'
       + '<div class="pf-lab">They can</div><div class="pf-seg" data-k="level">' + LEVELS.map(function (l) { return '<button type="button" data-v="' + l[0] + '"' + (l[0] === pick.level ? ' class="on"' : '') + '>' + l[1] + '</button>'; }).join('') + '</div>'
       + '<div class="pf-lab">For</div><div class="pf-seg" data-k="dur">' + DURS.map(function (d) { return '<button type="button" data-v="' + d[0] + '"' + (d[0] === pick.dur ? ' class="on"' : '') + '>' + d[1] + '</button>'; }).join('') + '</div>'
