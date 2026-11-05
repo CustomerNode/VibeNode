@@ -148,3 +148,14 @@ def test_either_side_edits_the_note_others_cannot(pg, org):
     assert pg.call("pf_set_note", dana, g["grant_id"], "fixed, thanks")["note"] == "fixed, thanks"
     _fails(pg, "pf_set_note", priya["token"], g["grant_id"], "x", match="no_access")
     _fails(pg, "pf_set_note", dana, g["grant_id"], "x" * 501, match="bad_text")
+
+
+def test_the_project_travels_with_the_call_and_old_callers_still_work(pg, org):
+    dana, sam = org["owner"]["token"], org["Sam"]
+    g = pg.call("pf_share", dana, sam["member_id"], "box", "s-8", "T", "view", 60, "", "CustomerNode")
+    assert g["project"] == "CustomerNode"
+    assert pg.call("pf_grants_list", sam["token"], "in", 7)[0]["project"] in ("CustomerNode", "")
+    # A VibeNode that does not send the project (the eight-argument call) still works
+    # and keeps the project already recorded.
+    g2 = pg.call("pf_share", dana, sam["member_id"], "box", "s-8", "T2", "view", 60, "")
+    assert g2["project"] == "CustomerNode" and g2["title"] == "T2"

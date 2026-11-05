@@ -123,12 +123,16 @@ def test_calling_marks_the_row_and_revoke_clears_it(browser):
 
 def test_a_call_to_you_shows_a_toast_and_a_project_row(browser):
     rows = fake_sessions(1)
-    st = _state(**{"in": [_grant("x-1", owner="Priya", owner_id="33333333-3333-3333-3333-333333333333", title="Flaky login test")]})
+    st = _state(**{"in": [dict(_grant("x-1", owner="Priya", owner_id="33333333-3333-3333-3333-333333333333", title="Flaky login test"), project="Acme")]})
     app = FakeApp(browser, rows, extra_routes=_routes(st))
     app.page.wait_for_function("window.PF && PF.isMember() && PF.state().incoming.length")
     app.push("pf_incoming", st["in"][0])
     toast = app.page.wait_for_selector(".pf-toast")
-    assert "Priya phoned you" in toast.inner_text() and "Flaky login test" in toast.inner_text()
+    assert "Priya phoned you" in toast.inner_text() and "Acme · Flaky login test" in toast.inner_text()
+    app.page.evaluate("() => PF.openFriend('33333333-3333-3333-3333-333333333333')")
+    assert "Acme" in app.page.wait_for_selector(".pf-vrow .pf-vproj").inner_text()
+    assert "in Acme on box" in app.page.inner_text(".pf-banner")
+    app.page.evaluate("() => document.querySelector('.pf-view').remove()")
     html = app.page.evaluate("() => PF.projectRows()")
     assert "Priya phoned you" in html and html.count("pf-friend-row") == 1
     assert not app.errors

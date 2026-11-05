@@ -97,11 +97,12 @@ class Node:
         cfg_mod._kanban_config_cache = None
         return self
 
-    def transcript(self, sid, lines):
+    def transcript(self, sid, lines, cwd="/work/Acme"):
         p = self.projects / "-proj" / f"{sid}.jsonl"
         with p.open("a", encoding="utf-8") as fh:
             for text in lines:
-                fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n")
+                fh.write(json.dumps({"type": "user", "cwd": cwd,
+                                     "message": {"role": "user", "content": text}}) + "\n")
 
 
 @pytest.fixture
@@ -272,3 +273,15 @@ def test_the_note_travels_both_ways_and_stays_editable(world):
     assert seen == [("pf_note", "Lockfile, fixed", "Sam")]
     _ok(client.post(f"/api/phone/revoke/{g['grant_id']}"))
     assert _ok(client.post(f"/api/phone/note/{g['grant_id']}", json={"note": "Done, thanks"}))["grant"]["note"] == "Done, thanks"
+
+
+def test_the_friend_sees_the_project_the_session_is_in(world):
+    app, client, mods, dana, sam = world
+    sam_id = _org(client, mods, dana, sam, "Projects")
+    dana.use(mods)
+    dana.transcript("s-10", ["hello"], cwd="/home/someone/code/CustomerNode")
+    g = _ok(client.post("/api/phone/call", json={"session_id": "s-10", "guest_id": sam_id,
+                                                  "level": "view", "duration": "1h", "title": "Login bug"}))["grant"]
+    assert g["project"] == "CustomerNode"
+    sam.use(mods)
+    assert _ok(client.get("/api/phone/in"))["grants"][0]["project"] == "CustomerNode"

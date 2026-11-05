@@ -38,6 +38,11 @@
       .catch(function () { return { ok: false, error: 'network', message: 'Could not reach VibeNode.' }; });
   }
   function toastText(msg, err) { if (window.showToast) showToast(msg, !!err); }
+  // What a friend calls a shared session: its project first, then its title.
+  function label(g) {
+    var t = g.title || 'a session';
+    return g.project ? g.project + ' · ' + t : t;
+  }
   function left(g) {
     if (!g.expires_at) return 'until revoked';
     var ms = new Date(g.expires_at) - Date.now();
@@ -278,9 +283,9 @@
 
   function onIncoming(g) {
     if (!g || !g.grant_id) return;
-    var t = floatToast(PHONE_SVG + '<span><b>' + esc(g.owner) + ' phoned you</b> about “' + esc(g.title || 'a session') + '”' + (g.note ? '<br><span class="pf-tnote">' + esc(g.note) + '</span>' : '') + '</span><button type="button" class="pf-ghost pf-open">Open</button>', 60000);
+    var t = floatToast(PHONE_SVG + '<span><b>' + esc(g.owner) + ' phoned you</b> about “' + esc(label(g)) + '”' + (g.note ? '<br><span class="pf-tnote">' + esc(g.note) + '</span>' : '') + '</span><button type="button" class="pf-ghost pf-open">Open</button>', 60000);
     t.el.querySelector('.pf-open').onclick = function () { t.close(); openFriend(g.owner_id, g.share_id); };
-    if (window.VNNotify && VNNotify.notice) VNNotify.notice({ key: 'pf:' + g.grant_id, title: g.owner + ' phoned you', body: (g.title || 'A session') + ' · ' + LEVEL_WORDS[g.level] + (g.note ? '\n' + g.note : ''), banner: true });
+    if (window.VNNotify && VNNotify.notice) VNNotify.notice({ key: 'pf:' + g.grant_id, title: g.owner + ' phoned you', body: label(g) + ' · ' + LEVEL_WORDS[g.level] + (g.note ? '\n' + g.note : ''), banner: true });
     refresh();
   }
 
@@ -297,7 +302,7 @@
     if (!g || !g.grant_id) return;
     putGrant(g); paintNotes(g);
     if (st.me && g.note_by && g.note_by !== st.me.username)
-      toastText(g.note_by + ' changed the note on “' + (g.title || 'a session') + '”: ' + (g.note || '(cleared)'));
+      toastText(g.note_by + ' changed the note on “' + label(g) + '”: ' + (g.note || '(cleared)'));
   }
 
   function onMessage(d) {
@@ -353,7 +358,7 @@
     view = { el: ov, owner: ownerId, share: null, grant: null, last: 0, timer: null };
     var listEl = ov.querySelector('.pf-vlist');
     listEl.innerHTML = f.grants.map(function (g) {
-      return '<button type="button" class="pf-vrow' + (g.live ? '' : ' ended') + '" data-share="' + esc(g.share_id) + '">' + esc(g.title || 'Untitled session') + '<small>' + (g.live ? esc(LEVEL_WORDS[g.level]) + ' · ' + esc(left(g)) : 'ended') + '</small>' + (g.note ? '<small class="pf-vnote">' + esc(g.note) + '</small>' : '') + '</button>';
+      return '<button type="button" class="pf-vrow' + (g.live ? '' : ' ended') + '" data-share="' + esc(g.share_id) + '">' + (g.project ? '<small class="pf-vproj">' + esc(g.project) + '</small>' : '') + esc(g.title || 'Untitled session') + '<small>' + (g.live ? esc(LEVEL_WORDS[g.level]) + ' · ' + esc(left(g)) : 'ended') + '</small>' + (g.note ? '<small class="pf-vnote">' + esc(g.note) + '</small>' : '') + '</button>';
     }).join('');
     listEl.onclick = function (e) { var b = e.target.closest('[data-share]'); if (b) pickShare(b.dataset.share); };
     var first = shareId || ((f.grants.filter(function (g) { return g.live; })[0] || f.grants[0]) || {}).share_id;
@@ -376,7 +381,7 @@
     thread.innerHTML = '';
     var banner = view.el.querySelector('.pf-banner');
     banner.textContent = g.live
-      ? g.owner + "'s session on " + g.source + ' · you ' + LEVEL_WORDS[g.level] + ' · ' + left(g)
+      ? g.owner + "'s session" + (g.project ? ' in ' + g.project : '') + ' on ' + g.source + ' · you ' + LEVEL_WORDS[g.level] + ' · ' + left(g)
       : 'This call has ended.';
     if (g.live) {
       var hang = document.createElement('button');
@@ -426,7 +431,7 @@
         try { card = JSON.parse(m[1]); } catch (e) { card = null; }
         var before = text.slice(0, m.index).trim();
         if (card) return (before ? '<div class="pf-e pf-asst">' + (window.mdParse ? mdParse(before) : esc(before)) + '</div>' : '')
-          + '<div class="pf-e pf-card">' + (card.title ? '<b>' + esc(card.title) + '</b>' : '')
+          + '<div class="pf-e pf-card">' + ((view && view.grant && view.grant.project) ? '<small class="pf-vproj">' + esc(view.grant.project) + '</small>' : '') + (card.title ? '<b>' + esc(card.title) + '</b>' : '')
           + (card.headline ? '<div>' + esc(card.headline) + '</div>' : '')
           + (card.answer ? '<div class="pf-card-a">' + esc(card.answer) + '</div>' : '') + '</div>';
       }

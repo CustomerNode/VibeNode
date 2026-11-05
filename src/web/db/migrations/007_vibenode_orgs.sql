@@ -231,6 +231,10 @@ END $$;
 
 -- ── Phone a Friend ──────────────────────────────────────────────────────────
 
+-- The project a shared session belongs to on its owner's computer, so a
+-- friend always sees which project they were phoned about.
+ALTER TABLE pf_shared_sessions ADD COLUMN IF NOT EXISTS project TEXT NOT NULL DEFAULT '';
+
 -- The call's note: written when phoning, editable afterwards by either side.
 ALTER TABLE pf_grants ADD COLUMN IF NOT EXISTS note_by UUID REFERENCES org_members(id) ON DELETE SET NULL;
 ALTER TABLE pf_grants ADD COLUMN IF NOT EXISTS note_at TIMESTAMPTZ;
@@ -239,7 +243,7 @@ CREATE OR REPLACE FUNCTION pf_grant_json(g pf_grants, s pf_shared_sessions) RETU
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, extensions AS $$
     SELECT jsonb_build_object(
         'grant_id', g.id, 'share_id', s.id, 'session_id', s.session_id, 'source', s.source,
-        'title', s.title, 'status', s.status, 'last_seq', s.last_seq, 'level', g.level,
+        'title', s.title, 'project', s.project, 'status', s.status, 'last_seq', s.last_seq, 'level', g.level,
         'note', g.note, 'expires_at', g.expires_at, 'revoked_at', g.revoked_at,
         'created_at', g.created_at, 'live', pf_grant_live(g),
         'owner_id', s.owner_id, 'owner', (SELECT username FROM org_members WHERE id = s.owner_id),
@@ -249,8 +253,12 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, extensions AS $$
 $$;
 
 -- Open one of your sessions to one member. p_minutes NULL = until revoked.
+-- p_project has a default so a VibeNode that does not send it still calls
+-- this one function (the eight-argument version it replaced is dropped).
+DROP FUNCTION IF EXISTS pf_share(TEXT, UUID, TEXT, TEXT, TEXT, TEXT, INT, TEXT);
 CREATE OR REPLACE FUNCTION pf_share(p_token TEXT, p_guest UUID, p_source TEXT, p_session TEXT,
-                                    p_title TEXT, p_level TEXT, p_minutes INT, p_note TEXT)
+                                    p_title TEXT, p_level TEXT, p_minutes INT, p_note TEXT,
+                                    p_project TEXT DEFAULT '')
 RETURNS JSONB
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, extensions AS $$
 DECLARE m org_members := orgs_member(p_token); s pf_shared_sessions; g pf_grants;
@@ -262,9 +270,11 @@ BEGIN
     IF p_minutes IS NOT NULL AND (p_minutes < 1 OR p_minutes > 60 * 24 * 90) THEN
         RAISE EXCEPTION 'bad_minutes' USING ERRCODE = '22023';
     END IF;
-    INSERT INTO pf_shared_sessions (org_id, owner_id, source, session_id, title)
-         VALUES (m.org_id, m.id, p_source, p_session, coalesce(p_title, ''))
-    ON CONFLICT (owner_id, source, session_id) DO UPDATE SET title = EXCLUDED.title
+    INSERT INTO pf_shared_sessions (org_id, owner_id, source, session_id, title, project)
+         VALUES (m.org_id, m.id, p_source, p_session, coalesce(p_title, ''), left(coalesce(p_project, ''), 120))
+    ON CONFLICT (owner_id, source, session_id) DO UPDATE
+        SET title = EXCLUDED.title,
+            project = CASE WHEN EXCLUDED.project <> '' THEN EXCLUDED.project ELSE pf_shared_sessions.project END
       RETURNING * INTO s;
     -- One live grant per person per session: a second call changes it.
     UPDATE pf_grants SET revoked_at = now()
@@ -420,13 +430,13 @@ REVOKE EXECUTE ON FUNCTION orgs_hash(TEXT), orgs_new_secret(), orgs_member(TEXT)
 GRANT EXECUTE ON FUNCTION orgs_create(TEXT, TEXT) TO service_role;
 REVOKE EXECUTE ON FUNCTION orgs_me(TEXT), orgs_members(TEXT), orgs_create_invite(TEXT, INT),
     orgs_redeem_invite(TEXT, TEXT), orgs_revoke_invites(TEXT), orgs_remove_member(TEXT, UUID),
-    pf_share(TEXT, UUID, TEXT, TEXT, TEXT, TEXT, INT, TEXT), pf_revoke(TEXT, UUID),
+    pf_share(TEXT, UUID, TEXT, TEXT, TEXT, TEXT, INT, TEXT, TEXT), pf_revoke(TEXT, UUID),
     pf_grants_list(TEXT, TEXT, INT), pf_post(TEXT, UUID, JSONB, TEXT),
     pf_read(TEXT, UUID, BIGINT, INT, BIGINT), pf_guest_message(TEXT, UUID, TEXT),
     pf_inbox(TEXT, TIMESTAMPTZ), pf_set_note(TEXT, UUID, TEXT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION orgs_me(TEXT), orgs_members(TEXT), orgs_create_invite(TEXT, INT),
     orgs_redeem_invite(TEXT, TEXT), orgs_revoke_invites(TEXT), orgs_remove_member(TEXT, UUID),
-    pf_share(TEXT, UUID, TEXT, TEXT, TEXT, TEXT, INT, TEXT), pf_revoke(TEXT, UUID),
+    pf_share(TEXT, UUID, TEXT, TEXT, TEXT, TEXT, INT, TEXT, TEXT), pf_revoke(TEXT, UUID),
     pf_grants_list(TEXT, TEXT, INT), pf_post(TEXT, UUID, JSONB, TEXT),
     pf_read(TEXT, UUID, BIGINT, INT, BIGINT), pf_guest_message(TEXT, UUID, TEXT),
     pf_inbox(TEXT, TIMESTAMPTZ), pf_set_note(TEXT, UUID, TEXT) TO anon, authenticated, service_role;

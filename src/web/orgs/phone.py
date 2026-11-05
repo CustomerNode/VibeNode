@@ -129,6 +129,26 @@ def find_transcript(session_id: str) -> Path | None:
 
 # ── calls the routes make ────────────────────────────────────────────────────
 
+def project_name(path: Path) -> str:
+    """The project a transcript belongs to, as its owner knows it: the last
+    part of the first working folder the transcript records."""
+    try:
+        with path.open(encoding="utf-8") as fh:
+            for i, line in enumerate(fh):
+                if i > 50:
+                    break
+                if '"cwd"' not in line:
+                    continue
+                cwd = (json.loads(line).get("cwd") or "").rstrip("/\\")
+                if cwd:
+                    return re.split(r"[/\\]", cwd)[-1][:120]
+    except (OSError, ValueError):
+        pass
+    # No recorded folder: the end of the project folder's name (the CLI names it
+    # after the working folder, with separators turned into dashes).
+    return path.parent.name.rsplit("-", 1)[-1][:120]
+
+
 def call_friend(session_id: str, guest_id: str, level: str, duration: str,
                 title: str = "", note: str = "") -> dict:
     """Open ``session_id`` to one member. Posts the thread's last part at once
@@ -137,7 +157,8 @@ def call_friend(session_id: str, guest_id: str, level: str, duration: str,
         raise OrgsError("bad_level")
     if duration not in DURATIONS:
         raise OrgsError("bad_duration")
-    if find_transcript(session_id) is None:
+    path = find_transcript(session_id)
+    if path is None:
         raise OrgsError("no_session", "That session has no transcript on this computer yet.")
     minutes = DURATIONS[duration]
     if duration == "today":
@@ -145,7 +166,7 @@ def call_friend(session_id: str, guest_id: str, level: str, duration: str,
         minutes = max(1, 24 * 60 - (lt.tm_hour * 60 + lt.tm_min))
     g = store.call("pf_share", p_guest=guest_id, p_source=source_name(), p_session=session_id,
                    p_title=(title or "")[:200], p_level=level, p_minutes=minutes,
-                   p_note=(note or "")[:500])
+                   p_note=(note or "")[:500], p_project=project_name(path))
     try:
         publish_once(only_share=g.get("share_id"))
     except Exception:
