@@ -192,6 +192,18 @@ Mobile Command is off by default. It requires [Tailscale](https://tailscale.com/
 
 **Surviving unattended reboots.** Out of the box, the phone link comes back when you log in to the computer. If the machine reboots while nobody is around (power blip, auto-update) and you want your phone to bring VibeNode back *before anyone logs in*, run the one-time setup for your OS in [`scripts/boot_access/`](scripts/boot_access/README.md) — including an "Unlock & start" page for Linux machines with encrypted home directories.
 
+## Phone a Friend — open one session to someone who can help
+
+Stuck in a session? **Phone a Friend** opens just that one session to someone you trust, so they can watch it, suggest messages, or drive it, until you or they hang up. Nothing else on your computer is shared. It is the first feature of **VibeNode Orgs**: a small group of people whose VibeNodes can reach each other through your cloud storage.
+
+- **Set up once.** Under **System → VibeNode Orgs**, create an org (it lives in the Supabase project you already use for Persistent Storage). **Add member** makes a one-time invite prompt that expires in 1, 3 or 7 days; copy it into an email, your friend pastes it into any session on their VibeNode, picks a username and is in. No accounts to create, no ports to open, no shared network needed.
+- **Call from the session.** Tap the four squares beside Send (or use the session's menu) → **Phone a friend**. Pick one or more people, what they can do and for how long (until you revoke, by default), and add a note about what you need. Each person gets their own call, so you can hang up on one without ending the others. A phone mark on the session lists who is on it, with Revoke.
+- **Three levels.** **View** shows them the thread. **Suggest** lets them write a message that waits for you to send it. **Drive** runs their messages in your session as if you typed them; the dialog warns what that allows.
+- **Being phoned feels like any session.** You get a notification, and a "*name* phoned you" project appears at the top of your projects with a phone icon. Their session is a normal session in it, titled with their project, drawn by VibeNode's own chat, summaries and composer. Type in it and it goes to them; Hang up is in the four-squares menu. The note is shown on both sides and either of you can edit it.
+- **Live.** Updates arrive in about a second each way, and the caller's Working status shows on the friend's side.
+
+**Security.** Every line of a shared thread and every message a friend writes is encrypted end to end before it leaves a VibeNode: each member has a key pair that never leaves their computer, each shared session has its own key locked separately for each person on the call, and anyone hung up on never gets the keys for what follows. Your cloud storage, and whoever owns it, holds only scrambled text; who called whom, session titles, projects and notes stay readable there. A VibeNode only ever holds the project's public key and its own member token; every table is closed to it and each call goes through database functions that check what that member may do. Unlocked or forged messages are refused, a friend can write at most 10 messages a minute, and threads nobody has had a call on for a week are deleted. Over Mobile Command only your own Tailscale sign-in counts as you, and the publish check refuses every org member's name.
+
 ## Runs unattended
 
 Validation leverage only pays off if the work keeps moving while you're not looking. The Session Engine is built so that a session you walked away from is still going, or tells you why not, when you come back:
