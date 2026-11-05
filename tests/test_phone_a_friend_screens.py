@@ -299,3 +299,19 @@ def test_a_phoned_session_gets_its_call_rows_in_the_composer_menu(browser):
     pg.evaluate("document.getElementById('live-image-btn').click()")
     menu = pg.inner_text(".vn-more-menu")
     assert "Hang up" in menu and "Call note" in menu and "Phone a friend" not in menu
+
+
+def test_a_friends_message_shows_a_quiet_caption_not_brackets(browser):
+    app = FakeApp(browser, fake_sessions(1))
+    got = app.page.evaluate("""() => [
+        '[LeeDesktop via Phone a Friend]\\ntry running the tests',
+        '[Suggested to DanaLaptop] check the settings file',
+        'a plain message'].map(t => {
+          const d = renderLiveEntry({kind: 'user', text: t});
+          const c = d.querySelector('.pf-from');
+          return [c ? c.textContent : null, d.querySelector('.msg-body').textContent.trim()];
+        })""")
+    assert got[0] == ["LeeDesktop · via Phone a Friend", "try running the tests"]
+    assert got[1] == ["Suggested to DanaLaptop", "check the settings file"]
+    assert got[2] == [None, "a plain message"]
+    assert not app.errors

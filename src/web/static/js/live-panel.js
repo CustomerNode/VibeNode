@@ -2178,6 +2178,19 @@ function _stoppedDivider(div, e) {
   return div;
 }
 
+// A Phone a Friend label at the start of a message (src/web/orgs/phone.py
+// writes "[Name via Phone a Friend]", "[Name via Phone a Friend, sent by you]";
+// src/web/orgs/mirror.py writes "[Suggested to Name]"). Returns the caption
+// and the message without the label, or null.
+function _phoneFriendLabel(text) {
+  const m = /^\[([^\]\n]{1,80}?) via Phone a Friend(, sent by you)?\]\s*/.exec(text || '');
+  if (m) return { caption: m[1] + ' · via Phone a Friend' + (m[2] ? ', sent by you' : ''), body: text.slice(m[0].length) };
+  const s = /^\[Suggested to ([^\]\n]{1,80})\]\s*/.exec(text || '');
+  if (s) return { caption: 'Suggested to ' + s[1], body: text.slice(s[0].length) };
+  return null;
+}
+window._phoneFriendLabel = _phoneFriendLabel;
+
 function renderLiveEntry(e, opts) {
   const div = document.createElement('div');
   if (!e) return div;
@@ -2251,6 +2264,15 @@ function renderLiveEntry(e, opts) {
       return div;
     }
 
+    // Phone a Friend: a friend's message arrives labelled "[Sam via Phone a
+    // Friend]" (and a suggestion, in the friend's copy, "[Suggested to Dana]").
+    // Drawn as a quiet caption over a normal bubble, not as bracket text.
+    let _pfCaption = '';
+    if (e.kind === 'user') {
+      const _pf = _phoneFriendLabel(text);
+      if (_pf) { _pfCaption = _pf.caption; text = _pf.body; }
+    }
+
     div.className = 'msg ' + role;
     // Whose message this is: a summary's buttons answer only this session
     // (last-card.js _send).
@@ -2261,6 +2283,7 @@ function renderLiveEntry(e, opts) {
     const ts = e.timestamp ? _formatMsgTime(e.timestamp) : '';
     // Scaffold: role line + an empty body that _fillMsgBody() populates below.
     div.innerHTML = '<div class="msg-role">' + roleLabel + (ts ? ' <span class="msg-time">' + ts + '</span>' : '') + '</div>' +
+      (_pfCaption ? '<div class="pf-from">' + escHtml(_pfCaption) + '</div>' : '') +
       '<div class="msg-body msg-content"></div>';
 
     // The caller can force the most-recent assistant message to render fully
