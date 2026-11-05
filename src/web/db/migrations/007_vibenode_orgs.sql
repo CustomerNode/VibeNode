@@ -154,7 +154,7 @@ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, extensions AS
 DECLARE m org_members := orgs_member(p_token);
 BEGIN
     RETURN coalesce((SELECT jsonb_agg(jsonb_build_object(
-                'member_id', x.id, 'username', x.username, 'role', x.role,
+                'member_id', x.id, 'username', x.username, 'role', x.role, 'public_key', x.public_key,
                 'you', x.id = m.id, 'joined_at', x.created_at) ORDER BY lower(x.username))
              FROM org_members x WHERE x.org_id = m.org_id AND x.removed_at IS NULL), '[]'::jsonb);
 END $$;
@@ -231,6 +231,50 @@ END $$;
 
 -- ── Phone a Friend ──────────────────────────────────────────────────────────
 
+-- End-to-end encryption (src/web/orgs/crypto.py): each member's public key,
+-- and on each grant the thread key locked for that guest, with its version.
+ALTER TABLE org_members ADD COLUMN IF NOT EXISTS public_key TEXT CHECK (length(public_key) <= 100);
+ALTER TABLE pf_grants ADD COLUMN IF NOT EXISTS wrapped_key TEXT CHECK (length(wrapped_key) <= 20000);
+ALTER TABLE pf_grants ADD COLUMN IF NOT EXISTS key_version INT;
+
+CREATE OR REPLACE FUNCTION orgs_set_key(p_token TEXT, p_public TEXT) RETURNS BOOLEAN
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, extensions AS $$
+DECLARE m org_members := orgs_member(p_token);
+BEGIN
+    IF p_public IS NULL OR p_public !~ '^[A-Za-z0-9_-]{40,60}$' THEN
+        RAISE EXCEPTION 'bad_key' USING ERRCODE = '22023';
+    END IF;
+    UPDATE org_members SET public_key = p_public WHERE id = m.id;
+    RETURN TRUE;
+END $$;
+
+-- The caller locks the thread key for one guest (only the session's owner may).
+CREATE OR REPLACE FUNCTION pf_set_wrapped(p_token TEXT, p_grant UUID, p_wrapped TEXT, p_version INT) RETURNS BOOLEAN
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, extensions AS $$
+DECLARE m org_members := orgs_member(p_token); n INT;
+BEGIN
+    UPDATE pf_grants g SET wrapped_key = p_wrapped, key_version = p_version
+      FROM pf_shared_sessions s
+     WHERE g.id = p_grant AND g.share_id = s.id AND s.owner_id = m.id;
+    GET DIAGNOSTICS n = ROW_COUNT;
+    RETURN n > 0;
+END $$;
+
+-- Keep nothing longer than needed: the caller's shared sessions with no live
+-- call and none in the last p_days days are deleted with their posts.
+CREATE OR REPLACE FUNCTION pf_prune(p_token TEXT, p_days INT) RETURNS INT
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, extensions AS $$
+DECLARE m org_members := orgs_member(p_token); n INT;
+BEGIN
+    DELETE FROM pf_shared_sessions s
+     WHERE s.owner_id = m.id
+       AND NOT EXISTS (SELECT 1 FROM pf_grants g WHERE g.share_id = s.id AND
+                       (pf_grant_live(g) OR coalesce(g.revoked_at, g.expires_at, g.created_at)
+                                            > now() - make_interval(days => greatest(coalesce(p_days, 7), 1))));
+    GET DIAGNOSTICS n = ROW_COUNT;
+    RETURN n;
+END $$;
+
 -- The project a shared session belongs to on its owner's computer, so a
 -- friend always sees which project they were phoned about.
 ALTER TABLE pf_shared_sessions ADD COLUMN IF NOT EXISTS project TEXT NOT NULL DEFAULT '';
@@ -249,6 +293,7 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, extensions AS $$
         'owner_id', s.owner_id, 'owner', (SELECT username FROM org_members WHERE id = s.owner_id),
         'guest_id', g.guest_id, 'guest', (SELECT username FROM org_members WHERE id = g.guest_id),
         'note_at', coalesce(g.note_at, g.created_at),
+        'wrapped_key', g.wrapped_key, 'key_version', g.key_version,
         'note_by', (SELECT username FROM org_members WHERE id = coalesce(g.note_by, s.owner_id)))
 $$;
 
@@ -464,14 +509,16 @@ REVOKE EXECUTE ON FUNCTION orgs_me(TEXT), orgs_members(TEXT), orgs_create_invite
     pf_grants_list(TEXT, TEXT, INT), pf_post(TEXT, UUID, JSONB, TEXT),
     pf_read(TEXT, UUID, BIGINT, INT, BIGINT), pf_guest_message(TEXT, UUID, TEXT),
     pf_inbox(TEXT, TIMESTAMPTZ), pf_set_note(TEXT, UUID, TEXT),
-    pf_sync(TEXT, JSONB, TIMESTAMPTZ, INT) FROM PUBLIC;
+    pf_sync(TEXT, JSONB, TIMESTAMPTZ, INT), orgs_set_key(TEXT, TEXT),
+    pf_set_wrapped(TEXT, UUID, TEXT, INT), pf_prune(TEXT, INT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION orgs_me(TEXT), orgs_members(TEXT), orgs_create_invite(TEXT, INT),
     orgs_redeem_invite(TEXT, TEXT), orgs_revoke_invites(TEXT), orgs_remove_member(TEXT, UUID),
     pf_share(TEXT, UUID, TEXT, TEXT, TEXT, TEXT, INT, TEXT, TEXT), pf_revoke(TEXT, UUID),
     pf_grants_list(TEXT, TEXT, INT), pf_post(TEXT, UUID, JSONB, TEXT),
     pf_read(TEXT, UUID, BIGINT, INT, BIGINT), pf_guest_message(TEXT, UUID, TEXT),
     pf_inbox(TEXT, TIMESTAMPTZ), pf_set_note(TEXT, UUID, TEXT),
-    pf_sync(TEXT, JSONB, TIMESTAMPTZ, INT) TO anon, authenticated, service_role;
+    pf_sync(TEXT, JSONB, TIMESTAMPTZ, INT), orgs_set_key(TEXT, TEXT),
+    pf_set_wrapped(TEXT, UUID, TEXT, INT), pf_prune(TEXT, INT) TO anon, authenticated, service_role;
 
 -- Tell the API to see the new functions now, not on its next schema refresh.
 NOTIFY pgrst, 'reload schema';

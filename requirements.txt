@@ -23,6 +23,8 @@ tzdata
 # engine with it (app/engine_freshness.py), and the watchdog uses it to see
 # background commands.  Without it the banner never shows.
 psutil>=5.9
+# Phone a Friend's end-to-end encryption (src/web/orgs/crypto.py).
+cryptography>=41
 pytest
 pytest-timeout
 # tests/test_api_docs_coverage.py reads docs/api/openapi.yaml.  Without it

@@ -170,6 +170,10 @@ def test_set_up_invite_join_call_read_drive_and_revoke(world):
     assert pings == ["pf_incoming"]
     texts = json.dumps(_ok(client.get(f"/api/phone/read/{g['share_id']}"))["posts"])
     assert "why does the build fail" in texts and FAKE_API not in texts and "[hidden]" in texts
+    # What the cloud storage holds is locked: neither the words nor the hidden
+    # key appear in the stored posts.
+    stored = json.dumps(phone.read(g["share_id"]))
+    assert "why does the build fail" not in stored and '"enc"' in stored
     _ok(client.post(f"/api/phone/send/{g['grant_id']}", json={"text": "run the tests"}))
 
     # Dana's VibeNode hands it to the session, labelled, once.

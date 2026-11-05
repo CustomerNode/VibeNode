@@ -104,9 +104,12 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict) -> None:
+    """Written readable by this account only: it holds the thread keys."""
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE_FILE.parent / (STATE_FILE.name + ".tmp")
-    tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=1)
     os.replace(tmp, STATE_FILE)
 
 
@@ -161,6 +164,11 @@ def call_friend(session_id: str, guest_id: str, level: str, duration: str,
     path = find_transcript(session_id)
     if path is None:
         raise OrgsError("no_session", "That session has no transcript on this computer yet.")
+    from . import keys
+    keys.my_private_key()
+    if not keys.public_key_of(guest_id):
+        raise OrgsError("friend_needs_update",
+                        "Their VibeNode needs an update before you can phone them (it cannot unlock calls yet).")
     minutes = DURATIONS[duration]
     if duration == "today":
         lt = time.localtime()
@@ -193,11 +201,66 @@ def incoming(days: int = 7) -> list:
 
 
 def read(share_id: str, after: int = 0, limit: int = 100, before: int | None = None) -> dict:
+    """A shared thread as stored: its lines are locked (see read_open)."""
     return store.call("pf_read", p_share=share_id, p_after=after, p_limit=limit, p_before=before)
 
 
+def read_open(share_id: str, after: int = 0, limit: int = 100, before: int | None = None) -> dict:
+    """A shared thread with its lines opened for this member: the friend with
+    the keys the caller locked for them, the caller with its own. A line
+    neither can open is left out."""
+    from . import keys
+    got = read(share_id, after, limit, before) or {}
+    with _lock:
+        state = _load_state()
+        g = next((x for x in incoming(days=0) if x["share_id"] == share_id), None)
+        key_for = ((lambda v: keys.thread_key_for_reading(state, g, v)) if g
+                   else (lambda v: keys.owner_key(state, share_id, v)))
+        posts = []
+        for p in got.get("posts") or []:
+            body = p.get("body") or {}
+            if p.get("kind") == "entry":
+                opened = keys.open_body(body, key_for) if "enc" in body else None
+                if opened is None:
+                    continue
+                p = dict(p, body=opened)
+            posts.append(p)
+        _save_state(state)
+    return dict(got, posts=posts)
+
+
+MAX_MESSAGE = 12000
+
+
 def send_to_friend_session(grant_id: str, text: str) -> int:
-    return store.call("pf_guest_message", p_grant=grant_id, p_text=text)
+    """Write into a friend's session: locked with the call's thread key."""
+    from . import keys
+    g = next((x for x in incoming(days=0) if x["grant_id"] == grant_id), None)
+    if g is None:
+        raise OrgsError("no_access", "This call has ended.")
+    v = g.get("key_version")
+    with _lock:
+        state = _load_state()
+        key = keys.thread_key_for_reading(state, g, v) if v else None
+        _save_state(state)
+    if not key:
+        raise OrgsError("no_key", "The call is not unlocked on this computer yet; try again in a moment.")
+    body = keys.seal_line(key, v, {"text": (text or "")[:MAX_MESSAGE]})
+    return store.call("pf_guest_message", p_grant=grant_id, p_text=json.dumps(body))
+
+
+def _open_message(state: dict, msg: dict) -> str | None:
+    """A friend's message as text, opened with the session's thread key."""
+    from . import keys
+    raw = msg.get("text") or ""
+    try:
+        body = json.loads(raw) if raw.startswith("{") else None
+    except ValueError:
+        body = None
+    if not isinstance(body, dict) or "enc" not in body:
+        return None                                       # plain text is never accepted
+    opened = keys.open_body(body, lambda v: keys.owner_key(state, msg["share_id"], v))
+    return (opened or {}).get("text") if isinstance(opened, dict) else None
 
 
 def suggestions() -> list:
@@ -220,7 +283,7 @@ def dismiss_suggestion(key: str) -> dict | None:
 # Transcript line types a friend's copy needs; the rest (file snapshots,
 # progress ticks, the caller's own title) are left out.
 _SHARED_TYPES = {"user", "assistant", "system"}
-MAX_LINE_BYTES = 60000
+MAX_LINE_BYTES = 40000    # locked, a line grows by about a third; a post body is at most 64 KB
 
 
 def _lines_since(path: Path, line_no: int) -> tuple[list, int]:
@@ -261,7 +324,9 @@ def publish_once(only_share: str | None = None, status_of=None, grants: list | N
         grants = outgoing(days=0)
     grants = [g for g in grants if g.get("live") and g.get("source") == source_name()]
     shares = {}
+    live_by_share: dict = {}
     for g in grants:
+        live_by_share.setdefault(g["share_id"], []).append(g)
         if only_share is None or g["share_id"] == only_share:
             shares[g["share_id"]] = g
     posted = 0
@@ -280,14 +345,18 @@ def publish_once(only_share: str | None = None, status_of=None, grants: list | N
             except OSError:
                 continue
             if share_id in cursors and sizes.get(share_id) == size and status == sent_status.get(share_id):
-                continue                          # nothing new: no round trip
+                from . import keys
+                keys.thread_key_for_posting(state, share_id, live_by_share.get(share_id, []))
+                continue                          # nothing new to post
             cur = cursors.get(share_id)
             if cur is None:                       # a new share: start with the recent part
                 total = sum(1 for l in path.read_text(encoding="utf-8").splitlines() if l.strip())
                 cur = max(0, total - 150)
             lines, new_cur = _lines_since(path, cur)
             if lines or status != sent_status.get(share_id):
-                batch = [{"kind": "entry", "body": {"line": ln}} for ln in lines[-MAX_BATCH:]]
+                from . import keys
+                v, key = keys.thread_key_for_posting(state, share_id, live_by_share.get(share_id, []))
+                batch = [{"kind": "entry", "body": keys.seal_line(key, v, {"line": ln})} for ln in lines[-MAX_BATCH:]]
                 store.call("pf_post", p_share=share_id, p_posts=batch, p_status=status)
                 posted += len(batch)
             cursors[share_id] = new_cur
@@ -322,6 +391,23 @@ def _deliver(msg: dict, sm, notify) -> None:
         notify("pf_suggestion", {"key": key, "session_id": sid, "from": who, "text": text[:300]})
 
 
+# A friend can write into your session at most this often; the rest are
+# dropped, so a call cannot be used to flood a session with turns.
+MAX_PER_MINUTE = 10
+_recent: dict = {}
+
+
+def _too_many(grant_id) -> bool:
+    now = time.monotonic()
+    times = [t for t in _recent.get(grant_id, []) if now - t < 60]
+    if len(times) >= MAX_PER_MINUTE:
+        _recent[grant_id] = times
+        return True
+    times.append(now)
+    _recent[grant_id] = times
+    return False
+
+
 def inbox_once(sm=None, notify=lambda e, d: None, msgs: list | None = None) -> int:
     with _lock:
         state = _load_state()
@@ -336,9 +422,16 @@ def inbox_once(sm=None, notify=lambda e, d: None, msgs: list | None = None) -> i
             continue
         seen.add(key)
         if msg.get("live") and msg.get("source") == source_name():
+            if _too_many(msg.get("grant_id")):
+                log.warning("a friend sent more than %d messages a minute; the rest were dropped", MAX_PER_MINUTE)
+                continue
             with _lock:
-                _deliver(msg, sm, notify)
-            handled += 1
+                text = _open_message(_load_state(), msg)
+                if text:
+                    _deliver(dict(msg, text=text), sm, notify)
+                    handled += 1
+                else:
+                    log.warning("dropped a friend's message that was not locked with this call's key")
         since = msg.get("created_at") or since
     with _lock:
         state = _load_state()
@@ -411,6 +504,7 @@ def tick(sm=None, status_of=None, notify=lambda e, d: None) -> bool:
         mirror.sync_once(notify=notify)
         return True
     refresh_org_names()
+    _housekeeping()
     out, inn = data.get("out") or [], data.get("in") or []
     publish_once(status_of=status_of, grants=out)
     inbox_once(sm=sm, notify=notify, msgs=data.get("inbox") or [])
@@ -430,6 +524,24 @@ _names_at: dict = {"t": 0.0}
 NAMES_EVERY_S = 300.0
 
 
+_kept_at: dict = {"t": 0.0}
+KEEP_DAYS = 7
+
+
+def _housekeeping() -> None:
+    """Every few minutes: make sure this member's key is registered, and delete
+    this member's shared threads nobody has had a call on for a week."""
+    if time.monotonic() - _kept_at["t"] < NAMES_EVERY_S:
+        return
+    _kept_at["t"] = time.monotonic()
+    try:
+        from . import keys
+        keys.my_private_key()
+        store.call("pf_prune", p_days=KEEP_DAYS)
+    except OrgsError as e:
+        log.warning("Phone a Friend housekeeping: %s", e.code)
+
+
 def refresh_org_names(force: bool = False) -> None:
     """Keep the publish scan's list of org members' names current
     (src/web/git_scanner.py remember_org_names), so none can be published."""
@@ -441,6 +553,8 @@ def refresh_org_names(force: bool = False) -> None:
     except OrgsError:
         return
     from ..git_scanner import remember_org_names
+    from . import keys
+    keys.remember_members(members)
     remember_org_names([m.get("username") for m in members if m.get("username")])
 _thread: dict = {"t": None, "stop": None}
 

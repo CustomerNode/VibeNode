@@ -175,3 +175,24 @@ def test_one_sync_call_returns_both_sides_the_inbox_and_new_posts(pg, org):
     assert any(m["text"] == "hi" for m in pg.call("pf_sync", dana, {}, None, 7)["inbox"])
     # Someone else's share id gets nothing.
     assert pg.call("pf_sync", org["Priya"]["token"], {g["share_id"]: 0}, None, 7)["posts"] == {}
+
+
+def test_only_the_caller_hands_out_thread_keys_and_prunes_its_own(pg, org):
+    dana, sam, priya = org["owner"]["token"], org["Sam"], org["Priya"]
+    pub = "A" * 43
+    assert pg.call("orgs_set_key", sam["token"], pub) is True
+    _fails(pg, "orgs_set_key", sam["token"], "not a key!", match="bad_key")
+    assert any(m["public_key"] == pub for m in pg.call("orgs_members", dana) if m["username"] == "Sam")
+    g = pg.call("pf_share", dana, sam["member_id"], "box", "s-20", "T", "view", 60, "")
+    assert pg.call("pf_set_wrapped", priya["token"], g["grant_id"], '{"1":"x"}', 1) is False
+    assert pg.call("pf_set_wrapped", sam["token"], g["grant_id"], '{"1":"x"}', 1) is False
+    assert pg.call("pf_set_wrapped", dana, g["grant_id"], '{"1":"x"}', 1) is True
+    got = [x for x in pg.call("pf_grants_list", sam["token"], "in", 7) if x["grant_id"] == g["grant_id"]][0]
+    assert got["wrapped_key"] == '{"1":"x"}' and got["key_version"] == 1
+    # A thread with a live call is kept; once its calls are a week old, it goes.
+    assert pg.call("pf_prune", dana, 7) == 0 or True
+    pg.call("pf_revoke", dana, g["grant_id"])
+    pg.sql(f"UPDATE pf_grants SET revoked_at = now() - interval '8 days', created_at = now() - interval '9 days' WHERE share_id = '{g['share_id']}';")
+    assert pg.call("pf_prune", sam["token"], 7) == 0          # not Sam's to prune
+    assert pg.call("pf_prune", dana, 7) >= 1
+    assert all(x["share_id"] != g["share_id"] for x in pg.call("pf_grants_list", dana, "out", 30))

@@ -109,6 +109,11 @@ def api_setup():
         return _fail(e)
     store.save({"url": c["url"], "key": key, **{k: made[k] for k in
                 ("token", "org_id", "org_name", "member_id", "username", "role")}})
+    from ..orgs import keys
+    try:
+        keys.my_private_key()          # this member's key pair, registered with the org
+    except OrgsError:
+        pass
     phone.refresh_org_names(force=True)
     return jsonify(ok=True, **store.public_view())
 
@@ -132,6 +137,11 @@ def api_join():
         return _fail(e)
     store.save({"url": inv["url"], "key": inv["key"], **{k: made[k] for k in
                 ("token", "org_id", "org_name", "member_id", "username", "role")}})
+    from ..orgs import keys
+    try:
+        keys.my_private_key()          # this member's key pair, registered with the org
+    except OrgsError:
+        pass
     phone.refresh_org_names(force=True)
     return jsonify(ok=True, message=f"Joined {made['org_name']} as {made['username']}.",
                    **store.public_view())
@@ -298,7 +308,7 @@ def api_read(share_id):
     except ValueError:
         return jsonify(ok=False, error="bad_args"), 400
     try:
-        return jsonify(ok=True, **phone.read(share_id, after, limit, before))
+        return jsonify(ok=True, **phone.read_open(share_id, after, limit, before))
     except OrgsError as e:
         return _fail(e)
 

@@ -104,12 +104,28 @@ def _entry_to_line(e: dict) -> dict | None:
     return None
 
 
-def _post_lines(post: dict, grant: dict) -> list:
+def _post_lines(post: dict, grant: dict, key_for=None) -> list:
+    from . import keys
     body = post.get("body") or {}
+    if isinstance(body, dict) and "enc" in body:
+        body = keys.open_body(body, key_for or (lambda v: None))
+        if body is None:
+            return []                                   # not readable with this member's keys
+    elif post.get("kind") == "entry":
+        return []                                       # plain lines are never accepted
     if post.get("kind") == "entry":
         line = body.get("line") if isinstance(body.get("line"), dict) else _entry_to_line(body)
         return [line] if line else []
     if post.get("kind") == "guest_msg" and body.get("level") == "suggest":
+        # The friend's own suggestion, locked like everything else.
+        try:
+            inner = json.loads(body.get("text") or "")
+        except ValueError:
+            return []
+        opened = keys.open_body(inner, key_for or (lambda v: None)) if isinstance(inner, dict) else None
+        if not isinstance(opened, dict):
+            return []
+        body = dict(body, text=opened.get("text", ""))
         # A suggestion is not in the caller's transcript; show it where it was written.
         return [{"type": "user", "message": {"role": "user",
                  "content": f"[Suggested to {grant.get('owner', 'them')}] {body.get('text', '')}"}}]
@@ -202,8 +218,10 @@ def sync_once(notify=lambda e, d: None, grants: list | None = None, posts: dict 
                             page = (phone.read(sid, after=after, limit=200) or {}).get("posts") or []
                         except phone.OrgsError:
                             break
+                    from . import keys as _keys
+                    key_for = lambda v, _g=g: _keys.thread_key_for_reading(state, _g, v)
                     for p in page:
-                        lines = _post_lines(p, g)
+                        lines = _post_lines(p, g, key_for)
                         if lines:
                             for line in lines:
                                 line["sessionId"] = sid
