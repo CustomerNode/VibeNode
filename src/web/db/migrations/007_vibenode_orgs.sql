@@ -231,6 +231,10 @@ END $$;
 
 -- ── Phone a Friend ──────────────────────────────────────────────────────────
 
+-- The call's note: written when phoning, editable afterwards by either side.
+ALTER TABLE pf_grants ADD COLUMN IF NOT EXISTS note_by UUID REFERENCES org_members(id) ON DELETE SET NULL;
+ALTER TABLE pf_grants ADD COLUMN IF NOT EXISTS note_at TIMESTAMPTZ;
+
 CREATE OR REPLACE FUNCTION pf_grant_json(g pf_grants, s pf_shared_sessions) RETURNS JSONB
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, extensions AS $$
     SELECT jsonb_build_object(
@@ -239,7 +243,9 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, extensions AS $$
         'note', g.note, 'expires_at', g.expires_at, 'revoked_at', g.revoked_at,
         'created_at', g.created_at, 'live', pf_grant_live(g),
         'owner_id', s.owner_id, 'owner', (SELECT username FROM org_members WHERE id = s.owner_id),
-        'guest_id', g.guest_id, 'guest', (SELECT username FROM org_members WHERE id = g.guest_id))
+        'guest_id', g.guest_id, 'guest', (SELECT username FROM org_members WHERE id = g.guest_id),
+        'note_at', coalesce(g.note_at, g.created_at),
+        'note_by', (SELECT username FROM org_members WHERE id = coalesce(g.note_by, s.owner_id)))
 $$;
 
 -- Open one of your sessions to one member. p_minutes NULL = until revoked.
@@ -280,6 +286,25 @@ BEGIN
        AND (s.owner_id = m.id OR g.guest_id = m.id);
     GET DIAGNOSTICS n = ROW_COUNT;
     RETURN n > 0;
+END $$;
+
+-- Change a call's note. Either side of the call may, live or ended, so the
+-- note can record how it went.
+CREATE OR REPLACE FUNCTION pf_set_note(p_token TEXT, p_grant UUID, p_note TEXT) RETURNS JSONB
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, extensions AS $$
+DECLARE m org_members := orgs_member(p_token); g pf_grants; s pf_shared_sessions;
+BEGIN
+    IF p_note IS NULL OR length(p_note) > 500 THEN
+        RAISE EXCEPTION 'bad_text' USING ERRCODE = '22023';
+    END IF;
+    SELECT * INTO g FROM pf_grants WHERE id = p_grant FOR UPDATE;
+    IF NOT FOUND THEN RAISE EXCEPTION 'no_access' USING ERRCODE = '42501'; END IF;
+    SELECT * INTO s FROM pf_shared_sessions WHERE id = g.share_id;
+    IF NOT (s.owner_id = m.id OR g.guest_id = m.id) THEN
+        RAISE EXCEPTION 'no_access' USING ERRCODE = '42501';
+    END IF;
+    UPDATE pf_grants SET note = p_note, note_by = m.id, note_at = now() WHERE id = g.id RETURNING * INTO g;
+    RETURN pf_grant_json(g, s);
 END $$;
 
 -- Grants you gave (p_side 'out') or hold ('in'), live ones and those that
@@ -398,13 +423,13 @@ REVOKE EXECUTE ON FUNCTION orgs_me(TEXT), orgs_members(TEXT), orgs_create_invite
     pf_share(TEXT, UUID, TEXT, TEXT, TEXT, TEXT, INT, TEXT), pf_revoke(TEXT, UUID),
     pf_grants_list(TEXT, TEXT, INT), pf_post(TEXT, UUID, JSONB, TEXT),
     pf_read(TEXT, UUID, BIGINT, INT, BIGINT), pf_guest_message(TEXT, UUID, TEXT),
-    pf_inbox(TEXT, TIMESTAMPTZ) FROM PUBLIC;
+    pf_inbox(TEXT, TIMESTAMPTZ), pf_set_note(TEXT, UUID, TEXT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION orgs_me(TEXT), orgs_members(TEXT), orgs_create_invite(TEXT, INT),
     orgs_redeem_invite(TEXT, TEXT), orgs_revoke_invites(TEXT), orgs_remove_member(TEXT, UUID),
     pf_share(TEXT, UUID, TEXT, TEXT, TEXT, TEXT, INT, TEXT), pf_revoke(TEXT, UUID),
     pf_grants_list(TEXT, TEXT, INT), pf_post(TEXT, UUID, JSONB, TEXT),
     pf_read(TEXT, UUID, BIGINT, INT, BIGINT), pf_guest_message(TEXT, UUID, TEXT),
-    pf_inbox(TEXT, TIMESTAMPTZ) TO anon, authenticated, service_role;
+    pf_inbox(TEXT, TIMESTAMPTZ), pf_set_note(TEXT, UUID, TEXT) TO anon, authenticated, service_role;
 
 -- Tell the API to see the new functions now, not on its next schema refresh.
 NOTIFY pgrst, 'reload schema';

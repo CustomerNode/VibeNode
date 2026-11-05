@@ -251,3 +251,24 @@ def test_secrets_are_hidden_and_long_fields_trimmed():
     e = clean_entry({"text": "password=hunter2abc and " + FAKE_BEARER + " ok", "output": "x" * 9000})
     assert "hunter2abc" not in e["text"] and "abcdefghijklmnop" not in e["text"]
     assert len(e["output"]) < 4200 and "not shared" in e["output"]
+
+
+def test_the_note_travels_both_ways_and_stays_editable(world):
+    app, client, mods, dana, sam = world
+    phone = mods[2]
+    sam_id = _org(client, mods, dana, sam, "Notes")
+    dana.use(mods)
+    dana.transcript("s-9", ["hello"])
+    g = _ok(client.post("/api/phone/call", json={"session_id": "s-9", "guest_id": sam_id, "level": "view",
+                                                  "duration": "1h", "note": "CI fails on Node 20"}))["grant"]
+    phone.notes_once()
+    sam.use(mods)
+    assert _ok(client.get("/api/phone/in"))["grants"][0]["note"] == "CI fails on Node 20"
+    phone.notes_once()
+    _ok(client.post(f"/api/phone/note/{g['grant_id']}", json={"note": "Lockfile, fixed"}))
+    dana.use(mods)
+    seen = []
+    phone.notes_once(notify=lambda e, d: seen.append((e, d["note"], d["note_by"])))
+    assert seen == [("pf_note", "Lockfile, fixed", "Sam")]
+    _ok(client.post(f"/api/phone/revoke/{g['grant_id']}"))
+    assert _ok(client.post(f"/api/phone/note/{g['grant_id']}", json={"note": "Done, thanks"}))["grant"]["note"] == "Done, thanks"

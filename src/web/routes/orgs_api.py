@@ -223,6 +223,26 @@ def api_revoke(grant_id):
         return _fail(e)
 
 
+@bp.route("/api/phone/note/<grant_id>", methods=["POST"])
+@local_only
+def api_note(grant_id):
+    if not _ID_RE.match(grant_id):
+        return jsonify(ok=False, error="bad_id"), 400
+    note = str(_body().get("note") or "").strip()
+    if len(note) > 500:
+        return jsonify(ok=False, error="bad_text", message="A note is at most 500 characters."), 400
+    try:
+        g = phone.set_note(grant_id, note)
+    except OrgsError as e:
+        return _fail(e)
+    try:
+        from .. import socketio
+        socketio.emit("pf_note", g)
+    except Exception:
+        pass
+    return jsonify(ok=True, grant=g)
+
+
 @bp.route("/api/phone/out")
 @local_only
 def api_out():

@@ -17,7 +17,8 @@ does three jobs every ``TICK_S`` seconds:
    View grants cannot write at all (the database refuses).
 3. **Pings.** A new grant to this member is announced once
    (``pf_incoming`` push + notification); a grant that ends is announced too,
-   so open tabs drop it at once.
+   so open tabs drop it at once; a changed call note (``pf_note``), on either
+   side, so every view shows the latest.
 
 Local state (``data/phone_a_friend.json``): posting cursors per share, the
 grants already announced, the inbox cursor, pending suggestions.
@@ -154,6 +155,11 @@ def call_friend(session_id: str, guest_id: str, level: str, duration: str,
 
 def revoke(grant_id: str) -> bool:
     return bool(store.call("pf_revoke", p_grant=grant_id))
+
+
+def set_note(grant_id: str, note: str) -> dict:
+    """Change a call's note; either side of the call may, live or ended."""
+    return store.call("pf_set_note", p_grant=grant_id, p_note=(note or "")[:500])
 
 
 def outgoing(days: int = 7) -> list:
@@ -306,6 +312,24 @@ def pings_once(notify=lambda e, d: None) -> list:
     return new
 
 
+def notes_once(notify=lambda e, d: None) -> list:
+    """Tell open tabs when a call's note changed, on either side."""
+    grants = outgoing(days=7) + incoming(days=7)
+    changed = []
+    with _lock:
+        state = _load_state()
+        seen = state.setdefault("notes", {})
+        for g in grants:
+            mark = f"{g.get('note_at')}|{g.get('note', '')}"
+            if g["grant_id"] in seen and seen[g["grant_id"]] != mark:
+                changed.append(g)
+                notify("pf_note", g)
+            seen[g["grant_id"]] = mark
+        state["notes"] = dict(list(seen.items())[-500:])
+        _save_state(state)
+    return changed
+
+
 _thread: dict = {"t": None, "stop": None}
 
 
@@ -338,6 +362,7 @@ def start(app, socketio) -> None:
                 publish_once(status_of=status_of)
                 inbox_once(sm=app.session_manager, notify=notify)
                 pings_once(notify=notify)
+                notes_once(notify=notify)
                 backoff = TICK_S
             except OrgsError as e:
                 if e.code in ("not_a_member",):

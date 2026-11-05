@@ -20,7 +20,8 @@ ME = {"ok": True, "member": True, "org_name": "Pair Up", "username": "Dana", "ro
       "member_id": "11111111-1111-1111-1111-111111111111", "cloud_storage": True, "publishable_key_set": True}
 SAM = "22222222-2222-2222-2222-222222222222"
 MEMBERS = [{"member_id": ME["member_id"], "username": "Dana", "role": "owner", "you": True},
-           {"member_id": SAM, "username": "Sam", "role": "member", "you": False}]
+           {"member_id": SAM, "username": "Sam", "role": "member", "you": False},
+           {"member_id": "44444444-4444-4444-4444-444444444444", "username": "Lee", "role": "member", "you": False}]
 
 
 @pytest.fixture(scope="module")
@@ -42,7 +43,9 @@ def _routes(state, member=True):
     def call(req):
         body = json.loads(req.post_data or "{}")
         state["calls"].append(body)
-        g = _grant(body["session_id"], gid="g%d" % len(state["calls"]))
+        name = {m["member_id"]: m["username"] for m in MEMBERS}[body["guest_id"]]
+        g = _grant(body["session_id"], guest=name, gid="g%d" % len(state["calls"]))
+        g["note"], g["note_by"] = body.get("note", ""), "Dana"
         state["out"].append(g)
         return 200, {"ok": True, "grant": g}
 
@@ -52,7 +55,15 @@ def _routes(state, member=True):
         state["out"] = [g for g in state["out"] if g["grant_id"] != gid]
         return 200, {"ok": True, "revoked": True}
 
+    def note(req):
+        gid = req.url.rsplit("/", 1)[1]
+        body = json.loads(req.post_data or "{}")
+        state["notes"].append((gid, body["note"]))
+        g = dict([x for x in state["out"] + state["in"] if x["grant_id"] == gid][0], note=body["note"], note_by="Dana")
+        return 200, {"ok": True, "grant": g}
+
     return {
+        "/api/phone/note/": note,
         # Longest prefix first: the fake app matches routes by prefix.
         "/api/orgs/members": j({"ok": True, "members": MEMBERS}),
         "/api/orgs/me": j(ME if member else {"ok": True, "member": False, "cloud_storage": True}),
@@ -65,7 +76,7 @@ def _routes(state, member=True):
 
 
 def _state(**kw):
-    s = {"out": [], "in": [], "calls": [], "revoked": []}
+    s = {"out": [], "in": [], "calls": [], "revoked": [], "notes": []}
     s.update(kw)
     return s
 
@@ -137,4 +148,71 @@ def test_the_orgs_panel_copies_an_invite(browser):
     app.page.click(".pf-mkinv")
     pre = app.page.wait_for_selector(".pf-prompt")
     assert "vibenode-orgs-invite" in pre.inner_text()
+    assert not app.errors
+
+
+def test_the_note_is_written_shown_and_edited_on_both_sides(browser):
+    rows = fake_sessions(2)
+    sid = rows[0]["id"]
+    st = _state(**{"in": [dict(_grant("x-1", gid="gin", owner="Priya", owner_id="33333333-3333-3333-3333-333333333333",
+                                      title="Flaky login test"), note="Login flakes on CI", note_by="Priya")]})
+    app = FakeApp(browser, rows, extra_routes=_routes(st))
+    app.page.wait_for_function("window.PF && PF.isMember() && PF.state().incoming.length")
+    # Phoning with a note.
+    _open_menu(app, sid)
+    app.page.click(".session-ctx-menu >> text=Phone a friend")
+    app.page.click(".pf-pop .pf-opt >> text=Sam")
+    app.page.fill(".pf-pop .pf-callnote-in", "CI fails on Node 20")
+    app.page.click(".pf-pop .pf-go")
+    app.page.wait_for_function(f"document.querySelector('[data-sid=\"{sid}\"] .pf-mark')")
+    assert st["calls"][0]["note"] == "CI fails on Node 20"
+    # The caller sees it in the list and edits it later.
+    app.page.evaluate("sid => { activeId = sid; }", sid)
+    app.page.wait_for_selector("#pf-head-mark", state="attached", timeout=5000)
+    app.page.evaluate("() => document.getElementById('pf-head-mark').click()")
+    assert "CI fails on Node 20" in app.page.inner_text(".pf-pop .pf-callnote")
+    app.page.click(".pf-pop .pf-nedit")
+    app.page.fill(".pf-pop .pf-nin", "Lockfile, fixed")
+    app.page.click(".pf-pop .pf-nsave")
+    app.page.wait_for_function("document.querySelector('.pf-pop .pf-callnote') && document.querySelector('.pf-pop .pf-callnote').innerText.includes('Lockfile, fixed')")
+    assert st["notes"] == [("g1", "Lockfile, fixed")]
+    # The friend's side: the toast, the project row and the friend view show the note.
+    app.page.keyboard.press("Escape")
+    app.push("pf_incoming", st["in"][0])
+    assert "Login flakes on CI" in app.page.wait_for_selector(".pf-toast").inner_text()
+    assert "Login flakes on CI" in app.page.evaluate("() => PF.projectRows()")
+    app.page.evaluate("() => PF.openFriend('33333333-3333-3333-3333-333333333333')")
+    assert "Login flakes on CI" in app.page.wait_for_selector(".pf-vnotebox .pf-callnote").inner_text()
+    # A change from the other side repaints every copy.
+    app.push("pf_note", dict(st["in"][0], note="Pinned the clock", note_by="Priya"))
+    app.page.wait_for_function("document.querySelector('.pf-vnotebox').innerText.includes('Pinned the clock')")
+    assert not app.errors
+
+
+def test_one_call_can_reach_several_people(browser):
+    rows = fake_sessions(2)
+    sid = rows[0]["id"]
+    st = _state()
+    app = FakeApp(browser, rows, extra_routes=_routes(st))
+    app.page.wait_for_function("window.PF && PF.isMember()")
+    _open_menu(app, sid)
+    app.page.click(".session-ctx-menu >> text=Phone a friend")
+    go = app.page.locator(".pf-pop .pf-go")
+    app.page.click(".pf-pop .pf-opt >> text=Sam")
+    assert go.inner_text() == "Call Sam"
+    app.page.click(".pf-pop .pf-opt >> text=Lee")
+    assert go.inner_text() == "Call 2 people"
+    app.page.click(".pf-pop .pf-opt >> text=Sam")          # tap again to drop someone
+    assert go.inner_text() == "Call Lee"
+    app.page.click(".pf-pop .pf-opt >> text=Sam")
+    app.page.fill(".pf-pop .pf-callnote-in", "Both of you, please")
+    go.click()
+    app.page.wait_for_function("!document.querySelector('.pf-pop')")
+    assert sorted(c["guest_id"] for c in st["calls"]) == sorted([SAM, "44444444-4444-4444-4444-444444444444"])
+    assert {c["note"] for c in st["calls"]} == {"Both of you, please"}
+    app.page.evaluate("sid => { activeId = sid; }", sid)
+    app.page.wait_for_selector("#pf-head-mark", state="attached", timeout=5000)
+    app.page.evaluate("() => document.getElementById('pf-head-mark').click()")
+    text = app.page.inner_text(".pf-pop")
+    assert "Shared with 2" in text and "Sam" in text and "Lee" in text
     assert not app.errors

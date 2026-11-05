@@ -7272,6 +7272,17 @@ paths:
           description: Done
         "403":
           description: Not allowed for this member, or not the owner of this VibeNode
+  /api/phone/note/{grant_id}:
+    post:
+      tags: [Orgs]
+      summary: Change a call's note
+      operationId: phoneNote
+      description: Either side of the call, live or ended. Body note (up to 500 characters). Both sides' tabs get the pf_note event.
+      responses:
+        "200":
+          description: Done
+        "403":
+          description: Not a side of this call, or not the owner of this VibeNode
   /api/phone/out:
     get:
       tags: [Orgs]

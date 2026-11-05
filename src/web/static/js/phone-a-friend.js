@@ -65,7 +65,7 @@
   function rowMark(sid) {
     var n = liveOut(sid).length;
     if (!n) return '';
-    var who = liveOut(sid).map(function (g) { return g.guest; }).join(', ');
+    var who = liveOut(sid).map(function (g) { return g.guest + (g.note ? ': ' + g.note : ''); }).join('; ');
     return '<span class="pf-mark" title="Shared with ' + esc(who) + '">' + PHONE_SVG + '</span>';
   }
 
@@ -103,8 +103,58 @@
       mark.onclick = function (e) { e.stopPropagation(); openList(curSid(), mark); };
       title.insertAdjacentElement('afterend', mark);
     }
-    mark.title = 'Shared with ' + grants.map(function (g) { return g.guest; }).join(', ');
+    mark.title = 'Shared with ' + grants.map(function (g) { return g.guest + (g.note ? ': ' + g.note : ''); }).join('\n');
     mark.innerHTML = PHONE_SVG + (grants.length > 1 ? '<sup>' + grants.length + '</sup>' : '');
+  }
+
+  // ── the call's note: shown everywhere, either side edits it ──────────────
+  function noteHtml(g) {
+    var who = g.note_by ? '<span class="pf-nby">' + esc(g.note_by) + '</span>' : '';
+    return '<div class="pf-callnote" data-grant="' + esc(g.grant_id) + '">'
+      + '<div class="pf-ntext">' + (g.note ? esc(g.note) : '<span class="pf-nempty">No note</span>') + '</div>'
+      + '<div class="pf-nmeta">' + (g.note ? who : '') + '<button type="button" class="pf-ghost pf-nedit">' + (g.note ? 'Edit' : 'Add note') + '</button></div></div>';
+  }
+  function wireNotes(root) {
+    root.querySelectorAll('.pf-callnote').forEach(function (box) {
+      var btn = box.querySelector('.pf-nedit');
+      if (!btn || btn._wired) return;
+      btn._wired = true;
+      btn.onclick = function (e) {
+        e.stopPropagation();
+        var gid = box.getAttribute('data-grant');
+        var g = findGrant(gid) || {};
+        box.innerHTML = '<textarea class="pf-nin" maxlength="500" rows="2"></textarea><div class="pf-nmeta"><button type="button" class="pf-go pf-nsave">Save</button><button type="button" class="pf-ghost pf-ncancel">Cancel</button></div>';
+        var ta = box.querySelector('textarea');
+        ta.value = g.note || ''; ta.focus();
+        var restore = function (gg) { var r = box.parentNode; box.outerHTML = noteHtml(gg || g); if (r) wireNotes(r); };
+        box.querySelector('.pf-ncancel').onclick = function (ev) { ev.stopPropagation(); restore(); };
+        box.querySelector('.pf-nsave').onclick = function (ev) {
+          ev.stopPropagation();
+          api('/api/phone/note/' + gid, { body: { note: ta.value.trim() } }).then(function (d) {
+            if (!d.ok) { toastText(d.message || 'Note not saved.', true); return; }
+            putGrant(d.grant); restore(d.grant); paintNotes(d.grant);
+          });
+        };
+      };
+    });
+  }
+  function findGrant(gid) {
+    return st.out.concat(st.incoming).filter(function (g) { return g.grant_id === gid; })[0];
+  }
+  function putGrant(g) {
+    [st.out, st.incoming].forEach(function (list) {
+      for (var i = 0; i < list.length; i++) if (list[i].grant_id === g.grant_id) list[i] = Object.assign({}, list[i], g);
+    });
+  }
+  // Every note on screen for this call shows the latest text.
+  function paintNotes(g) {
+    document.querySelectorAll('.pf-callnote[data-grant="' + g.grant_id + '"]').forEach(function (box) {
+      if (box.querySelector('textarea')) return;
+      var root = box.parentNode;
+      box.outerHTML = noteHtml(g);
+      if (root) wireNotes(root);
+    });
+    paintHeader();
   }
 
   // ── popovers ─────────────────────────────────────────────────────────────
@@ -137,10 +187,12 @@
 
   function openCall(sid, anchor) {
     if (!isMember()) { openOrgs(); return; }
-    var pick = { guest: null, level: 'drive', dur: '4h' };
-    var p = popAt('<h4>Phone a friend</h4><div class="pf-members">Loading members…</div>'
+    // One or more people: each gets their own call (grant), revoked on its own.
+    var pick = { guests: {}, level: 'drive', dur: '4h' };
+    var p = popAt('<h4>Phone a friend</h4><div class="pf-lab pf-lab-top">Pick one or more</div><div class="pf-members">Loading members…</div>'
       + '<div class="pf-lab">They can</div><div class="pf-seg" data-k="level">' + LEVELS.map(function (l) { return '<button type="button" data-v="' + l[0] + '"' + (l[0] === pick.level ? ' class="on"' : '') + '>' + l[1] + '</button>'; }).join('') + '</div>'
       + '<div class="pf-lab">For</div><div class="pf-seg" data-k="dur">' + DURS.map(function (d) { return '<button type="button" data-v="' + d[0] + '"' + (d[0] === pick.dur ? ' class="on"' : '') + '>' + d[1] + '</button>'; }).join('') + '</div>'
+      + '<div class="pf-lab">Note</div><textarea class="pf-nin pf-callnote-in" maxlength="500" rows="2" placeholder="What you need help with"></textarea>'
       + '<div class="pf-note"></div><div class="pf-acts"><button type="button" class="pf-go" disabled>Call</button><button type="button" class="pf-ghost pf-cancel">Cancel</button></div>', anchor);
     p.querySelector('.pf-cancel').onclick = closePop;
     p.querySelectorAll('.pf-seg').forEach(function (seg) {
@@ -160,19 +212,37 @@
       box.innerHTML = others.map(function (m) { return '<button type="button" class="pf-opt" data-id="' + esc(m.member_id) + '" data-name="' + esc(m.username) + '"><span class="pf-av">' + esc(m.username.charAt(0).toUpperCase()) + '</span>' + esc(m.username) + '<span class="pf-tick"></span></button>'; }).join('');
       box.onclick = function (e) {
         var b = e.target.closest('.pf-opt'); if (!b) return;
-        pick.guest = b.dataset.id;
-        box.querySelectorAll('.pf-opt').forEach(function (x) { x.classList.toggle('on', x === b); x.querySelector('.pf-tick').textContent = x === b ? '✓' : ''; });
-        go.disabled = false; go.textContent = 'Call ' + b.dataset.name;
+        if (pick.guests[b.dataset.id]) delete pick.guests[b.dataset.id];
+        else pick.guests[b.dataset.id] = b.dataset.name;
+        b.classList.toggle('on', !!pick.guests[b.dataset.id]);
+        b.querySelector('.pf-tick').textContent = pick.guests[b.dataset.id] ? '✓' : '';
+        var names = Object.keys(pick.guests).map(function (k) { return pick.guests[k]; });
+        go.disabled = !names.length;
+        go.textContent = !names.length ? 'Call' : names.length === 1 ? 'Call ' + names[0] : 'Call ' + names.length + ' people';
       };
     });
     go.onclick = function () {
-      if (!pick.guest) return;
+      var ids = Object.keys(pick.guests);
+      if (!ids.length) return;
       go.disabled = true; go.textContent = 'Calling…';
-      api('/api/phone/call', { body: { session_id: sid, guest_id: pick.guest, level: pick.level, duration: pick.dur, title: sessionTitle(sid) } }).then(function (d) {
-        if (!d.ok) { p.querySelector('.pf-note').textContent = d.message || 'The call did not go through.'; go.disabled = false; go.textContent = 'Try again'; return; }
-        closePop();
-        toastText('Phoned ' + d.grant.guest + '. They ' + LEVEL_WORDS[d.grant.level] + ', ' + left(d.grant) + '.');
+      var note = (p.querySelector('.pf-callnote-in').value || '').trim();
+      Promise.all(ids.map(function (id) {
+        return api('/api/phone/call', { body: { session_id: sid, guest_id: id, level: pick.level, duration: pick.dur, title: sessionTitle(sid), note: note } })
+          .then(function (d) { d._id = id; return d; });
+      })).then(function (results) {
+        var ok = results.filter(function (d) { return d.ok; }), bad = results.filter(function (d) { return !d.ok; });
         refresh();
+        if (!bad.length) {
+          closePop();
+          var g = ok[0].grant;
+          toastText('Phoned ' + ok.map(function (d) { return d.grant.guest; }).join(', ') + '. They ' + LEVEL_WORDS[g.level] + ', ' + left(g) + '.');
+          return;
+        }
+        // Keep only the people whose call failed selected, so Try again redoes just them.
+        ok.forEach(function (d) { delete pick.guests[d._id]; var b = p.querySelector('.pf-opt[data-id="' + d._id + '"]'); if (b) { b.classList.remove('on'); b.querySelector('.pf-tick').textContent = ''; } });
+        p.querySelector('.pf-note').textContent = (ok.length ? 'Phoned ' + ok.map(function (d) { return d.grant.guest; }).join(', ') + '. ' : '')
+          + 'Not through to ' + bad.map(function (d) { return pick.guests[d._id]; }).join(', ') + ': ' + (bad[0].message || 'the call did not go through.');
+        go.disabled = false; go.textContent = 'Try again';
       });
     };
   }
@@ -180,12 +250,13 @@
   function openList(sid, anchor) {
     var grants = liveOut(sid);
     var p = popAt('<h4>Shared with ' + grants.length + '</h4><div class="pf-glist">' + grants.map(function (g) {
-      return '<div class="pf-gl"><span class="pf-av">' + esc(g.guest.charAt(0).toUpperCase()) + '</span><span class="pf-gn">' + esc(g.guest) + '</span><span class="pf-meta">' + esc(LEVEL_WORDS[g.level]) + ' · ' + esc(left(g)) + '</span><button type="button" class="pf-ghost" data-g="' + esc(g.grant_id) + '">Revoke</button></div>';
+      return '<div class="pf-gl"><span class="pf-av">' + esc(g.guest.charAt(0).toUpperCase()) + '</span><span class="pf-gn">' + esc(g.guest) + '</span><span class="pf-meta">' + esc(LEVEL_WORDS[g.level]) + ' · ' + esc(left(g)) + '</span><button type="button" class="pf-ghost" data-g="' + esc(g.grant_id) + '">Revoke</button></div>' + noteHtml(g);
     }).join('') + '</div><div class="pf-acts"><button type="button" class="pf-ghost pf-all">Revoke all</button><button type="button" class="pf-ghost pf-more">Phone someone else</button></div>', anchor);
     function revoke(ids) {
       return Promise.all(ids.map(function (id) { return api('/api/phone/revoke/' + id, { body: {} }); })).then(function () { closePop(); refresh(); toastText(ids.length > 1 ? 'Ended every call on this session.' : 'Ended that call.'); });
     }
     p.querySelectorAll('[data-g]').forEach(function (b) { b.onclick = function () { revoke([b.dataset.g]); }; });
+    wireNotes(p);
     p.querySelector('.pf-all').onclick = function () { revoke(grants.map(function (g) { return g.grant_id; })); };
     p.querySelector('.pf-more').onclick = function () { openCall(sid, anchor); };
   }
@@ -206,9 +277,9 @@
 
   function onIncoming(g) {
     if (!g || !g.grant_id) return;
-    var t = floatToast(PHONE_SVG + '<span><b>' + esc(g.owner) + ' phoned you</b> about “' + esc(g.title || 'a session') + '”</span><button type="button" class="pf-ghost pf-open">Open</button>', 60000);
+    var t = floatToast(PHONE_SVG + '<span><b>' + esc(g.owner) + ' phoned you</b> about “' + esc(g.title || 'a session') + '”' + (g.note ? '<br><span class="pf-tnote">' + esc(g.note) + '</span>' : '') + '</span><button type="button" class="pf-ghost pf-open">Open</button>', 60000);
     t.el.querySelector('.pf-open').onclick = function () { t.close(); openFriend(g.owner_id, g.share_id); };
-    if (window.VNNotify && VNNotify.notice) VNNotify.notice({ key: 'pf:' + g.grant_id, title: g.owner + ' phoned you', body: (g.title || 'A session') + ' · ' + LEVEL_WORDS[g.level], banner: true });
+    if (window.VNNotify && VNNotify.notice) VNNotify.notice({ key: 'pf:' + g.grant_id, title: g.owner + ' phoned you', body: (g.title || 'A session') + ' · ' + LEVEL_WORDS[g.level] + (g.note ? '\n' + g.note : ''), banner: true });
     refresh();
   }
 
@@ -221,6 +292,13 @@
     if (window.VNNotify && VNNotify.notice) VNNotify.notice({ key: 'pfs:' + d.key, title: d.from + ' suggests a message', body: (d.text || '').slice(0, 120), banner: true });
   }
 
+  function onNote(g) {
+    if (!g || !g.grant_id) return;
+    putGrant(g); paintNotes(g);
+    if (st.me && g.note_by && g.note_by !== st.me.username)
+      toastText(g.note_by + ' changed the note on “' + (g.title || 'a session') + '”: ' + (g.note || '(cleared)'));
+  }
+
   function onMessage(d) {
     if (d && d.from) toastText(d.from + ' sent a message to “' + sessionTitle(d.session_id) + '”.');
   }
@@ -231,6 +309,7 @@
     st.incoming.forEach(function (g) {
       var f = by[g.owner_id] || (by[g.owner_id] = { id: g.owner_id, name: g.owner, live: 0, grants: [] });
       f.grants.push(g); if (g.live) f.live++;
+      if (g.note && (!f.noteAt || (g.note_at || '') > f.noteAt)) { f.note = g.note; f.noteAt = g.note_at || ''; }
     });
     return Object.keys(by).map(function (k) { return by[k]; }).sort(function (a, b) { return b.live - a.live || a.name.localeCompare(b.name); });
   }
@@ -242,7 +321,7 @@
       return '<div class="project-item pf-friend-row" data-pf-friend="' + esc(f.id) + '" title="Sessions ' + esc(f.name) + ' shared with you">'
         + '<span class="project-item-mark pf-friend-mark" aria-hidden="true">' + PHONE_SVG + '</span>'
         + '<div class="project-item-info"><div class="project-item-name">' + esc(f.name) + ' phoned you</div>'
-        + '<div class="project-item-path">' + (f.live ? f.live + ' open now' : 'Ended') + '</div></div>'
+        + '<div class="project-item-path">' + (f.note ? esc(f.note) : (f.live ? f.live + ' open now' : 'Ended')) + '</div></div>'
         + '<span class="project-item-count">' + f.grants.length + ' ' + (f.grants.length === 1 ? 'session' : 'sessions') + '</span></div>';
     }).join('');
   }
@@ -266,14 +345,14 @@
     var ov = document.createElement('div');
     ov.className = 'pf-view';
     ov.innerHTML = '<div class="pf-vcard"><div class="pf-vhead"><span class="pf-friend-mark">' + PHONE_SVG + '</span><h3>' + esc(f.name) + ' phoned you</h3><button type="button" class="pf-ghost pf-close">Close</button></div>'
-      + '<div class="pf-vbody"><div class="pf-vlist"></div><div class="pf-vmain"><div class="pf-banner"></div><div class="pf-thread"></div><div class="pf-compose"></div></div></div></div>';
+      + '<div class="pf-vbody"><div class="pf-vlist"></div><div class="pf-vmain"><div class="pf-banner"></div><div class="pf-vnotebox"></div><div class="pf-thread"></div><div class="pf-compose"></div></div></div></div>';
     document.body.appendChild(ov);
     ov.querySelector('.pf-close').onclick = closeFriend;
     ov.onclick = function (e) { if (e.target === ov) closeFriend(); };
     view = { el: ov, owner: ownerId, share: null, grant: null, last: 0, timer: null };
     var listEl = ov.querySelector('.pf-vlist');
     listEl.innerHTML = f.grants.map(function (g) {
-      return '<button type="button" class="pf-vrow' + (g.live ? '' : ' ended') + '" data-share="' + esc(g.share_id) + '">' + esc(g.title || 'Untitled session') + '<small>' + (g.live ? esc(LEVEL_WORDS[g.level]) + ' · ' + esc(left(g)) : 'ended') + '</small></button>';
+      return '<button type="button" class="pf-vrow' + (g.live ? '' : ' ended') + '" data-share="' + esc(g.share_id) + '">' + esc(g.title || 'Untitled session') + '<small>' + (g.live ? esc(LEVEL_WORDS[g.level]) + ' · ' + esc(left(g)) : 'ended') + '</small>' + (g.note ? '<small class="pf-vnote">' + esc(g.note) + '</small>' : '') + '</button>';
     }).join('');
     listEl.onclick = function (e) { var b = e.target.closest('[data-share]'); if (b) pickShare(b.dataset.share); };
     var first = shareId || ((f.grants.filter(function (g) { return g.live; })[0] || f.grants[0]) || {}).share_id;
@@ -297,6 +376,8 @@
     view.el.querySelector('.pf-banner').textContent = g.live
       ? g.owner + "'s session on " + g.source + ' · you ' + LEVEL_WORDS[g.level] + ' · ' + left(g)
       : g.owner + ' ended this call. What you saw is gone from here.';
+    var nb = view.el.querySelector('.pf-vnotebox');
+    nb.innerHTML = noteHtml(g); wireNotes(nb);
     var comp = view.el.querySelector('.pf-compose');
     if (g.live && (g.level === 'suggest' || g.level === 'drive')) {
       comp.innerHTML = '<textarea rows="2" placeholder="' + (g.level === 'drive' ? 'Message the session as ' + esc(st.me.username) : 'Suggest a message; ' + esc(g.owner) + ' decides') + '"></textarea><button type="button" class="pf-go">' + (g.level === 'drive' ? 'Send' : 'Suggest') + '</button>';
@@ -449,6 +530,7 @@
     s.on('pf_ended', function () { refresh(); });
     s.on('pf_suggestion', onSuggestion);
     s.on('pf_message', onMessage);
+    s.on('pf_note', onNote);
   }
 
   var _lastActive = null;

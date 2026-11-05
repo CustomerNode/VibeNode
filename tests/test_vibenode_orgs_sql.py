@@ -137,3 +137,14 @@ def test_removing_a_member_ends_their_grants_and_access(pg, org):
 
 def test_the_migration_runs_twice(pg):
     pg.sql(MIGRATION.read_text(encoding="utf-8"))
+
+
+def test_either_side_edits_the_note_others_cannot(pg, org):
+    dana, sam, priya = org["owner"]["token"], org["Sam"], org["Priya"]
+    g = pg.call("pf_share", dana, sam["member_id"], "box", "s-7", "T", "view", 60, "help with CI")
+    assert g["note"] == "help with CI" and g["note_by"] == "Dana"
+    assert pg.call("pf_set_note", sam["token"], g["grant_id"], "found it: the lockfile")["note_by"] == "Sam"
+    pg.call("pf_revoke", dana, g["grant_id"])
+    assert pg.call("pf_set_note", dana, g["grant_id"], "fixed, thanks")["note"] == "fixed, thanks"
+    _fails(pg, "pf_set_note", priya["token"], g["grant_id"], "x", match="no_access")
+    _fails(pg, "pf_set_note", dana, g["grant_id"], "x" * 501, match="bad_text")
