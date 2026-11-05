@@ -1246,6 +1246,7 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
 .lm-view-gone { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 24px; text-align: center; background: var(--bg-body); color: var(--text-secondary); }
 .lm-view-gone b { color: var(--text-primary, inherit); font-size: 16px; }
 .lm-view-gone span { max-width: 420px; line-height: 1.5; font-size: 14px; }
+.lm-view-retry { margin-top: 6px; padding: 7px 16px; border-radius: 8px; border: 1px solid var(--border, rgba(127,127,127,.4)); background: transparent; color: var(--text-primary, inherit); font: inherit; font-size: 14px; cursor: pointer; }
 /* What the running job is printing right now. */
 .lm-live .lm-run { display: flex; flex-direction: column; gap: 10px; margin-bottom: 10px; }
 .lm-live .lm-run .h { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-heading); }
@@ -1481,3 +1482,13 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
 .lm.skim .lm-answer .lm-depth-b { padding: 3px 0 !important; border-radius: 0 !important; }
 .lm.skim .lm-answer .lm-depth-b[aria-pressed="true"] { background: none !important; box-shadow: inset 0 -1.5px 0 var(--text-secondary) !important; }
 @media (max-width: 640px) { .lm.skim .lm-answer .lm-depth-bar, .lm.skim .lm-answer .lm-depth-p { margin-left: 10px !important; } }
+
+/* A summary is text to read and copy. It carries data-sid (whose session its
+   buttons answer), and the long-press rule for session rows in mobile.css
+   matches [data-sid], so the card states its own selectability here; this file
+   also hot-loads into open tabs (live-assets.js). */
+.lm[data-sid], .lm[data-sid] *:not(input):not(textarea) {
+  -webkit-touch-callout: default;
+  -webkit-user-select: text;
+  user-select: text;
+}

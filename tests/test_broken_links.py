@@ -16,6 +16,9 @@ from engine import handoff_rules as hr  # noqa: E402
 @pytest.fixture(autouse=True)
 def _check_on(monkeypatch):
     monkeypatch.setenv("VIBENODE_LINK_CHECK", "1")
+    # A stopped port is retried for _PORT_GRACE_S; keep the dead-port tests
+    # quick.  The comeback test below sets its own.
+    monkeypatch.setattr(hr, "_PORT_GRACE_S", 0.3)
 
 
 @pytest.fixture
@@ -128,6 +131,46 @@ def test_a_page_on_a_stopped_server_is_sent_back(real_files, running_port):
                                                  {"label": "q", "kind": "link", "url": "http://localhost:%d/" % running_port}]})
     p = " ".join(hr.broken_link_problems(card))
     assert "not running" in p and "validate.url" in p and "needs.look[0]" in p and "needs.look[1]" not in p
+
+
+def test_a_dev_server_restarting_is_not_called_stopped(real_files, monkeypatch):
+    """Django's runserver and Vite restart themselves when a session edits
+    code and refuse connections for a moment.  A card checked in that moment
+    was sent back saying the server was not running; the port is now retried
+    and passes once it answers again."""
+    import socket
+    import threading
+    monkeypatch.setattr(hr, "_PORT_GRACE_S", 5.0)
+    port = _closed_port()
+    up = threading.Event()
+    srv = socket.socket()
+
+    def come_back():
+        up.wait(0.6)
+        srv.bind(("127.0.0.1", port))
+        srv.listen(4)
+
+    t = threading.Thread(target=come_back, daemon=True)
+    t.start()
+    try:
+        card = _card(validate={"how": "open", "url": "http://127.0.0.1:%d/app" % port})
+        assert hr.broken_link_problems(card) == []
+    finally:
+        t.join(2)
+        srv.close()
+
+
+def test_the_viewer_and_the_proxy_wait_for_a_restarting_server():
+    """The full-screen viewer and the phone's proxy page used to say "This
+    page's server has stopped" after one failed try and never look again;
+    both now wait, retry and load the page when it answers."""
+    js = (ROOT / "src" / "web" / "static" / "js" / "last-card.js").read_text(encoding="utf-8")
+    body = js[js.index("function _noteStoppedServer"):]
+    body = body[:body.index("\n  }\n") + 4]
+    assert "setInterval" in body and "frame.replaceWith" not in body and "Try again" in body
+    assert "server has stopped" not in js
+    py = (ROOT / "src" / "web" / "routes" / "preview_api.py").read_text(encoding="utf-8")
+    assert "X-VN-Proxy-Down" in py and "setInterval" in py and "server has stopped" not in py
 
 
 def test_it_can_be_turned_off(real_files, monkeypatch):

@@ -41,14 +41,17 @@
 /* Applies to every element that represents a session — sidebar rows
    (.session-item) and workspace grid cards (.ws-card[data-sid]) alike.
    Using [data-sid] as the universal selector keeps future session
-   surfaces covered without needing to touch this file. */
-[data-sid],
-[data-sid] *:not(input):not(textarea) {
+   surfaces covered without needing to touch this file.
+   Messages in the chat thread (.msg) and end-of-turn summaries (.lm) carry
+   data-sid too (whose session a summary's buttons answer), but they are text
+   to read and copy, not rows to long-press: they stay selectable. */
+[data-sid]:not(.msg):not(.lm),
+[data-sid]:not(.msg):not(.lm) *:not(input):not(textarea) {
   -webkit-touch-callout: none;
   -webkit-user-select: none;
   user-select: none;
 }
-[data-sid] {
+[data-sid]:not(.msg):not(.lm) {
   touch-action: manipulation;
 }
 

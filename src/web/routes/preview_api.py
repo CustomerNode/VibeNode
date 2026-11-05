@@ -391,18 +391,31 @@ def proxy():
         ctype = e.headers.get("Content-Type", "application/octet-stream")
         raw = e.read()
     except Exception as e:  # noqa: BLE001
-        # Nothing answers: usually a demo or approval page whose server has
-        # stopped since the summary linked it. Say so in words, not a blank.
+        # Nothing answers.  Most often a dev server restarting itself after a
+        # session edited code (Django, Vite): down for a few seconds.  So the
+        # page says it is waiting, asks again every 1.5 s and loads the real
+        # page the moment the server answers; it never declares the server
+        # gone after one try.  The poll asks this same address and looks for
+        # the X-VN-Proxy-Down mark, so a real 5xx from the target still loads.
         import html as _html
         page = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
                 "<body style='font:15px system-ui,sans-serif;margin:0;display:flex;min-height:100vh;"
                 "align-items:center;justify-content:center;background:#141418;color:#ddd'>"
-                "<div style='max-width:420px;padding:24px'><b style='font-size:17px'>This page's server has stopped</b>"
-                "<p style='color:#999;line-height:1.5'>%s is not answering, so there is nothing to show. "
-                "It was running when the summary was written; ask the session to start it again if you "
-                "still need it.</p><p style='color:#666;font-size:12px'>%s</p></div>"
+                "<div style='max-width:420px;padding:24px'><b style='font-size:17px'>Waiting for %s</b>"
+                "<p style='color:#999;line-height:1.5'>It is not answering right now, usually because it is "
+                "restarting after a code change. The page opens by itself as soon as it is back.</p>"
+                "<button id=r style='padding:7px 16px;border-radius:8px;border:1px solid #555;background:none;"
+                "color:#ddd;font:inherit;cursor:pointer'>Try again</button>"
+                "<p style='color:#666;font-size:12px'>%s</p></div>"
+                "<script>(function(){var busy=0;function t(){if(busy)return;busy=1;"
+                "fetch(location.href,{cache:'no-store'}).then(function(r){busy=0;"
+                "if(!r.headers.get('X-VN-Proxy-Down'))location.reload();},function(){busy=0;});}"
+                "setInterval(t,1500);document.getElementById('r').onclick=t;})();</script>"
                 % (_html.escape(urllib.parse.urlsplit(u).netloc or u), _html.escape(str(e)[:160])))
-        return Response(page, status=502, mimetype="text/html")
+        resp = Response(page, status=502, mimetype="text/html")
+        resp.headers["X-VN-Proxy-Down"] = "1"
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
     if "text/html" in ctype.lower():
         try:
             html = raw.decode("utf-8", "replace")

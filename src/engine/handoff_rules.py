@@ -2190,9 +2190,16 @@ def _stopped_ports(urls):
     A preview-proxy address is judged by
 
     the page it relays.  A short connect only, at most 6 ports, VibeNode's
-    own port never."""
+    own port never.
+
+    A port that refuses is tried again for ``_PORT_GRACE_S`` before it counts
+    as stopped: a dev server that reloads itself when a session edits code
+    (Django's runserver, Vite) refuses for a second or two while it restarts,
+    and one refusal sent cards back saying a running server was down."""
     import socket
-    seen: dict = {}
+    import time
+    hosts: dict = {}
+    order = []
     for where, url in urls:
         target = url
         m = re.search(r"/api/preview/proxy\?(?:.*&)?u=([^&#]+)", url)
@@ -2202,21 +2209,35 @@ def _stopped_ports(urls):
         if not lm or not lm.group(2) or lm.group(2) == "5050":
             continue
         port = int(lm.group(2))
-        if port not in seen:
-            if len(seen) >= 6:
+        if port not in hosts:
+            if len(hosts) >= 6:
                 continue
             host = "::1" if lm.group(1).startswith("[") else "127.0.0.1"
-            alive = False
-            for h in ([host, "::1"] if lm.group(1).lower() == "localhost" else [host]):
-                try:
-                    with socket.create_connection((h, port), timeout=0.4):
-                        alive = True
-                        break
-                except OSError:
-                    continue
-            seen[port] = alive
-        if not seen[port]:
+            hosts[port] = [host, "::1"] if lm.group(1).lower() == "localhost" else [host]
+        order.append((where, url, port))
+
+    def _answers(port):
+        for h in hosts[port]:
+            try:
+                with socket.create_connection((h, port), timeout=0.4):
+                    return True
+            except OSError:
+                continue
+        return False
+
+    dead = {p for p in hosts if not _answers(p)}
+    deadline = time.monotonic() + _PORT_GRACE_S
+    while dead and time.monotonic() < deadline:
+        time.sleep(0.25)
+        dead = {p for p in dead if not _answers(p)}
+    for where, url, port in order:
+        if port in dead:
             yield where, url
+
+
+# How long a refusing port on this machine is retried before a card's link to
+# it counts as a stopped server (see _stopped_ports).
+_PORT_GRACE_S = 6.0
 
 
 def review(message: str, facts=None) -> Optional[str]:

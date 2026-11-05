@@ -2440,20 +2440,43 @@
     _ov = { el, onKey };
     _panelOpened((isImage ? 'img:' : 'page:') + src);
   }
-  // A page on another port of this machine whose server has stopped (a demo
-  // or approval page, once its job ended) framed as a blank: say so instead.
-  // A no-cors fetch rejects only when nothing answers.
+  // A page on another port of this machine that does not answer framed as a
+  // blank: say so, and keep trying.  A dev server that reloads itself when a
+  // session edits code (Django, Vite) refuses for a few seconds while it
+  // restarts; one refusal used to replace the page for good with "stopped",
+  // in every open summary at once.  Now the note waits for the server, loads
+  // the page the moment it answers, and has Try again.  It stops trying when
+  // the viewer closes.  A no-cors fetch rejects only when nothing answers.
   function _noteStoppedServer(frame, src) {
     let u;
     try { u = new URL(String(src || ''), location.href); } catch (_e) { return; }
     if (!_LOOPBACK.test(u.hostname) || u.host === location.host || typeof fetch !== 'function') return;
-    fetch(u.href, { mode: 'no-cors', cache: 'no-store' }).catch(() => {
-      if (!frame.isConnected) return;
+    const probe = () => fetch(u.href, { mode: 'no-cors', cache: 'no-store' }).then(() => true, () => false);
+    probe().then(ok => {
+      if (ok || !frame.isConnected) return;
       const n = document.createElement('div');
       n.className = 'lm-view-gone';
-      n.innerHTML = '<b>This page\'s server has stopped</b><span>' + esc(u.host) + ' is not answering, so there is nothing to show. ' +
-        'It was running when the summary was written; ask the session to start it again if you still need it.</span>';
-      frame.replaceWith(n);
+      n.innerHTML = '<b>Waiting for ' + esc(u.host) + '</b><span>It is not answering right now, usually because it is restarting after a code change. ' +
+        'The page opens by itself as soon as it is back.</span><button type="button" class="lm-view-retry">Try again</button>';
+      const host = frame.parentNode;
+      frame.style.display = 'none';
+      host.insertBefore(n, frame);
+      let busy = false, timer = 0;
+      const back = () => {
+        clearInterval(timer);
+        if (!frame.isConnected) return;
+        n.remove();
+        frame.style.display = '';
+        frame.src = frame.src;   // reload what the frame showed while it was down
+      };
+      const tryNow = () => {
+        if (busy) return;
+        if (!frame.isConnected) { clearInterval(timer); return; }
+        busy = true;
+        probe().then(up => { busy = false; if (up) back(); });
+      };
+      timer = setInterval(tryNow, 1500);
+      n.querySelector('.lm-view-retry').addEventListener('click', tryNow);
     });
   }
   /** A deliverable full screen, drawn as its format says, with Copy.  HTML

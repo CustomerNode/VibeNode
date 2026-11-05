@@ -92,6 +92,22 @@ def test_proxy_rejects_non_http(client):
     assert client.get("/api/preview/proxy?u=file:///etc/passwd").status_code == 400
 
 
+def test_proxy_waits_for_a_server_that_is_down_instead_of_calling_it_stopped(client):
+    """A dev server restarting after a code edit refuses for a moment.  The
+    page the phone sees then must wait and reload itself, marked so its own
+    poll can tell the proxy's page from a real error of the target."""
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    r = client.get("/api/preview/proxy?u=http%3A%2F%2F127.0.0.1%3A" + str(port) + "%2F")
+    page = r.get_data(as_text=True)
+    assert r.status_code == 502 and r.headers.get("X-VN-Proxy-Down") == "1"
+    assert "Waiting for 127.0.0.1:%d" % port in page and "location.reload()" in page and "Try again" in page
+    assert "stopped" not in page.split("<p style='color:#666")[0]
+
+
 @pytest.mark.parametrize("method", ["GET", "POST"])
 @pytest.mark.parametrize("incoming,expected", [
     ({}, "127.0.0.1"),                                          # the test client's own address
