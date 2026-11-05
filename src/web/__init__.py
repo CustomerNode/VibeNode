@@ -116,6 +116,8 @@ def create_app(testing=False) -> Flask:
     from .routes.search_api import bp as search_bp
     from .routes.jobs_api import bp as jobs_bp
     from .routes.usage_pace_api import bp as usage_pace_bp
+    from .routes.disk_api import bp as disk_bp
+    from .routes.pace_api import bp as pace_bp
     from .routes.orgs_api import bp as orgs_bp
 
     app.register_blueprint(main_bp)
@@ -137,6 +139,8 @@ def create_app(testing=False) -> Flask:
     app.register_blueprint(search_bp)
     app.register_blueprint(jobs_bp)
     app.register_blueprint(usage_pace_bp)
+    app.register_blueprint(disk_bp)
+    app.register_blueprint(pace_bp)
     app.register_blueprint(orgs_bp)
 
     # SpeechNode (extracted package) — mount its routes + serve its web assets.
@@ -227,6 +231,11 @@ def create_app(testing=False) -> Flask:
         from .engine_freshness import start_auto_restart; start_auto_restart(app)
         # Weekly usage pace pop-ups (src/web/usage_pace.py); never in a test app.
         from .usage_pace import start as start_usage_pace; start_usage_pace(app, socketio)
+        # Disk cap: frees disk when sessions and Trash take more than the cap
+        # set in the usage panel (src/web/disk_cleanup.py); never in a test app.
+        from .disk_cleanup import start_cap_watch; from .config import _CLAUDE_PROJECTS as _cp; start_cap_watch(app, socketio, _cp)
+        # 5-hour pacing: a self-set 5-hour limit from the weekly one (src/web/pace_5h.py).
+        from .pace_5h import start as start_pace_5h; start_pace_5h(app, socketio)
         # Phone a Friend: post shared threads, pick up friends' messages, ping
         # on a new call (src/web/orgs/phone.py); quiet when not in an org.
         from .orgs.phone import start as start_phone_a_friend; start_phone_a_friend(app, socketio)

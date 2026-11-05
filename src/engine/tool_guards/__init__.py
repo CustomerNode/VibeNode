@@ -64,6 +64,17 @@ def _text(tool_name, tool_input) -> str:
         return str(tool_name).lower()
 
 
+# (mark, what it does, tools that may still name it).  Code that serves the
+# button may be read and edited; only calling it, or touching its record, is
+# refused.
+_READ_ONLY_TOOLS = ("Read", "Grep", "Glob")
+_HUMAN_ONLY = (
+    ("pace-5h/reset", "Resetting the 5-hour pace limit",
+     _READ_ONLY_TOOLS + ("Write", "Edit", "MultiEdit", "NotebookEdit")),
+    ("pace_5h.json", "Changing the 5-hour pace limit's record", _READ_ONLY_TOOLS),
+)
+
+
 def decide(tool_name: str, tool_input, cwd: str = "", config=None):
     """The first reason a guard gives to refuse this call, or None to let it run.
 
@@ -75,6 +86,11 @@ def decide(tool_name: str, tool_input, cwd: str = "", config=None):
     if why:
         return f"[{publish_guard.NAME}] {why}"
     hay = _text(tool_name, tool_input)
+    # Buttons only a person may press: a session is refused any tool call
+    # that names them, whatever the tool (a request, a script, a file edit).
+    for mark, what, allowed in _HUMAN_ONLY:
+        if mark in hay and str(tool_name) not in allowed:
+            return f"[human only] {what} is a button for a person in VibeNode's window; a session may not press it."
     for entry in _folders(config):
         if "error" in entry:
             return None    # an unreadable config refuses nothing: no folder can be scoped

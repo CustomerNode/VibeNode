@@ -972,8 +972,15 @@
       // A decision is ONE Decide button; the choices, the page to look at and
       // a box for your own answer live in a full-screen view, one choice at a
       // time.
-      const decide = n.kind === 'decision' && n.replies && n.replies.length;
-      if (decide) {
+      // A split-view template (a form, pairs): one button opens every item.
+      const split = n.kind === 'decision' ? _splitOf(n) : null;
+      const decide = !!split || (n.kind === 'decision' && n.replies && n.replies.length);
+      if (split) {
+        const t = _SPLIT[split.key], data = { ask: n.ask || '', why: n.why || '', tpl: split.key, items: split.items };
+        x += '<ul class="lm-dlist lm-fmlist">' + split.items.map((it, j) => '<li><b>' + (j + 1) + '</b> ' + t.listItem(it, j) + '</li>').join('') + '</ul>';
+        x += '<button type="button" class="lm-decide" data-decide="' + esc(JSON.stringify(data)) + '">' +
+          esc(t.button(split.items.length)) + '<span class="go">' + I.chev + '</span></button>';
+      } else if (decide) {
         const pi = look.findIndex(l => _reviewSrc((l || {}).url));
         const page = pi >= 0 ? look.splice(pi, 1)[0].url : '';
         const data = { ask: n.ask || '', why: n.why || '', page, replies: n.replies.map((r, i) => { r = r || {};
@@ -1408,6 +1415,9 @@
     const n = (c && c.needs) || {};
     const said = _norm(text);
     if (!said) return false;
+    // A form is answered by the one message its popup sends.
+    // A split-view template (a form, pairs) is answered by the one message its popup sends.
+    if (Object.keys(_SPLIT).some(k => Array.isArray(n[k]) && n[k].length && said.indexOf(_norm(_SPLIT[k].prefix)) === 0)) return true;
     const rs = (Array.isArray(n.replies) ? n.replies : []).map(r => r || {});
     // The reply's own words (what its button sends) count wherever they sit.
     if (rs.some(r => { const v = _norm(r.reply); return v.length >= 3 && said.indexOf(v.slice(0, 40)) !== -1; })) return true;
@@ -2210,10 +2220,195 @@
     _navClosing = true;   // the copy that is opening owns the URL now
     try { _closeDecide(); _closeReview(); } finally { _navClosing = false; }
   });
+  // ── Split-view templates: several items answered in one go ───────────
+  // A decision may carry, instead of needs.replies, a list the popup shows in
+  // ONE split view: the items down the left with their answer, the open one on
+  // the right, and one Send that returns every answer in a single message
+  // starting with the template's prefix.  SPLIT_TEMPLATES in
+  // src/engine/handoff_rules.py is the server's twin of this table
+  // (tests/test_split_templates.py holds them together).  An entry gives:
+  //   parse(n)        the card's items, cleaned, or null when nothing to answer
+  //   listItem(x, j)  the item's line on the card
+  //   status(x, st)   its line under the title in the left panel
+  //   pane(x, i, k)   the right side; [data-pick="v"] sets st.pick[x.id] = v,
+  //                   [data-when="v"] shows only while that is the pick,
+  //                   textarea[data-note] keeps st.note[x.id], [data-next] moves on
+  //   advance(v)      true when picking v moves to the next unanswered item
+  //   line(x, st)     its part of the message
+  const _str = v => (typeof v === 'string' ? v : '');
+  const _PAIR_URL = /^(?:\/(?!\/)|https?:\/\/\S)/i;
+  function _pairSide(x, other, fallback) {
+    let body;
+    if (x.kind === 'image') body = _PAIR_URL.test(x.url) ? '<img alt="" src="' + esc(x.url) + '">' : '<p class="nf">This picture cannot be shown here.</p>';
+    else if (x.kind === 'page') { const src = _PAIR_URL.test(x.url) ? _reviewSrc(x.url) : '';
+      body = src ? '<iframe title="' + esc(x.label || fallback) + '" data-src="' + esc(src) + '"></iframe>' : '<p class="nf">This page cannot be shown here.</p>'; }
+    // an html side is a frame with an EMPTY sandbox: no scripts, no access to the app
+    else if (x.kind === 'html') body = '<iframe sandbox="" title="' + esc(x.label || fallback) + '" srcdoc="' + esc(x.html) + '"></iframe>';
+    else {
+      // text: mark where it starts to differ from the other side
+      const t = x.text, o = (other && other.kind === 'text') ? other.text : null;
+      let k = 0;
+      if (o !== null) while (k < t.length && t[k] === o[k]) k++;
+      body = '<pre>' + (o === null || (k === t.length && t.length === o.length) ? esc(t) : esc(t.slice(0, k)) + '<mark>' + esc(t.slice(k)) + '</mark>') + '</pre>';
+    }
+    return '<div class="lm-pr-side k-' + x.kind + '"><div class="ph">' + esc(x.label || fallback) + '</div><div class="pc">' + body + '</div></div>';
+  }
+  const _SPLIT = {
+    form: {
+      prefix: 'My answers to the', min: 2, one: 'question', many: 'questions', cls: '', hint: 'answer each, then send them together',
+      button: n => 'Answer the ' + n + ' questions', send: 'Send answers', sent: n => 'Sent your answers to the ' + n + ' questions',
+      parse: n => (Array.isArray(n.form) ? n.form : []).filter(q => q && typeof q === 'object').map((q, i) => ({
+        id: _str(q.id) || 'q' + (i + 1), question: _str(q.question), context: _str(q.context),
+        options: (Array.isArray(q.options) ? q.options : []).filter(o => o && typeof o === 'object').map((o, j) => ({
+          key: _str(o.key) || String.fromCharCode(65 + j), label: _str(o.label), gain: _str(o.gain), verdict: _str(o.verdict), recommended: o.recommended === true })),
+      })).filter(q => q.question && q.options.length >= 2),
+      title: q => q.question,
+      listItem: q => { const rec = q.options.find(o => o.recommended); return inl(q.question) + (rec ? '<span class="dt"> · recommended: ' + inl(rec.label) + '</span>' : ''); },
+      status: (q, st) => { const o = q.options.find(x => x.key === st.pick[q.id]); return o ? '<span class="rp ok">' + I.check + inl(o.label) + '</span>' : '<span class="rp">Not answered</span>'; },
+      pane: (q, i, k) => (q.context ? '<p class="ctx">' + inl(q.context) + '</p>' : '') +
+        '<div class="lm-fm-cards">' + q.options.map(o => '<button type="button" class="lm-fm-cd" data-pick="' + esc(o.key) + '">' +
+          '<span class="ol">' + inl(o.label) + (o.recommended ? '<span class="rec">Recommended</span>' : '') + '</span>' +
+          (o.gain ? '<span class="li"><b>Gets you</b> ' + inl(o.gain) + '</span>' : '') +
+          (o.verdict ? '<span class="li"><b>' + (o.recommended ? 'Why it wins' : 'Why not') + '</b> ' + inl(o.verdict) + '</span>' : '') + '</button>').join('') + '</div>' +
+        '<textarea data-note placeholder="Add a note (optional)"></textarea>' +
+        (i < k - 1 ? '<button type="button" class="lm-fm-next" data-next>Next question' + I.chev + '</button>' : ''),
+      advance: () => false,
+      line: (q, st) => { const o = q.options.find(x => x.key === st.pick[q.id]), nt = String(st.note[q.id] || '').trim();
+        return q.question + '\n   ' + (o ? o.label + (o.recommended ? ' (recommended)' : '') : 'No answer') + (nt ? '\n   Note: ' + nt : ''); },
+    },
+    pairs: {
+      prefix: 'My review of the', min: 1, one: 'pair', many: 'pairs', cls: 'lm-pr', hint: 'mark each Same or Not the same',
+      button: n => 'Review the ' + (n > 1 ? n + ' pairs' : 'pair'), send: 'Send review', sent: n => 'Sent your review of ' + (n > 1 ? 'the ' + n + ' pairs' : 'the pair'),
+      parse: n => { const side = x => { x = x && typeof x === 'object' ? x : {};
+          return { kind: ['image', 'page', 'html', 'text'].indexOf(x.kind) >= 0 ? x.kind : '', url: _str(x.url), html: _str(x.html), text: _str(x.text), label: _str(x.label) }; };
+        return (Array.isArray(n.pairs) ? n.pairs : []).filter(p => p && typeof p === 'object').map((p, i) => ({
+          id: _str(p.id) || 'p' + (i + 1), title: _str(p.title), a: side(p.a), b: side(p.b) })).filter(p => p.title && p.a.kind && p.b.kind); },
+      title: p => p.title,
+      listItem: p => inl(p.title),
+      status: (p, st) => st.pick[p.id] === 'same' ? '<span class="rp ok">' + I.check + 'Same</span>'
+        : st.pick[p.id] === 'diff' ? '<span class="rp no">Not the same</span>' : '<span class="rp">Not reviewed</span>',
+      pane: p => '<div class="lm-pr-pair">' + _pairSide(p.a, p.b, 'Before') + _pairSide(p.b, p.a, 'After') + '</div>' +
+        '<div class="lm-pr-marks"><button type="button" class="lm-pr-ok" data-pick="same">' + I.check + 'Same</button>' +
+        '<button type="button" class="lm-pr-no" data-pick="diff">Not the same</button></div>' +
+        '<div class="lm-pr-why" data-when="diff" hidden><textarea data-note placeholder="What is different?"></textarea></div>',
+      advance: v => v === 'same',
+      line: (p, st) => { const m = st.pick[p.id], nt = String(st.note[p.id] || '').trim();
+        return p.title + ': ' + (m === 'same' ? 'same' : m === 'diff' ? 'NOT the same' + (nt ? ' (' + nt + ')' : '') : 'not reviewed'); },
+    },
+  };
+  /** The split-view template a card uses and its items, or null. */
+  function _splitOf(n) {
+    for (const key of Object.keys(_SPLIT)) {
+      if (!n || !(key in n)) continue;
+      const items = _SPLIT[key].parse(n);
+      return items.length >= _SPLIT[key].min ? { key, items } : null;
+    }
+    return null;
+  }
+  function _splitMessage(t, items, st) {
+    return t.prefix + ' ' + items.length + ' ' + (items.length > 1 ? t.many : t.one) + ':\n' +
+      items.map((x, i) => (i + 1) + '. ' + t.line(x, st)).join('\n');
+  }
+  function _openSplit(btn, d) {
+    const t = _SPLIT[d.tpl], items = d.items, st = { pick: {}, note: {} };
+    let cur = 0;
+    const el = document.createElement('div');
+    el.className = 'lm-dz lm-fm' + (t.cls ? ' ' + t.cls : '');
+    el.setAttribute('role', 'dialog');
+    el.setAttribute('aria-modal', 'true');
+    el.innerHTML = '<div class="top"><div class="txt"><p class="q"' + (d.why ? ' title="' + esc(d.why) + '"' : '') + '>' + inl(d.ask) + '</p><div class="lab"></div></div>' +
+      '<span class="cnt"></span><button type="button" class="go">' + esc(t.send) + '</button>' +
+      '<button type="button" class="xf" aria-label="Close">' + I.close + '</button></div>' +
+      '<div class="body"><div class="lm-fm-split"><div class="lm-fm-rail" role="tablist"></div><div class="lm-fm-pane"></div></div></div>';
+    const top = el.querySelector('.top'), rail = el.querySelector('.lm-fm-rail'), pane = el.querySelector('.lm-fm-pane'),
+      go = el.querySelector('.go'), cnt = top.querySelector('.cnt'), lab = top.querySelector('.lab');
+    const done = () => items.filter(x => st.pick[x.id]).length;
+    const drawRail = () => {
+      rail.innerHTML = items.map((x, i) => '<button type="button" role="tab" class="lm-fm-ri' + (i === cur ? ' on' : '') + '" data-q="' + i + '" aria-selected="' + (i === cur) + '">' +
+        '<span class="rq">' + inl(t.title(x)) + '</span>' + t.status(x, st) + '</button>').join('');
+      cnt.textContent = done() + ' of ' + items.length;
+      lab.innerHTML = '<b>' + items.length + ' ' + (items.length > 1 ? t.many : t.one) + '</b><span class="dt"> · ' + esc(t.hint) + '</span>';
+      go.disabled = done() < items.length;
+    };
+    // Picks change classes in place, so a page shown in the pane never reloads.
+    const syncPane = focusNote => {
+      const x = items[cur], v = st.pick[x.id];
+      pane.querySelectorAll('[data-pick]').forEach(b => { const on = b.dataset.pick === v; b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on)); });
+      pane.querySelectorAll('[data-when]').forEach(w => { w.hidden = w.dataset.when !== v; });
+      const ta = pane.querySelector('textarea[data-note]');
+      if (ta && focusNote && !ta.closest('[hidden]')) setTimeout(() => ta.focus({ preventScroll: true }), 0);
+    };
+    const drawPane = () => {
+      const x = items[cur];
+      pane.innerHTML = '<div class="k">' + t.one[0].toUpperCase() + t.one.slice(1) + ' ' + (cur + 1) + ' of ' + items.length + '</div>' +
+        '<h3 class="qt">' + inl(t.title(x)) + '</h3>' + t.pane(x, cur, items.length);
+      pane.querySelectorAll('iframe[data-src]').forEach(f => { _matchTheme(f); f.src = _themedSrc(f.dataset.src); });
+      const ta = pane.querySelector('textarea[data-note]');
+      if (ta) { ta.value = st.note[x.id] || ''; ta.addEventListener('input', () => { st.note[x.id] = ta.value; }); }
+      syncPane(false);
+      pane.scrollTop = 0;
+    };
+    const goTo = i => { if (i < 0 || i >= items.length || i === cur) return; cur = i; drawRail(); drawPane();
+      const on = rail.querySelector('.lm-fm-ri.on');
+      if (on && on.scrollIntoView) on.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      _stagger(pane, { transform: 'translateY(8px)' }, 0, 25); };
+    el.addEventListener('click', ev => {
+      if (ev.target.closest('.xf')) { _closeDecide(true); return; }
+      const ri = ev.target.closest('.lm-fm-ri');
+      if (ri) { goTo(Number(ri.dataset.q)); return; }
+      const pk = ev.target.closest('[data-pick]');
+      if (pk) {
+        const x = items[cur], v = pk.dataset.pick;
+        st.pick[x.id] = v;
+        drawRail(); syncPane(true);
+        if (t.advance(v)) {
+          const nx = items.findIndex(y => !st.pick[y.id]), me = _dz;
+          if (nx >= 0) setTimeout(() => { if (_dz === me && items[cur] === x) goTo(nx); }, _rm() ? 0 : 280);
+        }
+        return;
+      }
+      if (ev.target.closest('[data-next]')) { goTo(cur + 1); return; }
+      if (ev.target.closest('.go') && !go.disabled) {
+        const text = _splitMessage(t, items, st);
+        if (!_send(text, btn)) { _sendFail('Couldn’t send that. Try again.'); return; }
+        btn.dataset.sent = '1';
+        btn.classList.add('sent');
+        btn.innerHTML = I.check + '<span>' + esc(t.sent(items.length)) + '</span>';
+        _markAnswered(btn.closest('.lm'), text);
+        go.disabled = true;
+        go.innerHTML = I.check + '<span>Sent</span>';
+        const me = _dz;
+        setTimeout(() => { if (_dz === me) _closeDecide(true, true); }, _rm() ? 0 : 520);
+      }
+    });
+    const onKey = ev => {
+      if (ev.key === 'Escape') { ev.stopPropagation(); _closeDecide(true); return; }
+      if (ev.target && ev.target.tagName === 'TEXTAREA') return;
+      if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') { ev.preventDefault(); goTo(cur + (ev.key === 'ArrowDown' ? 1 : -1)); }
+    };
+    const onResize = () => el.style.setProperty('--dz-top', top.offsetHeight + 'px');
+    document.addEventListener('keydown', onKey, true);
+    window.addEventListener('resize', onResize);
+    const scrim = document.createElement('div');
+    scrim.className = 'lm-dz-scrim';
+    document.body.appendChild(scrim);
+    document.body.appendChild(el);
+    document.documentElement.classList.add('lm-ov-open');
+    _dz = { el, onKey, onResize, btn, scrim };
+    const dl = [...document.querySelectorAll('#live-log .lm-decide')], di = dl.indexOf(btn);
+    _panelOpened(di >= 0 ? 'decide:' + (dl.length - di) : '');
+    drawRail(); drawPane(); onResize();
+    const clip = _btnClip(btn);
+    if (clip) _anim(el, [{ clipPath: clip }, { clipPath: _FULL }], { duration: 560, easing: _EXPO });
+    else _anim(el, [{ opacity: 0, transform: 'scale(.98)' }, { opacity: 1, transform: 'none' }], { duration: 320, easing: _EXPO });
+    _anim(scrim, [{ opacity: 0 }, { opacity: 1 }], { duration: 420, easing: 'ease-out' });
+    _anim(top, [{ opacity: 0, transform: 'translateY(-12px)' }, { opacity: 1, transform: 'none' }], { duration: 440, delay: 200, easing: _EXPO });
+  }
   function _openDecide(root, btn) {
     _closeAll();
     let d = null;
     try { d = JSON.parse(btn.dataset.decide || ''); } catch (_e) { d = null; }
+    if (d && _SPLIT[d.tpl] && Array.isArray(d.items) && d.items.length) { _openSplit(btn, d); return; }
     const rs = (d && d.replies) || [];
     if (!rs.length) return;
     const src = d.page ? _reviewSrc(d.page) : '';

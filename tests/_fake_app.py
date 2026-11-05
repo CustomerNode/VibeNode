@@ -165,7 +165,16 @@ localStorage.setItem('vnSmartTermination', 'on');
 window.__emits = [];
 window.__push = (ev, d) => { for (const fn of socket.listeners(ev)) fn(d); };
 %s
-""" % (PROJECT, view_mode, display_mode, extra)
+%s
+""" % (PROJECT, view_mode, display_mode, extra, _open_view(view_mode))
+
+
+def _open_view(view_mode: str) -> str:
+    """The app always opens on Sessions; another view is opened the way the
+    person opens it, through setViewMode once the page has loaded."""
+    if view_mode == "sessions":
+        return ""
+    return "window.addEventListener('load', () => setViewMode(%r));" % view_mode
 
 
 _index_cache: tuple = (None, "")

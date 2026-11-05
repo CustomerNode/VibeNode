@@ -539,6 +539,22 @@ def register_ws_events(socketio, app):
             payload['all_projects'] = True
         emit('state_snapshot', payload)
 
+    def _pace_refusal(session_id):
+        """While the 5-hour pace is hit, a message is refused the way the
+        account's own 5-hour limit refused it, with its reset time."""
+        try:
+            from .. import pace_5h
+            until = pace_5h.is_hit()
+        except Exception:
+            return False
+        if not until:
+            return False
+        import datetime as _dt
+        at = _dt.datetime.fromtimestamp(until).strftime('%-I:%M %p')
+        emit('error', {'message': "You've hit your 5-hour pace limit · resets " + at,
+                       'session_id': session_id, 'pace_limit': True, 'resets_at': until})
+        return True
+
     @socketio.on('start_session')
     def handle_start_session(data):
         """Start a new or resumed SDK session."""
@@ -554,6 +570,8 @@ def register_ws_events(socketio, app):
         name = data.get('name', '').strip()
         resume = bool(data.get('resume', False))
         if session_id and _phoned_session_reply(session_id, prompt):
+            return
+        if prompt and _pace_refusal(session_id):
             return
 
         # Optional session options
@@ -790,6 +808,8 @@ def register_ws_events(socketio, app):
         if _is_tailnet_turn(data):
             text = _with_mobile_preamble(text)
 
+        if _pace_refusal(session_id):
+            return
         sm = app.session_manager
         result = sm.send_message(session_id, text, voice=voice, _ttft_t0_ns=_ttft_t0_ns)
 

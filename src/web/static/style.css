@@ -738,6 +738,8 @@ header h1 { font-family: 'Space Grotesk', sans-serif; font-size: var(--fs-4xl); 
   gap: var(--sp-2);
 }
 /* Sidebar action button (Add Agent) */
+/* The Sessions back button hides with [hidden]; display:flex would beat it. */
+#sidebar-nav[hidden] { display: none; }
 .sidebar-action-btn {
   display: flex;
   align-items: center;
@@ -12052,7 +12054,81 @@ body:has(.kanban-planner-panel.open:not(.minimized)) #live-input-bar { display: 
 .vsp-row.ulp-warn .vsp-pct { color: #d97706; } .vsp-row.ulp-warn .vsp-trk i { background: #d97706; }
 .vsp-row.ulp-crit .vsp-pct { color: #dc2626; } .vsp-row.ulp-crit .vsp-trk i { background: #dc2626; }
 .vsp-row.ulp-stale { opacity: .6; }
+.vsp-row.ulp-off { opacity: .6; }
 .vsp-empty { font-size: 12px; color: var(--text-faint); }
+/* Model & usage as a modal (markup: _statusModalHtml).  The element keeps
+   .vn-status-panel for its colours and chip styles; this turns it into a
+   centered window over a dimmed backdrop, and a bottom sheet on a phone. */
+.vn-status-scrim { position: fixed; inset: 0; z-index: 99999; background: rgba(0,0,0,.42);
+  backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); animation: vsmFade .18s ease; }
+[data-theme="light"] .vn-status-scrim { background: rgba(20,20,30,.22); }
+.vn-status-panel.vn-status-modal { left: 50% !important; top: 50%; bottom: auto !important; transform: translate(-50%, -50%);
+  width: 640px; max-width: calc(100vw - 32px); max-height: calc(100vh - 64px); max-height: calc(100dvh - 64px);
+  display: flex; flex-direction: column; padding: 0; overflow: hidden; border-radius: 20px;
+  box-shadow: 0 30px 80px rgba(0,0,0,.45), 0 0 0 1px rgba(0,0,0,.05); animation: vsmIn .2s cubic-bezier(.2,.8,.2,1); outline: none; }
+[data-theme="light"] .vn-status-panel.vn-status-modal { box-shadow: 0 30px 80px rgba(0,0,0,.18); }
+@keyframes vsmIn { from { opacity: 0; transform: translate(-50%, -48%) scale(.97); } }
+@keyframes vsmFade { from { opacity: 0; } }
+.vsm-head { flex: none; display: flex; align-items: center; gap: 12px; padding: 16px 18px 14px 20px;
+  border-bottom: 1px solid rgba(var(--bt), .07); }
+.vsm-head h2 { margin: 0; padding: 0; font-size: 15px; font-weight: 650; letter-spacing: -.01em; color: var(--text-heading); }
+.vsm-x { margin-left: auto; width: 30px; height: 30px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 9px;
+  background: rgba(var(--bt), .06); color: var(--text-muted); cursor: pointer; }
+.vsm-x:hover { background: rgba(var(--bt), .12); color: var(--text-primary); }
+.vsm-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 18px 20px 20px; }
+.vsm-tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
+.vsm-tile { min-width: 0; padding: 12px 12px 11px; border-radius: 14px; cursor: pointer; outline: none;
+  background: rgba(var(--bt), .04); border: 1px solid rgba(var(--bt), .07); transition: background .12s, border-color .12s; }
+.vsm-tile:hover { background: rgba(var(--bt), .07); }
+.vsm-tile:focus-visible { box-shadow: 0 0 0 2px var(--vn-set); }
+.vsm-tile.on { background: rgba(var(--bt), .08); border-color: rgba(var(--bt), .28); }
+.vsm-lbl { font-size: 11px; color: var(--text-faint); }
+.vsm-big { margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 22px; font-weight: 700;
+  letter-spacing: -.02em; font-variant-numeric: tabular-nums; color: var(--text-heading); }
+.vsm-off .vsm-big { color: var(--text-faint); }
+.vsm-mini { height: 4px; margin-top: 8px; border-radius: 2px; overflow: hidden; background: rgba(var(--bt), .10); }
+.vsm-mini i { display: block; height: 100%; border-radius: 2px; background: var(--vn-read); }
+.vsm-tile.ulp-warn .vsm-big { color: #d97706; } .vsm-tile.ulp-warn .vsm-mini i { background: #d97706; }
+.vsm-tile.ulp-crit .vsm-big { color: #dc2626; } .vsm-tile.ulp-crit .vsm-mini i { background: #dc2626; }
+.vsm-tile small { display: block; margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 10.5px; color: var(--text-faint); }
+.vsm-card { padding: 14px 16px 16px; border-radius: 14px; background: rgba(var(--bt), .035); border: 1px solid rgba(var(--bt), .06); }
+.vsm-card > .vsp-sec:first-child { margin-top: 0; }
+.vn-status-modal > .vsp-foot { flex: none; margin: 0; padding: 12px 20px; border-top: 1px solid rgba(var(--bt), .08); }
+@media (max-width: 640px) {
+  .vn-status-panel.vn-status-modal { left: 0 !important; right: 0; top: auto; bottom: 0 !important; transform: none;
+    width: auto; max-width: none; max-height: 88vh; max-height: 88dvh; border-radius: 20px 20px 0 0;
+    padding-bottom: env(safe-area-inset-bottom); animation: vsmUp .22s cubic-bezier(.2,.8,.2,1); }
+  @keyframes vsmUp { from { opacity: 0; transform: translateY(30px); } }
+  .vsm-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .vsm-body { padding: 14px 14px 18px; }
+}
+/* Disk (markup: _diskSectionHtml) */
+.ulp-gap { width: 1px; height: 14px; margin: 0 1px; background: rgba(var(--bt), .18); align-self: center; }
+.vsp-cap { margin-top: 10px; font-size: 12px; color: var(--text-muted); }
+.vsp-cap-top { display: flex; justify-content: space-between; align-items: baseline; font-size: 12.5px; color: var(--text-primary); }
+.vsp-cap-top b { font-weight: 650; font-variant-numeric: tabular-nums; }
+.vsp-cap input[type=range] { width: 100%; margin: 8px 0 2px; accent-color: var(--text-heading); }
+.vsp-cap-scale { display: flex; justify-content: space-between; gap: 8px; font-size: 10.5px; color: var(--text-faint); }
+.vsp-cap small { display: block; margin-top: 4px; font-size: 11px; line-height: 1.4; color: var(--text-faint); }
+.vsp-mlist { margin-top: 10px; padding: 2px 12px; border-radius: 11px; background: rgba(var(--bt), .045); }
+.vsp-srow { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 10px; padding: 7px 0;
+  border-top: 1px solid rgba(var(--bt), .07); font-size: 12px; color: var(--text-primary); }
+.vsp-srow:first-child { border-top: 0; }
+.vsp-sname { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vsp-sname small { display: block; font-size: 10.5px; color: var(--text-faint); }
+.vsp-smb { font-variant-numeric: tabular-nums; color: var(--text-muted); }
+.vsp-srow button, .vsp-go { font: inherit; font-size: 11px; padding: 3px 9px; border: 0; border-radius: 7px; cursor: pointer;
+  background: rgba(var(--bt), .09); color: var(--text-primary); }
+.vsp-srow button:hover, .vsp-go:hover:not([disabled]) { background: rgba(var(--bt), .16); }
+.vsp-srow.gone { opacity: .4; }
+.vsp-mc { padding: 10px 12px; border-radius: 11px; background: rgba(var(--bt), .045); font-size: 12px; color: var(--text-muted); }
+.vsp-mc p { margin: 0 0 8px; font-size: 11px; line-height: 1.4; color: var(--text-faint); }
+.vsp-line { display: flex; align-items: center; gap: 7px; margin: 6px 0; cursor: pointer; }
+.vsp-num { width: 44px; padding: 3px 6px; border-radius: 7px; border: 1px solid rgba(var(--bt), .16); background: transparent;
+  color: var(--text-primary); font: inherit; text-align: center; }
+.vsp-go { padding: 6px 12px; font-size: 12px; font-weight: 600; }
+.vsp-go[disabled] { opacity: .4; cursor: default; }
 .vsp-hint { margin-top: 7px; font-size: 11px; color: var(--text-faint); }
 .vsp-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 14px; padding-top: 11px;
   border-top: 1px solid rgba(var(--bt), .08); font-size: 11px; line-height: 1.35; color: var(--text-muted); }
@@ -14606,3 +14682,8 @@ details.rw-internal > summary { cursor: pointer; }
 .pbk-tries { display: inline-flex; gap: 6px; flex-wrap: wrap; }
 .pbk-try:disabled { opacity: .45; cursor: default; }
 .pbk-try:disabled:hover { background: none; }
+/* 5-hour pacing slider: six named steps under the track (markup: _paceSectionHtml) */
+.vsp-pace-scale { display: grid; grid-template-columns: repeat(6, 1fr); }
+.vsp-pace-scale span { text-align: center; }
+.vsp-pace-scale span:first-child { text-align: left; }
+.vsp-pace-scale span:last-child { text-align: right; }

@@ -1097,7 +1097,10 @@ def format_problems(card: dict) -> list[str]:
         if not _s(needs.get("why")):
             out.append("needs.why is empty: why this needs the user and not you.")
         replies = [r for r in _items(needs.get("replies")) if isinstance(r, dict)]
-        if kind == "decision":
+        if kind == "decision" and split_field(needs):
+            # A split-view template (a form, pairs): its answers live inside its items.
+            out += split_problems(card)
+        elif kind == "decision":
             if len(replies) < 2:
                 out.append("A decision needs at least two reply buttons in needs.replies.")
             bare = [r for r in replies if len(_s(r.get("label")).split()) < 3]
@@ -1347,6 +1350,204 @@ def choice_explain_problems(card: dict) -> list[str]:
     return out
 
 
+# ── Split-view templates: several items answered in one go ──────────────
+# A decision may carry, instead of needs.replies, a list of items the Decide
+# popup shows in one split view (the items down the left with their answer,
+# the open one on the right) and answers in ONE message that starts with the
+# template's prefix (_SPLIT and _openSplit in last-card.js):
+#   form   several questions, each with options and one recommended
+#          (several architecture choices blocking one task)
+#   pairs  before-and-after pairs marked Same or Not the same (a change that
+#          should leave something looking identical)
+# SPLIT_TEMPLATES is the one table of fields, sizes and answer prefixes
+# (handoff_evidence.py reads it too).  Drawn only in the popup, so outside the card's
+# 120 words (_POPUP_ONLY); each line keeps its cap, except a form question's
+# context (60) and a pair's own html or text (none).
+# To add a template: an entry in SPLIT_TEMPLATES, its item check in
+# _SPLIT_CHECKS, its entry in _SPLIT in last-card.js; tests/test_split_templates.py
+# holds the three together.
+
+SPLIT_TEMPLATES = {
+    "form": {
+        "prefix": "My answers to the", "title": "question", "min": 2, "max": 8,
+        # when to use it: the card guide and the summary starter both read this
+        "when": "several independent choices block one task (architecture choices, say)",
+        "does": "the popup lists the questions down the left and shows the open one with its "
+                "options as cards and a note box",
+        "example": {"id": "<short id>", "question": "<the question, plain words>",
+                    "context": "<why it matters: 6 to 60 words>",
+                    "options": [{"key": "A", "label": "<the choice spelled out>",
+                                 "gain": "<6+ words: what it gets the user>",
+                                 "verdict": "<6+ words: why it wins>", "recommended": True},
+                                {"key": "B", "label": "<the other choice>",
+                                 "gain": "<6+ words: what it gets the user>",
+                                 "verdict": "<6+ words: why the recommended one beats it>"}]},
+        "rules": "2 to 6 options and exactly one recommended per question; context up to 60 words",
+    },
+    "pairs": {
+        "prefix": "My review of the", "title": "title", "min": 1, "max": 12,
+        "when": "a change should leave things looking identical (a refactor, a move, a new "
+                "stylesheet) and the user confirms before and after",
+        "does": "the popup lists the pairs down the left and shows the open pair side by side "
+                "with Same and Not the same",
+        "example": {"id": "<short id>", "title": "<what should match, 2+ words>",
+                    "a": {"kind": "image", "url": "</static/... or /api/preview/asset/<id>>", "label": "Before"},
+                    "b": {"kind": "image", "url": "</static/... or /api/preview/asset/<id>>", "label": "After"}},
+        "rules": "a side's kind is image or page (with \"url\", an address this app shows), "
+                 "html (with \"html\", drawn with no scripts) or text (with \"text\")",
+    },
+}
+
+
+def split_guide() -> str:
+    """The card guide's lines for the split-view templates."""
+    return "".join(f"- {t['when'][0].upper() + t['when'][1:]} → that same decision, as ONE card with "
+                   f"needs.{k} instead of needs.replies (start it with --start {k}).\n"
+                   for k, t in SPLIT_TEMPLATES.items())
+
+
+def split_instructions() -> str:
+    """What every session is told about each split-view template."""
+    out = []
+    for k, t in SPLIT_TEMPLATES.items():
+        out.append(
+            f"When {t['when']}: ONE decision with needs.{k} instead of needs.replies, "
+            f"{t['min']} to {t['max']} items, each shaped like {json.dumps(t['example'], ensure_ascii=False)}; "
+            f"{t['rules']}. {t['does'][0].upper() + t['does'][1:]}, and sends every answer back in one "
+            f"message starting \"{t['prefix']}\". No needs.look or screens needed; not counted in "
+            f"the card's length. The summary starter prints a blank one: --start {k}.\n")
+    return "".join(out)
+FORM_MIN_OPTIONS, FORM_MAX_OPTIONS = 2, 6
+PAIR_KINDS = {"image": "url", "page": "url", "html": "html", "text": "text"}
+FORM_ANSWER_PREFIX = SPLIT_TEMPLATES["form"]["prefix"]
+PAIRS_ANSWER_PREFIX = SPLIT_TEMPLATES["pairs"]["prefix"]
+
+
+def split_field(needs) -> str:
+    """The split-view template a decision uses ("form", "pairs"), or ''."""
+    if not isinstance(needs, dict):
+        return ""
+    return next((k for k in SPLIT_TEMPLATES if k in needs), "")
+
+
+def split_items(needs, field: str = "") -> list:
+    """The template's items, as given (dicts only)."""
+    field = field or split_field(needs)
+    if not field or not isinstance(needs, dict):
+        return []
+    return [x for x in _items(needs.get(field)) if isinstance(x, dict)]
+
+
+def _form_question_faults(name: str, q: dict) -> list:
+    faults = []
+    if not _s(q.get("question")):
+        faults.append(f"{name} has no \"question\"")
+    if _words(_s(q.get("context"))) < CHOICE_EXPLAIN_MIN_WORDS:
+        faults.append(f"{name} needs \"context\": why it matters, at least {CHOICE_EXPLAIN_MIN_WORDS} words")
+    opts = [o for o in _items(q.get("options")) if isinstance(o, dict)]
+    if not (FORM_MIN_OPTIONS <= len(opts) <= FORM_MAX_OPTIONS):
+        return faults + [f"{name} needs {FORM_MIN_OPTIONS} to {FORM_MAX_OPTIONS} options"]
+    keys = [_s(o.get("key")) or chr(65 + j) for j, o in enumerate(opts)]
+    if len(set(keys)) != len(keys):
+        faults.append(f"{name} repeats an option key")
+    for k, o in zip(keys, opts):
+        if _words(_s(o.get("label"))) < 2:
+            faults.append(f"{name}, option {k}: spell the choice out in \"label\"")
+        for f in ("gain", "verdict"):
+            if _words(_s(o.get(f))) < CHOICE_EXPLAIN_MIN_WORDS:
+                faults.append(f"{name}, option {k}: \"{f}\" needs at least {CHOICE_EXPLAIN_MIN_WORDS} words")
+        if _HEX_ID.search(_s(o.get("gain")) + " " + _s(o.get("verdict"))):
+            faults.append(f"{name}, option {k}: say what the thing is, not its hash")
+    if len([o for o in opts if o.get("recommended") is True]) != 1:
+        faults.append(f"{name} must mark exactly one option \"recommended\": true")
+    verdicts = [_norm(_s(o.get("verdict"))).lower() for o in opts if _s(o.get("verdict"))]
+    if len(set(verdicts)) != len(verdicts):
+        faults.append(f"{name}: two options share one verdict")
+    return faults
+
+
+def _pair_faults(name: str, p: dict) -> list:
+    faults = []
+    if len(_s(p.get("title")).split()) < 2:
+        faults.append(f"{name} needs a \"title\" saying what should match")
+    for side in ("a", "b"):
+        x = p.get(side)
+        if not isinstance(x, dict) or x.get("kind") not in PAIR_KINDS:
+            faults.append(f"{name}, side {side}: \"kind\" is one of image, page, html, text")
+            continue
+        field = PAIR_KINDS[x["kind"]]
+        if not _s(x.get(field)):
+            faults.append(f"{name}, side {side}: a {x['kind']} needs \"{field}\"")
+        elif field == "url" and not _VALIDATE_URL.match(_s(x.get(field))):
+            faults.append(f"{name}, side {side}: \"url\" must be an address the app can show "
+                          "(\"/static/...\", \"/api/preview/asset/<id>\" or http(s)://), not a file path")
+    return faults
+
+
+# (item check, word for one item, the shape to quote when the list is wrong,
+#  what a complete item gives)
+_SPLIT_CHECKS = {
+    "form": (_form_question_faults, "question",
+             "{\"id\", \"question\", \"context\", \"options\": [{\"key\", \"label\", \"gain\", \"verdict\", \"recommended\"}]}",
+             "Each question gives its \"context\" (why it matters), and each option a \"label\", a \"gain\" (what it "
+             "gets the user) and a \"verdict\" (recommended: why it wins; any other: why the recommended one beats "
+             "it), with exactly one option recommended per question."),
+    "pairs": (_pair_faults, "pair",
+              "{\"id\", \"title\", \"a\": {\"kind\": \"image|page|html|text\", \"url|html|text\": ..., \"label\"}, \"b\": {...}}",
+              "Each pair has a \"title\" and two sides, each a kind with its content."),
+}
+
+
+def split_problems(card: dict) -> list[str]:
+    """What is wrong with a decision's split-view template, if it has one."""
+    needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
+    field = split_field(needs)
+    if not field:
+        return []
+    t = SPLIT_TEMPLATES[field]
+    check, noun, shape, complete = _SPLIT_CHECKS[field]
+    out = []
+    if needs.get("kind") != "decision":
+        out.append(f"needs.{field} belongs on a decision (needs.kind \"decision\").")
+    others = [f"needs.{k}" for k in ("replies", *SPLIT_TEMPLATES) if k != field and (k in needs if k != "replies" else _items(needs.get(k)))]
+    if others:
+        out.append(f"needs.{field} carries its own answers; leave " + " and ".join(others) + " out of the "
+                   "same card, or the popup would show two sets of choices.")
+    items = split_items(needs, field)
+    lo, hi = t["min"], t["max"]
+    if not isinstance(needs.get(field), list) or not (lo <= len(items) <= hi):
+        return out + [f"needs.{field} is a list of {lo} to {hi} {noun}s, each {shape}."
+                      + (" For one question use needs.replies." if field == "form" else "")]
+    ids, faults = set(), []
+    for i, x in enumerate(items):
+        name = f"{noun} {i + 1}"
+        xid = _s(x.get("id"))
+        if not xid:
+            faults.append(f"{name} has no \"id\"")
+        elif xid in ids:
+            faults.append(f"{name} repeats the id \"{xid}\"")
+        ids.add(xid)
+        faults += check(name, x)
+    if faults:
+        out.append(f"The {noun}s are incomplete: " + "; ".join(faults[:8]) + ". " + complete)
+    return out
+
+
+def split_usable(needs) -> bool:
+    """Is there enough to answer?  The card's own test (_SPLIT[...].parse in
+    last-card.js): a form needs two questions with two options each, pairs one
+    pair with a title and two sides."""
+    field = split_field(needs)
+    items = split_items(needs, field)
+    if field == "form":
+        ok = [q for q in items if _s(q.get("question"))
+              and len([o for o in _items(q.get("options")) if isinstance(o, dict)]) >= FORM_MIN_OPTIONS]
+    else:
+        ok = [p for p in items if _s(p.get("title")) and all(
+            isinstance(p.get(s), dict) and p[s].get("kind") in PAIR_KINDS for s in ("a", "b"))]
+    return len(ok) >= SPLIT_TEMPLATES[field]["min"] if field else False
+
+
 # ── Layer 1a: handing over work the session could do ─────────────────────
 # The class: a session that hits a missing tool (or a command it could run)
 # and hands the job to the user instead of finding another way (for example
@@ -1514,7 +1715,13 @@ _LONG_LISTS = ("asks", "links", "needs.look", "needs.stages")
 # Decide popup, one choice at a time, never on the card, so they are not
 # counted toward the card's length or its list limit.  Each line still has
 # the per-line cap.
-_POPUP_ONLY = re.compile(r"^needs\.replies\[\d+\]\.(?:strengths|weaknesses|opportunities|risks|fit|effort|undo|risk|screens|what|gain|verdict)\b")
+_POPUP_ONLY = re.compile(r"^(?:needs\.replies\[\d+\]\.(?:strengths|weaknesses|opportunities|risks|fit|effort|undo|risk|screens|what|gain|verdict)\b"
+                         r"|needs\.(?:" + "|".join(SPLIT_TEMPLATES) + r")\b)")
+# A pair's own text or page source is content to compare, not a line to read.
+_PAIR_CONTENT = re.compile(r"^needs\.pairs\[\d+\]\.[ab]\.(?:html|text)$")
+# A form question's context may run longer than a line: it is the paragraph
+# the popup shows above that question's options.
+_FORM_CONTEXT = re.compile(r"^needs\.form\[\d+\]\.context$")
 
 
 def _words(s: str) -> int:
@@ -1603,8 +1810,11 @@ def word_table(card: dict) -> list:
         # what_was_done / checked: the two lines every summary carries in its
         # What was done and Checked sections; outside the 120,
         # each still capped like any line.  Popup-only reply fields likewise.
+        if _PAIR_CONTENT.match(where):
+            rows.append((where, n, False, None))
+            continue
         if where.startswith(("finding", "what_was_done", "checked")) or _POPUP_ONLY.match(where):
-            rows.append((where, n, False, MAX_LINE_WORDS))
+            rows.append((where, n, False, MAX_ANSWER_WORDS if _FORM_CONTEXT.match(where) else MAX_LINE_WORDS))
             continue
         cap = (MAX_HEADLINE_WORDS if where == "headline"
                else MAX_ANSWER_WORDS if where == "answer" else MAX_LINE_WORDS)
@@ -1830,7 +2040,7 @@ with "files".
 - The user gave an order, and a choice that only the user can make blocks it → \
 "needs_you" with needs.kind "decision", tied to that order in "asks" (state \
 "needs_you"). One decision, the one that blocks the work.
-- A matter of taste in the user's order (how something looks, reads or is laid \
+{split_guide}- A matter of taste in the user's order (how something looks, reads or is laid \
 out, its tone, wording or naming) IS such a choice: lean toward showing \
 variants instead of picking one yourself and calling it done. Build 3 or 4 \
 that span a real range, from the safe one closest to how it is now to a \
@@ -2058,7 +2268,7 @@ links. Full stays under 400 words. Never leave the user a job in any tab ("run X
 Done. When the user redirects you ("focus", "what was your task", "get back to the \
 actual work"), put the user's whole message in asks, say where the task the user first \
 gave this session stands, and go back to it.
-"""
+""".replace("{split_guide}", split_guide())
 
 _REWRITE = "Rewrite only your final message unless the problem is unfinished work; then do the work first."
 
@@ -2093,6 +2303,11 @@ def _card_urls(card: dict):
                     yield f"needs.replies[{i}].screens[{j}]", _s(s.get("url"))
                     for k, pic in _screen_pictures(s.get("image")):
                         yield f"needs.replies[{i}].screens[{j}].image{k}", pic
+    for i, pr in enumerate(split_items(needs, "pairs") if split_field(needs) == "pairs" else []):
+        for side in ("a", "b"):
+            x = pr.get(side) if isinstance(pr.get(side), dict) else {}
+            if x.get("kind") in ("image", "page") and _s(x.get("url")):
+                yield f"needs.pairs[{i}].{side}.url", _s(x.get("url"))
     d = card.get("deliverable")
     if isinstance(d, dict):
         for i, f in enumerate(_items(d.get("files"))):

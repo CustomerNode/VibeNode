@@ -1322,7 +1322,7 @@ function _renderSessionThinkingBadge(sessionId) {
 window._usageLimits = window._usageLimits || null;
 
 const _USAGE_WINDOW_ORDER = [
-  {key: 'five_hour', label: '5h', name: 'Session (5-hour) limit'},
+  {key: 'five_hour', label: '5h', name: 'Session (5-hour) limit', optional: true},
   {key: 'seven_day', label: '7d', name: 'Weekly limit'},
   {key: 'seven_day_overage_included', label: 'Fable', name: 'Weekly Fable limit'},
 ];
@@ -1346,14 +1346,16 @@ function _fmtUsageTime(sec) {
  */
 function _usageLimitsParts() {
   const rows = _usageRows();
-  const shown = rows.filter(r => r.known);
-  if (!shown.length) return null;  // no turn seen yet: show nothing, not zeros
-  const data = window._usageLimits;
+  const shown = rows.filter(r => r.known && !r.off);
+  if (!shown.length && !_diskColumn()) return null;  // nothing known yet: show nothing, not zeros
+  const data = window._usageLimits || {};
   const tips = rows.map(r => r.tip);
   if (data.updated_at) tips.push('As of ' + _fmtUsageTime(data.updated_at));
+  const disk = _diskColumn();
+  if (disk) tips.push(disk.tip);
   return {
     html: shown.map(r => '<span class="ulp-c' + r.cls + '"><i style="height:' +
-      (r.pct > 0 ? Math.max(8, Math.min(100, r.pct)) : 0) + '%"></i></span>').join(''),
+      (r.pct > 0 ? Math.max(8, Math.min(100, r.pct)) : 0) + '%"></i></span>').join('') + (disk ? disk.html : ''),
     title: tips.join('\n'),
   };
 }
@@ -1371,6 +1373,18 @@ function _usageRows() {
     }
     let cls = '';
     let pct = Math.max(0, Math.round(v.percent));
+    // The CLI stopped reporting this window after it reset: the account no
+    // longer has it.  Listed as Off in the panel, left out of the columns.
+    // Worked out here too (same rule as usage_limits._window_off), because the
+    // engine's live push may come from code started before the server learned it.
+    const upd = (window._usageLimits && window._usageLimits.updated_at) || 0;
+    const off = v.off || (w.optional && v.resets_at && v.resets_at <= nowSec &&
+      upd > v.resets_at && (v.seen_at || 0) < upd);
+    if (off) {
+      return {name: w.name, known: true, off: true, pct: 0, cls: ' ulp-off',
+        note: 'Not applied to your account right now',
+        tip: w.name + ': off (not applied to your account right now)'};
+    }
     if (v.resets_at && v.resets_at <= nowSec) {
       return {name: w.name, known: true, pct: 0, cls: cls + ' ulp-stale',
         note: 'Reset at ' + _fmtUsageTime(v.resets_at) + ', updates after the next reply',
@@ -1515,6 +1529,335 @@ if (!window._usageLimitsTicker) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// DISK — the fourth column, and the panel's Disk section: how full the drive
+// is, what sessions and the Trash take, the cap ("VibeNode may use"), the
+// biggest sessions with Delete, Delete old sessions and Empty Trash.  Every
+// action is a plain request to the web server (src/web/routes/disk_api.py),
+// which frees space before writing anything, so it works on a full disk,
+// when no Claude session can run.
+// ═══════════════════════════════════════════════════════════════════════
+
+window._disk = window._disk || {disk: null, cap: 0, share: null, biggest: null,
+  delOpen: false, rules: {useStarted: false, started: 30, useLast: true, last: 14},
+  preview: null, msg: '', delMsg: '', gone: {}};
+
+function _fmtBytes(b) {
+  const K = 1024, MB = K * K, GB = MB * K, TB = GB * K;
+  return b >= TB ? (b / TB).toFixed(1) + ' TB' : b >= GB ? (b / GB).toFixed(1) + ' GB'
+    : b >= MB ? Math.round(b / MB) + ' MB' : Math.max(0, Math.round(b / K)) + ' KB';
+}
+function _diskCls(p) { return p >= 95 ? ' ulp-crit' : p >= 85 ? ' ulp-warn' : ''; }
+
+/** What VibeNode may take: its allotment, else everything it could have
+ *  (free space plus what it already holds). */
+function _diskAvail() { const m = window._disk; return (m.disk ? m.disk.free : 0) + _diskUsed(); }
+function _diskAllotted() { const m = window._disk, a = _diskAvail(); return m.cap && m.cap < a ? m.cap : a; }
+function _diskUsePct() { const a = _diskAllotted(); return a ? Math.min(100, Math.round(100 * _diskUsed() / a)) : 0; }
+
+function _diskColumn() {
+  const m = window._disk;
+  if (!m.disk || !m.disk.known || !m.share) return null;
+  const p = _diskUsePct();
+  return {html: '<span class="ulp-gap"></span><span class="ulp-c ulp-disk' + _diskCls(p) +
+      '"><i style="height:' + Math.max(8, p) + '%"></i></span>',
+    tip: 'Disk: VibeNode uses ' + _fmtBytes(_diskUsed()) + ' of ' + _fmtBytes(_diskAllotted()) + ' allotted'};
+}
+
+function _loadDisk(full) {
+  return fetch('/api/disk' + (full ? '' : '?light=1')).then(r => r.ok ? r.json() : null).then(d => {
+    if (!d || !d.disk) return;
+    const m = window._disk;
+    m.disk = d.disk; m.cap = d.cap || 0;
+    if (d.share) m.share = d.share;
+    if (full) { m.biggest = d.biggest || []; m.gone = {}; }
+    _renderUsageLimits();
+  }).catch(() => {});
+}
+
+// The slider is the allotment drawn to scale against what is available, in
+// 1000 steps, never below 1 GB: its fill reads as "allotted of available".
+const _DISK_MIN = 1073741824;
+function _diskPosToBytes(p) {
+  const t = _diskAvail();
+  return p >= 1000 ? t : Math.max(_DISK_MIN, Math.round(t * p / 1000));
+}
+function _diskBytesToPos(b) {
+  const t = _diskAvail();
+  if (!t || !b || b >= t) return 1000;
+  return Math.max(0, Math.min(1000, Math.round(1000 * b / t)));
+}
+function _diskUsed() { const s = window._disk.share; return s ? s.sessions + s.trash : 0; }
+function _diskCapLabel(b) {
+  const a = _diskAvail();
+  return b >= a ? 'All available' : _fmtBytes(b) + ' · ' + Math.max(1, Math.round(100 * b / a)) + '% of available';
+}
+function _diskCapNote(b) {
+  const rule = 'the Trash is emptied, then the sessions quiet the longest are deleted for good. Pinned and running ones never are.';
+  if (b < _diskAvail() && _diskUsed() > b) {
+    return 'Sessions and Trash take ' + _fmtBytes(_diskUsed()) + ': ' + rule.replace('deleted for good.', 'deleted for good until they fit.');
+  }
+  return 'Past this, ' + rule;
+}
+
+function _diskCapHtml() {
+  const m = window._disk, d = m.disk;
+  const cap = _diskAllotted();
+  return '<div class="vsp-cap"><div class="vsp-cap-top"><span>Allotted to VibeNode</span><b id="vsp-cap-val">' +
+    _diskCapLabel(cap) + '</b></div>' +
+    '<input type="range" id="vsp-cap" min="0" max="1000" step="1" value="' + _diskBytesToPos(cap) + '" aria-label="Most disk VibeNode may use">' +
+    '<div class="vsp-cap-scale"><span>1 GB</span><span>' + _fmtBytes(_diskAvail()) + ' available · disk ' + d.percent + '% full</span></div>' +
+    '<small id="vsp-cap-note">' + _diskCapNote(cap) + '</small></div>';
+}
+
+function _diskDelHtml() {
+  const m = window._disk, r = m.rules, pv = m.preview, any = r.useStarted || r.useLast;
+  const n = pv && any ? pv.count : 0;
+  return '<div class="vsp-mc"><p>Moves them to the Trash (you can restore them; Empty Trash frees the space). Pinned and running sessions are kept.</p>' +
+    '<label class="vsp-line"><input type="checkbox" data-mrule="useStarted"' + (r.useStarted ? ' checked' : '') + '> Started more than ' +
+    '<input class="vsp-num" data-mrule="started" inputmode="numeric" value="' + r.started + '"> days ago</label>' +
+    '<label class="vsp-line"><input type="checkbox" data-mrule="useLast"' + (r.useLast ? ' checked' : '') + '> No new messages for ' +
+    '<input class="vsp-num" data-mrule="last" inputmode="numeric" value="' + r.last + '"> days</label>' +
+    '<div class="vsp-line"><button class="vsp-go" id="vsp-del-go" data-act="disk-delete"' + (n ? '' : ' disabled') + '>' +
+    _diskDelLabel(pv && any ? pv : null) + '</button></div>' +
+    (m.delMsg ? '<div class="vsp-hint">' + escHtml(m.delMsg) + '</div>' : '') + '</div>';
+}
+function _diskDelLabel(pv) {
+  if (!pv) return 'Delete';
+  return 'Delete ' + pv.count + ' session' + (pv.count === 1 ? '' : 's') + (pv.count ? ' (' + _fmtBytes(pv.bytes) + ')' : '');
+}
+
+function _diskAgo(sec) {
+  const d = Math.floor((Date.now() / 1000 - sec) / 86400);
+  return d < 1 ? 'Active today' : 'Last active ' + d + ' d ago';
+}
+
+function _diskSectionHtml() {
+  const m = window._disk, d = m.disk;
+  if (!d || !d.known) return '';
+  const s = m.share;
+  let out = '<div class="vsp-sec"><span>Disk</span><em>' +
+    (s && s.trash > 0 ? '<a role="button" tabindex="0" data-act="disk-trash">Empty Trash (' + _fmtBytes(s.trash) + ')</a>' : '') + '</em></div>' +
+    (s ? '<div class="vsp-row' + _diskCls(_diskUsePct()) + '" style="margin-top:0"><span>VibeNode uses</span><span class="vsp-pct">' +
+      _diskUsePct() + '%</span><span class="vsp-trk"><i style="width:' + _diskUsePct() + '%"></i></span><small>' +
+      _fmtBytes(_diskUsed()) + ' of ' + _fmtBytes(_diskAllotted()) + ' allotted · sessions ' + _fmtBytes(s.sessions) +
+      ', Trash ' + _fmtBytes(s.trash) + '</small></div>' : '') + _diskCapHtml();
+  out += '<div class="vsp-sec"><span>Biggest sessions</span><em></em></div>';
+  if (m.biggest === null) out += '<div class="vsp-empty"><span class="spinner"></span></div>';
+  else if (!m.biggest.length) out += '<div class="vsp-hint" style="margin-top:0">No sessions to delete.</div>';
+  else {
+    out += '<div class="vsp-mlist" style="margin-top:0">' + m.biggest.map(b => {
+      const gone = !!m.gone[b.id];
+      return '<div class="vsp-srow' + (gone ? ' gone' : '') + '"><span class="vsp-sname">' + escHtml(_diskName(b)) +
+        '<small>' + _diskAgo(b.last_active) + '</small></span><span class="vsp-smb">' + _fmtBytes(b.bytes) + '</span>' +
+        (gone ? '<span class="vsp-smb">Deleted</span>'
+          : '<button data-act="disk-one" data-id="' + escHtml(b.id) + '" data-project="' + escHtml(b.project) + '">Delete</button>') + '</div>';
+    }).join('') + '</div>';
+  }
+  if (m.msg) out += '<div class="vsp-hint">' + escHtml(m.msg) + '</div>';
+  out += '<div class="vsp-sec"><span>Old sessions</span><em><a role="button" tabindex="0" data-act="disk-delopen">' +
+    (m.delOpen ? 'Close' : 'Delete old…') + '</a></em></div>';
+  out += m.delOpen ? _diskDelHtml() : '<div class="vsp-hint" style="margin-top:0">Delete sessions by age.</div>';
+  return out;
+}
+
+function _diskName(b) {
+  if (b.name) return b.name;
+  const row = (typeof SessionStore !== 'undefined' && SessionStore.get) ? SessionStore.get(b.id) : null;
+  return (row && (row.custom_title || row.display_title || row.title)) || ('Session ' + b.id.slice(0, 8));
+}
+
+function _diskPost(url, body) {
+  return fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})})
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)));
+}
+
+function _diskDoneWords(d) {
+  const parts = [];
+  if (d.trashed) parts.push(d.trashed + ' moved to the Trash');
+  if (d.removed) parts.push(d.removed + ' deleted for good (the disk was full), freed ' + _fmtBytes(d.freed || 0));
+  return parts.length ? parts.join('; ') + '.' : 'Nothing was deleted.';
+}
+
+let _diskPreviewTimer = null;
+function _diskPreview() {
+  clearTimeout(_diskPreviewTimer);
+  _diskPreviewTimer = setTimeout(() => {
+    const r = window._disk.rules;
+    if (!r.useStarted && !r.useLast) { window._disk.preview = null; _diskSyncDelBtn(); return; }
+    _diskPost('/api/disk/delete', Object.assign(_diskRuleBody(), {dry_run: true}))
+      .then(d => { window._disk.preview = d; _diskSyncDelBtn(); }).catch(() => {});
+  }, 250);
+}
+function _diskRuleBody() {
+  const r = window._disk.rules;
+  return {created_days: r.useStarted ? r.started : null, inactive_days: r.useLast ? r.last : null};
+}
+function _diskSyncDelBtn() {
+  const b = document.getElementById('vsp-del-go'), pv = window._disk.preview;
+  if (!b) return;
+  b.disabled = !(pv && pv.count);
+  b.textContent = _diskDelLabel(pv);
+}
+
+function _diskFail(what) { if (typeof showToast === 'function') showToast('Could not ' + what, true); }
+
+/** Clicks on the Disk section; true when handled. */
+function _diskClick(a, el) {
+  const m = window._disk;
+  if (a === 'disk-one') {
+    _diskPost('/api/disk/delete', {ids: [{id: el.dataset.id, project: el.dataset.project}]}).then(d => {
+      m.gone[el.dataset.id] = 1; m.msg = _diskDoneWords(d); _renderStatusPanel();
+      setTimeout(() => _loadDisk(true), 1200);
+    }).catch(() => _diskFail('delete the session'));
+  } else if (a === 'disk-trash') {
+    const t = m.share ? m.share.trash : 0;
+    if (!confirm('Empty the Trash for good? This frees ' + _fmtBytes(t) + ' and cannot be undone.')) return true;
+    _diskPost('/api/disk/empty-trash').then(d => {
+      m.msg = 'Trash emptied, freed ' + _fmtBytes(d.freed || 0) + '.'; _loadDisk(true);
+    }).catch(() => _diskFail('empty the Trash'));
+  } else if (a === 'disk-delopen') {
+    m.delOpen = !m.delOpen; m.delMsg = ''; _renderStatusPanel(); if (m.delOpen) _diskPreview();
+  } else if (a === 'disk-delete') {
+    const n = m.preview ? m.preview.count : 0;
+    if (!n || !confirm('Move ' + n + ' session' + (n === 1 ? '' : 's') + ' to the Trash? You can restore them from the Trash.')) return true;
+    _diskPost('/api/disk/delete', _diskRuleBody()).then(d => {
+      m.delMsg = _diskDoneWords(d); m.preview = null; _loadDisk(true); _diskPreview();
+    }).catch(() => _diskFail('delete old sessions'));
+  } else return false;
+  return true;
+}
+
+/** Typing and dragging update in place: a redraw mid-drag would drop the
+ *  slider out from under the finger. */
+function _diskInput(e) {
+  if (e.target.id === 'vsp-pace') return _paceInput(e);
+  const t = e.target, m = window._disk;
+  if (t.id === 'vsp-cap') {
+    const b = _diskPosToBytes(+t.value);
+    const val = document.getElementById('vsp-cap-val'), note = document.getElementById('vsp-cap-note');
+    if (val) val.textContent = _diskCapLabel(b);
+    if (note) note.textContent = _diskCapNote(b);
+    return;
+  }
+  const k = t.dataset && t.dataset.mrule;
+  if (!k) return;
+  m.rules[k] = t.type === 'checkbox' ? t.checked : Math.max(0, parseInt(t.value, 10) || 0);
+  _diskPreview();
+}
+function _diskChange(e) {
+  if (e.target.id === 'vsp-pace') return _paceChange(e);
+  if (e.target.id !== 'vsp-cap') return;
+  window._diskDragging = false;
+  const m = window._disk, b = _diskPosToBytes(+e.target.value);
+  const bytes = b >= _diskAvail() ? 0 : b;
+  if (bytes && _diskUsed() > bytes && !confirm('Sessions and Trash take ' + _fmtBytes(_diskUsed()) +
+      '. Over ' + _fmtBytes(bytes) + ', the Trash is emptied and the sessions quiet the longest are deleted for good. Set it?')) {
+    e.target.value = _diskBytesToPos(_diskAllotted());
+    _diskInput({target: e.target});
+    return;
+  }
+  _diskPost('/api/disk/cap', {bytes: bytes}).then(d => { m.cap = d.cap || 0; })
+    .catch(() => _diskFail('save the disk limit'));
+}
+
+// The column stays current without a socket: a light reading once a minute.
+if (!window._diskTicker) {
+  window._diskTicker = setInterval(() => { _loadDisk(!!document.getElementById('vn-status-panel')); if (typeof _loadPace === 'function') _loadPace(); }, 60000);
+  _loadDisk(false);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 5-HOUR PACING — a 5-hour limit VibeNode sets itself from the weekly one
+// (src/web/pace_5h.py).  The slider runs from Linear (the weekly usage left,
+// spread evenly over the 5-hour blocks to the reset) through bigger bursts to
+// Off (the default).  When a window's share is used, sessions stop and new
+// messages are refused until its reset, as the account's own 5-hour limit
+// used to work; Reset ends the window now and is a button for a person only.
+// ═══════════════════════════════════════════════════════════════════════
+
+window._pace = window._pace || null;
+const _PACE_STEPS = [1, 1.5, 2, 3, 5, 0];
+const _PACE_NAMES = ['Linear', '1.5×', '2×', '3×', '5×', 'Off'];
+
+function _loadPace() {
+  _bindPace();
+  return fetch('/api/pace-5h').then(r => r.ok ? r.json() : null).then(d => {
+    if (d && d.steps) { window._pace = d; _renderUsageLimits(); }
+  }).catch(() => {});
+}
+function _bindPace() {
+  if (window._paceBound || typeof socket === 'undefined' || !socket || !socket.on) return;
+  window._paceBound = true;
+  socket.on('pace_5h', d => { if (d && d.steps) { window._pace = d; _renderUsageLimits(); } });
+}
+_bindPace();
+
+function _paceIndex(mult) { const i = _PACE_STEPS.indexOf(+mult || 0); return i < 0 ? 5 : i; }
+function _paceWords(i) {
+  const p = window._pace, m = _PACE_STEPS[i];
+  if (!m) return 'Off: no limit per 5 hours.';
+  const per = p ? p.next_share * m : 0;
+  return (m === 1 ? 'Linear' : _PACE_NAMES[i] + ' linear') + ': about ' + per.toFixed(1) +
+    '% of the week per 5 hours' + (m === 1 ? ', the week spread evenly.' : '.');
+}
+
+/** The 5-hour tile from pacing: null when the account's own 5-hour limit is on. */
+function _paceTile() {
+  const p = window._pace;
+  if (!p) return null;
+  if (!p.mult) return {big: 'Off', pct: null, small: 'Pacing off', cls: ' vsm-off'};
+  if (!p.active) return {big: '0%', pct: 0, small: 'Starts with your next message', cls: ''};
+  const at = _fmtUsageTime(p.reset_at);
+  if (p.hit) return {big: '100%', pct: 100, small: 'Limit hit · resets ' + at, cls: ' ulp-crit'};
+  return {big: p.percent + '%', pct: p.percent, small: 'Resets ' + at, cls: p.percent >= 95 ? ' ulp-crit' : p.percent >= 80 ? ' ulp-warn' : ''};
+}
+
+function _paceSectionHtml() {
+  const p = window._pace;
+  if (!p) return '';
+  const i = _paceIndex(p.mult);
+  let h = '<div class="vsp-sec"><span>5-hour pacing</span><em>' +
+    (p.active ? '<a role="button" tabindex="0" data-act="pace-reset">Reset 5-hour limit</a>' : '') + '</em></div>';
+  if (p.active) {
+    const cls = p.hit ? ' ulp-crit' : p.percent >= 80 ? ' ulp-warn' : '';
+    h += '<div class="vsp-row' + cls + '" style="margin-top:0"><span>This 5 hours</span><span class="vsp-pct">' +
+      (p.hit ? 'Hit' : p.percent + '%') + '</span><span class="vsp-trk"><i style="width:' + p.percent + '%"></i></span><small>' +
+      p.used.toFixed(1) + '% of ' + p.share.toFixed(1) + '% of the week · ' +
+      (p.hit ? 'sessions wait, and continue at ' : 'resets ') + _fmtUsageTime(p.reset_at) + '</small></div>';
+  }
+  h += '<div class="vsp-cap"><div class="vsp-cap-top"><span>Pace</span><b id="vsp-pace-val">' + _PACE_NAMES[i] + '</b></div>' +
+    '<input type="range" id="vsp-pace" min="0" max="5" step="1" value="' + i + '" aria-label="5-hour pacing">' +
+    '<div class="vsp-cap-scale vsp-pace-scale">' + _PACE_NAMES.map(n => '<span>' + n + '</span>').join('') + '</div>' +
+    '<small id="vsp-pace-note">' + _paceWords(i) + '</small></div>';
+  return h;
+}
+
+function _paceInput(e) {
+  const i = +e.target.value;
+  const v = document.getElementById('vsp-pace-val'), n = document.getElementById('vsp-pace-note');
+  if (v) v.textContent = _PACE_NAMES[i];
+  if (n) n.textContent = _paceWords(i);
+}
+function _paceChange(e) {
+  window._diskDragging = false;
+  const mult = _PACE_STEPS[+e.target.value];
+  fetch('/api/pace-5h/setting', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mult: mult})}).then(r => r.ok ? r.json() : Promise.reject(r))
+    .then(d => { window._pace = d; _renderUsageLimits(); })
+    .catch(() => { if (typeof showToast === 'function') showToast('Could not save 5-hour pacing', true); });
+}
+function _paceReset() {
+  if (!confirm('Reset the 5-hour limit now? A new 5 hours starts with the next message, and stopped sessions continue.')) return;
+  fetch('/api/pace-5h/reset', {method: 'POST', headers: {'Content-Type': 'application/json', 'X-VN-Human': 'reset'}, body: '{}'})
+    .then(r => r.ok ? r.json() : Promise.reject(r))
+    .then(d => {
+      window._pace = d; _renderUsageLimits();
+      if (typeof showToast === 'function') showToast('5-hour limit reset' + (d.resumed && d.resumed.length ? ', ' + d.resumed.length + ' session(s) continuing' : ''));
+    })
+    .catch(() => { if (typeof showToast === 'function') showToast('Could not reset the 5-hour limit', true); });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // STATUS CONTROL — the bar's whole left side is ONE small control: the model
 // gauge (name + thinking-level track) and a mini column per usage limit.
 // Clicking it opens a panel with everything in words and numbers: model and
@@ -1587,6 +1930,8 @@ function _statusPanelHtml() {
     if (st.pThink === null) h += '<div class="vsp-hint">Level not reported while this session is sleeping. Pick one to set it.</div>';
   }
 
+  const modelPart = h;
+  h = '';
   const at = window._usageLimits && window._usageLimits.updated_at;
   h += '<div class="vsp-sec"><span>Usage limits</span><em>' + (at ? 'Updated ' + _fmtUsageTime(at) + ' · ' : '') +
     '<a role="button" tabindex="0" data-act="refresh">Refresh</a></em></div>';
@@ -1596,11 +1941,14 @@ function _statusPanelHtml() {
   } else {
     rows.forEach((r, i) => {
       h += '<div class="vsp-row' + r.cls + '"' + (i ? '' : ' style="margin-top:0"') + '><span>' + escHtml(r.name) + '</span>' +
-        '<span class="vsp-pct">' + (r.known ? r.pct + '%' : '') + '</span>' +
-        (r.known ? '<span class="vsp-trk"><i style="width:' + Math.min(100, r.pct) + '%"></i></span>' : '') +
+        '<span class="vsp-pct">' + (r.off ? 'Off' : r.known ? r.pct + '%' : '') + '</span>' +
+        (r.known && !r.off ? '<span class="vsp-trk"><i style="width:' + Math.min(100, r.pct) + '%"></i></span>' : '') +
         (r.note ? '<small>' + escHtml(r.note) + '</small>' : '') + '</div>';
     });
   }
+
+  h += _paceSectionHtml();
+  const diskPart = _diskSectionHtml();
 
   // Context: same arithmetic as _buildCtxBarCompact (live-panel.js) and
   // _contextPillParts above.  The window size tracks the CLI's [1m] marker
@@ -1618,6 +1966,8 @@ function _statusPanelHtml() {
       '<span class="vsp-trk"><i style="width:' + pct + '%"></i></span></div>';
   }
 
+  const usagePart = h;
+  h = '';
   // Apply appears only when something staged differs from what is running,
   // with the consequence next to it.  It is the panel's one accent element.
   if (!c.isNew && (st.dModel || st.dThink)) {
@@ -1632,7 +1982,60 @@ function _statusPanelHtml() {
       '.</span><span class="vsp-actions">' +
       '<a role="button" tabindex="0" data-act="unqueue">Cancel</a></span></div>';
   }
-  return h;
+  return _statusModalHtml(st, {model: modelPart, usage: usagePart, disk: diskPart, foot: h});
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// The panel is a modal: a title bar with Close, four tiles with the key
+// numbers (model, weekly limit, 5-hour limit, disk), and the details of the
+// tile picked below them.  Staged model / thinking changes keep their Apply
+// bar at the bottom whichever tile is open.  On a phone it is a bottom sheet
+// (CSS).  The element keeps the id vn-status-panel, which every renderer and
+// the outside-click handler already use.
+// ═══════════════════════════════════════════════════════════════════════
+
+const _STATUS_TABS = ['model', 'usage', 'disk'];
+
+function _statusTilesHtml(st) {
+  const tab = _statusPanelFor.tab || 'model';
+  // Weekly and 5-hour open the same details; only the tile tapped lights up.
+  const picked = _statusPanelFor.tile || {model: 'model', usage: 'weekly', disk: 'disk'}[tab];
+  const tile = (key, t, label, big, pct, small, cls) =>
+    '<div class="vsm-tile' + (key === picked ? ' on' : '') + (cls || '') + '" role="tab" tabindex="0" aria-selected="' + (key === picked) +
+    '" data-act="tab" data-t="' + t + '" data-tile="' + key + '"><div class="vsm-lbl">' + label + '</div>' +
+    '<div class="vsm-big">' + big + '</div>' +
+    (pct == null ? '' : '<div class="vsm-mini"><i style="width:' + Math.max(0, Math.min(100, pct)) + '%"></i></div>') +
+    '<small>' + small + '</small></div>';
+  const SM = st.SM;
+  const modelName = st.model ? _runningModelLabel(st.model, st.sid) : '—';
+  const thinkLbl = st.think === null ? 'Thinking not reported'
+    : 'Thinking: ' + ((SM && (SM.THINKING_LEVELS.find(l => l.key === (st.think || '')) || {}).label) || 'Default');
+  const rows = _usageRows();
+  const wk = rows[1], fh = rows[0];
+  const wkTile = wk && wk.known && !wk.off
+    ? tile('weekly', 'usage', 'Weekly', wk.pct + '%', wk.pct, wk.note ? wk.note.replace(/ \d{1,2}:\d\d\s?(AM|PM)$/i, '') : '', wk.cls)
+    : tile('weekly', 'usage', 'Weekly', '—', null, 'After the first reply');
+  // The account's own 5-hour limit when it applies; otherwise pacing's.
+  const pt = _paceTile();
+  const fhTile = fh && fh.known && !fh.off ? tile('five', 'usage', '5-hour', fh.pct + '%', fh.pct, fh.note || '', fh.cls)
+    : pt ? tile('five', 'usage', '5-hour', pt.big, pt.pct, pt.small, pt.cls)
+    : tile('five', 'usage', '5-hour', 'Off', null, 'Not applied', ' vsm-off');
+  const m = window._disk;
+  const dTile = m.disk && m.disk.known && m.share
+    ? tile('disk', 'disk', 'Disk', _diskUsePct() + '%', _diskUsePct(),
+        _fmtBytes(_diskUsed()) + ' of ' + _fmtBytes(_diskAllotted()), _diskCls(_diskUsePct()))
+    : tile('disk', 'disk', 'Disk', '—', null, 'Reading…');
+  return '<div class="vsm-tiles" role="tablist">' + tile('model', 'model', 'Model', escHtml(modelName), null, escHtml(thinkLbl)) +
+    wkTile + fhTile + dTile + '</div>';
+}
+
+function _statusModalHtml(st, parts) {
+  const tab = _statusPanelFor.tab || 'model';
+  return '<div class="vsm-head"><h2 id="vsm-title">Model &amp; usage</h2>' +
+    '<button class="vsm-x" data-act="close" aria-label="Close">' +
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>' +
+    '<div class="vsm-body">' + _statusTilesHtml(st) +
+    '<div class="vsm-card" role="tabpanel">' + (parts[tab] || '') + '</div></div>' + (parts.foot || '');
 }
 
 /** One delegated handler for everything clickable in the panel. */
@@ -1642,6 +2045,10 @@ function _statusPanelClick(e) {
   const row = e.target.closest('.msel-row'), act = e.target.closest('[data-act]');
   if (act) {
     const a = act.dataset.act;
+    if (a === 'close') { _closeStatusPanel(); return; }
+    if (a === 'pace-reset') { _paceReset(); return; }
+    if (a === 'tab') { c.tab = act.dataset.t; c.tile = act.dataset.tile || ''; _renderStatusPanel(); return; }
+    if (_diskClick(a, act)) return;
     if (a === 'refresh') _refreshUsageLimits();                       // numbers arrive by push; panel stays open
     else if (a === 'compact') { _closeStatusPanel(); if (typeof liveCompact === 'function') liveCompact(); }
     else if (a === 'cancel') { c.pModel = c.pThink = null; _renderStatusPanel(); }
@@ -1689,6 +2096,7 @@ function _positionStatusPanel() {
   const p = document.getElementById('vn-status-panel');
   const trig = document.querySelector('.vn-status');
   if (!p) return;
+  if (p.classList.contains('vn-status-modal')) return;   // centered by CSS
   if (!trig) { _closeStatusPanel(); return; }
   const r = trig.getBoundingClientRect();
   p.style.left = Math.max(8, Math.min(r.left, window.innerWidth - p.offsetWidth - 8)) + 'px';
@@ -1704,12 +2112,18 @@ function _renderStatusPanel() {
   // its progress into it).  Leave the panel alone until it settles: on success
   // the staged values equal the running ones and the footer goes away; on
   // failure the apply path re-enables the button.
+  const ae = document.activeElement;
+  if (ae && ae.tagName === 'INPUT' && p.contains(ae) &&
+      (ae.type === 'text' || (ae.type === 'range' && window._diskDragging))) return;   // typing or dragging in the Disk section
   const btn = document.getElementById('sm-apply-btn');
   const st = _statusState();
   if (btn && btn.disabled && (st.dModel || st.dThink)) return;
   if (!st.dModel) _statusPanelFor.pModel = null;     // applied (or picked back): nothing staged
   if (!st.dThink) _statusPanelFor.pThink = null;
+  const ob = p.querySelector('.vsm-body'), top = ob ? ob.scrollTop : 0;
   p.innerHTML = _statusPanelHtml();
+  const nb = p.querySelector('.vsm-body');
+  if (nb && top) nb.scrollTop = top;
   const list = document.getElementById('vsp-models');
   if (list && list.querySelector('.msel-group-hd')) {
     _groupModelChips(list);
@@ -1724,20 +2138,39 @@ function _renderStatusPanel() {
 function _closeStatusPanel() {
   const p = document.getElementById('vn-status-panel');
   if (p) p.remove();
+  const sc = document.getElementById('vn-status-scrim');
+  if (sc) sc.remove();
   _statusPanelFor = null;
   document.querySelectorAll('.vn-status.open').forEach(el => el.classList.remove('open'));
 }
 
 function _toggleStatusPanel(trig) {
   if (document.getElementById('vn-status-panel')) { _closeStatusPanel(); return; }
-  _statusPanelFor = {isNew: trig.dataset.new === '1', sid: trig.dataset.sid || ''};
+  _statusPanelFor = {isNew: trig.dataset.new === '1', sid: trig.dataset.sid || '', tab: 'model'};
+  const sc = document.createElement('div');
+  sc.id = 'vn-status-scrim';
+  sc.className = 'vn-status-scrim';
+  document.body.appendChild(sc);   // a tap on it closes: the outside-click handler
   const p = document.createElement('div');
   p.id = 'vn-status-panel';
-  p.className = 'vn-status-panel';
+  p.className = 'vn-status-panel vn-status-modal';
   p.setAttribute('role', 'dialog');
-  p.setAttribute('aria-label', 'Model, thinking and usage limits');
+  p.setAttribute('aria-modal', 'true');
+  p.setAttribute('aria-labelledby', 'vsm-title');
+  p.tabIndex = -1;
   p.addEventListener('click', _statusPanelClick);
+  p.addEventListener('keydown', e => {
+    const t = e.target.closest && e.target.closest('[data-act="tab"]');
+    if (t && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); t.click(); }
+  });
+  p.addEventListener('input', _diskInput);
+  p.addEventListener('change', _diskChange);
+  p.addEventListener('pointerdown', e => { if (e.target.type === 'range') window._diskDragging = true; });
   document.body.appendChild(p);
+  window._disk.msg = '';
+  _loadDisk(true);
+  _loadPace();
+  setTimeout(() => { try { p.focus({preventScroll: true}); } catch (_) {} }, 0);
   trig.classList.add('open');
   _loadStatusModels();
   _renderStatusPanel();
@@ -1753,6 +2186,7 @@ if (!window._statusPanelBound) {
   }, true);
   document.addEventListener('keydown', e => { if (e.key === 'Escape') _closeStatusPanel(); });
   window.addEventListener('resize', _positionStatusPanel);
+  document.addEventListener('pointerup', () => { window._diskDragging = false; });
 }
 
 // ═══════════════════════════════════════════════════════════════════════

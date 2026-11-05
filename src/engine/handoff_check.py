@@ -179,8 +179,13 @@ def skeleton(kind: str, facts=None) -> dict:
     budget, and what history fixes filled in."""
     from engine import handoff_rules as rules
     from engine import smart_termination as st
+    # A split-view template ("form", "pairs") is a needs_you decision whose
+    # answers live in its items (SPLIT_TEMPLATES in handoff_rules.py).
+    split = kind if kind in rules.SPLIT_TEMPLATES else ""
+    if split:
+        kind = "needs_you"
     if kind not in rules.TYPES:
-        raise ValueError("type must be one of: " + ", ".join(rules.TYPES))
+        raise ValueError("type must be one of: " + ", ".join(rules.TYPES + tuple(rules.SPLIT_TEMPLATES)))
     prev_path = (getattr(facts, "prev_path", "") or "") if facts else ""
     prev_big = (getattr(facts, "prev_big", "") or "") if facts else ""
     requests = list(getattr(facts, "requests", []) or []) if facts else []
@@ -246,6 +251,13 @@ def skeleton(kind: str, facts=None) -> dict:
                      {"key": "B", "label": "<the other choice>", "reply": "<what the button sends>",
                       "what": "<≥6 words>", "gain": "<≥6 words>",
                       "verdict": "<≥6 words: why the recommended one wins over it>"}]}
+    if split:
+        t = rules.SPLIT_TEMPLATES[split]
+        needs = {"kind": "decision",
+                 "ask": f"<≤{L} words: what the user answers, project and thing named, no code>",
+                 "why": f"<≤{L} words: why these block the work>",
+                 "next": f"<≤{L} words: what you do with the answers>",
+                 split: [dict(t["example"], id=f"<short id {i + 1}>") for i in range(max(t["min"], 2))]}
     card["needs"] = needs
     if isinstance(open_choice, dict):
         card["_open_choice"] = ("The user has not answered this earlier choice; ask it again with its buttons or "
@@ -284,9 +296,23 @@ def _command() -> str:
         return "python src/engine/handoff_check.py"
 
 
+def _split_hint(kind: str) -> str:
+    """On a decision's blank: the split-view templates, so a session meets
+    them at the moment it picks its card."""
+    from engine import handoff_rules as rules
+    if kind == "needs_you":
+        return "".join(f"If {t['when']}, use --start {k} instead.\n" for k, t in rules.SPLIT_TEMPLATES.items())
+    if kind in rules.SPLIT_TEMPLATES:
+        t = rules.SPLIT_TEMPLATES[kind]
+        return (f"needs.{kind}: {t['min']} to {t['max']} items; {t['rules']}. Add or remove items as needed; "
+                f"the user's answer arrives as one message starting \"{t['prefix']}\".\n")
+    return ""
+
+
 def start_text(kind: str, facts=None, limit: int = 120) -> str:
-    return (_PREAMBLE.format(limit=limit, command=_command())
-            + json.dumps(skeleton(kind, facts), indent=1, ensure_ascii=False))
+    card = skeleton(kind, facts)
+    return (_PREAMBLE.format(limit=limit, command=_command()) + _split_hint(kind)
+            + json.dumps(card, indent=1, ensure_ascii=False))
 
 
 def main(argv=None) -> int:

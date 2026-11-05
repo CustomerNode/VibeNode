@@ -85,13 +85,9 @@ let activeId = localStorage.getItem('activeSessionId') || null;
 let renameTarget = null;
 let sortMode = localStorage.getItem('sortMode') || 'date';
 let sortAsc  = localStorage.getItem('sortAsc') === 'true';
-let viewMode = localStorage.getItem('viewMode') || 'homepage';
-// Migrate old view modes (grid/list collapse into sessions)
-if (viewMode === 'workforce' || viewMode === 'list') viewMode = 'sessions';
-// Guard against invalid view modes persisted in localStorage
-if (!['homepage', 'sessions', 'workplace', 'kanban', 'compose'].includes(viewMode)) viewMode = 'sessions';
-// First-ever load detection — if no viewMode was ever set, force homepage
-if (!localStorage.getItem('viewMode')) viewMode = 'homepage';
+// VibeNode always opens on Sessions (there is no view switcher in the
+// sidebar any more; the other views are under the ••• menu).
+let viewMode = 'sessions';
 // Hash-based routing: URL hash overrides stored viewMode for direct-link support
 if (window.location.hash.startsWith('#kanban')) viewMode = 'kanban';
 if (window.location.hash.startsWith('#compose')) viewMode = 'compose';
@@ -424,8 +420,7 @@ async function setProject(encoded, reload = true) {
     // in every other view, suppress restore so the view resets to base state.
     // Use the saved per-project view (if any) to decide, since viewMode
     // hasn't been updated to the target yet at this point.
-    const _targetView = localStorage.getItem('projectView_' + encoded) || viewMode;
-    _suppressSessionRestore = (_targetView !== 'sessions');
+    _suppressSessionRestore = false;  // a project switch always lands on Sessions
     _projectSwitchLoad = loadSessions();
   }
 }
@@ -616,15 +611,9 @@ async function selectProjectFromOverlay(encoded) {
   _projectSwitchLoad = null;
   await setProject(encoded, true);
 
-  // Restore the view the user was last using in this project, or fall back
-  // to the current view.  Re-entering the mode re-initialises it at its
-  // base state with saved drill-down / session position restored by
-  // _setViewModeImmediate via _restoreViewPosition().
-  const _savedView = localStorage.getItem('projectView_' + encoded);
-  let _targetView = _savedView || viewMode || 'homepage';
-  // Workflow and Subsessions are one project's: All projects opens on Sessions.
-  if (_toAll && VNAllProjects.PER_PROJECT_VIEWS[_targetView]) _targetView = 'sessions';
-  if (typeof setViewMode === 'function') setViewMode(_targetView);
+  // A project switch always lands on Sessions: the sidebar has no view
+  // switcher, so restoring another view would strand the user there.
+  if (typeof setViewMode === 'function') setViewMode('sessions');
 
   // Hold the splash until the new project has actually finished drawing:
   // the session list has loaded (setProject starts that load but does not
@@ -947,82 +936,11 @@ const _viewModes = {
   },
 };
 
-function openViewModeSelector() {
-  setViewMode('homepage');
-}
-
-const _viewNames = { homepage: 'Home', sessions: 'Sessions', kanban: 'Workflow', workplace: 'Workforce', compose: 'Subsessions' };
-const _viewIcons = {
-  homepage: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10" fill="var(--bg-body)"/></svg>',
-  sessions: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
-  kanban: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="3" y="3" width="5" height="18" rx="1"/><rect x="10" y="3" width="5" height="12" rx="1"/><rect x="17" y="3" width="5" height="15" rx="1"/></svg>',
-  workplace: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="2" y="3" width="20" height="14" rx="2"/><rect x="8" y="20" width="8" height="2" rx="1"/><rect x="11" y="17" width="2" height="4"/><circle cx="7" cy="10" r="1.5" fill="var(--bg-body)"/><circle cx="17" cy="10" r="1.5" fill="var(--bg-body)"/><rect x="10" y="9.5" width="4" height="1.5" rx="0.5" fill="var(--bg-body)"/></svg>',
-  compose: '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/><rect x="12" y="19" width="9" height="2" rx="1"/></svg>'
-};
-
 function _updateViewModeButton(mode) {
-  // Update trigger label and icon
-  const label = document.getElementById('sidebar-view-label');
-  const icon = document.getElementById('sidebar-view-icon');
-  if (label) label.textContent = _viewNames[mode] || mode;
-  if (icon && _viewIcons[mode]) icon.outerHTML = '<svg id="sidebar-view-icon" ' + _viewIcons[mode].slice(5);
-  // Highlight active flyout option
-  const flyout = document.getElementById('sidebar-view-flyout');
-  if (flyout) {
-    flyout.querySelectorAll('.sidebar-view-opt').forEach(btn => {
-      btn.classList.toggle('active', btn.dataset.view === mode);
-    });
-  }
+  // The sidebar's "Sessions" back button shows only outside Sessions.
+  const back = document.getElementById('sidebar-nav');
+  if (back) back.hidden = (mode === 'sessions');
 }
-
-// View flyout hover with delayed open (100ms) and delayed collapse (300ms)
-(function() {
-  let _openTimer = null;
-  let _closeTimer = null;
-  const wrap = document.querySelector('.sidebar-view-wrap');
-  if (!wrap) return;
-  const clearTimers = () => {
-    if (_openTimer) { clearTimeout(_openTimer); _openTimer = null; }
-    if (_closeTimer) { clearTimeout(_closeTimer); _closeTimer = null; }
-  };
-  wrap.addEventListener('mouseenter', () => {
-    if (_closeTimer) { clearTimeout(_closeTimer); _closeTimer = null; }
-    _openTimer = setTimeout(() => wrap.classList.add('flyout-open'), 200);
-  });
-  wrap.addEventListener('mouseleave', () => {
-    if (_openTimer) { clearTimeout(_openTimer); _openTimer = null; }
-    _closeTimer = setTimeout(() => wrap.classList.remove('flyout-open'), 300);
-  });
-  // Tapping the trigger toggles the flyout. On touch devices `mouseenter`
-  // fires on tap (opening the flyout) but `mouseleave` never fires, so hover
-  // alone leaves no way to collapse it. A click toggle gives an explicit
-  // open/close on both touch and mouse. Cancel any pending hover timers first
-  // so the delayed-open doesn't re-open a flyout we just tapped closed.
-  const trigger = document.getElementById('sidebar-view-trigger');
-  if (trigger) {
-    trigger.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      clearTimers();
-      wrap.classList.toggle('flyout-open');
-    });
-  }
-  // Tapping/clicking outside the flyout collapses it (touch has no mouseleave).
-  document.addEventListener('click', (e) => {
-    if (wrap.classList.contains('flyout-open') && !wrap.contains(e.target)) {
-      clearTimers();
-      wrap.classList.remove('flyout-open');
-    }
-  });
-  // Picking a view option collapses the flyout (touch has no mouseleave to
-  // auto-close it after the selection).
-  wrap.querySelectorAll('.sidebar-view-opt').forEach((opt) => {
-    opt.addEventListener('click', () => {
-      clearTimers();
-      wrap.classList.remove('flyout-open');
-    });
-  });
-})();
 
 // Hydrate view mode button on load
 _updateViewModeButton(viewMode);

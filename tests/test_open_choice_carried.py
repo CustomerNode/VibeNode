@@ -226,3 +226,42 @@ def test_walking_away_from_the_choices_closes_it():
         assert f.open_choice is None, said
     # a question about another case stays a question
     assert ev.facts_from_entries(_entries(E("user", "ok but\nwhat about phones?"))).open_choice is not None
+
+
+# ── A pick made in the user's own words, shown by the work ───────────────
+# The user answers with a direction that names no choice; the session builds
+# it and ends on Done; the user moves on.  The choice is closed.
+
+BUILT = {"type": "done", "title": "Editor toolbar", "headline": "The editor toolbar now sits in a strip like the menus.",
+         "what_was_done": "Built the toolbar layout into the editor.",
+         "needs": {"kind": "none", "why": "Built.", "next": "Nothing."}}
+
+
+def test_a_direction_then_a_build_on_its_topic_then_moving_on_closes_it():
+    f = ev.facts_from_entries(_entries(E("user", "put it up with the menus like the file bar"),
+                                       E("asst", _msg(BUILT)), E("user", "now tidy the status bar")))
+    assert f.open_choice is None
+
+
+def test_an_objection_after_the_build_keeps_it_open():
+    for said in ("no, that's not what i meant", "wrong one, go back", "that is wrong, redo it"):
+        f = ev.facts_from_entries(_entries(E("user", "put it up with the menus like the file bar"),
+                                           E("asst", _msg(BUILT)), E("user", said)))
+        assert f.open_choice is not None, said
+
+
+def test_the_build_must_be_answered_by_a_next_message_and_be_on_the_choices_topic():
+    # the build is the card being checked: nothing from the user after it yet
+    f = ev.facts_from_entries(_entries(E("user", "put it up with the menus like the file bar"), E("asst", _msg(BUILT))))
+    assert f.open_choice is not None
+    off = dict(BUILT, title="Login page", headline="The login page shows a remember-me box.",
+               what_was_done="Added a remember-me box to the login page.")
+    f = ev.facts_from_entries(_entries(E("user", "the login page should remember me between visits"),
+                                       E("asst", _msg(off)), E("user", "now tidy the status bar")))
+    assert f.open_choice is not None
+
+
+def test_a_question_or_a_look_first_request_is_not_a_direction():
+    for said in ("which one is faster?", "show me the strip one again"):
+        f = ev.facts_from_entries(_entries(E("user", said), E("asst", _msg(BUILT)), E("user", "ok next thing")))
+        assert f.open_choice is not None, said

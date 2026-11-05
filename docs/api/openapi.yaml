@@ -7358,6 +7358,128 @@ paths:
           description: Done
         "403":
           description: Not allowed for this member, or not the owner of this VibeNode
+  /api/disk:
+    get:
+      tags: [App]
+      summary: Disk reading behind the usage panel's Disk gauge
+      operationId: diskReading
+      description: |
+        The drive's size and free space, VibeNode's share of it and the cap
+        ("VibeNode may use"). With light=1 only the drive, the share and the
+        cap are returned, for the bar.
+      parameters:
+        - name: light
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The reading
+  /api/disk/cap:
+    post:
+      tags: [App]
+      summary: Set how much of the disk VibeNode may use
+      operationId: diskCap
+      description: 0, or the drive's size or more, removes the cap.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                bytes:
+                  type: integer
+      responses:
+        "200":
+          description: The cap now in force (0 = no cap)
+        "400":
+          description: bytes is not a number
+        "507":
+          description: Could not save, the disk may be full
+  /api/disk/delete:
+    post:
+      tags: [App]
+      summary: Delete sessions to free disk space
+      operationId: diskDelete
+      description: |
+        Deletes the listed sessions, or every session created more than
+        created_days ago and inactive for inactive_days. Running sessions are
+        never deleted. dry_run returns the count and size without deleting.
+        Broadcasts sessions_refresh.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      project:
+                        type: string
+                created_days:
+                  type: number
+                inactive_days:
+                  type: number
+                dry_run:
+                  type: boolean
+      responses:
+        "200":
+          description: What was deleted (or would be, on a dry run) and the space freed
+  /api/disk/empty-trash:
+    post:
+      tags: [App]
+      summary: Empty the session Trash
+      operationId: diskEmptyTrash
+      responses:
+        "200":
+          description: The bytes freed
+  /api/pace-5h:
+    get:
+      tags: [App]
+      summary: The 5-hour pacing tile's reading
+      operationId: pace5hReading
+      responses:
+        "200":
+          description: The current 5-hour window, the pace setting and the weekly reading
+  /api/pace-5h/setting:
+    post:
+      tags: [App]
+      summary: Set the 5-hour pacing slider
+      operationId: pace5hSetting
+      description: mult is one of the slider's steps (0, 1, 1.5, 2, 3, 5); 0 turns pacing off. Broadcasts pace_5h.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mult:
+                  type: number
+      responses:
+        "200":
+          description: The new reading
+        "400":
+          description: mult is not a number or not a slider step
+  /api/pace-5h/reset:
+    post:
+      tags: [App]
+      summary: End the 5-hour pacing window now
+      operationId: pace5hReset
+      description: |
+        A button for a person: taken only from VibeNode's own page (the owner,
+        a same-site Origin and the X-VN-Human header). Sessions are refused a
+        tool call that names it. Broadcasts pace_5h.
+      responses:
+        "200":
+          description: The window was reset; returns the new reading
+        "403":
+          description: Not the owner, or not sent from VibeNode's page
   /api/usage-pace:
     get:
       tags: [App]

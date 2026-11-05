@@ -84,6 +84,25 @@ class TestPublicView:
         assert later["windows"]["five_hour"]["expired"] is True
         assert later["windows"]["seven_day"]["expired"] is False
 
+    def test_five_hour_window_left_out_after_its_reset_is_off(self):
+        state, _ = ul.merge({}, FABLE_TURN, now=NOW)
+        reset = state["windows"]["five_hour"]["resets_at"]
+        # Still within its window, or expired with no newer reading: not off.
+        assert ul.public_view(state, now=NOW)["windows"]["five_hour"]["off"] is False
+        assert ul.public_view(state, now=reset + 1)["windows"]["five_hour"]["off"] is False
+        # A reading after the reset that no longer carries the 5-hour window.
+        weekly_only = {"unifiedWindows": {"seven_day": {"utilization": 0.5, "resetsAt": 1790964000}}}
+        later, _ = ul.merge(state, weekly_only, now=reset + 60)
+        view = ul.public_view(later, now=reset + 120)["windows"]
+        assert view["five_hour"]["off"] is True
+        assert view["seven_day"]["off"] is False
+        # Fable is left out of every non-Fable turn, so it is never "off".
+        assert view["seven_day_overage_included"]["off"] is False
+        # The window comes back: it is on again.
+        back, _ = ul.merge(later, FABLE_TURN | {}, now=reset + 200)
+        back["windows"]["five_hour"]["resets_at"] = reset + 18000
+        assert ul.public_view(back, now=reset + 300)["windows"]["five_hour"]["off"] is False
+
     def test_unseen_window_is_omitted(self):
         state, _ = ul.merge({}, OPUS_TURN, now=NOW)
         assert "seven_day_overage_included" not in ul.public_view(state, now=NOW)["windows"]

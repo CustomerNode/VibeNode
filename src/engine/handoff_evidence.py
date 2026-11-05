@@ -345,6 +345,11 @@ def answers_choice(card: dict, text: str) -> bool:
     said = _norm_said(text)
     if not said:
         return False
+    # A split-view template (a form, pairs) is answered by the one message
+    # its popup sends.
+    from engine.handoff_rules import SPLIT_TEMPLATES   # local: handoff_rules imports this module
+    if any(needs.get(k) and text.lstrip().startswith(t["prefix"]) for k, t in SPLIT_TEMPLATES.items()):
+        return True
     rs = [r for r in (needs.get("replies") or []) if isinstance(r, dict)]
     for r in rs:
         v = _norm_said(r.get("reply") if isinstance(r.get("reply"), str) else "")
@@ -410,7 +415,7 @@ def open_choice(entries: list) -> Optional[dict]:
             continue
         needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
         if needs.get("kind") in ("decision", "approve") and \
-                any(isinstance(r, dict) for r in (needs.get("replies") or [])):
+                (any(isinstance(r, dict) for r in needs.get("replies") or []) or handoff_rules.split_items(needs)):
             last = (i, card)
         elif needs.get("kind") in ("decision", "approve", "action"):
             last = None   # a newer question replaced it
@@ -424,7 +429,42 @@ def open_choice(entries: list) -> Optional[dict]:
         if said.startswith("Wrong kind of card:") or answers_choice(card, said) or _RELEASES.search(said) \
                 or _go_ahead(said) or _own_way(said):
             return None
+    if _built_and_moved_on(card, entries[i + 1:]):
+        return None
     return card
+
+
+# The user can pick in words that name no choice ("use the same left panel as
+# the questions" for "Split view list").  The work shows the pick was made: the
+# user gave a direction, the session then finished a build on the choice's own
+# topic (a Done card sharing at least two words with the choice), and the
+# user's next message moved on without objecting.
+_OBJECTS = re.compile(
+    r"^\W*(?:no|nope|nah)\b|\b(?:wrong|not\s+what|that'?s\s+not|isn'?t\s+what|didn'?t\s+(?:ask|want|mean)|"
+    r"i\s+said|undo|revert|roll\s+(?:it\s+)?back|redo|go\s+back|instead|other\s+one|different\s+one)\b", re.I)
+
+
+def _built_and_moved_on(card: dict, later: list) -> bool:
+    from engine import handoff_rules   # local: handoff_rules imports this module
+    topic = _stem(_words(_choice_words(card)))
+    directed = built = False
+    for e in later:
+        said = _his(e)
+        if said:
+            if built:
+                return not _OBJECTS.search(said) and not said.startswith("Wrong kind of card:")
+            directed = not said.rstrip().endswith("?") and not _LOOKS_FIRST.search(said)
+            continue
+        if not directed or getattr(e, "kind", "") != "asst" or "```handoff" not in (getattr(e, "text", "") or ""):
+            continue
+        done, _, err = handoff_rules.extract(e.text)
+        if err or not isinstance(done, dict) or done.get("type") != "done":
+            continue
+        said_there = " ".join(x for x in (done.get("title"), done.get("headline"), done.get("what_was_done"))
+                              if isinstance(x, str))
+        if len(topic & _stem(_words(said_there))) >= 2:
+            built = True
+    return False
 
 
 def _choice_words(card: dict) -> str:
@@ -433,6 +473,10 @@ def _choice_words(card: dict) -> str:
     for r in needs.get("replies") or []:
         if isinstance(r, dict):
             bits += [r.get("label"), r.get("reply")]
+    from engine import handoff_rules   # local: handoff_rules imports this module
+    field = handoff_rules.split_field(needs)
+    for x in handoff_rules.split_items(needs, field):
+        bits.append(x.get(handoff_rules.SPLIT_TEMPLATES[field]["title"]))
     return " ".join(b for b in bits if isinstance(b, str))
 
 
@@ -474,6 +518,11 @@ def open_choice_problems(card: dict, facts: TurnFacts) -> list:
         return []
     needs = card.get("needs") if isinstance(card.get("needs"), dict) else {}
     old_words = _stem(_words(_choice_words(old)))
+    from engine import handoff_rules   # local: handoff_rules imports this module
+    field = handoff_rules.split_field(needs)
+    if needs.get("kind") == "decision" and field and handoff_rules.split_field(old.get("needs")) == field:
+        if len(old_words & _stem(_words(_choice_words(card)))) >= 2:
+            return []
     if needs.get("kind") in ("decision", "approve") and needs.get("replies"):
         old_r = {_norm_said(r.get(k)) for r in (old.get("needs") or {}).get("replies") or [] if isinstance(r, dict)
                  for k in ("label", "reply") if isinstance(r.get(k), str) and r.get(k).strip()}

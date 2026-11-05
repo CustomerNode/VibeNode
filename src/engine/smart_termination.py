@@ -124,6 +124,7 @@ INSTRUCTIONS = _rules.INSTRUCTIONS + (
     "A section shows only the design: no caption, tag, badge or \"Option A\" / "
     "\"Now\" heading inside it, since the popup's top bar already names the choice; "
     "its name and description go in the reply.\n"
+    "{split_instructions}"
     "A project whose own instructions show design options in its real app "
     "(design trials in that app) does that instead of a scratch page here: each "
     "screen's \"url\" is that app's live page on this machine "
@@ -146,7 +147,7 @@ INSTRUCTIONS = _rules.INSTRUCTIONS + (
     "prints the word count, every problem at once and, when too long, where the words "
     "are. Fix them all and run it again until it prints OK, then send exactly that card, "
     "unchanged. THE STOP REFUSES A CARD THE CHECK DID NOT PASS: a card never checked, or "
-    "changed after its last check, is sent back whatever else is right about it.\n")
+    "changed after its last check, is sent back whatever else is right about it.\n").replace("{split_instructions}", _rules.split_instructions())
 
 
 # ── The check is not optional ─────────────────────────────────────────────
@@ -500,7 +501,11 @@ def unusable_problems(card, err=None) -> list:
             out.append("needs.kind must say what the user does: decision, approve or action.")
         if not str(needs.get("ask") or "").strip():
             out.append("needs.ask is empty: the one thing the user must decide or do.")
-        if kind == "decision" and len(replies) < 2:
+        if kind == "decision" and _rules.split_field(needs):
+            if not _rules.split_usable(needs):
+                out.append(f"needs.{_rules.split_field(needs)} has nothing the user can answer: a form needs at "
+                           "least two questions with two options each, pairs at least one pair with two sides.")
+        elif kind == "decision" and len(replies) < 2:
             out.append("A decision needs at least two buttons in needs.replies "
                        "(not at the top level of the card).")
         if kind == "approve" and not replies and not (needs.get("look") or []):

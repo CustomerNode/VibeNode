@@ -1492,3 +1492,78 @@ html.lm-ov-open, html.lm-ov-open body { overflow: hidden !important; }
   -webkit-user-select: text;
   user-select: text;
 }
+
+/* ── The Decide popup's form: several questions in a split view ──
+   (_openForm, last-card.js).  Questions down the left with what was picked,
+   the open one on the right; on a phone the list is a strip on top. */
+.lm-dz.lm-fm .top .cnt { flex: none; font-size: 12.5px; color: var(--text-muted); }
+.lm-dz.lm-fm .go[disabled] { opacity: .35; cursor: default; }
+.lm-dz.lm-fm .body { overflow: hidden; }
+.lm-fm-split { display: flex; height: 100%; }
+.lm-fm-rail { flex: none; width: 280px; box-sizing: border-box; overflow: auto; padding: 10px 8px; border-right: 1px solid rgba(var(--bt), .12); }
+.lm-fm-ri { all: unset; box-sizing: border-box; cursor: pointer; display: block; width: 100%; padding: 10px 12px; border-radius: 9px; margin-bottom: 2px; }
+.lm-fm-ri:hover { background: rgba(var(--bt), .05); }
+.lm-fm-ri.on { background: rgba(var(--bt), .08); }
+.lm-fm-ri:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.lm-fm-ri .rq { display: block; font-size: 13.5px; font-weight: 600; line-height: 1.35; color: var(--text-heading); }
+.lm-fm-ri .rp { display: flex; align-items: center; gap: 5px; margin-top: 3px; font-size: 12px; color: var(--text-muted); }
+.lm-fm-ri .rp.ok { color: var(--status-complete, #3fb950); }
+.lm-fm-ri .rp svg { flex: none; width: 12px; height: 12px; }
+.lm-fm-pane { flex: 1; min-width: 0; overflow: auto; padding: 26px 28px 40px; }
+.lm-fm-pane .k { font-size: 12px; color: var(--text-faint); margin: 0 0 4px; }
+.lm-fm-pane .qt { margin: 0; font-size: 20px; font-weight: 600; line-height: 1.35; color: var(--text-heading); }
+.lm-fm-pane .ctx { margin: 6px 0 0; font-size: 13.5px; line-height: 1.55; color: var(--text-muted); max-width: 760px; }
+.lm-fm-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-top: 18px; }
+.lm-fm-cd { all: unset; box-sizing: border-box; cursor: pointer; display: flex; flex-direction: column; gap: 6px; padding: 14px; border-radius: 11px;
+  box-shadow: inset 0 0 0 1px rgba(var(--bt), .14); }
+.lm-fm-cd:hover { box-shadow: inset 0 0 0 1px rgba(var(--bt), .3); }
+.lm-fm-cd.on { box-shadow: inset 0 0 0 1.5px var(--accent); background: rgba(var(--bt), .03); }
+.lm-fm-cd:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.lm-fm-cd .ol { font-weight: 650; color: var(--text-heading); line-height: 1.35; }
+.lm-fm-cd .ol .rec { margin-left: 8px; }
+.lm-fm-cd .li { font-size: 12.5px; line-height: 1.45; color: var(--text-secondary); }
+.lm-fm-cd .li b { font-weight: 500; color: var(--text-muted); }
+.lm-dz.lm-fm textarea { min-height: 44px; margin-top: 12px; }
+.lm-fm-next { all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; margin-top: 14px; padding: 7px 13px; border-radius: 9px;
+  font-size: 13px; font-weight: 600; color: var(--text-secondary); box-shadow: inset 0 0 0 1px rgba(var(--bt), .2); }
+.lm-fm-next:hover { color: var(--text-heading); }
+.lm-fm-next svg { width: 14px; height: 14px; }
+.lm-fmlist .dt { color: var(--text-muted); }
+@media (max-width: 700px) {
+  .lm-dz.lm-fm .top .txt { flex-basis: calc(100% - 56px); }
+  .lm-dz.lm-fm .top .cnt { order: 4; }
+  .lm-fm-split { flex-direction: column; }
+  .lm-fm-rail { width: auto; display: flex; gap: 4px; overflow-x: auto; overflow-y: hidden; border-right: 0; border-bottom: 1px solid rgba(var(--bt), .12); padding: 8px; }
+  .lm-fm-ri { flex: none; width: 190px; margin: 0; }
+  .lm-fm-pane { padding: 18px 16px 30px; }
+}
+
+/* ── Pairs: Same or Not the same, side by side (_openPairs, last-card.js).
+   The left panel is the form's (.lm-fm-rail). */
+.lm-fm-ri .rp.no { color: #e5534b; }
+.lm-pr .lm-fm-pane { display: flex; flex-direction: column; }
+.lm-pr-pair { flex: 1; min-height: 260px; display: flex; gap: 12px; margin-top: 14px; }
+.lm-pr-side { flex: 1; min-width: 0; display: flex; flex-direction: column; border-radius: 10px; overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(var(--bt), .14); background: rgba(var(--bt), .02); }
+.lm-pr-side .ph { flex: none; padding: 7px 11px; font-size: 12px; color: var(--text-muted); border-bottom: 1px solid rgba(var(--bt), .1); }
+.lm-pr-side .pc { flex: 1; min-height: 0; overflow: auto; display: grid; place-items: start center; }
+.lm-pr-side img { max-width: 100%; display: block; }
+.lm-pr-side iframe { border: 0; width: 100%; height: 100%; min-height: 240px; display: block; background: #fff; }
+.lm-pr-side.k-page iframe { background: var(--bg-body); }
+.lm-pr-side pre { margin: 0; padding: 14px; justify-self: stretch; white-space: pre-wrap; font: 13px/1.55 var(--font-mono, monospace); color: var(--text-secondary); }
+.lm-pr-side pre mark { background: rgba(229, 83, 75, .3); color: var(--text-heading); border-radius: 3px; }
+.lm-pr-side .nf { margin: 20px; font-size: 13px; color: var(--text-faint); }
+.lm-pr-marks { flex: none; display: flex; gap: 8px; margin-top: 12px; }
+.lm-pr-ok, .lm-pr-no { all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 9px;
+  font-size: 13.5px; font-weight: 650; color: var(--text-secondary); box-shadow: inset 0 0 0 1px rgba(var(--bt), .22); }
+.lm-pr-ok svg { width: 14px; height: 14px; }
+.lm-pr-ok:hover, .lm-pr-no:hover { color: var(--text-heading); }
+.lm-pr-ok:focus-visible, .lm-pr-no:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.lm-pr-ok.on { color: var(--status-complete, #3fb950); box-shadow: inset 0 0 0 1.5px var(--status-complete, #3fb950); }
+.lm-pr-no.on { color: #e5534b; box-shadow: inset 0 0 0 1.5px #e5534b; }
+.lm-pr-why { flex: none; }
+.lm-pr-why[hidden] { display: none; }
+@media (max-width: 700px) {
+  .lm-pr-pair { flex: none; flex-direction: column; min-height: 0; }
+  .lm-pr-side { flex: none; height: 300px; }
+}

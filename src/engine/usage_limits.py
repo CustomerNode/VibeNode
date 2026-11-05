@@ -118,16 +118,37 @@ def public_view(state: dict, now: Optional[float] = None) -> dict:
     now = time.time() if now is None else now
     out = {}
     windows = (state or {}).get("windows", {}) or {}
+    updated = (state or {}).get("updated_at", 0)
     for key, label in WINDOWS.items():
         w = windows.get(key)
         if not isinstance(w, dict):
             continue
         resets = int(w.get("resets_at") or 0)
+        expired = bool(resets and resets <= now)
         out[key] = {
             "label": label,
             "percent": int(round(float(w.get("utilization", 0)) * 100)),
             "resets_at": resets,
             "seen_at": w.get("seen_at", 0),
-            "expired": bool(resets and resets <= now),
+            "expired": expired,
+            "off": key in OPTIONAL_WINDOWS and _window_off(w, resets, expired, updated),
         }
-    return {"windows": out, "updated_at": (state or {}).get("updated_at", 0)}
+    return {"windows": out, "updated_at": updated}
+
+
+# Windows the account may stop having.  The CLI reports the 5-hour window on
+# every turn while it applies; once it is lifted the CLI simply leaves it out.
+# The Fable window is left out on every non-Fable turn, so its absence means
+# nothing and it is never judged "off".
+OPTIONAL_WINDOWS = ("five_hour",)
+
+
+def _window_off(w: dict, resets: int, expired: bool, updated: float) -> bool:
+    """True when the window is no longer applied: its last reading has reset,
+    and a reading taken after that reset no longer carried it."""
+    try:
+        seen = float(w.get("seen_at") or 0)
+        updated = float(updated or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(expired and resets and updated > resets and seen < updated)

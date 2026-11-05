@@ -158,8 +158,10 @@ SIDEBAR_STATE = """() => {
 @pytest.mark.slow
 @pytest.mark.parametrize("hash_, mode", [("#kanban", "kanban"), ("#compose", "compose")])
 def test_fresh_tab_on_a_hash_route_shows_the_sidebar(browser, hash_, mode):
-    """Stored view = homepage (sidebar hidden at boot), URL = /#kanban."""
-    app = FakeApp(browser, fake_sessions(3), init=init_script("homepage", "grid"),
+    """A fresh tab on /#kanban or /#compose opens that view with its sidebar
+    (the app otherwise always opens on Sessions; a stored view is ignored)."""
+    app = FakeApp(browser, fake_sessions(3), init=init_script("sessions", "grid",
+                  extra="localStorage.setItem('viewMode', 'homepage');"),
                   path="/" + hash_, wait_for="viewMode === '%s' && typeof allSessions !== 'undefined' && allSessions.length > 0" % mode)
     try:
         app.page.wait_for_timeout(300)   # setViewMode's fade + initKanban/initCompose
