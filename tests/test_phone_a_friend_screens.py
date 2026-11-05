@@ -14,7 +14,7 @@ import json
 import pytest
 
 from tests._browser import shared_browser_scope
-from tests._fake_app import FakeApp, fake_sessions
+from tests._fake_app import ANIMATIONS_DONE, FakeApp, fake_sessions
 
 ME = {"ok": True, "member": True, "org_name": "Pair Up", "username": "Dana", "role": "owner",
       "member_id": "11111111-1111-1111-1111-111111111111", "cloud_storage": True, "publishable_key_set": True}
@@ -261,3 +261,45 @@ def test_the_friend_view_shows_summaries_as_words_and_can_hang_up(browser):
     app.page.wait_for_function("document.querySelector('.pf-toast, #toast.show') || true")
     assert st["revoked"] == ["gin"]
     assert not app.errors
+
+
+PHONE = {"has_touch": True, "is_mobile": True}
+
+
+def test_on_a_phone_the_call_is_a_big_bottom_sheet_that_never_zooms(browser):
+    rows = fake_sessions(1)
+    sid = rows[0]["id"]
+    st = _state()
+    app = FakeApp(browser, rows, extra_routes=_routes(st), viewport={"width": 390, "height": 844}, context=PHONE)
+    app.page.wait_for_function("window.PF && PF.isMember()")
+    app.page.evaluate("sid => PF.openCall(sid, null)", sid)
+    app.page.wait_for_selector(".pf-pop.pf-sheet .pf-opt")
+    app.page.wait_for_function(ANIMATIONS_DONE)
+    box = app.page.evaluate("""() => { const r = document.querySelector('.pf-sheet').getBoundingClientRect();
+        return {left: r.left, right: r.right, bottom: r.bottom}; }""")
+    assert box["left"] == 0 and box["right"] == 390 and abs(box["bottom"] - 844) < 1
+    # Text boxes at 16px or more: iOS zooms the page in on anything smaller.
+    assert app.page.evaluate("parseFloat(getComputedStyle(document.querySelector('.pf-sheet textarea')).fontSize)") >= 16
+    go = app.page.locator(".pf-sheet .pf-go")
+    assert go.inner_text() == "Pick someone to call" and go.bounding_box()["height"] >= 48
+    assert app.page.locator(".pf-sheet .pf-opt").first.bounding_box()["height"] >= 44
+    app.page.locator(".pf-sheet .pf-opt", has_text="Sam").tap()
+    assert go.inner_text() == "Call Sam"
+    go.tap()
+    app.page.wait_for_function("!document.querySelector('.pf-sheet') && !document.querySelector('.pf-scrim')")
+    assert st["calls"] and st["calls"][0]["guest_id"] == SAM
+    assert "Phoned Sam" in app.page.inner_text("#toast")
+    assert not app.errors
+
+
+def test_the_only_other_member_is_picked_already(browser):
+    rows = fake_sessions(1)
+    routes = _routes(_state())
+    routes["/api/orgs/members"] = lambda req: (200, {"ok": True, "members": MEMBERS[:2]})
+    app = FakeApp(browser, rows, extra_routes=routes, viewport={"width": 390, "height": 844}, context=PHONE)
+    app.page.wait_for_function("window.PF && PF.isMember()")
+    app.page.evaluate("sid => PF.openCall(sid, null)", rows[0]["id"])
+    app.page.wait_for_selector(".pf-sheet .pf-opt.on")
+    assert app.page.inner_text(".pf-sheet .pf-go") == "Call Sam"
+    app.page.touchscreen.tap(195, 40)          # above the sheet, on the dimmed page
+    app.page.wait_for_function("!document.querySelector('.pf-sheet')")

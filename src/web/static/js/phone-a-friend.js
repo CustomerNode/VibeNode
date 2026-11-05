@@ -164,12 +164,34 @@
   }
 
   // ── popovers ─────────────────────────────────────────────────────────────
-  function closePop() { var p = document.querySelector('.pf-pop'); if (p) p.remove(); }
+  // A phone gets a bottom sheet: full width, finger-sized rows, and text
+  // boxes at 16px so iOS does not zoom the page in on focus.
+  function isPhone() {
+    return (window.matchMedia && window.matchMedia('(max-width: 768px)').matches)
+      || (typeof window._isTouchKeyboard === 'function' && window._isTouchKeyboard());
+  }
+  var _popCloser = null;
+  function closePop() {
+    var p = document.querySelector('.pf-pop'); if (p) p.remove();
+    var sc = document.querySelector('.pf-scrim'); if (sc) sc.remove();
+    if (_popCloser) { document.removeEventListener('pointerdown', _popCloser, true); _popCloser = null; }
+  }
   function popAt(html, anchor) {
     closePop();
     var p = document.createElement('div');
     p.className = 'pf-pop';
     p.innerHTML = html;
+    if (isPhone()) {
+      // Drop the composer's keyboard first, so the sheet is not pushed off screen.
+      if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+      var scrim = document.createElement('div');
+      scrim.className = 'pf-scrim';
+      scrim.addEventListener('click', closePop);
+      document.body.appendChild(scrim);
+      p.classList.add('pf-sheet');
+      document.body.appendChild(p);
+      return p;
+    }
     document.body.appendChild(p);
     var r = anchor && anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : null;
     if (r && !r.width && !r.height) r = null;          // anchor not on screen: centre it
@@ -179,8 +201,9 @@
     p.style.left = Math.max(8, x) + 'px';
     p.style.top = Math.max(8, y) + 'px';
     setTimeout(function () {
-      var closer = function (ev) { if (!p.contains(ev.target)) { p.remove(); document.removeEventListener('mousedown', closer, true); } };
-      document.addEventListener('mousedown', closer, true);
+      if (!p.isConnected) return;
+      _popCloser = function (ev) { if (!p.contains(ev.target)) closePop(); };
+      document.addEventListener('pointerdown', _popCloser, true);
     }, 0);
     return p;
   }
@@ -199,7 +222,7 @@
       + '<div class="pf-lab">They can</div><div class="pf-seg" data-k="level">' + LEVELS.map(function (l) { return '<button type="button" data-v="' + l[0] + '"' + (l[0] === pick.level ? ' class="on"' : '') + '>' + l[1] + '</button>'; }).join('') + '</div>'
       + '<div class="pf-lab">For</div><div class="pf-seg" data-k="dur">' + DURS.map(function (d) { return '<button type="button" data-v="' + d[0] + '"' + (d[0] === pick.dur ? ' class="on"' : '') + '>' + d[1] + '</button>'; }).join('') + '</div>'
       + '<div class="pf-lab">Note</div><textarea class="pf-nin pf-callnote-in" maxlength="500" rows="2" placeholder="What you need help with"></textarea>'
-      + '<div class="pf-note"></div><div class="pf-acts"><button type="button" class="pf-go" disabled>Call</button><button type="button" class="pf-ghost pf-cancel">Cancel</button></div>', anchor);
+      + '<div class="pf-note"></div><div class="pf-acts"><button type="button" class="pf-go" disabled>Pick someone to call</button><button type="button" class="pf-ghost pf-cancel">Cancel</button></div>', anchor);
     p.querySelector('.pf-cancel').onclick = closePop;
     p.querySelectorAll('.pf-seg').forEach(function (seg) {
       seg.onclick = function (e) {
@@ -224,8 +247,10 @@
         b.querySelector('.pf-tick').textContent = pick.guests[b.dataset.id] ? '✓' : '';
         var names = Object.keys(pick.guests).map(function (k) { return pick.guests[k]; });
         go.disabled = !names.length;
-        go.textContent = !names.length ? 'Call' : names.length === 1 ? 'Call ' + names[0] : 'Call ' + names.length + ' people';
+        go.textContent = !names.length ? 'Pick someone to call' : names.length === 1 ? 'Call ' + names[0] : 'Call ' + names.length + ' people';
       };
+      // Only one person to call: pick them already.
+      if (others.length === 1) box.querySelector('.pf-opt').click();
     });
     go.onclick = function () {
       var ids = Object.keys(pick.guests);

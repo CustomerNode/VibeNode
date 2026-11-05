@@ -110,3 +110,28 @@
 /* A friend always sees which project a shared session is in. */
 .pf-vproj { display: block; font-size: 11px; font-weight: 600; color: var(--text-faint); letter-spacing: .01em; }
 .pf-vrow .pf-vproj { margin-bottom: 1px; }
+
+/* Phone: the call, list and note popovers are a bottom sheet with finger-sized
+   targets; every text box is 16px so iOS never zooms in on focus. */
+.pf-scrim { position: fixed; inset: 0; z-index: 10049; background: rgba(0,0,0,.45); }
+.pf-pop.pf-sheet { left: 0; right: 0; bottom: 0; top: auto; width: auto; max-width: none; box-sizing: border-box;
+  max-height: 85vh; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  padding: 18px 16px calc(18px + env(safe-area-inset-bottom)); border-radius: 18px 18px 0 0;
+  border-left: 0; border-right: 0; border-bottom: 0; font-size: 15px; animation: pfSheet .2s ease-out; }
+@keyframes pfSheet { from { transform: translateY(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+.pf-sheet h4 { font-size: 17px; margin-bottom: 12px; }
+.pf-sheet .pf-lab { font-size: 13px; margin: 14px 0 6px; }
+.pf-sheet .pf-opt { min-height: 48px; padding: 10px 12px; font-size: 16px; box-sizing: border-box; width: 100%; }
+.pf-sheet .pf-opt.on { background: var(--bg-hover); box-shadow: inset 0 0 0 1px var(--text-muted); }
+.pf-sheet .pf-av { width: 28px; height: 28px; font-size: 13px; }
+.pf-sheet .pf-seg { gap: 6px; }
+.pf-sheet .pf-seg button { flex: 1 1 auto; text-align: center; min-height: 44px; padding: 10px 12px; font-size: 15px; box-sizing: border-box; }
+.pf-sheet .pf-acts { flex-direction: column; align-items: stretch; gap: 6px; }
+.pf-sheet .pf-go { display: block; text-align: center; min-height: 50px; padding: 14px; font-size: 17px; box-sizing: border-box; }
+.pf-sheet .pf-ghost { text-align: center; padding: 12px; font-size: 15px; }
+.pf-sheet .pf-gl { min-height: 48px; }
+@media (max-width: 768px) {
+  .pf-nin, .pf-in, .pf-compose textarea { font-size: 16px; }
+  .pf-compose .pf-go { min-height: 44px; }
+  .pf-toast { left: 12px; right: 12px; max-width: none; }
+}
