@@ -372,3 +372,17 @@ def test_an_old_tab_gets_no_calls_to_draw_its_own_rows(world):
     sam.use(mods)
     assert _ok(client.get("/api/phone/in?days=7"))["grants"] == []
     assert len(_ok(client.get("/api/phone/in?days=7&v=2"))["grants"]) == 1
+
+
+def test_a_phoned_project_is_marked_for_its_phone_icon(world, monkeypatch):
+    app, client, mods, dana, sam = world
+    sam_id = _org(client, mods, dana, sam, "Icon")
+    dana.use(mods)
+    dana.transcript("s-13", ["hello"])
+    _ok(client.post("/api/phone/call", json={"session_id": "s-13", "guest_id": sam_id, "level": "view", "duration": "1h"}))
+    sam.use(mods)
+    mirror = _use_mirror(sam, monkeypatch)
+    mirror.sync_once()
+    projects = _ok(client.get("/api/projects"))
+    assert projects[0].get("phoned") is True
+    assert all("phoned" not in p for p in projects[1:])

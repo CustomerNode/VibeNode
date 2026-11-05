@@ -85,6 +85,9 @@ def api_projects():
     pre = mirror.project_prefix()
     # A phoned project with no session left is never shown.
     results = [r for r in results if not (r["encoded"].startswith(pre) and r["session_count"] == 0)]
+    for r in results:
+        if r["encoded"].startswith(pre):
+            r["phoned"] = True
     results.sort(key=lambda r: not r["encoded"].startswith(pre))
     return jsonify(results)
 

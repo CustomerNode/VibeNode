@@ -276,6 +276,8 @@ function _updateProjectLabel(project) {
   const name = document.createElement('span');
   name.textContent = _projectShortName(project);
   if (btn) btn.dataset.initial = (name.textContent.trim().charAt(0) || '?').toUpperCase();
+  // A "phoned you" project (Phone a Friend) shows a phone instead of its initial.
+  if (btn) { if (project.phoned) btn.dataset.phoned = '1'; else delete btn.dataset.phoned; }
   label.innerHTML = name.innerHTML + ' <span class="sidebar-mini-label">project</span>';
 }
 
@@ -473,6 +475,10 @@ function _projectShortPath(p) {
     .replace(/^[A-Za-z]:[\\\/]Users[\\\/][^\\\/]+/, '~');
 }
 
+// A project of sessions friends phoned you about (Phone a Friend) is marked
+// with a phone instead of its first letter.
+const _PHONED_PROJECT_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.7a2 2 0 0 1-.5 2.1L8 9.8a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.7.7a2 2 0 0 1 1.7 2z"/></svg>';
+
 function _renderProjectOverlay() {
   const list = document.getElementById('project-list');
   if (!list) return;
@@ -515,7 +521,7 @@ function _renderProjectOverlay() {
     const isActive = !_inAll && p.encoded === saved;
     return `
     <div class="project-item${isActive ? ' active' : ''}" data-encoded="${escHtml(p.encoded)}" data-name="${escHtml(shortName)}" title="${escHtml(p.display)}">
-      <span class="project-item-mark" aria-hidden="true">${escHtml((shortName || '?').trim().charAt(0).toUpperCase())}</span>
+      <span class="project-item-mark${p.phoned ? ' project-item-phoned' : ''}" aria-hidden="true">${p.phoned ? _PHONED_PROJECT_SVG : escHtml((shortName || '?').trim().charAt(0).toUpperCase())}</span>
       <div class="project-item-info">
         <div class="project-item-name">${escHtml(shortName)}</div>
         <div class="project-item-path">${escHtml(_projectShortPath(p.display))}</div>
