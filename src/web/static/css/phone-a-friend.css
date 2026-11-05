@@ -25,9 +25,9 @@
 .pf-av { width: 20px; height: 20px; border-radius: 50%; display: inline-grid; place-items: center; flex: none;
   font-size: 10.5px; font-weight: 700; color: var(--text-heading); background: var(--bg-hover); }
 .pf-acts { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
-.pf-go { all: unset; cursor: pointer; padding: 6px 13px; border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--text-heading);
+.pf-go:not(.pm-btn) { all: unset; cursor: pointer; padding: 6px 13px; border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--text-heading);
   border: 1px solid var(--text-muted); }
-.pf-go:hover { background: var(--bg-hover); }
+.pf-go:not(.pm-btn):hover { background: var(--bg-hover); }
 .pf-go[disabled] { opacity: .5; cursor: default; }
 .pf-ghost { all: unset; cursor: pointer; font-size: 12px; color: var(--text-muted); padding: 4px 8px; border-radius: 7px; }
 .pf-ghost:hover { color: var(--text-heading); background: var(--bg-hover); }
@@ -108,3 +108,25 @@
 /* A friend's message (or a suggestion) in the chat: a quiet caption above a
    normal bubble (live-panel.js _phoneFriendLabel). */
 .msg.user .pf-from { font-family: var(--font-sans); font-size: 11.5px; color: var(--text-muted); margin: 0 4px 4px; text-align: right; }
+
+/* The call dialog on a computer: the app's own dialog and choice cards. */
+.pf-call .pf-call-sec { font-size: var(--fs-md, 13px); font-weight: 600; color: var(--text-secondary); margin: 14px 0 6px; }
+.pf-call .pm-body p { margin: 0; }
+.pf-call .add-mode-card { all: unset; box-sizing: border-box; display: flex; align-items: center; gap: 10px; width: 100%; cursor: pointer;
+  padding: 10px 14px; border: 1px solid var(--border); border-radius: var(--r-lg); margin-bottom: 6px; transition: background .12s, border-color .15s; }
+.pf-call .add-mode-card:hover { background: var(--bg-hover); border-color: var(--border-hover); }
+.pf-call .add-mode-card.active { border-color: var(--accent); background: var(--bg-active); }
+.pf-call .add-mode-card.active .add-mode-title { color: var(--accent); }
+.pf-call .add-mode-title { font-size: var(--fs-lg, 14px); }
+.pf-call .add-mode-desc { font-size: 12px; }
+.pf-call .pf-members .pf-av { width: 26px; height: 26px; font-size: 12px; }
+.pf-call .pf-members .add-mode-info { flex: 1; }
+.pf-call .pf-tick { color: var(--accent); font-weight: 700; }
+.pf-call .pf-grid3, .pf-call .pf-grid4 { display: grid; gap: 6px; }
+.pf-call .pf-grid3 { grid-template-columns: repeat(3, 1fr); }
+.pf-call .pf-grid4 { grid-template-columns: repeat(4, 1fr); }
+.pf-call .pf-grid3 .add-mode-card, .pf-call .pf-grid4 .add-mode-card { margin: 0; align-items: flex-start; }
+.pf-call .pf-grid4 .add-mode-card { justify-content: center; text-align: center; padding: 9px 6px; }
+.pf-call .pf-grid4 .add-mode-title { font-size: 13px; margin: 0; }
+.pf-call textarea.pm-input { width: 100%; box-sizing: border-box; resize: vertical; font: inherit; }
+.pf-call .pf-note { margin-top: 6px; }

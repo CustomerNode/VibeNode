@@ -8,6 +8,8 @@ no AI involved, just regex pattern matching.
 
 import functools
 import hashlib
+import json
+import os
 import re
 import subprocess
 import sys
@@ -379,6 +381,72 @@ _ESCAPE = re.compile(r"\\[nrtbfv0]")
 _CAMEL_SPLIT = re.compile(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])")
 
 
+# ── People in this VibeNode's org (VibeNode Orgs) ──
+# Every member's username is a name that must never be published either. The
+# org's member list lives in the cloud storage, so the VibeNode keeps a local
+# list of fingerprints of their words (``data/org_names.json``, gitignored,
+# written by ``remember_org_names`` from src/web/orgs/), and this rule reads it
+# on every scan. A username is checked whole and by its distinctive parts
+# ("DanaLaptop" -> "danalaptop", "dana"), leaving out words that only name a
+# kind of computer.
+ORG_NAMES_FILE: Path = Path(os.environ.get("VIBENODE_ORG_NAMES_FILE")
+                            or (_VIBENODE_DIR / "data" / "org_names.json"))
+_ORG_COMMON = frozenset("""linux windows win mac macos desktop laptop pc box home work dev server
+machine phone iphone android ipad tablet desk mini air pro book macbook studio tower rig main
+the and vm""".split())
+_ORG_PART = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+")
+_org_cache: dict = {"mtime": None, "rule": None}
+
+
+def org_name_words(username: str) -> set:
+    """The words of an org username the scan refuses, lowercased."""
+    u = (username or "").strip()
+    words = {u.lower()} if len(u) >= 3 else set()
+    for part in _ORG_PART.findall(u):
+        p = part.lower()
+        if len(p) >= 3 and not p.isdigit() and p not in _ORG_COMMON:
+            words.add(p)
+    return words
+
+
+def remember_org_names(usernames) -> bool:
+    """Keep the fingerprints of the org's usernames for the scan. Returns True
+    when the list changed."""
+    words = set()
+    for u in usernames or []:
+        words |= org_name_words(u)
+    data = {"fingerprints": sorted(_fingerprint(w) for w in words),
+            "lengths": sorted({len(w) for w in words})}
+    try:
+        old = json.loads(ORG_NAMES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        old = None
+    if old == data:
+        return False
+    ORG_NAMES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ORG_NAMES_FILE.parent / (ORG_NAMES_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    os.replace(tmp, ORG_NAMES_FILE)
+    return True
+
+
+def _org_name_rule():
+    try:
+        mtime = ORG_NAMES_FILE.stat().st_mtime_ns
+    except OSError:
+        return None
+    if _org_cache["mtime"] != mtime:
+        try:
+            data = json.loads(ORG_NAMES_FILE.read_text(encoding="utf-8"))
+            fps, lens = data.get("fingerprints") or [], data.get("lengths") or []
+            _org_cache["rule"] = (_IdentityRule("Org Member Name", "Name of a person in your VibeNode org found in file",
+                                                fps, lens, as_name=True) if fps else None)
+        except (OSError, ValueError, AttributeError):
+            _org_cache["rule"] = None
+        _org_cache["mtime"] = mtime
+    return _org_cache["rule"]
+
+
 def _identity_findings(content: str) -> list:
     # In source text a line break is written "\\n": blank such escapes (same
     # length, so line numbers hold) or "\\n\\nName" reads as one word "nName".
@@ -388,7 +456,8 @@ def _identity_findings(content: str) -> list:
     # on the underscore). Only spaces are inserted, never newlines, so line
     # numbers are unchanged.
     content = _CAMEL_SPLIT.sub(" ", content)
-    rules = _IDENTITY_RULES
+    org = _org_name_rule()
+    rules = _IDENTITY_RULES + ([org] if org else [])
     lengths = set().union(*(r.lengths | {n + 1 for n in r.lengths} for r in rules)) if rules else set()
     out = []
     # Fingerprint each distinct word once; walk positions only when one matches.

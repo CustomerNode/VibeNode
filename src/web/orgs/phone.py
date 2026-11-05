@@ -410,6 +410,7 @@ def tick(sm=None, status_of=None, notify=lambda e, d: None) -> bool:
         notes_once(notify=notify)
         mirror.sync_once(notify=notify)
         return True
+    refresh_org_names()
     out, inn = data.get("out") or [], data.get("in") or []
     publish_once(status_of=status_of, grants=out)
     inbox_once(sm=sm, notify=notify, msgs=data.get("inbox") or [])
@@ -425,6 +426,22 @@ def tick(sm=None, status_of=None, notify=lambda e, d: None) -> bool:
 
 
 _last_lists: dict = {"key": None}
+_names_at: dict = {"t": 0.0}
+NAMES_EVERY_S = 300.0
+
+
+def refresh_org_names(force: bool = False) -> None:
+    """Keep the publish scan's list of org members' names current
+    (src/web/git_scanner.py remember_org_names), so none can be published."""
+    if not force and time.monotonic() - _names_at["t"] < NAMES_EVERY_S:
+        return
+    _names_at["t"] = time.monotonic()
+    try:
+        members = store.call("orgs_members") or []
+    except OrgsError:
+        return
+    from ..git_scanner import remember_org_names
+    remember_org_names([m.get("username") for m in members if m.get("username")])
 _thread: dict = {"t": None, "stop": None}
 
 

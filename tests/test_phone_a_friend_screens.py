@@ -106,8 +106,8 @@ def test_calling_marks_the_row_and_revoke_clears_it(browser):
     app.page.wait_for_function("window.PF && PF.isMember()")
     _open_menu(app, sid)
     app.page.click(".session-ctx-menu >> text=Phone a friend")
-    app.page.click(".pf-pop .pf-opt >> text=Sam")
-    app.page.click(".pf-pop .pf-go")
+    app.page.click(".pf-call .pf-opt >> text=Sam")
+    app.page.click(".pf-call .pf-go")
     app.page.wait_for_function(f"document.querySelector('[data-sid=\"{sid}\"] .pf-mark')")
     assert st["calls"][0]["guest_id"] == SAM and st["calls"][0]["level"] == "drive"
     # Open the session: the header shows the mark; it lists Sam with Revoke.
@@ -154,9 +154,9 @@ def test_the_note_is_written_shown_and_edited_on_both_sides(browser):
     # Phoning with a note.
     _open_menu(app, sid)
     app.page.click(".session-ctx-menu >> text=Phone a friend")
-    app.page.click(".pf-pop .pf-opt >> text=Sam")
-    app.page.fill(".pf-pop .pf-callnote-in", "CI fails on Node 20")
-    app.page.click(".pf-pop .pf-go")
+    app.page.click(".pf-call .pf-opt >> text=Sam")
+    app.page.fill(".pf-call .pf-callnote-in", "CI fails on Node 20")
+    app.page.click(".pf-call .pf-go")
     app.page.wait_for_function(f"document.querySelector('[data-sid=\"{sid}\"] .pf-mark')")
     assert st["calls"][0]["note"] == "CI fails on Node 20"
     # The caller sees it in the list and edits it later.
@@ -188,17 +188,17 @@ def test_one_call_can_reach_several_people(browser):
     app.page.wait_for_function("window.PF && PF.isMember()")
     _open_menu(app, sid)
     app.page.click(".session-ctx-menu >> text=Phone a friend")
-    go = app.page.locator(".pf-pop .pf-go")
-    app.page.click(".pf-pop .pf-opt >> text=Sam")
+    go = app.page.locator(".pf-call .pf-go")
+    app.page.click(".pf-call .pf-opt >> text=Sam")
     assert go.inner_text() == "Call Sam"
-    app.page.click(".pf-pop .pf-opt >> text=Lee")
+    app.page.click(".pf-call .pf-opt >> text=Lee")
     assert go.inner_text() == "Call 2 people"
-    app.page.click(".pf-pop .pf-opt >> text=Sam")          # tap again to drop someone
+    app.page.click(".pf-call .pf-opt >> text=Sam")          # tap again to drop someone
     assert go.inner_text() == "Call Lee"
-    app.page.click(".pf-pop .pf-opt >> text=Sam")
-    app.page.fill(".pf-pop .pf-callnote-in", "Both of you, please")
+    app.page.click(".pf-call .pf-opt >> text=Sam")
+    app.page.fill(".pf-call .pf-callnote-in", "Both of you, please")
     go.click()
-    app.page.wait_for_function("!document.querySelector('.pf-pop')")
+    app.page.wait_for_function("!document.querySelector('.pf-call')")
     assert sorted(c["guest_id"] for c in st["calls"]) == sorted([SAM, "44444444-4444-4444-4444-444444444444"])
     assert {c["note"] for c in st["calls"]} == {"Both of you, please"}
     app.page.evaluate("sid => { activeId = sid; }", sid)
@@ -224,9 +224,9 @@ def test_phone_a_friend_is_in_the_composer_menu_beside_send(browser):
     pg.evaluate("document.getElementById('live-image-btn').click()")
     assert "Phone a friend" in pg.inner_text(".vn-more-menu")
     pg.evaluate("() => [...document.querySelectorAll('.vn-more-menu .vn-more-row')].find(r => r.innerText.includes('Phone a friend')).click()")
-    pg.wait_for_selector(".pf-pop")
+    pg.wait_for_selector(".pf-call")
     assert not pg.query_selector(".vn-more-menu")
-    assert "Phone a friend" in pg.inner_text(".pf-pop h4")
+    assert "Phone a friend" in pg.inner_text(".pf-call .pm-title")
 
 
 PHONE = {"has_touch": True, "is_mobile": True}
@@ -277,11 +277,11 @@ def test_a_call_lasts_until_revoked_unless_you_pick_a_time(browser):
     app = FakeApp(browser, rows, extra_routes=_routes(st))
     app.page.wait_for_function("window.PF && PF.isMember()")
     app.page.evaluate("sid => PF.openCall(sid, null)", rows[0]["id"])
-    app.page.wait_for_selector(".pf-pop .pf-opt")
-    assert app.page.inner_text(".pf-pop .pf-seg[data-k='dur'] button.on") == "Until I revoke"
-    app.page.click(".pf-pop .pf-opt >> text=Sam")
-    app.page.click(".pf-pop .pf-go")
-    app.page.wait_for_function("!document.querySelector('.pf-pop')")
+    app.page.wait_for_selector(".pf-call .pf-opt")
+    assert app.page.inner_text(".pf-call .pf-seg[data-k='dur'] button.on") == "Until I revoke"
+    app.page.click(".pf-call .pf-opt >> text=Sam")
+    app.page.click(".pf-call .pf-go")
+    app.page.wait_for_function("!document.querySelector('.pf-call')")
     assert st["calls"][0]["duration"] == "revoked"
 
 

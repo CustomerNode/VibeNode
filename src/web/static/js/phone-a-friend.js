@@ -215,36 +215,70 @@
     return (s && (s.display_title || s.custom_title)) || (sid === curSid() && document.getElementById('main-title') ? document.getElementById('main-title').textContent : '') || 'Untitled session';
   }
 
+  var LEVEL_DESC = { view: 'Watch the thread', suggest: 'Write drafts you send', drive: 'Messages run here' };
+
   function openCall(sid, anchor) {
     if (!isMember()) { openOrgs(); return; }
     // One or more people: each gets their own call (grant), revoked on its own.
     var pick = { guests: {}, level: 'drive', dur: 'revoked' };
-    var p = popAt('<h4>Phone a friend</h4><div class="pf-lab pf-lab-top">Pick one or more</div><div class="pf-members">Loading members…</div>'
-      + '<div class="pf-lab">They can</div><div class="pf-seg" data-k="level">' + LEVELS.map(function (l) { return '<button type="button" data-v="' + l[0] + '"' + (l[0] === pick.level ? ' class="on"' : '') + '>' + l[1] + '</button>'; }).join('') + '</div>'
-      + '<div class="pf-lab">For</div><div class="pf-seg" data-k="dur">' + DURS.map(function (d) { return '<button type="button" data-v="' + d[0] + '"' + (d[0] === pick.dur ? ' class="on"' : '') + '>' + d[1] + '</button>'; }).join('') + '</div>'
-      + '<div class="pf-lab">Note</div><textarea class="pf-nin pf-callnote-in" maxlength="500" rows="2" placeholder="What you need help with"></textarea>'
-      + '<div class="pf-note"></div><div class="pf-acts"><button type="button" class="pf-go" disabled>Pick someone to call</button><button type="button" class="pf-ghost pf-cancel">Cancel</button></div>', anchor);
-    p.querySelector('.pf-cancel').onclick = closePop;
+    var desk = !isPhone();
+    var p, close;
+    if (desk) {
+      // On a computer: the app's own dialog (the one System settings use),
+      // with its choice cards, text box and buttons.
+      var overlay = document.getElementById('pm-overlay');
+      var title = sessionTitle(sid);
+      overlay.innerHTML = '<div class="pm-card pm-enter pf-call" style="width:480px;max-height:86vh;overflow:auto">'
+        + '<h2 class="pm-title">Phone a friend</h2>'
+        + '<div class="pm-body"><p>Open “' + esc(title) + '” to people in ' + esc((st.me && st.me.org_name) || 'your org') + '. Each one can be hung up on alone.</p></div>'
+        + '<div class="pf-call-sec">Who</div><div class="pf-members">Loading members…</div>'
+        + '<div class="pf-call-sec">They can</div><div class="pf-seg pf-grid3" data-k="level">' + LEVELS.map(function (l) {
+            return '<button type="button" class="add-mode-card' + (l[0] === pick.level ? ' active on' : '') + '" data-v="' + l[0] + '"><div class="add-mode-info"><div class="add-mode-title">' + l[1] + '</div><div class="add-mode-desc">' + LEVEL_DESC[l[0]] + '</div></div></button>';
+          }).join('') + '</div>'
+        + '<div class="pf-call-sec">For</div><div class="pf-seg pf-grid4" data-k="dur">' + DURS.map(function (d) {
+            return '<button type="button" class="add-mode-card' + (d[0] === pick.dur ? ' active on' : '') + '" data-v="' + d[0] + '"><div class="add-mode-info"><div class="add-mode-title">' + d[1] + '</div></div></button>';
+          }).join('') + '</div>'
+        + '<div class="pf-call-sec">Note</div><textarea class="pm-input pf-callnote-in" maxlength="500" rows="2" placeholder="What you need help with"></textarea>'
+        + '<div class="pf-note"></div>'
+        + '<div class="pm-actions"><button type="button" class="pm-btn pm-btn-secondary pf-cancel">Cancel</button><button type="button" class="pm-btn pm-btn-primary pf-go" disabled>Pick someone to call</button></div></div>';
+      overlay.classList.add('show');
+      requestAnimationFrame(function () { var c = overlay.querySelector('.pm-card'); if (c) c.classList.remove('pm-enter'); });
+      overlay.onclick = function (e) { if (e.target === overlay) close(); };
+      p = overlay.querySelector('.pf-call');
+      close = function () { if (window._closePm) _closePm(); };
+    } else {
+      p = popAt('<h4>Phone a friend</h4><div class="pf-lab pf-lab-top">Pick one or more</div><div class="pf-members">Loading members…</div>'
+        + '<div class="pf-lab">They can</div><div class="pf-seg" data-k="level">' + LEVELS.map(function (l) { return '<button type="button" data-v="' + l[0] + '"' + (l[0] === pick.level ? ' class="on"' : '') + '>' + l[1] + '</button>'; }).join('') + '</div>'
+        + '<div class="pf-lab">For</div><div class="pf-seg" data-k="dur">' + DURS.map(function (d) { return '<button type="button" data-v="' + d[0] + '"' + (d[0] === pick.dur ? ' class="on"' : '') + '>' + d[1] + '</button>'; }).join('') + '</div>'
+        + '<div class="pf-lab">Note</div><textarea class="pf-nin pf-callnote-in" maxlength="500" rows="2" placeholder="What you need help with"></textarea>'
+        + '<div class="pf-note"></div><div class="pf-acts"><button type="button" class="pf-go" disabled>Pick someone to call</button><button type="button" class="pf-ghost pf-cancel">Cancel</button></div>', anchor);
+      close = closePop;
+    }
+    var mark = function (el, on) { el.classList.toggle('on', on); el.classList.toggle('active', on && desk); };
+    p.querySelector('.pf-cancel').onclick = function () { close(); };
     p.querySelectorAll('.pf-seg').forEach(function (seg) {
       seg.onclick = function (e) {
         var b = e.target.closest('button'); if (!b) return;
         pick[seg.dataset.k] = b.dataset.v;
-        seg.querySelectorAll('button').forEach(function (x) { x.classList.toggle('on', x === b); });
+        seg.querySelectorAll('button').forEach(function (x) { mark(x, x === b); });
       };
     });
     var go = p.querySelector('.pf-go');
     api('/api/orgs/members').then(function (d) {
       var box = p.querySelector('.pf-members');
-      if (!box) return;
+      if (!box || !box.isConnected) return;
       var others = (d.members || []).filter(function (m) { return !m.you; });
       if (!d.ok) { box.textContent = d.message || 'Could not load your org.'; return; }
-      if (!others.length) { box.innerHTML = 'Nobody else is in your org yet. <a href="#" class="pf-add">Add member</a>'; box.querySelector('.pf-add').onclick = function (e) { e.preventDefault(); closePop(); openOrgs(); }; return; }
-      box.innerHTML = others.map(function (m) { return '<button type="button" class="pf-opt" data-id="' + esc(m.member_id) + '" data-name="' + esc(m.username) + '"><span class="pf-av">' + esc(m.username.charAt(0).toUpperCase()) + '</span>' + esc(m.username) + '<span class="pf-tick"></span></button>'; }).join('');
+      if (!others.length) { box.innerHTML = 'Nobody else is in your org yet. <a href="#" class="pf-add">Add member</a>'; box.querySelector('.pf-add').onclick = function (e) { e.preventDefault(); close(); openOrgs(); }; return; }
+      box.innerHTML = others.map(function (m) {
+        if (desk) return '<button type="button" class="add-mode-card pf-opt" data-id="' + esc(m.member_id) + '" data-name="' + esc(m.username) + '"><span class="pf-av">' + esc(m.username.charAt(0).toUpperCase()) + '</span><div class="add-mode-info"><div class="add-mode-title">' + esc(m.username) + '</div><div class="add-mode-desc">' + esc(m.role === 'owner' ? 'Started the org' : 'Member') + '</div></div><span class="pf-tick"></span></button>';
+        return '<button type="button" class="pf-opt" data-id="' + esc(m.member_id) + '" data-name="' + esc(m.username) + '"><span class="pf-av">' + esc(m.username.charAt(0).toUpperCase()) + '</span>' + esc(m.username) + '<span class="pf-tick"></span></button>';
+      }).join('');
       box.onclick = function (e) {
         var b = e.target.closest('.pf-opt'); if (!b) return;
         if (pick.guests[b.dataset.id]) delete pick.guests[b.dataset.id];
         else pick.guests[b.dataset.id] = b.dataset.name;
-        b.classList.toggle('on', !!pick.guests[b.dataset.id]);
+        mark(b, !!pick.guests[b.dataset.id]);
         b.querySelector('.pf-tick').textContent = pick.guests[b.dataset.id] ? '✓' : '';
         var names = Object.keys(pick.guests).map(function (k) { return pick.guests[k]; });
         go.disabled = !names.length;
@@ -265,13 +299,13 @@
         var ok = results.filter(function (d) { return d.ok; }), bad = results.filter(function (d) { return !d.ok; });
         refresh();
         if (!bad.length) {
-          closePop();
+          close();
           var g = ok[0].grant;
           toastText('Phoned ' + ok.map(function (d) { return d.grant.guest; }).join(', ') + '. They ' + LEVEL_WORDS[g.level] + ', ' + left(g) + '.');
           return;
         }
         // Keep only the people whose call failed selected, so Try again redoes just them.
-        ok.forEach(function (d) { delete pick.guests[d._id]; var b = p.querySelector('.pf-opt[data-id="' + d._id + '"]'); if (b) { b.classList.remove('on'); b.querySelector('.pf-tick').textContent = ''; } });
+        ok.forEach(function (d) { delete pick.guests[d._id]; var b = p.querySelector('.pf-opt[data-id="' + d._id + '"]'); if (b) { mark(b, false); b.querySelector('.pf-tick').textContent = ''; } });
         p.querySelector('.pf-note').textContent = (ok.length ? 'Phoned ' + ok.map(function (d) { return d.grant.guest; }).join(', ') + '. ' : '')
           + 'Not through to ' + bad.map(function (d) { return pick.guests[d._id]; }).join(', ') + ': ' + (bad[0].message || 'the call did not go through.');
         go.disabled = false; go.textContent = 'Try again';

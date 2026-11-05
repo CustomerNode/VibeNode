@@ -109,6 +109,7 @@ def api_setup():
         return _fail(e)
     store.save({"url": c["url"], "key": key, **{k: made[k] for k in
                 ("token", "org_id", "org_name", "member_id", "username", "role")}})
+    phone.refresh_org_names(force=True)
     return jsonify(ok=True, **store.public_view())
 
 
@@ -131,6 +132,7 @@ def api_join():
         return _fail(e)
     store.save({"url": inv["url"], "key": inv["key"], **{k: made[k] for k in
                 ("token", "org_id", "org_name", "member_id", "username", "role")}})
+    phone.refresh_org_names(force=True)
     return jsonify(ok=True, message=f"Joined {made['org_name']} as {made['username']}.",
                    **store.public_view())
 
@@ -139,9 +141,13 @@ def api_join():
 @local_only
 def api_members():
     try:
-        return jsonify(ok=True, members=store.call("orgs_members"))
+        members = store.call("orgs_members") or []
     except OrgsError as e:
         return _fail(e)
+    # Every member's name joins the publish scan's refused names.
+    from ..git_scanner import remember_org_names
+    remember_org_names([m.get("username") for m in members if m.get("username")])
+    return jsonify(ok=True, members=members)
 
 
 @bp.route("/api/orgs/invite", methods=["POST"])

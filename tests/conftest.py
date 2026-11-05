@@ -271,6 +271,22 @@ def _box_path(tmp_path_factory) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def _org_names_per_test(tmp_path, monkeypatch):
+    """Each test gets its own list of org members' names for the publish scan,
+    so one test's made-up members never become names another test's scan
+    refuses."""
+    try:
+        from web import git_scanner
+    except Exception:
+        yield
+        return
+    monkeypatch.setattr(git_scanner, "ORG_NAMES_FILE", tmp_path / "org_names.json")
+    git_scanner._org_cache.update(mtime=None, rule=None)
+    yield
+    git_scanner._org_cache.update(mtime=None, rule=None)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_daemon_home(request, tmp_path_factory, monkeypatch):
     """Redirect ``Path.home()`` to a per-session tmp dir so daemon-owned state
     files land in a sandbox instead of the user's real ``~/.claude/``.
@@ -448,6 +464,10 @@ os.environ["VIBENODE_SESSION_HOST"] = "0"
 # ("/static/scratch/x.png"), and src/web/static/scratch is gitignored, so the check is
 # off for the suite; tests/test_broken_links.py turns it on per test.
 os.environ["VIBENODE_LINK_CHECK"] = "0"
+# The org members' names the publish scan refuses (src/web/git_scanner.py):
+# tests write made-up members, never into the real list. The publish-scan test
+# reads the real list itself.
+os.environ["VIBENODE_ORG_NAMES_FILE"] = os.path.join(tempfile.gettempdir(), "vibenode-test-org-names.json")
 # The owner's saved tailnet login (src/web/mobile_auth.py) must never decide a
 # test: tests send made-up logins. Point it at a file that does not exist.
 os.environ["VIBENODE_TAILNET_OWNER_LEARN"] = "0"

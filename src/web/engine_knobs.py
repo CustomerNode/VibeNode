@@ -126,6 +126,8 @@ KNOBS = [
      "Where this VibeNode keeps its org membership (default data/vibenode_orgs.json)."),
     ("VIBENODE_PHONE_FILE", "VibeNode Orgs", "",
      "Where Phone a Friend keeps its posting cursors and pending suggestions (default data/phone_a_friend.json)."),
+    ("VIBENODE_ORG_NAMES_FILE", "VibeNode Orgs", "",
+     "Where the names of org members the publish scan refuses are kept (default data/org_names.json)."),
     ("VIBENODE_PHONED_DIR", "VibeNode Orgs", "",
      "Folder for the projects of sessions friends phoned you about (default ~/.vibenode-phoned)."),
     ("VIBENODE_ORGS_SOURCE", "VibeNode Orgs", "",
