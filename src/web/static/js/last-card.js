@@ -2446,12 +2446,21 @@
   // restarts; one refusal used to replace the page for good with "stopped",
   // in every open summary at once.  Now the note waits for the server, loads
   // the page the moment it answers, and has Try again.  It stops trying when
-  // the viewer closes.  A no-cors fetch rejects only when nothing answers.
+  // the viewer closes.
+  //
+  // The question goes to this app's preview proxy (a HEAD, so nothing but the
+  // headers moves), never straight to the port: a server that sends
+  // Cross-Origin-Resource-Policy: same-origin (CustomerNode does) makes the
+  // browser reject a direct no-cors fetch exactly as if nothing listened, so
+  // a running server showed "Waiting" forever.  The proxy marks a reply it
+  // made up because nothing answered with X-VN-Proxy-Down; any reply the
+  // server itself sent, a 404 or 405 included, means it is up.
   function _noteStoppedServer(frame, src) {
     let u;
     try { u = new URL(String(src || ''), location.href); } catch (_e) { return; }
     if (!_LOOPBACK.test(u.hostname) || u.host === location.host || typeof fetch !== 'function') return;
-    const probe = () => fetch(u.href, { mode: 'no-cors', cache: 'no-store' }).then(() => true, () => false);
+    const probe = () => fetch('/api/preview/proxy?u=' + encodeURIComponent(u.href), { method: 'HEAD', cache: 'no-store' })
+      .then(r => !r.headers.get('X-VN-Proxy-Down'), () => true);   // VibeNode itself unreachable: say nothing, its own check covers that
     probe().then(ok => {
       if (ok || !frame.isConnected) return;
       const n = document.createElement('div');

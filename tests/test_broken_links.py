@@ -173,6 +173,46 @@ def test_the_viewer_and_the_proxy_wait_for_a_restarting_server():
     assert "X-VN-Proxy-Down" in py and "setInterval" in py and "server has stopped" not in py
 
 
+def test_the_viewer_asks_the_proxy_whether_a_server_answers():
+    """A direct no-cors fetch to another port is rejected by the browser when
+    that server sends Cross-Origin-Resource-Policy: same-origin, exactly as
+    when nothing listens, so a running server showed "Waiting" forever.  The
+    viewer asks the preview proxy instead and reads its down mark."""
+    js = (ROOT / "src" / "web" / "static" / "js" / "last-card.js").read_text(encoding="utf-8")
+    body = js[js.index("function _noteStoppedServer"):]
+    body = body[:body.index("\n  }\n") + 4]
+    assert "no-cors" not in body
+    assert "/api/preview/proxy?u=" in body and "X-VN-Proxy-Down" in body and "'HEAD'" in body
+
+
+def test_the_proxy_answers_a_head_without_the_down_mark_when_the_server_is_up():
+    import socket
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from web import create_app
+
+    class H(BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(200)
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); dead = s.getsockname()[1]; s.close()
+    try:
+        c = create_app(testing=True).test_client()
+        up = c.head("/api/preview/proxy?u=http://127.0.0.1:%d/" % srv.server_port)
+        assert up.status_code == 200 and not up.headers.get("X-VN-Proxy-Down")
+        down = c.head("/api/preview/proxy?u=http://127.0.0.1:%d/" % dead)
+        assert down.headers.get("X-VN-Proxy-Down") == "1"
+    finally:
+        srv.shutdown()
+
+
 def test_it_can_be_turned_off(real_files, monkeypatch):
     monkeypatch.setenv("VIBENODE_LINK_CHECK", "0")
     card = _card(links=[{"label": "x", "kind": "image", "url": "/static/scratch/missing.png"}])
