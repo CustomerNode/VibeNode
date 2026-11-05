@@ -499,6 +499,9 @@
     s.on('pf_message', onMessage);
     s.on('pf_note', onNote);
     s.on('pf_notice', onNotice);
+    // A call started, ended or changed on either side: redraw at once.
+    var _chg = null;
+    s.on('pf_changed', function () { clearTimeout(_chg); _chg = setTimeout(refresh, 150); });
   }
 
   var _lastActive = null;

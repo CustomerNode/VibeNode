@@ -152,11 +152,20 @@ def _drop_project(encoded: str) -> None:
         _cfg._save_project_names(names)
 
 
-def sync_once(notify=lambda e, d: None) -> int:
-    """Bring every phoned session's file up to date; returns lines written."""
+# The caller's session status, as the chat shows it: working while their
+# session works, idle otherwise.
+_WORKING = {"working", "starting", "running", "thinking"}
+
+
+def sync_once(notify=lambda e, d: None, grants: list | None = None, posts: dict | None = None) -> int:
+    """Bring every phoned session's file up to date; returns lines written.
+
+    ``grants`` and ``posts`` come from the loop's single round trip; without
+    them (tests, older cloud storage) this fetches them itself."""
     from ..routes.ws_events import _parse_raw_line
 
-    grants = phone.incoming(days=KEEP_DAYS)
+    if grants is None:
+        grants = phone.incoming(days=KEEP_DAYS)
     # One file per shared session: the newest grant for it decides what may be done.
     by_share: dict = {}
     for g in sorted(grants, key=lambda g: g.get("created_at") or ""):
@@ -180,13 +189,20 @@ def sync_once(notify=lambda e, d: None) -> int:
                 m["title"] = title
             if g.get("live"):
                 after = m.get("cursor", 0)
-                for _ in range(20):                      # at most 20 pages a tick
-                    try:
-                        got = phone.read(sid, after=after, limit=200)
-                    except phone.OrgsError:
-                        break
-                    posts = got.get("posts") or []
-                    for p in posts:
+                handed = posts.get(sid) if posts is not None else None
+                if posts is not None and handed is None:
+                    pages = 0                            # nothing new: the sync said so
+                else:
+                    pages = 20                           # at most 20 pages a tick
+                for _ in range(pages):
+                    if handed is not None:
+                        page, handed = handed, None
+                    else:
+                        try:
+                            page = (phone.read(sid, after=after, limit=200) or {}).get("posts") or []
+                        except phone.OrgsError:
+                            break
+                    for p in page:
                         lines = _post_lines(p, g)
                         if lines:
                             for line in lines:
@@ -197,9 +213,14 @@ def sync_once(notify=lambda e, d: None) -> int:
                                 for entry in _parse_raw_line(json.dumps(line)):
                                     notify("session_entry", {"session_id": sid, "entry": entry})
                         after = max(after, p.get("seq", after))
-                    if len(posts) < 200:
+                    if len(page) < 200:
                         break
                 m["cursor"] = after
+            # The caller's session status, drawn by the chat's own state handling.
+            shown = "working" if (g.get("live") and str(g.get("status") or "").lower() in _WORKING) else "idle"
+            if m.get("shown_state") != shown:
+                notify("session_state", {"session_id": sid, "state": shown})
+                m["shown_state"] = shown
             m.update(grant_id=g["grant_id"], level=g["level"], live=bool(g.get("live")),
                      owner=g.get("owner"), owner_id=g.get("owner_id"), note=g.get("note", ""),
                      project=g.get("project", ""), title_text=g.get("title", ""))

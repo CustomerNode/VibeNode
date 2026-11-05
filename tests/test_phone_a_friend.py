@@ -386,3 +386,30 @@ def test_a_phoned_project_is_marked_for_its_phone_icon(world, monkeypatch):
     projects = _ok(client.get("/api/projects"))
     assert projects[0].get("phoned") is True
     assert all("phoned" not in p for p in projects[1:])
+
+
+def test_one_tick_is_one_round_trip_and_carries_status(world, monkeypatch):
+    import httpx
+    app, client, mods, dana, sam = world
+    phone = mods[2]
+    sam_id = _org(client, mods, dana, sam, "Tick")
+    dana.use(mods)
+    dana.transcript("s-14", ["hello"])
+    _ok(client.post("/api/phone/call", json={"session_id": "s-14", "guest_id": sam_id, "level": "drive", "duration": "1h"}))
+    calls = []
+    real = httpx.post
+    monkeypatch.setattr(httpx, "post", lambda url, **k: (calls.append(url.rsplit("/", 1)[1]), real(url, **k))[1])
+    # Dana's side, session working: one sync, one post with the status.
+    phone.tick(status_of=lambda sid: "working")
+    assert calls.count("pf_sync") == 1 and calls.count("pf_post") == 1
+    calls.clear()
+    phone.tick(status_of=lambda sid: "working")            # nothing changed: only the sync
+    assert calls == ["pf_sync"]
+    # Sam's side: the copy shows Dana's session working, from the same one call.
+    sam.use(mods)
+    mirror = _use_mirror(sam, monkeypatch)
+    seen = []
+    calls.clear()
+    phone.tick(notify=lambda e, d: seen.append((e, d.get("state"))))
+    assert calls == ["pf_sync"]
+    assert ("session_state", "working") in seen

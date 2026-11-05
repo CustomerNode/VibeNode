@@ -421,6 +421,36 @@ BEGIN
     ), '[]'::jsonb);
 END $$;
 
+-- Everything a VibeNode needs in one round trip, called about once a second:
+-- the calls it gave and holds, friends' new messages on its sessions, and the
+-- new posts of each phoned session after the cursor it sends
+-- (p_cursors: {share_id: last seq seen}; a session not in it starts at 0).
+CREATE OR REPLACE FUNCTION pf_sync(p_token TEXT, p_cursors JSONB, p_inbox_since TIMESTAMPTZ, p_days INT)
+RETURNS JSONB
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, extensions AS $$
+DECLARE m org_members := orgs_member(p_token); posts JSONB := '{}'::jsonb; k TEXT; after BIGINT;
+BEGIN
+    -- Every phoned session with a live call to this member: its posts after
+    -- the cursor sent for it (0 for one not seen yet).
+    FOR k, after IN
+        SELECT DISTINCT s.id::text, coalesce((p_cursors ->> s.id::text)::BIGINT, 0)
+          FROM pf_shared_sessions s JOIN pf_grants g ON g.share_id = s.id
+         WHERE g.guest_id = m.id AND pf_grant_live(g)
+           AND s.last_seq > coalesce((p_cursors ->> s.id::text)::BIGINT, 0)
+    LOOP
+        posts := posts || jsonb_build_object(k, coalesce((SELECT jsonb_agg(x ORDER BY x.seq) FROM (
+            SELECT p.seq, p.kind, p.body, p.created_at,
+                   (SELECT username FROM org_members WHERE id = p.author_id) AS author
+              FROM pf_posts p WHERE p.share_id::text = k AND p.seq > after
+             ORDER BY p.seq LIMIT 300) x), '[]'::jsonb));
+    END LOOP;
+    RETURN jsonb_build_object(
+        'in', pf_grants_list(p_token, 'in', p_days),
+        'out', pf_grants_list(p_token, 'out', p_days),
+        'inbox', pf_inbox(p_token, p_inbox_since),
+        'posts', posts);
+END $$;
+
 -- ── who may call what ───────────────────────────────────────────────────────
 
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM anon, authenticated;
@@ -433,13 +463,15 @@ REVOKE EXECUTE ON FUNCTION orgs_me(TEXT), orgs_members(TEXT), orgs_create_invite
     pf_share(TEXT, UUID, TEXT, TEXT, TEXT, TEXT, INT, TEXT, TEXT), pf_revoke(TEXT, UUID),
     pf_grants_list(TEXT, TEXT, INT), pf_post(TEXT, UUID, JSONB, TEXT),
     pf_read(TEXT, UUID, BIGINT, INT, BIGINT), pf_guest_message(TEXT, UUID, TEXT),
-    pf_inbox(TEXT, TIMESTAMPTZ), pf_set_note(TEXT, UUID, TEXT) FROM PUBLIC;
+    pf_inbox(TEXT, TIMESTAMPTZ), pf_set_note(TEXT, UUID, TEXT),
+    pf_sync(TEXT, JSONB, TIMESTAMPTZ, INT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION orgs_me(TEXT), orgs_members(TEXT), orgs_create_invite(TEXT, INT),
     orgs_redeem_invite(TEXT, TEXT), orgs_revoke_invites(TEXT), orgs_remove_member(TEXT, UUID),
     pf_share(TEXT, UUID, TEXT, TEXT, TEXT, TEXT, INT, TEXT, TEXT), pf_revoke(TEXT, UUID),
     pf_grants_list(TEXT, TEXT, INT), pf_post(TEXT, UUID, JSONB, TEXT),
     pf_read(TEXT, UUID, BIGINT, INT, BIGINT), pf_guest_message(TEXT, UUID, TEXT),
-    pf_inbox(TEXT, TIMESTAMPTZ), pf_set_note(TEXT, UUID, TEXT) TO anon, authenticated, service_role;
+    pf_inbox(TEXT, TIMESTAMPTZ), pf_set_note(TEXT, UUID, TEXT),
+    pf_sync(TEXT, JSONB, TIMESTAMPTZ, INT) TO anon, authenticated, service_role;
 
 -- Tell the API to see the new functions now, not on its next schema refresh.
 NOTIFY pgrst, 'reload schema';

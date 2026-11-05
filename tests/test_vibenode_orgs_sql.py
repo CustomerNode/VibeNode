@@ -159,3 +159,19 @@ def test_the_project_travels_with_the_call_and_old_callers_still_work(pg, org):
     # and keeps the project already recorded.
     g2 = pg.call("pf_share", dana, sam["member_id"], "box", "s-8", "T2", "view", 60, "")
     assert g2["project"] == "CustomerNode" and g2["title"] == "T2"
+
+
+def test_one_sync_call_returns_both_sides_the_inbox_and_new_posts(pg, org):
+    dana, sam = org["owner"]["token"], org["Sam"]
+    g = pg.call("pf_share", dana, sam["member_id"], "box", "s-9", "T", "drive", None, "", "Acme")
+    pg.call("pf_post", dana, g["share_id"], [{"kind": "entry", "body": {"text": "a"}},
+                                             {"kind": "entry", "body": {"text": "b"}}], "working")
+    out = pg.call("pf_sync", sam["token"], {g["share_id"]: 1}, None, 7)
+    assert [p["body"]["text"] for p in out["posts"][g["share_id"]]] == ["b"]
+    assert any(x["grant_id"] == g["grant_id"] and x["status"] == "working" for x in out["in"])
+    # Nothing new after the last seen post: no posts sent back for it.
+    assert g["share_id"] not in pg.call("pf_sync", sam["token"], {g["share_id"]: 2}, None, 7)["posts"]
+    pg.call("pf_guest_message", sam["token"], g["grant_id"], "hi")
+    assert any(m["text"] == "hi" for m in pg.call("pf_sync", dana, {}, None, 7)["inbox"])
+    # Someone else's share id gets nothing.
+    assert pg.call("pf_sync", org["Priya"]["token"], {g["share_id"]: 0}, None, 7)["posts"] == {}

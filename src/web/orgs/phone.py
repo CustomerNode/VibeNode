@@ -43,7 +43,7 @@ log = logging.getLogger("web.orgs.phone")
 
 STATE_FILE: Path = Path(os.environ.get("VIBENODE_PHONE_FILE")
                         or (_VIBENODE_DIR / "data" / "phone_a_friend.json"))
-TICK_S = 3.0
+TICK_S = 1.0
 MAX_FIELD = 4000
 MAX_BATCH = 150
 LEVELS = ("view", "suggest", "drive")
@@ -250,9 +250,15 @@ def _lines_since(path: Path, line_no: int) -> tuple[list, int]:
     return out, len(lines)
 
 
-def publish_once(only_share: str | None = None, status_of=None) -> int:
-    """Post new thread entries for every share with a live grant. Returns how many."""
-    grants = [g for g in outgoing(days=0) if g.get("live") and g.get("source") == source_name()]
+def publish_once(only_share: str | None = None, status_of=None, grants: list | None = None) -> int:
+    """Post new thread entries for every share with a live grant. Returns how many.
+
+    Runs every tick, so it only touches the cloud storage when something
+    changed: the transcript grew (checked by its size, no read) or the
+    session's status changed (working, idle…)."""
+    if grants is None:
+        grants = outgoing(days=0)
+    grants = [g for g in grants if g.get("live") and g.get("source") == source_name()]
     shares = {}
     for g in grants:
         if only_share is None or g["share_id"] == only_share:
@@ -261,22 +267,31 @@ def publish_once(only_share: str | None = None, status_of=None) -> int:
     with _lock:
         state = _load_state()
         cursors = state.setdefault("cursors", {})
+        sizes = state.setdefault("sizes", {})
+        sent_status = state.setdefault("sent_status", {})
         for share_id, g in shares.items():
             path = find_transcript(g["session_id"])
             if path is None:
                 continue
+            status = status_of(g["session_id"]) if status_of else None
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if share_id in cursors and sizes.get(share_id) == size and status == sent_status.get(share_id):
+                continue                          # nothing new: no round trip
             cur = cursors.get(share_id)
             if cur is None:                       # a new share: start with the recent part
                 total = sum(1 for l in path.read_text(encoding="utf-8").splitlines() if l.strip())
                 cur = max(0, total - 150)
             lines, new_cur = _lines_since(path, cur)
-            status = status_of(g["session_id"]) if status_of else None
-            if not lines and new_cur == cur and status is None:
-                continue
-            batch = [{"kind": "entry", "body": {"line": ln}} for ln in lines[-MAX_BATCH:]]
-            store.call("pf_post", p_share=share_id, p_posts=batch, p_status=status)
+            if lines or status != sent_status.get(share_id):
+                batch = [{"kind": "entry", "body": {"line": ln}} for ln in lines[-MAX_BATCH:]]
+                store.call("pf_post", p_share=share_id, p_posts=batch, p_status=status)
+                posted += len(batch)
             cursors[share_id] = new_cur
-            posted += len(batch)
+            sizes[share_id] = size
+            sent_status[share_id] = status
         _save_state(state)
     return posted
 
@@ -306,12 +321,13 @@ def _deliver(msg: dict, sm, notify) -> None:
         notify("pf_suggestion", {"key": key, "session_id": sid, "from": who, "text": text[:300]})
 
 
-def inbox_once(sm=None, notify=lambda e, d: None) -> int:
+def inbox_once(sm=None, notify=lambda e, d: None, msgs: list | None = None) -> int:
     with _lock:
         state = _load_state()
         since = state.get("inbox_since")
         seen = set(state.get("inbox_seen", []))
-    msgs = store.call("pf_inbox", p_since=since) or []
+    if msgs is None:
+        msgs = store.call("pf_inbox", p_since=since) or []
     handled = 0
     for msg in msgs:
         key = f"{msg['share_id']}:{msg['seq']}"
@@ -331,9 +347,10 @@ def inbox_once(sm=None, notify=lambda e, d: None) -> int:
     return handled
 
 
-def pings_once(notify=lambda e, d: None) -> list:
+def pings_once(notify=lambda e, d: None, grants: list | None = None) -> list:
     """Announce each new incoming grant once, and each that ended."""
-    grants = incoming(days=1)
+    if grants is None:
+        grants = incoming(days=1)
     with _lock:
         state = _load_state()
         announced = state.setdefault("announced", {})
@@ -353,9 +370,10 @@ def pings_once(notify=lambda e, d: None) -> list:
     return new
 
 
-def notes_once(notify=lambda e, d: None) -> list:
+def notes_once(notify=lambda e, d: None, grants: list | None = None) -> list:
     """Tell open tabs when a call's note changed, on either side."""
-    grants = outgoing(days=7) + incoming(days=7)
+    if grants is None:
+        grants = outgoing(days=7) + incoming(days=7)
     changed = []
     with _lock:
         state = _load_state()
@@ -371,6 +389,40 @@ def notes_once(notify=lambda e, d: None) -> list:
     return changed
 
 
+def tick(sm=None, status_of=None, notify=lambda e, d: None) -> None:
+    """One pass of the background loop in ONE round trip to the cloud storage
+    (``pf_sync``): the calls on both sides, friends' new messages and the new
+    posts of each phoned session come back together, then each job works from
+    that. Falls back to the separate calls on cloud storage set up before it."""
+    from . import mirror
+    with _lock:
+        state = _load_state()
+    cursors = {sid: m.get("cursor", 0) for sid, m in state.get("mirrors", {}).items()}
+    try:
+        data = store.call("pf_sync", p_cursors=cursors, p_inbox_since=state.get("inbox_since"), p_days=7)
+    except OrgsError as e:
+        if e.code != "schema_missing":
+            raise
+        publish_once(status_of=status_of)
+        inbox_once(sm=sm, notify=notify)
+        pings_once(notify=notify)
+        notes_once(notify=notify)
+        mirror.sync_once(notify=notify)
+        return
+    out, inn = data.get("out") or [], data.get("in") or []
+    publish_once(status_of=status_of, grants=out)
+    inbox_once(sm=sm, notify=notify, msgs=data.get("inbox") or [])
+    pings_once(notify=notify, grants=inn)
+    notes_once(notify=notify, grants=out + inn)
+    mirror.sync_once(notify=notify, grants=inn, posts=data.get("posts") or {})
+    # Open tabs redraw marks and lists as soon as a call starts, ends or changes.
+    key = json.dumps([[g["grant_id"], g.get("live"), g.get("level"), g.get("note")] for g in out + inn])
+    if key != _last_lists.get("key"):
+        _last_lists["key"] = key
+        notify("pf_changed", {})
+
+
+_last_lists: dict = {"key": None}
 _thread: dict = {"t": None, "stop": None}
 
 
@@ -400,12 +452,7 @@ def start(app, socketio) -> None:
                 backoff = 15.0
                 continue
             try:
-                publish_once(status_of=status_of)
-                inbox_once(sm=app.session_manager, notify=notify)
-                pings_once(notify=notify)
-                notes_once(notify=notify)
-                from . import mirror
-                mirror.sync_once(notify=notify)
+                tick(sm=app.session_manager, status_of=status_of, notify=notify)
                 backoff = TICK_S
             except OrgsError as e:
                 if e.code in ("not_a_member",):
