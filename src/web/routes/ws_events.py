@@ -1306,7 +1306,7 @@ def register_ws_events(socketio, app):
             })
 
     @socketio.on('get_permission_policy')
-    def handle_get_permission_policy():
+    def handle_get_permission_policy(data=None):
         """Return the persisted permission policy to the browser."""
         sm = app.session_manager
         try:
@@ -1343,7 +1343,7 @@ def register_ws_events(socketio, app):
             _record_policy_change(old, policy, source)
 
     @socketio.on('get_ui_prefs')
-    def handle_get_ui_prefs():
+    def handle_get_ui_prefs(data=None):
         """Return persisted UI preferences to the browser."""
         sm = app.session_manager
         try:

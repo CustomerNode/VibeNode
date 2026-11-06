@@ -933,3 +933,24 @@ class TestLoadOlderRegression:
         )
         assert data['offset'] == 1900
         client.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Load requests answer with or without a payload
+# ---------------------------------------------------------------------------
+
+class TestLoadRequestsTakeOptionalPayload:
+    """A wrapped socket.emit can forward an absent payload as null."""
+
+    @pytest.mark.parametrize("event,reply,method", [
+        ('get_ui_prefs', 'ui_prefs_loaded', 'get_ui_prefs'),
+        ('get_permission_policy', 'permission_policy_loaded', 'get_permission_policy'),
+    ])
+    @pytest.mark.parametrize("payload", [(), (None,)])
+    def test_answers(self, app_and_client, mock_session_manager, event, reply, method, payload):
+        app, socketio, client = app_and_client
+        getattr(mock_session_manager, method).return_value = {'ok': True}
+        client.get_received()
+        client.emit(event, *payload)
+        replies = [m for m in client.get_received() if m['name'] == reply]
+        assert replies and replies[0]['args'][0] == {'ok': True}

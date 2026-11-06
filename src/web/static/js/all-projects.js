@@ -115,9 +115,11 @@
   function patchSocket() {
     if (typeof socket === 'undefined' || !socket || socket._vnApPatched) return;
     const orig = socket.emit.bind(socket);
-    socket.emit = function (ev, data, ...rest) {
-      if (ev === 'request_state_snapshot' && on()) data = Object.assign({}, data || {}, { all_projects: true });
-      return orig(ev, data, ...rest);
+    // Pass other events through with their own arguments: forwarding an
+    // absent payload sends null, which breaks handlers that take none.
+    socket.emit = function (ev, ...args) {
+      if (ev === 'request_state_snapshot' && on()) args[0] = Object.assign({}, args[0] || {}, { all_projects: true });
+      return orig(ev, ...args);
     };
     socket._vnApPatched = true;
   }
