@@ -153,6 +153,24 @@ def _is_tailnet_turn(data: dict) -> bool:
     return False
 
 
+_MOBILE_UA = re.compile(r"Mobi|Android|iPhone|iPad|iPod", re.I)
+
+
+def _sender_device(data: dict) -> str:
+    """"Mobile" or "PC": the device word in the "Sent from ... at" stamp.
+
+    A phone reaches VibeNode over the Tailscale tunnel or, on the home network,
+    with a mobile browser; anything else is the PC. Any failure reads as PC."""
+    if _is_tailnet_turn(data):
+        return "Mobile"
+    try:
+        if _MOBILE_UA.search(flask_request.headers.get("User-Agent") or ""):
+            return "Mobile"
+    except Exception:
+        pass
+    return "PC"
+
+
 _POLICY_CHANGE_LOG = Path(__file__).resolve().parents[3] / "logs" / "permission_policy.log"
 
 
@@ -708,7 +726,8 @@ def register_ws_events(socketio, app):
         voice = bool(data.get('voice'))
         if prompt and session_type not in ('planner', 'title'):
             from datetime import datetime as _dt
-            _ts_tag = '\n\nSent from Mobile at ' + _dt.now().strftime('%Y-%m-%d %I:%M %p')
+            _ts_tag = ('\n\nSent from ' + _sender_device(data) + ' at '
+                       + _dt.now().strftime('%Y-%m-%d %I:%M %p'))
             if voice:
                 _ts_tag += ' (transcribed from voice \u2014 may contain transcription errors)'
             prompt = prompt + _ts_tag

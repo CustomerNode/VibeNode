@@ -452,12 +452,13 @@ function _queueDisplayText(text) {
   return ev ? ev.source + ': ' + ev.body : text;
 }
 
-// ── Strip "Sent from Mobile at ..." footer from message text for display ──
+// ── Strip "Sent from <device> at ..." footer from message text for display ──
 function _stripVnMeta(text) {
   // Remove the server-injected headless-mobile preamble (⟦VN-MOBILE⟧…⟦/VN-MOBILE⟧)
   // so it never shows in the user's own bubble — it's context for the agent only.
   text = text.replace(/⟦VN-MOBILE⟧[\s\S]*?⟦\/VN-MOBILE⟧\s*/g, '');
-  const m = text.match(/\n{1,2}Sent from Mobile at (\d{4}-\d{2}-\d{2} \d{1,2}:\d{2} [AP]M)(\s*\(transcribed from voice[^)]*\))?\s*$/);
+  // Any device word: "Mobile", "PC", and older stamps such as "Q".
+  const m = text.match(/\n{1,2}Sent from \S+ at (\d{4}-\d{2}-\d{2} \d{1,2}:\d{2} [AP]M)(\s*\(transcribed from voice[^)]*\))?\s*$/);
   if (!m) return {clean: text, sentAt: null, voice: false};
   return {clean: text.replace(m[0], ''), sentAt: m[1], voice: !!m[2]};
 }
@@ -4008,6 +4009,11 @@ function _addOptimisticBubble(sid, text, isVoice, opts) {
   if (sid !== liveSessionId) return;
   const logEl = document.getElementById('live-log');
   if (!logEl) return;
+  // A queued or hook message arrives with the server's "Sent from ... at" stamp:
+  // hide it here too, as the confirmed bubble does.
+  const _vnMeta = _stripVnMeta(text || '');
+  text = _vnMeta.clean;
+  if (_vnMeta.voice) isVoice = true;
   // A hook line (see _parseVnEvent) is drawn under its source, without its markers.
   const _vnEvent = _parseVnEvent(text);
   if (_vnEvent) text = _vnEvent.body;

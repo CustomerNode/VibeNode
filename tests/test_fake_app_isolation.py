@@ -409,6 +409,11 @@ READ = "() => [window.__log, Math.round((Date.now() - window.__d0) / 100), Math.
 
 
 def _run_scenario(page, clock):
+    # Both clocks flow in real time between advances, so on a loaded machine
+    # the wall time spent between these calls leaked into the measured window
+    # (13 vs 12 tenths) and could fire timers before run_for. Pausing first
+    # makes the window exactly what run_for advanced, on both clocks.
+    clock.pause_at("2030-01-01T00:00:00Z")
     page.evaluate(SCENARIO)
     clock.run_for(40)
     early = page.evaluate(READ)

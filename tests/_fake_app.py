@@ -137,7 +137,9 @@ PAGE_CLOCK = r"""
     // Jump to ``epoch`` and stay there until runFor(): every timer due by then
     // fires at most once, as Playwright's clock.pauseAt does.
     async pauseAt(epoch) {
-      const end = vnow() + (epoch - VDate.now());
+      // Exactly ``epoch``: deriving it from two readings of the flowing clock
+      // could land a millisecond short and show the previous year.
+      const end = epoch - base;
       for (const t of timers.values()) R.clearTimeout(t.real);
       running = true; paused = true; cursor = vnow();
       for (const t of [...timers.values()].filter((x) => x.due <= end).sort((a, b) => a.due - b.due || a.order - b.order)) {
