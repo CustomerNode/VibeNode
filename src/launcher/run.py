@@ -455,60 +455,15 @@ if not _TEST_PORT:
               "Starting anyway." % _WEB_PORT, flush=True)
 
 # ---------------------------------------------------------------------------
-# Self-healing desktop shortcut.
-# After a git pull the shortcut may still point to py.exe (console flash) or
-# python.exe instead of pythonw.exe (windowless).  Fix it on every launch so
-# the user never has to think about it.
+# Self-healing desktop shortcut (see shortcut_repair.py).
 # ---------------------------------------------------------------------------
 def _fix_shortcut():
-    if sys.platform != "win32":
-        return
-    try:
-        lnk_path = Path.home() / "Desktop" / "VibeNode.lnk"
-        if not lnk_path.exists():
-            return
-        # Find pythonw.exe next to the running python.exe
-        pythonw = Path(sys.executable).parent / "pythonw.exe"
-        if not pythonw.exists():
-            return
-        script = Path(__file__).resolve().parent / "session_manager.py"
-        icon = _ROOT / "src" / "web" / "static" / "vibenode.ico"
-        # Read current shortcut target to see if it already points to pythonw
-        # (avoid rewriting on every launch if already correct)
-        ps_read = (
-            "$ws = New-Object -ComObject WScript.Shell;"
-            f"$lnk = $ws.CreateShortcut('{lnk_path}');"
-            "Write-Output $lnk.TargetPath;"
-            "Write-Output $lnk.IconLocation"
-        )
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_read],
-            capture_output=True, text=True, timeout=5,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-        lines = r.stdout.strip().splitlines()
-        current_target = (lines[0] if lines else "").lower()
-        current_icon = (lines[1] if len(lines) > 1 else "").lower()
-        expected_icon = str(icon).lower()
-        if "pythonw" in current_target and expected_icon in current_icon:
-            return  # Already correct
-        # Rewrite the shortcut
-        ps_write = (
-            "$ws = New-Object -ComObject WScript.Shell;"
-            f"$lnk = $ws.CreateShortcut('{lnk_path}');"
-            f"$lnk.TargetPath = '{pythonw}';"
-            f"$lnk.Arguments = '\"{script}\"';"
-            f"$lnk.WorkingDirectory = '{script.parent}';"
-            f"$lnk.IconLocation = '{icon},0';"
-            "$lnk.WindowStyle = 7;"
-            "$lnk.Save()"
-        )
-        subprocess.Popen(
-            ["powershell", "-NoProfile", "-Command", ps_write],
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-    except Exception:
-        pass  # Best effort — never block startup
+    from launcher import shortcut_repair
+    shortcut_repair.fix_shortcuts(
+        _ROOT,
+        Path(__file__).resolve().parent / "session_manager.py",
+        _ROOT / "src" / "web" / "static" / "vibenode.ico",
+    )
 
 # Run shortcut repair in background — it's best-effort and involves
 # slow PowerShell calls that shouldn't block startup.
