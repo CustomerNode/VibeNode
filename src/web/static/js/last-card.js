@@ -2672,7 +2672,10 @@
       j = (j + all.length) % all.length;
       if (j === i) return;
       const dir = j > i ? 1 : -1;
-      i = j; shot = 0;
+      // Switching choice keeps the page being viewed, so a reviewer comparing
+      // one page across choices never has to pick it again; a choice with
+      // fewer pages shows its last one (every reader clamps with Math.min).
+      i = j;
       show(dir);
     };
     const restage = () => {
