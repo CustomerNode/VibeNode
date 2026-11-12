@@ -2723,7 +2723,12 @@ folder that loads the real code and opens on it. When the real check \
 only happens later (the next time something occurs), build a demo page that \
 shows it happening, link it in "url", and put the real moment in "later". A \
 Validate row with nothing to open, or one that only opens VibeNode's front \
-page (the app the user is already in), is sent back. Never tell the user which \
+page (the app the user is already in), is sent back. The page must open \
+where the user is already signed in: one that lands on a sign-in page (a \
+server you started on a new port, a second copy, an address the user's browser \
+holds no sign-in for) leaves the user a job and is sent back. Link the copy and \
+address the user already uses, or bring the change there; only when the work is \
+sign-in itself may "url" be the sign-in page. Never tell the user which \
 device to use ("open it on your phone"): the user may be at the computer. A \
 change that shows only at phone size is shown at that size here: a page that \
 frames the live page at phone width in "url", plus a phone-size screenshot.
@@ -3084,6 +3089,197 @@ def _stopped_ports(urls):
 _PORT_GRACE_S = 6.0
 
 
+# A Validate page that lands on a sign-in page hands the user a job: sign in
+# before trying anything (and, on a second copy of an app sharing the host,
+# possibly signing out of the copy the user uses).  Checked only for pages on
+# another port of this machine, and only when the browsers VibeNode opens in
+# (Chrome-family, any profile, and VibeNode's own window profile) hold no
+# sign-in cookie for that host, so a page the user is signed in to is never
+# loaded.  The page is loaded the way a signed-out visitor sees it: a plain
+# request following redirects, then, when that ends on a page of scripts, a
+# headless browser (a single-page app redirects in script).
+# VIBENODE_SIGNIN_CHECK=0 or VIBENODE_LINK_CHECK=0 turns it off (the suite).
+_SIGNIN_PATH = re.compile(
+    r"/(?:accounts/)?(?:log-?in|sign-?in|signon|auth(?:enticate)?|sso|session/new|users?/sign_in)(?:[/?#.]|$)",
+    re.I)
+_SIGNIN_WORK = re.compile(r"\b(?:log-?in|sign-?in|sign(?:ing)? in|log(?:ging)? in|auth\w*|password|sso)\b", re.I)
+_SESSION_COOKIE = re.compile(r"sess|^sid$|auth|jwt|login|remember|access|refresh|^token$|_token$|bearer", re.I)
+_NOT_SESSION_COOKIE = re.compile(r"csrf|xsrf", re.I)
+_PASSWORD_FIELD = re.compile(r"<input[^>]+type\s*=\s*[\"']?password", re.I)
+_signin_cache: dict = {}
+
+
+def _browser_cookie_dbs():
+    """Cookie stores of the browsers VibeNode opens in on this machine
+    (Chrome, Chromium, Edge, Brave: every profile; VibeNode's own window
+    profile).  Only host and cookie NAME are read, never a value."""
+    home = Path.home()
+    roots = [
+        home / ".config/google-chrome", home / ".config/chromium",
+        home / ".config/microsoft-edge", home / ".config/BraveSoftware/Brave-Browser",
+        home / "Library/Application Support/Google/Chrome",
+        home / "Library/Application Support/Chromium",
+        Path(__file__).resolve().parents[2] / "data" / "chrome-profile",
+    ]
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        roots += [Path(local) / "Google/Chrome/User Data", Path(local) / "Microsoft/Edge/User Data",
+                  Path(local) / "Chromium/User Data"]
+    for root in roots:
+        try:
+            yield from list(root.glob("*/Cookies")) + list(root.glob("*/Network/Cookies"))
+        except OSError:
+            continue
+
+
+def _signed_in_hosts() -> Optional[set]:
+    """Hosts those browsers hold a sign-in cookie for, or None when no
+    cookie store could be read (then nothing is judged)."""
+    import sqlite3
+    found, read_any = set(), False
+    for path in _browser_cookie_dbs():
+        try:
+            uri = "file:" + urllib.parse.quote(str(path)) + "?mode=ro&immutable=1"
+            db = sqlite3.connect(uri, uri=True, timeout=0.5)
+            try:
+                rows = db.execute("SELECT host_key, name FROM cookies").fetchall()
+            finally:
+                db.close()
+        except Exception:
+            continue
+        read_any = True
+        for host, name in rows:
+            name = str(name or "")
+            if _SESSION_COOKIE.search(name) and not _NOT_SESSION_COOKIE.search(name):
+                found.add(str(host or "").lstrip(".").lower())
+    return found if read_any else None
+
+
+def _visited_past_signin(origin: str) -> bool:
+    """True when a browser VibeNode opens in has history of a page on
+    *origin* (scheme://host:port) that is not a sign-in page.  Read only, and
+    only the addresses of that origin."""
+    import sqlite3
+    for cookies in _browser_cookie_dbs():
+        hist = cookies.parent.parent / "History" if cookies.parent.name == "Network" else cookies.parent / "History"
+        if not hist.is_file():
+            continue
+        try:
+            db = sqlite3.connect("file:" + urllib.parse.quote(str(hist)) + "?mode=ro&immutable=1",
+                                 uri=True, timeout=0.5)
+            try:
+                rows = db.execute("SELECT url FROM urls WHERE substr(url, 1, ?) = ? LIMIT 500",
+                                  (len(origin) + 1, origin + "/")).fetchall()
+            finally:
+                db.close()
+        except Exception:
+            continue
+        if any(not _SIGNIN_PATH.search(urllib.parse.urlsplit(u).path) for (u,) in rows):
+            return True
+    return False
+
+
+def _lands_on_signin(url: str, timeout: float = 4.0) -> Optional[str]:
+    """Where a signed-out visit to *url* ends when that is a sign-in page,
+    else None (also None when it cannot tell)."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "VibeNode link check"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            final = r.geturl()
+            body = r.read(400_000).decode("utf-8", "replace")
+    except Exception:
+        return None
+    if _SIGNIN_PATH.search(urllib.parse.urlsplit(final).path) or _PASSWORD_FIELD.search(body):
+        return final
+    if "<script" not in body.lower():
+        return None
+    return _browser_lands_on_signin(url)
+
+
+_PROBE = r"""
+import sys, re
+from urllib.parse import urlsplit
+from playwright.sync_api import sync_playwright
+url, pat = sys.argv[1], re.compile(sys.argv[2], re.I)
+with sync_playwright() as p:
+    b = p.chromium.launch()
+    try:
+        pg = b.new_context().new_page()
+        pg.goto(url, wait_until="domcontentloaded", timeout=8000)
+        for _ in range(16):
+            if pat.search(urlsplit(pg.url).path) or pg.locator("input[type=password]").count():
+                print("SIGNIN " + pg.url); break
+            pg.wait_for_timeout(250)
+        else:
+            print("OK " + pg.url)
+    finally:
+        b.close()
+"""
+
+
+def _browser_lands_on_signin(url: str) -> Optional[str]:
+    """The same question for a page that redirects in script, asked of a
+    headless browser in its own process (no cookies).  None when no
+    interpreter here has a browser, or it is slow: the check never guesses."""
+    import shutil
+    import subprocess
+    import sys
+    for exe in dict.fromkeys(x for x in (sys.executable, shutil.which("python3")) if x):
+        try:
+            out = subprocess.run([exe, "-c", _PROBE, url, _SIGNIN_PATH.pattern],
+                                 capture_output=True, text=True, timeout=20).stdout
+        except Exception:
+            continue
+        m = re.search(r"^(SIGNIN|OK) (\S+)", out or "", re.M)
+        if m:   # this interpreter had a browser: its answer stands
+            return m.group(2) if m.group(1) == "SIGNIN" else None
+    return None
+
+
+def signin_wall_problems(card: dict) -> list[str]:
+    if (not isinstance(card, dict) or os.environ.get("VIBENODE_SIGNIN_CHECK") == "0"
+            or os.environ.get("VIBENODE_LINK_CHECK") == "0"):
+        return []
+    v = card.get("validate")
+    url = _s(v.get("url")) if isinstance(v, dict) else ""
+    m = re.search(r"/api/preview/proxy\?(?:.*&)?u=([^&#]+)", url)
+    if m:
+        url = urllib.parse.unquote(m.group(1))
+    lm = _LOOPBACK_URL.match(url)
+    if not lm or not lm.group(2) or lm.group(2) == "5050":
+        return []
+    if _SIGNIN_PATH.search(urllib.parse.urlsplit(url).path):
+        return []   # the sign-in page itself, linked on purpose
+    zoom = card.get("zoom") if isinstance(card.get("zoom"), dict) else {}
+    about = " ".join(_s(x) for x in (card.get("title"), card.get("headline"), zoom.get("task")))
+    if _SIGNIN_WORK.search(about):
+        return []   # the work is sign-in itself
+    host = lm.group(1).lower().strip("[]")
+    signed = _signed_in_hosts()
+    if signed is None:
+        return []
+    # A cookie is the host's, whatever the port, so a sign-in on the copy the
+    # user uses (one port) says nothing about a second copy (another port)
+    # with its own sign-in.  The host's cookie counts only when the user's
+    # browser has also been past the sign-in page on this exact port.
+    if host in signed and _visited_past_signin(f"{url.split(':')[0].lower()}://{lm.group(1)}:{lm.group(2)}"):
+        return []
+    import time
+    hit = _signin_cache.get(url)
+    if not hit or time.monotonic() - hit[0] > 60:
+        hit = (time.monotonic(), _lands_on_signin(url))
+        _signin_cache[url] = hit
+    landed = hit[1]
+    if not landed:
+        return []
+    return [f"validate.url ({url}) opens on a sign-in page ({landed}): the user's browser has never "
+            f"been signed in at {lm.group(1)}:{lm.group(2)}, so the user would have to sign in before trying anything, a job left to the user "
+            "(and on a second copy of an app, signing in there can sign the user out of the copy the user "
+            "uses). Link the page on the copy and address the user is already signed in to, or bring the "
+            "change there. Only when the work is sign-in itself may the link be the sign-in page."]
+
+
 def review(message: str, facts=None) -> Optional[str]:
     """The reason to send the session back, or None when the card passes.
 
@@ -3106,7 +3302,7 @@ def review(message: str, facts=None) -> Optional[str]:
                 + words_card_problems(card) + errand_button_problems(card)
                 + device_order_problems(card)
                 + length_problems(card) + machinery_problems(card) + variant_name_problems(card)
-                + broken_link_problems(card))
+                + broken_link_problems(card) + signin_wall_problems(card))
     hits = _checks(card, prose)
     labels = label_problems(card, prose)
     from engine import handoff_evidence

@@ -114,6 +114,8 @@ KNOBS = [
      "Set by the test suite to <pid>:<create time> of the pytest process; a Session Host shuts down once that process is gone, so a stopped test run leaves no host behind. Not for manual use."),
     ("VIBENODE_LINK_CHECK", "Session Engine", "1",
      "Set to 0 to stop Smart termination from sending back a summary whose pictures or pages on this app do not load. The test suite sets it to 0 for its made-up addresses."),
+    ("VIBENODE_SIGNIN_CHECK", "Session Engine", "1",
+     "Set to 0 to stop Smart termination from sending back a summary whose Validate page, on another port of this machine, lands on a sign-in page the user's browser holds no sign-in for. VIBENODE_LINK_CHECK=0 turns it off too (the test suite does)."),
     ("VIBENODE_CARD_PICTURES", "Session Engine", "1",
      "Set to 0 to stop saving a copy of each picture a passing summary shows (common/card_pictures.py); without the copies, a summary whose picture a session later deleted draws it broken. The test suite sets it to 0."),
     ("VIBENODE_CARD_PICTURES_DIR", "Session Engine", "",
