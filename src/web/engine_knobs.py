@@ -158,6 +158,8 @@ KNOBS = [
      "Set by the web-only restart path so the launcher does not kill the running engine. Not for manual use."),
     ("VIBENODE_DAEMON_PATH_AUGMENTED", "Session Engine", "",
      "Internal marker that the engine's PATH was already extended. Not for manual use."),
+    ("VIBENODE_ENGINE_ONLY", "Session Engine", "",
+     "Set by the Session Engine restart so the launcher starts only the engine and leaves the running web server alone. Not for manual use."),
     # Ports and paths
     ("VIBENODE_WEB_PORT", "Ports and paths", "5050", "Web server port."),
     ("VIBENODE_DAEMON_PORT", "Ports and paths", "5051", "Session Engine IPC port."),
@@ -209,6 +211,7 @@ KNOBS = [
 ]
 
 _INTERNAL = {"VIBENODE_PRESERVE_DAEMON", "VIBENODE_DAEMON_PATH_AUGMENTED",
+             "VIBENODE_ENGINE_ONLY",
              "VIBENODE_NO_BROWSER",
              "VIBENODE_HOST_FORBID_REAL_CLI", "VIBENODE_HOST_TEST_OWNER",
              # Engine → settings-hook handshake (src/engine/smart_termination_hook.py)

@@ -522,21 +522,30 @@ class TestSessionStateChange:
         resp = kanban_client.post('/api/kanban/session-state-change', json={})
         assert resp.status_code in (400, 200)
 
-    def test_unlinked_session_returns_not_linked(self, kanban_client):
+    def test_answers_at_once_and_queues(self, kanban_client):
         resp = kanban_client.post('/api/kanban/session-state-change',
                                   json={"session_id": "orphan", "state": "working"})
-        assert resp.status_code == 200
-        assert resp.get_json().get("linked") is False
+        assert resp.status_code == 202
+        assert resp.get_json()["queued"] is True
 
-    def test_working_state_transitions_linked_task(self, kanban_app):
+    def test_working_state_transitions_linked_task(self, kanban_app, monkeypatch):
+        import time
+        from web.routes import kanban_api
         app, client, repo = kanban_app
         task = client.post('/api/kanban/tasks', json={"title": "Linked"}).get_json()
         client.post(f'/api/kanban/tasks/{task["id"]}/sessions',
                     json={"session_id": "sess-sc-1"})
+        started = []
+        real = kanban_api.handle_session_start
+        monkeypatch.setattr(kanban_api, "handle_session_start",
+                            lambda r, tid, **kw: started.append(tid) or real(r, tid, **kw))
         resp = client.post('/api/kanban/session-state-change',
                            json={"session_id": "sess-sc-1", "state": "working"})
-        assert resp.status_code == 200
-        assert resp.get_json()["linked"] is True
+        assert resp.status_code == 202
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not started:
+            time.sleep(0.02)
+        assert started == [task["id"]]
 
 
 # ---------------------------------------------------------------------------

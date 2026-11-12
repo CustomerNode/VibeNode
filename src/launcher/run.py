@@ -378,6 +378,20 @@ def _kill_port(port):
         except Exception:
             break
 
+# ---- Session Engine only ----
+# A Session Engine restart (/api/restart scope "daemon", which the automatic
+# restart-when-idle uses) starts only the engine.  The web server keeps
+# running and its client reconnects by itself.  Booting the whole app here
+# killed port 5050 as a cold start does, so every engine restart also took
+# the web server down and every open tab showed "VibeNode Server
+# Unreachable" for about ten seconds.  The restart command has already
+# stopped the old engine, so nothing is killed here: an engine the web's
+# reconnect loop started in the meantime is kept (ensure_daemon finds it).
+if os.environ.get("VIBENODE_ENGINE_ONLY") == "1":
+    ensure_daemon()
+    _boot_done.set()
+    sys.exit(0)
+
 if not _TEST_PORT:
     _update_boot_status("STEP:ports")
     # PORT-5050 RESTART-RACE FIX.

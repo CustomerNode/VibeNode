@@ -34,6 +34,8 @@ Rule of thumb: never call repo.get_children / repo.get_task_sessions /
 repo.get_ancestors in a loop.  Fetch all tasks once, compute in Python.
 """
 
+import logging
+import threading
 import os
 import subprocess
 import uuid as uuid_mod
@@ -1578,36 +1580,84 @@ def session_state_change():
     """Bridge: when a session changes state, update linked kanban task.
 
     Body: {session_id, state}
-    Called by the frontend socket.js when session_state events fire.
+    Called by the frontend socket.js on every session_state event.
+
+    Answers at once and does the work on one background thread.  The board
+    store can be remote (Supabase) and slow or down; answering only after it
+    replied held one browser connection per state change, and a browser
+    opens at most six to one site, so the whole page stalled behind them.
     """
-    try:
-        data = request.get_json(silent=True) or {}
-        session_id = data.get("session_id", "").strip()
-        state = data.get("state", "").strip()
-        if not session_id or not state:
-            return jsonify({"ok": False}), 400
+    data = request.get_json(silent=True) or {}
+    session_id = (data.get("session_id") or "").strip()
+    state = (data.get("state") or "").strip()
+    if not session_id or not state:
+        return jsonify({"ok": False}), 400
+    _state_bridge.submit(session_id, state)
+    return jsonify({"ok": True, "queued": True}), 202
 
-        repo = _get_repo()
-        task_id = repo.get_session_task(session_id)
-        if not task_id:
-            return jsonify({"ok": True, "linked": False})
 
-        task = repo.get_task(task_id)
-        if not task:
-            return jsonify({"ok": True, "linked": False})
+def _apply_session_state(session_id, state):
+    """Move the task linked to a session along with the session's state."""
+    repo = _get_repo()
+    task_id = repo.get_session_task(session_id)
+    if not task_id:
+        return
+    task = repo.get_task(task_id)
+    if not task:
+        return
+    if state in ("working",):
+        # Session became active -> task should be Working
+        updated = handle_session_start(repo, task_id, session_id=session_id)
+        _emit("kanban_task_updated", updated)
+    elif state in ("idle", "stopped"):
+        # Session went idle/stopped -> check if auto-advance needed
+        updated = handle_session_complete(repo, task_id, session_id=session_id)
+        _emit("kanban_task_updated", updated)
 
-        if state in ("working",):
-            # Session became active -> task should be Working
-            updated = handle_session_start(repo, task_id, session_id=session_id)
-            _emit("kanban_task_updated", updated)
-        elif state in ("idle", "stopped"):
-            # Session went idle/stopped -> check if auto-advance needed
-            updated = handle_session_complete(repo, task_id, session_id=session_id)
-            _emit("kanban_task_updated", updated)
 
-        return jsonify({"ok": True, "linked": True, "task_id": task_id})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+class _StateBridge:
+    """One worker thread; the newest state per session wins.
+
+    A burst of state events for one session (working, idle, working...)
+    while the store is slow becomes one call with the latest state, so a
+    slow store never builds a backlog.
+    """
+
+    def __init__(self, apply):
+        self._apply = apply
+        self._pending = {}
+        self._cond = threading.Condition()
+        self._thread = None
+
+    def submit(self, session_id, state):
+        with self._cond:
+            self._pending.pop(session_id, None)
+            self._pending[session_id] = state
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._run, daemon=True, name="kanban-state-bridge")
+                self._thread.start()
+            self._cond.notify()
+
+    def _run(self):
+        while True:
+            with self._cond:
+                while not self._pending:
+                    if not self._cond.wait(timeout=60):
+                        if not self._pending:
+                            self._thread = None
+                            return
+                session_id = next(iter(self._pending))
+                state = self._pending.pop(session_id)
+            try:
+                self._apply(session_id, state)
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    "kanban state bridge: %s -> %s failed", session_id, state,
+                    exc_info=True)
+
+
+_state_bridge = _StateBridge(lambda sid, st: _apply_session_state(sid, st))
 
 
 @bp.route("/api/kanban/tasks/<task_id>/ai-status", methods=["POST"])

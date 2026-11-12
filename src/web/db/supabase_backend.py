@@ -41,6 +41,9 @@ except ImportError:
         "Install it with:  pip install supabase"
     )
 
+# Seconds any one Supabase call may take before it fails.
+REQUEST_TIMEOUT_S = 10
+
 from .repository import (
     BoardColumn,
     KanbanRepository,
@@ -243,7 +246,18 @@ class SupabaseRepository(KanbanRepository):
         tables haven't been created yet — the caller should surface the
         setup SQL to the user.
         """
-        self.client = create_client(self._url, self._key)
+        # Every call has a time limit.  Without one, a Supabase project that
+        # accepts the connection but never answers held each request thread
+        # for minutes; the browser's few connections to VibeNode filled up
+        # with them and the whole page stalled ("Server Unreachable", slow
+        # session opens, project switches that never finished).
+        try:
+            from supabase import ClientOptions
+            options = ClientOptions(postgrest_client_timeout=REQUEST_TIMEOUT_S)
+        except Exception:
+            options = None
+        self.client = (create_client(self._url, self._key, options=options)
+                       if options is not None else create_client(self._url, self._key))
 
         # Smoke-test: try to read from the schema_version table.
         try:

@@ -325,6 +325,14 @@ def restart_server():
         # so active sessions and their CLI subprocesses are not killed.
         preserve_daemon = scope == "web"
 
+        # A Session Engine restart starts run.py in engine-only mode: it
+        # brings the engine back and exits, and this web server stays up.
+        # Relaunching the whole app was a cold start that killed port 5050
+        # too, so each automatic engine restart showed "Server Unreachable".
+        engine_only = scope == "daemon"
+        if engine_only:
+            entry_script = os.path.join(project_dir, "run.py")
+
         if sys.platform == "win32":
             pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
             if not os.path.exists(pythonw):
@@ -337,6 +345,8 @@ def restart_server():
             # Session Engine restart is a cold start for run.py (no
             # PRESERVE_DAEMON) and used to open a second VibeNode window.
             env_set += "$env:VIBENODE_NO_BROWSER='1'; "
+            if engine_only:
+                env_set += "$env:VIBENODE_ENGINE_ONLY='1'; "
             # PORT-5050 RESTART RACE.
             #
             # The kill loop MUST capture the target PIDs upfront and never
@@ -467,6 +477,8 @@ def restart_server():
             )
             # No new window on any restart (see the Windows branch).
             env_export += "export VIBENODE_NO_BROWSER=1; "
+            if engine_only:
+                env_export += "export VIBENODE_ENGINE_ONLY=1; "
             restart_log = os.path.join(project_dir, "logs", "restart.log")
             # Ensure logs dir exists so the bash redirect can't fail.
             try:
